@@ -5,14 +5,15 @@ import (
 )
 
 // handleKey translates GDK key events into bytes and writes them to the
-// PTY. Spike-grade: handles printable ASCII via the keyval's Unicode
-// mapping plus a small switch for the special keys you can't live
+// PTY. Spike-grade: handles printable text via the keyval's Unicode
+// mapping, plus a small switch for the special keys you can't live
 // without (Enter, Backspace, Tab, arrows, Esc). The proper key encoder
-// (modifiers, Kitty keyboard protocol) is Phase 2 work.
+// (full modifier handling, Kitty keyboard protocol) is later work.
 //
 // Returns true if we consumed the key.
-func handleKey(s *session, keyval uint, mods gdk.ModifierType) bool {
-	// Bytes we'll write to the PTY.
+func handleKey(s *Session, keyval uint, mods uint) bool {
+	gdkMods := gdk.ModifierType(mods)
+
 	var buf []byte
 
 	switch keyval {
@@ -43,16 +44,15 @@ func handleKey(s *session, keyval uint, mods gdk.ModifierType) bool {
 	case gdk.KEY_Delete:
 		buf = []byte("\x1b[3~")
 	default:
-		// gdk.KeyvalToUnicode returns 0 for non-character keys.
 		r := gdk.KeyvalToUnicode(keyval)
 		if r == 0 {
 			return false
 		}
-		// Ctrl-letter → control byte. Spike-only: ignores Ctrl-Shift,
-		// Ctrl-symbol, etc.
-		if mods&gdk.ControlMask != 0 && r >= 'a' && r <= 'z' {
+		// Ctrl-letter → control byte. Modifiers beyond plain Ctrl
+		// (Ctrl-Shift, Ctrl-Alt, etc.) are not handled yet.
+		if gdkMods&gdk.ControlMask != 0 && r >= 'a' && r <= 'z' {
 			buf = []byte{byte(r) - 'a' + 1}
-		} else if mods&gdk.ControlMask != 0 && r >= 'A' && r <= 'Z' {
+		} else if gdkMods&gdk.ControlMask != 0 && r >= 'A' && r <= 'Z' {
 			buf = []byte{byte(r) - 'A' + 1}
 		} else {
 			buf = []byte(string(rune(r)))
