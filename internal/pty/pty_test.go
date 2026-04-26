@@ -19,7 +19,7 @@ func TestPTYToRenderState(t *testing.T) {
 	t.Setenv("PS1", "$ ")        // a known prompt
 	t.Setenv("SHELL", "/bin/sh") // bypass the user's $SHELL for predictability
 
-	p, err := SpawnShell("", 60, 6)
+	p, err := SpawnShell("", 60, 6, "ROOST_PTY_TEST=1")
 	if err != nil {
 		t.Fatalf("SpawnShell: %v", err)
 	}

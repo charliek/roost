@@ -1,15 +1,20 @@
 package main
 
 import (
+	"errors"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
+	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
+	"github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/charliek/roost/internal/core"
+	"github.com/charliek/roost/internal/ipc"
 )
 
 // App is the top-level UI coordinator. It owns the workspace, every
@@ -21,11 +26,14 @@ type App struct {
 	ws     *core.Workspace
 	home   string
 
+	socketPath string
+	ipcServer  *ipc.Server
+
 	win *adw.ApplicationWindow
 
 	// One AdwTabView per project. Stack switches between them so each
 	// project keeps its own tab strip + selection state.
-	stack       *gtk.Stack
+	stack        *gtk.Stack
 	projectViews map[int64]*adw.TabView
 
 	// The sidebar is a Gtk.ListBox of project rows.
@@ -37,20 +45,25 @@ type App struct {
 	// page->tab lookup. Each AdwTabPage maps back to a tab ID so we
 	// can resolve user actions (close, reorder) to core state.
 	pageTabs map[*adw.TabPage]int64
+	// tab->page reverse lookup, used for badge updates from the IPC
+	// goroutine via glib.IdleAdd.
+	tabPages map[int64]*adw.TabPage
 
 	activeProjectID int64
 }
 
 // NewApp wires the app together. The window is built in activate.
-func NewApp(gtkApp *adw.Application, ws *core.Workspace, home string) *App {
+func NewApp(gtkApp *adw.Application, ws *core.Workspace, home, socketPath string) *App {
 	return &App{
 		gtkApp:       gtkApp,
 		ws:           ws,
 		home:         home,
+		socketPath:   socketPath,
 		projectViews: map[int64]*adw.TabView{},
 		projectRows:  map[int64]*gtk.ListBoxRow{},
 		sessions:     map[int64]*Session{},
 		pageTabs:     map[*adw.TabPage]int64{},
+		tabPages:     map[int64]*adw.TabPage{},
 	}
 }
 
@@ -121,7 +134,9 @@ func (a *App) activate() {
 	a.win.SetContent(root)
 
 	a.installShortcuts()
+	a.subscribeWorkspace()
 	a.rehydrate()
+	a.startIPC()
 
 	a.win.ConnectCloseRequest(func() bool {
 		a.shutdown()
@@ -129,6 +144,114 @@ func (a *App) activate() {
 	})
 
 	a.win.Present()
+}
+
+// startIPC opens the Unix socket server. Failure is logged but
+// non-fatal — the GUI still works without the companion CLI.
+func (a *App) startIPC() {
+	a.ipcServer = ipc.NewServer(a.socketPath, a)
+	if err := a.ipcServer.Start(); err != nil {
+		slog.Error("ipc start", "err", err)
+		a.ipcServer = nil
+		return
+	}
+	slog.Info("ipc listening", "socket", a.socketPath)
+}
+
+// subscribeWorkspace bridges core events to the UI. Subscribers run on
+// the goroutine that triggered the event, so each handler marshals to
+// the GTK main thread via glib.IdleAdd before touching widgets.
+func (a *App) subscribeWorkspace() {
+	ch := a.ws.Subscribe(64)
+	go func() {
+		for ev := range ch {
+			ev := ev
+			coreglib.IdleAdd(func() bool {
+				a.handleEvent(ev)
+				return false
+			})
+		}
+	}()
+}
+
+func (a *App) handleEvent(ev core.Event) {
+	switch ev.Kind {
+	case core.EventNotification:
+		a.handleNotification(ev.TabID, ev.Title, ev.Body)
+	}
+}
+
+// handleNotification updates tab + project visual state when something
+// notifies us. Active tab is left alone (you're already looking at it).
+func (a *App) handleNotification(tabID int64, title, body string) {
+	page, ok := a.tabPages[tabID]
+	if !ok {
+		slog.Warn("notification for unknown tab", "tab", tabID)
+		return
+	}
+	if a.tabIsActive(tabID) {
+		// Already focused — no badge, no desktop notification.
+		slog.Info("notification (suppressed; tab active)", "tab", tabID, "title", title)
+		return
+	}
+	page.SetNeedsAttention(true)
+
+	n := gio.NewNotification(title)
+	if body != "" {
+		n.SetBody(body)
+	}
+	// Notification ID is per-tab so a second notification on the same
+	// tab replaces the first instead of stacking.
+	id := "roost.tab." + strconv.FormatInt(tabID, 10)
+	a.gtkApp.Application.SendNotification(id, n)
+	slog.Info("notification", "tab", tabID, "title", title, "body", body)
+}
+
+func (a *App) tabIsActive(tabID int64) bool {
+	view := a.projectViews[a.activeProjectID]
+	if view == nil {
+		return false
+	}
+	page := view.SelectedPage()
+	if page == nil {
+		return false
+	}
+	if id, ok := a.pageTabs[page]; ok {
+		return id == tabID && a.win.IsActive()
+	}
+	return false
+}
+
+// --- ipc.Handler --------------------------------------------------------
+
+func (a *App) Notify(tabID int64, title, body string) error {
+	if tabID == 0 {
+		return errors.New("tab_id required (set ROOST_TAB_ID or pass --tab)")
+	}
+	return a.ws.Notify(tabID, title, body)
+}
+
+func (a *App) SetTitle(tabID int64, title string) error {
+	if tabID == 0 {
+		return errors.New("tab_id required (set ROOST_TAB_ID or pass --tab)")
+	}
+	return a.ws.UpdateTabTitle(tabID, title)
+}
+
+func (a *App) Identify() ipc.Identity {
+	id := ipc.Identity{
+		SocketPath: a.socketPath,
+		PID:        os.Getpid(),
+	}
+	id.ActiveProjectID = a.activeProjectID
+	if view := a.projectViews[a.activeProjectID]; view != nil {
+		if page := view.SelectedPage(); page != nil {
+			if tid, ok := a.pageTabs[page]; ok {
+				id.ActiveTabID = tid
+			}
+		}
+	}
+	return id
 }
 
 // rehydrate reads every persisted project + tab and recreates UI for
@@ -179,6 +302,7 @@ func (a *App) addProjectUI(p core.Project) {
 		if page == nil {
 			return
 		}
+		page.SetNeedsAttention(false) // user's looking at it now
 		if id, ok := a.pageTabs[page]; ok {
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
@@ -200,14 +324,19 @@ func (a *App) addProjectUI(p core.Project) {
 }
 
 // addTabUI creates a Session for the tab and adds a tab page to the
-// project's TabView.
+// project's TabView. Injects ROOST_TAB_ID + ROOST_SOCKET into the
+// shell's env so the companion CLI inside the tab can call back.
 func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	view, ok := a.projectViews[projectID]
 	if !ok {
 		slog.Warn("addTabUI: missing project view", "project", projectID)
 		return
 	}
-	sess, err := NewSession(a.ws, tab, initialCols, initialRows)
+	env := []string{
+		"ROOST_TAB_ID=" + strconv.FormatInt(tab.ID, 10),
+		"ROOST_SOCKET=" + a.socketPath,
+	}
+	sess, err := NewSession(a.ws, tab, initialCols, initialRows, env...)
 	if err != nil {
 		slog.Error("NewSession", "tab", tab.ID, "err", err)
 		return
@@ -218,6 +347,28 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	page.SetTitle(displayTitle(tab))
 	page.SetLiveThumbnail(false)
 	a.pageTabs[page] = tab.ID
+	a.tabPages[tab.ID] = page
+
+	// OSC 0/1/2 title updates → refresh tab page + persist.
+	tabID := tab.ID
+	sess.onTitleChanged = func(title string) {
+		if title == "" {
+			page.SetTitle(displayTitle(sess.tab))
+			return
+		}
+		page.SetTitle(title)
+		_ = a.ws.UpdateTabTitle(tabID, title)
+	}
+	// OSC 7 cwd updates → persist for next-launch shell spawn.
+	sess.onPWDChanged = func(cwd string) {
+		if cwd == "" {
+			return
+		}
+		_ = a.ws.UpdateTabCWD(tabID, cwd)
+	}
+
+	// Clearing the badge when the user actually looks at the tab is
+	// done in the project view's selected-page notify handler below.
 }
 
 func displayTitle(t core.Tab) string {
@@ -352,6 +503,7 @@ func (a *App) closeTab(page *adw.TabPage) {
 		return
 	}
 	delete(a.pageTabs, page)
+	delete(a.tabPages, tabID)
 
 	sess, ok := a.sessions[tabID]
 	if ok {
@@ -425,6 +577,9 @@ func (a *App) switchProjectByIndex(idx int) {
 
 // shutdown closes every Session cleanly. Called on window close.
 func (a *App) shutdown() {
+	if a.ipcServer != nil {
+		_ = a.ipcServer.Close()
+	}
 	for _, s := range a.sessions {
 		s.Close()
 	}

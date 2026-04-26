@@ -21,19 +21,20 @@ type PTY struct {
 }
 
 // SpawnShell starts $SHELL inside a fresh PTY at the given grid size.
-// Returns a PTY whose master fd is ready for read/write. Caller must
-// eventually call Close.
-func SpawnShell(cwd string, cols, rows uint16) (*PTY, error) {
+// extraEnv is appended after os.Environ + TERM/COLORTERM, so it can be
+// used to set Roost-specific env (ROOST_TAB_ID, ROOST_SOCKET) that the
+// companion CLI reads from inside the shell.
+func SpawnShell(cwd string, cols, rows uint16, extraEnv ...string) (*PTY, error) {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/sh"
 	}
 
 	cmd := exec.Command(shell)
-	cmd.Env = append(os.Environ(),
-		"TERM=xterm-256color",
-		"COLORTERM=truecolor",
-	)
+	env := append([]string{}, os.Environ()...)
+	env = append(env, "TERM=xterm-256color", "COLORTERM=truecolor")
+	env = append(env, extraEnv...)
+	cmd.Env = env
 	if cwd != "" {
 		cmd.Dir = cwd
 	}

@@ -28,8 +28,10 @@ type Event struct {
 	Kind      EventKind
 	Project   *Project // populated for project events
 	Tab       *Tab     // populated for tab events
-	ProjectID int64    // populated for ProjectDeleted
-	TabID     int64    // populated for TabDeleted
+	ProjectID int64    // populated for ProjectDeleted and EventNotification
+	TabID     int64    // populated for TabDeleted and EventNotification
+	Title     string   // populated for EventNotification
+	Body      string   // populated for EventNotification
 }
 
 // EventKind is the type discriminator for Event.
@@ -42,6 +44,10 @@ const (
 	EventTabAdded
 	EventTabUpdated
 	EventTabDeleted
+	// EventNotification fires when something (the CLI, an OSC parser,
+	// future hooks) requests a notification on a tab. Subscribers are
+	// expected to handle UI badging + desktop notification surface.
+	EventNotification
 )
 
 // Workspace owns the persistent state and broadcasts changes.
@@ -172,6 +178,17 @@ func (w *Workspace) DeleteTab(id int64) error {
 		return err
 	}
 	w.emit(Event{Kind: EventTabDeleted, TabID: id})
+	return nil
+}
+
+// Notify emits an EventNotification for a tab. Does not persist
+// anything; notifications are ephemeral state that lives in memory and
+// in the UI.
+func (w *Workspace) Notify(tabID int64, title, body string) error {
+	if title == "" {
+		return errors.New("core: notification title required")
+	}
+	w.emit(Event{Kind: EventNotification, TabID: tabID, Title: title, Body: body})
 	return nil
 }
 

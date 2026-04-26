@@ -13,6 +13,7 @@ import (
 
 	"github.com/charliek/roost/internal/core"
 	"github.com/charliek/roost/internal/ghostty"
+	"github.com/charliek/roost/internal/osc"
 	"github.com/charliek/roost/internal/pty"
 )
 
@@ -45,12 +46,35 @@ type Session struct {
 	// wait until all IdleAdd callbacks from pump have been queued
 	// before scheduling its own cleanup callback at the end.
 	pumpDone chan struct{}
+
+	// onTitleChanged is invoked on the GTK main thread when the
+	// terminal's OSC-set title changes. The App wires this up to
+	// refresh the AdwTabPage title and persist via core.Workspace.
+	onTitleChanged func(string)
+
+	// lastTitle is the most recent title we surfaced to the App, used
+	// to debounce changes (vt_write may run hundreds of times per
+	// second; we only want to fire when the title actually changes).
+	lastTitle string
+
+	// lastPWD mirrors lastTitle for the cwd reported via OSC 7.
+	lastPWD string
+
+	// onPWDChanged is invoked on the main thread on cwd updates.
+	onPWDChanged func(string)
+
+	// osc is the streaming OSC scanner used as a fallback notification
+	// path. Fed from the pump goroutine in parallel with vt_write.
+	osc *osc.Scanner
 }
 
 // NewSession spawns a shell at the tab's persisted cwd, allocates a
 // libghostty terminal + render state, builds the DrawingArea, and
 // starts the PTY-pump goroutine. Caller adds da to a parent widget.
-func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16) (*Session, error) {
+//
+// extraEnv is forwarded to pty.SpawnShell so callers can inject
+// ROOST_TAB_ID + ROOST_SOCKET (or any tab-specific env).
+func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ...string) (*Session, error) {
 	term, err := ghostty.NewTerminal(ghostty.Options{
 		Cols: cols, Rows: rows, MaxScrollback: 2000,
 	})
@@ -62,7 +86,7 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16) (*Session, 
 		term.Close()
 		return nil, err
 	}
-	p, err := pty.SpawnShell(tab.CWD, cols, rows)
+	p, err := pty.SpawnShell(tab.CWD, cols, rows, extraEnv...)
 	if err != nil {
 		rs.Close()
 		term.Close()
@@ -110,6 +134,24 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16) (*Session, 
 	return s, nil
 }
 
+// oscScanner returns the per-session OSC scanner. Lazily allocated so
+// sessions that never receive an OSC notification don't pay the cost.
+// Called only from the pump goroutine.
+func (s *Session) oscScanner() *osc.Scanner {
+	if s.osc == nil {
+		tabID := s.tab.ID
+		ws := s.ws
+		s.osc = osc.NewScanner(func(n osc.Notification) {
+			title := n.Title
+			if title == "" {
+				title = "(notification)"
+			}
+			_ = ws.Notify(tabID, title, n.Body)
+		})
+	}
+	return s.osc
+}
+
 // DrawingArea returns the widget to host inside a tab page.
 func (s *Session) DrawingArea() *gtk.DrawingArea { return s.da }
 
@@ -149,12 +191,17 @@ func (s *Session) pumpPTY() {
 		n, err := s.pty.Read(buf)
 		if n > 0 {
 			chunk := append([]byte{}, buf[:n]...)
+			// OSC scanning happens in the pump goroutine so we don't
+			// burn main-thread cycles on byte-by-byte parsing. The
+			// scanner only fires the workspace event channel — no GTK.
+			s.oscScanner().Feed(chunk)
 			glib.IdleAdd(func() {
 				if s.closed.Load() {
 					return
 				}
 				s.term.VTWrite(chunk)
 				_ = s.rs.Update(s.term)
+				s.checkTitleAndPWD()
 				s.da.QueueDraw()
 			})
 		}
@@ -183,6 +230,27 @@ func (s *Session) measureCells() {
 	}
 	s.cellW = float64(w)
 	s.cellH = float64(h)
+}
+
+// checkTitleAndPWD polls the terminal's OSC-set title and cwd after a
+// vt_write. Cheap (one cgo call each) and runs only when the on-change
+// callback is set. Fires the callback only when the value actually
+// changes.
+func (s *Session) checkTitleAndPWD() {
+	if s.onTitleChanged != nil {
+		t := s.term.Title()
+		if t != s.lastTitle {
+			s.lastTitle = t
+			s.onTitleChanged(t)
+		}
+	}
+	if s.onPWDChanged != nil {
+		p := s.term.PWD()
+		if p != s.lastPWD {
+			s.lastPWD = p
+			s.onPWDChanged(p)
+		}
+	}
 }
 
 // onResize reflows the terminal to fit the new pixel dimensions. Called

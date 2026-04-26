@@ -47,7 +47,7 @@ func main() {
 	}
 
 	gtkApp := adw.NewApplication("dev.charliek.roost", 0)
-	app := NewApp(gtkApp, ws, home)
+	app := NewApp(gtkApp, ws, home, paths.SocketPath())
 	gtkApp.ConnectActivate(app.activate)
 	if code := gtkApp.Run(os.Args); code > 0 {
 		log.Fatalf("roost exited with code %d", code)

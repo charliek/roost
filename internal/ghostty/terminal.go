@@ -77,3 +77,30 @@ func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
 	}
 	return nil
 }
+
+// Title returns the terminal's current title (set via OSC 0/1/2). Empty
+// if no title has been set. The returned string is a Go-owned copy; the
+// underlying libghostty buffer can be reused on the next vt_write.
+func (t *Terminal) Title() string {
+	var s C.GhosttyString
+	if rc := C.ghostty_terminal_get(t.c, C.GHOSTTY_TERMINAL_DATA_TITLE, unsafe.Pointer(&s)); rc != C.GHOSTTY_SUCCESS {
+		return ""
+	}
+	if s.ptr == nil || s.len == 0 {
+		return ""
+	}
+	return C.GoStringN((*C.char)(unsafe.Pointer(s.ptr)), C.int(s.len))
+}
+
+// PWD returns the terminal's working directory (set via OSC 7). Empty
+// if no pwd has been reported.
+func (t *Terminal) PWD() string {
+	var s C.GhosttyString
+	if rc := C.ghostty_terminal_get(t.c, C.GHOSTTY_TERMINAL_DATA_PWD, unsafe.Pointer(&s)); rc != C.GHOSTTY_SUCCESS {
+		return ""
+	}
+	if s.ptr == nil || s.len == 0 {
+		return ""
+	}
+	return C.GoStringN((*C.char)(unsafe.Pointer(s.ptr)), C.int(s.len))
+}
