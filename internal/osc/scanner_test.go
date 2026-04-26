@@ -81,6 +81,18 @@ func TestMalformedRecoversToOutside(t *testing.T) {
 	}
 }
 
+// Back-to-back ESC-terminated OSC sequences where the first's
+// trailing ESC is followed by an ESC starting the second instead of a
+// `\`. The first should be discarded as malformed and the second
+// should still fire.
+func TestOSCBackToBackAfterMalformedSTRecovers(t *testing.T) {
+	s, got := collect(t)
+	s.Feed([]byte("\x1b]9;first\x1b\x1b]9;second\x07"))
+	if len(*got) != 1 || (*got)[0].Title != "second" {
+		t.Fatalf("got %+v", *got)
+	}
+}
+
 func TestBodyTruncatedAtMax(t *testing.T) {
 	s, got := collect(t)
 	s.Feed([]byte("\x1b]9;"))

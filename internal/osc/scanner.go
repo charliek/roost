@@ -115,9 +115,16 @@ func (s *Scanner) step(b byte) {
 	case stateBodyEsc:
 		if b == '\\' {
 			s.dispatch()
+			s.state = stateOutside
+			return
 		}
-		// Any byte other than \ aborts the sequence (malformed).
+		// Any byte other than \ aborts the sequence (malformed). Re-feed
+		// the byte through the outer state machine so that an ESC
+		// starting a new OSC sequence isn't lost — back-to-back OSC
+		// notifications terminated with ESC + non-\ would otherwise
+		// silently swallow the second sequence's start.
 		s.state = stateOutside
+		s.step(b)
 	}
 }
 
