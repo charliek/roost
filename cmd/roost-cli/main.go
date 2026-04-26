@@ -4,9 +4,9 @@
 // (typically by Claude Code hooks).
 //
 // Usage:
-//   roost notify --title "Build done" [--body "..."] [--tab <id>]
-//   roost set-title "my-tab"
-//   roost identify
+//   roost-cli notify --title "Build done" [--body "..."] [--tab <id>]
+//   roost-cli set-title "my-tab"
+//   roost-cli identify
 //
 // Tab id falls back to $ROOST_TAB_ID when --tab is not given. Socket
 // path falls back to $ROOST_SOCKET, then the platform default.
@@ -50,9 +50,9 @@ func main() {
 
 func usage(w *os.File) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  roost notify --title TITLE [--body BODY] [--tab ID]")
-	fmt.Fprintln(w, "  roost set-title --title TITLE [--tab ID]")
-	fmt.Fprintln(w, "  roost identify")
+	fmt.Fprintln(w, "  roost-cli notify --title TITLE [--body BODY] [--tab ID]")
+	fmt.Fprintln(w, "  roost-cli set-title --title TITLE [--tab ID]")
+	fmt.Fprintln(w, "  roost-cli identify")
 }
 
 func cmdNotify(args []string) int {
