@@ -1,0 +1,12 @@
+/roost
+/roost-cli
+/build/out/
+/build/.cache/
+/build/ghostty-src/
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
