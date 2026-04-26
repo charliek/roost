@@ -41,7 +41,10 @@ func main() {
 	defer st.Close()
 
 	ws := core.New(st)
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("os.UserHomeDir: %v", err)
+	}
 	if _, _, err := ws.EnsureDefault(home); err != nil {
 		log.Fatalf("EnsureDefault: %v", err)
 	}
