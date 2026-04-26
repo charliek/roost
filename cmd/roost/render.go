@@ -32,9 +32,15 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 	textBuf := make([]byte, 0, 8)
 
+	// Cursor cell info captured during the walk; drawn *after* the
+	// walk so the inverted block goes on top of the underlying glyph.
+	cx, cy, cursorVisible := s.rs.CursorPos()
+	var cursorCodepoint rune
+	cursorHasCell := false
+
 	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
-		x := pad + float64(col)*cellW
-		y := pad + float64(row)*cellH
+		x := pad + float64(col*cellW)
+		y := pad + float64(row*cellH)
 
 		fg := defaultFG
 		bg := defaultBG
@@ -52,23 +58,28 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 		if hasExplicitBG {
 			setRGB(cr, bg)
-			cr.Rectangle(x, y, cellW, cellH)
+			cr.Rectangle(x, y, float64(cellW), float64(cellH))
 			cr.Fill()
+		}
+		if cursorVisible && row == cy && col == cx && cell.Codepoint != 0 {
+			cursorCodepoint = cell.Codepoint
+			cursorHasCell = true
 		}
 		if cell.Codepoint == 0 {
 			return
 		}
 
+		if cell.Bold {
+			layout.SetFontDescription(s.fontBold)
+		}
 		textBuf = textBuf[:0]
 		textBuf = appendRune(textBuf, cell.Codepoint)
 		layout.SetText(string(textBuf))
 		setRGB(cr, fg)
 		cr.MoveTo(x, y)
 		pangocairo.ShowLayout(cr, layout)
-
 		if cell.Bold {
-			cr.MoveTo(x+1, y)
-			pangocairo.ShowLayout(cr, layout)
+			layout.SetFontDescription(s.font)
 		}
 	}); err != nil {
 		// libghostty's row iterator failed. Frame so far is partial;
@@ -78,13 +89,36 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		slog.Warn("render-state walk", "err", err)
 	}
 
-	if cx, cy, visible := s.rs.CursorPos(); visible {
-		x := pad + float64(cx)*cellW
-		y := pad + float64(cy)*cellH
-		setRGB(cr, defaultFG)
-		cr.SetLineWidth(1)
-		cr.Rectangle(x+0.5, y+0.5, cellW-1, cellH-1)
-		cr.Stroke()
+	if cursorVisible {
+		x := pad + float64(cx*cellW)
+		y := pad + float64(cy*cellH)
+		w := float64(cellW)
+		h := float64(cellH)
+
+		switch {
+		case !s.windowFocused:
+			// Unfocused: hollow outline only, no blink.
+			setRGB(cr, defaultFG)
+			cr.SetLineWidth(1)
+			cr.Rectangle(x+0.5, y+0.5, w-1, h-1)
+			cr.Stroke()
+		case s.cursorOn:
+			// Focused + on phase: solid block in FG, glyph in BG.
+			setRGB(cr, defaultFG)
+			cr.Rectangle(x, y, w, h)
+			cr.Fill()
+			if cursorHasCell {
+				textBuf = textBuf[:0]
+				textBuf = appendRune(textBuf, cursorCodepoint)
+				layout.SetFontDescription(s.font)
+				layout.SetText(string(textBuf))
+				setRGB(cr, defaultBG)
+				cr.MoveTo(x, y)
+				pangocairo.ShowLayout(cr, layout)
+			}
+		}
+		// Focused + off phase: draw nothing — the underlying cell
+		// already painted in the walk above shows through.
 	}
 }
 

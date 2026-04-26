@@ -18,9 +18,17 @@ import (
 const (
 	initialCols = 80
 	initialRows = 24
-	fontFamily  = "Monaco"
-	fontSizePt  = 12
-	pad         = 4
+	pad         = 8
+)
+
+// fontFamily and fontSizePt are populated from the user's config at
+// startup (with built-in defaults from internal/config). Globals
+// because they're consumed deep inside Session construction; promoting
+// them into a struct would mean threading a config object through every
+// constructor.
+var (
+	fontFamily = "JetBrains Mono, Monaco, monospace"
+	fontSizePt = 12
 )
 
 func main() {
@@ -33,6 +41,12 @@ func main() {
 	if err := paths.EnsureDirs(); err != nil {
 		log.Fatalf("config.EnsureDirs: %v", err)
 	}
+	cfg, err := paths.Load()
+	if err != nil {
+		log.Fatalf("config.Load: %v", err)
+	}
+	fontFamily = cfg.FontFamily
+	fontSizePt = cfg.FontSizePt
 
 	st, err := store.Open(paths.DBPath())
 	if err != nil {

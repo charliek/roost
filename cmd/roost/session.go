@@ -17,6 +17,10 @@ import (
 	"github.com/charliek/roost/internal/pty"
 )
 
+// blinkPeriodMs is the cursor blink half-period in milliseconds. 530ms
+// matches xterm/iTerm; faster reads as jittery, slower reads as dead.
+const blinkPeriodMs = 530
+
 // Session is one tab's runtime state: the persistent record from core
 // plus the PTY, libghostty terminal, render state, and the drawing area
 // that hosts it. One Session per open tab; alive even when not visible
@@ -30,11 +34,20 @@ type Session struct {
 	rs   *ghostty.RenderState
 	da   *gtk.DrawingArea
 
-	font  *pango.FontDescription
-	cellW float64
-	cellH float64
-	cols  uint16
-	rows  uint16
+	font     *pango.FontDescription
+	fontBold *pango.FontDescription
+	cellW    int
+	cellH    int
+	cols     uint16
+	rows     uint16
+
+	// cursorOn is the current blink phase. windowFocused mirrors the
+	// containing window's is-active so the cursor stops blinking and
+	// degrades to a hollow outline when the window is unfocused.
+	// blinkSrc is the timeout source ID, removed in Close.
+	cursorOn      bool
+	windowFocused bool
+	blinkSrc      glib.SourceHandle
 
 	// closed is set to true when Close has been called. The PTY-pump
 	// goroutine's queued IdleAdd callbacks check it before touching
@@ -62,6 +75,11 @@ type Session struct {
 
 	// onPWDChanged is invoked on the main thread on cwd updates.
 	onPWDChanged func(string)
+
+	// onPTYExit fires once when the PTY's read loop hits EOF (the
+	// child shell exited). Used by App to close the tab page so the
+	// view doesn't show a frozen post-exit screen.
+	onPTYExit func()
 
 	// osc is the streaming OSC scanner used as a fallback notification
 	// path. Fed from the pump goroutine in parallel with vt_write.
@@ -94,16 +112,25 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 	}
 
 	font := pango.NewFontDescription()
-	font.SetFamily(fontFamily)
+	// Resolve "JetBrains Mono, Monaco, monospace" → the first installed
+	// family. Avoids Pango falling back to Verdana on macOS when the
+	// head of the list is missing (which produces wide cells with
+	// narrow glyphs and huge gaps between letters).
+	font.SetFamily(pickFontFamily(fontFamily))
 	font.SetSize(fontSizePt * pango.SCALE)
+	fontBold := font.Copy()
+	fontBold.SetWeight(pango.WeightBold)
 
 	s := &Session{
 		ws: ws, tab: tab,
 		pty: p, term: term, rs: rs,
-		font:     font,
-		cols:     cols,
-		rows:     rows,
-		pumpDone: make(chan struct{}),
+		font:          font,
+		fontBold:      fontBold,
+		cols:          cols,
+		rows:          rows,
+		pumpDone:      make(chan struct{}),
+		cursorOn:      true,
+		windowFocused: true,
 	}
 
 	s.da = gtk.NewDrawingArea()
@@ -112,11 +139,33 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 	s.da.SetCanFocus(true)
 	s.da.SetFocusable(true)
 	s.da.SetFocusOnClick(true)
+	// NOTE: pango_cairo_context_set_font_options would normally pin
+	// glyph metrics to the integer pixel grid (the single biggest text
+	// crispness win) but the gotk4 binding for ContextSetFontOptions
+	// crashes — it expects cairo.FontOptions to follow the gextras
+	// "record" struct convention, which the cairo binding does not.
+	// We rely on integer cellW/cellH + bold-via-FontDescription
+	// instead; revisit if/when that binding is fixed upstream.
 	s.measureCells()
 	s.da.SetDrawFunc(func(_ *gtk.DrawingArea, cr *cairo.Context, _, _ int) {
 		drawTerminal(cr, s)
 	})
 	s.da.ConnectResize(s.onResize)
+
+	// Cursor blink. The toggle queues a redraw on the same DA; cheap
+	// enough to leave running at all times, but we still pause it when
+	// the window is unfocused (drawTerminal renders a hollow outline
+	// in that case). Removed in Close.
+	s.blinkSrc = glib.TimeoutAdd(blinkPeriodMs, func() bool {
+		if s.closed.Load() {
+			return false
+		}
+		if s.windowFocused {
+			s.cursorOn = !s.cursorOn
+			s.da.QueueDraw()
+		}
+		return true
+	})
 
 	keyCtrl := gtk.NewEventControllerKey()
 	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) (ok bool) {
@@ -167,6 +216,10 @@ func (s *Session) Close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
+	if s.blinkSrc != 0 {
+		glib.SourceRemove(s.blinkSrc)
+		s.blinkSrc = 0
+	}
 	_ = s.pty.Close()
 	<-s.pumpDone
 	// At this point no more IdleAdd callbacks will be queued from the
@@ -209,13 +262,27 @@ func (s *Session) pumpPTY() {
 			if err != io.EOF {
 				slog.Warn("pty read", "tab_id", s.tab.ID, "err", err)
 			}
+			// Notify the App that the shell exited so it can close
+			// the tab. Marshalled to the main thread because
+			// onPTYExit touches widgets. Guard against double-close
+			// in case Close() races us.
+			if cb := s.onPTYExit; cb != nil {
+				glib.IdleAdd(func() {
+					if s.closed.Load() {
+						return
+					}
+					cb()
+				})
+			}
 			return
 		}
 	}
 }
 
 // measureCells uses Pango to size one monospace cell. Called once at
-// construction; the renderer reads cellW/cellH on every draw.
+// construction; the renderer reads cellW/cellH on every draw. Stored
+// as ints so cell origins land on integer pixel boundaries (text
+// crispness).
 func (s *Session) measureCells() {
 	ctx := s.da.PangoContext()
 	layout := pango.NewLayout(ctx)
@@ -228,8 +295,8 @@ func (s *Session) measureCells() {
 	if h < 1 {
 		h = 16
 	}
-	s.cellW = float64(w)
-	s.cellH = float64(h)
+	s.cellW = w
+	s.cellH = h
 }
 
 // checkTitleAndPWD polls the terminal's OSC-set title and cwd after a
@@ -259,8 +326,8 @@ func (s *Session) onResize(width, height int) {
 	if s.closed.Load() {
 		return
 	}
-	cols := uint16((float64(width) - 2*pad) / s.cellW)
-	rows := uint16((float64(height) - 2*pad) / s.cellH)
+	cols := uint16((width - 2*pad) / s.cellW)
+	rows := uint16((height - 2*pad) / s.cellH)
 	if cols < 1 {
 		cols = 1
 	}
@@ -279,5 +346,18 @@ func (s *Session) onResize(width, height int) {
 		slog.Warn("pty resize", "tab_id", s.tab.ID, "err", err)
 	}
 	_ = s.rs.Update(s.term)
+	s.da.QueueDraw()
+}
+
+// SetWindowFocused updates the cursor blink state based on whether the
+// containing window has keyboard focus. Called from App in response to
+// the AdwApplicationWindow's is-active notify. When unfocused the
+// cursor is rendered as a hollow outline; on regain we snap back to
+// the on phase so it's immediately visible.
+func (s *Session) SetWindowFocused(focused bool) {
+	s.windowFocused = focused
+	if focused {
+		s.cursorOn = true
+	}
 	s.da.QueueDraw()
 }
