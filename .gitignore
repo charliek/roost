@@ -11,5 +11,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 *.swp
 *~
+coverage.out
+coverage.html
