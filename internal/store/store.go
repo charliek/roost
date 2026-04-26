@@ -42,8 +42,12 @@ type Tab struct {
 	LastActive  time.Time
 }
 
-// Store is the SQLite handle and migration state. Safe for concurrent
-// use only via the Methods below — they each take the DB lock.
+// Store is the SQLite handle and migration state. database/sql's
+// connection pool plus SQLite's own locking make the methods below
+// goroutine-safe for individual statements. Multi-statement sequences
+// (e.g. CreateProject's SELECT MAX(position) + INSERT) are not atomic
+// and should be called from a single goroutine — today that's the GTK
+// main thread.
 type Store struct {
 	db *sql.DB
 }

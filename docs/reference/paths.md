@@ -78,8 +78,8 @@ To wipe Roost's persistent state and start fresh:
 # macOS
 rm "$HOME/Library/Application Support/Roost/roost.db"*
 
-# Linux
-rm "$XDG_DATA_HOME/roost/roost.db"*
+# Linux (uses XDG_DATA_HOME with the spec-default fallback)
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/roost.db"*
 ```
 
 Relaunch `roost`. It will recreate the schema and a `default` project + tab.

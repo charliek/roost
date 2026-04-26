@@ -1,6 +1,8 @@
 package main
 
 import (
+	"log/slog"
+
 	"github.com/diamondburned/gotk4/pkg/cairo"
 	"github.com/diamondburned/gotk4/pkg/pangocairo"
 
@@ -30,7 +32,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 	textBuf := make([]byte, 0, 8)
 
-	_ = s.rs.Walk(func(row, col int, cell ghostty.Cell) {
+	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
 		x := pad + float64(col)*cellW
 		y := pad + float64(row)*cellH
 
@@ -68,7 +70,13 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 			cr.MoveTo(x+1, y)
 			pangocairo.ShowLayout(cr, layout)
 		}
-	})
+	}); err != nil {
+		// libghostty's row iterator failed. Frame so far is partial;
+		// no fallback paint — surfacing the error in the log is what
+		// we actually want, since this should never happen in normal
+		// operation.
+		slog.Warn("render-state walk", "err", err)
+	}
 
 	if cx, cy, visible := s.rs.CursorPos(); visible {
 		x := pad + float64(cx)*cellW

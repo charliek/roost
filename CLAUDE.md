@@ -26,7 +26,7 @@ GTK4 is strictly single-threaded. Every widget operation MUST happen on the main
 | PTY read/write              | Goroutine per tab                   |
 | `ghostty_terminal_vt_write` | **Main thread**                     |
 | `ghostty_render_state_*`    | **Main thread**                     |
-| SQLite writes               | Goroutine, serialized via channel   |
+| SQLite writes               | Goroutine-safe (database/sql handles locking) |
 | OSC handler dispatch        | Goroutine; marshal via `glib.IdleAdd` |
 
 PTY-read goroutine pushes raw bytes onto a per-tab buffered channel. A `glib.IdleAdd`-installed drain handler on the main thread pulls bytes and calls `ghostty_terminal_vt_write`. Never touch a libghostty-vt terminal handle from a goroutine. Never call any `gtk.*` or `glib.*` widget API from a goroutine.
