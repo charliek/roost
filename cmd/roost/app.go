@@ -9,7 +9,6 @@ import (
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
-	"github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
@@ -196,14 +195,8 @@ func (a *App) handleNotification(tabID int64, title, body string) {
 	}
 	page.SetNeedsAttention(true)
 
-	n := gio.NewNotification(title)
-	if body != "" {
-		n.SetBody(body)
-	}
-	// Notification ID is per-tab so a second notification on the same
-	// tab replaces the first instead of stacking.
 	id := "roost.tab." + strconv.FormatInt(tabID, 10)
-	a.gtkApp.Application.SendNotification(id, n)
+	sendDesktopNotification(a.gtkApp, id, title, body)
 	slog.Info("notification", "tab", tabID, "title", title, "body", body)
 }
 
