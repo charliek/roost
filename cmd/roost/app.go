@@ -231,20 +231,30 @@ func (a *App) SetTitle(tabID int64, title string) error {
 	return a.ws.UpdateTabTitle(tabID, title)
 }
 
+// Identify is called from the IPC server's per-connection goroutine
+// but reads activeProjectID, projectViews, and pageTabs which are
+// otherwise mutated only on the GTK main thread. Marshal the body
+// onto the main thread and block on a result channel to keep the
+// reads consistent.
 func (a *App) Identify() ipc.Identity {
-	id := ipc.Identity{
-		SocketPath: a.socketPath,
-		PID:        os.Getpid(),
-	}
-	id.ActiveProjectID = a.activeProjectID
-	if view := a.projectViews[a.activeProjectID]; view != nil {
-		if page := view.SelectedPage(); page != nil {
-			if tid, ok := a.pageTabs[page]; ok {
-				id.ActiveTabID = tid
+	done := make(chan ipc.Identity, 1)
+	coreglib.IdleAdd(func() bool {
+		id := ipc.Identity{
+			SocketPath:      a.socketPath,
+			PID:             os.Getpid(),
+			ActiveProjectID: a.activeProjectID,
+		}
+		if view := a.projectViews[a.activeProjectID]; view != nil {
+			if page := view.SelectedPage(); page != nil {
+				if tid, ok := a.pageTabs[page]; ok {
+					id.ActiveTabID = tid
+				}
 			}
 		}
-	}
-	return id
+		done <- id
+		return false
+	})
+	return <-done
 }
 
 // rehydrate reads every persisted project + tab and recreates UI for
