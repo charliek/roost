@@ -16,8 +16,11 @@ import (
 	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotk4/pkg/pangocairo"
 
+	"github.com/charliek/roost/internal/config"
+	"github.com/charliek/roost/internal/core"
 	"github.com/charliek/roost/internal/ghostty"
 	"github.com/charliek/roost/internal/pty"
+	"github.com/charliek/roost/internal/store"
 )
 
 const (
@@ -28,10 +31,13 @@ const (
 	pad         = 4
 )
 
-// session holds everything for one terminal: PTY, libghostty terminal,
-// render state, and the cell-size metrics the renderer measured. There's
-// only one of these in the spike; multi-tab moves it into core.
+// session holds everything for one terminal: the persistent tab record
+// from core, plus its PTY, libghostty terminal, render state, and the
+// cell-size metrics the renderer measured. Phase 2 will hold many of
+// these (one per open tab).
 type session struct {
+	ws    *core.Workspace
+	tab   core.Tab
 	pty   *pty.PTY
 	term  *ghostty.Terminal
 	rs    *ghostty.RenderState
@@ -43,14 +49,38 @@ type session struct {
 }
 
 func main() {
+	installLogFilter()
+
+	paths, err := config.Resolve()
+	if err != nil {
+		log.Fatalf("config.Resolve: %v", err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		log.Fatalf("config.EnsureDirs: %v", err)
+	}
+
+	st, err := store.Open(paths.DBPath())
+	if err != nil {
+		log.Fatalf("store.Open(%s): %v", paths.DBPath(), err)
+	}
+	defer st.Close()
+
+	ws := core.New(st)
+
+	home, _ := os.UserHomeDir()
+	_, tab, err := ws.EnsureDefault(home)
+	if err != nil {
+		log.Fatalf("EnsureDefault: %v", err)
+	}
+
 	app := adw.NewApplication("dev.charliek.roost", 0)
-	app.ConnectActivate(func() { activate(app) })
+	app.ConnectActivate(func() { activate(app, ws, tab) })
 	if code := app.Run(os.Args); code > 0 {
 		log.Fatalf("roost exited with code %d", code)
 	}
 }
 
-func activate(app *adw.Application) {
+func activate(app *adw.Application, ws *core.Workspace, tab core.Tab) {
 	win := adw.NewApplicationWindow(&app.Application)
 	win.SetTitle("Roost")
 	win.SetDefaultSize(900, 600)
@@ -64,7 +94,7 @@ func activate(app *adw.Application) {
 	surface.SetFocusable(true)
 	surface.SetFocusOnClick(true)
 
-	sess, err := newSession(initialCols, initialRows)
+	sess, err := newSession(ws, tab, initialCols, initialRows)
 	if err != nil {
 		log.Fatalf("newSession: %v", err)
 	}
@@ -112,7 +142,7 @@ func activate(app *adw.Application) {
 	surface.GrabFocus()
 }
 
-func newSession(cols, rows uint16) (*session, error) {
+func newSession(ws *core.Workspace, tab core.Tab, cols, rows uint16) (*session, error) {
 	term, err := ghostty.NewTerminal(ghostty.Options{Cols: cols, Rows: rows, MaxScrollback: 2000})
 	if err != nil {
 		return nil, err
@@ -122,7 +152,7 @@ func newSession(cols, rows uint16) (*session, error) {
 		term.Close()
 		return nil, err
 	}
-	p, err := pty.SpawnShell("", cols, rows)
+	p, err := pty.SpawnShell(tab.CWD, cols, rows)
 	if err != nil {
 		rs.Close()
 		term.Close()
@@ -133,7 +163,10 @@ func newSession(cols, rows uint16) (*session, error) {
 	font.SetFamily(fontFamily)
 	font.SetSize(fontSizePt * pango.SCALE)
 
-	return &session{pty: p, term: term, rs: rs, font: font, cols: cols, rows: rows}, nil
+	return &session{
+		ws: ws, tab: tab, pty: p, term: term, rs: rs,
+		font: font, cols: cols, rows: rows,
+	}, nil
 }
 
 // measureCells uses a temporary Pango layout to size one monospace cell.
