@@ -53,8 +53,8 @@ func TestPTYToRenderState(t *testing.T) {
 			term.VTWrite(buf[:n])
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
-				break
+			if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Logf("unexpected read error: %v", err)
 			}
 			break
 		}
