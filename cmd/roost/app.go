@@ -383,14 +383,18 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 			return
 		}
 		page.SetTitle(title)
-		_ = a.ws.UpdateTabTitle(tabID, title)
+		if err := a.ws.UpdateTabTitle(tabID, title); err != nil {
+			slog.Warn("UpdateTabTitle", "tab", tabID, "title", title, "err", err)
+		}
 	}
 	// OSC 7 cwd updates → persist for next-launch shell spawn.
 	sess.onPWDChanged = func(cwd string) {
 		if cwd == "" {
 			return
 		}
-		_ = a.ws.UpdateTabCWD(tabID, cwd)
+		if err := a.ws.UpdateTabCWD(tabID, cwd); err != nil {
+			slog.Warn("UpdateTabCWD", "tab", tabID, "cwd", cwd, "err", err)
+		}
 	}
 
 	// Clearing the badge when the user actually looks at the tab is
