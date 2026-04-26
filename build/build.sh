@@ -68,7 +68,13 @@ stage_build() {
   fi
 
   export CGO_CFLAGS="-I${OUT_DIR}/include"
-  export CGO_LDFLAGS="-L${OUT_DIR}/lib -lghostty-vt"
+  # Don't set CGO_LDFLAGS="-L... -lghostty-vt" here. The cgo directive in
+  # internal/ghostty/terminal.go already statically links libghostty-vt.a
+  # by absolute path. Adding -lghostty-vt makes macOS ld prefer the dylib
+  # over the static archive, embedding @rpath/libghostty-vt.dylib in the
+  # binary; without a matching -Wl,-rpath the result aborts at launch with
+  # `dyld: Library not loaded: @rpath/libghostty-vt.dylib / Reason: no
+  # LC_RPATH's found`. Static-only is what we want.
 
   echo "==> Building roost"
   cd "${ROOT_DIR}"
