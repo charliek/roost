@@ -22,6 +22,13 @@ type Handler interface {
 	Identify() Identity
 }
 
+// maxRequestBytes is the per-request size cap. Real requests
+// (notification.create, system.identify, tab.set_title) are well under
+// 1 KiB; the cap exists to bound memory if a misbehaving client streams
+// without ever sending a newline. Mode 0600 keeps the surface
+// local-user-only, but we still don't want a stuck client to OOM us.
+const maxRequestBytes = 1 << 20 // 1 MiB
+
 // Server listens on a Unix socket and dispatches Requests to a Handler.
 type Server struct {
 	socketPath string
@@ -97,11 +104,15 @@ func (s *Server) acceptLoop(l net.Listener) {
 
 func (s *Server) serve(conn net.Conn) {
 	defer conn.Close()
-	r := bufio.NewReader(conn)
+	r := bufio.NewReaderSize(conn, 64<<10)
 	enc := json.NewEncoder(conn)
 	for {
-		line, err := r.ReadBytes('\n')
+		line, err := readBoundedLine(r, maxRequestBytes)
 		if err != nil {
+			if errors.Is(err, errRequestTooLarge) {
+				_ = enc.Encode(Response{OK: false, Error: NewError(CodeBadRequest, "request exceeds max size")})
+				return
+			}
 			if err != io.EOF {
 				slog.Debug("ipc read", "err", err)
 			}
@@ -116,6 +127,33 @@ func (s *Server) serve(conn net.Conn) {
 		if err := enc.Encode(resp); err != nil {
 			return
 		}
+	}
+}
+
+// errRequestTooLarge signals a connection that streamed past the size
+// cap without sending a newline. We respond with bad_request and close.
+var errRequestTooLarge = errors.New("ipc: request exceeds max size")
+
+// readBoundedLine reads a single newline-terminated request, refusing
+// to grow past max bytes. Implemented in terms of bufio.Reader.ReadSlice
+// to avoid allocating per-byte; ReadSlice returns ErrBufferFull when the
+// underlying buffer fills, at which point we accumulate up to max and
+// then bail.
+func readBoundedLine(r *bufio.Reader, max int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(buf)+len(chunk) > max {
+			return nil, errRequestTooLarge
+		}
+		buf = append(buf, chunk...)
+		if err == nil {
+			return buf, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return buf, err
 	}
 }
 

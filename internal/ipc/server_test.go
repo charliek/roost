@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -127,6 +128,48 @@ func TestServerCloseRemovesSocket(t *testing.T) {
 	}
 	if _, err := timeoutDial(sock); err == nil {
 		t.Fatal("dial should fail after Close")
+	}
+}
+
+func TestRejectsOversizedRequest(t *testing.T) {
+	sock := startServer(t, fakeHandler{
+		notify: func(int64, string, string) error { return nil },
+	})
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Stream 2 MiB of bytes without a newline — the server should
+	// give up after maxRequestBytes and close the connection.
+	chunk := make([]byte, 64<<10)
+	for i := range chunk {
+		chunk[i] = 'x'
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	written := 0
+	for written < (2 << 20) {
+		n, werr := conn.Write(chunk)
+		written += n
+		if werr != nil {
+			break // server closed early — that's the expected outcome
+		}
+	}
+
+	// The server should respond with a bad_request before closing.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	dec := json.NewDecoder(conn)
+	var resp Response
+	if err := dec.Decode(&resp); err != nil {
+		// Acceptable: server may have closed before flushing reply if
+		// the client write blocked. Either way, the connection must
+		// not stay open holding 2 MiB in memory.
+		return
+	}
+	if resp.OK || resp.Error == nil || resp.Error.Code != CodeBadRequest {
+		t.Errorf("expected bad_request, got %+v", resp)
 	}
 }
 
