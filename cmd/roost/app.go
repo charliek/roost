@@ -296,8 +296,20 @@ func (a *App) addProjectUI(p core.Project) {
 
 	view := adw.NewTabView()
 	view.ConnectClosePage(func(page *adw.TabPage) bool {
+		// Resolve the project before closeTab mutates the lookup
+		// maps so we can check NPages on the right view *after*
+		// ClosePageFinish has actually removed the page.
+		pid := a.projectIDForPage(page)
 		a.closeTab(page)
 		view.ClosePageFinish(page, true)
+		if v := a.projectViews[pid]; v != nil && v.NPages() == 0 {
+			tab, err := a.ws.CreateTab(pid, a.home)
+			if err != nil {
+				slog.Error("CreateTab fallback", "err", err)
+			} else {
+				a.addTabUI(pid, tab)
+			}
+		}
 		return true // we handled it
 	})
 	view.NotifyProperty("selected-page", func() {
@@ -497,9 +509,23 @@ func (a *App) newTabInActiveProject() {
 	}
 }
 
-// closeTab handles AdwTabView::close-page. Frees the Session, deletes
-// the tab from the store, and prevents the project from going to zero
-// tabs (auto-creates a fresh one if it would).
+// projectIDForPage returns the project the page belongs to. Resolved
+// from the session's tab if available; falls back to the active
+// project. Used by the ConnectClosePage handler to remember which
+// project to refill after the close finishes.
+func (a *App) projectIDForPage(page *adw.TabPage) int64 {
+	if tabID, ok := a.pageTabs[page]; ok {
+		if sess, ok := a.sessions[tabID]; ok {
+			return sess.tab.ProjectID
+		}
+	}
+	return a.activeProjectID
+}
+
+// closeTab handles AdwTabView::close-page. Frees the Session and
+// deletes the tab from the store. The zero-tab fallback lives in the
+// ConnectClosePage handler so it can run *after* ClosePageFinish
+// removes the page from the view.
 func (a *App) closeTab(page *adw.TabPage) {
 	tabID, ok := a.pageTabs[page]
 	if !ok {
@@ -508,28 +534,13 @@ func (a *App) closeTab(page *adw.TabPage) {
 	delete(a.pageTabs, page)
 	delete(a.tabPages, tabID)
 
-	sess, ok := a.sessions[tabID]
-	if ok {
+	if sess, ok := a.sessions[tabID]; ok {
 		sess.Close()
 		delete(a.sessions, tabID)
 	}
 
-	pid := a.activeProjectID
-	if sess != nil {
-		pid = sess.tab.ProjectID
-	}
 	if err := a.ws.DeleteTab(tabID); err != nil {
 		slog.Error("DeleteTab", "err", err)
-	}
-
-	// Don't let the project (or the app) go to zero tabs.
-	if view := a.projectViews[pid]; view != nil && view.NPages() == 0 {
-		tab, err := a.ws.CreateTab(pid, a.home)
-		if err != nil {
-			slog.Error("CreateTab fallback", "err", err)
-			return
-		}
-		a.addTabUI(pid, tab)
 	}
 }
 
