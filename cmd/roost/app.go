@@ -667,12 +667,17 @@ func (a *App) newTabInActiveProject() {
 		return
 	}
 	cwd := a.home
-	// Inherit the active tab's cwd if we have one.
+	// Inherit the active tab's *current* cwd. Prefer lastPWD (live OSC 7)
+	// so Cmd-T after `cd` opens in the new directory; tab.CWD is only the
+	// snapshot at session creation.
 	if view := a.projectViews[a.activeProjectID]; view != nil {
 		if page := view.SelectedPage(); page != nil {
 			if id, ok := a.pageTabs[page]; ok {
 				if sess, ok := a.sessions[id]; ok {
-					cwd = sess.tab.CWD
+					cwd = sess.lastPWD
+					if cwd == "" {
+						cwd = sess.tab.CWD
+					}
 				}
 			}
 		}
