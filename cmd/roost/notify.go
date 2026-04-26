@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -33,10 +34,19 @@ func sendDesktopNotification(app *adw.Application, id, title, body string) {
 // sendMacNotification shells out to osascript. Inputs are escaped for
 // AppleScript string literal safety (backslash + double-quote). osascript
 // startup is ~50ms; debounce upstream if we ever fire many in a row.
+//
+// We Start the child and Wait on a goroutine so the kernel reaps the
+// process — without this, every notification leaks a zombie until the
+// parent exits.
 func sendMacNotification(title, body string) {
 	script := `display notification "` + escapeApplescript(body) +
 		`" with title "` + escapeApplescript(title) + `"`
-	_ = exec.Command("osascript", "-e", script).Start()
+	cmd := exec.Command("osascript", "-e", script)
+	if err := cmd.Start(); err != nil {
+		slog.Warn("osascript start", "err", err)
+		return
+	}
+	go func() { _ = cmd.Wait() }()
 }
 
 func escapeApplescript(s string) string {
