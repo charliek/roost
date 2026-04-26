@@ -638,8 +638,7 @@ func (a *App) newProject() {
 
 func (a *App) projectsByName() map[string]bool {
 	out := map[string]bool{}
-	for id, pr := range a.projectRows {
-		_ = id
+	for _, pr := range a.projectRows {
 		out[pr.label.Text()] = true
 	}
 	return out
@@ -1010,10 +1009,13 @@ func (a *App) removeProjectUI(pid int64) {
 		return
 	}
 	if a.activeProjectID == 0 {
-		// Pick the first remaining row.
-		for nextID := range a.projectViews {
-			a.selectProject(nextID)
-			break
+		// Pick the top-most remaining sidebar row. Map iteration over
+		// projectViews would be non-deterministic; the ListBox order
+		// matches what the user sees.
+		if row := a.sidebar.RowAtIndex(0); row != nil {
+			if id, err := strconv.ParseInt(row.Name(), 10, 64); err == nil {
+				a.selectProject(id)
+			}
 		}
 	}
 }
