@@ -82,20 +82,10 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	applied := map[int]bool{}
-	rows, err := s.db.Query(`SELECT version FROM schema_migrations`)
+	applied, err := s.loadAppliedMigrations()
 	if err != nil {
-		return fmt.Errorf("query migrations: %w", err)
+		return err
 	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return err
-		}
-		applied[v] = true
-	}
-	rows.Close()
 
 	files, err := fs.Glob(migrationsFS, "migrations/*.sql")
 	if err != nil {
@@ -137,6 +127,30 @@ func (s *Store) migrate() error {
 		}
 	}
 	return nil
+}
+
+// loadAppliedMigrations reads the schema_migrations table into a set
+// of applied versions. Errors during iteration are surfaced (via
+// rows.Err) so a transient driver failure can't masquerade as a clean
+// "no migrations applied" result, which would re-run them all.
+func (s *Store) loadAppliedMigrations() (map[int]bool, error) {
+	applied := map[int]bool{}
+	rows, err := s.db.Query(`SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("query migrations: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan schema_migrations: %w", err)
+		}
+		applied[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate schema_migrations: %w", err)
+	}
+	return applied, nil
 }
 
 // CreateProject inserts a new project. Position is auto-assigned to the
