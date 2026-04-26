@@ -4,7 +4,7 @@
 
 A cross-platform (Mac + Linux) desktop terminal multiplexer built around libghostty-vt. Sidebar of projects, tabs per project, one terminal per tab. The differentiator is multi-project workspace with notification routing for AI coding agents (Claude Code, Codex, etc.). Inspiration: cmux. Constraint: smaller scope than cmux.
 
-See `docs/spec.md` for the design doc and `docs/architecture.md` for diagrams.
+See `docs/development/spec.md` for the design doc and `docs/reference/architecture.md` for diagrams.
 
 ## Architecture
 
