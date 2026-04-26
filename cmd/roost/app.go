@@ -106,18 +106,19 @@ func (a *App) activate() {
 	a.stack.SetHExpand(true)
 	a.stack.SetVExpand(true)
 
-	contentBox := gtk.NewBox(gtk.OrientationVertical, 0)
-	contentBox.Append(header)
-	contentBox.Append(a.stack)
-
 	paned := gtk.NewPaned(gtk.OrientationHorizontal)
 	paned.SetStartChild(sidebarBox)
-	paned.SetEndChild(contentBox)
+	paned.SetEndChild(a.stack)
 	paned.SetResizeStartChild(false)
 	paned.SetShrinkStartChild(false)
 	paned.SetPosition(220)
 
-	a.win.SetContent(paned)
+	// HeaderBar at the very top of the window so GTK reserves space for
+	// the macOS traffic lights and the sidebar doesn't get clipped.
+	root := gtk.NewBox(gtk.OrientationVertical, 0)
+	root.Append(header)
+	root.Append(paned)
+	a.win.SetContent(root)
 
 	a.installShortcuts()
 	a.rehydrate()

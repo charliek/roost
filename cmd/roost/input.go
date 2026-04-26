@@ -10,9 +10,19 @@ import (
 // without (Enter, Backspace, Tab, arrows, Esc). The proper key encoder
 // (full modifier handling, Kitty keyboard protocol) is later work.
 //
-// Returns true if we consumed the key.
+// Returns true if we consumed the key. When the user holds Cmd (Meta on
+// macOS) or Super, we bail out so the window-level ShortcutController
+// can see the event for app-level keybindings (Cmd-T, Cmd-W, etc.).
 func handleKey(s *Session, keyval uint, mods uint) bool {
 	gdkMods := gdk.ModifierType(mods)
+
+	// Don't eat app shortcuts. On macOS, GTK's <primary> resolves to
+	// Meta (Cmd); on Linux it resolves to Ctrl, but we explicitly want
+	// Ctrl-letter to flow to the shell as control bytes there. Super
+	// (Linux Win key) is also reserved for app/system shortcuts.
+	if gdkMods&(gdk.MetaMask|gdk.SuperMask) != 0 {
+		return false
+	}
 
 	var buf []byte
 
