@@ -404,11 +404,15 @@ func displayTitle(t core.Tab) string {
 	return shorten(t.CWD, 22)
 }
 
+// shorten clamps a string to max display characters, prepending an
+// ellipsis if it had to be cut. Iterates runes rather than bytes so
+// CJK, emoji, and accented characters don't get sliced mid-codepoint.
 func shorten(s string, max int) string {
-	if len(s) <= max {
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
-	return "…" + s[len(s)-max+1:]
+	return "…" + string(runes[len(runes)-max+1:])
 }
 
 // selectProject switches the right-side Stack to the given project's
