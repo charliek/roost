@@ -22,6 +22,14 @@ Install the system packages:
 brew install gtk4 libadwaita pkgconf gobject-introspection
 ```
 
+Recommended: install JetBrains Mono. It's the default font Roost looks for and renders well through Pango/Cairo on macOS:
+
+```bash
+brew install --cask font-jetbrains-mono
+```
+
+Roost falls back to Monaco if JetBrains Mono isn't installed, but the fallback path on macOS is finicky (Pango can drop to Verdana when the requested family is missing) — see [Config keys](../reference/paths.md#config-keys) to override the family or set up your own preference order.
+
 If you don't already have [`mise`](https://mise.jdx.dev/), install it:
 
 ```bash
@@ -66,6 +74,12 @@ sudo apt install -y \
   build-essential git curl \
   libgtk-4-dev libadwaita-1-dev \
   pkgconf gobject-introspection libgirepository1.0-dev
+```
+
+Recommended: install JetBrains Mono (the default Roost looks for). On Debian/Ubuntu:
+
+```bash
+sudo apt install -y fonts-jetbrains-mono
 ```
 
 `mise` install (one-time, [official instructions](https://mise.jdx.dev/getting-started.html)):

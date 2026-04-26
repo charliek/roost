@@ -15,7 +15,7 @@ All Roost state lives under `~/Library/Application Support/Roost/`:
 | `~/Library/Application Support/Roost/roost.db-wal`  | SQLite write-ahead log (auto-created)             |
 | `~/Library/Application Support/Roost/roost.db-shm`  | SQLite shared memory (auto-created)               |
 | `~/Library/Application Support/Roost/roost.sock`    | Unix socket the GUI listens on                    |
-| `~/Library/Application Support/Roost/config.toml`   | User-editable config (Phase 4 — not used yet)     |
+| `~/Library/Application Support/Roost/config.toml`   | User-editable config; see [Config keys](#config-keys) below |
 
 ### Linux
 
@@ -28,6 +28,32 @@ Linux follows XDG conventions:
 | `$XDG_RUNTIME_DIR/roost/roost.sock`   | Unix socket; falls back to data dir when `XDG_RUNTIME_DIR` is unset |
 
 The directories are created at first launch with mode `0700`.
+
+## Config keys
+
+`config.toml` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored.
+
+| Key           | Default                              | Effect                                                 |
+|---------------|--------------------------------------|--------------------------------------------------------|
+| `font_family` | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
+| `font_size`   | `12`                                 | Pango points.                                          |
+
+Roost probes the system at startup for each candidate in `font_family` (left-to-right) and picks the first that's installed. Pango's own comma-separated fallback is unreliable on macOS — when the head of the list is missing it can silently fall through to a *proportional* font (Verdana), which produces wide cells with narrow glyphs and huge gaps between letters. The probe avoids that.
+
+If none of the requested families exist, Roost falls back to `monospace` and logs a warning at startup:
+
+```bash
+./roost 2>&1 | grep -i 'font:'
+```
+
+Successful family selection is logged at debug level only (silent on a normal launch); the surface signal is the absence of a warning.
+
+Example `config.toml`:
+
+```toml
+font_family = "Iosevka, JetBrains Mono, Monaco, monospace"
+font_size   = 13
+```
 
 ## Environment variables Roost sets
 

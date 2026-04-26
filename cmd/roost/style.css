@@ -1,0 +1,32 @@
+/* Roost UI overrides. Targets libadwaita 1.x; revisit on major bumps.
+ * Keep this small — every rule is a surface that can fight a future
+ * libadwaita restyle. */
+
+/* Sidebar selection: libadwaita's default selection is faint; promote
+ * it to the accent color so the active project clearly pops. */
+listbox.navigation-sidebar > row:selected {
+  background: @accent_bg_color;
+  color: @accent_fg_color;
+}
+listbox.navigation-sidebar > row:selected:hover {
+  background: shade(@accent_bg_color, 1.05);
+}
+listbox.navigation-sidebar > row:hover:not(:selected) {
+  background: alpha(currentColor, 0.06);
+}
+
+/* Tab bar: subtle accent tint on the checked tab. Only restyle the
+ * tab body — leave the close button + indicator dot to libadwaita. */
+tabbar tab:checked {
+  background: alpha(@accent_bg_color, 0.18);
+}
+
+/* Sidebar section header above the project list. */
+.sidebar-section-header {
+  padding: 8px 12px 4px;
+  font-size: 0.78em;
+  font-weight: bold;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}

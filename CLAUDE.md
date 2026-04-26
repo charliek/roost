@@ -45,6 +45,11 @@ When in doubt: if it touches GTK or libghostty-vt, it runs on the main thread.
 
 If you need a new dependency, prefer pure-Go. If you reach for cgo for anything other than libghostty-vt, stop and reconsider.
 
+## Known gotk4 binding gotchas
+
+- `pangocairo.ContextSetFontOptions` crashes — it expects `cairo.FontOptions` to follow the gextras "record" struct convention, but the cairo package uses a raw native pointer. Don't try to set Cairo font options through it; we accept the loss of integer-pixel hint metrics in exchange. Revisit if upstream fixes the mismatch.
+- `pango_font_description_set_family` accepts a comma-separated list (Pango ≥ 1.46) but on macOS its fallback is unreliable — when the head of the list is missing it can drop to a *proportional* font (Verdana), giving wide cells with narrow glyphs. We resolve the family ourselves via `pickFontFamily` before calling `SetFamily`. Add new font defaults through that helper, not via raw comma-separated strings.
+
 ## Style
 
 - Prefer flat package layouts and concrete types until duplication forces an interface. No `Manager`, `Coordinator`, `Service`, `Helper` — name things for what they are.
