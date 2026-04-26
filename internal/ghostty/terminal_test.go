@@ -27,6 +27,17 @@ func TestNewBadOptions(t *testing.T) {
 	}
 }
 
+func TestResizeAfterCloseReturnsError(t *testing.T) {
+	term, err := NewTerminal(Options{Cols: 80, Rows: 24})
+	if err != nil {
+		t.Fatalf("NewTerminal: %v", err)
+	}
+	term.Close()
+	if err := term.Resize(120, 40, 9, 18); err == nil {
+		t.Fatal("expected Resize to error after Close")
+	}
+}
+
 func TestRenderStateWalk(t *testing.T) {
 	term, err := NewTerminal(Options{Cols: 10, Rows: 3, MaxScrollback: 100})
 	if err != nil {

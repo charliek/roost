@@ -72,6 +72,9 @@ func (t *Terminal) VTWrite(data []byte) {
 // Resize changes the terminal grid dimensions. cellW/cellH are pixel sizes
 // (used for Kitty graphics); pass 0 if you don't know yet.
 func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
+	if t.c == nil {
+		return errors.New("ghostty: terminal closed")
+	}
 	if rc := C.ghostty_terminal_resize(t.c, C.uint16_t(cols), C.uint16_t(rows), C.uint32_t(cellW), C.uint32_t(cellH)); rc != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("ghostty_terminal_resize failed: %d", int(rc))
 	}
