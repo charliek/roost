@@ -49,8 +49,14 @@ func sendMacNotification(title, body string) {
 	go func() { _ = cmd.Wait() }()
 }
 
+// escapeApplescript escapes a string for embedding inside an
+// AppleScript double-quoted literal. Newlines must be turned into
+// `\n` because a raw newline closes nothing in AppleScript but does
+// break the surrounding `display notification "..."` invocation.
 func escapeApplescript(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
 	return s
 }
