@@ -430,11 +430,19 @@ func (a *App) shutdown() {
 	}
 }
 
-// installShortcuts wires Cmd/Ctrl shortcuts on the window. The ShortcutController
-// captures keys before they reach focused widgets.
+// installShortcuts wires Ctrl-* shortcuts on the window. The
+// ShortcutController is set to PhaseCapture so it runs *before* the
+// drawing area's key controller — otherwise terminal-focused keys get
+// consumed by handleKey and the shortcut never fires.
+//
+// Modifier choice: GTK on macOS doesn't reliably deliver Cmd as
+// MetaMask, so we bind everything on Ctrl for both platforms (matches
+// tmux/screen ergonomics). The <primary> alias resolves to Ctrl on
+// Linux and (when it works) Meta on macOS, so we add it as a bonus.
 func (a *App) installShortcuts() {
 	ctrl := gtk.NewShortcutController()
 	ctrl.SetScope(gtk.ShortcutScopeGlobal)
+	ctrl.SetPropagationPhase(gtk.PhaseCapture)
 
 	add := func(spec string, fn func()) {
 		t := gtk.NewShortcutTriggerParseString(spec)
@@ -448,18 +456,30 @@ func (a *App) installShortcuts() {
 		ctrl.AddShortcut(gtk.NewShortcut(t, action))
 	}
 
-	// Mac uses Cmd; Linux uses Ctrl. <Meta> on GTK4/macOS = Cmd; <primary>
-	// resolves to <Meta> on Mac, <Ctrl> on Linux. Use <primary> so the
-	// shortcuts feel native on each platform.
-	add("<primary>t", a.newTabInActiveProject)
-	add("<primary>w", a.closeActiveTab)
-	add("<primary><shift>t", a.newProject)
-	add("<primary><shift>bracketleft", func() { a.cycleTab(-1) })
-	add("<primary><shift>bracketright", func() { a.cycleTab(1) })
+	// Bind both <Control> and <primary> so Ctrl works everywhere AND
+	// Cmd works on macOS where the platform delivers it.
+	bindBoth := func(suffix string, fn func()) {
+		add("<Control>"+suffix, fn)
+		add("<primary>"+suffix, fn)
+	}
+
+	bindBoth("t", a.newTabInActiveProject)
+	bindBoth("w", a.closeActiveTab)
+	bindBoth("<shift>t", a.newProject)
+
+	// Shift+[ produces braceleft on US layouts. GTK matches the
+	// transformed keyval, so we bind the curly forms (and the bracket
+	// forms as a safety net for layouts that don't transform).
+	for _, k := range []string{"braceleft", "bracketleft"} {
+		bindBoth("<shift>"+k, func() { a.cycleTab(-1) })
+	}
+	for _, k := range []string{"braceright", "bracketright"} {
+		bindBoth("<shift>"+k, func() { a.cycleTab(1) })
+	}
 
 	for i := 1; i <= 9; i++ {
 		idx := i - 1
-		add("<primary>"+strings.TrimLeft(strconv.Itoa(i), "0"), func() {
+		bindBoth(strings.TrimLeft(strconv.Itoa(i), "0"), func() {
 			a.switchProjectByIndex(idx)
 		})
 	}

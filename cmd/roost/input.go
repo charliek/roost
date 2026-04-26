@@ -16,10 +16,12 @@ import (
 func handleKey(s *Session, keyval uint, mods uint) bool {
 	gdkMods := gdk.ModifierType(mods)
 
-	// Don't eat app shortcuts. On macOS, GTK's <primary> resolves to
-	// Meta (Cmd); on Linux it resolves to Ctrl, but we explicitly want
-	// Ctrl-letter to flow to the shell as control bytes there. Super
-	// (Linux Win key) is also reserved for app/system shortcuts.
+	// Don't eat app shortcuts. Cmd (Meta) and Super are always reserved.
+	// Ctrl is mostly terminal control bytes (Ctrl-C etc.), but we have
+	// a few app bindings on Ctrl too — those are handled by the window's
+	// ShortcutController in PhaseCapture, which runs *before* this key
+	// controller. So if Ctrl is held and the shortcut controller didn't
+	// already consume the event, we treat it as a terminal control byte.
 	if gdkMods&(gdk.MetaMask|gdk.SuperMask) != 0 {
 		return false
 	}
