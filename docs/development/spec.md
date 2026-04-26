@@ -24,7 +24,7 @@ No Windows support. No xterm.js or web-based terminals. No Electron, Tauri, or w
 
 | Concern | Choice | Notes |
 |---|---|---|
-| Language | Go 1.22+ | Single language for ~95% of the codebase |
+| Language | Go 1.24+ (mise-managed) | Single language for ~95% of the codebase |
 | UI toolkit | GTK4 + libadwaita | Single codebase for both platforms |
 | GTK bindings | `github.com/diamondburned/gotk4` | Most actively maintained Go GTK4 bindings |
 | Adwaita bindings | `github.com/diamondburned/gotk4-adwaita` | For headerbar, toast overlays, styled widgets |
