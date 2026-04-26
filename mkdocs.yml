@@ -1,0 +1,109 @@
+# =============================================================================
+# Documentation Style Guidelines
+# =============================================================================
+# - Professional, direct tone (no marketing language)
+# - Tables for all CLI options and configuration fields
+# - Code blocks with language hints (yaml, bash, json, go)
+# - Use admonitions sparingly (only for important notes/warnings)
+# - Examples should be copy-pasteable
+# - Keep pages focused and concise - one topic per page
+# - No deep troubleshooting guides - keep it minimal but useful
+# =============================================================================
+
+site_name: roost
+site_description: 'Cross-platform terminal multiplexer for AI coding agents, built on libghostty-vt'
+site_author: 'roost Contributors'
+site_url: 'https://charliek.github.io/roost/'
+
+repo_name: charliek/roost
+repo_url: https://github.com/charliek/roost
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site-build
+
+dev_addr: '127.0.0.1:7070'
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - search.highlight
+    - search.share
+    - header.autohide
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - navigation.footer
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    logo: material/console-line
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - First Run: getting-started/first-run.md
+      - Keybindings: getting-started/keybindings.md
+  - Guides:
+      - Notifications: guides/notifications.md
+      - Claude Code Hooks: guides/claude-code.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Paths & Environment: reference/paths.md
+      - Architecture: reference/architecture.md
+  - Development:
+      - Setup: development/setup.md
+      - Design Spec: development/spec.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/charliek/roost

@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feature/*']
+  pull_request:
+    branches: [main, 'feature/*']
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # GTK system deps are only needed for cmd/roost, which we only
+      # build on macOS (see the Linux-vs-macOS step split below).
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gtk4 libadwaita pkgconf gobject-introspection
+
+      - uses: jdx/mise-action@v2
+
+      - name: Cache Go modules + build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: gomod-${{ runner.os }}-
+
+      - name: Cache libghostty-vt
+        id: cache-libghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/out
+            build/ghostty-src
+          key: libghostty-${{ runner.os }}-${{ hashFiles('build/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-libghostty.outputs.cache-hit != 'true'
+        run: ./build/build.sh libghostty
+
+      # cmd/roost imports gotk4-adwaita which currently references
+      # libadwaita 1.6 symbols (e.g. adw_about_dialog_add_other_app).
+      # Ubuntu 24.04 LTS ships libadwaita 1.5, so vet/test/build of
+      # cmd/roost only succeeds on macOS (Homebrew has 1.9). Linux
+      # exercises the GTK-free packages — every internal package +
+      # cmd/roost-cli.
+      - name: Vet + test + build (Linux — GTK-free packages)
+        if: runner.os == 'Linux'
+        run: |
+          go vet ./internal/... ./cmd/roost-cli
+          go test ./internal/... ./cmd/roost-cli
+          go build ./cmd/roost-cli
+
+      - name: Vet + test + build (macOS — full)
+        if: runner.os == 'macOS'
+        run: |
+          go vet ./...
+          go test ./...
+          go build ./cmd/roost ./cmd/roost-cli
+
+      - name: Assert no dynamic ghostty-vt link (macOS regression guard)
+        if: runner.os == 'macOS'
+        run: |
+          if otool -L ./roost | grep -q '@rpath/libghostty-vt'; then
+            echo "FAIL: roost is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in build/build.sh."
+            otool -L ./roost
+            exit 1
+          fi
+
+      - name: Lint cmd/roost (macOS-only — see Linux note above)
+        if: runner.os == 'macOS'
+        run: golangci-lint run ./cmd/roost
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-race-ubuntu-${{ hashFiles('**/go.sum') }}
+          restore-keys: gomod-race-ubuntu-
+      - name: Race detector on non-cgo packages
+        run: go test -race ./internal/ipc/ ./internal/osc/ ./internal/core/ ./internal/store/ ./internal/config/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v2
+
+      - name: Cache Go modules + build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-lint-ubuntu-${{ hashFiles('**/go.sum') }}
+          restore-keys: gomod-lint-ubuntu-
+
+      - name: Cache libghostty-vt (shares Linux test job's key)
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/out
+            build/ghostty-src
+          key: libghostty-Linux-${{ hashFiles('build/build.sh') }}
+
+      - name: Build libghostty-vt (only on cache miss)
+        run: |
+          if [ ! -f build/out/lib/libghostty-vt.a ]; then
+            ./build/build.sh libghostty
+          fi
+
+      # cmd/roost is linted on the macOS test job because Ubuntu's
+      # libadwaita is too old to compile gotk4-adwaita's 1.6 bindings.
+      - run: golangci-lint run ./internal/... ./cmd/roost-cli
