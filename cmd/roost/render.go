@@ -37,6 +37,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 	cx, cy, cursorVisible := s.rs.CursorPos()
 	var cursorCodepoint rune
 	cursorHasCell := false
+	cursorBold := false
 
 	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
 		x := pad + float64(col*cellW)
@@ -64,6 +65,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		if cursorVisible && row == cy && col == cx && cell.Codepoint != 0 {
 			cursorCodepoint = cell.Codepoint
 			cursorHasCell = true
+			cursorBold = cell.Bold
 		}
 		if cell.Codepoint == 0 {
 			return
@@ -110,7 +112,11 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 			if cursorHasCell {
 				textBuf = textBuf[:0]
 				textBuf = appendRune(textBuf, cursorCodepoint)
-				layout.SetFontDescription(s.font)
+				if cursorBold {
+					layout.SetFontDescription(s.fontBold)
+				} else {
+					layout.SetFontDescription(s.font)
+				}
 				layout.SetText(string(textBuf))
 				setRGB(cr, defaultBG)
 				cr.MoveTo(x, y)

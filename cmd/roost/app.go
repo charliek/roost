@@ -367,6 +367,18 @@ func (a *App) addProjectUI(p core.Project) {
 	)
 	pr.closeBtn.ConnectClicked(func() { a.requestCloseProject(pid) })
 
+	// Action group bound to the row once. Used by the right-click
+	// popover menu so we don't allocate + insert a new group on every
+	// right-click.
+	group := gio.NewSimpleActionGroup()
+	renameAct := gio.NewSimpleAction("rename", nil)
+	renameAct.ConnectActivate(func(_ *glib.Variant) { pr.enterEditMode() })
+	group.AddAction(renameAct)
+	closeAct := gio.NewSimpleAction("close", nil)
+	closeAct.ConnectActivate(func(_ *glib.Variant) { a.requestCloseProject(pid) })
+	group.AddAction(closeAct)
+	pr.row.InsertActionGroup("row", group)
+
 	// Double-click on the label area enters rename mode.
 	dbl := gtk.NewGestureClick()
 	dbl.SetButton(1)
@@ -380,8 +392,8 @@ func (a *App) addProjectUI(p core.Project) {
 	// Right-click anywhere on the row opens a Rename / Close menu.
 	right := gtk.NewGestureClick()
 	right.SetButton(3)
-	right.ConnectPressed(func(_ int, x, y float64) {
-		a.showRowMenu(pr, pid, x, y)
+	right.ConnectPressed(func(_ int, _, _ float64) {
+		a.showRowMenu(pr)
 	})
 	pr.row.AddController(right)
 
@@ -585,7 +597,15 @@ func (a *App) updateHeader() {
 		if page := view.SelectedPage(); page != nil {
 			if id, ok := a.pageTabs[page]; ok {
 				if sess, ok := a.sessions[id]; ok {
-					subtitle = shorten(sess.tab.CWD, 48)
+					// lastPWD is the live cwd from OSC 7; tab.CWD is
+					// only the snapshot at session creation. Use the
+					// live value when we have one so the subtitle
+					// follows `cd` without waiting for a tab switch.
+					cwd := sess.lastPWD
+					if cwd == "" {
+						cwd = sess.tab.CWD
+					}
+					subtitle = shorten(cwd, 48)
 				}
 			}
 		}
@@ -874,29 +894,18 @@ func (a *App) commitRename(pid int64, text string) {
 	}
 }
 
-// showRowMenu pops up a Rename / Close menu on the row. Both items map
-// to actions in a per-row action group named "row" so the menu items
-// can reference them via "row.rename" / "row.close".
-func (a *App) showRowMenu(pr *projectRow, pid int64, x, y float64) {
+// showRowMenu pops up the Rename / Close menu on the row. The menu
+// items reference the per-row action group ("row") that addProjectUI
+// installed once at row creation time.
+func (a *App) showRowMenu(pr *projectRow) {
 	menu := gio.NewMenu()
 	menu.AppendItem(gio.NewMenuItem("Rename", "row.rename"))
 	menu.AppendItem(gio.NewMenuItem("Close project", "row.close"))
-
-	group := gio.NewSimpleActionGroup()
-	renameAct := gio.NewSimpleAction("rename", nil)
-	renameAct.ConnectActivate(func(_ *glib.Variant) { pr.enterEditMode() })
-	group.AddAction(renameAct)
-	closeAct := gio.NewSimpleAction("close", nil)
-	closeAct.ConnectActivate(func(_ *glib.Variant) { a.requestCloseProject(pid) })
-	group.AddAction(closeAct)
-	pr.row.InsertActionGroup("row", group)
 
 	popover := gtk.NewPopoverMenuFromModel(menu)
 	popover.SetParent(pr.row)
 	popover.SetHasArrow(false)
 	popover.Popup()
-	_ = x
-	_ = y
 }
 
 // requestCloseProject is the entry point for explicit "close this

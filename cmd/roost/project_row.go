@@ -101,9 +101,9 @@ func (pr *projectRow) enterEditMode() {
 	pr.entry.SelectRegion(0, -1)
 }
 
-// exitEditMode swaps back to the label. Returns the (possibly trimmed)
-// text the user typed and a bool indicating whether the change should
-// be committed (false on cancel).
+// exitEditMode swaps back to the label. Returns the raw text the user
+// typed (callers are expected to trim/validate) and a bool indicating
+// whether the change should be committed (false on cancel).
 func (pr *projectRow) exitEditMode(commit bool) (text string, ok bool) {
 	if !pr.editing {
 		return "", false

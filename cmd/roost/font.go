@@ -25,10 +25,14 @@ func pickFontFamily(want string) string {
 
 	fontMap := pangocairo.FontMapGetDefault()
 	if fontMap == nil {
-		// No font map yet — caller is too early. Return the input so
-		// SetFamily still gets something; this path shouldn't fire in
-		// practice because pickFontFamily runs after gtk_init.
-		return strings.TrimSpace(strings.SplitN(want, ",", 2)[0])
+		// No font map yet — caller is too early. Return the first
+		// candidate so SetFamily still gets something; this path
+		// shouldn't fire in practice because pickFontFamily runs
+		// after gtk_init.
+		if len(candidates) > 0 {
+			return candidates[0]
+		}
+		return "monospace"
 	}
 	available := installedFamilies(fontMap)
 

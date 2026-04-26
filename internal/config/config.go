@@ -66,6 +66,9 @@ func (p Paths) Load() (Config, error) {
 			if perr != nil {
 				return cfg, fmt.Errorf("config: %s:%d: font_size: %w", p.ConfigFile(), lineNum, perr)
 			}
+			if n <= 0 {
+				return cfg, fmt.Errorf("config: %s:%d: font_size must be > 0, got %d", p.ConfigFile(), lineNum, n)
+			}
 			cfg.FontSizePt = n
 		}
 	}

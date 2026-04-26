@@ -40,11 +40,13 @@ The directories are created at first launch with mode `0700`.
 
 Roost probes the system at startup for each candidate in `font_family` (left-to-right) and picks the first that's installed. Pango's own comma-separated fallback is unreliable on macOS — when the head of the list is missing it can silently fall through to a *proportional* font (Verdana), which produces wide cells with narrow glyphs and huge gaps between letters. The probe avoids that.
 
-If none of the requested families exist, Roost falls back to `monospace` and logs a warning. To verify which font was picked:
+If none of the requested families exist, Roost falls back to `monospace` and logs a warning at startup:
 
 ```bash
-./roost 2>&1 | grep '^.*font'
+./roost 2>&1 | grep -i 'font:'
 ```
+
+Successful family selection is logged at debug level only (silent on a normal launch); the surface signal is the absence of a warning.
 
 Example `config.toml`:
 
