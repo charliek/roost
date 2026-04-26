@@ -6,9 +6,9 @@
 // The scanner handles OSC sequences that may be split across multiple
 // PTY reads. It recognizes:
 //
-//   ESC ] 9 ; <message> BEL              — iTerm2 / general notification
-//   ESC ] 9 ; <message> ESC \            — same with ST terminator
-//   ESC ] 777 ; notify ; <title> ; <body> BEL  — Konsole / KDE
+//	ESC ] 9 ; <message> BEL              — iTerm2 / general notification
+//	ESC ] 9 ; <message> ESC \            — same with ST terminator
+//	ESC ] 777 ; notify ; <title> ; <body> BEL  — Konsole / KDE
 //
 // Other OSC commands are recognized at the prefix level and ignored.
 // Bodies longer than maxBody bytes are truncated rather than buffered
@@ -38,10 +38,10 @@ type state int
 
 const (
 	stateOutside state = iota
-	stateEsc          // saw ESC, waiting for ]
-	statePrefix       // collecting <number> before ;
-	stateBody         // collecting body before BEL or ESC \
-	stateBodyEsc      // saw ESC in body, expecting \
+	stateEsc           // saw ESC, waiting for ]
+	statePrefix        // collecting <number> before ;
+	stateBody          // collecting body before BEL or ESC \
+	stateBodyEsc       // saw ESC in body, expecting \
 )
 
 // NewScanner returns a scanner that calls fn for every completed

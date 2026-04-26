@@ -31,7 +31,7 @@ type ColorRGB struct {
 // minimal style flags. Multi-codepoint graphemes (emoji, ZWJ) collapse to
 // the base codepoint in the spike.
 type Cell struct {
-	Codepoint rune    // 0 = empty cell
+	Codepoint rune     // 0 = empty cell
 	FG        ColorRGB // valid if HasFG
 	BG        ColorRGB // valid if HasBG
 	HasFG     bool

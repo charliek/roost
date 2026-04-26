@@ -28,7 +28,7 @@ func sendDesktopNotification(app *adw.Application, id, title, body string) {
 	if body != "" {
 		n.SetBody(body)
 	}
-	app.Application.SendNotification(id, n)
+	app.SendNotification(id, n)
 }
 
 // sendMacNotification shells out to osascript. Inputs are escaped for

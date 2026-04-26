@@ -4,9 +4,10 @@
 // (typically by Claude Code hooks).
 //
 // Usage:
-//   roost-cli notify --title "Build done" [--body "..."] [--tab <id>]
-//   roost-cli set-title "my-tab"
-//   roost-cli identify
+//
+//	roost-cli notify --title "Build done" [--body "..."] [--tab <id>]
+//	roost-cli set-title "my-tab"
+//	roost-cli identify
 //
 // Tab id falls back to $ROOST_TAB_ID when --tab is not given. Socket
 // path falls back to $ROOST_SOCKET, then the platform default.

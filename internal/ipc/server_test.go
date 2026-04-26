@@ -35,7 +35,7 @@ func startServer(t *testing.T, h Handler) string {
 
 func TestNotifyRoundtrip(t *testing.T) {
 	got := struct {
-		tab        int64
+		tab         int64
 		title, body string
 	}{}
 	sock := startServer(t, fakeHandler{
