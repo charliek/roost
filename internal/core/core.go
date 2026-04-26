@@ -24,6 +24,13 @@ type (
 // Event is fired on every state change. Subscribers receive a snapshot
 // of the affected entity (or its ID for deletes). The discriminator is
 // the Kind field.
+//
+// Tab payload contract for EventTabUpdated: only the ID and the field
+// that changed are populated. UpdateTabTitle emits a Tab with ID+Title;
+// UpdateTabCWD emits a Tab with ID+CWD. Subscribers must guard on the
+// specific field rather than treating the Tab as a complete snapshot.
+// If a future subscriber needs the full Tab, switch the producer to a
+// store.GetTab(id) round-trip.
 type Event struct {
 	Kind      EventKind
 	Project   *Project // populated for project events

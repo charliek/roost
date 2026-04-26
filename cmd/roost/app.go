@@ -177,6 +177,17 @@ func (a *App) handleEvent(ev core.Event) {
 	switch ev.Kind {
 	case core.EventNotification:
 		a.handleNotification(ev.TabID, ev.Title, ev.Body)
+	case core.EventTabUpdated:
+		// Payload is partial — see Event doc-comment in internal/core.
+		// Title is the only field with a UI surface today; CWD lives
+		// only in the store. Guard on Title != "" to skip CWD-only
+		// updates without overwriting the displayed title with empty.
+		if ev.Tab == nil || ev.Tab.Title == "" {
+			return
+		}
+		if page, ok := a.tabPages[ev.Tab.ID]; ok {
+			page.SetTitle(ev.Tab.Title)
+		}
 	}
 }
 
