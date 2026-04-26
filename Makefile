@@ -1,4 +1,4 @@
-.PHONY: all libghostty build run test lint clean
+.PHONY: all libghostty build run test lint clean docs docs-serve
 
 # Default: full build (libghostty-vt then Go binary).
 all: build
@@ -22,4 +22,14 @@ lint:
 	golangci-lint run
 
 clean:
-	rm -rf build/out build/ghostty-src ./roost ./roost-cli
+	rm -rf build/out build/ghostty-src ./roost ./roost-cli site-build
+
+# Build the static documentation site under site-build/.
+docs:
+	uv sync --group docs
+	uv run mkdocs build
+
+# Serve the documentation site locally on http://127.0.0.1:7070.
+docs-serve:
+	uv sync --group docs
+	uv run mkdocs serve

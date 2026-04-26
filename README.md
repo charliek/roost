@@ -1,32 +1,39 @@
 # Roost
 
-A Mac + Linux desktop terminal multiplexer for AI coding agents. Sidebar of projects on the left, tabs per project, one terminal per tab. Built around libghostty-vt for terminal correctness, GTK4 + libadwaita for cross-platform UI, and Go for everything not on the cgo boundary.
+A macOS + Linux desktop terminal multiplexer for AI coding agents. Sidebar of projects on the left, tabs per project, one libghostty-vt terminal per tab. Companion CLI surfaces notifications when an agent in a tab needs attention.
 
-This is an early work in progress. See `docs/spec.md` for the design and `CLAUDE.md` for project conventions.
-
-## Building from source
-
-Prerequisites: [`mise`](https://mise.jdx.dev/) for tool versioning. Clone next to the repo or anywhere convenient.
+## Quick start
 
 ```bash
 git clone https://github.com/charliek/roost
 cd roost
-mise install                  # provisions go + zig at the pinned versions
-./build/build.sh libghostty   # clones Ghostty at the pinned SHA, builds libghostty-vt
-./build/build.sh build        # builds ./roost and ./roost-cli
+mise install                  # provisions Go 1.24 + Zig 0.15.2
+make libghostty               # clones Ghostty at the pinned SHA, builds libghostty-vt
+make build                    # produces ./roost and ./roost-cli
 ./roost
 ```
 
 System packages:
 
-- macOS: `brew install gtk4 libadwaita`
-- Ubuntu/Debian: `sudo apt install libgtk-4-dev libadwaita-1-dev`
+- macOS: `brew install gtk4 libadwaita pkgconf gobject-introspection`
+- Ubuntu / Debian: `sudo apt install libgtk-4-dev libadwaita-1-dev pkgconf gobject-introspection libgirepository1.0-dev`
 
-## Layout
+## Documentation
 
-- `cmd/roost/` — GUI binary entrypoint
-- `cmd/roost-cli/` — companion CLI (Phase 3)
-- `internal/ghostty/` — cgo bindings to libghostty-vt (the only cgo package)
-- `build/build.sh` — orchestrates the libghostty-vt build and the Go build
-- `docs/spec.md` — design doc
-- `CLAUDE.md` — project conventions and the GTK threading contract
+The full documentation site lives under `docs/` and builds with `mkdocs-material`:
+
+```bash
+make docs-serve               # http://127.0.0.1:7070
+```
+
+Highlights:
+
+- [Installation](docs/getting-started/installation.md) — system packages and first build
+- [First Run](docs/getting-started/first-run.md) — what happens on launch and where state lives
+- [Keybindings](docs/getting-started/keybindings.md) — `Ctrl-T`, project switching, etc.
+- [Notifications](docs/guides/notifications.md) — how `roost-cli` and OSC fallbacks surface in the UI
+- [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
+- [Architecture](docs/reference/architecture.md) — package layout and threading contract
+- [Design Spec](docs/development/spec.md) — original design rationale
+
+`CLAUDE.md` at the repo root captures the project conventions enforced by review.

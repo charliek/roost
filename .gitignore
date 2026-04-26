@@ -3,6 +3,9 @@
 /build/out/
 /build/.cache/
 /build/ghostty-src/
+/site-build/
+.venv/
+__pycache__/
 *.test
 *.out
 .DS_Store
