@@ -67,8 +67,6 @@ func handleKey(s *Session, keyval uint, mods uint) bool {
 	// Snap viewport before delivering the keystroke — matches every
 	// other terminal's "type to return to the prompt" behavior.
 	s.snapToBottom()
-	if _, err := s.pty.Write(out); err != nil {
-		return false
-	}
+	s.QueueWrite(out)
 	return true
 }

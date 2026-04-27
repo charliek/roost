@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"github.com/diamondburned/gotk4/pkg/cairo"
@@ -56,6 +57,11 @@ type Session struct {
 	// libghostty state, so callbacks already in the GTK queue at the
 	// time of Close become no-ops instead of use-after-free.
 	closed atomic.Bool
+
+	// writeMu serializes background PTY writes spawned by QueueWrite
+	// so that bytes from concurrent paste / keystroke / mouse-event
+	// goroutines don't interleave on the wire.
+	writeMu sync.Mutex
 
 	// scrollAccum aggregates fractional smooth-scroll deltas
 	// (gdk.ScrollUnitSurface, common on macOS trackpads) so we only
@@ -539,7 +545,7 @@ func (s *Session) handleScroll(ctrl *gtk.EventControllerScroll, dy float64) {
 			if err != nil || len(out) == 0 {
 				continue
 			}
-			_, _ = s.pty.Write(out)
+			s.QueueWrite(out)
 		}
 		return
 	}
@@ -596,6 +602,41 @@ func (s *Session) quantizeScroll(unit gdk.ScrollUnit, dy float64) int {
 	}
 }
 
+// QueueWrite serializes a write to the PTY off the GTK main thread.
+// Spawns a goroutine that takes writeMu and performs pty.Write with
+// a short-write loop. Order is preserved across calls because every
+// goroutine must acquire writeMu before writing — a paste followed
+// by a keystroke arrives at the shell in that order even though both
+// run concurrently.
+//
+// Per CLAUDE.md, PTY read/write must run in per-tab goroutines so a
+// slow consumer can't stall the GTK main thread. The data slice is
+// copied so the caller can recycle its buffer immediately. Safe to
+// call from the main thread; safe to call after Close (no-op).
+func (s *Session) QueueWrite(data []byte) {
+	if s.closed.Load() || len(data) == 0 {
+		return
+	}
+	buf := append([]byte(nil), data...)
+	tabID := s.tab.ID
+	go func() {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		if s.closed.Load() {
+			return
+		}
+		for off := 0; off < len(buf); {
+			n, err := s.pty.Write(buf[off:])
+			if err != nil {
+				slog.Warn("pty write", "tab_id", tabID, "err", err,
+					"wrote", off+n, "total", len(buf))
+				return
+			}
+			off += n
+		}
+	}()
+}
+
 // useMouseTracking decides whether mouse events should be encoded and
 // forwarded to the PTY (true) or drive local selection/scroll (false).
 //
@@ -636,7 +677,7 @@ func (s *Session) sendMouseEvent(action ghostty.MouseAction, button ghostty.Mous
 	if err != nil || len(out) == 0 {
 		return
 	}
-	_, _ = s.pty.Write(out)
+	s.QueueWrite(out)
 }
 
 // gtkButtonToGhostty maps GTK's 1=left/2=middle/3=right convention to

@@ -920,6 +920,24 @@ func (a *App) installShortcuts() {
 		ctrl.AddShortcut(gtk.NewShortcut(t, action))
 	}
 
+	// addCond is like add but lets the action signal "I didn't
+	// handle this; let GTK keep propagating." Used for clipboard
+	// shortcuts so a focused GtkEditable can keep its native
+	// copy/paste behavior — returning false here lets GTK deliver
+	// the keystroke to the focused widget after our capture-phase
+	// controller declines.
+	addCond := func(spec string, fn func() bool) {
+		t := gtk.NewShortcutTriggerParseString(spec)
+		if t == nil {
+			slog.Warn("shortcut: trigger parse failed", "spec", spec)
+			return
+		}
+		action := gtk.NewCallbackAction(func(_ gtk.Widgetter, _ *glib.Variant) (ok bool) {
+			return fn()
+		})
+		ctrl.AddShortcut(gtk.NewShortcut(t, action))
+	}
+
 	primary := "<Control>"
 	projectMod := "<Alt>"
 	if runtime.GOOS == "darwin" {
@@ -940,10 +958,22 @@ func (a *App) installShortcuts() {
 	if runtime.GOOS == "darwin" {
 		clipboardMod = "<Meta>"
 	}
-	add(clipboardMod+"v", a.pasteIntoActive)
-	add("<Control><Shift>v", a.pasteIntoActive)
-	add(clipboardMod+"c", a.copyFromActive)
-	add("<Control><Shift>c", a.copyFromActive)
+	clipboardGuard := func(fn func()) func() bool {
+		return func() bool {
+			if a.editableHasFocus() {
+				// Tell GTK we didn't consume the event so the
+				// focused entry / text view gets its native
+				// copy/paste handling.
+				return false
+			}
+			fn()
+			return true
+		}
+	}
+	addCond(clipboardMod+"v", clipboardGuard(a.pasteIntoActive))
+	addCond("<Control><Shift>v", clipboardGuard(a.pasteIntoActive))
+	addCond(clipboardMod+"c", clipboardGuard(a.copyFromActive))
+	addCond("<Control><Shift>c", clipboardGuard(a.copyFromActive))
 
 	// Shift+[ produces braceleft on US layouts. GTK matches the
 	// transformed keyval, so we bind the curly forms (and the bracket
@@ -1023,16 +1053,14 @@ func (a *App) editableHasFocus() bool {
 	return false
 }
 
-// pastePipeline drives a clipboard read → encode → chunked PTY write
-// for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
+// pasteIntoActive drives a clipboard read → encode → background PTY
+// write for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
 //
-// The window's ShortcutController fires in PhaseCapture, so these
-// shortcuts intercept the event before any focused widget (including
-// a sidebar rename GtkEntry) sees it. That matches how every other
-// app-level binding in installShortcuts works (Cmd+T, Cmd+W, etc.).
-// If we ever want to defer to focused editable widgets, the right
-// place is GtkShortcut.SetScope or a focus-aware predicate, not a
-// silent post-fire bail.
+// The encoded bytes are queued via Session.QueueWrite, which runs the
+// actual pty.Write on a per-tab goroutine so a slow PTY consumer
+// can't stall the GTK main thread. Per-session writeMu serializes
+// against keystrokes / mouse events so a paste-then-type doesn't
+// interleave on the wire.
 //
 // Limits and behavior:
 //   - Cap the clipboard at pasteMaxBytes (4 MiB); above that, log and
@@ -1043,13 +1071,7 @@ func (a *App) editableHasFocus() bool {
 //     including any embedded \x1b[201~ sentinel that would otherwise
 //     let pasted content escape bracketed mode), and replaces \n with
 //     \r when not bracketed.
-//   - Chunk PTY writes at pasteChunkBytes (64 KiB) with glib.IdleAdd
-//     between chunks so the GTK frame clock isn't blocked when piping
-//     into a slow consumer.
-const (
-	pasteMaxBytes   = 4 * 1024 * 1024
-	pasteChunkBytes = 64 * 1024
-)
+const pasteMaxBytes = 4 * 1024 * 1024
 
 func (a *App) pasteIntoActive() {
 	if a.editableHasFocus() {
@@ -1084,7 +1106,7 @@ func (a *App) pasteIntoActive() {
 			slog.Warn("paste encode", "err", err)
 			return
 		}
-		a.writeChunked(sess, encoded, 0)
+		sess.QueueWrite(encoded)
 	})
 }
 
@@ -1124,37 +1146,6 @@ func (a *App) copyFromActive() {
 		if pc := display.PrimaryClipboard(); pc != nil {
 			pc.SetText(text)
 		}
-	}
-}
-
-// writeChunked writes encoded paste bytes to the session's PTY in
-// pasteChunkBytes-sized slices, yielding to the GTK main loop between
-// chunks via glib.IdleAdd so a multi-MB paste doesn't freeze the UI.
-//
-// Honors short writes by advancing `off` by the actual number of
-// bytes the kernel accepted. Without this, a partial write would
-// silently drop the unwritten tail. (PTY short writes are rare —
-// the kernel's tty layer usually accepts the full chunk — but worth
-// handling for correctness.)
-func (a *App) writeChunked(sess *Session, data []byte, off int) {
-	if sess.closed.Load() || off >= len(data) {
-		return
-	}
-	end := off + pasteChunkBytes
-	if end > len(data) {
-		end = len(data)
-	}
-	n, err := sess.pty.Write(data[off:end])
-	if err != nil {
-		slog.Warn("paste pty write", "err", err, "wrote", n, "asked", end-off)
-		return
-	}
-	next := off + n
-	if next < len(data) {
-		coreglib.IdleAdd(func() bool {
-			a.writeChunked(sess, data, next)
-			return false
-		})
 	}
 }
 
