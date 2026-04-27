@@ -13,7 +13,7 @@ type selection struct {
 	// anchor is where the drag started; current is where it is now.
 	// Either may be "earlier" in row-major order — normalize() returns
 	// the topological start/end.
-	anchorCol, anchorRow int
+	anchorCol, anchorRow   int
 	currentCol, currentRow int
 }
 
@@ -62,9 +62,8 @@ func (s *selection) touches(minRow, maxRow int) bool {
 	if !s.active {
 		return false
 	}
-	sCol, sRow, _, eRow := s.normalized()
-	_ = sCol
-	return !(eRow < minRow || sRow > maxRow)
+	_, sRow, _, eRow := s.normalized()
+	return eRow >= minRow && sRow <= maxRow
 }
 
 // ribbonRect describes one of the (up to three) rectangles that make
@@ -94,40 +93,38 @@ func (s *selection) ribbonRects(cols, cellW, cellH int, padX, padY float64) []ri
 	cw := float64(cellW)
 	ch := float64(cellH)
 
-	switch {
-	case sRow == eRow:
+	if sRow == eRow {
 		return []ribbonRect{{
 			X: padX + float64(sCol)*cw,
 			Y: padY + float64(sRow)*ch,
 			W: float64(eCol-sCol) * cw,
 			H: ch,
 		}}
+	}
 
-	default:
-		out := make([]ribbonRect, 0, 3)
-		// First row: from start col to right edge.
-		out = append(out, ribbonRect{
-			X: padX + float64(sCol)*cw,
-			Y: padY + float64(sRow)*ch,
-			W: float64(cols-sCol) * cw,
-			H: ch,
-		})
-		// Middle rows: full width.
-		if eRow-sRow > 1 {
-			out = append(out, ribbonRect{
-				X: padX,
-				Y: padY + float64(sRow+1)*ch,
-				W: float64(cols) * cw,
-				H: float64(eRow-sRow-1) * ch,
-			})
-		}
-		// Last row: from left edge to end col.
+	out := make([]ribbonRect, 0, 3)
+	// First row: from start col to right edge.
+	out = append(out, ribbonRect{
+		X: padX + float64(sCol)*cw,
+		Y: padY + float64(sRow)*ch,
+		W: float64(cols-sCol) * cw,
+		H: ch,
+	})
+	// Middle rows: full width.
+	if eRow-sRow > 1 {
 		out = append(out, ribbonRect{
 			X: padX,
-			Y: padY + float64(eRow)*ch,
-			W: float64(eCol) * cw,
-			H: ch,
+			Y: padY + float64(sRow+1)*ch,
+			W: float64(cols) * cw,
+			H: float64(eRow-sRow-1) * ch,
 		})
-		return out
 	}
+	// Last row: from left edge to end col.
+	out = append(out, ribbonRect{
+		X: padX,
+		Y: padY + float64(eRow)*ch,
+		W: float64(eCol) * cw,
+		H: ch,
+	})
+	return out
 }

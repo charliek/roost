@@ -90,13 +90,13 @@ func TestSelection_TouchesRowRange(t *testing.T) {
 		min, max int
 		want     bool
 	}{
-		{0, 4, false},   // entirely above
-		{9, 12, false},  // entirely below
-		{4, 5, true},    // overlaps top
-		{8, 10, true},   // overlaps bottom
-		{6, 7, true},    // entirely inside
-		{0, 100, true},  // contains
-		{5, 8, true},    // exact match
+		{0, 4, false},  // entirely above
+		{9, 12, false}, // entirely below
+		{4, 5, true},   // overlaps top
+		{8, 10, true},  // overlaps bottom
+		{6, 7, true},   // entirely inside
+		{0, 100, true}, // contains
+		{5, 8, true},   // exact match
 	}
 	for _, c := range cases {
 		if got := s.touches(c.min, c.max); got != c.want {

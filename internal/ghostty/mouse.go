@@ -44,10 +44,10 @@ const (
 type MouseButton uint8
 
 const (
-	MouseButtonNone   MouseButton = C.GHOSTTY_MOUSE_BUTTON_UNKNOWN
-	MouseButtonLeft   MouseButton = C.GHOSTTY_MOUSE_BUTTON_LEFT
-	MouseButtonRight  MouseButton = C.GHOSTTY_MOUSE_BUTTON_RIGHT
-	MouseButtonMiddle MouseButton = C.GHOSTTY_MOUSE_BUTTON_MIDDLE
+	MouseButtonNone      MouseButton = C.GHOSTTY_MOUSE_BUTTON_UNKNOWN
+	MouseButtonLeft      MouseButton = C.GHOSTTY_MOUSE_BUTTON_LEFT
+	MouseButtonRight     MouseButton = C.GHOSTTY_MOUSE_BUTTON_RIGHT
+	MouseButtonMiddle    MouseButton = C.GHOSTTY_MOUSE_BUTTON_MIDDLE
 	MouseButtonWheelUp   MouseButton = C.GHOSTTY_MOUSE_BUTTON_FOUR
 	MouseButtonWheelDown MouseButton = C.GHOSTTY_MOUSE_BUTTON_FIVE
 )

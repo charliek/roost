@@ -990,9 +990,9 @@ func (a *App) activeSession() *Session {
 	if page == nil {
 		return nil
 	}
-	selectedPtr := coreglib.InternObject(page).Native()
+	selectedPtr := coreglib.BaseObject(page).Native()
 	for tabID, p := range a.tabPages {
-		if coreglib.InternObject(p).Native() == selectedPtr {
+		if coreglib.BaseObject(p).Native() == selectedPtr {
 			return a.sessions[tabID]
 		}
 	}
