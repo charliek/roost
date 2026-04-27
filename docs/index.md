@@ -37,6 +37,6 @@ If the tab is not currently focused you will see:
 
 - [Installation](getting-started/installation.md) — system packages, building from source
 - [First Run](getting-started/first-run.md) — what happens on launch and where state lives
-- [Keybindings](getting-started/keybindings.md) — Ctrl-T, Ctrl-W, project switching
+- [Keybindings](getting-started/keybindings.md) — tab and project switching, platform-native modifiers
 - [Notifications](guides/notifications.md) — how the notification pipeline works
 - [Claude Code Hooks](guides/claude-code.md) — wire `roost-cli notify` into Claude

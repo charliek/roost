@@ -12,7 +12,9 @@ import (
 //
 // Returns true if we consumed the key. When the user holds Cmd (Meta on
 // macOS) or Super, we bail out so the window-level ShortcutController
-// can see the event for app-level keybindings (Cmd-T, Cmd-W, etc.).
+// can see the event for app-level keybindings (Cmd-T, Cmd-W, Cmd-1..9
+// on macOS; Alt-1..9 also flows through to the controller on Linux —
+// see installShortcuts).
 func handleKey(s *Session, keyval uint, mods uint) bool {
 	gdkMods := gdk.ModifierType(mods)
 
