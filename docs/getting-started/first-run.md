@@ -45,6 +45,9 @@ See [Paths & Environment](../reference/paths.md) for the full layout.
 - The default tab title shows the working directory if the shell hasn't set its own title yet
 - Resizing the window reflows the terminal — `vim` and `htop` adjust correctly
 - Output renders with full 24-bit color and basic styles (bold, italic, inverse)
+- Two-finger scroll (or wheel) navigates the scrollback; pressing any input-producing key snaps the viewport back to the bottom
+- Click + drag selects cells with a translucent accent overlay; selection clears on PTY output, on resize, and on the next click. See [Keybindings → Mouse](keybindings.md#mouse) for the full table including pass-through to `vim` / `htop` / `tmux` and the Shift-bypass convention.
+- `Cmd-V` (macOS) / `Alt-V` (Linux) / `Ctrl-Shift-V` (both) pastes the system clipboard. Multi-line pastes into modern shells are wrapped in bracketed-paste sequences so they don't auto-execute. Pastes are sanitized (NUL/ESC/DEL stripped) and capped at 4 MiB.
 
 ## Common first-launch behaviors
 

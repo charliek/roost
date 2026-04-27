@@ -18,6 +18,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/charliek/roost/internal/core"
+	"github.com/charliek/roost/internal/ghostty"
 	"github.com/charliek/roost/internal/ipc"
 )
 
@@ -909,6 +910,7 @@ func (a *App) installShortcuts() {
 	add := func(spec string, fn func()) {
 		t := gtk.NewShortcutTriggerParseString(spec)
 		if t == nil {
+			slog.Warn("shortcut: trigger parse failed", "spec", spec)
 			return
 		}
 		action := gtk.NewCallbackAction(func(_ gtk.Widgetter, _ *glib.Variant) (ok bool) {
@@ -928,6 +930,20 @@ func (a *App) installShortcuts() {
 	// Tab management on the primary modifier.
 	add(primary+"t", a.newTabInActiveProject)
 	add(primary+"w", a.closeActiveTab)
+
+	// Clipboard. Cmd+V on macOS, Alt+V on Linux, Ctrl+Shift+V on both
+	// (terminal convention) so muscle memory works either way. Bare
+	// Ctrl+V remains as terminal input. Bare Ctrl+C is left as SIGINT
+	// — Cmd+C / Alt+C / Ctrl+Shift+C handle copy without overloading
+	// the SIGINT key.
+	clipboardMod := "<Alt>"
+	if runtime.GOOS == "darwin" {
+		clipboardMod = "<Meta>"
+	}
+	add(clipboardMod+"v", a.pasteIntoActive)
+	add("<Control><Shift>v", a.pasteIntoActive)
+	add(clipboardMod+"c", a.copyFromActive)
+	add("<Control><Shift>c", a.copyFromActive)
 
 	// Shift+[ produces braceleft on US layouts. GTK matches the
 	// transformed keyval, so we bind the curly forms (and the bracket
@@ -953,6 +969,156 @@ func (a *App) installShortcuts() {
 	}
 
 	a.win.AddController(ctrl)
+}
+
+// activeSession returns the currently selected session in the active
+// project, or nil if none. Resolves: active project → its TabView's
+// selected page → tab id → session.
+//
+// We can't key directly into a.pageTabs by the *adw.TabPage Go pointer
+// because gotk4 may hand us a different Go wrapper for the same C
+// GObject between the call to view.Append (where the entry was
+// inserted) and the call to view.SelectedPage here — the wrapper's
+// C pointer is the stable identity, not the Go pointer. Look up by
+// C pointer via the tabPages reverse map instead.
+func (a *App) activeSession() *Session {
+	view := a.projectViews[a.activeProjectID]
+	if view == nil {
+		return nil
+	}
+	page := view.SelectedPage()
+	if page == nil {
+		return nil
+	}
+	selectedPtr := coreglib.InternObject(page).Native()
+	for tabID, p := range a.tabPages {
+		if coreglib.InternObject(p).Native() == selectedPtr {
+			return a.sessions[tabID]
+		}
+	}
+	return nil
+}
+
+// pastePipeline drives a clipboard read → encode → chunked PTY write
+// for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
+//
+// The window's ShortcutController fires in PhaseCapture, so these
+// shortcuts intercept the event before any focused widget (including
+// a sidebar rename GtkEntry) sees it. That matches how every other
+// app-level binding in installShortcuts works (Cmd+T, Cmd+W, etc.).
+// If we ever want to defer to focused editable widgets, the right
+// place is GtkShortcut.SetScope or a focus-aware predicate, not a
+// silent post-fire bail.
+//
+// Limits and behavior:
+//   - Cap the clipboard at pasteMaxBytes (4 MiB); above that, log and
+//     drop. A confirmation dialog is later polish.
+//   - Encode through libghostty-vt's ghostty_paste_encode, which wraps
+//     in \x1b[200~ … \x1b[201~ when the foreground app has bracketed
+//     paste enabled, strips unsafe control bytes (NUL/ESC/DEL → space,
+//     including any embedded \x1b[201~ sentinel that would otherwise
+//     let pasted content escape bracketed mode), and replaces \n with
+//     \r when not bracketed.
+//   - Chunk PTY writes at pasteChunkBytes (64 KiB) with glib.IdleAdd
+//     between chunks so the GTK frame clock isn't blocked when piping
+//     into a slow consumer.
+const (
+	pasteMaxBytes   = 4 * 1024 * 1024
+	pasteChunkBytes = 64 * 1024
+)
+
+func (a *App) pasteIntoActive() {
+	sess := a.activeSession()
+	if sess == nil {
+		return
+	}
+	display := gdk.DisplayGetDefault()
+	if display == nil {
+		return
+	}
+	clip := display.Clipboard()
+	clip.ReadTextAsync(context.Background(), func(res gio.AsyncResulter) {
+		text, err := clip.ReadTextFinish(res)
+		if err != nil {
+			slog.Warn("clipboard read", "err", err)
+			return
+		}
+		if text == "" {
+			return
+		}
+		if len(text) > pasteMaxBytes {
+			slog.Warn("paste exceeds size limit",
+				"bytes", len(text), "limit", pasteMaxBytes)
+			return
+		}
+		bracketed := sess.term.BracketedPasteEnabled()
+		encoded, err := ghostty.EncodePaste([]byte(text), bracketed)
+		if err != nil {
+			slog.Warn("paste encode", "err", err)
+			return
+		}
+		a.writeChunked(sess, encoded, 0)
+	})
+}
+
+// copyFromActive extracts the active session's selection via the
+// libghostty-vt formatter (handles soft-wrap unwrap, trailing-space
+// trim, interior-whitespace preservation) and places the result on
+// the system clipboard. On Linux it also writes to the PRIMARY
+// clipboard so middle-click paste in other apps works; PRIMARY
+// doesn't exist on macOS and the call is a no-op there.
+func (a *App) copyFromActive() {
+	sess := a.activeSession()
+	if sess == nil || sess.sel.empty() {
+		return
+	}
+	sCol, sRow, eCol, eRow := sess.sel.normalized()
+	text, err := ghostty.CopyViewportSelection(
+		sess.term,
+		uint16(sCol), uint32(sRow),
+		uint16(eCol), uint32(eRow),
+	)
+	if err != nil {
+		slog.Warn("copy selection", "err", err)
+		return
+	}
+	if text == "" {
+		return
+	}
+	display := gdk.DisplayGetDefault()
+	if display == nil {
+		return
+	}
+	display.Clipboard().SetText(text)
+	if runtime.GOOS != "darwin" {
+		if pc := display.PrimaryClipboard(); pc != nil {
+			pc.SetText(text)
+		}
+	}
+}
+
+// writeChunked writes encoded paste bytes to the session's PTY in
+// pasteChunkBytes-sized slices, yielding to the GTK main loop between
+// chunks via glib.IdleAdd so a multi-MB paste doesn't freeze the UI.
+func (a *App) writeChunked(sess *Session, data []byte, off int) {
+	if sess.closed.Load() || off >= len(data) {
+		return
+	}
+	end := off + pasteChunkBytes
+	if end > len(data) {
+		end = len(data)
+	}
+	if _, err := sess.pty.Write(data[off:end]); err != nil {
+		slog.Warn("paste pty write", "err", err)
+		return
+	}
+	if end < len(data) {
+		next := end
+		coreglib.IdleAdd(func() bool {
+			a.writeChunked(sess, data, next)
+			return false
+		})
+	}
 }
 
 // emptyStackName is the stack child name for the "no projects" status
