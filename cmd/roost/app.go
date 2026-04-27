@@ -243,6 +243,12 @@ func (a *App) handleEvent(ev core.Event) {
 		if page, ok := a.tabPages[ev.Tab.ID]; ok {
 			page.SetTitle(ev.Tab.Title)
 		}
+		// Keep the in-memory Session.tab title in sync so the OSC-empty
+		// fallback at session.go's onTitleChanged uses the latest title
+		// rather than the value from session creation.
+		if sess, ok := a.sessions[ev.Tab.ID]; ok {
+			sess.tab.Title = ev.Tab.Title
+		}
 	case core.EventProjectRenamed:
 		if ev.Project == nil {
 			return
@@ -970,7 +976,8 @@ func (a *App) buildEmptyState() *adw.StatusPage {
 }
 
 // beginRenameActiveProject puts the active project's row into edit mode.
-// Wired to F2; safe no-op when there is no active project.
+// Wired to Cmd-Shift-R on macOS, Alt-Shift-R on Linux; safe no-op when
+// there is no active project.
 func (a *App) beginRenameActiveProject() {
 	if a.activeProjectID == 0 {
 		return
