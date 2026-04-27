@@ -23,8 +23,10 @@ cmd/
     main.go             # entry, config + store + workspace + GTK app bootstrap
     app.go              # App struct: owns sessions map, sidebar, tab views, IPC handler
     session.go          # Session: PTY + libghostty terminal + render state + DrawingArea
-    render.go           # Cairo cell drawing
-    input.go            # GDK key event → PTY bytes
+    render.go           # Cairo cell drawing + selection overlay
+    input.go            # GDK key event → libghostty key encoder → PTY bytes
+    keymap.go           # GDK keyval → ghostty.Key + ghostty.Mods (pure Go, no cgo)
+    selection.go        # Stable selection model + ribbon-rect math for the renderer
     notify.go           # Desktop notification (gio on Linux, osascript on macOS)
     loghandler.go       # slog filter for noisy GLib theme warnings
   roost-cli/            # Companion CLI binary
@@ -50,6 +52,8 @@ GTK4 is strictly single-threaded. Widget operations must run on the main thread.
 | GTK widgets, draw functions, input     | Main thread only                              |
 | `ghostty_terminal_vt_write`            | **Main thread**                               |
 | `ghostty_render_state_update` and walk | **Main thread**                               |
+| `KeyEncoder` / `MouseEncoder` (encode + `setopt_from_terminal`) | **Main thread** (same handle reused per session) |
+| `EncodePaste` / `CopyViewportSelection` | **Main thread**                               |
 | Per-tab PTY `Read` / `Write`           | One goroutine per tab                         |
 | OSC scanner (parses notifications)     | Same goroutine as the PTY pump                |
 | SQLite writes                          | Goroutine-safe (database/sql handles locking) |

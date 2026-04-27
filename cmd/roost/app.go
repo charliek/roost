@@ -18,6 +18,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/charliek/roost/internal/core"
+	"github.com/charliek/roost/internal/ghostty"
 	"github.com/charliek/roost/internal/ipc"
 )
 
@@ -909,11 +910,30 @@ func (a *App) installShortcuts() {
 	add := func(spec string, fn func()) {
 		t := gtk.NewShortcutTriggerParseString(spec)
 		if t == nil {
+			slog.Warn("shortcut: trigger parse failed", "spec", spec)
 			return
 		}
 		action := gtk.NewCallbackAction(func(_ gtk.Widgetter, _ *glib.Variant) (ok bool) {
 			fn()
 			return true
+		})
+		ctrl.AddShortcut(gtk.NewShortcut(t, action))
+	}
+
+	// addCond is like add but lets the action signal "I didn't
+	// handle this; let GTK keep propagating." Used for clipboard
+	// shortcuts so a focused GtkEditable can keep its native
+	// copy/paste behavior — returning false here lets GTK deliver
+	// the keystroke to the focused widget after our capture-phase
+	// controller declines.
+	addCond := func(spec string, fn func() bool) {
+		t := gtk.NewShortcutTriggerParseString(spec)
+		if t == nil {
+			slog.Warn("shortcut: trigger parse failed", "spec", spec)
+			return
+		}
+		action := gtk.NewCallbackAction(func(_ gtk.Widgetter, _ *glib.Variant) (ok bool) {
+			return fn()
 		})
 		ctrl.AddShortcut(gtk.NewShortcut(t, action))
 	}
@@ -928,6 +948,32 @@ func (a *App) installShortcuts() {
 	// Tab management on the primary modifier.
 	add(primary+"t", a.newTabInActiveProject)
 	add(primary+"w", a.closeActiveTab)
+
+	// Clipboard. Cmd+V on macOS, Alt+V on Linux, Ctrl+Shift+V on both
+	// (terminal convention) so muscle memory works either way. Bare
+	// Ctrl+V remains as terminal input. Bare Ctrl+C is left as SIGINT
+	// — Cmd+C / Alt+C / Ctrl+Shift+C handle copy without overloading
+	// the SIGINT key.
+	clipboardMod := "<Alt>"
+	if runtime.GOOS == "darwin" {
+		clipboardMod = "<Meta>"
+	}
+	clipboardGuard := func(fn func()) func() bool {
+		return func() bool {
+			if a.editableHasFocus() {
+				// Tell GTK we didn't consume the event so the
+				// focused entry / text view gets its native
+				// copy/paste handling.
+				return false
+			}
+			fn()
+			return true
+		}
+	}
+	addCond(clipboardMod+"v", clipboardGuard(a.pasteIntoActive))
+	addCond("<Control><Shift>v", clipboardGuard(a.pasteIntoActive))
+	addCond(clipboardMod+"c", clipboardGuard(a.copyFromActive))
+	addCond("<Control><Shift>c", clipboardGuard(a.copyFromActive))
 
 	// Shift+[ produces braceleft on US layouts. GTK matches the
 	// transformed keyval, so we bind the curly forms (and the bracket
@@ -953,6 +999,154 @@ func (a *App) installShortcuts() {
 	}
 
 	a.win.AddController(ctrl)
+}
+
+// activeSession returns the currently selected session in the active
+// project, or nil if none. Resolves: active project → its TabView's
+// selected page → tab id → session.
+//
+// We can't key directly into a.pageTabs by the *adw.TabPage Go pointer
+// because gotk4 may hand us a different Go wrapper for the same C
+// GObject between the call to view.Append (where the entry was
+// inserted) and the call to view.SelectedPage here — the wrapper's
+// C pointer is the stable identity, not the Go pointer. Look up by
+// C pointer via the tabPages reverse map instead.
+func (a *App) activeSession() *Session {
+	view := a.projectViews[a.activeProjectID]
+	if view == nil {
+		return nil
+	}
+	page := view.SelectedPage()
+	if page == nil {
+		return nil
+	}
+	selectedPtr := page.Native()
+	for tabID, p := range a.tabPages {
+		if p.Native() == selectedPtr {
+			return a.sessions[tabID]
+		}
+	}
+	return nil
+}
+
+// editableHasFocus reports whether keyboard focus currently lives in
+// a GtkEditable widget — typically a sidebar rename GtkEntry, but
+// also any GtkText / GtkTextView a future feature might add. Used
+// by the clipboard shortcuts to step aside so the focused entry
+// gets its native copy/paste behavior.
+//
+// We check via type assertion against gtk.EditableTextWidget (the
+// gotk4 wrapper for GtkEditable). Walks one parent up to handle the
+// AdwEntryRow / GtkSearchEntry case where the actual focusable text
+// is a child widget of the visible entry.
+func (a *App) editableHasFocus() bool {
+	if a.win == nil {
+		return false
+	}
+	w := a.win.Focus()
+	for i := 0; i < 2 && w != nil; i++ {
+		if _, ok := w.(*gtk.EditableTextWidget); ok {
+			return true
+		}
+		w = gtk.BaseWidget(w).Parent()
+	}
+	return false
+}
+
+// pasteIntoActive drives a clipboard read → encode → background PTY
+// write for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
+//
+// The encoded bytes are queued via Session.QueueWrite, which runs the
+// actual pty.Write on a per-tab goroutine so a slow PTY consumer
+// can't stall the GTK main thread. Per-session writeMu serializes
+// against keystrokes / mouse events so a paste-then-type doesn't
+// interleave on the wire.
+//
+// Limits and behavior:
+//   - Cap the clipboard at pasteMaxBytes (4 MiB); above that, log and
+//     drop. A confirmation dialog is later polish.
+//   - Encode through libghostty-vt's ghostty_paste_encode, which wraps
+//     in \x1b[200~ … \x1b[201~ when the foreground app has bracketed
+//     paste enabled, strips unsafe control bytes (NUL/ESC/DEL → space,
+//     including any embedded \x1b[201~ sentinel that would otherwise
+//     let pasted content escape bracketed mode), and replaces \n with
+//     \r when not bracketed.
+const pasteMaxBytes = 4 * 1024 * 1024
+
+func (a *App) pasteIntoActive() {
+	if a.editableHasFocus() {
+		return
+	}
+	sess := a.activeSession()
+	if sess == nil {
+		return
+	}
+	display := gdk.DisplayGetDefault()
+	if display == nil {
+		return
+	}
+	clip := display.Clipboard()
+	clip.ReadTextAsync(context.Background(), func(res gio.AsyncResulter) {
+		text, err := clip.ReadTextFinish(res)
+		if err != nil {
+			slog.Warn("clipboard read", "err", err)
+			return
+		}
+		if text == "" {
+			return
+		}
+		if len(text) > pasteMaxBytes {
+			slog.Warn("paste exceeds size limit",
+				"bytes", len(text), "limit", pasteMaxBytes)
+			return
+		}
+		bracketed := sess.term.BracketedPasteEnabled()
+		encoded, err := ghostty.EncodePaste([]byte(text), bracketed)
+		if err != nil {
+			slog.Warn("paste encode", "err", err)
+			return
+		}
+		sess.QueueWrite(encoded)
+	})
+}
+
+// copyFromActive extracts the active session's selection via the
+// libghostty-vt formatter (handles soft-wrap unwrap, trailing-space
+// trim, interior-whitespace preservation) and places the result on
+// the system clipboard. On Linux it also writes to the PRIMARY
+// clipboard so middle-click paste in other apps works; PRIMARY
+// doesn't exist on macOS and the call is a no-op there.
+func (a *App) copyFromActive() {
+	if a.editableHasFocus() {
+		return
+	}
+	sess := a.activeSession()
+	if sess == nil || sess.sel.empty() {
+		return
+	}
+	sCol, sRow, eCol, eRow := sess.sel.normalized()
+	text, err := ghostty.CopyViewportSelection(
+		sess.term,
+		uint16(sCol), uint32(sRow),
+		uint16(eCol), uint32(eRow),
+	)
+	if err != nil {
+		slog.Warn("copy selection", "err", err)
+		return
+	}
+	if text == "" {
+		return
+	}
+	display := gdk.DisplayGetDefault()
+	if display == nil {
+		return
+	}
+	display.Clipboard().SetText(text)
+	if runtime.GOOS != "darwin" {
+		if pc := display.PrimaryClipboard(); pc != nil {
+			pc.SetText(text)
+		}
+	}
 }
 
 // emptyStackName is the stack child name for the "no projects" status

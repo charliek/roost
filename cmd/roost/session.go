@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"github.com/diamondburned/gotk4/pkg/cairo"
@@ -29,10 +30,12 @@ type Session struct {
 	ws  *core.Workspace
 	tab core.Tab
 
-	pty  *pty.PTY
-	term *ghostty.Terminal
-	rs   *ghostty.RenderState
-	da   *gtk.DrawingArea
+	pty   *pty.PTY
+	term  *ghostty.Terminal
+	rs    *ghostty.RenderState
+	keys  *ghostty.KeyEncoder
+	mouse *ghostty.MouseEncoder
+	da    *gtk.DrawingArea
 
 	font     *pango.FontDescription
 	fontBold *pango.FontDescription
@@ -54,6 +57,27 @@ type Session struct {
 	// libghostty state, so callbacks already in the GTK queue at the
 	// time of Close become no-ops instead of use-after-free.
 	closed atomic.Bool
+
+	// writeMu serializes background PTY writes spawned by QueueWrite
+	// so that bytes from concurrent paste / keystroke / mouse-event
+	// goroutines don't interleave on the wire.
+	writeMu sync.Mutex
+
+	// scrollAccum aggregates fractional smooth-scroll deltas
+	// (gdk.ScrollUnitSurface, common on macOS trackpads) so we only
+	// dispatch whole-row scrolls to libghostty. Reset whenever it
+	// crosses ±1.0 by subtracting the dispatched integer.
+	scrollAccum float64
+
+	// scrolledBack is true when the user has scrolled the viewport
+	// above the active area. Cleared on snap-to-bottom, on returning
+	// to bottom via wheel, and used by handleKey to snap back before
+	// delivering an input-producing keystroke.
+	scrolledBack bool
+
+	// sel is the local mouse-drag selection (viewport coordinates).
+	// Cleared on resize and on PTY output that touches selected rows.
+	sel selection
 
 	// pumpDone closes when the PTY-pump goroutine exits, letting Close
 	// wait until all IdleAdd callbacks from pump have been queued
@@ -104,8 +128,23 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 		term.Close()
 		return nil, err
 	}
+	keys, err := ghostty.NewKeyEncoder()
+	if err != nil {
+		rs.Close()
+		term.Close()
+		return nil, err
+	}
+	mouse, err := ghostty.NewMouseEncoder()
+	if err != nil {
+		keys.Close()
+		rs.Close()
+		term.Close()
+		return nil, err
+	}
 	p, err := pty.SpawnShell(tab.CWD, cols, rows, extraEnv...)
 	if err != nil {
+		mouse.Close()
+		keys.Close()
 		rs.Close()
 		term.Close()
 		return nil, err
@@ -123,7 +162,7 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 
 	s := &Session{
 		ws: ws, tab: tab,
-		pty: p, term: term, rs: rs,
+		pty: p, term: term, rs: rs, keys: keys, mouse: mouse,
 		font:          font,
 		fontBold:      fontBold,
 		cols:          cols,
@@ -168,16 +207,76 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 	})
 
 	keyCtrl := gtk.NewEventControllerKey()
+	// Capture phase so we see Tab / Shift+Tab before GTK's default
+	// focus chain consumes them for widget traversal. Without this,
+	// the toplevel may eat Shift+Tab and our handleKey never fires.
+	keyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) (ok bool) {
 		return handleKey(s, keyval, uint(state))
 	})
 	s.da.AddController(keyCtrl)
 
+	// Mouse button + drag handling. Two controllers cooperate:
+	//   - GestureClick: focus grab on press, plus encoded press/release
+	//     when the foreground app has mouse tracking on (vim, htop,
+	//     tmux). When tracking is off, click starts a local selection.
+	//   - GestureDrag: extends the selection on drag (or sends encoded
+	//     motion events when tracking is on).
+	// Shift always bypasses tracking → local selection / scroll, the
+	// xterm convention every terminal emulator implements.
 	clickCtrl := gtk.NewGestureClick()
-	clickCtrl.ConnectPressed(func(_ int, _, _ float64) {
+	clickCtrl.SetButton(0) // listen for any button, not just primary
+	clickCtrl.ConnectPressed(func(_ int, x, y float64) {
 		s.da.GrabFocus()
+		state := clickCtrl.CurrentEventState()
+		button := clickCtrl.CurrentButton()
+		if s.useMouseTracking(state) {
+			s.sendMouseEvent(ghostty.MouseActionPress, gtkButtonToGhostty(button), state, x, y)
+		} else if button == 1 {
+			col, row := s.cellAt(x, y)
+			s.sel.start(col, row)
+			s.da.QueueDraw()
+		}
+	})
+	clickCtrl.ConnectReleased(func(_ int, x, y float64) {
+		state := clickCtrl.CurrentEventState()
+		button := clickCtrl.CurrentButton()
+		if s.useMouseTracking(state) {
+			s.sendMouseEvent(ghostty.MouseActionRelease, gtkButtonToGhostty(button), state, x, y)
+		}
 	})
 	s.da.AddController(clickCtrl)
+
+	dragCtrl := gtk.NewGestureDrag()
+	dragCtrl.SetButton(1) // selection drags only on primary button
+	var pressX, pressY float64
+	dragCtrl.ConnectDragBegin(func(x, y float64) {
+		pressX, pressY = x, y
+	})
+	dragCtrl.ConnectDragUpdate(func(dx, dy float64) {
+		state := dragCtrl.CurrentEventState()
+		x, y := pressX+dx, pressY+dy
+		if s.useMouseTracking(state) {
+			s.sendMouseEvent(ghostty.MouseActionMotion, ghostty.MouseButtonLeft, state, x, y)
+		} else {
+			col, row := s.cellAt(x, y)
+			s.sel.update(col, row)
+			s.da.QueueDraw()
+		}
+	})
+	s.da.AddController(dragCtrl)
+
+	// Scroll wheel → scrollback. Three rows per discrete wheel notch;
+	// for macOS-style smooth-scroll (gdk.ScrollUnitSurface) we
+	// accumulate fractional deltas and dispatch whole rows when
+	// |accum| ≥ 1.0. Returning true tells GTK we consumed the event
+	// so it doesn't bubble to a parent ScrolledWindow.
+	scrollCtrl := gtk.NewEventControllerScroll(gtk.EventControllerScrollVertical)
+	scrollCtrl.ConnectScroll(func(_, dy float64) (ok bool) {
+		s.handleScroll(scrollCtrl, dy)
+		return true
+	})
+	s.da.AddController(scrollCtrl)
 
 	go s.pumpPTY()
 	return s, nil
@@ -228,7 +327,11 @@ func (s *Session) Close() {
 	// so it lands after any pending vt_write callbacks.
 	rs := s.rs
 	term := s.term
+	keys := s.keys
+	mouse := s.mouse
 	glib.IdleAdd(func() {
+		mouse.Close()
+		keys.Close()
 		rs.Close()
 		term.Close()
 	})
@@ -254,6 +357,13 @@ func (s *Session) pumpPTY() {
 				}
 				s.term.VTWrite(chunk)
 				_ = s.rs.Update(s.term)
+				// Clear any active selection on output. Most
+				// terminals clear-on-any-write rather than tracking
+				// which rows changed; that matches user
+				// expectations and avoids the bookkeeping.
+				if s.sel.active {
+					s.sel.clear()
+				}
 				s.checkTitleAndPWD()
 				s.da.QueueDraw()
 			})
@@ -339,12 +449,286 @@ func (s *Session) onResize(width, height int) {
 	}
 	s.cols = cols
 	s.rows = rows
+	// Selection cells become invalid after a reflow (the underlying
+	// content reorganizes around the new column count); clearing is
+	// simpler and matches user expectations.
+	if s.sel.active {
+		s.sel.clear()
+	}
 	if err := s.term.Resize(cols, rows, uint32(s.cellW), uint32(s.cellH)); err != nil {
 		slog.Warn("ghostty resize", "tab_id", s.tab.ID, "err", err)
 	}
 	if err := s.pty.Resize(cols, rows, uint16(s.cellW), uint16(s.cellH)); err != nil {
 		slog.Warn("pty resize", "tab_id", s.tab.ID, "err", err)
 	}
+	// Update mouse encoder geometry so its pixel→cell conversion
+	// matches the new layout.
+	s.mouse.SetGeometry(
+		uint32(width), uint32(height),
+		uint32(s.cellW), uint32(s.cellH),
+		uint32(pad), uint32(pad),
+	)
+	_ = s.rs.Update(s.term)
+	s.da.QueueDraw()
+}
+
+// handleScroll converts a GTK scroll event into one of three actions,
+// in order of priority:
+//
+//  1. **Mouse-tracking pass-through** (htop, tmux, vim with mouse=a):
+//     encode wheel as button-4/5 press+release pairs to the PTY.
+//  2. **Alt-screen "alt-scroll"** (vim, less, jed without mouse=a,
+//     anything on the alternate screen): translate wheel into
+//     ArrowUp/ArrowDown keystrokes via the key encoder. This is the
+//     convention every modern terminal implements; the alt screen
+//     has no scrollback, so a literal viewport scroll there is a
+//     no-op and users would (correctly) see it as a bug.
+//  3. **Local viewport scroll** (primary screen, no app tracking):
+//     scroll roost's own scrollback buffer.
+//
+// Shift held bypasses mouse-tracking pass-through (xterm convention)
+// but does NOT bypass alt-scroll — the alt screen still has no
+// scrollback to scroll into.
+//
+// Quantization: discrete wheel notches contribute 3 rows per tick;
+// smooth-scroll (Surface unit, common on macOS trackpads) is in
+// surface pixels, scaled to rows by cellH and accumulated. Both
+// branches use the same row count so trackpads "just work" wherever
+// the wheel does.
+//
+// scrolledBack is set whenever a local scroll moves the viewport
+// above the active area, and cleared as soon as the user scrolls
+// back to (or past) the bottom. handleKey reads it to snap the
+// viewport down before delivering an input-producing keystroke.
+func (s *Session) handleScroll(ctrl *gtk.EventControllerScroll, dy float64) {
+	if s.closed.Load() || dy == 0 {
+		return
+	}
+	rows := s.quantizeScroll(ctrl.Unit(), dy)
+	if rows == 0 {
+		return
+	}
+
+	state := ctrl.CurrentEventState()
+
+	// 1. Mouse-tracking pass-through.
+	if s.useMouseTracking(state) {
+		btn := ghostty.MouseButtonWheelUp
+		count := -rows
+		if rows > 0 {
+			btn = ghostty.MouseButtonWheelDown
+			count = rows
+		}
+		for i := 0; i < count; i++ {
+			s.sendMouseEvent(ghostty.MouseActionPress, btn, state, 0, 0)
+			s.sendMouseEvent(ghostty.MouseActionRelease, btn, state, 0, 0)
+		}
+		return
+	}
+
+	// 2. Alt-screen alt-scroll. Translate wheel into arrow keys so
+	// vim/less/jed/etc. respond to trackpad scroll the way users
+	// expect. One keystroke per row of motion.
+	if s.term.AltScreenActive() {
+		key := ghostty.KeyArrowUp
+		count := -rows
+		if rows > 0 {
+			key = ghostty.KeyArrowDown
+			count = rows
+		}
+		s.keys.SyncFromTerminal(s.term)
+		for i := 0; i < count; i++ {
+			out, err := s.keys.Encode(ghostty.KeyEvent{
+				Action: ghostty.KeyActionPress,
+				Key:    key,
+			})
+			if err != nil || len(out) == 0 {
+				continue
+			}
+			s.QueueWrite(out)
+		}
+		return
+	}
+
+	// 3. Local viewport scroll (primary screen).
+	s.term.ScrollViewportDelta(rows)
+	if rows < 0 {
+		s.scrolledBack = true
+	} else if s.scrolledBack {
+		if _, _, visible := s.rs.CursorPos(); visible {
+			s.scrolledBack = false
+			s.scrollAccum = 0
+		}
+	}
+	_ = s.rs.Update(s.term)
+	s.da.QueueDraw()
+}
+
+// quantizeScroll converts a raw dy delta into integer rows using the
+// per-session accumulator. Discrete wheel notches dispatch immediately
+// (3 rows per tick). Smooth-scroll deltas (gdk.ScrollUnitSurface) are
+// in *surface pixels*; we divide by cell height to get rows then
+// scale by surfaceScrollSensitivity, accumulating fractional
+// remainders across events. A single fast trackpad event can dispatch
+// many rows; a slow drag accumulates over events.
+//
+// surfaceScrollSensitivity is a hand-tuned multiplier: 1.0 = one row
+// per cellH pixels of motion (sluggish on macOS trackpads); 2.0 =
+// two rows per cellH (the default — feels right on a Magic Trackpad
+// and on a notched mouse with high-DPI smooth scroll).
+const surfaceScrollSensitivity = 2.0
+
+func (s *Session) quantizeScroll(unit gdk.ScrollUnit, dy float64) int {
+	const rowsPerWheelNotch = 3
+	switch unit {
+	case gdk.ScrollUnitWheel:
+		if dy > 0 {
+			return rowsPerWheelNotch
+		}
+		return -rowsPerWheelNotch
+	case gdk.ScrollUnitSurface:
+		if s.cellH <= 0 {
+			return 0
+		}
+		s.scrollAccum += dy * surfaceScrollSensitivity / float64(s.cellH)
+		if s.scrollAccum >= 1 || s.scrollAccum <= -1 {
+			rows := int(s.scrollAccum)
+			s.scrollAccum -= float64(rows)
+			return rows
+		}
+		return 0
+	default:
+		return 0
+	}
+}
+
+// QueueWrite serializes a write to the PTY off the GTK main thread.
+// Spawns a goroutine that takes writeMu and performs pty.Write with
+// a short-write loop. Order is preserved across calls because every
+// goroutine must acquire writeMu before writing — a paste followed
+// by a keystroke arrives at the shell in that order even though both
+// run concurrently.
+//
+// Per CLAUDE.md, PTY read/write must run in per-tab goroutines so a
+// slow consumer can't stall the GTK main thread. The data slice is
+// copied so the caller can recycle its buffer immediately. Safe to
+// call from the main thread; safe to call after Close (no-op).
+func (s *Session) QueueWrite(data []byte) {
+	if s.closed.Load() || len(data) == 0 {
+		return
+	}
+	buf := append([]byte(nil), data...)
+	tabID := s.tab.ID
+	go func() {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		if s.closed.Load() {
+			return
+		}
+		for off := 0; off < len(buf); {
+			n, err := s.pty.Write(buf[off:])
+			if err != nil {
+				slog.Warn("pty write", "tab_id", tabID, "err", err,
+					"wrote", off+n, "total", len(buf))
+				return
+			}
+			off += n
+		}
+	}()
+}
+
+// useMouseTracking decides whether mouse events should be encoded and
+// forwarded to the PTY (true) or drive local selection/scroll (false).
+//
+// Pass-through is suppressed when:
+//   - Shift is held — xterm/iTerm2 convention; lets users select text
+//     in apps that grab the mouse (vim, tmux). Non-optional muscle
+//     memory for the target user base.
+//   - The user has scrolled into history. Mouse interactions during
+//     scrollback are about reading, not interacting with the app.
+func (s *Session) useMouseTracking(state gdk.ModifierType) bool {
+	if s.scrolledBack {
+		return false
+	}
+	if state&gdk.ShiftMask != 0 {
+		return false
+	}
+	return s.term.MouseTrackingActive()
+}
+
+// sendMouseEvent encodes one mouse event via libghostty-vt and writes
+// the result to the PTY. SyncFromTerminal is called per-event so live
+// terminal-mode changes (X10/normal/button/any-event, SGR/X10 format)
+// are honored. The encoder picks the right escape sequence based on
+// those modes.
+func (s *Session) sendMouseEvent(action ghostty.MouseAction, button ghostty.MouseButton, state gdk.ModifierType, x, y float64) {
+	if s.closed.Load() || s.mouse == nil {
+		return
+	}
+	s.mouse.SyncFromTerminal(s.term)
+	s.mouse.SetAnyButtonPressed(action != ghostty.MouseActionRelease)
+	out, err := s.mouse.Encode(ghostty.MouseEvent{
+		Action: action,
+		Button: button,
+		Mods:   gdkModsToGhosttyMods(state),
+		X:      float32(x),
+		Y:      float32(y),
+	})
+	if err != nil || len(out) == 0 {
+		return
+	}
+	s.QueueWrite(out)
+}
+
+// gtkButtonToGhostty maps GTK's 1=left/2=middle/3=right convention to
+// libghostty-vt's MouseButton enum.
+func gtkButtonToGhostty(btn uint) ghostty.MouseButton {
+	switch btn {
+	case 1:
+		return ghostty.MouseButtonLeft
+	case 2:
+		return ghostty.MouseButtonMiddle
+	case 3:
+		return ghostty.MouseButtonRight
+	default:
+		return ghostty.MouseButtonNone
+	}
+}
+
+// cellAt converts pixel coordinates within the DrawingArea into
+// viewport cell (col, row), clamped to [0, cols) and [0, rows).
+func (s *Session) cellAt(x, y float64) (col, row int) {
+	if s.cellW <= 0 || s.cellH <= 0 {
+		return 0, 0
+	}
+	col = int((x - float64(pad)) / float64(s.cellW))
+	row = int((y - float64(pad)) / float64(s.cellH))
+	if col < 0 {
+		col = 0
+	}
+	if row < 0 {
+		row = 0
+	}
+	if col >= int(s.cols) {
+		col = int(s.cols) - 1
+	}
+	if row >= int(s.rows) {
+		row = int(s.rows) - 1
+	}
+	return
+}
+
+// snapToBottom returns the viewport to the active area if the user
+// has scrolled back. Called from handleKey before dispatching an
+// input-producing keystroke, mirroring the behavior of every other
+// terminal multiplexer.
+func (s *Session) snapToBottom() {
+	if !s.scrolledBack {
+		return
+	}
+	s.term.ScrollViewportToBottom()
+	s.scrolledBack = false
+	s.scrollAccum = 0
 	_ = s.rs.Update(s.term)
 	s.da.QueueDraw()
 }

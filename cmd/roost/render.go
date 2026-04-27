@@ -91,6 +91,20 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		slog.Warn("render-state walk", "err", err)
 	}
 
+	// Selection overlay (Ghostty/iTerm style). Drawn after the cell
+	// pass so text underneath stays visible, and before the cursor
+	// pass so the cursor remains opaque inside the selection.
+	if !s.sel.empty() {
+		rects := s.sel.ribbonRects(int(s.cols), s.cellW, s.cellH, pad, pad)
+		// Fixed GNOME-blue accent at moderate alpha. Theming via
+		// libadwaita's StyleManager is later polish.
+		cr.SetSourceRGBA(0x35/255.0, 0x84/255.0, 0xE4/255.0, 0.35)
+		for _, r := range rects {
+			cr.Rectangle(r.X, r.Y, r.W, r.H)
+			cr.Fill()
+		}
+	}
+
 	if cursorVisible {
 		x := pad + float64(cx*cellW)
 		y := pad + float64(cy*cellH)

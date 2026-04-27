@@ -9,6 +9,27 @@ package ghostty
 // #cgo LDFLAGS: ${SRCDIR}/../../build/out/lib/libghostty-vt.a
 // #include <ghostty/vt.h>
 // #include <stdlib.h>
+//
+// // ghostty_mode_new is a static inline in modes.h; cgo can't call C
+// // statics directly, so wrap the bracketed-paste mode constant.
+// static GhosttyMode roost_mode_bracketed_paste(void) {
+//     return GHOSTTY_MODE_BRACKETED_PASTE;
+// }
+//
+// // Build a scroll-viewport tagged-union value with a delta. The union
+// // member layout is C-only (anonymous fields in Go cgo bindings are
+// // awkward), so do the construction in C.
+// static GhosttyTerminalScrollViewport roost_scroll_viewport_delta(intptr_t delta) {
+//     GhosttyTerminalScrollViewport sv;
+//     sv.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA;
+//     sv.value.delta = delta;
+//     return sv;
+// }
+// static GhosttyTerminalScrollViewport roost_scroll_viewport_bottom(void) {
+//     GhosttyTerminalScrollViewport sv;
+//     sv.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
+//     return sv;
+// }
 import "C"
 
 import (
@@ -106,4 +127,85 @@ func (t *Terminal) PWD() string {
 		return ""
 	}
 	return C.GoStringN((*C.char)(unsafe.Pointer(s.ptr)), C.int(s.len))
+}
+
+// ScrollViewportDelta scrolls the viewport by `rows`. Negative scrolls
+// up (into scrollback), positive scrolls down toward the active area.
+// Must be called from the same thread as the terminal.
+func (t *Terminal) ScrollViewportDelta(rows int) {
+	if t.c == nil || rows == 0 {
+		return
+	}
+	sv := C.roost_scroll_viewport_delta(C.intptr_t(rows))
+	C.ghostty_terminal_scroll_viewport(t.c, sv)
+}
+
+// ScrollViewportToBottom snaps the viewport to the active area (most
+// recent rows). Cheap to call when already at the bottom.
+func (t *Terminal) ScrollViewportToBottom() {
+	if t.c == nil {
+		return
+	}
+	C.ghostty_terminal_scroll_viewport(t.c, C.roost_scroll_viewport_bottom())
+}
+
+// BracketedPasteEnabled reports whether the foreground app has enabled
+// DEC private mode 2004 (bracketed paste). When true, pastes should be
+// wrapped in \x1b[200~ … \x1b[201~ — use EncodePaste in paste.go for
+// the wrapping and unsafe-byte stripping.
+func (t *Terminal) BracketedPasteEnabled() bool {
+	if t.c == nil {
+		return false
+	}
+	var v C.bool
+	if rc := C.ghostty_terminal_mode_get(t.c, C.roost_mode_bracketed_paste(), &v); rc != C.GHOSTTY_SUCCESS {
+		return false
+	}
+	return bool(v)
+}
+
+// KittyKeyboardFlags returns the live Kitty keyboard protocol flags
+// stack top, or 0 if no app has pushed flags. Used to gate Kitty CSI-u
+// sequences (e.g. Shift+Enter as \x1b[13;2u) on apps that opted in.
+func (t *Terminal) KittyKeyboardFlags() uint8 {
+	if t.c == nil {
+		return 0
+	}
+	var v C.uint8_t
+	if rc := C.ghostty_terminal_get(t.c, C.GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS, unsafe.Pointer(&v)); rc != C.GHOSTTY_SUCCESS {
+		return 0
+	}
+	return uint8(v)
+}
+
+// MouseTrackingActive reports whether any mouse tracking mode (X10,
+// normal, button, any-event) is currently enabled. Use to branch
+// between encoding mouse events to the PTY versus driving local
+// selection / scroll.
+func (t *Terminal) MouseTrackingActive() bool {
+	if t.c == nil {
+		return false
+	}
+	var v C.bool
+	if rc := C.ghostty_terminal_get(t.c, C.GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, unsafe.Pointer(&v)); rc != C.GHOSTTY_SUCCESS {
+		return false
+	}
+	return bool(v)
+}
+
+// AltScreenActive reports whether the alternate screen is currently
+// active. Apps like vim, less, htop, jed switch into the alt screen
+// for full-screen UIs. The alt screen has no scrollback, so a wheel
+// scroll there should be translated to arrow keys (the "alt-scroll"
+// convention every modern terminal implements) rather than wasted on
+// a no-op viewport scroll.
+func (t *Terminal) AltScreenActive() bool {
+	if t.c == nil {
+		return false
+	}
+	var screen C.GhosttyTerminalScreen
+	if rc := C.ghostty_terminal_get(t.c, C.GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, unsafe.Pointer(&screen)); rc != C.GHOSTTY_SUCCESS {
+		return false
+	}
+	return screen == C.GHOSTTY_TERMINAL_SCREEN_ALTERNATE
 }
