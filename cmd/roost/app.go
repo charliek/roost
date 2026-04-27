@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -109,7 +110,11 @@ func (a *App) activate() {
 	header.SetTitleWidget(a.headerTitle)
 
 	newTabBtn := gtk.NewButtonFromIconName("tab-new-symbolic")
-	newTabBtn.SetTooltipText("New tab in current project (Cmd-T)")
+	newTabTip := "New tab in current project (Ctrl-T)"
+	if runtime.GOOS == "darwin" {
+		newTabTip = "New tab in current project (Cmd-T)"
+	}
+	newTabBtn.SetTooltipText(newTabTip)
 	newTabBtn.ConnectClicked(func() { a.newTabInActiveProject() })
 	header.PackEnd(newTabBtn)
 
@@ -237,6 +242,12 @@ func (a *App) handleEvent(ev core.Event) {
 		}
 		if page, ok := a.tabPages[ev.Tab.ID]; ok {
 			page.SetTitle(ev.Tab.Title)
+		}
+		// Keep the in-memory Session.tab title in sync so the OSC-empty
+		// fallback at session.go's onTitleChanged uses the latest title
+		// rather than the value from session creation.
+		if sess, ok := a.sessions[ev.Tab.ID]; ok {
+			sess.tab.Title = ev.Tab.Title
 		}
 	case core.EventProjectRenamed:
 		if ev.Project == nil {
@@ -405,8 +416,8 @@ func (a *App) addProjectUI(p core.Project) {
 		ownerPID := a.projectIDForPage(page)
 		a.closeTab(page)
 		view.ClosePageFinish(page, true)
-		// When a project's last tab closes (whether via UI close, Cmd-W,
-		// or a shell exiting), close the project silently. The "are you
+		// When a project's last tab closes (whether via UI close, Cmd-W /
+		// Ctrl-W, or a shell exiting), close the project silently. The "are you
 		// sure" dialog only fires for explicit close-project clicks.
 		if v := a.projectViews[ownerPID]; v != nil && v.NPages() == 0 {
 			a.deleteProject(ownerPID)
@@ -667,8 +678,8 @@ func (a *App) newTabInActiveProject() {
 	}
 	cwd := a.home
 	// Inherit the active tab's *current* cwd. Prefer lastPWD (live OSC 7)
-	// so Cmd-T after `cd` opens in the new directory; tab.CWD is only the
-	// snapshot at session creation.
+	// so Cmd-T / Ctrl-T after `cd` opens in the new directory; tab.CWD is
+	// only the snapshot at session creation.
 	if view := a.projectViews[a.activeProjectID]; view != nil {
 		if page := view.SelectedPage(); page != nil {
 			if id, ok := a.pageTabs[page]; ok {
@@ -733,7 +744,8 @@ func (a *App) closeTab(page *adw.TabPage) {
 	}
 }
 
-// closeActiveTab is bound to Cmd-W. Closes the currently selected page.
+// closeActiveTab is bound to Cmd-W on macOS, Ctrl-W on Linux. Closes
+// the currently selected page.
 func (a *App) closeActiveTab() {
 	if view := a.projectViews[a.activeProjectID]; view != nil {
 		if page := view.SelectedPage(); page != nil {
@@ -763,7 +775,7 @@ func (a *App) cycleTab(delta int) {
 }
 
 // switchProjectByIndex picks the project at zero-based index in the
-// sidebar (Cmd-1..9 mapping).
+// sidebar (Cmd-1..9 on macOS, Alt-1..9 on Linux).
 func (a *App) switchProjectByIndex(idx int) {
 	row := a.sidebar.RowAtIndex(idx)
 	if row == nil {
@@ -778,6 +790,89 @@ func (a *App) switchProjectByIndex(idx int) {
 	}
 }
 
+// switchTabByIndex picks the tab at zero-based index in the active
+// project's tab strip (Ctrl-1..9 on both platforms).
+func (a *App) switchTabByIndex(idx int) {
+	view := a.projectViews[a.activeProjectID]
+	if view == nil {
+		return
+	}
+	if idx < 0 || idx >= int(view.NPages()) {
+		return
+	}
+	if page := view.NthPage(int(idx)); page != nil {
+		view.SetSelectedPage(page)
+	}
+}
+
+// renameActiveTab opens a popover with a GtkEntry to rename the active
+// tab. Bound to Cmd-R on macOS and Alt-R on Linux. The new title is
+// persisted via UpdateTabTitle, but a subsequent OSC 1/2 from the shell
+// can overwrite it — locking against OSC is a follow-up.
+func (a *App) renameActiveTab() {
+	view := a.projectViews[a.activeProjectID]
+	if view == nil {
+		return
+	}
+	page := view.SelectedPage()
+	if page == nil {
+		return
+	}
+	// gotk4 may hand back a fresh Go wrapper from SelectedPage() that
+	// doesn't pointer-equal the wrapper in pageTabs. Resolve via the
+	// underlying GObject pointer instead.
+	target := page.Native()
+	var tabID int64
+	var ok bool
+	for id, p := range a.tabPages {
+		if p.Native() == target {
+			tabID = id
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return
+	}
+
+	entry := gtk.NewEntry()
+	entry.SetText(page.Title())
+	entry.SelectRegion(0, -1)
+
+	popover := gtk.NewPopover()
+	popover.SetChild(entry)
+	popover.SetParent(a.headerTitle)
+	popover.SetAutohide(true)
+	popover.SetHasArrow(true)
+
+	commit := func() {
+		text := strings.TrimSpace(entry.Text())
+		popover.Popdown()
+		if text == "" || text == page.Title() {
+			return
+		}
+		if err := a.ws.UpdateTabTitle(tabID, text); err != nil {
+			slog.Error("UpdateTabTitle", "tab", tabID, "err", err)
+		}
+	}
+	entry.ConnectActivate(commit)
+
+	keyCtrl := gtk.NewEventControllerKey()
+	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, _ gdk.ModifierType) bool {
+		if keyval == gdk.KEY_Escape {
+			popover.Popdown()
+			return true
+		}
+		return false
+	})
+	entry.AddController(keyCtrl)
+
+	popover.ConnectClosed(func() { popover.Unparent() })
+
+	popover.Popup()
+	entry.GrabFocus()
+}
+
 // shutdown closes every Session cleanly. Called on window close.
 func (a *App) shutdown() {
 	if a.ipcServer != nil {
@@ -788,15 +883,24 @@ func (a *App) shutdown() {
 	}
 }
 
-// installShortcuts wires Ctrl-* shortcuts on the window. The
-// ShortcutController is set to PhaseCapture so it runs *before* the
+// installShortcuts wires the app's keyboard shortcuts on the window.
+// The ShortcutController is set to PhaseCapture so it runs *before* the
 // drawing area's key controller — otherwise terminal-focused keys get
 // consumed by handleKey and the shortcut never fires.
 //
-// Modifier choice: GTK on macOS doesn't reliably deliver Cmd as
-// MetaMask, so we bind everything on Ctrl for both platforms (matches
-// tmux/screen ergonomics). The <primary> alias resolves to Ctrl on
-// Linux and (when it works) Meta on macOS, so we add it as a bonus.
+// Per-platform modifier policy:
+//   - macOS: Cmd is the "primary" app modifier (tab management, cycle).
+//     Cmd is also the project-management modifier (new project, rename
+//     project, rename tab, switch project 1..9). Ctrl-1..9 switches
+//     tabs in the active project.
+//   - Linux: Ctrl is the primary app modifier. Alt is the project-
+//     management modifier (mirrors Cmd on macOS). Ctrl-1..9 switches
+//     tabs.
+//
+// On macOS gdk-macos translates NSEventModifierFlagCommand directly to
+// GDK_META_MASK, so <Meta>x in a trigger reliably matches Cmd-x. The
+// <Primary> alias is hardcoded to Control on every platform in GTK4, so
+// we substitute the modifier ourselves rather than relying on it.
 func (a *App) installShortcuts() {
 	ctrl := gtk.NewShortcutController()
 	ctrl.SetScope(gtk.ShortcutScopeGlobal)
@@ -814,36 +918,39 @@ func (a *App) installShortcuts() {
 		ctrl.AddShortcut(gtk.NewShortcut(t, action))
 	}
 
-	// Bind both <Control> and <primary> so Ctrl works everywhere AND
-	// Cmd works on macOS where the platform delivers it.
-	bindBoth := func(suffix string, fn func()) {
-		add("<Control>"+suffix, fn)
-		add("<primary>"+suffix, fn)
+	primary := "<Control>"
+	projectMod := "<Alt>"
+	if runtime.GOOS == "darwin" {
+		primary = "<Meta>"
+		projectMod = "<Meta>"
 	}
 
-	bindBoth("t", a.newTabInActiveProject)
-	bindBoth("w", a.closeActiveTab)
-	bindBoth("<shift>t", a.newProject)
+	// Tab management on the primary modifier.
+	add(primary+"t", a.newTabInActiveProject)
+	add(primary+"w", a.closeActiveTab)
 
 	// Shift+[ produces braceleft on US layouts. GTK matches the
 	// transformed keyval, so we bind the curly forms (and the bracket
 	// forms as a safety net for layouts that don't transform).
 	for _, k := range []string{"braceleft", "bracketleft"} {
-		bindBoth("<shift>"+k, func() { a.cycleTab(-1) })
+		add(primary+"<Shift>"+k, func() { a.cycleTab(-1) })
 	}
 	for _, k := range []string{"braceright", "bracketright"} {
-		bindBoth("<shift>"+k, func() { a.cycleTab(1) })
+		add(primary+"<Shift>"+k, func() { a.cycleTab(1) })
 	}
 
+	// Project / tab management on the project modifier.
+	add(projectMod+"n", a.newProject)
+	add(projectMod+"<Shift>r", a.beginRenameActiveProject)
+	add(projectMod+"r", a.renameActiveTab)
+
+	// Numeric switchers: project on the project modifier, tab on Ctrl.
 	for i := 1; i <= 9; i++ {
 		idx := i - 1
-		bindBoth(strings.TrimLeft(strconv.Itoa(i), "0"), func() {
-			a.switchProjectByIndex(idx)
-		})
+		n := strconv.Itoa(i)
+		add(projectMod+n, func() { a.switchProjectByIndex(idx) })
+		add("<Control>"+n, func() { a.switchTabByIndex(idx) })
 	}
-
-	// F2 enters rename mode on the currently selected sidebar row.
-	add("F2", a.beginRenameActiveProject)
 
 	a.win.AddController(ctrl)
 }
@@ -869,7 +976,8 @@ func (a *App) buildEmptyState() *adw.StatusPage {
 }
 
 // beginRenameActiveProject puts the active project's row into edit mode.
-// Wired to F2; safe no-op when there is no active project.
+// Wired to Cmd-Shift-R on macOS, Alt-Shift-R on Linux; safe no-op when
+// there is no active project.
 func (a *App) beginRenameActiveProject() {
 	if a.activeProjectID == 0 {
 		return

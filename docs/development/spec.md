@@ -132,7 +132,7 @@ No UI work this phase beyond the spike window staying functional. The deliverabl
 
 **Goal:** First usable version. You can dogfood it.
 
-Sidebar widget showing list of projects. Tab strip showing tabs in the active project. Click project → switch tab strip. Click tab → swap libghostty surface. New tab button creates a fresh shell tab. Close tab kills PTY and removes from DB. Rename tab and project. Persist all of this — restart the app, your projects and tabs come back (open shells with last cwd, do not auto-restart commands). Default keybindings: `Cmd/Ctrl+1..9` switches projects, `Cmd/Ctrl+T` new tab, `Cmd/Ctrl+W` close tab, `Cmd/Ctrl+Shift+[` and `]` cycle tabs.
+Sidebar widget showing list of projects. Tab strip showing tabs in the active project. Click project → switch tab strip. Click tab → swap libghostty surface. New tab button creates a fresh shell tab. Close tab kills PTY and removes from DB. Rename tab and project. Persist all of this — restart the app, your projects and tabs come back (open shells with last cwd, do not auto-restart commands). Default keybindings (platform-native modifiers — Cmd on macOS, Ctrl plus Alt on Linux): `Cmd/Ctrl+T` new tab, `Cmd/Ctrl+W` close tab, `Cmd/Alt+R` rename tab, `Cmd/Ctrl+Shift+[` and `]` cycle tabs. Projects: `Cmd/Alt+N` new project, `Cmd/Alt+Shift+R` rename project, `Cmd+1..9` (macOS) / `Alt+1..9` (Linux) switches projects. `Ctrl+1..9` switches tabs in the active project on both platforms.
 
 **Exit criteria:** You replace your daily Ghostty + manual project juggling with this for a week.
 
