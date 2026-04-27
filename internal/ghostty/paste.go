@@ -7,7 +7,7 @@ package ghostty
 import "C"
 
 import (
-	"errors"
+	"fmt"
 	"unsafe"
 )
 
@@ -33,7 +33,7 @@ func EncodePaste(data []byte, bracketed bool) ([]byte, error) {
 	var needed C.size_t
 	rc := C.ghostty_paste_encode(dataPtr, dataLen, C.bool(bracketed), nil, 0, &needed)
 	if rc != C.GHOSTTY_SUCCESS && rc != C.GHOSTTY_OUT_OF_SPACE {
-		return nil, errors.New("ghostty_paste_encode size query failed")
+		return nil, fmt.Errorf("ghostty_paste_encode size query failed: %d", int(rc))
 	}
 	if needed == 0 {
 		return nil, nil
@@ -46,7 +46,7 @@ func EncodePaste(data []byte, bracketed bool) ([]byte, error) {
 		(*C.char)(unsafe.Pointer(&out[0])), needed, &written,
 	)
 	if rc != C.GHOSTTY_SUCCESS {
-		return nil, errors.New("ghostty_paste_encode failed")
+		return nil, fmt.Errorf("ghostty_paste_encode failed: %d", int(rc))
 	}
 	return out[:int(written)], nil
 }

@@ -16,7 +16,6 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"runtime"
 	"unsafe"
 )
 
@@ -178,11 +177,16 @@ func NewKeyEncoder() (*KeyEncoder, error) {
 		C.ghostty_key_encoder_free(e.c)
 		return nil, fmt.Errorf("ghostty_key_event_new: %d", int(rc))
 	}
-	runtime.SetFinalizer(e, func(e *KeyEncoder) { e.Close() })
 	return e, nil
 }
 
 // Close frees the encoder and reusable event. Safe to call twice.
+//
+// No runtime.SetFinalizer is installed: libghostty_key_encoder_free /
+// libghostty_key_event_free must run on the GTK main thread (same
+// constraint as the Terminal handle), and finalizers run on the GC
+// goroutine. The Session.Close path explicitly schedules cleanup on
+// the main thread via glib.IdleAdd; that is the only correct path.
 func (e *KeyEncoder) Close() {
 	if e.event != nil {
 		C.ghostty_key_event_free(e.event)
@@ -192,7 +196,6 @@ func (e *KeyEncoder) Close() {
 		C.ghostty_key_encoder_free(e.c)
 		e.c = nil
 	}
-	runtime.SetFinalizer(e, nil)
 }
 
 // SyncFromTerminal pulls the terminal's live cursor-key/keypad/Kitty

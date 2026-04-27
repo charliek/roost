@@ -26,7 +26,6 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"runtime"
 	"unsafe"
 )
 
@@ -83,11 +82,14 @@ func NewMouseEncoder() (*MouseEncoder, error) {
 		return nil, fmt.Errorf("ghostty_mouse_event_new: %d", int(rc))
 	}
 	C.roost_init_mouse_size(&e.size)
-	runtime.SetFinalizer(e, func(e *MouseEncoder) { e.Close() })
 	return e, nil
 }
 
 // Close frees the encoder + reusable event. Safe to call twice.
+//
+// No runtime.SetFinalizer is installed — see KeyEncoder.Close for the
+// rationale (libghostty-vt cleanup must run on the GTK main thread,
+// finalizers don't honor that).
 func (e *MouseEncoder) Close() {
 	if e.event != nil {
 		C.ghostty_mouse_event_free(e.event)
@@ -97,7 +99,6 @@ func (e *MouseEncoder) Close() {
 		C.ghostty_mouse_encoder_free(e.c)
 		e.c = nil
 	}
-	runtime.SetFinalizer(e, nil)
 }
 
 // SetGeometry tells the encoder the current surface dimensions and

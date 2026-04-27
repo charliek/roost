@@ -102,7 +102,7 @@ The terminal's own key controller is also in capture phase — that's what stops
 | Wheel in a mouse-tracking app         | Forwarded as button-4 / button-5 press+release pairs                                         |
 | **Shift-click / Shift-drag / Shift-wheel** | Bypasses mouse-tracking (xterm convention) so you can always select / scroll locally even when the app is grabbing the mouse |
 
-Selection clears automatically on PTY output that touches the selected rows, on resize, and on a new click.
+Selection clears automatically on any PTY output, on resize, and on a new click. (Most terminals clear-on-any-output rather than tracking which rows changed; matches user expectation and avoids the bookkeeping.)
 
 Pressing any input-producing key when the viewport is scrolled back snaps the viewport to the bottom before delivering the keystroke — same behavior as every other terminal multiplexer.
 

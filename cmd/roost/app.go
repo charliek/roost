@@ -1100,6 +1100,12 @@ func (a *App) copyFromActive() {
 // writeChunked writes encoded paste bytes to the session's PTY in
 // pasteChunkBytes-sized slices, yielding to the GTK main loop between
 // chunks via glib.IdleAdd so a multi-MB paste doesn't freeze the UI.
+//
+// Honors short writes by advancing `off` by the actual number of
+// bytes the kernel accepted. Without this, a partial write would
+// silently drop the unwritten tail. (PTY short writes are rare —
+// the kernel's tty layer usually accepts the full chunk — but worth
+// handling for correctness.)
 func (a *App) writeChunked(sess *Session, data []byte, off int) {
 	if sess.closed.Load() || off >= len(data) {
 		return
@@ -1108,12 +1114,13 @@ func (a *App) writeChunked(sess *Session, data []byte, off int) {
 	if end > len(data) {
 		end = len(data)
 	}
-	if _, err := sess.pty.Write(data[off:end]); err != nil {
-		slog.Warn("paste pty write", "err", err)
+	n, err := sess.pty.Write(data[off:end])
+	if err != nil {
+		slog.Warn("paste pty write", "err", err, "wrote", n, "asked", end-off)
 		return
 	}
-	if end < len(data) {
-		next := end
+	next := off + n
+	if next < len(data) {
 		coreglib.IdleAdd(func() bool {
 			a.writeChunked(sess, data, next)
 			return false
