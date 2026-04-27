@@ -999,6 +999,30 @@ func (a *App) activeSession() *Session {
 	return nil
 }
 
+// editableHasFocus reports whether keyboard focus currently lives in
+// a GtkEditable widget — typically a sidebar rename GtkEntry, but
+// also any GtkText / GtkTextView a future feature might add. Used
+// by the clipboard shortcuts to step aside so the focused entry
+// gets its native copy/paste behavior.
+//
+// We check via type assertion against gtk.EditableTextWidget (the
+// gotk4 wrapper for GtkEditable). Walks one parent up to handle the
+// AdwEntryRow / GtkSearchEntry case where the actual focusable text
+// is a child widget of the visible entry.
+func (a *App) editableHasFocus() bool {
+	if a.win == nil {
+		return false
+	}
+	w := a.win.Focus()
+	for i := 0; i < 2 && w != nil; i++ {
+		if _, ok := w.(*gtk.EditableTextWidget); ok {
+			return true
+		}
+		w = gtk.BaseWidget(w).Parent()
+	}
+	return false
+}
+
 // pastePipeline drives a clipboard read → encode → chunked PTY write
 // for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
 //
@@ -1028,6 +1052,9 @@ const (
 )
 
 func (a *App) pasteIntoActive() {
+	if a.editableHasFocus() {
+		return
+	}
 	sess := a.activeSession()
 	if sess == nil {
 		return
@@ -1068,6 +1095,9 @@ func (a *App) pasteIntoActive() {
 // clipboard so middle-click paste in other apps works; PRIMARY
 // doesn't exist on macOS and the call is a no-op there.
 func (a *App) copyFromActive() {
+	if a.editableHasFocus() {
+		return
+	}
 	sess := a.activeSession()
 	if sess == nil || sess.sel.empty() {
 		return

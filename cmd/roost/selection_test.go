@@ -103,6 +103,14 @@ func TestSelection_TouchesRowRange(t *testing.T) {
 			t.Errorf("touches(%d,%d): got %v, want %v", c.min, c.max, got, c.want)
 		}
 	}
+
+	// Inactive selections (e.g. zero-value or post-Clear) should
+	// short-circuit to false regardless of the row range — guards
+	// the early-return path in touches().
+	var inactive selection
+	if inactive.touches(0, 100) {
+		t.Errorf("inactive selection: touches(0,100) = true, want false")
+	}
 }
 
 func TestSelection_ClearMakesEmpty(t *testing.T) {
