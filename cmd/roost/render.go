@@ -33,36 +33,39 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 	textBuf := make([]byte, 0, 8)
 
-	// Cursor cell info captured during the walk; drawn *after* the
-	// walk so the inverted block goes on top of the underlying glyph.
+	// Cursor cell info captured during the glyph pass; drawn *after* the
+	// walks so the inverted block goes on top of the underlying glyph.
 	cx, cy, cursorVisible := s.rs.CursorPos()
 	var cursorCodepoint rune
 	cursorHasCell := false
 	cursorBold := false
 
+	// Pass A — backgrounds. Painted first across the whole frame so any
+	// glyph in Pass B whose descender ink extends into row N+1 lands on
+	// top of the next row's BG fill, instead of being painted before
+	// (and then overwritten by) it. Without this split, descenders
+	// inside multi-row prompt boxes (opencode, codex) would be clipped
+	// by the next row's gray BG.
+	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
+		_, bg, hasExplicitBG := cellColors(cell, defaultFG, defaultBG)
+		if !hasExplicitBG {
+			return
+		}
+		x := pad + float64(col*cellW)
+		y := pad + float64(row*cellH)
+		setRGB(cr, bg)
+		cr.Rectangle(x, y, float64(cellW), float64(cellH))
+		cr.Fill()
+	}); err != nil {
+		slog.Warn("render-state walk (bg)", "err", err)
+	}
+
+	// Pass B — glyphs + cursor capture.
 	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
 		x := pad + float64(col*cellW)
 		y := pad + float64(row*cellH)
+		fg, _, _ := cellColors(cell, defaultFG, defaultBG)
 
-		fg := defaultFG
-		bg := defaultBG
-		if cell.HasFG {
-			fg = cell.FG
-		}
-		hasExplicitBG := cell.HasBG
-		if cell.HasBG {
-			bg = cell.BG
-		}
-		if cell.Inverse {
-			fg, bg = bg, fg
-			hasExplicitBG = true
-		}
-
-		if hasExplicitBG {
-			setRGB(cr, bg)
-			cr.Rectangle(x, y, float64(cellW), float64(cellH))
-			cr.Fill()
-		}
 		if cursorVisible && row == cy && col == cx && cell.Codepoint != 0 {
 			cursorCodepoint = cell.Codepoint
 			cursorHasCell = true
@@ -92,11 +95,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 			layout.SetFontDescription(s.font)
 		}
 	}); err != nil {
-		// libghostty's row iterator failed. Frame so far is partial;
-		// no fallback paint — surfacing the error in the log is what
-		// we actually want, since this should never happen in normal
-		// operation.
-		slog.Warn("render-state walk", "err", err)
+		slog.Warn("render-state walk (glyphs)", "err", err)
 	}
 
 	// Selection overlay (Ghostty/iTerm style). Drawn after the cell
@@ -153,6 +152,27 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 func setRGB(cr *cairo.Context, c ghostty.ColorRGB) {
 	cr.SetSourceRGB(float64(c.R)/255.0, float64(c.G)/255.0, float64(c.B)/255.0)
+}
+
+// cellColors resolves a cell's effective fg/bg, applying SGR inverse,
+// and reports whether a BG fill is required (true if the cell has an
+// explicit BG or is inverted; false for plain default-colour cells, so
+// the canvas-wide default-bg paint stays visible).
+func cellColors(cell ghostty.Cell, defaultFG, defaultBG ghostty.ColorRGB) (fg, bg ghostty.ColorRGB, hasExplicitBG bool) {
+	fg = defaultFG
+	bg = defaultBG
+	if cell.HasFG {
+		fg = cell.FG
+	}
+	if cell.HasBG {
+		bg = cell.BG
+	}
+	hasExplicitBG = cell.HasBG
+	if cell.Inverse {
+		fg, bg = bg, fg
+		hasExplicitBG = true
+	}
+	return
 }
 
 // appendRune is an allocation-light utf-8 encoder. Saves a string()

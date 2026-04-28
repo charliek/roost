@@ -442,17 +442,32 @@ func (s *Session) pumpPTY() {
 // crispness).
 func (s *Session) measureCells() {
 	ctx := s.da.PangoContext()
+
 	layout := pango.NewLayout(ctx)
 	layout.SetFontDescription(s.font)
 	layout.SetText("M")
-	w, h := layout.PixelSize()
+	w, _ := layout.PixelSize()
 	if w < 1 {
 		w = 8
 	}
+	s.cellW = w
+
+	// Height: prefer the font's recommended line-height (distance
+	// between baselines, includes any line-gap the font designer set),
+	// fall back to ascent+descent if the font reports no Height. M has
+	// no descender so PixelSize("M") undercounts; even ascent+descent
+	// alone leaves no slack for glyphs whose ink exceeds metric
+	// descent (common for `g`/`p`/`y` in many monospace fonts), so
+	// using Height gives the font designer's intended row spacing.
+	metrics := ctx.Metrics(s.font, nil)
+	hUnits := metrics.Height()
+	if hUnits <= 0 {
+		hUnits = metrics.Ascent() + metrics.Descent()
+	}
+	h := (hUnits + pango.SCALE - 1) / pango.SCALE
 	if h < 1 {
 		h = 16
 	}
-	s.cellW = w
 	s.cellH = h
 }
 
