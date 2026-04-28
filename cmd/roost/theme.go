@@ -91,3 +91,23 @@ func cubeAxis(n int) uint8 {
 	}
 	return uint8(n*40 + 55)
 }
+
+// DefaultDeviceAttrs is what libghostty advertises when programs probe
+// the terminal type via CSI c / CSI > c / CSI = c. Conservative
+// xterm-256color-ish values: VT220 conformance, ANSI color, no sixel.
+// Programs that gate on these will enable the modern feature set.
+var DefaultDeviceAttrs = ghostty.DeviceAttrs{
+	// DA1: \e[?62;22c — VT220 + ANSI_COLOR.
+	PrimaryConformance: 62, // VT220
+	PrimaryFeatures:    []uint16{22 /* ANSI_COLOR */},
+
+	// DA2: \e[>0;276;0c — VT100 device, version 276 (matches xterm.js
+	// parity placeholder used by similar terminals), no ROM cartridge.
+	SecondaryDeviceType:      0,
+	SecondaryFirmwareVersion: 276,
+	SecondaryRomCartridge:    0,
+
+	// DA3: programs that ask for this mostly check it exists; the value
+	// is rendered as 8 hex digits (DECRPTUI). Zero is fine.
+	TertiaryUnitID: 0,
+}

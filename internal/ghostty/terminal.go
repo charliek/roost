@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -44,6 +45,23 @@ import (
 // all calls on a single thread (typically the GTK main thread).
 type Terminal struct {
 	c C.GhosttyTerminal
+
+	// cbs aggregates the Go-side state for libghostty terminal callbacks.
+	// Allocated lazily by ensureCallbacks the first time any Set… method
+	// fires. cbsHandle is the matching cgo.Handle stored in libghostty's
+	// userdata slot so the callbacks can resolve it.
+	cbs       *terminalCallbacks
+	cbsHandle cgo.Handle
+}
+
+// terminalCallbacks holds Go-side state for every libghostty callback
+// Roost wires up. libghostty exposes only one userdata slot per terminal,
+// so all callbacks share this struct via a single cgo.Handle.
+type terminalCallbacks struct {
+	writePty    func([]byte)
+	deviceAttrs *DeviceAttrs
+	colorScheme C.GhosttyColorScheme
+	hasScheme   bool
 }
 
 // Options configures a new Terminal.
@@ -77,6 +95,11 @@ func (t *Terminal) Close() {
 		C.ghostty_terminal_free(t.c)
 		t.c = nil
 		runtime.SetFinalizer(t, nil)
+	}
+	if t.cbsHandle != 0 {
+		t.cbsHandle.Delete()
+		t.cbsHandle = 0
+		t.cbs = nil
 	}
 }
 

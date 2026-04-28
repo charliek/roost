@@ -132,6 +132,14 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 		term.Close()
 		return nil, err
 	}
+	if err := term.SetDeviceAttributes(&DefaultDeviceAttrs); err != nil {
+		term.Close()
+		return nil, err
+	}
+	if err := term.SetColorSchemeDark(true); err != nil {
+		term.Close()
+		return nil, err
+	}
 	rs, err := ghostty.NewRenderState()
 	if err != nil {
 		term.Close()
@@ -179,6 +187,19 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 		pumpDone:      make(chan struct{}),
 		cursorOn:      true,
 		windowFocused: true,
+	}
+
+	// Route libghostty's terminal-to-pty responses (OSC 10/11/12 query
+	// replies, DSR, DA1/2/3) through the same writer the user input goes
+	// through. Without this, programs like Codex that probe the terminal
+	// for state see silence and fall back to degraded rendering.
+	if err := term.SetPtyWriter(s.QueueWrite); err != nil {
+		mouse.Close()
+		keys.Close()
+		rs.Close()
+		term.Close()
+		_ = p.Close()
+		return nil, err
 	}
 
 	s.da = gtk.NewDrawingArea()

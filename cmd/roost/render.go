@@ -121,13 +121,13 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		switch {
 		case !s.windowFocused:
 			// Unfocused: hollow outline only, no blink.
-			setRGB(cr, DefaultTheme.Cursor)
+			setRGB(cr, defaultFG)
 			cr.SetLineWidth(1)
 			cr.Rectangle(x+0.5, y+0.5, w-1, h-1)
 			cr.Stroke()
 		case s.cursorOn:
-			// Focused + on phase: solid block in cursor color, glyph in BG.
-			setRGB(cr, DefaultTheme.Cursor)
+			// Focused + on phase: solid block in FG, glyph in BG.
+			setRGB(cr, defaultFG)
 			cr.Rectangle(x, y, w, h)
 			cr.Fill()
 			if cursorHasCell {
