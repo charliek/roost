@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 
 	"github.com/diamondburned/gotk4/pkg/cairo"
@@ -58,10 +57,16 @@ type Session struct {
 	// time of Close become no-ops instead of use-after-free.
 	closed atomic.Bool
 
-	// writeMu serializes background PTY writes spawned by QueueWrite
-	// so that bytes from concurrent paste / keystroke / mouse-event
-	// goroutines don't interleave on the wire.
-	writeMu sync.Mutex
+	// writeChan feeds the single per-session PTY writer goroutine.
+	// Senders (QueueWrite) push owned []byte chunks; the writer drains
+	// in order and performs the actual pty.Write. A buffered channel +
+	// one writer goroutine is the canonical Go pattern for serialised
+	// I/O; the previous design spawned a goroutine per call that all
+	// blocked on a mutex, which under probe-heavy load (libghostty
+	// WRITE_PTY responses + keystrokes + mouse) could pile up.
+	writeChan  chan []byte
+	stopWrite  chan struct{}
+	writerDone chan struct{}
 
 	// scrollAccum aggregates fractional smooth-scroll deltas
 	// (gdk.ScrollUnitSurface, common on macOS trackpads) so we only
@@ -185,9 +190,13 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 		cols:          cols,
 		rows:          rows,
 		pumpDone:      make(chan struct{}),
+		writeChan:     make(chan []byte, 256),
+		stopWrite:     make(chan struct{}),
+		writerDone:    make(chan struct{}),
 		cursorOn:      true,
 		windowFocused: true,
 	}
+	go s.runWriter()
 
 	// Route libghostty's terminal-to-pty responses (OSC 10/11/12 query
 	// replies, DSR, DA1/2/3) through the same writer the user input goes
@@ -368,6 +377,11 @@ func (s *Session) Close() {
 	}
 	_ = s.pty.Close()
 	<-s.pumpDone
+	// Tell the per-session writer goroutine to exit and wait for it.
+	// Done before scheduling libghostty cleanup so a stray in-flight
+	// pty.Write can't race with the goroutine's exit.
+	close(s.stopWrite)
+	<-s.writerDone
 	// At this point no more IdleAdd callbacks will be queued from the
 	// pump, but already-queued ones may still run. Schedule libghostty
 	// cleanup to run at the tail of the GTK queue (FIFO at default prio),
@@ -664,39 +678,57 @@ func (s *Session) quantizeScroll(unit gdk.ScrollUnit, dy float64) int {
 	}
 }
 
-// QueueWrite serializes a write to the PTY off the GTK main thread.
-// Spawns a goroutine that takes writeMu and performs pty.Write with
-// a short-write loop. Order is preserved across calls because every
-// goroutine must acquire writeMu before writing — a paste followed
-// by a keystroke arrives at the shell in that order even though both
-// run concurrently.
+// QueueWrite enqueues bytes for the per-session writer goroutine to
+// flush to the PTY. The buffered channel + single-writer pattern keeps
+// order (FIFO across all callers — keystrokes, paste, libghostty query
+// responses, mouse events) without spawning a goroutine per call.
 //
-// Per CLAUDE.md, PTY read/write must run in per-tab goroutines so a
-// slow consumer can't stall the GTK main thread. The data slice is
-// copied so the caller can recycle its buffer immediately. Safe to
-// call from the main thread; safe to call after Close (no-op).
+// Per CLAUDE.md, PTY writes must not run on the GTK main thread. The
+// data slice is copied so the caller can recycle its buffer immediately.
+// Safe to call from the main thread, safe to call after Close (drops),
+// and safe under concurrent callers.
+//
+// If the queue is full (extreme load: writer blocked on a stalled PTY
+// while a probe-heavy program floods queries) the bytes are dropped
+// with a warning rather than blocking the caller — blocking would
+// freeze the GTK main thread, which is worse than losing one reply.
 func (s *Session) QueueWrite(data []byte) {
-	if s.closed.Load() || len(data) == 0 {
+	if len(data) == 0 {
 		return
 	}
 	buf := append([]byte(nil), data...)
-	tabID := s.tab.ID
-	go func() {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		if s.closed.Load() {
+	select {
+	case s.writeChan <- buf:
+	case <-s.stopWrite:
+		// Session closing — drop.
+	default:
+		slog.Warn("pty write queue full; dropping",
+			"tab_id", s.tab.ID, "bytes", len(buf))
+	}
+}
+
+// runWriter is the single per-session PTY writer. Drains writeChan
+// in order and writes each chunk to the PTY with a short-write loop.
+// Exits when stopWrite closes; closes writerDone on the way out so
+// Close can wait for in-flight writes to finish.
+func (s *Session) runWriter() {
+	defer close(s.writerDone)
+	for {
+		select {
+		case <-s.stopWrite:
 			return
-		}
-		for off := 0; off < len(buf); {
-			n, err := s.pty.Write(buf[off:])
-			if err != nil {
-				slog.Warn("pty write", "tab_id", tabID, "err", err,
-					"wrote", off+n, "total", len(buf))
-				return
+		case buf := <-s.writeChan:
+			for off := 0; off < len(buf); {
+				n, err := s.pty.Write(buf[off:])
+				if err != nil {
+					slog.Warn("pty write", "tab_id", s.tab.ID, "err", err,
+						"wrote", off+n, "total", len(buf))
+					break
+				}
+				off += n
 			}
-			off += n
 		}
-	}()
+	}
 }
 
 // useMouseTracking decides whether mouse events should be encoded and

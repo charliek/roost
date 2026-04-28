@@ -1050,11 +1050,11 @@ func (a *App) editableHasFocus() bool {
 // pasteIntoActive drives a clipboard read → encode → background PTY
 // write for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
 //
-// The encoded bytes are queued via Session.QueueWrite, which runs the
-// actual pty.Write on a per-tab goroutine so a slow PTY consumer
-// can't stall the GTK main thread. Per-session writeMu serializes
-// against keystrokes / mouse events so a paste-then-type doesn't
-// interleave on the wire.
+// The encoded bytes are queued via Session.QueueWrite, which feeds
+// them into a per-session buffered channel drained by a single writer
+// goroutine. That serialises against keystrokes / mouse events so a
+// paste-then-type doesn't interleave on the wire and keeps PTY I/O
+// off the GTK main thread.
 //
 // Limits and behavior:
 //   - Cap the clipboard at pasteMaxBytes (4 MiB); above that, log and
