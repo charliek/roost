@@ -43,6 +43,13 @@ type Session struct {
 	cols     uint16
 	rows     uint16
 
+	// theme is the source of truth for fg/bg/cursor/palette across this
+	// session. It is what gets pushed into libghostty (SetTheme) and
+	// what OSC 10/11/12 queries respond with — same source on both
+	// sides keeps the answers consistent if the theme is ever swapped
+	// at runtime. Initialised from DefaultTheme.
+	theme Theme
+
 	// cursorOn is the current blink phase. windowFocused mirrors the
 	// containing window's is-active so the cursor stops blinking and
 	// degrades to a hollow outline when the window is unfocused.
@@ -128,11 +135,12 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 	if err != nil {
 		return nil, err
 	}
+	theme := DefaultTheme
 	if err := term.SetTheme(
-		DefaultTheme.Foreground,
-		DefaultTheme.Background,
-		DefaultTheme.Cursor,
-		&DefaultTheme.Palette,
+		theme.Foreground,
+		theme.Background,
+		theme.Cursor,
+		&theme.Palette,
 	); err != nil {
 		term.Close()
 		return nil, err
@@ -189,6 +197,7 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 		fontBold:      fontBold,
 		cols:          cols,
 		rows:          rows,
+		theme:         theme,
 		pumpDone:      make(chan struct{}),
 		writeChan:     make(chan []byte, 256),
 		stopWrite:     make(chan struct{}),
@@ -345,9 +354,9 @@ func (s *Session) oscScanner() *osc.Scanner {
 			},
 			OnQueryResponse: s.QueueWrite,
 			QueryColors: func() (osc.RGB, osc.RGB, osc.RGB) {
-				return toOSCRGB(DefaultTheme.Foreground),
-					toOSCRGB(DefaultTheme.Background),
-					toOSCRGB(DefaultTheme.Cursor)
+				return toOSCRGB(s.theme.Foreground),
+					toOSCRGB(s.theme.Background),
+					toOSCRGB(s.theme.Cursor)
 			},
 		})
 	}
