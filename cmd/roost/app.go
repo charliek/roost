@@ -55,9 +55,12 @@ type App struct {
 
 	// All open tab sessions, keyed by tab ID.
 	sessions map[int64]*Session
-	// page->tab lookup. Each AdwTabPage maps back to a tab ID so we
-	// can resolve user actions (close, reorder) to core state.
-	pageTabs map[*adw.TabPage]int64
+	// page->tab lookup. Keyed by the AdwTabPage's underlying GObject
+	// pointer (page.Native()) rather than the Go wrapper pointer —
+	// gotk4 may hand back a fresh wrapper from getter calls like
+	// view.SelectedPage(), and the wrapper's Go identity is not stable
+	// across those calls. Use pageKey() to derive the lookup key.
+	pageTabs map[uintptr]int64
 	// tab->page reverse lookup, used for badge updates from the IPC
 	// goroutine via glib.IdleAdd.
 	tabPages map[int64]*adw.TabPage
@@ -75,7 +78,7 @@ func NewApp(gtkApp *adw.Application, ws *core.Workspace, home, socketPath string
 		projectViews: map[int64]*adw.TabView{},
 		projectRows:  map[int64]*projectRow{},
 		sessions:     map[int64]*Session{},
-		pageTabs:     map[*adw.TabPage]int64{},
+		pageTabs:     map[uintptr]int64{},
 		tabPages:     map[int64]*adw.TabPage{},
 	}
 }
@@ -294,7 +297,7 @@ func (a *App) tabIsActive(tabID int64) bool {
 	if page == nil {
 		return false
 	}
-	if id, ok := a.pageTabs[page]; ok {
+	if id, ok := a.pageTabs[pageKey(page)]; ok {
 		return id == tabID && a.win.IsActive()
 	}
 	return false
@@ -331,7 +334,7 @@ func (a *App) Identify() ipc.Identity {
 		}
 		if view := a.projectViews[a.activeProjectID]; view != nil {
 			if page := view.SelectedPage(); page != nil {
-				if tid, ok := a.pageTabs[page]; ok {
+				if tid, ok := a.pageTabs[pageKey(page)]; ok {
 					id.ActiveTabID = tid
 				}
 			}
@@ -431,7 +434,7 @@ func (a *App) addProjectUI(p core.Project) {
 			return
 		}
 		page.SetNeedsAttention(false) // user's looking at it now
-		if id, ok := a.pageTabs[page]; ok {
+		if id, ok := a.pageTabs[pageKey(page)]; ok {
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
 			}
@@ -477,7 +480,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	page := view.Append(sess.DrawingArea())
 	page.SetTitle(displayTitle(tab))
 	page.SetLiveThumbnail(false)
-	a.pageTabs[page] = tab.ID
+	a.pageTabs[pageKey(page)] = tab.ID
 	a.tabPages[tab.ID] = page
 
 	// OSC 0/1/2 title updates → refresh tab page + persist.
@@ -529,7 +532,7 @@ func (a *App) tabIsSelected(tabID int64) bool {
 	if page == nil {
 		return false
 	}
-	id, ok := a.pageTabs[page]
+	id, ok := a.pageTabs[pageKey(page)]
 	return ok && id == tabID
 }
 
@@ -573,7 +576,7 @@ func (a *App) selectProject(projectID int64) {
 	// Focus the active tab so keystrokes go to the terminal.
 	view := a.projectViews[projectID]
 	if page := view.SelectedPage(); page != nil {
-		if id, ok := a.pageTabs[page]; ok {
+		if id, ok := a.pageTabs[pageKey(page)]; ok {
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
 			}
@@ -607,7 +610,7 @@ func (a *App) updateHeader() {
 	subtitle := ""
 	if view := a.projectViews[a.activeProjectID]; view != nil {
 		if page := view.SelectedPage(); page != nil {
-			if id, ok := a.pageTabs[page]; ok {
+			if id, ok := a.pageTabs[pageKey(page)]; ok {
 				if sess, ok := a.sessions[id]; ok {
 					// lastPWD is the live cwd from OSC 7; tab.CWD is
 					// only the snapshot at session creation. Use the
@@ -683,7 +686,7 @@ func (a *App) newTabInActiveProject() {
 	// only the snapshot at session creation.
 	if view := a.projectViews[a.activeProjectID]; view != nil {
 		if page := view.SelectedPage(); page != nil {
-			if id, ok := a.pageTabs[page]; ok {
+			if id, ok := a.pageTabs[pageKey(page)]; ok {
 				if sess, ok := a.sessions[id]; ok {
 					cwd = sess.lastPWD
 					if cwd == "" {
@@ -715,7 +718,7 @@ func (a *App) newTabInActiveProject() {
 // project. Used by the ConnectClosePage handler to remember which
 // project to refill after the close finishes.
 func (a *App) projectIDForPage(page *adw.TabPage) int64 {
-	if tabID, ok := a.pageTabs[page]; ok {
+	if tabID, ok := a.pageTabs[pageKey(page)]; ok {
 		if sess, ok := a.sessions[tabID]; ok {
 			return sess.tab.ProjectID
 		}
@@ -728,11 +731,11 @@ func (a *App) projectIDForPage(page *adw.TabPage) int64 {
 // ConnectClosePage handler so it can run *after* ClosePageFinish
 // removes the page from the view.
 func (a *App) closeTab(page *adw.TabPage) {
-	tabID, ok := a.pageTabs[page]
+	tabID, ok := a.pageTabs[pageKey(page)]
 	if !ok {
 		return
 	}
-	delete(a.pageTabs, page)
+	delete(a.pageTabs, pageKey(page))
 	delete(a.tabPages, tabID)
 
 	if sess, ok := a.sessions[tabID]; ok {
@@ -819,19 +822,7 @@ func (a *App) renameActiveTab() {
 	if page == nil {
 		return
 	}
-	// gotk4 may hand back a fresh Go wrapper from SelectedPage() that
-	// doesn't pointer-equal the wrapper in pageTabs. Resolve via the
-	// underlying GObject pointer instead.
-	target := page.Native()
-	var tabID int64
-	var ok bool
-	for id, p := range a.tabPages {
-		if p.Native() == target {
-			tabID = id
-			ok = true
-			break
-		}
-	}
+	tabID, ok := a.pageTabs[pageKey(page)]
 	if !ok {
 		return
 	}
@@ -1001,16 +992,21 @@ func (a *App) installShortcuts() {
 	a.win.AddController(ctrl)
 }
 
+// pageKey returns the stable GObject pointer for an AdwTabPage, used
+// as the pageTabs map key. gotk4 may return a fresh Go wrapper from
+// getter calls (view.SelectedPage, NthPage, etc.) that doesn't
+// pointer-equal the wrapper inserted via view.Append, so keying by Go
+// pointer would silently miss. The underlying C pointer is stable.
+func pageKey(p *adw.TabPage) uintptr {
+	if p == nil {
+		return 0
+	}
+	return p.Native()
+}
+
 // activeSession returns the currently selected session in the active
 // project, or nil if none. Resolves: active project → its TabView's
 // selected page → tab id → session.
-//
-// We can't key directly into a.pageTabs by the *adw.TabPage Go pointer
-// because gotk4 may hand us a different Go wrapper for the same C
-// GObject between the call to view.Append (where the entry was
-// inserted) and the call to view.SelectedPage here — the wrapper's
-// C pointer is the stable identity, not the Go pointer. Look up by
-// C pointer via the tabPages reverse map instead.
 func (a *App) activeSession() *Session {
 	view := a.projectViews[a.activeProjectID]
 	if view == nil {
@@ -1020,13 +1016,11 @@ func (a *App) activeSession() *Session {
 	if page == nil {
 		return nil
 	}
-	selectedPtr := page.Native()
-	for tabID, p := range a.tabPages {
-		if p.Native() == selectedPtr {
-			return a.sessions[tabID]
-		}
+	id, ok := a.pageTabs[pageKey(page)]
+	if !ok {
+		return nil
 	}
-	return nil
+	return a.sessions[id]
 }
 
 // editableHasFocus reports whether keyboard focus currently lives in
@@ -1264,9 +1258,9 @@ func (a *App) deleteProject(pid int64) {
 	var tabIDs []int64
 	for i := 0; i < int(view.NPages()); i++ {
 		page := view.NthPage(i)
-		if id, ok := a.pageTabs[page]; ok {
+		if id, ok := a.pageTabs[pageKey(page)]; ok {
 			tabIDs = append(tabIDs, id)
-			delete(a.pageTabs, page)
+			delete(a.pageTabs, pageKey(page))
 			delete(a.tabPages, id)
 		}
 	}
