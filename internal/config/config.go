@@ -10,9 +10,11 @@ import (
 	"strings"
 )
 
-// Config is the parsed user-editable configuration. Today only font
-// settings are surfaced; the file is intentionally tiny so it can grow
-// organically without forcing a TOML library dependency yet.
+// Config is the parsed user-editable configuration. The file is a
+// simple `key = value` format with `#` comments; `keybind` lines use
+// Ghostty's `keybind = trigger=action` syntax. The format is
+// intentionally tiny so it can grow organically without forcing a TOML
+// dependency.
 type Config struct {
 	// FontFamily is a Pango family string. Comma-separated lists fall
 	// through left-to-right, so the default is JetBrains Mono with
@@ -22,6 +24,21 @@ type Config struct {
 	// FontSizePt is the font size in Pango points (typographic, not
 	// pixels — Pango scales by display DPI internally).
 	FontSizePt int
+
+	// Keybinds is the ordered sequence of `keybind = ...` lines from
+	// the config file, applied on top of platform defaults at install
+	// time. Order matters: later lines override earlier ones for the
+	// same trigger. The special action "unbind" removes whatever the
+	// trigger currently maps to (default or user override).
+	Keybinds []Keybind
+}
+
+// Keybind is one `keybind = trigger=action` line. Trigger uses
+// Ghostty's modifier-plus-key syntax (e.g. "super+shift+t"); Action
+// is a snake_case action name from cmd/roost or the literal "unbind".
+type Keybind struct {
+	Trigger string
+	Action  string
 }
 
 // Defaults returns the built-in Config used when no file exists.
@@ -70,9 +87,34 @@ func (p Paths) Load() (Config, error) {
 				return cfg, fmt.Errorf("config: %s:%d: font_size must be > 0, got %d", p.ConfigFile(), lineNum, n)
 			}
 			cfg.FontSizePt = n
+		case "keybind":
+			kb, kerr := parseKeybind(val)
+			if kerr != nil {
+				return cfg, fmt.Errorf("config: %s:%d: keybind: %w", p.ConfigFile(), lineNum, kerr)
+			}
+			cfg.Keybinds = append(cfg.Keybinds, kb)
 		}
 	}
 	return cfg, sc.Err()
+}
+
+// parseKeybind splits a Ghostty-style `trigger=action` value into its
+// two halves. Returns an error on missing inner `=`, empty trigger, or
+// empty action.
+func parseKeybind(raw string) (Keybind, error) {
+	eq := strings.IndexByte(raw, '=')
+	if eq < 0 {
+		return Keybind{}, fmt.Errorf("expected trigger=action, got %q", raw)
+	}
+	trigger := strings.TrimSpace(raw[:eq])
+	action := strings.TrimSpace(raw[eq+1:])
+	if trigger == "" {
+		return Keybind{}, fmt.Errorf("empty trigger in %q", raw)
+	}
+	if action == "" {
+		return Keybind{}, fmt.Errorf("empty action in %q", raw)
+	}
+	return Keybind{Trigger: trigger, Action: action}, nil
 }
 
 // splitKV parses one `key = value` line. Strips an optional pair of

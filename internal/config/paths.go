@@ -17,14 +17,24 @@ const AppName = "roost"
 
 // Paths bundles the standard Roost filesystem locations. Resolved once at
 // startup; callers should not derive their own.
+//
+// Mac note: ConfigDir lives under XDG (~/.config/roost) on both
+// platforms — a deliberate divergence from Apple's HIG (which would
+// put it in ~/Library/Application Support). The trade-off matches
+// Ghostty / nvim / fish / most CLI-adjacent tools, simplifies dotfile
+// management, and lets the same config follow a user across platforms.
+// State files (DataDir, RuntimeDir) stay in the conventional Mac
+// location. If Roost ever needs sandboxing for the Mac App Store, this
+// decision needs to be revisited.
 type Paths struct {
-	// ConfigDir holds the user-editable config file (config.toml). Created
-	// on first launch.
+	// ConfigDir holds the user-editable config file (config.conf).
+	// Created on first launch. XDG-style on both platforms.
 	ConfigDir string
 
 	// DataDir holds persistent state (the SQLite DB, scrollback caches if
-	// any). On Mac this is the same as ConfigDir; on Linux it follows
-	// $XDG_DATA_HOME so backups can target it independently of config.
+	// any). On Mac this is ~/Library/Application Support/Roost; on Linux
+	// it follows $XDG_DATA_HOME so backups can target it independently
+	// of config.
 	DataDir string
 
 	// RuntimeDir holds the Unix socket for the companion CLI. On Mac it's
@@ -36,11 +46,18 @@ type Paths struct {
 // DBPath is where the SQLite database lives.
 func (p Paths) DBPath() string { return filepath.Join(p.DataDir, "roost.db") }
 
-// ConfigFile is where the user-editable TOML config lives.
-func (p Paths) ConfigFile() string { return filepath.Join(p.ConfigDir, "config.toml") }
+// ConfigFile is where the user-editable config lives.
+func (p Paths) ConfigFile() string { return filepath.Join(p.ConfigDir, "config.conf") }
 
 // SocketPath is where the companion CLI's Unix socket lives.
 func (p Paths) SocketPath() string { return filepath.Join(p.RuntimeDir, "roost.sock") }
+
+// LegacyMacConfigFile is where pre-cutover Mac configs lived. Only used
+// by main.go to log a one-shot migration hint when the legacy file
+// exists and the new one does not. No automatic migration.
+func (p Paths) LegacyMacConfigFile() string {
+	return filepath.Join(p.DataDir, "config.toml")
+}
 
 // Resolve returns the standard Paths for the current platform. Does not
 // create the directories — call EnsureDirs to do that.
@@ -50,17 +67,18 @@ func Resolve() (Paths, error) {
 		return Paths{}, err
 	}
 
+	configDir := envOr("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
 	switch runtime.GOOS {
 	case "darwin":
 		base := filepath.Join(home, "Library", "Application Support", "Roost")
 		return Paths{
-			ConfigDir:  base,
+			ConfigDir:  filepath.Join(configDir, AppName),
 			DataDir:    base,
 			RuntimeDir: base,
 		}, nil
 
 	case "linux":
-		configDir := envOr("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 		dataDir := envOr("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 		runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
 		if runtimeDir == "" {

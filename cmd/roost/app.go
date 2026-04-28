@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
+	"github.com/charliek/roost/internal/config"
 	"github.com/charliek/roost/internal/core"
 	"github.com/charliek/roost/internal/ghostty"
 	"github.com/charliek/roost/internal/ipc"
@@ -33,6 +35,11 @@ type App struct {
 	gtkApp *adw.Application
 	ws     *core.Workspace
 	home   string
+
+	// cfg is the parsed user config. Immutable after construction:
+	// safe to read from any thread during init, then only from the GTK
+	// main thread. If live-reload lands, this needs to grow a mutex.
+	cfg config.Config
 
 	socketPath string
 	ipcServer  *ipc.Server
@@ -69,10 +76,11 @@ type App struct {
 }
 
 // NewApp wires the app together. The window is built in activate.
-func NewApp(gtkApp *adw.Application, ws *core.Workspace, home, socketPath string) *App {
+func NewApp(gtkApp *adw.Application, ws *core.Workspace, cfg config.Config, home, socketPath string) *App {
 	return &App{
 		gtkApp:       gtkApp,
 		ws:           ws,
+		cfg:          cfg,
 		home:         home,
 		socketPath:   socketPath,
 		projectViews: map[int64]*adw.TabView{},
@@ -478,7 +486,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 		"ROOST_TAB_ID=" + strconv.FormatInt(tab.ID, 10),
 		"ROOST_SOCKET=" + a.socketPath,
 	}
-	sess, err := NewSession(a.ws, tab, initialCols, initialRows, env...)
+	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, env...)
 	if err != nil {
 		slog.Error("NewSession", "tab", tab.ID, "err", err)
 		return
@@ -894,28 +902,26 @@ func (a *App) shutdown() {
 // drawing area's key controller — otherwise terminal-focused keys get
 // consumed by handleKey and the shortcut never fires.
 //
-// Per-platform modifier policy:
-//   - macOS: Cmd is the "primary" app modifier (tab management, cycle).
-//     Cmd is also the project-management modifier (new project, rename
-//     project, rename tab, switch project 1..9). Ctrl-1..9 switches
-//     tabs in the active project.
-//   - Linux: Ctrl is the primary app modifier. Alt is the project-
-//     management modifier (mirrors Cmd on macOS). Ctrl-1..9 switches
-//     tabs.
+// Per-platform modifier policy (defaults; overridable via the config
+// file's `keybind = trigger=action` lines):
+//   - macOS: super (Cmd) is the primary app modifier and the
+//     project-management modifier; ctrl is reserved for tab-switch.
+//   - Linux: ctrl is the primary app modifier; alt is the project
+//     modifier; ctrl is also tab-switch.
 //
 // On macOS gdk-macos translates NSEventModifierFlagCommand directly to
 // GDK_META_MASK, so <Meta>x in a trigger reliably matches Cmd-x. The
 // <Primary> alias is hardcoded to Control on every platform in GTK4, so
-// we substitute the modifier ourselves rather than relying on it.
+// the trigger parser substitutes the modifier ourselves.
 func (a *App) installShortcuts() {
 	ctrl := gtk.NewShortcutController()
 	ctrl.SetScope(gtk.ShortcutScopeGlobal)
 	ctrl.SetPropagationPhase(gtk.PhaseCapture)
 
-	add := func(spec string, fn func()) {
+	addUnconditional := func(spec string, fn func()) {
 		t := gtk.NewShortcutTriggerParseString(spec)
 		if t == nil {
-			slog.Warn("shortcut: trigger parse failed", "spec", spec)
+			slog.Warn("shortcut: unparseable accel", "accel", spec)
 			return
 		}
 		action := gtk.NewCallbackAction(func(_ gtk.Widgetter, _ *glib.Variant) (ok bool) {
@@ -924,86 +930,130 @@ func (a *App) installShortcuts() {
 		})
 		ctrl.AddShortcut(gtk.NewShortcut(t, action))
 	}
-
-	// addCond is like add but lets the action signal "I didn't
-	// handle this; let GTK keep propagating." Used for clipboard
-	// shortcuts so a focused GtkEditable can keep its native
-	// copy/paste behavior — returning false here lets GTK deliver
-	// the keystroke to the focused widget after our capture-phase
-	// controller declines.
-	addCond := func(spec string, fn func() bool) {
+	// addGated is the propagate-false variant used by clipboard
+	// actions: when an editable widget has focus, return false so GTK
+	// keeps propagating the event to that widget's native copy/paste
+	// handler. Returning true here would swallow it and break paste
+	// in the sidebar rename entry.
+	addGated := func(spec string, fn func()) {
 		t := gtk.NewShortcutTriggerParseString(spec)
 		if t == nil {
-			slog.Warn("shortcut: trigger parse failed", "spec", spec)
+			slog.Warn("shortcut: unparseable accel", "accel", spec)
 			return
 		}
 		action := gtk.NewCallbackAction(func(_ gtk.Widgetter, _ *glib.Variant) (ok bool) {
-			return fn()
-		})
-		ctrl.AddShortcut(gtk.NewShortcut(t, action))
-	}
-
-	primary := "<Control>"
-	projectMod := "<Alt>"
-	if runtime.GOOS == "darwin" {
-		primary = "<Meta>"
-		projectMod = "<Meta>"
-	}
-
-	// Tab management on the primary modifier.
-	add(primary+"t", a.newTabInActiveProject)
-	add(primary+"w", a.closeActiveTab)
-
-	// Clipboard. Cmd+V on macOS, Alt+V on Linux, Ctrl+Shift+V on both
-	// (terminal convention) so muscle memory works either way. Bare
-	// Ctrl+V remains as terminal input. Bare Ctrl+C is left as SIGINT
-	// — Cmd+C / Alt+C / Ctrl+Shift+C handle copy without overloading
-	// the SIGINT key.
-	clipboardMod := "<Alt>"
-	if runtime.GOOS == "darwin" {
-		clipboardMod = "<Meta>"
-	}
-	clipboardGuard := func(fn func()) func() bool {
-		return func() bool {
 			if a.editableHasFocus() {
-				// Tell GTK we didn't consume the event so the
-				// focused entry / text view gets its native
-				// copy/paste handling.
 				return false
 			}
 			fn()
 			return true
+		})
+		ctrl.AddShortcut(gtk.NewShortcut(t, action))
+	}
+
+	type shortcutAction struct {
+		fn    func()
+		gated bool
+	}
+	handlers := map[string]shortcutAction{
+		ActionNewTab:        {fn: a.newTabInActiveProject},
+		ActionCloseTab:      {fn: a.closeActiveTab},
+		ActionRenameTab:     {fn: a.renameActiveTab},
+		ActionCycleTabPrev:  {fn: func() { a.cycleTab(-1) }},
+		ActionCycleTabNext:  {fn: func() { a.cycleTab(1) }},
+		ActionPaste:         {fn: a.pasteIntoActive, gated: true},
+		ActionCopy:          {fn: a.copyFromActive, gated: true},
+		ActionNewProject:    {fn: a.newProject},
+		ActionRenameProject: {fn: a.beginRenameActiveProject},
+	}
+	for i := 1; i <= 9; i++ {
+		i := i
+		handlers[switchProjectAction(i)] = shortcutAction{
+			fn: func() { a.switchProjectByIndex(i - 1) },
+		}
+		handlers[switchTabAction(i)] = shortcutAction{
+			fn: func() { a.switchTabByIndex(i - 1) },
 		}
 	}
-	addCond(clipboardMod+"v", clipboardGuard(a.pasteIntoActive))
-	addCond("<Control><Shift>v", clipboardGuard(a.pasteIntoActive))
-	addCond(clipboardMod+"c", clipboardGuard(a.copyFromActive))
-	addCond("<Control><Shift>c", clipboardGuard(a.copyFromActive))
 
-	// Shift+[ produces braceleft on US layouts. GTK matches the
-	// transformed keyval, so we bind the curly forms (and the bracket
-	// forms as a safety net for layouts that don't transform).
-	for _, k := range []string{"braceleft", "bracketleft"} {
-		add(primary+"<Shift>"+k, func() { a.cycleTab(-1) })
+	known := make(map[string]bool, len(handlers))
+	for action := range handlers {
+		known[action] = true
 	}
-	for _, k := range []string{"braceright", "bracketright"} {
-		add(primary+"<Shift>"+k, func() { a.cycleTab(1) })
+	resolved := canonicalizeBindings(
+		defaultBindings(), a.cfg.Keybinds, known,
+		func(msg, trigger, action string) {
+			slog.Warn("shortcut: "+msg, "trigger", trigger, "action", action)
+		},
+	)
+
+	// Sort the canonical accels before installing so the order is
+	// deterministic — matters only if two installable accels collide
+	// at the GTK level, but cheap insurance.
+	accels := make([]string, 0, len(resolved))
+	for accel := range resolved {
+		accels = append(accels, accel)
 	}
+	sort.Strings(accels)
 
-	// Project / tab management on the project modifier.
-	add(projectMod+"n", a.newProject)
-	add(projectMod+"<Shift>r", a.beginRenameActiveProject)
-	add(projectMod+"r", a.renameActiveTab)
-
-	// Numeric switchers: project on the project modifier, tab on Ctrl.
-	for i := 1; i <= 9; i++ {
-		idx := i - 1
-		n := strconv.Itoa(i)
-		add(projectMod+n, func() { a.switchProjectByIndex(idx) })
-		add("<Control>"+n, func() { a.switchTabByIndex(idx) })
+	for _, accel := range accels {
+		sa := handlers[resolved[accel]]
+		if sa.gated {
+			addGated(accel, sa.fn)
+		} else {
+			addUnconditional(accel, sa.fn)
+		}
 	}
 
 	a.win.AddController(ctrl)
+}
+
+// switchProjectAction / switchTabAction synthesize the indexed action
+// names for the project / tab numeric switchers. Kept as small helpers
+// so installShortcuts and defaultBindings stay in sync.
+func switchProjectAction(i int) string { return "switch_project_" + strconv.Itoa(i) }
+func switchTabAction(i int) string     { return "switch_tab_" + strconv.Itoa(i) }
+
+// defaultBindings returns the platform-default trigger list per action,
+// in Ghostty trigger syntax. installShortcuts layers user `keybind`
+// lines on top via resolveBindings.
+//
+// Linux clipboardMod is "alt" because the existing default has been
+// Alt-V / Alt-C since PR #4; ctrl+shift+v / ctrl+shift+c are kept as
+// secondary triggers. macOS clipboardMod is "super".
+func defaultBindings() map[string][]string {
+	primary := "ctrl"
+	projectMod := "alt"
+	clipboardMod := "alt"
+	if runtime.GOOS == "darwin" {
+		primary = "super"
+		projectMod = "super"
+		clipboardMod = "super"
+	}
+	m := map[string][]string{
+		ActionNewTab:    {primary + "+t"},
+		ActionCloseTab:  {primary + "+w"},
+		ActionRenameTab: {projectMod + "+r"},
+		// Shift-[ produces braceleft on US layouts; bracketleft on
+		// layouts that don't transform. Keep both.
+		ActionCycleTabPrev: {
+			primary + "+shift+braceleft",
+			primary + "+shift+bracketleft",
+		},
+		ActionCycleTabNext: {
+			primary + "+shift+braceright",
+			primary + "+shift+bracketright",
+		},
+		ActionPaste:         {clipboardMod + "+v", "ctrl+shift+v"},
+		ActionCopy:          {clipboardMod + "+c", "ctrl+shift+c"},
+		ActionNewProject:    {projectMod + "+n"},
+		ActionRenameProject: {projectMod + "+shift+r"},
+	}
+	for i := 1; i <= 9; i++ {
+		m[switchProjectAction(i)] = []string{projectMod + "+" + strconv.Itoa(i)}
+		m[switchTabAction(i)] = []string{"ctrl+" + strconv.Itoa(i)}
+	}
+	return m
 }
 
 // pageKey returns the stable GObject pointer for an AdwTabPage, used

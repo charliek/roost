@@ -113,3 +113,63 @@ The sidebar still supports mouse-driven rename: double-click a project row to re
 If you close the last tab in a project, Roost closes that project too. The "Are you sure?" confirmation dialog only appears for explicit close-project actions (the sidebar X button or the right-click menu); `Cmd-W` / `Ctrl-W` on the final tab closes the project silently.
 
 Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roost-cli set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.
+
+## Custom keybindings
+
+Roost reads `~/.config/roost/config.conf` (more precisely `$XDG_CONFIG_HOME/roost/config.conf`) on both platforms. The keybinding syntax mirrors [Ghostty](https://ghostty.org/docs/config/keybind):
+
+```conf
+keybind = trigger = action
+```
+
+Each `keybind` line either binds a trigger to an action, or unbinds one. Multiple `keybind` lines accumulate; later lines override earlier ones for the same trigger (last-wins per trigger).
+
+### Modifiers
+
+Combine with `+`. Aliases are accepted on both sides:
+
+| Canonical | Aliases             |
+|-----------|---------------------|
+| `shift`   |                     |
+| `ctrl`    | `control`           |
+| `alt`     | `opt`, `option`     |
+| `super`   | `cmd`, `command`    |
+
+The key segment (last token) passes through to GTK's keyval lookup unchanged.
+
+### Examples
+
+```conf
+# Add Cmd-J as a second trigger for new_tab. Cmd-T (the default) still works.
+keybind = super+j = new_tab
+
+# Disable the default rename-project shortcut.
+keybind = super+shift+r = unbind
+
+# Reassign Cmd-T to close the active tab. Cmd-W still also closes (default).
+keybind = super+t = close_tab
+```
+
+Use only leading-line `#` comments. A `#` after a `keybind` value is treated as part of the action string, not as an inline comment.
+
+### Available actions
+
+| Action                | Default (macOS / Linux)                                |
+|-----------------------|--------------------------------------------------------|
+| `new_tab`             | `super+t` / `ctrl+t`                                   |
+| `close_tab`           | `super+w` / `ctrl+w`                                   |
+| `rename_tab`          | `super+r` / `alt+r`                                    |
+| `cycle_tab_prev`      | `super+shift+bracketleft` / `ctrl+shift+bracketleft`   |
+| `cycle_tab_next`      | `super+shift+bracketright` / `ctrl+shift+bracketright` |
+| `paste`               | `super+v`, `ctrl+shift+v` / `alt+v`, `ctrl+shift+v`    |
+| `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
+| `new_project`         | `super+n` / `alt+n`                                    |
+| `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
+| `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
+| `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
+
+Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
+
+Triggers using Ghostty prefixes (`global:`, `all:`, `unconsumed:`, `performable:`) and unknown action names are logged and skipped — they're out of scope for v1.
+
+The config file is read once at startup; restart Roost to pick up edits.
