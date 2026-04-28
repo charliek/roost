@@ -962,13 +962,37 @@ func (a *App) installShortcuts() {
 		}
 	}
 
+	// Seed with defaults only, then merge user keybinds inline so we
+	// can validate each one before it replaces a default. Otherwise a
+	// typo'd action (e.g. `ctrl+t = typo`) would erase the default
+	// binding, leaving the trigger unbound rather than falling back.
+	// resolveBindings still handles `unbind` and the structural merge
+	// when called with a vetted slice; here we vet entry-by-entry.
+	resolved := resolveBindings(defaultBindings(), nil)
+	for _, kb := range a.cfg.Keybinds {
+		if kb.Action == ActionUnbind {
+			delete(resolved, kb.Trigger)
+			continue
+		}
+		if _, ok := handlers[kb.Action]; !ok {
+			slog.Warn("shortcut: unknown action (default kept)",
+				"trigger", kb.Trigger, "action", kb.Action)
+			continue
+		}
+		if _, ok := triggerToAccel(kb.Trigger); !ok {
+			slog.Warn("shortcut: unparseable trigger (default kept)",
+				"trigger", kb.Trigger, "action", kb.Action)
+			continue
+		}
+		resolved[kb.Trigger] = kb.Action
+	}
+
 	// Sort the resolved triggers before iterating so the install order
 	// is deterministic. This matters when two distinct triggers in the
 	// resolved map normalize to the same GTK accel (e.g. user binds
 	// `ctrl+t=action_a` and `control+t=action_b` — both produce
 	// `<Control>t`). Without sorting, map iteration would pick a winner
 	// at random; sorting gives lexicographic last-wins.
-	resolved := resolveBindings(defaultBindings(), a.cfg.Keybinds)
 	triggers := make([]string, 0, len(resolved))
 	for trigger := range resolved {
 		triggers = append(triggers, trigger)

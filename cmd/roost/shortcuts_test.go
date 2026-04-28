@@ -167,10 +167,13 @@ func TestResolveBindingsLastWinsPerTrigger(t *testing.T) {
 	}
 }
 
-// TestResolveBindingsUnknownActionSurvivesPipeline verifies that an
-// unknown action name is preserved by resolveBindings — the install
-// loop is responsible for skipping it (with a slog.Warn). resolveBindings
-// is purely structural; semantic validation happens later.
+// TestResolveBindingsUnknownActionSurvivesPipeline pins the structural
+// contract: resolveBindings does NOT validate action names, so an
+// unknown action survives the merge. Production semantic validation
+// lives in installShortcuts (app.go), which vets each user keybind
+// against the handlers map before merging — so a typo'd action can't
+// erase a default binding in production. This test exists for callers
+// that want to plug in their own validation strategy.
 func TestResolveBindingsUnknownActionSurvivesPipeline(t *testing.T) {
 	defaults := map[string][]string{}
 	got := resolveBindings(defaults, []config.Keybind{
