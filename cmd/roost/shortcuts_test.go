@@ -188,6 +188,105 @@ func TestResolveBindingsUnknownActionSurvivesPipeline(t *testing.T) {
 	}
 }
 
+// canonicalize tests cover the production install path's three jobs:
+// alias collapse, action validation, and trigger validation.
+
+func newCanonHelpers() (knownActions map[string]bool, warns *[]canonWarn) {
+	knownActions = map[string]bool{
+		"new_tab":   true,
+		"close_tab": true,
+	}
+	w := []canonWarn{}
+	warns = &w
+	return knownActions, warns
+}
+
+type canonWarn struct{ msg, trigger, action string }
+
+func captureWarn(warns *[]canonWarn) func(string, string, string) {
+	return func(msg, trigger, action string) {
+		*warns = append(*warns, canonWarn{msg, trigger, action})
+	}
+}
+
+func TestCanonicalizeCollapsesAliases(t *testing.T) {
+	known, warns := newCanonHelpers()
+	defaults := map[string][]string{"new_tab": {"super+t"}}
+	user := []config.Keybind{
+		{Trigger: "cmd+t", Action: "unbind"},
+	}
+	got := canonicalizeBindings(defaults, user, known, captureWarn(warns))
+	if _, ok := got["<Meta>t"]; ok {
+		t.Errorf("cmd+t = unbind should remove super+t (both → <Meta>t): %+v", got)
+	}
+	if len(*warns) != 0 {
+		t.Errorf("unexpected warns: %+v", *warns)
+	}
+}
+
+func TestCanonicalizeReassignViaAlias(t *testing.T) {
+	known, warns := newCanonHelpers()
+	defaults := map[string][]string{"new_tab": {"super+t"}}
+	user := []config.Keybind{
+		{Trigger: "cmd+t", Action: "close_tab"},
+	}
+	got := canonicalizeBindings(defaults, user, known, captureWarn(warns))
+	if got["<Meta>t"] != "close_tab" {
+		t.Errorf("cmd+t = close_tab should reassign super+t (alias): %+v", got)
+	}
+	if len(got) != 1 {
+		t.Errorf("expected one canonical accel, got %+v", got)
+	}
+	if len(*warns) != 0 {
+		t.Errorf("unexpected warns: %+v", *warns)
+	}
+}
+
+func TestCanonicalizeUnknownActionPreservesDefault(t *testing.T) {
+	known, warns := newCanonHelpers()
+	defaults := map[string][]string{"new_tab": {"ctrl+t"}}
+	user := []config.Keybind{
+		{Trigger: "ctrl+t", Action: "typo"},
+	}
+	got := canonicalizeBindings(defaults, user, known, captureWarn(warns))
+	if got["<Control>t"] != "new_tab" {
+		t.Errorf("typo should not erase default: got %+v", got)
+	}
+	if len(*warns) != 1 || (*warns)[0].action != "typo" {
+		t.Errorf("expected one warn for the typo, got %+v", *warns)
+	}
+}
+
+func TestCanonicalizeUnparseableUserTriggerPreservesDefault(t *testing.T) {
+	known, warns := newCanonHelpers()
+	defaults := map[string][]string{"new_tab": {"ctrl+t"}}
+	user := []config.Keybind{
+		{Trigger: "hyper+t", Action: "close_tab"}, // unknown modifier
+	}
+	got := canonicalizeBindings(defaults, user, known, captureWarn(warns))
+	if got["<Control>t"] != "new_tab" {
+		t.Errorf("default should be intact: %+v", got)
+	}
+	if len(*warns) != 1 {
+		t.Errorf("expected one warn for unparseable trigger, got %+v", *warns)
+	}
+}
+
+func TestCanonicalizeUnbindAlreadyCanonical(t *testing.T) {
+	known, warns := newCanonHelpers()
+	defaults := map[string][]string{"new_tab": {"ctrl+t"}}
+	user := []config.Keybind{
+		{Trigger: "control+t", Action: "unbind"},
+	}
+	got := canonicalizeBindings(defaults, user, known, captureWarn(warns))
+	if _, ok := got["<Control>t"]; ok {
+		t.Errorf("control+t = unbind should remove ctrl+t default: %+v", got)
+	}
+	if len(*warns) != 0 {
+		t.Errorf("unexpected warns: %+v", *warns)
+	}
+}
+
 func mapEq(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false

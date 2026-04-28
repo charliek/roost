@@ -60,17 +60,11 @@ func triggerToAccel(trigger string) (string, bool) {
 }
 
 // resolveBindings layers user keybinds on top of the platform defaults
-// and returns a map from Ghostty trigger → action name.
-//
-// Semantics (matches Ghostty):
-//   - Defaults seed the map.
-//   - Each user keybind, in source order, sets or removes one trigger:
-//     `unbind` deletes; any other action assigns the trigger.
-//   - Last write wins per trigger.
-//   - Removing the only trigger of an action makes that action
-//     unreachable (intentional).
-//
-// Pure: no GTK calls, deterministic output. Unit-tested in isolation.
+// and returns a map from Ghostty trigger → action name. Pure structural
+// merge: literal trigger strings as keys, no validation. Production no
+// longer calls this — installShortcuts uses canonicalizeBindings, which
+// collapses aliases and validates user entries. Kept for the tests
+// that pin the structural-merge contract.
 func resolveBindings(defaults map[string][]string, user []config.Keybind) map[string]string {
 	triggerToAction := make(map[string]string, len(defaults))
 	for action, triggers := range defaults {
@@ -86,4 +80,57 @@ func resolveBindings(defaults map[string][]string, user []config.Keybind) map[st
 		triggerToAction[kb.Trigger] = kb.Action
 	}
 	return triggerToAction
+}
+
+// canonicalizeBindings is the production merge. Returns a map from
+// canonical GTK accel → action, with three properties the literal-key
+// form lacks:
+//
+//  1. Alias collapse: super+t / cmd+t / command+t all canonicalize to
+//     <Meta>t, so `keybind = cmd+t = unbind` correctly removes a macOS
+//     default seeded as `super+t`.
+//  2. Action validation: a user keybind whose action isn't in
+//     knownActions is reported via warn and skipped — the default
+//     binding for that trigger is preserved (a typo can't erase the
+//     default).
+//  3. Trigger validation: unparseable user triggers are reported and
+//     skipped; unparseable default triggers (a bug in defaultBindings)
+//     are reported but skipped so the rest of the table still installs.
+//
+// Pure: no GTK calls. The warn callback lets the production caller
+// emit slog and lets tests capture without setup.
+func canonicalizeBindings(
+	defaults map[string][]string,
+	user []config.Keybind,
+	knownActions map[string]bool,
+	warn func(msg, trigger, action string),
+) map[string]string {
+	accelToAction := map[string]string{}
+	for action, triggers := range defaults {
+		for _, t := range triggers {
+			accel, ok := triggerToAccel(t)
+			if !ok {
+				warn("unparseable default trigger", t, action)
+				continue
+			}
+			accelToAction[accel] = action
+		}
+	}
+	for _, kb := range user {
+		accel, ok := triggerToAccel(kb.Trigger)
+		if !ok {
+			warn("unparseable trigger (default kept)", kb.Trigger, kb.Action)
+			continue
+		}
+		if kb.Action == ActionUnbind {
+			delete(accelToAction, accel)
+			continue
+		}
+		if !knownActions[kb.Action] {
+			warn("unknown action (default kept)", kb.Trigger, kb.Action)
+			continue
+		}
+		accelToAction[accel] = kb.Action
+	}
+	return accelToAction
 }

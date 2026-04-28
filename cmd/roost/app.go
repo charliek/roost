@@ -962,55 +962,28 @@ func (a *App) installShortcuts() {
 		}
 	}
 
-	// Seed with defaults only, then merge user keybinds inline so we
-	// can validate each one before it replaces a default. Otherwise a
-	// typo'd action (e.g. `ctrl+t = typo`) would erase the default
-	// binding, leaving the trigger unbound rather than falling back.
-	// resolveBindings still handles `unbind` and the structural merge
-	// when called with a vetted slice; here we vet entry-by-entry.
-	resolved := resolveBindings(defaultBindings(), nil)
-	for _, kb := range a.cfg.Keybinds {
-		if kb.Action == ActionUnbind {
-			delete(resolved, kb.Trigger)
-			continue
-		}
-		if _, ok := handlers[kb.Action]; !ok {
-			slog.Warn("shortcut: unknown action (default kept)",
-				"trigger", kb.Trigger, "action", kb.Action)
-			continue
-		}
-		if _, ok := triggerToAccel(kb.Trigger); !ok {
-			slog.Warn("shortcut: unparseable trigger (default kept)",
-				"trigger", kb.Trigger, "action", kb.Action)
-			continue
-		}
-		resolved[kb.Trigger] = kb.Action
+	known := make(map[string]bool, len(handlers))
+	for action := range handlers {
+		known[action] = true
 	}
+	resolved := canonicalizeBindings(
+		defaultBindings(), a.cfg.Keybinds, known,
+		func(msg, trigger, action string) {
+			slog.Warn("shortcut: "+msg, "trigger", trigger, "action", action)
+		},
+	)
 
-	// Sort the resolved triggers before iterating so the install order
-	// is deterministic. This matters when two distinct triggers in the
-	// resolved map normalize to the same GTK accel (e.g. user binds
-	// `ctrl+t=action_a` and `control+t=action_b` — both produce
-	// `<Control>t`). Without sorting, map iteration would pick a winner
-	// at random; sorting gives lexicographic last-wins.
-	triggers := make([]string, 0, len(resolved))
-	for trigger := range resolved {
-		triggers = append(triggers, trigger)
+	// Sort the canonical accels before installing so the order is
+	// deterministic — matters only if two installable accels collide
+	// at the GTK level, but cheap insurance.
+	accels := make([]string, 0, len(resolved))
+	for accel := range resolved {
+		accels = append(accels, accel)
 	}
-	sort.Strings(triggers)
+	sort.Strings(accels)
 
-	for _, trigger := range triggers {
-		action := resolved[trigger]
-		sa, ok := handlers[action]
-		if !ok {
-			slog.Warn("shortcut: unknown action", "trigger", trigger, "action", action)
-			continue
-		}
-		accel, ok := triggerToAccel(trigger)
-		if !ok {
-			slog.Warn("shortcut: unparseable trigger", "trigger", trigger, "action", action)
-			continue
-		}
+	for _, accel := range accels {
+		sa := handlers[resolved[accel]]
 		if sa.gated {
 			addGated(accel, sa.fn)
 		} else {
