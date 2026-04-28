@@ -40,6 +40,11 @@ type Tab struct {
 	Position    int
 	CreatedAt   time.Time
 	LastActive  time.Time
+	// UserTitled is true once the user explicitly renamed the tab (Cmd-R
+	// popover or `roost-cli set-title`). While set, OSC 1/2 writes from
+	// the shell are suppressed by UpdateTabTitleIfNotUserSet. v1 has no
+	// in-app way to clear the lock.
+	UserTitled bool
 }
 
 // Store is the SQLite handle and migration state. database/sql's
@@ -241,7 +246,7 @@ func (s *Store) CreateTab(projectID int64, cwd string) (Tab, error) {
 func (s *Store) ListTabs(projectID int64) ([]Tab, error) {
 	rows, err := s.db.Query(
 		`SELECT id, project_id, COALESCE(title,''), cwd, COALESCE(last_command,''),
-		        position, created_at, last_active
+		        position, created_at, last_active, user_titled
 		 FROM tab WHERE project_id = ? ORDER BY position`,
 		projectID)
 	if err != nil {
@@ -252,14 +257,16 @@ func (s *Store) ListTabs(projectID int64) ([]Tab, error) {
 	for rows.Next() {
 		var t Tab
 		var created, active int64
+		var userTitled int
 		if err := rows.Scan(
 			&t.ID, &t.ProjectID, &t.Title, &t.CWD, &t.LastCommand,
-			&t.Position, &created, &active,
+			&t.Position, &created, &active, &userTitled,
 		); err != nil {
 			return nil, err
 		}
 		t.CreatedAt = time.Unix(created, 0)
 		t.LastActive = time.Unix(active, 0)
+		t.UserTitled = userTitled != 0
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -271,10 +278,44 @@ func (s *Store) UpdateTabCWD(id int64, cwd string) error {
 	return err
 }
 
-// UpdateTabTitle sets the tab's display title (OSC 1/2 or user rename).
+// UpdateTabTitle sets the tab's display title unconditionally. Used
+// only by the test suite today; production callers go through
+// RenameTabAndLock (user intent) or UpdateTabTitleIfNotUserSet (OSC).
 func (s *Store) UpdateTabTitle(id int64, title string) error {
 	_, err := s.db.Exec(`UPDATE tab SET title = ? WHERE id = ?`, title, id)
 	return err
+}
+
+// RenameTabAndLock writes the user-chosen title and flips the
+// user-titled lock in a single atomic UPDATE. Doing both in one
+// statement closes the race where an interleaved
+// UpdateTabTitleIfNotUserSet could observe user_titled=0 between two
+// separate UPDATEs and overwrite the manual title before the lock
+// flips. Returns the number of rows affected; 0 indicates the tab is
+// missing.
+func (s *Store) RenameTabAndLock(id int64, title string) (int64, error) {
+	res, err := s.db.Exec(
+		`UPDATE tab SET title = ?, user_titled = 1 WHERE id = ?`,
+		title, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// UpdateTabTitleIfNotUserSet conditionally writes the title only when
+// the tab is not user-locked. Returns rows-affected so the caller can
+// distinguish "applied" (1) from "suppressed by lock or tab missing"
+// (0). The lock check + write happen as one atomic UPDATE so an
+// interleaved RenameTabAndLock from another goroutine cannot lose.
+func (s *Store) UpdateTabTitleIfNotUserSet(id int64, title string) (int64, error) {
+	res, err := s.db.Exec(
+		`UPDATE tab SET title = ? WHERE id = ? AND user_titled = 0`,
+		title, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // TouchTab marks the tab as the most recently active.

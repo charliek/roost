@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 
 	"github.com/diamondburned/gotk4/pkg/cairo"
@@ -44,6 +43,13 @@ type Session struct {
 	cols     uint16
 	rows     uint16
 
+	// theme is the source of truth for fg/bg/cursor/palette across this
+	// session. It is what gets pushed into libghostty (SetTheme) and
+	// what OSC 10/11/12 queries respond with — same source on both
+	// sides keeps the answers consistent if the theme is ever swapped
+	// at runtime. Initialised from DefaultTheme.
+	theme Theme
+
 	// cursorOn is the current blink phase. windowFocused mirrors the
 	// containing window's is-active so the cursor stops blinking and
 	// degrades to a hollow outline when the window is unfocused.
@@ -58,10 +64,16 @@ type Session struct {
 	// time of Close become no-ops instead of use-after-free.
 	closed atomic.Bool
 
-	// writeMu serializes background PTY writes spawned by QueueWrite
-	// so that bytes from concurrent paste / keystroke / mouse-event
-	// goroutines don't interleave on the wire.
-	writeMu sync.Mutex
+	// writeChan feeds the single per-session PTY writer goroutine.
+	// Senders (QueueWrite) push owned []byte chunks; the writer drains
+	// in order and performs the actual pty.Write. A buffered channel +
+	// one writer goroutine is the canonical Go pattern for serialised
+	// I/O; the previous design spawned a goroutine per call that all
+	// blocked on a mutex, which under probe-heavy load (libghostty
+	// WRITE_PTY responses + keystrokes + mouse) could pile up.
+	writeChan  chan []byte
+	stopWrite  chan struct{}
+	writerDone chan struct{}
 
 	// scrollAccum aggregates fractional smooth-scroll deltas
 	// (gdk.ScrollUnitSurface, common on macOS trackpads) so we only
@@ -123,6 +135,24 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 	if err != nil {
 		return nil, err
 	}
+	theme := DefaultTheme
+	if err := term.SetTheme(
+		theme.Foreground,
+		theme.Background,
+		theme.Cursor,
+		&theme.Palette,
+	); err != nil {
+		term.Close()
+		return nil, err
+	}
+	if err := term.SetDeviceAttributes(&DefaultDeviceAttrs); err != nil {
+		term.Close()
+		return nil, err
+	}
+	if err := term.SetColorSchemeDark(true); err != nil {
+		term.Close()
+		return nil, err
+	}
 	rs, err := ghostty.NewRenderState()
 	if err != nil {
 		term.Close()
@@ -167,9 +197,27 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 		fontBold:      fontBold,
 		cols:          cols,
 		rows:          rows,
+		theme:         theme,
 		pumpDone:      make(chan struct{}),
+		writeChan:     make(chan []byte, 256),
+		stopWrite:     make(chan struct{}),
+		writerDone:    make(chan struct{}),
 		cursorOn:      true,
 		windowFocused: true,
+	}
+	go s.runWriter()
+
+	// Route libghostty's terminal-to-pty responses (OSC 10/11/12 query
+	// replies, DSR, DA1/2/3) through the same writer the user input goes
+	// through. Without this, programs like Codex that probe the terminal
+	// for state see silence and fall back to degraded rendering.
+	if err := term.SetPtyWriter(s.QueueWrite); err != nil {
+		mouse.Close()
+		keys.Close()
+		rs.Close()
+		term.Close()
+		_ = p.Close()
+		return nil, err
 	}
 
 	s.da = gtk.NewDrawingArea()
@@ -283,22 +331,39 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 }
 
 // oscScanner returns the per-session OSC scanner. Lazily allocated so
-// sessions that never receive an OSC notification don't pay the cost.
-// Called only from the pump goroutine.
+// sessions that never receive an OSC don't pay the cost. Called only
+// from the pump goroutine.
+//
+// The scanner does two jobs in parallel to libghostty's parser:
+//   - Forward OSC 9 / OSC 777 notifications to the workspace UI.
+//   - Synthesise OSC 10/11/12 query responses (libghostty-vt currently
+//     drops the .query arm of color operations, so without this Codex
+//     and similar agents see silence and skip emitting their styled
+//     prompt rows).
 func (s *Session) oscScanner() *osc.Scanner {
 	if s.osc == nil {
 		tabID := s.tab.ID
 		ws := s.ws
-		s.osc = osc.NewScanner(func(n osc.Notification) {
-			title := n.Title
-			if title == "" {
-				title = "(notification)"
-			}
-			_ = ws.Notify(tabID, title, n.Body)
+		s.osc = osc.NewScanner(osc.Handler{
+			OnNotification: func(n osc.Notification) {
+				title := n.Title
+				if title == "" {
+					title = "(notification)"
+				}
+				_ = ws.Notify(tabID, title, n.Body)
+			},
+			OnQueryResponse: s.QueueWrite,
+			QueryColors: func() (osc.RGB, osc.RGB, osc.RGB) {
+				return toOSCRGB(s.theme.Foreground),
+					toOSCRGB(s.theme.Background),
+					toOSCRGB(s.theme.Cursor)
+			},
 		})
 	}
 	return s.osc
 }
+
+func toOSCRGB(c ghostty.ColorRGB) osc.RGB { return osc.RGB{R: c.R, G: c.G, B: c.B} }
 
 // DrawingArea returns the widget to host inside a tab page.
 func (s *Session) DrawingArea() *gtk.DrawingArea { return s.da }
@@ -321,6 +386,11 @@ func (s *Session) Close() {
 	}
 	_ = s.pty.Close()
 	<-s.pumpDone
+	// Tell the per-session writer goroutine to exit and wait for it.
+	// Done before scheduling libghostty cleanup so a stray in-flight
+	// pty.Write can't race with the goroutine's exit.
+	close(s.stopWrite)
+	<-s.writerDone
 	// At this point no more IdleAdd callbacks will be queued from the
 	// pump, but already-queued ones may still run. Schedule libghostty
 	// cleanup to run at the tail of the GTK queue (FIFO at default prio),
@@ -395,17 +465,32 @@ func (s *Session) pumpPTY() {
 // crispness).
 func (s *Session) measureCells() {
 	ctx := s.da.PangoContext()
+
 	layout := pango.NewLayout(ctx)
 	layout.SetFontDescription(s.font)
 	layout.SetText("M")
-	w, h := layout.PixelSize()
+	w, _ := layout.PixelSize()
 	if w < 1 {
 		w = 8
 	}
+	s.cellW = w
+
+	// Height: prefer the font's recommended line-height (distance
+	// between baselines, includes any line-gap the font designer set),
+	// fall back to ascent+descent if the font reports no Height. M has
+	// no descender so PixelSize("M") undercounts; even ascent+descent
+	// alone leaves no slack for glyphs whose ink exceeds metric
+	// descent (common for `g`/`p`/`y` in many monospace fonts), so
+	// using Height gives the font designer's intended row spacing.
+	metrics := ctx.Metrics(s.font, nil)
+	hUnits := metrics.Height()
+	if hUnits <= 0 {
+		hUnits = metrics.Ascent() + metrics.Descent()
+	}
+	h := (hUnits + pango.SCALE - 1) / pango.SCALE
 	if h < 1 {
 		h = 16
 	}
-	s.cellW = w
 	s.cellH = h
 }
 
@@ -602,39 +687,57 @@ func (s *Session) quantizeScroll(unit gdk.ScrollUnit, dy float64) int {
 	}
 }
 
-// QueueWrite serializes a write to the PTY off the GTK main thread.
-// Spawns a goroutine that takes writeMu and performs pty.Write with
-// a short-write loop. Order is preserved across calls because every
-// goroutine must acquire writeMu before writing — a paste followed
-// by a keystroke arrives at the shell in that order even though both
-// run concurrently.
+// QueueWrite enqueues bytes for the per-session writer goroutine to
+// flush to the PTY. The buffered channel + single-writer pattern keeps
+// order (FIFO across all callers — keystrokes, paste, libghostty query
+// responses, mouse events) without spawning a goroutine per call.
 //
-// Per CLAUDE.md, PTY read/write must run in per-tab goroutines so a
-// slow consumer can't stall the GTK main thread. The data slice is
-// copied so the caller can recycle its buffer immediately. Safe to
-// call from the main thread; safe to call after Close (no-op).
+// Per CLAUDE.md, PTY writes must not run on the GTK main thread. The
+// data slice is copied so the caller can recycle its buffer immediately.
+// Safe to call from the main thread, safe to call after Close (drops),
+// and safe under concurrent callers.
+//
+// If the queue is full (extreme load: writer blocked on a stalled PTY
+// while a probe-heavy program floods queries) the bytes are dropped
+// with a warning rather than blocking the caller — blocking would
+// freeze the GTK main thread, which is worse than losing one reply.
 func (s *Session) QueueWrite(data []byte) {
-	if s.closed.Load() || len(data) == 0 {
+	if len(data) == 0 {
 		return
 	}
 	buf := append([]byte(nil), data...)
-	tabID := s.tab.ID
-	go func() {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		if s.closed.Load() {
+	select {
+	case s.writeChan <- buf:
+	case <-s.stopWrite:
+		// Session closing — drop.
+	default:
+		slog.Warn("pty write queue full; dropping",
+			"tab_id", s.tab.ID, "bytes", len(buf))
+	}
+}
+
+// runWriter is the single per-session PTY writer. Drains writeChan
+// in order and writes each chunk to the PTY with a short-write loop.
+// Exits when stopWrite closes; closes writerDone on the way out so
+// Close can wait for in-flight writes to finish.
+func (s *Session) runWriter() {
+	defer close(s.writerDone)
+	for {
+		select {
+		case <-s.stopWrite:
 			return
-		}
-		for off := 0; off < len(buf); {
-			n, err := s.pty.Write(buf[off:])
-			if err != nil {
-				slog.Warn("pty write", "tab_id", tabID, "err", err,
-					"wrote", off+n, "total", len(buf))
-				return
+		case buf := <-s.writeChan:
+			for off := 0; off < len(buf); {
+				n, err := s.pty.Write(buf[off:])
+				if err != nil {
+					slog.Warn("pty write", "tab_id", s.tab.ID, "err", err,
+						"wrote", off+n, "total", len(buf))
+					break
+				}
+				off += n
 			}
-			off += n
 		}
-	}()
+	}
 }
 
 // useMouseTracking decides whether mouse events should be encoded and

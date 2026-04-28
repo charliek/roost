@@ -257,9 +257,15 @@ func (a *App) handleEvent(ev core.Event) {
 		}
 		// Keep the in-memory Session.tab title in sync so the OSC-empty
 		// fallback at session.go's onTitleChanged uses the latest title
-		// rather than the value from session creation.
+		// rather than the value from session creation. UserTitled is
+		// set-only here: SetTabTitleFromOSC's event leaves the field
+		// false, so we must not infer "unlocked" from absence — only
+		// propagate true. (See Event doc-comment in internal/core.)
 		if sess, ok := a.sessions[ev.Tab.ID]; ok {
 			sess.tab.Title = ev.Tab.Title
+			if ev.Tab.UserTitled {
+				sess.tab.UserTitled = true
+			}
 		}
 	case core.EventProjectRenamed:
 		if ev.Project == nil {
@@ -324,7 +330,9 @@ func (a *App) SetTitle(tabID int64, title string) error {
 	if tabID == 0 {
 		return errors.New("tab_id required (set ROOST_TAB_ID or pass --tab)")
 	}
-	return a.ws.UpdateTabTitle(tabID, title)
+	// CLI title-set is user intent — lock the tab against subsequent OSC
+	// overwrites just like the Cmd-R popover does.
+	return a.ws.RenameTab(tabID, title)
 }
 
 // Identify is called from the IPC server's per-connection goroutine
@@ -491,16 +499,22 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	a.pageTabs[pageKey(page)] = tab.ID
 	a.tabPages[tab.ID] = page
 
-	// OSC 0/1/2 title updates → refresh tab page + persist.
+	// OSC 0/1/2 title updates → refresh tab page + persist, except when
+	// the tab is user-locked. The visible-flash gate matters: without
+	// it, we'd briefly call page.SetTitle(title) before the persist
+	// no-ops, showing the OSC title for a frame on a locked tab.
 	tabID := tab.ID
 	sess.onTitleChanged = func(title string) {
 		if title == "" {
 			page.SetTitle(displayTitle(sess.tab))
 			return
 		}
+		if sess.tab.UserTitled {
+			return
+		}
 		page.SetTitle(title)
-		if err := a.ws.UpdateTabTitle(tabID, title); err != nil {
-			slog.Warn("UpdateTabTitle", "tab", tabID, "title", title, "err", err)
+		if err := a.ws.SetTabTitleFromOSC(tabID, title); err != nil {
+			slog.Warn("SetTabTitleFromOSC", "tab", tabID, "title", title, "err", err)
 		}
 	}
 	// OSC 7 cwd updates → persist for next-launch shell spawn, and
@@ -818,9 +832,9 @@ func (a *App) switchTabByIndex(idx int) {
 }
 
 // renameActiveTab opens a popover with a GtkEntry to rename the active
-// tab. Bound to Cmd-R on macOS and Alt-R on Linux. The new title is
-// persisted via UpdateTabTitle, but a subsequent OSC 1/2 from the shell
-// can overwrite it — locking against OSC is a follow-up.
+// tab. Bound to Cmd-R on macOS and Alt-R on Linux. The rename routes
+// through Workspace.RenameTab which sets the user-titled lock — once
+// renamed, OSC 1/2 from the shell stops overwriting the title.
 func (a *App) renameActiveTab() {
 	view := a.projectViews[a.activeProjectID]
 	if view == nil {
@@ -851,8 +865,8 @@ func (a *App) renameActiveTab() {
 		if text == "" || text == page.Title() {
 			return
 		}
-		if err := a.ws.UpdateTabTitle(tabID, text); err != nil {
-			slog.Error("UpdateTabTitle", "tab", tabID, "err", err)
+		if err := a.ws.RenameTab(tabID, text); err != nil {
+			slog.Error("RenameTab", "tab", tabID, "err", err)
 		}
 	}
 	entry.ConnectActivate(commit)
@@ -1100,11 +1114,11 @@ func (a *App) editableHasFocus() bool {
 // pasteIntoActive drives a clipboard read → encode → background PTY
 // write for the active session. Bound to Cmd+V / Alt+V / Ctrl+Shift+V.
 //
-// The encoded bytes are queued via Session.QueueWrite, which runs the
-// actual pty.Write on a per-tab goroutine so a slow PTY consumer
-// can't stall the GTK main thread. Per-session writeMu serializes
-// against keystrokes / mouse events so a paste-then-type doesn't
-// interleave on the wire.
+// The encoded bytes are queued via Session.QueueWrite, which feeds
+// them into a per-session buffered channel drained by a single writer
+// goroutine. That serialises against keystrokes / mouse events so a
+// paste-then-type doesn't interleave on the wire and keeps PTY I/O
+// off the GTK main thread.
 //
 // Limits and behavior:
 //   - Cap the clipboard at pasteMaxBytes (4 MiB); above that, log and

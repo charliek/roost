@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -44,6 +45,23 @@ import (
 // all calls on a single thread (typically the GTK main thread).
 type Terminal struct {
 	c C.GhosttyTerminal
+
+	// cbs aggregates the Go-side state for libghostty terminal callbacks.
+	// Allocated lazily by ensureCallbacks the first time any Set… method
+	// fires. cbsHandle is the matching cgo.Handle stored in libghostty's
+	// userdata slot so the callbacks can resolve it.
+	cbs       *terminalCallbacks
+	cbsHandle cgo.Handle
+}
+
+// terminalCallbacks holds Go-side state for every libghostty callback
+// Roost wires up. libghostty exposes only one userdata slot per terminal,
+// so all callbacks share this struct via a single cgo.Handle.
+type terminalCallbacks struct {
+	writePty    func([]byte)
+	deviceAttrs *DeviceAttrs
+	colorScheme C.GhosttyColorScheme
+	hasScheme   bool
 }
 
 // Options configures a new Terminal.
@@ -78,6 +96,11 @@ func (t *Terminal) Close() {
 		t.c = nil
 		runtime.SetFinalizer(t, nil)
 	}
+	if t.cbsHandle != 0 {
+		t.cbsHandle.Delete()
+		t.cbsHandle = 0
+		t.cbs = nil
+	}
 }
 
 // VTWrite feeds bytes into the VT parser. Updates terminal state (cursor,
@@ -98,6 +121,39 @@ func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
 	}
 	if rc := C.ghostty_terminal_resize(t.c, C.uint16_t(cols), C.uint16_t(rows), C.uint32_t(cellW), C.uint32_t(cellH)); rc != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("ghostty_terminal_resize failed: %d", int(rc))
+	}
+	return nil
+}
+
+// SetTheme installs default foreground, background, cursor color, and
+// 256-color palette on the terminal. Programs running in the terminal can
+// still override any of these at runtime via OSC 4 / 10 / 11 / 12. Call
+// once after NewTerminal, before any VT bytes are written, so the first
+// frame paints with the right colors.
+func (t *Terminal) SetTheme(fg, bg, cursor ColorRGB, palette *[256]ColorRGB) error {
+	if t.c == nil {
+		return errors.New("ghostty: terminal closed")
+	}
+	cFG := C.GhosttyColorRgb{r: C.uint8_t(fg.R), g: C.uint8_t(fg.G), b: C.uint8_t(fg.B)}
+	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, unsafe.Pointer(&cFG)); rc != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("set COLOR_FOREGROUND: %d", int(rc))
+	}
+	cBG := C.GhosttyColorRgb{r: C.uint8_t(bg.R), g: C.uint8_t(bg.G), b: C.uint8_t(bg.B)}
+	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, unsafe.Pointer(&cBG)); rc != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("set COLOR_BACKGROUND: %d", int(rc))
+	}
+	cCursor := C.GhosttyColorRgb{r: C.uint8_t(cursor.R), g: C.uint8_t(cursor.G), b: C.uint8_t(cursor.B)}
+	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, unsafe.Pointer(&cCursor)); rc != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("set COLOR_CURSOR: %d", int(rc))
+	}
+	if palette != nil {
+		var cPalette [256]C.GhosttyColorRgb
+		for i, c := range palette {
+			cPalette[i] = C.GhosttyColorRgb{r: C.uint8_t(c.R), g: C.uint8_t(c.G), b: C.uint8_t(c.B)}
+		}
+		if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, unsafe.Pointer(&cPalette[0])); rc != C.GHOSTTY_SUCCESS {
+			return fmt.Errorf("set COLOR_PALETTE: %d", int(rc))
+		}
 	}
 	return nil
 }

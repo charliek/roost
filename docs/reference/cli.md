@@ -32,7 +32,7 @@ roost-cli notify --tab 3 --title "From CI" --body "deploy ready"
 
 ## `set-title`
 
-Set a tab's display title. Persists across restarts.
+Set a tab's display title. Persists across restarts and locks the tab against subsequent OSC 1/2 escapes from the shell — once set via `set-title` (or via `Cmd-R` / `Alt-R` in the GUI), prompt-frame title-rewrites stop overwriting it. v1 has no in-app way to clear the lock; the workaround is to delete and recreate the tab.
 
 ```bash
 roost-cli set-title --title "build-watcher"
