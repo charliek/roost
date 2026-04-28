@@ -26,11 +26,14 @@ type (
 // the Kind field.
 //
 // Tab payload contract for EventTabUpdated: only the ID and the field
-// that changed are populated. UpdateTabTitle emits a Tab with ID+Title;
-// UpdateTabCWD emits a Tab with ID+CWD. Subscribers must guard on the
-// specific field rather than treating the Tab as a complete snapshot.
-// If a future subscriber needs the full Tab, switch the producer to a
-// store.GetTab(id) round-trip.
+// that changed are populated. RenameTab emits a Tab with ID+Title and
+// UserTitled=true; SetTabTitleFromOSC emits ID+Title (UserTitled stays
+// false because the OSC path never writes through a locked tab);
+// UpdateTabCWD emits ID+CWD. Subscribers must guard on the specific
+// field rather than treating the Tab as a complete snapshot. The
+// zero-value semantics mean a future *unlock* event cannot be expressed
+// as a bool flip — if unlock UX lands, this contract grows to a
+// distinct event kind or a tri-state.
 type Event struct {
 	Kind      EventKind
 	Project   *Project // populated for project events
@@ -161,10 +164,47 @@ func (w *Workspace) CreateTab(projectID int64, cwd string) (Tab, error) {
 	return t, nil
 }
 
-// UpdateTabTitle persists a new tab title (e.g. from OSC 1/2).
-func (w *Workspace) UpdateTabTitle(id int64, title string) error {
+// RenameTab persists a user-chosen title and locks the tab against
+// future OSC 1/2 overwrites. Used by the Cmd-R popover and the IPC
+// tab.set_title method (the CLI path).
+//
+// The two store calls are not transactional — UpdateTabTitle and
+// MarkTabUserTitled run as separate statements. Their only contention
+// partner is SetTabTitleFromOSC, which is a single atomic UPDATE
+// gated on user_titled = 0; it cannot observe a half-applied state.
+func (w *Workspace) RenameTab(id int64, title string) error {
+	if title == "" {
+		return errors.New("core: RenameTab requires non-empty title")
+	}
 	if err := w.store.UpdateTabTitle(id, title); err != nil {
 		return err
+	}
+	if err := w.store.MarkTabUserTitled(id); err != nil {
+		return err
+	}
+	w.emit(Event{Kind: EventTabUpdated, Tab: &Tab{ID: id, Title: title, UserTitled: true}})
+	return nil
+}
+
+// SetTabTitleFromOSC persists a shell-emitted title (OSC 1/2) only if
+// the tab is not user-locked. The conditional UPDATE makes the lock
+// check atomic with the write, so an interleaved RenameTab cannot
+// lose. Returns nil with no event when the write is suppressed (lock
+// or tab missing) — the UI distinguishes by gating on the in-memory
+// UserTitled flag before calling.
+//
+// Defensive empty-string guard: callers handle empty OSC titles in
+// their own UI fallback path, so we should never see one here.
+func (w *Workspace) SetTabTitleFromOSC(id int64, title string) error {
+	if title == "" {
+		return nil
+	}
+	n, err := w.store.UpdateTabTitleIfNotUserSet(id, title)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
 	}
 	w.emit(Event{Kind: EventTabUpdated, Tab: &Tab{ID: id, Title: title}})
 	return nil

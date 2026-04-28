@@ -1,7 +1,9 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -86,6 +88,159 @@ func TestTabCRUDAndCascade(t *testing.T) {
 	tabs, _ = s.ListTabs(p.ID)
 	if len(tabs) != 0 {
 		t.Errorf("expected tabs cascaded away, got %d", len(tabs))
+	}
+}
+
+func TestUserTitledLockBlocksOSC(t *testing.T) {
+	s := openTemp(t)
+	p, _ := s.CreateProject("p", "/p")
+	tab, _ := s.CreateTab(p.ID, "/p")
+
+	if err := s.UpdateTabTitle(tab.ID, "manual"); err != nil {
+		t.Fatalf("UpdateTabTitle: %v", err)
+	}
+	if err := s.MarkTabUserTitled(tab.ID); err != nil {
+		t.Fatalf("MarkTabUserTitled: %v", err)
+	}
+
+	tabs, _ := s.ListTabs(p.ID)
+	if len(tabs) != 1 || !tabs[0].UserTitled || tabs[0].Title != "manual" {
+		t.Fatalf("after lock: %+v", tabs)
+	}
+
+	n, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "from-osc")
+	if err != nil {
+		t.Fatalf("UpdateTabTitleIfNotUserSet: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("locked OSC write rows-affected: got %d want 0", n)
+	}
+	tabs, _ = s.ListTabs(p.ID)
+	if tabs[0].Title != "manual" {
+		t.Errorf("title clobbered by OSC: got %q want %q", tabs[0].Title, "manual")
+	}
+}
+
+func TestUnlockedTabAcceptsOSC(t *testing.T) {
+	s := openTemp(t)
+	p, _ := s.CreateProject("p", "/p")
+	tab, _ := s.CreateTab(p.ID, "/p")
+
+	n, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "from-osc")
+	if err != nil {
+		t.Fatalf("UpdateTabTitleIfNotUserSet: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("unlocked OSC write rows-affected: got %d want 1", n)
+	}
+	tabs, _ := s.ListTabs(p.ID)
+	if tabs[0].Title != "from-osc" || tabs[0].UserTitled {
+		t.Fatalf("unlocked write didn't take: %+v", tabs)
+	}
+}
+
+// TestUserTitledLockRace verifies the lock-wins invariant under
+// concurrent MarkTabUserTitled and UpdateTabTitleIfNotUserSet. After
+// the wait, the title must be either the value from before the lock
+// (if the lock won early) or the last OSC write that beat the lock.
+// Crucially: no OSC write may succeed *after* the tab is locked.
+func TestUserTitledLockRace(t *testing.T) {
+	s := openTemp(t)
+	p, _ := s.CreateProject("p", "/p")
+	tab, _ := s.CreateTab(p.ID, "/p")
+	if err := s.UpdateTabTitle(tab.ID, "initial"); err != nil {
+		t.Fatalf("UpdateTabTitle: %v", err)
+	}
+
+	const N = 32
+	var wg sync.WaitGroup
+	wg.Add(2 * N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			_ = s.MarkTabUserTitled(tab.ID)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = s.UpdateTabTitleIfNotUserSet(tab.ID, "osc")
+		}()
+	}
+	wg.Wait()
+
+	tabs, _ := s.ListTabs(p.ID)
+	if len(tabs) != 1 || !tabs[0].UserTitled {
+		t.Fatalf("expected lock set after race: %+v", tabs)
+	}
+	// One more OSC write post-lock must be a no-op.
+	n, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "post-lock")
+	if err != nil {
+		t.Fatalf("UpdateTabTitleIfNotUserSet: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("post-lock OSC rows-affected: got %d want 0", n)
+	}
+	final, _ := s.ListTabs(p.ID)
+	if final[0].Title == "post-lock" {
+		t.Errorf("post-lock OSC took effect: %q", final[0].Title)
+	}
+}
+
+// TestUserTitledMigrationApplied opens a database created with only
+// the 0001 schema (simulated by stripping the user_titled column),
+// then re-runs Open and verifies 0002 brings the column back with
+// default 0 and the existing row intact.
+func TestUserTitledMigrationApplied(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// First: open + insert with the current code (which already runs
+	// 0002), then drop the column to simulate a 0001-only database.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	p, _ := s.CreateProject("p", "/p")
+	tab, _ := s.CreateTab(p.ID, "/p")
+	if err := s.UpdateTabTitle(tab.ID, "preserved"); err != nil {
+		t.Fatalf("UpdateTabTitle: %v", err)
+	}
+
+	// Forcibly roll back to a 0001-only state: drop the column and the
+	// migration record. SQLite's DROP COLUMN was added in 3.35; modernc
+	// is current enough.
+	if _, err := s.db.Exec(`ALTER TABLE tab DROP COLUMN user_titled`); err != nil {
+		t.Fatalf("DROP COLUMN: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_migrations WHERE version = 2`); err != nil {
+		t.Fatalf("DELETE migration: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Re-open: 0002 should re-apply.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	tabs, err := s.ListTabs(p.ID)
+	if err != nil {
+		t.Fatalf("ListTabs after migrate: %v", err)
+	}
+	if len(tabs) != 1 || tabs[0].Title != "preserved" || tabs[0].UserTitled {
+		t.Fatalf("migration didn't preserve row or default user_titled: %+v", tabs)
+	}
+
+	var hasCol int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('tab') WHERE name = 'user_titled'`,
+	).Scan(&hasCol); err != nil && err != sql.ErrNoRows {
+		t.Fatalf("pragma table_info: %v", err)
+	}
+	if hasCol != 1 {
+		t.Errorf("user_titled column missing after re-migrate")
 	}
 }
 
