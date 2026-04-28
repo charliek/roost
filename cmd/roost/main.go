@@ -6,6 +6,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"log/slog"
@@ -77,8 +78,10 @@ func warnLegacyMacConfig(p config.Paths) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return
 	}
+	// %q quotes both paths so the macOS path with spaces (Library/
+	// Application Support/Roost/...) is copy-paste safe.
 	slog.Warn("legacy config detected; not auto-migrating",
 		"old", legacy,
 		"new", p.ConfigFile(),
-		"hint", "mv "+legacy+" "+p.ConfigFile())
+		"hint", fmt.Sprintf("mv %q %q", legacy, p.ConfigFile()))
 }

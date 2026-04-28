@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -961,7 +962,21 @@ func (a *App) installShortcuts() {
 		}
 	}
 
-	for trigger, action := range resolveBindings(defaultBindings(), a.cfg.Keybinds) {
+	// Sort the resolved triggers before iterating so the install order
+	// is deterministic. This matters when two distinct triggers in the
+	// resolved map normalize to the same GTK accel (e.g. user binds
+	// `ctrl+t=action_a` and `control+t=action_b` — both produce
+	// `<Control>t`). Without sorting, map iteration would pick a winner
+	// at random; sorting gives lexicographic last-wins.
+	resolved := resolveBindings(defaultBindings(), a.cfg.Keybinds)
+	triggers := make([]string, 0, len(resolved))
+	for trigger := range resolved {
+		triggers = append(triggers, trigger)
+	}
+	sort.Strings(triggers)
+
+	for _, trigger := range triggers {
+		action := resolved[trigger]
 		sa, ok := handlers[action]
 		if !ok {
 			slog.Warn("shortcut: unknown action", "trigger", trigger, "action", action)

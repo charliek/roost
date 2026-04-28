@@ -20,8 +20,11 @@ func TestResolve(t *testing.T) {
 
 	switch runtime.GOOS {
 	case "darwin":
-		if !strings.Contains(p.ConfigDir, ".config/"+AppName) {
-			t.Errorf("Mac ConfigDir should now be XDG (~/.config/roost), got %q", p.ConfigDir)
+		// Don't hard-code the default ~/.config layout: a developer with
+		// XDG_CONFIG_HOME set would otherwise spuriously fail this test.
+		// TestResolveConfigDirRespectsXDG covers the env-var path explicitly.
+		if filepath.Base(p.ConfigDir) != AppName {
+			t.Errorf("Mac ConfigDir basename: got %q, want %q", filepath.Base(p.ConfigDir), AppName)
 		}
 		if !strings.Contains(p.DataDir, "Library/Application Support/Roost") {
 			t.Errorf("Mac DataDir should still be Application Support, got %q", p.DataDir)
