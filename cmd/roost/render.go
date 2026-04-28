@@ -71,6 +71,13 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 			return
 		}
 
+		// Box-drawing and block elements get a custom geometric renderer
+		// so they tile pixel-perfectly across cells; Pango fonts produce
+		// visible seams in TUI chrome (Codex/Claude/OpenCode).
+		if drawCellSprite(cr, x, y, float64(cellW), float64(cellH), fg, cell.Codepoint) {
+			return
+		}
+
 		if cell.Bold {
 			layout.SetFontDescription(s.fontBold)
 		}
@@ -124,17 +131,19 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 			cr.Rectangle(x, y, w, h)
 			cr.Fill()
 			if cursorHasCell {
-				textBuf = textBuf[:0]
-				textBuf = appendRune(textBuf, cursorCodepoint)
-				if cursorBold {
-					layout.SetFontDescription(s.fontBold)
-				} else {
-					layout.SetFontDescription(s.font)
+				if !drawCellSprite(cr, x, y, w, h, defaultBG, cursorCodepoint) {
+					textBuf = textBuf[:0]
+					textBuf = appendRune(textBuf, cursorCodepoint)
+					if cursorBold {
+						layout.SetFontDescription(s.fontBold)
+					} else {
+						layout.SetFontDescription(s.font)
+					}
+					layout.SetText(string(textBuf))
+					setRGB(cr, defaultBG)
+					cr.MoveTo(x, y)
+					pangocairo.ShowLayout(cr, layout)
 				}
-				layout.SetText(string(textBuf))
-				setRGB(cr, defaultBG)
-				cr.MoveTo(x, y)
-				pangocairo.ShowLayout(cr, layout)
 			}
 		}
 		// Focused + off phase: draw nothing — the underlying cell
