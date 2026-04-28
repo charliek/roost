@@ -123,6 +123,15 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 	if err != nil {
 		return nil, err
 	}
+	if err := term.SetTheme(
+		DefaultTheme.Foreground,
+		DefaultTheme.Background,
+		DefaultTheme.Cursor,
+		&DefaultTheme.Palette,
+	); err != nil {
+		term.Close()
+		return nil, err
+	}
 	rs, err := ghostty.NewRenderState()
 	if err != nil {
 		term.Close()

@@ -15,8 +15,9 @@ import (
 func drawTerminal(cr *cairo.Context, s *Session) {
 	defaultFG, defaultBG, err := s.rs.DefaultColors()
 	if err != nil {
-		// First frame, before any update.
-		cr.SetSourceRGB(0.07, 0.08, 0.10)
+		// First frame, before any update. Match DefaultTheme.Background
+		// so there is no flash when the first VT bytes arrive.
+		setRGB(cr, DefaultTheme.Background)
 		cr.Paint()
 		return
 	}
@@ -103,9 +104,8 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 	// pass so the cursor remains opaque inside the selection.
 	if !s.sel.empty() {
 		rects := s.sel.ribbonRects(int(s.cols), s.cellW, s.cellH, pad, pad)
-		// Fixed GNOME-blue accent at moderate alpha. Theming via
-		// libadwaita's StyleManager is later polish.
-		cr.SetSourceRGBA(0x35/255.0, 0x84/255.0, 0xE4/255.0, 0.35)
+		sb := DefaultTheme.SelectionBackground
+		cr.SetSourceRGBA(float64(sb.R)/255, float64(sb.G)/255, float64(sb.B)/255, 0.35)
 		for _, r := range rects {
 			cr.Rectangle(r.X, r.Y, r.W, r.H)
 			cr.Fill()
@@ -121,13 +121,13 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		switch {
 		case !s.windowFocused:
 			// Unfocused: hollow outline only, no blink.
-			setRGB(cr, defaultFG)
+			setRGB(cr, DefaultTheme.Cursor)
 			cr.SetLineWidth(1)
 			cr.Rectangle(x+0.5, y+0.5, w-1, h-1)
 			cr.Stroke()
 		case s.cursorOn:
-			// Focused + on phase: solid block in FG, glyph in BG.
-			setRGB(cr, defaultFG)
+			// Focused + on phase: solid block in cursor color, glyph in BG.
+			setRGB(cr, DefaultTheme.Cursor)
 			cr.Rectangle(x, y, w, h)
 			cr.Fill()
 			if cursorHasCell {

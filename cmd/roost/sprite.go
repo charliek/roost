@@ -60,6 +60,16 @@ const (
 )
 
 func drawBlockElement(cr *cairo.Context, x, y, w, h float64, fg ghostty.ColorRGB, cp rune) bool {
+	// Block elements are pure axis-aligned rect fills. Cairo's default
+	// antialiasing softens edges by a fraction of a pixel even on
+	// integer-aligned coordinates under some surface transforms; turning
+	// it off here ensures adjacent cells (e.g. the OpenCode wordmark)
+	// abut with no visible seam. Box-drawing curves and diagonals keep
+	// the default AA so they don't go jaggy.
+	cr.Save()
+	defer cr.Restore()
+	cr.SetAntialias(cairo.AntialiasNone)
+
 	setRGB(cr, fg)
 	switch cp {
 	case 0x2580: // ▀ upper half

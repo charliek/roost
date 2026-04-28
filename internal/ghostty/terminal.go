@@ -102,6 +102,39 @@ func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
 	return nil
 }
 
+// SetTheme installs default foreground, background, cursor color, and
+// 256-color palette on the terminal. Programs running in the terminal can
+// still override any of these at runtime via OSC 4 / 10 / 11 / 12. Call
+// once after NewTerminal, before any VT bytes are written, so the first
+// frame paints with the right colors.
+func (t *Terminal) SetTheme(fg, bg, cursor ColorRGB, palette *[256]ColorRGB) error {
+	if t.c == nil {
+		return errors.New("ghostty: terminal closed")
+	}
+	cFG := C.GhosttyColorRgb{r: C.uint8_t(fg.R), g: C.uint8_t(fg.G), b: C.uint8_t(fg.B)}
+	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, unsafe.Pointer(&cFG)); rc != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("set COLOR_FOREGROUND: %d", int(rc))
+	}
+	cBG := C.GhosttyColorRgb{r: C.uint8_t(bg.R), g: C.uint8_t(bg.G), b: C.uint8_t(bg.B)}
+	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, unsafe.Pointer(&cBG)); rc != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("set COLOR_BACKGROUND: %d", int(rc))
+	}
+	cCursor := C.GhosttyColorRgb{r: C.uint8_t(cursor.R), g: C.uint8_t(cursor.G), b: C.uint8_t(cursor.B)}
+	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, unsafe.Pointer(&cCursor)); rc != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("set COLOR_CURSOR: %d", int(rc))
+	}
+	if palette != nil {
+		var cPalette [256]C.GhosttyColorRgb
+		for i, c := range palette {
+			cPalette[i] = C.GhosttyColorRgb{r: C.uint8_t(c.R), g: C.uint8_t(c.G), b: C.uint8_t(c.B)}
+		}
+		if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, unsafe.Pointer(&cPalette[0])); rc != C.GHOSTTY_SUCCESS {
+			return fmt.Errorf("set COLOR_PALETTE: %d", int(rc))
+		}
+	}
+	return nil
+}
+
 // Title returns the terminal's current title (set via OSC 0/1/2). Empty
 // if no title has been set. The returned string is a Go-owned copy; the
 // underlying libghostty buffer can be reused on the next vt_write.
