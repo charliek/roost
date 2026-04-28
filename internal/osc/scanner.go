@@ -1,21 +1,27 @@
 // Package osc is a minimal streaming OSC scanner used as a fallback
-// notification path. It runs in parallel to libghostty-vt's parser
-// (which still owns the actual VT state) — its only job is to extract
-// notification commands so Roost can surface them in the UI.
+// path next to libghostty-vt's parser. libghostty owns the actual VT
+// state; this scanner observes the same byte stream to handle two
+// classes of OSC that libghostty either doesn't surface or doesn't
+// answer:
 //
-// The scanner handles OSC sequences that may be split across multiple
-// PTY reads. It recognizes:
+//  1. Notifications (OSC 9, OSC 777) — extracted and forwarded to the
+//     workspace UI via OnNotification.
+//  2. Color queries (OSC 10/11/12 with body "?") — synthesised into the
+//     `\e]Ps;rgb:RRRR/GGGG/BBBB\a` response and emitted via
+//     OnQueryResponse, since libghostty-vt drops the .query arm of OSC
+//     color operations (see ../../ghostty/src/terminal/stream_terminal.zig:616-618).
+//     Without this Codex doesn't know our background colour and skips
+//     the gray-bar BG SGR for its prompt row.
 //
-//	ESC ] 9 ; <message> BEL              — iTerm2 / general notification
-//	ESC ] 9 ; <message> ESC \            — same with ST terminator
-//	ESC ] 777 ; notify ; <title> ; <body> BEL  — Konsole / KDE
-//
-// Other OSC commands are recognized at the prefix level and ignored.
+// The scanner handles OSC sequences split across multiple PTY reads.
 // Bodies longer than maxBody bytes are truncated rather than buffered
 // indefinitely (a misbehaving program shouldn't be able to OOM us).
 package osc
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 const maxBody = 8192
 
@@ -25,13 +31,35 @@ type Notification struct {
 	Body  string
 }
 
-// Scanner is a stateful byte stream parser. Not safe for concurrent use;
-// each PTY/Session has its own.
+// RGB is an 8-bit-per-channel colour. Defined here so the package has
+// no upstream dependencies; callers convert from their own type.
+type RGB struct{ R, G, B uint8 }
+
+// Handler is the set of callbacks Scanner invokes. Any field may be
+// nil; the scanner skips the matching OSC class silently in that case.
+type Handler struct {
+	// OnNotification fires when an OSC 9 / OSC 777 notification is parsed.
+	OnNotification func(Notification)
+
+	// OnQueryResponse receives raw bytes that should be written back to
+	// the pty (OSC 10/11/12 query responses we synthesise). The caller
+	// is responsible for actually writing them; the scanner only emits.
+	// The slice is owned by the receiver — safe to retain.
+	OnQueryResponse func([]byte)
+
+	// QueryColors returns the (foreground, background, cursor) colours
+	// to use for OSC 10/11/12 query responses. Called once per query.
+	// Required if OnQueryResponse is set.
+	QueryColors func() (fg, bg, cursor RGB)
+}
+
+// Scanner is a stateful byte stream parser. Not safe for concurrent
+// use; each PTY/Session has its own.
 type Scanner struct {
 	state state
 	num   strings.Builder
 	body  strings.Builder
-	out   func(Notification)
+	h     Handler
 }
 
 type state int
@@ -44,11 +72,10 @@ const (
 	stateBodyEsc       // saw ESC in body, expecting \
 )
 
-// NewScanner returns a scanner that calls fn for every completed
-// notification. fn runs synchronously inside Feed and may be invoked
-// from any goroutine — make it safe accordingly.
-func NewScanner(fn func(Notification)) *Scanner {
-	return &Scanner{out: fn}
+// NewScanner returns a scanner that invokes the callbacks in h for
+// matching OSC sequences. Callbacks run synchronously inside Feed.
+func NewScanner(h Handler) *Scanner {
+	return &Scanner{h: h}
 }
 
 // Feed processes len(p) bytes. The scanner is purely additive — bytes
@@ -130,25 +157,54 @@ func (s *Scanner) step(b byte) {
 
 // dispatch is called when a complete OSC sequence has been buffered.
 func (s *Scanner) dispatch() {
-	if s.out == nil {
-		return
-	}
 	num := s.num.String()
 	body := s.body.String()
 	switch num {
 	case "9":
 		// iTerm2 OSC 9: body is the notification message.
-		s.out(Notification{Title: body})
+		if s.h.OnNotification != nil {
+			s.h.OnNotification(Notification{Title: body})
+		}
 	case "777":
 		// Konsole OSC 777: body is "notify;<summary>;<body>".
 		// Some senders also emit "notify;<summary>" (no body).
+		if s.h.OnNotification == nil {
+			return
+		}
 		parts := strings.SplitN(body, ";", 3)
 		if len(parts) >= 2 && parts[0] == "notify" {
 			n := Notification{Title: parts[1]}
 			if len(parts) == 3 {
 				n.Body = parts[2]
 			}
-			s.out(n)
+			s.h.OnNotification(n)
 		}
+	case "10", "11", "12":
+		// Dynamic-color queries. Body of exactly "?" means a query for
+		// the current foreground (10), background (11), or cursor (12).
+		// Anything else is a set/reset operation that libghostty
+		// already handles correctly.
+		if body != "?" {
+			return
+		}
+		if s.h.OnQueryResponse == nil || s.h.QueryColors == nil {
+			return
+		}
+		fg, bg, cursor := s.h.QueryColors()
+		var c RGB
+		switch num {
+		case "10":
+			c = fg
+		case "11":
+			c = bg
+		case "12":
+			c = cursor
+		}
+		// Response uses the 16-bit-per-channel xterm form (RR repeated
+		// to fill 4 hex digits). BEL terminator — universally accepted
+		// and matches what Codex emits for its own OSCs.
+		resp := fmt.Sprintf("\x1b]%s;rgb:%02x%02x/%02x%02x/%02x%02x\x07",
+			num, c.R, c.R, c.G, c.G, c.B, c.B)
+		s.h.OnQueryResponse([]byte(resp))
 	}
 }

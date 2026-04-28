@@ -313,22 +313,39 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ..
 }
 
 // oscScanner returns the per-session OSC scanner. Lazily allocated so
-// sessions that never receive an OSC notification don't pay the cost.
-// Called only from the pump goroutine.
+// sessions that never receive an OSC don't pay the cost. Called only
+// from the pump goroutine.
+//
+// The scanner does two jobs in parallel to libghostty's parser:
+//   - Forward OSC 9 / OSC 777 notifications to the workspace UI.
+//   - Synthesise OSC 10/11/12 query responses (libghostty-vt currently
+//     drops the .query arm of color operations, so without this Codex
+//     and similar agents see silence and skip emitting their styled
+//     prompt rows).
 func (s *Session) oscScanner() *osc.Scanner {
 	if s.osc == nil {
 		tabID := s.tab.ID
 		ws := s.ws
-		s.osc = osc.NewScanner(func(n osc.Notification) {
-			title := n.Title
-			if title == "" {
-				title = "(notification)"
-			}
-			_ = ws.Notify(tabID, title, n.Body)
+		s.osc = osc.NewScanner(osc.Handler{
+			OnNotification: func(n osc.Notification) {
+				title := n.Title
+				if title == "" {
+					title = "(notification)"
+				}
+				_ = ws.Notify(tabID, title, n.Body)
+			},
+			OnQueryResponse: s.QueueWrite,
+			QueryColors: func() (osc.RGB, osc.RGB, osc.RGB) {
+				return toOSCRGB(DefaultTheme.Foreground),
+					toOSCRGB(DefaultTheme.Background),
+					toOSCRGB(DefaultTheme.Cursor)
+			},
 		})
 	}
 	return s.osc
 }
+
+func toOSCRGB(c ghostty.ColorRGB) osc.RGB { return osc.RGB{R: c.R, G: c.G, B: c.B} }
 
 // DrawingArea returns the widget to host inside a tab page.
 func (s *Session) DrawingArea() *gtk.DrawingArea { return s.da }

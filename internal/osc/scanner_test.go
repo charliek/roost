@@ -5,7 +5,23 @@ import "testing"
 func collect(t *testing.T) (*Scanner, *[]Notification) {
 	t.Helper()
 	var got []Notification
-	return NewScanner(func(n Notification) { got = append(got, n) }), &got
+	return NewScanner(Handler{
+		OnNotification: func(n Notification) { got = append(got, n) },
+	}), &got
+}
+
+// collectQuery returns a scanner configured with the given fg/bg/cursor
+// colours and a slice that captures every synthesised query response.
+func collectQuery(t *testing.T, fg, bg, cursor RGB) (*Scanner, *[][]byte) {
+	t.Helper()
+	var got [][]byte
+	s := NewScanner(Handler{
+		OnQueryResponse: func(b []byte) {
+			got = append(got, append([]byte(nil), b...))
+		},
+		QueryColors: func() (RGB, RGB, RGB) { return fg, bg, cursor },
+	})
+	return s, &got
 }
 
 func TestOSC9SingleChunk(t *testing.T) {
@@ -107,5 +123,107 @@ func TestBodyTruncatedAtMax(t *testing.T) {
 	}
 	if len((*got)[0].Title) != maxBody {
 		t.Fatalf("title len: got %d want %d", len((*got)[0].Title), maxBody)
+	}
+}
+
+// --- OSC 10/11/12 query response synthesis ---------------------------
+
+var (
+	tFG     = RGB{R: 0xFF, G: 0xFF, B: 0xFF}
+	tBG     = RGB{R: 0x1E, G: 0x1E, B: 0x1E}
+	tCursor = RGB{R: 0x98, G: 0x98, B: 0x9D}
+)
+
+func TestOSC10QueryBELForeground(t *testing.T) {
+	s, got := collectQuery(t, tFG, tBG, tCursor)
+	s.Feed([]byte("\x1b]10;?\x07"))
+	want := []byte("\x1b]10;rgb:ffff/ffff/ffff\x07")
+	if len(*got) != 1 || string((*got)[0]) != string(want) {
+		t.Fatalf("got %q want %q", *got, want)
+	}
+}
+
+func TestOSC11QueryBELBackground(t *testing.T) {
+	s, got := collectQuery(t, tFG, tBG, tCursor)
+	s.Feed([]byte("\x1b]11;?\x07"))
+	want := []byte("\x1b]11;rgb:1e1e/1e1e/1e1e\x07")
+	if len(*got) != 1 || string((*got)[0]) != string(want) {
+		t.Fatalf("got %q want %q", *got, want)
+	}
+}
+
+func TestOSC12QueryBELCursor(t *testing.T) {
+	s, got := collectQuery(t, tFG, tBG, tCursor)
+	s.Feed([]byte("\x1b]12;?\x07"))
+	want := []byte("\x1b]12;rgb:9898/9898/9d9d\x07")
+	if len(*got) != 1 || string((*got)[0]) != string(want) {
+		t.Fatalf("got %q want %q", *got, want)
+	}
+}
+
+func TestOSC11QuerySTTerminator(t *testing.T) {
+	s, got := collectQuery(t, tFG, tBG, tCursor)
+	s.Feed([]byte("\x1b]11;?\x1b\\"))
+	// Response always uses BEL regardless of which terminator the
+	// query used; both forms are universally accepted.
+	want := []byte("\x1b]11;rgb:1e1e/1e1e/1e1e\x07")
+	if len(*got) != 1 || string((*got)[0]) != string(want) {
+		t.Fatalf("got %q want %q", *got, want)
+	}
+}
+
+func TestOSC11QuerySplitAcrossFeeds(t *testing.T) {
+	s, got := collectQuery(t, tFG, tBG, tCursor)
+	// Split right between the `?` and the BEL.
+	s.Feed([]byte("\x1b]11;?"))
+	if len(*got) != 0 {
+		t.Fatalf("premature dispatch: %q", *got)
+	}
+	s.Feed([]byte("\x07"))
+	if len(*got) != 1 {
+		t.Fatalf("expected one response after second Feed, got %q", *got)
+	}
+}
+
+func TestOSC11SetColorIsNotAQuery(t *testing.T) {
+	// libghostty handles set/reset colour operations correctly. Our
+	// scanner must NOT respond to them — only to body == "?".
+	s, got := collectQuery(t, tFG, tBG, tCursor)
+	s.Feed([]byte("\x1b]11;rgb:00/00/00\x07"))
+	s.Feed([]byte("\x1b]10;#ffffff\x07"))
+	if len(*got) != 0 {
+		t.Fatalf("set-colour OSCs incorrectly produced responses: %q", *got)
+	}
+}
+
+func TestQueryResponseSkippedWhenHandlerNil(t *testing.T) {
+	// Notification-only handler: no OnQueryResponse, no QueryColors.
+	// OSC 11 query must be silently ignored, not panic.
+	var notes []Notification
+	s := NewScanner(Handler{
+		OnNotification: func(n Notification) { notes = append(notes, n) },
+	})
+	s.Feed([]byte("\x1b]11;?\x07"))
+	if len(notes) != 0 {
+		t.Fatalf("OSC 11 query produced notifications: %+v", notes)
+	}
+}
+
+func TestQueryAndNotificationCoexist(t *testing.T) {
+	// One scanner handling both notification and query callbacks must
+	// route each OSC class correctly without crosstalk.
+	var notes []Notification
+	var resps [][]byte
+	s := NewScanner(Handler{
+		OnNotification:  func(n Notification) { notes = append(notes, n) },
+		OnQueryResponse: func(b []byte) { resps = append(resps, append([]byte(nil), b...)) },
+		QueryColors:     func() (RGB, RGB, RGB) { return tFG, tBG, tCursor },
+	})
+	s.Feed([]byte("\x1b]9;hello\x07\x1b]11;?\x07\x1b]9;world\x07"))
+	if len(notes) != 2 || notes[0].Title != "hello" || notes[1].Title != "world" {
+		t.Fatalf("notifications: %+v", notes)
+	}
+	if len(resps) != 1 || string(resps[0]) != "\x1b]11;rgb:1e1e/1e1e/1e1e\x07" {
+		t.Fatalf("responses: %q", resps)
 	}
 }
