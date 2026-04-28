@@ -29,13 +29,19 @@ package ghostty
 //     return ghostty_terminal_set(t, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
 //                                 (const void*)roostColorSchemeFn);
 // }
+// // roost_register_userdata stashes the cgo.Handle (an integer-sized
+// // uintptr in Go) into libghostty's void* userdata slot. The
+// // uintptr_t->void* cast happens in C so go vet's unsafeptr check
+// // doesnt flag the equivalent Go-side conversion.
+// static GhosttyResult roost_register_userdata(GhosttyTerminal t, uintptr_t h) {
+//     return ghostty_terminal_set(t, GHOSTTY_TERMINAL_OPT_USERDATA, (void*)h);
+// }
 import "C"
 
 import (
 	"errors"
 	"fmt"
 	"runtime/cgo"
-	"unsafe"
 )
 
 // DeviceAttrs is the Go-side mirror of GhosttyDeviceAttributes — the
@@ -68,8 +74,7 @@ func (t *Terminal) ensureCallbacks() error {
 	}
 	t.cbs = &terminalCallbacks{}
 	t.cbsHandle = cgo.NewHandle(t.cbs)
-	ud := unsafe.Pointer(uintptr(t.cbsHandle))
-	if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_USERDATA, ud); rc != C.GHOSTTY_SUCCESS {
+	if rc := C.roost_register_userdata(t.c, C.uintptr_t(t.cbsHandle)); rc != C.GHOSTTY_SUCCESS {
 		t.cbsHandle.Delete()
 		t.cbsHandle = 0
 		t.cbs = nil
