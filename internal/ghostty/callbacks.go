@@ -98,16 +98,17 @@ func (t *Terminal) SetPtyWriter(fn func([]byte)) error {
 	if err := t.ensureCallbacks(); err != nil {
 		return err
 	}
-	t.cbs.writePty = fn
 	if fn == nil {
 		if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_WRITE_PTY, nil); rc != C.GHOSTTY_SUCCESS {
 			return fmt.Errorf("clear WRITE_PTY: %d", int(rc))
 		}
+		t.cbs.writePty = nil
 		return nil
 	}
 	if rc := C.roost_register_write_pty(t.c); rc != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("set WRITE_PTY: %d", int(rc))
 	}
+	t.cbs.writePty = fn
 	return nil
 }
 
@@ -118,16 +119,17 @@ func (t *Terminal) SetDeviceAttributes(d *DeviceAttrs) error {
 	if err := t.ensureCallbacks(); err != nil {
 		return err
 	}
-	t.cbs.deviceAttrs = d
 	if d == nil {
 		if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, nil); rc != C.GHOSTTY_SUCCESS {
 			return fmt.Errorf("clear DEVICE_ATTRIBUTES: %d", int(rc))
 		}
+		t.cbs.deviceAttrs = nil
 		return nil
 	}
 	if rc := C.roost_register_device_attrs(t.c); rc != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("set DEVICE_ATTRIBUTES: %d", int(rc))
 	}
+	t.cbs.deviceAttrs = d
 	return nil
 }
 
@@ -138,14 +140,14 @@ func (t *Terminal) SetColorSchemeDark(dark bool) error {
 	if err := t.ensureCallbacks(); err != nil {
 		return err
 	}
-	t.cbs.hasScheme = true
+	scheme := C.GhosttyColorScheme(C.GHOSTTY_COLOR_SCHEME_LIGHT)
 	if dark {
-		t.cbs.colorScheme = C.GHOSTTY_COLOR_SCHEME_DARK
-	} else {
-		t.cbs.colorScheme = C.GHOSTTY_COLOR_SCHEME_LIGHT
+		scheme = C.GHOSTTY_COLOR_SCHEME_DARK
 	}
 	if rc := C.roost_register_color_scheme(t.c); rc != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("set COLOR_SCHEME: %d", int(rc))
 	}
+	t.cbs.colorScheme = scheme
+	t.cbs.hasScheme = true
 	return nil
 }
