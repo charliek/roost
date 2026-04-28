@@ -64,6 +64,98 @@ func TestEventsFireOnMutation(t *testing.T) {
 	}
 }
 
+func TestRenameTabLocksAgainstOSC(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch // EventProjectAdded
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch // EventTabAdded
+
+	if err := w.RenameTab(tab.ID, "manual"); err != nil {
+		t.Fatalf("RenameTab: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventTabUpdated || ev.Tab == nil ||
+		ev.Tab.Title != "manual" || !ev.Tab.UserTitled {
+		t.Fatalf("RenameTab event: %+v %+v", ev, ev.Tab)
+	}
+
+	// OSC after lock: silent no-op, no event.
+	if err := w.SetTabTitleFromOSC(tab.ID, "from-osc"); err != nil {
+		t.Fatalf("SetTabTitleFromOSC: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("OSC after lock emitted event: %+v", ev)
+	default:
+	}
+
+	tabs, _ := w.LoadAll()
+	if tabs[0].Tabs[0].Title != "manual" || !tabs[0].Tabs[0].UserTitled {
+		t.Fatalf("OSC clobbered locked tab: %+v", tabs[0].Tabs[0])
+	}
+}
+
+func TestSetTabTitleFromOSCBeforeRenameApplies(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.SetTabTitleFromOSC(tab.ID, "from-osc"); err != nil {
+		t.Fatalf("SetTabTitleFromOSC: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventTabUpdated || ev.Tab.Title != "from-osc" {
+		t.Fatalf("OSC event: %+v", ev)
+	}
+	if ev.Tab.UserTitled {
+		t.Errorf("OSC event populated UserTitled=true unexpectedly")
+	}
+
+	if err := w.RenameTab(tab.ID, "manual"); err != nil {
+		t.Fatalf("RenameTab: %v", err)
+	}
+	<-ch // EventTabUpdated for rename
+
+	if err := w.SetTabTitleFromOSC(tab.ID, "post-rename"); err != nil {
+		t.Fatalf("SetTabTitleFromOSC: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("OSC after rename emitted event: %+v", ev)
+	default:
+	}
+}
+
+func TestSetTabTitleFromOSCEmptyIsNoOp(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.SetTabTitleFromOSC(tab.ID, ""); err != nil {
+		t.Fatalf("SetTabTitleFromOSC empty: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("empty OSC emitted event: %+v", ev)
+	default:
+	}
+}
+
+func TestRenameTabRequiresTitle(t *testing.T) {
+	w := newWorkspace(t)
+	if err := w.RenameTab(1, ""); err == nil {
+		t.Fatalf("RenameTab with empty title: want error, got nil")
+	}
+}
+
 func TestEventChannelDoesNotBlockOnFullSubscriber(t *testing.T) {
 	w := newWorkspace(t)
 	_ = w.Subscribe(1) // never drained

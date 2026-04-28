@@ -112,4 +112,4 @@ The sidebar still supports mouse-driven rename: double-click a project row to re
 
 If you close the last tab in a project, Roost closes that project too. The "Are you sure?" confirmation dialog only appears for explicit close-project actions (the sidebar X button or the right-click menu); `Cmd-W` / `Ctrl-W` on the final tab closes the project silently.
 
-Tab titles set via `Cmd-R` / `Alt-R` are persisted, but a subsequent OSC 1/2 escape from the shell (`\e]2;new-title\a`, common in shell prompts) will overwrite the manual rename. Locking against OSC overwrites is a planned follow-up.
+Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roost-cli set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.

@@ -27,7 +27,7 @@ Every project, tab, working directory, and tab title is persisted to a SQLite da
 |----------------------|------------|--------------------------------------------------------|
 | Project name + cwd   | Yes        | Sidebar order is preserved                             |
 | Tab order, cwd       | Yes        | Tab strip order is preserved per project               |
-| Tab title (OSC 0/1/2)| Yes        | Updated live as the shell sets it                      |
+| Tab title (OSC 0/1/2)| Yes        | Updated live as the shell sets it; locked once you rename via `Cmd-R` / `Alt-R` or `roost-cli set-title` |
 | Scrollback           | No         | Lost on shell exit; surface restart is fresh           |
 | Last command         | No (not auto-restarted) | Use shell history (`up arrow`) to re-run    |
 
