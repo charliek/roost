@@ -17,6 +17,41 @@ func openTemp(t *testing.T) *Store {
 	return s
 }
 
+// mustProject and mustTab are setup helpers that fail-fast on store
+// errors so tests don't panic when indexing the returned slices.
+func mustProject(t *testing.T, s *Store, name, cwd string) Project {
+	t.Helper()
+	p, err := s.CreateProject(name, cwd)
+	if err != nil {
+		t.Fatalf("CreateProject(%q,%q): %v", name, cwd, err)
+	}
+	return p
+}
+
+func mustTab(t *testing.T, s *Store, projectID int64, cwd string) Tab {
+	t.Helper()
+	tab, err := s.CreateTab(projectID, cwd)
+	if err != nil {
+		t.Fatalf("CreateTab(%d,%q): %v", projectID, cwd, err)
+	}
+	return tab
+}
+
+// mustListTabs reads tabs and asserts a minimum length so callers can
+// index into the result safely. Use len-aware assertions on the
+// returned slice; this just guards against the panic-on-empty case.
+func mustListTabs(t *testing.T, s *Store, projectID int64, minLen int) []Tab {
+	t.Helper()
+	tabs, err := s.ListTabs(projectID)
+	if err != nil {
+		t.Fatalf("ListTabs(%d): %v", projectID, err)
+	}
+	if len(tabs) < minLen {
+		t.Fatalf("ListTabs(%d): got %d tabs, want >= %d (%+v)", projectID, len(tabs), minLen, tabs)
+	}
+	return tabs
+}
+
 func TestProjectCRUD(t *testing.T) {
 	s := openTemp(t)
 
@@ -47,22 +82,21 @@ func TestProjectCRUD(t *testing.T) {
 	if err := s.RenameProject(p1.ID, "alpha-renamed"); err != nil {
 		t.Fatalf("RenameProject: %v", err)
 	}
-	projects, _ = s.ListProjects()
-	if projects[0].Name != "alpha-renamed" {
-		t.Errorf("rename: got %q", projects[0].Name)
+	projects, err = s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects after rename: %v", err)
+	}
+	if len(projects) == 0 || projects[0].Name != "alpha-renamed" {
+		t.Errorf("rename: got %+v", projects)
 	}
 }
 
 func TestTabCRUDAndCascade(t *testing.T) {
 	s := openTemp(t)
 
-	p, _ := s.CreateProject("p", "/p")
-
-	t1, err := s.CreateTab(p.ID, "/p/sub")
-	if err != nil {
-		t.Fatalf("CreateTab: %v", err)
-	}
-	t2, _ := s.CreateTab(p.ID, "/p")
+	p := mustProject(t, s, "p", "/p")
+	t1 := mustTab(t, s, p.ID, "/p/sub")
+	t2 := mustTab(t, s, p.ID, "/p")
 	if t1.Position != 0 || t2.Position != 1 {
 		t.Errorf("tab positions: got %d,%d want 0,1", t1.Position, t2.Position)
 	}
@@ -74,18 +108,18 @@ func TestTabCRUDAndCascade(t *testing.T) {
 		t.Fatalf("UpdateTabCWD: %v", err)
 	}
 
-	tabs, err := s.ListTabs(p.ID)
-	if err != nil {
-		t.Fatalf("ListTabs: %v", err)
-	}
-	if len(tabs) != 2 || tabs[0].Title != "hello" || tabs[0].CWD != "/p/new" {
+	tabs := mustListTabs(t, s, p.ID, 2)
+	if tabs[0].Title != "hello" || tabs[0].CWD != "/p/new" {
 		t.Fatalf("ListTabs: %+v", tabs)
 	}
 
 	if err := s.DeleteProject(p.ID); err != nil {
 		t.Fatalf("DeleteProject: %v", err)
 	}
-	tabs, _ = s.ListTabs(p.ID)
+	tabs, err := s.ListTabs(p.ID)
+	if err != nil {
+		t.Fatalf("ListTabs after delete: %v", err)
+	}
 	if len(tabs) != 0 {
 		t.Errorf("expected tabs cascaded away, got %d", len(tabs))
 	}
@@ -93,8 +127,8 @@ func TestTabCRUDAndCascade(t *testing.T) {
 
 func TestUserTitledLockBlocksOSC(t *testing.T) {
 	s := openTemp(t)
-	p, _ := s.CreateProject("p", "/p")
-	tab, _ := s.CreateTab(p.ID, "/p")
+	p := mustProject(t, s, "p", "/p")
+	tab := mustTab(t, s, p.ID, "/p")
 
 	n, err := s.RenameTabAndLock(tab.ID, "manual")
 	if err != nil {
@@ -104,8 +138,8 @@ func TestUserTitledLockBlocksOSC(t *testing.T) {
 		t.Errorf("RenameTabAndLock rows-affected: got %d want 1", n)
 	}
 
-	tabs, _ := s.ListTabs(p.ID)
-	if len(tabs) != 1 || !tabs[0].UserTitled || tabs[0].Title != "manual" {
+	tabs := mustListTabs(t, s, p.ID, 1)
+	if !tabs[0].UserTitled || tabs[0].Title != "manual" {
 		t.Fatalf("after lock: %+v", tabs)
 	}
 
@@ -116,7 +150,7 @@ func TestUserTitledLockBlocksOSC(t *testing.T) {
 	if n != 0 {
 		t.Errorf("locked OSC write rows-affected: got %d want 0", n)
 	}
-	tabs, _ = s.ListTabs(p.ID)
+	tabs = mustListTabs(t, s, p.ID, 1)
 	if tabs[0].Title != "manual" {
 		t.Errorf("title clobbered by OSC: got %q want %q", tabs[0].Title, "manual")
 	}
@@ -124,8 +158,8 @@ func TestUserTitledLockBlocksOSC(t *testing.T) {
 
 func TestUnlockedTabAcceptsOSC(t *testing.T) {
 	s := openTemp(t)
-	p, _ := s.CreateProject("p", "/p")
-	tab, _ := s.CreateTab(p.ID, "/p")
+	p := mustProject(t, s, "p", "/p")
+	tab := mustTab(t, s, p.ID, "/p")
 
 	n, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "from-osc")
 	if err != nil {
@@ -134,7 +168,7 @@ func TestUnlockedTabAcceptsOSC(t *testing.T) {
 	if n != 1 {
 		t.Errorf("unlocked OSC write rows-affected: got %d want 1", n)
 	}
-	tabs, _ := s.ListTabs(p.ID)
+	tabs := mustListTabs(t, s, p.ID, 1)
 	if tabs[0].Title != "from-osc" || tabs[0].UserTitled {
 		t.Fatalf("unlocked write didn't take: %+v", tabs)
 	}
@@ -150,8 +184,8 @@ func TestUnlockedTabAcceptsOSC(t *testing.T) {
 // driver failure can't masquerade as the test passing.
 func TestUserTitledLockRace(t *testing.T) {
 	s := openTemp(t)
-	p, _ := s.CreateProject("p", "/p")
-	tab, _ := s.CreateTab(p.ID, "/p")
+	p := mustProject(t, s, "p", "/p")
+	tab := mustTab(t, s, p.ID, "/p")
 	if err := s.UpdateTabTitle(tab.ID, "initial"); err != nil {
 		t.Fatalf("UpdateTabTitle: %v", err)
 	}
@@ -181,8 +215,8 @@ func TestUserTitledLockRace(t *testing.T) {
 		t.Errorf("concurrent write error: %v", err)
 	}
 
-	tabs, _ := s.ListTabs(p.ID)
-	if len(tabs) != 1 || !tabs[0].UserTitled {
+	tabs := mustListTabs(t, s, p.ID, 1)
+	if !tabs[0].UserTitled {
 		t.Fatalf("expected lock set after race: %+v", tabs)
 	}
 	// The only titles ever written by the user goroutine are
@@ -204,7 +238,7 @@ func TestUserTitledLockRace(t *testing.T) {
 	if n != 0 {
 		t.Errorf("post-lock OSC rows-affected: got %d want 0", n)
 	}
-	final, _ := s.ListTabs(p.ID)
+	final := mustListTabs(t, s, p.ID, 1)
 	if final[0].Title == "post-lock" {
 		t.Errorf("post-lock OSC took effect: %q", final[0].Title)
 	}
@@ -224,8 +258,8 @@ func TestUserTitledMigrationApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	p, _ := s.CreateProject("p", "/p")
-	tab, _ := s.CreateTab(p.ID, "/p")
+	p := mustProject(t, s, "p", "/p")
+	tab := mustTab(t, s, p.ID, "/p")
 	if err := s.UpdateTabTitle(tab.ID, "preserved"); err != nil {
 		t.Fatalf("UpdateTabTitle: %v", err)
 	}
@@ -289,7 +323,10 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	projects, _ := s.ListProjects()
+	projects, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects after reopen: %v", err)
+	}
 	if len(projects) != 1 {
 		t.Fatalf("data lost across reopen: %+v", projects)
 	}
