@@ -18,12 +18,22 @@ import (
 
 // resolveCallbacks pulls the shared callback struct out of libghostty's
 // userdata slot. Returns nil if userdata is unset or the handle is bad.
-func resolveCallbacks(userdata unsafe.Pointer) *terminalCallbacks {
+//
+// The recover guard catches the panic cgo.Handle.Value emits if the
+// handle was already deleted, which can happen if libghostty fires a
+// callback during the brief window between Terminal.Close calling
+// cbsHandle.Delete and the C-side teardown completing.
+func resolveCallbacks(userdata unsafe.Pointer) (cbs *terminalCallbacks) {
 	if userdata == nil {
 		return nil
 	}
+	defer func() {
+		if recover() != nil {
+			cbs = nil
+		}
+	}()
 	v := cgo.Handle(uintptr(userdata)).Value()
-	cbs, _ := v.(*terminalCallbacks)
+	cbs, _ = v.(*terminalCallbacks)
 	return cbs
 }
 

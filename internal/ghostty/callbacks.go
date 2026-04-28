@@ -100,7 +100,9 @@ func (t *Terminal) SetPtyWriter(fn func([]byte)) error {
 	}
 	t.cbs.writePty = fn
 	if fn == nil {
-		C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_WRITE_PTY, nil)
+		if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_WRITE_PTY, nil); rc != C.GHOSTTY_SUCCESS {
+			return fmt.Errorf("clear WRITE_PTY: %d", int(rc))
+		}
 		return nil
 	}
 	if rc := C.roost_register_write_pty(t.c); rc != C.GHOSTTY_SUCCESS {
@@ -118,7 +120,9 @@ func (t *Terminal) SetDeviceAttributes(d *DeviceAttrs) error {
 	}
 	t.cbs.deviceAttrs = d
 	if d == nil {
-		C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, nil)
+		if rc := C.ghostty_terminal_set(t.c, C.GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, nil); rc != C.GHOSTTY_SUCCESS {
+			return fmt.Errorf("clear DEVICE_ATTRIBUTES: %d", int(rc))
+		}
 		return nil
 	}
 	if rc := C.roost_register_device_attrs(t.c); rc != C.GHOSTTY_SUCCESS {
