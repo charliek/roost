@@ -9,20 +9,20 @@ import (
 
 func TestTriggerToAccelAliases(t *testing.T) {
 	cases := map[string]string{
-		"super+t":         "<Meta>t",
-		"cmd+t":           "<Meta>t",
-		"command+t":       "<Meta>t",
-		"ctrl+t":          "<Control>t",
-		"control+t":       "<Control>t",
-		"alt+v":           "<Alt>v",
-		"opt+v":           "<Alt>v",
-		"option+v":        "<Alt>v",
-		"shift+Tab":       "<Shift>Tab",
-		"super+shift+t":   "<Meta><Shift>t",
-		"Super+T":         "<Meta>T",
-		"SUPER+t":         "<Meta>t",
-		"ctrl+shift+v":    "<Control><Shift>v",
-		"ctrl+shift+1":    "<Control><Shift>1",
+		"super+t":           "<Meta>t",
+		"cmd+t":             "<Meta>t",
+		"command+t":         "<Meta>t",
+		"ctrl+t":            "<Control>t",
+		"control+t":         "<Control>t",
+		"alt+v":             "<Alt>v",
+		"opt+v":             "<Alt>v",
+		"option+v":          "<Alt>v",
+		"shift+Tab":         "<Shift>Tab",
+		"super+shift+t":     "<Meta><Shift>t",
+		"Super+T":           "<Meta>T",
+		"SUPER+t":           "<Meta>t",
+		"ctrl+shift+v":      "<Control><Shift>v",
+		"ctrl+shift+1":      "<Control><Shift>1",
 		"super+bracketleft": "<Meta>bracketleft",
 	}
 	for in, want := range cases {
@@ -39,11 +39,11 @@ func TestTriggerToAccelAliases(t *testing.T) {
 
 func TestTriggerToAccelRejects(t *testing.T) {
 	cases := []string{
-		"hyper+t",   // unknown modifier
-		"super+",    // empty key
-		"",          // empty input
-		"+t",        // empty modifier slot
-		"   ",       // whitespace only
+		"hyper+t", // unknown modifier
+		"super+",  // empty key
+		"",        // empty input
+		"+t",      // empty modifier slot
+		"   ",     // whitespace only
 	}
 	for _, in := range cases {
 		if got, ok := triggerToAccel(in); ok {
