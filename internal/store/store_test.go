@@ -96,11 +96,12 @@ func TestUserTitledLockBlocksOSC(t *testing.T) {
 	p, _ := s.CreateProject("p", "/p")
 	tab, _ := s.CreateTab(p.ID, "/p")
 
-	if err := s.UpdateTabTitle(tab.ID, "manual"); err != nil {
-		t.Fatalf("UpdateTabTitle: %v", err)
+	n, err := s.RenameTabAndLock(tab.ID, "manual")
+	if err != nil {
+		t.Fatalf("RenameTabAndLock: %v", err)
 	}
-	if err := s.MarkTabUserTitled(tab.ID); err != nil {
-		t.Fatalf("MarkTabUserTitled: %v", err)
+	if n != 1 {
+		t.Errorf("RenameTabAndLock rows-affected: got %d want 1", n)
 	}
 
 	tabs, _ := s.ListTabs(p.ID)
@@ -108,7 +109,7 @@ func TestUserTitledLockBlocksOSC(t *testing.T) {
 		t.Fatalf("after lock: %+v", tabs)
 	}
 
-	n, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "from-osc")
+	n, err = s.UpdateTabTitleIfNotUserSet(tab.ID, "from-osc")
 	if err != nil {
 		t.Fatalf("UpdateTabTitleIfNotUserSet: %v", err)
 	}
@@ -140,10 +141,13 @@ func TestUnlockedTabAcceptsOSC(t *testing.T) {
 }
 
 // TestUserTitledLockRace verifies the lock-wins invariant under
-// concurrent MarkTabUserTitled and UpdateTabTitleIfNotUserSet. After
-// the wait, the title must be either the value from before the lock
-// (if the lock won early) or the last OSC write that beat the lock.
-// Crucially: no OSC write may succeed *after* the tab is locked.
+// concurrent RenameTabAndLock (user) and UpdateTabTitleIfNotUserSet
+// (OSC). The atomicity guarantee under test: once any RenameTabAndLock
+// has run, the only title values the tab can ever hold are values
+// passed to RenameTabAndLock — never an OSC string.
+//
+// Both goroutines forward errors to a shared channel so a transient
+// driver failure can't masquerade as the test passing.
 func TestUserTitledLockRace(t *testing.T) {
 	s := openTemp(t)
 	p, _ := s.CreateProject("p", "/p")
@@ -153,24 +157,45 @@ func TestUserTitledLockRace(t *testing.T) {
 	}
 
 	const N = 32
+	const userTitle = "manual"
 	var wg sync.WaitGroup
+	errCh := make(chan error, 2*N)
 	wg.Add(2 * N)
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
-			_ = s.MarkTabUserTitled(tab.ID)
+			if _, err := s.RenameTabAndLock(tab.ID, userTitle); err != nil {
+				errCh <- err
+			}
 		}()
 		go func() {
 			defer wg.Done()
-			_, _ = s.UpdateTabTitleIfNotUserSet(tab.ID, "osc")
+			if _, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "osc"); err != nil {
+				errCh <- err
+			}
 		}()
 	}
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Errorf("concurrent write error: %v", err)
+	}
 
 	tabs, _ := s.ListTabs(p.ID)
 	if len(tabs) != 1 || !tabs[0].UserTitled {
 		t.Fatalf("expected lock set after race: %+v", tabs)
 	}
+	// The only titles ever written by the user goroutine are
+	// userTitle; the only ones written by the OSC goroutine are "osc"
+	// (and only when the lock wasn't yet set). The atomicity bug
+	// CodeRabbit flagged would manifest as title="osc" after at least
+	// one RenameTabAndLock has run — which the post-race state below
+	// would catch because every RenameTabAndLock has run by now.
+	if tabs[0].Title != userTitle {
+		t.Errorf("atomicity violated: title=%q want %q (an OSC write clobbered the manual rename)",
+			tabs[0].Title, userTitle)
+	}
+
 	// One more OSC write post-lock must be a no-op.
 	n, err := s.UpdateTabTitleIfNotUserSet(tab.ID, "post-lock")
 	if err != nil {

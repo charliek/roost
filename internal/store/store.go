@@ -278,26 +278,36 @@ func (s *Store) UpdateTabCWD(id int64, cwd string) error {
 	return err
 }
 
-// UpdateTabTitle sets the tab's display title unconditionally.
-// User-rename callers go through UpdateTabTitle + MarkTabUserTitled;
-// OSC callers go through UpdateTabTitleIfNotUserSet.
+// UpdateTabTitle sets the tab's display title unconditionally. Used
+// only by the test suite today; production callers go through
+// RenameTabAndLock (user intent) or UpdateTabTitleIfNotUserSet (OSC).
 func (s *Store) UpdateTabTitle(id int64, title string) error {
 	_, err := s.db.Exec(`UPDATE tab SET title = ? WHERE id = ?`, title, id)
 	return err
 }
 
-// MarkTabUserTitled flips the user-set lock for an explicit rename.
-// Idempotent: calling on an already-locked tab is a no-op.
-func (s *Store) MarkTabUserTitled(id int64) error {
-	_, err := s.db.Exec(`UPDATE tab SET user_titled = 1 WHERE id = ?`, id)
-	return err
+// RenameTabAndLock writes the user-chosen title and flips the
+// user-titled lock in a single atomic UPDATE. Doing both in one
+// statement closes the race where an interleaved
+// UpdateTabTitleIfNotUserSet could observe user_titled=0 between two
+// separate UPDATEs and overwrite the manual title before the lock
+// flips. Returns the number of rows affected; 0 indicates the tab is
+// missing.
+func (s *Store) RenameTabAndLock(id int64, title string) (int64, error) {
+	res, err := s.db.Exec(
+		`UPDATE tab SET title = ?, user_titled = 1 WHERE id = ?`,
+		title, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // UpdateTabTitleIfNotUserSet conditionally writes the title only when
 // the tab is not user-locked. Returns rows-affected so the caller can
 // distinguish "applied" (1) from "suppressed by lock or tab missing"
 // (0). The lock check + write happen as one atomic UPDATE so an
-// interleaved RenameTab from another goroutine cannot lose.
+// interleaved RenameTabAndLock from another goroutine cannot lose.
 func (s *Store) UpdateTabTitleIfNotUserSet(id int64, title string) (int64, error) {
 	res, err := s.db.Exec(
 		`UPDATE tab SET title = ? WHERE id = ? AND user_titled = 0`,

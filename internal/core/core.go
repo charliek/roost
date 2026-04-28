@@ -168,19 +168,20 @@ func (w *Workspace) CreateTab(projectID int64, cwd string) (Tab, error) {
 // future OSC 1/2 overwrites. Used by the Cmd-R popover and the IPC
 // tab.set_title method (the CLI path).
 //
-// The two store calls are not transactional — UpdateTabTitle and
-// MarkTabUserTitled run as separate statements. Their only contention
-// partner is SetTabTitleFromOSC, which is a single atomic UPDATE
-// gated on user_titled = 0; it cannot observe a half-applied state.
+// The title write and lock flip happen as one atomic UPDATE in the
+// store, so an interleaved SetTabTitleFromOSC from the PTY drain
+// cannot observe user_titled=0 between two separate writes and clobber
+// the manual title before the lock takes effect.
 func (w *Workspace) RenameTab(id int64, title string) error {
 	if title == "" {
 		return errors.New("core: RenameTab requires non-empty title")
 	}
-	if err := w.store.UpdateTabTitle(id, title); err != nil {
+	n, err := w.store.RenameTabAndLock(id, title)
+	if err != nil {
 		return err
 	}
-	if err := w.store.MarkTabUserTitled(id); err != nil {
-		return err
+	if n == 0 {
+		return nil // tab missing — caller is racing with DeleteTab
 	}
 	w.emit(Event{Kind: EventTabUpdated, Tab: &Tab{ID: id, Title: title, UserTitled: true}})
 	return nil
