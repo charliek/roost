@@ -4,39 +4,51 @@ Roost resolves all of its filesystem state once at startup. Other components rea
 
 ## File locations
 
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). The state files (database, socket) follow each platform's native convention.
+
+This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/Roost/`.
+
 ### macOS
 
-All Roost state lives under `~/Library/Application Support/Roost/`:
-
-| Path                                                | Purpose                                           |
-|-----------------------------------------------------|---------------------------------------------------|
-| `~/Library/Application Support/Roost/`              | Config + data + runtime root                      |
-| `~/Library/Application Support/Roost/roost.db`      | SQLite database (projects, tabs, scrollback off)  |
-| `~/Library/Application Support/Roost/roost.db-wal`  | SQLite write-ahead log (auto-created)             |
-| `~/Library/Application Support/Roost/roost.db-shm`  | SQLite shared memory (auto-created)               |
-| `~/Library/Application Support/Roost/roost.sock`    | Unix socket the GUI listens on                    |
-| `~/Library/Application Support/Roost/config.toml`   | User-editable config; see [Config keys](#config-keys) below |
+| Path                                                | Purpose                                                    |
+|-----------------------------------------------------|------------------------------------------------------------|
+| `~/.config/roost/config.conf`                       | User-editable config; see [Config keys](#config-keys) below |
+| `~/Library/Application Support/Roost/roost.db`      | SQLite database (projects, tabs, scrollback off)           |
+| `~/Library/Application Support/Roost/roost.db-wal`  | SQLite write-ahead log (auto-created)                      |
+| `~/Library/Application Support/Roost/roost.db-shm`  | SQLite shared memory (auto-created)                        |
+| `~/Library/Application Support/Roost/roost.sock`    | Unix socket the GUI listens on                             |
 
 ### Linux
 
-Linux follows XDG conventions:
+Linux follows XDG conventions for everything:
 
 | Path                                  | Purpose                                                    |
 |---------------------------------------|------------------------------------------------------------|
-| `$XDG_CONFIG_HOME/roost/config.toml`  | User-editable config; defaults to `~/.config/roost/`        |
+| `$XDG_CONFIG_HOME/roost/config.conf`  | User-editable config; defaults to `~/.config/roost/`        |
 | `$XDG_DATA_HOME/roost/roost.db`       | SQLite database; defaults to `~/.local/share/roost/`        |
 | `$XDG_RUNTIME_DIR/roost/roost.sock`   | Unix socket; falls back to data dir when `XDG_RUNTIME_DIR` is unset |
 
 The directories are created at first launch with mode `0700`.
 
+### Migrating from a pre-cutover macOS install
+
+Before this version Roost stored its config at `~/Library/Application Support/Roost/config.toml`. On startup the new build logs a one-shot warning when that legacy file exists and the new path does not:
+
+```bash
+mv ~/Library/Application\ Support/Roost/config.toml ~/.config/roost/config.conf
+```
+
+Roost does not auto-move the file — moving and renaming a user-edited file silently is the kind of thing that loses changes, so a warning + manual move is the cutover path.
+
 ## Config keys
 
-`config.toml` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored.
+`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored. Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list.
 
 | Key           | Default                              | Effect                                                 |
 |---------------|--------------------------------------|--------------------------------------------------------|
 | `font_family` | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
 | `font_size`   | `12`                                 | Pango points.                                          |
+| `keybind`     | (built-in defaults; see Keybindings) | Repeatable. `trigger=action`; later lines override.    |
 
 Roost probes the system at startup for each candidate in `font_family` (left-to-right) and picks the first that's installed. Pango's own comma-separated fallback is unreliable on macOS — when the head of the list is missing it can silently fall through to a *proportional* font (Verdana), which produces wide cells with narrow glyphs and huge gaps between letters. The probe avoids that.
 
@@ -48,11 +60,17 @@ If none of the requested families exist, Roost falls back to `monospace` and log
 
 Successful family selection is logged at debug level only (silent on a normal launch); the surface signal is the absence of a warning.
 
-Example `config.toml`:
+Example `config.conf`:
 
-```toml
-font_family = "Iosevka, JetBrains Mono, Monaco, monospace"
+```conf
+font_family = Iosevka, JetBrains Mono, Monaco, monospace
 font_size   = 13
+
+# Add a second trigger for new_tab without removing the default Cmd-T.
+keybind = super+j = new_tab
+
+# Disable the default rename-project shortcut.
+keybind = super+shift+r = unbind
 ```
 
 ## Environment variables Roost sets

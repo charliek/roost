@@ -33,10 +33,10 @@ Every project, tab, working directory, and tab title is persisted to a SQLite da
 
 ## Where state lives
 
-The database, socket, and (later) configuration files live under a platform path:
+The user-editable config file lives under XDG on both platforms (`~/.config/roost/config.conf`); state files (the SQLite database and the IPC socket) follow each platform's native convention:
 
-- macOS: `~/Library/Application Support/Roost/`
-- Linux: `~/.local/share/roost/` (data) and `~/.config/roost/` (config); the socket lives under `$XDG_RUNTIME_DIR/roost/`
+- macOS: `~/.config/roost/config.conf` (config) plus `~/Library/Application Support/Roost/` (data + socket)
+- Linux: `~/.config/roost/config.conf` (config), `~/.local/share/roost/` (data), and `$XDG_RUNTIME_DIR/roost/` (socket)
 
 See [Paths & Environment](../reference/paths.md) for the full layout.
 

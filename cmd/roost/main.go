@@ -5,7 +5,10 @@
 package main
 
 import (
+	"errors"
+	"io/fs"
 	"log"
+	"log/slog"
 	"os"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
@@ -19,16 +22,6 @@ const (
 	initialCols = 80
 	initialRows = 24
 	pad         = 8
-)
-
-// fontFamily and fontSizePt are populated from the user's config at
-// startup (with built-in defaults from internal/config). Globals
-// because they're consumed deep inside Session construction; promoting
-// them into a struct would mean threading a config object through every
-// constructor.
-var (
-	fontFamily = "JetBrains Mono, Monaco, monospace"
-	fontSizePt = 12
 )
 
 func main() {
@@ -45,8 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("config.Load: %v", err)
 	}
-	fontFamily = cfg.FontFamily
-	fontSizePt = cfg.FontSizePt
+	warnLegacyMacConfig(paths)
 
 	st, err := store.Open(paths.DBPath())
 	if err != nil {
@@ -64,9 +56,29 @@ func main() {
 	}
 
 	gtkApp := adw.NewApplication("dev.charliek.roost", 0)
-	app := NewApp(gtkApp, ws, home, paths.SocketPath())
+	app := NewApp(gtkApp, ws, cfg, home, paths.SocketPath())
 	gtkApp.ConnectActivate(app.activate)
 	if code := gtkApp.Run(os.Args); code > 0 {
 		log.Fatalf("roost exited with code %d", code)
 	}
+}
+
+// warnLegacyMacConfig logs a one-shot migration hint when the user has
+// a pre-cutover ~/Library/Application Support/Roost/config.toml but no
+// new ~/.config/roost/config.conf. No automatic migration; the move is
+// trivial and we don't want to silently rewrite a user's edited file.
+func warnLegacyMacConfig(p config.Paths) {
+	legacy := p.LegacyMacConfigFile()
+	if _, err := os.Stat(legacy); err != nil {
+		return
+	}
+	if _, err := os.Stat(p.ConfigFile()); err == nil {
+		return // user has both; assume they migrated
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	slog.Warn("legacy config detected; not auto-migrating",
+		"old", legacy,
+		"new", p.ConfigFile(),
+		"hint", "mv "+legacy+" "+p.ConfigFile())
 }

@@ -2,7 +2,7 @@
 
 A Mac + Linux terminal multiplexer for AI coding agents, built as a single Go + GTK4 codebase using libghostty as the rendering engine. Similar in shape to cmux, but cross-platform and scoped tighter.
 
-The name draws on the metaphor of a place where flocks gather between flights — each project is a roost where coding agents perch, work, and signal when they need attention. The CLI binary is `roost`; configuration lives in `~/.config/roost/` on Linux and `~/Library/Application Support/Roost/` on Mac.
+The name draws on the metaphor of a place where flocks gather between flights — each project is a roost where coding agents perch, work, and signal when they need attention. The CLI binary is `roost`; user-editable config lives in `~/.config/roost/config.conf` on both platforms (XDG on Mac too — a deliberate divergence from Apple HIG, matching Ghostty / nvim / fish), while state files (database, socket) keep their platform-native location.
 
 ## Overview
 
@@ -124,7 +124,7 @@ The two specific unknowns this de-risks: (1) the cgo binding to libghostty's emb
 
 **Goal:** Lock in the package structure, data model, and persistence layer so the agent has a clear scaffold to build into for the rest of the project.
 
-Project structure per the layout above. Workspace data model: `Workspace` has many `Tab`s; `Tab` has `cwd`, `command`, `env`, `created_at`, `last_active`. SQLite schema and migrations. CRUD via `internal/store`. PTY supervisor that can spawn and kill processes, attach stdin/stdout/stderr, and survive process exit cleanly. Threading model document committed to `CLAUDE.md`. Config file location and parsing (XDG on Linux, `~/Library/Application Support/...` on Mac).
+Project structure per the layout above. Workspace data model: `Workspace` has many `Tab`s; `Tab` has `cwd`, `command`, `env`, `created_at`, `last_active`. SQLite schema and migrations. CRUD via `internal/store`. PTY supervisor that can spawn and kill processes, attach stdin/stdout/stderr, and survive process exit cleanly. Threading model document committed to `CLAUDE.md`. Config file location and parsing (XDG `~/.config/roost/config.conf` on both platforms; state files stay platform-native).
 
 No UI work this phase beyond the spike window staying functional. The deliverable is a clean skeleton an agent can pattern-match into.
 

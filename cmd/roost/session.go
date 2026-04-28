@@ -116,7 +116,7 @@ type Session struct {
 //
 // extraEnv is forwarded to pty.SpawnShell so callers can inject
 // ROOST_TAB_ID + ROOST_SOCKET (or any tab-specific env).
-func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, extraEnv ...string) (*Session, error) {
+func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily string, fontSizePt int, extraEnv ...string) (*Session, error) {
 	term, err := ghostty.NewTerminal(ghostty.Options{
 		Cols: cols, Rows: rows, MaxScrollback: 2000,
 	})
