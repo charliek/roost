@@ -350,6 +350,160 @@ func (a *App) SetTitle(tabID int64, title string) error {
 	return a.ws.RenameTab(tabID, title)
 }
 
+// FocusTab switches the active project to the tab's owner, selects
+// the tab inside that project's view, and raises the window. Returns
+// the previously focused (project, tab) so a client can implement
+// "go back."
+//
+// Caveat: on Wayland, win.Present() without an XDG-activation token
+// may only flash the taskbar instead of raising. The terminal-notifier
+// click path passes a token through; CLI scripts that call this
+// directly may not. Best-effort.
+func (a *App) FocusTab(tabID int64) (ipc.TabFocusResult, error) {
+	type result struct {
+		res ipc.TabFocusResult
+		err error
+	}
+	done := make(chan result, 1)
+	coreglib.IdleAdd(func() bool {
+		page, ok := a.tabPages[tabID]
+		if !ok {
+			done <- result{err: errors.New("tab not found")}
+			return false
+		}
+		// Capture previous focus before switching.
+		prev := ipc.TabFocusResult{PreviousProjectID: a.activeProjectID}
+		if view := a.projectViews[a.activeProjectID]; view != nil {
+			if p := view.SelectedPage(); p != nil {
+				if id, ok := a.pageTabs[pageKey(p)]; ok {
+					prev.PreviousTabID = id
+				}
+			}
+		}
+
+		ownerProject, ok := a.projectForTab(tabID)
+		if !ok {
+			done <- result{err: errors.New("tab owner project not found")}
+			return false
+		}
+		a.selectProject(ownerProject)
+		if view := a.projectViews[ownerProject]; view != nil {
+			view.SetSelectedPage(page)
+		}
+		// Selected-page handler clears needs-attention + grabs DA focus.
+		a.win.Present()
+		done <- result{res: prev}
+		return false
+	})
+	r := <-done
+	return r.res, r.err
+}
+
+// projectForTab returns the project ID that owns a tab. Reads
+// in-memory state populated on the main thread; callers must already
+// be on the main thread.
+func (a *App) projectForTab(tabID int64) (int64, bool) {
+	if sess, ok := a.sessions[tabID]; ok {
+		return sess.tab.ProjectID, true
+	}
+	return 0, false
+}
+
+// ListTabs returns a project-grouped tree of every tab. Display order
+// for projects matches the sidebar; tab order within a project matches
+// the visible AdwTabView. Marshalled onto the main thread to keep the
+// widget reads consistent.
+func (a *App) ListTabs() (ipc.TabListResult, error) {
+	type result struct {
+		res ipc.TabListResult
+		err error
+	}
+	done := make(chan result, 1)
+	coreglib.IdleAdd(func() bool {
+		// Project order comes from the store (sidebar mirrors store
+		// position). Map iteration would be non-deterministic.
+		snap, err := a.ws.LoadAll()
+		if err != nil {
+			done <- result{err: err}
+			return false
+		}
+		var activeTabID int64
+		if view := a.projectViews[a.activeProjectID]; view != nil {
+			if p := view.SelectedPage(); p != nil {
+				if id, ok := a.pageTabs[pageKey(p)]; ok {
+					activeTabID = id
+				}
+			}
+		}
+		out := ipc.TabListResult{Projects: make([]ipc.TabListProject, 0, len(snap))}
+		for _, ps := range snap {
+			view := a.projectViews[ps.Project.ID]
+			tabsOut := make([]ipc.TabListTab, 0, len(ps.Tabs))
+			// Walk the live tab view (matches visual order). Fall back to
+			// store order if the view hasn't been built yet.
+			if view != nil {
+				for i := 0; i < view.NPages(); i++ {
+					page := view.NthPage(i)
+					id, ok := a.pageTabs[pageKey(page)]
+					if !ok {
+						continue
+					}
+					title := page.Title()
+					tabsOut = append(tabsOut, ipc.TabListTab{
+						ID:              id,
+						Title:           title,
+						AgentState:      string(a.ws.TabAgentState(id)),
+						HasNotification: a.ws.HasNotification(id),
+						IsActive:        ps.Project.ID == a.activeProjectID && id == activeTabID,
+					})
+				}
+			} else {
+				for _, t := range ps.Tabs {
+					tabsOut = append(tabsOut, ipc.TabListTab{
+						ID:              t.ID,
+						Title:           t.Title,
+						AgentState:      string(a.ws.TabAgentState(t.ID)),
+						HasNotification: a.ws.HasNotification(t.ID),
+					})
+				}
+			}
+			out.Projects = append(out.Projects, ipc.TabListProject{
+				ID:   ps.Project.ID,
+				Name: ps.Project.Name,
+				Tabs: tabsOut,
+			})
+		}
+		done <- result{res: out}
+		return false
+	})
+	r := <-done
+	return r.res, r.err
+}
+
+// SetTabState writes the sticky agent state. The IPC server already
+// validated `state`; treat the workspace setter as the authority on
+// idempotency / event emission.
+func (a *App) SetTabState(tabID int64, state string) error {
+	a.ws.SetTabAgentState(tabID, core.TabAgentState(state))
+	return nil
+}
+
+// ClearTabNotification flips the per-tab pending-notification flag
+// off. Used by the prompt-submit hook so a fresh prompt clears any
+// stale awaiting-input badge.
+func (a *App) ClearTabNotification(tabID int64) error {
+	a.ws.MarkNotification(tabID, false)
+	return nil
+}
+
+// SetHookActive toggles the per-tab hook-session-active flag. While
+// true, raw OSC 9/777 from inside the tab is suppressed by the PTY
+// pump (see session.go OnNotification).
+func (a *App) SetHookActive(tabID int64, active bool) error {
+	a.ws.SetHookSessionActive(tabID, active)
+	return nil
+}
+
 // Identify is called from the IPC server's per-connection goroutine
 // but reads activeProjectID, projectViews, and pageTabs which are
 // otherwise mutated only on the GTK main thread. Marshal the body

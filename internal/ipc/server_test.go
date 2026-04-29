@@ -11,9 +11,14 @@ import (
 )
 
 type fakeHandler struct {
-	notify   func(int64, string, string) error
-	setTitle func(int64, string) error
-	identify func() Identity
+	notify           func(int64, string, string) error
+	setTitle         func(int64, string) error
+	identify         func() Identity
+	focusTab         func(int64) (TabFocusResult, error)
+	listTabs         func() (TabListResult, error)
+	setTabState      func(int64, string) error
+	clearTabNotif    func(int64) error
+	setHookActive    func(int64, bool) error
 }
 
 func (f fakeHandler) Notify(tab int64, title, body string) error {
@@ -21,6 +26,36 @@ func (f fakeHandler) Notify(tab int64, title, body string) error {
 }
 func (f fakeHandler) SetTitle(tab int64, title string) error { return f.setTitle(tab, title) }
 func (f fakeHandler) Identify() Identity                     { return f.identify() }
+func (f fakeHandler) FocusTab(tab int64) (TabFocusResult, error) {
+	if f.focusTab == nil {
+		return TabFocusResult{}, nil
+	}
+	return f.focusTab(tab)
+}
+func (f fakeHandler) ListTabs() (TabListResult, error) {
+	if f.listTabs == nil {
+		return TabListResult{}, nil
+	}
+	return f.listTabs()
+}
+func (f fakeHandler) SetTabState(tab int64, state string) error {
+	if f.setTabState == nil {
+		return nil
+	}
+	return f.setTabState(tab, state)
+}
+func (f fakeHandler) ClearTabNotification(tab int64) error {
+	if f.clearTabNotif == nil {
+		return nil
+	}
+	return f.clearTabNotif(tab)
+}
+func (f fakeHandler) SetHookActive(tab int64, active bool) error {
+	if f.setHookActive == nil {
+		return nil
+	}
+	return f.setHookActive(tab, active)
+}
 
 func startServer(t *testing.T, h Handler) string {
 	t.Helper()
@@ -101,6 +136,147 @@ func TestIdentify(t *testing.T) {
 	m, _ := resp.Result.(map[string]any)
 	if int64(m["active_tab_id"].(float64)) != want.ActiveTabID {
 		t.Fatalf("active_tab_id: got %v want %d", m["active_tab_id"], want.ActiveTabID)
+	}
+}
+
+func TestTabFocusRoundtrip(t *testing.T) {
+	want := TabFocusResult{PreviousProjectID: 3, PreviousTabID: 7}
+	var gotTab int64
+	sock := startServer(t, fakeHandler{
+		focusTab: func(tab int64) (TabFocusResult, error) {
+			gotTab = tab
+			return want, nil
+		},
+	})
+	params, _ := json.Marshal(TabFocusParams{TabID: 42})
+	resp, err := Dial(context.Background(), sock, Request{
+		ID: "1", Method: MethodTabFocus, Params: params,
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("expected OK, got %+v", resp)
+	}
+	if gotTab != 42 {
+		t.Fatalf("handler got tab %d", gotTab)
+	}
+	m, _ := resp.Result.(map[string]any)
+	if int64(m["previous_tab_id"].(float64)) != want.PreviousTabID {
+		t.Fatalf("previous_tab_id: %v", m["previous_tab_id"])
+	}
+}
+
+func TestTabFocusRequiresTabID(t *testing.T) {
+	sock := startServer(t, fakeHandler{
+		focusTab: func(int64) (TabFocusResult, error) { return TabFocusResult{}, nil },
+	})
+	params, _ := json.Marshal(TabFocusParams{TabID: 0})
+	resp, _ := Dial(context.Background(), sock, Request{
+		ID: "1", Method: MethodTabFocus, Params: params,
+	})
+	if resp.OK || resp.Error.Code != CodeBadRequest {
+		t.Fatalf("expected bad_request, got %+v", resp)
+	}
+}
+
+func TestTabSetStateValidatesEnum(t *testing.T) {
+	called := false
+	sock := startServer(t, fakeHandler{
+		setTabState: func(int64, string) error { called = true; return nil },
+	})
+
+	for _, tc := range []struct {
+		name    string
+		state   string
+		wantOK  bool
+		wantErr string
+	}{
+		{"running", "running", true, ""},
+		{"needs_input", "needs_input", true, ""},
+		{"idle", "idle", true, ""},
+		{"none", "none", true, ""},
+		{"invalid Caps", "Running", false, CodeBadRequest},
+		{"invalid empty", "", false, CodeBadRequest},
+		{"invalid garbage", "done", false, CodeBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called = false
+			params, _ := json.Marshal(SetStateParams{TabID: 1, State: tc.state})
+			resp, _ := Dial(context.Background(), sock, Request{
+				ID: "1", Method: MethodTabSetState, Params: params,
+			})
+			if resp.OK != tc.wantOK {
+				t.Fatalf("OK = %v, want %v (resp %+v)", resp.OK, tc.wantOK, resp)
+			}
+			if !tc.wantOK && resp.Error.Code != tc.wantErr {
+				t.Fatalf("err code: got %s want %s", resp.Error.Code, tc.wantErr)
+			}
+			if tc.wantOK && !called {
+				t.Fatal("handler was not called for valid state")
+			}
+		})
+	}
+}
+
+func TestTabClearNotif(t *testing.T) {
+	var gotTab int64
+	sock := startServer(t, fakeHandler{
+		clearTabNotif: func(tab int64) error { gotTab = tab; return nil },
+	})
+	params, _ := json.Marshal(ClearNotificationParams{TabID: 5})
+	resp, _ := Dial(context.Background(), sock, Request{
+		ID: "1", Method: MethodTabClearNotification, Params: params,
+	})
+	if !resp.OK || gotTab != 5 {
+		t.Fatalf("clear: resp=%+v gotTab=%d", resp, gotTab)
+	}
+}
+
+func TestSetHookActive(t *testing.T) {
+	var gotTab int64
+	var gotActive bool
+	sock := startServer(t, fakeHandler{
+		setHookActive: func(tab int64, active bool) error {
+			gotTab = tab
+			gotActive = active
+			return nil
+		},
+	})
+	params, _ := json.Marshal(SetHookActiveParams{TabID: 7, Active: true})
+	resp, _ := Dial(context.Background(), sock, Request{
+		ID: "1", Method: MethodSystemSetHookActive, Params: params,
+	})
+	if !resp.OK || gotTab != 7 || gotActive != true {
+		t.Fatalf("set_hook_active: resp=%+v gotTab=%d active=%v", resp, gotTab, gotActive)
+	}
+}
+
+func TestTabListReturnsResult(t *testing.T) {
+	want := TabListResult{
+		Projects: []TabListProject{
+			{ID: 1, Name: "alpha", Tabs: []TabListTab{
+				{ID: 11, Title: "tab a", AgentState: "running", HasNotification: true, IsActive: false},
+			}},
+		},
+	}
+	sock := startServer(t, fakeHandler{
+		listTabs: func() (TabListResult, error) { return want, nil },
+	})
+	resp, _ := Dial(context.Background(), sock, Request{
+		ID: "1", Method: MethodTabList, Params: json.RawMessage(`{}`),
+	})
+	if !resp.OK {
+		t.Fatalf("expected OK, got %+v", resp)
+	}
+	m, _ := resp.Result.(map[string]any)
+	projects, _ := m["projects"].([]any)
+	if len(projects) != 1 {
+		t.Fatalf("projects: %v", m)
+	}
+	first, _ := projects[0].(map[string]any)
+	if first["name"].(string) != "alpha" {
+		t.Errorf("name: %v", first["name"])
 	}
 }
 
