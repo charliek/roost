@@ -219,13 +219,11 @@ func TestEveryBundledThemeParses(t *testing.T) {
 			}
 			// Sanity: 16 palette entries customized, 240 computed.
 			// Index 232 must equal the gray-ramp formula regardless of
-			// the theme — proves fillPalette240 ran.
+			// the theme — proves fillPalette240 ran. (Background is
+			// already required-key-checked by parseTheme; LoadTheme
+			// would have errored above if it were missing.)
 			if (th.Palette[232] != ghostty.ColorRGB{R: 8, G: 8, B: 8}) {
 				t.Errorf("palette[232] not gray-ramp: %+v", th.Palette[232])
-			}
-			// Background must be set (every bundled theme defines it).
-			if (th.Background == ghostty.ColorRGB{}) {
-				t.Errorf("theme %q: background is zero", name)
 			}
 		})
 	}
