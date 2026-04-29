@@ -77,6 +77,11 @@ type App struct {
 	// goroutine via glib.IdleAdd.
 	tabPages map[int64]*adw.TabPage
 
+	// stateIcons holds the three colored-circle indicator icons used
+	// by AdwTabPage.SetIndicatorIcon. Built once on activate so the
+	// per-event handler can swap by reference.
+	stateIcons stateIcons
+
 	activeProjectID int64
 }
 
@@ -112,6 +117,9 @@ func (a *App) activate() {
 	// Terminals are dark-by-convention; force dark so libadwaita's accent
 	// colors land strongly against the dark surface.
 	adw.StyleManagerGetDefault().SetColorScheme(adw.ColorSchemePreferDark)
+
+	// Per-state indicator icons. Built once; tab updates swap by reference.
+	a.stateIcons = newStateIcons()
 
 	a.win = adw.NewApplicationWindow(&a.gtkApp.Application)
 	a.win.SetTitle("Roost")
@@ -294,6 +302,21 @@ func (a *App) handleEvent(ev core.Event) {
 		}
 	case core.EventProjectDeleted:
 		a.removeProjectUI(ev.ProjectID)
+	case core.EventTabStateChanged:
+		if page, ok := a.tabPages[ev.TabID]; ok {
+			// Indicator-icon and SetNeedsAttention are independent
+			// surfaces: state lives in the indicator slot; the
+			// "needs attention" pulse is driven by the notification
+			// flag elsewhere.
+			page.SetIndicatorIcon(a.indicatorIconForState(ev.AgentState))
+		}
+	case core.EventTabNotificationChanged:
+		// Today the desktop banner is fired straight from
+		// EventNotification; the per-tab "needs attention" badge is
+		// flipped on by handleNotification and off by the
+		// selected-page handler. This case exists so future
+		// in-app surfaces (sidebar dot, project rollup count) can
+		// react without a separate listener.
 	}
 }
 
@@ -620,6 +643,12 @@ func (a *App) addProjectUI(p core.Project) {
 		}
 		page.SetNeedsAttention(false) // user's looking at it now
 		if id, ok := a.pageTabs[pageKey(page)]; ok {
+			// Clear the in-core notification flag too — emits
+			// EventTabNotificationChanged which the rollup
+			// recompute (commit 6) listens to. State (running /
+			// needs_input / idle) is *not* cleared on focus; only
+			// hook events change it.
+			a.ws.MarkNotification(id, false)
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
 			}
