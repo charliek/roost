@@ -82,6 +82,17 @@ type App struct {
 	// per-event handler can swap by reference.
 	stateIcons stateIcons
 
+	// terminalNotifierPath is the absolute path of the
+	// terminal-notifier binary, resolved once at activate. Empty
+	// string means "not installed" — macOS desktop banners become
+	// silent no-ops; in-app indicators continue working.
+	terminalNotifierPath string
+	// roostCLIPath is the absolute path of the roost-cli binary.
+	// Used as the click-through target on macOS so terminal-notifier
+	// -execute does not depend on PATH at click time. Resolved once
+	// at activate.
+	roostCLIPath string
+
 	activeProjectID int64
 }
 
@@ -120,6 +131,39 @@ func (a *App) activate() {
 
 	// Per-state indicator icons. Built once; tab updates swap by reference.
 	a.stateIcons = newStateIcons()
+
+	// Resolve external-binary paths once. Empty terminal-notifier
+	// means "no macOS banners" (logged below); empty roost-cli only
+	// hurts the click-through target on macOS — Linux uses an
+	// in-process action handler.
+	if runtime.GOOS == "darwin" {
+		a.terminalNotifierPath = lookupTerminalNotifier()
+		if a.terminalNotifierPath == "" {
+			slog.Warn("terminal-notifier not found on PATH; macOS desktop banners disabled. Install with: brew install terminal-notifier")
+		}
+	}
+	a.roostCLIPath = lookupRoostCLI()
+
+	// Register the app-level "tab-focus" GIO action. The Linux
+	// gio.Notification default action invokes this in-process; the
+	// signal ferries the tab id as an int64 variant. macOS uses a
+	// different transport (terminal-notifier -execute) so this
+	// handler is unused there, but it's cheap to register on both.
+	{
+		focusAct := gio.NewSimpleAction("tab-focus", glib.NewVariantType("x"))
+		focusAct.ConnectActivate(func(param *glib.Variant) {
+			if param == nil {
+				return
+			}
+			tabID := param.Int64()
+			go func() {
+				if _, err := a.FocusTab(tabID); err != nil {
+					slog.Warn("tab-focus action", "tab", tabID, "err", err)
+				}
+			}()
+		})
+		a.gtkApp.AddAction(focusAct)
+	}
 
 	a.win = adw.NewApplicationWindow(&a.gtkApp.Application)
 	a.win.SetTitle("Roost")
@@ -351,7 +395,7 @@ func (a *App) handleNotification(tabID int64, title, body string) {
 	page.SetNeedsAttention(true)
 
 	id := "roost.tab." + strconv.FormatInt(tabID, 10)
-	sendDesktopNotification(a.gtkApp, id, title, body)
+	sendDesktopNotification(a.gtkApp, id, tabID, title, body, a.terminalNotifierPath, a.roostCLIPath)
 	slog.Info("notification", "tab", tabID, "title", title, "body", body)
 }
 
@@ -744,6 +788,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	}
 	env := []string{
 		"ROOST_TAB_ID=" + strconv.FormatInt(tab.ID, 10),
+		"ROOST_PROJECT_ID=" + strconv.FormatInt(projectID, 10),
 		"ROOST_SOCKET=" + a.socketPath,
 	}
 	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, a.theme, env...)

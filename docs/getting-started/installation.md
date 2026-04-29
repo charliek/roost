@@ -30,6 +30,14 @@ brew install --cask font-jetbrains-mono
 
 Roost falls back to Monaco if JetBrains Mono isn't installed, but the fallback path on macOS is finicky (Pango can drop to Verdana when the requested family is missing) — see [Config keys](../reference/paths.md#config-keys) to override the family or set up your own preference order.
 
+For clickable, supersedable desktop notifications on macOS, install `terminal-notifier`:
+
+```bash
+brew install terminal-notifier
+```
+
+Without it, in-app indicators (tab icons, project rollup stripe) keep working but desktop banners are silent no-ops. Roost-branded macOS notifications need a code-signed `.app` bundle, which is separate work; until then banners show "terminal-notifier" as the source. See [Notifications](../guides/notifications.md) for details.
+
 If you don't already have [`mise`](https://mise.jdx.dev/), install it:
 
 ```bash
