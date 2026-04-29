@@ -393,11 +393,19 @@ func (a *App) handleNotification(tabID int64, title, body string) {
 		return
 	}
 	if a.tabIsActive(tabID) {
-		// Already focused — no badge, no desktop notification.
+		// Already focused — no badge, no desktop notification, no
+		// pending-attention flag. Notify already emitted
+		// EventNotification; we just don't escalate any of the
+		// surfaces the user can already see.
 		slog.Info("notification (suppressed; tab active)", "tab", tabID, "title", title)
 		return
 	}
 	page.SetNeedsAttention(true)
+	// Mark the in-core flag too — drives the rollup recompute and any
+	// future surfaces (sidebar dot count, inbox) listening on
+	// EventTabNotificationChanged. Owned by the UI layer because the
+	// focused-tab decision is here.
+	a.ws.MarkNotification(tabID, true)
 
 	id := "roost.tab." + strconv.FormatInt(tabID, 10)
 	sendDesktopNotification(a.gtkApp, id, tabID, title, body, a.terminalNotifierPath, a.roostCLIPath)
@@ -477,7 +485,13 @@ func (a *App) FocusTab(tabID int64) (ipc.TabFocusResult, error) {
 		if view := a.projectViews[ownerProject]; view != nil {
 			view.SetSelectedPage(page)
 		}
-		// Selected-page handler clears needs-attention + grabs DA focus.
+		// Selected-page handler clears needs-attention + grabs DA focus
+		// when the selection changes. If the target tab was already
+		// the project's selected page (e.g. you switched away from this
+		// project earlier without picking a different tab), no
+		// selected-page event fires — clear the surfaces explicitly.
+		page.SetNeedsAttention(false)
+		a.ws.MarkNotification(tabID, false)
 		a.win.Present()
 		done <- result{res: prev}
 		return false
@@ -905,10 +919,16 @@ func (a *App) selectProject(projectID int64) {
 		a.sidebar.SelectRow(pr.row)
 	}
 
-	// Focus the active tab so keystrokes go to the terminal.
+	// Focus the active tab so keystrokes go to the terminal. Also clear
+	// any pending notification on the now-visible tab — switching to a
+	// project whose currently-selected tab is the target wouldn't fire
+	// that view's selected-page handler (the selection didn't change),
+	// so the badge would persist even though the user is looking at it.
 	view := a.projectViews[projectID]
 	if page := view.SelectedPage(); page != nil {
 		if id, ok := a.pageTabs[pageKey(page)]; ok {
+			page.SetNeedsAttention(false)
+			a.ws.MarkNotification(id, false)
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
 			}

@@ -208,7 +208,10 @@ func (w *Workspace) RenameProject(id int64, name string) error {
 // agentState/hookActive/hasNotification entries for the deleted tabs
 // would linger until next process restart.
 func (w *Workspace) DeleteProject(id int64) error {
-	tabs, _ := w.store.ListTabs(id)
+	tabs, err := w.store.ListTabs(id)
+	if err != nil {
+		return err
+	}
 	if err := w.store.DeleteProject(id); err != nil {
 		return err
 	}
@@ -330,9 +333,10 @@ func (w *Workspace) Notify(tabID int64, title, body string) error {
 	w.lastNotify[tabID] = notifyDedupe{at: now, key: key}
 	w.mu.Unlock()
 	w.emit(Event{Kind: EventNotification, TabID: tabID, Title: title, Body: body})
-	// MarkNotification fires its own EventTabNotificationChanged on
-	// transition (idempotent if the tab already has a pending flag).
-	w.MarkNotification(tabID, true)
+	// MarkNotification is owned by the UI layer (App.handleNotification)
+	// because the focused-tab suppression decision lives there; setting
+	// the flag here would leave a stale pending-attention state on a
+	// tab the user is already looking at.
 	return nil
 }
 

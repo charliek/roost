@@ -167,15 +167,9 @@ func TestNotifyDedupesExactRepeatsWithinCooldown(t *testing.T) {
 	if err := w.Notify(tab.ID, "title", "body"); err != nil {
 		t.Fatalf("Notify 1: %v", err)
 	}
-	// Notify emits EventNotification then EventTabNotificationChanged
-	// (transitioning the has-notification flag from false to true).
 	ev := <-ch
 	if ev.Kind != EventNotification || ev.TabID != tab.ID || ev.Title != "title" {
 		t.Fatalf("first Notify event: %+v", ev)
-	}
-	ev = <-ch
-	if ev.Kind != EventTabNotificationChanged {
-		t.Fatalf("expected EventTabNotificationChanged after Notify, got %+v", ev)
 	}
 
 	// Identical pair within window — silently dropped (no events).
@@ -189,19 +183,12 @@ func TestNotifyDedupesExactRepeatsWithinCooldown(t *testing.T) {
 	}
 
 	// Distinct body within the same window — fires EventNotification.
-	// MarkNotification is idempotent (flag already true), so no
-	// second EventTabNotificationChanged.
 	if err := w.Notify(tab.ID, "title", "different body"); err != nil {
 		t.Fatalf("Notify 3: %v", err)
 	}
 	ev = <-ch
 	if ev.Kind != EventNotification || ev.Body != "different body" {
 		t.Fatalf("distinct-body Notify event: %+v", ev)
-	}
-	select {
-	case ev := <-ch:
-		t.Fatalf("idempotent has-flag emitted: %+v", ev)
-	default:
 	}
 }
 
@@ -218,8 +205,7 @@ func TestNotifyDedupeIsPerTab(t *testing.T) {
 	if err := w.Notify(t1.ID, "title", "body"); err != nil {
 		t.Fatalf("Notify t1: %v", err)
 	}
-	<-ch // EventNotification
-	<-ch // EventTabNotificationChanged
+	<-ch // EventNotification for t1
 	// Same content on a different tab still fires — dedupe is per-tab.
 	if err := w.Notify(t2.ID, "title", "body"); err != nil {
 		t.Fatalf("Notify t2: %v", err)
@@ -297,7 +283,7 @@ func TestHookSessionFlagIsSilent(t *testing.T) {
 	}
 }
 
-func TestMarkNotificationFiresOnTransitionsAndNotifySetsFlag(t *testing.T) {
+func TestMarkNotificationFiresOnTransitions(t *testing.T) {
 	w := newWorkspace(t)
 	ch := w.Subscribe(16)
 	p, _ := w.CreateProject("p", "/p")
@@ -305,20 +291,16 @@ func TestMarkNotificationFiresOnTransitionsAndNotifySetsFlag(t *testing.T) {
 	tab, _ := w.CreateTab(p.ID, "/p")
 	<-ch
 
-	if err := w.Notify(tab.ID, "title", "body"); err != nil {
-		t.Fatalf("Notify: %v", err)
-	}
-	// Notify emits EventNotification followed by EventTabNotificationChanged.
+	// MarkNotification drives the per-tab flag. Notify itself does NOT
+	// flip the flag — the UI layer owns that call so it can suppress
+	// the flag on the active tab. See App.handleNotification.
+	w.MarkNotification(tab.ID, true)
 	ev := <-ch
-	if ev.Kind != EventNotification {
-		t.Fatalf("expected EventNotification first, got %+v", ev)
-	}
-	ev = <-ch
 	if ev.Kind != EventTabNotificationChanged || ev.TabID != tab.ID {
 		t.Fatalf("expected EventTabNotificationChanged, got %+v", ev)
 	}
 	if !w.HasNotification(tab.ID) {
-		t.Fatal("expected HasNotification true after Notify")
+		t.Fatal("expected HasNotification true after Mark(true)")
 	}
 
 	// Idempotent set: no event.
@@ -337,6 +319,34 @@ func TestMarkNotificationFiresOnTransitionsAndNotifySetsFlag(t *testing.T) {
 	}
 	if w.HasNotification(tab.ID) {
 		t.Fatal("expected HasNotification false after clear")
+	}
+}
+
+func TestNotifyDoesNotAutoMark(t *testing.T) {
+	// Regression: Notify used to call MarkNotification(true) directly.
+	// Moved into the UI layer so the focused-tab suppression in
+	// App.handleNotification can avoid leaving a stale pending flag.
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.Notify(tab.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventNotification {
+		t.Fatalf("expected EventNotification, got %+v", ev)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("Notify emitted unexpected follow-up event: %+v", ev)
+	default:
+	}
+	if w.HasNotification(tab.ID) {
+		t.Fatal("Notify should not flip the pending-notification flag")
 	}
 }
 

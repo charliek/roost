@@ -172,9 +172,12 @@ func TestTabFocusRequiresTabID(t *testing.T) {
 		focusTab: func(int64) (TabFocusResult, error) { return TabFocusResult{}, nil },
 	})
 	params, _ := json.Marshal(TabFocusParams{TabID: 0})
-	resp, _ := Dial(context.Background(), sock, Request{
+	resp, err := Dial(context.Background(), sock, Request{
 		ID: "1", Method: MethodTabFocus, Params: params,
 	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
 	if resp.OK || resp.Error.Code != CodeBadRequest {
 		t.Fatalf("expected bad_request, got %+v", resp)
 	}
@@ -203,9 +206,12 @@ func TestTabSetStateValidatesEnum(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			called = false
 			params, _ := json.Marshal(SetStateParams{TabID: 1, State: tc.state})
-			resp, _ := Dial(context.Background(), sock, Request{
+			resp, err := Dial(context.Background(), sock, Request{
 				ID: "1", Method: MethodTabSetState, Params: params,
 			})
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
 			if resp.OK != tc.wantOK {
 				t.Fatalf("OK = %v, want %v (resp %+v)", resp.OK, tc.wantOK, resp)
 			}
@@ -214,6 +220,9 @@ func TestTabSetStateValidatesEnum(t *testing.T) {
 			}
 			if tc.wantOK && !called {
 				t.Fatal("handler was not called for valid state")
+			}
+			if !tc.wantOK && called {
+				t.Fatal("handler was called for invalid state — bad_request should short-circuit")
 			}
 		})
 	}
@@ -225,9 +234,12 @@ func TestTabClearNotif(t *testing.T) {
 		clearTabNotif: func(tab int64) error { gotTab = tab; return nil },
 	})
 	params, _ := json.Marshal(ClearNotificationParams{TabID: 5})
-	resp, _ := Dial(context.Background(), sock, Request{
+	resp, err := Dial(context.Background(), sock, Request{
 		ID: "1", Method: MethodTabClearNotification, Params: params,
 	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
 	if !resp.OK || gotTab != 5 {
 		t.Fatalf("clear: resp=%+v gotTab=%d", resp, gotTab)
 	}
@@ -244,9 +256,12 @@ func TestSetHookActive(t *testing.T) {
 		},
 	})
 	params, _ := json.Marshal(SetHookActiveParams{TabID: 7, Active: true})
-	resp, _ := Dial(context.Background(), sock, Request{
+	resp, err := Dial(context.Background(), sock, Request{
 		ID: "1", Method: MethodSystemSetHookActive, Params: params,
 	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
 	if !resp.OK || gotTab != 7 || gotActive != true {
 		t.Fatalf("set_hook_active: resp=%+v gotTab=%d active=%v", resp, gotTab, gotActive)
 	}
@@ -263,9 +278,12 @@ func TestTabListReturnsResult(t *testing.T) {
 	sock := startServer(t, fakeHandler{
 		listTabs: func() (TabListResult, error) { return want, nil },
 	})
-	resp, _ := Dial(context.Background(), sock, Request{
+	resp, err := Dial(context.Background(), sock, Request{
 		ID: "1", Method: MethodTabList, Params: json.RawMessage(`{}`),
 	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
 	if !resp.OK {
 		t.Fatalf("expected OK, got %+v", resp)
 	}
