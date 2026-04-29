@@ -203,10 +203,17 @@ func (w *Workspace) RenameProject(id int64, name string) error {
 	return nil
 }
 
-// DeleteProject removes the project + cascades to its tabs.
+// DeleteProject removes the project + cascades to its tabs. Clears
+// in-memory per-tab state for the cascaded tabs too — without this,
+// agentState/hookActive/hasNotification entries for the deleted tabs
+// would linger until next process restart.
 func (w *Workspace) DeleteProject(id int64) error {
+	tabs, _ := w.store.ListTabs(id)
 	if err := w.store.DeleteProject(id); err != nil {
 		return err
+	}
+	for _, t := range tabs {
+		w.clearTabState(t.ID)
 	}
 	w.emit(Event{Kind: EventProjectDeleted, ProjectID: id})
 	return nil

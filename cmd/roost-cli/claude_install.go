@@ -87,7 +87,13 @@ func cmdClaudeInstall(args []string) int {
 	fmt.Fprintln(os.Stderr, "# Fish/zsh: adapt the alias syntax for your shell.")
 	fmt.Println()
 	fmt.Println("# Roost: route Claude Code hooks to the running GUI.")
-	fmt.Printf("alias claude='claude --settings %s'\n", settingsPath)
+	// Concat a single-quoted prefix with quoteForShell's output. Bash
+	// merges adjacent quoted strings into one word, so this survives
+	// spaces, apostrophes, and `$` in $HOME without the alias body
+	// expanding any of them. When the path needs no quoting at all
+	// quoteForShell returns it bare and the result simplifies to
+	// `alias claude='claude --settings '/path` (still one shell word).
+	fmt.Printf("alias claude='claude --settings '%s\n", quoteForShell(settingsPath))
 	return 0
 }
 
@@ -139,7 +145,7 @@ func absoluteCLIPath() (string, error) {
 // strings, both of which are shell-parsed.
 func quoteForShell(s string) string {
 	for _, c := range s {
-		if c == ' ' || c == '\t' || c == '"' || c == '$' || c == '\\' || c == '`' {
+		if c == ' ' || c == '\t' || c == '"' || c == '$' || c == '\\' || c == '`' || c == '\'' {
 			return "'" + escapeSingleQuote(s) + "'"
 		}
 	}

@@ -157,18 +157,35 @@ func (s *Scanner) step(b byte) {
 
 // isConEmuBody reports whether an OSC 9 body looks like a ConEmu
 // extension rather than an iTerm2 notification. ConEmu uses OSC 9;<n>
-// where <n> is 1..12; the body we see (everything after the leading
-// "9;") starts with that decimal number and is either bare or followed
-// by ';'. A genuine iTerm2 notification whose text starts with a digit
-// followed by a non-digit, non-`;` byte (e.g. "1 file changed") still
+// for n in 1..12 (sleep, message-box, change-tab-title, progress,
+// wait-input, GUI-macro, run-process, env-var, xterm-emulation,
+// comment); the body we see (everything after the leading "9;") starts
+// with that decimal number and is either bare or followed by ';'.
+//
+// A bare numeric body outside the 1..12 range (e.g. "9;42;summary") is
+// treated as an iTerm2 notification — ConEmu doesn't define those, so
+// the conservative interpretation is that a sender used a numeric
+// title. A genuine iTerm2 notification whose text starts with a digit
+// followed by any non-digit byte (e.g. "1 file changed") still
 // passes through.
 func isConEmuBody(body string) bool {
 	if body == "" || body[0] < '0' || body[0] > '9' {
 		return false
 	}
-	i := 1
+	n := 0
+	i := 0
 	for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+		// Cap to keep this from overflowing on absurd inputs; any
+		// number of digits here is already out of range anyway.
+		if n < 100 {
+			n = n*10 + int(body[i]-'0')
+		} else {
+			n = 100
+		}
 		i++
+	}
+	if n < 1 || n > 12 {
+		return false
 	}
 	return i == len(body) || body[i] == ';'
 }

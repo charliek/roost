@@ -110,7 +110,11 @@ func sendHookCall(method string, params any) error {
 	if err != nil {
 		return err
 	}
-	socket := socketPath()
+	socket, err := lookupSocketPath()
+	if err != nil {
+		hookDebug("socket: %v", err)
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	resp, err := ipc.Dial(ctx, socket, ipc.Request{

@@ -64,12 +64,18 @@ func sendMacNotification(notifier, cliPath string, tabID int64, title, body stri
 		return
 	}
 	group := "roost.tab." + strconv.FormatInt(tabID, 10)
-	execCmd := fmt.Sprintf("%s tab focus --tab %d", quoteForExecute(cliPath), tabID)
 	args := []string{
 		"-title", title,
 		"-message", body,
 		"-group", group,
-		"-execute", execCmd,
+	}
+	// Click-through requires roost-cli on disk. Without it the banner
+	// still fires (in-app indicators are the primary surface anyway);
+	// we just skip -execute rather than passing a malformed empty
+	// command.
+	if cliPath != "" {
+		execCmd := fmt.Sprintf("%s tab focus --tab %d", quoteForExecute(cliPath), tabID)
+		args = append(args, "-execute", execCmd)
 	}
 	cmd := exec.Command(notifier, args...)
 	if err := cmd.Start(); err != nil {

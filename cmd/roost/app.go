@@ -370,12 +370,17 @@ func (a *App) handleEvent(ev core.Event) {
 			a.recomputeProjectRollup(pid)
 		}
 	case core.EventTabNotificationChanged:
-		// Today the desktop banner is fired straight from
-		// EventNotification; the per-tab "needs attention" badge is
-		// flipped on by handleNotification and off by the
-		// selected-page handler. This case exists so future
-		// in-app surfaces (sidebar dot, project rollup count) can
-		// react without a separate listener.
+		// The notification flag flipped. handleNotification calls
+		// SetNeedsAttention(true) directly when a fresh notification
+		// arrives; this case handles the clear path so a hook event
+		// (claude-hook prompt-submit) or an explicit
+		// tab.clear_notification can also turn the pulse off without
+		// requiring the user to focus the tab.
+		if !a.ws.HasNotification(ev.TabID) {
+			if page, ok := a.tabPages[ev.TabID]; ok {
+				page.SetNeedsAttention(false)
+			}
+		}
 	}
 }
 

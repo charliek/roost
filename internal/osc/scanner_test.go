@@ -90,6 +90,21 @@ func TestOSC9ConEmuOtherSubcommandsIgnored(t *testing.T) {
 	}
 }
 
+func TestOSC9NumericOutOfConEmuRangeFires(t *testing.T) {
+	// ConEmu defines codes 1..12 only. A body like "42;summary" is not
+	// ConEmu — treat it as an iTerm2 notification with a numeric-prefix
+	// title. The same goes for 0; ConEmu has no zeroth code.
+	s, got := collect(t)
+	s.Feed([]byte("\x1b]9;42;summary\x07"))
+	s.Feed([]byte("\x1b]9;0\x07"))
+	if len(*got) != 2 {
+		t.Fatalf("expected two notifications, got %d: %+v", len(*got), *got)
+	}
+	if (*got)[0].Title != "42;summary" || (*got)[1].Title != "0" {
+		t.Fatalf("titles: %+v", *got)
+	}
+}
+
 func TestOSC9DigitTitlePassthrough(t *testing.T) {
 	// Regression: a bare iTerm2 notification whose title HAPPENS to
 	// start with a digit followed by a non-`;` byte must still fire.

@@ -16,7 +16,7 @@ OSC 9 disambiguation: bodies starting with a digit followed by `;` (or only digi
 
 ## Output surfaces
 
-A notification has three places it can show up. They are independent — clearing one does not clear the others, except where noted.
+A notification has four places it can show up. They are independent — clearing one does not clear the others, except where noted.
 
 1. **Pending-attention badge on the tab.** The built-in libadwaita "needs attention" pulse (a subtle dot / underline). Set when a notification arrives for a non-focused tab; cleared when you select that tab.
 2. **Sticky agent-state indicator on the tab.** A small colored circle next to the title — blue (running), orange (needs your input), gray (idle / turn complete), or none. State only changes from agent hook events (`roost-cli claude-hook ...` or future equivalents); it survives focus events.

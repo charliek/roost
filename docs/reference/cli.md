@@ -15,7 +15,7 @@ roost-cli <command> [flags]
 | `identify`        | Print info about the running GUI (socket path, active tab, PID) |
 | `tab focus`       | Focus a tab (raises window, switches project, selects tab)      |
 | `tab list`        | List every tab grouped by project                               |
-| `tab set-state`   | Set the per-tab agent state (running / needs-input / idle / none) |
+| `tab set-state`   | Set the per-tab agent state (running / needs_input / idle / none) |
 | `claude install`  | Generate a Claude Code settings file and print a bash alias     |
 | `claude-hook`     | Bridge Claude Code hook events into Roost (reads JSON on stdin) |
 | `help`            | Print usage                                                     |

@@ -147,15 +147,32 @@ func tabIDFromEnv() int64 {
 }
 
 // socketPath resolves the socket address: $ROOST_SOCKET wins; otherwise
-// the platform-default path under config.Paths.RuntimeDir.
+// the platform-default path under config.Paths.RuntimeDir. Fatal on
+// resolution failure — used by the user-facing CLI verbs where exiting
+// non-zero is the right signal.
+//
+// Hook paths must use lookupSocketPath instead: claude-hook is required
+// to exit 0 silently when anything is misconfigured, so a fatal here
+// would surface as a hook failure to the user.
 func socketPath() string {
-	if v := os.Getenv("ROOST_SOCKET"); v != "" {
-		return v
-	}
-	p, err := config.Resolve()
+	p, err := lookupSocketPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "roost: config.Resolve: %v\n", err)
 		os.Exit(1)
 	}
-	return p.SocketPath()
+	return p
+}
+
+// lookupSocketPath is the non-fatal variant of socketPath. Returns an
+// error rather than calling os.Exit so callers in the hook path can
+// fail soft.
+func lookupSocketPath() (string, error) {
+	if v := os.Getenv("ROOST_SOCKET"); v != "" {
+		return v, nil
+	}
+	p, err := config.Resolve()
+	if err != nil {
+		return "", err
+	}
+	return p.SocketPath(), nil
 }
