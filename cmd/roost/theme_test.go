@@ -174,28 +174,44 @@ func TestParseThemeCommentsAndBlankLines(t *testing.T) {
 }
 
 func TestParseThemeBadHexErrors(t *testing.T) {
+	// Each case includes valid required keys so a failure can only be
+	// attributed to the bad hex value, not to missing-required-keys.
+	const validForeground = "foreground = #ffffff\n"
 	cases := []string{
-		"background = nothex\n",
-		"background = #zz0000\n",
-		"background = #fff\n",      // too short
-		"background = #ffffffff\n", // too long
+		"background = nothex\n" + validForeground,
+		"background = #zz0000\n" + validForeground,
+		"background = #fff\n" + validForeground,      // too short
+		"background = #ffffffff\n" + validForeground, // too long
 	}
 	for _, body := range cases {
-		if _, err := parseTheme(strings.NewReader(body)); err == nil {
+		_, err := parseTheme(strings.NewReader(body))
+		if err == nil {
 			t.Errorf("expected error for %q", body)
+			continue
+		}
+		if !strings.Contains(err.Error(), "background") {
+			t.Errorf("expected background-attributed error for %q, got %v", body, err)
 		}
 	}
 }
 
 func TestParseThemeBadPaletteEntry(t *testing.T) {
+	// Each case includes valid required keys so failures pin to the
+	// palette parser rather than the required-keys check.
+	const valid = "background = #000000\nforeground = #ffffff\n"
 	cases := []string{
-		"palette = 999=#ffffff\n", // out of range
-		"palette = abc=#ffffff\n", // non-numeric index
-		"palette = 0\n",           // missing color
+		valid + "palette = 999=#ffffff\n", // out of range
+		valid + "palette = abc=#ffffff\n", // non-numeric index
+		valid + "palette = 0\n",           // missing color
 	}
 	for _, body := range cases {
-		if _, err := parseTheme(strings.NewReader(body)); err == nil {
+		_, err := parseTheme(strings.NewReader(body))
+		if err == nil {
 			t.Errorf("expected error for %q", body)
+			continue
+		}
+		if !strings.Contains(err.Error(), "palette") {
+			t.Errorf("expected palette-attributed error for %q, got %v", body, err)
 		}
 	}
 }
