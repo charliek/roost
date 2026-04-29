@@ -9,6 +9,7 @@
 package core
 
 import (
+	"database/sql"
 	"errors"
 	"sync"
 	"time"
@@ -291,13 +292,21 @@ func (w *Workspace) UpdateTabCWD(id int64, cwd string) error {
 // DeleteTab removes a tab. Captures the tab's ProjectID before delete
 // so subscribers (notably the project rollup recompute in the UI) can
 // react without doing a separate lookup.
+//
+// If the tab is already gone (concurrent caller), the event still
+// fires with ProjectID=0 and subscribers tolerate that. Any other
+// store error from the lookup is propagated so a real DB failure
+// surfaces to the caller rather than continuing into the delete.
 func (w *Workspace) DeleteTab(id int64) error {
-	// Best-effort lookup of the owning project before removal. If the
-	// tab is already gone (concurrent caller), the event still fires
-	// with ProjectID=0 — subscribers tolerate that.
 	var projectID int64
-	if t, err := w.store.GetTab(id); err == nil {
+	t, err := w.store.GetTab(id)
+	switch {
+	case err == nil:
 		projectID = t.ProjectID
+	case errors.Is(err, sql.ErrNoRows):
+		// already gone; carry on with projectID==0
+	default:
+		return err
 	}
 	if err := w.store.DeleteTab(id); err != nil {
 		return err
