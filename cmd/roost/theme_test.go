@@ -130,7 +130,7 @@ func TestParseThemeBadHexErrors(t *testing.T) {
 	cases := []string{
 		"background = nothex\n",
 		"background = #zz0000\n",
-		"background = #fff\n",     // too short
+		"background = #fff\n",      // too short
 		"background = #ffffffff\n", // too long
 	}
 	for _, body := range cases {
@@ -144,7 +144,7 @@ func TestParseThemeBadPaletteEntry(t *testing.T) {
 	cases := []string{
 		"palette = 999=#ffffff\n", // out of range
 		"palette = abc=#ffffff\n", // non-numeric index
-		"palette = 0\n",            // missing color
+		"palette = 0\n",           // missing color
 	}
 	for _, body := range cases {
 		if _, err := parseTheme(strings.NewReader(body)); err == nil {
