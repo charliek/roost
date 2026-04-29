@@ -25,6 +25,12 @@ type Config struct {
 	// pixels — Pango scales by display DPI internally).
 	FontSizePt int
 
+	// Theme is the name of a bundled color theme (e.g. "roost-dark",
+	// "Dracula+"). Names match the filenames under cmd/roost/themes/,
+	// which mirror ghostty's themes/ directory exactly. Unknown names
+	// fall back to "roost-dark" with a logged warning.
+	Theme string
+
 	// Keybinds is the ordered sequence of `keybind = ...` lines from
 	// the config file, applied on top of platform defaults at install
 	// time. Order matters: later lines override earlier ones for the
@@ -46,6 +52,7 @@ func Defaults() Config {
 	return Config{
 		FontFamily: "JetBrains Mono, Monaco, monospace",
 		FontSizePt: 12,
+		Theme:      "roost-dark",
 	}
 }
 
@@ -93,6 +100,11 @@ func (p Paths) Load() (Config, error) {
 				return cfg, fmt.Errorf("config: %s:%d: keybind: %w", p.ConfigFile(), lineNum, kerr)
 			}
 			cfg.Keybinds = append(cfg.Keybinds, kb)
+		case "theme":
+			if val == "" {
+				return cfg, fmt.Errorf("config: %s:%d: theme: empty value", p.ConfigFile(), lineNum)
+			}
+			cfg.Theme = val
 		}
 	}
 	return cfg, sc.Err()

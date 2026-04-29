@@ -15,12 +15,15 @@ import (
 func drawTerminal(cr *cairo.Context, s *Session) {
 	defaultFG, defaultBG, err := s.rs.DefaultColors()
 	if err != nil {
-		// First frame, before any update. Match DefaultTheme.Background
-		// so there is no flash when the first VT bytes arrive.
-		setRGB(cr, DefaultTheme.Background)
+		// First frame, before any update. Match the session theme's
+		// background so there is no flash when the first VT bytes
+		// arrive.
+		setRGB(cr, s.theme.Background)
 		cr.Paint()
 		return
 	}
+	boldColor := s.theme.BoldColor
+	cursorText := s.theme.CursorText
 
 	setRGB(cr, defaultBG)
 	cr.Paint()
@@ -47,7 +50,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 	// inside multi-row prompt boxes (opencode, codex) would be clipped
 	// by the next row's gray BG.
 	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
-		_, bg, hasExplicitBG := cellColors(cell, defaultFG, defaultBG)
+		_, bg, hasExplicitBG := cellColors(cell, defaultFG, defaultBG, boldColor)
 		if !hasExplicitBG {
 			return
 		}
@@ -64,7 +67,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 	if err := s.rs.Walk(func(row, col int, cell ghostty.Cell) {
 		x := pad + float64(col*cellW)
 		y := pad + float64(row*cellH)
-		fg, _, _ := cellColors(cell, defaultFG, defaultBG)
+		fg, _, _ := cellColors(cell, defaultFG, defaultBG, boldColor)
 
 		if cursorVisible && row == cy && col == cx && cell.Codepoint != 0 {
 			cursorCodepoint = cell.Codepoint
@@ -103,7 +106,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 	// pass so the cursor remains opaque inside the selection.
 	if !s.sel.empty() {
 		rects := s.sel.ribbonRects(int(s.cols), s.cellW, s.cellH, pad, pad)
-		sb := DefaultTheme.SelectionBackground
+		sb := s.theme.SelectionBackground
 		cr.SetSourceRGBA(float64(sb.R)/255, float64(sb.G)/255, float64(sb.B)/255, 0.35)
 		for _, r := range rects {
 			cr.Rectangle(r.X, r.Y, r.W, r.H)
@@ -119,18 +122,22 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 		switch {
 		case !s.windowFocused:
-			// Unfocused: hollow outline only, no blink.
-			setRGB(cr, defaultFG)
+			// Unfocused: hollow outline only, no blink. Outlined in
+			// the theme's cursor color so the user can still find it
+			// against arbitrary text colors.
+			setRGB(cr, s.theme.Cursor)
 			cr.SetLineWidth(1)
 			cr.Rectangle(x+0.5, y+0.5, w-1, h-1)
 			cr.Stroke()
 		case s.cursorOn:
-			// Focused + on phase: solid block in FG, glyph in BG.
-			setRGB(cr, defaultFG)
+			// Focused + on phase: solid block in cursor color, glyph
+			// in cursor-text. cursor-text falls back to background if
+			// the theme didn't set it (parseTheme handles the default).
+			setRGB(cr, s.theme.Cursor)
 			cr.Rectangle(x, y, w, h)
 			cr.Fill()
 			if cursorHasCell {
-				if !drawCellSprite(cr, x, y, w, h, defaultBG, cursorCodepoint) {
+				if !drawCellSprite(cr, x, y, w, h, cursorText, cursorCodepoint) {
 					textBuf = textBuf[:0]
 					textBuf = appendRune(textBuf, cursorCodepoint)
 					if cursorBold {
@@ -139,7 +146,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 						layout.SetFontDescription(s.font)
 					}
 					layout.SetText(string(textBuf))
-					setRGB(cr, defaultBG)
+					setRGB(cr, cursorText)
 					cr.MoveTo(x, y)
 					pangocairo.ShowLayout(cr, layout)
 				}
@@ -158,7 +165,16 @@ func setRGB(cr *cairo.Context, c ghostty.ColorRGB) {
 // and reports whether a BG fill is required (true if the cell has an
 // explicit BG or is inverted; false for plain default-colour cells, so
 // the canvas-wide default-bg paint stays visible).
-func cellColors(cell ghostty.Cell, defaultFG, defaultBG ghostty.ColorRGB) (fg, bg ghostty.ColorRGB, hasExplicitBG bool) {
+//
+// boldColor is applied only when the cell is bold AND has no explicit
+// fg AND is not inverted. The "no explicit fg" check matches the rule
+// every terminal honors: bold red text stays red; only bold default-fg
+// text gets the bold accent color. Cell.HasFG is the precise signal —
+// internal/ghostty/render.go sets it only when libghostty returns an
+// explicit FG, not when it falls back to default. The "not inverted"
+// check happens AFTER the inverse swap so boldColor never lands as a
+// background fill.
+func cellColors(cell ghostty.Cell, defaultFG, defaultBG, boldColor ghostty.ColorRGB) (fg, bg ghostty.ColorRGB, hasExplicitBG bool) {
 	fg = defaultFG
 	bg = defaultBG
 	if cell.HasFG {
@@ -171,6 +187,9 @@ func cellColors(cell ghostty.Cell, defaultFG, defaultBG ghostty.ColorRGB) (fg, b
 	if cell.Inverse {
 		fg, bg = bg, fg
 		hasExplicitBG = true
+	}
+	if cell.Bold && !cell.HasFG && !cell.Inverse {
+		fg = boldColor
 	}
 	return
 }

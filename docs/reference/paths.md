@@ -48,6 +48,7 @@ Roost does not auto-move the file — moving and renaming a user-edited file sil
 |---------------|--------------------------------------|--------------------------------------------------------|
 | `font_family` | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
 | `font_size`   | `12`                                 | Pango points.                                          |
+| `theme`       | `roost-dark`                         | Bundled color theme name. See [Themes](themes.md).     |
 | `keybind`     | (built-in defaults; see Keybindings) | Repeatable. `trigger=action`; later lines override.    |
 
 Roost probes the system at startup for each candidate in `font_family` (left-to-right) and picks the first that's installed. Pango's own comma-separated fallback is unreliable on macOS — when the head of the list is missing it can silently fall through to a *proportional* font (Verdana), which produces wide cells with narrow glyphs and huge gaps between letters. The probe avoids that.
