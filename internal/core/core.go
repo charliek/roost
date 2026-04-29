@@ -77,7 +77,7 @@ type Event struct {
 	Kind       EventKind
 	Project    *Project      // populated for project events
 	Tab        *Tab          // populated for tab events
-	ProjectID  int64         // populated for ProjectDeleted, EventNotification, EventTabDeleted
+	ProjectID  int64         // populated for ProjectDeleted, EventTabDeleted
 	TabID      int64         // populated for TabDeleted, EventNotification, EventTabStateChanged, EventTabNotificationChanged
 	Title      string        // populated for EventNotification
 	Body       string        // populated for EventNotification
