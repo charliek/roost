@@ -146,8 +146,8 @@ func quoteForShell(s string) string {
 	return s
 }
 
-// escapeSingleQuote escapes embedded single quotes for bash's
-// '...'\''...' pattern.
+// escapeSingleQuote escapes embedded single quotes using bash's
+// close-quote/escape/open-quote pattern (replace ' with \-quote-\).
 func escapeSingleQuote(s string) string {
 	out := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {

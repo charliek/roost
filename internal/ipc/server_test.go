@@ -11,14 +11,14 @@ import (
 )
 
 type fakeHandler struct {
-	notify           func(int64, string, string) error
-	setTitle         func(int64, string) error
-	identify         func() Identity
-	focusTab         func(int64) (TabFocusResult, error)
-	listTabs         func() (TabListResult, error)
-	setTabState      func(int64, string) error
-	clearTabNotif    func(int64) error
-	setHookActive    func(int64, bool) error
+	notify        func(int64, string, string) error
+	setTitle      func(int64, string) error
+	identify      func() Identity
+	focusTab      func(int64) (TabFocusResult, error)
+	listTabs      func() (TabListResult, error)
+	setTabState   func(int64, string) error
+	clearTabNotif func(int64) error
+	setHookActive func(int64, bool) error
 }
 
 func (f fakeHandler) Notify(tab int64, title, body string) error {
