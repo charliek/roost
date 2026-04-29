@@ -348,6 +348,17 @@ func (s *Session) oscScanner() *osc.Scanner {
 		ws := s.ws
 		s.osc = osc.NewScanner(osc.Handler{
 			OnNotification: func(n osc.Notification) {
+				// Suppress raw OSC notifications while a structured hook
+				// session is driving this tab. Hooks are the trusted
+				// channel; OSC is the fallback for tools that can't be
+				// modified, and hook-driven agents emit OSC noise we
+				// don't want to surface twice. (Claude Code's progress
+				// reports use OSC 9;<digit>, which the scanner already
+				// drops; this guard catches anything else the agent
+				// might emit while a hook session is live.)
+				if ws.IsHookSessionActive(tabID) {
+					return
+				}
 				title := n.Title
 				if title == "" {
 					title = "(notification)"

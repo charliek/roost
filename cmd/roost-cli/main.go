@@ -39,6 +39,12 @@ func main() {
 		os.Exit(cmdSetTitle(os.Args[2:]))
 	case "identify":
 		os.Exit(cmdIdentify(os.Args[2:]))
+	case "tab":
+		os.Exit(cmdTab(os.Args[2:]))
+	case "claude-hook":
+		os.Exit(cmdClaudeHook(os.Args[2:]))
+	case "claude":
+		os.Exit(cmdClaude(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 		os.Exit(0)
@@ -54,6 +60,11 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  roost-cli notify --title TITLE [--body BODY] [--tab ID]")
 	fmt.Fprintln(w, "  roost-cli set-title --title TITLE [--tab ID]")
 	fmt.Fprintln(w, "  roost-cli identify")
+	fmt.Fprintln(w, "  roost-cli tab focus [--tab ID]")
+	fmt.Fprintln(w, "  roost-cli tab list [--json]")
+	fmt.Fprintln(w, "  roost-cli tab set-state --state STATE [--tab ID]")
+	fmt.Fprintln(w, "  roost-cli claude install [--force]")
+	fmt.Fprintln(w, "  roost-cli claude-hook EVENT     (reads JSON from stdin)")
 }
 
 func cmdNotify(args []string) int {
