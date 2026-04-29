@@ -1,67 +1,193 @@
 package main
 
-import "github.com/charliek/roost/internal/ghostty"
+import (
+	"bufio"
+	"embed"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
 
-// Theme is the set of colors Roost installs on every new terminal.
+	"github.com/charliek/roost/internal/ghostty"
+)
+
+// bundledThemes ships the user-selectable color schemes. Filenames mirror
+// ghostty's themes/ directory exactly (no extension, spaces and `+`
+// preserved) so users can copy theme files in from
+// /Applications/Ghostty.app/Contents/Resources/ghostty/themes/ without
+// renaming.
 //
-// Designed so a future LoadGhosttyConf(path string) (Theme, error) can
-// drop in alongside DefaultTheme without touching call sites: keep the
-// type a public value type, keep DefaultTheme a var (not a const), and
-// keep Terminal.SetTheme accepting unpacked args so adding fields here
-// is not an API break.
+//go:embed all:themes
+var bundledThemes embed.FS
+
+// Theme is the set of colors Roost installs on every new terminal. The
+// shape mirrors a ghostty theme file: a 256-entry palette plus the
+// renderer-side colors libghostty doesn't model (selection, cursor-text,
+// bold-color).
 type Theme struct {
 	Foreground          ghostty.ColorRGB
 	Background          ghostty.ColorRGB
 	Cursor              ghostty.ColorRGB
+	CursorText          ghostty.ColorRGB
+	BoldColor           ghostty.ColorRGB
 	SelectionBackground ghostty.ColorRGB
 	SelectionForeground ghostty.ColorRGB
 	Palette             [256]ghostty.ColorRGB
 }
 
-// DefaultTheme is Roost's built-in dark theme. The 16 named ANSI entries
-// mirror cmux's dark palette (Sources/GhosttyConfig.swift in cmux); the
-// remaining 240 entries (16–231 RGB cube, 232–255 gray ramp) are
-// generated to match libghostty-vt's built-in defaults so unmodified
-// indices behave identically to a stock terminal.
-var DefaultTheme = Theme{
-	Foreground:          rgb(0xFF, 0xFF, 0xFF),
-	Background:          rgb(0x1E, 0x1E, 0x1E),
-	Cursor:              rgb(0x98, 0x98, 0x9D),
-	SelectionBackground: rgb(0x3F, 0x63, 0x8B),
-	SelectionForeground: rgb(0xFF, 0xFF, 0xFF),
-	Palette:             buildPalette(),
+// DefaultTheme is the bundled "roost-dark" theme parsed at init. It is
+// the runtime fallback when the user names an unknown theme. A parse
+// failure here is a build error: the embedded file is broken.
+var DefaultTheme = mustLoadTheme("roost-dark")
+
+// LoadTheme parses a bundled ghostty-format theme file by name. Names
+// match the embedded filenames (e.g. "Dracula+", "Catppuccin Mocha").
+// Returns an error if the theme isn't bundled or fails to parse.
+func LoadTheme(name string) (Theme, error) {
+	f, err := bundledThemes.Open("themes/" + name)
+	if err != nil {
+		return Theme{}, fmt.Errorf("theme %q: %w", name, err)
+	}
+	defer f.Close()
+	th, err := parseTheme(f)
+	if err != nil {
+		return Theme{}, fmt.Errorf("theme %q: %w", name, err)
+	}
+	return th, nil
 }
 
-func rgb(r, g, b uint8) ghostty.ColorRGB { return ghostty.ColorRGB{R: r, G: g, B: b} }
+// BundledThemeNames returns the list of embedded theme names, sorted.
+// Used by docs / debug output.
+func BundledThemeNames() []string {
+	entries, err := bundledThemes.ReadDir("themes")
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	return names
+}
 
-// buildPalette returns the 256-color palette: cmux dark for indices 0–15,
-// the standard xterm 6×6×6 cube for 16–231, and a 24-step gray ramp for
-// 232–255. The 16-color block matches cmux; the 240-color block matches
-// the algorithm in ../ghostty/src/terminal/color.zig:7-45.
-func buildPalette() [256]ghostty.ColorRGB {
-	var p [256]ghostty.ColorRGB
+func mustLoadTheme(name string) Theme {
+	th, err := LoadTheme(name)
+	if err != nil {
+		panic(fmt.Errorf("bundled %s", err))
+	}
+	return th
+}
 
-	// 0-7: standard ANSI
-	p[0] = rgb(0x1A, 0x1A, 0x1A) // black
-	p[1] = rgb(0xCC, 0x37, 0x2E) // red
-	p[2] = rgb(0x26, 0xA4, 0x39) // green
-	p[3] = rgb(0xCD, 0xAC, 0x08) // yellow
-	p[4] = rgb(0x08, 0x69, 0xCB) // blue
-	p[5] = rgb(0x96, 0x47, 0xBF) // magenta
-	p[6] = rgb(0x47, 0x9E, 0xC2) // cyan
-	p[7] = rgb(0x98, 0x98, 0x9D) // white
-	// 8-15: bright variants
-	p[8] = rgb(0x46, 0x46, 0x46)  // bright black (the gray Codex cards use)
-	p[9] = rgb(0xFF, 0x45, 0x3A)  // bright red
-	p[10] = rgb(0x32, 0xD7, 0x4B) // bright green
-	p[11] = rgb(0xFF, 0xD6, 0x0A) // bright yellow
-	p[12] = rgb(0x0A, 0x84, 0xFF) // bright blue
-	p[13] = rgb(0xBF, 0x5A, 0xF2) // bright magenta
-	p[14] = rgb(0x76, 0xD6, 0xFF) // bright cyan
-	p[15] = rgb(0xFF, 0xFF, 0xFF) // bright white
+// parseTheme reads a ghostty-format theme file. Format: `key = value`
+// with `#` comments, identical to roost's main config syntax. Unknown
+// keys are ignored (matches ghostty's tolerant loader); bad values
+// produce errors. Indices 16-255 of the palette are not user-controlled
+// in theme files — fillPalette240 writes the standard 6×6×6 cube and
+// 24-step gray ramp after parsing.
+func parseTheme(r io.Reader) (Theme, error) {
+	var th Theme
+	var sawCursorText, sawBoldColor bool
 
-	// 16-231: 6x6x6 RGB cube. Each axis takes 6 values; index 0 maps to 0,
-	// indices 1-5 map to 55, 95, 135, 175, 215 (i.e. r*40 + 55).
+	sc := bufio.NewScanner(r)
+	lineNum := 0
+	for sc.Scan() {
+		lineNum++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := splitThemeKV(line)
+		if !ok {
+			return Theme{}, fmt.Errorf("line %d: expected key = value", lineNum)
+		}
+		switch key {
+		case "background":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: background: %w", lineNum, err)
+			}
+			th.Background = c
+		case "foreground":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: foreground: %w", lineNum, err)
+			}
+			th.Foreground = c
+		case "cursor-color":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: cursor-color: %w", lineNum, err)
+			}
+			th.Cursor = c
+		case "cursor-text":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: cursor-text: %w", lineNum, err)
+			}
+			th.CursorText = c
+			sawCursorText = true
+		case "bold-color":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: bold-color: %w", lineNum, err)
+			}
+			th.BoldColor = c
+			sawBoldColor = true
+		case "selection-background":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: selection-background: %w", lineNum, err)
+			}
+			th.SelectionBackground = c
+		case "selection-foreground":
+			c, err := parseHexColor(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: selection-foreground: %w", lineNum, err)
+			}
+			th.SelectionForeground = c
+		case "palette":
+			idx, c, err := parsePaletteEntry(val)
+			if err != nil {
+				return Theme{}, fmt.Errorf("line %d: palette: %w", lineNum, err)
+			}
+			// 16-255 are computed; ignore any explicit overrides so we
+			// don't end up with a half-customized palette.
+			if idx < 16 {
+				th.Palette[idx] = c
+			}
+		}
+		// Unknown keys are silently ignored.
+	}
+	if err := sc.Err(); err != nil {
+		return Theme{}, fmt.Errorf("read: %w", err)
+	}
+
+	// Optional fields — fall back to ghostty's documented defaults so
+	// every Theme value is renderable without a nil check.
+	if !sawCursorText {
+		th.CursorText = th.Background
+	}
+	if !sawBoldColor {
+		th.BoldColor = th.Foreground
+	}
+	if (th.SelectionBackground == ghostty.ColorRGB{}) {
+		th.SelectionBackground = th.Foreground
+	}
+	if (th.SelectionForeground == ghostty.ColorRGB{}) {
+		th.SelectionForeground = th.Background
+	}
+
+	fillPalette240(&th.Palette)
+	return th, nil
+}
+
+// fillPalette240 writes indices 16-255: the standard xterm 6×6×6 RGB
+// cube (16-231) and 24-step gray ramp (232-255). Algorithm matches
+// ../ghostty/src/terminal/color.zig:7-45.
+func fillPalette240(p *[256]ghostty.ColorRGB) {
 	i := 16
 	for r := 0; r < 6; r++ {
 		for g := 0; g < 6; g++ {
@@ -75,14 +201,10 @@ func buildPalette() [256]ghostty.ColorRGB {
 			}
 		}
 	}
-
-	// 232-255: 24-step gray ramp. value = (n * 10) + 8 for n = 0..23.
 	for n := 0; n < 24; n++ {
 		v := uint8(n*10 + 8)
 		p[232+n] = ghostty.ColorRGB{R: v, G: v, B: v}
 	}
-
-	return p
 }
 
 func cubeAxis(n int) uint8 {
@@ -90,6 +212,63 @@ func cubeAxis(n int) uint8 {
 		return 0
 	}
 	return uint8(n*40 + 55)
+}
+
+// parseHexColor accepts "#RRGGBB" (case-insensitive).
+func parseHexColor(s string) (ghostty.ColorRGB, error) {
+	s = strings.TrimSpace(s)
+	if len(s) != 7 || s[0] != '#' {
+		return ghostty.ColorRGB{}, fmt.Errorf("expected #RRGGBB, got %q", s)
+	}
+	r, err := strconv.ParseUint(s[1:3], 16, 8)
+	if err != nil {
+		return ghostty.ColorRGB{}, fmt.Errorf("bad red in %q: %w", s, err)
+	}
+	g, err := strconv.ParseUint(s[3:5], 16, 8)
+	if err != nil {
+		return ghostty.ColorRGB{}, fmt.Errorf("bad green in %q: %w", s, err)
+	}
+	b, err := strconv.ParseUint(s[5:7], 16, 8)
+	if err != nil {
+		return ghostty.ColorRGB{}, fmt.Errorf("bad blue in %q: %w", s, err)
+	}
+	return ghostty.ColorRGB{R: uint8(r), G: uint8(g), B: uint8(b)}, nil
+}
+
+// parsePaletteEntry parses a `palette` value: "N=#RRGGBB" where N is
+// 0-255. Returns the index and color.
+func parsePaletteEntry(val string) (int, ghostty.ColorRGB, error) {
+	eq := strings.IndexByte(val, '=')
+	if eq < 0 {
+		return 0, ghostty.ColorRGB{}, fmt.Errorf("expected N=#RRGGBB, got %q", val)
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(val[:eq]))
+	if err != nil {
+		return 0, ghostty.ColorRGB{}, fmt.Errorf("index in %q: %w", val, err)
+	}
+	if idx < 0 || idx > 255 {
+		return 0, ghostty.ColorRGB{}, fmt.Errorf("index out of range [0,255]: %d", idx)
+	}
+	c, err := parseHexColor(strings.TrimSpace(val[eq+1:]))
+	if err != nil {
+		return 0, ghostty.ColorRGB{}, err
+	}
+	return idx, c, nil
+}
+
+// splitThemeKV mirrors config.splitKV: trim whitespace around `=`,
+// strip an optional pair of surrounding double quotes from the value.
+func splitThemeKV(line string) (key, val string, ok bool) {
+	eq := strings.IndexByte(line, '=')
+	if eq < 0 {
+		return "", "", false
+	}
+	key = strings.TrimSpace(line[:eq])
+	val = strings.TrimSpace(line[eq+1:])
+	if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+		val = val[1 : len(val)-1]
+	}
+	return key, val, key != ""
 }
 
 // DefaultDeviceAttrs is what libghostty advertises when programs probe

@@ -126,16 +126,23 @@ type Session struct {
 // libghostty terminal + render state, builds the DrawingArea, and
 // starts the PTY-pump goroutine. Caller adds da to a parent widget.
 //
+// themeName names a bundled theme (see cmd/roost/themes/). Unknown
+// names log a warning and fall back to roost-dark.
+//
 // extraEnv is forwarded to pty.SpawnShell so callers can inject
 // ROOST_TAB_ID + ROOST_SOCKET (or any tab-specific env).
-func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily string, fontSizePt int, extraEnv ...string) (*Session, error) {
+func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily string, fontSizePt int, themeName string, extraEnv ...string) (*Session, error) {
 	term, err := ghostty.NewTerminal(ghostty.Options{
 		Cols: cols, Rows: rows, MaxScrollback: 2000,
 	})
 	if err != nil {
 		return nil, err
 	}
-	theme := DefaultTheme
+	theme, err := LoadTheme(themeName)
+	if err != nil {
+		slog.Warn("theme load failed; using roost-dark", "name", themeName, "err", err)
+		theme = DefaultTheme
+	}
 	if err := term.SetTheme(
 		theme.Foreground,
 		theme.Background,

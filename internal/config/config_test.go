@@ -25,8 +25,54 @@ func TestLoadDefaultsWhenMissing(t *testing.T) {
 	if cfg.FontFamily == "" || cfg.FontSizePt == 0 {
 		t.Fatalf("expected defaults, got %+v", cfg)
 	}
+	if cfg.Theme != "roost-dark" {
+		t.Errorf("expected default theme roost-dark, got %q", cfg.Theme)
+	}
 	if len(cfg.Keybinds) != 0 {
 		t.Errorf("expected no keybinds when file missing, got %+v", cfg.Keybinds)
+	}
+}
+
+func TestLoadThemeKey(t *testing.T) {
+	p := writeConfig(t, "theme = Dracula+\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Theme != "Dracula+" {
+		t.Fatalf("theme not applied: got %q", cfg.Theme)
+	}
+}
+
+func TestLoadThemeWithSpaces(t *testing.T) {
+	// Bundled theme names like "Catppuccin Mocha" have spaces. The
+	// parser must preserve them — value is everything after the first
+	// `=`, trimmed.
+	p := writeConfig(t, "theme = Catppuccin Mocha\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Theme != "Catppuccin Mocha" {
+		t.Fatalf("theme not preserved: got %q", cfg.Theme)
+	}
+}
+
+func TestLoadThemeQuoted(t *testing.T) {
+	p := writeConfig(t, "theme = \"Gruvbox Dark Hard\"\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Theme != "Gruvbox Dark Hard" {
+		t.Fatalf("quoted theme value: got %q", cfg.Theme)
+	}
+}
+
+func TestLoadThemeEmptyRejected(t *testing.T) {
+	p := writeConfig(t, "theme = \n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for empty theme value")
 	}
 }
 

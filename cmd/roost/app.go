@@ -486,7 +486,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 		"ROOST_TAB_ID=" + strconv.FormatInt(tab.ID, 10),
 		"ROOST_SOCKET=" + a.socketPath,
 	}
-	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, env...)
+	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, a.cfg.Theme, env...)
 	if err != nil {
 		slog.Error("NewSession", "tab", tab.ID, "err", err)
 		return
