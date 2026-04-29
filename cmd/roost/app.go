@@ -41,6 +41,11 @@ type App struct {
 	// main thread. If live-reload lands, this needs to grow a mutex.
 	cfg config.Config
 
+	// theme is the resolved color scheme used by every Session. Loaded
+	// once in NewApp from cfg.Theme so a typo in the config file warns
+	// once at startup, not once per tab open.
+	theme Theme
+
 	socketPath string
 	ipcServer  *ipc.Server
 
@@ -76,11 +81,21 @@ type App struct {
 }
 
 // NewApp wires the app together. The window is built in activate.
+//
+// Theme resolution happens here rather than per-Session: a bad theme
+// name in the config produces one warning at startup instead of a
+// duplicate warning for every tab opened or rehydrated.
 func NewApp(gtkApp *adw.Application, ws *core.Workspace, cfg config.Config, home, socketPath string) *App {
+	theme, err := LoadTheme(cfg.Theme)
+	if err != nil {
+		slog.Warn("theme load failed; using roost-dark", "name", cfg.Theme, "err", err)
+		theme = DefaultTheme
+	}
 	return &App{
 		gtkApp:       gtkApp,
 		ws:           ws,
 		cfg:          cfg,
+		theme:        theme,
 		home:         home,
 		socketPath:   socketPath,
 		projectViews: map[int64]*adw.TabView{},
@@ -486,7 +501,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 		"ROOST_TAB_ID=" + strconv.FormatInt(tab.ID, 10),
 		"ROOST_SOCKET=" + a.socketPath,
 	}
-	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, a.cfg.Theme, env...)
+	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, a.theme, env...)
 	if err != nil {
 		slog.Error("NewSession", "tab", tab.ID, "err", err)
 		return

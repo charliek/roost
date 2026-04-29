@@ -17,11 +17,14 @@ func parseThemeString(t *testing.T, body string) Theme {
 }
 
 func TestParseThemeMinimal(t *testing.T) {
+	// Non-zero palette[0] proves the entry was parsed (vs. left at the
+	// zero-value default), and we assert cursor-color so it doesn't
+	// silently regress.
 	body := "" +
 		"background = #112233\n" +
 		"foreground = #aabbcc\n" +
 		"cursor-color = #ffffff\n" +
-		"palette = 0=#000000\n" +
+		"palette = 0=#010203\n" +
 		"palette = 15=#ffffff\n"
 	th := parseThemeString(t, body)
 	if (th.Background != ghostty.ColorRGB{R: 0x11, G: 0x22, B: 0x33}) {
@@ -30,7 +33,10 @@ func TestParseThemeMinimal(t *testing.T) {
 	if (th.Foreground != ghostty.ColorRGB{R: 0xaa, G: 0xbb, B: 0xcc}) {
 		t.Errorf("foreground: %+v", th.Foreground)
 	}
-	if (th.Palette[0] != ghostty.ColorRGB{}) {
+	if (th.Cursor != ghostty.ColorRGB{R: 0xff, G: 0xff, B: 0xff}) {
+		t.Errorf("cursor-color: %+v", th.Cursor)
+	}
+	if (th.Palette[0] != ghostty.ColorRGB{R: 0x01, G: 0x02, B: 0x03}) {
 		t.Errorf("palette[0]: %+v", th.Palette[0])
 	}
 	if (th.Palette[15] != ghostty.ColorRGB{R: 0xff, G: 0xff, B: 0xff}) {
@@ -93,13 +99,21 @@ func TestParseThemeOptionalSet(t *testing.T) {
 	body := "" +
 		"background = #000000\nforeground = #ffffff\n" +
 		"cursor-text = #aaaaaa\n" +
-		"bold-color = #bbbbbb\n"
+		"bold-color = #bbbbbb\n" +
+		"selection-background = #123456\n" +
+		"selection-foreground = #654321\n"
 	th := parseThemeString(t, body)
 	if (th.CursorText != ghostty.ColorRGB{R: 0xaa, G: 0xaa, B: 0xaa}) {
 		t.Errorf("cursor-text: %+v", th.CursorText)
 	}
 	if (th.BoldColor != ghostty.ColorRGB{R: 0xbb, G: 0xbb, B: 0xbb}) {
 		t.Errorf("bold-color: %+v", th.BoldColor)
+	}
+	if (th.SelectionBackground != ghostty.ColorRGB{R: 0x12, G: 0x34, B: 0x56}) {
+		t.Errorf("selection-background: %+v", th.SelectionBackground)
+	}
+	if (th.SelectionForeground != ghostty.ColorRGB{R: 0x65, G: 0x43, B: 0x21}) {
+		t.Errorf("selection-foreground: %+v", th.SelectionForeground)
 	}
 }
 

@@ -122,8 +122,10 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 		switch {
 		case !s.windowFocused:
-			// Unfocused: hollow outline only, no blink.
-			setRGB(cr, defaultFG)
+			// Unfocused: hollow outline only, no blink. Outlined in
+			// the theme's cursor color so the user can still find it
+			// against arbitrary text colors.
+			setRGB(cr, s.theme.Cursor)
 			cr.SetLineWidth(1)
 			cr.Rectangle(x+0.5, y+0.5, w-1, h-1)
 			cr.Stroke()
@@ -131,7 +133,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 			// Focused + on phase: solid block in cursor color, glyph
 			// in cursor-text. cursor-text falls back to background if
 			// the theme didn't set it (parseTheme handles the default).
-			setRGB(cr, defaultFG)
+			setRGB(cr, s.theme.Cursor)
 			cr.Rectangle(x, y, w, h)
 			cr.Fill()
 			if cursorHasCell {
@@ -169,14 +171,14 @@ func setRGB(cr *cairo.Context, c ghostty.ColorRGB) {
 // every terminal honors: bold red text stays red; only bold default-fg
 // text gets the bold accent color. Cell.HasFG is the precise signal —
 // internal/ghostty/render.go sets it only when libghostty returns an
-// explicit FG, not when it falls back to default.
+// explicit FG, not when it falls back to default. The "not inverted"
+// check happens AFTER the inverse swap so boldColor never lands as a
+// background fill.
 func cellColors(cell ghostty.Cell, defaultFG, defaultBG, boldColor ghostty.ColorRGB) (fg, bg ghostty.ColorRGB, hasExplicitBG bool) {
 	fg = defaultFG
 	bg = defaultBG
 	if cell.HasFG {
 		fg = cell.FG
-	} else if cell.Bold {
-		fg = boldColor
 	}
 	if cell.HasBG {
 		bg = cell.BG
@@ -185,6 +187,9 @@ func cellColors(cell ghostty.Cell, defaultFG, defaultBG, boldColor ghostty.Color
 	if cell.Inverse {
 		fg, bg = bg, fg
 		hasExplicitBG = true
+	}
+	if cell.Bold && !cell.HasFG && !cell.Inverse {
+		fg = boldColor
 	}
 	return
 }
