@@ -29,14 +29,14 @@ Theme files are plain key=value text with `#` comments — the same syntax as `c
 
 | Key                    | Required | Effect                                                                |
 |------------------------|----------|-----------------------------------------------------------------------|
-| `palette = N=#RRGGBB`  | yes (0–15) | One of the 16 ANSI colors. Indices 16–255 are computed (xterm 6×6×6 cube + 24-step gray ramp). |
-| `background`           | yes      | Default background color.                                             |
-| `foreground`           | yes      | Default foreground color.                                             |
-| `cursor-color`         | yes      | Cursor block fill.                                                    |
+| `background`           | yes      | Default background color. Parser errors if missing.                   |
+| `foreground`           | yes      | Default foreground color. Parser errors if missing.                   |
+| `palette = N=#RRGGBB`  | no       | One of the 16 ANSI colors (`N` in `0..15`). Unset entries default to black. Indices 16–255 are computed (xterm 6×6×6 cube + 24-step gray ramp). |
+| `cursor-color`         | no       | Cursor block fill. Defaults to `foreground`.                          |
 | `cursor-text`          | no       | Glyph color when the cursor sits over a non-empty cell. Defaults to `background`. |
 | `bold-color`           | no       | Color for bold text drawn with the *default* foreground. Bold-with-explicit-color (e.g. bold red) is unaffected. Defaults to `foreground`. |
-| `selection-background` | no       | Selection overlay color (rendered at 35% alpha).                       |
-| `selection-foreground` | no       | Parsed but currently unused (see *Limitations*).                       |
+| `selection-background` | no       | Selection overlay color (rendered at 35% alpha). Defaults to `foreground`. |
+| `selection-foreground` | no       | Parsed but currently unused (see *Limitations*). Defaults to `background`. |
 
 Unknown keys are silently ignored. A theme file is typically ~22 lines.
 
@@ -68,8 +68,9 @@ selection-foreground = #545454
 The format is identical, so you can usually copy a file in:
 
 ```bash
+# Run from your roost checkout.
 cp "/Applications/Ghostty.app/Contents/Resources/ghostty/themes/Solarized Dark - Patched" \
-   /Users/charliek/projects/roost/cmd/roost/themes/
+   ./cmd/roost/themes/
 ./build/build.sh
 ```
 

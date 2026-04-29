@@ -77,10 +77,14 @@ func TestParseThemeIgnoresPaletteIndicesAt16OrAbove(t *testing.T) {
 }
 
 func TestParseThemeOptionalDefaults(t *testing.T) {
-	// cursor-text falls back to background, bold-color to foreground,
-	// selection-* to fg/bg, when not set.
+	// cursor-color and bold-color and selection-background fall back
+	// to foreground; cursor-text and selection-foreground fall back to
+	// background.
 	body := "background = #001122\nforeground = #aabbcc\n"
 	th := parseThemeString(t, body)
+	if (th.Cursor != ghostty.ColorRGB{R: 0xaa, G: 0xbb, B: 0xcc}) {
+		t.Errorf("cursor-color default: %+v", th.Cursor)
+	}
 	if (th.CursorText != ghostty.ColorRGB{R: 0x00, G: 0x11, B: 0x22}) {
 		t.Errorf("cursor-text default: %+v", th.CursorText)
 	}
@@ -92,6 +96,35 @@ func TestParseThemeOptionalDefaults(t *testing.T) {
 	}
 	if (th.SelectionForeground != ghostty.ColorRGB{R: 0x00, G: 0x11, B: 0x22}) {
 		t.Errorf("selection-foreground default: %+v", th.SelectionForeground)
+	}
+}
+
+func TestParseThemeMissingRequiredKeys(t *testing.T) {
+	cases := map[string]string{
+		"missing both":       "",
+		"missing background": "foreground = #ffffff\n",
+		"missing foreground": "background = #000000\n",
+	}
+	for name, body := range cases {
+		if _, err := parseTheme(strings.NewReader(body)); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+}
+
+func TestParseThemeBlackSelectionPreserved(t *testing.T) {
+	// A pure-black selection-background must round-trip as #000000,
+	// not be treated as "unset" via zero-value comparison.
+	body := "" +
+		"background = #ffffff\nforeground = #000000\n" +
+		"selection-background = #000000\n" +
+		"selection-foreground = #ffffff\n"
+	th := parseThemeString(t, body)
+	if (th.SelectionBackground != ghostty.ColorRGB{R: 0x00, G: 0x00, B: 0x00}) {
+		t.Errorf("selection-background should be black, got %+v", th.SelectionBackground)
+	}
+	if (th.SelectionForeground != ghostty.ColorRGB{R: 0xff, G: 0xff, B: 0xff}) {
+		t.Errorf("selection-foreground should be white, got %+v", th.SelectionForeground)
 	}
 }
 

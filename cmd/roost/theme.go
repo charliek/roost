@@ -89,7 +89,9 @@ func mustLoadTheme(name string) Theme {
 // 24-step gray ramp after parsing.
 func parseTheme(r io.Reader) (Theme, error) {
 	var th Theme
+	var sawBackground, sawForeground, sawCursor bool
 	var sawCursorText, sawBoldColor bool
+	var sawSelectionBackground, sawSelectionForeground bool
 
 	sc := bufio.NewScanner(r)
 	lineNum := 0
@@ -110,18 +112,21 @@ func parseTheme(r io.Reader) (Theme, error) {
 				return Theme{}, fmt.Errorf("line %d: background: %w", lineNum, err)
 			}
 			th.Background = c
+			sawBackground = true
 		case "foreground":
 			c, err := parseHexColor(val)
 			if err != nil {
 				return Theme{}, fmt.Errorf("line %d: foreground: %w", lineNum, err)
 			}
 			th.Foreground = c
+			sawForeground = true
 		case "cursor-color":
 			c, err := parseHexColor(val)
 			if err != nil {
 				return Theme{}, fmt.Errorf("line %d: cursor-color: %w", lineNum, err)
 			}
 			th.Cursor = c
+			sawCursor = true
 		case "cursor-text":
 			c, err := parseHexColor(val)
 			if err != nil {
@@ -142,12 +147,14 @@ func parseTheme(r io.Reader) (Theme, error) {
 				return Theme{}, fmt.Errorf("line %d: selection-background: %w", lineNum, err)
 			}
 			th.SelectionBackground = c
+			sawSelectionBackground = true
 		case "selection-foreground":
 			c, err := parseHexColor(val)
 			if err != nil {
 				return Theme{}, fmt.Errorf("line %d: selection-foreground: %w", lineNum, err)
 			}
 			th.SelectionForeground = c
+			sawSelectionForeground = true
 		case "palette":
 			idx, c, err := parsePaletteEntry(val)
 			if err != nil {
@@ -165,18 +172,34 @@ func parseTheme(r io.Reader) (Theme, error) {
 		return Theme{}, fmt.Errorf("read: %w", err)
 	}
 
-	// Optional fields — fall back to ghostty's documented defaults so
-	// every Theme value is renderable without a nil check.
+	// Required fields. Without these the theme would render unreadable
+	// (zero-value black on black). Bundled themes always set both;
+	// failing fast catches a broken theme file at LoadTheme time.
+	if !sawBackground {
+		return Theme{}, fmt.Errorf("missing required key: background")
+	}
+	if !sawForeground {
+		return Theme{}, fmt.Errorf("missing required key: foreground")
+	}
+
+	// Optional fields — fall back to documented defaults so every
+	// Theme value is renderable without a nil check. Presence is
+	// tracked by bool, not by zero-value comparison: an explicit
+	// "selection-background = #000000" must round-trip as black, not
+	// be treated as unset.
+	if !sawCursor {
+		th.Cursor = th.Foreground
+	}
 	if !sawCursorText {
 		th.CursorText = th.Background
 	}
 	if !sawBoldColor {
 		th.BoldColor = th.Foreground
 	}
-	if (th.SelectionBackground == ghostty.ColorRGB{}) {
+	if !sawSelectionBackground {
 		th.SelectionBackground = th.Foreground
 	}
-	if (th.SelectionForeground == ghostty.ColorRGB{}) {
+	if !sawSelectionForeground {
 		th.SelectionForeground = th.Background
 	}
 
