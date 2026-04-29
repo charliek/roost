@@ -11,9 +11,21 @@ package core
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/charliek/roost/internal/store"
 )
+
+// notifyCooldown is the per-tab dedupe window for identical (title, body)
+// pairs. Short enough to be invisible to humans, long enough to absorb
+// double-fires from misbehaving senders or rapid OSC-burst loops that
+// slip past the OSC 9 ConEmu filter.
+const notifyCooldown = 1 * time.Second
+
+type notifyDedupe struct {
+	at  time.Time
+	key string
+}
 
 // Re-exports so the UI doesn't import internal/store directly.
 type (
@@ -66,6 +78,10 @@ type Workspace struct {
 
 	mu          sync.Mutex
 	subscribers []chan<- Event
+	// lastNotify holds the last (title|body) and timestamp per tab,
+	// used by Notify to drop exact-repeat notifications inside
+	// notifyCooldown. Guarded by mu.
+	lastNotify map[int64]notifyDedupe
 }
 
 // New wraps an opened Store.
@@ -232,10 +248,28 @@ func (w *Workspace) DeleteTab(id int64) error {
 // Notify emits an EventNotification for a tab. Does not persist
 // anything; notifications are ephemeral state that lives in memory and
 // in the UI.
+//
+// Identical (title, body) pairs on the same tab inside notifyCooldown
+// are dropped silently. Distinct content within the window still fires;
+// only exact repeats are suppressed. The cooldown protects against
+// scripts that double-fire and against pathological OSC streams that
+// slip past the scanner's ConEmu filter.
 func (w *Workspace) Notify(tabID int64, title, body string) error {
 	if title == "" {
 		return errors.New("core: notification title required")
 	}
+	key := title + "\x00" + body
+	now := time.Now()
+	w.mu.Lock()
+	if w.lastNotify == nil {
+		w.lastNotify = make(map[int64]notifyDedupe)
+	}
+	if prev, ok := w.lastNotify[tabID]; ok && prev.key == key && now.Sub(prev.at) < notifyCooldown {
+		w.mu.Unlock()
+		return nil
+	}
+	w.lastNotify[tabID] = notifyDedupe{at: now, key: key}
+	w.mu.Unlock()
 	w.emit(Event{Kind: EventNotification, TabID: tabID, Title: title, Body: body})
 	return nil
 }

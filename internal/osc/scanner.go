@@ -155,13 +155,40 @@ func (s *Scanner) step(b byte) {
 	}
 }
 
+// isConEmuBody reports whether an OSC 9 body looks like a ConEmu
+// extension rather than an iTerm2 notification. ConEmu uses OSC 9;<n>
+// where <n> is 1..12; the body we see (everything after the leading
+// "9;") starts with that decimal number and is either bare or followed
+// by ';'. A genuine iTerm2 notification whose text starts with a digit
+// followed by a non-digit, non-`;` byte (e.g. "1 file changed") still
+// passes through.
+func isConEmuBody(body string) bool {
+	if body == "" || body[0] < '0' || body[0] > '9' {
+		return false
+	}
+	i := 1
+	for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+		i++
+	}
+	return i == len(body) || body[i] == ';'
+}
+
 // dispatch is called when a complete OSC sequence has been buffered.
 func (s *Scanner) dispatch() {
 	num := s.num.String()
 	body := s.body.String()
 	switch num {
 	case "9":
-		// iTerm2 OSC 9: body is the notification message.
+		// OSC 9 is overloaded: iTerm2 uses the body as a notification
+		// message, but ConEmu uses OSC 9;<n>[;...] for sleep/progress/
+		// message-box/etc. (see ../ghostty/src/terminal/osc/parsers/osc9.zig).
+		// A digit followed by `;` (or end of body) signals ConEmu — drop
+		// it; libghostty-vt parses the actual semantics. Bodies starting
+		// with a digit followed by something else (e.g. "1 file changed")
+		// are still legitimate iTerm2 notifications.
+		if isConEmuBody(body) {
+			return
+		}
 		if s.h.OnNotification != nil {
 			s.h.OnNotification(Notification{Title: body})
 		}

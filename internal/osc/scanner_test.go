@@ -68,6 +68,38 @@ func TestOSC777NoBody(t *testing.T) {
 	}
 }
 
+func TestOSC9ConEmuProgressIgnored(t *testing.T) {
+	s, got := collect(t)
+	// ConEmu OSC 9;4 is a progress report; Claude Code emits these
+	// constantly. Body the scanner sees is "4;0;" (state=remove).
+	s.Feed([]byte("\x1b]9;4;0;\x07"))
+	s.Feed([]byte("\x1b]9;4;1;30\x07"))
+	if len(*got) != 0 {
+		t.Fatalf("ConEmu progress fired notification: %+v", *got)
+	}
+}
+
+func TestOSC9ConEmuOtherSubcommandsIgnored(t *testing.T) {
+	s, got := collect(t)
+	// 9;1 sleep, 9;11 comment, 9;2 message box. All ConEmu.
+	s.Feed([]byte("\x1b]9;1;100\x07"))
+	s.Feed([]byte("\x1b]9;11;just a comment\x07"))
+	s.Feed([]byte("\x1b]9;2;some message\x07"))
+	if len(*got) != 0 {
+		t.Fatalf("ConEmu subcommands fired notification: %+v", *got)
+	}
+}
+
+func TestOSC9DigitTitlePassthrough(t *testing.T) {
+	// Regression: a bare iTerm2 notification whose title HAPPENS to
+	// start with a digit followed by a non-`;` byte must still fire.
+	s, got := collect(t)
+	s.Feed([]byte("\x1b]9;1 file changed\x07"))
+	if len(*got) != 1 || (*got)[0].Title != "1 file changed" {
+		t.Fatalf("digit-prefixed iTerm2 notification dropped: %+v", *got)
+	}
+}
+
 func TestUnrelatedOSCIgnored(t *testing.T) {
 	s, got := collect(t)
 	// OSC 0 (icon+title) and OSC 1 (icon) — should NOT fire.

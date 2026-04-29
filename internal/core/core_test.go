@@ -156,6 +156,73 @@ func TestRenameTabRequiresTitle(t *testing.T) {
 	}
 }
 
+func TestNotifyDedupesExactRepeatsWithinCooldown(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.Notify(tab.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify 1: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventNotification || ev.TabID != tab.ID || ev.Title != "title" {
+		t.Fatalf("first Notify event: %+v", ev)
+	}
+
+	// Identical pair within window — silently dropped.
+	if err := w.Notify(tab.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify 2: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("repeat Notify within cooldown emitted event: %+v", ev)
+	default:
+	}
+
+	// Distinct body within the same window — fires.
+	if err := w.Notify(tab.ID, "title", "different body"); err != nil {
+		t.Fatalf("Notify 3: %v", err)
+	}
+	ev = <-ch
+	if ev.Body != "different body" {
+		t.Fatalf("distinct-body Notify dropped or wrong: %+v", ev)
+	}
+}
+
+func TestNotifyDedupeIsPerTab(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	t1, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+	t2, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.Notify(t1.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify t1: %v", err)
+	}
+	<-ch
+	// Same content on a different tab still fires — dedupe is per-tab.
+	if err := w.Notify(t2.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify t2: %v", err)
+	}
+	ev := <-ch
+	if ev.TabID != t2.ID {
+		t.Fatalf("expected event for t2, got %+v", ev)
+	}
+}
+
+func TestNotifyRequiresTitle(t *testing.T) {
+	w := newWorkspace(t)
+	if err := w.Notify(1, "", "body"); err == nil {
+		t.Fatalf("Notify with empty title: want error, got nil")
+	}
+}
+
 func TestEventChannelDoesNotBlockOnFullSubscriber(t *testing.T) {
 	w := newWorkspace(t)
 	_ = w.Subscribe(1) // never drained
