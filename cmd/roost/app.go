@@ -302,6 +302,18 @@ func (a *App) handleEvent(ev core.Event) {
 		}
 	case core.EventProjectDeleted:
 		a.removeProjectUI(ev.ProjectID)
+	case core.EventTabAdded:
+		// New tab — recompute the rollup for its owning project so a
+		// fresh tab in agent-state none doesn't leave a stale stripe.
+		if ev.Tab != nil {
+			a.recomputeProjectRollup(ev.Tab.ProjectID)
+		}
+	case core.EventTabDeleted:
+		// EventTabDeleted now carries ProjectID — recompute so a
+		// freshly cleaned project loses its stripe.
+		if ev.ProjectID != 0 {
+			a.recomputeProjectRollup(ev.ProjectID)
+		}
 	case core.EventTabStateChanged:
 		if page, ok := a.tabPages[ev.TabID]; ok {
 			// Indicator-icon and SetNeedsAttention are independent
@@ -309,6 +321,9 @@ func (a *App) handleEvent(ev core.Event) {
 			// "needs attention" pulse is driven by the notification
 			// flag elsewhere.
 			page.SetIndicatorIcon(a.indicatorIconForState(ev.AgentState))
+		}
+		if pid, ok := a.projectForTab(ev.TabID); ok {
+			a.recomputeProjectRollup(pid)
 		}
 	case core.EventTabNotificationChanged:
 		// Today the desktop banner is fired straight from
@@ -430,6 +445,53 @@ func (a *App) projectForTab(tabID int64) (int64, bool) {
 		return sess.tab.ProjectID, true
 	}
 	return 0, false
+}
+
+// rollupSeverity returns a comparable rank for project rollup
+// computation. needs-input dominates because it's the most actionable
+// state: a project with one blocked tab and four running tabs should
+// flag the user, not look "busy."
+func rollupSeverity(s core.TabAgentState) int {
+	switch s {
+	case core.TabAgentNeedsInput:
+		return 3
+	case core.TabAgentRunning:
+		return 2
+	case core.TabAgentIdle:
+		return 1
+	}
+	return 0
+}
+
+// recomputeProjectRollup walks every tab in the project's TabView,
+// asks core for its agent state, and applies the highest-severity
+// state to the project's sidebar row. Cheap: O(tabs in project) of
+// in-memory map lookups. Called from the event handler on every
+// state change that could affect the rollup.
+//
+// Must run on the main thread (touches GTK widgets).
+func (a *App) recomputeProjectRollup(projectID int64) {
+	view, ok := a.projectViews[projectID]
+	if !ok {
+		return
+	}
+	pr, ok := a.projectRows[projectID]
+	if !ok {
+		return
+	}
+	rollup := core.TabAgentNone
+	for i := 0; i < view.NPages(); i++ {
+		page := view.NthPage(i)
+		tabID, ok := a.pageTabs[pageKey(page)]
+		if !ok {
+			continue
+		}
+		s := a.ws.TabAgentState(tabID)
+		if rollupSeverity(s) > rollupSeverity(rollup) {
+			rollup = s
+		}
+	}
+	pr.setRollupState(rollup)
 }
 
 // ListTabs returns a project-grouped tree of every tab. Display order
