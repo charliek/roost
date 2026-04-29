@@ -33,6 +33,32 @@ type (
 	Tab     = store.Tab
 )
 
+// TabAgentState is the sticky per-tab agent status. Independent of
+// "has pending notification" — state survives focus events; notification
+// flag clears on focus.
+//
+// Wire format is the constant string (not the int), so external scripts
+// invoking tab.set_state stay stable across refactors.
+type TabAgentState string
+
+const (
+	TabAgentNone       TabAgentState = "none"
+	TabAgentRunning    TabAgentState = "running"
+	TabAgentNeedsInput TabAgentState = "needs_input"
+	TabAgentIdle       TabAgentState = "idle"
+)
+
+// ValidTabAgentState returns true iff s matches one of the four
+// canonical state strings. Callers (the IPC server) reject everything
+// else as bad_request.
+func ValidTabAgentState(s string) bool {
+	switch TabAgentState(s) {
+	case TabAgentNone, TabAgentRunning, TabAgentNeedsInput, TabAgentIdle:
+		return true
+	}
+	return false
+}
+
 // Event is fired on every state change. Subscribers receive a snapshot
 // of the affected entity (or its ID for deletes). The discriminator is
 // the Kind field.
@@ -47,13 +73,14 @@ type (
 // as a bool flip — if unlock UX lands, this contract grows to a
 // distinct event kind or a tri-state.
 type Event struct {
-	Kind      EventKind
-	Project   *Project // populated for project events
-	Tab       *Tab     // populated for tab events
-	ProjectID int64    // populated for ProjectDeleted and EventNotification
-	TabID     int64    // populated for TabDeleted and EventNotification
-	Title     string   // populated for EventNotification
-	Body      string   // populated for EventNotification
+	Kind       EventKind
+	Project    *Project      // populated for project events
+	Tab        *Tab          // populated for tab events
+	ProjectID  int64         // populated for ProjectDeleted, EventNotification, EventTabDeleted
+	TabID      int64         // populated for TabDeleted, EventNotification, EventTabStateChanged, EventTabNotificationChanged
+	Title      string        // populated for EventNotification
+	Body       string        // populated for EventNotification
+	AgentState TabAgentState // populated for EventTabStateChanged
 }
 
 // EventKind is the type discriminator for Event.
@@ -70,6 +97,14 @@ const (
 	// future hooks) requests a notification on a tab. Subscribers are
 	// expected to handle UI badging + desktop notification surface.
 	EventNotification
+	// EventTabStateChanged fires when a tab's TabAgentState transitions.
+	// Idempotent re-sets are silent.
+	EventTabStateChanged
+	// EventTabNotificationChanged fires when the per-tab "has pending
+	// notification" flag flips. Used by the UI to redraw indicators
+	// independently of EventNotification (which only fires on new
+	// notifications, not on the user clearing them by focusing the tab).
+	EventTabNotificationChanged
 )
 
 // Workspace owns the persistent state and broadcasts changes.
@@ -82,6 +117,13 @@ type Workspace struct {
 	// used by Notify to drop exact-repeat notifications inside
 	// notifyCooldown. Guarded by mu.
 	lastNotify map[int64]notifyDedupe
+	// agentState, hookActive, hasNotification are the per-tab agent
+	// surface. In-memory only — Roost restart resets them; agents
+	// re-emit SessionStart, so this avoids tracking liveness against
+	// possibly-dead processes. Guarded by mu.
+	agentState      map[int64]TabAgentState
+	hookActive      map[int64]bool
+	hasNotification map[int64]bool
 }
 
 // New wraps an opened Store.
@@ -236,12 +278,22 @@ func (w *Workspace) UpdateTabCWD(id int64, cwd string) error {
 	return nil
 }
 
-// DeleteTab removes a tab.
+// DeleteTab removes a tab. Captures the tab's ProjectID before delete
+// so subscribers (notably the project rollup recompute in the UI) can
+// react without doing a separate lookup.
 func (w *Workspace) DeleteTab(id int64) error {
+	// Best-effort lookup of the owning project before removal. If the
+	// tab is already gone (concurrent caller), the event still fires
+	// with ProjectID=0 — subscribers tolerate that.
+	var projectID int64
+	if t, err := w.store.GetTab(id); err == nil {
+		projectID = t.ProjectID
+	}
 	if err := w.store.DeleteTab(id); err != nil {
 		return err
 	}
-	w.emit(Event{Kind: EventTabDeleted, TabID: id})
+	w.clearTabState(id)
+	w.emit(Event{Kind: EventTabDeleted, TabID: id, ProjectID: projectID})
 	return nil
 }
 
@@ -271,7 +323,117 @@ func (w *Workspace) Notify(tabID int64, title, body string) error {
 	w.lastNotify[tabID] = notifyDedupe{at: now, key: key}
 	w.mu.Unlock()
 	w.emit(Event{Kind: EventNotification, TabID: tabID, Title: title, Body: body})
+	// MarkNotification fires its own EventTabNotificationChanged on
+	// transition (idempotent if the tab already has a pending flag).
+	w.MarkNotification(tabID, true)
 	return nil
+}
+
+// SetTabAgentState writes the sticky agent state for a tab and emits
+// EventTabStateChanged on real transitions. Idempotent re-sets are
+// silent (no event). Pass TabAgentNone to clear.
+func (w *Workspace) SetTabAgentState(tabID int64, state TabAgentState) {
+	w.mu.Lock()
+	if w.agentState == nil {
+		w.agentState = make(map[int64]TabAgentState)
+	}
+	prev := w.agentState[tabID]
+	if prev == state {
+		w.mu.Unlock()
+		return
+	}
+	if state == TabAgentNone {
+		delete(w.agentState, tabID)
+	} else {
+		w.agentState[tabID] = state
+	}
+	w.mu.Unlock()
+	w.emit(Event{Kind: EventTabStateChanged, TabID: tabID, AgentState: state})
+}
+
+// TabAgentState returns the current sticky state for a tab, or
+// TabAgentNone if unknown.
+func (w *Workspace) TabAgentState(tabID int64) TabAgentState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if s, ok := w.agentState[tabID]; ok {
+		return s
+	}
+	return TabAgentNone
+}
+
+// SetHookSessionActive marks whether a structured hook session (e.g.
+// Claude Code's hook subcommand) is currently driving this tab. Used
+// by the OSC pump to suppress raw OSC 9/777 from inside the agent —
+// the hook is the trusted channel; OSC is the fallback for tools that
+// can't be modified, and hook-driven agents emit OSC noise we don't
+// want to surface twice.
+//
+// Pure setter: does not emit an event. The OSC suppression is the
+// only consumer.
+func (w *Workspace) SetHookSessionActive(tabID int64, active bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.hookActive == nil {
+		w.hookActive = make(map[int64]bool)
+	}
+	if active {
+		w.hookActive[tabID] = true
+	} else {
+		delete(w.hookActive, tabID)
+	}
+}
+
+// IsHookSessionActive reports whether a hook session is currently
+// driving the tab. Safe to call from any goroutine (used by the PTY
+// pump in session.go).
+func (w *Workspace) IsHookSessionActive(tabID int64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.hookActive[tabID]
+}
+
+// MarkNotification flips the per-tab "has pending notification" flag
+// and emits EventTabNotificationChanged on transitions. The UI sets
+// true via Notify (indirectly) and false from the selected-page
+// handler when the user looks at the tab.
+func (w *Workspace) MarkNotification(tabID int64, has bool) {
+	w.mu.Lock()
+	if w.hasNotification == nil {
+		w.hasNotification = make(map[int64]bool)
+	}
+	prev := w.hasNotification[tabID]
+	if prev == has {
+		w.mu.Unlock()
+		return
+	}
+	if has {
+		w.hasNotification[tabID] = true
+	} else {
+		delete(w.hasNotification, tabID)
+	}
+	w.mu.Unlock()
+	w.emit(Event{Kind: EventTabNotificationChanged, TabID: tabID})
+}
+
+// HasNotification reports whether the tab has a pending notification
+// the user has not yet seen.
+func (w *Workspace) HasNotification(tabID int64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.hasNotification[tabID]
+}
+
+// clearTabState wipes all in-memory per-tab state. Called from
+// DeleteTab so a future tab with the same ID (impossible today; the
+// store autoincrements) wouldn't inherit stale entries.
+func (w *Workspace) clearTabState(tabID int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.agentState, tabID)
+	delete(w.hookActive, tabID)
+	delete(w.hasNotification, tabID)
+	delete(w.lastNotify, tabID)
 }
 
 // EnsureDefault makes sure there's at least one project containing at

@@ -242,6 +242,27 @@ func (s *Store) CreateTab(projectID int64, cwd string) (Tab, error) {
 	}, nil
 }
 
+// GetTab loads a single tab by id. Returns sql.ErrNoRows if missing.
+func (s *Store) GetTab(id int64) (Tab, error) {
+	row := s.db.QueryRow(
+		`SELECT id, project_id, COALESCE(title,''), cwd, COALESCE(last_command,''),
+		        position, created_at, last_active, user_titled
+		 FROM tab WHERE id = ?`, id)
+	var t Tab
+	var created, active int64
+	var userTitled int
+	if err := row.Scan(
+		&t.ID, &t.ProjectID, &t.Title, &t.CWD, &t.LastCommand,
+		&t.Position, &created, &active, &userTitled,
+	); err != nil {
+		return Tab{}, err
+	}
+	t.CreatedAt = time.Unix(created, 0)
+	t.LastActive = time.Unix(active, 0)
+	t.UserTitled = userTitled != 0
+	return t, nil
+}
+
 // ListTabs returns every tab belonging to a project, ordered by tab position.
 func (s *Store) ListTabs(projectID int64) ([]Tab, error) {
 	rows, err := s.db.Query(
