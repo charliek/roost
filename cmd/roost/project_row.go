@@ -4,7 +4,18 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
+
+	"github.com/charliek/roost/internal/core"
 )
+
+// rollupCSSClasses are the per-state classes the row may carry. Kept
+// in one place so setRollupState can clear all before applying the
+// next, and so the CSS file (style.css) is grep-able for them.
+var rollupCSSClasses = []string{
+	"roost-rollup-running",
+	"roost-rollup-needs-input",
+	"roost-rollup-idle",
+}
 
 // projectRow bundles the per-row sidebar widgets for a project. The row
 // hosts a label/entry stack so the name can be edited inline, and a
@@ -120,6 +131,24 @@ func (pr *projectRow) exitEditMode(commit bool) (text string, ok bool) {
 func (pr *projectRow) setName(name string) {
 	pr.label.SetText(name)
 	pr.entry.SetText(name)
+}
+
+// setRollupState swaps the row's CSS class to match the project's
+// rolled-up agent state. Severity is computed by the App
+// (needs-input wins); this method is a pure setter. TabAgentNone
+// removes all rollup classes, leaving the row unstyled.
+func (pr *projectRow) setRollupState(s core.TabAgentState) {
+	for _, c := range rollupCSSClasses {
+		pr.row.RemoveCSSClass(c)
+	}
+	switch s {
+	case core.TabAgentRunning:
+		pr.row.AddCSSClass("roost-rollup-running")
+	case core.TabAgentNeedsInput:
+		pr.row.AddCSSClass("roost-rollup-needs-input")
+	case core.TabAgentIdle:
+		pr.row.AddCSSClass("roost-rollup-idle")
+	}
 }
 
 // installEditControllers wires F2/Escape on the entry. Caller provides

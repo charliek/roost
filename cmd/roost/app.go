@@ -77,6 +77,22 @@ type App struct {
 	// goroutine via glib.IdleAdd.
 	tabPages map[int64]*adw.TabPage
 
+	// stateIcons holds the three colored-circle indicator icons used
+	// by AdwTabPage.SetIndicatorIcon. Built once on activate so the
+	// per-event handler can swap by reference.
+	stateIcons stateIcons
+
+	// terminalNotifierPath is the absolute path of the
+	// terminal-notifier binary, resolved once at activate. Empty
+	// string means "not installed" — macOS desktop banners become
+	// silent no-ops; in-app indicators continue working.
+	terminalNotifierPath string
+	// roostCLIPath is the absolute path of the roost-cli binary.
+	// Used as the click-through target on macOS so terminal-notifier
+	// -execute does not depend on PATH at click time. Resolved once
+	// at activate.
+	roostCLIPath string
+
 	activeProjectID int64
 }
 
@@ -112,6 +128,42 @@ func (a *App) activate() {
 	// Terminals are dark-by-convention; force dark so libadwaita's accent
 	// colors land strongly against the dark surface.
 	adw.StyleManagerGetDefault().SetColorScheme(adw.ColorSchemePreferDark)
+
+	// Per-state indicator icons. Built once; tab updates swap by reference.
+	a.stateIcons = newStateIcons()
+
+	// Resolve external-binary paths once. Empty terminal-notifier
+	// means "no macOS banners" (logged below); empty roost-cli only
+	// hurts the click-through target on macOS — Linux uses an
+	// in-process action handler.
+	if runtime.GOOS == "darwin" {
+		a.terminalNotifierPath = lookupTerminalNotifier()
+		if a.terminalNotifierPath == "" {
+			slog.Warn("terminal-notifier not found on PATH; macOS desktop banners disabled. Install with: brew install terminal-notifier")
+		}
+	}
+	a.roostCLIPath = lookupRoostCLI()
+
+	// Register the app-level "tab-focus" GIO action. The Linux
+	// gio.Notification default action invokes this in-process; the
+	// signal ferries the tab id as an int64 variant. macOS uses a
+	// different transport (terminal-notifier -execute) so this
+	// handler is unused there, but it's cheap to register on both.
+	{
+		focusAct := gio.NewSimpleAction("tab-focus", glib.NewVariantType("x"))
+		focusAct.ConnectActivate(func(param *glib.Variant) {
+			if param == nil {
+				return
+			}
+			tabID := param.Int64()
+			go func() {
+				if _, err := a.FocusTab(tabID); err != nil {
+					slog.Warn("tab-focus action", "tab", tabID, "err", err)
+				}
+			}()
+		})
+		a.gtkApp.AddAction(focusAct)
+	}
 
 	a.win = adw.NewApplicationWindow(&a.gtkApp.Application)
 	a.win.SetTitle("Roost")
@@ -294,6 +346,41 @@ func (a *App) handleEvent(ev core.Event) {
 		}
 	case core.EventProjectDeleted:
 		a.removeProjectUI(ev.ProjectID)
+	case core.EventTabAdded:
+		// New tab — recompute the rollup for its owning project so a
+		// fresh tab in agent-state none doesn't leave a stale stripe.
+		if ev.Tab != nil {
+			a.recomputeProjectRollup(ev.Tab.ProjectID)
+		}
+	case core.EventTabDeleted:
+		// EventTabDeleted now carries ProjectID — recompute so a
+		// freshly cleaned project loses its stripe.
+		if ev.ProjectID != 0 {
+			a.recomputeProjectRollup(ev.ProjectID)
+		}
+	case core.EventTabStateChanged:
+		if page, ok := a.tabPages[ev.TabID]; ok {
+			// Indicator-icon and SetNeedsAttention are independent
+			// surfaces: state lives in the indicator slot; the
+			// "needs attention" pulse is driven by the notification
+			// flag elsewhere.
+			page.SetIndicatorIcon(a.indicatorIconForState(ev.AgentState))
+		}
+		if pid, ok := a.projectForTab(ev.TabID); ok {
+			a.recomputeProjectRollup(pid)
+		}
+	case core.EventTabNotificationChanged:
+		// The notification flag flipped. handleNotification calls
+		// SetNeedsAttention(true) directly when a fresh notification
+		// arrives; this case handles the clear path so a hook event
+		// (claude-hook prompt-submit) or an explicit
+		// tab.clear_notification can also turn the pulse off without
+		// requiring the user to focus the tab.
+		if !a.ws.HasNotification(ev.TabID) {
+			if page, ok := a.tabPages[ev.TabID]; ok {
+				page.SetNeedsAttention(false)
+			}
+		}
 	}
 }
 
@@ -306,14 +393,22 @@ func (a *App) handleNotification(tabID int64, title, body string) {
 		return
 	}
 	if a.tabIsActive(tabID) {
-		// Already focused — no badge, no desktop notification.
+		// Already focused — no badge, no desktop notification, no
+		// pending-attention flag. Notify already emitted
+		// EventNotification; we just don't escalate any of the
+		// surfaces the user can already see.
 		slog.Info("notification (suppressed; tab active)", "tab", tabID, "title", title)
 		return
 	}
 	page.SetNeedsAttention(true)
+	// Mark the in-core flag too — drives the rollup recompute and any
+	// future surfaces (sidebar dot count, inbox) listening on
+	// EventTabNotificationChanged. Owned by the UI layer because the
+	// focused-tab decision is here.
+	a.ws.MarkNotification(tabID, true)
 
 	id := "roost.tab." + strconv.FormatInt(tabID, 10)
-	sendDesktopNotification(a.gtkApp, id, title, body)
+	sendDesktopNotification(a.gtkApp, id, tabID, title, body, a.terminalNotifierPath, a.roostCLIPath)
 	slog.Info("notification", "tab", tabID, "title", title, "body", body)
 }
 
@@ -348,6 +443,213 @@ func (a *App) SetTitle(tabID int64, title string) error {
 	// CLI title-set is user intent — lock the tab against subsequent OSC
 	// overwrites just like the Cmd-R popover does.
 	return a.ws.RenameTab(tabID, title)
+}
+
+// FocusTab switches the active project to the tab's owner, selects
+// the tab inside that project's view, and raises the window. Returns
+// the previously focused (project, tab) so a client can implement
+// "go back."
+//
+// Caveat: on Wayland, win.Present() without an XDG-activation token
+// may only flash the taskbar instead of raising. The terminal-notifier
+// click path passes a token through; CLI scripts that call this
+// directly may not. Best-effort.
+func (a *App) FocusTab(tabID int64) (ipc.TabFocusResult, error) {
+	type result struct {
+		res ipc.TabFocusResult
+		err error
+	}
+	done := make(chan result, 1)
+	coreglib.IdleAdd(func() bool {
+		page, ok := a.tabPages[tabID]
+		if !ok {
+			done <- result{err: errors.New("tab not found")}
+			return false
+		}
+		// Capture previous focus before switching.
+		prev := ipc.TabFocusResult{PreviousProjectID: a.activeProjectID}
+		if view := a.projectViews[a.activeProjectID]; view != nil {
+			if p := view.SelectedPage(); p != nil {
+				if id, ok := a.pageTabs[pageKey(p)]; ok {
+					prev.PreviousTabID = id
+				}
+			}
+		}
+
+		ownerProject, ok := a.projectForTab(tabID)
+		if !ok {
+			done <- result{err: errors.New("tab owner project not found")}
+			return false
+		}
+		a.selectProject(ownerProject)
+		if view := a.projectViews[ownerProject]; view != nil {
+			view.SetSelectedPage(page)
+		}
+		// Selected-page handler clears needs-attention + grabs DA focus
+		// when the selection changes. If the target tab was already
+		// the project's selected page (e.g. you switched away from this
+		// project earlier without picking a different tab), no
+		// selected-page event fires — clear the surfaces explicitly.
+		page.SetNeedsAttention(false)
+		a.ws.MarkNotification(tabID, false)
+		a.win.Present()
+		done <- result{res: prev}
+		return false
+	})
+	r := <-done
+	return r.res, r.err
+}
+
+// projectForTab returns the project ID that owns a tab. Reads
+// in-memory state populated on the main thread; callers must already
+// be on the main thread.
+func (a *App) projectForTab(tabID int64) (int64, bool) {
+	if sess, ok := a.sessions[tabID]; ok {
+		return sess.tab.ProjectID, true
+	}
+	return 0, false
+}
+
+// rollupSeverity returns a comparable rank for project rollup
+// computation. needs-input dominates because it's the most actionable
+// state: a project with one blocked tab and four running tabs should
+// flag the user, not look "busy."
+func rollupSeverity(s core.TabAgentState) int {
+	switch s {
+	case core.TabAgentNeedsInput:
+		return 3
+	case core.TabAgentRunning:
+		return 2
+	case core.TabAgentIdle:
+		return 1
+	}
+	return 0
+}
+
+// recomputeProjectRollup walks every tab in the project's TabView,
+// asks core for its agent state, and applies the highest-severity
+// state to the project's sidebar row. Cheap: O(tabs in project) of
+// in-memory map lookups. Called from the event handler on every
+// state change that could affect the rollup.
+//
+// Must run on the main thread (touches GTK widgets).
+func (a *App) recomputeProjectRollup(projectID int64) {
+	view, ok := a.projectViews[projectID]
+	if !ok {
+		return
+	}
+	pr, ok := a.projectRows[projectID]
+	if !ok {
+		return
+	}
+	rollup := core.TabAgentNone
+	for i := 0; i < view.NPages(); i++ {
+		page := view.NthPage(i)
+		tabID, ok := a.pageTabs[pageKey(page)]
+		if !ok {
+			continue
+		}
+		s := a.ws.TabAgentState(tabID)
+		if rollupSeverity(s) > rollupSeverity(rollup) {
+			rollup = s
+		}
+	}
+	pr.setRollupState(rollup)
+}
+
+// ListTabs returns a project-grouped tree of every tab. Display order
+// for projects matches the sidebar; tab order within a project matches
+// the visible AdwTabView. Marshalled onto the main thread to keep the
+// widget reads consistent.
+func (a *App) ListTabs() (ipc.TabListResult, error) {
+	type result struct {
+		res ipc.TabListResult
+		err error
+	}
+	done := make(chan result, 1)
+	coreglib.IdleAdd(func() bool {
+		// Project order comes from the store (sidebar mirrors store
+		// position). Map iteration would be non-deterministic.
+		snap, err := a.ws.LoadAll()
+		if err != nil {
+			done <- result{err: err}
+			return false
+		}
+		var activeTabID int64
+		if view := a.projectViews[a.activeProjectID]; view != nil {
+			if p := view.SelectedPage(); p != nil {
+				if id, ok := a.pageTabs[pageKey(p)]; ok {
+					activeTabID = id
+				}
+			}
+		}
+		out := ipc.TabListResult{Projects: make([]ipc.TabListProject, 0, len(snap))}
+		for _, ps := range snap {
+			view := a.projectViews[ps.Project.ID]
+			tabsOut := make([]ipc.TabListTab, 0, len(ps.Tabs))
+			// Walk the live tab view (matches visual order). Fall back to
+			// store order if the view hasn't been built yet.
+			if view != nil {
+				for i := 0; i < view.NPages(); i++ {
+					page := view.NthPage(i)
+					id, ok := a.pageTabs[pageKey(page)]
+					if !ok {
+						continue
+					}
+					title := page.Title()
+					tabsOut = append(tabsOut, ipc.TabListTab{
+						ID:              id,
+						Title:           title,
+						AgentState:      string(a.ws.TabAgentState(id)),
+						HasNotification: a.ws.HasNotification(id),
+						IsActive:        ps.Project.ID == a.activeProjectID && id == activeTabID,
+					})
+				}
+			} else {
+				for _, t := range ps.Tabs {
+					tabsOut = append(tabsOut, ipc.TabListTab{
+						ID:              t.ID,
+						Title:           t.Title,
+						AgentState:      string(a.ws.TabAgentState(t.ID)),
+						HasNotification: a.ws.HasNotification(t.ID),
+					})
+				}
+			}
+			out.Projects = append(out.Projects, ipc.TabListProject{
+				ID:   ps.Project.ID,
+				Name: ps.Project.Name,
+				Tabs: tabsOut,
+			})
+		}
+		done <- result{res: out}
+		return false
+	})
+	r := <-done
+	return r.res, r.err
+}
+
+// SetTabState writes the sticky agent state. The IPC server already
+// validated `state`; treat the workspace setter as the authority on
+// idempotency / event emission.
+func (a *App) SetTabState(tabID int64, state string) error {
+	a.ws.SetTabAgentState(tabID, core.TabAgentState(state))
+	return nil
+}
+
+// ClearTabNotification flips the per-tab pending-notification flag
+// off. Used by the prompt-submit hook so a fresh prompt clears any
+// stale awaiting-input badge.
+func (a *App) ClearTabNotification(tabID int64) error {
+	a.ws.MarkNotification(tabID, false)
+	return nil
+}
+
+// SetHookActive toggles the per-tab hook-session-active flag. While
+// true, raw OSC 9/777 from inside the tab is suppressed by the PTY
+// pump (see session.go OnNotification).
+func (a *App) SetHookActive(tabID int64, active bool) error {
+	a.ws.SetHookSessionActive(tabID, active)
+	return nil
 }
 
 // Identify is called from the IPC server's per-connection goroutine
@@ -466,6 +768,12 @@ func (a *App) addProjectUI(p core.Project) {
 		}
 		page.SetNeedsAttention(false) // user's looking at it now
 		if id, ok := a.pageTabs[pageKey(page)]; ok {
+			// Clear the in-core notification flag too — emits
+			// EventTabNotificationChanged which the rollup
+			// recompute (commit 6) listens to. State (running /
+			// needs_input / idle) is *not* cleared on focus; only
+			// hook events change it.
+			a.ws.MarkNotification(id, false)
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
 			}
@@ -499,6 +807,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	}
 	env := []string{
 		"ROOST_TAB_ID=" + strconv.FormatInt(tab.ID, 10),
+		"ROOST_PROJECT_ID=" + strconv.FormatInt(projectID, 10),
 		"ROOST_SOCKET=" + a.socketPath,
 	}
 	sess, err := NewSession(a.ws, tab, initialCols, initialRows, a.cfg.FontFamily, a.cfg.FontSizePt, a.theme, env...)
@@ -610,10 +919,16 @@ func (a *App) selectProject(projectID int64) {
 		a.sidebar.SelectRow(pr.row)
 	}
 
-	// Focus the active tab so keystrokes go to the terminal.
+	// Focus the active tab so keystrokes go to the terminal. Also clear
+	// any pending notification on the now-visible tab — switching to a
+	// project whose currently-selected tab is the target wouldn't fire
+	// that view's selected-page handler (the selection didn't change),
+	// so the badge would persist even though the user is looking at it.
 	view := a.projectViews[projectID]
 	if page := view.SelectedPage(); page != nil {
 		if id, ok := a.pageTabs[pageKey(page)]; ok {
+			page.SetNeedsAttention(false)
+			a.ws.MarkNotification(id, false)
 			if sess, ok := a.sessions[id]; ok {
 				sess.da.GrabFocus()
 			}

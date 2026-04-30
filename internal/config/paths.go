@@ -52,6 +52,14 @@ func (p Paths) ConfigFile() string { return filepath.Join(p.ConfigDir, "config.c
 // SocketPath is where the companion CLI's Unix socket lives.
 func (p Paths) SocketPath() string { return filepath.Join(p.RuntimeDir, "roost.sock") }
 
+// ClaudeSettingsPath is where `roost-cli claude install` writes its
+// generated Claude Code settings file. Users add an alias pointing
+// `--settings` here; Claude merges it into their other settings
+// sources at run time.
+func (p Paths) ClaudeSettingsPath() string {
+	return filepath.Join(p.ConfigDir, "claude-settings.json")
+}
+
 // LegacyMacConfigFile is where pre-cutover Mac configs lived. Only used
 // by main.go to log a one-shot migration hint when the legacy file
 // exists and the new one does not. No automatic migration.

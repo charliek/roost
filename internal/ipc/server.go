@@ -20,6 +20,11 @@ type Handler interface {
 	Notify(tabID int64, title, body string) error
 	SetTitle(tabID int64, title string) error
 	Identify() Identity
+	FocusTab(tabID int64) (TabFocusResult, error)
+	ListTabs() (TabListResult, error)
+	SetTabState(tabID int64, state string) error
+	ClearTabNotification(tabID int64) error
+	SetHookActive(tabID int64, active bool) error
 }
 
 // maxRequestBytes is the per-request size cap. Real requests
@@ -185,9 +190,83 @@ func (s *Server) dispatch(req Request) Response {
 	case MethodSystemIdentify:
 		return Response{ID: req.ID, OK: true, Result: s.handler.Identify()}
 
+	case MethodTabFocus:
+		var p TabFocusParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, err.Error())}
+		}
+		if p.TabID == 0 {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, "tab_id required")}
+		}
+		res, err := s.handler.FocusTab(p.TabID)
+		if err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeNotFound, err.Error())}
+		}
+		return Response{ID: req.ID, OK: true, Result: res}
+
+	case MethodTabList:
+		res, err := s.handler.ListTabs()
+		if err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeInternal, err.Error())}
+		}
+		return Response{ID: req.ID, OK: true, Result: res}
+
+	case MethodTabSetState:
+		var p SetStateParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, err.Error())}
+		}
+		if p.TabID == 0 {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, "tab_id required")}
+		}
+		if !validStateString(p.State) {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, "invalid state: "+p.State)}
+		}
+		if err := s.handler.SetTabState(p.TabID, p.State); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeInternal, err.Error())}
+		}
+		return Response{ID: req.ID, OK: true, Result: map[string]any{"updated": true}}
+
+	case MethodTabClearNotification:
+		var p ClearNotificationParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, err.Error())}
+		}
+		if p.TabID == 0 {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, "tab_id required")}
+		}
+		if err := s.handler.ClearTabNotification(p.TabID); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeInternal, err.Error())}
+		}
+		return Response{ID: req.ID, OK: true, Result: map[string]any{"cleared": true}}
+
+	case MethodSystemSetHookActive:
+		var p SetHookActiveParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, err.Error())}
+		}
+		if p.TabID == 0 {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, "tab_id required")}
+		}
+		if err := s.handler.SetHookActive(p.TabID, p.Active); err != nil {
+			return Response{ID: req.ID, OK: false, Error: NewError(CodeInternal, err.Error())}
+		}
+		return Response{ID: req.ID, OK: true, Result: map[string]any{"updated": true}}
+
 	default:
 		return Response{ID: req.ID, OK: false, Error: NewError(CodeBadRequest, "unknown method: "+req.Method)}
 	}
+}
+
+// validStateString mirrors core.ValidTabAgentState. Duplicated here so
+// internal/ipc keeps no upstream import on internal/core (the wire
+// surface is intentionally a flat constant set, not the core enum).
+func validStateString(s string) bool {
+	switch s {
+	case "none", "running", "needs_input", "idle":
+		return true
+	}
+	return false
 }
 
 // Dial is a small client helper used by roost-cli (and tests). Sends one

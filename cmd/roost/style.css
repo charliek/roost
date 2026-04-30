@@ -30,3 +30,23 @@ tabbar tab:checked {
   text-transform: uppercase;
   opacity: 0.55;
 }
+
+/* Project row agent-state rollup: a 3px left-edge stripe coloured by
+ * the highest-severity state across the project's tabs. box-shadow
+ * inset is used instead of border-left because libadwaita reserves
+ * the row's leading margin for the selection state — a real border
+ * would shift the label. needs-input wins; running is informational;
+ * idle is muted. The "none" state has no class, no stripe.
+ *
+ * Colors mirror the per-tab indicator SVGs (cmd/roost/indicator.go).
+ * Hard-coded rather than @accent_bg_color etc. because the indicator
+ * meaning is semantic, not theme-dependent. */
+listbox.navigation-sidebar > row.roost-rollup-running {
+  box-shadow: inset 3px 0 0 #5fa3f0;
+}
+listbox.navigation-sidebar > row.roost-rollup-needs-input {
+  box-shadow: inset 3px 0 0 #f0a040;
+}
+listbox.navigation-sidebar > row.roost-rollup-idle {
+  box-shadow: inset 3px 0 0 #7a7a7a;
+}

@@ -156,6 +156,252 @@ func TestRenameTabRequiresTitle(t *testing.T) {
 	}
 }
 
+func TestNotifyDedupesExactRepeatsWithinCooldown(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(16)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.Notify(tab.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify 1: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventNotification || ev.TabID != tab.ID || ev.Title != "title" {
+		t.Fatalf("first Notify event: %+v", ev)
+	}
+
+	// Identical pair within window — silently dropped (no events).
+	if err := w.Notify(tab.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify 2: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("repeat Notify within cooldown emitted event: %+v", ev)
+	default:
+	}
+
+	// Distinct body within the same window — fires EventNotification.
+	if err := w.Notify(tab.ID, "title", "different body"); err != nil {
+		t.Fatalf("Notify 3: %v", err)
+	}
+	ev = <-ch
+	if ev.Kind != EventNotification || ev.Body != "different body" {
+		t.Fatalf("distinct-body Notify event: %+v", ev)
+	}
+}
+
+func TestNotifyDedupeIsPerTab(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(16)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	t1, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+	t2, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.Notify(t1.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify t1: %v", err)
+	}
+	<-ch // EventNotification for t1
+	// Same content on a different tab still fires — dedupe is per-tab.
+	if err := w.Notify(t2.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify t2: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventNotification || ev.TabID != t2.ID {
+		t.Fatalf("expected EventNotification for t2, got %+v", ev)
+	}
+}
+
+func TestSetTabAgentStateEmitsOnTransitionsOnly(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	w.SetTabAgentState(tab.ID, TabAgentRunning)
+	ev := <-ch
+	if ev.Kind != EventTabStateChanged || ev.TabID != tab.ID || ev.AgentState != TabAgentRunning {
+		t.Fatalf("first SetTabAgentState event: %+v", ev)
+	}
+	if got := w.TabAgentState(tab.ID); got != TabAgentRunning {
+		t.Fatalf("TabAgentState: got %q want %q", got, TabAgentRunning)
+	}
+
+	// Idempotent re-set: silent.
+	w.SetTabAgentState(tab.ID, TabAgentRunning)
+	select {
+	case ev := <-ch:
+		t.Fatalf("idempotent re-set emitted: %+v", ev)
+	default:
+	}
+
+	// Real transition: fires.
+	w.SetTabAgentState(tab.ID, TabAgentNeedsInput)
+	ev = <-ch
+	if ev.AgentState != TabAgentNeedsInput {
+		t.Fatalf("transition event: %+v", ev)
+	}
+
+	// None clears the map entry; lookup returns TabAgentNone.
+	w.SetTabAgentState(tab.ID, TabAgentNone)
+	<-ch
+	if got := w.TabAgentState(tab.ID); got != TabAgentNone {
+		t.Fatalf("after clear: got %q", got)
+	}
+}
+
+func TestHookSessionFlagIsSilent(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if w.IsHookSessionActive(tab.ID) {
+		t.Fatal("expected no hook session initially")
+	}
+	w.SetHookSessionActive(tab.ID, true)
+	if !w.IsHookSessionActive(tab.ID) {
+		t.Fatal("expected hook session active after set")
+	}
+	w.SetHookSessionActive(tab.ID, false)
+	if w.IsHookSessionActive(tab.ID) {
+		t.Fatal("expected hook session inactive after clear")
+	}
+	// No events for any of the above.
+	select {
+	case ev := <-ch:
+		t.Fatalf("hook flag emitted event: %+v", ev)
+	default:
+	}
+}
+
+func TestMarkNotificationFiresOnTransitions(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(16)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	// MarkNotification drives the per-tab flag. Notify itself does NOT
+	// flip the flag — the UI layer owns that call so it can suppress
+	// the flag on the active tab. See App.handleNotification.
+	w.MarkNotification(tab.ID, true)
+	ev := <-ch
+	if ev.Kind != EventTabNotificationChanged || ev.TabID != tab.ID {
+		t.Fatalf("expected EventTabNotificationChanged, got %+v", ev)
+	}
+	if !w.HasNotification(tab.ID) {
+		t.Fatal("expected HasNotification true after Mark(true)")
+	}
+
+	// Idempotent set: no event.
+	w.MarkNotification(tab.ID, true)
+	select {
+	case ev := <-ch:
+		t.Fatalf("idempotent MarkNotification emitted: %+v", ev)
+	default:
+	}
+
+	// Clear: fires once.
+	w.MarkNotification(tab.ID, false)
+	ev = <-ch
+	if ev.Kind != EventTabNotificationChanged {
+		t.Fatalf("clear event: %+v", ev)
+	}
+	if w.HasNotification(tab.ID) {
+		t.Fatal("expected HasNotification false after clear")
+	}
+}
+
+func TestNotifyDoesNotAutoMark(t *testing.T) {
+	// Regression: Notify used to call MarkNotification(true) directly.
+	// Moved into the UI layer so the focused-tab suppression in
+	// App.handleNotification can avoid leaving a stale pending flag.
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	if err := w.Notify(tab.ID, "title", "body"); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventNotification {
+		t.Fatalf("expected EventNotification, got %+v", ev)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("Notify emitted unexpected follow-up event: %+v", ev)
+	default:
+	}
+	if w.HasNotification(tab.ID) {
+		t.Fatal("Notify should not flip the pending-notification flag")
+	}
+}
+
+func TestDeleteTabClearsAgentStateAndPopulatesProjectID(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(8)
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	tab, _ := w.CreateTab(p.ID, "/p")
+	<-ch
+
+	w.SetTabAgentState(tab.ID, TabAgentRunning)
+	<-ch
+	w.SetHookSessionActive(tab.ID, true)
+	w.MarkNotification(tab.ID, true)
+	<-ch
+
+	if err := w.DeleteTab(tab.ID); err != nil {
+		t.Fatalf("DeleteTab: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventTabDeleted || ev.TabID != tab.ID || ev.ProjectID != p.ID {
+		t.Fatalf("EventTabDeleted: %+v", ev)
+	}
+	if w.TabAgentState(tab.ID) != TabAgentNone {
+		t.Fatal("agent state not cleared")
+	}
+	if w.IsHookSessionActive(tab.ID) {
+		t.Fatal("hook flag not cleared")
+	}
+	if w.HasNotification(tab.ID) {
+		t.Fatal("notification flag not cleared")
+	}
+}
+
+func TestValidTabAgentState(t *testing.T) {
+	for _, s := range []string{"none", "running", "needs_input", "idle"} {
+		if !ValidTabAgentState(s) {
+			t.Errorf("ValidTabAgentState(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "Running", "NEEDS_INPUT", "done", "garbage"} {
+		if ValidTabAgentState(s) {
+			t.Errorf("ValidTabAgentState(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestNotifyRequiresTitle(t *testing.T) {
+	w := newWorkspace(t)
+	if err := w.Notify(1, "", "body"); err == nil {
+		t.Fatalf("Notify with empty title: want error, got nil")
+	}
+}
+
 func TestEventChannelDoesNotBlockOnFullSubscriber(t *testing.T) {
 	w := newWorkspace(t)
 	_ = w.Subscribe(1) // never drained

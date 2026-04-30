@@ -66,20 +66,38 @@ Goroutines marshal back to the main thread via `glib.IdleAdd`. The shortcut cont
 ```mermaid
 flowchart LR
     Sender["roost-cli notify"]
+    Hook["roost-cli claude-hook"]
     OSC["printf '\\033]9;...'"]
     Pump["Session.pumpPTY (goroutine)"]
     Scanner["osc.Scanner"]
     IPC["ipc.Server"]
-    WS["core.Workspace"]
-    App["App.handleNotification (main thread)"]
-    UI["AdwTabPage.SetNeedsAttention + desktop notification"]
+    WS["core.Workspace<br/>(state + events)"]
+    App["App.handleEvent<br/>(main thread)"]
+    Indicator["AdwTabPage.SetIndicatorIcon<br/>state colored circle"]
+    Badge["AdwTabPage.SetNeedsAttention<br/>pulse"]
+    Stripe["projectRow rollup stripe"]
+    Banner["terminal-notifier (mac)<br/>gio.Notification (Linux)"]
 
     Sender --> IPC --> WS
+    Hook --> IPC
     OSC --> Pump --> Scanner --> WS
-    WS --> App --> UI
+    WS --> App
+    App --> Indicator
+    App --> Badge
+    App --> Stripe
+    App --> Banner
 ```
 
-Both input paths converge on `core.Workspace.Notify`, which emits an `EventNotification` on the workspace event channel. The App subscribes to that channel and marshals each event to the main thread before touching widgets.
+Three input paths (`roost-cli notify`, `roost-cli claude-hook`, OSC 9/777) converge on `core.Workspace`. The Workspace emits four event kinds the UI cares about:
+
+- `EventNotification` — drives the desktop banner and the `SetNeedsAttention` pulse.
+- `EventTabNotificationChanged` — fires when the per-tab pending-attention flag flips. Today consumed only for symmetry; future surfaces (sidebar dot count, etc.) layer on top.
+- `EventTabStateChanged` — drives the per-tab indicator icon and the project rollup stripe recompute.
+- `EventTabDeleted` — carries `ProjectID` so the rollup stripe can be recomputed without a separate lookup.
+
+The App subscribes once and marshals each event to the main thread via `coreglib.IdleAdd` before touching widgets. Banners on macOS go through `terminal-notifier` (`-execute "roost-cli tab focus --tab N"` for click-through, `-group roost.tab.<id>` for supersede); on Linux a `gio.SimpleAction` wires the banner's default action to in-process `App.FocusTab`.
+
+OSC suppression: when a tab has an active hook session (`system.set_hook_active`), the OSC scanner's `OnNotification` callback drops raw OSC 9/777 from inside the agent. Hook events are the trusted channel; OSC is the fallback for tools that can't be modified.
 
 ## Boundaries
 
