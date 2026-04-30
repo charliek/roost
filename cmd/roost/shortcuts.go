@@ -19,6 +19,9 @@ const (
 	ActionCopy          = "copy"
 	ActionNewProject    = "new_project"
 	ActionRenameProject = "rename_project"
+	ActionFontIncrease  = "font_increase"
+	ActionFontDecrease  = "font_decrease"
+	ActionFontReset     = "font_reset"
 	// switch_project_1..9 and switch_tab_1..9 are generated; not const'd.
 	ActionUnbind = "unbind"
 )

@@ -1295,6 +1295,9 @@ func (a *App) installShortcuts() {
 		ActionCopy:          {fn: a.copyFromActive, gated: true},
 		ActionNewProject:    {fn: a.newProject},
 		ActionRenameProject: {fn: a.beginRenameActiveProject},
+		ActionFontIncrease:  {fn: func() { a.adjustActiveFontSize(+1) }},
+		ActionFontDecrease:  {fn: func() { a.adjustActiveFontSize(-1) }},
+		ActionFontReset:     {fn: a.resetActiveFontSize},
 	}
 	for i := 1; i <= 9; i++ {
 		i := i
@@ -1378,6 +1381,12 @@ func defaultBindings() map[string][]string {
 		ActionCopy:          {clipboardMod + "+c", "ctrl+shift+c"},
 		ActionNewProject:    {projectMod + "+n"},
 		ActionRenameProject: {projectMod + "+shift+r"},
+		// Browser-style font sizing per tab. + and = both bind because
+		// cmd-+ on US layouts is really cmd-shift-=, and many users
+		// hit cmd-= without the shift; both work.
+		ActionFontIncrease: {primary + "+plus", primary + "+equal"},
+		ActionFontDecrease: {primary + "+minus"},
+		ActionFontReset:    {primary + "+0"},
 	}
 	for i := 1; i <= 9; i++ {
 		m[switchProjectAction(i)] = []string{projectMod + "+" + strconv.Itoa(i)}
@@ -1396,6 +1405,21 @@ func pageKey(p *adw.TabPage) uintptr {
 		return 0
 	}
 	return p.Native()
+}
+
+// adjustActiveFontSize / resetActiveFontSize are the cmd+/-/0
+// keybinding entry points. They no-op when there is no active tab so
+// the empty-window state doesn't flash an error.
+func (a *App) adjustActiveFontSize(delta int) {
+	if s := a.activeSession(); s != nil {
+		s.AdjustFontSize(delta)
+	}
+}
+
+func (a *App) resetActiveFontSize() {
+	if s := a.activeSession(); s != nil {
+		s.ResetFontSize()
+	}
 }
 
 // activeSession returns the currently selected session in the active

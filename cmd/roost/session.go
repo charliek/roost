@@ -41,6 +41,7 @@ type Session struct {
 	fontBold         *pango.FontDescription
 	fontFeaturesAttr *pango.AttrList
 	fontCfg          FontConfig
+	defaultFontSize  int // for ResetFontSize; immutable after construction
 	cellW            int
 	cellH            int
 	cols             uint16
@@ -217,6 +218,7 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg Fon
 		fontBold:         fontBold,
 		fontFeaturesAttr: fontFeaturesAttr,
 		fontCfg:          fontCfg,
+		defaultFontSize:  fontCfg.SizePt,
 		cols:             cols,
 		rows:             rows,
 		theme:            theme,
@@ -552,6 +554,21 @@ func (s *Session) checkTitleAndPWD() {
 // onResize reflows the terminal to fit the new pixel dimensions. Called
 // by GtkDrawingArea every time it's allocated a new size.
 func (s *Session) onResize(width, height int) {
+	s.applyGeometry(width, height, false)
+}
+
+// applyGeometry pushes the current cellW/cellH into libghostty + the
+// PTY for the given pixel area. Shared between GtkDrawingArea resize
+// events and AdjustFontSize, where the area is unchanged but the cell
+// dimensions just moved.
+//
+// force=false short-circuits when neither cols nor rows changed (the
+// resize-event hot path; cheap insurance against GTK's "size changed"
+// callbacks that don't actually change cell counts). force=true is the
+// font-resize path: cell dimensions changed even when grid counts
+// happen to round to the same value, so libghostty needs to hear the
+// new pixel-per-cell numbers regardless.
+func (s *Session) applyGeometry(width, height int, force bool) {
 	if s.closed.Load() {
 		return
 	}
@@ -563,7 +580,7 @@ func (s *Session) onResize(width, height int) {
 	if rows < 1 {
 		rows = 1
 	}
-	if cols == s.cols && rows == s.rows {
+	if !force && cols == s.cols && rows == s.rows {
 		return
 	}
 	s.cols = cols
@@ -589,6 +606,51 @@ func (s *Session) onResize(width, height int) {
 	)
 	_ = s.rs.Update(s.term)
 	s.da.QueueDraw()
+}
+
+// minFontSizePt and maxFontSizePt clamp runtime font-size adjustments.
+// Bounds are intentionally generous; the user can still set anything
+// in between via the config file, and clamp protects only the cmd+/-
+// hot path from accidentally shrinking text to invisibility or growing
+// it past a single screen of cells.
+const (
+	minFontSizePt = 6
+	maxFontSizePt = 72
+)
+
+// AdjustFontSize changes this tab's font size by delta points and
+// reflows the cell grid in place. Per-tab and held in memory only —
+// closing and reopening the tab returns to the config default. Out-of
+// -range deltas saturate at minFontSizePt / maxFontSizePt; a delta
+// that would land on the current size is a no-op.
+func (s *Session) AdjustFontSize(delta int) {
+	s.setFontSize(s.fontCfg.SizePt + delta)
+}
+
+// ResetFontSize returns this tab's font size to the value loaded from
+// config at session-construction time.
+func (s *Session) ResetFontSize() {
+	s.setFontSize(s.defaultFontSize)
+}
+
+func (s *Session) setFontSize(newPt int) {
+	if newPt < minFontSizePt {
+		newPt = minFontSizePt
+	} else if newPt > maxFontSizePt {
+		newPt = maxFontSizePt
+	}
+	if newPt == s.fontCfg.SizePt {
+		return
+	}
+	s.fontCfg.SizePt = newPt
+	s.font.SetSize(newPt * pango.SCALE)
+	s.fontBold.SetSize(newPt * pango.SCALE)
+	s.measureCells()
+	// Window pixel area is unchanged; re-derive cols/rows from the
+	// new cell dimensions and force the cascade so libghostty sees
+	// the new pixel-per-cell ratio even if the cell count rounds the
+	// same way.
+	s.applyGeometry(s.da.Width(), s.da.Height(), true)
 }
 
 // handleScroll converts a GTK scroll event into one of three actions,
