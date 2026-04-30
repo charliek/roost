@@ -2,10 +2,13 @@ package main
 
 import (
 	"log/slog"
+	"runtime"
 	"strings"
 
 	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotk4/pkg/pangocairo"
+
+	"github.com/charliek/roost/internal/pangoextra"
 )
 
 // pickFontFamily returns the first family from a comma-separated list
@@ -57,6 +60,25 @@ func splitFamilies(s string) []string {
 		}
 	}
 	return out
+}
+
+// defaultFontOptions returns the platform's recommended Cairo font
+// options. hint_metrics=on is always set — it snaps glyph advance
+// widths to integer pixels and is the single biggest contributor to
+// crisp monospace cells. macOS native rendering is grayscale AA without
+// hinting (Apple's font designs aren't built for it); the typical
+// FreeType setup on Linux is grayscale AA with slight hinting.
+func defaultFontOptions() pangoextra.FontOptions {
+	opts := pangoextra.FontOptions{
+		Antialias:   pangoextra.AntialiasGray,
+		HintMetrics: pangoextra.HintMetricsOn,
+	}
+	if runtime.GOOS == "darwin" {
+		opts.HintStyle = pangoextra.HintStyleNone
+	} else {
+		opts.HintStyle = pangoextra.HintStyleSlight
+	}
+	return opts
 }
 
 // installedFamilies returns a lower-cased set of every family the font

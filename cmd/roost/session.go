@@ -14,6 +14,7 @@ import (
 	"github.com/charliek/roost/internal/core"
 	"github.com/charliek/roost/internal/ghostty"
 	"github.com/charliek/roost/internal/osc"
+	"github.com/charliek/roost/internal/pangoextra"
 	"github.com/charliek/roost/internal/pty"
 )
 
@@ -228,13 +229,14 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 	s.da.SetCanFocus(true)
 	s.da.SetFocusable(true)
 	s.da.SetFocusOnClick(true)
-	// NOTE: pango_cairo_context_set_font_options would normally pin
-	// glyph metrics to the integer pixel grid (the single biggest text
-	// crispness win) but the gotk4 binding for ContextSetFontOptions
-	// crashes — it expects cairo.FontOptions to follow the gextras
-	// "record" struct convention, which the cairo binding does not.
-	// We rely on integer cellW/cellH + bold-via-FontDescription
-	// instead; revisit if/when that binding is fixed upstream.
+	// Apply Cairo font options (hint_metrics, antialias, hint_style)
+	// before measuring cells so the metrics reflect the snapped values.
+	// hint_metrics=on is the lever that snaps glyph advances to integer
+	// pixels, which is what makes monospace cells look crisp on a
+	// cell-aligned grid. Wraps pango_cairo_context_set_font_options
+	// directly because gotk4's pangocairo.ContextSetFontOptions binding
+	// crashes — see internal/pangoextra and CLAUDE.md.
+	pangoextra.SetFontOptions(s.da.PangoContext(), defaultFontOptions())
 	s.measureCells()
 	s.da.SetDrawFunc(func(_ *gtk.DrawingArea, cr *cairo.Context, _, _ int) {
 		drawTerminal(cr, s)
