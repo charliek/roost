@@ -572,14 +572,21 @@ func (s *Session) applyGeometry(width, height int, force bool) {
 	if s.closed.Load() {
 		return
 	}
-	cols := uint16((width - 2*pad) / s.cellW)
-	rows := uint16((height - 2*pad) / s.cellH)
-	if cols < 1 {
-		cols = 1
+	// Compute in signed int and clamp before the uint16 cast — when
+	// width or height is smaller than 2*pad (e.g. before the
+	// DrawingArea is realized, when Width()/Height() return 0), the
+	// subtraction goes negative and would wrap into a huge uint16
+	// otherwise, slipping past the < 1 floor.
+	colsI := (width - 2*pad) / s.cellW
+	rowsI := (height - 2*pad) / s.cellH
+	if colsI < 1 {
+		colsI = 1
 	}
-	if rows < 1 {
-		rows = 1
+	if rowsI < 1 {
+		rowsI = 1
 	}
+	cols := uint16(colsI)
+	rows := uint16(rowsI)
 	if !force && cols == s.cols && rows == s.rows {
 		return
 	}

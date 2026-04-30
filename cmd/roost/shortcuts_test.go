@@ -32,6 +32,8 @@ func TestTriggerToAccelAliases(t *testing.T) {
 		"super+minus": "<Meta>minus",
 		"super+0":     "<Meta>0",
 		"ctrl+plus":   "<Control>plus",
+		"ctrl+equal":  "<Control>equal",
+		"ctrl+minus":  "<Control>minus",
 		"ctrl+0":      "<Control>0",
 	}
 	for in, want := range cases {

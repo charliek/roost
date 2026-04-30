@@ -127,17 +127,19 @@ func (p Paths) Load() (Config, error) {
 			}
 			cfg.FontFeatures = append(cfg.FontFeatures, val)
 		case "hint_metrics":
-			if !validHintMetrics(val) {
+			// "" and "default" both mean "use the platform default"
+			// per docs/reference/fonts.md; only validate non-empty.
+			if val != "" && !validHintMetrics(val) {
 				return cfg, fmt.Errorf("config: %s:%d: hint_metrics: %q not in {on, off, default}", p.ConfigFile(), lineNum, val)
 			}
 			cfg.HintMetrics = val
 		case "hint_style":
-			if !validHintStyle(val) {
+			if val != "" && !validHintStyle(val) {
 				return cfg, fmt.Errorf("config: %s:%d: hint_style: %q not in {none, slight, medium, full, default}", p.ConfigFile(), lineNum, val)
 			}
 			cfg.HintStyle = val
 		case "antialias":
-			if !validAntialias(val) {
+			if val != "" && !validAntialias(val) {
 				return cfg, fmt.Errorf("config: %s:%d: antialias: %q not in {none, gray, subpixel, default}", p.ConfigFile(), lineNum, val)
 			}
 			cfg.Antialias = val

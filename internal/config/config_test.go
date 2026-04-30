@@ -225,6 +225,22 @@ func TestLoadHintAndAAValid(t *testing.T) {
 	}
 }
 
+func TestLoadHintAndAAEmptyAccepted(t *testing.T) {
+	// Empty value means "use the platform default" per docs/reference/fonts.md.
+	// Parser must accept it without error so the documented config syntax works.
+	p := writeConfig(t, ""+
+		"hint_metrics = \n"+
+		"hint_style = \n"+
+		"antialias = \n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HintMetrics != "" || cfg.HintStyle != "" || cfg.Antialias != "" {
+		t.Errorf("blank values should round-trip as empty strings: %+v", cfg)
+	}
+}
+
 func TestLoadHintMetricsInvalid(t *testing.T) {
 	p := writeConfig(t, "hint_metrics = sometimes\n")
 	if _, err := p.Load(); err == nil {
