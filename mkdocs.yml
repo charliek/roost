@@ -99,6 +99,7 @@ nav:
       - CLI: reference/cli.md
       - Paths & Environment: reference/paths.md
       - Themes: reference/themes.md
+      - Fonts: reference/fonts.md
       - Architecture: reference/architecture.md
   - Development:
       - Setup: development/setup.md

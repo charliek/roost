@@ -12,7 +12,7 @@ See `docs/development/spec.md` for the design doc and `docs/reference/architectu
 - libghostty-vt is the terminal engine. Used for VT parsing, screen state, OSC parsing, key/mouse encoding.
 - The renderer is ours — Cairo + Pango on a `GtkDrawingArea`. We walk libghostty-vt's render state and draw cell-aligned rects + text.
 - The PTY is ours — `creack/pty`, one per tab.
-- cgo lives ONLY in `internal/ghostty`. No cgo elsewhere.
+- cgo lives in `internal/ghostty` (libghostty-vt embedding) and `internal/pangoextra` (a narrow wrapper around `pango_cairo_context_set_font_options` to work around a gotk4 binding crash — see *Known gotk4 binding gotchas* below). Adding a third cgo location requires named justification here; the bar is "no pure-Go alternative exists and the workaround is small and self-contained."
 - UI ↔ core boundary is via interfaces in `internal/core`. The UI never reaches into core internals directly.
 - Treat the architecture as if core were a separate daemon, even though it isn't yet. This preserves a future option to split into a Go daemon + native UI clients without rewrites.
 
@@ -42,12 +42,13 @@ When in doubt: if it touches GTK or libghostty-vt, it runs on the main thread.
 | PTY      | `github.com/creack/pty`                              | Pure Go, no cgo                        |
 | SQLite   | `modernc.org/sqlite`                                 | Pure Go, no cgo                        |
 | libghostty-vt | cgo, only in `internal/ghostty`                 | Pinned Ghostty SHA in `build/build.sh` |
+| Pango/Cairo font options | cgo, only in `internal/pangoextra`     | Linked via `pkg-config: pangocairo`. Workaround for a gotk4 binding crash. |
 
-If you need a new dependency, prefer pure-Go. If you reach for cgo for anything other than libghostty-vt, stop and reconsider.
+If you need a new dependency, prefer pure-Go. cgo is permitted in the two packages above; reaching for it elsewhere requires the same justification bar described in *Architecture* — name the constraint, keep the wrapper small.
 
 ## Known gotk4 binding gotchas
 
-- `pangocairo.ContextSetFontOptions` crashes — it expects `cairo.FontOptions` to follow the gextras "record" struct convention, but the cairo package uses a raw native pointer. Don't try to set Cairo font options through it; we accept the loss of integer-pixel hint metrics in exchange. Revisit if upstream fixes the mismatch.
+- `pangocairo.ContextSetFontOptions` crashes — it expects `cairo.FontOptions` to follow the gextras "record" struct convention, but the cairo package uses a raw native pointer. Don't call it through gotk4. The `internal/pangoextra` package wraps `pango_cairo_context_set_font_options` directly via cgo; route font-option control through there. Drop the workaround if upstream fixes the mismatch.
 - `pango_font_description_set_family` accepts a comma-separated list (Pango ≥ 1.46) but on macOS its fallback is unreliable — when the head of the list is missing it can drop to a *proportional* font (Verdana), giving wide cells with narrow glyphs. We resolve the family ourselves via `pickFontFamily` before calling `SetFamily`. Add new font defaults through that helper, not via raw comma-separated strings.
 
 ## Style

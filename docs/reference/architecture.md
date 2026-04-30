@@ -35,7 +35,8 @@ internal/
   core/                 # Project + Tab models, Workspace coordinator, event channel
   store/                # SQLite schema + migrations + CRUD
   config/               # Cross-platform path resolution
-  ghostty/              # cgo bindings to libghostty-vt (the only cgo package)
+  ghostty/              # cgo bindings to libghostty-vt
+  pangoextra/           # cgo wrapper for Pango/Cairo font options
   pty/                  # creack/pty wrapper
   osc/                  # OSC 9 / OSC 777 streaming parser
   ipc/                  # Unix socket protocol + server + client helper
@@ -102,7 +103,7 @@ OSC suppression: when a tab has an active hook session (`system.set_hook_active`
 ## Boundaries
 
 - The UI layer (`cmd/roost`) calls `core.Workspace` only — never `internal/store` directly. This preserves the option of moving the workspace into a separate daemon process later.
-- cgo lives only in `internal/ghostty`. Other packages are pure Go.
+- cgo lives in `internal/ghostty` (libghostty-vt embedding) and `internal/pangoextra` (a small wrapper for `pango_cairo_context_set_font_options`, present only because gotk4's binding for the same call crashes). Every other package is pure Go.
 - Per-tab Sessions are independent: closing one cannot affect another's pump or libghostty terminal.
 
 See [Design Spec](../development/spec.md) for the rationale behind these choices.

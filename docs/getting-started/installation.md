@@ -9,7 +9,7 @@ Roost ships as two binaries — `roost` (GUI) and `roost-cli` (companion). Both 
 | Go                   | Builds the Roost binaries                          | 1.24+          |
 | Zig                  | Compiles libghostty-vt from the Ghostty source     | 0.15.2         |
 | GTK4 + libadwaita    | UI toolkit (linked at build time and at runtime)   | 4.x / 1.x      |
-| pkg-config (`pkgconf`) | Resolves GTK / glib / cairo include + lib paths  | any            |
+| pkg-config (`pkgconf`) | Resolves GTK / glib / pango / cairo include + lib paths | any   |
 | gobject-introspection | Required at build time by gotk4                   | 1.x            |
 | `mise`               | Manages the pinned Go and Zig versions             | any            |
 | `git`                | Clones Ghostty during the libghostty-vt build      | any            |

@@ -34,6 +34,16 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 
 Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy.
 
+### Font sizing
+
+| Shortcut         | Action                                          |
+|------------------|-------------------------------------------------|
+| `Cmd-+` / `Cmd-=` | Increase font size for the active tab          |
+| `Cmd--`          | Decrease font size for the active tab           |
+| `Cmd-0`          | Reset font size to the `font_size` from config  |
+
+Font size adjustments are per-tab and held in memory only. They do not persist across restarts, and new tabs always start at `font_size` from `config.conf`. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
+
 ## Linux
 
 ### Tab management (active project)
@@ -65,6 +75,16 @@ Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy.
 | `Ctrl-Shift-V`   | Same as `Alt-V` (terminal-convention alternate)     |
 
 Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy. Copying also writes to the X11/Wayland PRIMARY clipboard so middle-click paste in other apps works.
+
+### Font sizing
+
+| Shortcut         | Action                                          |
+|------------------|-------------------------------------------------|
+| `Ctrl-+` / `Ctrl-=` | Increase font size for the active tab        |
+| `Ctrl--`         | Decrease font size for the active tab           |
+| `Ctrl-0`         | Reset font size to the `font_size` from config  |
+
+Font size adjustments are per-tab and held in memory only. They do not persist across restarts, and new tabs always start at `font_size` from `config.conf`. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
 
 ## Terminal keys
 
@@ -167,6 +187,9 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
+| `font_increase`       | `super+plus`, `super+equal` / `ctrl+plus`, `ctrl+equal` |
+| `font_decrease`       | `super+minus` / `ctrl+minus`                           |
+| `font_reset`          | `super+0` / `ctrl+0`                                   |
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 
