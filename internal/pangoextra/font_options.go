@@ -15,11 +15,17 @@ package pangoextra
 
 // #cgo pkg-config: pangocairo
 // #include <pango/pangocairo.h>
+// #include <stdint.h>
+//
+// // roost_set_font_options does the uintptr_t→PangoContext* cast in C
+// // so the equivalent Go conversion doesn't trip govet's unsafeptr
+// // check. Same pattern as internal/ghostty/callbacks.go.
+// static void roost_set_font_options(uintptr_t ctx, const cairo_font_options_t *opts) {
+//     pango_cairo_context_set_font_options((PangoContext*)ctx, opts);
+// }
 import "C"
 
 import (
-	"unsafe"
-
 	"github.com/diamondburned/gotk4/pkg/pango"
 )
 
@@ -86,8 +92,7 @@ func SetFontOptions(ctx *pango.Context, opts FontOptions) {
 	C.cairo_font_options_set_hint_style(cOpts, cairoHintStyle(opts.HintStyle))
 	C.cairo_font_options_set_hint_metrics(cOpts, cairoHintMetrics(opts.HintMetrics))
 
-	cCtx := (*C.PangoContext)(unsafe.Pointer(ctx.Native()))
-	C.pango_cairo_context_set_font_options(cCtx, cOpts)
+	C.roost_set_font_options(C.uintptr_t(ctx.Native()), cOpts)
 }
 
 func cairoAntialias(a Antialias) C.cairo_antialias_t {
