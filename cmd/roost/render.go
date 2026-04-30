@@ -33,6 +33,9 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 
 	layout := pangocairo.CreateLayout(cr)
 	layout.SetFontDescription(s.font)
+	if s.fontFeaturesAttr != nil {
+		layout.SetAttributes(s.fontFeaturesAttr)
+	}
 
 	textBuf := make([]byte, 0, 8)
 

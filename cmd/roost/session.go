@@ -37,12 +37,14 @@ type Session struct {
 	mouse *ghostty.MouseEncoder
 	da    *gtk.DrawingArea
 
-	font     *pango.FontDescription
-	fontBold *pango.FontDescription
-	cellW    int
-	cellH    int
-	cols     uint16
-	rows     uint16
+	font             *pango.FontDescription
+	fontBold         *pango.FontDescription
+	fontFeaturesAttr *pango.AttrList
+	fontCfg          FontConfig
+	cellW            int
+	cellH            int
+	cols             uint16
+	rows             uint16
 
 	// theme is the source of truth for fg/bg/cursor/palette across this
 	// session. It is what gets pushed into libghostty (SetTheme) and
@@ -130,9 +132,12 @@ type Session struct {
 // theme is resolved by the caller (App). Resolving once at the app
 // boundary keeps a bad theme name from logging a warning per tab.
 //
+// fontCfg is the per-tab font setup; passed by value because each tab
+// owns its own copy and may mutate SizePt at runtime via cmd+/-.
+//
 // extraEnv is forwarded to pty.SpawnShell so callers can inject
 // ROOST_TAB_ID + ROOST_SOCKET (or any tab-specific env).
-func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily string, fontSizePt int, theme Theme, extraEnv ...string) (*Session, error) {
+func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg FontConfig, theme Theme, extraEnv ...string) (*Session, error) {
 	term, err := ghostty.NewTerminal(ghostty.Options{
 		Cols: cols, Rows: rows, MaxScrollback: 2000,
 	})
@@ -188,25 +193,39 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 	// family. Avoids Pango falling back to Verdana on macOS when the
 	// head of the list is missing (which produces wide cells with
 	// narrow glyphs and huge gaps between letters).
-	font.SetFamily(pickFontFamily(fontFamily))
-	font.SetSize(fontSizePt * pango.SCALE)
+	font.SetFamily(pickFontFamily(fontCfg.Family))
+	font.SetSize(fontCfg.SizePt * pango.SCALE)
 	fontBold := font.Copy()
+	if fontCfg.FamilyBold != "" {
+		fontBold.SetFamily(pickFontFamily(fontCfg.FamilyBold))
+	}
 	fontBold.SetWeight(pango.WeightBold)
+
+	// Build the OpenType font-features attribute list once. Pango
+	// expects a single comma-separated value (e.g. "-calt,+ss01"), not
+	// one attribute per feature. Reused per-frame in drawTerminal.
+	var fontFeaturesAttr *pango.AttrList
+	if joined := fontCfg.JoinedFeatures(); joined != "" {
+		fontFeaturesAttr = pango.NewAttrList()
+		fontFeaturesAttr.Insert(pango.NewAttrFontFeatures(joined))
+	}
 
 	s := &Session{
 		ws: ws, tab: tab,
 		pty: p, term: term, rs: rs, keys: keys, mouse: mouse,
-		font:          font,
-		fontBold:      fontBold,
-		cols:          cols,
-		rows:          rows,
-		theme:         theme,
-		pumpDone:      make(chan struct{}),
-		writeChan:     make(chan []byte, 256),
-		stopWrite:     make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		cursorOn:      true,
-		windowFocused: true,
+		font:             font,
+		fontBold:         fontBold,
+		fontFeaturesAttr: fontFeaturesAttr,
+		fontCfg:          fontCfg,
+		cols:             cols,
+		rows:             rows,
+		theme:            theme,
+		pumpDone:         make(chan struct{}),
+		writeChan:        make(chan []byte, 256),
+		stopWrite:        make(chan struct{}),
+		writerDone:       make(chan struct{}),
+		cursorOn:         true,
+		windowFocused:    true,
 	}
 	go s.runWriter()
 
@@ -236,7 +255,7 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 	// cell-aligned grid. Wraps pango_cairo_context_set_font_options
 	// directly because gotk4's pangocairo.ContextSetFontOptions binding
 	// crashes — see internal/pangoextra and CLAUDE.md.
-	pangoextra.SetFontOptions(s.da.PangoContext(), defaultFontOptions())
+	pangoextra.SetFontOptions(s.da.PangoContext(), s.fontCfg.Options)
 	s.measureCells()
 	s.da.SetDrawFunc(func(_ *gtk.DrawingArea, cr *cairo.Context, _, _ int) {
 		drawTerminal(cr, s)

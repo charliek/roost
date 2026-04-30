@@ -25,6 +25,31 @@ type Config struct {
 	// pixels — Pango scales by display DPI internally).
 	FontSizePt int
 
+	// FontFamilyBold optionally overrides the family used for bold
+	// text. Empty means "use FontFamily and let Pango synthesize bold."
+	// Useful for pairing fonts (e.g. Iosevka regular + Berkeley Mono
+	// Bold). Resolved through the same pickFontFamily helper as
+	// FontFamily, so a comma-separated fallback list is allowed.
+	FontFamilyBold string
+
+	// FontFeatures is a list of OpenType feature tags applied at render
+	// time (e.g. "-calt" to disable contextual ligatures, "+ss01" for a
+	// stylistic set). Each `font_feature = ...` line in the config
+	// appends one entry; the renderer joins them into a single Pango
+	// font-features attribute.
+	FontFeatures []string
+
+	// HintMetrics, HintStyle, and Antialias control Cairo's glyph
+	// rendering. Empty string means "use the platform default" — the
+	// effective values per platform live in cmd/roost/font.go.
+	//
+	// HintMetrics ∈ {"on", "off", "default"}.
+	// HintStyle   ∈ {"none", "slight", "medium", "full", "default"}.
+	// Antialias   ∈ {"none", "gray", "subpixel", "default"}.
+	HintMetrics string
+	HintStyle   string
+	Antialias   string
+
 	// Theme is the name of a bundled color theme (e.g. "roost-dark",
 	// "Dracula+"). Names match the filenames under cmd/roost/themes/,
 	// which mirror ghostty's themes/ directory exactly. Unknown names
@@ -94,6 +119,28 @@ func (p Paths) Load() (Config, error) {
 				return cfg, fmt.Errorf("config: %s:%d: font_size must be > 0, got %d", p.ConfigFile(), lineNum, n)
 			}
 			cfg.FontSizePt = n
+		case "font_family_bold":
+			cfg.FontFamilyBold = val
+		case "font_feature":
+			if val == "" {
+				return cfg, fmt.Errorf("config: %s:%d: font_feature: empty value", p.ConfigFile(), lineNum)
+			}
+			cfg.FontFeatures = append(cfg.FontFeatures, val)
+		case "hint_metrics":
+			if !validHintMetrics(val) {
+				return cfg, fmt.Errorf("config: %s:%d: hint_metrics: %q not in {on, off, default}", p.ConfigFile(), lineNum, val)
+			}
+			cfg.HintMetrics = val
+		case "hint_style":
+			if !validHintStyle(val) {
+				return cfg, fmt.Errorf("config: %s:%d: hint_style: %q not in {none, slight, medium, full, default}", p.ConfigFile(), lineNum, val)
+			}
+			cfg.HintStyle = val
+		case "antialias":
+			if !validAntialias(val) {
+				return cfg, fmt.Errorf("config: %s:%d: antialias: %q not in {none, gray, subpixel, default}", p.ConfigFile(), lineNum, val)
+			}
+			cfg.Antialias = val
 		case "keybind":
 			kb, kerr := parseKeybind(val)
 			if kerr != nil {
@@ -127,6 +174,30 @@ func parseKeybind(raw string) (Keybind, error) {
 		return Keybind{}, fmt.Errorf("empty action in %q", raw)
 	}
 	return Keybind{Trigger: trigger, Action: action}, nil
+}
+
+func validHintMetrics(v string) bool {
+	switch v {
+	case "on", "off", "default":
+		return true
+	}
+	return false
+}
+
+func validHintStyle(v string) bool {
+	switch v {
+	case "none", "slight", "medium", "full", "default":
+		return true
+	}
+	return false
+}
+
+func validAntialias(v string) bool {
+	switch v {
+	case "none", "gray", "subpixel", "default":
+		return true
+	}
+	return false
 }
 
 // splitKV parses one `key = value` line. Strips an optional pair of
