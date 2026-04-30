@@ -16,11 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # GTK system deps are only needed for cmd/roost, which we only
-      # build on macOS (see the Linux-vs-macOS step split below).
+      # System deps split:
+      # - macOS gets the full GTK4 + libadwaita stack because the test
+      #   job builds cmd/roost there.
+      # - Linux only installs Pango + Cairo dev headers, which is all
+      #   internal/pangoextra needs (its cgo wrapper links pangocairo
+      #   via pkg-config). The other internal packages are pure Go.
+      #   We skip libgtk-4-dev / libadwaita-1-dev because cmd/roost is
+      #   not built on Linux (libadwaita 1.6 vs Ubuntu's 1.5).
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: brew install gtk4 libadwaita pkgconf gobject-introspection
+      - name: Install system deps (Linux — Pango/Cairo for internal/pangoextra)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpango1.0-dev libcairo2-dev
 
       - uses: jdx/mise-action@v2
 
@@ -99,6 +108,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      # internal/pangoextra is a cgo wrapper that links pangocairo via
+      # pkg-config; lint runs cgo preprocessing, which needs the dev
+      # headers present on the runner.
+      - name: Install Pango/Cairo dev headers
+        run: sudo apt-get update && sudo apt-get install -y libpango1.0-dev libcairo2-dev
 
       - uses: jdx/mise-action@v2
 
