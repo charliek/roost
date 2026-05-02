@@ -19,31 +19,39 @@ font_feature = -calt
 | `font_feature`     | (none)                                    | OpenType feature tag. Repeatable: each line appends one entry. Joined with commas at render time. |
 | `hint_metrics`     | `on`                                      | One of `on`, `off`, `default`. Snaps glyph advance widths to integer pixels. Keep `on` for monospace crispness — without it, cells look soft. |
 | `hint_style`       | `none` (macOS) / `slight` (Linux)         | One of `none`, `slight`, `medium`, `full`, `default`. macOS fonts are not designed for hinting; FreeType `slight` is the typical Linux setup. |
-| `antialias`        | `gray`                                    | One of `none`, `gray`, `subpixel`, `default`. macOS uses grayscale natively; `subpixel` is meaningful on RGB-stripe LCDs (most desktop monitors on Linux). |
+| `antialias`        | `gray`                                    | One of `none`, `gray`, `subpixel`, `default`. On Linux RGB-stripe panels `subpixel` gives sharper strokes; on macOS `subpixel` is effectively a no-op (Apple removed system-wide subpixel AA in Mojave) and falls back to grayscale, so setting `subpixel` explicitly is a safe cross-platform choice. |
 
 Empty string and `default` both mean "use the platform default for this setting."
 
 ## Cell tuning
 
-Four additional knobs adjust the cell grid and glyph rendering. Useful when matching the look of another terminal (cmux, ghostty, iTerm) where the natural Pango/Cairo metrics feel a touch tight or thin. All take effect on the next launch.
+Four knobs adjust the cell grid and glyph rendering. The defaults already give roost a polished out-of-the-box look (Pango's natural cell metrics are tighter than mainstream terminals); these knobs let you fine-tune from there. All take effect on the next launch.
 
-| Key                    | Value syntax                              | Effect                                                                                  |
-|------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------|
-| `adjust_cell_height`   | `2`, `2px`, `10%`, `-1`, `-5%`            | Add or subtract from the natural cell height. Positive values add line spacing; glyphs auto-center in the enlarged cell. |
-| `adjust_cell_width`    | same syntax                               | Add or subtract from the natural cell width (letter spacing).                           |
-| `adjust_font_baseline` | same syntax                               | Shift glyphs vertically inside the cell. A fine-tune *after* `adjust_cell_height` — leave it unset until you need to bias the glyph up or down. |
-| `font_thicken`         | `true` / `false` (default `false`)        | Render each glyph twice with a 0.5 px horizontal offset, fattening strokes. Approximates Apple Core Text stem darkening for pipelines that don't apply it natively (notably Cairo on macOS). Not a perfect parity with Apple's algorithm. |
+| Key                    | Default | Value syntax                       | Effect                                                                                  |
+|------------------------|---------|------------------------------------|-----------------------------------------------------------------------------------------|
+| `adjust_cell_height`   | `2px`   | `2`, `2px`, `10%`, `-1`, `-5%`     | Add or subtract from the natural cell height. Positive values add line spacing; glyphs auto-center in the enlarged cell. |
+| `adjust_cell_width`    | `2px`   | same syntax                        | Add or subtract from the natural cell width (letter spacing).                           |
+| `adjust_font_baseline` | (none)  | same syntax                        | Shift glyphs vertically inside the cell. A fine-tune *after* `adjust_cell_height` — leave it unset until you need to bias the glyph up or down. |
+| `font_thicken`         | `false` | `true` / `false`                   | Render each glyph twice with a 0.5 px horizontal offset, fattening strokes. Approximates Apple Core Text stem darkening for pipelines that don't apply it natively (notably Cairo on macOS). Not a perfect parity with Apple's algorithm. |
 
 A bare integer means pixels (`2` is the same as `2px`). A trailing `%` means a signed percentage of the natural metric. Negative values shrink. The cell metrics are clamped to a minimum of 1 px so a runaway negative can't crash the geometry.
 
-### Targeting the cmux look on macOS
+### Opting out of the cell padding
 
-The default config aims at ghostty-style polish with modern programming fonts. To get closer to cmux/Terminal.app's look — Menlo at a smaller size with a touch more line spacing and Apple-like stem weight — try:
+The cell padding defaults can be reverted to Pango's natural metrics by setting them to `0`:
+
+```conf
+adjust_cell_width = 0
+adjust_cell_height = 0
+```
+
+### Going for a cmux / Terminal.app look on macOS
+
+cmux and Apple's Terminal.app both use Menlo at a smaller size with Apple-like stem weight. Layered on top of the defaults:
 
 ```conf
 font_family = Menlo
 font_size = 11
-adjust_cell_height = 2px
 font_thicken = true
 ```
 

@@ -92,8 +92,10 @@ func TestBuildFontConfigEmptyOverridesKeepDefaults(t *testing.T) {
 }
 
 func TestBuildFontConfigCarriesAdjusters(t *testing.T) {
+	// Use values that differ from Defaults() so the assertions prove
+	// the wiring carried the user's overrides, not just the defaults.
 	cfg := config.Defaults()
-	cfg.AdjustCellWidth = config.Adjust{Mode: config.AdjustModePixels, Value: 2}
+	cfg.AdjustCellWidth = config.Adjust{Mode: config.AdjustModePixels, Value: 5}
 	cfg.AdjustCellHeight = config.Adjust{Mode: config.AdjustModePercent, Value: 10}
 	cfg.AdjustFontBaseline = config.Adjust{Mode: config.AdjustModePixels, Value: -1}
 	cfg.FontThicken = true

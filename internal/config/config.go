@@ -92,11 +92,20 @@ type Keybind struct {
 }
 
 // Defaults returns the built-in Config used when no file exists.
+//
+// AdjustCellWidth and AdjustCellHeight default to +2 px because Pango's
+// natural cell metrics are tighter than mainstream terminals (cmux,
+// ghostty, iTerm, Terminal.app) which all add a small amount of cell
+// padding. Setting tasteful defaults here saves every user from
+// discovering and tuning the same knobs. Opt out with `adjust_cell_* =
+// 0` (or any other value) in the config file.
 func Defaults() Config {
 	return Config{
-		FontFamily: "JetBrains Mono, Monaco, monospace",
-		FontSizePt: 12,
-		Theme:      "roost-dark",
+		FontFamily:       "JetBrains Mono, Monaco, monospace",
+		FontSizePt:       12,
+		AdjustCellWidth:  Adjust{Mode: AdjustModePixels, Value: 2},
+		AdjustCellHeight: Adjust{Mode: AdjustModePixels, Value: 2},
+		Theme:            "roost-dark",
 	}
 }
 

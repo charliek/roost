@@ -31,6 +31,18 @@ func TestLoadDefaultsWhenMissing(t *testing.T) {
 	if len(cfg.Keybinds) != 0 {
 		t.Errorf("expected no keybinds when file missing, got %+v", cfg.Keybinds)
 	}
+	// Cell adjusters default to +2px each — this gives roost a polished
+	// look out of the box (Pango's natural cell metrics are tighter
+	// than other mainstream terminals). Pinning the defaults here so
+	// they don't quietly drift.
+	wantW := Adjust{Mode: AdjustModePixels, Value: 2}
+	wantH := Adjust{Mode: AdjustModePixels, Value: 2}
+	if cfg.AdjustCellWidth != wantW {
+		t.Errorf("default AdjustCellWidth: got %+v want %+v", cfg.AdjustCellWidth, wantW)
+	}
+	if cfg.AdjustCellHeight != wantH {
+		t.Errorf("default AdjustCellHeight: got %+v want %+v", cfg.AdjustCellHeight, wantH)
+	}
 }
 
 func TestLoadThemeKey(t *testing.T) {
@@ -282,9 +294,11 @@ func TestLoadAdjustKeysValid(t *testing.T) {
 	}
 }
 
-func TestLoadAdjustEmptyKeepsNoOp(t *testing.T) {
-	// Defaults() leaves the Adjust fields zero-valued (AdjustModeNone).
-	// An empty value in the config file should round-trip the same way.
+func TestLoadAdjustEmptyOverridesDefault(t *testing.T) {
+	// Defaults() sets AdjustCellWidth/Height to +2px. Writing an
+	// explicit blank value lets the user opt out — ParseAdjust("")
+	// returns AdjustModeNone and the case branch unconditionally
+	// assigns it, so `adjust_cell_width =` wins over the default.
 	p := writeConfig(t, ""+
 		"adjust_cell_width = \n"+
 		"adjust_cell_height = \n"+
@@ -296,7 +310,7 @@ func TestLoadAdjustEmptyKeepsNoOp(t *testing.T) {
 	if cfg.AdjustCellWidth.Mode != AdjustModeNone ||
 		cfg.AdjustCellHeight.Mode != AdjustModeNone ||
 		cfg.AdjustFontBaseline.Mode != AdjustModeNone {
-		t.Errorf("blank adjust values should remain no-op, got %+v", cfg)
+		t.Errorf("blank adjust values should override default to no-op, got %+v", cfg)
 	}
 }
 
