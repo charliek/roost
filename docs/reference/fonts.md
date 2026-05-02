@@ -23,6 +23,32 @@ font_feature = -calt
 
 Empty string and `default` both mean "use the platform default for this setting."
 
+## Cell tuning
+
+Four additional knobs adjust the cell grid and glyph rendering. Useful when matching the look of another terminal (cmux, ghostty, iTerm) where the natural Pango/Cairo metrics feel a touch tight or thin. All take effect on the next launch.
+
+| Key                    | Value syntax                              | Effect                                                                                  |
+|------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------|
+| `adjust_cell_height`   | `2`, `2px`, `10%`, `-1`, `-5%`            | Add or subtract from the natural cell height. Positive values add line spacing; glyphs auto-center in the enlarged cell. |
+| `adjust_cell_width`    | same syntax                               | Add or subtract from the natural cell width (letter spacing).                           |
+| `adjust_font_baseline` | same syntax                               | Shift glyphs vertically inside the cell. A fine-tune *after* `adjust_cell_height` — leave it unset until you need to bias the glyph up or down. |
+| `font_thicken`         | `true` / `false` (default `false`)        | Render each glyph twice with a 0.5 px horizontal offset, fattening strokes. Approximates Apple Core Text stem darkening for pipelines that don't apply it natively (notably Cairo on macOS). Not a perfect parity with Apple's algorithm. |
+
+A bare integer means pixels (`2` is the same as `2px`). A trailing `%` means a signed percentage of the natural metric. Negative values shrink. The cell metrics are clamped to a minimum of 1 px so a runaway negative can't crash the geometry.
+
+### Targeting the cmux look on macOS
+
+The default config aims at ghostty-style polish with modern programming fonts. To get closer to cmux/Terminal.app's look — Menlo at a smaller size with a touch more line spacing and Apple-like stem weight — try:
+
+```conf
+font_family = Menlo
+font_size = 11
+adjust_cell_height = 2px
+font_thicken = true
+```
+
+Eyeball alongside cmux and adjust `adjust_cell_height` and `font_size` to taste.
+
 ## Tuning for crisp text
 
 The defaults aim at the cmux/ghostty look: cell-snapped metrics, grayscale AA, light-or-no hinting depending on platform. Tweak from there:
@@ -48,7 +74,7 @@ The defaults aim at the cmux/ghostty look: cell-snapped metrics, grayscale AA, l
 ## Limitations
 
 - **Italic family is not configurable yet.** `font_family_italic` is reserved.
-- **Ghostty's `adjust-cell-*` metric tweaks are not exposed.** Cell width / height / cursor thickness adjustments come later if needed.
+- **Cursor / underline / strikethrough thickness adjusters are not exposed.** Only the cell, baseline, and stem-thicken knobs land here; the TUI-alignment family of `adjust_cursor_*`, `adjust_underline_*`, `adjust_strikethrough_*`, and `adjust_box_thickness` are deferred.
 - **Sidebar and tab-label fonts use GTK's UI font.** Only the terminal cell font is configurable.
-- **`hint_metrics`, `hint_style`, and `antialias` require restart.** Only size responds to runtime hotkeys.
+- **All restart-required except size hotkeys.** `Cmd-+/-/0` rescales live; every other knob (family, features, AA, hint, cell adjusters, font-thicken) takes effect on next launch.
 - **Cairo font option control is implemented via a small cgo wrapper** (`internal/pangoextra`) because gotk4's `pangocairo.ContextSetFontOptions` binding crashes. See [Architecture](architecture.md) for the package layout.

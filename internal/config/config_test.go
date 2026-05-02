@@ -262,6 +262,81 @@ func TestLoadAntialiasInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadAdjustKeysValid(t *testing.T) {
+	p := writeConfig(t, ""+
+		"adjust_cell_width = 2px\n"+
+		"adjust_cell_height = 10%\n"+
+		"adjust_font_baseline = -1\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AdjustCellWidth != (Adjust{Mode: AdjustModePixels, Value: 2}) {
+		t.Errorf("AdjustCellWidth: %+v", cfg.AdjustCellWidth)
+	}
+	if cfg.AdjustCellHeight != (Adjust{Mode: AdjustModePercent, Value: 10}) {
+		t.Errorf("AdjustCellHeight: %+v", cfg.AdjustCellHeight)
+	}
+	if cfg.AdjustFontBaseline != (Adjust{Mode: AdjustModePixels, Value: -1}) {
+		t.Errorf("AdjustFontBaseline: %+v", cfg.AdjustFontBaseline)
+	}
+}
+
+func TestLoadAdjustEmptyKeepsNoOp(t *testing.T) {
+	// Defaults() leaves the Adjust fields zero-valued (AdjustModeNone).
+	// An empty value in the config file should round-trip the same way.
+	p := writeConfig(t, ""+
+		"adjust_cell_width = \n"+
+		"adjust_cell_height = \n"+
+		"adjust_font_baseline = \n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AdjustCellWidth.Mode != AdjustModeNone ||
+		cfg.AdjustCellHeight.Mode != AdjustModeNone ||
+		cfg.AdjustFontBaseline.Mode != AdjustModeNone {
+		t.Errorf("blank adjust values should remain no-op, got %+v", cfg)
+	}
+}
+
+func TestLoadAdjustInvalid(t *testing.T) {
+	p := writeConfig(t, "adjust_cell_height = nonsense\n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for invalid adjust_cell_height value")
+	} else if !strings.Contains(err.Error(), "adjust_cell_height") {
+		t.Errorf("error doesn't mention adjust_cell_height: %v", err)
+	}
+}
+
+func TestLoadFontThicken(t *testing.T) {
+	cases := map[string]bool{
+		"font_thicken = true\n":  true,
+		"font_thicken = false\n": false,
+		"font_thicken = 1\n":     true,
+		"font_thicken = 0\n":     false,
+	}
+	for body, want := range cases {
+		t.Run(body, func(t *testing.T) {
+			p := writeConfig(t, body)
+			cfg, err := p.Load()
+			if err != nil {
+				t.Fatalf("Load %q: %v", body, err)
+			}
+			if cfg.FontThicken != want {
+				t.Errorf("Load %q: got FontThicken=%v want %v", body, cfg.FontThicken, want)
+			}
+		})
+	}
+}
+
+func TestLoadFontThickenInvalid(t *testing.T) {
+	p := writeConfig(t, "font_thicken = sometimes\n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for invalid font_thicken value")
+	}
+}
+
 // TestLoadKeybindTrailingHashNotStripped pins the parser's behavior
 // when a `#` appears after the action — it is NOT treated as an inline
 // comment, so it ends up as part of the action string. Documentation

@@ -23,6 +23,18 @@ type FontConfig struct {
 	SizePt     int                    // current point size; mutable per-tab via AdjustFontSize
 	Features   []string               // OpenType feature tags (e.g. "-calt", "+ss01")
 	Options    pangoextra.FontOptions // Cairo hint/AA settings; user values override defaults
+
+	// AdjustCellWidth, AdjustCellHeight, AdjustFontBaseline are
+	// Ghostty-style cell metric tweaks. Applied in measureCells. Empty
+	// (the default) is no-op so existing configs are unchanged.
+	AdjustCellWidth    config.Adjust
+	AdjustCellHeight   config.Adjust
+	AdjustFontBaseline config.Adjust
+
+	// FontThicken triggers double-draw glyph rendering at a 0.5px
+	// horizontal offset. Approximates Apple Core Text stem darkening
+	// for non-Apple rendering pipelines (notably Cairo on macOS).
+	FontThicken bool
 }
 
 // BuildFontConfig assembles a FontConfig from the user config layered on
@@ -39,11 +51,15 @@ func BuildFontConfig(cfg config.Config) FontConfig {
 		opts.HintMetrics = v
 	}
 	return FontConfig{
-		Family:     cfg.FontFamily,
-		FamilyBold: cfg.FontFamilyBold,
-		SizePt:     cfg.FontSizePt,
-		Features:   append([]string(nil), cfg.FontFeatures...),
-		Options:    opts,
+		Family:             cfg.FontFamily,
+		FamilyBold:         cfg.FontFamilyBold,
+		SizePt:             cfg.FontSizePt,
+		Features:           append([]string(nil), cfg.FontFeatures...),
+		Options:            opts,
+		AdjustCellWidth:    cfg.AdjustCellWidth,
+		AdjustCellHeight:   cfg.AdjustCellHeight,
+		AdjustFontBaseline: cfg.AdjustFontBaseline,
+		FontThicken:        cfg.FontThicken,
 	}
 }
 
