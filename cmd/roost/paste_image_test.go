@@ -132,11 +132,12 @@ func TestWriteClipboardImageGIFReencode(t *testing.T) {
 }
 
 func TestWriteClipboardImageRejectsHugePixelCount(t *testing.T) {
-	// 7000x7000 = 49 MP, above the 40 MP cap. We encode a real JPEG so
-	// DecodeConfig succeeds and only the pixel-count guard trips —
-	// proving image.Decode never allocates the ~196 MiB RGBA buffer
-	// that would follow.
-	big := makeRGBA(t, 7000, 7000)
+	// 7000x7000 = 49 MP, above the 40 MP cap. Use image.NewPaletted to
+	// keep the source buffer to ~49 MiB (1 byte/pixel) instead of the
+	// ~196 MiB an RGBA would cost — the JPEG encoder accepts both, and
+	// only the encoded output's *config* matters for the guard we're
+	// testing.
+	big := image.NewPaletted(image.Rect(0, 0, 7000, 7000), color.Palette{color.Black, color.White})
 	jpegBytes := encodeJPEG(t, big)
 	_, err := writeClipboardImage(jpegBytes, "image/jpeg")
 	if err == nil {
