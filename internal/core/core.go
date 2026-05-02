@@ -74,14 +74,16 @@ func ValidTabAgentState(s string) bool {
 // as a bool flip — if unlock UX lands, this contract grows to a
 // distinct event kind or a tri-state.
 type Event struct {
-	Kind       EventKind
-	Project    *Project      // populated for project events
-	Tab        *Tab          // populated for tab events
-	ProjectID  int64         // populated for ProjectDeleted, EventTabDeleted
-	TabID      int64         // populated for TabDeleted, EventNotification, EventTabStateChanged, EventTabNotificationChanged
-	Title      string        // populated for EventNotification
-	Body       string        // populated for EventNotification
-	AgentState TabAgentState // populated for EventTabStateChanged
+	Kind              EventKind
+	Project           *Project      // populated for project events
+	Tab               *Tab          // populated for tab events
+	ProjectID         int64         // populated for ProjectDeleted, EventTabDeleted, EventTabsReordered
+	TabID             int64         // populated for TabDeleted, EventNotification, EventTabStateChanged, EventTabNotificationChanged
+	Title             string        // populated for EventNotification
+	Body              string        // populated for EventNotification
+	AgentState        TabAgentState // populated for EventTabStateChanged
+	OrderedProjectIDs []int64       // populated for EventProjectsReordered
+	OrderedTabIDs     []int64       // populated for EventTabsReordered
 }
 
 // EventKind is the type discriminator for Event.
@@ -106,6 +108,12 @@ const (
 	// independently of EventNotification (which only fires on new
 	// notifications, not on the user clearing them by focusing the tab).
 	EventTabNotificationChanged
+	// EventProjectsReordered fires after the sidebar order is persisted.
+	// OrderedProjectIDs holds the new order (positions 0..N-1).
+	EventProjectsReordered
+	// EventTabsReordered fires after a project's tab order is persisted.
+	// ProjectID identifies the project; OrderedTabIDs holds the new order.
+	EventTabsReordered
 )
 
 // Workspace owns the persistent state and broadcasts changes.
@@ -220,6 +228,31 @@ func (w *Workspace) DeleteProject(id int64) error {
 		w.clearTabState(t.ID)
 	}
 	w.emit(Event{Kind: EventProjectDeleted, ProjectID: id})
+	return nil
+}
+
+// ReorderProjects persists a new sidebar order and emits an event. The
+// caller (typically the UI after a drag) is responsible for sending the
+// full set of project IDs in their desired visual order.
+func (w *Workspace) ReorderProjects(orderedIDs []int64) error {
+	if err := w.store.ReorderProjects(orderedIDs); err != nil {
+		return err
+	}
+	// Copy so callers mutating their slice can't affect subscribers.
+	ids := append([]int64(nil), orderedIDs...)
+	w.emit(Event{Kind: EventProjectsReordered, OrderedProjectIDs: ids})
+	return nil
+}
+
+// ReorderTabs persists a new tab order within a project and emits an
+// event. orderedIDs must be the project's full tab set in desired
+// visual order.
+func (w *Workspace) ReorderTabs(projectID int64, orderedIDs []int64) error {
+	if err := w.store.ReorderTabs(projectID, orderedIDs); err != nil {
+		return err
+	}
+	ids := append([]int64(nil), orderedIDs...)
+	w.emit(Event{Kind: EventTabsReordered, ProjectID: projectID, OrderedTabIDs: ids})
 	return nil
 }
 

@@ -218,6 +218,62 @@ func (s *Store) DeleteProject(id int64) error {
 	return err
 }
 
+// ReorderProjects renumbers project positions to 0..N-1 in the order
+// given by orderedIDs. The set of IDs must match the persisted set
+// exactly — a missing or extra id aborts the transaction so we never
+// half-write a partial reorder.
+func (s *Store) ReorderProjects(orderedIDs []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(`SELECT id FROM project`)
+	if err != nil {
+		return err
+	}
+	existing := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(orderedIDs) != len(existing) {
+		return fmt.Errorf("store: ReorderProjects expected %d ids, got %d", len(existing), len(orderedIDs))
+	}
+	seen := map[int64]bool{}
+	for _, id := range orderedIDs {
+		if !existing[id] {
+			return fmt.Errorf("store: ReorderProjects unknown id %d", id)
+		}
+		if seen[id] {
+			return fmt.Errorf("store: ReorderProjects duplicate id %d", id)
+		}
+		seen[id] = true
+	}
+
+	stmt, err := tx.Prepare(`UPDATE project SET position = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for i, id := range orderedIDs {
+		if _, err := stmt.Exec(i, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // CreateTab inserts a tab inside a project. Position is auto-assigned to
 // the end of the project's tab list.
 func (s *Store) CreateTab(projectID int64, cwd string) (Tab, error) {
@@ -349,6 +405,62 @@ func (s *Store) TouchTab(id int64) error {
 func (s *Store) DeleteTab(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM tab WHERE id = ?`, id)
 	return err
+}
+
+// ReorderTabs renumbers tab positions inside projectID to 0..N-1 in
+// the order given by orderedIDs. The set of IDs must match the
+// project's persisted tab set exactly; any mismatch aborts.
+func (s *Store) ReorderTabs(projectID int64, orderedIDs []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(`SELECT id FROM tab WHERE project_id = ?`, projectID)
+	if err != nil {
+		return err
+	}
+	existing := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(orderedIDs) != len(existing) {
+		return fmt.Errorf("store: ReorderTabs(project %d) expected %d ids, got %d",
+			projectID, len(existing), len(orderedIDs))
+	}
+	seen := map[int64]bool{}
+	for _, id := range orderedIDs {
+		if !existing[id] {
+			return fmt.Errorf("store: ReorderTabs(project %d) unknown id %d", projectID, id)
+		}
+		if seen[id] {
+			return fmt.Errorf("store: ReorderTabs(project %d) duplicate id %d", projectID, id)
+		}
+		seen[id] = true
+	}
+
+	stmt, err := tx.Prepare(`UPDATE tab SET position = ? WHERE id = ? AND project_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for i, id := range orderedIDs {
+		if _, err := stmt.Exec(i, id, projectID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 var errProjectNotFound = errors.New("store: project not found")

@@ -402,6 +402,56 @@ func TestNotifyRequiresTitle(t *testing.T) {
 	}
 }
 
+func TestReorderProjectsEmitsEvent(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(16)
+
+	a, _ := w.CreateProject("a", "/a")
+	<-ch
+	b, _ := w.CreateProject("b", "/b")
+	<-ch
+
+	if err := w.ReorderProjects([]int64{b.ID, a.ID}); err != nil {
+		t.Fatalf("ReorderProjects: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventProjectsReordered ||
+		len(ev.OrderedProjectIDs) != 2 ||
+		ev.OrderedProjectIDs[0] != b.ID || ev.OrderedProjectIDs[1] != a.ID {
+		t.Fatalf("ReorderProjects event: %+v", ev)
+	}
+
+	loaded, err := w.LoadAll()
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if len(loaded) < 2 || loaded[0].Project.ID != b.ID || loaded[1].Project.ID != a.ID {
+		t.Fatalf("LoadAll order after reorder: %+v", loaded)
+	}
+}
+
+func TestReorderTabsEmitsEvent(t *testing.T) {
+	w := newWorkspace(t)
+	ch := w.Subscribe(16)
+
+	p, _ := w.CreateProject("p", "/p")
+	<-ch
+	t1, _ := w.CreateTab(p.ID, "/p/1")
+	<-ch
+	t2, _ := w.CreateTab(p.ID, "/p/2")
+	<-ch
+
+	if err := w.ReorderTabs(p.ID, []int64{t2.ID, t1.ID}); err != nil {
+		t.Fatalf("ReorderTabs: %v", err)
+	}
+	ev := <-ch
+	if ev.Kind != EventTabsReordered || ev.ProjectID != p.ID ||
+		len(ev.OrderedTabIDs) != 2 ||
+		ev.OrderedTabIDs[0] != t2.ID || ev.OrderedTabIDs[1] != t1.ID {
+		t.Fatalf("ReorderTabs event: %+v", ev)
+	}
+}
+
 func TestEventChannelDoesNotBlockOnFullSubscriber(t *testing.T) {
 	w := newWorkspace(t)
 	_ = w.Subscribe(1) // never drained
