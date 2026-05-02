@@ -26,6 +26,14 @@ import (
 // cmux's 10 MiB ceiling and keeps the in-process decode bounded.
 const pasteImageMaxBytes = 10 * 1024 * 1024
 
+// pasteImageMaxPixels guards the re-encode path against compression-bomb
+// inputs: a 10 MiB JPEG can describe an 8000x8000 image whose decoded
+// RGBA buffer is 256 MiB. We check dimensions via image.DecodeConfig
+// before allocating the full buffer. 40 megapixels comfortably covers
+// 5K (14.7 MP) and 8K (33 MP) screenshots while rejecting the obvious
+// adversarial cases.
+const pasteImageMaxPixels = 40 * 1024 * 1024
+
 // clipboardImageMimes is the priority order we use when negotiating an
 // image format with the clipboard. PNG is first because it needs no
 // re-encoding; the rest are stdlib-decodable and re-encoded to PNG
@@ -142,6 +150,13 @@ func writeClipboardImage(data []byte, mime string) (string, error) {
 	if mime == "image/png" {
 		pngBytes = data
 	} else {
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return "", fmt.Errorf("decode %s config: %w", mime, err)
+		}
+		if int64(cfg.Width)*int64(cfg.Height) > pasteImageMaxPixels {
+			return "", fmt.Errorf("clipboard image too large to decode: %dx%d", cfg.Width, cfg.Height)
+		}
 		img, _, err := image.Decode(bytes.NewReader(data))
 		if err != nil {
 			return "", fmt.Errorf("decode %s: %w", mime, err)

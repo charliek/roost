@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"os"
@@ -36,6 +37,22 @@ func encodeJPEG(t *testing.T, img image.Image) []byte {
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, nil); err != nil {
 		t.Fatalf("encode jpeg: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func encodeGIF(t *testing.T, w, h int) []byte {
+	t.Helper()
+	palette := color.Palette{color.Black, color.White, color.RGBA{R: 0xff, A: 0xff}}
+	frame := image.NewPaletted(image.Rect(0, 0, w, h), palette)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			frame.SetColorIndex(x, y, uint8((x+y)%len(palette)))
+		}
+	}
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, frame, nil); err != nil {
+		t.Fatalf("encode gif: %v", err)
 	}
 	return buf.Bytes()
 }
@@ -85,6 +102,48 @@ func TestWriteClipboardImageJPEGReencode(t *testing.T) {
 	}
 	if cfg.Width != 8 || cfg.Height != 6 {
 		t.Errorf("dimensions = %dx%d, want 8x6", cfg.Width, cfg.Height)
+	}
+}
+
+func TestWriteClipboardImageGIFReencode(t *testing.T) {
+	src := encodeGIF(t, 5, 7)
+
+	path, err := writeClipboardImage(src, "image/gif")
+	if err != nil {
+		t.Fatalf("writeClipboardImage: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	cfg, format, err := image.DecodeConfig(f)
+	if err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if format != "png" {
+		t.Errorf("output format = %q, want png", format)
+	}
+	if cfg.Width != 5 || cfg.Height != 7 {
+		t.Errorf("dimensions = %dx%d, want 5x7", cfg.Width, cfg.Height)
+	}
+}
+
+func TestWriteClipboardImageRejectsHugePixelCount(t *testing.T) {
+	// 7000x7000 = 49 MP, above the 40 MP cap. We encode a real JPEG so
+	// DecodeConfig succeeds and only the pixel-count guard trips —
+	// proving image.Decode never allocates the ~196 MiB RGBA buffer
+	// that would follow.
+	big := makeRGBA(t, 7000, 7000)
+	jpegBytes := encodeJPEG(t, big)
+	_, err := writeClipboardImage(jpegBytes, "image/jpeg")
+	if err == nil {
+		t.Fatalf("expected pixel-count rejection for 7000x7000 jpeg")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("expected 'too large' error, got %v", err)
 	}
 }
 
