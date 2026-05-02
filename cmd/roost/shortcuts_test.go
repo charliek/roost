@@ -24,6 +24,17 @@ func TestTriggerToAccelAliases(t *testing.T) {
 		"ctrl+shift+v":      "<Control><Shift>v",
 		"ctrl+shift+1":      "<Control><Shift>1",
 		"super+bracketleft": "<Meta>bracketleft",
+		// Font sizing default triggers — both the +/- and =/-/0 forms
+		// since cmd-+ on US layouts is typically typed as cmd-shift-=
+		// and many users hit cmd-= instead.
+		"super+plus":  "<Meta>plus",
+		"super+equal": "<Meta>equal",
+		"super+minus": "<Meta>minus",
+		"super+0":     "<Meta>0",
+		"ctrl+plus":   "<Control>plus",
+		"ctrl+equal":  "<Control>equal",
+		"ctrl+minus":  "<Control>minus",
+		"ctrl+0":      "<Control>0",
 	}
 	for in, want := range cases {
 		got, ok := triggerToAccel(in)

@@ -1,6 +1,6 @@
 # Development Setup
 
-Roost is a Go module with one cgo package (`internal/ghostty`) that links a Zig-built static library. Outside of the Zig step, day-to-day development is normal `go build` / `go test`.
+Roost is a Go module with two cgo packages — `internal/ghostty` (links the Zig-built libghostty-vt static library) and `internal/pangoextra` (a small wrapper around `pango_cairo_context_set_font_options`, linked dynamically via `pkg-config: pangocairo`). Outside of the Zig step for libghostty-vt, day-to-day development is normal `go build` / `go test`.
 
 ## Prerequisites
 
@@ -47,6 +47,7 @@ Tests live next to the code they exercise (no separate `tests/` tree):
 | `internal/store`     | SQLite schema, migrations, CRUD, cascade delete                     |
 | `internal/core`      | Workspace event emission, default-state bootstrap                   |
 | `internal/ghostty`   | cgo smoke tests, render-state walking, title/pwd getters            |
+| `internal/pangoextra` | cgo smoke tests for the Pango/Cairo font-options wrapper           |
 | `internal/pty`       | PTY spawn → vt_write → render-state pipeline (full backend, no GTK) |
 | `internal/osc`       | OSC 9 / 777 streaming parser, split reads, ST terminator, truncation |
 | `internal/ipc`       | JSON-RPC roundtrip, error envelope, close behaviour                  |
@@ -82,4 +83,4 @@ The full set is in `CLAUDE.md` at the repo root. Highlights:
 - Errors are returned, not logged-and-swallowed. Log at the boundary that handles them.
 - Default to no comments. Add one when the *why* is non-obvious.
 - All UI calls happen on the main thread; goroutines marshal via `glib.IdleAdd`. See [Architecture](../reference/architecture.md#threading-contract).
-- cgo is allowed only in `internal/ghostty`. Everything else is pure Go.
+- cgo is allowed only in `internal/ghostty` (libghostty-vt embedding) and `internal/pangoextra` (gotk4 binding workaround for Pango/Cairo font options). Every other package is pure Go.

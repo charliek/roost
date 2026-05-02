@@ -14,6 +14,7 @@ import (
 	"github.com/charliek/roost/internal/core"
 	"github.com/charliek/roost/internal/ghostty"
 	"github.com/charliek/roost/internal/osc"
+	"github.com/charliek/roost/internal/pangoextra"
 	"github.com/charliek/roost/internal/pty"
 )
 
@@ -36,12 +37,15 @@ type Session struct {
 	mouse *ghostty.MouseEncoder
 	da    *gtk.DrawingArea
 
-	font     *pango.FontDescription
-	fontBold *pango.FontDescription
-	cellW    int
-	cellH    int
-	cols     uint16
-	rows     uint16
+	font             *pango.FontDescription
+	fontBold         *pango.FontDescription
+	fontFeaturesAttr *pango.AttrList
+	fontCfg          FontConfig
+	defaultFontSize  int // for ResetFontSize; immutable after construction
+	cellW            int
+	cellH            int
+	cols             uint16
+	rows             uint16
 
 	// theme is the source of truth for fg/bg/cursor/palette across this
 	// session. It is what gets pushed into libghostty (SetTheme) and
@@ -129,9 +133,12 @@ type Session struct {
 // theme is resolved by the caller (App). Resolving once at the app
 // boundary keeps a bad theme name from logging a warning per tab.
 //
+// fontCfg is the per-tab font setup; passed by value because each tab
+// owns its own copy and may mutate SizePt at runtime via cmd+/-.
+//
 // extraEnv is forwarded to pty.SpawnShell so callers can inject
 // ROOST_TAB_ID + ROOST_SOCKET (or any tab-specific env).
-func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily string, fontSizePt int, theme Theme, extraEnv ...string) (*Session, error) {
+func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg FontConfig, theme Theme, extraEnv ...string) (*Session, error) {
 	term, err := ghostty.NewTerminal(ghostty.Options{
 		Cols: cols, Rows: rows, MaxScrollback: 2000,
 	})
@@ -187,25 +194,40 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 	// family. Avoids Pango falling back to Verdana on macOS when the
 	// head of the list is missing (which produces wide cells with
 	// narrow glyphs and huge gaps between letters).
-	font.SetFamily(pickFontFamily(fontFamily))
-	font.SetSize(fontSizePt * pango.SCALE)
+	font.SetFamily(pickFontFamily(fontCfg.Family))
+	font.SetSize(fontCfg.SizePt * pango.SCALE)
 	fontBold := font.Copy()
+	if fontCfg.FamilyBold != "" {
+		fontBold.SetFamily(pickFontFamily(fontCfg.FamilyBold))
+	}
 	fontBold.SetWeight(pango.WeightBold)
+
+	// Build the OpenType font-features attribute list once. Pango
+	// expects a single comma-separated value (e.g. "-calt,+ss01"), not
+	// one attribute per feature. Reused per-frame in drawTerminal.
+	var fontFeaturesAttr *pango.AttrList
+	if joined := fontCfg.JoinedFeatures(); joined != "" {
+		fontFeaturesAttr = pango.NewAttrList()
+		fontFeaturesAttr.Insert(pango.NewAttrFontFeatures(joined))
+	}
 
 	s := &Session{
 		ws: ws, tab: tab,
 		pty: p, term: term, rs: rs, keys: keys, mouse: mouse,
-		font:          font,
-		fontBold:      fontBold,
-		cols:          cols,
-		rows:          rows,
-		theme:         theme,
-		pumpDone:      make(chan struct{}),
-		writeChan:     make(chan []byte, 256),
-		stopWrite:     make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		cursorOn:      true,
-		windowFocused: true,
+		font:             font,
+		fontBold:         fontBold,
+		fontFeaturesAttr: fontFeaturesAttr,
+		fontCfg:          fontCfg,
+		defaultFontSize:  fontCfg.SizePt,
+		cols:             cols,
+		rows:             rows,
+		theme:            theme,
+		pumpDone:         make(chan struct{}),
+		writeChan:        make(chan []byte, 256),
+		stopWrite:        make(chan struct{}),
+		writerDone:       make(chan struct{}),
+		cursorOn:         true,
+		windowFocused:    true,
 	}
 	go s.runWriter()
 
@@ -228,13 +250,14 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontFamily 
 	s.da.SetCanFocus(true)
 	s.da.SetFocusable(true)
 	s.da.SetFocusOnClick(true)
-	// NOTE: pango_cairo_context_set_font_options would normally pin
-	// glyph metrics to the integer pixel grid (the single biggest text
-	// crispness win) but the gotk4 binding for ContextSetFontOptions
-	// crashes — it expects cairo.FontOptions to follow the gextras
-	// "record" struct convention, which the cairo binding does not.
-	// We rely on integer cellW/cellH + bold-via-FontDescription
-	// instead; revisit if/when that binding is fixed upstream.
+	// Apply Cairo font options (hint_metrics, antialias, hint_style)
+	// before measuring cells so the metrics reflect the snapped values.
+	// hint_metrics=on is the lever that snaps glyph advances to integer
+	// pixels, which is what makes monospace cells look crisp on a
+	// cell-aligned grid. Wraps pango_cairo_context_set_font_options
+	// directly because gotk4's pangocairo.ContextSetFontOptions binding
+	// crashes — see internal/pangoextra and CLAUDE.md.
+	pangoextra.SetFontOptions(s.da.PangoContext(), s.fontCfg.Options)
 	s.measureCells()
 	s.da.SetDrawFunc(func(_ *gtk.DrawingArea, cr *cairo.Context, _, _ int) {
 		drawTerminal(cr, s)
@@ -531,18 +554,40 @@ func (s *Session) checkTitleAndPWD() {
 // onResize reflows the terminal to fit the new pixel dimensions. Called
 // by GtkDrawingArea every time it's allocated a new size.
 func (s *Session) onResize(width, height int) {
+	s.applyGeometry(width, height, false)
+}
+
+// applyGeometry pushes the current cellW/cellH into libghostty + the
+// PTY for the given pixel area. Shared between GtkDrawingArea resize
+// events and AdjustFontSize, where the area is unchanged but the cell
+// dimensions just moved.
+//
+// force=false short-circuits when neither cols nor rows changed (the
+// resize-event hot path; cheap insurance against GTK's "size changed"
+// callbacks that don't actually change cell counts). force=true is the
+// font-resize path: cell dimensions changed even when grid counts
+// happen to round to the same value, so libghostty needs to hear the
+// new pixel-per-cell numbers regardless.
+func (s *Session) applyGeometry(width, height int, force bool) {
 	if s.closed.Load() {
 		return
 	}
-	cols := uint16((width - 2*pad) / s.cellW)
-	rows := uint16((height - 2*pad) / s.cellH)
-	if cols < 1 {
-		cols = 1
+	// Compute in signed int and clamp before the uint16 cast — when
+	// width or height is smaller than 2*pad (e.g. before the
+	// DrawingArea is realized, when Width()/Height() return 0), the
+	// subtraction goes negative and would wrap into a huge uint16
+	// otherwise, slipping past the < 1 floor.
+	colsI := (width - 2*pad) / s.cellW
+	rowsI := (height - 2*pad) / s.cellH
+	if colsI < 1 {
+		colsI = 1
 	}
-	if rows < 1 {
-		rows = 1
+	if rowsI < 1 {
+		rowsI = 1
 	}
-	if cols == s.cols && rows == s.rows {
+	cols := uint16(colsI)
+	rows := uint16(rowsI)
+	if !force && cols == s.cols && rows == s.rows {
 		return
 	}
 	s.cols = cols
@@ -568,6 +613,51 @@ func (s *Session) onResize(width, height int) {
 	)
 	_ = s.rs.Update(s.term)
 	s.da.QueueDraw()
+}
+
+// minFontSizePt and maxFontSizePt clamp runtime font-size adjustments.
+// Bounds are intentionally generous; the user can still set anything
+// in between via the config file, and clamp protects only the cmd+/-
+// hot path from accidentally shrinking text to invisibility or growing
+// it past a single screen of cells.
+const (
+	minFontSizePt = 6
+	maxFontSizePt = 72
+)
+
+// AdjustFontSize changes this tab's font size by delta points and
+// reflows the cell grid in place. Per-tab and held in memory only —
+// closing and reopening the tab returns to the config default. Out-of
+// -range deltas saturate at minFontSizePt / maxFontSizePt; a delta
+// that would land on the current size is a no-op.
+func (s *Session) AdjustFontSize(delta int) {
+	s.setFontSize(s.fontCfg.SizePt + delta)
+}
+
+// ResetFontSize returns this tab's font size to the value loaded from
+// config at session-construction time.
+func (s *Session) ResetFontSize() {
+	s.setFontSize(s.defaultFontSize)
+}
+
+func (s *Session) setFontSize(newPt int) {
+	if newPt < minFontSizePt {
+		newPt = minFontSizePt
+	} else if newPt > maxFontSizePt {
+		newPt = maxFontSizePt
+	}
+	if newPt == s.fontCfg.SizePt {
+		return
+	}
+	s.fontCfg.SizePt = newPt
+	s.font.SetSize(newPt * pango.SCALE)
+	s.fontBold.SetSize(newPt * pango.SCALE)
+	s.measureCells()
+	// Window pixel area is unchanged; re-derive cols/rows from the
+	// new cell dimensions and force the cascade so libghostty sees
+	// the new pixel-per-cell ratio even if the cell count rounds the
+	// same way.
+	s.applyGeometry(s.da.Width(), s.da.Height(), true)
 }
 
 // handleScroll converts a GTK scroll event into one of three actions,

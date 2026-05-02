@@ -2,11 +2,98 @@ package main
 
 import (
 	"log/slog"
+	"runtime"
 	"strings"
 
 	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotk4/pkg/pangocairo"
+
+	"github.com/charliek/roost/internal/config"
+	"github.com/charliek/roost/internal/pangoextra"
 )
+
+// FontConfig is the per-session font setup: family + size + features +
+// Cairo rendering options. Built once at App startup from the user
+// config + platform defaults; passed by value into NewSession so a tab
+// owns its own copy and can mutate SizePt at runtime (cmd+/-) without
+// affecting other tabs or future ones.
+type FontConfig struct {
+	Family     string                 // resolved through pickFontFamily
+	FamilyBold string                 // optional override; "" means synthesize bold from Family
+	SizePt     int                    // current point size; mutable per-tab via AdjustFontSize
+	Features   []string               // OpenType feature tags (e.g. "-calt", "+ss01")
+	Options    pangoextra.FontOptions // Cairo hint/AA settings; user values override defaults
+}
+
+// BuildFontConfig assembles a FontConfig from the user config layered on
+// top of the platform defaults. Empty config fields keep the defaults.
+func BuildFontConfig(cfg config.Config) FontConfig {
+	opts := defaultFontOptions()
+	if v, ok := parseAntialias(cfg.Antialias); ok {
+		opts.Antialias = v
+	}
+	if v, ok := parseHintStyle(cfg.HintStyle); ok {
+		opts.HintStyle = v
+	}
+	if v, ok := parseHintMetrics(cfg.HintMetrics); ok {
+		opts.HintMetrics = v
+	}
+	return FontConfig{
+		Family:     cfg.FontFamily,
+		FamilyBold: cfg.FontFamilyBold,
+		SizePt:     cfg.FontSizePt,
+		Features:   append([]string(nil), cfg.FontFeatures...),
+		Options:    opts,
+	}
+}
+
+// JoinedFeatures returns the OpenType features as a single
+// comma-separated string ready for pango.NewAttrFontFeatures, or "" if
+// there are none. Pango's font-features attribute accepts a single
+// comma-separated list, not multiple attributes.
+func (fc FontConfig) JoinedFeatures() string {
+	return strings.Join(fc.Features, ",")
+}
+
+// parseAntialias / parseHintStyle / parseHintMetrics map a validated
+// config string to a pangoextra enum. The boolean is false when the
+// input is empty or "default" (in which case the caller should keep
+// the platform default rather than overriding it).
+func parseAntialias(s string) (pangoextra.Antialias, bool) {
+	switch s {
+	case "none":
+		return pangoextra.AntialiasNone, true
+	case "gray":
+		return pangoextra.AntialiasGray, true
+	case "subpixel":
+		return pangoextra.AntialiasSubpixel, true
+	}
+	return 0, false
+}
+
+func parseHintStyle(s string) (pangoextra.HintStyle, bool) {
+	switch s {
+	case "none":
+		return pangoextra.HintStyleNone, true
+	case "slight":
+		return pangoextra.HintStyleSlight, true
+	case "medium":
+		return pangoextra.HintStyleMedium, true
+	case "full":
+		return pangoextra.HintStyleFull, true
+	}
+	return 0, false
+}
+
+func parseHintMetrics(s string) (pangoextra.HintMetrics, bool) {
+	switch s {
+	case "on":
+		return pangoextra.HintMetricsOn, true
+	case "off":
+		return pangoextra.HintMetricsOff, true
+	}
+	return 0, false
+}
 
 // pickFontFamily returns the first family from a comma-separated list
 // that the system actually has installed. Falls back to "monospace"
@@ -57,6 +144,25 @@ func splitFamilies(s string) []string {
 		}
 	}
 	return out
+}
+
+// defaultFontOptions returns the platform's recommended Cairo font
+// options. hint_metrics=on is always set — it snaps glyph advance
+// widths to integer pixels and is the single biggest contributor to
+// crisp monospace cells. macOS native rendering is grayscale AA without
+// hinting (Apple's font designs aren't built for it); the typical
+// FreeType setup on Linux is grayscale AA with slight hinting.
+func defaultFontOptions() pangoextra.FontOptions {
+	opts := pangoextra.FontOptions{
+		Antialias:   pangoextra.AntialiasGray,
+		HintMetrics: pangoextra.HintMetricsOn,
+	}
+	if runtime.GOOS == "darwin" {
+		opts.HintStyle = pangoextra.HintStyleNone
+	} else {
+		opts.HintStyle = pangoextra.HintStyleSlight
+	}
+	return opts
 }
 
 // installedFamilies returns a lower-cased set of every family the font

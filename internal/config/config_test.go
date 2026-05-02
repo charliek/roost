@@ -178,6 +178,90 @@ func TestLoadCommentsIgnored(t *testing.T) {
 	}
 }
 
+func TestLoadFontFamilyBold(t *testing.T) {
+	p := writeConfig(t, "font_family_bold = Berkeley Mono Bold\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FontFamilyBold != "Berkeley Mono Bold" {
+		t.Fatalf("font_family_bold not applied: %q", cfg.FontFamilyBold)
+	}
+}
+
+func TestLoadFontFeatureRepeatable(t *testing.T) {
+	p := writeConfig(t, ""+
+		"font_feature = -calt\n"+
+		"font_feature = +ss01\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.FontFeatures) != 2 ||
+		cfg.FontFeatures[0] != "-calt" ||
+		cfg.FontFeatures[1] != "+ss01" {
+		t.Fatalf("font_feature accumulation: %+v", cfg.FontFeatures)
+	}
+}
+
+func TestLoadFontFeatureEmptyRejected(t *testing.T) {
+	p := writeConfig(t, "font_feature = \n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for empty font_feature")
+	}
+}
+
+func TestLoadHintAndAAValid(t *testing.T) {
+	p := writeConfig(t, ""+
+		"hint_metrics = on\n"+
+		"hint_style = slight\n"+
+		"antialias = subpixel\n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HintMetrics != "on" || cfg.HintStyle != "slight" || cfg.Antialias != "subpixel" {
+		t.Fatalf("hint/aa not applied: %+v", cfg)
+	}
+}
+
+func TestLoadHintAndAAEmptyAccepted(t *testing.T) {
+	// Empty value means "use the platform default" per docs/reference/fonts.md.
+	// Parser must accept it without error so the documented config syntax works.
+	p := writeConfig(t, ""+
+		"hint_metrics = \n"+
+		"hint_style = \n"+
+		"antialias = \n")
+	cfg, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HintMetrics != "" || cfg.HintStyle != "" || cfg.Antialias != "" {
+		t.Errorf("blank values should round-trip as empty strings: %+v", cfg)
+	}
+}
+
+func TestLoadHintMetricsInvalid(t *testing.T) {
+	p := writeConfig(t, "hint_metrics = sometimes\n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for invalid hint_metrics value")
+	}
+}
+
+func TestLoadHintStyleInvalid(t *testing.T) {
+	p := writeConfig(t, "hint_style = aggressive\n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for invalid hint_style value")
+	}
+}
+
+func TestLoadAntialiasInvalid(t *testing.T) {
+	p := writeConfig(t, "antialias = quantum\n")
+	if _, err := p.Load(); err == nil {
+		t.Fatalf("expected error for invalid antialias value")
+	}
+}
+
 // TestLoadKeybindTrailingHashNotStripped pins the parser's behavior
 // when a `#` appears after the action — it is NOT treated as an inline
 // comment, so it ends up as part of the action string. Documentation
