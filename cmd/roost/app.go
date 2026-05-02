@@ -65,6 +65,15 @@ type App struct {
 	sidebar     *gtk.ListBox
 	projectRows map[int64]*projectRow
 
+	// Sidebar drag-reorder state. draggedProjectID is 0 when no drag is
+	// in progress. dragOriginalOrder is captured at drag-begin for the
+	// cancel-restore path. dropOccurred is set in the drop handler only
+	// after persistence succeeds; drag-end consults it to decide whether
+	// to roll the UI back to dragOriginalOrder.
+	draggedProjectID  int64
+	dragOriginalOrder []int64
+	dropOccurred      bool
+
 	// All open tab sessions, keyed by tab ID.
 	sessions map[int64]*Session
 	// page->tab lookup. Keyed by the AdwTabPage's underlying GObject
@@ -213,6 +222,9 @@ func (a *App) activate() {
 		}
 		a.selectProject(pid)
 	})
+
+	a.installSidebarDropTarget()
+
 	sidebarScroll := gtk.NewScrolledWindow()
 	sidebarScroll.SetChild(a.sidebar)
 	sidebarScroll.SetSizeRequest(220, -1)
@@ -747,6 +759,7 @@ func (a *App) addProjectUI(p core.Project) {
 
 	a.sidebar.Append(pr.row)
 	a.projectRows[pid] = pr
+	a.installRowDragSource(pr, pid)
 
 	view := adw.NewTabView()
 	view.ConnectClosePage(func(page *adw.TabPage) bool {
@@ -782,6 +795,9 @@ func (a *App) addProjectUI(p core.Project) {
 			a.updateHeader()
 		}
 	})
+	view.ConnectPageReordered(func(_ *adw.TabPage, _ int) {
+		a.persistTabOrder(pid, view)
+	})
 
 	bar := adw.NewTabBar()
 	bar.SetView(view)
@@ -794,6 +810,227 @@ func (a *App) addProjectUI(p core.Project) {
 	stackName := strconv.FormatInt(pid, 10)
 	a.stack.AddNamed(box, stackName)
 	a.projectViews[pid] = view
+}
+
+// installRowDragSource wires a drag-source controller on a project row
+// so it can be picked up. The dragged content is the project's int64
+// ID. Drop handling is owned by the listbox-level drop target installed
+// in installSidebarDropTarget.
+//
+// Visual feedback while a drag is in progress: the dragged row is
+// dimmed to ~40% via direct gtk_widget_set_opacity. CSS-based styling
+// of the source row (background / box-shadow on a class we add here)
+// did not render reliably in our environment despite multiple known-
+// working patterns; the opacity API is a separate code path from CSS
+// and applies cleanly. On drag-end opacity reverts to 1.0.
+func (a *App) installRowDragSource(pr *projectRow, pid int64) {
+	src := gtk.NewDragSource()
+	src.SetActions(gdk.ActionMove)
+	src.ConnectPrepare(func(_, _ float64) *gdk.ContentProvider {
+		// Don't initiate a drag while the user is renaming inline —
+		// the GtkEntry needs to keep focus + own mouse input.
+		if pr.editing {
+			return nil
+		}
+		return gdk.NewContentProviderForValue(coreglib.NewValue(pid))
+	})
+	src.ConnectDragBegin(func(_ gdk.Dragger) {
+		pr.row.SetOpacity(0.4)
+		a.draggedProjectID = pid
+		a.dragOriginalOrder = a.sidebarOrder()
+		a.dropOccurred = false
+	})
+	// deleteData is documented as "the source should delete its data
+	// after a MOVE" — that's adjacent to "drop succeeded" but not the
+	// same contract, so we ignore it and rely on dropOccurred (set
+	// inside ConnectDrop only after persistence) for the cancel test.
+	src.ConnectDragEnd(func(_ gdk.Dragger, _ bool) {
+		pr.row.SetOpacity(1.0)
+		if !a.dropOccurred {
+			a.applySidebarOrder(a.dragOriginalOrder)
+		}
+		a.draggedProjectID = 0
+		a.dragOriginalOrder = nil
+		a.dropOccurred = false
+	})
+	pr.row.AddController(src)
+}
+
+// shuffleSidebarToward moves srcID's row in the sidebar listbox to the
+// position implied by rawTargetIdx (an insertion point in the *current*
+// visual order, with the source still in place). No-op when the drop
+// would land on the source's existing slot. No persistence — the drop
+// handler owns that, and only after a successful drop.
+//
+// Relies on a.projectRows[srcID].row keeping the row widget alive
+// across Remove/Insert; otherwise the active GdkDrag would lose its
+// source widget.
+func (a *App) shuffleSidebarToward(srcID int64, rawTargetIdx int) {
+	pr, ok := a.projectRows[srcID]
+	if !ok {
+		return
+	}
+	sourceIdx := pr.row.Index()
+	if sourceIdx < 0 {
+		return
+	}
+	insertIdx, noop := computeInsertIdx(sourceIdx, rawTargetIdx)
+	if noop {
+		return
+	}
+	// Preserve the previously-active project across the remove/insert.
+	// Removing the selected row in a SelectionBrowse listbox clears
+	// selection, which would otherwise switch projects whenever the
+	// active row is the one being dragged.
+	prevActiveID := a.activeProjectID
+	a.sidebar.Remove(pr.row)
+	a.sidebar.Insert(pr.row, insertIdx)
+	if prev, ok := a.projectRows[prevActiveID]; ok {
+		a.sidebar.SelectRow(prev.row)
+	}
+}
+
+// computeInsertIdx returns the listbox Insert position for a drag-drop
+// where the source row currently sits at sourceIdx and the desired
+// insertion point in the present (with-source) order is rawTargetIdx.
+// noop is true when rawTargetIdx implies the source's current slot.
+func computeInsertIdx(sourceIdx, rawTargetIdx int) (insertIdx int, noop bool) {
+	if rawTargetIdx == sourceIdx || rawTargetIdx == sourceIdx+1 {
+		return 0, true
+	}
+	if rawTargetIdx > sourceIdx {
+		return rawTargetIdx - 1, false
+	}
+	return rawTargetIdx, false
+}
+
+// applySidebarOrder rearranges the sidebar listbox so rows match
+// orderedIDs in order. Implemented as in-place selection sort: walks
+// orderedIDs and, for each (i, id), removes/reinserts that row at
+// index i if it isn't already there. Active selection is restored at
+// the end. Running this twice converges (the second pass is a no-op)
+// but a single pass is NOT a no-op when any row is out of place —
+// convergence is from selection-sort semantics, not idempotence.
+//
+// IDs no longer present in projectRows (e.g. project deleted mid-drag
+// via IPC) are silently skipped; surviving rows still end up in their
+// snapshot slots.
+func (a *App) applySidebarOrder(orderedIDs []int64) {
+	prevActiveID := a.activeProjectID
+	for i, id := range orderedIDs {
+		pr, ok := a.projectRows[id]
+		if !ok {
+			continue
+		}
+		if pr.row.Index() != i {
+			a.sidebar.Remove(pr.row)
+			a.sidebar.Insert(pr.row, i)
+		}
+	}
+	if prev, ok := a.projectRows[prevActiveID]; ok {
+		a.sidebar.SelectRow(prev.row)
+	}
+}
+
+func slicesEqualInt64(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sidebarOrder reads the current visual order of project IDs by
+// walking the sidebar's rows. Each row was tagged with its project ID
+// via SetName at addProjectUI time.
+func (a *App) sidebarOrder() []int64 {
+	var ids []int64
+	for i := 0; ; i++ {
+		row := a.sidebar.RowAtIndex(i)
+		if row == nil {
+			break
+		}
+		if v := row.Name(); v != "" {
+			if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+// installSidebarDropTarget wires a single drop target on the sidebar
+// listbox. Motion live-shuffles the dragged row to the insertion point
+// implied by the pointer y; drop persists the resulting order in one
+// transaction (or skips the write if the order didn't change). Cancel
+// and rollback paths are handled by the drag source's drag-end via
+// dropOccurred (see installRowDragSource).
+func (a *App) installSidebarDropTarget() {
+	dst := gtk.NewDropTarget(coreglib.TypeInt64, gdk.ActionMove)
+	dst.ConnectMotion(func(_, y float64) gdk.DragAction {
+		if a.draggedProjectID != 0 {
+			a.shuffleSidebarToward(a.draggedProjectID, a.rawTargetForY(y))
+		}
+		return gdk.ActionMove
+	})
+	dst.ConnectDrop(func(value *coreglib.Value, _, _ float64) bool {
+		if _, ok := value.GoValue().(int64); !ok {
+			return false
+		}
+		current := a.sidebarOrder()
+		if slicesEqualInt64(current, a.dragOriginalOrder) {
+			a.dropOccurred = true // unchanged drop is still a successful drop
+			return true
+		}
+		if err := a.ws.ReorderProjects(current); err != nil {
+			slog.Error("ReorderProjects", "err", err)
+			a.applySidebarOrder(a.dragOriginalOrder)
+			return false
+		}
+		a.dropOccurred = true
+		return true
+	})
+	a.sidebar.AddController(dst)
+}
+
+// rawTargetForY returns the raw insertion index for a pointer at y in
+// the listbox's coordinate space. When the pointer is over a row, the
+// index is row.Index() if y is above the row's midline, else
+// row.Index()+1. When the pointer is in the empty area below the last
+// row, the index is the row count ("insert at end").
+func (a *App) rawTargetForY(y float64) int {
+	if r := a.sidebar.RowAtY(int(y)); r != nil {
+		idx := r.Index()
+		if b, ok := r.ComputeBounds(a.sidebar); ok {
+			if y >= float64(b.Y())+float64(b.Height())/2 {
+				idx++
+			}
+		}
+		return idx
+	}
+	return len(a.sidebarOrder())
+}
+
+// persistTabOrder reads the current visual page order from view and
+// writes the matching tab IDs back to the workspace. Triggered from
+// AdwTabView's page-reordered signal — by the time the signal fires,
+// the visual move is already done, so this is purely persistence.
+func (a *App) persistTabOrder(projectID int64, view *adw.TabView) {
+	n := view.NPages()
+	orderedIDs := make([]int64, 0, n)
+	for i := 0; i < n; i++ {
+		page := view.NthPage(i)
+		if id, ok := a.pageTabs[pageKey(page)]; ok {
+			orderedIDs = append(orderedIDs, id)
+		}
+	}
+	if err := a.ws.ReorderTabs(projectID, orderedIDs); err != nil {
+		slog.Error("ReorderTabs", "project", projectID, "err", err)
+	}
 }
 
 // addTabUI creates a Session for the tab and adds a tab page to the
@@ -1698,6 +1935,13 @@ func (a *App) deleteProject(pid int64) {
 // nothing's left, switches to the empty state and clears the header.
 // If the deleted project was active, picks a sensible neighbor.
 func (a *App) removeProjectUI(pid int64) {
+	// If the deleted project is the one currently being dragged, drop
+	// the drag-state snapshot so a subsequent drag-end can't try to
+	// restore using a stale ID list.
+	if a.draggedProjectID == pid {
+		a.draggedProjectID = 0
+		a.dragOriginalOrder = nil
+	}
 	if pr, ok := a.projectRows[pid]; ok {
 		a.sidebar.Remove(pr.row)
 		delete(a.projectRows, pid)

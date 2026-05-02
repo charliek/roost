@@ -50,3 +50,10 @@ listbox.navigation-sidebar > row.roost-rollup-needs-input {
 listbox.navigation-sidebar > row.roost-rollup-idle {
   box-shadow: inset 3px 0 0 #7a7a7a;
 }
+
+/* Drag-to-reorder feedback lives in cmd/roost/app.go: the dragged
+ * row's opacity is set directly via gtk_widget_set_opacity in
+ * installRowDragSource. CSS-based styling of the source row was tried
+ * (multiple variants of background, box-shadow, outline) but did not
+ * render reliably during a drag; the opacity API takes a different
+ * code path and applies cleanly. */

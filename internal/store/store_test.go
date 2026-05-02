@@ -303,6 +303,89 @@ func TestUserTitledMigrationApplied(t *testing.T) {
 	}
 }
 
+func TestReorderProjects(t *testing.T) {
+	s := openTemp(t)
+
+	a := mustProject(t, s, "a", "/a")
+	b := mustProject(t, s, "b", "/b")
+	c := mustProject(t, s, "c", "/c")
+
+	// Move c to the front, then b, then a.
+	if err := s.ReorderProjects([]int64{c.ID, b.ID, a.ID}); err != nil {
+		t.Fatalf("ReorderProjects: %v", err)
+	}
+	projects, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 3 ||
+		projects[0].ID != c.ID || projects[0].Position != 0 ||
+		projects[1].ID != b.ID || projects[1].Position != 1 ||
+		projects[2].ID != a.ID || projects[2].Position != 2 {
+		t.Fatalf("after reorder: %+v", projects)
+	}
+
+	// Mismatched length is rejected and leaves order untouched.
+	if err := s.ReorderProjects([]int64{c.ID, b.ID}); err == nil {
+		t.Errorf("ReorderProjects: expected error on short list, got nil")
+	}
+	// Unknown id is rejected.
+	if err := s.ReorderProjects([]int64{c.ID, b.ID, 99999}); err == nil {
+		t.Errorf("ReorderProjects: expected error on unknown id, got nil")
+	}
+	// Duplicate id is rejected.
+	if err := s.ReorderProjects([]int64{c.ID, c.ID, a.ID}); err == nil {
+		t.Errorf("ReorderProjects: expected error on duplicate id, got nil")
+	}
+
+	// Order should still be c,b,a after the rejected calls.
+	projects, err = s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects after rejected reorders: %v", err)
+	}
+	if len(projects) != 3 || projects[0].ID != c.ID || projects[2].ID != a.ID {
+		t.Fatalf("rejected reorder mutated state: %+v", projects)
+	}
+}
+
+func TestReorderTabs(t *testing.T) {
+	s := openTemp(t)
+
+	p := mustProject(t, s, "p", "/p")
+	other := mustProject(t, s, "other", "/other")
+	t1 := mustTab(t, s, p.ID, "/p/1")
+	t2 := mustTab(t, s, p.ID, "/p/2")
+	t3 := mustTab(t, s, p.ID, "/p/3")
+	otherTab := mustTab(t, s, other.ID, "/other/1")
+
+	// Reverse the order in p.
+	if err := s.ReorderTabs(p.ID, []int64{t3.ID, t2.ID, t1.ID}); err != nil {
+		t.Fatalf("ReorderTabs: %v", err)
+	}
+	tabs := mustListTabs(t, s, p.ID, 3)
+	if tabs[0].ID != t3.ID || tabs[0].Position != 0 ||
+		tabs[1].ID != t2.ID || tabs[1].Position != 1 ||
+		tabs[2].ID != t1.ID || tabs[2].Position != 2 {
+		t.Fatalf("after reorder: %+v", tabs)
+	}
+
+	// A tab from another project must be rejected.
+	if err := s.ReorderTabs(p.ID, []int64{t3.ID, t2.ID, otherTab.ID}); err == nil {
+		t.Errorf("ReorderTabs: expected error when slice contains another project's tab")
+	}
+	// Other project's tab order must be untouched.
+	otherTabs := mustListTabs(t, s, other.ID, 1)
+	if otherTabs[0].ID != otherTab.ID || otherTabs[0].Position != 0 {
+		t.Fatalf("other project's tabs disturbed: %+v", otherTabs)
+	}
+
+	// Order still reversed in p.
+	tabs = mustListTabs(t, s, p.ID, 3)
+	if tabs[0].ID != t3.ID || tabs[2].ID != t1.ID {
+		t.Fatalf("rejected reorder mutated state: %+v", tabs)
+	}
+}
+
 func TestMigrateIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
