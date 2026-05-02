@@ -1722,6 +1722,16 @@ func (a *App) editableHasFocus() bool {
 //     \r when not bracketed.
 const pasteMaxBytes = 4 * 1024 * 1024
 
+// Known limitation: on the GTK4 macOS backend, GDK's clipboard MIME set
+// lags behind NSPasteboard right after window focus changes. A paste
+// triggered by Cmd+V before GDK has re-polled NSPasteboard fails with
+// "No compatible transfer format found". The lag is event-driven, not
+// time-driven (NSPasteboard sync needs an NSEvent like a click), so
+// time-based retries don't reliably help. Workaround: click in the
+// terminal once after switching apps, which fires the NSEvent that
+// makes GDK refresh. A real fix would mean reaching into NSPasteboard
+// directly; out of scope for now.
+
 func (a *App) pasteIntoActive() {
 	if a.editableHasFocus() {
 		return
@@ -1735,6 +1745,26 @@ func (a *App) pasteIntoActive() {
 		return
 	}
 	clip := display.Clipboard()
+
+	// Prefer text whenever the clipboard has any. An image-only
+	// clipboard (e.g. a fresh Cmd+Shift+4 screenshot) takes the image
+	// branch — we materialize the bytes as a temp PNG and paste the
+	// file path so coding agents like Claude Code can attach it.
+	formats := clip.Formats()
+	if formats == nil || formats.ContainMIMEType("text/plain") {
+		a.pasteTextFromClipboard(sess, clip)
+		return
+	}
+	if mime := firstAvailableImageMime(formats); mime != "" {
+		a.pasteImageFromClipboard(sess, clip, mime)
+		return
+	}
+	// No text and no recognized image: try text anyway so behavior
+	// matches the previous code on unusual format sets.
+	a.pasteTextFromClipboard(sess, clip)
+}
+
+func (a *App) pasteTextFromClipboard(sess *Session, clip *gdk.Clipboard) {
 	clip.ReadTextAsync(context.Background(), func(res gio.AsyncResulter) {
 		text, err := clip.ReadTextFinish(res)
 		if err != nil {
