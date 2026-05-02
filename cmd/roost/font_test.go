@@ -91,6 +91,31 @@ func TestBuildFontConfigEmptyOverridesKeepDefaults(t *testing.T) {
 	}
 }
 
+func TestBuildFontConfigCarriesAdjusters(t *testing.T) {
+	// Use values that differ from Defaults() so the assertions prove
+	// the wiring carried the user's overrides, not just the defaults.
+	cfg := config.Defaults()
+	cfg.AdjustCellWidth = config.Adjust{Mode: config.AdjustModePixels, Value: 5}
+	cfg.AdjustCellHeight = config.Adjust{Mode: config.AdjustModePercent, Value: 10}
+	cfg.AdjustFontBaseline = config.Adjust{Mode: config.AdjustModePixels, Value: -1}
+	cfg.FontThicken = true
+
+	fc := BuildFontConfig(cfg)
+
+	if fc.AdjustCellWidth != cfg.AdjustCellWidth {
+		t.Errorf("AdjustCellWidth not carried: %+v", fc.AdjustCellWidth)
+	}
+	if fc.AdjustCellHeight != cfg.AdjustCellHeight {
+		t.Errorf("AdjustCellHeight not carried: %+v", fc.AdjustCellHeight)
+	}
+	if fc.AdjustFontBaseline != cfg.AdjustFontBaseline {
+		t.Errorf("AdjustFontBaseline not carried: %+v", fc.AdjustFontBaseline)
+	}
+	if !fc.FontThicken {
+		t.Errorf("FontThicken not carried")
+	}
+}
+
 func TestJoinedFeaturesEmpty(t *testing.T) {
 	fc := FontConfig{}
 	if got := fc.JoinedFeatures(); got != "" {

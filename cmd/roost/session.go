@@ -44,8 +44,14 @@ type Session struct {
 	defaultFontSize  int // for ResetFontSize; immutable after construction
 	cellW            int
 	cellH            int
-	cols             uint16
-	rows             uint16
+	// glyphYOffset shifts glyph drawing inside the cell vertically.
+	// Auto-set when AdjustCellHeight grows the cell so glyphs stay
+	// vertically centered, plus AdjustFontBaseline as a fine-tune.
+	// Backgrounds, cursor rect, and selection rects ignore it — they
+	// stay anchored to the cell grid.
+	glyphYOffset int
+	cols         uint16
+	rows         uint16
 
 	// theme is the source of truth for fg/bg/cursor/palette across this
 	// session. It is what gets pushed into libghostty (SetTheme) and
@@ -496,9 +502,9 @@ func (s *Session) pumpPTY() {
 }
 
 // measureCells uses Pango to size one monospace cell. Called once at
-// construction; the renderer reads cellW/cellH on every draw. Stored
-// as ints so cell origins land on integer pixel boundaries (text
-// crispness).
+// construction and again whenever the font changes (e.g. AdjustFontSize).
+// The renderer reads cellW/cellH/glyphYOffset on every draw. Stored as
+// ints so cell origins land on integer pixel boundaries (text crispness).
 func (s *Session) measureCells() {
 	ctx := s.da.PangoContext()
 
@@ -509,7 +515,6 @@ func (s *Session) measureCells() {
 	if w < 1 {
 		w = 8
 	}
-	s.cellW = w
 
 	// Height: prefer the font's recommended line-height (distance
 	// between baselines, includes any line-gap the font designer set),
@@ -527,7 +532,22 @@ func (s *Session) measureCells() {
 	if h < 1 {
 		h = 16
 	}
-	s.cellH = h
+
+	// Apply the user's cell-metric adjusters. Empty (the default) is a
+	// no-op so existing configs render identically. The natural metric
+	// is also the reference for the percent mode, so it must come
+	// before Apply.
+	naturalH := h
+	s.cellW = s.fontCfg.AdjustCellWidth.Apply(w)
+	s.cellH = s.fontCfg.AdjustCellHeight.Apply(h)
+
+	// Auto-center glyphs when AdjustCellHeight grows the cell so they
+	// don't stick to the top with a big gap below. Extra height splits
+	// evenly above and below the natural glyph box. AdjustFontBaseline
+	// is an additional fine-tune on top, computed against the natural
+	// height so percent values are predictable across font sizes.
+	extraH := s.cellH - naturalH
+	s.glyphYOffset = extraH/2 + s.fontCfg.AdjustFontBaseline.Delta(naturalH)
 }
 
 // checkTitleAndPWD polls the terminal's OSC-set title and cwd after a

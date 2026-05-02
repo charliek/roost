@@ -50,6 +50,25 @@ type Config struct {
 	HintStyle   string
 	Antialias   string
 
+	// AdjustCellWidth, AdjustCellHeight, and AdjustFontBaseline are
+	// Ghostty-style cell metric tweaks. Empty (the default) is no-op.
+	// AdjustCellHeight closes the line-spacing gap with cmux/ghostty;
+	// AdjustCellWidth widens letter spacing; AdjustFontBaseline shifts
+	// glyphs vertically inside the (possibly enlarged) cell as a
+	// fine-tune on top of the auto-centering applied when AdjustCellHeight
+	// is positive.
+	AdjustCellWidth    Adjust
+	AdjustCellHeight   Adjust
+	AdjustFontBaseline Adjust
+
+	// FontThicken approximates Apple's Core Text stem darkening for
+	// non-Apple rendering pipelines: each glyph is drawn twice with a
+	// 0.5px horizontal offset, fattening strokes by roughly half a
+	// pixel. Default false; opt in if grayscale rendering looks too
+	// thin (most relevant on macOS where Cairo doesn't apply Apple's
+	// stem darkening).
+	FontThicken bool
+
 	// Theme is the name of a bundled color theme (e.g. "roost-dark",
 	// "Dracula+"). Names match the filenames under cmd/roost/themes/,
 	// which mirror ghostty's themes/ directory exactly. Unknown names
@@ -73,11 +92,20 @@ type Keybind struct {
 }
 
 // Defaults returns the built-in Config used when no file exists.
+//
+// AdjustCellWidth and AdjustCellHeight default to +2 px because Pango's
+// natural cell metrics are tighter than mainstream terminals (cmux,
+// ghostty, iTerm, Terminal.app) which all add a small amount of cell
+// padding. Setting tasteful defaults here saves every user from
+// discovering and tuning the same knobs. Opt out with `adjust_cell_* =
+// 0` (or any other value) in the config file.
 func Defaults() Config {
 	return Config{
-		FontFamily: "JetBrains Mono, Monaco, monospace",
-		FontSizePt: 12,
-		Theme:      "roost-dark",
+		FontFamily:       "JetBrains Mono, Monaco, monospace",
+		FontSizePt:       12,
+		AdjustCellWidth:  Adjust{Mode: AdjustModePixels, Value: 2},
+		AdjustCellHeight: Adjust{Mode: AdjustModePixels, Value: 2},
+		Theme:            "roost-dark",
 	}
 }
 
@@ -143,6 +171,30 @@ func (p Paths) Load() (Config, error) {
 				return cfg, fmt.Errorf("config: %s:%d: antialias: %q not in {none, gray, subpixel, default}", p.ConfigFile(), lineNum, val)
 			}
 			cfg.Antialias = val
+		case "adjust_cell_width":
+			a, aerr := ParseAdjust(val)
+			if aerr != nil {
+				return cfg, fmt.Errorf("config: %s:%d: adjust_cell_width: %w", p.ConfigFile(), lineNum, aerr)
+			}
+			cfg.AdjustCellWidth = a
+		case "adjust_cell_height":
+			a, aerr := ParseAdjust(val)
+			if aerr != nil {
+				return cfg, fmt.Errorf("config: %s:%d: adjust_cell_height: %w", p.ConfigFile(), lineNum, aerr)
+			}
+			cfg.AdjustCellHeight = a
+		case "adjust_font_baseline":
+			a, aerr := ParseAdjust(val)
+			if aerr != nil {
+				return cfg, fmt.Errorf("config: %s:%d: adjust_font_baseline: %w", p.ConfigFile(), lineNum, aerr)
+			}
+			cfg.AdjustFontBaseline = a
+		case "font_thicken":
+			b, berr := strconv.ParseBool(val)
+			if berr != nil {
+				return cfg, fmt.Errorf("config: %s:%d: font_thicken: %w", p.ConfigFile(), lineNum, berr)
+			}
+			cfg.FontThicken = b
 		case "keybind":
 			kb, kerr := parseKeybind(val)
 			if kerr != nil {

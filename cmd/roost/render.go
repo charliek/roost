@@ -4,10 +4,25 @@ import (
 	"log/slog"
 
 	"github.com/diamondburned/gotk4/pkg/cairo"
+	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotk4/pkg/pangocairo"
 
 	"github.com/charliek/roost/internal/ghostty"
 )
+
+// showGlyphLayout positions the layout at (x, y) and paints it. When
+// thicken is true the glyph is painted again at (x+0.5, y) — a
+// poor-man's stem darkening that approximates Apple's Core Text
+// behavior on rendering pipelines (notably Cairo on macOS) that don't
+// apply the darkening natively.
+func showGlyphLayout(cr *cairo.Context, layout *pango.Layout, x, y float64, thicken bool) {
+	cr.MoveTo(x, y)
+	pangocairo.ShowLayout(cr, layout)
+	if thicken {
+		cr.MoveTo(x+0.5, y)
+		pangocairo.ShowLayout(cr, layout)
+	}
+}
 
 // drawTerminal walks the session's render state and paints the cell
 // grid into the Cairo context. Called from GtkDrawingArea's draw
@@ -95,8 +110,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		textBuf = appendRune(textBuf, cell.Codepoint)
 		layout.SetText(string(textBuf))
 		setRGB(cr, fg)
-		cr.MoveTo(x, y)
-		pangocairo.ShowLayout(cr, layout)
+		showGlyphLayout(cr, layout, x, y+float64(s.glyphYOffset), s.fontCfg.FontThicken)
 		if cell.Bold {
 			layout.SetFontDescription(s.font)
 		}
@@ -150,8 +164,7 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 					}
 					layout.SetText(string(textBuf))
 					setRGB(cr, cursorText)
-					cr.MoveTo(x, y)
-					pangocairo.ShowLayout(cr, layout)
+					showGlyphLayout(cr, layout, x, y+float64(s.glyphYOffset), s.fontCfg.FontThicken)
 				}
 			}
 		}
