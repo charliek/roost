@@ -119,14 +119,14 @@ func TestFindAt(t *testing.T) {
 
 func TestTrimURL(t *testing.T) {
 	cases := map[string]string{
-		"https://x.test":               "https://x.test",
-		"https://x.test.":              "https://x.test",
-		"https://x.test,":              "https://x.test",
-		"https://x.test);":             "https://x.test",
-		"https://w.org/Rust_(lang)":    "https://w.org/Rust_(lang)",
-		"https://w.org/Rust_(lang).":   "https://w.org/Rust_(lang)",
-		"https://x.test])":             "https://x.test",
-		"https://x.test/(a)b":          "https://x.test/(a)b",
+		"https://x.test":             "https://x.test",
+		"https://x.test.":            "https://x.test",
+		"https://x.test,":            "https://x.test",
+		"https://x.test);":           "https://x.test",
+		"https://w.org/Rust_(lang)":  "https://w.org/Rust_(lang)",
+		"https://w.org/Rust_(lang).": "https://w.org/Rust_(lang)",
+		"https://x.test])":           "https://x.test",
+		"https://x.test/(a)b":        "https://x.test/(a)b",
 	}
 	for in, want := range cases {
 		t.Run(in, func(t *testing.T) {
