@@ -16,22 +16,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # System deps split:
-      # - macOS gets the full GTK4 + libadwaita stack because the test
-      #   job builds cmd/roost there.
-      # - Linux only installs Pango + Cairo dev headers, which is all
-      #   internal/pangoextra needs (its cgo wrapper links pangocairo
-      #   via pkg-config). The other internal packages are pure Go.
-      #   We skip libgtk-4-dev / libadwaita-1-dev because cmd/roost is
-      #   not built on Linux (libadwaita 1.6 vs Ubuntu's 1.5).
+      # Both platforms install the full GTK4 + libadwaita stack so that
+      # cmd/roost builds on each. gotk4-adwaita is pinned to a commit
+      # that targets libadwaita 1.5 symbols, which matches Ubuntu 24.04
+      # / Pop!_OS noble's apt candidate. macOS Homebrew ships a newer
+      # libadwaita but the binding only uses the 1.5 surface, so this
+      # works on both.
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: brew install gtk4 libadwaita pkgconf gobject-introspection
-      - name: Install system deps (Linux — Pango/Cairo for internal/pangoextra)
+      - name: Install system deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpango1.0-dev libcairo2-dev libgirepository1.0-dev
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            libpango1.0-dev libcairo2-dev \
+            pkgconf gobject-introspection libgirepository1.0-dev
 
       - uses: jdx/mise-action@v2
 
@@ -58,21 +59,7 @@ jobs:
         if: steps.cache-libghostty.outputs.cache-hit != 'true'
         run: ./build/build.sh libghostty
 
-      # cmd/roost imports gotk4-adwaita which currently references
-      # libadwaita 1.6 symbols (e.g. adw_about_dialog_add_other_app).
-      # Ubuntu 24.04 LTS ships libadwaita 1.5, so vet/test/build of
-      # cmd/roost only succeeds on macOS (Homebrew has 1.9). Linux
-      # exercises the GTK-free packages — every internal package +
-      # cmd/roost-cli.
-      - name: Vet + test + build (Linux — GTK-free packages)
-        if: runner.os == 'Linux'
-        run: |
-          go vet ./internal/... ./cmd/roost-cli
-          go test ./internal/... ./cmd/roost-cli
-          go build ./cmd/roost-cli
-
-      - name: Vet + test + build (macOS — full)
-        if: runner.os == 'macOS'
+      - name: Vet + test + build
         run: |
           go vet ./...
           go test ./...
@@ -87,9 +74,14 @@ jobs:
             exit 1
           fi
 
-      - name: Lint cmd/roost (macOS-only — see Linux note above)
-        if: runner.os == 'macOS'
-        run: golangci-lint run ./cmd/roost
+      - name: Assert no dynamic ghostty-vt link (Linux regression guard)
+        if: runner.os == 'Linux'
+        run: |
+          if ldd ./roost | grep -q libghostty-vt; then
+            echo "FAIL: roost is dynamically linked to libghostty-vt; the cgo directive in internal/ghostty/terminal.go is supposed to statically link the .a."
+            ldd ./roost
+            exit 1
+          fi
 
   race:
     runs-on: ubuntu-latest
@@ -111,15 +103,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # internal/pangoextra is a cgo wrapper that links pangocairo via
-      # pkg-config; lint runs cgo preprocessing, which needs the dev
-      # headers present on the runner. libgirepository1.0-dev provides
-      # gobject-introspection-1.0.pc, which gotk4's pango package
-      # transitively requires.
-      - name: Install Pango/Cairo dev headers
+      # Lint runs cgo preprocessing across the whole module, including
+      # cmd/roost (gotk4 + gotk4-adwaita) and internal/pangoextra
+      # (pangocairo via pkg-config), so we need the full GTK4 +
+      # libadwaita dev headers, not just Pango/Cairo.
+      - name: Install GTK4 + libadwaita dev headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpango1.0-dev libcairo2-dev libgirepository1.0-dev
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            libpango1.0-dev libcairo2-dev \
+            pkgconf gobject-introspection libgirepository1.0-dev
 
       - uses: jdx/mise-action@v2
 
@@ -146,6 +140,4 @@ jobs:
             ./build/build.sh libghostty
           fi
 
-      # cmd/roost is linted on the macOS test job because Ubuntu's
-      # libadwaita is too old to compile gotk4-adwaita's 1.6 bindings.
-      - run: golangci-lint run ./internal/... ./cmd/roost-cli
+      - run: golangci-lint run ./...
