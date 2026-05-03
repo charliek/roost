@@ -13,10 +13,24 @@ import (
 
 	"github.com/charliek/roost/internal/core"
 	"github.com/charliek/roost/internal/ghostty"
+	"github.com/charliek/roost/internal/links"
+	"github.com/charliek/roost/internal/openuri"
 	"github.com/charliek/roost/internal/osc"
 	"github.com/charliek/roost/internal/pangoextra"
 	"github.com/charliek/roost/internal/pty"
 )
+
+// linkModMask is the modifier set that gates URL hover/click. Ctrl on
+// Linux, Cmd on macOS — gdk.MetaMask is Cmd on macOS and the Windows key
+// on Linux, gdk.ControlMask is Ctrl everywhere. Either is enough.
+const linkModMask = gdk.ControlMask | gdk.MetaMask
+
+// linkSpan describes a clickable URL on a single visible row. Cols are
+// inclusive and refer to viewport-cell columns.
+type linkSpan struct {
+	row, col0, col1 int
+	uri             string
+}
 
 // blinkPeriodMs is the cursor blink half-period in milliseconds. 530ms
 // matches xterm/iTerm; faster reads as jittery, slower reads as dead.
@@ -130,6 +144,29 @@ type Session struct {
 	// osc is the streaming OSC scanner used as a fallback notification
 	// path. Fed from the pump goroutine in parallel with vt_write.
 	osc *osc.Scanner
+
+	// rowText caches the visible row text as []rune slices for URL regex
+	// scanning. Built lazily from the current render-state walk on first
+	// hover request; invalidated wholesale when the render state updates.
+	// Read/written on the GTK main thread only.
+	rowText [][]rune
+
+	// hoverLink is the link span currently under the pointer, or nil if
+	// none. Drives both the hand cursor and the underline overlay. Set
+	// only when the user holds Ctrl/Cmd inside the DA.
+	hoverLink *linkSpan
+
+	// handCursor is the cached pointing-hand cursor swapped onto the DA
+	// when hoverLink is non-nil. Lazy-allocated.
+	handCursor *gdk.Cursor
+
+	// Last seen pointer position + modifier state. Used to recompute
+	// hoverLink after the render state updates (rowText cache is wiped)
+	// or after the user toggles Ctrl while still hovering.
+	lastPtrX     float64
+	lastPtrY     float64
+	ptrInside    bool
+	lastModState gdk.ModifierType
 }
 
 // NewSession spawns a shell at the tab's persisted cwd, allocates a
@@ -291,7 +328,15 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg Fon
 	// the toplevel may eat Shift+Tab and our handleKey never fires.
 	keyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) (ok bool) {
+		if isLinkModifierKey(keyval) {
+			s.refreshHoverLink()
+		}
 		return handleKey(s, keyval, uint(state))
+	})
+	keyCtrl.ConnectKeyReleased(func(keyval, _ uint, _ gdk.ModifierType) {
+		if isLinkModifierKey(keyval) {
+			s.refreshHoverLink()
+		}
 	})
 	s.da.AddController(keyCtrl)
 
@@ -311,7 +356,20 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg Fon
 		button := clickCtrl.CurrentButton()
 		if s.useMouseTracking(state) {
 			s.sendMouseEvent(ghostty.MouseActionPress, gtkButtonToGhostty(button), state, x, y)
-		} else if button == 1 {
+			return
+		}
+		if button == 1 && state&linkModMask != 0 {
+			// Recompute the hover link at the click position rather
+			// than trusting the cached one — the user may have
+			// pressed Ctrl after pointing at a fresh URL but before
+			// the next motion event refreshed the cache.
+			s.updateHoverLink(x, y, state)
+			if s.hoverLink != nil {
+				openuri.OpenURI(s.hoverLink.uri)
+				return
+			}
+		}
+		if button == 1 {
 			col, row := s.cellAt(x, y)
 			s.sel.start(col, row)
 			s.da.QueueDraw()
@@ -344,6 +402,21 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg Fon
 		}
 	})
 	s.da.AddController(dragCtrl)
+
+	// Pointer motion → URL hover detection. Underlines a link and swaps
+	// the cursor to a hand when the user holds Ctrl/Cmd while pointing
+	// at a URL. Plain hover (no modifier) is a no-op so the underline
+	// doesn't churn during ordinary mouse movement.
+	motionCtrl := gtk.NewEventControllerMotion()
+	motionCtrl.ConnectMotion(func(x, y float64) {
+		s.ptrInside = true
+		s.updateHoverLink(x, y, motionCtrl.CurrentEventState())
+	})
+	motionCtrl.ConnectLeave(func() {
+		s.ptrInside = false
+		s.clearHoverLink()
+	})
+	s.da.AddController(motionCtrl)
 
 	// Scroll wheel → scrollback. Three rows per discrete wheel notch;
 	// for macOS-style smooth-scroll (gdk.ScrollUnitSurface) we
@@ -476,6 +549,7 @@ func (s *Session) pumpPTY() {
 				if s.sel.active {
 					s.sel.clear()
 				}
+				s.onRenderStateChanged()
 				s.checkTitleAndPWD()
 				s.da.QueueDraw()
 			})
@@ -632,6 +706,7 @@ func (s *Session) applyGeometry(width, height int, force bool) {
 		uint32(pad), uint32(pad),
 	)
 	_ = s.rs.Update(s.term)
+	s.onRenderStateChanged()
 	s.da.QueueDraw()
 }
 
@@ -769,6 +844,7 @@ func (s *Session) handleScroll(ctrl *gtk.EventControllerScroll, dy float64) {
 		}
 	}
 	_ = s.rs.Update(s.term)
+	s.onRenderStateChanged()
 	s.da.QueueDraw()
 }
 
@@ -944,6 +1020,173 @@ func (s *Session) cellAt(x, y float64) (col, row int) {
 	return
 }
 
+// isLinkModifierKey reports whether keyval is a Ctrl/Cmd key whose
+// press/release should retrigger hover-link evaluation.
+func isLinkModifierKey(keyval uint) bool {
+	switch keyval {
+	case gdk.KEY_Control_L, gdk.KEY_Control_R,
+		gdk.KEY_Meta_L, gdk.KEY_Meta_R,
+		gdk.KEY_Super_L, gdk.KEY_Super_R:
+		return true
+	}
+	return false
+}
+
+// ensureRowText materializes the visible row text from the current
+// render-state walk. Cells with codepoint 0 (empty) are filled with
+// space so column indices line up with cell columns. Idempotent —
+// subsequent calls with a populated cache are a no-op.
+func (s *Session) ensureRowText() {
+	if s.rowText != nil {
+		return
+	}
+	rows := int(s.rows)
+	cols := int(s.cols)
+	rt := make([][]rune, rows)
+	for i := range rt {
+		rt[i] = make([]rune, 0, cols)
+	}
+	_ = s.rs.Walk(func(row, col int, cell ghostty.Cell) {
+		if row < 0 || row >= rows || col < 0 {
+			return
+		}
+		line := rt[row]
+		for len(line) <= col {
+			line = append(line, ' ')
+		}
+		if cell.Codepoint != 0 {
+			line[col] = cell.Codepoint
+		}
+		rt[row] = line
+	})
+	s.rowText = rt
+}
+
+// linkAt returns the link span at viewport (col, row), if any. Tries
+// libghostty's OSC 8 hyperlink data first; falls back to the URL regex
+// over the cached row text. Caller is responsible for gating on
+// modifier keys / mouse-tracking.
+func (s *Session) linkAt(col, row int) (linkSpan, bool) {
+	if uri, ok := s.term.HyperlinkAt(col, row); ok {
+		col0 := col
+		for col0 > 0 {
+			u, ok := s.term.HyperlinkAt(col0-1, row)
+			if !ok || u != uri {
+				break
+			}
+			col0--
+		}
+		col1 := col
+		max := int(s.cols) - 1
+		for col1 < max {
+			u, ok := s.term.HyperlinkAt(col1+1, row)
+			if !ok || u != uri {
+				break
+			}
+			col1++
+		}
+		return linkSpan{row: row, col0: col0, col1: col1, uri: uri}, true
+	}
+	s.ensureRowText()
+	if row < 0 || row >= len(s.rowText) {
+		return linkSpan{}, false
+	}
+	sp, ok := links.FindAt(s.rowText[row], col)
+	if !ok {
+		return linkSpan{}, false
+	}
+	return linkSpan{row: row, col0: sp.Col0, col1: sp.Col1, uri: sp.URL}, true
+}
+
+// updateHoverLink recomputes the active hover link given the latest
+// pointer position and modifier state. Sets/clears the hand cursor and
+// queues a redraw if the active span changed.
+func (s *Session) updateHoverLink(x, y float64, mods gdk.ModifierType) {
+	s.lastPtrX, s.lastPtrY = x, y
+	s.lastModState = mods
+
+	var newHover *linkSpan
+	if s.ptrInside &&
+		mods&linkModMask != 0 &&
+		!s.useMouseTracking(mods) &&
+		s.cellW > 0 && s.cellH > 0 {
+		col, row := s.cellAt(x, y)
+		if sp, ok := s.linkAt(col, row); ok {
+			cp := sp
+			newHover = &cp
+		}
+	}
+	s.setHoverLink(newHover)
+}
+
+// refreshHoverLink re-runs hover-link detection using the most recent
+// pointer position and a freshly-fetched modifier state. Called when
+// the user toggles Ctrl/Cmd without moving the mouse.
+func (s *Session) refreshHoverLink() {
+	if !s.ptrInside {
+		return
+	}
+	display := gdk.DisplayGetDefault()
+	if display == nil {
+		return
+	}
+	seater := display.DefaultSeat()
+	if seater == nil {
+		return
+	}
+	kb := gdk.BaseSeat(seater).Keyboard()
+	if kb == nil {
+		return
+	}
+	mods := gdk.BaseDevice(kb).ModifierState()
+	s.updateHoverLink(s.lastPtrX, s.lastPtrY, mods)
+}
+
+// clearHoverLink resets any active hover state and the cursor.
+func (s *Session) clearHoverLink() {
+	s.setHoverLink(nil)
+}
+
+// setHoverLink installs the new span and side-effects (cursor + redraw)
+// only when it differs from the previous one.
+func (s *Session) setHoverLink(newHover *linkSpan) {
+	if hoverLinksEqual(newHover, s.hoverLink) {
+		return
+	}
+	s.hoverLink = newHover
+	if s.hoverLink != nil {
+		if s.handCursor == nil {
+			s.handCursor = gdk.NewCursorFromName("pointer", nil)
+		}
+		s.da.SetCursor(s.handCursor)
+	} else {
+		s.da.SetCursor(nil)
+	}
+	s.da.QueueDraw()
+}
+
+func hoverLinksEqual(a, b *linkSpan) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+// onRenderStateChanged is called from the PTY pump's main-thread
+// callback after a fresh rs.Update — invalidates the row-text cache
+// and re-evaluates the hover link in place.
+func (s *Session) onRenderStateChanged() {
+	s.rowText = nil
+	if s.ptrInside {
+		s.updateHoverLink(s.lastPtrX, s.lastPtrY, s.lastModState)
+	} else if s.hoverLink != nil {
+		s.clearHoverLink()
+	}
+}
+
 // snapToBottom returns the viewport to the active area if the user
 // has scrolled back. Called from handleKey before dispatching an
 // input-producing keystroke, mirroring the behavior of every other
@@ -956,6 +1199,7 @@ func (s *Session) snapToBottom() {
 	s.scrolledBack = false
 	s.scrollAccum = 0
 	_ = s.rs.Update(s.term)
+	s.onRenderStateChanged()
 	s.da.QueueDraw()
 }
 
