@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/diamondburned/gotk4-adwaita/pkg v0.0.0-20250703085337-e94555b846b6
+	github.com/diamondburned/gotk4-adwaita/pkg v0.0.0-20250223021911-503726bcfce6
 	github.com/diamondburned/gotk4/pkg v0.3.2-0.20250703063411-16654385f59a
 	modernc.org/sqlite v1.50.0
 )
