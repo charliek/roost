@@ -23,6 +23,18 @@ func TestFindAt(t *testing.T) {
 			col1:    22,
 		},
 		{
+			// UTF-8 prefix: "naïve " is 6 runes / 7 bytes (`ï` is 2 bytes).
+			// Without correct byte→rune indexing, regex match offsets
+			// would slip by one column from rune 4 onward.
+			name:    "url after multi-byte prefix",
+			row:     "naïve https://example.com",
+			col:     10,
+			wantURL: "https://example.com",
+			wantOK:  true,
+			col0:    6,
+			col1:    24,
+		},
+		{
 			name:    "github PR url",
 			row:     "Created PR https://github.com/charliek/roost/pull/42",
 			col:     30,

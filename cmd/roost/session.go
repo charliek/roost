@@ -844,6 +844,7 @@ func (s *Session) handleScroll(ctrl *gtk.EventControllerScroll, dy float64) {
 		}
 	}
 	_ = s.rs.Update(s.term)
+	s.onRenderStateChanged()
 	s.da.QueueDraw()
 }
 
@@ -1198,6 +1199,7 @@ func (s *Session) snapToBottom() {
 	s.scrolledBack = false
 	s.scrollAccum = 0
 	_ = s.rs.Update(s.term)
+	s.onRenderStateChanged()
 	s.da.QueueDraw()
 }
 

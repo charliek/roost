@@ -37,15 +37,20 @@ func FindAt(row []rune, col int) (Span, bool) {
 		return Span{}, false
 	}
 	// Convert the rune slice to a string for regex; build a parallel
-	// byte→rune index map so we can translate match offsets back.
+	// byte→rune index map so we can translate match offsets back. Each
+	// entry stores the BYTE offset where rune i starts (rune i may be
+	// multi-byte under UTF-8); the final entry holds the total byte
+	// length so the lookup can resolve an end-of-string offset.
 	var b strings.Builder
 	b.Grow(len(row))
 	byteToRune := make([]int, 0, len(row)+1)
-	for i, r := range row {
-		byteToRune = append(byteToRune, i)
-		b.WriteRune(r)
+	byteOff := 0
+	for _, r := range row {
+		byteToRune = append(byteToRune, byteOff)
+		n, _ := b.WriteRune(r)
+		byteOff += n
 	}
-	byteToRune = append(byteToRune, len(row))
+	byteToRune = append(byteToRune, byteOff)
 	s := b.String()
 
 	matches := urlPattern.FindAllStringIndex(s, -1)
