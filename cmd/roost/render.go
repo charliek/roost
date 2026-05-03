@@ -131,6 +131,19 @@ func drawTerminal(cr *cairo.Context, s *Session) {
 		}
 	}
 
+	// Hover-link underline. A 1px line at the cell's baseline area, in
+	// the link span's foreground color. Drawn after the cell pass so it
+	// sits on top of the glyphs.
+	if s.hoverLink != nil {
+		hl := s.hoverLink
+		setRGB(cr, defaultFG)
+		x := pad + float64(hl.col0*cellW)
+		y := pad + float64((hl.row+1)*cellH) - 1
+		w := float64((hl.col1 - hl.col0 + 1) * cellW)
+		cr.Rectangle(x, y, w, 1)
+		cr.Fill()
+	}
+
 	if cursorVisible {
 		x := pad + float64(cx*cellW)
 		y := pad + float64(cy*cellH)
