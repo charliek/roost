@@ -1922,7 +1922,7 @@ func (a *App) showCloseProjectDialog(pid int64) {
 			a.deleteProject(pid)
 		}
 	})
-	dlg.Choose(context.Background(), a.win, nil)
+	dlg.Present(a.win)
 }
 
 // deleteProject tears down a project: frees every Session's PTY and
