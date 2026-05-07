@@ -438,8 +438,12 @@ func NewSession(ws *core.Workspace, tab core.Tab, cols, rows uint16, fontCfg Fon
 // sessions that never receive an OSC don't pay the cost. Called only
 // from the pump goroutine.
 //
-// The scanner does two jobs in parallel to libghostty's parser:
+// The scanner does three jobs in parallel to libghostty's parser:
 //   - Forward OSC 9 / OSC 777 notifications to the workspace UI.
+//   - Track OSC 7 working-directory reports. libghostty-vt parses OSC 7
+//     but drops it in the "no terminal-modifying effect" group (see
+//     ../../ghostty/src/terminal/stream_terminal.zig "report_pwd"), so
+//     term.PWD() never sees it. The scanner gives us a working signal.
 //   - Synthesise OSC 10/11/12 query responses (libghostty-vt currently
 //     drops the .query arm of color operations, so without this Codex
 //     and similar agents see silence and skip emitting their styled
@@ -466,6 +470,23 @@ func (s *Session) oscScanner() *osc.Scanner {
 					title = "(notification)"
 				}
 				_ = ws.Notify(tabID, title, n.Body)
+			},
+			OnPWD: func(p string) {
+				// Runs on the pump goroutine. Marshal to the GTK main
+				// thread before touching session state or firing the
+				// callback (which calls into widgets / updateHeader).
+				glib.IdleAdd(func() {
+					if s.closed.Load() {
+						return
+					}
+					if p == s.lastPWD {
+						return
+					}
+					s.lastPWD = p
+					if s.onPWDChanged != nil {
+						s.onPWDChanged(p)
+					}
+				})
 			},
 			OnQueryResponse: s.QueueWrite,
 			QueryColors: func() (osc.RGB, osc.RGB, osc.RGB) {
@@ -550,7 +571,7 @@ func (s *Session) pumpPTY() {
 					s.sel.clear()
 				}
 				s.onRenderStateChanged()
-				s.checkTitleAndPWD()
+				s.checkTitle()
 				s.da.QueueDraw()
 			})
 		}
@@ -624,24 +645,21 @@ func (s *Session) measureCells() {
 	s.glyphYOffset = extraH/2 + s.fontCfg.AdjustFontBaseline.Delta(naturalH)
 }
 
-// checkTitleAndPWD polls the terminal's OSC-set title and cwd after a
-// vt_write. Cheap (one cgo call each) and runs only when the on-change
-// callback is set. Fires the callback only when the value actually
-// changes.
-func (s *Session) checkTitleAndPWD() {
-	if s.onTitleChanged != nil {
-		t := s.term.Title()
-		if t != s.lastTitle {
-			s.lastTitle = t
-			s.onTitleChanged(t)
-		}
+// checkTitle polls the terminal's OSC-set title after a vt_write.
+// Cheap (one cgo call) and runs only when the on-change callback is
+// set. Fires the callback only when the value actually changes.
+//
+// PWD has its own path: libghostty-vt drops OSC 7 in stream_terminal,
+// so term.PWD() never sees it. We track PWD via the per-session OSC
+// scanner instead — see oscScanner().OnPWD.
+func (s *Session) checkTitle() {
+	if s.onTitleChanged == nil {
+		return
 	}
-	if s.onPWDChanged != nil {
-		p := s.term.PWD()
-		if p != s.lastPWD {
-			s.lastPWD = p
-			s.onPWDChanged(p)
-		}
+	t := s.term.Title()
+	if t != s.lastTitle {
+		s.lastTitle = t
+		s.onTitleChanged(t)
 	}
 }
 

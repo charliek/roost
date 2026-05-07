@@ -1090,7 +1090,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	a.sessions[tab.ID] = sess
 
 	page := view.Append(sess.DrawingArea())
-	page.SetTitle(displayTitle(tab))
+	page.SetTitle(displayTitle(tab, sess.lastPWD, a.home))
 	page.SetLiveThumbnail(false)
 	a.pageTabs[pageKey(page)] = tab.ID
 	a.tabPages[tab.ID] = page
@@ -1102,7 +1102,7 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 	tabID := tab.ID
 	sess.onTitleChanged = func(title string) {
 		if title == "" {
-			page.SetTitle(displayTitle(sess.tab))
+			page.SetTitle(displayTitle(sess.tab, sess.lastPWD, a.home))
 			return
 		}
 		if sess.tab.UserTitled {
@@ -1121,6 +1121,12 @@ func (a *App) addTabUI(projectID int64, tab core.Tab) {
 		}
 		if err := a.ws.UpdateTabCWD(tabID, cwd); err != nil {
 			slog.Warn("UpdateTabCWD", "tab", tabID, "cwd", cwd, "err", err)
+		}
+		// Refresh the tab label only when it's still the file-path
+		// fallback. Mirrors Ghostty's gate: an OSC- or user-set title
+		// always wins over the cwd.
+		if sess.tab.Title == "" && !sess.tab.UserTitled {
+			page.SetTitle(displayTitle(sess.tab, cwd, a.home))
 		}
 		if a.tabIsSelected(tabID) {
 			a.updateHeader()
@@ -1154,20 +1160,29 @@ func (a *App) tabIsSelected(tabID int64) bool {
 	return ok && id == tabID
 }
 
-func displayTitle(t core.Tab) string {
+func displayTitle(t core.Tab, livePWD, home string) string {
 	if t.Title != "" {
 		return t.Title
 	}
-	return shorten(t.CWD, 22)
+	cwd := livePWD
+	if cwd == "" {
+		cwd = t.CWD
+	}
+	return pathDisplay(cwd, home, 22)
 }
 
-// shorten clamps a string to max display characters, prepending an
-// ellipsis if it had to be cut. Iterates runes rather than bytes so
-// CJK, emoji, and accented characters don't get sliced mid-codepoint.
-func shorten(s string, max int) string {
-	runes := []rune(s)
+// pathDisplay formats a filesystem path for chrome: collapses a $HOME
+// prefix to "~" and truncates from the *left* with "…" when longer
+// than max, since the trailing path segment is what users recognize at
+// a glance. Iterates runes rather than bytes so CJK, emoji, and
+// accented characters don't get sliced mid-codepoint.
+func pathDisplay(p, home string, max int) string {
+	if home != "" && (p == home || strings.HasPrefix(p, home+"/")) {
+		p = "~" + p[len(home):]
+	}
+	runes := []rune(p)
 	if len(runes) <= max {
-		return s
+		return p
 	}
 	return "…" + string(runes[len(runes)-max+1:])
 }
@@ -1270,7 +1285,7 @@ func (a *App) updateHeader() {
 					if cwd == "" {
 						cwd = sess.tab.CWD
 					}
-					subtitle = shorten(cwd, 48)
+					subtitle = pathDisplay(cwd, a.home, 48)
 				}
 			}
 		}

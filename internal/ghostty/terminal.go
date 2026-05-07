@@ -172,8 +172,12 @@ func (t *Terminal) Title() string {
 	return C.GoStringN((*C.char)(unsafe.Pointer(s.ptr)), C.int(s.len))
 }
 
-// PWD returns the terminal's working directory (set via OSC 7). Empty
-// if no pwd has been reported.
+// PWD returns the terminal's working directory as recorded in the
+// libghostty-vt Terminal struct. NOTE: libghostty-vt's stream_terminal
+// classifies OSC 7 as "no terminal-modifying effect" and never calls
+// setPwd internally, so this only returns a value if the embedder
+// explicitly sets it via GHOSTTY_TERMINAL_OPT_PWD. Roost doesn't —
+// it tracks cwd via its own OSC scanner (see internal/osc).
 func (t *Terminal) PWD() string {
 	var s C.GhosttyString
 	if rc := C.ghostty_terminal_get(t.c, C.GHOSTTY_TERMINAL_DATA_PWD, unsafe.Pointer(&s)); rc != C.GHOSTTY_SUCCESS {

@@ -42,7 +42,7 @@ See [Paths & Environment](../reference/paths.md) for the full layout.
 
 ## What you should see
 
-- The default tab title shows the working directory if the shell hasn't set its own title yet
+- The default tab title shows the working directory if the shell hasn't set its own title yet (a one-line shell snippet makes this follow `cd` — see [Working Directory Tracking](../guides/cwd-tracking.md))
 - Resizing the window reflows the terminal — `vim` and `htop` adjust correctly
 - Output renders with full 24-bit color and basic styles (bold, italic, inverse)
 - Two-finger scroll (or wheel) navigates the scrollback; pressing any input-producing key snaps the viewport back to the bottom
@@ -57,4 +57,5 @@ See [Paths & Environment](../reference/paths.md) for the full layout.
 ## Next
 
 - [Keybindings](keybindings.md) — how to drive Roost without the mouse
+- [Working Directory Tracking](../guides/cwd-tracking.md) — make the header subtitle and tab labels follow `cd`
 - [Notifications](../guides/notifications.md) — how `roost-cli` and OSC sequences surface in the UI
