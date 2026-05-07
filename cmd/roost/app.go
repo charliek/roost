@@ -1915,6 +1915,7 @@ func (a *App) beginRenameActiveProject() {
 	if a.activeProjectID == 0 {
 		return
 	}
+	a.ensureSidebarVisible()
 	if pr, ok := a.projectRows[a.activeProjectID]; ok {
 		pr.enterEditMode()
 	}
