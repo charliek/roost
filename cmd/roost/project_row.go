@@ -152,12 +152,17 @@ func (pr *projectRow) setRollupState(s core.TabAgentState) {
 }
 
 // installEditControllers wires F2/Escape on the entry. Caller provides
-// the commit callback (called from Enter/focus-out) and the cancel
-// callback (called from Escape).
-func (pr *projectRow) installEditControllers(onCommit func(string), onCancel func()) {
+// the commit callback (called from Enter/focus-out), the cancel
+// callback (called from Escape), and an onClose callback fired after
+// Enter or Escape (but NOT focus-out — focus already moved to wherever
+// the user clicked, so re-grabbing it would hijack their target).
+func (pr *projectRow) installEditControllers(onCommit func(string), onCancel func(), onClose func()) {
 	pr.entry.ConnectActivate(func() {
 		text, _ := pr.exitEditMode(true)
 		onCommit(text)
+		if onClose != nil {
+			onClose()
+		}
 	})
 
 	keyCtrl := gtk.NewEventControllerKey()
@@ -167,6 +172,9 @@ func (pr *projectRow) installEditControllers(onCommit func(string), onCancel fun
 			pr.exitEditMode(false)
 			onCancel()
 			pr.cancel = false
+			if onClose != nil {
+				onClose()
+			}
 			return true
 		}
 		return false

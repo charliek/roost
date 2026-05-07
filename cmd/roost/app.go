@@ -240,6 +240,21 @@ func (a *App) activate() {
 			}
 		}
 		a.selectProject(pid)
+		// GtkListBox focuses the clicked row as part of normal click
+		// handling, *after* RowSelected fires — so the synchronous
+		// GrabFocus inside selectProject loses to the row. Defer one
+		// idle tick so focus lands on the terminal. Skip the restore
+		// if a row is currently being renamed: this signal also fires
+		// from selectProject's programmatic SelectRow during
+		// newProject(), and we don't want to steal focus from the
+		// rename entry that enterEditMode just grabbed.
+		coreglib.IdleAdd(func() bool {
+			if a.anyProjectEditing() {
+				return false
+			}
+			a.focusActiveTab()
+			return false
+		})
 	})
 
 	a.installSidebarDropTarget()
@@ -743,6 +758,7 @@ func (a *App) addProjectUI(p core.Project) {
 	pr.installEditControllers(
 		func(text string) { a.commitRename(pid, text) },
 		func() {},
+		func() { a.focusActiveTab() },
 	)
 	pr.closeBtn.ConnectClicked(func() { a.requestCloseProject(pid) })
 
@@ -1180,17 +1196,43 @@ func (a *App) selectProject(projectID int64) {
 	// project whose currently-selected tab is the target wouldn't fire
 	// that view's selected-page handler (the selection didn't change),
 	// so the badge would persist even though the user is looking at it.
-	view := a.projectViews[projectID]
-	if page := view.SelectedPage(); page != nil {
-		if id, ok := a.pageTabs[pageKey(page)]; ok {
-			page.SetNeedsAttention(false)
-			a.ws.MarkNotification(id, false)
-			if sess, ok := a.sessions[id]; ok {
-				sess.da.GrabFocus()
-			}
+	a.focusActiveTab()
+	a.updateHeader()
+}
+
+// focusActiveTab grabs focus to the active project's currently-selected
+// tab terminal and clears any pending notification on it. Safe to call
+// when there is no active project / tab / session — bails silently.
+func (a *App) focusActiveTab() {
+	view, ok := a.projectViews[a.activeProjectID]
+	if !ok {
+		return
+	}
+	page := view.SelectedPage()
+	if page == nil {
+		return
+	}
+	id, ok := a.pageTabs[pageKey(page)]
+	if !ok {
+		return
+	}
+	page.SetNeedsAttention(false)
+	a.ws.MarkNotification(id, false)
+	if sess, ok := a.sessions[id]; ok {
+		sess.da.GrabFocus()
+	}
+}
+
+// anyProjectEditing reports whether any sidebar row currently has its
+// inline rename entry showing. Used by the deferred sidebar-focus
+// restore to avoid stealing focus from an in-progress rename.
+func (a *App) anyProjectEditing() bool {
+	for _, pr := range a.projectRows {
+		if pr.editing {
+			return true
 		}
 	}
-	a.updateHeader()
+	return false
 }
 
 // updateHeader refreshes the AdwWindowTitle in the headerbar with the
