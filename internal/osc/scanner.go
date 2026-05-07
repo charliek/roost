@@ -216,10 +216,14 @@ func parseOSC7(body string) string {
 		return ""
 	}
 	path := rest[slash:]
-	if decoded, err := url.PathUnescape(path); err == nil {
-		return decoded
+	decoded, err := url.PathUnescape(path)
+	if err != nil {
+		// Malformed percent-encoding (e.g. trailing %, "%ZZ"). Drop —
+		// silently displaying gibberish in the chrome is worse than
+		// missing one cwd update.
+		return ""
 	}
-	return path
+	return decoded
 }
 
 // dispatch is called when a complete OSC sequence has been buffered.

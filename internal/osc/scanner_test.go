@@ -184,12 +184,28 @@ func TestOSC7DroppedWhenNoCallback(t *testing.T) {
 
 func TestOSC7BadBodyDropped(t *testing.T) {
 	s, got := collectPWD(t)
-	s.Feed([]byte("\x1b]7;\x07"))              // empty body
-	s.Feed([]byte("\x1b]7;not-a-uri\x07"))     // no scheme
-	s.Feed([]byte("\x1b]7;http://x/path\x07")) // wrong scheme
-	s.Feed([]byte("\x1b]7;file://nopath\x07")) // no path
+	s.Feed([]byte("\x1b]7;\x07"))                     // empty body
+	s.Feed([]byte("\x1b]7;not-a-uri\x07"))            // no scheme
+	s.Feed([]byte("\x1b]7;http://x/path\x07"))        // wrong scheme
+	s.Feed([]byte("\x1b]7;file://nopath\x07"))        // no path
+	s.Feed([]byte("\x1b]7;file:///bad/%ZZ/path\x07")) // bad percent-encoding
+	s.Feed([]byte("\x1b]7;file:///trailing%\x07"))    // trailing %
 	if len(*got) != 0 {
 		t.Fatalf("malformed bodies fired: %+v", *got)
+	}
+}
+
+func TestOSC7UnencodedSpacePassesThrough(t *testing.T) {
+	// Shells emitting OSC 7 with bare $PWD (no urlencoding) produce
+	// literal spaces in the path for directories like
+	// "~/My Documents" or "/Library/Application Support". A literal
+	// space isn't a strictly valid URI character but url.PathUnescape
+	// accepts it; treat it as a regular path byte rather than dropping
+	// the report.
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;file:///Users/me/My Documents\x07"))
+	if len(*got) != 1 || (*got)[0] != "/Users/me/My Documents" {
+		t.Fatalf("got %+v", *got)
 	}
 }
 
