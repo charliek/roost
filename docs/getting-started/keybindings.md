@@ -21,6 +21,7 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 |----------------------|----------------------------------------------|
 | `Cmd-N`              | Create a new project (`untitled`, `untitled 2`, …) |
 | `Cmd-Shift-R`        | Rename the active project                   |
+| `Cmd-B`              | Toggle the projects sidebar                 |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
 
 ### Clipboard
@@ -63,6 +64,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 |----------------------|----------------------------------------------|
 | `Alt-N`              | Create a new project (`untitled`, `untitled 2`, …) |
 | `Alt-Shift-R`        | Rename the active project                   |
+| `Alt-B`              | Toggle the projects sidebar                 |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
 
 ### Clipboard
@@ -185,6 +187,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
 | `new_project`         | `super+n` / `alt+n`                                    |
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
+| `toggle_sidebar`      | `super+b` / `alt+b`                                    |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
 | `font_increase`       | `super+plus`, `super+equal` / `ctrl+plus`, `ctrl+equal` |

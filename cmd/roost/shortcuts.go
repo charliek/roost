@@ -22,6 +22,7 @@ const (
 	ActionFontIncrease  = "font_increase"
 	ActionFontDecrease  = "font_decrease"
 	ActionFontReset     = "font_reset"
+	ActionToggleSidebar = "toggle_sidebar"
 	// switch_project_1..9 and switch_tab_1..9 are generated; not const'd.
 	ActionUnbind = "unbind"
 )

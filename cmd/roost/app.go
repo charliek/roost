@@ -65,6 +65,14 @@ type App struct {
 	sidebar     *gtk.ListBox
 	projectRows map[int64]*projectRow
 
+	// sidebarBox is the paned start child wrapping the sidebar's section
+	// header, scrolled list, and "+ Project" button. Toggling its
+	// visibility collapses the GtkPaned gutter so the right-hand stack
+	// absorbs the full width. sidebarToggle is the header-bar button
+	// that flips it; its icon swaps to reflect the current state.
+	sidebarBox    *gtk.Box
+	sidebarToggle *gtk.Button
+
 	// Sidebar drag-reorder state. draggedProjectID is 0 when no drag is
 	// in progress. dragOriginalOrder is captured at drag-begin for the
 	// cancel-restore path. dropOccurred is set in the drop handler only
@@ -194,6 +202,17 @@ func (a *App) activate() {
 	a.headerIcon = gtk.NewImageFromIconName("folder-symbolic")
 	a.headerIcon.SetMarginEnd(4)
 	header.PackStart(a.headerIcon)
+
+	// Sidebar visibility toggle. Sits just to the right of the folder
+	// icon so it's near the panel it controls. Icon swaps between
+	// sidebar-show-symbolic and sidebar-show-right-symbolic to point at
+	// the panel that will appear next.
+	a.sidebarToggle = gtk.NewButtonFromIconName("sidebar-show-symbolic")
+	a.sidebarToggle.AddCSSClass("flat")
+	a.sidebarToggle.SetTooltipText(toggleSidebarTooltip(true))
+	a.sidebarToggle.ConnectClicked(func() { a.toggleSidebar() })
+	header.PackStart(a.sidebarToggle)
+
 	a.headerTitle = adw.NewWindowTitle("Roost", "")
 	header.SetTitleWidget(a.headerTitle)
 
@@ -240,12 +259,12 @@ func (a *App) activate() {
 	sectionHeader.SetXAlign(0)
 	sectionHeader.AddCSSClass("sidebar-section-header")
 
-	sidebarBox := gtk.NewBox(gtk.OrientationVertical, 0)
-	sidebarBox.Append(sectionHeader)
-	sidebarBox.Append(sidebarScroll)
-	sidebarBox.SetVExpand(true)
+	a.sidebarBox = gtk.NewBox(gtk.OrientationVertical, 0)
+	a.sidebarBox.Append(sectionHeader)
+	a.sidebarBox.Append(sidebarScroll)
+	a.sidebarBox.SetVExpand(true)
 	sidebarScroll.SetVExpand(true)
-	sidebarBox.Append(newProjectBtn)
+	a.sidebarBox.Append(newProjectBtn)
 
 	// Right side: a Stack of AdwTabView (one per project) plus an empty
 	// state for when there are no projects.
@@ -255,7 +274,7 @@ func (a *App) activate() {
 	a.stack.AddNamed(a.buildEmptyState(), emptyStackName)
 
 	paned := gtk.NewPaned(gtk.OrientationHorizontal)
-	paned.SetStartChild(sidebarBox)
+	paned.SetStartChild(a.sidebarBox)
 	paned.SetEndChild(a.stack)
 	paned.SetResizeStartChild(false)
 	paned.SetShrinkStartChild(false)
@@ -1217,10 +1236,48 @@ func (a *App) updateHeader() {
 	a.headerTitle.SetSubtitle(subtitle)
 }
 
+// toggleSidebar flips the projects sidebar's visibility. The GtkPaned
+// gutter collapses automatically when the start child is invisible, so
+// the right-hand stack absorbs the freed width with no manual position
+// math. The button icon swaps to point at the panel that will appear
+// next.
+func (a *App) toggleSidebar() {
+	visible := !a.sidebarBox.Visible()
+	a.sidebarBox.SetVisible(visible)
+	if visible {
+		a.sidebarToggle.SetIconName("sidebar-show-symbolic")
+	} else {
+		a.sidebarToggle.SetIconName("sidebar-show-right-symbolic")
+	}
+	a.sidebarToggle.SetTooltipText(toggleSidebarTooltip(visible))
+}
+
+// ensureSidebarVisible opens the sidebar if it's collapsed. Used by
+// new_project and switch_project_* so the user always sees the row
+// that just changed when they trigger the action via keyboard with
+// the sidebar hidden.
+func (a *App) ensureSidebarVisible() {
+	if !a.sidebarBox.Visible() {
+		a.toggleSidebar()
+	}
+}
+
+func toggleSidebarTooltip(currentlyVisible bool) string {
+	accel := "Alt-B"
+	if runtime.GOOS == "darwin" {
+		accel = "Cmd-B"
+	}
+	if currentlyVisible {
+		return "Hide sidebar (" + accel + ")"
+	}
+	return "Show sidebar (" + accel + ")"
+}
+
 // newProject creates a new project with an auto-generated placeholder
 // name and immediately puts the sidebar row into rename mode so the
 // user can name it before doing anything else.
 func (a *App) newProject() {
+	a.ensureSidebarVisible()
 	name := nextProjectName(a.projectsByName())
 	p, err := a.ws.CreateProject(name, a.home)
 	if err != nil {
@@ -1370,6 +1427,7 @@ func (a *App) cycleTab(delta int) {
 // switchProjectByIndex picks the project at zero-based index in the
 // sidebar (Cmd-1..9 on macOS, Alt-1..9 on Linux).
 func (a *App) switchProjectByIndex(idx int) {
+	a.ensureSidebarVisible()
 	row := a.sidebar.RowAtIndex(idx)
 	if row == nil {
 		return
@@ -1535,6 +1593,7 @@ func (a *App) installShortcuts() {
 		ActionFontIncrease:  {fn: func() { a.adjustActiveFontSize(+1) }},
 		ActionFontDecrease:  {fn: func() { a.adjustActiveFontSize(-1) }},
 		ActionFontReset:     {fn: a.resetActiveFontSize},
+		ActionToggleSidebar: {fn: a.toggleSidebar},
 	}
 	for i := 1; i <= 9; i++ {
 		i := i
@@ -1618,6 +1677,7 @@ func defaultBindings() map[string][]string {
 		ActionCopy:          {clipboardMod + "+c", "ctrl+shift+c"},
 		ActionNewProject:    {projectMod + "+n"},
 		ActionRenameProject: {projectMod + "+shift+r"},
+		ActionToggleSidebar: {projectMod + "+b"},
 		// Browser-style font sizing per tab. + and = both bind because
 		// cmd-+ on US layouts is really cmd-shift-=, and many users
 		// hit cmd-= without the shift; both work.
@@ -1855,6 +1915,7 @@ func (a *App) beginRenameActiveProject() {
 	if a.activeProjectID == 0 {
 		return
 	}
+	a.ensureSidebarVisible()
 	if pr, ok := a.projectRows[a.activeProjectID]; ok {
 		pr.enterEditMode()
 	}
