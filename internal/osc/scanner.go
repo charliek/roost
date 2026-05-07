@@ -1,12 +1,18 @@
 // Package osc is a minimal streaming OSC scanner used as a fallback
 // path next to libghostty-vt's parser. libghostty owns the actual VT
-// state; this scanner observes the same byte stream to handle two
+// state; this scanner observes the same byte stream to handle three
 // classes of OSC that libghostty either doesn't surface or doesn't
 // answer:
 //
 //  1. Notifications (OSC 9, OSC 777) — extracted and forwarded to the
 //     workspace UI via OnNotification.
-//  2. Color queries (OSC 10/11/12 with body "?") — synthesised into the
+//  2. Working-directory reports (OSC 7) — emitted via OnPWD. libghostty-vt
+//     parses OSC 7 but classifies it as a "no terminal-modifying effect"
+//     command (see ../../ghostty/src/terminal/stream_terminal.zig "report_pwd"),
+//     so it never reaches Terminal.pwd / GHOSTTY_TERMINAL_DATA_PWD. We
+//     parse it ourselves to drive the header subtitle, tab-label
+//     fallback, and new-tab cwd inheritance.
+//  3. Color queries (OSC 10/11/12 with body "?") — synthesised into the
 //     `\e]Ps;rgb:RRRR/GGGG/BBBB\a` response and emitted via
 //     OnQueryResponse, since libghostty-vt drops the .query arm of OSC
 //     color operations (see ../../ghostty/src/terminal/stream_terminal.zig:616-618).
@@ -20,6 +26,7 @@ package osc
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -40,6 +47,12 @@ type RGB struct{ R, G, B uint8 }
 type Handler struct {
 	// OnNotification fires when an OSC 9 / OSC 777 notification is parsed.
 	OnNotification func(Notification)
+
+	// OnPWD fires when an OSC 7 working-directory report is parsed.
+	// The path has been extracted from the file:// URI and percent-
+	// decoded. Empty bodies and unparseable URIs are dropped silently
+	// (callback not invoked).
+	OnPWD func(path string)
 
 	// OnQueryResponse receives raw bytes that should be written back to
 	// the pty (OSC 10/11/12 query responses we synthesise). The caller
@@ -190,6 +203,29 @@ func isConEmuBody(body string) bool {
 	return i == len(body) || body[i] == ';'
 }
 
+// parseOSC7 decodes an OSC 7 body of the form "file://[host]/path"
+// into "/path", percent-decoding the path component. Returns "" if the
+// body isn't a recognized file URI.
+func parseOSC7(body string) string {
+	if !strings.HasPrefix(body, "file://") {
+		return ""
+	}
+	rest := body[len("file://"):]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return ""
+	}
+	path := rest[slash:]
+	decoded, err := url.PathUnescape(path)
+	if err != nil {
+		// Malformed percent-encoding (e.g. trailing %, "%ZZ"). Drop —
+		// silently displaying gibberish in the chrome is worse than
+		// missing one cwd update.
+		return ""
+	}
+	return decoded
+}
+
 // dispatch is called when a complete OSC sequence has been buffered.
 func (s *Scanner) dispatch() {
 	num := s.num.String()
@@ -208,6 +244,17 @@ func (s *Scanner) dispatch() {
 		}
 		if s.h.OnNotification != nil {
 			s.h.OnNotification(Notification{Title: body})
+		}
+	case "7":
+		// OSC 7: shell-reported working directory. Body is a URI of the
+		// form "file://[host]/path" — host is informational and we do
+		// not validate it (Roost trusts its own PTY). Empty body or
+		// non-file URIs are ignored.
+		if s.h.OnPWD == nil {
+			return
+		}
+		if path := parseOSC7(body); path != "" {
+			s.h.OnPWD(path)
 		}
 	case "777":
 		// Konsole OSC 777: body is "notify;<summary>;<body>".

@@ -31,6 +31,7 @@ Highlights:
 - [Installation](docs/getting-started/installation.md) — system packages and first build
 - [First Run](docs/getting-started/first-run.md) — what happens on launch and where state lives
 - [Keybindings](docs/getting-started/keybindings.md) — tab and project switching, clipboard, mouse, scrollback, platform-native modifiers
+- [Working Directory Tracking](docs/guides/cwd-tracking.md) — one-line shell snippet that makes the header subtitle and tab labels follow `cd`
 - [Notifications](docs/guides/notifications.md) — how `roost-cli` and OSC fallbacks surface in the UI
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
 - [Architecture](docs/reference/architecture.md) — package layout and threading contract

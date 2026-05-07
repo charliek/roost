@@ -120,9 +120,92 @@ func TestUnrelatedOSCIgnored(t *testing.T) {
 	// OSC 0 (icon+title) and OSC 1 (icon) — should NOT fire.
 	s.Feed([]byte("\x1b]0;some title\x07"))
 	s.Feed([]byte("\x1b]1;icon\x07"))
-	s.Feed([]byte("\x1b]7;file:///tmp\x07"))
 	if len(*got) != 0 {
 		t.Fatalf("non-notification OSC fired: %+v", *got)
+	}
+}
+
+func collectPWD(t *testing.T) (*Scanner, *[]string) {
+	t.Helper()
+	var got []string
+	return NewScanner(Handler{
+		OnPWD: func(p string) { got = append(got, p) },
+	}), &got
+}
+
+func TestOSC7BasicBEL(t *testing.T) {
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;file:///tmp\x07"))
+	if len(*got) != 1 || (*got)[0] != "/tmp" {
+		t.Fatalf("got %+v", *got)
+	}
+}
+
+func TestOSC7BasicST(t *testing.T) {
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;file://hostname/home/charliek/projects/roost\x1b\\"))
+	if len(*got) != 1 || (*got)[0] != "/home/charliek/projects/roost" {
+		t.Fatalf("got %+v", *got)
+	}
+}
+
+func TestOSC7PercentDecode(t *testing.T) {
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;file:///home/me/some%20dir\x07"))
+	if len(*got) != 1 || (*got)[0] != "/home/me/some dir" {
+		t.Fatalf("got %+v", *got)
+	}
+}
+
+func TestOSC7SplitAcrossReads(t *testing.T) {
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;file:///var"))
+	if len(*got) != 0 {
+		t.Fatalf("premature dispatch: %+v", *got)
+	}
+	s.Feed([]byte("/log\x07"))
+	if len(*got) != 1 || (*got)[0] != "/var/log" {
+		t.Fatalf("got %+v", *got)
+	}
+}
+
+func TestOSC7DroppedWhenNoCallback(t *testing.T) {
+	// No OnPWD set: scanner must not panic and other handlers still fire.
+	var notes []Notification
+	s := NewScanner(Handler{
+		OnNotification: func(n Notification) { notes = append(notes, n) },
+	})
+	s.Feed([]byte("\x1b]7;file:///tmp\x07"))
+	s.Feed([]byte("\x1b]9;hi\x07"))
+	if len(notes) != 1 || notes[0].Title != "hi" {
+		t.Fatalf("got %+v", notes)
+	}
+}
+
+func TestOSC7BadBodyDropped(t *testing.T) {
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;\x07"))                     // empty body
+	s.Feed([]byte("\x1b]7;not-a-uri\x07"))            // no scheme
+	s.Feed([]byte("\x1b]7;http://x/path\x07"))        // wrong scheme
+	s.Feed([]byte("\x1b]7;file://nopath\x07"))        // no path
+	s.Feed([]byte("\x1b]7;file:///bad/%ZZ/path\x07")) // bad percent-encoding
+	s.Feed([]byte("\x1b]7;file:///trailing%\x07"))    // trailing %
+	if len(*got) != 0 {
+		t.Fatalf("malformed bodies fired: %+v", *got)
+	}
+}
+
+func TestOSC7UnencodedSpacePassesThrough(t *testing.T) {
+	// Shells emitting OSC 7 with bare $PWD (no urlencoding) produce
+	// literal spaces in the path for directories like
+	// "~/My Documents" or "/Library/Application Support". A literal
+	// space isn't a strictly valid URI character but url.PathUnescape
+	// accepts it; treat it as a regular path byte rather than dropping
+	// the report.
+	s, got := collectPWD(t)
+	s.Feed([]byte("\x1b]7;file:///Users/me/My Documents\x07"))
+	if len(*got) != 1 || (*got)[0] != "/Users/me/My Documents" {
+		t.Fatalf("got %+v", *got)
 	}
 }
 
