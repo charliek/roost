@@ -158,6 +158,13 @@ jobs:
       - name: Show Swift toolchain
         run: swift --version
 
+      - name: Install protoc
+        # The GRPCProtobufGenerator SwiftPM build plugin shells out to
+        # `protoc` for codegen. SwiftPM's plugin sandbox blocks system
+        # binaries by default; the `--disable-sandbox` flag below lets
+        # the plugin invoke this protoc.
+        run: brew install protobuf
+
       - name: Cache SwiftPM artifacts
         uses: actions/cache@v4
         with:
@@ -176,10 +183,15 @@ jobs:
       # steps that may need their own time-boxing when they land, but
       # baseline `swift build` + `swift test` should always be blocking
       # — they're the cross-platform contract on the Mac side.
+      #
+      # `--disable-sandbox` is required because grpc-swift-protobuf's
+      # build plugin invokes the system `protoc`. SwiftPM's plugin
+      # sandbox blocks `tool(named:)` lookups for system binaries by
+      # default; this flag lets the plugin run.
       - name: swift build
         working-directory: mac
-        run: swift build -v
+        run: swift build -v --disable-sandbox
 
       - name: swift test
         working-directory: mac
-        run: swift test
+        run: swift test --disable-sandbox

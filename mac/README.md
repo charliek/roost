@@ -19,6 +19,15 @@ target architecture and phased path.
 | 5.4 | 🚧 | Cell renderer (Core Graphics first) |
 | 5.5 | 🚧 | `StreamPty` consumed + keystrokes routed |
 
+## Prerequisites
+
+Both the daemon and the Mac UI require `protoc` (the protobuf compiler)
+because the gRPC bindings are generated at build time:
+
+```bash
+brew install protobuf
+```
+
 ## Run it
 
 From the repo root, in two terminals:
@@ -30,8 +39,13 @@ cargo run -p roost-core
 
 ```bash
 # Terminal 2 — run the Mac UI
-cd mac && swift run Roost
+cd mac && swift run --disable-sandbox Roost
 ```
+
+The `--disable-sandbox` flag is required because the
+`GRPCProtobufGenerator` SwiftPM build plugin invokes `protoc` to
+generate Swift bindings; the default SwiftPM plugin sandbox blocks
+system binaries. CI passes the same flag.
 
 You should see a window come up immediately with the daemon's actual
 **pid + version + protocol version** printed in the status panel within
