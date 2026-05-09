@@ -21,10 +21,9 @@
 /mac/.swiftpm/
 /mac/Roost.xcodeproj/xcuserdata/
 /mac/Roost.xcodeproj/project.xcworkspace/xcuserdata/
-
-# Generated Swift proto bindings — regenerated at CI time, not checked in.
-/mac/Sources/Roost/Generated/*.swift
-!/mac/Sources/Roost/Generated/.gitkeep
+# Generated Swift proto bindings live under .build/plugins/outputs/...
+# (the SwiftPM build plugin writes them there); nothing to ignore here
+# inside the source tree.
 
 # Phase 1 throwaway spikes
 /spikes/

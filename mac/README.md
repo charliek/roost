@@ -13,7 +13,11 @@ target architecture and phased path.
 | Phase | Done | What landed |
 |---|---|---|
 | 2 | ✅ | SwiftPM skeleton + grpc-swift v2 deps declared |
-| 5 | 🚧 | AppKit window + status panel (this commit). gRPC client + libghostty-vt + cell renderer land in follow-up commits. |
+| 5.1 | ✅ | AppKit window + status panel |
+| 5.2 | ✅ | grpc-swift v2 codegen via SwiftPM build plugin + live `Identify()` round-trip from the UI |
+| 5.3 | 🚧 | libghostty-vt FFI from Swift (next) |
+| 5.4 | 🚧 | Cell renderer (Core Graphics first) |
+| 5.5 | 🚧 | `StreamPty` consumed + keystrokes routed |
 
 ## Run it
 
@@ -29,9 +33,23 @@ cargo run -p roost-core
 cd mac && swift run Roost
 ```
 
-Today the window shows the resolved socket path and a placeholder
-connection status. The next commit wires the gRPC client and replaces the
-status with a live `Identify()` round-trip.
+You should see a window come up immediately with the daemon's actual
+**pid + version + protocol version** printed in the status panel within
+a second or two of launch (the gRPC `Identify()` round-trip happens
+asynchronously after the window appears). If the daemon isn't running
+the panel turns red and shows the failure reason + a hint to start it.
+
+## Codegen
+
+Swift bindings for `proto/roost.proto` are generated at `swift build`
+time by the `GRPCSwiftProtobufGenerator` SwiftPM build plugin from
+`grpc-swift-protobuf`. The plugin requires the `.proto` file to live
+inside the target source path, so `Sources/Roost/Proto/roost.proto` is
+a symlink back to the canonical `proto/roost.proto`. Plugin config is
+`Sources/Roost/Proto/grpc-swift-proto-generator-config.json`.
+
+No checked-in generated `.swift` files; no separate codegen step in CI.
+Drift between schema and Swift bindings is impossible by construction.
 
 ## Build
 

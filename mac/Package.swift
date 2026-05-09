@@ -39,15 +39,30 @@ let package = Package(
             dependencies: [
                 .product(name: "GRPCCore", package: "grpc-swift"),
                 .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
-                .product(name: "GRPCNIOTransportHTTP2", package: "grpc-swift-nio-transport"),
+                // Posix variant is the one that exposes Unix-domain-socket
+                // targets (`HTTP2ClientTransport.Posix(target:
+                // .unixDomainSocket(...), ...)`). The TransportServices
+                // variant — Apple's Network.framework backend — doesn't
+                // support UDS.
+                .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             path: "Sources/Roost",
             exclude: [
-                // Generated bindings are produced at CI time by proto/gen-swift.sh.
-                // Phase 5 adds the AppKit window + cell renderer; .xib/.storyboard
-                // resources will land in this exclude list when they do.
-                "Generated",
+                // Phase 5 adds the AppKit window + cell renderer; .xib /
+                // .storyboard resources will land in this exclude list when
+                // they do.
+            ],
+            plugins: [
+                // Generates Swift bindings + client stubs from
+                // Sources/Roost/Proto/roost.proto (a symlink to the
+                // canonical proto/roost.proto at the repo root) at
+                // `swift build` time. Configured by
+                // Sources/Roost/Proto/grpc-swift-proto-generator-config.json.
+                .plugin(
+                    name: "GRPCSwiftProtobufGenerator",
+                    package: "grpc-swift-protobuf"
+                ),
             ]
         ),
         .testTarget(

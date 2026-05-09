@@ -1,31 +1,33 @@
 // Roost Mac client — Phase 5 AppKit skeleton.
 //
 // First runnable Mac UI on the refactor branch. Opens a single window
-// with a status panel that shows the resolved roost-core socket path and
-// a placeholder for connection state. No gRPC client wired yet — that
-// lands in the next commit, once protoc-gen-grpc-swift-2 codegen is
-// integrated. No terminal grid yet — that's libghostty-vt + the cell
-// renderer, also follow-up commits.
+// with a status panel and performs a one-shot `Identify()` handshake
+// against `roost-core` over Unix domain socket. The status text updates
+// live with the daemon's pid + version + protocol version on success,
+// or the failure reason if the daemon isn't running.
 //
-// What this does today:
-//   * Opens an `NSWindow` with title "Roost".
-//   * Shows the resolved socket path (XDG/HOME-derived, matching
-//     roost-core's `default_socket_path`).
-//   * Shows daemon connection status as "not connected (Phase 5 stub)".
-//   * Quits when the last window closes (standard Mac convention).
+// What this commit adds (vs. the previous AppKit skeleton):
+//   * Real grpc-swift v2 client wired through Sources/Roost/Proto/
+//     (the SwiftPM build plugin generates bindings at `swift build` time
+//     from the symlinked roost.proto).
+//   * Async Identify() round-trip; UI updates on the main actor.
+//
+// Still deferred to follow-up commits:
+//   * libghostty-vt FFI from Swift.
+//   * Cell renderer (Core Graphics first; Metal later if profiling demands).
+//   * StreamPty + keystroke routing.
+//   * Sidebar + tabs + projects (Phase 6a).
 //
 // To run from the repo root:
 //   1. Start the daemon in another terminal:
 //        cargo run -p roost-core
 //   2. Then:
 //        cd mac && swift run Roost
-//
-// CI exercises `swift build` + `swift test` on macos-latest; see
-// .github/workflows/refactor.yml.
+// You should see a window come up with the daemon's actual pid + version
+// printed in the status panel within a second or two of launch.
 
 import AppKit
 import Foundation
-import GRPCCore
 
 @main
 final class RoostApp: NSObject, NSApplicationDelegate {
@@ -41,6 +43,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let socketPath = Self.defaultSocketPath()
+
         let window = NSWindow(
             contentRect: NSRect(x: 200, y: 200, width: 720, height: 480),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -50,8 +54,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         window.title = "Roost"
         window.minSize = NSSize(width: 480, height: 320)
 
-        // Standard Mac default-window style. Phase 6a replaces this with
-        // a sidebar + tab layout.
         let content = NSView(frame: window.contentRect(forFrameRect: window.frame))
         content.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = content
@@ -61,19 +63,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         header.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(header)
 
-        let socketLabel = NSTextField(
-            labelWithString: "socket: \(Self.defaultSocketPath())"
-        )
+        let socketLabel = NSTextField(labelWithString: "socket: \(socketPath)")
         socketLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         socketLabel.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(socketLabel)
 
-        let statusLabel = NSTextField(
-            labelWithString: "daemon: not connected (Phase 5 stub — gRPC client lands next commit)"
-        )
-        statusLabel.font = .systemFont(ofSize: 12)
+        let statusLabel = NSTextField(labelWithString: "daemon: connecting…")
+        statusLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.lineBreakMode = .byWordWrapping
+        statusLabel.maximumNumberOfLines = 0
         content.addSubview(statusLabel)
 
         let visionLabel = NSTextField(
@@ -100,21 +100,49 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             visionLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
         ])
 
-        // Phase 2 sanity touch: instantiate one grpc-swift type so the
-        // compiler proves the dependency graph still resolves. Replaced
-        // with a real client + Identify() call in the next commit.
-        let _ = RPCError(code: .unavailable, message: "Phase 5 stub")
-
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
         self.statusLabel = statusLabel
+
+        // Kick off the handshake. We deliberately don't block window
+        // presentation on it — if the daemon isn't running, the user
+        // still sees the window come up immediately and gets a clear
+        // failure message in the status panel.
+        Task { [weak self] in
+            let outcome = await runIdentify(socketPath: socketPath)
+            await MainActor.run { [weak self] in
+                self?.applyIdentifyOutcome(outcome)
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    @MainActor
+    private func applyIdentifyOutcome(_ outcome: IdentifyOutcome) {
+        guard let label = statusLabel else { return }
+        switch outcome {
+        case .ok(let id):
+            label.textColor = .labelColor
+            label.stringValue = """
+                daemon: connected
+                  pid: \(id.pid)
+                  version: \(id.daemonVersion)  (proto v\(id.protocolVersion))
+                  active project: \(id.activeProjectID)  active tab: \(id.activeTabID)
+                """
+        case .failed(let reason):
+            label.textColor = .systemRed
+            label.stringValue = """
+                daemon: not reachable
+                  reason: \(reason)
+                  hint: start it with \"cargo run -p roost-core\"
+                """
+        }
     }
 
     /// Resolve the same default socket path as `roost-core`'s

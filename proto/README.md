@@ -1,5 +1,28 @@
 # proto/
 
-Single source of truth for the gRPC IPC contract between `roost-core` and the Mac + Linux UIs. `roost.proto` and generated bindings (Rust via `prost`/`tonic`, Swift via `grpc-swift`) land here in Phase 2.
+Single source of truth for the gRPC IPC contract between `roost-core` and
+the Mac + Linux UIs. `roost.proto` is consumed by:
 
-See [../docs/development/vision.md](../docs/development/vision.md) for the target architecture and phased path. Empty for now — Phase 0 placeholder.
+* **Rust** — `crates/roost-proto/build.rs` runs `tonic-build` (which
+  shells out to `protoc`) at every `cargo build`. Generated bindings
+  land in the build target dir; nothing is checked in.
+* **Swift (Mac)** — the `GRPCSwiftProtobufGenerator` SwiftPM build
+  plugin from `grpc-swift-protobuf` regenerates bindings at every
+  `swift build`. The plugin needs the `.proto` file to live inside the
+  target's source path, so `mac/Sources/Roost/Proto/roost.proto` is a
+  symlink back to `proto/roost.proto`. Plugin config sits next to the
+  symlink: `mac/Sources/Roost/Proto/grpc-swift-proto-generator-config.json`.
+
+Bindings are never checked into VCS — drift between `roost.proto` and a
+stale generated file is impossible by construction.
+
+## Schema discipline
+
+* Every change to `roost.proto` lands in `CHANGELOG.md`.
+* Pre-1.0: anything goes. Once Phase 5 ships and a real Mac UI depends
+  on the schema, evolution is additive only — deprecate fields rather
+  than renumber, and bump `roost_proto::PROTOCOL_VERSION` for breaking
+  changes.
+
+See [../docs/development/vision.md](../docs/development/vision.md) for
+the architectural context.
