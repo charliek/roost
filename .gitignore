@@ -4,6 +4,30 @@
 /build/.cache/
 /build/ghostty-src/
 /site-build/
+
+# Rust workspace
+/target/
+**/*.rs.bk
+
+# Vendored Ghostty (new architecture; same source-of-truth model as build/)
+/third_party/ghostty/out/
+/third_party/ghostty/src/
+/third_party/ghostty/.cache/
+
+# Mac (Xcode + SwiftPM) build artifacts
+/mac/build/
+/mac/.build/
+/mac/DerivedData/
+/mac/.swiftpm/
+/mac/Roost.xcodeproj/xcuserdata/
+/mac/Roost.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Generated Swift proto bindings — regenerated at CI time, not checked in.
+/mac/Sources/Roost/Generated/*.swift
+!/mac/Sources/Roost/Generated/.gitkeep
+
+# Phase 1 throwaway spikes
+/spikes/
 .venv/
 __pycache__/
 *.test

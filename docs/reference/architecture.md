@@ -1,5 +1,7 @@
 # Architecture
 
+> See [../development/vision.md](../development/vision.md) for the target architecture this codebase is migrating toward (Rust core + native Mac/Linux UIs over a gRPC contract). This document remains authoritative for the current Go + GTK4 implementation on `main` until the cutover described there.
+
 Roost is one binary with a strictly layered package structure. The UI talks to a workspace coordinator, which owns persistence and emits events. PTY supervision and the libghostty-vt cgo boundary live in their own packages and never touch the UI layer.
 
 ## Stack

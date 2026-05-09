@@ -1,0 +1,30 @@
+[package]
+name        = "roost-vt"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Safe Rust wrapper over libghostty-vt's C API (VT parse, OSC, screen state)."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# When enabled, build.rs invokes bindgen and links the static archive at
+# third_party/ghostty/out/lib/libghostty-vt.a. The default (no feature)
+# compiles a stub so the workspace can `cargo check` without the vendored
+# archive being present — useful in CI before the libghostty-vt build job
+# has run, and on developer machines that haven't built it yet.
+default = []
+ffi     = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }
+
+[lints]
+workspace = true

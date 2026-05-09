@@ -16,6 +16,10 @@ set -euo pipefail
 
 # --- Pinned versions ---------------------------------------------------------
 # Ghostty SHA — bump deliberately, in its own PR, with a rebuild test.
+# KEEP IN SYNC with third_party/ghostty/build.sh until the Phase 9 cutover
+# described in docs/development/vision.md. Both scripts must pin the same
+# SHA so the legacy Go binary and the new Rust+Swift toolchain build against
+# identical libghostty-vt artifacts.
 GHOSTTY_SHA="c74f6d56d1feef473033057bc0ff7e3f00cf6421"  # 2026-04-25, builds lib-vt cleanly with zig 0.15.1
 GHOSTTY_REPO="https://github.com/ghostty-org/ghostty.git"
 

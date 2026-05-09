@@ -103,6 +103,7 @@ nav:
       - Fonts: reference/fonts.md
       - Architecture: reference/architecture.md
   - Development:
+      - Vision: development/vision.md
       - Setup: development/setup.md
       - Design Spec: development/spec.md
 

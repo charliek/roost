@@ -1,0 +1,2 @@
+Generated Swift bindings for proto/roost.proto land here. Run proto/gen-swift.sh
+to populate. CI on macos-latest runs the generator before `swift build`.

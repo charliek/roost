@@ -1,0 +1,316 @@
+// Roost IPC protocol.
+//
+// Single source of truth for the wire contract between roost-core (Rust
+// daemon) and the native UIs (Swift/AppKit on macOS, Rust/gtk4-rs on Linux).
+//
+// Transport: gRPC over Unix domain socket. Local IPC only — there is no
+// remote / network deployment. The socket lives at the runtime dir resolved
+// by roost-core (e.g. ~/.local/state/roost/roost.sock on Linux,
+// ~/Library/Application Support/roost/roost.sock on macOS).
+//
+// Schema evolution: additive changes only. Deprecate fields rather than
+// renumber. Bump proto/CHANGELOG.md on every change. Once Phase 5 ships,
+// breaking changes require coordinated client+daemon releases.
+//
+// Hot path: PTY bytes flow core->UI as gRPC server-streams via StreamPty;
+// the UI parses VT and renders in-process. OSC events detected during VT
+// parse upcall to ReportOsc. Renderer state never crosses the wire.
+
+syntax = "proto3";
+
+package roost.v1;
+
+// =============================================================================
+// Service
+// =============================================================================
+
+service Roost {
+  // ---- Identity / handshake ----
+  rpc Identify(IdentifyRequest) returns (IdentifyResponse);
+
+  // ---- Tab lifecycle ----
+  rpc OpenTab(OpenTabRequest) returns (OpenTabResponse);
+  rpc CloseTab(CloseTabRequest) returns (CloseTabResponse);
+  rpc ListTabs(ListTabsRequest) returns (ListTabsResponse);
+
+  // ---- Terminal stream ----
+  // Bidirectional. Client opens with PtyAttach{tab_id}, then sends
+  // PtyInput / PtyResize. Server streams PtyOutput until the PTY exits,
+  // then sends PtyExit and closes the stream.
+  rpc StreamPty(stream PtyClientMessage) returns (stream PtyServerMessage);
+
+  // ---- Workspace events (server-streams everything that mutates state) ----
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+
+  // ---- Control (mirrors current internal/ipc methods) ----
+  rpc CreateNotification(CreateNotificationRequest) returns (CreateNotificationResponse);
+  rpc SetTabTitle(SetTabTitleRequest) returns (SetTabTitleResponse);
+  rpc FocusTab(FocusTabRequest) returns (FocusTabResponse);
+  rpc SetTabState(SetTabStateRequest) returns (SetTabStateResponse);
+  rpc ClearTabNotification(ClearTabNotificationRequest) returns (ClearTabNotificationResponse);
+  rpc SetHookActive(SetHookActiveRequest) returns (SetHookActiveResponse);
+
+  // ---- OSC upcall ----
+  // The UI parses VT and reports OSC sequences back to core for routing.
+  // Core decides whether to fire a notification, update CWD, etc.
+  rpc ReportOsc(ReportOscRequest) returns (ReportOscResponse);
+}
+
+// =============================================================================
+// Common types
+// =============================================================================
+
+enum TabState {
+  TAB_STATE_UNSPECIFIED = 0;
+  TAB_STATE_NONE        = 1;  // no agent activity
+  TAB_STATE_RUNNING     = 2;  // agent is working
+  TAB_STATE_NEEDS_INPUT = 3;  // agent is waiting on the user
+  TAB_STATE_IDLE        = 4;  // agent finished, no pending input
+}
+
+message Project {
+  int64  id          = 1;
+  string name        = 2;
+  string cwd         = 3;
+  int32  position    = 4;
+  int64  created_at  = 5;  // unix seconds
+  repeated Tab tabs  = 6;
+}
+
+message Tab {
+  int64    id              = 1;
+  int64    project_id      = 2;
+  string   title           = 3;
+  string   cwd             = 4;
+  TabState state           = 5;
+  bool     has_notification = 6;
+  bool     is_active       = 7;
+  bool     user_titled     = 8;  // manual rename locks against OSC 1/2
+  int32    position        = 9;
+  int64    created_at      = 10;
+  int64    last_active     = 11;
+}
+
+// =============================================================================
+// Identity / handshake
+// =============================================================================
+
+message IdentifyRequest {
+  // Optional client identification for debugging in `roost-core` logs.
+  string client_name    = 1;  // e.g. "roost-mac", "roost-linux", "roost-cli-rs"
+  string client_version = 2;
+}
+
+message IdentifyResponse {
+  string socket_path        = 1;
+  int32  pid                = 2;
+  int64  active_project_id  = 3;
+  int64  active_tab_id      = 4;
+  string daemon_version     = 5;
+  uint32 protocol_version   = 6;  // bumps on breaking schema change
+}
+
+// =============================================================================
+// Tab lifecycle
+// =============================================================================
+
+message OpenTabRequest {
+  int64  project_id = 1;
+  string cwd        = 2;  // empty = use project's default cwd
+  string command    = 3;  // empty = user's $SHELL
+  uint32 cols       = 4;
+  uint32 rows       = 5;
+  string title      = 6;  // empty = derive from cwd
+}
+
+message OpenTabResponse {
+  Tab tab = 1;
+}
+
+message CloseTabRequest {
+  int64 tab_id = 1;
+}
+
+message CloseTabResponse {}
+
+message ListTabsRequest {}
+
+message ListTabsResponse {
+  repeated Project projects = 1;
+}
+
+// =============================================================================
+// PTY stream
+// =============================================================================
+
+message PtyClientMessage {
+  oneof kind {
+    PtyAttach attach = 1;
+    PtyInput  input  = 2;
+    PtyResize resize = 3;
+  }
+}
+
+message PtyAttach {
+  int64  tab_id = 1;
+  uint32 cols   = 2;  // resync on attach
+  uint32 rows   = 3;
+}
+
+message PtyInput {
+  bytes data = 1;
+}
+
+message PtyResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message PtyServerMessage {
+  oneof kind {
+    PtyOutput output = 1;
+    PtyExit   exit   = 2;
+  }
+}
+
+message PtyOutput {
+  bytes data = 1;
+}
+
+message PtyExit {
+  int32 status = 1;
+  string reason = 2;  // human-readable exit reason; empty on normal exit
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+
+message WatchEventsRequest {
+  // If set, only events for this tab are streamed. Zero = all events.
+  int64 tab_id_filter = 1;
+}
+
+message Event {
+  oneof kind {
+    NotificationEvent       notification        = 1;
+    TabStateChangedEvent    tab_state           = 2;
+    TabNotificationEvent    tab_notification    = 3;
+    TabDeletedEvent         tab_deleted         = 4;
+    ProjectsReorderedEvent  projects_reordered  = 5;
+    TabsReorderedEvent      tabs_reordered      = 6;
+    TabTitleChangedEvent    tab_title           = 7;
+    TabCwdChangedEvent      tab_cwd             = 8;
+  }
+}
+
+message NotificationEvent {
+  int64  tab_id = 1;
+  string title  = 2;
+  string body   = 3;
+}
+
+message TabStateChangedEvent {
+  int64    tab_id = 1;
+  TabState state  = 2;
+}
+
+message TabNotificationEvent {
+  int64 tab_id      = 1;
+  bool  has_pending = 2;
+}
+
+message TabDeletedEvent {
+  int64 tab_id = 1;
+}
+
+message ProjectsReorderedEvent {
+  repeated int64 project_ids = 1;
+}
+
+message TabsReorderedEvent {
+  int64           project_id = 1;
+  repeated int64  tab_ids    = 2;
+}
+
+message TabTitleChangedEvent {
+  int64  tab_id = 1;
+  string title  = 2;
+}
+
+message TabCwdChangedEvent {
+  int64  tab_id = 1;
+  string cwd    = 2;
+}
+
+// =============================================================================
+// Control RPCs
+// =============================================================================
+
+message CreateNotificationRequest {
+  int64  tab_id = 1;
+  string title  = 2;
+  string body   = 3;
+}
+
+message CreateNotificationResponse {}
+
+message SetTabTitleRequest {
+  int64  tab_id = 1;
+  string title  = 2;
+}
+
+message SetTabTitleResponse {}
+
+message FocusTabRequest {
+  int64 tab_id = 1;
+}
+
+message FocusTabResponse {
+  int64 previous_project_id = 1;
+  int64 previous_tab_id     = 2;
+}
+
+message SetTabStateRequest {
+  int64    tab_id = 1;
+  TabState state  = 2;
+}
+
+message SetTabStateResponse {}
+
+message ClearTabNotificationRequest {
+  int64 tab_id = 1;
+}
+
+message ClearTabNotificationResponse {}
+
+message SetHookActiveRequest {
+  int64 tab_id = 1;
+  bool  active = 2;
+}
+
+message SetHookActiveResponse {}
+
+// =============================================================================
+// OSC upcall
+//
+// The UI parses VT bytes in-process. When it detects an OSC sequence relevant
+// to roost-core's routing logic (notifications, cwd, title), it calls
+// ReportOsc. Core decides what to do — emit a NotificationEvent, fire the
+// hook-suppression rule, update tab CWD, etc.
+//
+// OSC commands of interest:
+//   0  / 1 / 2 -> title (handled mostly UI-side; reported only when locking applies)
+//   7          -> cwd (file://host/path URI)
+//   9          -> macOS-style notification (Title only)
+//   99         -> Apple notification with id (rare)
+//   777        -> notify;Title;Body (xterm extension widely used by agents)
+// =============================================================================
+
+message ReportOscRequest {
+  int64  tab_id      = 1;
+  uint32 osc_command = 2;  // 0, 1, 2, 7, 9, 99, 777, ...
+  string payload     = 3;  // semicolon-separated arguments per OSC convention
+}
+
+message ReportOscResponse {}
