@@ -1,5 +1,44 @@
 # mac/
 
-Native macOS UI: Swift + AppKit, packaged as a notarized `.app` bundle. Links libghostty-vt directly via the C ABI for in-process VT parse + render. Talks to `roost-core` via `grpc-swift` v2 over a Unix domain socket. Xcode project lands here in Phase 2; UI MVP in Phase 5.
+Native macOS UI: Swift + AppKit. Talks to `roost-core` via `grpc-swift` v2
+over a Unix domain socket. Will link libghostty-vt directly via the C ABI
+for in-process VT parse + render in Phase 6/7. Bundled as a notarized
+`.app` in Phase 8.
 
-See [../docs/development/vision.md](../docs/development/vision.md) for the target architecture and phased path. Empty for now — Phase 0 placeholder.
+See [../docs/development/vision.md](../docs/development/vision.md) for the
+target architecture and phased path.
+
+## Status
+
+| Phase | Done | What landed |
+|---|---|---|
+| 2 | ✅ | SwiftPM skeleton + grpc-swift v2 deps declared |
+| 5 | 🚧 | AppKit window + status panel (this commit). gRPC client + libghostty-vt + cell renderer land in follow-up commits. |
+
+## Run it
+
+From the repo root, in two terminals:
+
+```bash
+# Terminal 1 — run the daemon
+cargo run -p roost-core
+```
+
+```bash
+# Terminal 2 — run the Mac UI
+cd mac && swift run Roost
+```
+
+Today the window shows the resolved socket path and a placeholder
+connection status. The next commit wires the gRPC client and replaces the
+status with a live `Identify()` round-trip.
+
+## Build
+
+* Requires Xcode 16+ / Swift 6.0+ on macOS 14+.
+* `swift build` resolves dependencies and compiles.
+* `swift test` runs the smoke tests under `Tests/RoostTests/`.
+
+CI runs both on `macos-latest` via `.github/workflows/refactor.yml`. The
+job is `continue-on-error: true` through Phase 5 while the Swift codegen
++ libghostty-vt FFI pieces stabilise.
