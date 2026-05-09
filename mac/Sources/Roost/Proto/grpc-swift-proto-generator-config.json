@@ -1,17 +1,10 @@
 {
-    "_comment": "Configures the GRPCSwiftProtobufGenerator SwiftPM build plugin from grpc-swift-protobuf v2. Generates Swift bindings + client stubs for roost.proto at swift build time. The Mac client only acts as a gRPC client, so server stubs are off.",
-    "generate": {
-        "clients": true,
-        "servers": false,
-        "messages": true
-    },
-    "client": {
-        "accessLevel": "public"
-    },
-    "messages": {
-        "accessLevel": "public"
-    },
-    "fileNaming": {
-        "outputPath": ""
-    }
+  "_comment": "Configures the GRPCProtobufGenerator SwiftPM build plugin from grpc-swift-protobuf v2. Schema lives in https://github.com/grpc/grpc-swift-protobuf/blob/main/Plugins/PluginsShared/GenerationConfig.swift — keep this file in sync with that struct's field names. Generated bindings are written under .build/plugins/outputs/...; nothing checked into VCS.",
+
+  "accessLevel": "Public",
+  "clients": true,
+  "servers": false,
+  "messages": true,
+  "fileNaming": "DropPath",
+  "accessLevelOnImports": false
 }

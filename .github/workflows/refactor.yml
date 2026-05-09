@@ -159,10 +159,9 @@ jobs:
         run: swift --version
 
       - name: Install protoc
-        # The GRPCProtobufGenerator SwiftPM build plugin shells out to
-        # `protoc` for codegen. SwiftPM's plugin sandbox blocks system
-        # binaries by default; the `--disable-sandbox` flag below lets
-        # the plugin invoke this protoc.
+        # GRPCProtobufGenerator's deriveProtocPath() needs a real protoc
+        # binary to run — the SwiftPM-bundled tooling produces only
+        # protoc-gen-swift / protoc-gen-grpc-swift-2 (the plugin half).
         run: brew install protobuf
 
       - name: Cache SwiftPM artifacts
@@ -184,14 +183,18 @@ jobs:
       # baseline `swift build` + `swift test` should always be blocking
       # — they're the cross-platform contract on the Mac side.
       #
-      # `--disable-sandbox` is required because grpc-swift-protobuf's
-      # build plugin invokes the system `protoc`. SwiftPM's plugin
-      # sandbox blocks `tool(named:)` lookups for system binaries by
-      # default; this flag lets the plugin run.
+      # PROTOC_PATH is honored by GRPCProtobufGenerator's discovery
+      # function (PluginsShared/PluginUtils.swift::deriveProtocPath) when
+      # the plugin can't find protoc via SwiftPM's tool registry —
+      # which is the case for any system-installed protoc since SwiftPM
+      # only resolves tools that are package-graph products or binary
+      # targets. We point it at whatever `brew install protobuf` put on
+      # PATH so this works on both arm64 (/opt/homebrew/bin) and Intel
+      # (/usr/local/bin) macOS runners.
       - name: swift build
         working-directory: mac
-        run: swift build -v --disable-sandbox
+        run: PROTOC_PATH="$(which protoc)" swift build -v
 
       - name: swift test
         working-directory: mac
-        run: swift test --disable-sandbox
+        run: PROTOC_PATH="$(which protoc)" swift test

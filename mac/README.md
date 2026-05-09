@@ -39,13 +39,21 @@ cargo run -p roost-core
 
 ```bash
 # Terminal 2 — run the Mac UI
-cd mac && swift run --disable-sandbox Roost
+cd mac && PROTOC_PATH="$(which protoc)" swift run Roost
 ```
 
-The `--disable-sandbox` flag is required because the
-`GRPCProtobufGenerator` SwiftPM build plugin invokes `protoc` to
-generate Swift bindings; the default SwiftPM plugin sandbox blocks
-system binaries. CI passes the same flag.
+`PROTOC_PATH` is required because `GRPCProtobufGenerator`'s
+`deriveProtocPath` only checks (a) the plugin config's `protocPath`
+field, (b) the `PROTOC_PATH` env var, and (c) SwiftPM's `tool(named:)`
+registry. System binaries from Homebrew aren't registered as SwiftPM
+tools, so the env var is the cleanest portable way to point it at
+your local protoc. CI sets the same env var.
+
+If you'd rather not type `PROTOC_PATH` every time, set it in your
+shell profile (`export PROTOC_PATH=$(which protoc)`) or pin it in
+the plugin config `Sources/Roost/Proto/grpc-swift-proto-generator-config.json`
+under the `protocPath` field — note that pinning makes the config
+host-specific, which is why we don't do it in the repo by default.
 
 You should see a window come up immediately with the daemon's actual
 **pid + version + protocol version** printed in the status panel within
