@@ -34,8 +34,11 @@ use tower::service_fn;
 /// * **Linux (XDG):** `$XDG_RUNTIME_DIR/roost/roost.sock`
 /// * **Linux (fallback):** `/tmp/roost-<uid>/roost.sock`
 ///
-/// The Mac UI's `RoostApp.defaultSocketPath` (Swift) implements the
-/// same algorithm. Keep them in sync.
+/// Empty or non-absolute values for `XDG_RUNTIME_DIR` fall through to
+/// the uid-suffixed `/tmp` fallback. Some launchd-spawned processes
+/// inherit `XDG_RUNTIME_DIR=""` (set but empty); a relative path would
+/// otherwise yield a silently-broken socket. Mirrors the Swift
+/// `RoostApp.defaultSocketPath` validation rules — keep them in sync.
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME").context("$HOME not set")?;
@@ -44,7 +47,10 @@ pub fn default_socket_path() -> anyhow::Result<PathBuf> {
             .join("roost.sock"))
     } else {
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            return Ok(PathBuf::from(dir).join("roost").join("roost.sock"));
+            let p = PathBuf::from(dir);
+            if !p.as_os_str().is_empty() && p.is_absolute() {
+                return Ok(p.join("roost").join("roost.sock"));
+            }
         }
         let uid = libc_getuid();
         Ok(PathBuf::from(format!("/tmp/roost-{uid}")).join("roost.sock"))
@@ -57,6 +63,8 @@ pub fn default_socket_path() -> anyhow::Result<PathBuf> {
 /// * **macOS:** `~/Library/Application Support/roost/roost.db`
 /// * **Linux (XDG):** `$XDG_DATA_HOME/roost/roost.db`
 /// * **Linux (fallback):** `$HOME/.local/share/roost/roost.db`
+///
+/// Same empty/non-absolute fallthrough rule as `default_socket_path`.
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME").context("$HOME not set")?;
@@ -65,7 +73,10 @@ pub fn default_db_path() -> anyhow::Result<PathBuf> {
             .join("roost.db"))
     } else {
         if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(dir).join("roost").join("roost.db"));
+            let p = PathBuf::from(dir);
+            if !p.as_os_str().is_empty() && p.is_absolute() {
+                return Ok(p.join("roost").join("roost.db"));
+            }
         }
         let home = std::env::var_os("HOME").context("$HOME not set")?;
         Ok(PathBuf::from(home)

@@ -31,6 +31,12 @@ enum IdentifyOutcome: Sendable {
     case failed(String)
 }
 
+/// Default per-RPC timeout for the handshake. A reachable but stalled
+/// daemon shouldn't keep the UI in "connecting…" forever — 5s is plenty
+/// of budget for a local Unix-domain-socket round-trip on the loopback
+/// path, and short enough that a real failure surfaces quickly.
+private let identifyTimeout: Duration = .seconds(5)
+
 /// One-shot Identify against the daemon. Opens a transient gRPC client,
 /// performs the handshake, returns the result. The transport is closed
 /// before this function returns; subsequent calls open fresh clients.
@@ -50,7 +56,8 @@ func runIdentify(socketPath: String) async -> IdentifyOutcome {
                 .with {
                     $0.clientName = "roost-mac"
                     $0.clientVersion = clientVersion()
-                }
+                },
+                callOptions: CallOptions(timeout: identifyTimeout)
             )
             return .ok(
                 RoostIdentity(

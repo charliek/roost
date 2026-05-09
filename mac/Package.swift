@@ -7,9 +7,11 @@
 // for the skeleton stage SwiftPM is the simplest CI-friendly path.
 //
 // Dependencies are declared on grpc-swift v2 + the NIO HTTP/2 transport so
-// the Mac CI job exercises full Swift package resolution. Generated proto
-// bindings live under Sources/Roost/Generated/ and are produced by
-// proto/gen-swift.sh (run in CI before `swift build`).
+// the Mac CI job exercises full Swift package resolution. Swift bindings
+// for the proto schema are generated at every `swift build` by the
+// `GRPCSwiftProtobufGenerator` SwiftPM build plugin from
+// `grpc-swift-protobuf` — see Sources/Roost/Proto/ for the symlinked
+// .proto and the plugin's config. Nothing generated lives in VCS.
 
 import PackageDescription
 

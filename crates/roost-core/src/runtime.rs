@@ -67,7 +67,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .context("gRPC server crashed")?;
 
     info!("roost-core shutting down");
-    let _ = tokio::fs::remove_file(&config.socket_path).await;
+    // Use the same guarded helper so a misconfigured `--socket` pointed
+    // at a regular file doesn't get silently destroyed on shutdown.
+    let _ = remove_socket_if_present(&config.socket_path).await;
     Ok(())
 }
 
@@ -77,11 +79,45 @@ async fn prepare_socket_path(path: &Path) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    // Remove any stale socket from a previous run. roost-core is single-instance.
-    if path.exists() {
-        let _ = tokio::fs::remove_file(path).await;
-    }
+    // roost-core is single-instance, so a leftover socket from a prior
+    // run is expected and we want to remove it. But we ONLY remove it if
+    // it's actually a socket — refuse to silently delete a regular file
+    // or directory the user accidentally pointed `--socket` at.
+    remove_socket_if_present(path).await?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_socket(file_type: std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_socket()
+}
+
+#[cfg(not(unix))]
+fn is_socket(_file_type: std::fs::FileType) -> bool {
+    false
+}
+
+async fn remove_socket_if_present(path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => {
+            if is_socket(meta.file_type()) {
+                tokio::fs::remove_file(path)
+                    .await
+                    .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "refusing to remove non-socket path {} (file type: {:?}). \
+                     If this was intentional, remove it manually first.",
+                    path.display(),
+                    meta.file_type()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
 }
 
 #[cfg(unix)]
