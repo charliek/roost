@@ -120,12 +120,22 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Resolve the same default socket path as `roost-core`'s
     /// `default_socket_path`. Mac uses `~/Library/Caches/roost/roost.sock`;
     /// tests run on Linux runners hit the XDG branch.
-    static func defaultSocketPath() -> String {
-        let env = ProcessInfo.processInfo.environment
-        if let xdg = env["XDG_RUNTIME_DIR"] {
+    ///
+    /// The `environment` parameter defaults to the process's environment
+    /// but is injectable so unit tests can assert XDG → HOME → /tmp
+    /// precedence without mucking with the real env.
+    ///
+    /// Empty or non-absolute values for the relevant variables fall
+    /// through to the next branch. `XDG_RUNTIME_DIR=""` (set but empty)
+    /// is a real shape in some sandboxed launchd setups, and a relative
+    /// `HOME` would otherwise yield a silently-broken socket path.
+    static func defaultSocketPath(
+        environment env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        if let xdg = env["XDG_RUNTIME_DIR"], !xdg.isEmpty, xdg.hasPrefix("/") {
             return "\(xdg)/roost/roost.sock"
         }
-        if let home = env["HOME"] {
+        if let home = env["HOME"], !home.isEmpty, home.hasPrefix("/") {
             return "\(home)/Library/Caches/roost/roost.sock"
         }
         return "/tmp/roost.sock"

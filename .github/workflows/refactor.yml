@@ -107,7 +107,9 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: cargo test
-        # Phase 2 latitude: tests can flake while infrastructure settles.
+        # Time-boxed exception. `continue-on-error` lifts at the Phase 3
+        # exit milestone (roost-core MVP serving on UDS, smoke client
+        # round-trip), tracked in docs/development/vision.md.
         continue-on-error: true
         run: cargo test --workspace
 
@@ -131,9 +133,16 @@ jobs:
           key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
           restore-keys: swiftpm-${{ runner.os }}-
 
+      # Time-boxed exception. `continue-on-error: true` lifts at the
+      # Phase 6 exit milestone (Mac feature parity with the current Go
+      # binary), at which point the swift-mac job becomes
+      # required-green-on-every-commit. Tracked in mac/README.md and
+      # docs/development/vision.md. Reasons it's transitional today:
+      #   * grpc-swift v2 codegen path (SwiftPM build plugin vs.
+      #     checked-in protoc-gen-grpc-swift-2 output) is still
+      #     in flight.
+      #   * libghostty-vt FFI from Swift is unverified.
       - name: swift build
-        # Phase 2 latitude: grpc-swift v2 package coordinates may need a
-        # follow-up tweak. Flip continue-on-error off at Phase 5 entry.
         continue-on-error: true
         working-directory: mac
         run: swift build -v
