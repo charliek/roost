@@ -109,7 +109,7 @@ impl Roost for RoostService {
         // Spawn the PTY synchronously so the response confirms the shell is alive.
         let _handle = self
             .ptys
-            .spawn(tab.id, &cwd, &r.command, cols, rows)
+            .spawn(tab.id, &cwd, &r.argv, cols, rows)
             .map_err(|e| Status::internal(format!("spawn pty: {e}")))?;
 
         // We immediately drop the handle; the gRPC StreamPty handler will
@@ -136,6 +136,7 @@ impl Roost for RoostService {
                 position: tab.position,
                 created_at: tab.created_at,
                 last_active: tab.last_active,
+                hook_active: tab.hook_active,
             }),
         }))
     }
@@ -203,7 +204,7 @@ impl Roost for RoostService {
             .ok_or_else(|| Status::not_found(format!("tab {} not found", attach.tab_id)))?;
 
         let mut handle = ptys
-            .spawn(attach.tab_id, &tab.cwd, "", cols, rows)
+            .spawn(attach.tab_id, &tab.cwd, &[], cols, rows)
             .map_err(|e| Status::internal(format!("spawn: {e}")))?;
 
         let tab_id = attach.tab_id;
@@ -417,9 +418,14 @@ fn event_matches_tab(event: &Event, tab_id: i64) -> bool {
         Some(roost_proto::v1::event::Kind::TabDeleted(e)) => e.tab_id == tab_id,
         Some(roost_proto::v1::event::Kind::TabTitle(e)) => e.tab_id == tab_id,
         Some(roost_proto::v1::event::Kind::TabCwd(e)) => e.tab_id == tab_id,
-        // Structural events are workspace-wide; always include them.
+        Some(roost_proto::v1::event::Kind::TabOpened(e)) => {
+            e.tab.as_ref().map(|t| t.id) == Some(tab_id)
+        }
+        Some(roost_proto::v1::event::Kind::HookActive(e)) => e.tab_id == tab_id,
+        // Structural / global events are workspace-wide; always include them.
         Some(roost_proto::v1::event::Kind::ProjectsReordered(_)) => true,
         Some(roost_proto::v1::event::Kind::TabsReordered(_)) => true,
+        Some(roost_proto::v1::event::Kind::Active(_)) => true,
         None => false,
     }
 }
@@ -448,5 +454,6 @@ fn map_err(err: WorkspaceError) -> Status {
         WorkspaceError::ProjectNotFound(_) | WorkspaceError::TabNotFound(_) => {
             Status::not_found(err.to_string())
         }
+        WorkspaceError::Store(_) => Status::internal(err.to_string()),
     }
 }

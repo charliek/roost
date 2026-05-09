@@ -20,5 +20,6 @@ pub mod pty;
 pub mod runtime;
 pub mod service;
 pub mod state;
+pub mod store;
 
 pub use runtime::{run, Config};

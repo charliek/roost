@@ -36,9 +36,10 @@ struct Args {
     #[arg(long, env = "ROOST_SOCKET")]
     socket: Option<PathBuf>,
 
-    /// Shell command to spawn. Empty = $SHELL on the daemon side.
-    #[arg(long, default_value = "")]
-    command: String,
+    /// Argv to spawn. Repeat the flag for each token, e.g.
+    /// `--arg bash --arg --login`. Empty = the daemon picks $SHELL.
+    #[arg(long = "arg")]
+    argv: Vec<String>,
 }
 
 #[tokio::main]
@@ -82,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .open_tab(OpenTabRequest {
             project_id: 0,
             cwd: cwd.clone(),
-            command: args.command.clone(),
+            argv: args.argv.clone(),
             cols: 80,
             rows: 24,
             title: "smoke".into(),

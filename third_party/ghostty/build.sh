@@ -45,6 +45,15 @@ command -v zig >/dev/null 2>&1 || {
   exit 1
 }
 
+# Ghostty pins to Zig 0.15.x; both 0.14 and 0.16 produce surprising errors
+# downstream. Validate up front so a wrong toolchain is obvious.
+zig_version="$(zig version 2>/dev/null || true)"
+if ! printf '%s\n' "${zig_version}" | grep -E '^0\.15(\.|$)' >/dev/null; then
+  echo "error: zig version ${zig_version:-<unknown>} is not 0.15.x." >&2
+  echo "       Install the right toolchain via \`mise install\` from the repo root." >&2
+  exit 1
+fi
+
 if [ ! -d "${GHOSTTY_SRC}/.git" ]; then
   echo "==> Cloning Ghostty @ ${GHOSTTY_SHA}"
   git clone "${GHOSTTY_REPO}" "${GHOSTTY_SRC}"
@@ -62,8 +71,14 @@ echo "==> Building libghostty-vt"
 zig build -Demit-lib-vt=true -Doptimize=ReleaseFast --prefix "${OUT_DIR}"
 popd >/dev/null
 
-if [ ! -f "${OUT_DIR}/include/ghostty/vt.h" ]; then
-  echo "error: ghostty/vt.h not found in ${OUT_DIR}/include after zig build." >&2
+missing_header=0
+missing_archive=0
+[ -f "${OUT_DIR}/include/ghostty/vt.h" ] || missing_header=1
+[ -f "${OUT_DIR}/lib/libghostty-vt.a" ] || missing_archive=1
+if [ "${missing_header}" -eq 1 ] || [ "${missing_archive}" -eq 1 ]; then
+  echo "error: expected libghostty-vt artifacts not found under ${OUT_DIR} after zig build." >&2
+  echo "       missing header (vt.h):                  ${missing_header}" >&2
+  echo "       missing static archive (libghostty-vt.a): ${missing_archive}" >&2
   echo "       Inspect ${OUT_DIR} and ${GHOSTTY_SRC}/zig-out/." >&2
   exit 1
 fi

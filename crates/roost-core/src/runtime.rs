@@ -17,6 +17,9 @@ use crate::state::Workspace;
 /// Configuration for a daemon run.
 pub struct Config {
     pub socket_path: PathBuf,
+    /// Path to the SQLite database file. `None` uses an ephemeral in-memory
+    /// database — useful for smoke tests but loses state on shutdown.
+    pub db_path: Option<PathBuf>,
 }
 
 /// Resolve the default Unix domain socket path.
@@ -36,6 +39,28 @@ pub fn default_socket_path() -> anyhow::Result<PathBuf> {
         // Fallback for systems without XDG_RUNTIME_DIR (containers, SSH).
         let uid = libc_getuid();
         Ok(PathBuf::from(format!("/tmp/roost-{uid}")).join("roost.sock"))
+    }
+}
+
+/// Resolve the default SQLite path. Persisted state lives alongside the OS's
+/// per-user data directory.
+///
+/// Linux: `$XDG_DATA_HOME/roost/roost.db` (falls back to `$HOME/.local/share/roost`).
+/// macOS: `~/Library/Application Support/roost/roost.db`.
+pub fn default_db_path() -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME").context("$HOME not set")?;
+        Ok(PathBuf::from(home)
+            .join("Library/Application Support/roost")
+            .join("roost.db"))
+    } else {
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+            return Ok(PathBuf::from(dir).join("roost").join("roost.db"));
+        }
+        let home = std::env::var_os("HOME").context("$HOME not set")?;
+        Ok(PathBuf::from(home)
+            .join(".local/share/roost")
+            .join("roost.db"))
     }
 }
 
@@ -62,9 +87,27 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {}", config.socket_path.display()))?;
     set_socket_perms(&config.socket_path)?;
 
+    let workspace = match config.db_path.as_ref() {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            info!(path = %path.display(), "opening sqlite store");
+            Arc::new(
+                Workspace::open(path)
+                    .with_context(|| format!("open workspace at {}", path.display()))?,
+            )
+        }
+        None => {
+            info!("using in-memory sqlite store (state will be lost on shutdown)");
+            Arc::new(Workspace::new())
+        }
+    };
+
     info!(path = %config.socket_path.display(), "roost-core listening");
 
-    let workspace = Arc::new(Workspace::new());
     let service = RoostService::new(workspace, config.socket_path.clone());
 
     let stream = UnixListenerStream::new(listener);

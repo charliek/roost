@@ -9,6 +9,12 @@ struct Args {
     #[arg(long, env = "ROOST_SOCKET")]
     socket: Option<PathBuf>,
 
+    /// SQLite database path. Defaults to a per-platform data directory.
+    /// Pass `--db :memory:` for an ephemeral run that loses state on
+    /// shutdown (useful for smoke testing).
+    #[arg(long, env = "ROOST_DB")]
+    db: Option<String>,
+
     /// Verbosity. Pass `-v` for debug, `-vv` for trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -35,8 +41,15 @@ async fn main() -> anyhow::Result<()> {
         None => roost_core::runtime::default_socket_path()?,
     };
 
+    let db_path = match args.db.as_deref() {
+        Some(":memory:") => None,
+        Some(p) => Some(PathBuf::from(p)),
+        None => Some(roost_core::runtime::default_db_path()?),
+    };
+
     let config = roost_core::Config {
         socket_path: socket,
+        db_path,
     };
     roost_core::run(config).await
 }

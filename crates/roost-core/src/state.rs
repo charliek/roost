@@ -1,26 +1,37 @@
-//! In-memory workspace state.
+//! Workspace state.
 //!
-//! Tracks projects, tabs, the active selection, and an event broadcaster
-//! that powers `WatchEvents`. Persistence (SQLite) is not wired in Phase 3
-//! — when it lands, the public API of this module stays the same; only
-//! the storage backend changes.
+//! Persistent fields (project + tab rows) live in SQLite via [`crate::store`].
+//! Runtime-only fields — agent state, has_notification flag, hook-active
+//! flag, active project/tab selection — live in an in-memory `RuntimeState`
+//! and reset on daemon restart. The Go side made the same split: the
+//! `core.Workspace` struct held the ephemeral fields while `internal/store`
+//! owned the persisted ones.
+//!
+//! All mutators emit corresponding `Event`s on the broadcast channel that
+//! powers `WatchEvents`.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use roost_proto::v1::{
-    Event, NotificationEvent, Project, ProjectsReorderedEvent, Tab, TabCwdChangedEvent,
-    TabDeletedEvent, TabNotificationEvent, TabState, TabStateChangedEvent, TabTitleChangedEvent,
-    TabsReorderedEvent,
+    ActiveChangedEvent, Event, HookActiveChangedEvent, NotificationEvent, Project,
+    ProjectsReorderedEvent, Tab, TabCwdChangedEvent, TabDeletedEvent, TabNotificationEvent,
+    TabOpenedEvent, TabState, TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
 };
 
-/// How many events the broadcast channel buffers per subscriber. UI clients
-/// that fall this far behind get a `Lagged` and resync via `ListTabs`.
+use crate::store::{Store, StoreError};
+
+/// How many events the broadcast channel buffers per subscriber. Subscribers
+/// that fall behind get a `Lagged` and resync via `ListTabs`.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// One project as exposed by `Workspace::snapshot`-adjacent helpers. Mirrors
+/// the persisted columns; the proto `Project` is built from this plus the
+/// project's tabs.
 #[derive(Clone, Debug)]
 pub struct StoredProject {
     pub id: i64,
@@ -30,6 +41,9 @@ pub struct StoredProject {
     pub created_at: i64,
 }
 
+/// One tab as exposed by `Workspace::open_tab` / `Workspace::tab`. Combines
+/// persisted columns (from SQLite) with runtime-only flags (agent state,
+/// pending notification, hook-active suppression).
 #[derive(Clone, Debug)]
 pub struct StoredTab {
     pub id: i64,
@@ -45,38 +59,68 @@ pub struct StoredTab {
     pub hook_active: bool,
 }
 
-pub struct Workspace {
-    inner: Mutex<Inner>,
-    events: broadcast::Sender<Event>,
+#[derive(Clone, Copy, Default)]
+struct RuntimeTab {
+    state: TabState,
+    has_notification: bool,
+    hook_active: bool,
 }
 
-struct Inner {
-    projects: Vec<StoredProject>,
-    tabs: Vec<StoredTab>,
-    next_project_id: AtomicI64,
-    next_tab_id: AtomicI64,
+#[derive(Default)]
+struct RuntimeState {
+    tabs: HashMap<i64, RuntimeTab>,
     active_project_id: i64,
     active_tab_id: i64,
 }
 
-impl Default for Workspace {
-    fn default() -> Self {
-        Self::new()
+pub struct Workspace {
+    store: Mutex<Store>,
+    runtime: Mutex<RuntimeState>,
+    events: broadcast::Sender<Event>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceError {
+    #[error("project {0} not found")]
+    ProjectNotFound(i64),
+    #[error("tab {0} not found")]
+    TabNotFound(i64),
+    #[error("store: {0}")]
+    Store(StoreError),
+}
+
+/// Convert a `StoreError` to a `WorkspaceError` while preserving the precise
+/// `ProjectNotFound` / `TabNotFound` variants. Unlike a blanket `From`, this
+/// can't accidentally swallow not-found into the catch-all `Store(_)` case
+/// when used with `?`.
+fn wrap(err: StoreError) -> WorkspaceError {
+    match err {
+        StoreError::ProjectNotFound(id) => WorkspaceError::ProjectNotFound(id),
+        StoreError::TabNotFound(id) => WorkspaceError::TabNotFound(id),
+        other => WorkspaceError::Store(other),
     }
 }
 
 impl Workspace {
+    /// In-memory workspace. The schema is migrated immediately. Use
+    /// `Workspace::open` for a file-backed runtime.
     pub fn new() -> Self {
+        let store = Store::in_memory().expect("in-memory store should always open");
+        Self::with_store(store)
+    }
+
+    /// Open a file-backed workspace at `path`, creating + migrating the DB
+    /// if needed.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+        let store = Store::open(path).map_err(wrap)?;
+        Ok(Self::with_store(store))
+    }
+
+    fn with_store(store: Store) -> Self {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
-            inner: Mutex::new(Inner {
-                projects: Vec::new(),
-                tabs: Vec::new(),
-                next_project_id: AtomicI64::new(1),
-                next_tab_id: AtomicI64::new(1),
-                active_project_id: 0,
-                active_tab_id: 0,
-            }),
+            store: Mutex::new(store),
+            runtime: Mutex::new(RuntimeState::default()),
             events: tx,
         }
     }
@@ -87,48 +131,72 @@ impl Workspace {
     }
 
     pub fn snapshot(&self) -> Vec<Project> {
-        let inner = self.inner.lock().unwrap();
-        let mut projects: Vec<&StoredProject> = inner.projects.iter().collect();
-        projects.sort_by_key(|p| p.position);
-
+        let store = self.store.lock().unwrap();
+        let runtime = self.runtime.lock().unwrap();
+        let projects = match store.list_projects() {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(?err, "snapshot: list_projects failed");
+                return Vec::new();
+            }
+        };
         projects
             .into_iter()
             .map(|p| {
-                let mut tabs: Vec<&StoredTab> =
-                    inner.tabs.iter().filter(|t| t.project_id == p.id).collect();
-                tabs.sort_by_key(|t| t.position);
+                let tabs = match store.list_tabs(p.id) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        warn!(project_id = p.id, ?err, "snapshot: list_tabs failed");
+                        Vec::new()
+                    }
+                };
                 Project {
                     id: p.id,
-                    name: p.name.clone(),
-                    cwd: p.cwd.clone(),
+                    name: p.name,
+                    cwd: p.cwd,
                     position: p.position,
                     created_at: p.created_at,
-                    tabs: tabs.into_iter().map(|t| to_proto_tab(t, &inner)).collect(),
+                    tabs: tabs.into_iter().map(|t| merge_tab(t, &runtime)).collect(),
                 }
             })
             .collect()
     }
 
     pub fn active(&self) -> (i64, i64) {
-        let inner = self.inner.lock().unwrap();
-        (inner.active_project_id, inner.active_tab_id)
+        let r = self.runtime.lock().unwrap();
+        (r.active_project_id, r.active_tab_id)
     }
 
     pub fn ensure_default_project(&self, cwd: &str) -> i64 {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(p) = inner.projects.first() {
-            return p.id;
+        let store = self.store.lock().unwrap();
+        if let Ok(projects) = store.list_projects() {
+            if let Some(p) = projects.first() {
+                let mut runtime = self.runtime.lock().unwrap();
+                let mut active_changed = false;
+                if runtime.active_project_id == 0 {
+                    runtime.active_project_id = p.id;
+                    active_changed = true;
+                }
+                let id = p.id;
+                drop(runtime);
+                if active_changed {
+                    self.emit_active_changed();
+                }
+                return id;
+            }
         }
-        let id = inner.next_project_id.fetch_add(1, Ordering::Relaxed);
-        let project = StoredProject {
-            id,
-            name: "Default".into(),
-            cwd: cwd.into(),
-            position: 0,
-            created_at: now_secs(),
+        let project = match store.create_project("Default", cwd) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(?err, "ensure_default_project: create_project failed");
+                return 0;
+            }
         };
-        inner.projects.push(project);
-        inner.active_project_id = id;
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.active_project_id = project.id;
+        let id = project.id;
+        drop(runtime);
+        self.emit_active_changed();
         id
     }
 
@@ -138,75 +206,131 @@ impl Workspace {
         cwd: &str,
         title: &str,
     ) -> Result<StoredTab, WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.projects.iter().any(|p| p.id == project_id) {
+        let store = self.store.lock().unwrap();
+
+        // Confirm the project exists; map missing to a precise error.
+        let projects = store.list_projects().map_err(wrap)?;
+        if !projects.iter().any(|p| p.id == project_id) {
             return Err(WorkspaceError::ProjectNotFound(project_id));
         }
-        let id = inner.next_tab_id.fetch_add(1, Ordering::Relaxed);
-        let position = inner
-            .tabs
-            .iter()
-            .filter(|t| t.project_id == project_id)
-            .map(|t| t.position)
-            .max()
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        let title = if title.is_empty() {
+
+        let row = store.create_tab(project_id, cwd).map_err(wrap)?;
+        let chosen_title = if title.is_empty() {
             derive_title_from_cwd(cwd)
         } else {
             title.to_string()
         };
-        let tab = StoredTab {
-            id,
-            project_id,
-            title,
-            cwd: cwd.into(),
-            state: TabState::None,
-            has_notification: false,
-            user_titled: false,
-            position,
-            created_at: now_secs(),
-            last_active: now_secs(),
-            hook_active: false,
-        };
-        inner.tabs.push(tab.clone());
-        if inner.active_tab_id == 0 {
-            inner.active_tab_id = id;
+        if !chosen_title.is_empty() {
+            // First write goes through the OSC path so the user_titled
+            // lock is preserved (won't ever be set just because we
+            // assigned an initial title from the cwd).
+            store
+                .update_tab_title_if_not_user_set(row.id, &chosen_title)
+                .map_err(wrap)?;
         }
-        Ok(tab)
+        // Re-read so the returned tab reflects the title we just set.
+        let row = store.get_tab(row.id).map_err(wrap)?;
+        drop(store);
+
+        let mut active_changed = false;
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            runtime.tabs.insert(row.id, RuntimeTab::default());
+            if runtime.active_tab_id == 0 {
+                runtime.active_tab_id = row.id;
+                runtime.active_project_id = row.project_id;
+                active_changed = true;
+            }
+        }
+
+        let stored = merge_owned(row, RuntimeTab::default());
+        // Broadcast the new tab so other UIs converge without polling.
+        let runtime = self.runtime.lock().unwrap();
+        let proto_tab = merge_tab_from_stored(&stored, &runtime);
+        drop(runtime);
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::TabOpened(TabOpenedEvent {
+                tab: Some(proto_tab),
+            })),
+        });
+        if active_changed {
+            self.emit_active_changed();
+        }
+        Ok(stored)
     }
 
     pub fn close_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let pos = inner
-            .tabs
-            .iter()
-            .position(|t| t.id == tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        inner.tabs.remove(pos);
-        if inner.active_tab_id == tab_id {
-            inner.active_tab_id = inner.tabs.first().map(|t| t.id).unwrap_or(0);
+        {
+            let store = self.store.lock().unwrap();
+            // Confirm existence so we can return TabNotFound rather than
+            // silently swallowing missing IDs (matches Go semantics).
+            store.get_tab(tab_id).map_err(wrap)?;
+            store.delete_tab(tab_id).map_err(wrap)?;
         }
-        drop(inner);
+        let mut active_changed = false;
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            runtime.tabs.remove(&tab_id);
+            if runtime.active_tab_id == tab_id {
+                // Pick a fallback tab. The fallback may live in a different
+                // project, so update both `active_tab_id` AND
+                // `active_project_id` together — leaving them mismatched is
+                // a real bug since clients rely on `(project, tab)` pairing.
+                let store = self.store.lock().unwrap();
+                let fallback = store.list_projects().ok().and_then(|projects| {
+                    projects.into_iter().find_map(|p| {
+                        store
+                            .list_tabs(p.id)
+                            .ok()
+                            .and_then(|tabs| tabs.into_iter().next())
+                    })
+                });
+                match fallback {
+                    Some(t) => {
+                        runtime.active_tab_id = t.id;
+                        runtime.active_project_id = t.project_id;
+                    }
+                    None => {
+                        runtime.active_tab_id = 0;
+                        runtime.active_project_id = 0;
+                    }
+                }
+                active_changed = true;
+            }
+        }
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabDeleted(TabDeletedEvent {
                 tab_id,
             })),
         });
+        if active_changed {
+            let (active_project_id, active_tab_id) = self.active();
+            let _ = self.events.send(Event {
+                kind: Some(roost_proto::v1::event::Kind::Active(ActiveChangedEvent {
+                    project_id: active_project_id,
+                    tab_id: active_tab_id,
+                })),
+            });
+        }
         Ok(())
     }
 
     pub fn focus_tab(&self, tab_id: i64) -> Result<(i64, i64), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let (project_id, id) = inner
-            .tabs
-            .iter()
-            .find(|t| t.id == tab_id)
-            .map(|t| (t.project_id, t.id))
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        let prev = (inner.active_project_id, inner.active_tab_id);
-        inner.active_project_id = project_id;
-        inner.active_tab_id = id;
+        let store = self.store.lock().unwrap();
+        let row = store.get_tab(tab_id).map_err(wrap)?;
+        drop(store);
+        let prev;
+        let changed;
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            prev = (runtime.active_project_id, runtime.active_tab_id);
+            changed = prev != (row.project_id, row.id);
+            runtime.active_project_id = row.project_id;
+            runtime.active_tab_id = row.id;
+        }
+        if changed {
+            self.emit_active_changed();
+        }
         Ok(prev)
     }
 
@@ -216,28 +340,30 @@ impl Workspace {
         title: &str,
         user: bool,
     ) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let tab = inner
-            .tabs
-            .iter_mut()
-            .find(|t| t.id == tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        // Per the legacy 0002_user_titled migration: OSC writes don't override
-        // a manually-renamed tab. `user` distinguishes the two write paths.
-        if !user && tab.user_titled {
+        let store = self.store.lock().unwrap();
+        let n = if user {
+            store.rename_tab_and_lock(tab_id, title).map_err(wrap)?
+        } else {
+            store
+                .update_tab_title_if_not_user_set(tab_id, title)
+                .map_err(wrap)?
+        };
+        if n == 0 {
+            // For OSC writes, n=0 means the tab was missing OR the lock
+            // is set. Distinguish by re-checking existence; missing => 404,
+            // locked => silent no-op (Go semantics).
+            if store.get_tab(tab_id).is_err() {
+                return Err(WorkspaceError::TabNotFound(tab_id));
+            }
             return Ok(());
         }
-        tab.title = title.to_string();
-        if user {
-            tab.user_titled = true;
-        }
-        let title_clone = tab.title.clone();
-        drop(inner);
+        let final_title = store.get_tab(tab_id).map_err(wrap)?.title;
+        drop(store);
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabTitle(
                 TabTitleChangedEvent {
                     tab_id,
-                    title: title_clone,
+                    title: final_title,
                 },
             )),
         });
@@ -245,14 +371,17 @@ impl Workspace {
     }
 
     pub fn set_tab_state(&self, tab_id: i64, state: TabState) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let tab = inner
-            .tabs
-            .iter_mut()
-            .find(|t| t.id == tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        tab.state = state;
-        drop(inner);
+        // TabState is runtime-only; we don't persist it.
+        // Confirm the tab exists in the store.
+        {
+            let store = self.store.lock().unwrap();
+            store.get_tab(tab_id).map_err(wrap)?;
+        }
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            let entry = runtime.tabs.entry(tab_id).or_default();
+            entry.state = state;
+        }
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabState(
                 TabStateChangedEvent {
@@ -265,14 +394,10 @@ impl Workspace {
     }
 
     pub fn set_tab_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let tab = inner
-            .tabs
-            .iter_mut()
-            .find(|t| t.id == tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        tab.cwd = cwd.to_string();
-        drop(inner);
+        let store = self.store.lock().unwrap();
+        store.get_tab(tab_id).map_err(wrap)?;
+        store.update_tab_cwd(tab_id, cwd).map_err(wrap)?;
+        drop(store);
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabCwd(TabCwdChangedEvent {
                 tab_id,
@@ -287,14 +412,15 @@ impl Workspace {
         tab_id: i64,
         has_pending: bool,
     ) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let tab = inner
-            .tabs
-            .iter_mut()
-            .find(|t| t.id == tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        tab.has_notification = has_pending;
-        drop(inner);
+        {
+            let store = self.store.lock().unwrap();
+            store.get_tab(tab_id).map_err(wrap)?;
+        }
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            let entry = runtime.tabs.entry(tab_id).or_default();
+            entry.has_notification = has_pending;
+        }
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabNotification(
                 TabNotificationEvent {
@@ -307,14 +433,34 @@ impl Workspace {
     }
 
     pub fn set_hook_active(&self, tab_id: i64, active: bool) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let tab = inner
-            .tabs
-            .iter_mut()
-            .find(|t| t.id == tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        tab.hook_active = active;
+        {
+            let store = self.store.lock().unwrap();
+            store.get_tab(tab_id).map_err(wrap)?;
+        }
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            let entry = runtime.tabs.entry(tab_id).or_default();
+            entry.hook_active = active;
+        }
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::HookActive(
+                HookActiveChangedEvent { tab_id, active },
+            )),
+        });
         Ok(())
+    }
+
+    /// Snapshot the current `(active_project_id, active_tab_id)` and emit
+    /// an `ActiveChangedEvent`. Pulled out so the mutators above can
+    /// always emit consistently without re-locking-and-reading inline.
+    fn emit_active_changed(&self) {
+        let (project_id, tab_id) = self.active();
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::Active(ActiveChangedEvent {
+                project_id,
+                tab_id,
+            })),
+        });
     }
 
     pub fn fire_notification(
@@ -323,14 +469,14 @@ impl Workspace {
         title: &str,
         body: &str,
     ) -> Result<(), WorkspaceError> {
-        // Mark the tab as having a pending notification, then broadcast.
+        // set_tab_notification confirms existence and emits TabNotification.
         self.set_tab_notification(tab_id, true)?;
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::Notification(
                 NotificationEvent {
                     tab_id,
-                    title: title.into(),
-                    body: body.into(),
+                    title: title.to_string(),
+                    body: body.to_string(),
                 },
             )),
         });
@@ -338,7 +484,8 @@ impl Workspace {
     }
 
     /// Reports a `tabs_reordered` and a `projects_reordered` event for the
-    /// current snapshot. Useful when the UI requests a coarse resync.
+    /// current snapshot. Useful when a freshly-attached client wants a
+    /// resync without an explicit `ListTabs` call.
     pub fn broadcast_structural_resync(&self) {
         let snapshot = self.snapshot();
         let project_ids: Vec<i64> = snapshot.iter().map(|p| p.id).collect();
@@ -361,32 +508,73 @@ impl Workspace {
     }
 
     pub fn tab(&self, tab_id: i64) -> Option<StoredTab> {
-        let inner = self.inner.lock().unwrap();
-        inner.tabs.iter().find(|t| t.id == tab_id).cloned()
+        let store = self.store.lock().unwrap();
+        let row = store.get_tab(tab_id).ok()?;
+        drop(store);
+        let runtime = self.runtime.lock().unwrap();
+        let rt = runtime.tabs.get(&tab_id).copied().unwrap_or_default();
+        Some(merge_owned(row, rt))
     }
 }
 
-fn to_proto_tab(t: &StoredTab, inner: &Inner) -> Tab {
+impl Default for Workspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn merge_tab(row: crate::store::TabRow, runtime: &RuntimeState) -> Tab {
+    let rt = runtime.tabs.get(&row.id).copied().unwrap_or_default();
     Tab {
-        id: t.id,
-        project_id: t.project_id,
-        title: t.title.clone(),
-        cwd: t.cwd.clone(),
-        state: t.state as i32,
-        has_notification: t.has_notification,
-        is_active: inner.active_tab_id == t.id,
-        user_titled: t.user_titled,
-        position: t.position,
-        created_at: t.created_at,
-        last_active: t.last_active,
+        id: row.id,
+        project_id: row.project_id,
+        title: row.title,
+        cwd: row.cwd,
+        state: rt.state as i32,
+        has_notification: rt.has_notification,
+        is_active: runtime.active_tab_id == row.id,
+        user_titled: row.user_titled,
+        position: row.position,
+        created_at: row.created_at,
+        last_active: row.last_active,
+        hook_active: rt.hook_active,
     }
 }
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+fn merge_owned(row: crate::store::TabRow, rt: RuntimeTab) -> StoredTab {
+    StoredTab {
+        id: row.id,
+        project_id: row.project_id,
+        title: row.title,
+        cwd: row.cwd,
+        state: rt.state,
+        has_notification: rt.has_notification,
+        user_titled: row.user_titled,
+        position: row.position,
+        created_at: row.created_at,
+        last_active: row.last_active,
+        hook_active: rt.hook_active,
+    }
+}
+
+/// Build a proto `Tab` from a `StoredTab` (which already has runtime
+/// fields merged) by additionally tagging the `is_active` flag from the
+/// current selection. Used by `open_tab` to broadcast a `TabOpenedEvent`.
+fn merge_tab_from_stored(stored: &StoredTab, runtime: &RuntimeState) -> Tab {
+    Tab {
+        id: stored.id,
+        project_id: stored.project_id,
+        title: stored.title.clone(),
+        cwd: stored.cwd.clone(),
+        state: stored.state as i32,
+        has_notification: stored.has_notification,
+        is_active: runtime.active_tab_id == stored.id,
+        user_titled: stored.user_titled,
+        position: stored.position,
+        created_at: stored.created_at,
+        last_active: stored.last_active,
+        hook_active: stored.hook_active,
+    }
 }
 
 fn derive_title_from_cwd(cwd: &str) -> String {
@@ -394,14 +582,6 @@ fn derive_title_from_cwd(cwd: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| cwd.to_string())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WorkspaceError {
-    #[error("project {0} not found")]
-    ProjectNotFound(i64),
-    #[error("tab {0} not found")]
-    TabNotFound(i64),
 }
 
 #[cfg(test)]
@@ -413,7 +593,9 @@ mod tests {
         let ws = Workspace::new();
         let project = ws.ensure_default_project("/tmp");
         let tab = ws.open_tab(project, "/tmp/work", "").unwrap();
-        assert_eq!(ws.snapshot()[0].tabs.len(), 1);
+        let snap = ws.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tabs.len(), 1);
         ws.close_tab(tab.id).unwrap();
         assert!(ws.snapshot()[0].tabs.is_empty());
     }
@@ -428,5 +610,30 @@ mod tests {
         let after = ws.tab(tab.id).unwrap();
         assert_eq!(after.title, "manual");
         assert!(after.user_titled);
+    }
+
+    #[test]
+    fn persistence_round_trip_via_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ws.db");
+
+        let tab_id = {
+            let ws = Workspace::open(&path).unwrap();
+            let project = ws.ensure_default_project("/tmp/work");
+            let tab = ws.open_tab(project, "/tmp/work", "first").unwrap();
+            tab.id
+        };
+
+        // Reopen — projects + tabs survive, but runtime fields reset.
+        let ws = Workspace::open(&path).unwrap();
+        let snap = ws.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tabs.len(), 1);
+        let after = ws.tab(tab_id).unwrap();
+        assert_eq!(after.title, "first");
+        // Runtime state was not persisted — defaults restored.
+        assert_eq!(after.state, TabState::Unspecified);
+        assert!(!after.has_notification);
+        assert!(!after.hook_active);
     }
 }

@@ -69,6 +69,9 @@ tower      = { version = "0.5", features = ["util"] }
 bindgen = "0.70"
 cc      = "1.0"
 
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [profile.release]
 lto         = "thin"
 codegen-units = 1

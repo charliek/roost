@@ -89,6 +89,11 @@ message Tab {
   int32    position        = 9;
   int64    created_at      = 10;
   int64    last_active     = 11;
+  // True while a hook session (e.g. the Claude Code hook) owns the
+  // tab's notification surface; raw OSC 9/777 from the shell is
+  // suppressed in that mode. Exposed in snapshots so a UI joining
+  // mid-session can render the suppression state without polling.
+  bool     hook_active     = 12;
 }
 
 // =============================================================================
@@ -117,7 +122,13 @@ message IdentifyResponse {
 message OpenTabRequest {
   int64  project_id = 1;
   string cwd        = 2;  // empty = use project's default cwd
-  string command    = 3;  // empty = user's $SHELL
+  // Argument vector to spawn for the tab's PTY. Empty = the user's
+  // $SHELL. We deliberately do NOT take an opaque command string here —
+  // a single string forces the daemon into shell parsing and turns
+  // client-supplied commands into a shell-injection footgun. Clients
+  // that genuinely want shell-style word-splitting can pass
+  // `["sh", "-c", "...command line..."]` explicitly.
+  repeated string argv = 3;
   uint32 cols       = 4;
   uint32 rows       = 5;
   string title      = 6;  // empty = derive from cwd
@@ -191,6 +202,10 @@ message WatchEventsRequest {
   int64 tab_id_filter = 1;
 }
 
+// All workspace mutations clients need to converge on daemon state arrive
+// through this stream. A client that subscribes mid-session calls
+// `ListTabs` once, then keeps state in sync purely from these events —
+// no polling.
 message Event {
   oneof kind {
     NotificationEvent       notification        = 1;
@@ -201,6 +216,9 @@ message Event {
     TabsReorderedEvent      tabs_reordered      = 6;
     TabTitleChangedEvent    tab_title           = 7;
     TabCwdChangedEvent      tab_cwd             = 8;
+    TabOpenedEvent          tab_opened          = 9;
+    ActiveChangedEvent      active              = 10;
+    HookActiveChangedEvent  hook_active         = 11;
   }
 }
 
@@ -241,6 +259,26 @@ message TabTitleChangedEvent {
 message TabCwdChangedEvent {
   int64  tab_id = 1;
   string cwd    = 2;
+}
+
+// Emitted when a new tab is opened (by any client). The tab payload is the
+// freshly-created snapshot — a UI can splice it directly into its model.
+message TabOpenedEvent {
+  Tab tab = 1;
+}
+
+// Emitted when the active (project, tab) selection changes. Either ID may
+// be 0 if no tabs remain (e.g. last tab closed).
+message ActiveChangedEvent {
+  int64 project_id = 1;
+  int64 tab_id     = 2;
+}
+
+// Emitted when a tab's hook-active state flips. Mirrors `Tab.hook_active`
+// for clients that want to react without re-snapshotting.
+message HookActiveChangedEvent {
+  int64 tab_id = 1;
+  bool  active = 2;
 }
 
 // =============================================================================

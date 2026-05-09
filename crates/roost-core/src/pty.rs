@@ -50,13 +50,16 @@ impl PtySupervisor {
         }
     }
 
-    /// Spawn a shell for `tab_id` rooted at `cwd` and `command`. Returns
-    /// the handle a stream consumer needs.
+    /// Spawn a shell for `tab_id` rooted at `cwd`. `argv` is the argument
+    /// vector — empty means "use the user's `$SHELL`" (or `/bin/sh` as a
+    /// last resort). The supervisor never invokes a shell to parse a
+    /// composite command string; clients that want shell-style word
+    /// splitting must send `["sh", "-c", "..."]` themselves.
     pub fn spawn(
         &self,
         tab_id: i64,
         cwd: &str,
-        command: &str,
+        argv: &[String],
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<AttachHandle> {
@@ -70,7 +73,7 @@ impl PtySupervisor {
             })
             .context("openpty failed")?;
 
-        let cmd = build_command(cwd, command);
+        let cmd = build_command(cwd, argv);
         let mut child = pair.slave.spawn_command(cmd).context("spawn shell")?;
 
         // Drop the slave end now that the shell has it.
@@ -174,13 +177,20 @@ impl PtySupervisor {
     }
 }
 
-fn build_command(cwd: &str, command: &str) -> CommandBuilder {
-    let shell = if !command.is_empty() {
-        command.to_string()
+fn build_command(cwd: &str, argv: &[String]) -> CommandBuilder {
+    // Argv-first: never call a shell to parse a single command string. If
+    // the caller sent an empty argv, fall back to the user's $SHELL (or
+    // /bin/sh) with no arguments.
+    let mut cmd = if let Some((program, args)) = argv.split_first() {
+        let mut c = CommandBuilder::new(program);
+        for a in args {
+            c.arg(a);
+        }
+        c
     } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        CommandBuilder::new(shell)
     };
-    let mut cmd = CommandBuilder::new(&shell);
     if !cwd.is_empty() {
         cmd.cwd(cwd);
     }

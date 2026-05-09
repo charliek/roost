@@ -16,11 +16,24 @@ name: Refactor CI
 on:
   push:
     branches: ['claude/discuss-architecture-refactor-*']
+  # `pull_request.branches` matches the PR's BASE (target) branch, not the
+  # head (source). Refactor PRs target `main`, so that's what we filter
+  # on here. The job-level `if:` guards below restrict execution to PRs
+  # whose head branch is in the refactor namespace, so we don't run the
+  # Rust+Swift toolchain on every Go-only PR into main.
   pull_request:
-    branches: ['claude/discuss-architecture-refactor-*']
+    branches: ['main']
+
+# Each job below carries the same `if:` guard. `pull_request.branches` only
+# filters the PR target, so the per-job `startsWith(github.head_ref, ...)`
+# check is what scopes execution to refactor-source PRs. Push events have
+# `head_ref == ''`, hence the explicit `event_name == 'push'` branch.
 
 jobs:
   rust-lint:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -53,6 +66,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   rust-build:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
     strategy:
       fail-fast: false
       matrix:
@@ -96,6 +112,9 @@ jobs:
         run: cargo test --workspace
 
   swift-mac:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6

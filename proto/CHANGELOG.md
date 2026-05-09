@@ -7,6 +7,31 @@ daemon releases.
 
 ## Unreleased
 
+### Pre-1.0 schema tightening (Phase 3 follow-up)
+
+Schema is still pre-1.0 with no released clients, so these are fixes rather
+than evolutions — the bumps here will collapse into v1.0.
+
+- **`OpenTabRequest.command` (string) → `OpenTabRequest.argv` (repeated string).**
+  A single opaque string forced the daemon into shell parsing, which
+  pushes shell-injection risk onto every client. Argv is the safe shape;
+  clients that genuinely want shell-style word splitting send
+  `["sh", "-c", "..."]` explicitly. Field number unchanged (3); type
+  changed from `string` to `repeated string`. (CodeRabbit review.)
+- **`Tab.hook_active` (bool, field 12) added.** The hook-suppression
+  state is exposed in snapshots so a UI joining mid-session can render
+  it without polling. Mirrors the runtime-only flag the daemon has been
+  tracking since Phase 3.
+- **`Event.kind` gains three variants:**
+  - `TabOpenedEvent` (field 9) — fired when a tab is opened by any
+    client. Carries the full `Tab` snapshot so peers can splice it
+    directly into their model.
+  - `ActiveChangedEvent` (field 10) — fired on focus changes. Carries
+    `(project_id, tab_id)` together so clients never observe a stale
+    project pairing.
+  - `HookActiveChangedEvent` (field 11) — mirrors `Tab.hook_active` for
+    clients that prefer reacting to flips without re-snapshotting.
+
 ### v0.1.0 — Initial schema (Phase 2)
 
 Defines the wire contract from scratch, mirroring the JSON-RPC methods in

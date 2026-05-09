@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Generate Swift bindings for Roost's proto schema.
 #
-# Output: mac/Roost/Generated/{Roost.pb.swift, Roost.grpc.swift}
+# Output: mac/Sources/Roost/Generated/{Roost.pb.swift, Roost.grpc.swift}
+# (canonical location, matching Package.swift's source path and the repo's
+# .gitignore pattern that excludes generated bindings from VCS).
 #
 # Requirements:
 #   - protoc (Homebrew: brew install protobuf)
@@ -20,7 +22,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-OUT_DIR="${REPO_ROOT}/mac/Roost/Generated"
+OUT_DIR="${REPO_ROOT}/mac/Sources/Roost/Generated"
 mkdir -p "${OUT_DIR}"
 
 # Verify the toolchain. Fail with a helpful message rather than a cryptic
