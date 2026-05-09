@@ -8,20 +8,17 @@
 //! Usage:
 //!     roost-smoke                           # uses the default socket
 //!     roost-smoke --socket /path/to/sock
-//!     roost-smoke --command bash            # spawn a specific shell
-
-use std::path::PathBuf;
-use std::sync::Arc;
+//!     roost-smoke --arg bash --arg --login  # spawn a specific argv
 
 use anyhow::Context;
 use clap::Parser;
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
-use tower::service_fn;
 
+use roost_common::{connect_uds, default_socket_path};
 use roost_proto::v1::pty_client_message::Kind as PtyClientKind;
 use roost_proto::v1::pty_server_message::Kind as PtyServerKind;
 use roost_proto::v1::roost_client::RoostClient;
@@ -52,11 +49,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let socket = args
-        .socket
-        .clone()
-        .or_else(default_socket_path)
-        .context("could not determine default socket path")?;
+    let socket = match args.socket.clone() {
+        Some(p) => p,
+        None => default_socket_path()?,
+    };
 
     let channel = connect_uds(socket.clone()).await?;
     let mut client = RoostClient::new(channel);
@@ -170,57 +166,6 @@ async fn main() -> anyhow::Result<()> {
     std::process::exit(exit_code);
 }
 
-fn default_socket_path() -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join("Library/Caches/roost")
-                .join("roost.sock")
-        })
-    } else {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|dir| PathBuf::from(dir).join("roost").join("roost.sock"))
-            .or_else(|| {
-                let uid = libc_getuid();
-                Some(PathBuf::from(format!("/tmp/roost-{uid}")).join("roost.sock"))
-            })
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn getuid() -> u32;
-}
-
-#[cfg(unix)]
-fn libc_getuid() -> u32 {
-    unsafe { getuid() }
-}
-
-#[cfg(not(unix))]
-fn libc_getuid() -> u32 {
-    0
-}
-
-/// Build a tonic `Channel` over a Unix domain socket.
-///
-/// `Endpoint::connect_with_connector` lets us plug in a custom service that
-/// returns a Tokio `UnixStream` instead of a TCP one. The URL is irrelevant
-/// — tonic only uses it for routing — but it must be a syntactically valid
-/// http URI.
-async fn connect_uds(path: PathBuf) -> anyhow::Result<Channel> {
-    let path = Arc::new(path);
-    let endpoint = Endpoint::from_static("http://[::]:0");
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_| {
-            let path = path.clone();
-            async move {
-                let stream = tokio::net::UnixStream::connect(&*path).await?;
-                let io = hyper_util::rt::TokioIo::new(stream);
-                Ok::<_, std::io::Error>(io)
-            }
-        }))
-        .await
-        .context("connect_with_connector(uds)")?;
-    Ok(channel)
-}
+// default_socket_path / connect_uds are now imported from roost-common
+// — single source of truth shared with the daemon and roost-cli-rs. See
+// crates/roost-common/src/lib.rs.

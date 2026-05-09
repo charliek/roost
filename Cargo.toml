@@ -15,6 +15,7 @@
 resolver = "2"
 members = [
     "crates/roost-proto",
+    "crates/roost-common",
     "crates/roost-vt",
     "crates/roost-core",
     "crates/roost-smoke",

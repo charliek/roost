@@ -16,13 +16,12 @@ name = "roost-cli-rs"
 path = "src/main.rs"
 
 [dependencies]
-roost-proto = { path = "../roost-proto" }
+roost-proto  = { path = "../roost-proto" }
+roost-common = { path = "../roost-common" }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
-hyper-util = { workspace = true }
-tower = { workspace = true }
 
 anyhow = { workspace = true }
 clap   = { workspace = true }

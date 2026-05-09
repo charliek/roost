@@ -14,69 +14,18 @@ use roost_proto::v1::roost_server::RoostServer;
 use crate::service::RoostService;
 use crate::state::Workspace;
 
+// Re-export for backward compat with main.rs / tests / external callers
+// that already import these via `roost_core::runtime::default_*`.
+// The actual implementation lives in roost-common so the daemon and
+// every client agree byte-for-byte on path resolution.
+pub use roost_common::{default_db_path, default_socket_path};
+
 /// Configuration for a daemon run.
 pub struct Config {
     pub socket_path: PathBuf,
     /// Path to the SQLite database file. `None` uses an ephemeral in-memory
     /// database — useful for smoke tests but loses state on shutdown.
     pub db_path: Option<PathBuf>,
-}
-
-/// Resolve the default Unix domain socket path.
-///
-/// Linux: `$XDG_RUNTIME_DIR/roost/roost.sock` (falls back to `/tmp/roost-<uid>/roost.sock`).
-/// macOS: `~/Library/Caches/roost/roost.sock`.
-pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    if cfg!(target_os = "macos") {
-        let home = std::env::var_os("HOME").context("$HOME not set")?;
-        Ok(PathBuf::from(home)
-            .join("Library/Caches/roost")
-            .join("roost.sock"))
-    } else {
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            return Ok(PathBuf::from(dir).join("roost").join("roost.sock"));
-        }
-        // Fallback for systems without XDG_RUNTIME_DIR (containers, SSH).
-        let uid = libc_getuid();
-        Ok(PathBuf::from(format!("/tmp/roost-{uid}")).join("roost.sock"))
-    }
-}
-
-/// Resolve the default SQLite path. Persisted state lives alongside the OS's
-/// per-user data directory.
-///
-/// Linux: `$XDG_DATA_HOME/roost/roost.db` (falls back to `$HOME/.local/share/roost`).
-/// macOS: `~/Library/Application Support/roost/roost.db`.
-pub fn default_db_path() -> anyhow::Result<PathBuf> {
-    if cfg!(target_os = "macos") {
-        let home = std::env::var_os("HOME").context("$HOME not set")?;
-        Ok(PathBuf::from(home)
-            .join("Library/Application Support/roost")
-            .join("roost.db"))
-    } else {
-        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(dir).join("roost").join("roost.db"));
-        }
-        let home = std::env::var_os("HOME").context("$HOME not set")?;
-        Ok(PathBuf::from(home)
-            .join(".local/share/roost")
-            .join("roost.db"))
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn getuid() -> u32;
-}
-
-#[cfg(unix)]
-fn libc_getuid() -> u32 {
-    unsafe { getuid() }
-}
-
-#[cfg(not(unix))]
-fn libc_getuid() -> u32 {
-    0
 }
 
 /// Bind the socket and run the gRPC server until ctrl-c.

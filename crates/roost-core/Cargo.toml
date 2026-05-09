@@ -16,7 +16,8 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
-roost-proto = { path = "../roost-proto" }
+roost-proto  = { path = "../roost-proto" }
+roost-common = { path = "../roost-common" }
 # roost-vt is reserved for server-side VT semantics. We don't depend on it
 # in Phase 3 — the UI parses VT in-process. Add it later if core-side
 # parsing becomes necessary.

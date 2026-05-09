@@ -1117,14 +1117,25 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "hyper-util",
  "prost",
+ "roost-common",
  "roost-proto",
  "tokio",
  "tonic",
- "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "roost-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hyper-util",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
 ]
 
 [[package]]
@@ -1137,6 +1148,7 @@ dependencies = [
  "futures",
  "portable-pty",
  "prost",
+ "roost-common",
  "roost-proto",
  "rusqlite",
  "tempfile",
@@ -1166,13 +1178,12 @@ dependencies = [
  "async-stream",
  "clap",
  "futures",
- "hyper-util",
  "prost",
+ "roost-common",
  "roost-proto",
  "tokio",
  "tokio-stream",
  "tonic",
- "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]

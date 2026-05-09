@@ -14,12 +14,11 @@
 //! binary is deleted).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tonic::transport::{Channel, Endpoint};
-use tower::service_fn;
+
+use roost_common::{connect_uds, default_socket_path};
 
 use roost_proto::v1::roost_client::RoostClient;
 use roost_proto::v1::{
@@ -90,11 +89,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let socket = args
-        .socket
-        .clone()
-        .or_else(default_socket_path)
-        .context("could not resolve roost-core socket path")?;
+    let socket = match args.socket.clone() {
+        Some(p) => p,
+        None => default_socket_path()?,
+    };
     let channel = connect_uds(socket).await?;
     let mut client = RoostClient::new(channel);
 
@@ -193,51 +191,6 @@ fn format_state(state: i32) -> &'static str {
     }
 }
 
-fn default_socket_path() -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join("Library/Caches/roost")
-                .join("roost.sock")
-        })
-    } else {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|dir| PathBuf::from(dir).join("roost").join("roost.sock"))
-            .or_else(|| {
-                let uid = libc_getuid();
-                Some(PathBuf::from(format!("/tmp/roost-{uid}")).join("roost.sock"))
-            })
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn getuid() -> u32;
-}
-
-#[cfg(unix)]
-fn libc_getuid() -> u32 {
-    unsafe { getuid() }
-}
-
-#[cfg(not(unix))]
-fn libc_getuid() -> u32 {
-    0
-}
-
-async fn connect_uds(path: PathBuf) -> Result<Channel> {
-    let path = Arc::new(path);
-    let endpoint = Endpoint::from_static("http://[::]:0");
-    let channel = endpoint
-        .connect_with_connector(service_fn(move |_| {
-            let path = path.clone();
-            async move {
-                let stream = tokio::net::UnixStream::connect(&*path).await?;
-                let io = hyper_util::rt::TokioIo::new(stream);
-                Ok::<_, std::io::Error>(io)
-            }
-        }))
-        .await
-        .context("connect uds")?;
-    Ok(channel)
-}
+// default_socket_path / connect_uds are now imported from roost-common
+// — single source of truth shared with the daemon and roost-smoke. See
+// crates/roost-common/src/lib.rs.

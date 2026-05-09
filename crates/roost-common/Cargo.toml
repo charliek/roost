@@ -1,0 +1,25 @@
+[package]
+name        = "roost-common"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Shared helpers for Roost crates: default socket / DB path resolution, Unix-domain-socket gRPC channel construction. Single source of truth that roost-core, roost-cli-rs, and roost-smoke all depend on so the resolution logic can't drift between them."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+tonic       = { workspace = true }
+hyper-util  = { workspace = true }
+tower       = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
