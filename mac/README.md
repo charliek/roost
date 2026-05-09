@@ -58,14 +58,12 @@ Drift between schema and Swift bindings is impossible by construction.
 * `swift build` resolves dependencies and compiles.
 * `swift test` runs the smoke tests under `Tests/RoostTests/`.
 
-CI runs both on `macos-latest` via `.github/workflows/refactor.yml`.
-
-> **Time-boxed CI policy:** the `swift-mac` job currently carries
-> `continue-on-error: true`. This is a deliberate exception while
-> Phases 5–6 land grpc-swift codegen and libghostty-vt FFI on the Swift
-> side; both are expected to surface follow-up commits as the toolchain
-> stabilises. The flag is removed at the **Phase 6 exit** milestone
-> (Mac feature parity with the current Go binary), at which point the
-> job becomes required-green-on-every-commit. Tracked in
-> [docs/development/vision.md](../docs/development/vision.md) and
-> recorded in `.github/workflows/refactor.yml` next to the flag itself.
+CI runs both on `macos-latest` via `.github/workflows/refactor.yml`. The
+`swift build` and `swift test` steps in the `swift-mac` job are
+**required-green** — any breakage fails the workflow. The earlier
+time-boxed `continue-on-error` exception was removed in commit b59644d
+after a real package-coordinate bug got hidden by it; preventing
+similar drift means keeping the baseline Swift surface blocking from
+here on. The Phase 6+ Xcode bundling work may add new steps that
+warrant their own scoped exceptions when they land, but `swift build`
++ `swift test` will stay required.

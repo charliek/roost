@@ -23,6 +23,15 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/ghostty_vt.rs"));
 }
 
+/// libghostty-vt's success return code. Defined locally rather than
+/// referenced from `sys::` because bindgen's handling of the C-side
+/// constant varies (it might be a `#define`, an enum variant, or a
+/// typedef-enum value depending on the header), and any of those map
+/// to a different Rust path. Success-is-zero is universal C convention,
+/// so pinning the constant here is robust against bindgen output drift.
+#[cfg(feature = "ffi")]
+const GHOSTTY_SUCCESS: i32 = 0;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -80,7 +89,7 @@ pub fn vt_smoke() -> Result<(), Error> {
     // out-pointer we own, and a stack-allocated options struct.
     // Matches the legacy Go binding's call shape exactly.
     let rc = unsafe { sys::ghostty_terminal_new(ptr::null_mut(), &mut term, opts) };
-    if rc != sys::GHOSTTY_SUCCESS as i32 {
+    if rc != GHOSTTY_SUCCESS {
         return Err(Error::Ffi(rc));
     }
     if term.is_null() {
