@@ -260,35 +260,46 @@ impl Workspace {
     }
 
     pub fn close_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
-        {
+        // Phase 1 — store work: confirm existence, delete the row, then
+        // (still under the same store lock) precompute a fallback
+        // (project, tab) pair we can promote to active if the tab being
+        // closed currently holds that role. The fallback may live in a
+        // different project, which is why we capture both fields —
+        // leaving `active_project_id` stale would break clients that
+        // rely on the `(project, tab)` pair.
+        //
+        // We compute the fallback unconditionally rather than peeking
+        // at `runtime.active_tab_id` first: the lookup is one in-memory
+        // SQLite query, and it lets us hold ONLY the store lock during
+        // this phase. That preserves the global lock order — `store` is
+        // always taken before `runtime`, matching `snapshot()`.
+        // Reversing the order in any single method opens a deadlock
+        // window against concurrent callers.
+        let fallback: Option<(i64, i64)> = {
             let store = self.store.lock().unwrap();
-            // Confirm existence so we can return TabNotFound rather than
-            // silently swallowing missing IDs (matches Go semantics).
             store.get_tab(tab_id).map_err(wrap)?;
             store.delete_tab(tab_id).map_err(wrap)?;
-        }
+            store.list_projects().ok().and_then(|projects| {
+                projects.into_iter().find_map(|p| {
+                    store
+                        .list_tabs(p.id)
+                        .ok()
+                        .and_then(|tabs| tabs.into_iter().next().map(|t| (t.project_id, t.id)))
+                })
+            })
+        };
+
+        // Phase 2 — runtime work: drop the per-tab entry; if this tab
+        // was the active selection, promote the fallback (or zero out).
         let mut active_changed = false;
         {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.tabs.remove(&tab_id);
             if runtime.active_tab_id == tab_id {
-                // Pick a fallback tab. The fallback may live in a different
-                // project, so update both `active_tab_id` AND
-                // `active_project_id` together — leaving them mismatched is
-                // a real bug since clients rely on `(project, tab)` pairing.
-                let store = self.store.lock().unwrap();
-                let fallback = store.list_projects().ok().and_then(|projects| {
-                    projects.into_iter().find_map(|p| {
-                        store
-                            .list_tabs(p.id)
-                            .ok()
-                            .and_then(|tabs| tabs.into_iter().next())
-                    })
-                });
                 match fallback {
-                    Some(t) => {
-                        runtime.active_tab_id = t.id;
-                        runtime.active_project_id = t.project_id;
+                    Some((project_id, t_id)) => {
+                        runtime.active_tab_id = t_id;
+                        runtime.active_project_id = project_id;
                     }
                     None => {
                         runtime.active_tab_id = 0;
@@ -298,19 +309,15 @@ impl Workspace {
                 active_changed = true;
             }
         }
+
+        // Phase 3 — broadcast.
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabDeleted(TabDeletedEvent {
                 tab_id,
             })),
         });
         if active_changed {
-            let (active_project_id, active_tab_id) = self.active();
-            let _ = self.events.send(Event {
-                kind: Some(roost_proto::v1::event::Kind::Active(ActiveChangedEvent {
-                    project_id: active_project_id,
-                    tab_id: active_tab_id,
-                })),
-            });
+            self.emit_active_changed();
         }
         Ok(())
     }

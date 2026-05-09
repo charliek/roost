@@ -108,7 +108,11 @@ impl PtySupervisor {
                         }
                     }
                     Some(size) = resize_rx.recv() => {
-                        if let Err(err) = master.resize(size) {
+                        // `resize` ultimately calls `ioctl(TIOCSWINSZ)`,
+                        // which is fast but technically blocking. Stay
+                        // consistent with the `write_all` branch above and
+                        // mark it as a blocking section.
+                        if let Err(err) = tokio::task::block_in_place(|| master.resize(size)) {
                             warn!(tab_id, ?err, "pty resize failed");
                         }
                     }
