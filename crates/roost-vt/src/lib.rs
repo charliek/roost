@@ -113,8 +113,12 @@ mod tests {
 
     #[test]
     fn ffi_flag_matches_cfg() {
-        // Just confirms the helper compiles under both feature flag states.
-        let _ = ffi_available();
+        // Catches a class of regression where someone refactors
+        // `ffi_available` to a literal and breaks the runtime signal
+        // the daemon relies on to decide whether to expose VT-side
+        // helpers. The test exists at all because both feature-flag
+        // states need their own check.
+        assert_eq!(ffi_available(), cfg!(feature = "ffi"));
     }
 
     /// CI runs this with `--features ffi` after building libghostty-vt

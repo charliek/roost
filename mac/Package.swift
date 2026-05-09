@@ -24,13 +24,12 @@ let package = Package(
         .executable(name: "Roost", targets: ["Roost"]),
     ],
     dependencies: [
-        // grpc-swift v2 lives across three packages:
-        //   - grpc-swift                (core: services, calls, errors)
-        //   - grpc-swift-protobuf       (proto runtime, integrates swift-protobuf)
-        //   - grpc-swift-nio-transport  (HTTP/2 over TCP and Unix domain socket)
-        // Versions: track the 2.x line. Lock to a specific minor in CI as it
-        // stabilises.
-        .package(url: "https://github.com/grpc/grpc-swift.git", from: "2.0.0"),
+        // grpc-swift v2 lives across three packages. Note the `-2` suffix
+        // on the core URL — `https://github.com/grpc/grpc-swift.git`
+        // (without the suffix) still points at v1, and pulling both
+        // results in SwiftPM's "multiple similar targets" duplication
+        // error since the product names overlap. Lock to the 2.x line.
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.0.0"),
         .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", from: "2.0.0"),
         .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.27.0"),
@@ -39,7 +38,7 @@ let package = Package(
         .executableTarget(
             name: "Roost",
             dependencies: [
-                .product(name: "GRPCCore", package: "grpc-swift"),
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
                 .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
                 // Posix variant is the one that exposes Unix-domain-socket
                 // targets (`HTTP2ClientTransport.Posix(target:
@@ -60,9 +59,9 @@ let package = Package(
                 // Sources/Roost/Proto/roost.proto (a symlink to the
                 // canonical proto/roost.proto at the repo root) at
                 // `swift build` time. Configured by
-                // Sources/Roost/Proto/grpc-swift-proto-generator-config.json.
+                // Sources/Roost/Proto/grpc-protobuf-generator-config.json.
                 .plugin(
-                    name: "GRPCSwiftProtobufGenerator",
+                    name: "GRPCProtobufGenerator",
                     package: "grpc-swift-protobuf"
                 ),
             ]

@@ -42,11 +42,12 @@ the panel turns red and shows the failure reason + a hint to start it.
 ## Codegen
 
 Swift bindings for `proto/roost.proto` are generated at `swift build`
-time by the `GRPCSwiftProtobufGenerator` SwiftPM build plugin from
-`grpc-swift-protobuf`. The plugin requires the `.proto` file to live
+time by the `GRPCProtobufGenerator` SwiftPM build plugin from
+`grpc-swift-protobuf` (depending on `grpc-swift-2`, **not** the legacy
+`grpc-swift` v1 package). The plugin requires the `.proto` file to live
 inside the target source path, so `Sources/Roost/Proto/roost.proto` is
 a symlink back to the canonical `proto/roost.proto`. Plugin config is
-`Sources/Roost/Proto/grpc-swift-proto-generator-config.json`.
+`Sources/Roost/Proto/grpc-protobuf-generator-config.json`.
 
 No checked-in generated `.swift` files; no separate codegen step in CI.
 Drift between schema and Swift bindings is impossible by construction.

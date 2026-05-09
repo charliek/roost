@@ -6,12 +6,14 @@ the Mac + Linux UIs. `roost.proto` is consumed by:
 * **Rust** — `crates/roost-proto/build.rs` runs `tonic-build` (which
   shells out to `protoc`) at every `cargo build`. Generated bindings
   land in the build target dir; nothing is checked in.
-* **Swift (Mac)** — the `GRPCSwiftProtobufGenerator` SwiftPM build
-  plugin from `grpc-swift-protobuf` regenerates bindings at every
-  `swift build`. The plugin needs the `.proto` file to live inside the
-  target's source path, so `mac/Sources/Roost/Proto/roost.proto` is a
-  symlink back to `proto/roost.proto`. Plugin config sits next to the
-  symlink: `mac/Sources/Roost/Proto/grpc-swift-proto-generator-config.json`.
+* **Swift (Mac)** — the `GRPCProtobufGenerator` SwiftPM build plugin
+  from `grpc-swift-protobuf` (which itself depends on `grpc-swift-2`,
+  the v2 line of the package — **not** the legacy `grpc-swift` v1
+  URL) regenerates bindings at every `swift build`. The plugin needs
+  the `.proto` file to live inside the target's source path, so
+  `mac/Sources/Roost/Proto/roost.proto` is a symlink back to
+  `proto/roost.proto`. Plugin config sits next to the symlink:
+  `mac/Sources/Roost/Proto/grpc-protobuf-generator-config.json`.
 
 Bindings are never checked into VCS — drift between `roost.proto` and a
 stale generated file is impossible by construction.

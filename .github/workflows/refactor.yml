@@ -137,14 +137,14 @@ jobs:
         run: cargo build -p roost-vt --features ffi
 
       - name: cargo test (roost-vt ffi smoke)
+        # Same time-boxed exception as the ffi build above. Lifts at
+        # Phase 5 step 3 exit.
         continue-on-error: true
         run: cargo test -p roost-vt --features ffi -- --nocapture
 
       - name: cargo test
-        # Time-boxed exception. `continue-on-error` lifts at the Phase 3
-        # exit milestone (roost-core MVP serving on UDS, smoke client
-        # round-trip), tracked in docs/development/vision.md.
-        continue-on-error: true
+        # Required-green: the workspace test suite gates every commit.
+        # If a Rust test breaks on Linux or macOS the workflow fails.
         run: cargo test --workspace
 
   swift-mac:
@@ -167,21 +167,19 @@ jobs:
           key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
           restore-keys: swiftpm-${{ runner.os }}-
 
-      # Time-boxed exception. `continue-on-error: true` lifts at the
-      # Phase 6 exit milestone (Mac feature parity with the current Go
-      # binary), at which point the swift-mac job becomes
-      # required-green-on-every-commit. Tracked in mac/README.md and
-      # docs/development/vision.md. Reasons it's transitional today:
-      #   * grpc-swift v2 codegen path (SwiftPM build plugin vs.
-      #     checked-in protoc-gen-grpc-swift-2 output) is still
-      #     in flight.
-      #   * libghostty-vt FFI from Swift is unverified.
+      # Required-green from this commit on. `continue-on-error: true`
+      # was masking real coordinate breakage in Package.swift (the
+      # initial grpc-swift v2 wiring landed with the wrong package URL
+      # + plugin name; user manual `swift run` exposed it). Letting
+      # build/test fail the workflow forces every commit to keep the
+      # Swift surface compiling. Phase 6+ Xcode bundling adds further
+      # steps that may need their own time-boxing when they land, but
+      # baseline `swift build` + `swift test` should always be blocking
+      # — they're the cross-platform contract on the Mac side.
       - name: swift build
-        continue-on-error: true
         working-directory: mac
         run: swift build -v
 
       - name: swift test
-        continue-on-error: true
         working-directory: mac
         run: swift test
