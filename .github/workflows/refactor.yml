@@ -77,11 +77,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install protoc (Linux)
+      - name: Install protoc + libclang (Linux)
         if: runner.os == 'Linux'
+        # libclang-dev is needed by bindgen when roost-vt is built with
+        # `--features ffi`. macOS gets it via Xcode's command-line tools
+        # which the runner has preinstalled.
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libclang-dev
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -89,6 +92,24 @@ jobs:
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v2
+
+      - name: Cache vendored libghostty-vt
+        # Keyed on the build script + the SHA pin inside it. A bump to
+        # third_party/ghostty/build.sh invalidates and rebuilds — same
+        # discipline as the legacy build/build.sh cache in ci.yml.
+        id: cache-ghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -101,10 +122,23 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: cargo build (workspace, default features)
-        # Default features: roost-vt's `ffi` feature is OFF, so libghostty-vt
-        # is not required for this build. The libghostty-vt build job lands
-        # in Phase 3 once roost-vt is actually exercised by roost-core.
+        # Default features: roost-vt's `ffi` feature is OFF, so this
+        # build does not consume libghostty-vt. Keeps the non-ffi
+        # workspace green even if the Ghostty build itself bit-rots.
         run: cargo build --workspace --all-targets
+
+      - name: cargo build (roost-vt with ffi)
+        # Time-boxed exception. `continue-on-error` lifts when the FFI
+        # surface stabilises (Phase 5 step 3 exit). Today the smoke
+        # exercises ghostty_terminal_new + write + free; bindgen field
+        # names may differ slightly from my best-guess at the C struct
+        # layout, in which case CI surfaces the exact compile error.
+        continue-on-error: true
+        run: cargo build -p roost-vt --features ffi
+
+      - name: cargo test (roost-vt ffi smoke)
+        continue-on-error: true
+        run: cargo test -p roost-vt --features ffi -- --nocapture
 
       - name: cargo test
         # Time-boxed exception. `continue-on-error` lifts at the Phase 3
