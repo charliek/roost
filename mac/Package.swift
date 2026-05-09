@@ -59,7 +59,11 @@ let package = Package(
                 // Sources/Roost/Proto/roost.proto (a symlink to the
                 // canonical proto/roost.proto at the repo root) at
                 // `swift build` time. Configured by
-                // Sources/Roost/Proto/grpc-protobuf-generator-config.json.
+                // Sources/Roost/Proto/grpc-swift-proto-generator-config.json
+                // (note the `-swift-` infix — the plugin target is
+                // `GRPCProtobufGenerator` but the config filename
+                // it scans for is `grpc-swift-proto-generator-config.json`,
+                // a deliberate decoupling on the plugin author's side).
                 .plugin(
                     name: "GRPCProtobufGenerator",
                     package: "grpc-swift-protobuf"

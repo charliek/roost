@@ -47,7 +47,10 @@ time by the `GRPCProtobufGenerator` SwiftPM build plugin from
 `grpc-swift` v1 package). The plugin requires the `.proto` file to live
 inside the target source path, so `Sources/Roost/Proto/roost.proto` is
 a symlink back to the canonical `proto/roost.proto`. Plugin config is
-`Sources/Roost/Proto/grpc-protobuf-generator-config.json`.
+`Sources/Roost/Proto/grpc-swift-proto-generator-config.json` (the
+plugin's expected config filename — note the `-swift-` infix; the
+SwiftPM target is `GRPCProtobufGenerator` but its config file uses
+the older name as a stable convention).
 
 No checked-in generated `.swift` files; no separate codegen step in CI.
 Drift between schema and Swift bindings is impossible by construction.

@@ -13,7 +13,7 @@ the Mac + Linux UIs. `roost.proto` is consumed by:
   the `.proto` file to live inside the target's source path, so
   `mac/Sources/Roost/Proto/roost.proto` is a symlink back to
   `proto/roost.proto`. Plugin config sits next to the symlink:
-  `mac/Sources/Roost/Proto/grpc-protobuf-generator-config.json`.
+  `mac/Sources/Roost/Proto/grpc-swift-proto-generator-config.json`.
 
 Bindings are never checked into VCS — drift between `roost.proto` and a
 stale generated file is impossible by construction.
