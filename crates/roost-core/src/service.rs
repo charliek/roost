@@ -168,7 +168,10 @@ impl Roost for RoostService {
         } else {
             r.cwd
         };
-        let stored = self.workspace.create_project(&r.name, &cwd).map_err(map_err)?;
+        let stored = self
+            .workspace
+            .create_project(&r.name, &cwd)
+            .map_err(map_err)?;
         info!(project_id = stored.id, name = %stored.name, "project created");
         Ok(Response::new(CreateProjectResponse {
             project: Some(Project {

@@ -204,11 +204,7 @@ impl Workspace {
     /// Create a project. Empty `name` yields a daemon-picked
     /// `"Untitled <n>"` so a UI's "+" button can defer naming until
     /// the user types into the row.
-    pub fn create_project(
-        &self,
-        name: &str,
-        cwd: &str,
-    ) -> Result<StoredProject, WorkspaceError> {
+    pub fn create_project(&self, name: &str, cwd: &str) -> Result<StoredProject, WorkspaceError> {
         let store = self.store.lock().unwrap();
         let chosen_name = if name.is_empty() {
             let n = store.list_projects().map_err(wrap)?.len() + 1;
@@ -243,11 +239,7 @@ impl Workspace {
         Ok(stored)
     }
 
-    pub fn rename_project(
-        &self,
-        project_id: i64,
-        name: &str,
-    ) -> Result<(), WorkspaceError> {
+    pub fn rename_project(&self, project_id: i64, name: &str) -> Result<(), WorkspaceError> {
         let store = self.store.lock().unwrap();
         store.rename_project(project_id, name).map_err(wrap)?;
         drop(store);
@@ -285,12 +277,15 @@ impl Workspace {
                 .into_iter()
                 .map(|t| t.id)
                 .collect();
-            let fallback = projects.iter().filter(|p| p.id != project_id).find_map(|p| {
-                store
-                    .list_tabs(p.id)
-                    .ok()
-                    .and_then(|tabs| tabs.into_iter().next().map(|t| (t.project_id, t.id)))
-            });
+            let fallback = projects
+                .iter()
+                .filter(|p| p.id != project_id)
+                .find_map(|p| {
+                    store
+                        .list_tabs(p.id)
+                        .ok()
+                        .and_then(|tabs| tabs.into_iter().next().map(|t| (t.project_id, t.id)))
+                });
             store.delete_project(project_id).map_err(wrap)?;
             (tab_ids, fallback)
         };
