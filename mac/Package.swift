@@ -18,7 +18,11 @@ import PackageDescription
 let package = Package(
     name: "Roost",
     platforms: [
-        .macOS(.v14),
+        // grpc-swift-nio-transport's HTTP2ClientTransport.Posix +
+        // .unixDomainSocket(path:) target are gated to macOS 15+.
+        // Bumping the minimum platform is cheaper than scattering
+        // `@available(macOS 15, *)` annotations across every call site.
+        .macOS(.v15),
     ],
     products: [
         .executable(name: "Roost", targets: ["Roost"]),

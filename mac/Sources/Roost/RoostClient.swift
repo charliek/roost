@@ -1,12 +1,14 @@
 // gRPC client wrapper for talking to roost-core over a Unix domain socket.
 //
-// Uses grpc-swift v2 + the Posix HTTP/2 transport. UDS (not TCP) is the
-// only supported transport: roost-core is a strictly local daemon, never
-// remote. See docs/development/vision.md (DL-3, DL-4) for rationale.
+// Uses grpc-swift v2's `withGRPCClient(transport:)` pattern matching the
+// canonical hello-world example at
+// github.com/grpc/grpc-swift-2/blob/main/Examples/hello-world/Sources/Subcommands/Greet.swift.
+// UDS (not TCP) is the only transport: roost-core is a strictly local
+// daemon, never remote. See docs/development/vision.md (DL-3, DL-4).
 //
 // Phase 5 step 2: only `Identify()` is wired. `StreamPty` and
-// `WatchEvents` follow once the AppKit window has the cell renderer +
-// libghostty-vt FFI in place.
+// `WatchEvents` come once the AppKit window has the cell renderer +
+// libghostty-vt FFI.
 
 import Foundation
 import GRPCCore
@@ -23,41 +25,58 @@ struct RoostIdentity: Sendable {
     let protocolVersion: UInt32
 }
 
-/// Result of attempting to handshake with `roost-core`. Error path
-/// carries a human-readable summary, not a typed error — UI surfaces it
-/// directly in the status panel today.
+/// Result of attempting to handshake with `roost-core`. The error path
+/// carries a human-readable summary for the UI to surface.
 enum IdentifyOutcome: Sendable {
     case ok(RoostIdentity)
     case failed(String)
 }
 
-/// Default per-RPC timeout for the handshake. A reachable but stalled
-/// daemon shouldn't keep the UI in "connecting…" forever — 5s is plenty
-/// of budget for a local Unix-domain-socket round-trip on the loopback
-/// path, and short enough that a real failure surfaces quickly.
+/// Default deadline for the handshake. A reachable-but-stalled daemon
+/// shouldn't keep the UI in "connecting…" forever — 5s is plenty for a
+/// local UDS round-trip on the loopback path, and short enough that a
+/// real failure surfaces quickly.
 private let identifyTimeout: Duration = .seconds(5)
 
-/// One-shot Identify against the daemon. Opens a transient gRPC client,
-/// performs the handshake, returns the result. The transport is closed
-/// before this function returns; subsequent calls open fresh clients.
+/// One-shot Identify against the daemon, with a hard timeout.
 ///
-/// Long-lived clients (for `StreamPty` and `WatchEvents`) come in
-/// follow-up commits and will keep a single transport open for the
-/// lifetime of the window.
+/// We race the gRPC call against a `Task.sleep`-backed deadline rather
+/// than passing `CallOptions(timeout:)` so the deadline shape is
+/// independent of grpc-swift's evolving public surface — `CallOptions`
+/// has an internal initializer in v2 and only exposes a `.defaults`
+/// static factory you'd then mutate. Doing the timeout in user code
+/// avoids guessing at the right call-options overload entirely.
 func runIdentify(socketPath: String) async -> IdentifyOutcome {
+    await withTaskGroup(of: IdentifyOutcome.self) { group in
+        group.addTask { await runIdentifyUnbounded(socketPath: socketPath) }
+        group.addTask {
+            try? await Task.sleep(for: identifyTimeout)
+            return .failed("identify timed out after \(identifyTimeout)")
+        }
+        // First task to finish wins; cancel the other so we don't leak it.
+        let first = await group.next() ?? .failed("identify task group returned no result")
+        group.cancelAll()
+        return first
+    }
+}
+
+/// The actual gRPC call without any deadline. Wrapped by `runIdentify`
+/// for callers; a future StreamPty client will hold a long-lived gRPC
+/// client over the same transport.
+private func runIdentifyUnbounded(socketPath: String) async -> IdentifyOutcome {
     do {
-        let transport = try HTTP2ClientTransport.Posix(
-            target: .unixDomainSocket(path: socketPath),
-            transportSecurity: .plaintext
-        )
-        return try await withGRPCClient(transport: transport) { client in
+        return try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath),
+                transportSecurity: .plaintext
+            )
+        ) { client in
             let roost = Roost_V1_Roost.Client(wrapping: client)
             let response = try await roost.identify(
                 .with {
                     $0.clientName = "roost-mac"
                     $0.clientVersion = clientVersion()
-                },
-                callOptions: CallOptions(timeout: identifyTimeout)
+                }
             )
             return .ok(
                 RoostIdentity(
