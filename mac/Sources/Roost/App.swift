@@ -36,6 +36,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var terminalView: TerminalView?
     private var sessionTask: Task<Void, Never>?
 
+    /// AsyncStream feeding keystrokes into the StreamPty writer.
+    /// The continuation is set when the session starts and cleared
+    /// (`finish()`) when the session ends or the app shuts down.
+    /// Stored separately because the stream + continuation pair is
+    /// returned together by `AsyncStream.makeStream()` and we need
+    /// `yield` access from the TerminalView's keyDown callback.
+    private var keystrokeContinuation: AsyncStream<Data>.Continuation?
+
     static func main() {
         let app = NSApplication.shared
         let delegate = RoostApp()
@@ -115,6 +123,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
+        // Route keyboard focus to the terminal view so keyDown
+        // events go straight there. Without this, arrow keys etc.
+        // get eaten by the window's responder chain.
+        window.makeFirstResponder(terminalView)
+
         self.window = window
         self.statusLabel = statusLabel
         self.terminalView = terminalView
@@ -140,8 +153,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func startShellSession(socketPath: String) {
         // Cancel any prior session (eg if Identify ever re-runs).
         sessionTask?.cancel()
+        keystrokeContinuation?.finish()
+
+        // Build a fresh keystroke stream + continuation. The
+        // continuation lives on RoostApp so the TerminalView's
+        // onKey callback can yield into it; the stream is consumed
+        // by runShellSession's writer block.
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+        self.keystrokeContinuation = continuation
+        terminalView?.onKey = { [weak self] data in
+            self?.keystrokeContinuation?.yield(data)
+        }
+
         sessionTask = Task { [weak self] in
-            await runShellSession(socketPath: socketPath) { data in
+            await runShellSession(
+                socketPath: socketPath,
+                keystrokes: stream
+            ) { data in
                 // Callback runs on the gRPC background task; hop to
                 // the main actor before touching the libghostty-vt
                 // handle + invalidating the view.

@@ -46,6 +46,12 @@ final class TerminalView: NSView {
     /// it cell-by-cell.
     private let renderState = RenderState()
 
+    /// Set by RoostApp so keystrokes captured here can be forwarded
+    /// to the StreamPty writer. Phase 5.5b sends raw UTF-8 from
+    /// `event.characters`; 5.5c upgrades to libghostty-vt's full
+    /// key encoder for arrows / function keys / modifier handling.
+    @MainActor var onKey: ((Data) -> Void)?
+
     init(cols: UInt16 = 80, rows: UInt16 = 24) {
         self.cols = cols
         self.rows = rows
@@ -120,6 +126,29 @@ final class TerminalView: NSView {
     /// matches terminal coordinates and avoids one flip when 5.4b
     /// starts walking the render state.
     override var isFlipped: Bool { true }
+
+    /// Required for the view to receive `keyDown(with:)` events.
+    /// RoostApp explicitly makes this view the window's first
+    /// responder after construction so typing routes here.
+    override var acceptsFirstResponder: Bool { true }
+
+    /// Phase 5.5b: forward raw UTF-8 from `event.characters` to the
+    /// StreamPty writer. This handles printable ASCII + Tab + Enter
+    /// + Backspace correctly because NSEvent.characters returns the
+    /// shell-canonical bytes for those. Arrow keys, function keys,
+    /// and modifier-only chords come through with macOS-specific
+    /// representations that don't match VT escape sequences — those
+    /// land in 5.5c when we wire libghostty-vt's
+    /// `ghostty_key_encoder_*` to do real VT encoding.
+    override func keyDown(with event: NSEvent) {
+        guard let chars = event.characters,
+              let data = chars.data(using: .utf8),
+              !data.isEmpty
+        else {
+            return
+        }
+        onKey?(data)
+    }
 
     /// Lets AutoLayout size the view to its cell grid by default.
     /// Callers can still override with explicit constraints if they

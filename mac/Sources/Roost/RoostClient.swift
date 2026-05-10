@@ -111,14 +111,16 @@ private func clientVersion() -> String {
 /// responsible for hopping to the main actor before touching
 /// AppKit views.
 ///
-/// 5.5a: read-only — we send the initial `PtyAttach` and then keep
-/// the writer open so output keeps flowing, but we never write
-/// `PtyInput`. Phase 5.5b adds keystroke routing through this same
+/// `keystrokes` carries inbound input bytes the renderer captured
+/// via `keyDown` events; each emitted chunk gets forwarded to the
+/// daemon as a `PtyInput`. Closing the keystroke stream
+/// (`continuation.finish()`) closes the writer and ends the
 /// session.
 func runShellSession(
     socketPath: String,
     cols: UInt16 = 80,
     rows: UInt16 = 24,
+    keystrokes: AsyncStream<Data>,
     onOutput: @escaping @Sendable (Data) -> Void
 ) async {
     do {
@@ -142,11 +144,7 @@ func runShellSession(
                     $0.title = "roost-mac"
                 }
             )
-            let tab = opened.tab
-            // The tab is the openTab response's only field; treat
-            // a missing one as a protocol error and bail out clean.
-            // In practice the daemon always populates it.
-            let tabID = tab.id
+            let tabID = opened.tab.id
 
             try await roost.streamPty { writer in
                 // First message MUST be PtyAttach per the proto.
@@ -159,13 +157,15 @@ func runShellSession(
                         }
                     }
                 )
-                // Hold the writer open so the server keeps streaming
-                // output. Phase 5.5b reads keystrokes from a channel
-                // and writes them here as PtyInput. For now we just
-                // wait for cancellation; closing the writer would
-                // also close the response stream.
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(60))
+                // Pump keystrokes -> PtyInput. Loop ends naturally
+                // when the keystroke stream's continuation finishes
+                // (eg when the window closes).
+                for await chunk in keystrokes {
+                    try await writer.write(
+                        .with {
+                            $0.input = Roost_V1_PtyInput.with { $0.data = chunk }
+                        }
+                    )
                 }
             } onResponse: { response in
                 for try await message in response.messages {
@@ -179,7 +179,7 @@ func runShellSession(
         }
     } catch {
         // Logged to stderr so the user sees session failures even
-        // if the UI doesn't surface them yet. Phase 5.5b adds an
+        // if the UI doesn't surface them yet. Phase 5.5c adds an
         // error path through the status panel.
         FileHandle.standardError.write(
             Data("[Roost.mac] shell session ended: \(error)\n".utf8)
