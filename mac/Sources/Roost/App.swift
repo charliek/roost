@@ -45,59 +45,68 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let socketPath = Self.defaultSocketPath()
 
+        // Phase 5.4a: window now wraps a TerminalView. Size it to fit
+        // an 80x24 grid plus the status header above; minSize keeps
+        // the grid fully visible even if the user resizes down.
+        let terminalView = TerminalView(cols: 80, rows: 24)
+        let terminalSize = terminalView.intrinsicContentSize
+        // Header slice fits the up-to-four-line "daemon: connected
+        // / pid / version / active" status block above the terminal.
+        let headerSliceHeight: CGFloat = 112
+        let windowWidth = max(720, terminalSize.width + 48)
+        let windowHeight = terminalSize.height + headerSliceHeight + 32
+
         let window = NSWindow(
-            contentRect: NSRect(x: 200, y: 200, width: 720, height: 480),
+            contentRect: NSRect(x: 200, y: 200, width: windowWidth, height: windowHeight),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Roost"
-        window.minSize = NSSize(width: 480, height: 320)
+        window.minSize = NSSize(
+            width: terminalSize.width + 48,
+            height: terminalSize.height + headerSliceHeight + 32
+        )
 
         let content = NSView(frame: window.contentRect(forFrameRect: window.frame))
         content.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = content
 
-        let header = NSTextField(labelWithString: "Roost — Phase 5 skeleton")
-        header.font = .systemFont(ofSize: 18, weight: .semibold)
-        header.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(header)
-
         let socketLabel = NSTextField(labelWithString: "socket: \(socketPath)")
-        socketLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        socketLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        socketLabel.textColor = .secondaryLabelColor
         socketLabel.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(socketLabel)
 
         let statusLabel = NSTextField(labelWithString: "daemon: connecting…")
-        statusLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.maximumNumberOfLines = 0
         content.addSubview(statusLabel)
 
-        let visionLabel = NSTextField(
-            labelWithString: "See docs/development/vision.md for the target architecture."
-        )
-        visionLabel.font = .systemFont(ofSize: 11)
-        visionLabel.textColor = .tertiaryLabelColor
-        visionLabel.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(visionLabel)
+        terminalView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(terminalView)
 
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
-            header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            socketLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            socketLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            socketLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
 
-            socketLabel.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 16),
-            socketLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
-            socketLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            statusLabel.topAnchor.constraint(equalTo: socketLabel.bottomAnchor, constant: 4),
+            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
 
-            statusLabel.topAnchor.constraint(equalTo: socketLabel.bottomAnchor, constant: 8),
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
-            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
-
-            visionLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-            visionLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            // TerminalView keeps its intrinsic 80x24-grid size as the
+            // hard minimum. Letting the window grow beyond that just
+            // surrounds the grid with empty content; the renderer
+            // will start tracking real-window resize in 5.5.
+            terminalView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
+            terminalView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            terminalView.widthAnchor.constraint(greaterThanOrEqualToConstant: terminalSize.width),
+            terminalView.heightAnchor.constraint(greaterThanOrEqualToConstant: terminalSize.height),
+            terminalView.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -16),
         ])
 
         window.center()
