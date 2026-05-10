@@ -39,9 +39,23 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.27.0"),
     ],
     targets: [
+        // libghostty-vt's C API exposed to Swift via a module map.
+        // Sources/CGhosttyVT/module.modulemap reaches up into
+        // ../../../third_party/ghostty/out/include/ghostty/vt.h, which
+        // means `./third_party/ghostty/build.sh` must have produced
+        // the headers before `swift build` runs. The static archive
+        // is linked on the consuming target (Roost) below; the module
+        // map deliberately doesn't carry a `link "ghostty-vt"`
+        // directive so this target stays reusable for any future
+        // consumer that wants to re-export headers without re-linking.
+        .systemLibrary(
+            name: "CGhosttyVT",
+            path: "Sources/CGhosttyVT"
+        ),
         .executableTarget(
             name: "Roost",
             dependencies: [
+                .target(name: "CGhosttyVT"),
                 .product(name: "GRPCCore", package: "grpc-swift-2"),
                 .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
                 // Posix variant is the one that exposes Unix-domain-socket
@@ -57,6 +71,14 @@ let package = Package(
                 // Phase 5 adds the AppKit window + cell renderer; .xib /
                 // .storyboard resources will land in this exclude list when
                 // they do.
+            ],
+            // Linker settings for libghostty-vt: the static archive lives
+            // under ../third_party/ghostty/out/lib (relative to the
+            // package directory `mac/`). Both the -L path and the
+            // archive itself must exist before `swift build` runs.
+            linkerSettings: [
+                .unsafeFlags(["-L../third_party/ghostty/out/lib"]),
+                .linkedLibrary("ghostty-vt"),
             ],
             plugins: [
                 // Generates Swift bindings + client stubs from
@@ -76,8 +98,14 @@ let package = Package(
         ),
         .testTarget(
             name: "RoostTests",
-            dependencies: ["Roost"],
-            path: "Tests/RoostTests"
+            dependencies: ["Roost", "CGhosttyVT"],
+            path: "Tests/RoostTests",
+            // Tests link the static archive too because the FFI smoke
+            // calls C symbols directly. Same path as the Roost target.
+            linkerSettings: [
+                .unsafeFlags(["-L../third_party/ghostty/out/lib"]),
+                .linkedLibrary("ghostty-vt"),
+            ]
         ),
     ]
 )

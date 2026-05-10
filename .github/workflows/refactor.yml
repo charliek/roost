@@ -164,6 +164,30 @@ jobs:
         # protoc-gen-swift / protoc-gen-grpc-swift-2 (the plugin half).
         run: brew install protobuf
 
+      - uses: jdx/mise-action@v2
+
+      - name: Cache vendored libghostty-vt
+        # Same shape (and same key) as the rust-build matrix's cache:
+        # both jobs share the artifact, so the second runner-os miss
+        # would still be a hit. SHA pin lives in build.sh, hashFiles
+        # invalidates on any bump.
+        id: cache-ghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        # Required before `swift build` because the CGhosttyVT system
+        # library target's module map references
+        # ../../../third_party/ghostty/out/include/ghostty/vt.h, and
+        # the Roost target's linkerSettings reference the static
+        # archive at third_party/ghostty/out/lib/libghostty-vt.a.
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
       - name: Cache SwiftPM artifacts
         uses: actions/cache@v4
         with:

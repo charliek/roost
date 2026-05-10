@@ -28,6 +28,20 @@ because the gRPC bindings are generated at build time:
 brew install protobuf
 ```
 
+The Mac UI additionally links libghostty-vt from the vendored Ghostty
+build at `third_party/ghostty/out/lib/libghostty-vt.a`. Build it once
+before running `swift build`:
+
+```bash
+mise install                        # gets zig 0.15.2 if not already installed
+./third_party/ghostty/build.sh      # clones Ghostty at the pinned SHA, builds the static lib
+```
+
+Subsequent `swift build` runs are fast — the artifacts are cached and
+the script no-ops on the next invocation. Re-run the script after a
+Ghostty SHA bump (which happens in lockstep on `build/build.sh` and
+`third_party/ghostty/build.sh`).
+
 ## Run it
 
 From the repo root, in two terminals:
