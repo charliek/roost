@@ -14,6 +14,23 @@ import Foundation
 import GRPCCore
 import GRPCNIOTransportHTTP2Posix
 
+/// HTTP/2 `:authority` pseudo-header used for every UDS connection.
+///
+/// grpc-swift-nio-transport's UDS resolver defaults `:authority` to
+/// the raw socket path when no override is supplied. tonic's
+/// underlying `h2` crate then rejects it as malformed (the path's
+/// `/` characters fail RFC 3986 authority validation), terminating
+/// the stream with RST_STREAM(0x1) before our RPC ever runs. The
+/// gRPC-ecosystem convention over UDS — used by Go, grpcurl,
+/// Kubernetes CSI — is the literal `"localhost"`. tonic and the
+/// Rust client side both accept it.
+///
+/// See:
+///   * grpc-swift-nio-transport NameResolver+UDS.swift `authority:`
+///     parameter
+///   * hyperium/tonic#243 (canonical issue)
+private let udsAuthority = "localhost"
+
 /// A snapshot of `roost-core`'s identity, mirroring the proto
 /// `IdentifyResponse` with idiomatic Swift names.
 struct RoostIdentity: Sendable {
@@ -67,7 +84,7 @@ private func runIdentifyUnbounded(socketPath: String) async -> IdentifyOutcome {
     do {
         return try await withGRPCClient(
             transport: .http2NIOPosix(
-                target: .unixDomainSocket(path: socketPath),
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
                 transportSecurity: .plaintext
             )
         ) { client in
@@ -134,7 +151,7 @@ func runShellSession(
     do {
         try await withGRPCClient(
             transport: .http2NIOPosix(
-                target: .unixDomainSocket(path: socketPath),
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
                 transportSecurity: .plaintext
             )
         ) { client in
@@ -207,7 +224,7 @@ func closeShellTab(socketPath: String, tabID: Int64) async {
     do {
         try await withGRPCClient(
             transport: .http2NIOPosix(
-                target: .unixDomainSocket(path: socketPath),
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
                 transportSecurity: .plaintext
             )
         ) { client in
