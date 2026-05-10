@@ -285,25 +285,5 @@ final class TerminalView: NSView {
                 line.draw(at: NSPoint(x: rect.minX, y: rect.minY))
             }
         }
-
-        // Faint cell grid. 0.5pt offset on integer-pixel positions
-        // gives crisp 1px-wide lines that don't anti-alias to
-        // mush. Placeholder visual confirming the cell math; 5.4c
-        // replaces this with per-cell content from the render state.
-        NSColor(white: 0.15, alpha: 1.0).setStroke()
-        let path = NSBezierPath()
-        path.lineWidth = 0.5
-
-        for col in 0...Int(cols) {
-            let x = (CGFloat(col) * cellSize.width).rounded() + 0.5
-            path.move(to: NSPoint(x: x, y: 0))
-            path.line(to: NSPoint(x: x, y: bounds.height))
-        }
-        for row in 0...Int(rows) {
-            let y = (CGFloat(row) * cellSize.height).rounded() + 0.5
-            path.move(to: NSPoint(x: 0, y: y))
-            path.line(to: NSPoint(x: bounds.width, y: y))
-        }
-        path.stroke()
     }
 }
