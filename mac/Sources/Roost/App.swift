@@ -30,6 +30,7 @@ import AppKit
 import Foundation
 
 @main
+@MainActor
 final class RoostApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var statusLabel: NSTextField?
@@ -44,7 +45,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `yield` access from the TerminalView's keyDown callback.
     private var keystrokeContinuation: AsyncStream<Data>.Continuation?
 
-    static func main() {
+    nonisolated static func main() {
+        // Entry point runs on the main thread by AppKit convention,
+        // but `static func main()` itself can't be @MainActor under
+        // @MainActor-on-class without help. `nonisolated` lets it
+        // compile; the body explicitly transitions onto the main
+        // actor by configuring NSApplication.shared and calling run(),
+        // which spins the main runloop where everything else runs.
         let app = NSApplication.shared
         let delegate = RoostApp()
         app.delegate = delegate
@@ -225,7 +232,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Empty / non-absolute `HOME` falls through to `/tmp` —
     /// matching the daemon's robustness to malformed env vars in
     /// sandboxed launchd setups.
-    static func defaultSocketPath(
+    ///
+    /// Marked `nonisolated` because it's a pure function — no
+    /// instance state — and `RoostApp` is `@MainActor`, which would
+    /// otherwise force test callers (run on Swift Testing's task
+    /// pool, not the main actor) to also be `@MainActor`.
+    nonisolated static func defaultSocketPath(
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
         if let home = env["HOME"], !home.isEmpty, home.hasPrefix("/") {
