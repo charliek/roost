@@ -86,6 +86,19 @@ final class TerminalView: NSView {
             fatalError("ghostty_terminal_new failed (rc.rawValue=\(rc.rawValue))")
         }
         self.terminal = handle
+
+        // Demo write so 5.4c is visibly different from 5.4b. Phase 5.5
+        // replaces this with the real PTY stream from roost-core.
+        // Sequence: red bg "ROOST", then green bg + blue fg "HI",
+        // then default "  hello world".
+        if let term = handle {
+            let demo: [UInt8] = Array(
+                "\u{001b}[41mROOST\u{001b}[0m\u{001b}[42m\u{001b}[34mHI\u{001b}[0m  hello world\r\n".utf8
+            )
+            demo.withUnsafeBufferPointer { ptr in
+                ghostty_terminal_vt_write(term, ptr.baseAddress, demo.count)
+            }
+        }
     }
 
     @available(*, unavailable)
@@ -130,6 +143,24 @@ final class TerminalView: NSView {
         let colors = renderState.defaultColors()
         colors.background.setFill()
         bounds.fill()
+
+        // Per-cell backgrounds. Walk emits only cells that have an
+        // explicit bg (default-bg cells stay covered by the canvas
+        // fill above), so this loop touches O(non-default-bg cells)
+        // not O(cols*rows). Phase 5.4d adds glyph rendering on top.
+        let cellW = cellSize.width
+        let cellH = cellSize.height
+        renderState.walk { row, col, background in
+            guard let background else { return }
+            let rect = NSRect(
+                x: CGFloat(col) * cellW,
+                y: CGFloat(row) * cellH,
+                width: cellW,
+                height: cellH
+            )
+            background.setFill()
+            rect.fill()
+        }
 
         // Faint cell grid. 0.5pt offset on integer-pixel positions
         // gives crisp 1px-wide lines that don't anti-alias to
