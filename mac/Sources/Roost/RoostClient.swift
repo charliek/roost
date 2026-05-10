@@ -111,6 +111,12 @@ private func clientVersion() -> String {
 /// responsible for hopping to the main actor before touching
 /// AppKit views.
 ///
+/// `onTabOpened` fires once with the daemon-assigned tab id as soon
+/// as `OpenTab` returns, before the StreamPty stream attaches. The
+/// caller uses this to label the tab in the UI and to drive an
+/// explicit `CloseTab` later. Like `onOutput`, it runs off the main
+/// actor; consumers must hop before touching AppKit state.
+///
 /// `keystrokes` carries inbound input bytes the renderer captured
 /// via `keyDown` events; each emitted chunk gets forwarded to the
 /// daemon as a `PtyInput`. Closing the keystroke stream
@@ -120,7 +126,9 @@ func runShellSession(
     socketPath: String,
     cols: UInt16 = 80,
     rows: UInt16 = 24,
+    title: String = "roost-mac",
     keystrokes: AsyncStream<Data>,
+    onTabOpened: @escaping @Sendable (Int64) -> Void,
     onOutput: @escaping @Sendable (Data) -> Void
 ) async {
     do {
@@ -141,10 +149,11 @@ func runShellSession(
                     $0.cwd = ""
                     $0.cols = UInt32(cols)
                     $0.rows = UInt32(rows)
-                    $0.title = "roost-mac"
+                    $0.title = title
                 }
             )
             let tabID = opened.tab.id
+            onTabOpened(tabID)
 
             try await roost.streamPty { writer in
                 // First message MUST be PtyAttach per the proto.
@@ -183,6 +192,33 @@ func runShellSession(
         // error path through the status panel.
         FileHandle.standardError.write(
             Data("[Roost.mac] shell session ended: \(error)\n".utf8)
+        )
+    }
+}
+
+/// Best-effort `CloseTab` on the daemon. Used when the UI closes a
+/// tab so the daemon's PTY supervisor reaps the child immediately
+/// rather than waiting for the StreamPty stream to drain.
+///
+/// Failures are logged to stderr only. The caller has already torn
+/// down its keystroke stream by the time this runs, so the daemon
+/// will eventually clean up even if this RPC never lands.
+func closeShellTab(socketPath: String, tabID: Int64) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.closeTab(
+                .with { $0.tabID = tabID }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] closeTab(\(tabID)) failed: \(error)\n".utf8)
         )
     }
 }
