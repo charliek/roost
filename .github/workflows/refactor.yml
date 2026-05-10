@@ -238,6 +238,81 @@ jobs:
             fi
           done
 
+      # Live-daemon regression guard. Without this, the gRPC layer
+      # between grpc-swift-nio-transport and tonic was silently broken
+      # over UDS for the entire Phase 5 series — the `:authority`
+      # pseudo-header defaulted to the socket path, tonic's h2 layer
+      # RST_STREAM'd every RPC with PROTOCOL_ERROR, and no test
+      # caught it because nothing dialed a real daemon. `swift test`
+      # alone covers compile-time / packaging regressions; this step
+      # adds the end-to-end gRPC round-trip the unit tests can't.
+      #
+      # Tools cargo + Rust here use the toolchain pinned in
+      # rust-toolchain.toml (same as the rust-build job) so the
+      # daemon binary built for this step matches what users run.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo registry + target (shared with rust-build)
+        # Same key as rust-build's macos-latest cache so the daemon
+        # binary is usually already compiled by the time we get here.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build roost-core for live-daemon test
+        run: cargo build -p roost-core
+
+      - name: Start roost-core (live-daemon test backend)
+        # Backgrounded so the next step can dial it. We use a
+        # workflow-scoped tempdir under the runner's home so the
+        # cleanup step can blow it away without touching anything
+        # else, and a per-run socket name so reruns on the same
+        # runner don't collide.
+        run: |
+          mkdir -p "$HOME/roost-live-test"
+          SOCKET="$HOME/roost-live-test/roost.sock"
+          DB="$HOME/roost-live-test/roost.db"
+          nohup target/debug/roost-core --socket "$SOCKET" --db "$DB" \
+            > "$HOME/roost-live-test/daemon.log" 2>&1 &
+          echo "DAEMON_PID=$!" >> "$GITHUB_ENV"
+          echo "ROOST_LIVE_TEST_SOCKET=$SOCKET" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            if [ -S "$SOCKET" ]; then
+              echo "daemon socket ready at $SOCKET"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "FAIL: daemon socket never appeared at $SOCKET"
+          cat "$HOME/roost-live-test/daemon.log" || true
+          exit 1
+
       - name: swift test
         working-directory: mac
+        # ROOST_LIVE_TEST_SOCKET enables the liveIdentifyAgainstDaemon
+        # test in RoostTests; absent that env var the test is a no-op
+        # so local `swift test` runs (no daemon up) still pass.
         run: PROTOC_PATH="$(which protoc)" swift test
+
+      - name: Stop roost-core
+        if: always()
+        # always() so a swift-test failure still tears the daemon
+        # down — leaving it running can break a re-run on the same
+        # self-hosted runner.
+        run: |
+          if [ -n "${DAEMON_PID:-}" ]; then
+            kill "$DAEMON_PID" 2>/dev/null || true
+            wait "$DAEMON_PID" 2>/dev/null || true
+          fi
+          # Dump the daemon log unconditionally for diagnosis. Cheap,
+          # and the only signal we have when the live test fails.
+          if [ -f "$HOME/roost-live-test/daemon.log" ]; then
+            echo "--- daemon log ---"
+            cat "$HOME/roost-live-test/daemon.log"
+          fi

@@ -4,6 +4,7 @@
 // catches gross packaging regressions, plus pin a few invariants that
 // would silently break the daemon-discovery story if they regressed.
 
+import Foundation
 import Testing
 @testable import Roost
 
@@ -60,4 +61,30 @@ func defaultSocketPathInvariants() {
     #expect(!socket.isEmpty)
     #expect(socket.hasPrefix("/"))
     #expect(socket.contains("roost"))
+}
+
+// MARK: - Live-daemon regression guard
+//
+// Pinned because the gRPC layer between grpc-swift-nio-transport and
+// tonic has subtle interop edges (eg the `:authority` pseudo-header
+// must not contain `/` over UDS, or h2 RST_STREAMs every request).
+// `swift test` alone can't catch that — only an actual round-trip
+// can. This test runs against a live daemon when the calling
+// environment sets `ROOST_LIVE_TEST_SOCKET` to a UDS path; locally
+// without it the test is a no-op so `swift test` stays runnable
+// off-CI. CI's swift-mac job starts `roost-core --socket <tmp>` in
+// the background before invoking `swift test` with the env var set.
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["ROOST_LIVE_TEST_SOCKET"]?.isEmpty == false))
+func liveIdentifyAgainstDaemonSocket() async throws {
+    let socket = ProcessInfo.processInfo.environment["ROOST_LIVE_TEST_SOCKET"] ?? ""
+    let outcome = await runIdentify(socketPath: socket)
+    switch outcome {
+    case .ok(let identity):
+        #expect(!identity.daemonVersion.isEmpty)
+        #expect(identity.pid > 0)
+        #expect(identity.protocolVersion >= 1)
+    case .failed(let reason):
+        Issue.record("live Identify against \(socket) failed: \(reason)")
+    }
 }
