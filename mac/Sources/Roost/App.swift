@@ -162,28 +162,49 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         sessionTask?.cancel()
         keystrokeContinuation?.finish()
 
-        // Build a fresh keystroke stream + continuation. The
-        // continuation lives on RoostApp so the TerminalView's
-        // onKey callback can yield into it; the stream is consumed
-        // by runShellSession's writer block.
-        let (stream, continuation) = AsyncStream<Data>.makeStream()
-        self.keystrokeContinuation = continuation
+        // Two AsyncStreams bridge data across the actor boundary:
+        //
+        //   * `keystrokes`: main-actor yield from the TerminalView
+        //     onKey callback -> @Sendable consumer in
+        //     runShellSession's writer block.
+        //
+        //   * `output`: @Sendable yield from runShellSession's
+        //     onOutput callback -> @MainActor consumer that calls
+        //     terminalView.appendBytes.
+        //
+        // The reason for `output` is Swift 6 strict concurrency: a
+        // closure passed to runShellSession (which runs on the gRPC
+        // background task) is `@Sendable`, and AppKit views aren't
+        // Sendable. Capturing `self` or `terminalView` directly fails
+        // the "reference to captured var 'self' in concurrently-
+        // executing code" check. AsyncStream's Continuation IS
+        // Sendable, so the @Sendable callback yields into it, and
+        // a separate @MainActor task drains the stream and touches
+        // the view. Nothing non-Sendable crosses the boundary.
+        let (keystrokes, kContinuation) = AsyncStream<Data>.makeStream()
+        let (output, oContinuation) = AsyncStream<Data>.makeStream()
+        self.keystrokeContinuation = kContinuation
+
         terminalView?.onKey = { [weak self] data in
             self?.keystrokeContinuation?.yield(data)
         }
 
-        sessionTask = Task { [weak self] in
+        // Drain output -> terminalView on the main actor. Loop ends
+        // when the runShellSession task finishes oContinuation.
+        Task { @MainActor [weak self] in
+            for await chunk in output {
+                self?.terminalView?.appendBytes(chunk)
+            }
+        }
+
+        sessionTask = Task {
             await runShellSession(
                 socketPath: socketPath,
-                keystrokes: stream
+                keystrokes: keystrokes
             ) { data in
-                // Callback runs on the gRPC background task; hop to
-                // the main actor before touching the libghostty-vt
-                // handle + invalidating the view.
-                Task { @MainActor [weak self] in
-                    self?.terminalView?.appendBytes(data)
-                }
+                oContinuation.yield(data)
             }
+            oContinuation.finish()
         }
     }
 
