@@ -40,6 +40,11 @@ final class TerminalView: NSView {
     /// rendering path lands.
     nonisolated(unsafe) private var terminal: GhosttyTerminal?
 
+    /// Pull-model snapshot of the terminal used by `draw()`.
+    /// Phase 5.4b uses this only for the canvas color; 5.4c walks
+    /// it cell-by-cell.
+    private let renderState = RenderState()
+
     init(cols: UInt16 = 80, rows: UInt16 = 24) {
         self.cols = cols
         self.rows = rows
@@ -110,15 +115,25 @@ final class TerminalView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        // Background. Phase 5.4b reads this from the terminal's
-        // theme; for now a hardcoded black is fine and matches what
-        // most terminals look like at first glance.
-        NSColor.black.setFill()
+        // Snapshot terminal state, then ask libghostty-vt for the
+        // current default fg/bg colors. The default-bg fill below
+        // is the canvas the per-cell pass (Phase 5.4c) will paint
+        // overrides on top of. Even with no shell attached yet, this
+        // proves the render-state lifecycle round-trips: new -> update
+        // -> colors_get -> free. The only visible change in this
+        // commit vs 5.4a is the black-canvas swap to whatever the
+        // terminal reports as its default bg (typically still black,
+        // but no longer hardcoded).
+        if let terminal {
+            renderState.update(terminal: terminal)
+        }
+        let colors = renderState.defaultColors()
+        colors.background.setFill()
         bounds.fill()
 
         // Faint cell grid. 0.5pt offset on integer-pixel positions
         // gives crisp 1px-wide lines that don't anti-alias to
-        // mush. Placeholder visual confirming the cell math; 5.4b
+        // mush. Placeholder visual confirming the cell math; 5.4c
         // replaces this with per-cell content from the render state.
         NSColor(white: 0.15, alpha: 1.0).setStroke()
         let path = NSBezierPath()
