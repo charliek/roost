@@ -99,13 +99,24 @@ let package = Package(
                 // .storyboard resources will land in this exclude list when
                 // they do.
             ],
-            // Linker settings for libghostty-vt: the static archive lives
-            // under ../third_party/ghostty/out/lib (relative to the
-            // package directory `mac/`). Both the -L path and the
-            // archive itself must exist before `swift build` runs.
+            // Linker settings for libghostty-vt. We deliberately pass
+            // the static archive's path positionally instead of using
+            // `-L../third_party/ghostty/out/lib` + `-lghostty-vt`,
+            // because zig's `-Demit-lib-vt=true` build emits BOTH
+            // libghostty-vt.a and libghostty-vt.dylib into out/lib/.
+            // macOS `ld` with `-L<dir> -lname` prefers the dylib and
+            // embeds an `@rpath/libghostty-vt.dylib` reference in the
+            // binary; without a matching `-Wl,-rpath` the result
+            // aborts at launch with `dyld: Library not loaded:
+            // @rpath/libghostty-vt.dylib / Reason: no LC_RPATH's
+            // found`. The legacy build/build.sh ships the same
+            // workaround for the cgo binding — see its top-of-file
+            // comment.
+            //
+            // Passing the archive as a positional argument forces
+            // static linking and side-steps dyld entirely.
             linkerSettings: [
-                .unsafeFlags(["-L../third_party/ghostty/out/lib"]),
-                .linkedLibrary("ghostty-vt"),
+                .unsafeFlags(["../third_party/ghostty/out/lib/libghostty-vt.a"]),
             ],
             plugins: [
                 // Generates Swift bindings + client stubs from
@@ -128,10 +139,11 @@ let package = Package(
             dependencies: ["Roost", "CGhosttyVT"],
             path: "Tests/RoostTests",
             // Tests link the static archive too because the FFI smoke
-            // calls C symbols directly. Same path as the Roost target.
+            // calls C symbols directly. Same positional-path trick as
+            // the Roost target above to avoid dyld picking up the
+            // dylib and producing a broken @rpath reference.
             linkerSettings: [
-                .unsafeFlags(["-L../third_party/ghostty/out/lib"]),
-                .linkedLibrary("ghostty-vt"),
+                .unsafeFlags(["../third_party/ghostty/out/lib/libghostty-vt.a"]),
             ]
         ),
     ]

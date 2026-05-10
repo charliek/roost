@@ -219,6 +219,25 @@ jobs:
         working-directory: mac
         run: PROTOC_PATH="$(which protoc)" swift build -v
 
+      # Mirrors the macOS regression guard in ci.yml for the legacy Go
+      # binary: zig's libghostty-vt build emits both a static archive
+      # and a dylib, and `-L<dir> -lghostty-vt` makes ld pick the
+      # dylib + embed an @rpath/libghostty-vt.dylib reference that
+      # crashes at launch (no LC_RPATH). Package.swift passes the
+      # archive's path positionally to side-step this; this guard
+      # makes regressions immediate rather than letting them resurface
+      # in someone's runtime later.
+      - name: Assert no dynamic ghostty-vt link (regression guard)
+        working-directory: mac
+        run: |
+          for bin in $(find .build -type f -perm -u+x -name 'Roost' -o -name 'RoostPackageTests'); do
+            if otool -L "$bin" 2>/dev/null | grep -q '@rpath/libghostty-vt'; then
+              echo "FAIL: $bin is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in Package.swift's positional-archive linkerSettings."
+              otool -L "$bin"
+              exit 1
+            fi
+          done
+
       - name: swift test
         working-directory: mac
         run: PROTOC_PATH="$(which protoc)" swift test
