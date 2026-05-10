@@ -21,12 +21,13 @@ use roost_proto::v1::pty_server_message::Kind as PtyServerKind;
 use roost_proto::v1::roost_server::Roost;
 use roost_proto::v1::{
     ClearTabNotificationRequest, ClearTabNotificationResponse, CloseTabRequest, CloseTabResponse,
-    CreateNotificationRequest, CreateNotificationResponse, Event, FocusTabRequest,
+    CreateNotificationRequest, CreateNotificationResponse, CreateProjectRequest,
+    CreateProjectResponse, DeleteProjectRequest, DeleteProjectResponse, Event, FocusTabRequest,
     FocusTabResponse, IdentifyRequest, IdentifyResponse, ListTabsRequest, ListTabsResponse,
-    OpenTabRequest, OpenTabResponse, PtyClientMessage, PtyExit, PtyOutput, PtyServerMessage,
-    ReportOscRequest, ReportOscResponse, SetHookActiveRequest, SetHookActiveResponse,
-    SetTabStateRequest, SetTabStateResponse, SetTabTitleRequest, SetTabTitleResponse, TabState,
-    WatchEventsRequest,
+    OpenTabRequest, OpenTabResponse, Project, PtyClientMessage, PtyExit, PtyOutput,
+    PtyServerMessage, RenameProjectRequest, RenameProjectResponse, ReportOscRequest,
+    ReportOscResponse, SetHookActiveRequest, SetHookActiveResponse, SetTabStateRequest,
+    SetTabStateResponse, SetTabTitleRequest, SetTabTitleResponse, TabState, WatchEventsRequest,
 };
 
 use crate::pty::PtySupervisor;
@@ -153,6 +154,55 @@ impl Roost for RoostService {
         Ok(Response::new(ListTabsResponse {
             projects: self.workspace.snapshot(),
         }))
+    }
+
+    async fn create_project(
+        &self,
+        req: Request<CreateProjectRequest>,
+    ) -> Result<Response<CreateProjectResponse>, Status> {
+        let r = req.into_inner();
+        let cwd = if r.cwd.is_empty() {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "/".into())
+        } else {
+            r.cwd
+        };
+        let stored = self.workspace.create_project(&r.name, &cwd).map_err(map_err)?;
+        info!(project_id = stored.id, name = %stored.name, "project created");
+        Ok(Response::new(CreateProjectResponse {
+            project: Some(Project {
+                id: stored.id,
+                name: stored.name,
+                cwd: stored.cwd,
+                position: stored.position,
+                created_at: stored.created_at,
+                tabs: vec![],
+            }),
+        }))
+    }
+
+    async fn rename_project(
+        &self,
+        req: Request<RenameProjectRequest>,
+    ) -> Result<Response<RenameProjectResponse>, Status> {
+        let r = req.into_inner();
+        self.workspace
+            .rename_project(r.project_id, &r.name)
+            .map_err(map_err)?;
+        Ok(Response::new(RenameProjectResponse {}))
+    }
+
+    async fn delete_project(
+        &self,
+        req: Request<DeleteProjectRequest>,
+    ) -> Result<Response<DeleteProjectResponse>, Status> {
+        let r = req.into_inner();
+        self.workspace
+            .delete_project(r.project_id)
+            .map_err(map_err)?;
+        info!(project_id = r.project_id, "project deleted");
+        Ok(Response::new(DeleteProjectResponse {}))
     }
 
     type StreamPtyStream =
@@ -431,6 +481,9 @@ fn event_matches_tab(event: &Event, tab_id: i64) -> bool {
         Some(roost_proto::v1::event::Kind::ProjectsReordered(_)) => true,
         Some(roost_proto::v1::event::Kind::TabsReordered(_)) => true,
         Some(roost_proto::v1::event::Kind::Active(_)) => true,
+        Some(roost_proto::v1::event::Kind::ProjectCreated(_)) => true,
+        Some(roost_proto::v1::event::Kind::ProjectRenamed(_)) => true,
+        Some(roost_proto::v1::event::Kind::ProjectDeleted(_)) => true,
         None => false,
     }
 }

@@ -19,8 +19,9 @@ use tracing::warn;
 
 use roost_proto::v1::{
     ActiveChangedEvent, Event, HookActiveChangedEvent, NotificationEvent, Project,
-    ProjectsReorderedEvent, Tab, TabCwdChangedEvent, TabDeletedEvent, TabNotificationEvent,
-    TabOpenedEvent, TabState, TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
+    ProjectCreatedEvent, ProjectDeletedEvent, ProjectRenamedEvent, ProjectsReorderedEvent, Tab,
+    TabCwdChangedEvent, TabDeletedEvent, TabNotificationEvent, TabOpenedEvent, TabState,
+    TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
 };
 
 use crate::store::{Store, StoreError};
@@ -198,6 +199,139 @@ impl Workspace {
         drop(runtime);
         self.emit_active_changed();
         id
+    }
+
+    /// Create a project. Empty `name` yields a daemon-picked
+    /// `"Untitled <n>"` so a UI's "+" button can defer naming until
+    /// the user types into the row.
+    pub fn create_project(
+        &self,
+        name: &str,
+        cwd: &str,
+    ) -> Result<StoredProject, WorkspaceError> {
+        let store = self.store.lock().unwrap();
+        let chosen_name = if name.is_empty() {
+            let n = store.list_projects().map_err(wrap)?.len() + 1;
+            format!("Untitled {n}")
+        } else {
+            name.to_string()
+        };
+        let row = store.create_project(&chosen_name, cwd).map_err(wrap)?;
+        drop(store);
+
+        let stored = StoredProject {
+            id: row.id,
+            name: row.name.clone(),
+            cwd: row.cwd.clone(),
+            position: row.position,
+            created_at: row.created_at,
+        };
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::ProjectCreated(
+                ProjectCreatedEvent {
+                    project: Some(Project {
+                        id: row.id,
+                        name: row.name,
+                        cwd: row.cwd,
+                        position: row.position,
+                        created_at: row.created_at,
+                        tabs: vec![],
+                    }),
+                },
+            )),
+        });
+        Ok(stored)
+    }
+
+    pub fn rename_project(
+        &self,
+        project_id: i64,
+        name: &str,
+    ) -> Result<(), WorkspaceError> {
+        let store = self.store.lock().unwrap();
+        store.rename_project(project_id, name).map_err(wrap)?;
+        drop(store);
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::ProjectRenamed(
+                ProjectRenamedEvent {
+                    project_id,
+                    name: name.to_string(),
+                },
+            )),
+        });
+        Ok(())
+    }
+
+    /// Delete a project and all its tabs. The store's CASCADE drops
+    /// tab rows server-side; we mirror that by:
+    ///   * collecting the doomed tab ids BEFORE the SQL delete so
+    ///     subscribers see one `TabDeletedEvent` per tab,
+    ///   * dropping the per-tab runtime entries (state, hook flag),
+    ///   * computing a fallback active `(project, tab)` if the
+    ///     deletion took out the current selection.
+    /// Order of events on the wire: per-tab `TabDeletedEvent`s, then
+    /// `ProjectDeletedEvent`, then `ActiveChangedEvent` if the
+    /// selection moved.
+    pub fn delete_project(&self, project_id: i64) -> Result<(), WorkspaceError> {
+        let (deleted_tab_ids, fallback) = {
+            let store = self.store.lock().unwrap();
+            let projects = store.list_projects().map_err(wrap)?;
+            if !projects.iter().any(|p| p.id == project_id) {
+                return Err(WorkspaceError::ProjectNotFound(project_id));
+            }
+            let tab_ids: Vec<i64> = store
+                .list_tabs(project_id)
+                .map_err(wrap)?
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            let fallback = projects.iter().filter(|p| p.id != project_id).find_map(|p| {
+                store
+                    .list_tabs(p.id)
+                    .ok()
+                    .and_then(|tabs| tabs.into_iter().next().map(|t| (t.project_id, t.id)))
+            });
+            store.delete_project(project_id).map_err(wrap)?;
+            (tab_ids, fallback)
+        };
+
+        let mut active_changed = false;
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            for tid in &deleted_tab_ids {
+                runtime.tabs.remove(tid);
+            }
+            if runtime.active_project_id == project_id {
+                match fallback {
+                    Some((pid, tid)) => {
+                        runtime.active_project_id = pid;
+                        runtime.active_tab_id = tid;
+                    }
+                    None => {
+                        runtime.active_project_id = 0;
+                        runtime.active_tab_id = 0;
+                    }
+                }
+                active_changed = true;
+            }
+        }
+
+        for tab_id in deleted_tab_ids {
+            let _ = self.events.send(Event {
+                kind: Some(roost_proto::v1::event::Kind::TabDeleted(TabDeletedEvent {
+                    tab_id,
+                })),
+            });
+        }
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::ProjectDeleted(
+                ProjectDeletedEvent { project_id },
+            )),
+        });
+        if active_changed {
+            self.emit_active_changed();
+        }
+        Ok(())
     }
 
     pub fn open_tab(
@@ -617,6 +751,100 @@ mod tests {
         let after = ws.tab(tab.id).unwrap();
         assert_eq!(after.title, "manual");
         assert!(after.user_titled);
+    }
+
+    #[test]
+    fn create_project_assigns_untitled_when_name_empty() {
+        let ws = Workspace::new();
+        let p1 = ws.create_project("", "/tmp").unwrap();
+        let p2 = ws.create_project("", "/tmp").unwrap();
+        let p3 = ws.create_project("named", "/tmp").unwrap();
+        assert_eq!(p1.name, "Untitled 1");
+        assert_eq!(p2.name, "Untitled 2");
+        assert_eq!(p3.name, "named");
+    }
+
+    #[test]
+    fn rename_project_emits_event_and_persists() {
+        let ws = Workspace::new();
+        let mut rx = ws.subscribe();
+        let p = ws.create_project("orig", "/tmp").unwrap();
+        // Drain the ProjectCreated event so we observe the rename one.
+        let _ = rx.try_recv();
+        ws.rename_project(p.id, "renamed").unwrap();
+        let snap = ws.snapshot();
+        assert_eq!(snap.iter().find(|x| x.id == p.id).unwrap().name, "renamed");
+        match rx.try_recv() {
+            Ok(Event {
+                kind: Some(roost_proto::v1::event::Kind::ProjectRenamed(e)),
+            }) => {
+                assert_eq!(e.project_id, p.id);
+                assert_eq!(e.name, "renamed");
+            }
+            other => panic!("expected ProjectRenamed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_project_cascades_tabs_and_emits_events() {
+        let ws = Workspace::new();
+        let p = ws.create_project("doomed", "/tmp").unwrap();
+        let t1 = ws.open_tab(p.id, "/tmp", "").unwrap();
+        let t2 = ws.open_tab(p.id, "/tmp", "").unwrap();
+
+        let mut rx = ws.subscribe();
+        ws.delete_project(p.id).unwrap();
+
+        // Snapshot reflects the deletion.
+        assert!(ws.snapshot().iter().all(|x| x.id != p.id));
+
+        // Event order: TabDeleted x2 then ProjectDeleted.
+        let mut tab_deleted_ids = Vec::new();
+        let mut project_deleted = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev.kind {
+                Some(roost_proto::v1::event::Kind::TabDeleted(e)) => {
+                    tab_deleted_ids.push(e.tab_id);
+                }
+                Some(roost_proto::v1::event::Kind::ProjectDeleted(e)) => {
+                    assert_eq!(e.project_id, p.id);
+                    // TabDeleted must arrive before ProjectDeleted per the
+                    // contract documented on `delete_project`.
+                    assert_eq!(tab_deleted_ids.len(), 2);
+                    project_deleted = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(tab_deleted_ids.contains(&t1.id));
+        assert!(tab_deleted_ids.contains(&t2.id));
+        assert!(project_deleted);
+    }
+
+    #[test]
+    fn delete_project_promotes_fallback_active_selection() {
+        let ws = Workspace::new();
+        let keeper = ws.create_project("keeper", "/tmp").unwrap();
+        let keep_tab = ws.open_tab(keeper.id, "/tmp", "").unwrap();
+        let doomed = ws.create_project("doomed", "/tmp").unwrap();
+        let _doomed_tab = ws.open_tab(doomed.id, "/tmp", "").unwrap();
+        // Force active onto the doomed project.
+        ws.focus_tab(_doomed_tab.id).unwrap();
+        assert_eq!(ws.active(), (doomed.id, _doomed_tab.id));
+
+        ws.delete_project(doomed.id).unwrap();
+        // Active selection must have moved to the keeper's tab.
+        assert_eq!(ws.active(), (keeper.id, keep_tab.id));
+    }
+
+    #[test]
+    fn delete_project_unknown_returns_not_found() {
+        let ws = Workspace::new();
+        let err = ws.delete_project(999).unwrap_err();
+        match err {
+            WorkspaceError::ProjectNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected ProjectNotFound, got {other:?}"),
+        }
     }
 
     #[test]

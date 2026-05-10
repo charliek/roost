@@ -7,6 +7,29 @@ daemon releases.
 
 ## Unreleased
 
+### Phase 6a step 2 — explicit project lifecycle
+
+The UI sidebar needs to add / rename / remove projects without going
+through a tab. `OpenTab` with `project_id=0` continues to auto-create
+a default project on first use; these RPCs are additive.
+
+**New RPCs**
+
+- `CreateProject(name, cwd) -> Project` — create a project with an
+  explicit name. Empty `name` yields a daemon-picked `"Untitled <n>"`.
+- `RenameProject(project_id, name) -> {}`.
+- `DeleteProject(project_id) -> {}` — cascade-deletes the project's
+  tabs; clients observe one `TabDeletedEvent` per tab followed by the
+  terminal `ProjectDeletedEvent`.
+
+**New events** (added to `Event.kind`):
+
+- `ProjectCreatedEvent` (field 12) — fired when a project is created
+  by any client. Carries the full `Project` snapshot.
+- `ProjectRenamedEvent` (field 13) — fired on rename. `(project_id, name)`.
+- `ProjectDeletedEvent` (field 14) — fired after the project's tabs
+  have been individually deleted.
+
 ### Pre-1.0 schema tightening (Phase 3 follow-up)
 
 Schema is still pre-1.0 with no released clients, so these are fixes rather

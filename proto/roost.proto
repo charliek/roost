@@ -38,6 +38,15 @@ service Roost {
   rpc CloseTab(CloseTabRequest) returns (CloseTabResponse);
   rpc ListTabs(ListTabsRequest) returns (ListTabsResponse);
 
+  // ---- Project lifecycle ----
+  // The default project is auto-created by `OpenTab` when the client
+  // passes `project_id = 0` and no projects exist. These RPCs let
+  // a UI manage the project list explicitly: a sidebar that adds /
+  // renames / removes projects without going through a tab.
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
+  rpc RenameProject(RenameProjectRequest) returns (RenameProjectResponse);
+  rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
+
   // ---- Terminal stream ----
   // Bidirectional. Client opens with PtyAttach{tab_id}, then sends
   // PtyInput / PtyResize. Server streams PtyOutput until the PTY exits,
@@ -156,6 +165,34 @@ message ListTabsResponse {
 }
 
 // =============================================================================
+// Project lifecycle
+// =============================================================================
+
+message CreateProjectRequest {
+  string name = 1;  // empty = daemon picks "Untitled <n>"
+  string cwd  = 2;
+}
+
+message CreateProjectResponse {
+  Project project = 1;
+}
+
+message RenameProjectRequest {
+  int64  project_id = 1;
+  string name       = 2;
+}
+
+message RenameProjectResponse {}
+
+message DeleteProjectRequest {
+  int64 project_id = 1;
+  // Tabs in the project cascade-delete; clients see `TabDeletedEvent`
+  // for each one before the `ProjectDeletedEvent` arrives.
+}
+
+message DeleteProjectResponse {}
+
+// =============================================================================
 // PTY stream
 // =============================================================================
 
@@ -224,6 +261,9 @@ message Event {
     TabOpenedEvent          tab_opened          = 9;
     ActiveChangedEvent      active              = 10;
     HookActiveChangedEvent  hook_active         = 11;
+    ProjectCreatedEvent     project_created     = 12;
+    ProjectRenamedEvent     project_renamed     = 13;
+    ProjectDeletedEvent     project_deleted     = 14;
   }
 }
 
@@ -284,6 +324,26 @@ message ActiveChangedEvent {
 message HookActiveChangedEvent {
   int64 tab_id = 1;
   bool  active = 2;
+}
+
+// Emitted when a new project is created (by any client). The project
+// payload is the freshly-created snapshot with its `tabs` field empty.
+message ProjectCreatedEvent {
+  Project project = 1;
+}
+
+// Emitted when a project is renamed.
+message ProjectRenamedEvent {
+  int64  project_id = 1;
+  string name       = 2;
+}
+
+// Emitted after a project is deleted. Per-tab `TabDeletedEvent`s fire
+// for each child tab first, then this event arrives. A UI tracking
+// projects can react on this event alone to drop the project from its
+// model; tabs are guaranteed already-deleted by the time it arrives.
+message ProjectDeletedEvent {
+  int64 project_id = 1;
 }
 
 // =============================================================================

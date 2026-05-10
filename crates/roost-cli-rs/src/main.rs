@@ -22,8 +22,9 @@ use roost_common::{connect_uds, default_socket_path};
 
 use roost_proto::v1::roost_client::RoostClient;
 use roost_proto::v1::{
-    ClearTabNotificationRequest, CreateNotificationRequest, FocusTabRequest, IdentifyRequest,
-    ListTabsRequest, SetTabStateRequest, SetTabTitleRequest, TabState,
+    ClearTabNotificationRequest, CreateNotificationRequest, CreateProjectRequest,
+    DeleteProjectRequest, FocusTabRequest, IdentifyRequest, ListTabsRequest, RenameProjectRequest,
+    SetTabStateRequest, SetTabTitleRequest, TabState,
 };
 
 #[derive(Parser, Debug)]
@@ -59,6 +60,34 @@ enum Cmd {
     /// Tab subcommands.
     #[command(subcommand)]
     Tab(TabCmd),
+    /// Project subcommands.
+    #[command(subcommand)]
+    Project(ProjectCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectCmd {
+    /// List all projects (without their tabs — `tab list` for that).
+    List,
+    /// Create a project. Empty `--name` defaults to "Untitled <n>".
+    Create {
+        #[arg(long, default_value = "")]
+        name: String,
+        #[arg(long, default_value = "")]
+        cwd: String,
+    },
+    /// Rename a project.
+    Rename {
+        #[arg(long)]
+        id: i64,
+        #[arg(long)]
+        name: String,
+    },
+    /// Delete a project (cascade-deletes its tabs).
+    Delete {
+        #[arg(long)]
+        id: i64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -164,6 +193,39 @@ async fn main() -> Result<()> {
             let tab_id = resolve_tab(&mut client, tab).await?;
             client
                 .clear_tab_notification(ClearTabNotificationRequest { tab_id })
+                .await?;
+        }
+        Cmd::Project(ProjectCmd::List) => {
+            let resp = client.list_tabs(ListTabsRequest {}).await?.into_inner();
+            for p in resp.projects {
+                println!(
+                    "project {} — {}  cwd={}  tabs={}",
+                    p.id,
+                    p.name,
+                    p.cwd,
+                    p.tabs.len()
+                );
+            }
+        }
+        Cmd::Project(ProjectCmd::Create { name, cwd }) => {
+            let resp = client
+                .create_project(CreateProjectRequest { name, cwd })
+                .await?
+                .into_inner();
+            let p = resp.project.unwrap_or_default();
+            println!("created project {} — {}", p.id, p.name);
+        }
+        Cmd::Project(ProjectCmd::Rename { id, name }) => {
+            client
+                .rename_project(RenameProjectRequest {
+                    project_id: id,
+                    name,
+                })
+                .await?;
+        }
+        Cmd::Project(ProjectCmd::Delete { id }) => {
+            client
+                .delete_project(DeleteProjectRequest { project_id: id })
                 .await?;
         }
     }
