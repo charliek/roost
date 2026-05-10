@@ -39,6 +39,7 @@ tracing-subscriber = { workspace = true }
 portable-pty = { workspace = true }
 clap         = { workspace = true }
 rusqlite     = { workspace = true }
+percent-encoding = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

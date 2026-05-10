@@ -1146,6 +1146,7 @@ dependencies = [
  "async-stream",
  "clap",
  "futures",
+ "percent-encoding",
  "portable-pty",
  "prost",
  "roost-common",

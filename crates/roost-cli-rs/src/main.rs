@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
 
     match args.command {
         Cmd::Notify { title, body, tab } => {
-            let tab_id = tab.unwrap_or(0);
+            let tab_id = resolve_tab(&mut client, tab).await?;
             client
                 .create_notification(CreateNotificationRequest {
                     tab_id,
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Cmd::SetTitle { title, tab } => {
-            let tab_id = tab.unwrap_or(0);
+            let tab_id = resolve_tab(&mut client, tab).await?;
             client
                 .set_tab_title(SetTabTitleRequest { tab_id, title })
                 .await?;
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Tab(TabCmd::Focus { tab }) => {
-            let tab_id = tab.unwrap_or(0);
+            let tab_id = resolve_tab(&mut client, tab).await?;
             client.focus_tab(FocusTabRequest { tab_id }).await?;
         }
         Cmd::Tab(TabCmd::List) => {
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::SetState { state, tab }) => {
-            let tab_id = tab.unwrap_or(0);
+            let tab_id = resolve_tab(&mut client, tab).await?;
             let state = parse_state(&state)?;
             client
                 .set_tab_state(SetTabStateRequest {
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Cmd::Tab(TabCmd::ClearNotification { tab }) => {
-            let tab_id = tab.unwrap_or(0);
+            let tab_id = resolve_tab(&mut client, tab).await?;
             client
                 .clear_tab_notification(ClearTabNotificationRequest { tab_id })
                 .await?;
@@ -169,6 +169,38 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the tab id for a per-tab command. If the user passed
+/// `--tab` (or set `ROOST_TAB_ID`), use that verbatim. Otherwise ask
+/// the daemon via `Identify()` for the active tab and use that.
+///
+/// Without this helper the CLI would silently send `tab_id = 0` to the
+/// server when no tab was specified, and the server treats `0` as a
+/// real tab id to look up — yielding `TabNotFound(0)` for every
+/// per-tab command run without `--tab`. Calling `Identify()` is the
+/// same one round-trip pattern the legacy Go CLI used.
+async fn resolve_tab(
+    client: &mut RoostClient<tonic::transport::Channel>,
+    explicit: Option<i64>,
+) -> Result<i64> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+    let resp = client
+        .identify(IdentifyRequest {
+            client_name: "roost-cli-rs".into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+        })
+        .await?
+        .into_inner();
+    if resp.active_tab_id == 0 {
+        anyhow::bail!(
+            "no --tab specified and the daemon reports no active tab; \
+             pass --tab or set ROOST_TAB_ID"
+        );
+    }
+    Ok(resp.active_tab_id)
 }
 
 fn parse_state(s: &str) -> Result<TabState> {

@@ -106,21 +106,16 @@ impl Roost for RoostService {
             r.rows as u16
         };
 
-        // Spawn the PTY synchronously so the response confirms the shell is alive.
-        let _handle = self
-            .ptys
-            .spawn(tab.id, &cwd, &r.argv, cols, rows)
-            .map_err(|e| Status::internal(format!("spawn pty: {e}")))?;
-
-        // We immediately drop the handle; the gRPC StreamPty handler will
-        // re-attach via PtySupervisor by tab_id when a UI connects.
-        //
-        // XXX: Phase 3 limitation — the PTY supervisor as written delivers a
-        // single output stream per spawn. The current handle is therefore
-        // discarded; reattach semantics get fleshed out in Phase 5 when
-        // multiple UIs may share state. For now, OpenTab + StreamPty is the
-        // expected order: open the tab, then connect the bidirectional
-        // stream which spawns its own session.
+        // The cols/rows fields above bound the size StreamPty would
+        // attach with, but PTY creation itself is deferred to the
+        // first StreamPty call. The previous draft of this handler
+        // also called `ptys.spawn(...)` here — that produced two
+        // shells per OpenTab+StreamPty sequence (the first orphaned)
+        // because the streaming handler unconditionally spawns again.
+        // Removing the duplicate spawn is a clean win until Phase 5's
+        // multi-UI reattach semantics land; that work will introduce
+        // a real lifecycle for the supervisor handle.
+        let _ = (cols, rows);
         info!(tab_id = tab.id, project_id, "tab opened");
 
         Ok(Response::new(OpenTabResponse {
@@ -270,10 +265,11 @@ impl Roost for RoostService {
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
         let filter = req.into_inner().tab_id_filter;
         let mut rx = self.workspace.subscribe();
+        let workspace = self.workspace.clone();
 
         // Trigger an immediate structural resync so a freshly-attached
         // client doesn't have to call ListTabs separately.
-        self.workspace.broadcast_structural_resync();
+        workspace.broadcast_structural_resync();
 
         let stream = stream! {
             loop {
@@ -285,7 +281,16 @@ impl Roost for RoostService {
                     }
                     Err(RecvError::Lagged(n)) => {
                         warn!(filter, lagged = n, "WatchEvents subscriber lagged");
-                        // Keep going — subsequent events will resume.
+                        // Lagged subscribers have irrecoverably missed `n`
+                        // events. For structural events (tab opened, tab
+                        // deleted, reorders) those gaps would leave a
+                        // client with a stale model. Re-emit the current
+                        // structural snapshot so the client can resync
+                        // without explicitly calling ListTabs again.
+                        // Per-tab event content (titles, cwd, state) the
+                        // client may still miss gets re-asserted on the
+                        // next mutation that touches each tab.
+                        workspace.broadcast_structural_resync();
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -430,11 +435,21 @@ fn event_matches_tab(event: &Event, tab_id: i64) -> bool {
     }
 }
 
+/// Parse the cwd out of an OSC 7 payload. The payload is `file://<host>/<path>`,
+/// where `<path>` is percent-encoded. We strip the scheme + host and
+/// percent-decode so that `cd "/Users/me/Documents/My Project"` stored
+/// as `/Users/me/Documents/My%20Project` round-trips back to the
+/// original path with the space restored.
 fn parse_cwd_from_osc7(payload: &str) -> Option<String> {
-    // OSC 7 payload is `file://<host>/<path>`. Strip the scheme + host.
+    // OSC 7 payload is `file://<host>/<path>`. Strip the scheme + host,
+    // then percent-decode the path (spaces, unicode, etc.).
     let s = payload.strip_prefix("file://")?;
     let path_start = s.find('/')?;
-    Some(s[path_start..].to_string())
+    let raw_path = &s[path_start..];
+    percent_encoding::percent_decode_str(raw_path)
+        .decode_utf8()
+        .ok()
+        .map(|cow| cow.into_owned())
 }
 
 fn parse_osc_777(payload: &str) -> (String, String) {
@@ -455,5 +470,30 @@ fn map_err(err: WorkspaceError) -> Status {
             Status::not_found(err.to_string())
         }
         WorkspaceError::Store(_) => Status::internal(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc7_decodes_percent_escapes() {
+        // Spaces in cd-target paths come over the wire percent-encoded
+        // (cd "/Users/me/My Project" → file://host/Users/me/My%20Project).
+        let cwd = parse_cwd_from_osc7("file://host/Users/me/My%20Project");
+        assert_eq!(cwd.as_deref(), Some("/Users/me/My Project"));
+    }
+
+    #[test]
+    fn osc7_handles_unicode() {
+        // Multi-byte UTF-8 percent sequences should round-trip too.
+        let cwd = parse_cwd_from_osc7("file://host/tmp/r%C3%B6ost");
+        assert_eq!(cwd.as_deref(), Some("/tmp/röost"));
+    }
+
+    #[test]
+    fn osc7_rejects_non_file_scheme() {
+        assert!(parse_cwd_from_osc7("https://example.com/foo").is_none());
     }
 }

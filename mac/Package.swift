@@ -41,31 +41,43 @@ let package = Package(
     targets: [
         // libghostty-vt's C API exposed to Swift as `CGhosttyVT`.
         //
-        // Why a regular `.target` and not `.systemLibrary`: vt.h itself
-        // does `#include <ghostty/vt/types.h>`, an angle-bracket
-        // include that only resolves when the C include search path
-        // has third_party/ghostty/out/include/ on it. `systemLibrary`
-        // doesn't accept `cSettings`, so we can't add the -I path
-        // there. A regular target does, and lets us ship a one-line
-        // shim header (Sources/CGhosttyVT/include/CGhosttyVT.h) that
-        // re-exports the upstream API.
+        // The headers live in the vendored Ghostty build output at
+        // third_party/ghostty/out/include/ghostty/. Reaching them
+        // from inside this target is fiddly:
+        //
+        //   * `systemLibrary` targets don't accept `cSettings`, so we
+        //     can't add -I via that target type.
+        //   * `cSettings: [.headerSearchPath(...)]` gets validated at
+        //     manifest-parse time and SwiftPM rejects paths outside
+        //     the package root (we'd need ../../../third_party/...).
+        //   * `cSettings: [.unsafeFlags(["-I..."])]` works in theory
+        //     but flakes on path resolution depending on clang's
+        //     working directory.
+        //
+        // The cleanest answer: a relative symlink at
+        // Sources/CGhosttyVT/include/ghostty pointing back at the
+        // vendored include tree. The headers visually live inside the
+        // package, SwiftPM is happy, and vt.h's own
+        // `#include <ghostty/vt/types.h>` resolves because the
+        // target's `publicHeadersPath = "include"` puts include/ on
+        // the C compiler's search path. Sources/CGhosttyVT/include/
+        // contains:
+        //   * CGhosttyVT.h          -- shim that re-exports vt.h
+        //   * module.modulemap      -- exposes CGhosttyVT to Swift
+        //   * ghostty/  (symlink)   -- to third_party/ghostty/out/include/ghostty
         //
         // The static archive that backs the symbols lives at
         // third_party/ghostty/out/lib/libghostty-vt.a and is linked on
         // the consuming targets (Roost + RoostTests) via
-        // `linkerSettings` below. CGhosttyVT itself doesn't link it
-        // so future consumers can opt in or out of linking.
+        // `linkerSettings` below.
         //
-        // Both the shim and the static archive require
+        // Both the symlink target and the static archive require
         // `./third_party/ghostty/build.sh` to have run before
         // `swift build`. CI does that; local users run it once.
         .target(
             name: "CGhosttyVT",
             path: "Sources/CGhosttyVT",
-            publicHeadersPath: "include",
-            cSettings: [
-                .headerSearchPath("../../../third_party/ghostty/out/include"),
-            ]
+            publicHeadersPath: "include"
         ),
         .executableTarget(
             name: "Roost",

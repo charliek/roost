@@ -8,16 +8,7 @@ import Testing
 @testable import Roost
 
 @Test
-func defaultSocketPathPrefersXdgRuntimeDir() {
-    let socket = RoostApp.defaultSocketPath(environment: [
-        "XDG_RUNTIME_DIR": "/run/user/501",
-        "HOME": "/Users/tester",
-    ])
-    #expect(socket == "/run/user/501/roost/roost.sock")
-}
-
-@Test
-func defaultSocketPathFallsBackToHomeOnMac() {
+func defaultSocketPathUsesHomeOnMac() {
     let socket = RoostApp.defaultSocketPath(environment: [
         "HOME": "/Users/tester",
     ])
@@ -25,27 +16,38 @@ func defaultSocketPathFallsBackToHomeOnMac() {
 }
 
 @Test
-func defaultSocketPathFallsBackToTmpWhenEnvIsEmpty() {
+func defaultSocketPathIgnoresXdgRuntimeDirOnMac() {
+    // The daemon's macOS branch is HOME-derived only, so the Mac
+    // client must not chase XDG_RUNTIME_DIR even if a shell exports
+    // it. Both sides agreeing matters more than mirroring Linux.
+    let socket = RoostApp.defaultSocketPath(environment: [
+        "XDG_RUNTIME_DIR": "/run/user/501",
+        "HOME": "/Users/tester",
+    ])
+    #expect(socket == "/Users/tester/Library/Caches/roost/roost.sock")
+}
+
+@Test
+func defaultSocketPathFallsBackToTmpWhenHomeMissing() {
     let socket = RoostApp.defaultSocketPath(environment: [:])
     #expect(socket == "/tmp/roost.sock")
 }
 
 @Test
-func defaultSocketPathSkipsEmptyXdgRuntimeDir() {
-    // launchd-spawned processes sometimes inherit XDG_RUNTIME_DIR=""
-    // (set but empty). The function must fall through, not yield
-    // "/roost/roost.sock".
+func defaultSocketPathSkipsEmptyHome() {
+    // Sandboxed launchd processes can inherit HOME="" (set but empty).
+    // The function must fall through to /tmp, not yield
+    // "/Library/Caches/roost/roost.sock".
     let socket = RoostApp.defaultSocketPath(environment: [
-        "XDG_RUNTIME_DIR": "",
-        "HOME": "/Users/tester",
+        "HOME": "",
     ])
-    #expect(socket == "/Users/tester/Library/Caches/roost/roost.sock")
+    #expect(socket == "/tmp/roost.sock")
 }
 
 @Test
 func defaultSocketPathSkipsRelativeHome() {
-    // A relative HOME (or XDG_RUNTIME_DIR) would yield an unusable
-    // socket path; we fall through to /tmp instead.
+    // A relative HOME would yield an unusable socket path; fall
+    // through to /tmp instead.
     let socket = RoostApp.defaultSocketPath(environment: [
         "HOME": "relative/path",
     ])

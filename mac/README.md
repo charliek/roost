@@ -93,7 +93,7 @@ Drift between schema and Swift bindings is impossible by construction.
 
 ## Build
 
-* Requires Xcode 16+ / Swift 6.0+ on macOS 14+.
+* Requires Xcode 16+ / Swift 6.0+ on macOS 15+.
 * `swift build` resolves dependencies and compiles.
 * `swift test` runs the smoke tests under `Tests/RoostTests/`.
 

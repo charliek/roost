@@ -4,9 +4,14 @@
 // daemon) and the native UIs (Swift/AppKit on macOS, Rust/gtk4-rs on Linux).
 //
 // Transport: gRPC over Unix domain socket. Local IPC only — there is no
-// remote / network deployment. The socket lives at the runtime dir resolved
-// by roost-core (e.g. ~/.local/state/roost/roost.sock on Linux,
-// ~/Library/Application Support/roost/roost.sock on macOS).
+// remote / network deployment. The socket path is resolved by
+// `roost_common::default_socket_path` (and the Swift companion in
+// mac/Sources/Roost/App.swift::defaultSocketPath); both implementations
+// must stay in lockstep:
+//
+//   * macOS:        ~/Library/Caches/roost/roost.sock
+//   * Linux (XDG):  $XDG_RUNTIME_DIR/roost/roost.sock
+//   * Linux (else): /tmp/roost-<uid>/roost.sock
 //
 // Schema evolution: additive changes only. Deprecate fields rather than
 // renumber. Bump proto/CHANGELOG.md on every change. Once Phase 5 ships,

@@ -146,23 +146,27 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// Resolve the same default socket path as `roost-core`'s
-    /// `default_socket_path`. Mac uses `~/Library/Caches/roost/roost.sock`;
-    /// tests run on Linux runners hit the XDG branch.
+    /// `default_socket_path` for macOS — always
+    /// `~/Library/Caches/roost/roost.sock` when `HOME` is set;
+    /// `/tmp/roost.sock` only as a last resort.
     ///
-    /// The `environment` parameter defaults to the process's environment
-    /// but is injectable so unit tests can assert XDG → HOME → /tmp
-    /// precedence without mucking with the real env.
+    /// We deliberately do NOT consult `XDG_RUNTIME_DIR` here even
+    /// though the daemon does on Linux. The Roost Mac client is
+    /// macOS-only (Package.swift gates `.macOS(.v15)`); the daemon's
+    /// macOS path is unconditionally HOME-derived. A shell that
+    /// happens to export `XDG_RUNTIME_DIR` (some dev setups do)
+    /// would otherwise make the UI dial a different socket than the
+    /// daemon created. Both sides agreeing on the macOS default
+    /// matters more than mirroring the Linux ladder.
     ///
-    /// Empty or non-absolute values for the relevant variables fall
-    /// through to the next branch. `XDG_RUNTIME_DIR=""` (set but empty)
-    /// is a real shape in some sandboxed launchd setups, and a relative
-    /// `HOME` would otherwise yield a silently-broken socket path.
+    /// The `environment` parameter defaults to the process's
+    /// environment but is injectable so unit tests can pin behavior.
+    /// Empty / non-absolute `HOME` falls through to `/tmp` —
+    /// matching the daemon's robustness to malformed env vars in
+    /// sandboxed launchd setups.
     static func defaultSocketPath(
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
-        if let xdg = env["XDG_RUNTIME_DIR"], !xdg.isEmpty, xdg.hasPrefix("/") {
-            return "\(xdg)/roost/roost.sock"
-        }
         if let home = env["HOME"], !home.isEmpty, home.hasPrefix("/") {
             return "\(home)/Library/Caches/roost/roost.sock"
         }
