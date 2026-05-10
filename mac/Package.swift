@@ -39,18 +39,33 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.27.0"),
     ],
     targets: [
-        // libghostty-vt's C API exposed to Swift via a module map.
-        // Sources/CGhosttyVT/module.modulemap reaches up into
-        // ../../../third_party/ghostty/out/include/ghostty/vt.h, which
-        // means `./third_party/ghostty/build.sh` must have produced
-        // the headers before `swift build` runs. The static archive
-        // is linked on the consuming target (Roost) below; the module
-        // map deliberately doesn't carry a `link "ghostty-vt"`
-        // directive so this target stays reusable for any future
-        // consumer that wants to re-export headers without re-linking.
-        .systemLibrary(
+        // libghostty-vt's C API exposed to Swift as `CGhosttyVT`.
+        //
+        // Why a regular `.target` and not `.systemLibrary`: vt.h itself
+        // does `#include <ghostty/vt/types.h>`, an angle-bracket
+        // include that only resolves when the C include search path
+        // has third_party/ghostty/out/include/ on it. `systemLibrary`
+        // doesn't accept `cSettings`, so we can't add the -I path
+        // there. A regular target does, and lets us ship a one-line
+        // shim header (Sources/CGhosttyVT/include/CGhosttyVT.h) that
+        // re-exports the upstream API.
+        //
+        // The static archive that backs the symbols lives at
+        // third_party/ghostty/out/lib/libghostty-vt.a and is linked on
+        // the consuming targets (Roost + RoostTests) via
+        // `linkerSettings` below. CGhosttyVT itself doesn't link it
+        // so future consumers can opt in or out of linking.
+        //
+        // Both the shim and the static archive require
+        // `./third_party/ghostty/build.sh` to have run before
+        // `swift build`. CI does that; local users run it once.
+        .target(
             name: "CGhosttyVT",
-            path: "Sources/CGhosttyVT"
+            path: "Sources/CGhosttyVT",
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("../../../third_party/ghostty/out/include"),
+            ]
         ),
         .executableTarget(
             name: "Roost",

@@ -1,0 +1,8 @@
+// Module map for the CGhosttyVT Swift module. The shim header lives
+// next to this file; SwiftPM/Clang's lookup is relative to the
+// modulemap's directory.
+
+module CGhosttyVT {
+    header "CGhosttyVT.h"
+    export *
+}
