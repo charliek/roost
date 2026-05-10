@@ -88,19 +88,21 @@ final class TerminalView: NSView {
             fatalError("ghostty_terminal_new failed (rc.rawValue=\(rc.rawValue))")
         }
         self.terminal = handle
+    }
 
-        // Demo write so 5.4c is visibly different from 5.4b. Phase 5.5
-        // replaces this with the real PTY stream from roost-core.
-        // Sequence: red bg "ROOST", then green bg + blue fg "HI",
-        // then default "  hello world".
-        if let term = handle {
-            let demo: [UInt8] = Array(
-                "\u{001b}[41mROOST\u{001b}[0m\u{001b}[42m\u{001b}[34mHI\u{001b}[0m  hello world\r\n".utf8
-            )
-            demo.withUnsafeBufferPointer { ptr in
-                ghostty_terminal_vt_write(term, ptr.baseAddress, demo.count)
-            }
+    /// Feed VT bytes into the local libghostty-vt terminal and
+    /// trigger a redraw. Called from the StreamPty consumer in
+    /// `runShellSession` once per output chunk from `roost-core`.
+    /// Must be called on the main actor — the terminal handle and
+    /// AppKit invalidation both have main-thread requirements.
+    @MainActor
+    func appendBytes(_ data: Data) {
+        guard let terminal else { return }
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ghostty_terminal_vt_write(terminal, base, data.count)
         }
+        needsDisplay = true
     }
 
     @available(*, unavailable)

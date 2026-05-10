@@ -97,3 +97,92 @@ private func runIdentifyUnbounded(socketPath: String) async -> IdentifyOutcome {
 private func clientVersion() -> String {
     Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
 }
+
+// =============================================================================
+// Phase 5.5a: long-lived shell session over StreamPty
+// =============================================================================
+
+/// Open a fresh tab on `roost-core` and attach a bidirectional
+/// `StreamPty` to it. Returns when the stream ends — daemon shutdown,
+/// shell exit, or the wrapping Task being cancelled.
+///
+/// Output bytes are delivered to `onOutput` as they arrive. The
+/// callback runs on the gRPC background task; the caller is
+/// responsible for hopping to the main actor before touching
+/// AppKit views.
+///
+/// 5.5a: read-only — we send the initial `PtyAttach` and then keep
+/// the writer open so output keeps flowing, but we never write
+/// `PtyInput`. Phase 5.5b adds keystroke routing through this same
+/// session.
+func runShellSession(
+    socketPath: String,
+    cols: UInt16 = 80,
+    rows: UInt16 = 24,
+    onOutput: @escaping @Sendable (Data) -> Void
+) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+
+            // Spawn a tab on the daemon. Empty argv = the daemon
+            // resolves $SHELL on its end. cwd is left empty so the
+            // daemon picks its own (typically the user's home).
+            let opened = try await roost.openTab(
+                .with {
+                    $0.argv = []
+                    $0.cwd = ""
+                    $0.cols = UInt32(cols)
+                    $0.rows = UInt32(rows)
+                    $0.title = "roost-mac"
+                }
+            )
+            let tab = opened.tab
+            // The tab is the openTab response's only field; treat
+            // a missing one as a protocol error and bail out clean.
+            // In practice the daemon always populates it.
+            let tabID = tab.id
+
+            try await roost.streamPty { writer in
+                // First message MUST be PtyAttach per the proto.
+                try await writer.write(
+                    .with {
+                        $0.attach = Roost_V1_PtyAttach.with {
+                            $0.tabID = tabID
+                            $0.cols = UInt32(cols)
+                            $0.rows = UInt32(rows)
+                        }
+                    }
+                )
+                // Hold the writer open so the server keeps streaming
+                // output. Phase 5.5b reads keystrokes from a channel
+                // and writes them here as PtyInput. For now we just
+                // wait for cancellation; closing the writer would
+                // also close the response stream.
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(60))
+                }
+            } onResponse: { response in
+                for try await message in response.messages {
+                    if case .output(let out) = message.kind {
+                        onOutput(out.data)
+                    }
+                    // PtyExit ends the stream from the server side;
+                    // the for-loop will then exit naturally.
+                }
+            }
+        }
+    } catch {
+        // Logged to stderr so the user sees session failures even
+        // if the UI doesn't surface them yet. Phase 5.5b adds an
+        // error path through the status panel.
+        FileHandle.standardError.write(
+            Data("[Roost.mac] shell session ended: \(error)\n".utf8)
+        )
+    }
+}

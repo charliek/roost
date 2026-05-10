@@ -33,6 +33,8 @@ import Foundation
 final class RoostApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var statusLabel: NSTextField?
+    private var terminalView: TerminalView?
+    private var sessionTask: Task<Void, Never>?
 
     static func main() {
         let app = NSApplication.shared
@@ -115,15 +117,37 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         self.window = window
         self.statusLabel = statusLabel
+        self.terminalView = terminalView
 
         // Kick off the handshake. We deliberately don't block window
         // presentation on it — if the daemon isn't running, the user
         // still sees the window come up immediately and gets a clear
-        // failure message in the status panel.
+        // failure message in the status panel. On success, we open a
+        // shell session over StreamPty so the daemon's PTY output
+        // starts flowing into the renderer.
         Task { [weak self] in
             let outcome = await runIdentify(socketPath: socketPath)
             await MainActor.run { [weak self] in
                 self?.applyIdentifyOutcome(outcome)
+                if case .ok = outcome {
+                    self?.startShellSession(socketPath: socketPath)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func startShellSession(socketPath: String) {
+        // Cancel any prior session (eg if Identify ever re-runs).
+        sessionTask?.cancel()
+        sessionTask = Task { [weak self] in
+            await runShellSession(socketPath: socketPath) { data in
+                // Callback runs on the gRPC background task; hop to
+                // the main actor before touching the libghostty-vt
+                // handle + invalidating the view.
+                Task { @MainActor [weak self] in
+                    self?.terminalView?.appendBytes(data)
+                }
             }
         }
     }
