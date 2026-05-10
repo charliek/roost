@@ -87,18 +87,28 @@ final class RenderState {
         }
     }
 
-    /// Walk every cell in the latest snapshot. The callback receives
-    /// the row + column index plus an optional explicit background
-    /// color — `nil` means "use the default bg" (the renderer should
-    /// not redraw those cells against the default canvas).
+    /// One cell's renderable contents at frame snapshot time.
+    /// `background` and `foreground` are nil when the cell defers
+    /// to the terminal's default colors. `glyph` is nil when the
+    /// cell has no graphemes (empty cell — possibly with a bg fill,
+    /// e.g. erase-with-color).
+    struct Cell {
+        let row: Int
+        let col: Int
+        let background: NSColor?
+        let foreground: NSColor?
+        let glyph: Character?
+    }
+
+    /// Walk every cell in the latest snapshot. The callback runs
+    /// once per cell that the row iterator emits and must NOT call
+    /// any other RenderState method — the iterators are reused
+    /// per frame and re-entrancy would corrupt state.
     ///
-    /// The callback runs once per cell that the row iterator emits.
-    /// It must NOT call any other RenderState method — the iterators
-    /// are reused per frame and re-entrancy would corrupt state.
-    ///
-    /// 5.4d will extend the callback to also receive a glyph
-    /// codepoint (read via the GRAPHEMES_BUF data tag).
-    func walk(_ fn: (_ row: Int, _ col: Int, _ background: NSColor?) -> Void) {
+    /// Phase 5.4d wires grapheme + foreground readback so glyphs
+    /// render too. 5.4e will add styling (bold / italic / underline);
+    /// for now those bits are dropped.
+    func walk(_ fn: (Cell) -> Void) {
         guard let rs, let rowIter, let cells else { return }
 
         // Reset the row iterator from the latest snapshot. The C
@@ -132,19 +142,58 @@ final class RenderState {
             while ghostty_render_state_row_cells_next(cells) {
                 col += 1
 
-                // Background color is optional per cell: only reads
-                // back GHOSTTY_SUCCESS when the cell has an explicit
-                // bg (e.g. erase-with-color). Default-bg cells return
-                // a non-zero rc and we treat that as "no override".
+                // Background color: optional per cell. Default-bg
+                // cells return a non-zero rc and we treat that as
+                // "no override".
                 var bg = GhosttyColorRgb()
-                let rc = ghostty_render_state_row_cells_get(
+                let bgRc = ghostty_render_state_row_cells_get(
                     cells,
                     GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
                     &bg
                 )
                 let background: NSColor? =
-                    rc.rawValue == 0 ? nsColor(bg) : nil
-                fn(row, col, background)
+                    bgRc.rawValue == 0 ? nsColor(bg) : nil
+
+                // Foreground color: same optional shape as bg.
+                var fg = GhosttyColorRgb()
+                let fgRc = ghostty_render_state_row_cells_get(
+                    cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+                    &fg
+                )
+                let foreground: NSColor? =
+                    fgRc.rawValue == 0 ? nsColor(fg) : nil
+
+                // Grapheme codepoints: read length first, then the
+                // buffer. Empty cells (graphLen == 0) emit no glyph
+                // — the caller can still draw a bg fill over them.
+                var graphLen: UInt32 = 0
+                _ = ghostty_render_state_row_cells_get(
+                    cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
+                    &graphLen
+                )
+
+                var glyph: Character?
+                if graphLen > 0 {
+                    var cps = [UInt32](repeating: 0, count: Int(graphLen))
+                    cps.withUnsafeMutableBufferPointer { ptr in
+                        _ = ghostty_render_state_row_cells_get(
+                            cells,
+                            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                            UnsafeMutableRawPointer(ptr.baseAddress)
+                        )
+                    }
+                    glyph = makeCharacter(from: cps)
+                }
+
+                fn(Cell(
+                    row: row,
+                    col: col,
+                    background: background,
+                    foreground: foreground,
+                    glyph: glyph
+                ))
             }
         }
     }
@@ -180,4 +229,19 @@ private func nsColor(_ c: GhosttyColorRgb) -> NSColor {
         blue: CGFloat(c.b) / 255.0,
         alpha: 1.0
     )
+}
+
+/// Build a `Character` from a libghostty-vt grapheme codepoint
+/// sequence. Most cells have len == 1 (ASCII / single Unicode
+/// scalar). Multi-codepoint clusters (combining marks, ZWJ emoji)
+/// concatenate into one Character via Swift's String grapheme
+/// breaker. Returns nil if the sequence has no valid scalars.
+private func makeCharacter(from codepoints: [UInt32]) -> Character? {
+    var s = String()
+    s.reserveCapacity(codepoints.count)
+    for cp in codepoints {
+        guard let scalar = Unicode.Scalar(cp) else { continue }
+        s.unicodeScalars.append(scalar)
+    }
+    return s.first
 }

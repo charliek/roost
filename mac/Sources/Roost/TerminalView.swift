@@ -25,6 +25,7 @@ final class TerminalView: NSView {
     let cols: UInt16
     let rows: UInt16
     let cellSize: CGSize
+    let font: NSFont
 
     /// libghostty-vt terminal handle. Held for lifecycle hygiene;
     /// Phase 5.4b starts using it to drive rendering.
@@ -61,6 +62,7 @@ final class TerminalView: NSView {
         ).size().width.rounded(.up)
         let cellHeight = (font.ascender - font.descender + font.leading).rounded(.up)
         self.cellSize = CGSize(width: cellWidth, height: cellHeight)
+        self.font = font
 
         super.init(
             frame: NSRect(
@@ -144,22 +146,44 @@ final class TerminalView: NSView {
         colors.background.setFill()
         bounds.fill()
 
-        // Per-cell backgrounds. Walk emits only cells that have an
-        // explicit bg (default-bg cells stay covered by the canvas
-        // fill above), so this loop touches O(non-default-bg cells)
-        // not O(cols*rows). Phase 5.4d adds glyph rendering on top.
+        // Per-cell content. Walk yields backgrounds (always
+        // optional), grapheme characters (nil for empty cells),
+        // and foregrounds (optional, fall back to default fg).
+        // We do bg fills + glyph draws in a single pass so each
+        // cell is touched only once.
+        //
+        // Glyph drawing currently uses NSAttributedString.draw —
+        // simple, slow-but-correct. A glyph atlas (Core Text +
+        // CGContextShowGlyphsAtPositions) is the next-tier
+        // optimization once StreamPty starts pushing frames at
+        // human-typing rates and per-cell allocations matter.
         let cellW = cellSize.width
         let cellH = cellSize.height
-        renderState.walk { row, col, background in
-            guard let background else { return }
+        let defaultFg = colors.foreground
+        let cellFont = self.font
+        renderState.walk { cell in
             let rect = NSRect(
-                x: CGFloat(col) * cellW,
-                y: CGFloat(row) * cellH,
+                x: CGFloat(cell.col) * cellW,
+                y: CGFloat(cell.row) * cellH,
                 width: cellW,
                 height: cellH
             )
-            background.setFill()
-            rect.fill()
+            if let bg = cell.background {
+                bg.setFill()
+                rect.fill()
+            }
+            if let glyph = cell.glyph, !glyph.isWhitespace {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: cellFont,
+                    .foregroundColor: cell.foreground ?? defaultFg,
+                ]
+                let line = NSAttributedString(string: String(glyph), attributes: attrs)
+                // Bottom-align glyphs to the cell's baseline. The
+                // grid origin is top-left (isFlipped=true), so the
+                // glyph's drawing origin is at the cell top + the
+                // font's ascender.
+                line.draw(at: NSPoint(x: rect.minX, y: rect.minY))
+            }
         }
 
         // Faint cell grid. 0.5pt offset on integer-pixel positions
