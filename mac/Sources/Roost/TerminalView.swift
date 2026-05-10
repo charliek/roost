@@ -28,7 +28,17 @@ final class TerminalView: NSView {
 
     /// libghostty-vt terminal handle. Held for lifecycle hygiene;
     /// Phase 5.4b starts using it to drive rendering.
-    private var terminal: GhosttyTerminal?
+    ///
+    /// `nonisolated(unsafe)` because Swift 6 strict concurrency
+    /// otherwise forbids the `@MainActor`-implicit NSView property
+    /// from being touched in `deinit` (which is itself nonisolated).
+    /// The promise the annotation makes is "no concurrent access" —
+    /// safe here because the handle is allocated on the main thread
+    /// in `init`, only ever referenced from main-thread `draw()` /
+    /// future render-state walks, and freed on the main thread when
+    /// the NSView is torn down. Revisit if any background-thread
+    /// rendering path lands.
+    nonisolated(unsafe) private var terminal: GhosttyTerminal?
 
     init(cols: UInt16 = 80, rows: UInt16 = 24) {
         self.cols = cols
