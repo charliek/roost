@@ -35,6 +35,11 @@ final class TabSession {
     /// `onIDAssigned` callback passed to `start` fires once it's set.
     private(set) var id: Int64?
 
+    /// Project the tab belongs to. Pinned by `start(projectID:)`; the
+    /// daemon enforces this on `OpenTab`. Used by the window to
+    /// filter tabs into the sidebar-selected project's tab bar.
+    private(set) var projectID: Int64 = 0
+
     private var sessionTask: Task<Void, Never>?
     private var outputDrainTask: Task<Void, Never>?
     private var keystrokeContinuation: AsyncStream<Data>.Continuation?
@@ -50,13 +55,20 @@ final class TabSession {
     /// (would leak the first task). The window-level code only ever
     /// calls this in the same turn the TabSession is allocated.
     ///
+    /// `projectID` pins the new tab to a specific project on the
+    /// daemon. `0` is the legacy "auto-default" mode where the
+    /// daemon picks (or auto-creates) a project for the tab —
+    /// useful for first-run, before any project has been selected.
+    ///
     /// `onIDAssigned` lets the window splice the new tab into the tab
     /// bar with its real daemon id. Fires on the main actor.
     func start(
         socketPath: String,
+        projectID: Int64,
         title: String,
         onIDAssigned: @escaping @MainActor (Int64) -> Void
     ) {
+        self.projectID = projectID
         let (keystrokes, kCont) = AsyncStream<Data>.makeStream()
         let (output, oCont) = AsyncStream<Data>.makeStream()
         self.keystrokeContinuation = kCont
@@ -76,6 +88,7 @@ final class TabSession {
         sessionTask = Task {
             await runShellSession(
                 socketPath: socketPath,
+                projectID: projectID,
                 cols: cols,
                 rows: rows,
                 title: title,

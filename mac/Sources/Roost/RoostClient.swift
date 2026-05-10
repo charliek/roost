@@ -141,6 +141,7 @@ private func clientVersion() -> String {
 /// session.
 func runShellSession(
     socketPath: String,
+    projectID: Int64 = 0,
     cols: UInt16 = 80,
     rows: UInt16 = 24,
     title: String = "roost-mac",
@@ -160,8 +161,12 @@ func runShellSession(
             // Spawn a tab on the daemon. Empty argv = the daemon
             // resolves $SHELL on its end. cwd is left empty so the
             // daemon picks its own (typically the user's home).
+            // projectID = 0 lets the daemon's `ensure_default_project`
+            // kick in (legacy single-project behavior); non-zero
+            // pins the tab to the sidebar-selected project.
             let opened = try await roost.openTab(
                 .with {
+                    $0.projectID = projectID
                     $0.argv = []
                     $0.cwd = ""
                     $0.cols = UInt32(cols)
@@ -236,6 +241,118 @@ func closeShellTab(socketPath: String, tabID: Int64) async {
     } catch {
         FileHandle.standardError.write(
             Data("[Roost.mac] closeTab(\(tabID)) failed: \(error)\n".utf8)
+        )
+    }
+}
+
+// =============================================================================
+// Phase 6a step 2: project lifecycle
+// =============================================================================
+
+/// Plain-Swift mirror of the proto `Project` so the UI can hold a
+/// list without leaning on generated grpc-swift types in its view
+/// model. Tabs are intentionally not modeled here — the UI tracks
+/// its own `TabSession` instances in `RoostApp`.
+struct ProjectSnapshot: Sendable, Hashable {
+    let id: Int64
+    let name: String
+    let cwd: String
+}
+
+/// Fetch the full project list (without tabs — see comment on
+/// `ProjectSnapshot`). One round-trip; returns `[]` on any error so
+/// the caller can decide whether to surface a UI state.
+func listProjects(socketPath: String) async -> [ProjectSnapshot] {
+    do {
+        return try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            let response = try await roost.listTabs(.with { _ in })
+            return response.projects.map {
+                ProjectSnapshot(id: $0.id, name: $0.name, cwd: $0.cwd)
+            }
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] listProjects failed: \(error)\n".utf8)
+        )
+        return []
+    }
+}
+
+/// Best-effort `CreateProject`. `name = ""` → daemon picks
+/// `"Untitled <n>"`.
+func createProject(socketPath: String, name: String, cwd: String) async -> ProjectSnapshot? {
+    do {
+        return try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            let response = try await roost.createProject(
+                .with {
+                    $0.name = name
+                    $0.cwd = cwd
+                }
+            )
+            let p = response.project
+            return ProjectSnapshot(id: p.id, name: p.name, cwd: p.cwd)
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] createProject failed: \(error)\n".utf8)
+        )
+        return nil
+    }
+}
+
+/// Best-effort `RenameProject`. Errors logged, not surfaced.
+func renameProject(socketPath: String, projectID: Int64, name: String) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.renameProject(
+                .with {
+                    $0.projectID = projectID
+                    $0.name = name
+                }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] renameProject(\(projectID)) failed: \(error)\n".utf8)
+        )
+    }
+}
+
+/// Best-effort `DeleteProject`. Cascade-deletes tabs daemon-side.
+func deleteProject(socketPath: String, projectID: Int64) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.deleteProject(
+                .with { $0.projectID = projectID }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] deleteProject(\(projectID)) failed: \(error)\n".utf8)
         )
     }
 }

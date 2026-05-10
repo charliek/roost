@@ -1,23 +1,20 @@
-// Roost Mac client — Phase 6a: multi-tab AppKit shell.
+// Roost Mac client — Phase 6a step 2b: sidebar + multi-project.
 //
-// The window now hosts a stack of TabSession objects; each owns its
-// own libghostty-vt-backed TerminalView and a long-running StreamPty
-// gRPC session against `roost-core`. A horizontal tab bar above the
-// terminal area lets the user switch between them, "+" opens a new
-// tab, and the file menu wires ⌘T / ⌘W / ⌘1..⌘9 keyboard shortcuts.
+// The window splits horizontally into a project sidebar (left) and the
+// existing tab-bar + terminal area (right). Each project owns its own
+// set of `TabSession`s; switching the sidebar selection rebuilds the
+// tab bar with only that project's tabs.
 //
-// Project sidebar + WatchEvents subscription land in the next slice.
-// All tabs in this commit live under the daemon's auto-created
-// default project (the daemon does that itself when OpenTab arrives
-// with project_id = 0).
+// Project lifecycle is end-to-end against the daemon's new RPCs:
+//   * `+ New Project` at the bottom of the sidebar → CreateProject;
+//   * right-click on a project row → Rename / Delete (Delete cascades
+//     the project's tabs daemon-side, which we mirror locally before
+//     refreshing the sidebar);
+//   * the File menu gains "New Project" (⌘⇧N).
 //
-// To run from the repo root:
-//   1. Start the daemon in another terminal:
-//        cargo run -p roost-core
-//   2. Then:
-//        cd mac && swift run Roost
-// Once the window comes up the status panel shows the daemon's
-// pid + version; ⌘T opens additional shells.
+// WatchEvents subscription for cross-client convergence is the
+// follow-up slice; everything in this commit reads daemon state via
+// `listProjects` on launch and otherwise drives mutations directly.
 
 import AppKit
 import Foundation
@@ -28,36 +25,33 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var statusLabel: NSTextField?
 
-    /// Horizontal NSStackView holding one button per tab plus a
-    /// trailing "+" button. The "+" button is allocated once and
-    /// kept as the last view; tab buttons get inserted before it.
+    /// Sidebar widgets. `sidebarStack` arranges project buttons +
+    /// a trailing "+ New Project" row; `sidebarButtons` indexes them
+    /// by project id so we can update active highlighting in place
+    /// instead of rebuilding the whole stack on every selection
+    /// change.
+    private var sidebarStack: NSStackView?
+    private var newProjectButton: NSButton?
+    private var sidebarButtons: [Int64: NSButton] = [:]
+
     private var tabBar: NSStackView?
     private var addTabButton: NSButton?
-
-    /// Container view that holds whichever TabSession's terminalView
-    /// is currently in front. We use addSubview / removeFromSuperview
-    /// rather than isHidden so the inactive views can't accidentally
-    /// pick up keystrokes via the responder chain.
     private var terminalContainer: NSView?
-
-    /// Window menu — populated on launch with a placeholder per-tab
-    /// list, rebuilt every time the tab set changes so ⌘1..⌘9 stay
-    /// in sync with the visible tab order.
     private var windowMenu: NSMenu?
 
-    /// All open tabs in window order. The first tab corresponds to
-    /// ⌘1, the second to ⌘2, etc., capped at 9.
+    /// Workspace model. `projects` mirrors the daemon's project list
+    /// in display order; `tabs` is a flat list of every open
+    /// TabSession across all projects, filtered into the tab bar by
+    /// `activeProjectID`. `activeSessionByProject` remembers each
+    /// project's last-focused TabSession by reference (rather than by
+    /// daemon tab id) so the active marker survives the window
+    /// between `OpenTab` being called and the daemon assigning an id.
+    private var projects: [ProjectSnapshot] = []
     private var tabs: [TabSession] = []
-    private var activeIndex: Int?
+    private var activeProjectID: Int64?
+    private var activeSessionByProject: [Int64: TabSession] = [:]
 
-    /// Cached after the Identify handshake. Menu actions read it to
-    /// dial the daemon for new tabs / explicit CloseTab calls. Empty
-    /// until launch finishes.
     private var socketPath: String = ""
-
-    /// Set once Identify succeeds. New-tab actions are a no-op while
-    /// false to avoid spawning sessions that will only fail; the
-    /// status label tells the user the daemon is unreachable.
     private var daemonReachable: Bool = false
 
     nonisolated static func main() {
@@ -74,14 +68,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         installMainMenu()
 
-        // A throwaway TerminalView gives us the cell-grid intrinsic
-        // size used to fix the window's minimum content size. The
-        // first real tab is created later, after Identify succeeds.
+        // Cell-grid intrinsic size of an 80x24 terminal fixes the
+        // window's minimum content height + the right-pane width.
         let metricsProbe = TerminalView(cols: 80, rows: 24)
         let terminalSize = metricsProbe.intrinsicContentSize
+        let sidebarWidth: CGFloat = 200
         let headerSliceHeight: CGFloat = 112
         let tabBarHeight: CGFloat = 32
-        let windowWidth = max(720, terminalSize.width + 48)
+        let windowWidth = sidebarWidth + max(720, terminalSize.width + 48)
         let windowHeight = terminalSize.height + headerSliceHeight + tabBarHeight + 32
 
         let window = NSWindow(
@@ -91,20 +85,121 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = "Roost"
-        window.minSize = NSSize(
-            width: terminalSize.width + 48,
-            height: terminalSize.height + headerSliceHeight + tabBarHeight + 32
+        window.minSize = NSSize(width: windowWidth, height: windowHeight)
+
+        // ---- Split view: sidebar | content ---------------------------
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.translatesAutoresizingMaskIntoConstraints = false
+
+        let sidebar = makeSidebarPane(width: sidebarWidth)
+        let content = makeContentPane(
+            socketPath: socketPath,
+            terminalSize: terminalSize,
+            tabBarHeight: tabBarHeight
         )
 
-        let content = NSView(frame: window.contentRect(forFrameRect: window.frame))
-        content.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView = content
+        split.addArrangedSubview(sidebar)
+        split.addArrangedSubview(content)
+        split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+
+        let root = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        root.addSubview(split)
+        NSLayoutConstraint.activate([
+            split.topAnchor.constraint(equalTo: root.topAnchor),
+            split.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            split.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+        ])
+        window.contentView = root
+
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        self.window = window
+
+        Task { [weak self] in
+            let outcome = await runIdentify(socketPath: socketPath)
+            await MainActor.run { [weak self] in
+                self?.applyIdentifyOutcome(outcome)
+                if case .ok = outcome {
+                    self?.daemonReachable = true
+                    self?.bootstrapWorkspace()
+                }
+            }
+        }
+    }
+
+    // MARK: - Layout
+
+    @MainActor
+    private func makeSidebarPane(width: CGFloat) -> NSView {
+        let pane = NSView()
+        pane.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSTextField(labelWithString: "Projects")
+        header.font = .systemFont(ofSize: 13, weight: .semibold)
+        header.textColor = .secondaryLabelColor
+        header.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(header)
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(stack)
+
+        let addProject = NSButton(
+            title: "+ New Project",
+            target: self,
+            action: #selector(newProject(_:))
+        )
+        addProject.bezelStyle = .rounded
+        addProject.toolTip = "New project (⇧⌘N)"
+        addProject.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(addProject)
+
+        NSLayoutConstraint.activate([
+            pane.widthAnchor.constraint(greaterThanOrEqualToConstant: width),
+
+            header.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
+            header.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12),
+            header.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -12),
+
+            stack.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -8),
+
+            addProject.topAnchor.constraint(
+                greaterThanOrEqualTo: stack.bottomAnchor,
+                constant: 8
+            ),
+            addProject.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12),
+            addProject.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -12),
+        ])
+
+        self.sidebarStack = stack
+        self.newProjectButton = addProject
+        return pane
+    }
+
+    @MainActor
+    private func makeContentPane(
+        socketPath: String,
+        terminalSize: NSSize,
+        tabBarHeight: CGFloat
+    ) -> NSView {
+        let pane = NSView()
+        pane.translatesAutoresizingMaskIntoConstraints = false
 
         let socketLabel = NSTextField(labelWithString: "socket: \(socketPath)")
         socketLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         socketLabel.textColor = .secondaryLabelColor
         socketLabel.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(socketLabel)
+        pane.addSubview(socketLabel)
 
         let statusLabel = NSTextField(labelWithString: "daemon: connecting…")
         statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -112,14 +207,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.maximumNumberOfLines = 0
-        content.addSubview(statusLabel)
+        pane.addSubview(statusLabel)
 
         let tabBar = NSStackView()
         tabBar.orientation = .horizontal
         tabBar.alignment = .centerY
         tabBar.spacing = 4
         tabBar.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(tabBar)
+        pane.addSubview(tabBar)
 
         let addTabButton = NSButton(title: "+", target: self, action: #selector(newTab(_:)))
         addTabButton.bezelStyle = .rounded
@@ -128,52 +223,45 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let terminalContainer = NSView()
         terminalContainer.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(terminalContainer)
+        pane.addSubview(terminalContainer)
 
         NSLayoutConstraint.activate([
-            socketLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            socketLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            socketLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            socketLabel.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
+            socketLabel.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
+            socketLabel.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
 
             statusLabel.topAnchor.constraint(equalTo: socketLabel.bottomAnchor, constant: 4),
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            statusLabel.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
+            statusLabel.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
 
             tabBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
-            tabBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            tabBar.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
-            // Tab bar height is intrinsic — tallest arranged subview
-            // (a rounded NSButton, ~22pt) wins. We reserve `tabBarHeight`
-            // in the window's min-size calculation as a worst-case
-            // upper bound so the layout never clips the buttons.
+            tabBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
+            tabBar.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -16),
+            // Tab bar height stays intrinsic to its tallest button —
+            // worst-case `tabBarHeight` is reserved in the window's
+            // min-size calculation up in the parent layout.
 
             terminalContainer.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
-            terminalContainer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            terminalContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: terminalSize.width),
-            terminalContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: terminalSize.height),
-            terminalContainer.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -16),
+            terminalContainer.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
+            terminalContainer.widthAnchor.constraint(
+                greaterThanOrEqualToConstant: terminalSize.width
+            ),
+            terminalContainer.heightAnchor.constraint(
+                greaterThanOrEqualToConstant: terminalSize.height
+            ),
+            terminalContainer.bottomAnchor.constraint(
+                lessThanOrEqualTo: pane.bottomAnchor,
+                constant: -16
+            ),
         ])
 
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        _ = tabBarHeight  // referenced for window-min-size math; not constrained directly
 
-        self.window = window
         self.statusLabel = statusLabel
         self.tabBar = tabBar
         self.addTabButton = addTabButton
         self.terminalContainer = terminalContainer
-
-        Task { [weak self] in
-            let outcome = await runIdentify(socketPath: socketPath)
-            await MainActor.run { [weak self] in
-                self?.applyIdentifyOutcome(outcome)
-                if case .ok = outcome {
-                    self?.daemonReachable = true
-                    self?.openNewTab()
-                }
-            }
-        }
+        return pane
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -181,57 +269,291 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Tear down every tab so each StreamPty stream closes cleanly
-        // and the daemon issues a CloseTab for tabs that have an id.
         for tab in tabs {
             tab.close(socketPath: socketPath)
         }
         tabs.removeAll()
-        activeIndex = nil
+        activeSessionByProject.removeAll()
+    }
+
+    // MARK: - Workspace bootstrap
+
+    /// Right after Identify, fetch the daemon's project list and seat
+    /// the UI. If the daemon has no projects yet (first run), ask for
+    /// one — the UI is much friendlier with a populated sidebar than
+    /// with an empty one waiting for the user to discover the "+"
+    /// button. Tabs reported by the daemon are intentionally ignored
+    /// here: Phase 5's StreamPty re-spawns the shell on attach, so
+    /// reattaching to "old" tabs would just create fresh shells with
+    /// stale IDs. Each fresh launch starts clean.
+    @MainActor
+    private func bootstrapWorkspace() {
+        let socketPath = self.socketPath
+        Task { [weak self] in
+            var fetched = await listProjects(socketPath: socketPath)
+            if fetched.isEmpty {
+                if let created = await createProject(
+                    socketPath: socketPath,
+                    name: "",
+                    cwd: ""
+                ) {
+                    fetched = [created]
+                }
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.projects = fetched
+                self.rebuildSidebar()
+                if let first = self.projects.first {
+                    self.selectProject(id: first.id, openTabIfEmpty: true)
+                }
+            }
+        }
+    }
+
+    // MARK: - Project management
+
+    @MainActor
+    private func rebuildSidebar() {
+        guard let stack = sidebarStack else { return }
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        sidebarButtons.removeAll()
+
+        for project in projects {
+            let button = makeSidebarButton(for: project)
+            stack.addArrangedSubview(button)
+            sidebarButtons[project.id] = button
+        }
+        applySidebarHighlight()
+    }
+
+    @MainActor
+    private func makeSidebarButton(for project: ProjectSnapshot) -> NSButton {
+        let button = NSButton(
+            title: sidebarTitle(for: project, active: project.id == activeProjectID),
+            target: self,
+            action: #selector(sidebarProjectClicked(_:))
+        )
+        button.bezelStyle = .rounded
+        button.tag = Int(project.id)
+        button.alignment = .left
+        // Right-click → Rename / Delete. Setting `menu` makes AppKit
+        // route a right-click to it without needing a custom
+        // NSResponder override.
+        let menu = NSMenu()
+        let rename = NSMenuItem(
+            title: "Rename…",
+            action: #selector(renameProjectFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        rename.target = self
+        rename.tag = Int(project.id)
+        menu.addItem(rename)
+        let delete = NSMenuItem(
+            title: "Delete",
+            action: #selector(deleteProjectFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        delete.target = self
+        delete.tag = Int(project.id)
+        menu.addItem(delete)
+        button.menu = menu
+        return button
+    }
+
+    private func sidebarTitle(for project: ProjectSnapshot, active: Bool) -> String {
+        let marker = active ? "● " : "  "
+        return marker + project.name
+    }
+
+    @MainActor
+    private func applySidebarHighlight() {
+        for (id, button) in sidebarButtons {
+            if let project = projects.first(where: { $0.id == id }) {
+                button.title = sidebarTitle(for: project, active: id == activeProjectID)
+            }
+        }
+    }
+
+    @MainActor
+    private func selectProject(id: Int64, openTabIfEmpty: Bool) {
+        activeProjectID = id
+        applySidebarHighlight()
+        rebuildTabBar()
+
+        let projectTabs = tabsForActiveProject()
+        if projectTabs.isEmpty {
+            if openTabIfEmpty && daemonReachable {
+                openNewTab()
+            }
+            return
+        }
+
+        // Restore the project's last-active TabSession, falling back
+        // to the first if the remembered one was closed.
+        let preferred = activeSessionByProject[id]
+        let index = projectTabs.firstIndex(where: { $0 === preferred }) ?? 0
+        selectTab(at: index)
+    }
+
+    @objc @MainActor
+    private func sidebarProjectClicked(_ sender: NSButton) {
+        let id = Int64(sender.tag)
+        guard id != activeProjectID else { return }
+        selectProject(id: id, openTabIfEmpty: false)
+    }
+
+    @objc @MainActor
+    private func newProject(_ sender: Any?) {
+        guard daemonReachable else { return }
+        let socketPath = self.socketPath
+        Task { [weak self] in
+            let created = await createProject(socketPath: socketPath, name: "", cwd: "")
+            await MainActor.run { [weak self] in
+                guard let self, let created else { return }
+                self.projects.append(created)
+                self.rebuildSidebar()
+                self.selectProject(id: created.id, openTabIfEmpty: true)
+            }
+        }
+    }
+
+    @objc @MainActor
+    private func renameProjectFromMenu(_ sender: NSMenuItem) {
+        let id = Int64(sender.tag)
+        guard let project = projects.first(where: { $0.id == id }) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Rename Project"
+        alert.informativeText = "Choose a new name for \(project.name)."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        input.stringValue = project.name
+        alert.accessoryView = input
+        alert.window.initialFirstResponder = input
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+        let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty, newName != project.name else { return }
+
+        let socketPath = self.socketPath
+        Task { [weak self] in
+            await renameProject(socketPath: socketPath, projectID: id, name: newName)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if let idx = self.projects.firstIndex(where: { $0.id == id }) {
+                    self.projects[idx] = ProjectSnapshot(
+                        id: id,
+                        name: newName,
+                        cwd: self.projects[idx].cwd
+                    )
+                    self.rebuildSidebar()
+                }
+            }
+        }
+    }
+
+    @objc @MainActor
+    private func deleteProjectFromMenu(_ sender: NSMenuItem) {
+        let id = Int64(sender.tag)
+        guard let project = projects.first(where: { $0.id == id }) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Delete \(project.name)?"
+        alert.informativeText =
+            "This will close every tab in the project. The action can't be undone."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Close every UI-side TabSession in this project so the
+        // StreamPty streams shut down before the daemon cascade-deletes
+        // their rows. Without this the daemon-side CloseTab would race
+        // the project DELETE — harmless but noisy in the logs.
+        let condemned = tabs.filter { $0.projectID == id }
+        for session in condemned {
+            session.terminalView.removeFromSuperview()
+            session.close(socketPath: socketPath)
+        }
+        tabs.removeAll { $0.projectID == id }
+        activeSessionByProject.removeValue(forKey: id)
+
+        let socketPath = self.socketPath
+        Task { [weak self] in
+            await deleteProject(socketPath: socketPath, projectID: id)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.projects.removeAll { $0.id == id }
+                self.rebuildSidebar()
+                if self.activeProjectID == id {
+                    if let next = self.projects.first {
+                        self.selectProject(id: next.id, openTabIfEmpty: true)
+                    } else {
+                        self.activeProjectID = nil
+                        self.rebuildTabBar()
+                        // Empty workspace — show nothing in the terminal area.
+                        if let container = self.terminalContainer {
+                            for subview in container.subviews {
+                                subview.removeFromSuperview()
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Tab management
 
-    /// Spin up a new tab, append it to the tab bar, and switch to it.
-    /// No-op if Identify hasn't completed successfully yet — opening
-    /// shells against an unreachable daemon would just stack stderr
-    /// noise.
+    private func tabsForActiveProject() -> [TabSession] {
+        guard let activeProjectID else { return [] }
+        return tabs.filter { $0.projectID == activeProjectID }
+    }
+
     @MainActor
     private func openNewTab() {
-        guard daemonReachable else { return }
+        guard daemonReachable, let projectID = activeProjectID else { return }
         let session = TabSession(cols: 80, rows: 24)
         tabs.append(session)
-        let insertedIndex = tabs.count - 1
 
-        // Mount immediately and switch focus, even before the daemon
-        // has confirmed the tab id. The terminalView renders empty
-        // until the first PtyOutput chunk lands; this still feels
-        // responsive vs. waiting for the round-trip.
+        let projectTabs = tabsForActiveProject()
+        let insertedIndex = projectTabs.count - 1
         rebuildTabBar()
         selectTab(at: insertedIndex)
 
         let title = "roost-mac \(insertedIndex + 1)"
-        session.start(socketPath: socketPath, title: title) { [weak self] _ in
-            // ID assigned. Nothing to do here yet — the per-tab
-            // button title doesn't depend on the daemon id, and the
-            // window menu rebuild already happened. WatchEvents in a
-            // later slice will use the id for badge updates.
+        session.start(
+            socketPath: socketPath,
+            projectID: projectID,
+            title: title
+        ) { [weak self] _ in
+            // The id is now known; keep the window menu in sync so its
+            // tag-driven ⌘1..⌘9 routes to the current tab order.
             self?.rebuildWindowMenu()
         }
     }
 
-    /// Close the currently active tab. If it was the last one and
-    /// the daemon is still reachable, immediately open a fresh
-    /// replacement so the window is never blank.
     @MainActor
     private func closeActiveTabImpl() {
-        guard let index = activeIndex, tabs.indices.contains(index) else { return }
-        let session = tabs.remove(at: index)
+        guard let activeProjectID else { return }
+        let projectTabs = tabsForActiveProject()
+        guard let active = activeSessionByProject[activeProjectID],
+              let activeTabIndexInProject = projectTabs.firstIndex(where: { $0 === active })
+        else { return }
+        let session = projectTabs[activeTabIndexInProject]
+
+        tabs.removeAll { $0 === session }
+        activeSessionByProject.removeValue(forKey: activeProjectID)
         session.terminalView.removeFromSuperview()
         session.close(socketPath: socketPath)
 
-        if tabs.isEmpty {
-            activeIndex = nil
+        let remaining = tabsForActiveProject()
+        if remaining.isEmpty {
             rebuildTabBar()
             if daemonReachable {
                 openNewTab()
@@ -239,26 +561,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Pick the next-most-natural tab to focus: the one to the
-        // left of the closed slot, or the new last tab if we just
-        // closed the rightmost.
-        let nextIndex = min(index, tabs.count - 1)
+        let nextIndex = min(activeTabIndexInProject, remaining.count - 1)
         rebuildTabBar()
         selectTab(at: nextIndex)
     }
 
     @MainActor
-    private func selectTab(at index: Int) {
-        guard tabs.indices.contains(index) else { return }
+    private func selectTab(at indexInActiveProject: Int) {
+        guard let activeProjectID else { return }
+        let projectTabs = tabsForActiveProject()
+        guard projectTabs.indices.contains(indexInActiveProject) else { return }
         guard let container = terminalContainer else { return }
 
-        // Detach the previously-visible terminalView. Constraints
-        // pinned to the container are released by removeFromSuperview.
         for subview in container.subviews {
             subview.removeFromSuperview()
         }
 
-        let session = tabs[index]
+        let session = projectTabs[indexInActiveProject]
         let view = session.terminalView
         view.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(view)
@@ -269,33 +588,33 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             view.heightAnchor.constraint(equalToConstant: view.intrinsicContentSize.height),
         ])
 
-        activeIndex = index
+        activeSessionByProject[activeProjectID] = session
         window?.makeFirstResponder(view)
         rebuildTabBar()
     }
 
-    /// Rebuild the tab bar's button list from `tabs`. The "+" button
-    /// is preserved; tab buttons are recreated each time so the
-    /// active-state indicator and title indices stay in sync after
-    /// inserts / removes.
     @MainActor
     private func rebuildTabBar() {
         guard let tabBar = tabBar, let addTabButton = addTabButton else { return }
-
-        // Remove every arranged view that isn't the "+" button.
         for view in tabBar.arrangedSubviews where view !== addTabButton {
             tabBar.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
 
-        for (index, _) in tabs.enumerated() {
-            let isActive = (index == activeIndex)
+        let projectTabs = tabsForActiveProject()
+        let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
+
+        for (index, session) in projectTabs.enumerated() {
+            let isActive = session === activeSession
             let marker = isActive ? "● " : "  "
             let title = "\(marker)Tab \(index + 1)"
-            let button = NSButton(title: title, target: self, action: #selector(tabButtonClicked(_:)))
+            let button = NSButton(
+                title: title,
+                target: self,
+                action: #selector(tabButtonClicked(_:))
+            )
             button.tag = index
             button.bezelStyle = .rounded
-            button.toolTip = isActive ? "Active tab" : "Switch to Tab \(index + 1)"
             tabBar.insertArrangedSubview(button, at: tabBar.arrangedSubviews.count - 1)
         }
 
@@ -307,22 +626,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         guard let windowMenu = windowMenu else { return }
         windowMenu.removeAllItems()
 
-        for (index, _) in tabs.enumerated() {
-            let title = "Tab \(index + 1)"
+        let projectTabs = tabsForActiveProject()
+        let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
+        for (index, session) in projectTabs.enumerated() {
             let item = NSMenuItem(
-                title: title,
+                title: "Tab \(index + 1)",
                 action: #selector(selectTabFromMenu(_:)),
                 keyEquivalent: index < 9 ? "\(index + 1)" : ""
             )
             item.target = self
             item.tag = index
-            if index == activeIndex {
+            if session === activeSession {
                 item.state = .on
             }
             windowMenu.addItem(item)
         }
 
-        if !tabs.isEmpty {
+        if !projectTabs.isEmpty {
             windowMenu.addItem(.separator())
         }
         let minimize = NSMenuItem(
@@ -367,10 +687,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func installMainMenu() {
         let mainMenu = NSMenu()
 
-        // App menu (the bold one named after the binary). The OS
-        // pulls the title from the first menu's first submenu's
-        // parent; convention is to leave the title empty and let
-        // AppKit fill in the process name.
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         appMenu.addItem(
@@ -406,10 +722,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
 
-        // File menu — tab lifecycle lives here, matching the macOS
-        // convention used by Terminal.app and iTerm.
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
+        let newProjectItem = NSMenuItem(
+            title: "New Project",
+            action: #selector(newProject(_:)),
+            keyEquivalent: "n"
+        )
+        newProjectItem.keyEquivalentModifierMask = [.command, .shift]
+        newProjectItem.target = self
+        fileMenu.addItem(newProjectItem)
         let newTabItem = NSMenuItem(
             title: "New Tab",
             action: #selector(newTab(_:)),
@@ -427,10 +749,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
-        // Edit menu — minimal so Cocoa text-edit shortcuts (cut /
-        // copy / paste) work in the about-panel and any future text
-        // input fields. The TerminalView intercepts keyDown directly
-        // and doesn't go through these.
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(
@@ -456,14 +774,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
-        // Window menu — populated dynamically by rebuildWindowMenu()
-        // every time the tab set changes. The empty submenu here is
-        // a placeholder; rebuildWindowMenu fills it on first call.
-        //
-        // Deliberately NOT set as NSApp.windowsMenu: AppKit would then
-        // auto-append per-window entries that wipe + reappear on each
-        // rebuildWindowMenu() pass. We're managing this menu manually
-        // for the tab list, so we skip the OS auto-management.
         let windowItem = NSMenuItem()
         let windowMenu = NSMenu(title: "Window")
         windowItem.submenu = windowMenu
@@ -500,26 +810,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `default_socket_path` for macOS — always
     /// `~/Library/Caches/roost/roost.sock` when `HOME` is set;
     /// `/tmp/roost.sock` only as a last resort.
-    ///
-    /// We deliberately do NOT consult `XDG_RUNTIME_DIR` here even
-    /// though the daemon does on Linux. The Roost Mac client is
-    /// macOS-only (Package.swift gates `.macOS(.v15)`); the daemon's
-    /// macOS path is unconditionally HOME-derived. A shell that
-    /// happens to export `XDG_RUNTIME_DIR` (some dev setups do)
-    /// would otherwise make the UI dial a different socket than the
-    /// daemon created. Both sides agreeing on the macOS default
-    /// matters more than mirroring the Linux ladder.
-    ///
-    /// The `environment` parameter defaults to the process's
-    /// environment but is injectable so unit tests can pin behavior.
-    /// Empty / non-absolute `HOME` falls through to `/tmp` —
-    /// matching the daemon's robustness to malformed env vars in
-    /// sandboxed launchd setups.
-    ///
-    /// Marked `nonisolated` because it's a pure function — no
-    /// instance state — and `RoostApp` is `@MainActor`, which would
-    /// otherwise force test callers (run on Swift Testing's task
-    /// pool, not the main actor) to also be `@MainActor`.
     nonisolated static func defaultSocketPath(
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
