@@ -158,7 +158,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             action: #selector(newProject(_:))
         )
         addProject.bezelStyle = .rounded
-        addProject.toolTip = "New project (⇧⌘N)"
+        addProject.toolTip = "New project (⌘N)"
         addProject.translatesAutoresizingMaskIntoConstraints = false
         pane.addSubview(addProject)
 
@@ -328,6 +328,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             sidebarButtons[project.id] = button
         }
         applySidebarHighlight()
+        // Window menu's Project section is driven off `projects`; keep
+        // it in sync so ⌘1..⌘9 always reflects the current sidebar.
+        rebuildWindowMenu()
     }
 
     @MainActor
@@ -518,7 +521,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func openNewTab() {
         guard daemonReachable, let projectID = activeProjectID else { return }
-        let session = TabSession(cols: 80, rows: 24)
+        let session = TabSession(projectID: projectID, cols: 80, rows: 24)
         tabs.append(session)
 
         let projectTabs = tabsForActiveProject()
@@ -527,11 +530,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: insertedIndex)
 
         let title = "roost-mac \(insertedIndex + 1)"
-        session.start(
-            socketPath: socketPath,
-            projectID: projectID,
-            title: title
-        ) { [weak self] _ in
+        session.start(socketPath: socketPath, title: title) { [weak self] _ in
             // The id is now known; keep the window menu in sync so its
             // tag-driven ⌘1..⌘9 routes to the current tab order.
             self?.rebuildWindowMenu()
@@ -626,6 +625,27 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         guard let windowMenu = windowMenu else { return }
         windowMenu.removeAllItems()
 
+        // Project switching first — ⌘1..⌘9, matching the Go binary's
+        // `switch_project_N` defaults.
+        for (index, project) in projects.enumerated() {
+            let item = NSMenuItem(
+                title: project.name,
+                action: #selector(selectProjectFromMenu(_:)),
+                keyEquivalent: index < 9 ? "\(index + 1)" : ""
+            )
+            item.target = self
+            item.tag = Int(project.id)
+            if project.id == activeProjectID {
+                item.state = .on
+            }
+            windowMenu.addItem(item)
+        }
+        if !projects.isEmpty {
+            windowMenu.addItem(.separator())
+        }
+
+        // Tab switching — ⌃1..⌃9, matching the Go binary's
+        // `switch_tab_N` defaults (control-digit, not command-digit).
         let projectTabs = tabsForActiveProject()
         let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
         for (index, session) in projectTabs.enumerated() {
@@ -634,6 +654,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 action: #selector(selectTabFromMenu(_:)),
                 keyEquivalent: index < 9 ? "\(index + 1)" : ""
             )
+            item.keyEquivalentModifierMask = [.control]
             item.target = self
             item.tag = index
             if session === activeSession {
@@ -641,10 +662,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
             windowMenu.addItem(item)
         }
-
         if !projectTabs.isEmpty {
             windowMenu.addItem(.separator())
         }
+
         let minimize = NSMenuItem(
             title: "Minimize",
             action: #selector(NSWindow.performMiniaturize(_:)),
@@ -679,6 +700,24 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func selectTabFromMenu(_ sender: NSMenuItem) {
         selectTab(at: sender.tag)
+    }
+
+    @objc @MainActor
+    private func selectProjectFromMenu(_ sender: NSMenuItem) {
+        let id = Int64(sender.tag)
+        guard id != activeProjectID else { return }
+        selectProject(id: id, openTabIfEmpty: false)
+    }
+
+    /// ⌘⇧R entry point — pulls up the same rename dialog as the
+    /// right-click sidebar action, targeted at whichever project is
+    /// currently shown.
+    @objc @MainActor
+    private func renameActiveProject(_ sender: Any?) {
+        guard let id = activeProjectID else { return }
+        let placeholder = NSMenuItem()
+        placeholder.tag = Int(id)
+        renameProjectFromMenu(placeholder)
     }
 
     // MARK: - Menu installation
@@ -724,12 +763,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
+        // ⌘N for New Project — Roost has no multi-window concept, so
+        // ⌘N is free, and reaching for it is the natural first guess.
+        // ⌘T then opens a new tab in the current project, mirroring
+        // Terminal.app / iTerm.
         let newProjectItem = NSMenuItem(
             title: "New Project",
             action: #selector(newProject(_:)),
             keyEquivalent: "n"
         )
-        newProjectItem.keyEquivalentModifierMask = [.command, .shift]
         newProjectItem.target = self
         fileMenu.addItem(newProjectItem)
         let newTabItem = NSMenuItem(
@@ -746,6 +788,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         )
         closeTabItem.target = self
         fileMenu.addItem(closeTabItem)
+        fileMenu.addItem(.separator())
+        // ⌘⇧R = rename_project from the Go binary's defaults.
+        let renameProjectItem = NSMenuItem(
+            title: "Rename Project…",
+            action: #selector(renameActiveProject(_:)),
+            keyEquivalent: "r"
+        )
+        renameProjectItem.keyEquivalentModifierMask = [.command, .shift]
+        renameProjectItem.target = self
+        fileMenu.addItem(renameProjectItem)
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
