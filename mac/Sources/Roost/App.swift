@@ -10,7 +10,7 @@
 //   * right-click on a project row → Rename / Delete (Delete cascades
 //     the project's tabs daemon-side, which we mirror locally before
 //     refreshing the sidebar);
-//   * the File menu gains "New Project" (⌘⇧N).
+//   * the File menu gains "New Project" (⌘N).
 //
 // WatchEvents subscription for cross-client convergence is the
 // follow-up slice; everything in this commit reads daemon state via
@@ -305,7 +305,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 self.projects = fetched
                 self.rebuildSidebar()
                 if let first = self.projects.first {
-                    self.selectProject(id: first.id, openTabIfEmpty: true)
+                    self.selectProject(id: first.id)
                 }
             }
         }
@@ -382,15 +382,24 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func selectProject(id: Int64, openTabIfEmpty: Bool) {
+    private func selectProject(id: Int64) {
         activeProjectID = id
         applySidebarHighlight()
         rebuildTabBar()
 
         let projectTabs = tabsForActiveProject()
         if projectTabs.isEmpty {
-            if openTabIfEmpty && daemonReachable {
+            // Mirror the Go binary's "every project always shows a
+            // tab" feel: auto-open one so the terminal area is never
+            // stuck on a previous project's view. Lazy — only the
+            // visited project incurs the spawn cost.
+            if daemonReachable {
                 openNewTab()
+            } else {
+                // No daemon, can't open a tab — at minimum clear the
+                // container so the old project's terminal doesn't
+                // linger behind a fresh selection.
+                terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
             }
             return
         }
@@ -406,7 +415,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func sidebarProjectClicked(_ sender: NSButton) {
         let id = Int64(sender.tag)
         guard id != activeProjectID else { return }
-        selectProject(id: id, openTabIfEmpty: false)
+        selectProject(id: id)
     }
 
     @objc @MainActor
@@ -419,7 +428,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 guard let self, let created else { return }
                 self.projects.append(created)
                 self.rebuildSidebar()
-                self.selectProject(id: created.id, openTabIfEmpty: true)
+                self.selectProject(id: created.id)
             }
         }
     }
@@ -495,7 +504,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 self.rebuildSidebar()
                 if self.activeProjectID == id {
                     if let next = self.projects.first {
-                        self.selectProject(id: next.id, openTabIfEmpty: true)
+                        self.selectProject(id: next.id)
                     } else {
                         self.activeProjectID = nil
                         self.rebuildTabBar()
@@ -706,7 +715,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func selectProjectFromMenu(_ sender: NSMenuItem) {
         let id = Int64(sender.tag)
         guard id != activeProjectID else { return }
-        selectProject(id: id, openTabIfEmpty: false)
+        selectProject(id: id)
     }
 
     /// ⌘⇧R entry point — pulls up the same rename dialog as the
