@@ -24,7 +24,7 @@ Resolved on the `/goal` call:
 | Scope | Polish + WatchEvents + headless CLI surface + window resize (the most ambitious of the three offered scopes). |
 | Cadence | Milestone-sized commits, milestone-sized PRs (not micro-PRs, not one mega-PR). |
 | PR gating | I open the PR; auto-merge when CI green + CodeRabbit clean. Human reviewer-of-record on each PR. |
-| Milestone ordering | Strict: M1 → M2 → M3 → M4 → M5. (M4 is independent of the Mac UI work, but kept sequential to keep CodeRabbit's review load focused.) |
+| Milestone ordering | Strict: M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8. M4 and M8 are independent of the Mac UI work but kept sequential to keep CodeRabbit's review load focused. |
 
 ## Branch shape
 
@@ -47,8 +47,8 @@ CI: `.github/workflows/refactor.yml` was broadened in this same commit to trigge
 ## Out of scope (this goal)
 
 * Phase 6b — Mac OSC + notifications. Pulls the Go binary's `internal/osc/scanner.go` over to `crates/roost-core/src/osc.rs`. Real differentiator work, but its own scope. M3's tab strip lands with `"Tab N"` placeholder labels and a status-dot slot that goes live in Phase 6b.
-* Phase 6a step 2d — `~/.config/roost/config.conf` keybind override. Defaults already match the Go binary on Mac; the override port is a separate slice.
-* Phase 7 — Linux UI (gtk4-rs). Including the "GTK-on-Mac for dev convenience" stretch from the UX assessment.
+* Phase 8 — full notarization + DMG packaging for Mac. M7 lands the `.app` bundle; code-signing / notarization / DMG / Sparkle auto-update are intentional follow-ups so this goal stays scoped.
+* Phase 7 — full Linux UI (gtk4-rs cell renderer + sidebar + tab bar + StreamPty round-trip). M8 stops at the Identify spike on Mac for cross-platform dev convenience; the full Linux UI is multi-week work.
 * cmux-tier features: notification rings, multiline sidebar rows with git branch / cwd / ports, in-app browser, splits, SSH workspaces, command palette, custom commands.
 
 ## Milestones
@@ -165,9 +165,92 @@ PR target: `feature/rust-port`. Branch: `polish/selection-copy`.
 
 **Effort estimate**: ~2 days. Mouse handling is mostly NSResponder ceremony; the render-state walk for text extraction is the real work.
 
+### M6 — Themes + config file overrides
+
+PR target: `feature/rust-port`. Branch: `polish/themes-config`.
+
+**Scope:**
+1. Port the Go binary's theme system to Swift:
+   * `cmd/roost/theme.go` (palette resolution, named themes), `cmd/roost/theme_test.go` (test fixtures), and the `themes/` subdirectory (theme files).
+   * Wire the active theme into `TerminalView`'s glyph + cell background paths and into the chrome (NSWindow / NSOutlineView / tab strip) so a single source of truth drives both.
+2. Port the keybind override config (`cmd/roost/shortcuts.go`):
+   * Read `~/.config/roost/config.conf` (XDG-style path on macOS — deliberate divergence from Apple HIG, matches Ghostty / nvim / fish / the Go binary's spec).
+   * Reuse the action-name namespace verbatim (`new_tab`, `close_tab`, `switch_project_N`, `cycle_tab_prev`, `font_increase`, `paste`, `copy`, `toggle_sidebar`, etc.).
+   * Port `cmd/roost/shortcuts.go::triggerToAccel` (modifier alias rules — `super`/`cmd`/`command`, `ctrl`/`control`, `alt`/`option`/`opt`) to Swift.
+   * Port `canonicalizeBindings` so a user's `keybind = cmd+t = unbind` correctly removes the `super+t` default.
+   * Install resolved bindings into the NSMenu at startup (each `NSMenuItem.keyEquivalent` + `keyEquivalentModifierMask` driven by the resolved action map).
+   * Port `cmd/roost/shortcuts_test.go`'s scenarios verbatim.
+3. Port the font config (`cmd/roost/font.go`):
+   * Default font family + size from config.
+   * `font_increase` / `font_decrease` / `font_reset` actions wire into `TerminalView` (recompute cell metrics, re-layout).
+   * `pickFontFamily`-style fallback chain so a missing requested family falls through cleanly on macOS.
+
+**Exit criteria:**
+* `~/.config/roost/config.conf` with `keybind = cmd+t = new_tab` overrides the default and is reflected in the NSMenu shortcut listing.
+* `theme = solarized-dark` (or any of the Go binary's named themes) flips the Mac UI's colors to match the Go binary's render of the same theme.
+* `font_size = 14` is honored on launch.
+* `⌘+` / `⌘-` / `⌘0` resize the terminal in place.
+* Shipping default with no config file matches the Go binary's default look.
+
+**Effort estimate**: ~2.5 days. The theme system is the largest port; keybind + font lift directly from the Go side.
+
+### M7 — macOS `.app` bundling
+
+PR target: `feature/rust-port`. Branch: `polish/mac-bundle`.
+
+**Scope:**
+1. Build a proper `Roost.app` bundle from SwiftPM output:
+   * `Roost.app/Contents/MacOS/Roost` (the binary `swift build` already produces).
+   * `Roost.app/Contents/Info.plist` with `CFBundleIdentifier = com.charliek.roost`, `CFBundleVersion`, `CFBundleShortVersionString` (read from the goal's version), `NSHighResolutionCapable = YES`, `LSMinimumSystemVersion`, `NSPrincipalClass = NSApplication`, `CFBundleExecutable = Roost`.
+   * `Roost.app/Contents/Resources/AppIcon.icns` (rendered from a source PNG via `iconutil`).
+   * `Roost.app/Contents/Resources/` for any theme files / runtime resources.
+2. `mac/scripts/bundle.sh` automates assembly from `swift build` output. Idempotent on cache hit.
+3. `mac/README.md` documents the bundle workflow (`./mac/scripts/bundle.sh && open mac/build/Roost.app`).
+4. CI: optional `mac-ui-bundle` job in `refactor.yml` produces the bundle artifact on push; useful for dogfooding without doing local builds.
+
+**Out of scope (separate follow-ups):**
+* Code-signing with a Developer ID certificate.
+* Notarization via `notarytool`.
+* DMG packaging.
+* Sparkle auto-update wiring.
+
+**Exit criteria:**
+* `./mac/scripts/bundle.sh` produces `mac/build/Roost.app` from a clean tree.
+* Double-clicking `Roost.app` launches the UI (after the "downloaded from internet" dialog the first time, since we're not signed yet).
+* The bundle includes a proper icon in Finder + Dock.
+* `mdls Roost.app` shows the bundle identifier + version.
+
+**Effort estimate**: ~1 day. SwiftPM's executable target doesn't produce a bundle by default; the assembly is well-trodden but mechanical.
+
+### M8 — GTK version (initial spike on Mac)
+
+PR target: `feature/rust-port`. Branch: `polish/gtk-spike`.
+
+**Scope:**
+1. Stand up `crates/roost-linux` (or `linux/` — match the existing `plans/phase-7-linux-ui.md` decision):
+   * gtk4-rs + libadwaita-rs deps.
+   * `cargo build -p roost-linux` succeeds on macOS via Homebrew GTK4 / libadwaita (`brew install gtk4 libadwaita pkg-config`).
+   * Single-window `adw::ApplicationWindow` ≈ the Mac UI's Phase 5 step 2 Identify spike — connects to `roost-core` over UDS, displays the daemon pid + version + active project / tab in a status bar.
+2. CI: new `gtk-build` job in `refactor.yml` that runs on `macos-latest` (the requested cross-platform-development convenience) and `ubuntu-latest` (eventual production target). Both jobs `apt-get install` / `brew install` the GTK deps before `cargo build -p roost-linux`. macos-latest only required at this milestone; ubuntu-latest can be informational.
+3. README under `linux/` documents the Mac-side workflow (`brew install gtk4 libadwaita && cargo run -p roost-linux`).
+
+**Out of scope (Phase 7 step 2+ — separate later milestones):**
+* Cell renderer (Cairo + Pango walk over libghostty-vt render state).
+* StreamPty round-trip.
+* Sidebar + tab bar in gtk4-rs (mirror M2 / M3).
+* Notifications.
+* AppImage / Flatpak packaging.
+
+**Exit criteria:**
+* `cargo build -p roost-linux` clean on macOS (Apple Silicon) against Homebrew GTK4.
+* `cargo run -p roost-linux` opens a window on Mac, connects to the running `roost-core` daemon, displays daemon Identify info.
+* `gtk-build` CI job green on macos-latest.
+
+**Effort estimate**: ~1.5 days. gtk4-rs's bindgen setup + pkg-config wiring is the bulk; the actual Identify call is a copy of Phase 5 step 2 patterns in Rust.
+
 ## Total horizon
 
-~8–9 working days end-to-end at the cadence picked above. Reality budget: assume ~12 to handle CI churn, CodeRabbit cycles, and the inevitable mid-PR redesign.
+~8–9 working days for M1–M5; M6 adds ~2.5, M7 adds ~1, M8 adds ~1.5. End-to-end: ~13–14 working days. Reality budget: assume ~18 to handle CI churn, CodeRabbit cycles, the inevitable mid-PR redesign, and the GTK-on-Mac toolchain pitfalls.
 
 ## Process
 
@@ -202,6 +285,9 @@ PR target: `feature/rust-port`. Branch: `polish/selection-copy`.
   * Verified `roost-cli-rs project create / rename / delete` and `⌘1..⌘9` all converge correctly on the new outline view.
   * **Process learning**: linux CI runners were oversubscribed on 2026-05-16; `test (ubuntu-latest)` etc. ran 5–10× slower than usual while mac runners stayed fast. Branch protection on `feature/rust-port` was relaxed to require only the 3 macOS checks (`test (macos-latest)`, `rust-build (macos-latest)`, `swift-mac`); linux jobs still run on every PR but no longer block auto-merge. Revisit once the linux runner slowness is diagnosed.
 * **Process side-fix** — `polish/coderabbit-config` (PR [#25](https://github.com/charliek/roost/pull/25)) adds `.coderabbit.yaml` enabling auto-review on `feature/rust-port`. CodeRabbit's default policy skipped reviews on non-default base branches; observed on PR #23 as "Auto reviews are disabled on base/target branches other than the default branch." Without this fix the "auto-merge when CI green + CodeRabbit clean" gate silently degrades to "auto-merge when CI green."
-* M3 — pending M2.
-* M4 — pending M3.
-* M5 — pending M4.
+* M3 — Native tab strip + window resize. _(blocked on M2; M2 merged, now in flight)_
+* M4 — Headless CLI surface. _(blocked on M3)_
+* M5 — Selection + copy / paste. _(blocked on M4)_
+* M6 — Themes + config file overrides. _(blocked on M5; added 2026-05-16 after the goal-set conversation while the human stepped away)_
+* M7 — macOS `.app` bundling. _(blocked on M6; added 2026-05-16)_
+* M8 — GTK version initial spike (on Mac for dev convenience). _(blocked on M7; added 2026-05-16)_
