@@ -79,4 +79,3 @@ func TestFilterHandler(t *testing.T) {
 		})
 	}
 }
-
