@@ -196,7 +196,11 @@ PR target: `feature/rust-port`. Branch: `polish/selection-copy`.
     * Auto-merge fired immediately on first `gh pr merge --auto --squash` because no branch protection was set up at the time. Branch protection on `feature/rust-port` (requiring `ci.yml` + `refactor.yml` status checks) was applied after the merge; M2 onward will properly gate on green CI.
     * `allow_auto_merge` was off at the repo level; flipped to true.
     * Two settings to keep in mind for future PRs: branch protection rules are in place, and auto-merge respects them.
-* M2 — Native sidebar (NSOutlineView). _(blocked on M1; M1 merged, can now start)_
+* **M2 — Native sidebar (NSOutlineView)** — 🟡 in flight. PR [#24](https://github.com/charliek/roost/pull/24) opened 2026-05-16, queued for auto-merge gated on `ci.yml` + `refactor.yml`. Branch protection on `feature/rust-port` now requires all 8 status checks before merge.
+  * `NSOutlineView` in source-list style. PROJECTS uppercase header. Native row selection (no `"● "` marker). One column with `ProjectRowCellView`. Right-click menu uses `clickedRow` + `NSMenuDelegate.menuNeedsUpdate` to gate items.
+  * `applySidebarSelection()` programmatic-selection helper guarded by `isSyncingSidebarSelection` so `outlineViewSelectionDidChange` doesn't re-enter `selectProject(id:)`.
+  * Verified `roost-cli-rs project create / rename / delete` and `⌘1..⌘9` all converge correctly on the new outline view.
+* **Process side-fix** — `polish/coderabbit-config` (PR [#25](https://github.com/charliek/roost/pull/25)) adds `.coderabbit.yaml` enabling auto-review on `feature/rust-port`. CodeRabbit's default policy skipped reviews on non-default base branches; observed on PR #23 as "Auto reviews are disabled on base/target branches other than the default branch." Without this fix the "auto-merge when CI green + CodeRabbit clean" gate silently degrades to "auto-merge when CI green."
 * M3 — pending M2.
 * M4 — pending M3.
 * M5 — pending M4.
