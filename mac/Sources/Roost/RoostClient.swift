@@ -336,6 +336,59 @@ func renameProject(socketPath: String, projectID: Int64, name: String) async {
     }
 }
 
+// =============================================================================
+// Phase 6a step 2c — WatchEvents subscription
+// =============================================================================
+//
+// The Mac UI bootstraps its workspace by calling `listProjects` once on
+// launch and otherwise relies on its own RPC replies to update local state.
+// That's fine until a *second* client (the CLI, a future Linux UI, or just
+// a `roost-cli-rs project create` from another shell) mutates the daemon —
+// the Mac UI doesn't see the change until restart. `watchEvents` is the
+// daemon's server-stream of every workspace mutation; subscribing to it
+// keeps the sidebar + tab list converged with daemon state without
+// polling. See the goal doc M1 slice (b) for the full handler matrix.
+//
+// gRPC's server-stream is backed by `tokio::sync::broadcast` (capacity
+// 256) daemon-side. A slow UI that falls behind gets `Lagged` and should
+// re-`listProjects` to resync — handled in `RoostApp.subscribeToEvents`.
+
+/// A long-lived server-stream of workspace mutation events. Yields
+/// `Roost_V1_Event` values until the stream ends (e.g. daemon shutdown);
+/// callers should bridge to a `@MainActor` consumer and re-subscribe on
+/// stream end if they need reconnect-on-disconnect semantics.
+///
+/// On any underlying gRPC error the stream finishes; the error is logged
+/// to stderr so a failed connect is debuggable without a UI surface.
+func watchEvents(socketPath: String) -> AsyncStream<Roost_V1_Event> {
+    AsyncStream { continuation in
+        let task = Task {
+            do {
+                try await withGRPCClient(
+                    transport: .http2NIOPosix(
+                        target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                        transportSecurity: .plaintext
+                    )
+                ) { client in
+                    let roost = Roost_V1_Roost.Client(wrapping: client)
+                    try await roost.watchEvents(.with { _ in }) { response in
+                        for try await event in response.messages {
+                            if Task.isCancelled { return }
+                            continuation.yield(event)
+                        }
+                    }
+                }
+            } catch {
+                FileHandle.standardError.write(
+                    Data("[Roost.mac] watchEvents stream ended: \(error)\n".utf8)
+                )
+            }
+            continuation.finish()
+        }
+        continuation.onTermination = { _ in task.cancel() }
+    }
+}
+
 /// Best-effort `DeleteProject`. Cascade-deletes tabs daemon-side.
 func deleteProject(socketPath: String, projectID: Int64) async {
     do {

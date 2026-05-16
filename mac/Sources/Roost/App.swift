@@ -53,6 +53,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var socketPath: String = ""
     private var daemonReachable: Bool = false
 
+    /// Long-lived WatchEvents subscription task. `nil` until
+    /// `bootstrapWorkspace` resolves and `subscribeToEvents` runs; the
+    /// task runs forever (reconnecting on stream end) until
+    /// `applicationWillTerminate` cancels it.
+    private var eventsTask: Task<Void, Never>?
+
     nonisolated static func main() {
         let app = NSApplication.shared
         let delegate = RoostApp()
@@ -255,6 +261,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        eventsTask?.cancel()
+        eventsTask = nil
         for tab in tabs {
             tab.close(socketPath: socketPath)
         }
@@ -293,7 +301,135 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 if let first = self.projects.first {
                     self.selectProject(id: first.id)
                 }
+                self.subscribeToEvents()
             }
+        }
+    }
+
+    /// Long-lived WatchEvents subscription. Drains the daemon's
+    /// server-stream and dispatches each event to a `@MainActor`
+    /// handler. On stream end (daemon shutdown, network error,
+    /// `Lagged` from the broadcast buffer overflowing) the helper
+    /// performs a full `listProjects` resync and reconnects, so a
+    /// transient disconnect doesn't permanently leave the UI stale.
+    @MainActor
+    private func subscribeToEvents() {
+        guard eventsTask == nil else { return }
+        let socketPath = self.socketPath
+        eventsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let stream = watchEvents(socketPath: socketPath)
+                for await event in stream {
+                    if Task.isCancelled { return }
+                    let kind = event.kind
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        if let kind { self.handleEvent(kind) }
+                    }
+                }
+                // Stream ended — resync from scratch and try again.
+                // Without this any transient disconnect would leave
+                // the UI silently stale.
+                if Task.isCancelled { return }
+                let fresh = await listProjects(socketPath: socketPath)
+                await MainActor.run { [weak self] in
+                    self?.applyProjectsResync(fresh)
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    /// Reconcile the daemon's project list with our local model after
+    /// a stream reconnect. Adds new projects, removes deleted ones,
+    /// renames the rest in place. Active selection is preserved when
+    /// possible; if the active project was deleted server-side, fall
+    /// back to the first available project.
+    @MainActor
+    private func applyProjectsResync(_ fresh: [ProjectSnapshot]) {
+        let freshByID = Dictionary(uniqueKeysWithValues: fresh.map { ($0.id, $0) })
+        let staleIDs = Set(projects.map(\.id)).subtracting(freshByID.keys)
+        for staleID in staleIDs {
+            removeProjectLocally(id: staleID)
+        }
+        projects = fresh
+        rebuildSidebar()
+        if let activeProjectID, freshByID[activeProjectID] == nil {
+            self.activeProjectID = nil
+            if let first = projects.first {
+                selectProject(id: first.id)
+            } else {
+                updateWindowTitle()
+                terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
+            }
+        }
+    }
+
+    /// Project deletion path shared between `WatchEvents`-driven
+    /// `ProjectDeleted` and the resync codepath. Closes any UI-side
+    /// TabSession in the project so its StreamPty shuts down cleanly.
+    @MainActor
+    private func removeProjectLocally(id: Int64) {
+        let condemned = tabs.filter { $0.projectID == id }
+        for session in condemned {
+            session.terminalView.removeFromSuperview()
+            session.close(socketPath: socketPath)
+        }
+        tabs.removeAll { $0.projectID == id }
+        activeSessionByProject.removeValue(forKey: id)
+        projects.removeAll { $0.id == id }
+    }
+
+    /// Dispatch one event from the WatchEvents stream. Anything not
+    /// surfaced visually in M1 is logged and dropped — later
+    /// milestones (M3 tab strip, Phase 6b notifications) light up
+    /// the remaining cases.
+    @MainActor
+    private func handleEvent(_ kind: Roost_V1_Event.OneOf_Kind) {
+        switch kind {
+        case .projectCreated(let e):
+            let p = e.project
+            let snap = ProjectSnapshot(id: p.id, name: p.name, cwd: p.cwd)
+            if !projects.contains(where: { $0.id == snap.id }) {
+                projects.append(snap)
+                rebuildSidebar()
+            }
+        case .projectRenamed(let e):
+            if let idx = projects.firstIndex(where: { $0.id == e.projectID }) {
+                projects[idx] = ProjectSnapshot(
+                    id: e.projectID,
+                    name: e.name,
+                    cwd: projects[idx].cwd
+                )
+                rebuildSidebar()
+            }
+        case .projectDeleted(let e):
+            let wasActive = activeProjectID == e.projectID
+            removeProjectLocally(id: e.projectID)
+            rebuildSidebar()
+            if wasActive {
+                activeProjectID = nil
+                if let next = projects.first {
+                    selectProject(id: next.id)
+                } else {
+                    updateWindowTitle()
+                    terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
+                }
+            }
+        case .tabOpened, .tabDeleted, .active:
+            // Tab-level UI convergence (cross-client OpenTab/CloseTab
+            // visibility, daemon-driven active selection) lands with
+            // M3's tab strip rewrite — the current Mac UI tracks tabs
+            // by TabSession reference, not by daemon id, so wiring
+            // these events safely requires the tab-strip refactor.
+            // M1 logs them so the wire surface is observable.
+            NSLog("roost-mac: watchEvents tab event ignored in M1: %@", "\(kind)")
+        case .tabCwd, .tabTitle, .tabState, .tabNotification,
+             .notification, .tabsReordered, .projectsReordered,
+             .hookActive:
+            // Visual surfaces for these land in M3 (tab strip with
+            // cwd / status dot) and Phase 6b (notifications).
+            break
         }
     }
 
