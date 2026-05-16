@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/dev/charliek/roost/icons">
+    <file>scalable/places/folder-symbolic.svg</file>
+    <file>scalable/actions/sidebar-show-symbolic.svg</file>
+    <file>scalable/actions/sidebar-show-right-symbolic.svg</file>
+    <file>scalable/actions/tab-new-symbolic.svg</file>
+  </gresource>
+</gresources>

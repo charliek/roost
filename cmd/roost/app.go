@@ -186,8 +186,12 @@ func (a *App) activate() {
 	a.win.SetTitle("Roost")
 	a.win.SetDefaultSize(1200, 780)
 
-	// Application-level CSS overrides. Keep this small; see style.css.
+	// Application-level CSS overrides, plus the bundled icon-theme
+	// resource path so headerbar icons resolve without depending on
+	// the system Adwaita theme. Keep this small; see style.css.
 	if display := gdk.DisplayGetDefault(); display != nil {
+		gtk.IconThemeGetForDisplay(display).AddResourcePath(iconResourcePrefix)
+
 		provider := gtk.NewCSSProvider()
 		provider.LoadFromString(styleCSS)
 		gtk.StyleContextAddProviderForDisplay(display, provider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
