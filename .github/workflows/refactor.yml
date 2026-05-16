@@ -70,8 +70,11 @@ jobs:
       - name: cargo clippy
         # Phase 2 latitude: clippy still informational while crates settle.
         # Flip continue-on-error off at Phase 3 exit (roost-core MVP working).
+        # `--exclude roost-linux` because that crate needs GTK4 +
+        # libadwaita installed — handled by the dedicated `gtk-build`
+        # job (Phase 6a M8) instead of bloating this lint runner.
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 
   rust-build:
     if: >-
@@ -135,7 +138,11 @@ jobs:
         # Default features: roost-vt's `ffi` feature is OFF, so this
         # build does not consume libghostty-vt. Keeps the non-ffi
         # workspace green even if the Ghostty build itself bit-rots.
-        run: cargo build --workspace --all-targets
+        # `--exclude roost-linux` because that crate needs GTK4 +
+        # libadwaita installed — the dedicated `gtk-build` job
+        # (Phase 6a M8) does the GTK build separately so the
+        # default-features path stays toolchain-cheap.
+        run: cargo build --workspace --exclude roost-linux --all-targets
 
       - name: cargo build (roost-vt with ffi)
         # Time-boxed exception. `continue-on-error` lifts when the FFI
@@ -155,7 +162,9 @@ jobs:
       - name: cargo test
         # Required-green: the workspace test suite gates every commit.
         # If a Rust test breaks on Linux or macOS the workflow fails.
-        run: cargo test --workspace
+        # `--exclude roost-linux` for the same reason as the build
+        # step above — the GTK toolchain lives in the gtk-build job.
+        run: cargo test --workspace --exclude roost-linux
 
   swift-mac:
     if: >-
@@ -328,3 +337,65 @@ jobs:
             echo "--- daemon log ---"
             cat "$HOME/roost-live-test/daemon.log"
           fi
+
+  # Phase 6a M8: gtk4-rs + libadwaita-rs build. Lives in
+  # crates/roost-linux/, excluded from `default-members` in
+  # Cargo.toml so a contributor without GTK installed can still
+  # `cargo build`. CI installs the deps and builds explicitly.
+  #
+  # Runs on both ubuntu-latest (the eventual production target)
+  # and macos-latest (cross-platform dev convenience for the Mac
+  # UI maintainer). macos-latest only required at this milestone;
+  # ubuntu-latest is informational while the spike settles.
+  gtk-build:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
+      startsWith(github.head_ref, 'feature/rust-port') ||
+      startsWith(github.head_ref, 'polish/')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install GTK4 + libadwaita (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Install GTK4 + libadwaita (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gtk4 libadwaita pkg-config protobuf
+          # Brew installs into /opt/homebrew; the gtk4 / libadwaita
+          # .pc files live there. Surface them to pkg-config so the
+          # subsequent `cargo build` resolves the system libs.
+          echo "PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo registry + target (shared with rust-build)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo build -p roost-linux
+        # Phase 6a M8 first cut: a single-window Identify spike.
+        # `continue-on-error` is intentionally OFF — if this fails
+        # the spike's exit criteria aren't met. Lift the GTK
+        # toolchain pin only with explicit review.
+        run: cargo build -p roost-linux

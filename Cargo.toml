@@ -20,6 +20,20 @@ members = [
     "crates/roost-core",
     "crates/roost-smoke",
     "crates/roost-cli-rs",
+    "crates/roost-linux",
+]
+# `roost-linux` requires GTK4 + libadwaita system libs at build time
+# (Homebrew on macOS, apt on Linux). The default `cargo build` (no
+# `-p`) excludes it so contributors who don't want to install GTK can
+# still iterate on the daemon / proto / Mac side. `cargo build -p
+# roost-linux` opts in. CI's `gtk-build` job builds it explicitly.
+default-members = [
+    "crates/roost-proto",
+    "crates/roost-common",
+    "crates/roost-vt",
+    "crates/roost-core",
+    "crates/roost-smoke",
+    "crates/roost-cli-rs",
 ]
 
 [workspace.package]
