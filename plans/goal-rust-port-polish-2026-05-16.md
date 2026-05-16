@@ -289,7 +289,20 @@ PR target: `feature/rust-port`. Branch: `polish/gtk-spike`.
   * `TabPillView` with status-dot slot + label + × close on active; accent-tinted background. `PtyClientEvent` enum on the StreamPty stream so resize rides input. `TerminalView.setFrameSize` reflows the cell grid + propagates `PtyResize`. End-to-end verified: 1500×950 window → `stty size` 50 138.
 * **M4 — Headless CLI surface** — ✅ merged 2026-05-16 via PR [#27](https://github.com/charliek/roost/pull/27).
   * New `TabWrite` / `TabResize` non-streaming RPCs; `roost-cli-rs tab open / close / send / resize`. CLI-issued bytes flow through `PtySupervisor::write` and the UI's existing StreamPty subscription surfaces the shell's output. UI `TabDeleted` handler closes the cross-client convergence gap M1 flagged.
-* **M5 — Selection + copy / paste** — 🟡 in flight. PR [#28](https://github.com/charliek/roost/pull/28). Drag-select + translucent overlay; `⌘C` / `⌘V` through the standard responder chain; bracketed-paste detected via `ghostty_terminal_mode_get(GhosttyMode(2004 & 0x7FFF))`.
-* **M6 (first cut) — Themes + config file overrides** — 🟡 in flight stacked on M5. PR [#29](https://github.com/charliek/roost/pull/29). 7 bundled themes (lifted from `cmd/roost/themes/`); `~/.config/roost/config.conf` reader consumes `theme` / `font-family` / `font-size`. Keybind override config is a separate follow-up slice (`polish/keybind-config`).
-* **M7 — macOS `.app` bundling** — 🟡 in flight stacked on M6. PR [#30](https://github.com/charliek/roost/pull/30). `mac/scripts/bundle.sh` assembles `Roost.app` with proper `Info.plist` + bundle ID. Code-sign / notarize / DMG / Sparkle are intentional Phase 8 follow-ups.
-* **M8 (spike) — GTK version on Mac + Linux** — 🟡 in flight stacked on M7. PR [#31](https://github.com/charliek/roost/pull/31). `crates/roost-linux` with gtk4-rs + libadwaita-rs + tokio; single-window Identify spike that runs on both ubuntu-latest and (via Homebrew) macos-latest. Full Phase 7 (cell renderer + sidebar + tab bar + StreamPty) stays out of scope.
+* **M5 — Selection + copy / paste** — ✅ merged 2026-05-16 via PR [#28](https://github.com/charliek/roost/pull/28). Drag-select + translucent overlay; `⌘C` / `⌘V` through the standard responder chain; bracketed-paste detected via `ghostty_terminal_mode_get(GhosttyMode(2004 & 0x7FFF))`.
+* **M6 (first cut) — Themes + config file overrides** — ✅ merged 2026-05-16 via PR [#29](https://github.com/charliek/roost/pull/29). 7 bundled themes (lifted from `cmd/roost/themes/`); `~/.config/roost/config.conf` reader consumes `theme` / `font-family` / `font-size`. Keybind override config is a separate follow-up slice (`polish/keybind-config`).
+* **M7 — macOS `.app` bundling** — ✅ merged 2026-05-16 via PR [#30](https://github.com/charliek/roost/pull/30). `mac/scripts/bundle.sh` assembles `Roost.app` with proper `Info.plist` + bundle ID. Code-sign / notarize / DMG / Sparkle are intentional Phase 8 follow-ups.
+* **M8 (spike) — GTK version on Mac + Linux** — ✅ merged 2026-05-16 via PR [#31](https://github.com/charliek/roost/pull/31). `crates/roost-linux` with gtk4-rs + libadwaita-rs + tokio; single-window Identify spike that runs on both ubuntu-latest and (via Homebrew) macos-latest. Full Phase 7 (cell renderer + sidebar + tab bar + StreamPty) stays out of scope.
+  * **CI follow-ups during M8 settling**: `cargo build --workspace` and `cargo test --workspace` had to learn `--exclude roost-linux` so the rust-build / rust-lint jobs don't try to compile gtk4-rs without GTK installed (the GTK toolchain lives in the dedicated gtk-build job). `cargo fmt --all --check` also caught a rustfmt diff in the M8 spike source. Both folded into the same M8 PR before merge.
+
+## Status: goal closed 🎉
+
+All eight milestones M1–M8 merged into `feature/rust-port` on 2026-05-16. The branch is ready for review before the eventual merge to `main`. Open follow-up slices the goal scope-excluded:
+
+* `polish/keybind-config` — the larger half of M6 (port `cmd/roost/shortcuts.go` to Swift; install resolved bindings into NSMenu).
+* `polish/font-zoom` — M6 cleanup: `font_increase` / `font_decrease` / `font_reset` shortcuts with `TerminalView` reflow on font change.
+* `polish/palette` — M6 cleanup: per-cell palette override via `ghostty_terminal_set` so libghostty-vt's compiled-in palette matches the user theme for SGR cells.
+* Phase 6b — Mac OSC + notifications. Daemon-side OSC scanner port + UI notification surfaces. The differentiator vs. plain terminal multiplexers; M3's tab strip + M2's sidebar both reserved slots for it.
+* Phase 7 step 2+ — full Linux UI (cell renderer + sidebar + tab bar + StreamPty round-trip) built on top of the M8 spike.
+* Phase 8 — code-sign + notarize + DMG + Sparkle for the M7 `.app` bundle.
+* `tab snapshot` — M4 deferred this; needs daemon-side libghostty-vt parse or a PTY-output ring buffer.
