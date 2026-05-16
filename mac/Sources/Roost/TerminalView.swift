@@ -27,8 +27,13 @@ final class TerminalView: NSView {
     /// invariant so window resize reflows the terminal.
     private(set) var cols: UInt16
     private(set) var rows: UInt16
-    let cellSize: CGSize
-    let font: NSFont
+    /// Live cell metrics. `cellSize` recomputes when `font` changes
+    /// via `updateFont(_:)` (Phase 6a P2 font_increase / decrease /
+    /// reset). Both stay `private(set)` because callers shouldn't
+    /// poke them directly — the update path keeps libghostty-vt's
+    /// cell-grid in sync with the AppKit cell metrics.
+    private(set) var cellSize: CGSize
+    private(set) var font: NSFont
 
     /// libghostty-vt terminal handle. Held for lifecycle hygiene;
     /// Phase 5.4b starts using it to drive rendering.
@@ -455,6 +460,39 @@ final class TerminalView: NSView {
         )
     }
 
+    /// Swap the active font (Phase 6a P2 font_increase / decrease /
+    /// reset). Recomputes `cellSize` from the new font's advance
+    /// width + line height, then re-runs the standard reflow path
+    /// so the libghostty cell grid + PTY winsize converge on the
+    /// new metrics. AppKit's intrinsic-content-size + setFrameSize
+    /// loop picks up the rest.
+    @MainActor
+    func updateFont(_ newFont: NSFont) {
+        // No-op when the font didn't actually change — caller may
+        // clamp font size into a saturating range and call us with
+        // the same NSFont.
+        if newFont.fontName == self.font.fontName && newFont.pointSize == self.font.pointSize {
+            return
+        }
+        self.font = newFont
+        let cellWidth = NSAttributedString(
+            string: "M",
+            attributes: [.font: newFont]
+        ).size().width.rounded(.up)
+        let cellHeight = (newFont.ascender - newFont.descender + newFont.leading).rounded(.up)
+        self.cellSize = CGSize(width: cellWidth, height: cellHeight)
+        invalidateIntrinsicContentSize()
+        // Force a reflow against the current bounds with the NEW
+        // cell metrics. `reflowGridForBounds` short-circuits when
+        // cols/rows are unchanged — since cellSize just changed
+        // the cell count almost certainly differs, but we also
+        // need to push the new pixel cell size to libghostty so
+        // its graphics-extension consumers see the right per-cell
+        // dimensions.
+        reflowGridForBounds(forceResize: true)
+        needsDisplay = true
+    }
+
     /// On every frame size change, reflow the cell grid. Floor-
     /// quantizing the available pixels by `cellSize` keeps the
     /// rendered grid pixel-aligned — anything else and we'd get
@@ -477,11 +515,12 @@ final class TerminalView: NSView {
     /// use the same `cellSize.width`-typed integer step in
     /// `draw(_:)`.
     @MainActor
-    private func reflowGridForBounds() {
+    private func reflowGridForBounds(forceResize: Bool = false) {
         guard cellSize.width > 0, cellSize.height > 0 else { return }
         let newCols = max(1, UInt16(floor(bounds.width / cellSize.width)))
         let newRows = max(1, UInt16(floor(bounds.height / cellSize.height)))
-        if newCols == cols && newRows == rows { return }
+        let dimsChanged = (newCols != cols) || (newRows != rows)
+        if !dimsChanged && !forceResize { return }
         cols = newCols
         rows = newRows
         if let terminal {
@@ -491,7 +530,9 @@ final class TerminalView: NSView {
         }
         invalidateIntrinsicContentSize()
         needsDisplay = true
-        onResize?(newCols, newRows)
+        if dimsChanged {
+            onResize?(newCols, newRows)
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {

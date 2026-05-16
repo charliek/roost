@@ -1089,6 +1089,37 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
+        // View menu (Phase 6a P2): font_increase / font_decrease /
+        // font_reset. Default bindings ⌘+ / ⌘- / ⌘0 — keystroke "+"
+        // on macOS arrives as the unshifted "=" key with shift held,
+        // which is what `keyEquivalent: "+"` encodes correctly. The
+        // `⌘0` reset uses "0" verbatim.
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        let zoomInItem = NSMenuItem(
+            title: "Zoom In",
+            action: #selector(fontIncrease(_:)),
+            keyEquivalent: "+"
+        )
+        zoomInItem.target = self
+        viewMenu.addItem(zoomInItem)
+        let zoomOutItem = NSMenuItem(
+            title: "Zoom Out",
+            action: #selector(fontDecrease(_:)),
+            keyEquivalent: "-"
+        )
+        zoomOutItem.target = self
+        viewMenu.addItem(zoomOutItem)
+        let zoomResetItem = NSMenuItem(
+            title: "Actual Size",
+            action: #selector(fontReset(_:)),
+            keyEquivalent: "0"
+        )
+        zoomResetItem.target = self
+        viewMenu.addItem(zoomResetItem)
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
+
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(
@@ -1194,6 +1225,63 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // No family or unknown → system monospace. Same default the
         // Go binary uses when `font-family` is unset.
         return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    // MARK: - Font zoom (Phase 6a P2)
+
+    /// Lower bound on the cell-grid font size. Smaller renders cell
+    /// metrics that collapse the cursor / glyph into the wrong
+    /// rect. The Go binary uses the same floor.
+    private static let fontSizeMin: CGFloat = 8
+    /// Upper bound on the cell-grid font size. Anything larger and a
+    /// single tab's terminal eats the whole window before a useful
+    /// shell prompt can render.
+    private static let fontSizeMax: CGFloat = 32
+
+    @objc @MainActor
+    private func fontIncrease(_ sender: Any?) {
+        adjustFont(by: +1)
+    }
+
+    @objc @MainActor
+    private func fontDecrease(_ sender: Any?) {
+        adjustFont(by: -1)
+    }
+
+    @objc @MainActor
+    private func fontReset(_ sender: Any?) {
+        let defaultSize = config.fontSize ?? 14
+        applyFont(size: defaultSize)
+    }
+
+    /// Bump the font size in 1pt increments, clamped to
+    /// `[fontSizeMin, fontSizeMax]`. The change is applied
+    /// uniformly across every TabSession's TerminalView — global
+    /// zoom, mirroring the Go binary's behaviour. (Per-tab zoom
+    /// would need a TabSession-side stored size and a more
+    /// elaborate keybind dispatch; not worth the complexity for the
+    /// audience this serves.)
+    @MainActor
+    private func adjustFont(by delta: CGFloat) {
+        let currentSize = activeFont.pointSize
+        let proposed = (currentSize + delta).rounded()
+        let clamped = max(Self.fontSizeMin, min(Self.fontSizeMax, proposed))
+        if clamped == currentSize { return }
+        applyFont(size: clamped)
+    }
+
+    /// Build a new NSFont at `size` (respecting the user's
+    /// `font-family` config) and push it into every live
+    /// TerminalView. The Mac UI's M3 reflow path picks up the new
+    /// cell metrics + propagates a PtyResize over StreamPty
+    /// automatically — no separate plumbing needed here.
+    @MainActor
+    private func applyFont(size: CGFloat) {
+        let newFont = resolveFont(family: config.fontFamily, size: size)
+        activeFont = newFont
+        for session in tabs {
+            session.terminalView.updateFont(newFont)
+        }
     }
 
     /// Resolve the same default socket path as `roost-core`'s
