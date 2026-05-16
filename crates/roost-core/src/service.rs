@@ -476,11 +476,36 @@ impl Roost for RoostService {
         req: Request<ReportOscRequest>,
     ) -> Result<Response<ReportOscResponse>, Status> {
         let r = req.into_inner();
-        // Phase 3 routing is intentionally minimal: we only honour OSC 7
-        // (cwd) and OSC 9/777 (notification). OSC 0/1/2 (titles) are
-        // mostly handled UI-side; the UI calls SetTabTitle when it wants
-        // to upgrade to a server-side write.
+        // Phase 6a P5: full OSC dispatch table. The UI reports
+        // pre-parsed (osc_command, payload) tuples; we route each
+        // to the appropriate Workspace mutator.
+        //
+        //   0/1/2  -> set_tab_title(user=false), respecting the
+        //            user_titled lock (set_tab_title drops the
+        //            update internally when user_titled=true).
+        //   7      -> set_tab_cwd (after parsing the file:// URI).
+        //   9 / 777-> fire_notification UNLESS the tab's hook_active
+        //            is true — in which case the Claude Code hook
+        //            owns the notification surface for this tab's
+        //            window and the raw OSC drops on the daemon
+        //            side. Mirrors DL-8 in vision.md and the Go
+        //            scanner's `cmd/roost/app.go::OnNotification`.
         match r.osc_command {
+            0 | 1 | 2 => {
+                if !r.payload.is_empty() {
+                    if let Err(err) =
+                        self.workspace
+                            .set_tab_title(r.tab_id, &r.payload, false)
+                    {
+                        debug!(
+                            tab_id = r.tab_id,
+                            ?err,
+                            "set_tab_title from OSC {} failed",
+                            r.osc_command
+                        );
+                    }
+                }
+            }
             7 => {
                 if !r.payload.is_empty() {
                     let cwd = parse_cwd_from_osc7(&r.payload).unwrap_or(r.payload);
@@ -490,23 +515,37 @@ impl Roost for RoostService {
                 }
             }
             9 => {
-                let title = r.payload;
-                if let Err(err) = self.workspace.fire_notification(r.tab_id, &title, "") {
+                if self.tab_hook_active(r.tab_id) {
                     debug!(
                         tab_id = r.tab_id,
-                        ?err,
-                        "fire_notification from OSC 9 failed"
+                        "suppressed OSC 9 — hook_active=true (Claude hook owns surface)"
                     );
+                } else {
+                    let title = r.payload;
+                    if let Err(err) = self.workspace.fire_notification(r.tab_id, &title, "") {
+                        debug!(
+                            tab_id = r.tab_id,
+                            ?err,
+                            "fire_notification from OSC 9 failed"
+                        );
+                    }
                 }
             }
             777 => {
-                let (title, body) = parse_osc_777(&r.payload);
-                if let Err(err) = self.workspace.fire_notification(r.tab_id, &title, &body) {
+                if self.tab_hook_active(r.tab_id) {
                     debug!(
                         tab_id = r.tab_id,
-                        ?err,
-                        "fire_notification from OSC 777 failed"
+                        "suppressed OSC 777 — hook_active=true (Claude hook owns surface)"
                     );
+                } else {
+                    let (title, body) = parse_osc_777(&r.payload);
+                    if let Err(err) = self.workspace.fire_notification(r.tab_id, &title, &body) {
+                        debug!(
+                            tab_id = r.tab_id,
+                            ?err,
+                            "fire_notification from OSC 777 failed"
+                        );
+                    }
                 }
             }
             _ => {
@@ -514,6 +553,21 @@ impl Roost for RoostService {
             }
         }
         Ok(Response::new(ReportOscResponse {}))
+    }
+}
+
+impl RoostService {
+    /// True if the tab's runtime state has `hook_active=true`.
+    /// Wrapper around `Workspace::tab(id).hook_active` so the OSC
+    /// dispatch reads cleanly. Returns `false` for unknown tabs —
+    /// "no hook" is the safe default; the dispatch then proceeds
+    /// with normal notification flow and `fire_notification` fails
+    /// with NotFound for the bogus id.
+    fn tab_hook_active(&self, tab_id: i64) -> bool {
+        self.workspace
+            .tab(tab_id)
+            .map(|t| t.hook_active)
+            .unwrap_or(false)
     }
 }
 
