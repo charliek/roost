@@ -16,6 +16,7 @@
 //!
 //! Subsequent phases extend this without breaking the wire contract.
 
+pub mod osc;
 pub mod pty;
 pub mod runtime;
 pub mod service;
