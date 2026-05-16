@@ -39,3 +39,7 @@ __pycache__/
 *~
 coverage.out
 coverage.html
+
+# Phase 6a M7: Roost.app bundle output
+/mac/build/
+

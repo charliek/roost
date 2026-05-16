@@ -75,6 +75,40 @@ a second or two of launch (the gRPC `Identify()` round-trip happens
 asynchronously after the window appears). If the daemon isn't running
 the panel turns red and shows the failure reason + a hint to start it.
 
+## Bundle as `Roost.app` (Phase 6a M7)
+
+`swift run` is fine for hot-iteration development but not for Finder /
+Dock / Spotlight integration. `mac/scripts/bundle.sh` wraps the
+SwiftPM output into a real `.app` bundle.
+
+```bash
+./mac/scripts/bundle.sh             # release build -> mac/build/Roost.app
+./mac/scripts/bundle.sh debug       # debug build (same layout)
+ROOST_VERSION=0.2.0 ./mac/scripts/bundle.sh
+open mac/build/Roost.app
+```
+
+The script:
+
+* Runs `swift build -c <config> --product Roost`.
+* Assembles `mac/build/Roost.app/Contents/{MacOS, Resources, Info.plist, PkgInfo}`.
+* Substitutes `@VERSION@` in `mac/Resources/Info.plist.template` with
+  `$ROOST_VERSION` (defaults to `0.1.0`).
+* Copies the SwiftPM resource bundles (`Roost_Roost.bundle` carries
+  the embedded themes; `swift-crypto_*` bundles ship with gRPC SSL
+  deps) into `Contents/Resources/`.
+* Includes `mac/Resources/AppIcon.icns` if present (M7 doesn't
+  ship a real icon — drop one in and rerun).
+
+**Out of scope** (Phase 8 follow-ups, intentional): code-signing with a
+Developer ID certificate, notarization via `notarytool`, DMG creation,
+Sparkle auto-update feed.
+
+The first launch from Finder will hit the macOS "downloaded from
+internet" dialog because the bundle isn't signed; click Open. Inside
+a CI run or for installer flows, that dialog is bypassed by
+`xattr -dr com.apple.quarantine mac/build/Roost.app`.
+
 ## Codegen
 
 Swift bindings for `proto/roost.proto` are generated at `swift build`
