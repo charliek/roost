@@ -14,6 +14,7 @@
 // actually applies in `TerminalView.draw(_:)` and the window chrome.
 
 import AppKit
+import CGhosttyVT
 import Foundation
 
 /// Parsed terminal color scheme. Mirrors the Go binary's `Theme`
@@ -130,6 +131,83 @@ private func parse(_ text: String) throws -> Theme {
     }
     theme.palette = palette
     return theme
+}
+
+// MARK: - libghostty-vt application (Phase 6a P3)
+
+extension Theme {
+    /// Push this theme's foreground / background / cursor + 256-color
+    /// palette into a libghostty-vt terminal. Mirrors the Go binary's
+    /// `internal/ghostty/terminal.go::SetTheme`. MUST be called after
+    /// `ghostty_terminal_new` and BEFORE any `ghostty_terminal_vt_write`
+    /// so the very first frame paints with the right colors.
+    ///
+    /// libghostty-vt's `GHOSTTY_TERMINAL_OPT_COLOR_*` options take an
+    /// owning pointer to a `GhosttyColorRgb` (or `[256]GhosttyColorRgb`
+    /// for the palette). The pointers are read synchronously inside
+    /// the call — we don't have to keep the local storage alive past
+    /// the call returning.
+    @MainActor
+    static func apply(_ theme: Theme, to terminal: GhosttyTerminal) {
+        var fg = ghosttyColor(theme.foreground)
+        _ = ghostty_terminal_set(
+            terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
+            &fg
+        )
+        var bg = ghosttyColor(theme.background)
+        _ = ghostty_terminal_set(
+            terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND,
+            &bg
+        )
+        var cursor = ghosttyColor(theme.cursor)
+        _ = ghostty_terminal_set(
+            terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_CURSOR,
+            &cursor
+        )
+        // The palette is a contiguous 256-entry C array — fill a
+        // local fixed-size buffer and pass its base pointer. The 256
+        // count matches libghostty's signature exactly; sending fewer
+        // is undefined behaviour per the header docs.
+        var palette = [GhosttyColorRgb](repeating: ghosttyColor(.black), count: 256)
+        for i in 0..<min(theme.palette.count, 256) {
+            palette[i] = ghosttyColor(theme.palette[i])
+        }
+        palette.withUnsafeMutableBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            _ = ghostty_terminal_set(
+                terminal,
+                GHOSTTY_TERMINAL_OPT_COLOR_PALETTE,
+                UnsafeMutableRawPointer(base)
+            )
+        }
+    }
+}
+
+/// Convert an NSColor (in any color space) to libghostty's RGB struct.
+/// Converts to sRGB first to match the bit-exact values the Go binary
+/// pushes; `usingColorSpace(.sRGB)` returns nil for color spaces that
+/// can't be represented in sRGB (rare for the named colors we use),
+/// in which case we fall back to a black pixel rather than corrupting
+/// the FFI struct with NaN-derived bytes.
+@MainActor
+private func ghosttyColor(_ color: NSColor) -> GhosttyColorRgb {
+    let srgb = color.usingColorSpace(.sRGB) ?? .black
+    let r = UInt8((srgb.redComponent * 255.0).rounded().clamped(to: 0...255))
+    let g = UInt8((srgb.greenComponent * 255.0).rounded().clamped(to: 0...255))
+    let b = UInt8((srgb.blueComponent * 255.0).rounded().clamped(to: 0...255))
+    return GhosttyColorRgb(r: r, g: g, b: b)
+}
+
+private extension Comparable {
+    /// Clamp `self` into a closed range. Generic helper because Swift
+    /// stdlib's only built-in clamp lives on `Strideable` ranges, not
+    /// the closed-range arithmetic the color conversion above wants.
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
+    }
 }
 
 /// Parse `#RRGGBB` or `#RGB`. Lenient: returns nil for invalid
