@@ -54,13 +54,24 @@ final class TabSession {
     private var lastSentCols: UInt16
     private var lastSentRows: UInt16
 
-    init(projectID: Int64, cols: UInt16 = 80, rows: UInt16 = 24) {
+    init(
+        projectID: Int64,
+        cols: UInt16 = 80,
+        rows: UInt16 = 24,
+        theme: Theme = .fallback,
+        font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    ) {
         self.projectID = projectID
         self.initialCols = cols
         self.initialRows = rows
         self.lastSentCols = cols
         self.lastSentRows = rows
-        self.terminalView = TerminalView(cols: cols, rows: rows)
+        self.terminalView = TerminalView(
+            cols: cols,
+            rows: rows,
+            theme: theme,
+            font: font
+        )
     }
 
     /// Send a PTY resize event upstream. Called by the TerminalView

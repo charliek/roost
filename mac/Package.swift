@@ -99,6 +99,16 @@ let package = Package(
                 // .storyboard resources will land in this exclude list when
                 // they do.
             ],
+            // Phase 6a M6: bundled theme files lifted from the Go binary
+            // at `cmd/roost/themes/`. SwiftPM exposes them via
+            // `Bundle.module.url(forResource:withExtension:)` — see
+            // Theme.swift. The directory is copied (not processed) so the
+            // bundle layout mirrors the Go side and the same theme names
+            // ("Dracula", "Catppuccin Mocha", "roost-dark", …) resolve
+            // without renaming.
+            resources: [
+                .copy("Resources/themes"),
+            ],
             // Linker settings for libghostty-vt. We deliberately pass
             // the static archive's path positionally instead of using
             // `-L../third_party/ghostty/out/lib` + `-lghostty-vt`,
