@@ -70,8 +70,11 @@ jobs:
       - name: cargo clippy
         # Phase 2 latitude: clippy still informational while crates settle.
         # Flip continue-on-error off at Phase 3 exit (roost-core MVP working).
+        # `--exclude roost-linux` because that crate needs GTK4 +
+        # libadwaita installed — handled by the dedicated `gtk-build`
+        # job (Phase 6a M8) instead of bloating this lint runner.
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 
   rust-build:
     if: >-
@@ -135,7 +138,11 @@ jobs:
         # Default features: roost-vt's `ffi` feature is OFF, so this
         # build does not consume libghostty-vt. Keeps the non-ffi
         # workspace green even if the Ghostty build itself bit-rots.
-        run: cargo build --workspace --all-targets
+        # `--exclude roost-linux` because that crate needs GTK4 +
+        # libadwaita installed — the dedicated `gtk-build` job
+        # (Phase 6a M8) does the GTK build separately so the
+        # default-features path stays toolchain-cheap.
+        run: cargo build --workspace --exclude roost-linux --all-targets
 
       - name: cargo build (roost-vt with ffi)
         # Time-boxed exception. `continue-on-error` lifts when the FFI
