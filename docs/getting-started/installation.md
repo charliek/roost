@@ -19,10 +19,8 @@ Roost ships as two binaries — `roost` (GUI) and `roost-cli` (companion). Both 
 Install the system packages:
 
 ```bash
-brew install gtk4 libadwaita adwaita-icon-theme pkgconf gobject-introspection
+brew install gtk4 libadwaita pkgconf gobject-introspection
 ```
-
-`adwaita-icon-theme` is a separate Homebrew formula from `libadwaita` and ships the symbolic icons Roost's headerbar uses (`tab-new-symbolic`, `sidebar-show-symbolic`, etc.). Without it those buttons render as a missing-image placeholder.
 
 Recommended: install JetBrains Mono. It's the default font Roost looks for and renders well through Pango/Cairo on macOS:
 
@@ -94,11 +92,9 @@ System packages:
 sudo apt update
 sudo apt install -y \
   build-essential git curl \
-  libgtk-4-dev libadwaita-1-dev adwaita-icon-theme \
+  libgtk-4-dev libadwaita-1-dev \
   pkgconf gobject-introspection libgirepository1.0-dev
 ```
-
-`adwaita-icon-theme` is usually pulled in as a Recommends of `libadwaita-1-dev`, but listing it explicitly avoids the case where `apt install --no-install-recommends` (common on minimal/CI images) leaves the headerbar's new-tab and sidebar-toggle icons rendering as missing-image placeholders.
 
 Recommended: install JetBrains Mono (the default Roost looks for). On Debian/Ubuntu:
 

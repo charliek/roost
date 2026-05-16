@@ -41,6 +41,14 @@ func (h filterHandler) Handle(ctx context.Context, r slog.Record) error {
 			return nil
 		}
 	}
+	// GLib emits this when no gsettings-desktop-schemas package is on
+	// the search path (typical on Homebrew GTK4, and on any launcher
+	// that strips /opt/homebrew/share out of XDG_DATA_DIRS). We bundle
+	// our icons and don't read user GNOME settings, so the fallback to
+	// GTK defaults is fine — the line is cosmetic noise.
+	if r.Level >= slog.LevelWarn && strings.HasPrefix(r.Message, "g_settings_schema_source_lookup") {
+		return nil
+	}
 	return h.inner.Handle(ctx, r)
 }
 
