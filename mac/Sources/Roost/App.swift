@@ -23,7 +23,6 @@ import Foundation
 @MainActor
 final class RoostApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
-    private var statusLabel: NSTextField?
 
     /// Sidebar widgets. `sidebarStack` arranges project buttons +
     /// a trailing "+ New Project" row; `sidebarButtons` indexes them
@@ -54,6 +53,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var socketPath: String = ""
     private var daemonReachable: Bool = false
 
+    /// Long-lived WatchEvents subscription task. `nil` until
+    /// `bootstrapWorkspace` resolves and `subscribeToEvents` runs; the
+    /// task runs forever (reconnecting on stream end) until
+    /// `applicationWillTerminate` cancels it.
+    private var eventsTask: Task<Void, Never>?
+
     nonisolated static func main() {
         let app = NSApplication.shared
         let delegate = RoostApp()
@@ -68,24 +73,35 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         installMainMenu()
 
-        // Cell-grid intrinsic size of an 80x24 terminal fixes the
-        // window's minimum content height + the right-pane width.
+        // Probe the cell-grid intrinsic size so the right pane reserves
+        // enough room for an 80×24 terminal — `TerminalView` still pins
+        // its own width/height to that size in `selectTab(at:)`. The
+        // window itself opens at a generous default and is freely
+        // resizable; reflow to the larger cell grid is Phase 6a step 2g.
         let metricsProbe = TerminalView(cols: 80, rows: 24)
         let terminalSize = metricsProbe.intrinsicContentSize
-        let sidebarWidth: CGFloat = 200
-        let headerSliceHeight: CGFloat = 112
+        let sidebarWidth: CGFloat = 220
         let tabBarHeight: CGFloat = 32
-        let windowWidth = sidebarWidth + max(720, terminalSize.width + 48)
-        let windowHeight = terminalSize.height + headerSliceHeight + tabBarHeight + 32
+        let defaultContentWidth: CGFloat = 1100
+        let defaultContentHeight: CGFloat = 700
 
         let window = NSWindow(
-            contentRect: NSRect(x: 200, y: 200, width: windowWidth, height: windowHeight),
+            contentRect: NSRect(
+                x: 200,
+                y: 200,
+                width: defaultContentWidth,
+                height: defaultContentHeight
+            ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Roost"
-        window.minSize = NSSize(width: windowWidth, height: windowHeight)
+        window.minSize = NSSize(width: 720, height: 420)
+        // Dark chrome (toolbar/titlebar) so the white frame doesn't
+        // clash with the terminal's dark background. Will become a
+        // theme setting once `phase-6a` step 2d (keybind/config) lands.
+        window.appearance = NSAppearance(named: .darkAqua)
 
         // ---- Split view: sidebar | content ---------------------------
         let split = NSSplitView()
@@ -195,20 +211,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let pane = NSView()
         pane.translatesAutoresizingMaskIntoConstraints = false
 
-        let socketLabel = NSTextField(labelWithString: "socket: \(socketPath)")
-        socketLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        socketLabel.textColor = .secondaryLabelColor
-        socketLabel.translatesAutoresizingMaskIntoConstraints = false
-        pane.addSubview(socketLabel)
-
-        let statusLabel = NSTextField(labelWithString: "daemon: connecting…")
-        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.lineBreakMode = .byWordWrapping
-        statusLabel.maximumNumberOfLines = 0
-        pane.addSubview(statusLabel)
-
         let tabBar = NSStackView()
         tabBar.orientation = .horizontal
         tabBar.alignment = .centerY
@@ -226,20 +228,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         pane.addSubview(terminalContainer)
 
         NSLayoutConstraint.activate([
-            socketLabel.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
-            socketLabel.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            socketLabel.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
-
-            statusLabel.topAnchor.constraint(equalTo: socketLabel.bottomAnchor, constant: 4),
-            statusLabel.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
-
-            tabBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
+            tabBar.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
             tabBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
             tabBar.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -16),
-            // Tab bar height stays intrinsic to its tallest button —
-            // worst-case `tabBarHeight` is reserved in the window's
-            // min-size calculation up in the parent layout.
+            // Tab bar height stays intrinsic to its tallest button.
 
             terminalContainer.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
             terminalContainer.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
@@ -255,9 +247,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             ),
         ])
 
-        _ = tabBarHeight  // referenced for window-min-size math; not constrained directly
+        _ = socketPath    // retained for future toolbar/diagnostics surfacing
+        _ = tabBarHeight  // reserved for the window's min-size math
 
-        self.statusLabel = statusLabel
         self.tabBar = tabBar
         self.addTabButton = addTabButton
         self.terminalContainer = terminalContainer
@@ -269,6 +261,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        eventsTask?.cancel()
+        eventsTask = nil
         for tab in tabs {
             tab.close(socketPath: socketPath)
         }
@@ -307,7 +301,135 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 if let first = self.projects.first {
                     self.selectProject(id: first.id)
                 }
+                self.subscribeToEvents()
             }
+        }
+    }
+
+    /// Long-lived WatchEvents subscription. Drains the daemon's
+    /// server-stream and dispatches each event to a `@MainActor`
+    /// handler. On stream end (daemon shutdown, network error,
+    /// `Lagged` from the broadcast buffer overflowing) the helper
+    /// performs a full `listProjects` resync and reconnects, so a
+    /// transient disconnect doesn't permanently leave the UI stale.
+    @MainActor
+    private func subscribeToEvents() {
+        guard eventsTask == nil else { return }
+        let socketPath = self.socketPath
+        eventsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let stream = watchEvents(socketPath: socketPath)
+                for await event in stream {
+                    if Task.isCancelled { return }
+                    let kind = event.kind
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        if let kind { self.handleEvent(kind) }
+                    }
+                }
+                // Stream ended — resync from scratch and try again.
+                // Without this any transient disconnect would leave
+                // the UI silently stale.
+                if Task.isCancelled { return }
+                let fresh = await listProjects(socketPath: socketPath)
+                await MainActor.run { [weak self] in
+                    self?.applyProjectsResync(fresh)
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    /// Reconcile the daemon's project list with our local model after
+    /// a stream reconnect. Adds new projects, removes deleted ones,
+    /// renames the rest in place. Active selection is preserved when
+    /// possible; if the active project was deleted server-side, fall
+    /// back to the first available project.
+    @MainActor
+    private func applyProjectsResync(_ fresh: [ProjectSnapshot]) {
+        let freshByID = Dictionary(uniqueKeysWithValues: fresh.map { ($0.id, $0) })
+        let staleIDs = Set(projects.map(\.id)).subtracting(freshByID.keys)
+        for staleID in staleIDs {
+            removeProjectLocally(id: staleID)
+        }
+        projects = fresh
+        rebuildSidebar()
+        if let activeProjectID, freshByID[activeProjectID] == nil {
+            self.activeProjectID = nil
+            if let first = projects.first {
+                selectProject(id: first.id)
+            } else {
+                updateWindowTitle()
+                terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
+            }
+        }
+    }
+
+    /// Project deletion path shared between `WatchEvents`-driven
+    /// `ProjectDeleted` and the resync codepath. Closes any UI-side
+    /// TabSession in the project so its StreamPty shuts down cleanly.
+    @MainActor
+    private func removeProjectLocally(id: Int64) {
+        let condemned = tabs.filter { $0.projectID == id }
+        for session in condemned {
+            session.terminalView.removeFromSuperview()
+            session.close(socketPath: socketPath)
+        }
+        tabs.removeAll { $0.projectID == id }
+        activeSessionByProject.removeValue(forKey: id)
+        projects.removeAll { $0.id == id }
+    }
+
+    /// Dispatch one event from the WatchEvents stream. Anything not
+    /// surfaced visually in M1 is logged and dropped — later
+    /// milestones (M3 tab strip, Phase 6b notifications) light up
+    /// the remaining cases.
+    @MainActor
+    private func handleEvent(_ kind: Roost_V1_Event.OneOf_Kind) {
+        switch kind {
+        case .projectCreated(let e):
+            let p = e.project
+            let snap = ProjectSnapshot(id: p.id, name: p.name, cwd: p.cwd)
+            if !projects.contains(where: { $0.id == snap.id }) {
+                projects.append(snap)
+                rebuildSidebar()
+            }
+        case .projectRenamed(let e):
+            if let idx = projects.firstIndex(where: { $0.id == e.projectID }) {
+                projects[idx] = ProjectSnapshot(
+                    id: e.projectID,
+                    name: e.name,
+                    cwd: projects[idx].cwd
+                )
+                rebuildSidebar()
+            }
+        case .projectDeleted(let e):
+            let wasActive = activeProjectID == e.projectID
+            removeProjectLocally(id: e.projectID)
+            rebuildSidebar()
+            if wasActive {
+                activeProjectID = nil
+                if let next = projects.first {
+                    selectProject(id: next.id)
+                } else {
+                    updateWindowTitle()
+                    terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
+                }
+            }
+        case .tabOpened, .tabDeleted, .active:
+            // Tab-level UI convergence (cross-client OpenTab/CloseTab
+            // visibility, daemon-driven active selection) lands with
+            // M3's tab strip rewrite — the current Mac UI tracks tabs
+            // by TabSession reference, not by daemon id, so wiring
+            // these events safely requires the tab-strip refactor.
+            // M1 logs them so the wire surface is observable.
+            NSLog("roost-mac: watchEvents tab event ignored in M1: %@", "\(kind)")
+        case .tabCwd, .tabTitle, .tabState, .tabNotification,
+             .notification, .tabsReordered, .projectsReordered,
+             .hookActive:
+            // Visual surfaces for these land in M3 (tab strip with
+            // cwd / status dot) and Phase 6b (notifications).
+            break
         }
     }
 
@@ -328,6 +450,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             sidebarButtons[project.id] = button
         }
         applySidebarHighlight()
+        updateWindowTitle()
         // Window menu's Project section is driven off `projects`; keep
         // it in sync so ⌘1..⌘9 always reflects the current sidebar.
         rebuildWindowMenu()
@@ -385,6 +508,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func selectProject(id: Int64) {
         activeProjectID = id
         applySidebarHighlight()
+        updateWindowTitle()
         rebuildTabBar()
 
         let projectTabs = tabsForActiveProject()
@@ -847,23 +971,55 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func applyIdentifyOutcome(_ outcome: IdentifyOutcome) {
-        guard let label = statusLabel else { return }
         switch outcome {
         case .ok(let id):
-            label.textColor = .labelColor
-            label.stringValue = """
-                daemon: connected
-                  pid: \(id.pid)
-                  version: \(id.daemonVersion)  (proto v\(id.protocolVersion))
-                  active project: \(id.activeProjectID)  active tab: \(id.activeTabID)
-                """
+            NSLog(
+                "roost-mac: daemon connected pid=%d version=%@ proto=v%d active=project:%d/tab:%d",
+                id.pid,
+                id.daemonVersion,
+                id.protocolVersion,
+                id.activeProjectID,
+                id.activeTabID
+            )
         case .failed(let reason):
-            label.textColor = .systemRed
-            label.stringValue = """
-                daemon: not reachable
-                  reason: \(reason)
-                  hint: start it with \"cargo run -p roost-core\"
+            NSLog("roost-mac: daemon not reachable: %@", reason)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Can't reach the Roost daemon"
+            alert.informativeText = """
+                The Mac UI talks to `roost-core` over a Unix socket and \
+                couldn't connect:
+
+                \(reason)
+
+                Start the daemon with `cargo run -p roost-core` and \
+                relaunch the app.
                 """
+            alert.addButton(withTitle: "OK")
+            if let window = self.window {
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            } else {
+                alert.runModal()
+            }
+        }
+    }
+
+    /// Mirror the active project's identity in the window chrome: the
+    /// title becomes the project name and the subtitle becomes its cwd,
+    /// matching the libadwaita `AdwWindowTitle` pattern the Go binary
+    /// uses for the same window. Falls back to the plain product name
+    /// before bootstrap has resolved a project.
+    @MainActor
+    private func updateWindowTitle() {
+        guard let window else { return }
+        if let activeProjectID,
+           let project = projects.first(where: { $0.id == activeProjectID })
+        {
+            window.title = project.name.isEmpty ? "Roost" : project.name
+            window.subtitle = project.cwd
+        } else {
+            window.title = "Roost"
+            window.subtitle = ""
         }
     }
 
