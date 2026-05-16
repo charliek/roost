@@ -63,6 +63,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var socketPath: String = ""
     private var daemonReachable: Bool = false
 
+    /// User config (Phase 6a M6). Resolved once on launch from
+    /// `~/.config/roost/config.conf`; the values flow into theme
+    /// + font selection.
+    private var config: RoostConfig = .empty
+    private var activeTheme: Theme = .fallback
+    private var activeFont: NSFont = .monospacedSystemFont(
+        ofSize: 14,
+        weight: .regular
+    )
+
     /// Long-lived WatchEvents subscription task. `nil` until
     /// `bootstrapWorkspace` resolves and `subscribeToEvents` runs; the
     /// task runs forever (reconnecting on stream end) until
@@ -81,6 +91,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let socketPath = Self.defaultSocketPath()
         self.socketPath = socketPath
 
+        // Phase 6a M6: read user config + resolve theme + font
+        // before anything draws. Missing config → `.empty`; missing
+        // theme name → bundled `roost-dark`. Font defaults to
+        // `.monospacedSystemFont(ofSize: 14)` unless the user
+        // overrides `font-family` / `font-size`.
+        self.config = RoostConfig.load()
+        self.activeTheme = Theme.loadBundled(name: config.themeName ?? "roost-dark")
+        self.activeFont = resolveFont(
+            family: config.fontFamily,
+            size: config.fontSize ?? 14
+        )
+
         installMainMenu()
 
         // Probe the cell-grid intrinsic size so the right pane reserves
@@ -88,7 +110,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // its own width/height to that size in `selectTab(at:)`. The
         // window itself opens at a generous default and is freely
         // resizable; reflow to the larger cell grid is Phase 6a step 2g.
-        let metricsProbe = TerminalView(cols: 80, rows: 24)
+        let metricsProbe = TerminalView(
+            cols: 80,
+            rows: 24,
+            theme: activeTheme,
+            font: activeFont
+        )
         let terminalSize = metricsProbe.intrinsicContentSize
         let sidebarWidth: CGFloat = 220
         let tabBarHeight: CGFloat = 32
@@ -740,7 +767,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func openNewTab() {
         guard daemonReachable, let projectID = activeProjectID else { return }
-        let session = TabSession(projectID: projectID, cols: 80, rows: 24)
+        let session = TabSession(
+            projectID: projectID,
+            cols: 80,
+            rows: 24,
+            theme: activeTheme,
+            font: activeFont
+        )
         tabs.append(session)
 
         let projectTabs = tabsForActiveProject()
@@ -1143,6 +1176,24 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             window.title = "Roost"
             window.subtitle = ""
         }
+    }
+
+    /// Phase 6a M6: resolve the user's requested font into an
+    /// NSFont, falling back gracefully when the requested family
+    /// isn't installed. macOS's font fallback for monospaced text
+    /// is unreliable on a missing family, so we explicitly probe
+    /// before returning. `NSFont(name:size:)` returns nil for an
+    /// unknown family, so a single nil check is enough.
+    private func resolveFont(family: String?, size: CGFloat) -> NSFont {
+        if let family,
+           !family.isEmpty,
+           let f = NSFont(name: family, size: size)
+        {
+            return f
+        }
+        // No family or unknown → system monospace. Same default the
+        // Go binary uses when `font-family` is unset.
+        return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
     /// Resolve the same default socket path as `roost-core`'s

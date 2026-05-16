@@ -104,16 +104,25 @@ final class TerminalView: NSView {
 
     private var selection: CellSelection?
 
-    init(cols: UInt16 = 80, rows: UInt16 = 24) {
+    /// Active theme. M6 first-cut: applied to the canvas + selection
+    /// overlay + glyph fallback colors. Loaded from config on launch;
+    /// the runtime fallback is the bundled `roost-dark` theme.
+    private var theme: Theme = .fallback
+
+    init(
+        cols: UInt16 = 80,
+        rows: UInt16 = 24,
+        theme: Theme = .fallback,
+        font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    ) {
         self.cols = cols
         self.rows = rows
+        self.theme = theme
 
         // Cell metrics: monospaced system font, advance width measured
         // from a representative wide glyph ("M"), height from the
-        // font's vertical metrics. Pinning to .monospacedSystemFont
-        // means the metrics match what Core Text will draw later in
-        // 5.4c so the cell grid + glyph layout stay aligned.
-        let font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        // font's vertical metrics. Caller can override via the `font`
+        // arg so config-driven font-size (Phase 6a M6) flows through.
         let cellWidth = NSAttributedString(
             string: "M",
             attributes: [.font: font]
@@ -487,9 +496,22 @@ final class TerminalView: NSView {
         if let terminal {
             renderState.update(terminal: terminal)
         }
-        let colors = renderState.defaultColors()
-        colors.background.setFill()
+        // Phase 6a M6: prefer the user-loaded theme's fg/bg over
+        // libghostty-vt's compiled-in defaults. libghostty's
+        // default colors are what the embedded shell sees as
+        // `colors().background` when it queries via VT — flipping
+        // them at the libghostty level would require a `_set` call
+        // per startup, which the per-tab spawn lifecycle makes
+        // fiddly. Painting the canvas with the theme color here is
+        // visually equivalent for cells whose bg defers to the
+        // default; cells with explicit bg overrides still hit the
+        // walk path below.
+        let libDefaults = renderState.defaultColors()
+        let canvasBg = theme.background
+        let canvasFg = theme.foreground
+        canvasBg.setFill()
         bounds.fill()
+        _ = libDefaults
 
         // Per-cell content. Walk yields backgrounds (always
         // optional), grapheme characters (nil for empty cells),
@@ -504,7 +526,7 @@ final class TerminalView: NSView {
         // human-typing rates and per-cell allocations matter.
         let cellW = cellSize.width
         let cellH = cellSize.height
-        let defaultFg = colors.foreground
+        let defaultFg = canvasFg
         let cellFont = self.font
         renderState.walk { cell in
             let rect = NSRect(
@@ -535,8 +557,7 @@ final class TerminalView: NSView {
         // top of the glyph pass — translucent accent fill, no border.
         if let sel = selection, !sel.isEmpty {
             let n = sel.normalized()
-            let overlay = NSColor.selectedTextBackgroundColor
-                .withAlphaComponent(0.45)
+            let overlay = theme.selectionBackground.withAlphaComponent(0.6)
             overlay.setFill()
             for row in n.startRow..<n.endRow {
                 // Row-aware horizontal extent: a single-row selection
