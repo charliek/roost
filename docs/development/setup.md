@@ -75,6 +75,8 @@ The libghostty-vt API is documented as unstable. Bumps land in their own commit:
 4. Run `go test ./internal/ghostty/...` and `go test ./internal/pty/...` to validate the round-trip.
 5. Commit with a SHA + date in the message.
 
+If the bump also moves past Zig 0.15.2, drop the `maybe_arm64_sdk_shim` helper in `build/build.sh` — it exists only because Zig 0.15.2 links host artifacts as `arm64-macos`, which Apple's macOS 26+ SDK no longer exposes. See [Installation > macOS 26](../getting-started/installation.md#macos-26-tahoe--libghostty-vt-build-shim).
+
 ## Code conventions
 
 The full set is in `CLAUDE.md` at the repo root. Highlights:

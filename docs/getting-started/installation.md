@@ -19,8 +19,10 @@ Roost ships as two binaries — `roost` (GUI) and `roost-cli` (companion). Both 
 Install the system packages:
 
 ```bash
-brew install gtk4 libadwaita pkgconf gobject-introspection
+brew install gtk4 libadwaita adwaita-icon-theme pkgconf gobject-introspection
 ```
+
+`adwaita-icon-theme` is a separate Homebrew formula from `libadwaita` and ships the symbolic icons Roost's headerbar uses (`tab-new-symbolic`, `sidebar-show-symbolic`, etc.). Without it those buttons render as a missing-image placeholder.
 
 Recommended: install JetBrains Mono. It's the default font Roost looks for and renders well through Pango/Cairo on macOS:
 
@@ -72,6 +74,18 @@ Optionally install `roost-cli` on your `PATH` so Claude Code hooks (and any tab)
 sudo install -m 755 ./roost-cli /usr/local/bin/roost-cli
 ```
 
+### macOS 26 (Tahoe) — libghostty-vt build shim
+
+On macOS 26 with Apple Silicon, Apple's current `libSystem.tbd` exposes only `arm64e-macos`, but the pinned Zig 0.15.2 builds for plain `arm64-macos` — so `make libghostty` would fail at link time with `undefined symbol: _abort`, `_clock_gettime`, `__availability_version_check`, and so on for every libc symbol.
+
+`build/build.sh` works around this automatically: when it detects macOS 26+ on Apple Silicon with an arm64e-only system SDK, it generates a one-shot `xcrun` shim that redirects Zig's SDK lookup to a sibling `MacOSX15.sdk` for the duration of the `zig build` call. You'll see this line in the build output:
+
+```text
+==> macOS 26 SDK lacks arm64-macos in libSystem; redirecting xcrun to /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk
+```
+
+The shim is a no-op on Linux and on macOS where the default SDK still ships `arm64-macos`. It assumes a `MacOSX1[45].sdk` is available alongside the macOS 26 SDK — Xcode Command Line Tools usually keeps one prior major SDK installed. If you hit `error: Zig 0.15.2 needs an arm64-macos libSystem.tbd, but ... no sibling MacOSX1[45].sdk with plain arm64 was found`, reinstall the Command Line Tools (`xcode-select --install`) or bump the pinned Ghostty SHA + Zig version per the [development setup](../development/setup.md#bumping-the-pinned-ghostty-sha) instructions.
+
 ## Linux (Ubuntu / Debian)
 
 System packages:
@@ -80,9 +94,11 @@ System packages:
 sudo apt update
 sudo apt install -y \
   build-essential git curl \
-  libgtk-4-dev libadwaita-1-dev \
+  libgtk-4-dev libadwaita-1-dev adwaita-icon-theme \
   pkgconf gobject-introspection libgirepository1.0-dev
 ```
+
+`adwaita-icon-theme` is usually pulled in as a Recommends of `libadwaita-1-dev`, but listing it explicitly avoids the case where `apt install --no-install-recommends` (common on minimal/CI images) leaves the headerbar's new-tab and sidebar-toggle icons rendering as missing-image placeholders.
 
 Recommended: install JetBrains Mono (the default Roost looks for). On Debian/Ubuntu:
 
