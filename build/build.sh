@@ -151,6 +151,19 @@ stage_build() {
   # `dyld: Library not loaded: @rpath/libghostty-vt.dylib / Reason: no
   # LC_RPATH's found`. Static-only is what we want.
 
+  # Recompile the bundled icon GResource so a go build picks up any SVG
+  # edits via //go:embed. The compiled blob is also committed to the
+  # repo so a bare `go build` (without this script) still works.
+  if command -v glib-compile-resources >/dev/null 2>&1; then
+    echo "==> Compiling icon resources"
+    glib-compile-resources \
+      --target="${ROOT_DIR}/cmd/roost/icons/icons.gresource" \
+      --sourcedir="${ROOT_DIR}/cmd/roost/icons" \
+      "${ROOT_DIR}/cmd/roost/icons/icons.gresource.xml"
+  else
+    echo "warning: glib-compile-resources not found; using committed cmd/roost/icons/icons.gresource as-is."
+  fi
+
   echo "==> Building roost"
   cd "${ROOT_DIR}"
   go build -o ./roost ./cmd/roost

@@ -1,0 +1,23 @@
+Bundled icons under symbolic/ are copied unmodified from the GNOME
+Adwaita icon theme, version 50.0:
+
+    https://gitlab.gnome.org/GNOME/adwaita-icon-theme
+
+The Adwaita icon theme is dual-licensed under either:
+
+  - GNU Lesser General Public License, version 3.0 or later
+    (LGPL-3.0-or-later)
+
+  - Creative Commons Attribution-ShareAlike 3.0 Unported
+    (CC-BY-SA-3.0)
+
+The license texts (COPYING and COPYING_CCBYSA3.0) are distributed with
+the upstream repository. The CC-BY-SA share-alike clause applies to the
+icons themselves; the rest of Roost is unaffected.
+
+Files:
+
+  symbolic/places/folder-symbolic.svg
+  symbolic/actions/sidebar-show-symbolic.svg
+  symbolic/actions/sidebar-show-right-symbolic.svg
+  symbolic/actions/tab-new-symbolic.svg
