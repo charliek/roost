@@ -147,6 +147,55 @@ impl Roost for RoostService {
         Ok(Response::new(CloseTabResponse {}))
     }
 
+    /// Phase 6a M4: out-of-band PTY write so headless tools can feed
+    /// input into a tab that a UI is already showing. Routes through
+    /// `PtySupervisor::write`, which errors with `PtyError::NotFound`
+    /// if no UI has spawned the PTY yet — the same error surface the
+    /// CLI relies on to tell the user "open the tab in the UI first."
+    async fn tab_write(
+        &self,
+        req: Request<roost_proto::v1::TabWriteRequest>,
+    ) -> Result<Response<roost_proto::v1::TabWriteResponse>, Status> {
+        let r = req.into_inner();
+        self.ptys
+            .write(r.tab_id, r.data)
+            .await
+            .map_err(|e| match e {
+                crate::pty::PtyError::NotFound(_) => Status::not_found(format!(
+                    "tab {} has no live PTY (open it in the UI first)",
+                    r.tab_id
+                )),
+                crate::pty::PtyError::Closed(_) => {
+                    Status::failed_precondition(format!("tab {} PTY is closed", r.tab_id))
+                }
+            })?;
+        Ok(Response::new(roost_proto::v1::TabWriteResponse {}))
+    }
+
+    /// Phase 6a M4: out-of-band PTY resize. Same shape as
+    /// `tab_write` — useful for `roost-cli-rs tab resize` and for
+    /// future automation that wants to pin a tab to a particular
+    /// cell grid without dragging a window.
+    async fn tab_resize(
+        &self,
+        req: Request<roost_proto::v1::TabResizeRequest>,
+    ) -> Result<Response<roost_proto::v1::TabResizeResponse>, Status> {
+        let r = req.into_inner();
+        self.ptys
+            .resize(r.tab_id, r.cols as u16, r.rows as u16)
+            .await
+            .map_err(|e| match e {
+                crate::pty::PtyError::NotFound(_) => Status::not_found(format!(
+                    "tab {} has no live PTY (open it in the UI first)",
+                    r.tab_id
+                )),
+                crate::pty::PtyError::Closed(_) => {
+                    Status::failed_precondition(format!("tab {} PTY is closed", r.tab_id))
+                }
+            })?;
+        Ok(Response::new(roost_proto::v1::TabResizeResponse {}))
+    }
+
     async fn list_tabs(
         &self,
         _req: Request<ListTabsRequest>,

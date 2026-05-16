@@ -22,9 +22,10 @@ use roost_common::{connect_uds, default_socket_path};
 
 use roost_proto::v1::roost_client::RoostClient;
 use roost_proto::v1::{
-    ClearTabNotificationRequest, CreateNotificationRequest, CreateProjectRequest,
-    DeleteProjectRequest, FocusTabRequest, IdentifyRequest, ListTabsRequest, RenameProjectRequest,
-    SetTabStateRequest, SetTabTitleRequest, TabState,
+    ClearTabNotificationRequest, CloseTabRequest, CreateNotificationRequest, CreateProjectRequest,
+    DeleteProjectRequest, FocusTabRequest, IdentifyRequest, ListTabsRequest, OpenTabRequest,
+    RenameProjectRequest, SetTabStateRequest, SetTabTitleRequest, TabResizeRequest, TabState,
+    TabWriteRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -106,6 +107,52 @@ enum TabCmd {
     ClearNotification {
         #[arg(long, env = "ROOST_TAB_ID")]
         tab: Option<i64>,
+    },
+    /// Open a new tab in the given project. `--cwd` defaults to the
+    /// project's cwd; `--cols / --rows` default to 80x24 (the daemon
+    /// re-quantizes to the UI's cell grid on first attach). Returns
+    /// the new tab id on stdout.
+    Open {
+        #[arg(long)]
+        project_id: i64,
+        #[arg(long, default_value = "")]
+        cwd: String,
+        #[arg(long, default_value_t = 80)]
+        cols: u32,
+        #[arg(long, default_value_t = 24)]
+        rows: u32,
+        #[arg(long, default_value = "roost-cli-rs")]
+        title: String,
+    },
+    /// Close a tab. The daemon closes the PTY (if live) and emits
+    /// `TabDeleted`.
+    Close {
+        #[arg(long, env = "ROOST_TAB_ID")]
+        tab: Option<i64>,
+    },
+    /// Write bytes into a tab's PTY without attaching a StreamPty
+    /// stream. The tab must have an existing live PTY (i.e. a UI
+    /// must have already attached and spawned the shell) — errors
+    /// with NotFound otherwise. `--bytes` is treated as a Rust
+    /// string-escape sequence, so `\n`, `\r`, `\t`, `\x1b`, etc.
+    /// work. Pass `--raw` to disable escape decoding.
+    Send {
+        #[arg(long, env = "ROOST_TAB_ID")]
+        tab: Option<i64>,
+        #[arg(long)]
+        bytes: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Resize a tab's PTY. Same constraint as `tab send` — needs an
+    /// existing live PTY.
+    Resize {
+        #[arg(long, env = "ROOST_TAB_ID")]
+        tab: Option<i64>,
+        #[arg(long)]
+        cols: u32,
+        #[arg(long)]
+        rows: u32,
     },
 }
 
@@ -228,9 +275,106 @@ async fn main() -> Result<()> {
                 .delete_project(DeleteProjectRequest { project_id: id })
                 .await?;
         }
+        Cmd::Tab(TabCmd::Open {
+            project_id,
+            cwd,
+            cols,
+            rows,
+            title,
+        }) => {
+            let resp = client
+                .open_tab(OpenTabRequest {
+                    project_id,
+                    cwd,
+                    argv: vec![],
+                    cols,
+                    rows,
+                    title,
+                })
+                .await?
+                .into_inner();
+            let tab = resp.tab.unwrap_or_default();
+            println!(
+                "opened tab {} in project {} (cwd={})",
+                tab.id, tab.project_id, tab.cwd
+            );
+        }
+        Cmd::Tab(TabCmd::Close { tab }) => {
+            let tab_id = resolve_tab(&mut client, tab).await?;
+            client.close_tab(CloseTabRequest { tab_id }).await?;
+        }
+        Cmd::Tab(TabCmd::Send { tab, bytes, raw }) => {
+            let tab_id = resolve_tab(&mut client, tab).await?;
+            let data = if raw {
+                bytes.into_bytes()
+            } else {
+                decode_escapes(&bytes)
+            };
+            client.tab_write(TabWriteRequest { tab_id, data }).await?;
+        }
+        Cmd::Tab(TabCmd::Resize { tab, cols, rows }) => {
+            let tab_id = resolve_tab(&mut client, tab).await?;
+            client
+                .tab_resize(TabResizeRequest { tab_id, cols, rows })
+                .await?;
+        }
     }
 
     Ok(())
+}
+
+/// Decode common Rust-style string escapes from `tab send --bytes`
+/// so the user can write `--bytes "ls\n"` from a shell and get the
+/// expected newline byte (rather than the literal backslash-n).
+/// Unknown escapes pass through verbatim — the goal is convenience,
+/// not a full escape grammar.
+fn decode_escapes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            // Push the char's UTF-8 bytes verbatim.
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('0') => out.push(0),
+            Some('\\') => out.push(b'\\'),
+            Some('"') => out.push(b'"'),
+            Some('\'') => out.push(b'\''),
+            Some('x') => {
+                let h = chars.next();
+                let l = chars.next();
+                if let (Some(h), Some(l)) = (h, l) {
+                    if let Ok(b) = u8::from_str_radix(&format!("{h}{l}"), 16) {
+                        out.push(b);
+                        continue;
+                    }
+                }
+                out.push(b'\\');
+                out.push(b'x');
+                if let Some(h) = h {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(h.encode_utf8(&mut buf).as_bytes());
+                }
+                if let Some(l) = l {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(l.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            Some(other) => {
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
 }
 
 /// Resolve the tab id for a per-tab command. If the user passed

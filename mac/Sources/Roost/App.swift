@@ -486,14 +486,44 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
                 }
             }
-        case .tabOpened, .tabDeleted, .active:
-            // Tab-level UI convergence (cross-client OpenTab/CloseTab
-            // visibility, daemon-driven active selection) lands with
-            // M3's tab strip rewrite — the current Mac UI tracks tabs
-            // by TabSession reference, not by daemon id, so wiring
-            // these events safely requires the tab-strip refactor.
-            // M1 logs them so the wire surface is observable.
-            NSLog("roost-mac: watchEvents tab event ignored in M1: %@", "\(kind)")
+        case .tabDeleted(let e):
+            // Headless `tab close` (M4) or any external `CloseTab`
+            // call kills the daemon-side PTY; the Mac UI's
+            // StreamPty for that tab receives PtyExit and the
+            // TabSession's session task exits, but we still hold
+            // the reference in `tabs` until we hear this event.
+            // Tear it down now so the tab strip converges.
+            guard let session = tabs.first(where: { $0.id == e.tabID }) else { break }
+            let projectID = session.projectID
+            let wasActive = activeSessionByProject[projectID] === session
+            tabs.removeAll { $0 === session }
+            if wasActive {
+                activeSessionByProject.removeValue(forKey: projectID)
+            }
+            session.terminalView.removeFromSuperview()
+            session.close(socketPath: socketPath)
+            if projectID == activeProjectID {
+                rebuildTabBar()
+                if wasActive {
+                    let remaining = tabsForActiveProject()
+                    if remaining.isEmpty, daemonReachable {
+                        openNewTab()
+                    } else if !remaining.isEmpty {
+                        selectTab(at: 0)
+                    }
+                }
+            }
+        case .tabOpened, .active:
+            // Cross-client `OpenTab` produces a daemon-side tab the
+            // UI doesn't yet hold a TabSession for. Surfacing it in
+            // the strip would require an "attach to existing tab"
+            // path through `TabSession.start` that skips the
+            // OpenTab RPC (since the daemon tab already exists) —
+            // separate-slice work. For now we drop the event.
+            // `Active` is daemon-driven active selection: the UI's
+            // local active state is authoritative within the UI,
+            // so we drop this too.
+            NSLog("roost-mac: watchEvents tab event ignored: %@", "\(kind)")
         case .tabCwd, .tabTitle, .tabState, .tabNotification,
              .notification, .tabsReordered, .projectsReordered,
              .hookActive:
