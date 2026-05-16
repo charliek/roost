@@ -1,0 +1,40 @@
+[package]
+name        = "roost-linux"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Roost Linux UI — gtk4-rs + libadwaita-rs over the roost-core gRPC contract."
+
+# Phase 6a M8 (initial spike): single-window Identify against the
+# daemon. Cell renderer / sidebar / tab bar / StreamPty round-trip
+# are Phase 7 follow-up slices. The spike's primary purpose is to
+# prove the gtk4-rs + libadwaita-rs toolchain builds end-to-end —
+# both on Linux (the eventual production target) and on macOS via
+# Homebrew GTK4 so cross-platform development happens on a single
+# Mac.
+
+[[bin]]
+name = "roost-linux"
+path = "src/main.rs"
+
+[dependencies]
+roost-proto  = { path = "../roost-proto" }
+roost-common = { path = "../roost-common" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tonic = "0.12"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# gtk4-rs + libadwaita-rs. The `v4_12` feature on gtk4 enables the
+# 4.12+ APIs the Phase 7 step plan refers to (adw::NavigationSplitView
+# in particular, which lands in 4.10 but only stabilizes on the gtk4
+# crate side at 4.12). libadwaita's `v1_4` feature gates the
+# AdwApplicationWindow + AdwHeaderBar combination this spike uses.
+gtk4 = { version = "0.10", features = ["v4_12"] }
+libadwaita = { version = "0.8", features = ["v1_4"] }
+glib = "0.21"
