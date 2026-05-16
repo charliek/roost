@@ -156,6 +156,17 @@ final class TerminalView: NSView {
         }
         self.terminal = handle
 
+        // Phase 6a P3: push the theme's fg / bg / cursor + 256-color
+        // palette into libghostty-vt so SGR-color cells render in the
+        // theme's palette instead of libghostty's compiled-in default.
+        // M6 only changed the canvas + selection colors at draw time;
+        // this closes the SGR-cell gap so `ls --color`, `git diff`,
+        // `htop` etc. all flip with the active theme. Mirrors the
+        // Go binary's `internal/ghostty/terminal.go::SetTheme`. MUST
+        // run before any `ghostty_terminal_vt_write` so the very
+        // first frame paints with the right colors.
+        Theme.apply(theme, to: handle!)
+
         // Let edge-pinned hosts (the `terminalContainer` in
         // `RoostApp.selectTab`) stretch the view past its 80×24
         // intrinsic size. Without this AutoLayout would honor the
