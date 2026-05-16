@@ -15,14 +15,20 @@ name: Refactor CI
 
 on:
   push:
-    branches: ['claude/discuss-architecture-refactor-*']
+    branches:
+      - 'claude/discuss-architecture-refactor-*'
+      - 'feature/rust-port'
   # `pull_request.branches` matches the PR's BASE (target) branch, not the
-  # head (source). Refactor PRs target `main`, so that's what we filter
-  # on here. The job-level `if:` guards below restrict execution to PRs
-  # whose head branch is in the refactor namespace, so we don't run the
-  # Rust+Swift toolchain on every Go-only PR into main.
+  # head (source). Refactor PRs land into either `main` (legacy
+  # cjU3E -> main flow) or `feature/rust-port` (the long-lived polish
+  # branch — see plans/goal-rust-port-polish-2026-05-16.md). Job-level
+  # `if:` guards below restrict execution to PRs whose head branch is in
+  # the refactor / polish namespace so we don't run the Rust+Swift
+  # toolchain on every Go-only PR into main.
   pull_request:
-    branches: ['main']
+    branches:
+      - 'main'
+      - 'feature/rust-port'
 
 # Each job below carries the same `if:` guard. `pull_request.branches` only
 # filters the PR target, so the per-job `startsWith(github.head_ref, ...)`
@@ -33,7 +39,9 @@ jobs:
   rust-lint:
     if: >-
       github.event_name == 'push' ||
-      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
+      startsWith(github.head_ref, 'feature/rust-port') ||
+      startsWith(github.head_ref, 'polish/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -68,7 +76,9 @@ jobs:
   rust-build:
     if: >-
       github.event_name == 'push' ||
-      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
+      startsWith(github.head_ref, 'feature/rust-port') ||
+      startsWith(github.head_ref, 'polish/')
     strategy:
       fail-fast: false
       matrix:
@@ -150,7 +160,9 @@ jobs:
   swift-mac:
     if: >-
       github.event_name == 'push' ||
-      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
+      startsWith(github.head_ref, 'feature/rust-port') ||
+      startsWith(github.head_ref, 'polish/')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6

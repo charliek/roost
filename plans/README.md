@@ -47,11 +47,22 @@ All refactor work lives on `claude/discuss-architecture-refactor-cjU3E`. New Rus
     └── vision.md          # Target architecture (this dir + its kin describe the plan)
 ```
 
-## Status snapshot (2026-05-14)
+## Active goal
+
+[`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md)
+— polish the Swift Mac UI to match the Go binary on visual + key
+functional 6a items. Lives on the long-lived
+[`feature/rust-port`](../../../tree/feature/rust-port) branch as a sequence
+of milestone PRs (M1–M5). [UX assessment](ux-assessment-2026-05-16.md)
+captures the snapshot of where the prototype stood when the goal was set.
+
+## Status snapshot (2026-05-16)
 
 * Phases 0–5 landed and merged-ready.
-* Phase 6a is roughly 70% done. Multi-tab, project sidebar, project lifecycle RPCs, shortcut alignment with the Go binary, and a live-daemon CI regression guard are in. Remaining: WatchEvents subscription, keybind override config, secondary shortcuts (cycle_tab, font sizing, toggle_sidebar, rename_tab), visual polish.
-* Phases 6b, 7, 8, 9 not yet started.
+* Phase 6a is roughly 70% done on `cjU3E` (frozen at `00b3d10`). Multi-tab, project sidebar, project lifecycle RPCs, shortcut alignment with the Go binary, and a live-daemon CI regression guard are in.
+* The rest of Phase 6a's open items (WatchEvents, window resize, selection / copy) plus a polish-quality pass on the Swift UI now live in the [active goal](goal-rust-port-polish-2026-05-16.md) on `feature/rust-port`. Direction was set after a side-by-side comparison against the Go binary and cmux — see the [UX assessment](ux-assessment-2026-05-16.md).
+* Phase 6b (Mac OSC + notifications) and beyond not yet started.
+* macOS 26 arm64e-only SDK workaround is in both `build/build.sh` (from `f6e0d64` on main) and `third_party/ghostty/build.sh` (from `00b3d10` on cjU3E) — both Zig 0.15.2 + Ghostty SHA toolchains build on macOS 26 hosts.
 * Two ghostty builds (`build/build.sh` for Go cgo, `third_party/ghostty/build.sh` for Rust bindgen + Swift) coexist and must pin the same SHA. They collapse in Phase 9.
 
 ## How to use these documents
