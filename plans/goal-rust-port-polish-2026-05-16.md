@@ -188,8 +188,15 @@ PR target: `feature/rust-port`. Branch: `polish/selection-copy`.
 
 ## Milestone log
 
-* **M1 — Chrome foundation + WatchEvents** — PR opened 2026-05-16. _(in progress)_
-* M2 — pending M1.
+* **M1 — Chrome foundation + WatchEvents** — ✅ merged 2026-05-16 (PR [#23](https://github.com/charliek/roost/pull/23), squash commit [`90fbc58`](https://github.com/charliek/roost/commit/90fbc585052df0add0a2ae4c5122ed76a5d94883)).
+  * Slice (a) chrome polish: debug chrome removed, `NSWindow.title` + `subtitle` bound to active project, 1100×700 default + 720×420 min, `.darkAqua` chrome.
+  * Slice (b) WatchEvents: `RoostClient.watchEvents` + `RoostApp.subscribeToEvents` with stream-end resync; `projectCreated/Renamed/Deleted` fully propagated; tab events logged but not yet acted on (waiting on M3's tab-strip refactor).
+  * Verified end-to-end: `roost-cli-rs project create/rename/delete` reflects in the sidebar within ~50ms with no app restart.
+  * Process notes:
+    * Auto-merge fired immediately on first `gh pr merge --auto --squash` because no branch protection was set up at the time. Branch protection on `feature/rust-port` (requiring `ci.yml` + `refactor.yml` status checks) was applied after the merge; M2 onward will properly gate on green CI.
+    * `allow_auto_merge` was off at the repo level; flipped to true.
+    * Two settings to keep in mind for future PRs: branch protection rules are in place, and auto-merge respects them.
+* M2 — Native sidebar (NSOutlineView). _(blocked on M1; M1 merged, can now start)_
 * M3 — pending M2.
 * M4 — pending M3.
 * M5 — pending M4.

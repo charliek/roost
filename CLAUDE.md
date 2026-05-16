@@ -8,7 +8,11 @@ This file remains authoritative for the **current** Go + GTK4 implementation tha
 
 ## Branch policy
 
-Refactor work lands on `claude/discuss-architecture-refactor-cjU3E`. New Rust/Swift/proto code lives under `/proto`, `/crates`, `/mac`, `/linux`, `/third_party/ghostty`; the existing `cmd/` and `internal/` Go layout stays in place until the Phase 9 cutover. `main` must keep building as Go + GTK throughout, and both the existing CI workflow (`.github/workflows/ci.yml`) and the refactor CI (`.github/workflows/refactor.yml`) must stay green on every commit.
+The long-lived refactor branch is `feature/rust-port`. Polish PRs from short-lived `polish/*` topic branches merge into it (squash-merge, auto-merge gated on `ci.yml` + `refactor.yml` green via branch protection). When `feature/rust-port` is "shown enough polish to be the direction forward" — see [`plans/goal-rust-port-polish-2026-05-16.md`](plans/goal-rust-port-polish-2026-05-16.md) for the milestone schedule and exit bar — it merges to `main` as a single large merge.
+
+`claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor branch and is **frozen** at `00b3d10`. Do not start new work on it.
+
+New Rust/Swift/proto code lives under `/proto`, `/crates`, `/mac`, `/linux`, `/third_party/ghostty`; the existing `cmd/` and `internal/` Go layout stays in place until the Phase 9 cutover. `main` must keep building as Go + GTK throughout, and both the existing CI workflow (`.github/workflows/ci.yml`) and the refactor CI (`.github/workflows/refactor.yml`) must stay green on every commit.
 
 ### Two libghostty-vt builds coexist until Phase 9
 
