@@ -23,7 +23,6 @@ import Foundation
 @MainActor
 final class RoostApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
-    private var statusLabel: NSTextField?
 
     /// Sidebar widgets. `sidebarStack` arranges project buttons +
     /// a trailing "+ New Project" row; `sidebarButtons` indexes them
@@ -68,24 +67,35 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         installMainMenu()
 
-        // Cell-grid intrinsic size of an 80x24 terminal fixes the
-        // window's minimum content height + the right-pane width.
+        // Probe the cell-grid intrinsic size so the right pane reserves
+        // enough room for an 80×24 terminal — `TerminalView` still pins
+        // its own width/height to that size in `selectTab(at:)`. The
+        // window itself opens at a generous default and is freely
+        // resizable; reflow to the larger cell grid is Phase 6a step 2g.
         let metricsProbe = TerminalView(cols: 80, rows: 24)
         let terminalSize = metricsProbe.intrinsicContentSize
-        let sidebarWidth: CGFloat = 200
-        let headerSliceHeight: CGFloat = 112
+        let sidebarWidth: CGFloat = 220
         let tabBarHeight: CGFloat = 32
-        let windowWidth = sidebarWidth + max(720, terminalSize.width + 48)
-        let windowHeight = terminalSize.height + headerSliceHeight + tabBarHeight + 32
+        let defaultContentWidth: CGFloat = 1100
+        let defaultContentHeight: CGFloat = 700
 
         let window = NSWindow(
-            contentRect: NSRect(x: 200, y: 200, width: windowWidth, height: windowHeight),
+            contentRect: NSRect(
+                x: 200,
+                y: 200,
+                width: defaultContentWidth,
+                height: defaultContentHeight
+            ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Roost"
-        window.minSize = NSSize(width: windowWidth, height: windowHeight)
+        window.minSize = NSSize(width: 720, height: 420)
+        // Dark chrome (toolbar/titlebar) so the white frame doesn't
+        // clash with the terminal's dark background. Will become a
+        // theme setting once `phase-6a` step 2d (keybind/config) lands.
+        window.appearance = NSAppearance(named: .darkAqua)
 
         // ---- Split view: sidebar | content ---------------------------
         let split = NSSplitView()
@@ -195,20 +205,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let pane = NSView()
         pane.translatesAutoresizingMaskIntoConstraints = false
 
-        let socketLabel = NSTextField(labelWithString: "socket: \(socketPath)")
-        socketLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        socketLabel.textColor = .secondaryLabelColor
-        socketLabel.translatesAutoresizingMaskIntoConstraints = false
-        pane.addSubview(socketLabel)
-
-        let statusLabel = NSTextField(labelWithString: "daemon: connecting…")
-        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.lineBreakMode = .byWordWrapping
-        statusLabel.maximumNumberOfLines = 0
-        pane.addSubview(statusLabel)
-
         let tabBar = NSStackView()
         tabBar.orientation = .horizontal
         tabBar.alignment = .centerY
@@ -226,20 +222,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         pane.addSubview(terminalContainer)
 
         NSLayoutConstraint.activate([
-            socketLabel.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
-            socketLabel.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            socketLabel.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
-
-            statusLabel.topAnchor.constraint(equalTo: socketLabel.bottomAnchor, constant: 4),
-            statusLabel.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
-
-            tabBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
+            tabBar.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
             tabBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
             tabBar.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -16),
-            // Tab bar height stays intrinsic to its tallest button —
-            // worst-case `tabBarHeight` is reserved in the window's
-            // min-size calculation up in the parent layout.
+            // Tab bar height stays intrinsic to its tallest button.
 
             terminalContainer.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
             terminalContainer.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
@@ -255,9 +241,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             ),
         ])
 
-        _ = tabBarHeight  // referenced for window-min-size math; not constrained directly
+        _ = socketPath    // retained for future toolbar/diagnostics surfacing
+        _ = tabBarHeight  // reserved for the window's min-size math
 
-        self.statusLabel = statusLabel
         self.tabBar = tabBar
         self.addTabButton = addTabButton
         self.terminalContainer = terminalContainer
@@ -328,6 +314,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             sidebarButtons[project.id] = button
         }
         applySidebarHighlight()
+        updateWindowTitle()
         // Window menu's Project section is driven off `projects`; keep
         // it in sync so ⌘1..⌘9 always reflects the current sidebar.
         rebuildWindowMenu()
@@ -385,6 +372,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func selectProject(id: Int64) {
         activeProjectID = id
         applySidebarHighlight()
+        updateWindowTitle()
         rebuildTabBar()
 
         let projectTabs = tabsForActiveProject()
@@ -847,23 +835,55 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func applyIdentifyOutcome(_ outcome: IdentifyOutcome) {
-        guard let label = statusLabel else { return }
         switch outcome {
         case .ok(let id):
-            label.textColor = .labelColor
-            label.stringValue = """
-                daemon: connected
-                  pid: \(id.pid)
-                  version: \(id.daemonVersion)  (proto v\(id.protocolVersion))
-                  active project: \(id.activeProjectID)  active tab: \(id.activeTabID)
-                """
+            NSLog(
+                "roost-mac: daemon connected pid=%d version=%@ proto=v%d active=project:%d/tab:%d",
+                id.pid,
+                id.daemonVersion,
+                id.protocolVersion,
+                id.activeProjectID,
+                id.activeTabID
+            )
         case .failed(let reason):
-            label.textColor = .systemRed
-            label.stringValue = """
-                daemon: not reachable
-                  reason: \(reason)
-                  hint: start it with \"cargo run -p roost-core\"
+            NSLog("roost-mac: daemon not reachable: %@", reason)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Can't reach the Roost daemon"
+            alert.informativeText = """
+                The Mac UI talks to `roost-core` over a Unix socket and \
+                couldn't connect:
+
+                \(reason)
+
+                Start the daemon with `cargo run -p roost-core` and \
+                relaunch the app.
                 """
+            alert.addButton(withTitle: "OK")
+            if let window = self.window {
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            } else {
+                alert.runModal()
+            }
+        }
+    }
+
+    /// Mirror the active project's identity in the window chrome: the
+    /// title becomes the project name and the subtitle becomes its cwd,
+    /// matching the libadwaita `AdwWindowTitle` pattern the Go binary
+    /// uses for the same window. Falls back to the plain product name
+    /// before bootstrap has resolved a project.
+    @MainActor
+    private func updateWindowTitle() {
+        guard let window else { return }
+        if let activeProjectID,
+           let project = projects.first(where: { $0.id == activeProjectID })
+        {
+            window.title = project.name.isEmpty ? "Roost" : project.name
+            window.subtitle = project.cwd
+        } else {
+            window.title = "Roost"
+            window.subtitle = ""
         }
     }
 
