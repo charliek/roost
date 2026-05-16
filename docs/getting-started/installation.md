@@ -19,8 +19,10 @@ Roost ships as two binaries — `roost` (GUI) and `roost-cli` (companion). Both 
 Install the system packages:
 
 ```bash
-brew install gtk4 libadwaita pkgconf gobject-introspection
+brew install gtk4 libadwaita adwaita-icon-theme pkgconf gobject-introspection
 ```
+
+`adwaita-icon-theme` is a separate Homebrew formula from `libadwaita` and ships the symbolic icons Roost's headerbar uses (`tab-new-symbolic`, `sidebar-show-symbolic`, etc.). Without it those buttons render as a missing-image placeholder.
 
 Recommended: install JetBrains Mono. It's the default font Roost looks for and renders well through Pango/Cairo on macOS:
 
@@ -78,7 +80,7 @@ On macOS 26 with Apple Silicon, Apple's current `libSystem.tbd` exposes only `ar
 
 `build/build.sh` works around this automatically: when it detects macOS 26+ on Apple Silicon with an arm64e-only system SDK, it generates a one-shot `xcrun` shim that redirects Zig's SDK lookup to a sibling `MacOSX15.sdk` for the duration of the `zig build` call. You'll see this line in the build output:
 
-```
+```text
 ==> macOS 26 SDK lacks arm64-macos in libSystem; redirecting xcrun to /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk
 ```
 
@@ -92,9 +94,11 @@ System packages:
 sudo apt update
 sudo apt install -y \
   build-essential git curl \
-  libgtk-4-dev libadwaita-1-dev \
+  libgtk-4-dev libadwaita-1-dev adwaita-icon-theme \
   pkgconf gobject-introspection libgirepository1.0-dev
 ```
+
+`adwaita-icon-theme` is usually pulled in as a Recommends of `libadwaita-1-dev`, but listing it explicitly avoids the case where `apt install --no-install-recommends` (common on minimal/CI images) leaves the headerbar's new-tab and sidebar-toggle icons rendering as missing-image placeholders.
 
 Recommended: install JetBrains Mono (the default Roost looks for). On Debian/Ubuntu:
 

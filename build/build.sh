@@ -90,7 +90,13 @@ EOF
 sdk_has_plain_arm64() {
   local tbd="$1/usr/lib/libSystem.tbd"
   [ -f "${tbd}" ] || return 1
-  head -20 "${tbd}" | grep -Eq '(^|[, ])arm64-macos([, ]|$)'
+  # libSystem.tbd is a multi-document YAML: the first document is the
+  # libSystem entry itself; subsequent documents are re-exported
+  # sub-libraries that may still list arm64-macos even when libSystem
+  # itself is arm64e-only on macOS 26+. Restrict the match to the
+  # first document.
+  awk '/^---/ && ++n>1 { exit } { print }' "${tbd}" \
+    | grep -Eq '(^|[[:space:],])arm64-macos([[:space:],]|$)'
 }
 
 stage_libghostty() {
