@@ -22,8 +22,11 @@ import AppKit
 import CGhosttyVT
 
 final class TerminalView: NSView {
-    let cols: UInt16
-    let rows: UInt16
+    /// Live cell-grid metrics. `cols` and `rows` follow the view's
+    /// bounds — Phase 6a M3 lifts the previous "fixed at init"
+    /// invariant so window resize reflows the terminal.
+    private(set) var cols: UInt16
+    private(set) var rows: UInt16
     let cellSize: CGSize
     let font: NSFont
 
@@ -51,6 +54,11 @@ final class TerminalView: NSView {
     /// `event.characters`; 5.5c upgrades to libghostty-vt's full
     /// key encoder for arrows / function keys / modifier handling.
     @MainActor var onKey: ((Data) -> Void)?
+
+    /// Set by `TabSession.start` so the view can ask its host to
+    /// propagate a resize over StreamPty when the window resizes
+    /// and the cell grid changes shape.
+    @MainActor var onResize: ((UInt16, UInt16) -> Void)?
 
     init(cols: UInt16 = 80, rows: UInt16 = 24) {
         self.cols = cols
@@ -94,6 +102,16 @@ final class TerminalView: NSView {
             fatalError("ghostty_terminal_new failed (rc.rawValue=\(rc.rawValue))")
         }
         self.terminal = handle
+
+        // Let edge-pinned hosts (the `terminalContainer` in
+        // `RoostApp.selectTab`) stretch the view past its 80×24
+        // intrinsic size. Without this AutoLayout would honor the
+        // intrinsic content size and leave dead space inside the
+        // container.
+        setContentHuggingPriority(.defaultLow - 1, for: .horizontal)
+        setContentHuggingPriority(.defaultLow - 1, for: .vertical)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .vertical)
     }
 
     /// Feed VT bytes into the local libghostty-vt terminal and
@@ -227,6 +245,45 @@ final class TerminalView: NSView {
             width: cellSize.width * CGFloat(cols),
             height: cellSize.height * CGFloat(rows)
         )
+    }
+
+    /// On every frame size change, reflow the cell grid. Floor-
+    /// quantizing the available pixels by `cellSize` keeps the
+    /// rendered grid pixel-aligned — anything else and we'd get
+    /// fractional-pixel cell boundaries that smear glyphs on a
+    /// HiDPI display.
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        reflowGridForBounds()
+    }
+
+    /// Compute the largest (cols, rows) that fit in the current
+    /// bounds, push them to libghostty-vt via
+    /// `ghostty_terminal_resize`, fire `onResize` so the host can
+    /// propagate over StreamPty, and request a redraw.
+    ///
+    /// `cell_width_px` / `cell_height_px` are passed as integer
+    /// pixel sizes — libghostty-vt's resize signature exposes them
+    /// for graphics-extension consumers (e.g. sixel / Kitty
+    /// graphics). We round to nearest because the rendered cells
+    /// use the same `cellSize.width`-typed integer step in
+    /// `draw(_:)`.
+    @MainActor
+    private func reflowGridForBounds() {
+        guard cellSize.width > 0, cellSize.height > 0 else { return }
+        let newCols = max(1, UInt16(floor(bounds.width / cellSize.width)))
+        let newRows = max(1, UInt16(floor(bounds.height / cellSize.height)))
+        if newCols == cols && newRows == rows { return }
+        cols = newCols
+        rows = newRows
+        if let terminal {
+            let cellWPx = UInt32(cellSize.width.rounded())
+            let cellHPx = UInt32(cellSize.height.rounded())
+            _ = ghostty_terminal_resize(terminal, newCols, newRows, cellWPx, cellHPx)
+        }
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
+        onResize?(newCols, newRows)
     }
 
     override func draw(_ dirtyRect: NSRect) {

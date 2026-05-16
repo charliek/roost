@@ -27,8 +27,11 @@ import Foundation
 
 @MainActor
 final class TabSession {
-    let cols: UInt16
-    let rows: UInt16
+    /// Initial cell-grid size used to spawn the daemon-side PTY. The
+    /// live grid follows `terminalView.cols / rows`, which update on
+    /// window resize (Phase 6a M3 / step 2g).
+    let initialCols: UInt16
+    let initialRows: UInt16
     let terminalView: TerminalView
 
     /// Daemon-assigned tab id. `nil` until `OpenTab` returns; the
@@ -42,13 +45,36 @@ final class TabSession {
 
     private var sessionTask: Task<Void, Never>?
     private var outputDrainTask: Task<Void, Never>?
-    private var keystrokeContinuation: AsyncStream<Data>.Continuation?
+    private var keystrokeContinuation: AsyncStream<PtyClientEvent>.Continuation?
+
+    /// Last cols/rows we sent to the daemon. Used to deduplicate
+    /// resize events that fall within a single live-resize gesture
+    /// (NSView `setFrameSize` can fire dozens of times for one
+    /// drag, but the grid metric is stable in chunks).
+    private var lastSentCols: UInt16
+    private var lastSentRows: UInt16
 
     init(projectID: Int64, cols: UInt16 = 80, rows: UInt16 = 24) {
         self.projectID = projectID
-        self.cols = cols
-        self.rows = rows
+        self.initialCols = cols
+        self.initialRows = rows
+        self.lastSentCols = cols
+        self.lastSentRows = rows
         self.terminalView = TerminalView(cols: cols, rows: rows)
+    }
+
+    /// Send a PTY resize event upstream. Called by the TerminalView
+    /// host whenever the cell grid changes size due to a window
+    /// resize. Drops no-op resizes (same dimensions as the last sent
+    /// pair) so the writer loop doesn't get hammered during live
+    /// drag.
+    @MainActor
+    func resize(cols: UInt16, rows: UInt16) {
+        guard cols > 0, rows > 0 else { return }
+        guard cols != lastSentCols || rows != lastSentRows else { return }
+        lastSentCols = cols
+        lastSentRows = rows
+        keystrokeContinuation?.yield(.resize(cols: cols, rows: rows))
     }
 
     /// Spin up the StreamPty session. Safe to call once per
@@ -63,12 +89,15 @@ final class TabSession {
         title: String,
         onIDAssigned: @escaping @MainActor (Int64) -> Void
     ) {
-        let (keystrokes, kCont) = AsyncStream<Data>.makeStream()
+        let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
         let (output, oCont) = AsyncStream<Data>.makeStream()
         self.keystrokeContinuation = kCont
 
         terminalView.onKey = { [weak self] data in
-            self?.keystrokeContinuation?.yield(data)
+            self?.keystrokeContinuation?.yield(.input(data))
+        }
+        terminalView.onResize = { [weak self] cols, rows in
+            self?.resize(cols: cols, rows: rows)
         }
 
         outputDrainTask = Task { @MainActor [weak self] in
@@ -77,8 +106,8 @@ final class TabSession {
             }
         }
 
-        let cols = self.cols
-        let rows = self.rows
+        let cols = self.initialCols
+        let rows = self.initialRows
         let projectID = self.projectID
         sessionTask = Task {
             await runShellSession(

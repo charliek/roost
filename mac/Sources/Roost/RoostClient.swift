@@ -139,13 +139,21 @@ private func clientVersion() -> String {
 /// daemon as a `PtyInput`. Closing the keystroke stream
 /// (`continuation.finish()`) closes the writer and ends the
 /// session.
+/// Outbound events the UI can send on the StreamPty bidi stream.
+/// Phase 6a M3 lifts the previous "stream is just keystroke bytes"
+/// shape so window-resize can ride the same channel as input.
+enum PtyClientEvent: Sendable {
+    case input(Data)
+    case resize(cols: UInt16, rows: UInt16)
+}
+
 func runShellSession(
     socketPath: String,
     projectID: Int64 = 0,
     cols: UInt16 = 80,
     rows: UInt16 = 24,
     title: String = "roost-mac",
-    keystrokes: AsyncStream<Data>,
+    keystrokes: AsyncStream<PtyClientEvent>,
     onTabOpened: @escaping @Sendable (Int64) -> Void,
     onOutput: @escaping @Sendable (Data) -> Void
 ) async {
@@ -188,15 +196,27 @@ func runShellSession(
                         }
                     }
                 )
-                // Pump keystrokes -> PtyInput. Loop ends naturally
-                // when the keystroke stream's continuation finishes
-                // (eg when the window closes).
-                for await chunk in keystrokes {
-                    try await writer.write(
-                        .with {
-                            $0.input = Roost_V1_PtyInput.with { $0.data = chunk }
-                        }
-                    )
+                // Pump events -> PtyInput / PtyResize. Loop ends
+                // naturally when the keystroke stream's continuation
+                // finishes (eg when the window closes).
+                for await event in keystrokes {
+                    switch event {
+                    case .input(let chunk):
+                        try await writer.write(
+                            .with {
+                                $0.input = Roost_V1_PtyInput.with { $0.data = chunk }
+                            }
+                        )
+                    case .resize(let cols, let rows):
+                        try await writer.write(
+                            .with {
+                                $0.resize = Roost_V1_PtyResize.with {
+                                    $0.cols = UInt32(cols)
+                                    $0.rows = UInt32(rows)
+                                }
+                            }
+                        )
+                    }
                 }
             } onResponse: { response in
                 for try await message in response.messages {

@@ -269,13 +269,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let tabBar = NSStackView()
         tabBar.orientation = .horizontal
         tabBar.alignment = .centerY
-        tabBar.spacing = 4
+        tabBar.spacing = 6
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         pane.addSubview(tabBar)
 
-        let addTabButton = NSButton(title: "+", target: self, action: #selector(newTab(_:)))
-        addTabButton.bezelStyle = .rounded
+        // "+" is a plain bordered button to the right of the pills.
+        // Lighter affordance than a full-bezel rounded button so the
+        // tab pills carry the visual weight.
+        let addTabButton = NSButton(
+            title: "＋",
+            target: self,
+            action: #selector(newTab(_:))
+        )
+        addTabButton.bezelStyle = .accessoryBar
+        addTabButton.isBordered = false
         addTabButton.toolTip = "New tab (⌘T)"
+        addTabButton.font = .systemFont(ofSize: 16, weight: .regular)
+        addTabButton.contentTintColor = .secondaryLabelColor
         tabBar.addArrangedSubview(addTabButton)
 
         let terminalContainer = NSView()
@@ -288,17 +298,22 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             tabBar.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -16),
             // Tab bar height stays intrinsic to its tallest button.
 
+            // Terminal container fills the content pane below the
+            // tab bar. Width is unconstrained from above — when the
+            // window resizes, the container grows and `TerminalView`
+            // reflows its cell grid in `setFrameSize`. `terminalSize`
+            // (the 80x24 cell-grid intrinsic) is preserved as the
+            // floor so the terminal can't be squeezed below a
+            // minimal usable shape.
             terminalContainer.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
             terminalContainer.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
+            terminalContainer.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
+            terminalContainer.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -16),
             terminalContainer.widthAnchor.constraint(
                 greaterThanOrEqualToConstant: terminalSize.width
             ),
             terminalContainer.heightAnchor.constraint(
                 greaterThanOrEqualToConstant: terminalSize.height
-            ),
-            terminalContainer.bottomAnchor.constraint(
-                lessThanOrEqualTo: pane.bottomAnchor,
-                constant: -16
             ),
         ])
 
@@ -754,11 +769,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let view = session.terminalView
         view.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(view)
+        // Edge-pin instead of intrinsic-content-size pin so the
+        // terminal fills whatever rectangle the container has.
+        // `TerminalView.setFrameSize` recomputes cell-grid cols/rows
+        // from the new bounds and propagates a PtyResize over
+        // StreamPty (Phase 6a M3 / step 2g).
         NSLayoutConstraint.activate([
             view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             view.topAnchor.constraint(equalTo: container.topAnchor),
-            view.widthAnchor.constraint(equalToConstant: view.intrinsicContentSize.width),
-            view.heightAnchor.constraint(equalToConstant: view.intrinsicContentSize.height),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         activeSessionByProject[activeProjectID] = session
@@ -779,19 +799,54 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         for (index, session) in projectTabs.enumerated() {
             let isActive = session === activeSession
-            let marker = isActive ? "● " : "  "
-            let title = "\(marker)Tab \(index + 1)"
-            let button = NSButton(
-                title: title,
-                target: self,
-                action: #selector(tabButtonClicked(_:))
+            let pill = TabPillView(
+                index: index,
+                title: "Tab \(index + 1)",
+                isActive: isActive,
+                onSelect: { [weak self] idx in
+                    self?.selectTab(at: idx)
+                },
+                onClose: { [weak self] idx in
+                    self?.closeTab(at: idx)
+                }
             )
-            button.tag = index
-            button.bezelStyle = .rounded
-            tabBar.insertArrangedSubview(button, at: tabBar.arrangedSubviews.count - 1)
+            _ = session  // referenced for future per-session metadata (cwd, status)
+            tabBar.insertArrangedSubview(pill, at: tabBar.arrangedSubviews.count - 1)
         }
 
         rebuildWindowMenu()
+    }
+
+    /// Close the tab at the given index in the active project. The
+    /// only caller right now is `TabPillView.onClose` — the rest of
+    /// the close paths route through `closeActiveTabImpl()` via the
+    /// `⌘W` shortcut.
+    @MainActor
+    private func closeTab(at indexInActiveProject: Int) {
+        guard let activeProjectID else { return }
+        let projectTabs = tabsForActiveProject()
+        guard projectTabs.indices.contains(indexInActiveProject) else { return }
+        let session = projectTabs[indexInActiveProject]
+        let wasActive = activeSessionByProject[activeProjectID] === session
+
+        tabs.removeAll { $0 === session }
+        if wasActive {
+            activeSessionByProject.removeValue(forKey: activeProjectID)
+        }
+        session.terminalView.removeFromSuperview()
+        session.close(socketPath: socketPath)
+
+        let remaining = tabsForActiveProject()
+        if remaining.isEmpty {
+            rebuildTabBar()
+            if daemonReachable { openNewTab() }
+            return
+        }
+        rebuildTabBar()
+        if wasActive {
+            let nextIndex = min(indexInActiveProject, remaining.count - 1)
+            selectTab(at: nextIndex)
+        }
     }
 
     @MainActor
@@ -864,11 +919,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func closeActiveTab(_ sender: Any?) {
         closeActiveTabImpl()
-    }
-
-    @objc @MainActor
-    private func tabButtonClicked(_ sender: NSButton) {
-        selectTab(at: sender.tag)
     }
 
     @objc @MainActor
@@ -1075,6 +1125,124 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             return "\(home)/Library/Caches/roost/roost.sock"
         }
         return "/tmp/roost.sock"
+    }
+}
+
+// MARK: - Tab strip
+
+/// One pill in the tab strip. Custom `NSView` so the layout is:
+///   [status-dot slot 10x10] [label] [× close on active]
+/// inside a rounded background that flips between two tints based
+/// on active state. Clicks anywhere on the pill (except the close
+/// glyph) fire `onSelect(index)`; the close glyph fires
+/// `onClose(index)`. The status-dot slot draws nothing in M3 — it
+/// goes live in Phase 6b when `TabStateChangedEvent` lands.
+@MainActor
+final class TabPillView: NSView {
+    private let index: Int
+    private let isActive: Bool
+    private let onSelect: @MainActor (Int) -> Void
+    private let onClose: @MainActor (Int) -> Void
+
+    private let label: NSTextField
+    private let closeButton: NSButton
+
+    init(
+        index: Int,
+        title: String,
+        isActive: Bool,
+        onSelect: @escaping @MainActor (Int) -> Void,
+        onClose: @escaping @MainActor (Int) -> Void
+    ) {
+        self.index = index
+        self.isActive = isActive
+        self.onSelect = onSelect
+        self.onClose = onClose
+
+        self.label = NSTextField(labelWithString: title)
+        self.label.font = .systemFont(
+            ofSize: 12,
+            weight: isActive ? .medium : .regular
+        )
+        self.label.textColor = isActive ? .labelColor : .secondaryLabelColor
+        self.label.lineBreakMode = .byTruncatingTail
+        self.label.maximumNumberOfLines = 1
+        self.label.translatesAutoresizingMaskIntoConstraints = false
+
+        self.closeButton = NSButton(title: "×", target: nil, action: nil)
+        self.closeButton.isBordered = false
+        self.closeButton.font = .systemFont(ofSize: 13, weight: .regular)
+        self.closeButton.contentTintColor = .secondaryLabelColor
+        self.closeButton.isHidden = !isActive
+        self.closeButton.translatesAutoresizingMaskIntoConstraints = false
+
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.backgroundColor = (isActive
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
+            : NSColor.clear).cgColor
+
+        // Status-dot slot — reserves 10pt on the leading edge so the
+        // label position is stable when the dot turns on later.
+        let statusSlot = NSView()
+        statusSlot.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(statusSlot)
+        addSubview(label)
+        addSubview(closeButton)
+
+        // `closeButton.target/action` need self to be a captured
+        // weak reference so the pill doesn't leak through the
+        // closure → AppKit retain cycle.
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 24),
+
+            statusSlot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            statusSlot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            statusSlot.widthAnchor.constraint(equalToConstant: 10),
+            statusSlot.heightAnchor.constraint(equalToConstant: 10),
+
+            label.leadingAnchor.constraint(equalTo: statusSlot.trailingAnchor, constant: 6),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            closeButton.leadingAnchor.constraint(
+                greaterThanOrEqualTo: label.trailingAnchor,
+                constant: 6
+            ),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 16),
+            closeButton.heightAnchor.constraint(equalToConstant: 16),
+
+            // Inactive pills have no close button visible, but the
+            // trailing padding still needs to land on a fixed edge so
+            // the pill shape doesn't squeeze the label.
+            label.trailingAnchor.constraint(
+                lessThanOrEqualTo: trailingAnchor,
+                constant: isActive ? -28 : -12
+            ),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    /// Single-click anywhere on the pill (except over the close
+    /// glyph) selects the tab. `mouseDown` short-circuits AppKit's
+    /// drag tracking, which is what we want — clicks shouldn't have
+    /// to wait for a drag-threshold timeout to fire.
+    override func mouseDown(with event: NSEvent) {
+        // The close button intercepts its own clicks via the
+        // NSButton's hit-testing; if the event reaches the pill it
+        // wasn't over the close button.
+        onSelect(index)
+    }
+
+    @objc private func closeClicked() {
+        onClose(index)
     }
 }
 
