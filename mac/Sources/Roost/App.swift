@@ -24,14 +24,24 @@ import Foundation
 final class RoostApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
 
-    /// Sidebar widgets. `sidebarStack` arranges project buttons +
-    /// a trailing "+ New Project" row; `sidebarButtons` indexes them
-    /// by project id so we can update active highlighting in place
-    /// instead of rebuilding the whole stack on every selection
-    /// change.
-    private var sidebarStack: NSStackView?
+    /// Sidebar widgets. The project list is an `NSOutlineView` styled
+    /// as a source list (Phase 6a step 2i / goal doc M2). The outline
+    /// view's selection state is the single source of truth for the
+    /// active-row affordance — no `"● "` text marker; AppKit's native
+    /// row selection draws the highlight. `+ New Project` is a footer
+    /// button anchored at the pane's bottom.
+    private var projectsOutlineView: NSOutlineView?
+    private var projectsScrollView: NSScrollView?
     private var newProjectButton: NSButton?
-    private var sidebarButtons: [Int64: NSButton] = [:]
+
+    /// Set while a programmatic selection change is in flight, so the
+    /// `outlineViewSelectionDidChange` delegate method doesn't bounce
+    /// the user-initiated path. Without it, every
+    /// `applySidebarSelection()` would round-trip through
+    /// `selectProject(id:)` and cause spurious tab spawns / focus
+    /// changes when the selection is being driven from a non-click
+    /// path (WatchEvents, `⌘1..⌘9`, project lifecycle).
+    private var isSyncingSidebarSelection = false
 
     private var tabBar: NSStackView?
     private var addTabButton: NSButton?
@@ -155,19 +165,66 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let pane = NSView()
         pane.translatesAutoresizingMaskIntoConstraints = false
 
-        let header = NSTextField(labelWithString: "Projects")
-        header.font = .systemFont(ofSize: 13, weight: .semibold)
+        let header = NSTextField(labelWithString: "PROJECTS")
+        header.font = .systemFont(ofSize: 11, weight: .semibold)
         header.textColor = .secondaryLabelColor
         header.translatesAutoresizingMaskIntoConstraints = false
         pane.addSubview(header)
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        pane.addSubview(stack)
+        // ---- Outline view --------------------------------------------------
+        let outline = NSOutlineView()
+        outline.headerView = nil
+        outline.style = .sourceList
+        outline.rowSizeStyle = .default
+        outline.indentationPerLevel = 0
+        outline.allowsMultipleSelection = false
+        outline.allowsEmptySelection = true
+        outline.focusRingType = .none
+        outline.translatesAutoresizingMaskIntoConstraints = false
 
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        column.title = ""
+        column.resizingMask = .autoresizingMask
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+
+        outline.dataSource = self
+        outline.delegate = self
+        outline.action = #selector(sidebarRowClicked(_:))
+        outline.target = self
+
+        // Right-click context menu — items target `clickedRow` so the
+        // same NSMenu serves every project row without bespoke
+        // per-row construction.
+        let rowMenu = NSMenu()
+        rowMenu.delegate = self
+        let rename = NSMenuItem(
+            title: "Rename…",
+            action: #selector(renameProjectFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        rename.target = self
+        rowMenu.addItem(rename)
+        let delete = NSMenuItem(
+            title: "Delete",
+            action: #selector(deleteProjectFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        delete.target = self
+        rowMenu.addItem(delete)
+        outline.menu = rowMenu
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.documentView = outline
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(scrollView)
+
+        // ---- Footer --------------------------------------------------------
         let addProject = NSButton(
             title: "+ New Project",
             target: self,
@@ -182,22 +239,20 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             pane.widthAnchor.constraint(greaterThanOrEqualToConstant: width),
 
             header.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
-            header.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12),
+            header.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
             header.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -12),
 
-            stack.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
-            stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 8),
-            stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -8),
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            scrollView.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: addProject.topAnchor, constant: -8),
 
-            addProject.topAnchor.constraint(
-                greaterThanOrEqualTo: stack.bottomAnchor,
-                constant: 8
-            ),
             addProject.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12),
             addProject.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -12),
         ])
 
-        self.sidebarStack = stack
+        self.projectsOutlineView = outline
+        self.projectsScrollView = scrollView
         self.newProjectButton = addProject
         return pane
     }
@@ -437,77 +492,57 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func rebuildSidebar() {
-        guard let stack = sidebarStack else { return }
-        for view in stack.arrangedSubviews {
-            stack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        sidebarButtons.removeAll()
-
-        for project in projects {
-            let button = makeSidebarButton(for: project)
-            stack.addArrangedSubview(button)
-            sidebarButtons[project.id] = button
-        }
-        applySidebarHighlight()
+        guard let outline = projectsOutlineView else { return }
+        outline.reloadData()
+        applySidebarSelection()
         updateWindowTitle()
         // Window menu's Project section is driven off `projects`; keep
         // it in sync so ⌘1..⌘9 always reflects the current sidebar.
         rebuildWindowMenu()
     }
 
+    /// Match the outline view's selected row to `activeProjectID`.
+    /// Wrapped in `isSyncingSidebarSelection` so the corresponding
+    /// `outlineViewSelectionDidChange` callback doesn't bounce the
+    /// selection back through `selectProject(id:)`.
     @MainActor
-    private func makeSidebarButton(for project: ProjectSnapshot) -> NSButton {
-        let button = NSButton(
-            title: sidebarTitle(for: project, active: project.id == activeProjectID),
-            target: self,
-            action: #selector(sidebarProjectClicked(_:))
-        )
-        button.bezelStyle = .rounded
-        button.tag = Int(project.id)
-        button.alignment = .left
-        // Right-click → Rename / Delete. Setting `menu` makes AppKit
-        // route a right-click to it without needing a custom
-        // NSResponder override.
-        let menu = NSMenu()
-        let rename = NSMenuItem(
-            title: "Rename…",
-            action: #selector(renameProjectFromMenu(_:)),
-            keyEquivalent: ""
-        )
-        rename.target = self
-        rename.tag = Int(project.id)
-        menu.addItem(rename)
-        let delete = NSMenuItem(
-            title: "Delete",
-            action: #selector(deleteProjectFromMenu(_:)),
-            keyEquivalent: ""
-        )
-        delete.target = self
-        delete.tag = Int(project.id)
-        menu.addItem(delete)
-        button.menu = menu
-        return button
-    }
-
-    private func sidebarTitle(for project: ProjectSnapshot, active: Bool) -> String {
-        let marker = active ? "● " : "  "
-        return marker + project.name
-    }
-
-    @MainActor
-    private func applySidebarHighlight() {
-        for (id, button) in sidebarButtons {
-            if let project = projects.first(where: { $0.id == id }) {
-                button.title = sidebarTitle(for: project, active: id == activeProjectID)
-            }
+    private func applySidebarSelection() {
+        guard let outline = projectsOutlineView else { return }
+        let row: Int
+        if let activeProjectID,
+           let idx = projects.firstIndex(where: { $0.id == activeProjectID })
+        {
+            row = idx
+        } else {
+            row = -1
         }
+        isSyncingSidebarSelection = true
+        if row >= 0 {
+            outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        } else {
+            outline.deselectAll(nil)
+        }
+        isSyncingSidebarSelection = false
+    }
+
+    /// Single-click on a sidebar row. NSOutlineView fires `action` on
+    /// every click, including in-place clicks on the already-selected
+    /// row — guard against re-running `selectProject` in that case.
+    /// The `selectionDidChange` delegate also fires the same path; we
+    /// route through `selectProject` from one place to avoid double
+    /// work.
+    @objc @MainActor
+    private func sidebarRowClicked(_ sender: Any?) {
+        // No-op — selection changes route through
+        // `outlineViewSelectionDidChange(_:)`. Keeping the action
+        // wired so AppKit still flips selection on single click in
+        // source-list style.
     }
 
     @MainActor
     private func selectProject(id: Int64) {
         activeProjectID = id
-        applySidebarHighlight()
+        applySidebarSelection()
         updateWindowTitle()
         rebuildTabBar()
 
@@ -536,13 +571,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     @objc @MainActor
-    private func sidebarProjectClicked(_ sender: NSButton) {
-        let id = Int64(sender.tag)
-        guard id != activeProjectID else { return }
-        selectProject(id: id)
-    }
-
-    @objc @MainActor
     private func newProject(_ sender: Any?) {
         guard daemonReachable else { return }
         let socketPath = self.socketPath
@@ -557,10 +585,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Resolve the project the user right-clicked on in the sidebar.
+    /// AppKit sets `NSOutlineView.clickedRow` to the row under the
+    /// cursor at the moment the menu popped — which is what we want
+    /// even if the row isn't the selected one. Returns `nil` if the
+    /// click landed in empty space below the rows.
+    @MainActor
+    private func projectForClickedSidebarRow() -> ProjectSnapshot? {
+        guard let outline = projectsOutlineView else { return nil }
+        let row = outline.clickedRow
+        guard row >= 0, row < projects.count else { return nil }
+        return projects[row]
+    }
+
     @objc @MainActor
     private func renameProjectFromMenu(_ sender: NSMenuItem) {
-        let id = Int64(sender.tag)
-        guard let project = projects.first(where: { $0.id == id }) else { return }
+        guard let project = projectForClickedSidebarRow() else { return }
+        let id = project.id
 
         let alert = NSAlert()
         alert.messageText = "Rename Project"
@@ -595,8 +636,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @objc @MainActor
     private func deleteProjectFromMenu(_ sender: NSMenuItem) {
-        let id = Int64(sender.tag)
-        guard let project = projects.first(where: { $0.id == id }) else { return }
+        guard let project = projectForClickedSidebarRow() else { return }
+        let id = project.id
 
         let alert = NSAlert()
         alert.messageText = "Delete \(project.name)?"
@@ -1034,5 +1075,120 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             return "\(home)/Library/Caches/roost/roost.sock"
         }
         return "/tmp/roost.sock"
+    }
+}
+
+// MARK: - Sidebar NSOutlineView data source + delegate
+
+/// Cell view for one project row. Pulled out so the outline view's
+/// `viewFor:` delegate path stays a one-liner. `NSTableCellView`'s
+/// built-in `textField` outlet is what AppKit's source-list styling
+/// targets for selection-state color flips, so we wire our label
+/// through that outlet rather than holding a separate `NSTextField`
+/// reference.
+@MainActor
+final class ProjectRowCellView: NSTableCellView {
+    init() {
+        super.init(frame: .zero)
+        let field = NSTextField(labelWithString: "")
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.lineBreakMode = .byTruncatingTail
+        field.maximumNumberOfLines = 1
+        field.usesSingleLineMode = true
+        field.font = .systemFont(ofSize: 13)
+        field.allowsDefaultTighteningForTruncation = true
+        addSubview(field)
+        textField = field
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            field.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    func configure(with project: ProjectSnapshot) {
+        textField?.stringValue = project.name
+    }
+}
+
+extension RoostApp: NSOutlineViewDataSource {
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        item == nil ? projectCountForSidebar() : 0
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        // The model is flat — there's never a non-nil parent. Return
+        // the project at `index` boxed in a tiny reference type so
+        // NSOutlineView's identity-based caching stays consistent.
+        projectRowItem(at: index)
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        false
+    }
+}
+
+extension RoostApp: NSOutlineViewDelegate {
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        viewFor tableColumn: NSTableColumn?,
+        item: Any
+    ) -> NSView? {
+        guard let row = item as? ProjectRowItem else { return nil }
+        let cell = ProjectRowCellView()
+        cell.configure(with: row.project)
+        return cell
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        guard !isSyncingSidebarSelection else { return }
+        guard let outline = projectsOutlineView else { return }
+        let row = outline.selectedRow
+        guard row >= 0, row < projects.count else { return }
+        let projectID = projects[row].id
+        guard projectID != activeProjectID else { return }
+        selectProject(id: projectID)
+    }
+}
+
+extension RoostApp: NSMenuDelegate {
+    /// Gray out menu items when the user right-clicks below the last
+    /// row (`clickedRow == -1`) — `Rename` / `Delete` have nothing to
+    /// act on in that case.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let valid = projectForClickedSidebarRow() != nil
+        for item in menu.items {
+            item.isEnabled = valid
+        }
+    }
+}
+
+// Reference-typed row item — NSOutlineView caches items by identity,
+// so passing a value type through `child(ofItem:)` would defeat the
+// outline view's row-recycling. Wrapping `ProjectSnapshot` in a class
+// gives the outline view a stable reference per project for the
+// duration of a single `reloadData` cycle.
+@MainActor
+final class ProjectRowItem {
+    let project: ProjectSnapshot
+    init(_ project: ProjectSnapshot) { self.project = project }
+}
+
+extension RoostApp {
+    /// Bridge between the outline view's flat data-source API and
+    /// our `projects` array. Returns one `ProjectRowItem` per project,
+    /// rebuilt fresh on every `reloadData()` cycle (cheap — bounded
+    /// by the number of projects the user has).
+    @MainActor
+    fileprivate func projectCountForSidebar() -> Int {
+        projects.count
+    }
+
+    @MainActor
+    fileprivate func projectRowItem(at index: Int) -> ProjectRowItem {
+        ProjectRowItem(projects[index])
     }
 }
