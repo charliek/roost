@@ -48,7 +48,8 @@ fn main() {
         .build()
         .expect("build tokio runtime");
 
-    let identify_outcome: Arc<Mutex<IdentifyOutcome>> = Arc::new(Mutex::new(IdentifyOutcome::Connecting));
+    let identify_outcome: Arc<Mutex<IdentifyOutcome>> =
+        Arc::new(Mutex::new(IdentifyOutcome::Connecting));
     let outcome_clone = identify_outcome.clone();
     rt.spawn(async move {
         let result = run_identify().await;
@@ -91,10 +92,7 @@ async fn run_identify() -> IdentifyOutcome {
     let channel = match connect_uds(socket.clone()).await {
         Ok(c) => c,
         Err(err) => {
-            return IdentifyOutcome::Failed(format!(
-                "connect uds at {}: {err}",
-                socket.display()
-            ));
+            return IdentifyOutcome::Failed(format!("connect uds at {}: {err}", socket.display()));
         }
     };
     let mut client = RoostClient::new(channel);
@@ -159,7 +157,10 @@ fn build_window(app: &Application, outcome: Arc<Mutex<IdentifyOutcome>>) {
     let body_clone = body.clone();
     let outcome_clone = outcome.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-        let snapshot = outcome_clone.lock().expect("identify mutex poisoned").clone();
+        let snapshot = outcome_clone
+            .lock()
+            .expect("identify mutex poisoned")
+            .clone();
         match snapshot {
             IdentifyOutcome::Connecting => glib::ControlFlow::Continue,
             IdentifyOutcome::Ok {

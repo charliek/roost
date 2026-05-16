@@ -162,7 +162,9 @@ jobs:
       - name: cargo test
         # Required-green: the workspace test suite gates every commit.
         # If a Rust test breaks on Linux or macOS the workflow fails.
-        run: cargo test --workspace
+        # `--exclude roost-linux` for the same reason as the build
+        # step above — the GTK toolchain lives in the gtk-build job.
+        run: cargo test --workspace --exclude roost-linux
 
   swift-mac:
     if: >-
