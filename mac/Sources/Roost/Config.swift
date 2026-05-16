@@ -17,13 +17,22 @@ import Foundation
 
 /// Resolved user config. All fields optional so the caller can
 /// fall back to compiled-in defaults when the user hasn't set a
-/// preference.
+/// preference. `keybinds` is the ordered list of `keybind = …`
+/// lines in the order they appear — `canonicalizeBindings`
+/// applies them in order so later lines override earlier ones,
+/// matching the Go binary's semantics.
 struct RoostConfig: Sendable {
     var themeName: String?
     var fontFamily: String?
     var fontSize: CGFloat?
+    var keybinds: [Keybind] = []
 
-    static let empty = RoostConfig(themeName: nil, fontFamily: nil, fontSize: nil)
+    static let empty = RoostConfig(
+        themeName: nil,
+        fontFamily: nil,
+        fontSize: nil,
+        keybinds: []
+    )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
     /// the file doesn't exist, is empty, or fails to parse — a
@@ -71,10 +80,30 @@ func parse(_ text: String) -> RoostConfig {
             if let n = Double(value), n > 0 {
                 cfg.fontSize = CGFloat(n)
             }
+        case "keybind":
+            // `keybind = <trigger> = <action>`. The outer split on
+            // the first `=` already gave us `value = "<trigger> =
+            // <action>"`; split again on `=` to separate trigger
+            // from action. Lenient: drop malformed lines silently
+            // (matches the Go binary's tolerance for editor saves
+            // mid-edit).
+            //
+            // Note: `value` was unconditionally quote-stripped
+            // above for `theme` / `font-family`; that's safe for
+            // keybinds too since Ghostty triggers don't include
+            // matching quote characters at the ends.
+            if let inner = value.firstIndex(of: "=") {
+                let t = value[..<inner].trimmingCharacters(in: .whitespaces)
+                let a = value[value.index(after: inner)...]
+                    .trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty && !a.isEmpty {
+                    cfg.keybinds.append(Keybind(trigger: t, action: a))
+                }
+            }
         default:
             // Many other keys are valid in the Go binary's config
-            // (keybind, font-style, …); silently drop the ones M6
-            // doesn't yet consume.
+            // (font-style, …); silently drop the ones M6/P1 don't
+            // yet consume.
             continue
         }
     }

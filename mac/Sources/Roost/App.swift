@@ -67,6 +67,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `~/.config/roost/config.conf`; the values flow into theme
     /// + font selection.
     private var config: RoostConfig = .empty
+
+    /// Resolved keybind table — `(keyEquivalent, modifierMask) →
+    /// action`. Built from `defaultBindingsMac()` layered with
+    /// `config.keybinds` via `canonicalizeBindings`. Phase 6a P1
+    /// uses this in `installMainMenu` to drive each
+    /// `NSMenuItem.keyEquivalent` + `keyEquivalentModifierMask`.
+    /// Inverted lookup at install time (`action → first matching
+    /// Accel`) — actions with no entry in the table install with
+    /// an empty key equivalent (effectively unbound).
+    private var keybinds: [Accel: String] = [:]
     private var activeTheme: Theme = .fallback
     private var activeFont: NSFont = .monospacedSystemFont(
         ofSize: 14,
@@ -101,6 +111,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         self.activeFont = resolveFont(
             family: config.fontFamily,
             size: config.fontSize ?? 14
+        )
+
+        // Phase 6a P1: resolve the keybind table BEFORE the menu
+        // installs, so installMainMenu can drive every shortcut
+        // off the user's config (with the macOS defaults as the
+        // fallback layer).
+        self.keybinds = canonicalizeBindings(
+            defaults: defaultBindingsMac(),
+            user: config.keybinds,
+            warn: { msg, trigger, action in
+                NSLog(
+                    "roost-mac: keybind %@: trigger=%@ action=%@",
+                    msg,
+                    trigger,
+                    action
+                )
+            }
         )
 
         installMainMenu()
@@ -918,18 +945,24 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         guard let windowMenu = windowMenu else { return }
         windowMenu.removeAllItems()
 
-        // Project switching first — ⌘1..⌘9, matching the Go binary's
-        // `switch_project_N` defaults.
+        // Project switching first — defaults to ⌘1..⌘9 via
+        // `switch_project_N` in `defaultBindingsMac()`. P1 keybind
+        // table now drives both the key equivalent + modifier mask,
+        // so a user's `keybind = alt+1 = switch_project_1` override
+        // is honored.
         for (index, project) in projects.enumerated() {
             let item = NSMenuItem(
                 title: project.name,
                 action: #selector(selectProjectFromMenu(_:)),
-                keyEquivalent: index < 9 ? "\(index + 1)" : ""
+                keyEquivalent: ""
             )
             item.target = self
             item.tag = Int(project.id)
             if project.id == activeProjectID {
                 item.state = .on
+            }
+            if index < 9 {
+                bind(item, to: KeybindAction.switchProject(index + 1))
             }
             windowMenu.addItem(item)
         }
@@ -937,21 +970,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             windowMenu.addItem(.separator())
         }
 
-        // Tab switching — ⌃1..⌃9, matching the Go binary's
-        // `switch_tab_N` defaults (control-digit, not command-digit).
+        // Tab switching — defaults to ⌃1..⌃9 via `switch_tab_N` in
+        // `defaultBindingsMac()`. Same keybind-table path.
         let projectTabs = tabsForActiveProject()
         let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
         for (index, session) in projectTabs.enumerated() {
             let item = NSMenuItem(
                 title: "Tab \(index + 1)",
                 action: #selector(selectTabFromMenu(_:)),
-                keyEquivalent: index < 9 ? "\(index + 1)" : ""
+                keyEquivalent: ""
             )
-            item.keyEquivalentModifierMask = [.control]
             item.target = self
             item.tag = index
             if session === activeSession {
                 item.state = .on
+            }
+            if index < 9 {
+                bind(item, to: KeybindAction.switchTab(index + 1))
             }
             windowMenu.addItem(item)
         }
@@ -1049,94 +1084,108 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
 
+        // File menu — every shortcut driven through the keybind
+        // table (Phase 6a P1). The hardcoded keyEquivalents that
+        // used to live inline still apply by default (because
+        // `defaultBindingsMac()` seeds them) but the user's
+        // `~/.config/roost/config.conf` `keybind = … = …` lines
+        // now layer cleanly on top.
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
-        // ⌘N for New Project — Roost has no multi-window concept, so
-        // ⌘N is free, and reaching for it is the natural first guess.
-        // ⌘T then opens a new tab in the current project, mirroring
-        // Terminal.app / iTerm.
         let newProjectItem = NSMenuItem(
             title: "New Project",
             action: #selector(newProject(_:)),
-            keyEquivalent: "n"
+            keyEquivalent: ""
         )
         newProjectItem.target = self
+        bind(newProjectItem, to: KeybindAction.newProject)
         fileMenu.addItem(newProjectItem)
         let newTabItem = NSMenuItem(
             title: "New Tab",
             action: #selector(newTab(_:)),
-            keyEquivalent: "t"
+            keyEquivalent: ""
         )
         newTabItem.target = self
+        bind(newTabItem, to: KeybindAction.newTab)
         fileMenu.addItem(newTabItem)
         let closeTabItem = NSMenuItem(
             title: "Close Tab",
             action: #selector(closeActiveTab(_:)),
-            keyEquivalent: "w"
+            keyEquivalent: ""
         )
         closeTabItem.target = self
+        bind(closeTabItem, to: KeybindAction.closeTab)
         fileMenu.addItem(closeTabItem)
         fileMenu.addItem(.separator())
-        // ⌘⇧R = rename_project from the Go binary's defaults.
         let renameProjectItem = NSMenuItem(
             title: "Rename Project…",
             action: #selector(renameActiveProject(_:)),
-            keyEquivalent: "r"
+            keyEquivalent: ""
         )
-        renameProjectItem.keyEquivalentModifierMask = [.command, .shift]
         renameProjectItem.target = self
+        bind(renameProjectItem, to: KeybindAction.renameProject)
         fileMenu.addItem(renameProjectItem)
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
-        // View menu (Phase 6a P2): font_increase / font_decrease /
-        // font_reset. Default bindings ⌘+ / ⌘- / ⌘0 — keystroke "+"
-        // on macOS arrives as the unshifted "=" key with shift held,
-        // which is what `keyEquivalent: "+"` encodes correctly. The
-        // `⌘0` reset uses "0" verbatim.
+        // View menu (P2 font zoom) — same keybind-table lookup.
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "View")
         let zoomInItem = NSMenuItem(
             title: "Zoom In",
             action: #selector(fontIncrease(_:)),
-            keyEquivalent: "+"
+            keyEquivalent: ""
         )
         zoomInItem.target = self
+        bind(zoomInItem, to: KeybindAction.fontIncrease)
         viewMenu.addItem(zoomInItem)
         let zoomOutItem = NSMenuItem(
             title: "Zoom Out",
             action: #selector(fontDecrease(_:)),
-            keyEquivalent: "-"
+            keyEquivalent: ""
         )
         zoomOutItem.target = self
+        bind(zoomOutItem, to: KeybindAction.fontDecrease)
         viewMenu.addItem(zoomOutItem)
         let zoomResetItem = NSMenuItem(
             title: "Actual Size",
             action: #selector(fontReset(_:)),
-            keyEquivalent: "0"
+            keyEquivalent: ""
         )
         zoomResetItem.target = self
+        bind(zoomResetItem, to: KeybindAction.fontReset)
         viewMenu.addItem(zoomResetItem)
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
 
+        // Edit menu — copy/paste route through NSText.copy /
+        // NSText.paste selectors so AppKit's standard responder
+        // chain reaches TerminalView's `@objc copy(_:)` /
+        // `paste(_:)` (M5 wired those). Bind to the keybind
+        // table for keyEquivalent — `copy` / `paste` actions in
+        // the namespace can be overridden per user config.
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(
-            withTitle: "Cut",
+        let cutItem = NSMenuItem(
+            title: "Cut",
             action: #selector(NSText.cut(_:)),
             keyEquivalent: "x"
         )
-        editMenu.addItem(
-            withTitle: "Copy",
+        editMenu.addItem(cutItem)
+        let copyItem = NSMenuItem(
+            title: "Copy",
             action: #selector(NSText.copy(_:)),
-            keyEquivalent: "c"
+            keyEquivalent: ""
         )
-        editMenu.addItem(
-            withTitle: "Paste",
+        bind(copyItem, to: KeybindAction.copy)
+        editMenu.addItem(copyItem)
+        let pasteItem = NSMenuItem(
+            title: "Paste",
             action: #selector(NSText.paste(_:)),
-            keyEquivalent: "v"
+            keyEquivalent: ""
         )
+        bind(pasteItem, to: KeybindAction.paste)
+        editMenu.addItem(pasteItem)
         editMenu.addItem(
             withTitle: "Select All",
             action: #selector(NSText.selectAll(_:)),
@@ -1225,6 +1274,32 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // No family or unknown → system monospace. Same default the
         // Go binary uses when `font-family` is unset.
         return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    // MARK: - Keybind table → NSMenuItem (Phase 6a P1)
+
+    /// Look up the first `Accel` in `self.keybinds` whose action
+    /// matches `action`. Returns the canonical `(keyEquivalent,
+    /// modifiers)` pair to install on an `NSMenuItem`. Returns an
+    /// empty tuple when the action has no entry — produces an
+    /// effectively unbound menu item rather than crashing or
+    /// throwing on a user's `keybind = … = unbind` of a default.
+    @MainActor
+    private func accel(for action: String) -> (String, NSEvent.ModifierFlags) {
+        for (accel, act) in keybinds where act == action {
+            return (accel.key, accel.modifiers)
+        }
+        return ("", [])
+    }
+
+    /// Configure an NSMenuItem with the resolved keybind for
+    /// `action`. Centralizes the "look up + assign" pattern so
+    /// `installMainMenu` stays readable.
+    @MainActor
+    private func bind(_ item: NSMenuItem, to action: String) {
+        let (key, mask) = accel(for: action)
+        item.keyEquivalent = key
+        item.keyEquivalentModifierMask = mask
     }
 
     // MARK: - Font zoom (Phase 6a P2)
