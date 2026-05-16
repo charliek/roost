@@ -60,6 +60,50 @@ final class TerminalView: NSView {
     /// and the cell grid changes shape.
     @MainActor var onResize: ((UInt16, UInt16) -> Void)?
 
+    // MARK: - Selection state (Phase 6a M5)
+
+    /// Cell-coordinate selection state. Two cells form the
+    /// rectangle, normalized at draw + extract time so the user can
+    /// drag in any direction. Both points are inclusive on the
+    /// start side and exclusive on the end side — matching the
+    /// "drag-from-cursor" convention every other terminal uses.
+    private struct CellSelection {
+        var anchorCol: Int
+        var anchorRow: Int
+        var cursorCol: Int
+        var cursorRow: Int
+
+        /// True if the anchor and cursor land on the same cell —
+        /// shouldn't render selection chrome for a single-cell
+        /// "click but didn't drag" gesture.
+        var isEmpty: Bool { anchorCol == cursorCol && anchorRow == cursorRow }
+
+        /// Inclusive (startRow, startCol) and exclusive
+        /// (endRow, endCol) in the normalized direction.
+        func normalized() -> (startRow: Int, startCol: Int, endRow: Int, endCol: Int) {
+            let (sRow, sCol, eRow, eCol): (Int, Int, Int, Int)
+            if anchorRow == cursorRow {
+                sRow = anchorRow
+                eRow = anchorRow + 1
+                sCol = min(anchorCol, cursorCol)
+                eCol = max(anchorCol, cursorCol) + 1
+            } else if anchorRow < cursorRow {
+                sRow = anchorRow
+                sCol = anchorCol
+                eRow = cursorRow + 1
+                eCol = cursorCol + 1
+            } else {
+                sRow = cursorRow
+                sCol = cursorCol
+                eRow = anchorRow + 1
+                eCol = anchorCol + 1
+            }
+            return (sRow, sCol, eRow, eCol)
+        }
+    }
+
+    private var selection: CellSelection?
+
     init(cols: UInt16 = 80, rows: UInt16 = 24) {
         self.cols = cols
         self.rows = rows
@@ -149,6 +193,150 @@ final class TerminalView: NSView {
     /// RoostApp explicitly makes this view the window's first
     /// responder after construction so typing routes here.
     override var acceptsFirstResponder: Bool { true }
+
+    // MARK: - Selection (Phase 6a M5)
+
+    /// Convert a point in view coordinates to (col, row) clamped to
+    /// the cell grid. `isFlipped` is true so `y=0` is the top edge —
+    /// no flip needed.
+    private func cellAt(point: NSPoint) -> (col: Int, row: Int) {
+        guard cellSize.width > 0, cellSize.height > 0 else { return (0, 0) }
+        let col = max(0, min(Int(cols) - 1, Int(point.x / cellSize.width)))
+        let row = max(0, min(Int(rows) - 1, Int(point.y / cellSize.height)))
+        return (col, row)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let cell = cellAt(point: p)
+        selection = CellSelection(
+            anchorCol: cell.col,
+            anchorRow: cell.row,
+            cursorCol: cell.col,
+            cursorRow: cell.row
+        )
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard var sel = selection else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        let cell = cellAt(point: p)
+        sel.cursorCol = cell.col
+        sel.cursorRow = cell.row
+        selection = sel
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // If the drag never moved (anchor == cursor), clear the
+        // selection state — a single-cell "click but didn't drag"
+        // shouldn't leave a stray highlight. Real selections persist
+        // until the next mouseDown or `clearSelection()`.
+        if let sel = selection, sel.isEmpty {
+            selection = nil
+            needsDisplay = true
+        }
+    }
+
+    /// Reset the selection. Hooked by `RoostApp` when switching
+    /// tabs / projects so a selection from one tab doesn't bleed
+    /// into another.
+    @MainActor
+    func clearSelection() {
+        if selection != nil {
+            selection = nil
+            needsDisplay = true
+        }
+    }
+
+    /// Standard responder-chain copy. `⌘C` is wired into the App's
+    /// Edit menu via `selector: #selector(NSText.copy(_:))`; AppKit
+    /// routes it here once the TerminalView is first responder.
+    /// Walks the render-state snapshot for the selected cell rect,
+    /// joins glyphs into rows, and writes plain text to the
+    /// general pasteboard. No-op when there's no selection.
+    @objc
+    func copy(_ sender: Any?) {
+        guard let text = selectedPlainText(), !text.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+
+    /// Standard responder-chain paste. Reads the pasteboard's
+    /// string contents, asks libghostty-vt whether the shell has
+    /// enabled bracketed-paste mode (DECSET 2004), and wraps the
+    /// payload in `ESC[200~ … ESC[201~` if so. Falls through to
+    /// raw bytes when the shell hasn't asked for bracketed paste
+    /// (e.g. `cat`, basic POSIX shells).
+    @objc
+    func paste(_ sender: Any?) {
+        guard let s = NSPasteboard.general.string(forType: .string),
+              !s.isEmpty
+        else { return }
+        var payload = Data(s.utf8)
+        if bracketedPasteEnabled() {
+            // ESC [ 2 0 0 ~ … ESC [ 2 0 1 ~
+            var wrapped = Data([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e])
+            wrapped.append(payload)
+            wrapped.append(contentsOf: [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e])
+            payload = wrapped
+        }
+        onKey?(payload)
+    }
+
+    /// Walk the latest render-state snapshot and concatenate the
+    /// glyphs inside the current selection. Trims trailing whitespace
+    /// per row + drops empty trailing rows so a multi-line copy
+    /// doesn't carry a wall of spaces from cells the terminal hasn't
+    /// drawn into. Returns nil when there's no selection.
+    @MainActor
+    private func selectedPlainText() -> String? {
+        guard let sel = selection else { return nil }
+        let n = sel.normalized()
+        if let terminal { renderState.update(terminal: terminal) }
+        var rows: [String] = []
+        for _ in n.startRow..<n.endRow { rows.append("") }
+        renderState.walk { cell in
+            guard cell.row >= n.startRow, cell.row < n.endRow else { return }
+            guard cell.col >= n.startCol, cell.col < n.endCol else { return }
+            let idx = cell.row - n.startRow
+            if let g = cell.glyph {
+                rows[idx].append(String(g))
+            } else {
+                rows[idx].append(" ")
+            }
+        }
+        var trimmed = rows.map {
+            String($0.reversed().drop(while: { $0 == " " }).reversed())
+        }
+        while let last = trimmed.last, last.isEmpty {
+            trimmed.removeLast()
+        }
+        return trimmed.joined(separator: "\n")
+    }
+
+    /// Ask libghostty-vt whether the shell has enabled bracketed-paste
+    /// mode. Defaults to `false` on any FFI hiccup so we don't wrap a
+    /// paste in escape sequences a confused shell would echo back at
+    /// the user.
+    ///
+    /// `GHOSTTY_MODE_BRACKETED_PASTE` is a function-call macro in the
+    /// C header (`ghostty_mode_new(2004, false)`), which the Swift
+    /// importer can't bridge — Swift drops macros whose body isn't a
+    /// plain constant. Reconstruct the mode value inline using the
+    /// same bit packing as the `ghostty_mode_new` helper:
+    ///     low 15 bits = the mode number (2004),
+    ///     bit 15      = the ANSI flag (false for DEC private modes).
+    @MainActor
+    private func bracketedPasteEnabled() -> Bool {
+        guard let terminal else { return false }
+        var on = false
+        let mode = GhosttyMode(2004 & 0x7FFF)
+        let rc = ghostty_terminal_mode_get(terminal, mode, &on)
+        return rc.rawValue == 0 && on
+    }
 
     /// Phase 5.5b: forward keystrokes to the StreamPty writer.
     ///
@@ -340,6 +528,44 @@ final class TerminalView: NSView {
                 // glyph's drawing origin is at the cell top + the
                 // font's ascender.
                 line.draw(at: NSPoint(x: rect.minX, y: rect.minY))
+            }
+        }
+
+        // Selection overlay (Phase 6a M5). Drawn last so it sits on
+        // top of the glyph pass — translucent accent fill, no border.
+        if let sel = selection, !sel.isEmpty {
+            let n = sel.normalized()
+            let overlay = NSColor.selectedTextBackgroundColor
+                .withAlphaComponent(0.45)
+            overlay.setFill()
+            for row in n.startRow..<n.endRow {
+                // Row-aware horizontal extent: a single-row selection
+                // spans the user's start/end cols; a multi-row
+                // selection spans full rows for every interior row.
+                let isFirst = (row == n.startRow)
+                let isLast = (row == n.endRow - 1)
+                let startCol: Int
+                let endCol: Int
+                if n.endRow - n.startRow == 1 {
+                    startCol = n.startCol
+                    endCol = n.endCol
+                } else if isFirst {
+                    startCol = n.startCol
+                    endCol = Int(cols)
+                } else if isLast {
+                    startCol = 0
+                    endCol = n.endCol
+                } else {
+                    startCol = 0
+                    endCol = Int(cols)
+                }
+                let r = NSRect(
+                    x: CGFloat(startCol) * cellW,
+                    y: CGFloat(row) * cellH,
+                    width: CGFloat(endCol - startCol) * cellW,
+                    height: cellH
+                )
+                r.fill()
             }
         }
     }

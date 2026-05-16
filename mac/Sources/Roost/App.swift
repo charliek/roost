@@ -798,6 +798,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let session = projectTabs[indexInActiveProject]
         let view = session.terminalView
         view.translatesAutoresizingMaskIntoConstraints = false
+        view.clearSelection()
         container.addSubview(view)
         // Edge-pin instead of intrinsic-content-size pin so the
         // terminal fills whatever rectangle the container has.
