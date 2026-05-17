@@ -44,6 +44,10 @@ enum KeybindAction {
     static let fontDecrease  = "font_decrease"
     static let fontReset     = "font_reset"
     static let toggleSidebar = "toggle_sidebar"
+    /// Phase 6a P7: jump to the next unread (notified) tab. New
+    /// action; not present on the Go binary (cmux-inspired
+    /// ⌘⇧U convention).
+    static let jumpToUnread  = "jump_to_unread"
     static let unbind        = "unbind"
 
     /// `switch_project_N` (1..9). Defined as a function rather than
@@ -59,6 +63,7 @@ enum KeybindAction {
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
         paste, copy, newProject, renameProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
+        jumpToUnread,
     ]
 
     /// True if `action` is a recognized name (including the
@@ -210,6 +215,8 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.newProject:    ["\(projectMod)+n"],
         KeybindAction.renameProject: ["\(projectMod)+shift+r"],
         KeybindAction.toggleSidebar: ["\(projectMod)+b"],
+        // ⌘⇧U — cmux's "jump to latest unread" convention.
+        KeybindAction.jumpToUnread:  ["\(primary)+shift+u"],
         // Browser-style font sizing. + and = both bind because
         // cmd-+ on US layouts is really cmd-shift-=, and many
         // users hit cmd-= without the shift.

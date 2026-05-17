@@ -409,6 +409,30 @@ func watchEvents(socketPath: String) -> AsyncStream<Roost_V1_Event> {
     }
 }
 
+/// Best-effort `ClearTabNotification` — fires `TabNotificationEvent
+/// { has_pending: false }` for the tab, clearing the badge on
+/// every watching client. Phase 6a P7 calls this from
+/// `selectTab(at:)` so focusing a notified tab clears its badge.
+func clearTabNotification(socketPath: String, tabID: Int64) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.clearTabNotification(
+                .with { $0.tabID = tabID }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] clearTabNotification(\(tabID)) failed: \(error)\n".utf8)
+        )
+    }
+}
+
 /// Best-effort `ReportOsc` — sends a pre-parsed (osc_command,
 /// payload) tuple to the daemon's OSC routing layer (Phase 6a
 /// P5). One-shot RPC; the UI's OscScanner produces these from
