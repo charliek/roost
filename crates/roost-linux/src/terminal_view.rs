@@ -29,12 +29,15 @@ use gtk4::cairo;
 use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{DrawingArea, EventControllerFocus, EventControllerKey};
+use gtk4::{
+    DrawingArea, EventControllerFocus, EventControllerKey, EventControllerScroll,
+    EventControllerScrollFlags, GestureDrag,
+};
 use pangocairo::functions as pango_cairo;
 
 use roost_vt::{
-    Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, RenderState, Terminal,
-    TerminalOptions,
+    ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, RenderState,
+    ScrollViewport, Terminal, TerminalOptions,
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
@@ -49,6 +52,40 @@ const DEFAULT_ROWS: u16 = 24;
 
 /// Cursor blink half-period. 530ms matches the Mac UI + Go binary.
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Light-weight handle into a [`TerminalView`] that can be cloned
+/// into closures. Useful for keystroke handlers that need to invoke
+/// the view's copy / paste public methods without re-borrowing the
+/// outer Rc.
+#[derive(Clone)]
+struct TerminalViewHandle {
+    state: Rc<RefCell<TerminalViewState>>,
+    widget: DrawingArea,
+}
+
+impl TerminalViewHandle {
+    fn copy(&self) {
+        // Inline copy_selection_to_clipboard to avoid an Rc<TerminalView>
+        // captured in the closure (TerminalView itself is not Clone).
+        let view = TerminalView {
+            widget: self.widget.clone(),
+            state: self.state.clone(),
+        };
+        view.copy_selection_to_clipboard();
+        // Forget the shallow `TerminalView` we just constructed —
+        // the underlying widget + state are reference-counted.
+        std::mem::forget(view);
+    }
+
+    fn paste(&self) {
+        let view = TerminalView {
+            widget: self.widget.clone(),
+            state: self.state.clone(),
+        };
+        view.paste_from_clipboard();
+        std::mem::forget(view);
+    }
+}
 
 /// Owned widget + state for one terminal view. Wraps a
 /// [`gtk::DrawingArea`] so callers can drop it into any GTK container.
@@ -77,9 +114,11 @@ impl TerminalView {
         let terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
-            // Phase 7 commit 7 will bump this to 2000 with the
-            // scrollback wheel handler.
-            max_scrollback: 0,
+            // 2000 rows of off-screen history matches both the Go
+            // binary (`cmd/roost/session.go`) and the Mac UI's M6
+            // scrollback. Enough for a `seq 1 5000 | less` session
+            // without growing memory.
+            max_scrollback: 2000,
         })
         .expect("allocate libghostty-vt terminal");
 
@@ -108,6 +147,9 @@ impl TerminalView {
             cell_metrics: metrics,
             cursor_blink_on: true,
             has_focus: true,
+            scrolled_back: false,
+            scroll_accum: 0.0,
+            selection: None,
             input_callback: None,
         }));
 
@@ -141,6 +183,69 @@ impl TerminalView {
             }
         });
         widget.add_controller(focus_ctrl);
+
+        // Scroll wheel: 3 modes per the Mac UI / Go binary. Discrete
+        // notches + smooth scroll both go through the same path; the
+        // smooth-scroll accumulator handles trackpad fractional rows.
+        let scroll_ctrl = EventControllerScroll::new(
+            EventControllerScrollFlags::VERTICAL | EventControllerScrollFlags::DISCRETE,
+        );
+        scroll_ctrl.connect_scroll({
+            let state = state.clone();
+            let widget = widget.clone();
+            move |_ctrl, _dx, dy| {
+                let mut s = state.borrow_mut();
+                s.handle_scroll(dy);
+                drop(s);
+                widget.queue_draw();
+                glib::Propagation::Stop
+            }
+        });
+        widget.add_controller(scroll_ctrl);
+
+        // Drag selection. Anchor on press, update on drag, on release
+        // the selection becomes "committed" until the user clicks
+        // elsewhere or types (commit 7+'s `clearSelection` flow).
+        let drag = GestureDrag::new();
+        drag.connect_drag_begin({
+            let state = state.clone();
+            let widget = widget.clone();
+            move |_g, x, y| {
+                let mut s = state.borrow_mut();
+                if let Some((col, row)) = s.cell_at(x, y, &widget) {
+                    s.selection = Some(Selection {
+                        anchor_col: col,
+                        anchor_row: row,
+                        cursor_col: col,
+                        cursor_row: row,
+                    });
+                }
+                drop(s);
+                widget.queue_draw();
+            }
+        });
+        drag.connect_drag_update({
+            let state = state.clone();
+            let widget = widget.clone();
+            move |g, dx, dy| {
+                let mut s = state.borrow_mut();
+                if let Some((start_x, start_y)) = g.start_point() {
+                    let x = start_x + dx;
+                    let y = start_y + dy;
+                    let cell_w = s.cell_metrics.cell_width;
+                    let cell_h = s.cell_metrics.cell_height;
+                    if let Some(sel) = s.selection.as_mut() {
+                        if let Some((col, row)) = cell_at_inner(x, y, cell_w, cell_h) {
+                            sel.cursor_col = col;
+                            sel.cursor_row = row;
+                        }
+                    }
+                }
+                drop(s);
+                widget.queue_draw();
+            }
+        });
+        widget.add_controller(drag);
 
         // Cursor blink: toggle every 530ms while the widget exists.
         // Pausing the timer on focus loss is a polish nit deferred to
@@ -178,6 +283,110 @@ impl TerminalView {
         self.widget.queue_draw();
     }
 
+    /// Copy the current selection to the system clipboard. Walks the
+    /// libghostty render state, extracts plain text for the selected
+    /// cell range, and pushes to `gdk::Display::clipboard`. No-op if
+    /// the selection is empty.
+    pub fn copy_selection_to_clipboard(&self) {
+        let s = self.state.borrow();
+        let Some(sel) = s.selection else {
+            return;
+        };
+        if sel.is_empty() {
+            return;
+        }
+        let (sc, sr, ec, er) = sel.normalized();
+        drop(s);
+
+        let mut text = String::new();
+        let mut s = self.state.borrow_mut();
+        // Split-borrow so the walk can hold `&mut render_state` and
+        // `&terminal` simultaneously — both fields of `s` but
+        // Rust's borrow checker can't see through the outer
+        // `&mut TerminalViewState` without destructuring.
+        let TerminalViewState {
+            terminal,
+            render_state,
+            ..
+        } = &mut *s;
+        let _ = render_state.update(terminal);
+        let _ = render_state.walk(terminal, |row, cell| {
+            if row < sr as u32 || row >= er as u32 {
+                return;
+            }
+            let col = cell.col;
+            let in_range = if row == sr as u32 && row == er.saturating_sub(1) as u32 {
+                col >= sc && col < ec
+            } else if row == sr as u32 {
+                col >= sc
+            } else if row == er.saturating_sub(1) as u32 {
+                col < ec
+            } else {
+                true
+            };
+            if !in_range {
+                return;
+            }
+            // Row boundary: when col rolls back to 0 on a new row,
+            // append a newline. (`row` advances per-row, so we just
+            // detect row breaks by tracking the prior row.)
+            if col == 0 && !text.is_empty() {
+                text.push('\n');
+            }
+            if cell.text.is_empty() {
+                text.push(' ');
+            } else {
+                text.push_str(&cell.text);
+            }
+        });
+        drop(s);
+        // Trim trailing whitespace on each line for a cleaner paste.
+        let trimmed = text
+            .lines()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !trimmed.is_empty() {
+            if let Some(display) = gtk4::gdk::Display::default() {
+                display.clipboard().set_text(&trimmed);
+            }
+        }
+    }
+
+    /// Read text from the system clipboard and feed it into the PTY.
+    /// Wraps the payload in bracketed-paste escapes (`ESC[200~` …
+    /// `ESC[201~`) when the terminal has DECSET 2004 active (zsh,
+    /// bash with the bracketed-paste plugin, vim insert mode, etc.).
+    /// Async because the clipboard read is async; spawn on the GTK
+    /// main loop via `glib::spawn_future_local`.
+    pub fn paste_from_clipboard(&self) {
+        let Some(display) = gtk4::gdk::Display::default() else {
+            return;
+        };
+        let clipboard = display.clipboard();
+        let state = self.state.clone();
+        glib::spawn_future_local(async move {
+            let Ok(text) = clipboard.read_text_future().await else {
+                return;
+            };
+            let Some(text) = text else { return };
+            let s = state.borrow();
+            let bracketed = s.terminal.mode_get(2004);
+            let bytes = if bracketed {
+                let mut buf = Vec::with_capacity(text.len() + 8);
+                buf.extend_from_slice(b"\x1b[200~");
+                buf.extend_from_slice(text.as_bytes());
+                buf.extend_from_slice(b"\x1b[201~");
+                buf
+            } else {
+                text.as_bytes().to_vec()
+            };
+            if let Some(cb) = s.input_callback.as_ref() {
+                cb(bytes);
+            }
+        });
+    }
+
     /// Install a keystroke handler. Called with raw UTF-8 bytes when
     /// the view has focus and the user types a printable character.
     /// Bare-minimum bridge for commit 5 — the full key encoder (arrow
@@ -200,12 +409,50 @@ impl TerminalView {
         let key_ctrl = EventControllerKey::new();
         key_ctrl.connect_key_pressed({
             let state = self.state.clone();
+            let widget = self.widget.clone();
+            let view_handle = TerminalViewHandle {
+                state: self.state.clone(),
+                widget: self.widget.clone(),
+            };
             move |_ctrl, key, _keycode, mods| {
+                // Commit 7 stop-gap: Ctrl+Shift+C / Ctrl+Shift+V invoke
+                // copy/paste. Full keybind table (with config-file
+                // overrides + Mac-style ⌘C / ⌘V on Mac) lands in
+                // commit 9.
+                if mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                    && mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK)
+                {
+                    use gtk4::gdk::Key as K;
+                    match key {
+                        K::c | K::C => {
+                            view_handle.copy();
+                            return glib::Propagation::Stop;
+                        }
+                        K::v | K::V => {
+                            view_handle.paste();
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
                 // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
                 // (the safe wrapper landed in commit 1). The encoder
                 // handles modifier conventions, Kitty keyboard
                 // protocol, DECCKM application-mode arrows, etc.
                 let mut s = state.borrow_mut();
+                // Commit 7: snap viewport to bottom on any keystroke
+                // (matches the Go binary's `cmd/roost/input.go:67`).
+                // Clear any active selection — typing intent overrides.
+                if s.scrolled_back {
+                    s.terminal.scroll_viewport(ScrollViewport::Bottom);
+                    s.scrolled_back = false;
+                    s.scroll_accum = 0.0;
+                    widget.queue_draw();
+                }
+                if s.selection.is_some() {
+                    s.selection = None;
+                    widget.queue_draw();
+                }
                 let bytes = {
                     let s_mut: &mut TerminalViewState = &mut s;
                     key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, key, mods)
@@ -240,11 +487,64 @@ struct TerminalViewState {
     cell_metrics: CellMetrics,
     cursor_blink_on: bool,
     has_focus: bool,
+    /// True while the viewport has been scrolled back into history.
+    /// Cleared the moment we scroll back to bottom (either via a
+    /// keystroke snap or by the wheel reaching the active region).
+    /// The Go binary tracks this in `cmd/roost/session.go` to decide
+    /// whether to snap before encoding a key.
+    scrolled_back: bool,
+    /// Smooth-scroll accumulator. Trackpad / Magic Mouse deltas are
+    /// fractional rows; we accumulate until we have a whole row,
+    /// then dispatch. Discrete wheels usually report 1.0+ per notch
+    /// so the accumulator passes through.
+    scroll_accum: f64,
+    /// Current drag selection, in (col, row) viewport coordinates.
+    /// `None` outside an active drag.
+    selection: Option<Selection>,
     /// Caller-installed keystroke handler. Optional because the
     /// TerminalView can be built before its session is spawned;
     /// `set_on_input` populates it once the daemon round-trip is
     /// ready.
     input_callback: Option<Box<dyn Fn(Vec<u8>)>>,
+}
+
+/// Drag-selection state. Anchor = where the mouse-down landed,
+/// cursor = the current pointer cell.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    anchor_col: u16,
+    anchor_row: u16,
+    cursor_col: u16,
+    cursor_row: u16,
+}
+
+impl Selection {
+    fn is_empty(&self) -> bool {
+        self.anchor_col == self.cursor_col && self.anchor_row == self.cursor_row
+    }
+
+    /// Normalized (start_col, start_row, end_col, end_row) with
+    /// start <= end in row-major order. Inclusive on start, exclusive
+    /// on end, mirroring the Mac UI's `CellSelection.normalized`.
+    fn normalized(&self) -> (u16, u16, u16, u16) {
+        let (sc, sr, ec, er) =
+            if (self.anchor_row, self.anchor_col) <= (self.cursor_row, self.cursor_col) {
+                (
+                    self.anchor_col,
+                    self.anchor_row,
+                    self.cursor_col,
+                    self.cursor_row,
+                )
+            } else {
+                (
+                    self.cursor_col,
+                    self.cursor_row,
+                    self.anchor_col,
+                    self.anchor_row,
+                )
+            };
+        (sc, sr, ec, er.saturating_add(1))
+    }
 }
 
 impl TerminalViewState {
@@ -342,7 +642,144 @@ impl TerminalViewState {
             );
         }
 
+        // Pass D: selection overlay. Translucent fill so cell glyphs
+        // and the cursor stay legible underneath. Same shape as the
+        // Mac UI's `TerminalView.draw` selection draw.
+        if let Some(sel) = self.selection {
+            if !sel.is_empty() {
+                self.paint_selection(cr, sel, cell_w, cell_h);
+            }
+        }
+
         let _ = (width, height);
+    }
+
+    fn paint_selection(&self, cr: &cairo::Context, sel: Selection, cell_w: f64, cell_h: f64) {
+        let (sc, sr, ec, er) = sel.normalized();
+        let (r, g, b) = self.theme.selection_background.to_f64();
+        cr.set_source_rgba(r, g, b, 0.35);
+        if sr == er.saturating_sub(1) {
+            // Single-row selection: one rect from sc..ec.
+            cr.rectangle(
+                sc as f64 * cell_w,
+                sr as f64 * cell_h,
+                (ec.saturating_sub(sc)) as f64 * cell_w,
+                cell_h,
+            );
+            let _ = cr.fill();
+            return;
+        }
+        // Multi-row: head from sc → end-of-row, middle full rows,
+        // tail 0 → ec. Matches the Mac UI's `ribbonRects()`.
+        cr.rectangle(
+            sc as f64 * cell_w,
+            sr as f64 * cell_h,
+            ((DEFAULT_COLS as f64) - sc as f64) * cell_w,
+            cell_h,
+        );
+        let _ = cr.fill();
+        if er.saturating_sub(sr) > 1 {
+            cr.set_source_rgba(r, g, b, 0.35);
+            cr.rectangle(
+                0.0,
+                (sr + 1) as f64 * cell_h,
+                DEFAULT_COLS as f64 * cell_w,
+                (er.saturating_sub(sr).saturating_sub(1)) as f64 * cell_h,
+            );
+            let _ = cr.fill();
+        }
+        cr.set_source_rgba(r, g, b, 0.35);
+        cr.rectangle(
+            0.0,
+            (er.saturating_sub(1)) as f64 * cell_h,
+            ec as f64 * cell_w,
+            cell_h,
+        );
+        let _ = cr.fill();
+    }
+
+    /// Handle a single scroll-wheel `dy`. Negative = up (older
+    /// history). 3 modes per the Go binary `cmd/roost/session.go`:
+    ///   * Mouse-tracking (DECSET 1000/1002/1003) — defer; commit 7
+    ///     of this plan doesn't enable mouse-tracking encode yet.
+    ///   * Alt-screen — translate to ArrowUp / ArrowDown via the key
+    ///     encoder. Lets vim / less consume the wheel.
+    ///   * Primary screen — local viewport scroll via
+    ///     `Terminal::scroll_viewport(Delta)`.
+    fn handle_scroll(&mut self, dy: f64) {
+        // Smooth-scroll accumulator. Trackpad deltas are typically
+        // fractional rows; discrete wheels are integers.
+        self.scroll_accum += dy;
+        // 3 rows per discrete notch matches the Mac UI; for smooth
+        // scroll we step one row at a time so the animation isn't
+        // jumpy.
+        let rows_to_scroll = if self.scroll_accum.abs() >= 1.0 {
+            let rows = self.scroll_accum.trunc() as isize;
+            self.scroll_accum -= rows as f64;
+            rows
+        } else {
+            return;
+        };
+
+        if self.terminal.active_screen() == ActiveScreen::Alternate {
+            // Translate to arrow keys for alt-screen apps.
+            let key = if rows_to_scroll < 0 {
+                roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP
+            } else {
+                roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN
+            };
+            let mut event = match roost_vt::KeyEvent::new() {
+                Ok(ev) => ev,
+                Err(_) => return,
+            };
+            event.set_action(roost_vt::key_action::PRESS);
+            event.set_key(key);
+            event.set_mods(0);
+            self.encoder.sync_from_terminal(&self.terminal);
+            for _ in 0..rows_to_scroll.unsigned_abs() {
+                if let Ok(bytes) = self.encoder.encode(&event) {
+                    if let Some(cb) = self.input_callback.as_ref() {
+                        cb(bytes);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Primary screen: local scrollback. Negative dy = scroll up
+        // (older history). libghostty's Delta semantics use negative
+        // for up.
+        self.terminal
+            .scroll_viewport(ScrollViewport::Delta(-rows_to_scroll));
+        // Track whether we're scrolled back. A positive scroll-down
+        // that lands us at the active region clears the flag.
+        if rows_to_scroll < 0 {
+            self.scrolled_back = true;
+        } else if rows_to_scroll > 0 && self.scrolled_back {
+            // Heuristic: if we scrolled down by the request, assume
+            // we're back at bottom. A more precise check would call
+            // a render-state getter for the viewport offset; deferred
+            // since the keystroke snap is the primary "back-to-bottom"
+            // path.
+            self.scrolled_back = false;
+        }
+    }
+
+    /// Convert widget-pixel `(x, y)` to a (col, row) cell pair,
+    /// clamping to the visible viewport. Returns None for points
+    /// outside the rendered region.
+    fn cell_at(&self, x: f64, y: f64, widget: &DrawingArea) -> Option<(u16, u16)> {
+        let w = widget.width() as f64;
+        let h = widget.height() as f64;
+        if x < 0.0 || y < 0.0 || x > w || y > h {
+            return None;
+        }
+        cell_at_inner(
+            x,
+            y,
+            self.cell_metrics.cell_width,
+            self.cell_metrics.cell_height,
+        )
     }
 
     /// Decide whether to skip the per-cell glyph at the cursor and
@@ -442,4 +879,15 @@ impl TerminalViewState {
 fn set_cairo_color(cr: &cairo::Context, rgb: ColorRgb) {
     let (r, g, b) = rgb.to_f64();
     cr.set_source_rgb(r, g, b);
+}
+
+/// Pure-function variant of `TerminalViewState::cell_at` for use from
+/// closures that don't have a Borrow-able reference to the widget.
+fn cell_at_inner(x: f64, y: f64, cell_w: f64, cell_h: f64) -> Option<(u16, u16)> {
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return None;
+    }
+    let col = (x / cell_w).floor().max(0.0) as u16;
+    let row = (y / cell_h).floor().max(0.0) as u16;
+    Some((col, row))
 }
