@@ -24,8 +24,8 @@ use roost_proto::v1::roost_client::RoostClient;
 use roost_proto::v1::{
     ClearTabNotificationRequest, CloseTabRequest, CreateNotificationRequest, CreateProjectRequest,
     DeleteProjectRequest, FocusTabRequest, IdentifyRequest, ListTabsRequest, OpenTabRequest,
-    RenameProjectRequest, SetTabStateRequest, SetTabTitleRequest, TabResizeRequest, TabState,
-    TabWriteRequest,
+    RenameProjectRequest, SetHookActiveRequest, SetTabStateRequest, SetTabTitleRequest,
+    TabResizeRequest, TabState, TabWriteRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -64,6 +64,32 @@ enum Cmd {
     /// Project subcommands.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Claude Code hook entry point — invoked by the per-event
+    /// scripts that `claude install` registers. Reads the hook
+    /// payload from stdin (Claude's contract), dispatches state +
+    /// notification updates to the daemon, always exits 0 with
+    /// `{}` on stdout (Claude treats nonzero as a failed hook).
+    ClaudeHook {
+        /// Hook event name. Matches what Claude Code emits:
+        /// `session-start`, `prompt-submit`, `notification`,
+        /// `stop`, `session-end`.
+        event: String,
+    },
+    /// Claude Code subcommands (install hook settings file).
+    #[command(subcommand)]
+    Claude(ClaudeCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ClaudeCmd {
+    /// Write `~/.config/roost/claude-settings.json` pointing at
+    /// this binary's `claude-hook` subcommand for each Claude
+    /// Code lifecycle event, then print an `alias claude=…`
+    /// snippet the user pastes into their shell rc.
+    Install {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -318,9 +344,239 @@ async fn main() -> Result<()> {
                 .tab_resize(TabResizeRequest { tab_id, cols, rows })
                 .await?;
         }
+        Cmd::ClaudeHook { event } => {
+            // Phase 6a P9: Claude Code hook dispatch. Two strict
+            // invariants per Claude's contract:
+            //   * Always exit 0. Nonzero surfaces as a hook
+            //     error to the user.
+            //   * Always print `{}` to stdout. Empty payload
+            //     means "do nothing extra."
+            // Any failure path below is logged when ROOST_DEBUG
+            // is set + swallowed otherwise.
+            let _ = run_claude_hook(&event, &mut client).await;
+            println!("{{}}");
+        }
+        Cmd::Claude(ClaudeCmd::Install { force }) => {
+            return claude_install(force);
+        }
     }
 
     Ok(())
+}
+
+/// Hook event dispatch (Phase 6a P9). Reads the JSON payload from
+/// stdin (Claude's contract), maps the event name to a sequence
+/// of RPCs against the running daemon. Best-effort — failures
+/// don't surface to Claude.
+async fn run_claude_hook(
+    event: &str,
+    client: &mut RoostClient<tonic::transport::Channel>,
+) -> Result<()> {
+    // ROOST_TAB_ID is set by the per-tab shell environment when
+    // the shell launched inside a Roost tab. Outside a Roost tab,
+    // tab_id is 0 — silently no-op (Claude can be used outside
+    // Roost; the hook should not error).
+    let tab_id = std::env::var("ROOST_TAB_ID")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    if tab_id == 0 {
+        return Ok(());
+    }
+
+    // Drain stdin to a bounded buffer so Claude doesn't block on
+    // a closed reader, even though only `notification` uses the
+    // payload.
+    let mut stdin_buf = Vec::with_capacity(4096);
+    use std::io::Read;
+    let _ = std::io::stdin().take(1 << 20).read_to_end(&mut stdin_buf);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&stdin_buf).unwrap_or(serde_json::Value::Null);
+
+    let parse_state = |s: &str| match s {
+        "none" => Some(TabState::None),
+        "running" => Some(TabState::Running),
+        "needs_input" => Some(TabState::NeedsInput),
+        "idle" => Some(TabState::Idle),
+        _ => None,
+    };
+
+    match event {
+        "session-start" => {
+            // Engages OSC 9/777 suppression in the daemon's P5
+            // dispatch. Until session-end, the hook owns the
+            // notification surface.
+            let _ = client
+                .set_hook_active(SetHookActiveRequest {
+                    tab_id,
+                    active: true,
+                })
+                .await;
+        }
+        "prompt-submit" => {
+            let _ = client
+                .clear_tab_notification(ClearTabNotificationRequest { tab_id })
+                .await;
+            if let Some(state) = parse_state("running") {
+                let _ = client
+                    .set_tab_state(SetTabStateRequest {
+                        tab_id,
+                        state: state as i32,
+                    })
+                    .await;
+            }
+        }
+        "notification" => {
+            if let Some(state) = parse_state("needs_input") {
+                let _ = client
+                    .set_tab_state(SetTabStateRequest {
+                        tab_id,
+                        state: state as i32,
+                    })
+                    .await;
+            }
+            let body = parsed
+                .get("message")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Claude needs input")
+                .to_string();
+            let _ = client
+                .create_notification(CreateNotificationRequest {
+                    tab_id,
+                    title: "Claude Code".into(),
+                    body,
+                })
+                .await;
+        }
+        "stop" => {
+            if let Some(state) = parse_state("idle") {
+                let _ = client
+                    .set_tab_state(SetTabStateRequest {
+                        tab_id,
+                        state: state as i32,
+                    })
+                    .await;
+            }
+            let _ = client
+                .create_notification(CreateNotificationRequest {
+                    tab_id,
+                    title: "Claude Code".into(),
+                    body: "Turn complete".into(),
+                })
+                .await;
+        }
+        "session-end" => {
+            let _ = client
+                .set_hook_active(SetHookActiveRequest {
+                    tab_id,
+                    active: false,
+                })
+                .await;
+            if let Some(state) = parse_state("none") {
+                let _ = client
+                    .set_tab_state(SetTabStateRequest {
+                        tab_id,
+                        state: state as i32,
+                    })
+                    .await;
+            }
+            let _ = client
+                .clear_tab_notification(ClearTabNotificationRequest { tab_id })
+                .await;
+        }
+        other => {
+            if std::env::var("ROOST_DEBUG").is_ok() {
+                eprintln!("roost-cli-rs claude-hook: unknown event: {other}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write `~/.config/roost/claude-settings.json` and print the
+/// `alias claude=…` snippet. Mirrors the Go binary's
+/// `cmd/roost-cli/claude_install.go::cmdClaudeInstall`. The
+/// settings file lists each Claude lifecycle event with a
+/// command-hook entry pointing at this binary's `claude-hook`
+/// subcommand.
+fn claude_install(force: bool) -> Result<()> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME not set"))?;
+    let dir = PathBuf::from(&home).join(".config").join("roost");
+    std::fs::create_dir_all(&dir)?;
+    let settings_path = dir.join("claude-settings.json");
+
+    if !force && settings_path.exists() {
+        eprintln!(
+            "roost-cli-rs claude install: {} already exists; use --force to overwrite",
+            settings_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Resolve the absolute path of the current binary so the
+    // hook commands survive PATH changes. `std::env::current_exe`
+    // returns the canonical path on macOS/Linux (modulo symlinks);
+    // `canonicalize` resolves any symlink layer.
+    let exe = std::env::current_exe()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe_str = exe.to_string_lossy().to_string();
+    let exe_quoted = quote_for_shell(&exe_str);
+
+    let hook_for = |event: &str| -> serde_json::Value {
+        serde_json::json!([{
+            "hooks": [{
+                "type": "command",
+                "command": format!("{} claude-hook {}", exe_quoted, event),
+            }]
+        }])
+    };
+    let doc = serde_json::json!({
+        "hooks": {
+            "SessionStart":     hook_for("session-start"),
+            "UserPromptSubmit": hook_for("prompt-submit"),
+            "Notification":     hook_for("notification"),
+            "Stop":             hook_for("stop"),
+            "SessionEnd":       hook_for("session-end"),
+        }
+    });
+    let body = serde_json::to_string_pretty(&doc)? + "\n";
+    std::fs::write(&settings_path, body)?;
+
+    eprintln!("# Wrote {}", settings_path.display());
+    eprintln!("# Add the line below to your shell rc (e.g. ~/.bashrc), then `source ~/.bashrc`.");
+    eprintln!("# Fish/zsh: adapt the alias syntax for your shell.");
+    println!();
+    println!("# Roost: route Claude Code hooks to the running daemon.");
+    println!(
+        "alias claude='claude --settings '{}",
+        quote_for_shell(&settings_path.to_string_lossy())
+    );
+    Ok(())
+}
+
+/// Wrap `s` in single quotes if it contains characters bash would
+/// interpret. Embedded single quotes use the close-quote/escape/
+/// open-quote pattern (`'\''`). Used for the alias + hook command
+/// strings, both of which are shell-parsed.
+fn quote_for_shell(s: &str) -> String {
+    let needs_quote = s
+        .chars()
+        .any(|c| matches!(c, ' ' | '\t' | '"' | '$' | '\\' | '`' | '\''));
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Decode common Rust-style string escapes from `tab send --bytes`
