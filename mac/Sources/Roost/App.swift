@@ -606,10 +606,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     rebuildTabBar()
                 }
             }
-        case .tabNotification, .notification, .tabsReordered,
-             .projectsReordered, .hookActive:
-            // P7 (badges) + P8 (desktop notifications) light these
-            // up. P6 just routes title / cwd / state.
+        case .tabNotification(let e):
+            // Phase 6a P7: mirror has_pending onto the matching
+            // TabSession + rebuild the strip + sidebar so the
+            // badge slot reflects the new state. The daemon
+            // already aggregates per-tab; per-project rollup
+            // happens in `pillBadgeForProject` at render time.
+            if let session = tabs.first(where: { $0.id == e.tabID }) {
+                session.liveHasNotification = e.hasPending_p
+                if session.projectID == activeProjectID {
+                    rebuildTabBar()
+                }
+                rebuildSidebar()  // sidebar's per-project rollup
+            }
+        case .notification, .tabsReordered, .projectsReordered,
+             .hookActive:
+            // P8 (desktop notifications) consumes `.notification`.
+            // Reorder + hookActive are out of scope for this goal.
             break
         }
     }
@@ -901,6 +914,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         activeSessionByProject[activeProjectID] = session
         window?.makeFirstResponder(view)
+
+        // Phase 6a P7: focusing a notified tab clears its badge
+        // — fire ClearTabNotification daemon-side so every other
+        // watching client converges via the broadcast event. Also
+        // optimistically clear locally so the strip rebuild below
+        // doesn't render a stale badge for one frame.
+        if session.liveHasNotification, let tabID = session.id {
+            session.liveHasNotification = false
+            let socket = socketPath
+            Task.detached {
+                await clearTabNotification(socketPath: socket, tabID: tabID)
+            }
+        }
         rebuildTabBar()
     }
 
@@ -927,6 +953,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 title: pillTitle,
                 isActive: isActive,
                 statusColor: pillStatusColor(for: session),
+                hasBadge: session.liveHasNotification,
                 onSelect: { [weak self] idx in
                     self?.selectTab(at: idx)
                 },
@@ -1187,6 +1214,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         zoomResetItem.target = self
         bind(zoomResetItem, to: KeybindAction.fontReset)
         viewMenu.addItem(zoomResetItem)
+        viewMenu.addItem(.separator())
+        // Phase 6a P7: jump-to-unread shortcut.
+        let jumpItem = NSMenuItem(
+            title: "Jump to Unread",
+            action: #selector(jumpToUnread(_:)),
+            keyEquivalent: ""
+        )
+        jumpItem.target = self
+        bind(jumpItem, to: KeybindAction.jumpToUnread)
+        viewMenu.addItem(jumpItem)
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
 
@@ -1378,6 +1415,57 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         item.keyEquivalentModifierMask = mask
     }
 
+    // MARK: - Jump to next unread (Phase 6a P7)
+
+    /// Find the next tab with `liveHasNotification == true` and
+    /// focus it. Search order: tabs in the active project after
+    /// the current index first (cycle through within project),
+    /// then any tab in any other project. No-op if no tab has a
+    /// pending notification.
+    ///
+    /// Default binding is `⌘⇧U` (cmux convention), overrideable
+    /// via the P1 keybind table.
+    @objc @MainActor
+    private func jumpToUnread(_ sender: Any?) {
+        // Walk current project first, then other projects, until
+        // we find the first notified tab. Stable iteration order:
+        // `tabs` array order within each project.
+        if let activeID = activeProjectID {
+            let activeTabs = tabs.filter { $0.projectID == activeID }
+            let activeFocus = activeSessionByProject[activeID]
+            let startIdx: Int
+            if let activeFocus,
+               let i = activeTabs.firstIndex(where: { $0 === activeFocus })
+            {
+                startIdx = i + 1
+            } else {
+                startIdx = 0
+            }
+            for offset in 0..<activeTabs.count {
+                let idx = (startIdx + offset) % activeTabs.count
+                if activeTabs[idx].liveHasNotification {
+                    selectTab(at: idx)
+                    return
+                }
+            }
+        }
+        // Search other projects in order.
+        for project in projects where project.id != activeProjectID {
+            let projectTabs = tabs
+                .filter { $0.projectID == project.id }
+            if let first = projectTabs.first(where: { $0.liveHasNotification }) {
+                selectProject(id: project.id)
+                if let idx = tabs
+                    .filter({ $0.projectID == project.id })
+                    .firstIndex(where: { $0 === first })
+                {
+                    selectTab(at: idx)
+                }
+                return
+            }
+        }
+    }
+
     // MARK: - Font zoom (Phase 6a P2)
 
     /// Lower bound on the cell-grid font size. Smaller renders cell
@@ -1473,6 +1561,7 @@ final class TabPillView: NSView {
         title: String,
         isActive: Bool,
         statusColor: NSColor? = nil,
+        hasBadge: Bool = false,
         onSelect: @escaping @MainActor (Int) -> Void,
         onClose: @escaping @MainActor (Int) -> Void
     ) {
@@ -1507,8 +1596,7 @@ final class TabPillView: NSView {
 
         // Status-dot slot — reserves 10pt on the leading edge so
         // the label position is stable when the dot turns on. P6
-        // wires `TabStateChangedEvent` to fill `statusColor`; M3
-        // left the slot empty.
+        // wires `TabStateChangedEvent` to fill `statusColor`.
         let statusSlot = NSView()
         statusSlot.translatesAutoresizingMaskIntoConstraints = false
         statusSlot.wantsLayer = true
@@ -1516,9 +1604,22 @@ final class TabPillView: NSView {
             statusSlot.layer?.backgroundColor = color.cgColor
             statusSlot.layer?.cornerRadius = 5
         }
+        // Phase 6a P7: trailing accent-dot badge. Visible only on
+        // inactive notified pills (active pills are about to be
+        // cleared by the focus path; no need to badge the one the
+        // user is already looking at). Shares the same 16×16
+        // trailing slot as the close button — `closeButton.isHidden`
+        // is true on inactive pills so the slot is free.
+        let badgeDot = NSView()
+        badgeDot.translatesAutoresizingMaskIntoConstraints = false
+        badgeDot.wantsLayer = true
+        badgeDot.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        badgeDot.layer?.cornerRadius = 4
+        badgeDot.isHidden = !(hasBadge && !isActive)
         addSubview(statusSlot)
         addSubview(label)
         addSubview(closeButton)
+        addSubview(badgeDot)
 
         // `closeButton.target/action` need self to be a captured
         // weak reference so the pill doesn't leak through the
@@ -1546,12 +1647,21 @@ final class TabPillView: NSView {
             closeButton.widthAnchor.constraint(equalToConstant: 16),
             closeButton.heightAnchor.constraint(equalToConstant: 16),
 
-            // Inactive pills have no close button visible, but the
-            // trailing padding still needs to land on a fixed edge so
-            // the pill shape doesn't squeeze the label.
+            // Badge dot — same trailing slot the close button
+            // occupies on active pills. Inactive notified pills
+            // have closeButton hidden, so the slot is free for
+            // the dot. 8×8 centered in the 16-slot.
+            badgeDot.centerXAnchor.constraint(equalTo: closeButton.centerXAnchor),
+            badgeDot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            badgeDot.widthAnchor.constraint(equalToConstant: 8),
+            badgeDot.heightAnchor.constraint(equalToConstant: 8),
+
+            // Trailing padding for the label — same fixed -28
+            // either way now so the slot is always available for
+            // either close button (active) or badge (notified).
             label.trailingAnchor.constraint(
                 lessThanOrEqualTo: trailingAnchor,
-                constant: isActive ? -28 : -12
+                constant: -28
             ),
         ])
     }
@@ -1585,8 +1695,12 @@ final class TabPillView: NSView {
 /// reference.
 @MainActor
 final class ProjectRowCellView: NSTableCellView {
+    /// Phase 6a P7: small accent-tinted dot in the right column
+    /// when any tab in the project has a pending notification.
+    /// Hidden by default; `configure(with:notifying:)` flips it.
+    private let badgeDot: NSView
+
     init() {
-        super.init(frame: .zero)
         let field = NSTextField(labelWithString: "")
         field.translatesAutoresizingMaskIntoConstraints = false
         field.lineBreakMode = .byTruncatingTail
@@ -1594,20 +1708,37 @@ final class ProjectRowCellView: NSTableCellView {
         field.usesSingleLineMode = true
         field.font = .systemFont(ofSize: 13)
         field.allowsDefaultTighteningForTruncation = true
+
+        let dot = NSView()
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        dot.layer?.cornerRadius = 4
+        dot.isHidden = true
+        self.badgeDot = dot
+
+        super.init(frame: .zero)
         addSubview(field)
+        addSubview(dot)
         textField = field
         NSLayoutConstraint.activate([
             field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
-            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            field.trailingAnchor.constraint(equalTo: dot.leadingAnchor, constant: -6),
             field.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            dot.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
-    func configure(with project: ProjectSnapshot) {
+    func configure(with project: ProjectSnapshot, notifying: Bool) {
         textField?.stringValue = project.name
+        badgeDot.isHidden = !notifying
     }
 }
 
@@ -1636,7 +1767,11 @@ extension RoostApp: NSOutlineViewDelegate {
     ) -> NSView? {
         guard let row = item as? ProjectRowItem else { return nil }
         let cell = ProjectRowCellView()
-        cell.configure(with: row.project)
+        // Phase 6a P7 per-project rollup: badge the sidebar row
+        // if ANY tab in this project has a pending notification.
+        let notifying = tabs
+            .contains { $0.projectID == row.project.id && $0.liveHasNotification }
+        cell.configure(with: row.project, notifying: notifying)
         return cell
     }
 

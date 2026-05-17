@@ -45,6 +45,11 @@ final class TabSession {
     var liveTitle: String?
     var liveCwd: String?
     var liveState: Int32?
+    /// Phase 6a P7: tracks `TabNotificationEvent.has_pending` so
+    /// the tab pill + sidebar row can render an accent badge.
+    /// Cleared via `ClearTabNotification` when the user focuses
+    /// the tab.
+    var liveHasNotification: Bool = false
 
     /// Project the tab belongs to. Set at construction so the window
     /// can filter tabs by project before `start()` ever runs — the
