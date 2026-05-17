@@ -49,6 +49,13 @@ final class TerminalView: NSView {
     /// rendering path lands.
     nonisolated(unsafe) private var terminal: GhosttyTerminal?
 
+    /// libghostty-vt key encoder bridge (goal-mac-polish-cursor-keys
+    /// M1). Allocated alongside the terminal handle in `init`, freed
+    /// implicitly before the terminal in `deinit`. Optional only so
+    /// init can fall through gracefully if the encoder allocation
+    /// fails — in practice that should never happen.
+    private var keyEncoder: KeyEncoder?
+
     /// Pull-model snapshot of the terminal used by `draw()`.
     /// Phase 5.4b uses this only for the canvas color; 5.4c walks
     /// it cell-by-cell.
@@ -186,6 +193,15 @@ final class TerminalView: NSView {
         // run before any `ghostty_terminal_vt_write` so the very
         // first frame paints with the right colors.
         Theme.apply(theme, to: handle!)
+
+        // goal-mac-polish-cursor-keys M1: real key encoder bridge.
+        // Replaces the hand-rolled `specialKeyBytes` table that used
+        // to live in `keyDown` — fixes Shift+Tab, Shift+Enter,
+        // Option+Arrow, Ctrl+letter, and so on by routing every
+        // NSEvent through libghostty-vt's `ghostty_key_encoder_*`
+        // surface (same one the Go binary uses via
+        // `internal/ghostty/key.go`).
+        self.keyEncoder = KeyEncoder(terminal: handle!)
 
         // Let edge-pinned hosts (the `terminalContainer` in
         // `RoostApp.selectTab`) stretch the view past its 80×24
@@ -393,89 +409,21 @@ final class TerminalView: NSView {
 
     /// Phase 5.5b: forward keystrokes to the StreamPty writer.
     ///
-    /// Keys come in two flavors:
-    ///
-    ///   * **Printable / shell-canonical** — Tab, Enter, Backspace,
-    ///     Ctrl+letter, etc. NSEvent.characters returns the right
-    ///     bytes for these (Tab=`\t`, Enter=`\r`, Ctrl+C=`\u{0003}`),
-    ///     so we just send them as UTF-8.
-    ///
-    ///   * **Special / function keys** — arrows, Home/End, Page
-    ///     Up/Down, Delete (forward delete), Function keys.
-    ///     NSEvent.characters returns NS-private codepoints in the
-    ///     `\u{F700}+` range that shells don't recognize. The
-    ///     standard fix is the libghostty-vt key encoder
-    ///     (ghostty_key_encoder_*) which knows kitty keyboard modes,
-    ///     modifier consumption, etc. For Phase 5.5c-lite we
-    ///     translate the most common ones to plain VT/CSI escape
-    ///     sequences directly. Full encoder integration is the next
-    ///     bite (5.5c).
+    /// Every keystroke routes through `KeyEncoder.encode` (the M1
+    /// libghostty-vt bridge). The encoder respects live terminal
+    /// state — cursor-key application mode, Kitty keyboard flags,
+    /// modifyOtherKeys, etc. — and produces the correct escape
+    /// sequence for Shift+Tab (`\x1b[Z`), Shift+Enter, Option+Arrow,
+    /// Ctrl+letter, and arrow / function / navigation keys. Same
+    /// surface the Go binary uses via `internal/ghostty/key.go`.
     override func keyDown(with event: NSEvent) {
-        // Try the special-key table first; fall back to raw
-        // NSEvent.characters for everything else.
-        if let specialBytes = Self.specialKeyBytes(for: event) {
-            onKey?(specialBytes)
-            return
-        }
-        guard let chars = event.characters,
-              let data = chars.data(using: .utf8),
-              !data.isEmpty
-        else {
-            return
-        }
-        onKey?(data)
-    }
-
-    /// Translate well-known NS function-key codes to VT/CSI escape
-    /// sequences. Returns nil for keys we don't recognize so the
-    /// caller falls through to NSEvent.characters.
-    ///
-    /// Sequences chosen to match xterm's defaults — what virtually
-    /// every shell + readline + tmux understands. No modifier
-    /// support yet (Shift+Arrow, Option+Arrow); that lands with
-    /// the libghostty-vt key encoder in Phase 5.5c.
-    private static func specialKeyBytes(for event: NSEvent) -> Data? {
-        guard let chars = event.charactersIgnoringModifiers,
-              let scalar = chars.unicodeScalars.first
-        else {
-            return nil
-        }
-        // NS function-key constants are `Int`, scalar.value is `UInt32`.
-        // Bridge through Int once for a clean switch.
-        let codepoint = Int(scalar.value)
-        let csi = Data([0x1b, 0x5b])  // ESC [
-        let ss3 = Data([0x1b, 0x4f])  // ESC O (used for F1-F4)
-        switch codepoint {
-        // Arrows
-        case NSUpArrowFunctionKey:    return csi + Data("A".utf8)
-        case NSDownArrowFunctionKey:  return csi + Data("B".utf8)
-        case NSRightArrowFunctionKey: return csi + Data("C".utf8)
-        case NSLeftArrowFunctionKey:  return csi + Data("D".utf8)
-        // Navigation
-        case NSHomeFunctionKey:       return csi + Data("H".utf8)
-        case NSEndFunctionKey:        return csi + Data("F".utf8)
-        case NSPageUpFunctionKey:     return csi + Data("5~".utf8)
-        case NSPageDownFunctionKey:   return csi + Data("6~".utf8)
-        // Forward Delete (Fn+Delete on Mac). Backspace stays
-        // NSEvent.characters (yields `\u{7f}` DEL — what most shells
-        // expect for the backspace key on the main keyboard).
-        case NSDeleteFunctionKey:     return csi + Data("3~".utf8)
-        // Function keys F1-F4 use SS3, F5-F12 use CSI ~ encoding.
-        case NSF1FunctionKey:  return ss3 + Data("P".utf8)
-        case NSF2FunctionKey:  return ss3 + Data("Q".utf8)
-        case NSF3FunctionKey:  return ss3 + Data("R".utf8)
-        case NSF4FunctionKey:  return ss3 + Data("S".utf8)
-        case NSF5FunctionKey:  return csi + Data("15~".utf8)
-        case NSF6FunctionKey:  return csi + Data("17~".utf8)
-        case NSF7FunctionKey:  return csi + Data("18~".utf8)
-        case NSF8FunctionKey:  return csi + Data("19~".utf8)
-        case NSF9FunctionKey:  return csi + Data("20~".utf8)
-        case NSF10FunctionKey: return csi + Data("21~".utf8)
-        case NSF11FunctionKey: return csi + Data("23~".utf8)
-        case NSF12FunctionKey: return csi + Data("24~".utf8)
-        default:
-            return nil
-        }
+        guard let keyEncoder else { return }
+        let bytes = keyEncoder.encode(event)
+        // Empty bytes mean the encoder swallowed the event
+        // (modifier-only press, IME dead-key, etc.) — don't propagate
+        // a zero-length write to the PTY.
+        guard !bytes.isEmpty else { return }
+        onKey?(bytes)
     }
 
     /// Lets AutoLayout size the view to its cell grid by default.
