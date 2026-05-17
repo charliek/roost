@@ -93,7 +93,16 @@ enum State {
 pub struct OscScanner {
     state: State,
     num: String,
-    body: String,
+    /// Body bytes accumulated raw so multi-byte UTF-8 sequences
+    /// (emoji, CJK, anything outside ASCII) round-trip intact.
+    /// The earlier `body: String` + `b as char` push interpreted
+    /// each byte as a Latin-1 codepoint, so `0xF0 0x9F 0x9F 0xA2`
+    /// (🟢) became four mangled chars in titles. Decode happens
+    /// at dispatch time via `String::from_utf8_lossy`. The matching
+    /// fix landed on the Mac side in
+    /// `mac/Sources/Roost/OscScanner.swift` (merged from
+    /// feature/rust-port `aebd408`).
+    body: Vec<u8>,
     pending: Vec<OscEvent>,
 }
 
@@ -108,7 +117,7 @@ impl OscScanner {
         Self {
             state: State::Outside,
             num: String::new(),
-            body: String::new(),
+            body: Vec::new(),
             pending: Vec::new(),
         }
     }
@@ -165,7 +174,7 @@ impl OscScanner {
                 0x1B => self.state = State::BodyEsc,
                 _ => {
                     if self.body.len() < MAX_BODY {
-                        self.body.push(b as char);
+                        self.body.push(b);
                     }
                 }
             },
@@ -187,7 +196,12 @@ impl OscScanner {
 
     fn dispatch(&mut self) {
         let num = self.num.as_str();
-        let body = self.body.as_str();
+        // Decode the byte-buffered body as UTF-8 once. Invalid bytes
+        // become U+FFFD via the lossy decoder rather than dropping
+        // the whole OSC when one stray byte interrupts an otherwise
+        // valid title.
+        let body_cow = String::from_utf8_lossy(&self.body);
+        let body = body_cow.as_ref();
         match num {
             "0" | "1" | "2" => {
                 // Title. OSC 0 = window + icon; 1 = icon only; 2 =
@@ -581,5 +595,32 @@ mod tests {
         // and emit nothing.
         let events = feed_all(b"some shell output\nmore output\n");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn osc_title_preserves_utf8_multibyte() {
+        // 🟢 = U+1F7E2 = UTF-8 F0 9F 9F A2. Earlier implementation
+        // pushed each byte as a separate `char`, mangling this into
+        // four Latin-1 codepoints (ð control control ¢). With the
+        // byte-buffered scanner, the title should round-trip intact.
+        // Mirror of upstream `aebd408` (merged into Phase 7).
+        let title = "🟢 /Users/charliek/projects/roost";
+        let mut payload = b"\x1b]0;".to_vec();
+        payload.extend_from_slice(title.as_bytes());
+        payload.push(0x07);
+        let events = feed_all(&payload);
+        assert_eq!(events, vec![OscEvent::Title(title.to_string())]);
+    }
+
+    #[test]
+    fn osc_title_preserves_cjk() {
+        // 日本語 — Japanese, 9 UTF-8 bytes (E6 97 A5 / E6 9C AC /
+        // E8 AA 9E). Same regression class as the emoji case above.
+        let title = "日本語 prompt";
+        let mut payload = b"\x1b]0;".to_vec();
+        payload.extend_from_slice(title.as_bytes());
+        payload.push(0x07);
+        let events = feed_all(&payload);
+        assert_eq!(events, vec![OscEvent::Title(title.to_string())]);
     }
 }

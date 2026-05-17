@@ -14,6 +14,17 @@ use std::ptr;
 use crate::sys;
 use crate::{Error, Result};
 
+// Compile-time guards on the `ColorRgb` <-> `GhosttyColorRgb` cast in
+// `set_color_palette`. If a bindgen regen ever changes the size or
+// alignment of `GhosttyColorRgb`, the build breaks here instead of
+// silently corrupting palette data at runtime. CodeRabbit flagged
+// the cast on PR #50; the assertions are the requested guard.
+const _: () =
+    assert!(std::mem::size_of::<crate::ColorRgb>() == std::mem::size_of::<sys::GhosttyColorRgb>(),);
+const _: () = assert!(
+    std::mem::align_of::<crate::ColorRgb>() == std::mem::align_of::<sys::GhosttyColorRgb>(),
+);
+
 /// Construction parameters for a new terminal. Matches
 /// `GhosttyTerminalOptions` 1:1.
 #[derive(Debug, Clone, Copy)]

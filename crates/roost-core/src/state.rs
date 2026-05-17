@@ -114,6 +114,23 @@ impl Workspace {
     /// if needed.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
         let store = Store::open(path).map_err(wrap)?;
+        // Purge orphan tab rows from prior daemon sessions. A Tab
+        // implies a live PTY; PTYs don't survive a process restart,
+        // so any rows present at boot are stale by definition. Without
+        // this, M5's empty-project cascade misfires: the user types
+        // `exit` in their last visible tab, the daemon-side
+        // list_tabs(project_id) still returns the orphans, the project
+        // looks non-empty, and the cascade never deletes the project.
+        // Projects are preserved across restarts; only tabs are stale.
+        match store.delete_all_tabs() {
+            Ok(n) if n > 0 => {
+                warn!(removed = n, "purged orphan tab rows at daemon startup");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(?err, "failed to purge orphan tab rows at startup");
+            }
+        }
         Ok(Self::with_store(store))
     }
 
@@ -976,28 +993,40 @@ mod tests {
     }
 
     #[test]
-    fn persistence_round_trip_via_open() {
+    fn projects_survive_reopen_tabs_do_not() {
+        // Projects persist across daemon restarts; tabs don't.
+        // A Tab row implies a live PTY, and PTYs die with the daemon,
+        // so `Workspace::open` purges all tab rows at startup
+        // (commit on goal-mac-polish-cursor-keys follow-ups).
+        // Without that, M5's empty-project cascade misfires on the
+        // user's first `exit` because the daemon thinks orphan tabs
+        // still exist.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ws.db");
 
-        let tab_id = {
+        let project_name: String = {
             let ws = Workspace::open(&path).unwrap();
-            let project = ws.ensure_default_project("/tmp/work");
-            let tab = ws.open_tab(project, "/tmp/work", "first").unwrap();
-            tab.id
+            let project_id = ws.ensure_default_project("/tmp/work");
+            ws.open_tab(project_id, "/tmp/work", "first").unwrap();
+            let snap = ws.snapshot();
+            assert_eq!(snap.len(), 1);
+            assert_eq!(snap[0].tabs.len(), 1);
+            snap[0].name.clone()
         };
 
-        // Reopen — projects + tabs survive, but runtime fields reset.
+        // Reopen — projects survive (we want the user's named
+        // workspaces back), but tabs are wiped clean.
         let ws = Workspace::open(&path).unwrap();
         let snap = ws.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].tabs.len(), 1);
-        let after = ws.tab(tab_id).unwrap();
-        assert_eq!(after.title, "first");
-        // Runtime state was not persisted — defaults restored.
-        assert_eq!(after.state, TabState::Unspecified);
-        assert!(!after.has_notification);
-        assert!(!after.hook_active);
+        assert_eq!(snap.len(), 1, "project should persist across reopen");
+        assert_eq!(
+            snap[0].name, project_name,
+            "project name should match the original"
+        );
+        assert!(
+            snap[0].tabs.is_empty(),
+            "orphan tabs should be purged on Workspace::open"
+        );
     }
 
     #[test]
