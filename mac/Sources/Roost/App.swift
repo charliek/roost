@@ -89,6 +89,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `applicationWillTerminate` cancels it.
     private var eventsTask: Task<Void, Never>?
 
+    /// Phase 6a P8: desktop notification coordinator. Owns the
+    /// UNUserNotificationCenter delegate (retained for lifetime
+    /// of the app) + the authorized flag. `applicationDidFinishLaunching`
+    /// fires `requestAuthorization`; `handleEvent`'s
+    /// `notification(e)` case routes `NotificationEvent`s here.
+    private let desktopNotifications = DesktopNotifications()
+
     nonisolated static func main() {
         let app = NSApplication.shared
         let delegate = RoostApp()
@@ -131,6 +138,31 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         )
 
         installMainMenu()
+
+        // Phase 6a P8: prompt for notification permissions at launch
+        // so the system dialog arrives at a predictable moment rather
+        // than mid-session when the first NotificationEvent fires.
+        // Hook the click handler to focus the originating tab —
+        // walks `projects` / `tabs` and reuses the M2 selectProject
+        // + M3 selectTab paths.
+        desktopNotifications.requestAuthorization()
+        desktopNotifications.onActivate = { [weak self] tabID in
+            guard let self else { return }
+            guard let session = self.tabs.first(where: { $0.id == tabID }) else {
+                return
+            }
+            // Switch project first if needed, then focus the tab
+            // within it. selectProject is idempotent when the id
+            // matches.
+            if session.projectID != self.activeProjectID {
+                self.selectProject(id: session.projectID)
+            }
+            let projectTabs = self.tabs.filter { $0.projectID == session.projectID }
+            if let idx = projectTabs.firstIndex(where: { $0 === session }) {
+                self.selectTab(at: idx)
+            }
+            NSApp.activate(ignoringOtherApps: true)
+        }
 
         // Probe the cell-grid intrinsic size so the right pane reserves
         // enough room for an 80×24 terminal — `TerminalView` still pins
@@ -619,9 +651,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 }
                 rebuildSidebar()  // sidebar's per-project rollup
             }
-        case .notification, .tabsReordered, .projectsReordered,
-             .hookActive:
-            // P8 (desktop notifications) consumes `.notification`.
+        case .notification(let e):
+            // Phase 6a P8: route the daemon-emitted notification
+            // to a macOS banner via UNUserNotificationCenter.
+            // The daemon already applied hook_active suppression
+            // in P5; by the time we see a NotificationEvent here
+            // the surface is ours to render.
+            desktopNotifications.emit(
+                tabID: e.tabID,
+                title: e.title,
+                body: e.body
+            )
+        case .tabsReordered, .projectsReordered, .hookActive:
             // Reorder + hookActive are out of scope for this goal.
             break
         }
