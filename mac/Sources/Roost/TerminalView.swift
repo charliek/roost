@@ -22,6 +22,16 @@ import AppKit
 import CGhosttyVT
 
 final class TerminalView: NSView {
+    /// Maximum scrollback rows libghostty-vt retains per terminal.
+    /// Matches Go binary's `cmd/roost/session.go:186` (M6).
+    static let defaultScrollback: size_t = 2000
+
+    /// Discrete scroll-wheel notches → terminal rows. Matches Go
+    /// `cmd/roost/session.go:794`: ~3 rows per click on a discrete
+    /// wheel. Trackpad smooth-scroll bypasses this multiplier and
+    /// uses point-precision accumulation instead.
+    private static let rowsPerWheelNotch: Int = 3
+
     /// Live cell-grid metrics. `cols` and `rows` follow the view's
     /// bounds — Phase 6a M3 lifts the previous "fixed at init"
     /// invariant so window resize reflows the terminal.
@@ -182,6 +192,25 @@ final class TerminalView: NSView {
     private var cursorCellGlyph: Character?
     private var cursorCellOriginalForeground: NSColor?
 
+    // MARK: - Scrollback (goal-mac-polish-cursor-keys M6)
+
+    /// Fractional accumulator for trackpad smooth-scroll. NSEvent's
+    /// `scrollingDeltaY` is in points (continuous on Magic Mouse /
+    /// trackpads). We translate to rows by dividing by `cellSize.height`,
+    /// accumulate the fractional remainder, dispatch whole rows when
+    /// `|accum|` crosses a row boundary. Reset on direction change so
+    /// the user can quickly flick back without overshoot.
+    private var scrollAccum: Double = 0.0
+    private var lastScrollDirection: Int = 0
+
+    /// `true` when the viewport has been scrolled away from the bottom
+    /// by a local-scroll event. Cleared by the snap-to-bottom hook in
+    /// `keyDown`, which fires `GHOSTTY_SCROLL_VIEWPORT_BOTTOM` before
+    /// the keystroke reaches libghostty. Mirrors Go
+    /// `cmd/roost/input.go:67` ("Snap viewport before delivering the
+    /// keystroke") + `cmd/roost/session.go:108-112` (`scrolledBack`).
+    private var scrolledBack: Bool = false
+
     init(
         cols: UInt16 = 80,
         rows: UInt16 = 24,
@@ -220,7 +249,12 @@ final class TerminalView: NSView {
         var opts = GhosttyTerminalOptions()
         opts.cols = cols
         opts.rows = rows
-        opts.max_scrollback = 0
+        // M6: enable scrollback storage. Matches Go binary's
+        // MaxScrollback: 2000 in cmd/roost/session.go:186. Without
+        // a positive value libghostty-vt discards lines as they
+        // scroll off the screen — scroll-wheel events would have
+        // nothing to scroll into.
+        opts.max_scrollback = Self.defaultScrollback
 
         var handle: GhosttyTerminal?
         let rc = ghostty_terminal_new(nil, &handle, opts)
@@ -572,12 +606,137 @@ final class TerminalView: NSView {
     /// surface the Go binary uses via `internal/ghostty/key.go`.
     override func keyDown(with event: NSEvent) {
         guard let keyEncoder else { return }
+        // M6: snap the viewport back to the bottom before delivering
+        // the keystroke. Mirrors Go input.go:67. Without this, typing
+        // while scrolled-back would let the shell prompt scroll off
+        // the visible area on the next render.
+        if scrolledBack, let terminal {
+            var sv = GhosttyTerminalScrollViewport()
+            sv.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM
+            ghostty_terminal_scroll_viewport(terminal, sv)
+            scrolledBack = false
+            scrollAccum = 0
+            lastScrollDirection = 0
+            needsDisplay = true
+        }
         let bytes = keyEncoder.encode(event)
         // Empty bytes mean the encoder swallowed the event
         // (modifier-only press, IME dead-key, etc.) — don't propagate
         // a zero-length write to the PTY.
         guard !bytes.isEmpty else { return }
         onKey?(bytes)
+    }
+
+    /// Wheel / trackpad scroll. Three behaviors depending on terminal
+    /// state, matching Go `cmd/roost/session.go::handleScroll`
+    /// (:776-900):
+    ///
+    ///   1. Mouse-tracking mode → mouse-button-4/5 encode through
+    ///      a libghostty-vt mouse encoder. Deferred to a follow-up
+    ///      `polish/mouse-tracking-encoder` branch — for now we
+    ///      silently drop the event so the alt-screen / local
+    ///      paths stay simple.
+    ///   2. Alt-screen, no mouse tracking → translate to Up/Down
+    ///      arrow key presses through the existing key encoder so
+    ///      vim / less behave like the user expects.
+    ///   3. Primary screen, no mouse tracking → local viewport
+    ///      scroll via `ghostty_terminal_scroll_viewport`. Sets
+    ///      `scrolledBack` so the next keystroke snaps to bottom.
+    override func scrollWheel(with event: NSEvent) {
+        guard let terminal else { return }
+        let rowDelta = quantizeScrollDelta(event: event)
+        guard rowDelta != 0 else { return }
+
+        // Mouse tracking mode: app opted into mouse events. Drop
+        // for now — the mouse encoder bridge is a separate slice.
+        if isMouseTrackingActive() {
+            return
+        }
+
+        // Alt-screen: translate to arrow-key presses through the
+        // key encoder. One arrow per row; respects DECCKM application
+        // mode + Kitty keyboard flags because the encoder calls
+        // `setopt_from_terminal` itself.
+        if isAltScreenActive() {
+            guard let keyEncoder else { return }
+            let key: GhosttyKey = rowDelta > 0 ? GHOSTTY_KEY_ARROW_UP : GHOSTTY_KEY_ARROW_DOWN
+            for _ in 0..<abs(rowDelta) {
+                let bytes = keyEncoder.encode(syntheticKey: key)
+                if !bytes.isEmpty { onKey?(bytes) }
+            }
+            return
+        }
+
+        // Primary screen + no mouse tracking → local viewport scroll.
+        // The C delta sign is "up is negative" per terminal.h:201;
+        // NSEvent.scrollingDeltaY is positive when the user pushes
+        // the wheel up (which should scroll BACK in the buffer, i.e.
+        // toward earlier rows). So we pass `-rowDelta` to scroll
+        // back when delta is positive.
+        var sv = GhosttyTerminalScrollViewport()
+        sv.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA
+        sv.value.delta = intptr_t(-rowDelta)
+        ghostty_terminal_scroll_viewport(terminal, sv)
+        scrolledBack = true
+        needsDisplay = true
+    }
+
+    /// Quantize an NSEvent scroll into whole-row delta. Smooth-scroll
+    /// events accumulate fractional points; discrete wheel notches
+    /// dispatch `rowsPerWheelNotch` rows each. Returns 0 when we
+    /// haven't crossed a whole-row boundary yet (caller short-circuits).
+    private func quantizeScrollDelta(event: NSEvent) -> Int {
+        if event.hasPreciseScrollingDeltas {
+            // Trackpad / Magic Mouse: scrollingDeltaY is in screen
+            // points. Convert to row units via cell height, accumulate.
+            let cellH = max(cellSize.height, 1)
+            let delta = Double(event.scrollingDeltaY) / Double(cellH)
+            // Reset accumulator on direction change so a quick flick
+            // back doesn't carry stale fractional momentum.
+            let direction: Int = delta > 0 ? 1 : (delta < 0 ? -1 : 0)
+            if lastScrollDirection != 0,
+               direction != 0,
+               direction != lastScrollDirection
+            {
+                scrollAccum = 0
+            }
+            scrollAccum += delta
+            let rows = Int(scrollAccum.rounded(.towardZero))
+            if rows != 0 {
+                scrollAccum -= Double(rows)
+                lastScrollDirection = rows > 0 ? 1 : -1
+            }
+            return rows
+        }
+        // Discrete wheel: scrollingDeltaY is signed clicks. Bias by
+        // rowsPerWheelNotch so a single click moves a noticeable
+        // chunk (matches Go's session.go:794).
+        let clicks = Int(event.scrollingDeltaY.rounded())
+        scrollAccum = 0
+        lastScrollDirection = clicks > 0 ? 1 : (clicks < 0 ? -1 : 0)
+        return clicks * Self.rowsPerWheelNotch
+    }
+
+    /// Check whether the terminal currently has any mouse-tracking
+    /// mode enabled (X10 / normal / button / any-event). When true,
+    /// scroll-wheel events should be encoded as button-4/5 instead
+    /// of local viewport scroll — deferred to a separate milestone.
+    private func isMouseTrackingActive() -> Bool {
+        guard let terminal else { return false }
+        var active: Bool = false
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &active)
+        return active
+    }
+
+    /// Check whether the alt-screen is active (vim, less, etc.). The
+    /// alt-screen has no scrollback by design, so wheel events
+    /// translate to arrow-key presses for the focused app's own
+    /// scroll handling.
+    private func isAltScreenActive() -> Bool {
+        guard let terminal else { return false }
+        var screen: GhosttyTerminalScreen = GHOSTTY_TERMINAL_SCREEN_PRIMARY
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
+        return screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
     }
 
     /// Lets AutoLayout size the view to its cell grid by default.
