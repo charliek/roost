@@ -319,6 +319,16 @@ impl Store {
         Ok(())
     }
 
+    /// Drop every tab row in the DB. Used at daemon startup to flush
+    /// orphans from prior sessions: a Tab row implies a live PTY, and
+    /// no PTY survives a daemon restart, so any rows present at boot
+    /// are by definition stale. Returns the number of rows removed.
+    /// Project rows are untouched.
+    pub fn delete_all_tabs(&self) -> StoreResult<usize> {
+        let n = self.conn.execute("DELETE FROM tab", params![])?;
+        Ok(n)
+    }
+
     pub fn reorder_tabs(&mut self, project_id: i64, ordered_ids: &[i64]) -> StoreResult<()> {
         let tx = self.conn.transaction()?;
         let existing = collect_ids(
