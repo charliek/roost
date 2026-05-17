@@ -333,6 +333,33 @@ func createProject(socketPath: String, name: String, cwd: String) async -> Proje
 }
 
 /// Best-effort `RenameProject`. Errors logged, not surfaced.
+/// Rename a tab via the daemon. The daemon-side handler sets the
+/// per-tab `user_titled` lock so subsequent OSC 1/2 emissions from
+/// the shell stop overwriting (`crates/roost-core/src/service.rs:416`).
+/// Same semantics as Go's `ws.RenameTab`.
+func setTabTitle(socketPath: String, tabID: Int64, title: String) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.setTabTitle(
+                .with {
+                    $0.tabID = tabID
+                    $0.title = title
+                }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] setTabTitle(\(tabID)) failed: \(error)\n".utf8)
+        )
+    }
+}
+
 func renameProject(socketPath: String, projectID: Int64, name: String) async {
     do {
         try await withGRPCClient(

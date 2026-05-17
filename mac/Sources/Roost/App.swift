@@ -1250,6 +1250,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         bind(closeTabItem, to: KeybindAction.closeTab)
         fileMenu.addItem(closeTabItem)
         fileMenu.addItem(.separator())
+        // M4: rename the active tab. ⌘R; pairs with ⌘⇧R for rename
+        // project so the muscle-memory split mirrors Go's defaults.
+        let renameTabItem = NSMenuItem(
+            title: "Rename Tab…",
+            action: #selector(renameActiveTab(_:)),
+            keyEquivalent: ""
+        )
+        renameTabItem.target = self
+        bind(renameTabItem, to: KeybindAction.renameTab)
+        fileMenu.addItem(renameTabItem)
         let renameProjectItem = NSMenuItem(
             title: "Rename Project…",
             action: #selector(renameActiveProject(_:)),
@@ -1258,6 +1268,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         renameProjectItem.target = self
         bind(renameProjectItem, to: KeybindAction.renameProject)
         fileMenu.addItem(renameProjectItem)
+        fileMenu.addItem(.separator())
+        // M4: cycle prev / next within the active project's tabs.
+        // ⌘⇧[ / ⌘⇧]; wraps at ends. Matches Go cycle_tab_prev /
+        // cycle_tab_next actions.
+        let cyclePrevItem = NSMenuItem(
+            title: "Previous Tab",
+            action: #selector(cycleTabPrev(_:)),
+            keyEquivalent: ""
+        )
+        cyclePrevItem.target = self
+        bind(cyclePrevItem, to: KeybindAction.cycleTabPrev)
+        fileMenu.addItem(cyclePrevItem)
+        let cycleNextItem = NSMenuItem(
+            title: "Next Tab",
+            action: #selector(cycleTabNext(_:)),
+            keyEquivalent: ""
+        )
+        cycleNextItem.target = self
+        bind(cycleNextItem, to: KeybindAction.cycleTabNext)
+        fileMenu.addItem(cycleNextItem)
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
@@ -1498,6 +1528,80 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let (key, mask) = accel(for: action)
         item.keyEquivalent = key
         item.keyEquivalentModifierMask = mask
+    }
+
+    // MARK: - Cycle + rename tab (M4)
+
+    /// Move focus to the previous tab in the active project, wrapping
+    /// from the first to the last. ⌘⇧[ by default.
+    /// Mirrors Go `cmd/roost/app.go::cycleTab(delta=-1)`.
+    @objc @MainActor
+    private func cycleTabPrev(_ sender: Any?) {
+        cycleTab(delta: -1)
+    }
+
+    /// Move focus to the next tab in the active project, wrapping
+    /// from the last to the first. ⌘⇧] by default.
+    /// Mirrors Go `cmd/roost/app.go::cycleTab(delta=+1)`.
+    @objc @MainActor
+    private func cycleTabNext(_ sender: Any?) {
+        cycleTab(delta: 1)
+    }
+
+    @MainActor
+    private func cycleTab(delta: Int) {
+        guard let activeProjectID else { return }
+        let projectTabs = tabsForActiveProject()
+        guard !projectTabs.isEmpty else { return }
+        let active = activeSessionByProject[activeProjectID]
+        let currentIdx = projectTabs.firstIndex(where: { $0 === active }) ?? 0
+        let n = projectTabs.count
+        // ((i + delta) % n + n) % n for negative-safe modulo.
+        let next = ((currentIdx + delta) % n + n) % n
+        selectTab(at: next)
+    }
+
+    /// Rename the active tab via an NSAlert + text field, the same
+    /// idiom `renameProjectFromMenu` uses. On commit the daemon
+    /// sets the per-tab `user_titled` lock so shell-emitted OSC 1/2
+    /// stops overwriting. ⌘R by default (Mac convention "rename" —
+    /// also matches Go binary's `cmd/roost/app.go::renameActiveTab`).
+    @objc @MainActor
+    private func renameActiveTab(_ sender: Any?) {
+        guard let activeProjectID,
+              let session = activeSessionByProject[activeProjectID],
+              let tabID = session.id
+        else {
+            return
+        }
+        let projectTabs = tabsForActiveProject()
+        let index = projectTabs.firstIndex(where: { $0 === session }) ?? 0
+        let currentTitle = pillLabel(for: session, index: index)
+
+        let alert = NSAlert()
+        alert.messageText = "Rename Tab"
+        alert.informativeText = "Choose a new name for this tab. The shell can no longer change it after this."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        input.stringValue = currentTitle
+        alert.accessoryView = input
+        alert.window.initialFirstResponder = input
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+        let newTitle = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newTitle.isEmpty, newTitle != currentTitle else { return }
+
+        // Optimistic local update so the pill flips immediately. The
+        // daemon's TabTitleChangedEvent will reconcile if anything
+        // drifts (shouldn't happen since the daemon accepts blindly).
+        session.liveTitle = newTitle
+        rebuildTabBar()
+
+        let socketPath = self.socketPath
+        Task {
+            await setTabTitle(socketPath: socketPath, tabID: tabID, title: newTitle)
+        }
     }
 
     // MARK: - Sidebar toggle (M3)
