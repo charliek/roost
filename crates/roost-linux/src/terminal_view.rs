@@ -26,7 +26,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::cairo;
-use gtk4::gdk;
 use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
@@ -34,10 +33,12 @@ use gtk4::{DrawingArea, EventControllerFocus, EventControllerKey};
 use pangocairo::functions as pango_cairo;
 
 use roost_vt::{
-    Cell, ColorRgb, CursorInfo, CursorVisualStyle, RenderState, Terminal, TerminalOptions,
+    Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, RenderState, Terminal,
+    TerminalOptions,
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
+use crate::key_encoder;
 use crate::theme::Theme;
 
 /// Default cell grid the terminal allocates with. Cell pixels are
@@ -83,6 +84,7 @@ impl TerminalView {
         .expect("allocate libghostty-vt terminal");
 
         let render_state = RenderState::new().expect("allocate libghostty-vt render state");
+        let encoder = KeyEncoder::new().expect("allocate libghostty-vt key encoder");
 
         let pango_ctx = widget.pango_context();
         let font_desc = default_font_description();
@@ -100,6 +102,7 @@ impl TerminalView {
         let state = Rc::new(RefCell::new(TerminalViewState {
             terminal,
             render_state,
+            encoder,
             theme,
             font_desc,
             cell_metrics: metrics,
@@ -198,16 +201,18 @@ impl TerminalView {
         key_ctrl.connect_key_pressed({
             let state = self.state.clone();
             move |_ctrl, key, _keycode, mods| {
-                // Phase 7 commit 5 bare-minimum input path: forward
-                // printable Unicode keys + Enter / Tab / Backspace +
-                // basic Ctrl chords for ASCII letters. Anything more
-                // (arrows, function keys, Kitty modifyOtherKeys, etc.)
-                // routes through `roost_vt::KeyEncoder` in commit 6.
-                let bytes = encode_minimal_keystroke(key, mods);
+                // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
+                // (the safe wrapper landed in commit 1). The encoder
+                // handles modifier conventions, Kitty keyboard
+                // protocol, DECCKM application-mode arrows, etc.
+                let mut s = state.borrow_mut();
+                let bytes = {
+                    let s_mut: &mut TerminalViewState = &mut s;
+                    key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, key, mods)
+                };
                 if bytes.is_empty() {
                     return glib::Propagation::Proceed;
                 }
-                let s = state.borrow();
                 if let Some(cb) = s.input_callback.as_ref() {
                     cb(bytes);
                 }
@@ -216,44 +221,6 @@ impl TerminalView {
         });
         self.widget.add_controller(key_ctrl);
     }
-}
-
-/// Stop-gap key encoder for commit 5. Handles printable ASCII +
-/// Enter / Tab / Backspace + Ctrl+letter chords. Everything else
-/// returns empty (drops the keystroke); commit 6 replaces this with
-/// `roost_vt::KeyEncoder` and the full Kitty protocol surface.
-fn encode_minimal_keystroke(key: gdk::Key, mods: gdk::ModifierType) -> Vec<u8> {
-    use gdk::Key as K;
-    let is_ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-
-    // Named keys with fixed C0 mappings.
-    match key {
-        K::Return | K::ISO_Enter | K::KP_Enter => return b"\r".to_vec(),
-        K::Tab => return b"\t".to_vec(),
-        K::BackSpace => return b"\x7f".to_vec(),
-        K::Escape => return b"\x1b".to_vec(),
-        _ => {}
-    }
-
-    // Ctrl+letter → C0 control byte.
-    if is_ctrl {
-        if let Some(c) = key.to_unicode() {
-            if ('a'..='z').contains(&c) {
-                return vec![(c as u8) - b'a' + 1];
-            }
-            if ('A'..='Z').contains(&c) {
-                return vec![(c as u8) - b'A' + 1];
-            }
-        }
-    }
-
-    // Printable Unicode → UTF-8.
-    if let Some(c) = key.to_unicode() {
-        if !c.is_control() {
-            return c.to_string().into_bytes();
-        }
-    }
-    Vec::new()
 }
 
 impl Default for TerminalView {
@@ -265,6 +232,9 @@ impl Default for TerminalView {
 struct TerminalViewState {
     terminal: Terminal,
     render_state: RenderState,
+    /// Reused across keystrokes; an internal scratch buffer keeps
+    /// per-keystroke allocation amortized to zero in the steady state.
+    encoder: KeyEncoder,
     theme: Theme,
     font_desc: pango::FontDescription,
     cell_metrics: CellMetrics,

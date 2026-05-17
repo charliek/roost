@@ -13,6 +13,7 @@
 
 mod cell_metrics;
 mod client;
+mod key_encoder;
 mod tab_session;
 mod terminal_view;
 mod theme;

@@ -109,7 +109,7 @@ mod render_state;
 mod terminal;
 
 #[cfg(feature = "ffi")]
-pub use key_encoder::{Key, KeyAction, KeyEncoder, KeyEvent, Mods};
+pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
 #[cfg(feature = "ffi")]
 pub use render_state::{Cell, ColorRgb, Colors, CursorInfo, CursorVisualStyle, RenderState};
 #[cfg(feature = "ffi")]
