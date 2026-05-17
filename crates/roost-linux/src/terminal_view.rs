@@ -26,10 +26,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::cairo;
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{DrawingArea, EventControllerFocus};
+use gtk4::{DrawingArea, EventControllerFocus, EventControllerKey};
 use pangocairo::functions as pango_cairo;
 
 use roost_vt::{
@@ -104,6 +105,7 @@ impl TerminalView {
             cell_metrics: metrics,
             cursor_blink_on: true,
             has_focus: true,
+            input_callback: None,
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -172,6 +174,86 @@ impl TerminalView {
         }
         self.widget.queue_draw();
     }
+
+    /// Install a keystroke handler. Called with raw UTF-8 bytes when
+    /// the view has focus and the user types a printable character.
+    /// Bare-minimum bridge for commit 5 — the full key encoder (arrow
+    /// keys, function keys, Shift+Tab, IME, etc.) lands in commit 6.
+    pub fn set_on_input<F>(&self, callback: F)
+    where
+        F: Fn(Vec<u8>) + 'static,
+    {
+        // Lazily attach the EventControllerKey on first set. We rebind
+        // the held callback to support replacing the handler when a
+        // tab is closed + reopened.
+        let mut s = self.state.borrow_mut();
+        let already_attached = s.input_callback.is_some();
+        s.input_callback = Some(Box::new(callback));
+        drop(s);
+        if already_attached {
+            return;
+        }
+
+        let key_ctrl = EventControllerKey::new();
+        key_ctrl.connect_key_pressed({
+            let state = self.state.clone();
+            move |_ctrl, key, _keycode, mods| {
+                // Phase 7 commit 5 bare-minimum input path: forward
+                // printable Unicode keys + Enter / Tab / Backspace +
+                // basic Ctrl chords for ASCII letters. Anything more
+                // (arrows, function keys, Kitty modifyOtherKeys, etc.)
+                // routes through `roost_vt::KeyEncoder` in commit 6.
+                let bytes = encode_minimal_keystroke(key, mods);
+                if bytes.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
+                let s = state.borrow();
+                if let Some(cb) = s.input_callback.as_ref() {
+                    cb(bytes);
+                }
+                glib::Propagation::Stop
+            }
+        });
+        self.widget.add_controller(key_ctrl);
+    }
+}
+
+/// Stop-gap key encoder for commit 5. Handles printable ASCII +
+/// Enter / Tab / Backspace + Ctrl+letter chords. Everything else
+/// returns empty (drops the keystroke); commit 6 replaces this with
+/// `roost_vt::KeyEncoder` and the full Kitty protocol surface.
+fn encode_minimal_keystroke(key: gdk::Key, mods: gdk::ModifierType) -> Vec<u8> {
+    use gdk::Key as K;
+    let is_ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+
+    // Named keys with fixed C0 mappings.
+    match key {
+        K::Return | K::ISO_Enter | K::KP_Enter => return b"\r".to_vec(),
+        K::Tab => return b"\t".to_vec(),
+        K::BackSpace => return b"\x7f".to_vec(),
+        K::Escape => return b"\x1b".to_vec(),
+        _ => {}
+    }
+
+    // Ctrl+letter → C0 control byte.
+    if is_ctrl {
+        if let Some(c) = key.to_unicode() {
+            if ('a'..='z').contains(&c) {
+                return vec![(c as u8) - b'a' + 1];
+            }
+            if ('A'..='Z').contains(&c) {
+                return vec![(c as u8) - b'A' + 1];
+            }
+        }
+    }
+
+    // Printable Unicode → UTF-8.
+    if let Some(c) = key.to_unicode() {
+        if !c.is_control() {
+            return c.to_string().into_bytes();
+        }
+    }
+    Vec::new()
 }
 
 impl Default for TerminalView {
@@ -188,6 +270,11 @@ struct TerminalViewState {
     cell_metrics: CellMetrics,
     cursor_blink_on: bool,
     has_focus: bool,
+    /// Caller-installed keystroke handler. Optional because the
+    /// TerminalView can be built before its session is spawned;
+    /// `set_on_input` populates it once the daemon round-trip is
+    /// ready.
+    input_callback: Option<Box<dyn Fn(Vec<u8>)>>,
 }
 
 impl TerminalViewState {
