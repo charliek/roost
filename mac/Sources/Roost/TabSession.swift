@@ -38,6 +38,14 @@ final class TabSession {
     /// `onIDAssigned` callback passed to `start` fires once it's set.
     private(set) var id: Int64?
 
+    /// Live tab metadata mirrored from `TabTitleChangedEvent` /
+    /// `TabCwdChangedEvent` / `TabStateChangedEvent` (Phase 6a P6).
+    /// `nil` when the daemon hasn't emitted yet; the tab pill
+    /// falls back to "Tab N" labels until cwd / title arrive.
+    var liveTitle: String?
+    var liveCwd: String?
+    var liveState: Int32?
+
     /// Project the tab belongs to. Set at construction so the window
     /// can filter tabs by project before `start()` ever runs — the
     /// daemon enforces the same id on `OpenTab`.
@@ -109,6 +117,24 @@ final class TabSession {
         }
         terminalView.onResize = { [weak self] cols, rows in
             self?.resize(cols: cols, rows: rows)
+        }
+        // Phase 6a P6: each OSC event the scanner lifts out of the
+        // PTY byte stream goes straight to the daemon's ReportOsc
+        // handler. `tabID` may still be nil when the very first
+        // PTY bytes arrive (OpenTab hasn't returned yet) — skip
+        // in that case; the next chunk will catch any subsequent
+        // OSCs.
+        let socket = socketPath
+        terminalView.onOsc = { [weak self] cmd, payload in
+            guard let self, let tabID = self.id else { return }
+            Task.detached {
+                await reportOsc(
+                    socketPath: socket,
+                    tabID: tabID,
+                    oscCommand: cmd,
+                    payload: payload
+                )
+            }
         }
 
         outputDrainTask = Task { @MainActor [weak self] in
