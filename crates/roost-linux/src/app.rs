@@ -28,7 +28,9 @@ use roost_proto::v1::event::Kind as EventKind;
 use roost_proto::v1::{Project, Tab};
 
 use crate::client::RoostClient;
+use crate::config::RoostConfig;
 use crate::events;
+use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 
@@ -141,6 +143,11 @@ impl App {
                 }
             }
         });
+
+        // Install keybinds at window scope so shortcuts fire even
+        // when the terminal view doesn't have keyboard focus (e.g.
+        // user clicked on the sidebar).
+        app_struct.install_keybinds();
 
         app_struct.window.present();
 
@@ -513,6 +520,185 @@ impl App {
         }
     }
 
+    /// Load `~/.config/roost/config.conf`, merge user keybinds with
+    /// the Linux defaults, and install each `(Accel, action)` pair on
+    /// the window's ShortcutController.
+    fn install_keybinds(self: &Rc<Self>) {
+        let cfg = RoostConfig::load_default();
+        let bindings = canonicalize_bindings(default_bindings(), cfg.keybinds.clone(), |w| {
+            tracing::warn!("keybind: {w}")
+        });
+
+        let controller = gtk4::ShortcutController::new();
+        controller.set_scope(gtk4::ShortcutScope::Global);
+
+        for (accel, action) in bindings {
+            let trigger = build_shortcut_trigger(&accel);
+            let app = self.clone();
+            let cb = gtk4::CallbackAction::new(move |_widget, _args| {
+                app.dispatch_action(action);
+                glib::Propagation::Stop
+            });
+            let shortcut = gtk4::Shortcut::new(Some(trigger), Some(cb));
+            controller.add_shortcut(shortcut);
+        }
+
+        self.window.add_controller(controller);
+    }
+
+    fn dispatch_action(self: &Rc<Self>, action: KeybindAction) {
+        match action {
+            KeybindAction::NewTab => {
+                let pid = *self.active_project_id.borrow();
+                if pid == 0 {
+                    return;
+                }
+                let app = self.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(err) = app.open_new_tab_in(pid).await {
+                        tracing::warn!(?err, "new_tab failed");
+                    }
+                });
+            }
+            KeybindAction::CloseTab => {
+                let pid = *self.active_project_id.borrow();
+                if let Some(tab_id) = self.active_tab_id(pid) {
+                    self.close_tab_async(pid, tab_id);
+                }
+            }
+            KeybindAction::NewProject => {
+                let app = self.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(err) = app.create_new_project().await {
+                        tracing::warn!(?err, "new_project failed");
+                    }
+                });
+            }
+            KeybindAction::CycleTabPrev => self.cycle_tab(-1),
+            KeybindAction::CycleTabNext => self.cycle_tab(1),
+            KeybindAction::Copy => self.copy_active_selection(),
+            KeybindAction::Paste => self.paste_into_active(),
+            KeybindAction::ToggleSidebar => self.toggle_sidebar(),
+            KeybindAction::SwitchProject(n) => self.switch_project_by_index(n as usize),
+            KeybindAction::SwitchTab(n) => self.switch_tab_by_index(n as usize),
+            KeybindAction::Unbind => {
+                // Reaches here only if the table somehow installed an
+                // Unbind action; the canonicalizer should've dropped
+                // the entry instead. Harmless no-op.
+            }
+        }
+    }
+
+    fn active_tab_id(self: &Rc<Self>, project_id: i64) -> Option<i64> {
+        let projects = self.projects.borrow();
+        let ui = projects.get(&project_id)?;
+        let page = ui.tab_view.selected_page()?;
+        parse_tab_id_from_page(&page)
+    }
+
+    fn cycle_tab(self: &Rc<Self>, delta: i32) {
+        let pid = *self.active_project_id.borrow();
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&pid) else {
+            return;
+        };
+        let pages = ui.tab_view.pages();
+        let n = pages.n_items() as i32;
+        if n == 0 {
+            return;
+        }
+        let current = ui
+            .tab_view
+            .selected_page()
+            .map(|p| ui.tab_view.page_position(&p))
+            .unwrap_or(0);
+        let target = ((current + delta).rem_euclid(n)) as u32;
+        if let Some(obj) = pages.item(target) {
+            if let Ok(page) = obj.downcast::<libadwaita::TabPage>() {
+                ui.tab_view.set_selected_page(&page);
+            }
+        }
+    }
+
+    fn copy_active_selection(self: &Rc<Self>) {
+        if let Some(view) = self.active_terminal_view() {
+            view.copy_selection_to_clipboard();
+        }
+    }
+
+    fn paste_into_active(self: &Rc<Self>) {
+        if let Some(view) = self.active_terminal_view() {
+            view.paste_from_clipboard();
+        }
+    }
+
+    fn active_terminal_view(self: &Rc<Self>) -> Option<Rc<TerminalView>> {
+        let pid = *self.active_project_id.borrow();
+        let projects = self.projects.borrow();
+        let ui = projects.get(&pid)?;
+        let page = ui.tab_view.selected_page()?;
+        let tab_id = parse_tab_id_from_page(&page)?;
+        let view = ui.tabs.borrow().get(&tab_id).map(|t| t.view.clone());
+        view
+    }
+
+    fn toggle_sidebar(self: &Rc<Self>) {
+        // The sidebar lives inside the Paned's start child. Toggle
+        // its visibility — Paned auto-adjusts the divider position.
+        let visible = self.sidebar.is_visible();
+        self.sidebar.set_visible(!visible);
+        if let Some(scroll) = self.sidebar.parent() {
+            scroll.set_visible(!visible);
+        }
+    }
+
+    fn switch_project_by_index(self: &Rc<Self>, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let projects = self.projects.borrow();
+        let mut ids: Vec<i64> = projects.keys().copied().collect();
+        ids.sort();
+        if let Some(&id) = ids.get(n - 1) {
+            drop(projects);
+            self.set_active_project(id);
+        }
+    }
+
+    fn switch_tab_by_index(self: &Rc<Self>, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let pid = *self.active_project_id.borrow();
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&pid) else {
+            return;
+        };
+        let pages = ui.tab_view.pages();
+        if let Some(obj) = pages.item((n - 1) as u32) {
+            if let Ok(page) = obj.downcast::<libadwaita::TabPage>() {
+                ui.tab_view.set_selected_page(&page);
+            }
+        }
+    }
+
+    async fn create_new_project(self: &Rc<Self>) -> anyhow::Result<()> {
+        let Some(mut client) = self.client.borrow().clone() else {
+            return Ok(());
+        };
+        let rt = self.rt.clone();
+        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let project = rt
+            .spawn(async move { client.create_project("", &cwd).await })
+            .await
+            .context("create_project join")??;
+        // WatchEvents will also deliver ProjectCreated; the
+        // `add_project_ui` idempotent check prevents duplicate rows.
+        self.add_project_ui(&project);
+        self.set_active_project(project.id);
+        Ok(())
+    }
+
     /// Fire CloseTab on the daemon for the given tab. Async so we
     /// don't block the GTK main loop.
     fn close_tab_async(self: &Rc<Self>, _project_id: i64, tab_id: i64) {
@@ -538,7 +724,33 @@ fn stack_name(project_id: i64) -> String {
     format!("project-{project_id}")
 }
 
-fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
+pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
+}
+
+/// Convert our `Accel` to a `gtk::ShortcutTrigger` that the GTK
+/// shortcut controller understands.
+fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
+    let mut s = String::new();
+    if accel.modifiers.contains(AccelMods::CTRL) {
+        s.push_str("<Control>");
+    }
+    if accel.modifiers.contains(AccelMods::SHIFT) {
+        s.push_str("<Shift>");
+    }
+    if accel.modifiers.contains(AccelMods::ALT) {
+        s.push_str("<Alt>");
+    }
+    if accel.modifiers.contains(AccelMods::SUPER) {
+        s.push_str("<Meta>");
+    }
+    s.push_str(&accel.key);
+    gtk4::ShortcutTrigger::parse_string(&s).unwrap_or_else(|| {
+        // Parse fail = a programmer error in the binding table.
+        // Fall back to a never-firing trigger built by GTK itself.
+        let fallback = gtk4::ShortcutTrigger::parse_string("<Control><Shift>F24")
+            .expect("fallback shortcut trigger parse");
+        fallback
+    })
 }

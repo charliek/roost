@@ -1,0 +1,277 @@
+//! Keybind trigger parser + default action table.
+//!
+//! Mirrors `mac/Sources/Roost/Keybind.swift` (Phase 6 P1) in shape +
+//! the Go binary's `cmd/roost/shortcuts.go`. Defaults flip Linux's
+//! primary modifier to `ctrl` (Mac uses `super`/`cmd`); everything
+//! else — modifier-alias rules, `unbind` semantics, action namespace —
+//! is shared with the other UIs so config files port verbatim across
+//! `mac/`, `linux/`, and the Go binary.
+
+use std::collections::HashMap;
+
+/// Every recognized action. Adding a new action: extend the enum,
+/// extend `Self::name`, extend `Self::from_name`, and provide a
+/// handler in `App::install_keybinds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeybindAction {
+    NewTab,
+    CloseTab,
+    NewProject,
+    CycleTabPrev,
+    CycleTabNext,
+    Copy,
+    Paste,
+    ToggleSidebar,
+    /// Unbind a trigger; removes any default action attached to it.
+    Unbind,
+    /// `switch_project_N` where N is 1..=9.
+    SwitchProject(u8),
+    /// `switch_tab_N` where N is 1..=9.
+    SwitchTab(u8),
+}
+
+impl KeybindAction {
+    /// Parse an action name from a config-file string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "new_tab" => Some(Self::NewTab),
+            "close_tab" => Some(Self::CloseTab),
+            "new_project" => Some(Self::NewProject),
+            "cycle_tab_prev" => Some(Self::CycleTabPrev),
+            "cycle_tab_next" => Some(Self::CycleTabNext),
+            "copy" => Some(Self::Copy),
+            "paste" => Some(Self::Paste),
+            "toggle_sidebar" => Some(Self::ToggleSidebar),
+            "unbind" => Some(Self::Unbind),
+            other => {
+                if let Some(n) = other.strip_prefix("switch_project_") {
+                    n.parse::<u8>()
+                        .ok()
+                        .filter(|n| (1..=9).contains(n))
+                        .map(Self::SwitchProject)
+                } else if let Some(n) = other.strip_prefix("switch_tab_") {
+                    n.parse::<u8>()
+                        .ok()
+                        .filter(|n| (1..=9).contains(n))
+                        .map(Self::SwitchTab)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Canonical accelerator triple: modifier bitmask + a lowercased key
+/// name. `key` follows GTK accelerator syntax (e.g. "t", "1",
+/// "bracketleft", "Tab").
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Accel {
+    pub modifiers: AccelMods,
+    pub key: String,
+}
+
+bitflags::bitflags! {
+    /// Modifier bitmask. Matches `gdk::ModifierType` for Shift / Ctrl /
+    /// Alt / Super; carried as our own type so the parser doesn't
+    /// pull in gtk4 as a dep.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct AccelMods: u8 {
+        const SHIFT = 1;
+        const CTRL  = 2;
+        const ALT   = 4;
+        const SUPER = 8;
+    }
+}
+
+/// Parse a Ghostty-style trigger ("ctrl+shift+t", "alt+1") into an
+/// [`Accel`]. Returns `None` for unparseable input so the canonicalizer
+/// can warn + fall through to the default.
+pub fn parse_trigger(trigger: &str) -> Option<Accel> {
+    let trigger = trigger.trim();
+    if trigger.is_empty() {
+        return None;
+    }
+    let mut mods = AccelMods::empty();
+    let mut last: Option<&str> = None;
+    for part in trigger.split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "shift" => mods |= AccelMods::SHIFT,
+            "ctrl" | "control" => mods |= AccelMods::CTRL,
+            "alt" | "opt" | "option" => mods |= AccelMods::ALT,
+            "super" | "cmd" | "command" => mods |= AccelMods::SUPER,
+            _ => last = Some(part),
+        }
+    }
+    let key = last?.to_ascii_lowercase();
+    Some(Accel {
+        modifiers: mods,
+        key,
+    })
+}
+
+/// Default bindings table for Linux. Primary modifier = Ctrl,
+/// project switching = Alt, clipboard = Ctrl+Shift. Mirrors
+/// `cmd/roost/keymap.go::defaultBindings` on the Go side.
+pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
+    let mut out = Vec::new();
+    let add = |out: &mut Vec<(Accel, KeybindAction)>, trig: &str, action: KeybindAction| {
+        if let Some(accel) = parse_trigger(trig) {
+            out.push((accel, action));
+        }
+    };
+
+    add(&mut out, "ctrl+shift+t", KeybindAction::NewTab);
+    add(&mut out, "ctrl+shift+w", KeybindAction::CloseTab);
+    add(&mut out, "ctrl+shift+n", KeybindAction::NewProject);
+    add(
+        &mut out,
+        "ctrl+shift+bracketleft",
+        KeybindAction::CycleTabPrev,
+    );
+    add(
+        &mut out,
+        "ctrl+shift+bracketright",
+        KeybindAction::CycleTabNext,
+    );
+    add(&mut out, "ctrl+shift+c", KeybindAction::Copy);
+    add(&mut out, "ctrl+shift+v", KeybindAction::Paste);
+    add(&mut out, "ctrl+shift+b", KeybindAction::ToggleSidebar);
+    for n in 1..=9u8 {
+        add(
+            &mut out,
+            &format!("alt+{n}"),
+            KeybindAction::SwitchProject(n),
+        );
+        add(&mut out, &format!("ctrl+{n}"), KeybindAction::SwitchTab(n));
+    }
+
+    out
+}
+
+/// Build the final accel → action map. User-config bindings override
+/// defaults; `unbind` removes a default. `warn` is called for unparseable
+/// triggers or unknown actions so the UI can surface the line number
+/// alongside the message.
+pub fn canonicalize_bindings(
+    defaults: Vec<(Accel, KeybindAction)>,
+    user: Vec<(String, String)>,
+    mut warn: impl FnMut(&str),
+) -> HashMap<Accel, KeybindAction> {
+    let mut map: HashMap<Accel, KeybindAction> = defaults.into_iter().collect();
+
+    for (trigger, action_name) in user {
+        let Some(accel) = parse_trigger(&trigger) else {
+            warn(&format!("invalid keybind trigger: {trigger:?}"));
+            continue;
+        };
+        let Some(action) = KeybindAction::from_name(&action_name) else {
+            warn(&format!("unknown keybind action: {action_name:?}"));
+            continue;
+        };
+        match action {
+            KeybindAction::Unbind => {
+                map.remove(&accel);
+            }
+            other => {
+                map.insert(accel, other);
+            }
+        }
+    }
+
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_handles_modifier_aliases() {
+        let a = parse_trigger("CTRL+SHIFT+T").unwrap();
+        let b = parse_trigger("control+shift+t").unwrap();
+        assert_eq!(a, b);
+        assert!(a.modifiers.contains(AccelMods::CTRL));
+        assert!(a.modifiers.contains(AccelMods::SHIFT));
+        assert_eq!(a.key, "t");
+    }
+
+    #[test]
+    fn parser_handles_super_aliases() {
+        let a = parse_trigger("super+t").unwrap();
+        let b = parse_trigger("cmd+t").unwrap();
+        let c = parse_trigger("command+t").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert!(a.modifiers.contains(AccelMods::SUPER));
+    }
+
+    #[test]
+    fn parser_handles_alt_aliases() {
+        let a = parse_trigger("alt+t").unwrap();
+        let b = parse_trigger("opt+t").unwrap();
+        let c = parse_trigger("option+t").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert!(a.modifiers.contains(AccelMods::ALT));
+    }
+
+    #[test]
+    fn parser_rejects_empty_and_unknown() {
+        assert!(parse_trigger("").is_none());
+        assert!(parse_trigger("ctrl+").is_none());
+    }
+
+    #[test]
+    fn user_override_replaces_default() {
+        let defaults = default_bindings();
+        let user = vec![("ctrl+t".into(), "new_tab".into())];
+        let mut warnings = Vec::new();
+        let map = canonicalize_bindings(defaults, user, |w| warnings.push(w.to_string()));
+        // Default `ctrl+shift+t` still there; new `ctrl+t` added.
+        assert_eq!(
+            map.get(&parse_trigger("ctrl+shift+t").unwrap()),
+            Some(&KeybindAction::NewTab)
+        );
+        assert_eq!(
+            map.get(&parse_trigger("ctrl+t").unwrap()),
+            Some(&KeybindAction::NewTab)
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn unbind_removes_default() {
+        let defaults = default_bindings();
+        let user = vec![("ctrl+shift+t".into(), "unbind".into())];
+        let map = canonicalize_bindings(defaults, user, |_| {});
+        assert!(map.get(&parse_trigger("ctrl+shift+t").unwrap()).is_none());
+    }
+
+    #[test]
+    fn unknown_action_warns() {
+        let defaults = Vec::new();
+        let user = vec![("ctrl+t".into(), "do_a_thing".into())];
+        let mut warnings = Vec::new();
+        canonicalize_bindings(defaults, user, |w| warnings.push(w.to_string()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unknown"));
+    }
+
+    #[test]
+    fn from_name_parses_dynamic_actions() {
+        assert_eq!(
+            KeybindAction::from_name("switch_project_3"),
+            Some(KeybindAction::SwitchProject(3))
+        );
+        assert_eq!(
+            KeybindAction::from_name("switch_tab_9"),
+            Some(KeybindAction::SwitchTab(9))
+        );
+        assert!(KeybindAction::from_name("switch_project_10").is_none());
+    }
+}

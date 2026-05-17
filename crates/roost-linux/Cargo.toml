@@ -59,3 +59,5 @@ glib = "0.21"
 # `pango_cairo_context_set_font_options` so the `internal/pangoextra`
 # workaround the Go binary needs doesn't apply here (DL-6).
 pangocairo = "0.21"
+# Phase 7 commit 9: AccelMods bitflags for the keybind table.
+bitflags = "2"
