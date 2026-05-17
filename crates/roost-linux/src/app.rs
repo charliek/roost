@@ -794,7 +794,14 @@ impl App {
         use roost_osc::OscEvent as E;
         let (command, payload): (u32, String) = match event {
             E::Title(t) => (0, t),
-            E::Pwd(p) => (7, format!("file:/{}", p)),
+            // OSC 7 wire format is `file://<host>/<path>`. The
+            // scanner already stripped `file://[host]` so `p`
+            // starts with `/`. Wrap back as `file://<empty-host>/<p>`
+            // = `file:///path` so the daemon's parse_cwd_from_osc7
+            // doesn't mistake the first path segment for a host
+            // (caught during Phase 7 smoke testing — sending
+            // `file:/<path>` produced cwd `/<second-component>`).
+            E::Pwd(p) => (7, format!("file://{}", p)),
             E::Notification { title, body } => {
                 if body.is_empty() {
                     (9, title)
@@ -864,20 +871,36 @@ impl App {
 
     /// Fire CloseTab on the daemon for the given tab. Async so we
     /// don't block the GTK main loop.
+    ///
+    /// `NotFound` is treated as an expected race: when the daemon
+    /// cascade-deletes a tab (M5 shell-exit cascade, project delete,
+    /// CLI `tab close`), the resulting `TabDeletedEvent` lands in
+    /// `handle_event::TabDeleted` which calls `tab_view.close_page`
+    /// → which fires the `close-page` signal → which invokes this
+    /// method. By that time the daemon-side tab is already gone, so
+    /// the RPC's `NotFound` is the expected steady state, not a bug
+    /// to log. Other status codes (Internal, FailedPrecondition,
+    /// etc.) still surface as warnings.
     fn close_tab_async(self: &Rc<Self>, _project_id: i64, tab_id: i64) {
         let Some(mut client) = self.client.borrow().clone() else {
             return;
         };
         let rt = self.rt.clone();
         rt.spawn(async move {
-            if let Err(err) = client
+            match client
                 .inner()
                 .close_tab(tonic::Request::new(roost_proto::v1::CloseTabRequest {
                     tab_id,
                 }))
                 .await
             {
-                tracing::warn!(?err, tab_id, "CloseTab RPC failed");
+                Ok(_) => {}
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    tracing::debug!(tab_id, "CloseTab: tab already deleted server-side");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, tab_id, "CloseTab RPC failed");
+                }
             }
         });
     }
