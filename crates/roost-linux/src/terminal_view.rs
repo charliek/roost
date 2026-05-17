@@ -103,6 +103,23 @@ impl TerminalView {
         Self::with_theme(Theme::default())
     }
 
+    /// Construct with a custom theme + optional font overrides.
+    /// Phase 7 commit 11: the App passes user-supplied
+    /// `font_family` + `font_size_pt` from `~/.config/roost/config.conf`
+    /// when present, falling back to the JetBrains Mono / 13pt
+    /// defaults otherwise. The theme's palette is pushed into
+    /// libghostty so SGR cells (`ls --color`, `git diff`) flip to the
+    /// theme's reds / greens / etc.
+    pub fn with_theme_and_font(
+        theme: Theme,
+        font_family: Option<&str>,
+        font_size_pt: Option<f64>,
+    ) -> Self {
+        let view = Self::with_theme(theme);
+        view.apply_font(font_family, font_size_pt);
+        view
+    }
+
     pub fn with_theme(theme: Theme) -> Self {
         let widget = DrawingArea::builder()
             .hexpand(true)
@@ -124,6 +141,16 @@ impl TerminalView {
 
         let render_state = RenderState::new().expect("allocate libghostty-vt render state");
         let encoder = KeyEncoder::new().expect("allocate libghostty-vt key encoder");
+        // Push the theme's palette + chrome colors into libghostty so
+        // SGR cells (`ls --color`, `git diff`, htop, etc.) flip to
+        // the theme's reds / greens / etc. Failures are non-fatal:
+        // the renderer falls back to libghostty's compiled-in palette
+        // plus the theme.background canvas fill in the draw pass.
+        let mut terminal = terminal;
+        let _ = terminal.set_color_background(theme.background);
+        let _ = terminal.set_color_foreground(theme.foreground);
+        let _ = terminal.set_color_cursor(theme.cursor);
+        let _ = terminal.set_color_palette(&theme.palette);
 
         let pango_ctx = widget.pango_context();
         let font_desc = default_font_description();
@@ -271,6 +298,28 @@ impl TerminalView {
     /// The underlying widget — drop into any GTK container.
     pub fn widget(&self) -> &DrawingArea {
         &self.widget
+    }
+
+    /// Replace the font description + remeasure cell metrics. Used
+    /// by `with_theme_and_font` to honor `~/.config/roost/config.conf`
+    /// `font-family` / `font-size` settings. Triggers a redraw.
+    pub fn apply_font(&self, family: Option<&str>, size_pt: Option<f64>) {
+        if family.is_none() && size_pt.is_none() {
+            return;
+        }
+        let mut s = self.state.borrow_mut();
+        let mut desc = s.font_desc.clone();
+        if let Some(family) = family {
+            desc.set_family(family);
+        }
+        if let Some(pt) = size_pt {
+            desc.set_absolute_size(pt * gtk4::pango::SCALE as f64 * 96.0 / 72.0);
+        }
+        s.font_desc = desc.clone();
+        let pango_ctx = self.widget.pango_context();
+        s.cell_metrics = CellMetrics::measure(&pango_ctx, &desc);
+        drop(s);
+        self.widget.queue_draw();
     }
 
     /// Feed VT bytes into the terminal. Triggers a redraw so the new

@@ -33,6 +33,7 @@ use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
+use crate::theme::Theme;
 
 /// One per project: sidebar row + tab strip + tab content stack.
 struct ProjectUi {
@@ -65,6 +66,14 @@ pub struct App {
     /// Currently focused project (sidebar selection). 0 = no
     /// selection yet (e.g. workspace is empty).
     active_project_id: RefCell<i64>,
+    /// Resolved theme from `~/.config/roost/config.conf` (or the
+    /// bundled `roost-dark` fallback). Passed to each new
+    /// TerminalView so cells use the same palette.
+    theme: Theme,
+    /// Optional font-family override from config.
+    font_family: Option<String>,
+    /// Optional font-size override from config (points).
+    font_size_pt: Option<f64>,
 }
 
 impl App {
@@ -113,6 +122,14 @@ impl App {
         outer.append(&paned);
         window.set_content(Some(&outer));
 
+        // Load + apply user config now so the first TerminalView
+        // gets the right theme + font.
+        let cfg = RoostConfig::load_default();
+        let theme = match cfg.theme_name.as_deref() {
+            Some(name) => Theme::load_bundled(name),
+            None => Theme::roost_dark(),
+        };
+
         let app_struct = Rc::new(App {
             window,
             client: RefCell::new(None),
@@ -122,6 +139,9 @@ impl App {
             title_label: title_label.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
+            theme,
+            font_family: cfg.font_family.clone(),
+            font_size_pt: cfg.font_size,
         });
 
         // Sidebar row selection → switch active project.
@@ -148,6 +168,24 @@ impl App {
         // when the terminal view doesn't have keyboard focus (e.g.
         // user clicked on the sidebar).
         app_struct.install_keybinds();
+
+        // Register the focus-tab application action so notification
+        // clicks bring the originating tab forward (Phase 6b P8
+        // equivalent for the Linux UI). The action's payload is the
+        // tab id; the App locates the project + tab page + flips
+        // them to active.
+        {
+            use gtk4::gio::prelude::*;
+            let focus_action =
+                gtk4::gio::SimpleAction::new("focus-tab", Some(&i64::static_variant_type()));
+            let app_for_focus = app_struct.clone();
+            focus_action.connect_activate(move |_, target| {
+                if let Some(target) = target.and_then(|t| t.get::<i64>()) {
+                    app_for_focus.focus_tab_by_id(target);
+                }
+            });
+            app.add_action(&focus_action);
+        }
 
         app_struct.window.present();
 
@@ -344,7 +382,11 @@ impl App {
         if ui.tabs.borrow().contains_key(&tab.id) {
             return;
         }
-        let terminal = Rc::new(TerminalView::new());
+        let terminal = Rc::new(TerminalView::with_theme_and_font(
+            self.theme.clone(),
+            self.font_family.as_deref(),
+            self.font_size_pt,
+        ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
         let Some(mut client_for_session) = self.client.borrow().clone() else {
             return;
@@ -792,6 +834,32 @@ impl App {
         notification.set_default_action_and_target_value("app.focus-tab", Some(&target));
         let id = format!("roost-tab-{tab_id}");
         app.send_notification(Some(&id), &notification);
+    }
+
+    /// Bring the tab with `tab_id` forward — focus its project's
+    /// AdwTabView, select the matching page, then raise the window.
+    /// Wired via the `app.focus-tab` action; click-handler in the
+    /// gio::Notification's default action target.
+    fn focus_tab_by_id(self: &Rc<Self>, tab_id: i64) {
+        let projects = self.projects.borrow();
+        let mut hit: Option<(i64, libadwaita::TabPage)> = None;
+        for (project_id, ui) in projects.iter() {
+            if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                hit = Some((*project_id, tab_ui.page.clone()));
+                break;
+            }
+        }
+        drop(projects);
+        let Some((project_id, page)) = hit else {
+            return;
+        };
+        self.set_active_project(project_id);
+        let projects = self.projects.borrow();
+        if let Some(ui) = projects.get(&project_id) {
+            ui.tab_view.set_selected_page(&page);
+        }
+        // Bring the window forward.
+        self.window.present();
     }
 
     /// Fire CloseTab on the daemon for the given tab. Async so we
