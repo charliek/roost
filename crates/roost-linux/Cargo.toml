@@ -23,8 +23,22 @@ path = "src/main.rs"
 [dependencies]
 roost-proto  = { path = "../roost-proto" }
 roost-common = { path = "../roost-common" }
+# Phase 7 commit 2: pull in the safe-API wrappers landed in commit 1.
+# Linking `--features ffi` brings in libghostty-vt's static archive,
+# so the gtk-build CI job now needs the third_party/ghostty/build.sh
+# warm-up step (added in this same commit). Local dev: the .a/.dylib
+# under third_party/ghostty/out/lib/ must exist before `cargo build -p
+# roost-linux`.
+roost-vt     = { path = "../roost-vt", features = ["ffi"] }
+# Phase 7 commit 2: the OSC scanner moved out of roost-core. Both the
+# daemon and roost-linux consume it from here. Mac UI keeps its
+# hand-rolled Swift port (vision DL-5: no cross-language FFI tax for
+# ~230 LOC of pure-data parsing).
+roost-osc    = { path = "../roost-osc" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
 tonic = "0.12"
 anyhow = "1"
 tracing = "0.1"
@@ -38,3 +52,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gtk4 = { version = "0.10", features = ["v4_12"] }
 libadwaita = { version = "0.8", features = ["v1_4"] }
 glib = "0.21"
+# Phase 7 commit 4: Cairo + Pango for the cell renderer. gtk4-rs's
+# `gtk::DrawingArea::set_draw_func` callback hands us a Cairo context
+# directly; `pangocairo` is what bridges Pango layouts to Cairo for
+# text rendering. pangocairo-rs uses raw FFI for
+# `pango_cairo_context_set_font_options` so the `internal/pangoextra`
+# workaround the Go binary needs doesn't apply here (DL-6).
+pangocairo = "0.21"
+# Phase 7 commit 9: AccelMods bitflags for the keybind table.
+bitflags = "2"

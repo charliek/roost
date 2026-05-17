@@ -1515,6 +1515,7 @@ dependencies = [
  "portable-pty",
  "prost",
  "roost-common",
+ "roost-osc",
  "roost-proto",
  "rusqlite",
  "tempfile",
@@ -1536,12 +1537,18 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "roost-common",
+ "roost-osc",
  "roost-proto",
+ "roost-vt",
  "tokio",
  "tonic",
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "roost-osc"
+version = "0.1.0"
 
 [[package]]
 name = "roost-proto"

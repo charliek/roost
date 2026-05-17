@@ -383,6 +383,26 @@ jobs:
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      - uses: jdx/mise-action@v2
+
+      - name: Cache vendored libghostty-vt
+        # Phase 7 commit 2 makes roost-linux depend on
+        # roost-vt --features ffi (transitively, via Cargo.toml),
+        # which links libghostty-vt.a. Reuse the same cache key as
+        # rust-build + swift-mac so we share the build artifact across
+        # the matrix (rust-build runs first on the same SHA).
+        id: cache-ghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
       - name: Cache cargo registry + target (shared with rust-build)
         uses: actions/cache@v4
         with:
@@ -394,8 +414,9 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: cargo build -p roost-linux
-        # Phase 6a M8 first cut: a single-window Identify spike.
-        # `continue-on-error` is intentionally OFF — if this fails
-        # the spike's exit criteria aren't met. Lift the GTK
-        # toolchain pin only with explicit review.
+        # Phase 6a M8 first cut: a single-window Identify spike. Phase
+        # 7 commit 2 adds the roost-vt --features ffi + roost-osc
+        # deps, so the build now also links libghostty-vt.a (warm-up
+        # step above runs first). `continue-on-error` is intentionally
+        # OFF — if this fails Phase 7 isn't moving forward.
         run: cargo build -p roost-linux

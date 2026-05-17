@@ -25,7 +25,8 @@ use roost_proto::v1::{
     CreateProjectResponse, DeleteProjectRequest, DeleteProjectResponse, Event, FocusTabRequest,
     FocusTabResponse, IdentifyRequest, IdentifyResponse, ListTabsRequest, ListTabsResponse,
     OpenTabRequest, OpenTabResponse, Project, PtyClientMessage, PtyExit, PtyOutput,
-    PtyServerMessage, RenameProjectRequest, RenameProjectResponse, ReportOscRequest,
+    PtyServerMessage, RenameProjectRequest, RenameProjectResponse, ReorderProjectsRequest,
+    ReorderProjectsResponse, ReorderTabsRequest, ReorderTabsResponse, ReportOscRequest,
     ReportOscResponse, SetHookActiveRequest, SetHookActiveResponse, SetTabStateRequest,
     SetTabStateResponse, SetTabTitleRequest, SetTabTitleResponse, TabState, WatchEventsRequest,
 };
@@ -255,6 +256,34 @@ impl Roost for RoostService {
             .map_err(map_err)?;
         info!(project_id = r.project_id, "project deleted");
         Ok(Response::new(DeleteProjectResponse {}))
+    }
+
+    async fn reorder_tabs(
+        &self,
+        req: Request<ReorderTabsRequest>,
+    ) -> Result<Response<ReorderTabsResponse>, Status> {
+        let r = req.into_inner();
+        self.workspace
+            .reorder_tabs(r.project_id, &r.tab_ids)
+            .map_err(map_err)?;
+        info!(
+            project_id = r.project_id,
+            tab_count = r.tab_ids.len(),
+            "tabs reordered"
+        );
+        Ok(Response::new(ReorderTabsResponse {}))
+    }
+
+    async fn reorder_projects(
+        &self,
+        req: Request<ReorderProjectsRequest>,
+    ) -> Result<Response<ReorderProjectsResponse>, Status> {
+        let r = req.into_inner();
+        self.workspace
+            .reorder_projects(&r.project_ids)
+            .map_err(map_err)?;
+        info!(project_count = r.project_ids.len(), "projects reordered");
+        Ok(Response::new(ReorderProjectsResponse {}))
     }
 
     type StreamPtyStream =
