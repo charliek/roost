@@ -23,6 +23,18 @@ path = "src/main.rs"
 [dependencies]
 roost-proto  = { path = "../roost-proto" }
 roost-common = { path = "../roost-common" }
+# Phase 7 commit 2: pull in the safe-API wrappers landed in commit 1.
+# Linking `--features ffi` brings in libghostty-vt's static archive,
+# so the gtk-build CI job now needs the third_party/ghostty/build.sh
+# warm-up step (added in this same commit). Local dev: the .a/.dylib
+# under third_party/ghostty/out/lib/ must exist before `cargo build -p
+# roost-linux`.
+roost-vt     = { path = "../roost-vt", features = ["ffi"] }
+# Phase 7 commit 2: the OSC scanner moved out of roost-core. Both the
+# daemon and roost-linux consume it from here. Mac UI keeps its
+# hand-rolled Swift port (vision DL-5: no cross-language FFI tax for
+# ~230 LOC of pure-data parsing).
+roost-osc    = { path = "../roost-osc" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tonic = "0.12"
