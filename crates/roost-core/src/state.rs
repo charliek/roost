@@ -329,6 +329,52 @@ impl Workspace {
         Ok(())
     }
 
+    /// Persist a new sidebar ordering for projects and emit a
+    /// `ProjectsReorderedEvent`. The request carries the full target
+    /// order; the store's `validate_reorder` enforces id integrity (no
+    /// dupes, no unknowns, length matches the project count). Phase 7
+    /// commit 3 — Linux UI drag handlers consume this.
+    pub fn reorder_projects(&self, ordered_ids: &[i64]) -> Result<(), WorkspaceError> {
+        let mut store = self.store.lock().unwrap();
+        store.reorder_projects(ordered_ids).map_err(wrap)?;
+        drop(store);
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::ProjectsReordered(
+                ProjectsReorderedEvent {
+                    project_ids: ordered_ids.to_vec(),
+                },
+            )),
+        });
+        Ok(())
+    }
+
+    /// Persist a new tab ordering inside `project_id` and emit a
+    /// `TabsReorderedEvent`. Same validation contract as
+    /// [`Self::reorder_projects`]; ids that aren't in the project (or
+    /// are duplicated, or the length doesn't match) come back as a
+    /// `Store` error.
+    pub fn reorder_tabs(&self, project_id: i64, ordered_ids: &[i64]) -> Result<(), WorkspaceError> {
+        let mut store = self.store.lock().unwrap();
+        // Confirm the project exists; map missing to a precise error
+        // so callers see ProjectNotFound rather than a generic store
+        // error.
+        let projects = store.list_projects().map_err(wrap)?;
+        if !projects.iter().any(|p| p.id == project_id) {
+            return Err(WorkspaceError::ProjectNotFound(project_id));
+        }
+        store.reorder_tabs(project_id, ordered_ids).map_err(wrap)?;
+        drop(store);
+        let _ = self.events.send(Event {
+            kind: Some(roost_proto::v1::event::Kind::TabsReordered(
+                TabsReorderedEvent {
+                    project_id,
+                    tab_ids: ordered_ids.to_vec(),
+                },
+            )),
+        });
+        Ok(())
+    }
+
     pub fn open_tab(
         &self,
         project_id: i64,
@@ -952,5 +998,72 @@ mod tests {
         assert_eq!(after.state, TabState::Unspecified);
         assert!(!after.has_notification);
         assert!(!after.hook_active);
+    }
+
+    #[test]
+    fn reorder_projects_persists_and_emits_event() {
+        let ws = Workspace::new();
+        let p1 = ws.create_project("first", "/tmp/a").unwrap();
+        let p2 = ws.create_project("second", "/tmp/b").unwrap();
+        let p3 = ws.create_project("third", "/tmp/c").unwrap();
+
+        let mut rx = ws.subscribe();
+        // New order: 3, 1, 2
+        ws.reorder_projects(&[p3.id, p1.id, p2.id]).unwrap();
+
+        let snap = ws.snapshot();
+        let observed: Vec<i64> = snap.iter().map(|p| p.id).collect();
+        assert_eq!(observed, vec![p3.id, p1.id, p2.id]);
+
+        match rx.try_recv() {
+            Ok(Event {
+                kind: Some(roost_proto::v1::event::Kind::ProjectsReordered(e)),
+            }) => assert_eq!(e.project_ids, vec![p3.id, p1.id, p2.id]),
+            other => panic!("expected ProjectsReordered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reorder_tabs_persists_and_emits_event() {
+        let ws = Workspace::new();
+        let p = ws.create_project("p", "/tmp").unwrap();
+        let t1 = ws.open_tab(p.id, "/tmp", "").unwrap();
+        let t2 = ws.open_tab(p.id, "/tmp", "").unwrap();
+        let t3 = ws.open_tab(p.id, "/tmp", "").unwrap();
+
+        let mut rx = ws.subscribe();
+        ws.reorder_tabs(p.id, &[t3.id, t1.id, t2.id]).unwrap();
+
+        let snap = ws.snapshot();
+        let proj = snap.iter().find(|x| x.id == p.id).unwrap();
+        let observed: Vec<i64> = proj.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(observed, vec![t3.id, t1.id, t2.id]);
+
+        match rx.try_recv() {
+            Ok(Event {
+                kind: Some(roost_proto::v1::event::Kind::TabsReordered(e)),
+            }) => {
+                assert_eq!(e.project_id, p.id);
+                assert_eq!(e.tab_ids, vec![t3.id, t1.id, t2.id]);
+            }
+            other => panic!("expected TabsReordered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reorder_tabs_rejects_unknown_project() {
+        let ws = Workspace::new();
+        let err = ws.reorder_tabs(9999, &[]).unwrap_err();
+        assert!(matches!(err, WorkspaceError::ProjectNotFound(9999)));
+    }
+
+    #[test]
+    fn reorder_projects_rejects_wrong_count() {
+        let ws = Workspace::new();
+        let _ = ws.create_project("a", "").unwrap();
+        let _ = ws.create_project("b", "").unwrap();
+        // Only 1 id supplied; store validates the count and rejects.
+        let err = ws.reorder_projects(&[1]).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Store(_)));
     }
 }

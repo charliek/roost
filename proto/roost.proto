@@ -58,6 +58,17 @@ service Roost {
   rpc RenameProject(RenameProjectRequest) returns (RenameProjectResponse);
   rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
 
+  // ---- Reordering (Phase 7 commit 3) ----
+  // Persist a new ordering for tabs inside a project (or projects in
+  // the sidebar). The request carries the full target order; the
+  // daemon writes the `position` column and emits the matching
+  // `TabsReorderedEvent` / `ProjectsReorderedEvent` so peer clients
+  // converge. Any id missing from the request keeps its prior
+  // position. The Linux UI's drag handlers consume these; the Mac UI
+  // can wire them as a follow-up.
+  rpc ReorderTabs(ReorderTabsRequest) returns (ReorderTabsResponse);
+  rpc ReorderProjects(ReorderProjectsRequest) returns (ReorderProjectsResponse);
+
   // ---- Terminal stream ----
   // Bidirectional. Client opens with PtyAttach{tab_id}, then sends
   // PtyInput / PtyResize. Server streams PtyOutput until the PTY exits,
@@ -226,6 +237,26 @@ message DeleteProjectRequest {
 }
 
 message DeleteProjectResponse {}
+
+message ReorderTabsRequest {
+  int64           project_id = 1;
+  // New order, in display order (index 0 = leftmost / first). Any tab
+  // in the project not listed here keeps its existing position
+  // relative to the others. Ids not belonging to `project_id` are
+  // rejected with INVALID_ARGUMENT.
+  repeated int64  tab_ids    = 2;
+}
+
+message ReorderTabsResponse {}
+
+message ReorderProjectsRequest {
+  // New order, in sidebar display order (index 0 = topmost). Any
+  // project not listed here keeps its existing position. Ids that
+  // don't exist are rejected with INVALID_ARGUMENT.
+  repeated int64  project_ids = 1;
+}
+
+message ReorderProjectsResponse {}
 
 // =============================================================================
 // PTY stream

@@ -24,8 +24,8 @@ use roost_proto::v1::roost_client::RoostClient;
 use roost_proto::v1::{
     ClearTabNotificationRequest, CloseTabRequest, CreateNotificationRequest, CreateProjectRequest,
     DeleteProjectRequest, FocusTabRequest, IdentifyRequest, ListTabsRequest, OpenTabRequest,
-    RenameProjectRequest, SetHookActiveRequest, SetTabStateRequest, SetTabTitleRequest,
-    TabResizeRequest, TabState, TabWriteRequest,
+    RenameProjectRequest, ReorderProjectsRequest, ReorderTabsRequest, SetHookActiveRequest,
+    SetTabStateRequest, SetTabTitleRequest, TabResizeRequest, TabState, TabWriteRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -115,6 +115,14 @@ enum ProjectCmd {
         #[arg(long)]
         id: i64,
     },
+    /// Persist a new sidebar ordering. `--order` is a comma-separated
+    /// list of project ids in the target display order. Any project
+    /// not listed keeps its prior position; ids that don't exist or
+    /// duplicates fail INVALID_ARGUMENT.
+    Reorder {
+        #[arg(long, value_delimiter = ',')]
+        order: Vec<i64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -179,6 +187,16 @@ enum TabCmd {
         cols: u32,
         #[arg(long)]
         rows: u32,
+    },
+    /// Persist a new tab ordering within a project. `--order` is a
+    /// comma-separated list of tab ids in the target display order.
+    /// Any tab not listed keeps its prior position; ids that don't
+    /// belong to `--project-id`, or duplicates, fail INVALID_ARGUMENT.
+    Reorder {
+        #[arg(long)]
+        project_id: i64,
+        #[arg(long, value_delimiter = ',')]
+        order: Vec<i64>,
     },
 }
 
@@ -301,6 +319,11 @@ async fn main() -> Result<()> {
                 .delete_project(DeleteProjectRequest { project_id: id })
                 .await?;
         }
+        Cmd::Project(ProjectCmd::Reorder { order }) => {
+            client
+                .reorder_projects(ReorderProjectsRequest { project_ids: order })
+                .await?;
+        }
         Cmd::Tab(TabCmd::Open {
             project_id,
             cwd,
@@ -342,6 +365,14 @@ async fn main() -> Result<()> {
             let tab_id = resolve_tab(&mut client, tab).await?;
             client
                 .tab_resize(TabResizeRequest { tab_id, cols, rows })
+                .await?;
+        }
+        Cmd::Tab(TabCmd::Reorder { project_id, order }) => {
+            client
+                .reorder_tabs(ReorderTabsRequest {
+                    project_id,
+                    tab_ids: order,
+                })
                 .await?;
         }
         Cmd::ClaudeHook { event } => {
