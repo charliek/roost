@@ -21,8 +21,7 @@ reviews:
 
 language: en
 tone_instructions: |
-  Be direct and concrete. When citing code paths use the
-  `file:line` format (e.g. `mac/Sources/Roost/App.swift:123`).
-  Roost's CLAUDE.md and plans/goal-rust-port-polish-2026-05-16.md
-  carry the project's conventions and active milestone schedule —
-  reference them when feedback ties to those decisions.
+  Be direct and concrete. Cite code as `file:line`
+  (e.g. `mac/Sources/Roost/App.swift:123`). CLAUDE.md and
+  plans/ carry conventions and active milestones; reference
+  them when feedback hinges on those decisions.
