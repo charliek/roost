@@ -333,6 +333,11 @@ impl Roost for RoostService {
             debug!(tab_id, "client input stream closed");
         });
 
+        // Capture clones for the stream closure. `workspace_for_exit`
+        // is used to cascade-delete the tab row when the PTY exits
+        // — see the Exit branch below.
+        let workspace_for_exit = workspace.clone();
+        let ptys_for_exit = ptys.clone();
         let outbound = stream! {
             loop {
                 tokio::select! {
@@ -348,6 +353,17 @@ impl Roost for RoostService {
                                 reason: String::new(),
                             })),
                         });
+                        // M5: shell exit cascades to workspace.close_tab.
+                        // Triggers TabDeletedEvent via the workspace event
+                        // bus, which the Mac UI's WatchEvents subscriber
+                        // consumes to cascade further (delete project on
+                        // empty / close window on empty workspace).
+                        // Matches Go binary's pumpPTY → onPTYExit →
+                        // ClosePage → closeTab → DeleteTab flow.
+                        if let Err(err) = workspace_for_exit.close_tab(tab_id) {
+                            debug!(tab_id, ?err, "close_tab cascade after PTY exit failed");
+                        }
+                        ptys_for_exit.close(tab_id);
                         break;
                     }
                     else => break,

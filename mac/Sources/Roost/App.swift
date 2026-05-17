@@ -584,10 +584,27 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 activeProjectID = nil
                 if let next = projects.first {
                     selectProject(id: next.id)
-                } else {
-                    updateWindowTitle()
-                    terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
                 }
+                // The empty-workspace close path is hoisted below so
+                // it also runs for the `deleteProjectFromMenu` flow,
+                // which clears `activeProjectID` itself before this
+                // event arrives — in that path `wasActive` is already
+                // false here even though the workspace just became
+                // empty.
+            }
+            // M5: workspace is empty. Close the window unconditionally
+            // — applicationShouldTerminateAfterLastWindowClosed is true
+            // by default for NSWindow-based apps, so the window close
+            // cascades to app termination. Matches Go
+            // cmd/roost/app.go:2107-2115 ("len(a.projectViews) == 0 →
+            // win.Close()"). Hoisted out of the `if wasActive` branch
+            // so it fires after the menu-driven delete-last-project
+            // path too (that path nils `activeProjectID` before this
+            // event lands; `wasActive` is then false).
+            if projects.isEmpty {
+                updateWindowTitle()
+                terminalContainer?.subviews.forEach { $0.removeFromSuperview() }
+                window?.close()
             }
         case .tabDeleted(let e):
             // Headless `tab close` (M4) or any external `CloseTab`
@@ -605,13 +622,21 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
+            // M5: project-level cascade lives daemon-side now
+            // (state.rs::close_tab cascades to delete_project when
+            // the parent project is empty). The Mac UI's local `tabs`
+            // list omits headless-CLI-opened tabs, so a UI-side empty
+            // check could delete a project the daemon thinks still
+            // has tabs — moved the policy to the authoritative side.
+            // We just handle local cleanup here; the daemon's
+            // ProjectDeletedEvent (when cascaded) lands in the
+            // `.projectDeleted` arm below and closes the window if
+            // the workspace is empty.
             if projectID == activeProjectID {
                 rebuildTabBar()
                 if wasActive {
                     let remaining = tabsForActiveProject()
-                    if remaining.isEmpty, daemonReachable {
-                        openNewTab()
-                    } else if !remaining.isEmpty {
+                    if !remaining.isEmpty {
                         selectTab(at: 0)
                     }
                 }
