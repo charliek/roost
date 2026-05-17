@@ -60,6 +60,21 @@ final class TerminalView: NSView {
     /// key encoder for arrows / function keys / modifier handling.
     @MainActor var onKey: ((Data) -> Void)?
 
+    /// Set by `TabSession.start` so OSC events parsed out of the
+    /// PTY byte stream (Phase 6a P6) ride the existing ReportOsc
+    /// gRPC path to the daemon. First arg is the OSC command
+    /// number; second is the payload in the shape
+    /// `RoostService::report_osc` expects (see `OscEvent.asReport`
+    /// for the mapping).
+    @MainActor var onOsc: ((UInt32, String) -> Void)?
+
+    /// Local OSC scanner — observes every PTY-output chunk
+    /// `appendBytes` writes through to libghostty so we can lift
+    /// title / cwd / notification OSCs to the daemon. State
+    /// persists across calls so sequences split across chunks
+    /// scan correctly.
+    private let oscScanner = OscScanner()
+
     /// Set by `TabSession.start` so the view can ask its host to
     /// propagate a resize over StreamPty when the window resizes
     /// and the cell grid changes shape.
@@ -191,6 +206,19 @@ final class TerminalView: NSView {
     @MainActor
     func appendBytes(_ data: Data) {
         guard let terminal else { return }
+        // Phase 6a P6: scan the chunk for OSC events BEFORE
+        // feeding it to libghostty. libghostty's own VT processor
+        // also handles OSCs (titles, colors, etc.) for rendering,
+        // but it doesn't surface the events back out for the
+        // daemon to route. We run a parallel scanner so the
+        // daemon can react to title / cwd / notification OSCs.
+        // The bytes still flow through to libghostty unchanged —
+        // the scanner is purely additive.
+        let events = oscScanner.feed(data)
+        for event in events {
+            let (cmd, payload) = event.asReport
+            onOsc?(cmd, payload)
+        }
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             ghostty_terminal_vt_write(terminal, base, data.count)
