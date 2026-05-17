@@ -1,0 +1,22 @@
+[package]
+name        = "roost-proto"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Generated tonic + prost bindings for the Roost gRPC IPC contract."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true

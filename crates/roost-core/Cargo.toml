@@ -1,0 +1,48 @@
+[package]
+name        = "roost-core"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Roost's IPC daemon: PTY supervisor, project/tab state, OSC routing, gRPC server."
+
+[[bin]]
+name = "roost-core"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+roost-proto  = { path = "../roost-proto" }
+roost-common = { path = "../roost-common" }
+# roost-vt is reserved for server-side VT semantics. We don't depend on it
+# in Phase 3 — the UI parses VT in-process. Add it later if core-side
+# parsing becomes necessary.
+
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util   = { workspace = true }
+futures      = { workspace = true }
+async-stream = { workspace = true }
+
+tonic        = { workspace = true }
+prost        = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow    = { workspace = true }
+tracing   = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+portable-pty = { workspace = true }
+clap         = { workspace = true }
+rusqlite     = { workspace = true }
+percent-encoding = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

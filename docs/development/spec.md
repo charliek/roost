@@ -1,5 +1,7 @@
 # Roost — Design Document
 
+> See [vision.md](vision.md) for the target architecture this codebase is migrating toward (Rust core + native Mac/Linux UIs over a gRPC contract). This document remains authoritative for the current Go + GTK4 implementation on `main` until the cutover described there.
+
 A Mac + Linux terminal multiplexer for AI coding agents, built as a single Go + GTK4 codebase using libghostty as the rendering engine. Similar in shape to cmux, but cross-platform and scoped tighter.
 
 The name draws on the metaphor of a place where flocks gather between flights — each project is a roost where coding agents perch, work, and signal when they need attention. The CLI binary is `roost`; user-editable config lives in `~/.config/roost/config.conf` on both platforms (XDG on Mac too — a deliberate divergence from Apple HIG, matching Ghostty / nvim / fish), while state files (database, socket) keep their platform-native location.

@@ -1,0 +1,32 @@
+[package]
+name        = "roost-cli-rs"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Shell-integration CLI for roost-core (notify, set-title, focus, claude-hook). Transitional name; renamed to roost-cli in the Phase 9 cutover."
+
+[[bin]]
+# Transitional binary name so a user can have both the legacy `roost-cli`
+# (Go, talks to the in-process Workspace) and the new one side-by-side
+# during the refactor. Phase 9 cutover renames this back to "roost-cli".
+name = "roost-cli-rs"
+path = "src/main.rs"
+
+[dependencies]
+roost-proto  = { path = "../roost-proto" }
+roost-common = { path = "../roost-common" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+anyhow = { workspace = true }
+clap   = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

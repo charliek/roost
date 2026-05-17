@@ -1,0 +1,318 @@
+name: Refactor CI
+
+# CI for the architectural refactor described in docs/development/vision.md.
+# Sibling to .github/workflows/ci.yml — the existing Go CI continues to run
+# unchanged on the refactor branch and remains authoritative for the Go
+# binary on main. New jobs land additively here.
+#
+# Phase 2 jobs:
+#   - rust-lint  : cargo fmt + clippy on the Cargo workspace.
+#   - rust-build : cargo build/test on Linux + macOS.
+#   - swift-mac  : swift build on macOS for the Mac UI skeleton.
+#
+# Phases 5/7 add: mac-ui-build (xcodebuild), linux-ui-build (gtk4-rs).
+# Phase 8: release-bundle on tags.
+
+on:
+  push:
+    branches: ['claude/discuss-architecture-refactor-*']
+  # `pull_request.branches` matches the PR's BASE (target) branch, not the
+  # head (source). Refactor PRs target `main`, so that's what we filter
+  # on here. The job-level `if:` guards below restrict execution to PRs
+  # whose head branch is in the refactor namespace, so we don't run the
+  # Rust+Swift toolchain on every Go-only PR into main.
+  pull_request:
+    branches: ['main']
+
+# Each job below carries the same `if:` guard. `pull_request.branches` only
+# filters the PR target, so the per-job `startsWith(github.head_ref, ...)`
+# check is what scopes execution to refactor-source PRs. Push events have
+# `head_ref == ''`, hence the explicit `event_name == 'push'` branch.
+
+jobs:
+  rust-lint:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-lint-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # Phase 2 latitude: clippy still informational while crates settle.
+        # Flip continue-on-error off at Phase 3 exit (roost-core MVP working).
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-build:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc + libclang (Linux)
+        if: runner.os == 'Linux'
+        # libclang-dev is needed by bindgen when roost-vt is built with
+        # `--features ffi`. macOS gets it via Xcode's command-line tools
+        # which the runner has preinstalled.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libclang-dev
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v2
+
+      - name: Cache vendored libghostty-vt
+        # Keyed on the build script + the SHA pin inside it. A bump to
+        # third_party/ghostty/build.sh invalidates and rebuilds — same
+        # discipline as the legacy build/build.sh cache in ci.yml.
+        id: cache-ghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo build (workspace, default features)
+        # Default features: roost-vt's `ffi` feature is OFF, so this
+        # build does not consume libghostty-vt. Keeps the non-ffi
+        # workspace green even if the Ghostty build itself bit-rots.
+        run: cargo build --workspace --all-targets
+
+      - name: cargo build (roost-vt with ffi)
+        # Time-boxed exception. `continue-on-error` lifts when the FFI
+        # surface stabilises (Phase 5 step 3 exit). Today the smoke
+        # exercises ghostty_terminal_new + write + free; bindgen field
+        # names may differ slightly from my best-guess at the C struct
+        # layout, in which case CI surfaces the exact compile error.
+        continue-on-error: true
+        run: cargo build -p roost-vt --features ffi
+
+      - name: cargo test (roost-vt ffi smoke)
+        # Same time-boxed exception as the ffi build above. Lifts at
+        # Phase 5 step 3 exit.
+        continue-on-error: true
+        run: cargo test -p roost-vt --features ffi -- --nocapture
+
+      - name: cargo test
+        # Required-green: the workspace test suite gates every commit.
+        # If a Rust test breaks on Linux or macOS the workflow fails.
+        run: cargo test --workspace
+
+  swift-mac:
+    if: >-
+      github.event_name == 'push' ||
+      startsWith(github.head_ref, 'claude/discuss-architecture-refactor-')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Install protoc
+        # GRPCProtobufGenerator's deriveProtocPath() needs a real protoc
+        # binary to run — the SwiftPM-bundled tooling produces only
+        # protoc-gen-swift / protoc-gen-grpc-swift-2 (the plugin half).
+        run: brew install protobuf
+
+      - uses: jdx/mise-action@v2
+
+      - name: Cache vendored libghostty-vt
+        # Same shape (and same key) as the rust-build matrix's cache:
+        # both jobs share the artifact, so the second runner-os miss
+        # would still be a hit. SHA pin lives in build.sh, hashFiles
+        # invalidates on any bump.
+        id: cache-ghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        # Required before `swift build` because the CGhosttyVT system
+        # library target's module map references
+        # ../../../third_party/ghostty/out/include/ghostty/vt.h, and
+        # the Roost target's linkerSettings reference the static
+        # archive at third_party/ghostty/out/lib/libghostty-vt.a.
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            mac/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
+          restore-keys: swiftpm-${{ runner.os }}-
+
+      # Required-green from this commit on. `continue-on-error: true`
+      # was masking real coordinate breakage in Package.swift (the
+      # initial grpc-swift v2 wiring landed with the wrong package URL
+      # + plugin name; user manual `swift run` exposed it). Letting
+      # build/test fail the workflow forces every commit to keep the
+      # Swift surface compiling. Phase 6+ Xcode bundling adds further
+      # steps that may need their own time-boxing when they land, but
+      # baseline `swift build` + `swift test` should always be blocking
+      # — they're the cross-platform contract on the Mac side.
+      #
+      # PROTOC_PATH is honored by GRPCProtobufGenerator's discovery
+      # function (PluginsShared/PluginUtils.swift::deriveProtocPath) when
+      # the plugin can't find protoc via SwiftPM's tool registry —
+      # which is the case for any system-installed protoc since SwiftPM
+      # only resolves tools that are package-graph products or binary
+      # targets. We point it at whatever `brew install protobuf` put on
+      # PATH so this works on both arm64 (/opt/homebrew/bin) and Intel
+      # (/usr/local/bin) macOS runners.
+      - name: swift build
+        working-directory: mac
+        run: PROTOC_PATH="$(which protoc)" swift build -v
+
+      # Mirrors the macOS regression guard in ci.yml for the legacy Go
+      # binary: zig's libghostty-vt build emits both a static archive
+      # and a dylib, and `-L<dir> -lghostty-vt` makes ld pick the
+      # dylib + embed an @rpath/libghostty-vt.dylib reference that
+      # crashes at launch (no LC_RPATH). Package.swift passes the
+      # archive's path positionally to side-step this; this guard
+      # makes regressions immediate rather than letting them resurface
+      # in someone's runtime later.
+      - name: Assert no dynamic ghostty-vt link (regression guard)
+        working-directory: mac
+        run: |
+          for bin in $(find .build -type f -perm -u+x -name 'Roost' -o -name 'RoostPackageTests'); do
+            if otool -L "$bin" 2>/dev/null | grep -q '@rpath/libghostty-vt'; then
+              echo "FAIL: $bin is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in Package.swift's positional-archive linkerSettings."
+              otool -L "$bin"
+              exit 1
+            fi
+          done
+
+      # Live-daemon regression guard. Without this, the gRPC layer
+      # between grpc-swift-nio-transport and tonic was silently broken
+      # over UDS for the entire Phase 5 series — the `:authority`
+      # pseudo-header defaulted to the socket path, tonic's h2 layer
+      # RST_STREAM'd every RPC with PROTOCOL_ERROR, and no test
+      # caught it because nothing dialed a real daemon. `swift test`
+      # alone covers compile-time / packaging regressions; this step
+      # adds the end-to-end gRPC round-trip the unit tests can't.
+      #
+      # Tools cargo + Rust here use the toolchain pinned in
+      # rust-toolchain.toml (same as the rust-build job) so the
+      # daemon binary built for this step matches what users run.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo registry + target (shared with rust-build)
+        # Same key as rust-build's macos-latest cache so the daemon
+        # binary is usually already compiled by the time we get here.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build roost-core for live-daemon test
+        run: cargo build -p roost-core
+
+      - name: Start roost-core (live-daemon test backend)
+        # Backgrounded so the next step can dial it. We use a
+        # workflow-scoped tempdir under the runner's home so the
+        # cleanup step can blow it away without touching anything
+        # else, and a per-run socket name so reruns on the same
+        # runner don't collide.
+        run: |
+          mkdir -p "$HOME/roost-live-test"
+          SOCKET="$HOME/roost-live-test/roost.sock"
+          DB="$HOME/roost-live-test/roost.db"
+          nohup target/debug/roost-core --socket "$SOCKET" --db "$DB" \
+            > "$HOME/roost-live-test/daemon.log" 2>&1 &
+          echo "DAEMON_PID=$!" >> "$GITHUB_ENV"
+          echo "ROOST_LIVE_TEST_SOCKET=$SOCKET" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            if [ -S "$SOCKET" ]; then
+              echo "daemon socket ready at $SOCKET"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "FAIL: daemon socket never appeared at $SOCKET"
+          cat "$HOME/roost-live-test/daemon.log" || true
+          exit 1
+
+      - name: swift test
+        working-directory: mac
+        # ROOST_LIVE_TEST_SOCKET enables the liveIdentifyAgainstDaemon
+        # test in RoostTests; absent that env var the test is a no-op
+        # so local `swift test` runs (no daemon up) still pass.
+        run: PROTOC_PATH="$(which protoc)" swift test
+
+      - name: Stop roost-core
+        if: always()
+        # always() so a swift-test failure still tears the daemon
+        # down — leaving it running can break a re-run on the same
+        # self-hosted runner.
+        run: |
+          if [ -n "${DAEMON_PID:-}" ]; then
+            kill "$DAEMON_PID" 2>/dev/null || true
+            wait "$DAEMON_PID" 2>/dev/null || true
+          fi
+          # Dump the daemon log unconditionally for diagnosis. Cheap,
+          # and the only signal we have when the live test fails.
+          if [ -f "$HOME/roost-live-test/daemon.log" ]; then
+            echo "--- daemon log ---"
+            cat "$HOME/roost-live-test/daemon.log"
+          fi

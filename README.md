@@ -2,6 +2,10 @@
 
 A macOS + Linux desktop terminal multiplexer for AI coding agents. Sidebar of projects on the left, tabs per project, one libghostty-vt terminal per tab. Companion CLI surfaces notifications when an agent in a tab needs attention.
 
+## Direction
+
+Roost is undergoing an architectural refactor toward a Rust daemon (`roost-core`) with native UIs — Swift + AppKit on macOS, Rust + gtk4-rs on Linux — communicating over a gRPC contract on a Unix domain socket. The current Go + GTK4 binary on `main` continues to build and ship throughout. See [docs/development/vision.md](docs/development/vision.md) for the target architecture and phased rollout, and the `claude/discuss-architecture-refactor-cjU3E` branch for the in-progress work.
+
 ## Quick start
 
 ```bash

@@ -1,0 +1,85 @@
+# Roost Cargo workspace.
+#
+# Hosts the new architecture's Rust code: the daemon (roost-core), the
+# Linux UI (roost-linux, lands in Phase 7), the Rust shell-integration
+# CLI (roost-cli-rs, transitional name; renamed to roost-cli in the
+# Phase 9 cutover), the smoke-test client (roost-smoke), the generated
+# proto bindings (roost-proto), and the libghostty-vt FFI wrapper
+# (roost-vt).
+#
+# The legacy Go code under cmd/ + internal/ is unaffected by this
+# workspace and continues to build via build/build.sh + Makefile until
+# the Phase 9 cutover described in docs/development/vision.md.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/roost-proto",
+    "crates/roost-common",
+    "crates/roost-vt",
+    "crates/roost-core",
+    "crates/roost-smoke",
+    "crates/roost-cli-rs",
+]
+
+[workspace.package]
+edition       = "2021"
+rust-version  = "1.85"
+license       = "MIT"
+repository    = "https://github.com/charliek/roost"
+publish       = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+needless_collect = "warn"
+needless_pass_by_value = "warn"
+
+[workspace.dependencies]
+# Async runtime + utilities
+tokio        = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "sync", "process", "signal", "time", "rt"] }
+tokio-stream = { version = "0.1",  features = ["sync"] }
+tokio-util   = { version = "0.7",  features = ["compat"] }
+futures      = "0.3"
+async-stream = "0.3"
+
+# gRPC
+tonic        = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+tonic-build  = { version = "0.12", default-features = false, features = ["prost"] }
+prost        = "0.13"
+prost-types  = "0.13"
+
+# Errors / logging
+thiserror = "1.0"
+anyhow    = "1.0"
+tracing   = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# PTY
+portable-pty = "0.8"
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# UDS support helpers
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower      = { version = "0.5", features = ["util"] }
+
+# FFI / build
+bindgen = "0.70"
+cc      = "1.0"
+
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Misc
+percent-encoding = "2.3"
+
+[profile.release]
+lto         = "thin"
+codegen-units = 1
+strip       = "debuginfo"
+
+[profile.dev]
+debug = "limited"

@@ -1,5 +1,19 @@
 # Roost — Project Conventions
 
+## Direction (read first)
+
+Roost is mid-refactor toward a Rust core daemon and native UIs (Swift/AppKit on Mac, Rust/gtk4-rs on Linux) over a gRPC contract. See [docs/development/vision.md](docs/development/vision.md) for the target architecture and phased path.
+
+This file remains authoritative for the **current** Go + GTK4 implementation that ships on `main`. Do not rewrite the sections below to describe the target — they describe how `cmd/roost` actually works today.
+
+## Branch policy
+
+Refactor work lands on `claude/discuss-architecture-refactor-cjU3E`. New Rust/Swift/proto code lives under `/proto`, `/crates`, `/mac`, `/linux`, `/third_party/ghostty`; the existing `cmd/` and `internal/` Go layout stays in place until the Phase 9 cutover. `main` must keep building as Go + GTK throughout, and both the existing CI workflow (`.github/workflows/ci.yml`) and the refactor CI (`.github/workflows/refactor.yml`) must stay green on every commit.
+
+### Two libghostty-vt builds coexist until Phase 9
+
+`build/build.sh` (legacy, consumed by `cmd/roost` cgo) and `third_party/ghostty/build.sh` (new, consumed by `crates/roost-vt` bindgen and the Mac UI) both pin the same Ghostty SHA. Bumps must move both pins in lockstep. The two scripts cross-link in their headers; the legacy one disappears in the Phase 9 cutover.
+
 ## What this is
 
 A cross-platform (Mac + Linux) desktop terminal multiplexer built around libghostty-vt. Sidebar of projects, tabs per project, one terminal per tab. The differentiator is multi-project workspace with notification routing for AI coding agents (Claude Code, Codex, etc.). Inspiration: cmux. Constraint: smaller scope than cmux.
@@ -7,6 +21,8 @@ A cross-platform (Mac + Linux) desktop terminal multiplexer built around libghos
 See `docs/development/spec.md` for the design doc and `docs/reference/architecture.md` for diagrams.
 
 ## Architecture
+
+New work targeting Rust/Swift/proto lives in `/proto`, `/crates`, `/mac`, `/linux`, `/third_party/ghostty`. The Go layout described below remains authoritative for `main` until the Phase 9 cutover.
 
 - Single GTK4 + libadwaita app written in Go.
 - libghostty-vt is the terminal engine. Used for VT parsing, screen state, OSC parsing, key/mouse encoding.
