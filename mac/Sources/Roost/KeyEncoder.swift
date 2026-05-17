@@ -70,6 +70,39 @@ final class KeyEncoder {
         ghostty_key_encoder_free(encoder)
     }
 
+    /// Encode a synthetic key event (no NSEvent, no UTF-8 text).
+    /// Used by M6's alt-screen wheel translation: each scroll-up
+    /// row dispatches one `ARROW_UP` press through the same encoder
+    /// path real keystrokes use, so DECCKM application-mode + Kitty
+    /// flags are honored without hand-rolling escape sequences.
+    func encode(syntheticKey key: GhosttyKey, mods: GhosttyMods = 0) -> Data {
+        ghostty_key_encoder_setopt_from_terminal(encoder, terminal)
+        ghostty_key_event_set_action(event, GHOSTTY_KEY_ACTION_PRESS)
+        ghostty_key_event_set_key(event, key)
+        ghostty_key_event_set_mods(event, mods)
+        ghostty_key_event_set_unshifted_codepoint(event, 0)
+        ghostty_key_event_set_composing(event, false)
+        ghostty_key_event_set_utf8(event, nil, 0)
+
+        var stackBuf = [CChar](repeating: 0, count: 128)
+        var written: size_t = 0
+        let rc = stackBuf.withUnsafeMutableBufferPointer { buf in
+            ghostty_key_encoder_encode(encoder, event, buf.baseAddress, buf.count, &written)
+        }
+        if rc.rawValue == GHOSTTY_SUCCESS.rawValue {
+            return Self.dataFromCChars(stackBuf, count: written)
+        }
+        guard written > 0 else { return Data() }
+        var dynBuf = [CChar](repeating: 0, count: written)
+        let rc2 = dynBuf.withUnsafeMutableBufferPointer { buf in
+            ghostty_key_encoder_encode(encoder, event, buf.baseAddress, buf.count, &written)
+        }
+        if rc2.rawValue == GHOSTTY_SUCCESS.rawValue {
+            return Self.dataFromCChars(dynBuf, count: written)
+        }
+        return Data()
+    }
+
     /// Encode an NSEvent into bytes for the PTY. Empty Data means the
     /// encoder swallowed the event (modifier-only presses, IME-driven
     /// dead keys, etc.); the caller should NOT write zero bytes.
