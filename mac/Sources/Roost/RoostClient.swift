@@ -409,6 +409,41 @@ func watchEvents(socketPath: String) -> AsyncStream<Roost_V1_Event> {
     }
 }
 
+/// Best-effort `ReportOsc` — sends a pre-parsed (osc_command,
+/// payload) tuple to the daemon's OSC routing layer (Phase 6a
+/// P5). One-shot RPC; the UI's OscScanner produces these from
+/// the PTY byte stream and dispatches them via this fn. Errors
+/// log to stderr but don't fail loudly — a missed OSC update
+/// (transient daemon hiccup, etc.) shouldn't crash the UI.
+func reportOsc(
+    socketPath: String,
+    tabID: Int64,
+    oscCommand: UInt32,
+    payload: String
+) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.reportOsc(
+                .with {
+                    $0.tabID = tabID
+                    $0.oscCommand = oscCommand
+                    $0.payload = payload
+                }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] reportOsc(tab=\(tabID), cmd=\(oscCommand)) failed: \(error)\n".utf8)
+        )
+    }
+}
+
 /// Best-effort `DeleteProject`. Cascade-deletes tabs daemon-side.
 func deleteProject(socketPath: String, projectID: Int64) async {
     do {

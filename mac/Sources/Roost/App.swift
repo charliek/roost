@@ -578,11 +578,38 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // local active state is authoritative within the UI,
             // so we drop this too.
             NSLog("roost-mac: watchEvents tab event ignored: %@", "\(kind)")
-        case .tabCwd, .tabTitle, .tabState, .tabNotification,
-             .notification, .tabsReordered, .projectsReordered,
-             .hookActive:
-            // Visual surfaces for these land in M3 (tab strip with
-            // cwd / status dot) and Phase 6b (notifications).
+        case .tabTitle(let e):
+            // Phase 6a P6: OSC 0/1/2 changed a tab's title. Mirror
+            // into the matching TabSession so rebuildTabBar uses
+            // the live title in the pill label.
+            if let session = tabs.first(where: { $0.id == e.tabID }) {
+                session.liveTitle = e.title
+                if session.projectID == activeProjectID {
+                    rebuildTabBar()
+                }
+            }
+        case .tabCwd(let e):
+            // OSC 7 changed cwd. Same flow — update + rebuild
+            // when the affected tab is in the active project.
+            if let session = tabs.first(where: { $0.id == e.tabID }) {
+                session.liveCwd = e.cwd
+                if session.projectID == activeProjectID {
+                    rebuildTabBar()
+                }
+            }
+        case .tabState(let e):
+            // TabState updates light up the status-dot slot M3's
+            // TabPillView reserved. Stash and rebuild.
+            if let session = tabs.first(where: { $0.id == e.tabID }) {
+                session.liveState = Int32(e.state.rawValue)
+                if session.projectID == activeProjectID {
+                    rebuildTabBar()
+                }
+            }
+        case .tabNotification, .notification, .tabsReordered,
+             .projectsReordered, .hookActive:
+            // P7 (badges) + P8 (desktop notifications) light these
+            // up. P6 just routes title / cwd / state.
             break
         }
     }
@@ -890,10 +917,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         for (index, session) in projectTabs.enumerated() {
             let isActive = session === activeSession
+            // Phase 6a P6 label: prefer title (OSC 0/1/2) if set,
+            // else cwd (OSC 7) tilde-abbreviated, else "Tab N".
+            // This is the visible payoff for P4 + P5 + P6 — the
+            // pill stops saying "Tab N" once the shell emits OSCs.
+            let pillTitle = pillLabel(for: session, index: index)
             let pill = TabPillView(
                 index: index,
-                title: "Tab \(index + 1)",
+                title: pillTitle,
                 isActive: isActive,
+                statusColor: pillStatusColor(for: session),
                 onSelect: { [weak self] idx in
                     self?.selectTab(at: idx)
                 },
@@ -901,7 +934,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     self?.closeTab(at: idx)
                 }
             )
-            _ = session  // referenced for future per-session metadata (cwd, status)
             tabBar.insertArrangedSubview(pill, at: tabBar.arrangedSubviews.count - 1)
         }
 
@@ -1276,6 +1308,50 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
+    // MARK: - Tab pill labels (Phase 6a P6)
+
+    /// Compute the label string for a tab's pill in the strip.
+    /// Priority: live title (OSC 0/1/2) -> tilde-abbreviated cwd
+    /// (OSC 7) -> "Tab N" fallback. P6's WatchEvents handlers
+    /// populate `liveTitle` / `liveCwd` on the TabSession;
+    /// rebuildTabBar calls this each time the strip is rebuilt.
+    @MainActor
+    private func pillLabel(for session: TabSession, index: Int) -> String {
+        if let t = session.liveTitle, !t.isEmpty { return t }
+        if let cwd = session.liveCwd, !cwd.isEmpty {
+            return tildeAbbreviate(cwd)
+        }
+        return "Tab \(index + 1)"
+    }
+
+    /// Tilde-abbreviate `$HOME` prefixes in a path. Matches the Go
+    /// binary's `cmd/roost/path_display.go::tildeAbbreviate`.
+    private func tildeAbbreviate(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    /// Resolve the status-dot color for a tab pill based on
+    /// `liveState`. The proto's `TabState` enum: 0=NONE,
+    /// 1=RUNNING (green), 2=NEEDS_INPUT (yellow), 3=IDLE (gray),
+    /// 4=ERROR (red). Returns nil for NONE / unknown — TabPillView
+    /// then draws no dot (M3's empty slot).
+    @MainActor
+    private func pillStatusColor(for session: TabSession) -> NSColor? {
+        guard let state = session.liveState else { return nil }
+        switch state {
+        case 1: return .systemGreen
+        case 2: return .systemYellow
+        case 3: return .systemGray
+        case 4: return .systemRed
+        default: return nil
+        }
+    }
+
     // MARK: - Keybind table → NSMenuItem (Phase 6a P1)
 
     /// Look up the first `Accel` in `self.keybinds` whose action
@@ -1396,6 +1472,7 @@ final class TabPillView: NSView {
         index: Int,
         title: String,
         isActive: Bool,
+        statusColor: NSColor? = nil,
         onSelect: @escaping @MainActor (Int) -> Void,
         onClose: @escaping @MainActor (Int) -> Void
     ) {
@@ -1428,10 +1505,17 @@ final class TabPillView: NSView {
             ? NSColor.controlAccentColor.withAlphaComponent(0.18)
             : NSColor.clear).cgColor
 
-        // Status-dot slot — reserves 10pt on the leading edge so the
-        // label position is stable when the dot turns on later.
+        // Status-dot slot — reserves 10pt on the leading edge so
+        // the label position is stable when the dot turns on. P6
+        // wires `TabStateChangedEvent` to fill `statusColor`; M3
+        // left the slot empty.
         let statusSlot = NSView()
         statusSlot.translatesAutoresizingMaskIntoConstraints = false
+        statusSlot.wantsLayer = true
+        if let color = statusColor {
+            statusSlot.layer?.backgroundColor = color.cgColor
+            statusSlot.layer?.cornerRadius = 5
+        }
         addSubview(statusSlot)
         addSubview(label)
         addSubview(closeButton)
