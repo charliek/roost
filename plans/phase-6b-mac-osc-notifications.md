@@ -1,6 +1,6 @@
 # Phase 6b: Mac OSC + notifications
 
-**Status**: ⏳ pending
+**Status**: ✅ done — closed on `feature/rust-port` via P4–P9 of [`goal-phase-6-complete-2026-05-16.md`](goal-phase-6-complete-2026-05-16.md). Daemon-side OSC scanner (P4), routing + hook-active suppression (P5), UI OSC detect + `ReportOsc` upcall + tab pill cwd/title/status-dot (P6), per-tab + per-project notification badges with `⌘⇧U` jump-to-unread (P7), `UNUserNotificationCenter` desktop notifications (P8), `roost-cli-rs claude install` + `claude-hook` end-to-end (P9) all merged 2026-05-16.
 **Exit criteria**:
 * The Mac UI parses OSC sequences during VT processing (it owns the libghostty-vt instance, so the OSC stream is right there in render-state walks).
 * OSC 0/1/2 (title) — UI updates the tab's button title locally; if the tab is `user_titled`, the OSC is dropped daemon-side via `SetTabTitle` with `user=false`.

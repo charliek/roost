@@ -1,6 +1,6 @@
 # Phase 7: Linux UI (gtk4-rs)
 
-**Status**: ⏳ pending
+**Status**: 🚧 in progress — Step 1 (crate skeleton + Identify spike + `gtk-build` CI job) landed via M8 of [`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md). Steps 2–7 (cell renderer, PTY round-trip, sidebar + tab bar, keybind config, OSC + notifications, visual polish) still pending. The user is driving the remaining work on their Linux laptop in parallel.
 **Exit criteria**:
 * `linux/` Rust crate added to the Cargo workspace, building a runnable `roost-linux` binary.
 * gtk4-rs + libadwaita window with a project sidebar + tab bar + terminal area, structurally equivalent to the Mac UI.
@@ -39,7 +39,7 @@ No. New crate; the Go `cmd/roost` GTK4 binary remains the user-facing Linux buil
 
 ## Step plan
 
-* **Step 1 — Crate skeleton.** Add `crates/roost-linux/` (or `linux/` per the vision.md skeleton; pick a location consistent with the rest of the workspace and document it). gtk4-rs + libadwaita deps. Single-window adw.ApplicationWindow that does Identify against `roost-core` and shows pid/version in a status bar — Mac Phase 5 step 2 equivalent.
+* **Step 1 — Crate skeleton.** ✅ landed as `crates/roost-linux/` via M8 of `goal-rust-port-polish-2026-05-16.md` (PR #31, squash `c4d0d38`). gtk4-rs + libadwaita-rs + tokio deps; single-window `adw::ApplicationWindow` that does Identify against `roost-core`. CI job `gtk-build` runs on both `ubuntu-latest` and `macos-latest` (Homebrew GTK4). Resolved the "or `linux/`" vision-doc ambiguity in favor of the workspace-consistent `crates/` location.
 * **Step 2 — Terminal renderer.** Port the Mac `TerminalView` to a `gtk::DrawingArea` subclass. Same render-state walk via `crates/roost-vt`. Same Cairo per-cell background fill + Pango per-cell glyph layout. Mac Phase 5 step 4 equivalent. The Go binary's renderer in `cmd/roost/render.go` is a useful reference for cell-metric math + glyph caching strategy.
 * **Step 3 — PTY round-trip.** Bidirectional `StreamPty` against the daemon, same pattern as Mac Phase 5 step 5. The Rust tonic client side already works (`roost-cli-rs` proves it); just need the keystroke + output plumbing into the renderer.
 * **Step 4 — Sidebar + tab bar.** GTK4 has native `adw::TabView` / `adw::TabBar`. Use them or hand-roll like Mac — `adw::TabBar` is probably the right choice (it's what the Go binary uses). Sidebar is an `adw::NavigationSplitView` or hand-rolled `gtk::Box`.

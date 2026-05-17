@@ -1,18 +1,19 @@
 # Phase 6a: Mac structural parity
 
-**Status**: 🚧 in progress (~70%)
+**Status**: ✅ done — closed on `feature/rust-port` via the M1–M7 polish goal ([`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md)) and the P1–P3 followups from [`goal-phase-6-complete-2026-05-16.md`](goal-phase-6-complete-2026-05-16.md). Wide-char width (Step 2h) and the `toggle_sidebar`/`rename_tab` secondary shortcuts are deferred to dedicated `polish/wide-char-width` and `polish/secondary-shortcuts` followups noted in the goal doc.
+
 **Exit criteria**:
 * Multi-tab support — open / close / switch tabs within a project. ✅
-* Project sidebar — list projects, create / rename / delete. ✅
+* Project sidebar — list projects, create / rename / delete (`NSOutlineView` source-list style). ✅ (M2)
 * Project lifecycle proto + daemon — `CreateProject`, `RenameProject`, `DeleteProject` + matching events. ✅
 * Default shortcuts match the Go binary on macOS (`super+t`, `super+w`, `super+n`, `super+1..9`, `ctrl+1..9`, `super+shift+r`). ✅
-* Keybind override config — Ghostty-style `keybind = trigger=action` in a config file, layered over defaults. ⏳ pending
-* WatchEvents subscription — sidebar/tab bar converge on daemon state without restart when other clients mutate. ⏳ pending
-* Secondary shortcuts: `cycle_tab_prev`/`cycle_tab_next`, `font_increase`/`decrease`/`reset`, `toggle_sidebar`, `rename_tab`. ⏳ pending
-* Visual polish — sidebar styling, tab bar styling, custom row backgrounds for the active item rather than the leading "● " marker. ⏳ pending
-* Selection + copy / paste in the terminal view. ⏳ pending
-* Window/terminal resize: today the terminal is fixed at 80×24; resizing the window doesn't change `cols`/`rows`. ⏳ pending
-* Wide-char (CJK + emoji) cell width handling — the Mac renderer should consume libghostty-vt's per-cell width field. ⏳ pending
+* Keybind override config — Ghostty-style `keybind = trigger=action` in a config file, layered over defaults. ✅ (P1)
+* WatchEvents subscription — sidebar/tab bar converge on daemon state without restart when other clients mutate. ✅ (M1)
+* Secondary shortcuts: `font_increase`/`decrease`/`reset`. ✅ (P2). `cycle_tab_prev`/`cycle_tab_next`, `toggle_sidebar`, `rename_tab` deferred to `polish/secondary-shortcuts`.
+* Visual polish — sidebar styling, tab bar styling, custom row backgrounds for the active item rather than the leading "● " marker. ✅ (M1 chrome + M2 sidebar + M3 tab pills)
+* Selection + copy / paste in the terminal view. ✅ (M5)
+* Window/terminal resize → cell-grid reflow + `PtyResize` over the existing `StreamPty` stream. ✅ (M3)
+* Wide-char (CJK + emoji) cell width handling — the Mac renderer should consume libghostty-vt's per-cell width field. ⏳ deferred to `polish/wide-char-width`.
 
 **Mergeability to main**: yes, throughout. Phase 6a is entirely additive — every commit leaves `cmd/` + `internal/` untouched.
 

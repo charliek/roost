@@ -1,6 +1,6 @@
 # Vision: Native UIs over a Rust core
 
-This is the **target architecture** Roost is migrating toward. It is the durable north star for every PR on the refactor branch (`claude/discuss-architecture-refactor-cjU3E`). The currently-shipping Go + GTK4 implementation is described in [spec.md](spec.md) and [architecture.md](../reference/architecture.md); those documents remain authoritative for `main` until the cutover described in [Phased path](#phased-path) below.
+This is the **target architecture** Roost is migrating toward. It is the durable north star for every PR on the long-lived refactor branch `feature/rust-port` (predecessor `claude/discuss-architecture-refactor-cjU3E` is frozen at `00b3d10`). The currently-shipping Go + GTK4 implementation is described in [spec.md](spec.md) and [architecture.md](../reference/architecture.md); those documents remain authoritative for `main` until the cutover described in [Phased path](#phased-path) below.
 
 ## North Star
 
@@ -124,7 +124,7 @@ Phase 2 introduces `roost-cli` in Rust under the transitional name `roost-cli-rs
 
 ### DL-10: Ghostty SHA pinned in two places during the transition
 
-`build/build.sh` (current) and `vendor/ghostty/build.sh` (new, lands in Phase 2) both pin the same Ghostty commit. Bumps must move both in lockstep until Phase 9. Cross-link comments at the top of each script make this explicit.
+`build/build.sh` (current) and `third_party/ghostty/build.sh` (new, landed in Phase 2) both pin the same Ghostty commit. Bumps must move both in lockstep until Phase 9. Cross-link comments at the top of each script make this explicit.
 
 ## Relationship to existing docs
 

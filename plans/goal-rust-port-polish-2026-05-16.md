@@ -3,7 +3,7 @@
 **Set**: 2026-05-16
 **Owner**: Charlie Knudsen
 **Co-author / executor**: Claude (Opus 4.7)
-**Status**: 🚧 in flight — M1 PR opened on day 1.
+**Status**: ✅ closed — M1–M8 all merged on `feature/rust-port` (2026-05-16).
 
 ## Problem
 
