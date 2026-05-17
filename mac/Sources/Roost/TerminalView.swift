@@ -912,10 +912,25 @@ final class TerminalView: NSView {
             }
         }
 
-        // Cursor (goal-mac-polish-cursor-keys M2). Drawn AFTER glyphs
-        // but BEFORE selection — selection wants to visually dominate
-        // the cursor cell when the user's mid-drag.
-        if let cur = cursorInfo, cur.visible {
+        // Cursor (goal-mac-polish-cursor-keys M2 + Claude-cursor follow-up).
+        // Drawn AFTER glyphs but BEFORE selection — selection wants to
+        // visually dominate the cursor cell when the user's mid-drag.
+        //
+        // **Visibility policy**: we deliberately diverge from strict
+        // DECTCEM (mode 25) compliance when the view is focused. TUI
+        // apps like Claude Code disable the system cursor and render
+        // their own placeholder character — but the placeholder
+        // disappears the moment the user starts typing, leaving no
+        // indication of where input lands. We keep the system cursor
+        // visible whenever the view is focused, regardless of
+        // libghostty's `visible` flag, so the user can always see
+        // where their next keystroke will land. This matches cmux's
+        // behavior and is the UX the user requested.
+        //
+        // When the view is NOT focused we still defer to the
+        // visibility flag — background tabs whose TUI apps have
+        // hidden the cursor stay quiet (less visual noise).
+        if let cur = cursorInfo, cur.visible || hasFocus {
             let cursorRect = NSRect(
                 x: CGFloat(cur.col) * cellW,
                 y: CGFloat(cur.row) * cellH,
