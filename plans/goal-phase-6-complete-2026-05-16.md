@@ -3,7 +3,7 @@
 **Set**: 2026-05-16
 **Owner**: Charlie Knudsen
 **Co-author / executor**: Claude (Opus 4.7)
-**Status**: 🆕 not started
+**Status**: ✅ closed — all P1–P9 merged on `feature/rust-port` (2026-05-16)
 **Predecessor**: [`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md) (M1–M8, all merged on `feature/rust-port`)
 **Companion**: Phase 7 (full Linux UI on top of M8's gtk4-rs spike) — being driven separately on the user's Linux laptop, NOT part of this goal.
 
@@ -288,12 +288,20 @@ Captured here so they don't get lost; not part of THIS goal's scope:
 
 ## Milestone log
 
-* P1 — pending (Track B, independent).
-* P2 — pending (Track B; lands cleanly after P1 if you want keybind-driven action dispatch, runnable in parallel otherwise).
-* P3 — pending (Track B, independent).
-* P4 — pending (Track A, foundation).
-* P5 — blocked on P4.
-* P6 — blocked on P5.
-* P7 — blocked on P6.
-* P8 — blocked on P5 (could run in parallel with P6 / P7 since it consumes `NotificationEvent` directly; kept sequential here for queue-management simplicity, parallelize at PR-open time if convenient).
-* P9 — blocked on P5 + P8 (hook script needs both the daemon-side hook_active suppression and the desktop notification surface).
+All nine P-commits landed on `feature/rust-port` 2026-05-16 via stacked `polish/*` PRs auto-merged through branch-protection on the macOS-only required check set.
+
+* P1 — ✅ merged via #34 (`polish/keybind-config`, squash `bd2609a`).
+* P2 — ✅ merged via #33 (`polish/font-zoom`, squash `17af7d7`). Landed before P1 — branches were independent.
+* P3 — ✅ merged via #32 (`polish/palette`, squash `38fa60e`).
+* P4 — ✅ merged via #35 (`polish/osc-scanner-port`, squash `ab20cf3`). Needed a rustfmt amend on the rebased commit (4-line cleanup in `osc.rs`).
+* P5 — ✅ merged via #36 (`polish/osc-daemon-routing`, squash `72f3423`). Also needed a rustfmt amend (`if let Err` line break in `service.rs`).
+* P6 — ✅ merged via #37 (`polish/ui-osc-detect-report`, squash `2f64da0`).
+* P7 — ✅ merged via #38 (`polish/tab-notification-badges`, squash `15863c9`).
+* P8 — ✅ merged via #39 (`polish/desktop-notifications`, squash `886c9c1`).
+* P9 — ✅ merged via #41 (`polish/claude-hook-flow`, squash `91ad2f1`). Original PR #40 self-merged into the P8 branch when its base lacked required checks; split into a fresh PR (#41) properly stacked.
+
+### Notes from the cascade
+
+* **Stacked-PR retarget cycle**: as each PR landed, the downstream branches were rebased onto the new `feature/rust-port` HEAD (`git rebase --onto origin/feature/rust-port <prev-tip>`), force-pushed, retargeted via `gh pr edit N --base feature/rust-port`, closed + reopened to retrigger CI, and re-armed with `gh pr merge N --auto --squash`. Six iterations of that loop in total.
+* **Auto-merge on non-protected bases is instant**: setting `--auto --squash` on a PR whose base branch has no required checks merges immediately if no checks fail synchronously. This bit us on #40 — the P9 commit landed in the P8 branch before there was a chance to retarget. Fixed by force-resetting `polish/desktop-notifications` back to just P8 and opening a fresh PR (#41) for P9.
+* **Latent rustfmt drift**: `cargo fmt --all -- --check` failed on the rebased P4 and P5 commits even though the original (pre-rebase) commits had passed CI. Both were trivial style cleanups in newly-introduced sections of `osc.rs` / `service.rs`; amended into the offending commit each time. Possible CI cache or rustfmt environmental difference; not worth chasing further.
