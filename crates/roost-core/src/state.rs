@@ -389,13 +389,14 @@ impl Workspace {
     }
 
     pub fn close_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
-        // Phase 1 — store work: confirm existence, delete the row, then
-        // (still under the same store lock) precompute a fallback
-        // (project, tab) pair we can promote to active if the tab being
-        // closed currently holds that role. The fallback may live in a
-        // different project, which is why we capture both fields —
-        // leaving `active_project_id` stale would break clients that
-        // rely on the `(project, tab)` pair.
+        // Phase 1 — store work: confirm existence, capture the parent
+        // project_id, delete the row, then (still under the same store
+        // lock) precompute a fallback (project, tab) pair we can
+        // promote to active if the tab being closed currently holds
+        // that role, plus a flag for whether the project is now empty.
+        // The fallback may live in a different project, which is why
+        // we capture both fields — leaving `active_project_id` stale
+        // would break clients that rely on the `(project, tab)` pair.
         //
         // We compute the fallback unconditionally rather than peeking
         // at `runtime.active_tab_id` first: the lookup is one in-memory
@@ -404,19 +405,57 @@ impl Workspace {
         // always taken before `runtime`, matching `snapshot()`.
         // Reversing the order in any single method opens a deadlock
         // window against concurrent callers.
-        let fallback: Option<(i64, i64)> = {
+        let project_id: i64;
+        let fallback: Option<(i64, i64)>;
+        let project_now_empty: bool;
+        {
             let store = self.store.lock().unwrap();
-            store.get_tab(tab_id).map_err(wrap)?;
+            let row = store.get_tab(tab_id).map_err(wrap)?;
+            project_id = row.project_id;
             store.delete_tab(tab_id).map_err(wrap)?;
-            store.list_projects().ok().and_then(|projects| {
-                projects.into_iter().find_map(|p| {
+            fallback = match store.list_projects() {
+                Ok(projects) => projects.into_iter().find_map(|p| {
                     store
                         .list_tabs(p.id)
                         .ok()
                         .and_then(|tabs| tabs.into_iter().next().map(|t| (t.project_id, t.id)))
-                })
-            })
-        };
+                }),
+                Err(err) => {
+                    warn!(
+                        tab_id,
+                        ?err,
+                        "close_tab: list_projects failed while computing fallback"
+                    );
+                    None
+                }
+            };
+            // Empty-project check while we already hold the store lock.
+            // Used below to drive the cascade-to-delete_project — the
+            // policy the Go binary's `cmd/roost/app.go:807-808`
+            // implements ("when a project's last tab closes, close
+            // the project silently"). Doing it here (daemon-side)
+            // rather than client-side is what fixes the cross-client
+            // safety hole: the Mac UI's local `tabs` list omits
+            // headless-CLI-opened tabs, so the client could otherwise
+            // delete a project the daemon thinks still has tabs.
+            //
+            // On a SQLite error we default to "not empty" so the
+            // cascade doesn't fire on bad data — better to leave an
+            // empty project around than to delete one that still has
+            // tabs we just couldn't list.
+            project_now_empty = match store.list_tabs(project_id) {
+                Ok(tabs) => tabs.is_empty(),
+                Err(err) => {
+                    warn!(
+                        project_id,
+                        tab_id,
+                        ?err,
+                        "close_tab: list_tabs failed while checking project emptiness"
+                    );
+                    false
+                }
+            };
+        }
 
         // Phase 2 — runtime work: drop the per-tab entry; if this tab
         // was the active selection, promote the fallback (or zero out).
@@ -426,9 +465,9 @@ impl Workspace {
             runtime.tabs.remove(&tab_id);
             if runtime.active_tab_id == tab_id {
                 match fallback {
-                    Some((project_id, t_id)) => {
+                    Some((p_id, t_id)) => {
                         runtime.active_tab_id = t_id;
-                        runtime.active_project_id = project_id;
+                        runtime.active_project_id = p_id;
                     }
                     None => {
                         runtime.active_tab_id = 0;
@@ -439,7 +478,11 @@ impl Workspace {
             }
         }
 
-        // Phase 3 — broadcast.
+        // Phase 3 — broadcast the tab event before any cascade so the
+        // event order on the wire is per-tab `TabDeletedEvent` first,
+        // then `ProjectDeletedEvent` if the cascade triggered. Matches
+        // the order `delete_project` itself emits for multi-tab
+        // deletes.
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabDeleted(TabDeletedEvent {
                 tab_id,
@@ -447,6 +490,29 @@ impl Workspace {
         });
         if active_changed {
             self.emit_active_changed();
+        }
+
+        // Phase 4 — cascade. If the parent project is now empty,
+        // delete it. Daemon-authoritative empty-check (vs UI-local)
+        // is what makes this safe across clients: a Mac UI tab
+        // exiting won't wipe out a project that still has tabs
+        // opened headlessly by `roost-cli-rs tab open`.
+        // `delete_project` handles its own locking + events. A
+        // concurrent delete from another path produces
+        // `ProjectNotFound`, which we tolerate silently; any other
+        // error is logged so silent SQLite failures don't leave the
+        // workspace in a bad state without any signal.
+        if project_now_empty {
+            if let Err(err) = self.delete_project(project_id) {
+                if !matches!(err, WorkspaceError::ProjectNotFound(_)) {
+                    warn!(
+                        project_id,
+                        tab_id,
+                        ?err,
+                        "close_tab: cascade delete_project failed"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -725,7 +791,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_close_tab() {
+    fn open_close_tab_cascades_to_empty_project() {
+        // Closing the only tab in a project cascades to delete the
+        // parent project itself (M5 of goal-mac-polish-cursor-keys).
+        // Matches Go binary's cmd/roost/app.go:807-808 ("when a
+        // project's last tab closes, close the project silently").
         let ws = Workspace::new();
         let project = ws.ensure_default_project("/tmp");
         let tab = ws.open_tab(project, "/tmp/work", "").unwrap();
@@ -733,7 +803,24 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].tabs.len(), 1);
         ws.close_tab(tab.id).unwrap();
-        assert!(ws.snapshot()[0].tabs.is_empty());
+        // Cascade: project itself is gone now since it had no
+        // remaining tabs.
+        assert!(ws.snapshot().is_empty());
+    }
+
+    #[test]
+    fn close_one_of_many_tabs_keeps_project() {
+        // The cascade only fires when the project becomes empty.
+        // Closing one tab in a multi-tab project leaves the project
+        // (and its remaining tabs) in place.
+        let ws = Workspace::new();
+        let project = ws.ensure_default_project("/tmp");
+        let tab_a = ws.open_tab(project, "/tmp/a", "").unwrap();
+        let _tab_b = ws.open_tab(project, "/tmp/b", "").unwrap();
+        ws.close_tab(tab_a.id).unwrap();
+        let snap = ws.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tabs.len(), 1);
     }
 
     #[test]
