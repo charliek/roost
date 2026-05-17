@@ -48,6 +48,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var terminalContainer: NSView?
     private var windowMenu: NSMenu?
 
+    /// Captured at `init` time so the M3 toggle handler can flip the
+    /// pane's `isHidden` without re-finding it in the view hierarchy.
+    /// `NSSplitView.addArrangedSubview` honors hidden subviews by
+    /// collapsing their slot — no separate "collapsed" API needed.
+    private var sidebarPane: NSView?
+
+    /// Persistence key for the M3 toggle-sidebar state. Read at launch,
+    /// written on every toggle. Default = true (visible) for new users.
+    private static let sidebarVisibleDefaultsKey = "RoostSidebarVisible"
+
     /// Workspace model. `projects` mirrors the daemon's project list
     /// in display order; `tabs` is a flat list of every open
     /// TabSession across all projects, filtered into the tab bar by
@@ -215,6 +225,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         split.addArrangedSubview(sidebar)
         split.addArrangedSubview(content)
         split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        self.sidebarPane = sidebar
+        // Restore the user's last-known toggle state (M3). UserDefaults
+        // returns `false` for an unset key, so we read it back as
+        // Optional<Bool>-shaped to distinguish "not set" (default
+        // visible) from "explicitly false" (user hid it).
+        let stored = UserDefaults.standard.object(forKey: Self.sidebarVisibleDefaultsKey) as? Bool
+        sidebar.isHidden = stored == false
 
         let root = NSView(frame: window.contentRect(forFrameRect: window.frame))
         root.addSubview(split)
@@ -721,6 +738,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func selectProject(id: Int64) {
+        // M3: Reveal the sidebar on ⌘1-9 / explicit project-switch
+        // so the user can see which project they've landed on.
+        // Mirrors Go `cmd/roost/app.go:1487`. Programmatic selection
+        // paths that already have the sidebar in view (single-click
+        // sidebar row, WatchEvents reconcile) flow through here too
+        // — calling ensureVisible is idempotent when already shown.
+        ensureSidebarVisible()
         activeProjectID = id
         applySidebarSelection()
         updateWindowTitle()
@@ -753,6 +777,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func newProject(_ sender: Any?) {
         guard daemonReachable else { return }
+        // M3: reveal the sidebar BEFORE the async create round-trip
+        // so the user gets immediate visual feedback even if the
+        // create fails. Matches Go `cmd/roost/app.go:1337`. The
+        // follow-on `selectProject(id:)` call also ensures visibility
+        // for the success path; this one defends the failure path.
+        ensureSidebarVisible()
         let socketPath = self.socketPath
         Task { [weak self] in
             let created = await createProject(socketPath: socketPath, name: "", cwd: "")
@@ -1138,6 +1168,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func renameActiveProject(_ sender: Any?) {
         guard let id = activeProjectID else { return }
+        // M3: reveal the sidebar so the user sees the project row
+        // their rename will affect. Mirrors Go `app.go:1975`.
+        ensureSidebarVisible()
         let placeholder = NSMenuItem()
         placeholder.tag = Int(id)
         renameProjectFromMenu(placeholder)
@@ -1255,6 +1288,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         zoomResetItem.target = self
         bind(zoomResetItem, to: KeybindAction.fontReset)
         viewMenu.addItem(zoomResetItem)
+        viewMenu.addItem(.separator())
+        // M3: sidebar toggle. Routed through the standard responder
+        // chain so the keybind config can override the default ⌘B.
+        let toggleSidebarItem = NSMenuItem(
+            title: "Toggle Sidebar",
+            action: #selector(toggleSidebar(_:)),
+            keyEquivalent: ""
+        )
+        toggleSidebarItem.target = self
+        bind(toggleSidebarItem, to: KeybindAction.toggleSidebar)
+        viewMenu.addItem(toggleSidebarItem)
         viewMenu.addItem(.separator())
         // Phase 6a P7: jump-to-unread shortcut.
         let jumpItem = NSMenuItem(
@@ -1454,6 +1498,35 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let (key, mask) = accel(for: action)
         item.keyEquivalent = key
         item.keyEquivalentModifierMask = mask
+    }
+
+    // MARK: - Sidebar toggle (M3)
+
+    /// `toggle_sidebar` action handler. Flips `sidebarPane.isHidden`
+    /// (NSSplitView collapses hidden arranged subviews automatically),
+    /// then writes the new state to UserDefaults so it survives across
+    /// launches. Bound to ⌘B by default in `Keybind.swift`, overrideable
+    /// via the config file's `keybind = … = toggle_sidebar` line.
+    @objc @MainActor
+    private func toggleSidebar(_ sender: Any?) {
+        guard let sidebarPane else { return }
+        let nextHidden = !sidebarPane.isHidden
+        sidebarPane.isHidden = nextHidden
+        UserDefaults.standard.set(!nextHidden, forKey: Self.sidebarVisibleDefaultsKey)
+    }
+
+    /// Force the sidebar visible without toggling. Called from the
+    /// three user actions where Go (`cmd/roost/app.go:1337,1487,1975`)
+    /// auto-expands the sidebar so the user sees the affected row:
+    /// `newProject` (sidebar shows the freshly-created project),
+    /// `selectProject` (the ⌘1-9 switcher reveals the focused project),
+    /// and `beginRenameActiveProject` (M4 hookup — rename popover
+    /// needs the row visible to anchor against).
+    @MainActor
+    private func ensureSidebarVisible() {
+        guard let sidebarPane, sidebarPane.isHidden else { return }
+        sidebarPane.isHidden = false
+        UserDefaults.standard.set(true, forKey: Self.sidebarVisibleDefaultsKey)
     }
 
     // MARK: - Jump to next unread (Phase 6a P7)
