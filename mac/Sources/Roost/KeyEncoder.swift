@@ -136,39 +136,50 @@ final class KeyEncoder {
         // (0x00-0x1F and 0x7F) — the encoder re-derives them from
         // key+mods. Without this filter, Ctrl+A would arrive as both
         // a key+mods encoding AND a literal 0x01 byte in `utf8`.
+        //
+        // `ghostty_key_event_set_utf8` does NOT take ownership of the
+        // pointer (per the header docs); the encode call below reads
+        // it. So we MUST keep the bytes alive until after the encode
+        // returns — both calls live inside the same `withUnsafeBytes`
+        // scope. Setting the pointer and letting it dangle before the
+        // encode call is the bug we shipped in M1: ASCII characters
+        // arrived at the encoder as garbage, so the shell never
+        // received "l" or "s" but the empty-line Enter still made it
+        // through (Enter's "\r" gets filtered to empty UTF-8 and the
+        // encoder derives from key alone, so it wasn't affected).
         let utf8 = Self.printableUTF8(for: nsEvent)
-        utf8.withUnsafeBytes { raw in
+        return utf8.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
             if let base = raw.bindMemory(to: CChar.self).baseAddress, raw.count > 0 {
                 ghostty_key_event_set_utf8(event, base, raw.count)
             } else {
                 ghostty_key_event_set_utf8(event, nil, 0)
             }
-        }
 
-        // Try a 128-byte stack buffer first — covers every legacy and
-        // most Kitty-protocol encodings (the longest forms top out
-        // around ~40 bytes). Grow on OUT_OF_SPACE.
-        var stackBuf = [CChar](repeating: 0, count: 128)
-        var written: size_t = 0
-        let rc = stackBuf.withUnsafeMutableBufferPointer { buf in
-            ghostty_key_encoder_encode(encoder, event, buf.baseAddress, buf.count, &written)
+            // Try a 128-byte stack buffer first — covers every legacy
+            // and most Kitty-protocol encodings (the longest forms top
+            // out around ~40 bytes). Grow on OUT_OF_SPACE.
+            var stackBuf = [CChar](repeating: 0, count: 128)
+            var written: size_t = 0
+            let rc = stackBuf.withUnsafeMutableBufferPointer { buf in
+                ghostty_key_encoder_encode(encoder, event, buf.baseAddress, buf.count, &written)
+            }
+            if rc.rawValue == GHOSTTY_SUCCESS.rawValue {
+                return Self.dataFromCChars(stackBuf, count: written)
+            }
+            // OUT_OF_SPACE → `written` contains the required size. Retry
+            // with a heap buffer. (The C API contract: query-size returns
+            // OUT_OF_SPACE with `written` set; pass NULL+0 to query, but
+            // a small stack buffer is faster in the common case.)
+            guard written > 0 else { return Data() }
+            var dynBuf = [CChar](repeating: 0, count: written)
+            let rc2 = dynBuf.withUnsafeMutableBufferPointer { buf in
+                ghostty_key_encoder_encode(encoder, event, buf.baseAddress, buf.count, &written)
+            }
+            if rc2.rawValue == GHOSTTY_SUCCESS.rawValue {
+                return Self.dataFromCChars(dynBuf, count: written)
+            }
+            return Data()
         }
-        if rc.rawValue == GHOSTTY_SUCCESS.rawValue {
-            return Self.dataFromCChars(stackBuf, count: written)
-        }
-        // OUT_OF_SPACE → `written` contains the required size. Retry
-        // with a heap buffer. (The C API contract: query-size returns
-        // OUT_OF_SPACE with `written` set; pass NULL+0 to query, but
-        // a small stack buffer is faster in the common case.)
-        guard written > 0 else { return Data() }
-        var dynBuf = [CChar](repeating: 0, count: written)
-        let rc2 = dynBuf.withUnsafeMutableBufferPointer { buf in
-            ghostty_key_encoder_encode(encoder, event, buf.baseAddress, buf.count, &written)
-        }
-        if rc2.rawValue == GHOSTTY_SUCCESS.rawValue {
-            return Self.dataFromCChars(dynBuf, count: written)
-        }
-        return Data()
     }
 
     private static func dataFromCChars(_ buf: [CChar], count: size_t) -> Data {
