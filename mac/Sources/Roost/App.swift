@@ -374,7 +374,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         tabBar.alignment = .centerY
         tabBar.spacing = 6
         tabBar.translatesAutoresizingMaskIntoConstraints = false
-        pane.addSubview(tabBar)
 
         // "+" is a plain bordered button to the right of the pills.
         // Lighter affordance than a full-bezel rounded button so the
@@ -391,15 +390,44 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         addTabButton.contentTintColor = .secondaryLabelColor
         tabBar.addArrangedSubview(addTabButton)
 
+        // Wrap the tab strip in an NSScrollView so that adding tabs
+        // beyond the available width scrolls horizontally instead of
+        // pushing the window wider. The stack view is the document
+        // view; its intrinsic content size grows with its arranged
+        // subviews, and the scroll view exposes whatever fits in the
+        // pane's width.
+        let tabScroll = NSScrollView()
+        tabScroll.translatesAutoresizingMaskIntoConstraints = false
+        tabScroll.hasHorizontalScroller = false
+        tabScroll.hasVerticalScroller = false
+        tabScroll.horizontalScrollElasticity = .allowed
+        tabScroll.verticalScrollElasticity = .none
+        tabScroll.borderType = .noBorder
+        tabScroll.drawsBackground = false
+        tabScroll.scrollerStyle = .overlay
+        tabScroll.documentView = tabBar
+        pane.addSubview(tabScroll)
+
         let terminalContainer = NSView()
         terminalContainer.translatesAutoresizingMaskIntoConstraints = false
         pane.addSubview(terminalContainer)
 
         NSLayoutConstraint.activate([
-            tabBar.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
-            tabBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            tabBar.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -16),
-            // Tab bar height stays intrinsic to its tallest button.
+            tabScroll.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
+            tabScroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
+            tabScroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
+            tabScroll.heightAnchor.constraint(equalToConstant: tabBarHeight),
+
+            // Document view's height matches the scroll view's content
+            // height; width grows with arranged subviews so the strip
+            // scrolls horizontally when the pills exceed the available
+            // pane width.
+            tabBar.heightAnchor.constraint(equalTo: tabScroll.contentView.heightAnchor),
+            tabBar.topAnchor.constraint(equalTo: tabScroll.contentView.topAnchor),
+            tabBar.leadingAnchor.constraint(equalTo: tabScroll.contentView.leadingAnchor),
+            // Trailing pin is intentionally NOT set — letting the stack
+            // grow past the scroll view's right edge is what produces
+            // horizontal scrolling.
 
             // Terminal container fills the content pane below the
             // tab bar. Width is unconstrained from above — when the

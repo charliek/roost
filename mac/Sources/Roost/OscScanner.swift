@@ -87,7 +87,16 @@ private enum ScanState {
 final class OscScanner {
     private var state: ScanState = .outside
     private var num: String = ""
-    private var body: String = ""
+    /// Body is accumulated as raw bytes so multi-byte UTF-8
+    /// sequences (emoji, CJK, anything outside ASCII) round-trip
+    /// intact. The earlier implementation appended each byte as
+    /// `Character(UnicodeScalar(b))`, which interprets the byte
+    /// as a Latin-1 codepoint — `0xF0 0x9F 0x9F 0xA2` (🟢) became
+    /// `"ð¢"` (Latin-1 ð + Latin-1 control + Latin-1 control +
+    /// Latin-1 ¢) in tab titles. Bytes go in as bytes; UTF-8
+    /// decode happens at dispatch time when we hand a String to
+    /// downstream consumers.
+    private var bodyBytes: [UInt8] = []
     private var pending: [OscEvent] = []
 
     /// Feed a slice of PTY bytes. Returns OSC events parsed out
@@ -114,7 +123,7 @@ final class OscScanner {
             if b == UInt8(ascii: "]") {
                 state = .prefix
                 num.removeAll(keepingCapacity: true)
-                body.removeAll(keepingCapacity: true)
+                bodyBytes.removeAll(keepingCapacity: true)
             } else if b == 0x1B {
                 // ESC ESC: stay in esc.
             } else {
@@ -146,8 +155,8 @@ final class OscScanner {
             case 0x1B:
                 state = .bodyEsc
             default:
-                if body.count < maxBody {
-                    body.append(Character(UnicodeScalar(b)))
+                if bodyBytes.count < maxBody {
+                    bodyBytes.append(b)
                 }
             }
         case .bodyEsc:
@@ -164,6 +173,11 @@ final class OscScanner {
     }
 
     private func dispatch() {
+        // Decode the byte-buffered body as UTF-8 once, here. Invalid
+        // sequences become U+FFFD via the lossy decoder — better than
+        // dropping the whole OSC when one stray byte interrupts what's
+        // otherwise a valid title.
+        let body = String(decoding: bodyBytes, as: UTF8.self)
         switch num {
         case "0", "1", "2":
             if !body.isEmpty {
