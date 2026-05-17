@@ -218,6 +218,93 @@ final class RenderState {
             background: nsColor(colors.background)
         )
     }
+
+    /// Cursor state for the current frame (goal-mac-polish-cursor-keys
+    /// M2). `nil` means the cursor isn't in the visible viewport —
+    /// don't draw it. All position values are viewport-relative
+    /// (0-based row + col), respecting any active scroll-back.
+    struct CursorInfo {
+        let row: UInt16
+        let col: UInt16
+        /// True when the cursor lands on the second column of a
+        /// wide (CJK / emoji) character. Renderers may choose to
+        /// shift / underline differently in this case.
+        let wideTail: Bool
+        /// DECTCEM (terminal mode 25) state — `false` means the
+        /// terminal has explicitly hidden its cursor. Renderers
+        /// MUST honor this; otherwise apps like `less` show a
+        /// stray cursor.
+        let visible: Bool
+        /// Whether DECSCUSR set the cursor to a blinking style.
+        /// Roost's blink timer applies regardless, but apps may
+        /// flip this to request "always solid" — when false,
+        /// renderers should freeze the cursor on.
+        let blinking: Bool
+        let visualStyle: GhosttyRenderStateCursorVisualStyle
+        /// Explicit cursor color (OSC 12), or `nil` when the
+        /// terminal hasn't overridden the theme's cursor color.
+        let color: NSColor?
+    }
+
+    /// Read the current cursor state from the latest snapshot.
+    /// Returns `nil` when the cursor isn't in the visible viewport
+    /// (user has scrolled back past the cursor row); callers
+    /// shouldn't draw a cursor in that case.
+    func cursor() -> CursorInfo? {
+        guard let rs else { return nil }
+
+        var hasValue: Bool = false
+        _ = ghostty_render_state_get(
+            rs,
+            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
+            &hasValue
+        )
+        guard hasValue else { return nil }
+
+        var x: UInt16 = 0
+        var y: UInt16 = 0
+        var wideTail: Bool = false
+        var visible: Bool = false
+        var blinking: Bool = false
+        var style: GhosttyRenderStateCursorVisualStyle = GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK
+        _ = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &x)
+        _ = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &y)
+        _ = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL, &wideTail)
+        _ = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &visible)
+        _ = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING, &blinking)
+        _ = ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE, &style)
+
+        // Explicit cursor color is set via OSC 12; absent otherwise.
+        // The HAS_VALUE gate prevents reading uninitialized RGB bytes.
+        var colorHasValue: Bool = false
+        _ = ghostty_render_state_get(
+            rs,
+            GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR_HAS_VALUE,
+            &colorHasValue
+        )
+        var color: NSColor?
+        if colorHasValue {
+            var rgb = GhosttyColorRgb()
+            let rc = ghostty_render_state_get(
+                rs,
+                GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR,
+                &rgb
+            )
+            if rc.rawValue == 0 {
+                color = nsColor(rgb)
+            }
+        }
+
+        return CursorInfo(
+            row: y,
+            col: x,
+            wideTail: wideTail,
+            visible: visible,
+            blinking: blinking,
+            visualStyle: style,
+            color: color
+        )
+    }
 }
 
 /// Convert a libghostty-vt RGB triple into an NSColor in sRGB. The

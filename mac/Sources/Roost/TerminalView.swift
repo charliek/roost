@@ -136,6 +136,52 @@ final class TerminalView: NSView {
     /// the runtime fallback is the bundled `roost-dark` theme.
     private var theme: Theme = .fallback
 
+    // MARK: - Cursor blink (goal-mac-polish-cursor-keys M2)
+
+    /// Toggled by `cursorBlinkTimer` every `cursorBlinkPeriod`. `true`
+    /// means draw the cursor this frame; `false` means skip (the cell
+    /// underneath shows through). Forced back to `true` whenever
+    /// focus is regained so the cursor reappears immediately instead
+    /// of waiting for the next blink tick.
+    private var cursorBlinkOn: Bool = true
+
+    /// 530ms cadence matches the Go binary's `cursorBlinkPeriod`
+    /// (`cmd/roost/session.go:37`), which is also iTerm2 / Terminal.app's
+    /// default. Paused while the view doesn't have focus; restarted
+    /// on focus regain.
+    ///
+    /// `nonisolated(unsafe)`: Swift 6 strict concurrency otherwise
+    /// rejects `cursorBlinkTimer?.invalidate()` in the nonisolated
+    /// `deinit`. The timer is only touched from the main thread —
+    /// scheduled in `startCursorBlink`, invalidated here + in
+    /// `stopCursorBlink`. Same shape as the other unsafe FFI handles
+    /// in this file.
+    nonisolated(unsafe) private var cursorBlinkTimer: Timer?
+
+    /// Last-known window-key state, updated by NSNotification observers
+    /// in `viewDidMoveToWindow`.
+    private var windowIsKey: Bool = false
+
+    /// First-responder tracking. Updated in
+    /// `becomeFirstResponder` / `resignFirstResponder`. We combine
+    /// this with `windowIsKey` to derive "the user is actively typing
+    /// into this terminal."
+    private var viewIsFirstResponder: Bool = false
+
+    /// True when the cursor should render as a focused (solid block /
+    /// bar / underline depending on style) versus a blurred hollow
+    /// outline. Mirrors Go `cmd/roost/session.go::windowFocused`.
+    private var hasFocus: Bool { windowIsKey && viewIsFirstResponder }
+
+    /// Cached glyph from the cell the cursor lands on. Stashed during
+    /// the per-cell walk in `draw(_:)`; consumed by the cursor-draw
+    /// pass at end-of-frame so a focused block cursor can re-paint
+    /// the glyph in an inverted color (cursor block paints OVER the
+    /// original glyph, so we have to redraw it to keep the character
+    /// visible).
+    private var cursorCellGlyph: Character?
+    private var cursorCellOriginalForeground: NSColor?
+
     init(
         cols: UInt16 = 80,
         rows: UInt16 = 24,
@@ -248,6 +294,11 @@ final class TerminalView: NSView {
     }
 
     deinit {
+        // Drop cursor blink timer + notification observers BEFORE
+        // freeing the unsafe FFI handle — both touch state from
+        // the same actor and order matters for clean teardown.
+        NotificationCenter.default.removeObserver(self)
+        cursorBlinkTimer?.invalidate()
         if let term = terminal {
             ghostty_terminal_free(term)
         }
@@ -262,6 +313,109 @@ final class TerminalView: NSView {
     /// RoostApp explicitly makes this view the window's first
     /// responder after construction so typing routes here.
     override var acceptsFirstResponder: Bool { true }
+
+    // MARK: - Focus + cursor blink lifecycle
+
+    /// Track window-key state so the blink timer can pause when the
+    /// user clicks away. Registers / deregisters for `didBecomeKey`
+    /// / `didResignKey` notifications keyed by the view's window —
+    /// the view can be reparented (Phase 6a M3 tab switch) so we
+    /// re-attach on each move.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        let center = NotificationCenter.default
+        center.removeObserver(self)
+        guard let window else {
+            windowIsKey = false
+            stopCursorBlink()
+            return
+        }
+        center.addObserver(
+            self,
+            selector: #selector(handleWindowDidBecomeKey(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: window
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleWindowDidResignKey(_:)),
+            name: NSWindow.didResignKeyNotification,
+            object: window
+        )
+        windowIsKey = window.isKeyWindow
+        updateBlinkTimerForFocus()
+    }
+
+    @objc private func handleWindowDidBecomeKey(_ note: Notification) {
+        windowIsKey = true
+        // Snap the cursor on so it appears immediately rather than at
+        // the next blink tick — matches Go session.go:1232 behavior.
+        cursorBlinkOn = true
+        updateBlinkTimerForFocus()
+        needsDisplay = true
+    }
+
+    @objc private func handleWindowDidResignKey(_ note: Notification) {
+        windowIsKey = false
+        updateBlinkTimerForFocus()
+        needsDisplay = true
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became {
+            viewIsFirstResponder = true
+            cursorBlinkOn = true
+            updateBlinkTimerForFocus()
+            needsDisplay = true
+        }
+        return became
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            viewIsFirstResponder = false
+            updateBlinkTimerForFocus()
+            needsDisplay = true
+        }
+        return resigned
+    }
+
+    /// Drive the blink timer based on current focus. The timer only
+    /// runs while the cursor is genuinely interactive — window is
+    /// key + view is first responder. Outside that window we render
+    /// the cursor as a hollow outline that's always on, so the timer
+    /// would be wasted work.
+    private func updateBlinkTimerForFocus() {
+        if hasFocus {
+            startCursorBlink()
+        } else {
+            stopCursorBlink()
+        }
+    }
+
+    private func startCursorBlink() {
+        guard cursorBlinkTimer == nil else { return }
+        // 530ms half-period (= ~0.94 Hz full blink cycle). Common
+        // terminal value; matches Go `cursorBlinkPeriod` in
+        // `cmd/roost/session.go:37`.
+        cursorBlinkTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.530,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.cursorBlinkOn.toggle()
+                self.needsDisplay = true
+            }
+        }
+    }
+
+    private func stopCursorBlink() {
+        cursorBlinkTimer?.invalidate()
+        cursorBlinkTimer = nil
+    }
 
     // MARK: - Selection (Phase 6a M5)
 
@@ -524,6 +678,13 @@ final class TerminalView: NSView {
         if let terminal {
             renderState.update(terminal: terminal)
         }
+        // M2: read cursor state up-front so the walk can cache the
+        // glyph at the cursor cell. Cached glyph is consumed by the
+        // post-walk cursor-draw pass to re-paint the character in an
+        // inverted color over a focused block cursor.
+        let cursorInfo = renderState.cursor()
+        cursorCellGlyph = nil
+        cursorCellOriginalForeground = nil
         // Phase 6a M6: prefer the user-loaded theme's fg/bg over
         // libghostty-vt's compiled-in defaults. libghostty's
         // default colors are what the embedded shell sees as
@@ -579,6 +740,57 @@ final class TerminalView: NSView {
                 // font's ascender.
                 line.draw(at: NSPoint(x: rect.minX, y: rect.minY))
             }
+            // M2: stash glyph at the cursor's cell so the cursor
+            // pass can redraw it in an inverted color over a
+            // focused block cursor. Done inline here to avoid a
+            // second cell walk just for the cursor cell.
+            if let cur = cursorInfo,
+               cell.row == Int(cur.row),
+               cell.col == Int(cur.col)
+            {
+                self.cursorCellGlyph = cell.glyph
+                self.cursorCellOriginalForeground = cell.foreground ?? defaultFg
+            }
+        }
+
+        // Cursor (goal-mac-polish-cursor-keys M2). Drawn AFTER glyphs
+        // but BEFORE selection — selection wants to visually dominate
+        // the cursor cell when the user's mid-drag.
+        if let cur = cursorInfo, cur.visible {
+            let cursorRect = NSRect(
+                x: CGFloat(cur.col) * cellW,
+                y: CGFloat(cur.row) * cellH,
+                width: cellW,
+                height: cellH
+            )
+            let cursorColor = cur.color ?? theme.cursor
+            if !hasFocus {
+                // Unfocused: hollow outline, always on (no blink).
+                // Mirrors Go `cmd/roost/render.go:154-161`.
+                drawCursorOutline(in: cursorRect, color: cursorColor)
+            } else if cursorBlinkOn {
+                // Focused + blink-on: visual style decides shape.
+                // libghostty-vt can ask for BLOCK_HOLLOW directly
+                // (e.g. some apps via DECSCUSR variants); honor it
+                // by routing to the same outline path as blurred.
+                switch cur.visualStyle {
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+                    drawCursorBar(in: cursorRect, color: cursorColor)
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+                    drawCursorUnderline(in: cursorRect, color: cursorColor)
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+                    drawCursorOutline(in: cursorRect, color: cursorColor)
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
+                    fallthrough
+                default:
+                    drawCursorBlock(
+                        in: cursorRect,
+                        color: cursorColor,
+                        cellFont: cellFont
+                    )
+                }
+            }
+            // Focused + !cursorBlinkOn → don't draw; cell shows through.
         }
 
         // Selection overlay (Phase 6a M5). Drawn last so it sits on
@@ -617,5 +829,49 @@ final class TerminalView: NSView {
                 r.fill()
             }
         }
+    }
+
+    // MARK: - Cursor draw helpers (M2)
+
+    /// Solid block cursor with the underlying glyph re-painted in an
+    /// inverted color so the character stays legible. Uses
+    /// `theme.background` as the inverted-text color — fine for the
+    /// fallback + bundled themes; if a theme ever ships a dedicated
+    /// `cursorText` field we'd thread it through instead.
+    private func drawCursorBlock(in rect: NSRect, color: NSColor, cellFont: NSFont) {
+        color.setFill()
+        rect.fill()
+        guard let glyph = cursorCellGlyph, !glyph.isWhitespace else { return }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: cellFont,
+            .foregroundColor: theme.background,
+        ]
+        let line = NSAttributedString(string: String(glyph), attributes: attrs)
+        line.draw(at: NSPoint(x: rect.minX, y: rect.minY))
+    }
+
+    /// DECSCUSR 5/6 — thin vertical bar at the left edge of the cell.
+    /// 2pt wide is the standard convention (Terminal.app, iTerm).
+    private func drawCursorBar(in rect: NSRect, color: NSColor) {
+        color.setFill()
+        NSRect(x: rect.minX, y: rect.minY, width: 2, height: rect.height).fill()
+    }
+
+    /// DECSCUSR 3/4 — horizontal underline at the cell's baseline.
+    /// 2pt tall, sitting at the bottom edge.
+    private func drawCursorUnderline(in rect: NSRect, color: NSColor) {
+        color.setFill()
+        NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 2).fill()
+    }
+
+    /// Hollow outline — used when the view doesn't have focus or
+    /// when libghostty asks for `BLOCK_HOLLOW` explicitly. Insets
+    /// slightly so a 1pt stroke fits inside the cell rect rather
+    /// than bleeding over the neighbor's edge.
+    private func drawCursorOutline(in rect: NSRect, color: NSColor) {
+        color.setStroke()
+        let outline = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
+        outline.lineWidth = 1
+        outline.stroke()
     }
 }
