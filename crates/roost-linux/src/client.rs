@@ -14,7 +14,7 @@ use roost_common::connect_uds;
 use roost_proto::v1::roost_client::RoostClient as ProtoRoostClient;
 use roost_proto::v1::{
     CreateProjectRequest, IdentifyRequest, IdentifyResponse, ListTabsRequest, OpenTabRequest,
-    Project, Tab,
+    Project, ReportOscRequest, Tab,
 };
 
 #[derive(Clone)]
@@ -100,6 +100,21 @@ impl RoostClient {
             .context("OpenTab RPC failed")?
             .into_inner();
         resp.tab.ok_or_else(|| anyhow!("OpenTab returned no tab"))
+    }
+
+    /// Push a parsed OSC event up to the daemon for routing. Phase 7
+    /// commit 10 wires this from the per-tab byte drain through the
+    /// `roost_osc::OscScanner`.
+    pub async fn report_osc(&mut self, tab_id: i64, command: u32, payload: &str) -> Result<()> {
+        self.inner
+            .report_osc(ReportOscRequest {
+                tab_id,
+                osc_command: command,
+                payload: payload.to_string(),
+            })
+            .await
+            .context("ReportOsc RPC failed")?;
+        Ok(())
     }
 
     /// The underlying tonic client — exposed for the StreamPty

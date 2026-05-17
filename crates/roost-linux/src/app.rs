@@ -405,11 +405,25 @@ impl App {
             }
             drop(projects);
 
-            // Output drain: PTY bytes → renderer.
+            // Output drain: PTY bytes → renderer + OSC scanner
+            // (Phase 7 commit 10). For each OSC event the scanner
+            // emits, fire `ReportOsc` to the daemon so the routing
+            // layer (Phase 6b P5) can update title / cwd / state /
+            // notification fields. Bytes still flow through
+            // `vt_write` unchanged so libghostty owns the rendering
+            // state.
+            let app_for_osc = app_for_attach.clone();
             glib::spawn_future_local(async move {
+                let mut scanner = roost_osc::OscScanner::new();
                 while let Some(msg) = output_rx.recv().await {
                     match msg {
-                        TabOutput::Bytes(data) => terminal_for_drain.vt_write(&data),
+                        TabOutput::Bytes(data) => {
+                            let events = scanner.feed(&data);
+                            for event in events {
+                                app_for_osc.report_osc_event(tab_id, event);
+                            }
+                            terminal_for_drain.vt_write(&data);
+                        }
                         TabOutput::Exit { status, reason } => {
                             tracing::info!(status, %reason, "PTY exited");
                             break;
@@ -512,10 +526,41 @@ impl App {
                 // matters less because there's no drag-source on the
                 // sidebar yet.
             }
+            EventKind::TabCwd(c) => {
+                let projects = self.projects.borrow();
+                for ui in projects.values() {
+                    if let Some(tab_ui) = ui.tabs.borrow().get(&c.tab_id) {
+                        // Mirror the Mac UI's tilde abbreviation so
+                        // the pill label doesn't bloat with full
+                        // home-prefixed paths.
+                        let label = tilde_abbreviate(&c.cwd);
+                        // OSC 7 doesn't override an OSC 0/1/2 title;
+                        // only update the label when the page still
+                        // shows a daemon-default tab title.
+                        let current = tab_ui.page.title().to_string();
+                        if current.starts_with("Tab ") {
+                            tab_ui.page.set_title(&label);
+                        }
+                    }
+                }
+            }
+            EventKind::TabNotification(n) => {
+                // Light up the page's "needs attention" indicator so
+                // inactive tabs surface the pending notification.
+                let projects = self.projects.borrow();
+                for ui in projects.values() {
+                    if let Some(tab_ui) = ui.tabs.borrow().get(&n.tab_id) {
+                        tab_ui.page.set_needs_attention(n.has_pending);
+                    }
+                }
+            }
+            EventKind::Notification(n) => {
+                self.fire_desktop_notification(n.tab_id, &n.title, &n.body);
+            }
             _ => {
-                // TabCwd, TabState, TabNotification, Notification,
-                // HookActive, Active — wired up in commit 10
-                // (OSC + notifications).
+                // TabState, HookActive, Active — currently informational
+                // only on the Linux UI. Status-icon polish on the tab
+                // page comes in commit 11.
             }
         }
     }
@@ -699,6 +744,56 @@ impl App {
         Ok(())
     }
 
+    /// Forward a parsed OSC event to the daemon. Mirrors the Mac
+    /// UI's `RoostApp.reportOsc` path; the daemon decides whether
+    /// to emit `TabTitleChanged` / `TabCwdChanged` /
+    /// `NotificationEvent` / etc.
+    fn report_osc_event(self: &Rc<Self>, tab_id: i64, event: roost_osc::OscEvent) {
+        use roost_osc::OscEvent as E;
+        let (command, payload): (u32, String) = match event {
+            E::Title(t) => (0, t),
+            E::Pwd(p) => (7, format!("file:/{}", p)),
+            E::Notification { title, body } => {
+                if body.is_empty() {
+                    (9, title)
+                } else {
+                    (777, format!("notify;{title};{body}"))
+                }
+            }
+            E::ColorQuery(n) => (n as u32, "?".to_string()),
+        };
+        let Some(mut client) = self.client.borrow().clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        rt.spawn(async move {
+            if let Err(err) = client.report_osc(tab_id, command, &payload).await {
+                tracing::warn!(?err, tab_id, command, "ReportOsc failed");
+            }
+        });
+    }
+
+    /// Fire a desktop notification via `gio::Notification`. On Linux
+    /// this routes through `org.freedesktop.Notifications` (DBus);
+    /// on macOS Homebrew GTK's gio backend bridges to
+    /// NSUserNotification (good enough for side-by-side verification
+    /// against the Swift Mac UI).
+    fn fire_desktop_notification(self: &Rc<Self>, tab_id: i64, title: &str, body: &str) {
+        let Some(app) = self.window.application() else {
+            return;
+        };
+        let notification = gtk4::gio::Notification::new(title);
+        if !body.is_empty() {
+            notification.set_body(Some(body));
+        }
+        // Default-action target so click→focus-tab works once the
+        // tab-focus app action is registered (commit 11 hooks it).
+        let target = tab_id.to_variant();
+        notification.set_default_action_and_target_value("app.focus-tab", Some(&target));
+        let id = format!("roost-tab-{tab_id}");
+        app.send_notification(Some(&id), &notification);
+    }
+
     /// Fire CloseTab on the daemon for the given tab. Async so we
     /// don't block the GTK main loop.
     fn close_tab_async(self: &Rc<Self>, _project_id: i64, tab_id: i64) {
@@ -722,6 +817,22 @@ impl App {
 
 fn stack_name(project_id: i64) -> String {
     format!("project-{project_id}")
+}
+
+/// Replace `$HOME` prefix in a path with `~`. Used by the OSC 7
+/// (cwd) tab pill label so home-rooted dirs don't dominate the
+/// chrome.
+fn tilde_abbreviate(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) else {
+        return path.to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+        return format!("~/{rest}");
+    }
+    path.to_string()
 }
 
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
