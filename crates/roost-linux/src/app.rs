@@ -1198,12 +1198,20 @@ fn active_tab_cwd(ui: &ProjectUi) -> String {
 }
 
 /// Replace `$HOME` prefix in a path with `~`. Used by the OSC 7
-/// (cwd) tab pill label so home-rooted dirs don't dominate the
-/// chrome.
+/// (cwd) tab pill label and the headerbar subtitle (M2) so
+/// home-rooted dirs don't dominate the chrome.
 fn tilde_abbreviate(path: &str) -> String {
     let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) else {
         return path.to_string();
     };
+    tilde_abbreviate_with_home(path, &home)
+}
+
+/// Pure variant of `tilde_abbreviate` that takes the home directory
+/// explicitly. Lets tests pass a fixed `home` instead of mutating
+/// `std::env::HOME` (which would race with parallel tests; flagged
+/// by CodeRabbit on the initial M2 commit).
+fn tilde_abbreviate_with_home(path: &str, home: &str) -> String {
     if path == home {
         return "~".to_string();
     }
@@ -1246,30 +1254,32 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 
 #[cfg(test)]
 mod tests {
-    use super::tilde_abbreviate;
+    use super::tilde_abbreviate_with_home;
 
-    /// `tilde_abbreviate` is the headerbar-subtitle (M2) helper that
-    /// also powers the OSC 7 tab-pill label. Keep its contract pinned
-    /// so a future "shorten my path" optimisation doesn't break what
-    /// the chrome relies on.
+    /// `tilde_abbreviate_with_home` is the headerbar-subtitle (M2)
+    /// helper that also powers the OSC 7 tab-pill label. Keep its
+    /// contract pinned so a future "shorten my path" optimisation
+    /// doesn't break what the chrome relies on. We test the
+    /// pure-function variant directly so the test doesn't mutate
+    /// `std::env::HOME` (which would race with parallel tests —
+    /// CodeRabbit caught this on the initial M2 commit).
     #[test]
     fn tilde_abbreviate_replaces_home_prefix() {
-        // Lock HOME so the test result doesn't depend on the developer
-        // machine's actual env. SAFETY: only this test mutates HOME,
-        // and it runs sequentially within the `#[cfg(test)]` module.
-        unsafe {
-            std::env::set_var("HOME", "/Users/test");
-        }
+        let home = "/Users/test";
 
-        assert_eq!(tilde_abbreviate("/Users/test"), "~");
+        assert_eq!(tilde_abbreviate_with_home("/Users/test", home), "~");
         assert_eq!(
-            tilde_abbreviate("/Users/test/projects/roost"),
+            tilde_abbreviate_with_home("/Users/test/projects/roost", home),
             "~/projects/roost"
         );
         // Non-home paths pass through unchanged.
-        assert_eq!(tilde_abbreviate("/etc/hosts"), "/etc/hosts");
+        assert_eq!(tilde_abbreviate_with_home("/etc/hosts", home), "/etc/hosts");
         // Paths that share a prefix but aren't actually under HOME
-        // (e.g. `/Users/testbed`) must NOT be tilde-abbreviated.
-        assert_eq!(tilde_abbreviate("/Users/testbed"), "/Users/testbed");
+        // (e.g. `/Users/testbed` when HOME=`/Users/test`) must NOT
+        // be tilde-abbreviated.
+        assert_eq!(
+            tilde_abbreviate_with_home("/Users/testbed", home),
+            "/Users/testbed"
+        );
     }
 }
