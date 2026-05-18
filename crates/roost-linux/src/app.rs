@@ -20,7 +20,7 @@ use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use libadwaita::{ApplicationWindow, HeaderBar, TabView};
+use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
 use tokio::runtime::Handle;
 
 use roost_common::default_socket_path;
@@ -49,6 +49,11 @@ struct TabUi {
     view: Rc<TerminalView>,
     session: Rc<TabSession>,
     page: libadwaita::TabPage,
+    /// Tracked so the headerbar subtitle can reflect the active
+    /// tab's working directory. Mirrors the Mac UI's
+    /// `TabSession.liveCwd` field. Updated at attach time and on
+    /// every `TabCwdChangedEvent` (OSC 7).
+    cwd: RefCell<String>,
 }
 
 pub struct App {
@@ -58,10 +63,18 @@ pub struct App {
     client: RefCell<Option<RoostClient>>,
     rt: Handle,
     sidebar: gtk4::ListBox,
+    /// The whole sidebar container — header label + scrolled list +
+    /// footer `+ Project` button. Hidden as a unit by
+    /// `toggle_sidebar`; otherwise the header / button would remain
+    /// visible while only the list collapses.
+    sidebar_box: gtk4::Box,
     /// `gtk::Stack` of TabView widgets, one entry per project id.
     /// Switching the sidebar selection flips the visible child.
     tab_stack: gtk4::Stack,
-    title_label: gtk4::Label,
+    /// `adw::WindowTitle` widget in the headerbar. Title = active
+    /// project name, subtitle = active tab's cwd (tilde-abbreviated).
+    /// Mirrors the Mac UI's `updateWindowTitle` flow.
+    window_title: WindowTitle,
     projects: RefCell<HashMap<i64, ProjectUi>>,
     /// Currently focused project (sidebar selection). 0 = no
     /// selection yet (e.g. workspace is empty).
@@ -76,6 +89,33 @@ pub struct App {
     font_size_pt: Option<f64>,
 }
 
+/// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
+/// kept in sync verbatim with the Go binary so the two UIs feel
+/// identical. Loaded once at App::new and applied via the display's
+/// shared style context so it composes with the user's libadwaita
+/// theme rather than replacing it.
+const STYLE_CSS: &str = include_str!("resources/style.css");
+
+/// Bundled chrome icons. Vendored from `cmd/roost/icons/` (which in
+/// turn comes from upstream Adwaita) so the GTK app doesn't depend
+/// on the user's system `adwaita-icon-theme` being installed —
+/// matches the Go binary's icons.gresource approach but skips the
+/// gresource compilation step (one less build-tool dependency) by
+/// embedding the SVGs directly into the binary via `include_bytes!`.
+const ICON_FOLDER_SYMBOLIC: &[u8] = include_bytes!("resources/icons/folder-symbolic.svg");
+const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
+    include_bytes!("resources/icons/sidebar-show-symbolic.svg");
+const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
+
+/// Wrap an embedded SVG in a `gio::BytesIcon` so it can drive a
+/// `gtk::Image` regardless of the user's icon-theme search path.
+/// libadwaita's symbolic icons are tiny SVGs (~1 KB each), so the
+/// `glib::Bytes::from_static` allocation is free at runtime.
+fn embedded_icon(bytes: &'static [u8]) -> gtk4::gio::BytesIcon {
+    let glib_bytes = glib::Bytes::from_static(bytes);
+    gtk4::gio::BytesIcon::new(&glib_bytes)
+}
+
 impl App {
     /// Build the window + start the daemon bootstrap. Returns an
     /// `Rc<App>` so closures can hold references back into the App
@@ -88,22 +128,103 @@ impl App {
             .title("Roost (Linux)")
             .build();
 
-        let header = HeaderBar::new();
-        let title_label = gtk4::Label::new(Some("Roost — connecting…"));
-        title_label.add_css_class("title");
-        header.set_title_widget(Some(&title_label));
+        // Install the bundled chrome stylesheet on the default
+        // display. `load_from_string` is infallible in current
+        // gtk4-rs (parse warnings go through the GLib log writer,
+        // not a Rust Result), so the only failure mode is a missing
+        // `gdk::Display::default()` — vanishingly unlikely outside
+        // GTK-not-initialised contexts and we fall back to the
+        // unstyled defaults if it ever does happen.
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let provider = gtk4::CssProvider::new();
+            provider.load_from_string(STYLE_CSS);
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        } else {
+            tracing::warn!("no default GDK display; skipping chrome CSS load");
+        }
 
-        // Sidebar — single-level ListBox of projects.
+        let header = HeaderBar::new();
+        // `adw::WindowTitle` is the libadwaita 1.x analog of NSWindow's
+        // title + subtitle. Title = project name (or status during
+        // bootstrap), subtitle = active tab's cwd. Matches the Mac UI's
+        // two-line title format and the Go binary's `HeaderBar.WindowTitle`.
+        let window_title = WindowTitle::new("Roost", "connecting…");
+        header.set_title_widget(Some(&window_title));
+
+        // Headerbar buttons: folder picker (left) + sidebar toggle
+        // (left) + `+ Tab` (right). Matches the Go binary's
+        // `cmd/roost/app.go` chrome — same icons, same positions.
+        // Wired below after `app_struct` exists so the handlers can
+        // capture an `Rc<App>` clone.
+        let folder_button = gtk4::Button::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(
+                ICON_FOLDER_SYMBOLIC,
+            )))
+            .css_classes(["flat"])
+            .tooltip_text("New project from folder…")
+            .build();
+        let sidebar_toggle_button = gtk4::Button::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(
+                ICON_SIDEBAR_SHOW_SYMBOLIC,
+            )))
+            .css_classes(["flat"])
+            .tooltip_text("Toggle sidebar")
+            .build();
+        let new_tab_button = gtk4::Button::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(
+                ICON_TAB_NEW_SYMBOLIC,
+            )))
+            .css_classes(["flat"])
+            .tooltip_text("New tab")
+            .build();
+        header.pack_start(&folder_button);
+        header.pack_start(&sidebar_toggle_button);
+        header.pack_end(&new_tab_button);
+
+        // Sidebar: vertical Box of [section header] / [scrolled project
+        // list] / [`+ Project` footer button]. Matches the Go binary's
+        // `cmd/roost/app.go` sidebar layout verbatim — header label,
+        // list, button — so users moving between the two UIs find the
+        // same affordances in the same places.
+        let sidebar_header = gtk4::Label::builder()
+            .label("Projects")
+            .halign(gtk4::Align::Start)
+            .css_classes(["sidebar-section-header"])
+            .build();
+
         let sidebar = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Browse)
             .css_classes(["navigation-sidebar"])
+            .vexpand(true)
             .build();
         let sidebar_scroll = gtk4::ScrolledWindow::builder()
             .child(&sidebar)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vexpand(true)
+            .build();
+
+        let new_project_button = gtk4::Button::builder()
+            .label("+ Project")
+            .css_classes(["roost-add-project", "flat"])
+            .margin_top(4)
+            .margin_bottom(8)
+            .margin_start(8)
+            .margin_end(8)
+            .halign(gtk4::Align::Fill)
+            .build();
+
+        let sidebar_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
             .width_request(220)
             .build();
+        sidebar_box.append(&sidebar_header);
+        sidebar_box.append(&sidebar_scroll);
+        sidebar_box.append(&new_project_button);
 
         // Right pane: a Stack of per-project AdwTabView widgets.
         let tab_stack = gtk4::Stack::builder().hexpand(true).vexpand(true).build();
@@ -113,7 +234,7 @@ impl App {
             .resize_start_child(false)
             .shrink_start_child(false)
             .position(220)
-            .start_child(&sidebar_scroll)
+            .start_child(&sidebar_box)
             .end_child(&tab_stack)
             .build();
 
@@ -135,8 +256,9 @@ impl App {
             client: RefCell::new(None),
             rt: rt.clone(),
             sidebar: sidebar.clone(),
+            sidebar_box: sidebar_box.clone(),
             tab_stack: tab_stack.clone(),
-            title_label: title_label.clone(),
+            window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
             theme,
@@ -161,6 +283,95 @@ impl App {
                     }
                     let _ = pid;
                 }
+            }
+        });
+
+        // Sidebar footer button → fire the same `create_new_project`
+        // path the `Ctrl+Shift+N` keybind uses. Mac UI parity: both
+        // ⌘N and the sidebar `+ Project` button route through the
+        // identical RPC sequence (CreateProject → OpenTab → attach).
+        new_project_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| {
+                let app = app.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(err) = app.create_new_project().await {
+                        tracing::warn!(?err, "new_project (sidebar button) failed");
+                    }
+                });
+            }
+        });
+
+        // Headerbar buttons.
+        // - Folder picker: pop a FileChooser, then create a project
+        //   with the chosen cwd. Mirrors `cmd/roost/app.go`'s
+        //   "new project from folder" path.
+        folder_button.connect_clicked({
+            let app = app_struct.clone();
+            move |btn| {
+                let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                // `gtk::FileDialog` is the gtk-4.10 successor to the
+                // deprecated `FileChooserNative`. Async-only API:
+                // `select_folder` takes a callback that receives the
+                // chosen file (or a `Dismissed` error on cancel).
+                let dialog = gtk4::FileDialog::builder()
+                    .title("Choose project folder")
+                    .modal(true)
+                    .accept_label("Open")
+                    .build();
+                let app_for_pick = app.clone();
+                dialog.select_folder(
+                    parent.as_ref(),
+                    None::<&gtk4::gio::Cancellable>,
+                    move |result| match result {
+                        Ok(file) => {
+                            let Some(path) = file.path() else { return };
+                            let path = path.to_string_lossy().to_string();
+                            let app = app_for_pick.clone();
+                            glib::spawn_future_local(async move {
+                                if let Err(err) = app.create_new_project_with_cwd(&path).await {
+                                    tracing::warn!(
+                                        ?err,
+                                        path = %path,
+                                        "folder-picker new_project failed"
+                                    );
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            // The user dismissing the dialog comes
+                            // back as `Dismissed` — that's the happy
+                            // cancel path, not a failure. Anything
+                            // else is logged.
+                            if !err.matches(gtk4::DialogError::Dismissed) {
+                                tracing::warn!(?err, "folder-picker dialog failed");
+                            }
+                        }
+                    },
+                );
+            }
+        });
+        // - Sidebar toggle: route through the existing ToggleSidebar
+        //   action so both the keybind and the button share one
+        //   code path.
+        sidebar_toggle_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| app.toggle_sidebar()
+        });
+        // - `+ Tab`: open a tab in the currently active project.
+        new_tab_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| {
+                let pid = *app.active_project_id.borrow();
+                if pid == 0 {
+                    return;
+                }
+                let app = app.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(err) = app.open_new_tab_in(pid).await {
+                        tracing::warn!(?err, project_id = pid, "new_tab (headerbar) failed");
+                    }
+                });
             }
         });
 
@@ -194,7 +405,8 @@ impl App {
         let app_for_boot = app_struct.clone();
         glib::spawn_future_local(async move {
             if let Err(err) = app_for_boot.bootstrap().await {
-                app_for_boot.title_label.set_text(&format!("Roost — {err}"));
+                app_for_boot.window_title.set_title("Roost");
+                app_for_boot.window_title.set_subtitle(&format!("{err}"));
             }
         });
 
@@ -223,8 +435,12 @@ impl App {
             .await
             .context("setup join")??;
 
-        self.title_label
-            .set_text(&format!("Roost — daemon v{}", id.daemon_version));
+        // Transitional title until `set_active_project` lands the
+        // first project's name. The subtitle holds the daemon version
+        // so the user can confirm the round-trip succeeded at a glance.
+        self.window_title.set_title("Roost");
+        self.window_title
+            .set_subtitle(&format!("daemon v{}", id.daemon_version));
 
         // Materialize the project list. If empty, create a default
         // "roost-linux" project so the user has something to look at.
@@ -315,6 +531,18 @@ impl App {
                 glib::Propagation::Stop
             }
         });
+        // Switching tabs within a project updates the headerbar
+        // subtitle (cwd of the now-active tab). Cheap idempotent
+        // refresh; no-op if this project isn't the active one.
+        tab_view.connect_selected_page_notify({
+            let app = self.clone();
+            let project_id = project.id;
+            move |_| {
+                if *app.active_project_id.borrow() == project_id {
+                    app.refresh_window_subtitle();
+                }
+            }
+        });
 
         let tab_bar = libadwaita::TabBar::builder().view(&tab_view).build();
         let project_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -348,12 +576,26 @@ impl App {
         };
         self.tab_stack
             .set_visible_child_name(&stack_name(project_id));
-        // Update the headerbar title to the project name.
-        self.title_label.set_text(&format!("Roost — {}", ui.name));
+        self.window_title.set_title(&ui.name);
+        let subtitle = active_tab_cwd(ui);
+        self.window_title.set_subtitle(&subtitle);
         // Sync sidebar selection without re-firing the handler.
         self.sidebar.select_row(Some(&ui.sidebar_row));
         drop(projects);
         *self.active_project_id.borrow_mut() = project_id;
+    }
+
+    /// Recompute the headerbar subtitle from the active project's
+    /// active tab's cwd. Called whenever the active tab changes
+    /// (sidebar selection switch, tab pill click) or the active
+    /// tab's cwd updates (OSC 7 via WatchEvents `TabCwd`).
+    fn refresh_window_subtitle(self: &Rc<Self>) {
+        let projects = self.projects.borrow();
+        let active = *self.active_project_id.borrow();
+        if let Some(ui) = projects.get(&active) {
+            let subtitle = active_tab_cwd(ui);
+            self.window_title.set_subtitle(&subtitle);
+        }
     }
 
     /// OpenTab RPC → on success, attach the tab to the project's
@@ -424,6 +666,7 @@ impl App {
         let app_for_attach = self.clone();
         let project_id = tab.project_id;
         let terminal_for_drain = terminal.clone();
+        let tab_cwd = tab.cwd.clone();
         glib::spawn_future_local(async move {
             let session = match session_handle.await {
                 Ok(Ok(s)) => Rc::new(s),
@@ -448,10 +691,14 @@ impl App {
                         view: terminal_for_drain.clone(),
                         session: session.clone(),
                         page: page_for_future.clone(),
+                        cwd: RefCell::new(tab_cwd),
                     },
                 );
             }
             drop(projects);
+            // Update the headerbar subtitle if this tab belongs to
+            // the active project; cheap idempotent refresh.
+            app_for_attach.refresh_window_subtitle();
 
             // Output drain: PTY bytes → renderer + OSC scanner
             // (Phase 7 commit 10). For each OSC event the scanner
@@ -513,7 +760,7 @@ impl App {
                         }
                     }
                     if *self.active_project_id.borrow() == r.project_id {
-                        self.title_label.set_text(&format!("Roost — {}", r.name));
+                        self.window_title.set_title(&r.name);
                     }
                 }
             }
@@ -589,8 +836,13 @@ impl App {
                         if current.starts_with("Tab ") {
                             tab_ui.page.set_title(&label);
                         }
+                        // Persist for headerbar subtitle. M2 will
+                        // surface this through `refresh_window_subtitle`.
+                        *tab_ui.cwd.borrow_mut() = c.cwd.clone();
                     }
                 }
+                drop(projects);
+                self.refresh_window_subtitle();
             }
             EventKind::TabNotification(n) => {
                 // Light up the page's "needs attention" indicator so
@@ -736,13 +988,12 @@ impl App {
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {
-        // The sidebar lives inside the Paned's start child. Toggle
-        // its visibility — Paned auto-adjusts the divider position.
-        let visible = self.sidebar.is_visible();
-        self.sidebar.set_visible(!visible);
-        if let Some(scroll) = self.sidebar.parent() {
-            scroll.set_visible(!visible);
-        }
+        // Hide the entire sidebar container — header + list + footer
+        // button — so the Paned divider snaps to the left edge. Pre-M5
+        // we toggled only the list, leaving the Projects header and
+        // `+ Project` button orphaned in a thin strip.
+        let visible = self.sidebar_box.is_visible();
+        self.sidebar_box.set_visible(!visible);
     }
 
     fn switch_project_by_index(self: &Rc<Self>, n: usize) {
@@ -776,13 +1027,21 @@ impl App {
     }
 
     async fn create_new_project(self: &Rc<Self>) -> anyhow::Result<()> {
+        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        self.create_new_project_with_cwd(&cwd).await
+    }
+
+    /// Variant that lets the caller pin the project's cwd — used by
+    /// the headerbar folder-picker button (M5) where the user picks
+    /// a directory before the project exists.
+    async fn create_new_project_with_cwd(self: &Rc<Self>, cwd: &str) -> anyhow::Result<()> {
         let Some(mut client) = self.client.borrow().clone() else {
             return Ok(());
         };
         let rt = self.rt.clone();
-        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let cwd_owned = cwd.to_string();
         let project = rt
-            .spawn(async move { client.create_project("", &cwd).await })
+            .spawn(async move { client.create_project("", &cwd_owned).await })
             .await
             .context("create_project join")??;
         // WatchEvents will also deliver ProjectCreated; the
@@ -916,13 +1175,61 @@ fn stack_name(project_id: i64) -> String {
     format!("project-{project_id}")
 }
 
+/// Tilde-abbreviated cwd of `ui`'s currently selected tab (or the
+/// first tab if no selection exists yet). Empty string when the
+/// project has no attached tabs — caller uses that as the "subtitle
+/// goes blank" signal.
+fn active_tab_cwd(ui: &ProjectUi) -> String {
+    // adw::TabView::selected_page returns the currently focused tab.
+    // We resolve that back through `parse_tab_id_from_page` (same
+    // path the close-page handler uses) to find the matching TabUi.
+    if let Some(page) = ui.tab_view.selected_page() {
+        if let Some(tab_id) = parse_tab_id_from_page(&page) {
+            if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                return tilde_abbreviate(&tab_ui.cwd.borrow());
+            }
+        }
+    }
+    // Fallback: walk the TabView's page list in **display order** and
+    // pick the first page whose tab id we have a TabUi for. The
+    // previous version used `ui.tabs.borrow().iter().next()` which
+    // pulls an arbitrary entry from the HashMap — when `selected_page`
+    // briefly returns None (e.g. mid-close-page transition) the
+    // subtitle could flicker to a random tab's cwd. CodeRabbit caught
+    // this on PR #61.
+    let pages = ui.tab_view.pages();
+    let n = pages.n_items();
+    let tabs = ui.tabs.borrow();
+    for i in 0..n {
+        let Some(obj) = pages.item(i) else { continue };
+        let Ok(page) = obj.downcast::<libadwaita::TabPage>() else {
+            continue;
+        };
+        let Some(tab_id) = parse_tab_id_from_page(&page) else {
+            continue;
+        };
+        if let Some(tab_ui) = tabs.get(&tab_id) {
+            return tilde_abbreviate(&tab_ui.cwd.borrow());
+        }
+    }
+    String::new()
+}
+
 /// Replace `$HOME` prefix in a path with `~`. Used by the OSC 7
-/// (cwd) tab pill label so home-rooted dirs don't dominate the
-/// chrome.
+/// (cwd) tab pill label and the headerbar subtitle (M2) so
+/// home-rooted dirs don't dominate the chrome.
 fn tilde_abbreviate(path: &str) -> String {
     let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) else {
         return path.to_string();
     };
+    tilde_abbreviate_with_home(path, &home)
+}
+
+/// Pure variant of `tilde_abbreviate` that takes the home directory
+/// explicitly. Lets tests pass a fixed `home` instead of mutating
+/// `std::env::HOME` (which would race with parallel tests; flagged
+/// by CodeRabbit on the initial M2 commit).
+fn tilde_abbreviate_with_home(path: &str, home: &str) -> String {
     if path == home {
         return "~".to_string();
     }
@@ -961,4 +1268,36 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
             .expect("fallback shortcut trigger parse");
         fallback
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tilde_abbreviate_with_home;
+
+    /// `tilde_abbreviate_with_home` is the headerbar-subtitle (M2)
+    /// helper that also powers the OSC 7 tab-pill label. Keep its
+    /// contract pinned so a future "shorten my path" optimisation
+    /// doesn't break what the chrome relies on. We test the
+    /// pure-function variant directly so the test doesn't mutate
+    /// `std::env::HOME` (which would race with parallel tests —
+    /// CodeRabbit caught this on the initial M2 commit).
+    #[test]
+    fn tilde_abbreviate_replaces_home_prefix() {
+        let home = "/Users/test";
+
+        assert_eq!(tilde_abbreviate_with_home("/Users/test", home), "~");
+        assert_eq!(
+            tilde_abbreviate_with_home("/Users/test/projects/roost", home),
+            "~/projects/roost"
+        );
+        // Non-home paths pass through unchanged.
+        assert_eq!(tilde_abbreviate_with_home("/etc/hosts", home), "/etc/hosts");
+        // Paths that share a prefix but aren't actually under HOME
+        // (e.g. `/Users/testbed` when HOME=`/Users/test`) must NOT
+        // be tilde-abbreviated.
+        assert_eq!(
+            tilde_abbreviate_with_home("/Users/testbed", home),
+            "/Users/testbed"
+        );
+    }
 }
