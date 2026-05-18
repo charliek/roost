@@ -1190,9 +1190,27 @@ fn active_tab_cwd(ui: &ProjectUi) -> String {
             }
         }
     }
-    // Fallback: any tab if there is one.
-    if let Some((_, tab_ui)) = ui.tabs.borrow().iter().next() {
-        return tilde_abbreviate(&tab_ui.cwd.borrow());
+    // Fallback: walk the TabView's page list in **display order** and
+    // pick the first page whose tab id we have a TabUi for. The
+    // previous version used `ui.tabs.borrow().iter().next()` which
+    // pulls an arbitrary entry from the HashMap — when `selected_page`
+    // briefly returns None (e.g. mid-close-page transition) the
+    // subtitle could flicker to a random tab's cwd. CodeRabbit caught
+    // this on PR #61.
+    let pages = ui.tab_view.pages();
+    let n = pages.n_items();
+    let tabs = ui.tabs.borrow();
+    for i in 0..n {
+        let Some(obj) = pages.item(i) else { continue };
+        let Ok(page) = obj.downcast::<libadwaita::TabPage>() else {
+            continue;
+        };
+        let Some(tab_id) = parse_tab_id_from_page(&page) else {
+            continue;
+        };
+        if let Some(tab_ui) = tabs.get(&tab_id) {
+            return tilde_abbreviate(&tab_ui.cwd.borrow());
+        }
     }
     String::new()
 }
