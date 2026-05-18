@@ -20,7 +20,7 @@ use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use libadwaita::{ApplicationWindow, HeaderBar, TabView};
+use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
 use tokio::runtime::Handle;
 
 use roost_common::default_socket_path;
@@ -49,6 +49,11 @@ struct TabUi {
     view: Rc<TerminalView>,
     session: Rc<TabSession>,
     page: libadwaita::TabPage,
+    /// Tracked so the headerbar subtitle can reflect the active
+    /// tab's working directory. Mirrors the Mac UI's
+    /// `TabSession.liveCwd` field. Updated at attach time and on
+    /// every `TabCwdChangedEvent` (OSC 7).
+    cwd: RefCell<String>,
 }
 
 pub struct App {
@@ -61,7 +66,10 @@ pub struct App {
     /// `gtk::Stack` of TabView widgets, one entry per project id.
     /// Switching the sidebar selection flips the visible child.
     tab_stack: gtk4::Stack,
-    title_label: gtk4::Label,
+    /// `adw::WindowTitle` widget in the headerbar. Title = active
+    /// project name, subtitle = active tab's cwd (tilde-abbreviated).
+    /// Mirrors the Mac UI's `updateWindowTitle` flow.
+    window_title: WindowTitle,
     projects: RefCell<HashMap<i64, ProjectUi>>,
     /// Currently focused project (sidebar selection). 0 = no
     /// selection yet (e.g. workspace is empty).
@@ -89,9 +97,12 @@ impl App {
             .build();
 
         let header = HeaderBar::new();
-        let title_label = gtk4::Label::new(Some("Roost — connecting…"));
-        title_label.add_css_class("title");
-        header.set_title_widget(Some(&title_label));
+        // `adw::WindowTitle` is the libadwaita 1.x analog of NSWindow's
+        // title + subtitle. Title = project name (or status during
+        // bootstrap), subtitle = active tab's cwd. Matches the Mac UI's
+        // two-line title format and the Go binary's `HeaderBar.WindowTitle`.
+        let window_title = WindowTitle::new("Roost", "connecting…");
+        header.set_title_widget(Some(&window_title));
 
         // Sidebar — single-level ListBox of projects.
         let sidebar = gtk4::ListBox::builder()
@@ -136,7 +147,7 @@ impl App {
             rt: rt.clone(),
             sidebar: sidebar.clone(),
             tab_stack: tab_stack.clone(),
-            title_label: title_label.clone(),
+            window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
             theme,
@@ -194,7 +205,8 @@ impl App {
         let app_for_boot = app_struct.clone();
         glib::spawn_future_local(async move {
             if let Err(err) = app_for_boot.bootstrap().await {
-                app_for_boot.title_label.set_text(&format!("Roost — {err}"));
+                app_for_boot.window_title.set_title("Roost");
+                app_for_boot.window_title.set_subtitle(&format!("{err}"));
             }
         });
 
@@ -223,8 +235,12 @@ impl App {
             .await
             .context("setup join")??;
 
-        self.title_label
-            .set_text(&format!("Roost — daemon v{}", id.daemon_version));
+        // Transitional title until `set_active_project` lands the
+        // first project's name. The subtitle holds the daemon version
+        // so the user can confirm the round-trip succeeded at a glance.
+        self.window_title.set_title("Roost");
+        self.window_title
+            .set_subtitle(&format!("daemon v{}", id.daemon_version));
 
         // Materialize the project list. If empty, create a default
         // "roost-linux" project so the user has something to look at.
@@ -315,6 +331,18 @@ impl App {
                 glib::Propagation::Stop
             }
         });
+        // Switching tabs within a project updates the headerbar
+        // subtitle (cwd of the now-active tab). Cheap idempotent
+        // refresh; no-op if this project isn't the active one.
+        tab_view.connect_selected_page_notify({
+            let app = self.clone();
+            let project_id = project.id;
+            move |_| {
+                if *app.active_project_id.borrow() == project_id {
+                    app.refresh_window_subtitle();
+                }
+            }
+        });
 
         let tab_bar = libadwaita::TabBar::builder().view(&tab_view).build();
         let project_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -348,12 +376,26 @@ impl App {
         };
         self.tab_stack
             .set_visible_child_name(&stack_name(project_id));
-        // Update the headerbar title to the project name.
-        self.title_label.set_text(&format!("Roost — {}", ui.name));
+        self.window_title.set_title(&ui.name);
+        let subtitle = active_tab_cwd(ui);
+        self.window_title.set_subtitle(&subtitle);
         // Sync sidebar selection without re-firing the handler.
         self.sidebar.select_row(Some(&ui.sidebar_row));
         drop(projects);
         *self.active_project_id.borrow_mut() = project_id;
+    }
+
+    /// Recompute the headerbar subtitle from the active project's
+    /// active tab's cwd. Called whenever the active tab changes
+    /// (sidebar selection switch, tab pill click) or the active
+    /// tab's cwd updates (OSC 7 via WatchEvents `TabCwd`).
+    fn refresh_window_subtitle(self: &Rc<Self>) {
+        let projects = self.projects.borrow();
+        let active = *self.active_project_id.borrow();
+        if let Some(ui) = projects.get(&active) {
+            let subtitle = active_tab_cwd(ui);
+            self.window_title.set_subtitle(&subtitle);
+        }
     }
 
     /// OpenTab RPC → on success, attach the tab to the project's
@@ -424,6 +466,7 @@ impl App {
         let app_for_attach = self.clone();
         let project_id = tab.project_id;
         let terminal_for_drain = terminal.clone();
+        let tab_cwd = tab.cwd.clone();
         glib::spawn_future_local(async move {
             let session = match session_handle.await {
                 Ok(Ok(s)) => Rc::new(s),
@@ -448,10 +491,14 @@ impl App {
                         view: terminal_for_drain.clone(),
                         session: session.clone(),
                         page: page_for_future.clone(),
+                        cwd: RefCell::new(tab_cwd),
                     },
                 );
             }
             drop(projects);
+            // Update the headerbar subtitle if this tab belongs to
+            // the active project; cheap idempotent refresh.
+            app_for_attach.refresh_window_subtitle();
 
             // Output drain: PTY bytes → renderer + OSC scanner
             // (Phase 7 commit 10). For each OSC event the scanner
@@ -513,7 +560,7 @@ impl App {
                         }
                     }
                     if *self.active_project_id.borrow() == r.project_id {
-                        self.title_label.set_text(&format!("Roost — {}", r.name));
+                        self.window_title.set_title(&r.name);
                     }
                 }
             }
@@ -589,8 +636,13 @@ impl App {
                         if current.starts_with("Tab ") {
                             tab_ui.page.set_title(&label);
                         }
+                        // Persist for headerbar subtitle. M2 will
+                        // surface this through `refresh_window_subtitle`.
+                        *tab_ui.cwd.borrow_mut() = c.cwd.clone();
                     }
                 }
+                drop(projects);
+                self.refresh_window_subtitle();
             }
             EventKind::TabNotification(n) => {
                 // Light up the page's "needs attention" indicator so
@@ -916,6 +968,28 @@ fn stack_name(project_id: i64) -> String {
     format!("project-{project_id}")
 }
 
+/// Tilde-abbreviated cwd of `ui`'s currently selected tab (or the
+/// first tab if no selection exists yet). Empty string when the
+/// project has no attached tabs — caller uses that as the "subtitle
+/// goes blank" signal.
+fn active_tab_cwd(ui: &ProjectUi) -> String {
+    // adw::TabView::selected_page returns the currently focused tab.
+    // We resolve that back through `parse_tab_id_from_page` (same
+    // path the close-page handler uses) to find the matching TabUi.
+    if let Some(page) = ui.tab_view.selected_page() {
+        if let Some(tab_id) = parse_tab_id_from_page(&page) {
+            if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                return tilde_abbreviate(&tab_ui.cwd.borrow());
+            }
+        }
+    }
+    // Fallback: any tab if there is one.
+    if let Some((_, tab_ui)) = ui.tabs.borrow().iter().next() {
+        return tilde_abbreviate(&tab_ui.cwd.borrow());
+    }
+    String::new()
+}
+
 /// Replace `$HOME` prefix in a path with `~`. Used by the OSC 7
 /// (cwd) tab pill label so home-rooted dirs don't dominate the
 /// chrome.
@@ -961,4 +1035,29 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
             .expect("fallback shortcut trigger parse");
         fallback
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tilde_abbreviate;
+
+    /// `tilde_abbreviate` is the headerbar-subtitle (M2) helper that
+    /// also powers the OSC 7 tab-pill label. Keep its contract pinned
+    /// so a future "shorten my path" optimisation doesn't break what
+    /// the chrome relies on.
+    #[test]
+    fn tilde_abbreviate_replaces_home_prefix() {
+        // Lock HOME so the test result doesn't depend on the developer
+        // machine's actual env. SAFETY: only this test mutates HOME,
+        // and it runs sequentially within the `#[cfg(test)]` module.
+        unsafe { std::env::set_var("HOME", "/Users/test"); }
+
+        assert_eq!(tilde_abbreviate("/Users/test"), "~");
+        assert_eq!(tilde_abbreviate("/Users/test/projects/roost"), "~/projects/roost");
+        // Non-home paths pass through unchanged.
+        assert_eq!(tilde_abbreviate("/etc/hosts"), "/etc/hosts");
+        // Paths that share a prefix but aren't actually under HOME
+        // (e.g. `/Users/testbed`) must NOT be tilde-abbreviated.
+        assert_eq!(tilde_abbreviate("/Users/testbed"), "/Users/testbed");
+    }
 }
