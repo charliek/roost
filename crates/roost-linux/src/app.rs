@@ -27,6 +27,7 @@ use roost_common::default_socket_path;
 use roost_proto::v1::event::Kind as EventKind;
 use roost_proto::v1::{Project, Tab};
 
+use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::client::RoostClient;
 use crate::config::RoostConfig;
 use crate::events;
@@ -108,8 +109,17 @@ pub struct App {
     theme: Theme,
     /// Optional font-family override from config.
     font_family: Option<String>,
-    /// Optional font-size override from config (points).
+    /// Optional font-size override from config (points). Snapshot
+    /// of the value read at boot; the live size (with FontIncrease /
+    /// FontDecrease / FontReset adjustments) lives in
+    /// `current_font_size_pt`.
     font_size_pt: Option<f64>,
+    /// Live font size for the active session. Starts at
+    /// `font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT)` and shifts by
+    /// ±1 on each FontIncrease / FontDecrease; FontReset snaps back
+    /// to that baseline. Applied to every TerminalView via
+    /// `apply_font_size_to_all`.
+    current_font_size_pt: RefCell<f64>,
 }
 
 /// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
@@ -309,6 +319,7 @@ impl App {
             theme,
             font_family: cfg.font_family.clone(),
             font_size_pt: cfg.font_size,
+            current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
         });
 
         // Sidebar row selection → switch active project.
@@ -1072,10 +1083,14 @@ impl App {
         if ui.tabs.borrow().contains_key(&tab.id) {
             return;
         }
+        // Use the *live* font size (post-FontIncrease/Decrease) so a
+        // tab opened after the user has zoomed in matches the
+        // existing tabs, rather than snapping back to the config
+        // baseline.
         let terminal = Rc::new(TerminalView::with_theme_and_font(
             self.theme.clone(),
             self.font_family.as_deref(),
-            self.font_size_pt,
+            Some(*self.current_font_size_pt.borrow()),
         ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
         let Some(mut client_for_session) = self.client.borrow().clone() else {
@@ -1514,6 +1529,13 @@ impl App {
             KeybindAction::Copy => self.copy_active_selection(),
             KeybindAction::Paste => self.paste_into_active(),
             KeybindAction::ToggleSidebar => self.toggle_sidebar(),
+            KeybindAction::FontIncrease => self.adjust_font_size(1.0),
+            KeybindAction::FontDecrease => self.adjust_font_size(-1.0),
+            KeybindAction::FontReset => {
+                let baseline = self.font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT);
+                *self.current_font_size_pt.borrow_mut() = baseline;
+                self.apply_font_size_to_all(baseline);
+            }
             KeybindAction::SwitchProject(n) => self.switch_project_by_index(n as usize),
             KeybindAction::SwitchTab(n) => self.switch_tab_by_index(n as usize),
             KeybindAction::Unbind => {
@@ -1577,6 +1599,37 @@ impl App {
     fn paste_into_active(self: &Rc<Self>) {
         if let Some(view) = self.active_terminal_view() {
             view.paste_from_clipboard();
+        }
+    }
+
+    /// Shift the live font size by `delta` points (clamped to a
+    /// sane 6..72 range), then reapply to every TerminalView. The
+    /// daemon doesn't know or care about font size — it's purely
+    /// a UI concern — so no RPC fires.
+    fn adjust_font_size(self: &Rc<Self>, delta: f64) {
+        let mut size = self.current_font_size_pt.borrow_mut();
+        let new = (*size + delta).clamp(6.0, 72.0);
+        if (new - *size).abs() < 0.01 {
+            return;
+        }
+        *size = new;
+        let new = *size;
+        drop(size);
+        self.apply_font_size_to_all(new);
+    }
+
+    /// Push `size_pt` to every TerminalView in every project. Reuses
+    /// each view's existing `apply_font` path so cell metrics get
+    /// remeasured + a redraw is queued automatically.
+    fn apply_font_size_to_all(self: &Rc<Self>, size_pt: f64) {
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            let tabs = ui.tabs.borrow();
+            for tab_ui in tabs.values() {
+                tab_ui
+                    .view
+                    .apply_font(self.font_family.as_deref(), Some(size_pt));
+            }
         }
     }
 

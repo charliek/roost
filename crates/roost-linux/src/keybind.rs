@@ -19,10 +19,10 @@ pub enum KeybindAction {
     NewProject,
     /// M8: rename the active project — flips its sidebar row's
     /// `gtk::Stack` to the inline `gtk::Entry` (M9). Default
-    /// `ctrl+shift+r`.
+    /// `projectMod+shift+r`.
     RenameProject,
     /// M8: rename the active tab — opens a `gtk::Popover` over the
-    /// pill with an inline `gtk::Entry` (M9). Default `ctrl+r`.
+    /// pill with an inline `gtk::Entry` (M9). Default `projectMod+r`.
     RenameTab,
     /// M8: delete the active project (with an `adw::AlertDialog`
     /// confirmation, since this cascades to delete every tab in the
@@ -35,6 +35,17 @@ pub enum KeybindAction {
     Copy,
     Paste,
     ToggleSidebar,
+    /// Browser-style font sizing on the active tab's terminal.
+    /// Defaults to `primary+plus`/`primary+equal` (Go matches both
+    /// because `Cmd-+` on US layouts is really `Cmd-Shift-=` and
+    /// users frequently hit `Cmd-=` without shift). Mirrors the
+    /// Go binary's per-tab font adjusters.
+    FontIncrease,
+    /// Default `primary+minus`.
+    FontDecrease,
+    /// Default `primary+0`. Resets to the config-file default
+    /// (or `cell_metrics::DEFAULT_FONT_SIZE_PT` if no config).
+    FontReset,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
     /// `switch_project_N` where N is 1..=9.
@@ -58,6 +69,9 @@ impl KeybindAction {
             "copy" => Some(Self::Copy),
             "paste" => Some(Self::Paste),
             "toggle_sidebar" => Some(Self::ToggleSidebar),
+            "font_increase" => Some(Self::FontIncrease),
+            "font_decrease" => Some(Self::FontDecrease),
+            "font_reset" => Some(Self::FontReset),
             "unbind" => Some(Self::Unbind),
             other => {
                 if let Some(n) = other.strip_prefix("switch_project_") {
@@ -130,10 +144,25 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
     })
 }
 
-/// Default bindings table for Linux. Primary modifier = Ctrl,
-/// project switching = Alt, clipboard = Ctrl+Shift. Mirrors
-/// `cmd/roost/keymap.go::defaultBindings` on the Go side.
+/// Default bindings table — host-platform aware. Matches the Go
+/// binary's `cmd/roost/app.go::defaultBindings`:
+///
+/// * Linux: `primary = ctrl`, `projectMod = alt`, `clipboardMod = alt`.
+/// * macOS: `primary = super` (Cmd), `projectMod = super`,
+///   `clipboardMod = super`.
+///
+/// The GTK app is the Linux UI, but developers commonly run it on
+/// macOS Homebrew GTK4 for cross-client testing; flipping the
+/// primary modifier on Mac means the GTK app feels native there.
+/// Users override anything via `~/.config/roost/config.conf` —
+/// the `canonicalize_bindings` layer below preserves that.
 pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
+    let (primary, project_mod, clipboard_mod) = if cfg!(target_os = "macos") {
+        ("super", "super", "super")
+    } else {
+        ("ctrl", "alt", "alt")
+    };
+
     let mut out = Vec::new();
     let add = |out: &mut Vec<(Accel, KeybindAction)>, trig: &str, action: KeybindAction| {
         if let Some(accel) = parse_trigger(trig) {
@@ -141,40 +170,97 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         }
     };
 
-    add(&mut out, "ctrl+shift+t", KeybindAction::NewTab);
-    add(&mut out, "ctrl+shift+w", KeybindAction::CloseTab);
-    add(&mut out, "ctrl+shift+n", KeybindAction::NewProject);
-    // RenameTab: no default trigger on Linux — `Ctrl+R` would shadow
-    // bash/readline's reverse-history-search, and a window-global
-    // shortcut controller (`gtk::ShortcutScope::Global`) means it
-    // would steal the keystroke from the focused terminal. Users
-    // wanting a binding add one in `~/.config/roost/config.conf`,
-    // e.g. `keybind = ctrl+shift+r = rename_tab`. Rename is still
-    // reachable via right-click → Rename (M8) and double-click on
-    // the tab pill (M9). CodeRabbit caught this on PR #63. The
-    // M9.5 platform-detect follow-up adds `super+r` on macOS where
-    // shell shortcuts use Ctrl not Cmd.
-    add(&mut out, "ctrl+shift+r", KeybindAction::RenameProject);
-    // DeleteProject: no default trigger — see KeybindAction docs.
+    add(&mut out, &format!("{primary}+t"), KeybindAction::NewTab);
+    add(&mut out, &format!("{primary}+w"), KeybindAction::CloseTab);
     add(
         &mut out,
-        "ctrl+shift+bracketleft",
+        &format!("{project_mod}+n"),
+        KeybindAction::NewProject,
+    );
+    add(
+        &mut out,
+        &format!("{project_mod}+r"),
+        KeybindAction::RenameTab,
+    );
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+r"),
+        KeybindAction::RenameProject,
+    );
+    // DeleteProject: no default trigger — see KeybindAction docs.
+
+    // Cycle prev/next: Shift+[ and Shift+] map to bracketleft/right on
+    // most US layouts; some layouts emit braceleft/right after Shift.
+    // Bind both so the keybind fires regardless of layout — matches
+    // the Go binary's pair-bind in cmd/roost/app.go::defaultBindings.
+    add(
+        &mut out,
+        &format!("{primary}+shift+bracketleft"),
         KeybindAction::CycleTabPrev,
     );
     add(
         &mut out,
-        "ctrl+shift+bracketright",
+        &format!("{primary}+shift+braceleft"),
+        KeybindAction::CycleTabPrev,
+    );
+    add(
+        &mut out,
+        &format!("{primary}+shift+bracketright"),
         KeybindAction::CycleTabNext,
     );
+    add(
+        &mut out,
+        &format!("{primary}+shift+braceright"),
+        KeybindAction::CycleTabNext,
+    );
+
+    // Clipboard: native modifier first, plus Ctrl+Shift+C/V on every
+    // platform as a fallback for users who muscle-memory the
+    // X11/terminal-emulator default.
+    add(&mut out, &format!("{clipboard_mod}+c"), KeybindAction::Copy);
     add(&mut out, "ctrl+shift+c", KeybindAction::Copy);
+    add(
+        &mut out,
+        &format!("{clipboard_mod}+v"),
+        KeybindAction::Paste,
+    );
     add(&mut out, "ctrl+shift+v", KeybindAction::Paste);
-    add(&mut out, "ctrl+shift+b", KeybindAction::ToggleSidebar);
+
+    add(
+        &mut out,
+        &format!("{project_mod}+b"),
+        KeybindAction::ToggleSidebar,
+    );
+
+    // Browser-style font sizing on the active terminal. `Cmd-+` on
+    // US layouts is really `Cmd-Shift-=`, and many users hit `Cmd-=`
+    // without shift; bind both for FontIncrease (Go does the same).
+    add(
+        &mut out,
+        &format!("{primary}+plus"),
+        KeybindAction::FontIncrease,
+    );
+    add(
+        &mut out,
+        &format!("{primary}+equal"),
+        KeybindAction::FontIncrease,
+    );
+    add(
+        &mut out,
+        &format!("{primary}+minus"),
+        KeybindAction::FontDecrease,
+    );
+    add(&mut out, &format!("{primary}+0"), KeybindAction::FontReset);
+
     for n in 1..=9u8 {
         add(
             &mut out,
-            &format!("alt+{n}"),
+            &format!("{project_mod}+{n}"),
             KeybindAction::SwitchProject(n),
         );
+        // SwitchTab stays on Ctrl on both platforms — matches the Go
+        // binary, and keeps `Cmd+N` (or `Alt+N`) free for the
+        // project-switching keybind above.
         add(&mut out, &format!("ctrl+{n}"), KeybindAction::SwitchTab(n));
     }
 
@@ -275,44 +361,81 @@ mod tests {
     #[test]
     fn default_bindings_m8_actions() {
         let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
-        // Ctrl+Shift+R → RenameProject. The window-global shortcut
-        // controller takes priority over the terminal, so anything
-        // that conflicts with bash/readline (Ctrl+R reverse-search,
-        // Ctrl+W word-delete, etc.) must NOT be a default. Project
-        // rename's `Ctrl+Shift+R` is safe because shells don't bind
-        // shifted control keys.
-        let ctrl_shift_r = parse_trigger("ctrl+shift+r").unwrap();
+        // RenameTab + RenameProject default to the host's project
+        // modifier — `alt+r` / `alt+shift+r` on Linux, `super+r` /
+        // `super+shift+r` (Cmd+R / Cmd+Shift+R) on macOS — matching
+        // the Go binary's `cmd/roost/app.go::defaultBindings`. Same
+        // physical gesture maps to the same action regardless of
+        // host, which is what users expect when sharing a config
+        // file across machines.
+        //
+        // Why not `Ctrl+R` on Linux: bash/readline owns it for
+        // reverse-history-search and a window-global ShortcutController
+        // priority steals the keystroke from the focused terminal.
+        // `Alt+R` is bash's `revert-line` — much less critical and
+        // worth the trade-off; users who care override via config.
+        let (project_mod_r, project_mod_shift_r) = if cfg!(target_os = "macos") {
+            ("super+r", "super+shift+r")
+        } else {
+            ("alt+r", "alt+shift+r")
+        };
+        let rename_tab_trigger = parse_trigger(project_mod_r).unwrap();
         assert_eq!(
-            defaults.get(&ctrl_shift_r),
+            defaults.get(&rename_tab_trigger),
+            Some(&KeybindAction::RenameTab)
+        );
+        let rename_project_trigger = parse_trigger(project_mod_shift_r).unwrap();
+        assert_eq!(
+            defaults.get(&rename_project_trigger),
             Some(&KeybindAction::RenameProject)
         );
-        // RenameTab has no default trigger on Linux — the obvious
-        // `Ctrl+R` collides with bash/readline reverse-history-search.
-        // The M9.5 platform-detect follow-up adds `super+r` on macOS
-        // where shell shortcuts use Ctrl not Cmd; this assertion
-        // pins the deliberate Linux gap.
-        assert!(!defaults
-            .values()
-            .any(|a| matches!(a, KeybindAction::RenameTab)));
-        // DeleteProject has no default trigger either.
+        // DeleteProject has no default trigger — would cascade-delete
+        // every tab in the project, so users opt in via config.
         assert!(!defaults
             .values()
             .any(|a| matches!(a, KeybindAction::DeleteProject)));
     }
 
     #[test]
+    fn default_bindings_primary_modifier_is_host_appropriate() {
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // NewTab lives on `primary+t` — `ctrl+t` on Linux,
+        // `super+t` (Cmd+T) on macOS. Pins the host-detect logic so
+        // a refactor of `default_bindings` can't silently flip
+        // platforms.
+        let expected_new_tab = if cfg!(target_os = "macos") {
+            "super+t"
+        } else {
+            "ctrl+t"
+        };
+        let trigger = parse_trigger(expected_new_tab).unwrap();
+        assert_eq!(defaults.get(&trigger), Some(&KeybindAction::NewTab));
+    }
+
+    #[test]
     fn user_override_replaces_default() {
+        // Use a trigger the host-detect defaults won't already claim.
+        // On Linux `ctrl+t` is now the NewTab default; on macOS
+        // `super+t` is. `ctrl+shift+alt+t` is guaranteed unbound on
+        // both, so a user adding it as `new_tab` should appear in
+        // the canonicalized map alongside the platform default.
         let defaults = default_bindings();
-        let user = vec![("ctrl+t".into(), "new_tab".into())];
+        let user = vec![("ctrl+shift+alt+t".into(), "new_tab".into())];
         let mut warnings = Vec::new();
         let map = canonicalize_bindings(defaults, user, |w| warnings.push(w.to_string()));
-        // Default `ctrl+shift+t` still there; new `ctrl+t` added.
+        // User-added binding is present.
         assert_eq!(
-            map.get(&parse_trigger("ctrl+shift+t").unwrap()),
+            map.get(&parse_trigger("ctrl+shift+alt+t").unwrap()),
             Some(&KeybindAction::NewTab)
         );
+        // Platform default is also present (not clobbered).
+        let platform_default = if cfg!(target_os = "macos") {
+            "super+t"
+        } else {
+            "ctrl+t"
+        };
         assert_eq!(
-            map.get(&parse_trigger("ctrl+t").unwrap()),
+            map.get(&parse_trigger(platform_default).unwrap()),
             Some(&KeybindAction::NewTab)
         );
         assert!(warnings.is_empty());
@@ -321,9 +444,14 @@ mod tests {
     #[test]
     fn unbind_removes_default() {
         let defaults = default_bindings();
-        let user = vec![("ctrl+shift+t".into(), "unbind".into())];
+        let platform_default = if cfg!(target_os = "macos") {
+            "super+t"
+        } else {
+            "ctrl+t"
+        };
+        let user = vec![(platform_default.into(), "unbind".into())];
         let map = canonicalize_bindings(defaults, user, |_| {});
-        assert!(map.get(&parse_trigger("ctrl+shift+t").unwrap()).is_none());
+        assert!(map.get(&parse_trigger(platform_default).unwrap()).is_none());
     }
 
     #[test]
