@@ -383,6 +383,59 @@ func renameProject(socketPath: String, projectID: Int64, name: String) async {
     }
 }
 
+/// M2 of `goal-mac-parity-2026-05-18.md`: persist a new tab-order
+/// sequence within a project. The daemon validates that every id in
+/// `tabIDs` belongs to `projectID`; missing tabs keep their existing
+/// position, unknown ids fail with INVALID_ARGUMENT.
+func reorderTabs(socketPath: String, projectID: Int64, tabIDs: [Int64]) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.reorderTabs(
+                .with {
+                    $0.projectID = projectID
+                    $0.tabIds = tabIDs
+                }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] reorderTabs(\(projectID)) failed: \(error)\n".utf8)
+        )
+    }
+}
+
+/// M3 of `goal-mac-parity-2026-05-18.md`: persist a new sidebar
+/// project-order sequence. Same shape as `reorderTabs` but workspace-
+/// scoped — every id is rejected if it doesn't exist in the project
+/// table.
+func reorderProjects(socketPath: String, projectIDs: [Int64]) async {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            _ = try await roost.reorderProjects(
+                .with {
+                    $0.projectIds = projectIDs
+                }
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] reorderProjects failed: \(error)\n".utf8)
+        )
+    }
+}
+
 // =============================================================================
 // Phase 6a step 2c — WatchEvents subscription
 // =============================================================================
