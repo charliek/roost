@@ -1,6 +1,6 @@
 # Phase 7: Linux UI (gtk4-rs)
 
-**Status**: 🚧 in progress — Step 1 (crate skeleton + Identify spike + `gtk-build` CI job) landed via M8 of [`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md). Steps 2–7 (cell renderer, PTY round-trip, sidebar + tab bar, keybind config, OSC + notifications, visual polish) still pending. The user is driving the remaining work on their Linux laptop in parallel.
+**Status**: ✅ closed on `feature/rust-port` 2026-05-17 via PR #50 (squash `421b384`). M8 Identify spike landed earlier via `c4d0d38` (Phase 6a polish goal M8). The remaining steps 2–7 — cell renderer, StreamPty round-trip, sidebar + tab bar, keybind config, OSC + notifications, themes + config — landed as commits 1–11 of PR #50, plus a follow-up `e78da98` for two bugs found during end-to-end testing. Deferred polish items (drag-to-reorder UI, CSS port, headerbar icons, user theme overrides, AdwTabPage status indicator icons, automation API gaps, etc.) are consolidated in [`plans/phase-7-5-polish-and-gaps.md`](phase-7-5-polish-and-gaps.md).
 **Exit criteria**:
 * `linux/` Rust crate added to the Cargo workspace, building a runnable `roost-linux` binary.
 * gtk4-rs + libadwaita window with a project sidebar + tab bar + terminal area, structurally equivalent to the Mac UI.
@@ -62,5 +62,18 @@ Recommendation: hold Phase 7 until Phase 6a is complete, so the keybind config a
 
 ## Follow-ups
 
-* Wayland-specific features (e.g. `wlr_layer_shell` for floating notifications) — not in scope. We ride gtk4-rs's defaults.
-* HiDPI / fractional-scaling — gtk4 handles this for us, but verify glyph rendering doesn't fuzz on a 200% scale display before declaring parity.
+All consolidated in [`phase-7-5-polish-and-gaps.md`](phase-7-5-polish-and-gaps.md) — see that doc for milestone breakdown + ownership. Highlights:
+
+* **Linux UI visual polish**: CSS port from `cmd/roost/style.css`, GResource headerbar icons (folder / sidebar-show / tab-new), AdwTabPage status indicator icons (3 SVGs), inline rename via `gtk::Stack(label↔entry)`, sidebar drag-to-reorder, headerbar buttons, user theme overrides at `~/.config/roost/themes/`, filtering the cosmetic `g_settings_schema_source_lookup` GLib warning.
+* **Linux UI event handler completion**: `TabState` (status indicator dot per tab), `HookActiveChangedEvent`, `ActiveChangedEvent` — daemon emits them, Linux UI currently ignores.
+* **Mac UI drag-to-reorder**: consume the `ReorderTabs` / `ReorderProjects` RPCs landed in Phase 7 commit 3.
+* **Automation API gaps**: `tab snapshot` RPC (M4-deferred), `roost-cli-rs watch` for WatchEvents dumping, `tab send` should surface daemon `NotFound` (CLI currently swallows), `tracing::info!` in daemon-side `fire_notification`.
+* **Cross-platform deferred**: `polish/wide-char-width` (Phase 6a step 2h), `polish/ime-composition`, mouse-encoder bindings in `roost-vt`, Option-as-Alt config setting.
+* **Wayland-specific features** (e.g. `wlr_layer_shell` for floating notifications) — out of scope; ride gtk4-rs's defaults.
+* **HiDPI / fractional-scaling** — gtk4 handles this for us, but verify glyph rendering doesn't fuzz on a 200% scale display.
+
+## Closing log
+
+* Step 1 (crate skeleton + Identify spike + `gtk-build` CI) — landed via PR #31 (squash `c4d0d38`) on 2026-05-16.
+* Steps 2–7 + the planned commit-0 cherry-pick (`e48c76e` GResource icons from main) + the upstream feature/rust-port merge — landed via PR #50 (squash `421b384`) on 2026-05-17. Plan doc: `/Users/charliek/.claude/plans/i-d-like-to-plan-cryptic-pebble.md` (mirror at `plans/phase-7-5-polish-and-gaps.md` for the deferred follow-ups).
+* End-to-end test against daemon + 3 UIs (Go GTK4, Swift Mac `.app`, gtk4-rs) on Mac surfaced two bugs that were fixed before merge: spurious `CloseTab RPC failed` on cascade, OSC 7 cwd format error. Follow-up `e78da98`.

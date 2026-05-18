@@ -22,7 +22,8 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 | [5](phase-5-mac-ui-mvp.md) | Mac UI MVP (single-tab AppKit window over the daemon) | ✅ done | yes |
 | [6a](phase-6a-mac-structural.md) | Mac structural parity (multi-tab, sidebar, projects, persistence, menus) | ✅ done (M1–M7 + P1–P3 closed on `feature/rust-port`) | yes |
 | [6b](phase-6b-mac-osc-notifications.md) | Mac OSC + notifications (the differentiator) | ✅ done (P4–P9 closed on `feature/rust-port`) | yes |
-| [7](phase-7-linux-ui.md) | Linux UI (gtk4-rs + Cairo + Pango) | 🚧 M8 Identify spike landed (`crates/roost-linux`); cell renderer + sidebar + tab bar still pending | yes |
+| [7](phase-7-linux-ui.md) | Linux UI (gtk4-rs + Cairo + Pango) | ✅ done (commits 0–11 + follow-up landed via PR #50, squash `421b384`, 2026-05-17) | yes |
+| [7.5](phase-7-5-polish-and-gaps.md) | Linux/Mac polish + automation gaps (drag-reorder, CSS, icons, theme overrides, `tab snapshot`, etc.) | ⏳ scoped | yes |
 | [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG + notarytool; Linux AppImage) | ⏳ pending | yes |
 | [9](phase-9-cutover.md) | Cutover (delete `cmd/`, `internal/`, Go-specific make targets) | ⏳ pending | **destructive — separate PR** |
 
@@ -47,22 +48,25 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
     └── vision.md          # Target architecture (this dir + its kin describe the plan)
 ```
 
-## Closed goals (both on `feature/rust-port`, both 2026-05-16)
+## Closed goals (all on `feature/rust-port`)
 
 * [`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md) — M1–M8 (chrome foundation, native sidebar, tab strip + resize, headless CLI, selection + copy, themes + config, mac `.app` bundling, gtk4-rs Identify spike). [UX assessment](ux-assessment-2026-05-16.md) captures the pre-goal snapshot.
 * [`goal-phase-6-complete-2026-05-16.md`](goal-phase-6-complete-2026-05-16.md) — P1–P9 (keybind config, font zoom, palette FFI, OSC scanner port, daemon OSC routing, UI OSC detect, notification badges, desktop notifications, Claude hook end-to-end). Phase 6 is closed on `feature/rust-port`.
+* [`goal-mac-polish-cursor-keys-2026-05-17.md`](goal-mac-polish-cursor-keys-2026-05-17.md) — M1–M6 (libghostty key-encoder bridge, cursor rendering, sidebar toggle, cycle/rename tab, PTY-exit cascade, scrollback) + the post-goal fixes for orphan-tab purge, cursor-on-focus override, OSC UTF-8.
+* **Phase 7 (Linux UI)** — see [`phase-7-linux-ui.md`](phase-7-linux-ui.md). Landed via PR #50 squash `421b384`. Carries: `roost-vt` safe API, `roost-osc` shared crate, daemon `ReorderTabs`/`ReorderProjects` RPCs, Cairo+Pango cell renderer, StreamPty round-trip, full key encoder, scrollback + selection + clipboard, sidebar + AdwTabView + WatchEvents, keybind config, OSC + notifications, themes + config + focus-tab action.
 
-No active goal at the moment; next candidates are Phase 7 (full Linux UI on the M8 spike), Phase 8 (notarize + DMG), or the `feature/rust-port` → `main` merge.
+Active goal: [`phase-7-5-polish-and-gaps.md`](phase-7-5-polish-and-gaps.md) — Linux + Mac visual polish, drag-to-reorder UI, automation API gaps, deferred cross-platform items. Optional; can be skipped if the user wants to jump straight to Phase 8.
 
-## Status snapshot (2026-05-16, end of day)
+Next phase after that: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + Linux AppImage. The user's stated gate for `feature/rust-port → main` is "Phase 8 first so users pulling `main` get an installable artifact rather than source-only" (decision 2026-05-17).
 
-* Phases 0–5 landed and merged-ready.
-* Phase 6a closed on `feature/rust-port` (M1–M7 polish goal + P1–P3 followups). Native sidebar (`NSOutlineView`), tab strip with status-dot slot, window-resize reflow, headless CLI, selection + copy, themes + config, keybind override config, font zoom, palette FFI, `.app` bundling — all merged.
-* Phase 6b closed on `feature/rust-port` (P4–P9). Daemon-side OSC scanner port, full OSC routing dispatch, hook-active suppression, UI OSC detect + ReportOsc upcall, per-tab + per-project notification badges, `UNUserNotificationCenter` desktop notifications, `roost-cli-rs claude install` + `claude-hook` parity with the Go binary.
-* Phase 7 has its M8 Identify spike in (`crates/roost-linux`). Cell renderer + sidebar + tab bar + StreamPty round-trip + notifications are still pending.
-* `feature/rust-port` is ready for the merge-to-`main` decision per the milestone exit bar.
+## Status snapshot (2026-05-17, end of day)
+
+* Phases 0–7 landed and merged-ready on `feature/rust-port`.
+* Phase 7 closure: gtk4-rs Linux UI builds + runs on Mac Homebrew GTK4 + libadwaita with full feature surface; cross-client convergence with the Swift Mac UI verified end-to-end via `roost-cli-rs`. Daemon orphan-tab purge (`234378e`), Mac UI cursor-on-focus override (`266dea7`), OSC UTF-8 multibyte fix (`aebd408`), Swift OscScanner+KeyEncoder regression tests (`b5b7838`) all merged before Phase 7 PR.
+* Local Phase 7 worktree torn down. Local branch refs cleaned up. `feature/rust-port` is at `421b384`.
 * macOS 26 arm64e-only SDK workaround is in both `build/build.sh` (from `f6e0d64` on main) and `third_party/ghostty/build.sh` — both Zig 0.15.2 + Ghostty SHA toolchains build on macOS 26 hosts.
 * Two ghostty builds (`build/build.sh` for Go cgo, `third_party/ghostty/build.sh` for Rust bindgen + Swift) coexist and must pin the same SHA. They collapse in Phase 9.
+* `feature/rust-port → main` deferred until Phase 8 lands (user decision 2026-05-17): merging now would put source-only Rust+Swift code on `main` without an installable artifact.
 
 ## How to use these documents
 
