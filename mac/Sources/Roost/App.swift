@@ -1169,10 +1169,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
               daemonReachable
         else { return }
         let projectTabs = tabsForActiveProject()
-        guard let sourceIdx = projectTabs.firstIndex(where: { $0.id == sourceTabID })
+        // CodeRabbit on PR #68: the reorder math and the daemon-bound
+        // id sequence must live in the same index space. `projectTabs`
+        // includes tabs with `id == nil` (mid-OpenTab); the daemon-
+        // bound `ids` excludes them. Computing `mapped.index` in the
+        // visual space and applying it to `ids` skews by one for every
+        // nil-id tab before the drop target. Translate `rawTargetIdx`
+        // into the persisted-id space before calling `computeInsertIdx`.
+        let persisted: [(visualIdx: Int, id: Int64)] = projectTabs.enumerated().compactMap { idx, session in
+            guard let id = session.id else { return nil }
+            return (visualIdx: idx, id: id)
+        }
+        guard let sourcePersistedIdx = persisted.firstIndex(where: { $0.id == sourceTabID })
         else { return }
-
-        let mapped = computeInsertIdx(sourceIdx: sourceIdx, rawTargetIdx: rawTargetIdx)
+        let rawTargetPersistedIdx = persisted.reduce(into: 0) { count, entry in
+            if entry.visualIdx < rawTargetIdx { count += 1 }
+        }
+        let mapped = computeInsertIdx(
+            sourceIdx: sourcePersistedIdx,
+            rawTargetIdx: rawTargetPersistedIdx
+        )
         if mapped.isNoop { return }
 
         // Build the new id sequence: remove the source, insert at the
@@ -1180,9 +1196,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // mid-OpenTab and can't be reordered yet, but they keep
         // their relative position in the array (the daemon-side
         // reorder only operates on persisted ids).
-        var ids: [Int64] = projectTabs.compactMap { $0.id }
-        guard let sourceIDIdx = ids.firstIndex(of: sourceTabID) else { return }
-        let source = ids.remove(at: sourceIDIdx)
+        var ids: [Int64] = persisted.map { $0.id }
+        let source = ids.remove(at: sourcePersistedIdx)
         let clamped = min(max(mapped.index, 0), ids.count)
         ids.insert(source, at: clamped)
 
@@ -2375,7 +2390,12 @@ extension RoostApp: NSOutlineViewDataSource {
               let sourceIdx = projects.firstIndex(where: { $0.id == sourceID })
         else { return false }
         let mapped = computeInsertIdx(sourceIdx: sourceIdx, rawTargetIdx: index)
-        if mapped.isNoop { return false }
+        // CodeRabbit on PR #68: returning `false` for a same-position
+        // drop makes AppKit play the "rejected drop" animation, which
+        // is misleading — the gesture was valid, the order just didn't
+        // change. Return `true` so AppKit treats it as a successful
+        // (zero-effect) drop.
+        if mapped.isNoop { return true }
 
         var ids = projects.map { $0.id }
         let source = ids.remove(at: sourceIdx)
