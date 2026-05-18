@@ -161,7 +161,9 @@ impl App {
         // Wired below after `app_struct` exists so the handlers can
         // capture an `Rc<App>` clone.
         let folder_button = gtk4::Button::builder()
-            .child(&gtk4::Image::from_gicon(&embedded_icon(ICON_FOLDER_SYMBOLIC)))
+            .child(&gtk4::Image::from_gicon(&embedded_icon(
+                ICON_FOLDER_SYMBOLIC,
+            )))
             .css_classes(["flat"])
             .tooltip_text("New project from folder…")
             .build();
@@ -307,30 +309,27 @@ impl App {
         folder_button.connect_clicked({
             let app = app_struct.clone();
             move |btn| {
-                let parent = btn
-                    .root()
-                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
-                let mut builder = gtk4::FileChooserNative::builder()
+                let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                // `gtk::FileDialog` is the gtk-4.10 successor to the
+                // deprecated `FileChooserNative`. Async-only API:
+                // `select_folder` takes a callback that receives the
+                // chosen file (or a `Dismissed` error on cancel).
+                let dialog = gtk4::FileDialog::builder()
                     .title("Choose project folder")
-                    .action(gtk4::FileChooserAction::SelectFolder)
                     .modal(true)
                     .accept_label("Open")
-                    .cancel_label("Cancel");
-                if let Some(parent) = parent.as_ref() {
-                    builder = builder.transient_for(parent);
-                }
-                let dialog = builder.build();
-                let app = app.clone();
-                let dialog_handle = dialog.clone();
-                dialog.connect_response(move |dialog, response| {
-                    if response == gtk4::ResponseType::Accept {
-                        if let Some(folder) = dialog.file().and_then(|f| f.path()) {
-                            let path = folder.to_string_lossy().to_string();
-                            let app = app.clone();
+                    .build();
+                let app_for_pick = app.clone();
+                dialog.select_folder(
+                    parent.as_ref(),
+                    None::<&gtk4::gio::Cancellable>,
+                    move |result| match result {
+                        Ok(file) => {
+                            let Some(path) = file.path() else { return };
+                            let path = path.to_string_lossy().to_string();
+                            let app = app_for_pick.clone();
                             glib::spawn_future_local(async move {
-                                if let Err(err) =
-                                    app.create_new_project_with_cwd(&path).await
-                                {
+                                if let Err(err) = app.create_new_project_with_cwd(&path).await {
                                     tracing::warn!(
                                         ?err,
                                         path = %path,
@@ -339,10 +338,17 @@ impl App {
                                 }
                             });
                         }
-                    }
-                    dialog.destroy();
-                });
-                dialog_handle.show();
+                        Err(err) => {
+                            // The user dismissing the dialog comes
+                            // back as `Dismissed` — that's the happy
+                            // cancel path, not a failure. Anything
+                            // else is logged.
+                            if !err.matches(gtk4::DialogError::Dismissed) {
+                                tracing::warn!(?err, "folder-picker dialog failed");
+                            }
+                        }
+                    },
+                );
             }
         });
         // - Sidebar toggle: route through the existing ToggleSidebar
@@ -1251,10 +1257,15 @@ mod tests {
         // Lock HOME so the test result doesn't depend on the developer
         // machine's actual env. SAFETY: only this test mutates HOME,
         // and it runs sequentially within the `#[cfg(test)]` module.
-        unsafe { std::env::set_var("HOME", "/Users/test"); }
+        unsafe {
+            std::env::set_var("HOME", "/Users/test");
+        }
 
         assert_eq!(tilde_abbreviate("/Users/test"), "~");
-        assert_eq!(tilde_abbreviate("/Users/test/projects/roost"), "~/projects/roost");
+        assert_eq!(
+            tilde_abbreviate("/Users/test/projects/roost"),
+            "~/projects/roost"
+        );
         // Non-home paths pass through unchanged.
         assert_eq!(tilde_abbreviate("/etc/hosts"), "/etc/hosts");
         // Paths that share a prefix but aren't actually under HOME

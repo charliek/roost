@@ -21,7 +21,7 @@ mod tab_session;
 mod terminal_view;
 mod theme;
 
-use gtk4::glib::{self, LogLevel, LogWriterOutput};
+use gtk4::glib::{self, LogWriterOutput};
 use libadwaita::prelude::*;
 use libadwaita::Application;
 use tracing_subscriber::EnvFilter;
