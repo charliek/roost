@@ -51,6 +51,14 @@ final class TabSession {
     /// the tab.
     var liveHasNotification: Bool = false
 
+    /// M6 of `goal-mac-parity-2026-05-18.md`: tracks
+    /// `HookActiveChangedEvent.active`. While true, the tab's agent
+    /// state is suppressed in the per-project sidebar rollup — the
+    /// Claude hook owns the urgency surface and promoting a colored
+    /// stripe alongside would double-count it. Mirrors the Linux
+    /// `crates/roost-linux/src/rollup.rs` semantics.
+    var hookActive: Bool = false
+
     /// Project the tab belongs to. Set at construction so the window
     /// can filter tabs by project before `start()` ever runs — the
     /// daemon enforces the same id on `OpenTab`.
