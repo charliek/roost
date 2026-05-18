@@ -43,7 +43,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// path (WatchEvents, `⌘1..⌘9`, project lifecycle).
     private var isSyncingSidebarSelection = false
 
-    private var tabBar: NSStackView?
+    private var tabBar: TabBarStackView?
     private var addTabButton: NSButton?
     private var terminalContainer: NSView?
     private var windowMenu: NSMenu?
@@ -296,6 +296,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         outline.action = #selector(sidebarRowClicked(_:))
         outline.target = self
 
+        // M3 drag-and-drop: rows are reorderable within the projects
+        // section. Source-side pasteboard writing happens via
+        // `outlineView(_:pasteboardWriterForItem:)`; the drop side
+        // uses `roostProjectID` UTI so we don't accept arbitrary text.
+        outline.registerForDraggedTypes([.roostProjectID])
+        outline.setDraggingSourceOperationMask(.move, forLocal: true)
+        outline.setDraggingSourceOperationMask([], forLocal: false)
+
         // Right-click context menu — items target `clickedRow` so the
         // same NSMenu serves every project row without bespoke
         // per-row construction.
@@ -369,11 +377,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let pane = NSView()
         pane.translatesAutoresizingMaskIntoConstraints = false
 
-        let tabBar = NSStackView()
+        let tabBar = TabBarStackView()
         tabBar.orientation = .horizontal
         tabBar.alignment = .centerY
         tabBar.spacing = 6
         tabBar.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.onDropTab = { [weak self] sourceTabID, rawTargetIdx in
+            self?.handleTabDrop(sourceTabID: sourceTabID, rawTargetIdx: rawTargetIdx)
+        }
 
         // "+" is a plain bordered button to the right of the pills.
         // Lighter affordance than a full-bezel rounded button so the
@@ -764,12 +775,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 session.hookActive = e.active
                 rebuildSidebar()
             }
-        case .tabsReordered, .projectsReordered:
-            // M2 / M3 of `goal-mac-parity-2026-05-18.md` wire these.
-            // Until then Mac keeps its local-authoritative stance:
-            // reorder events arriving without a matching outbound RPC
-            // have nowhere to land.
-            break
+        case .tabsReordered(let e):
+            // M2 of `goal-mac-parity-2026-05-18.md`: apply daemon-
+            // authoritative tab order so a Mac drag + a sibling
+            // `roost-cli-rs tab reorder` both converge through the
+            // same code path. Reverses Mac's pre-M2 stance of
+            // dropping reorder events.
+            applyTabsReorder(projectID: e.projectID, newOrder: e.tabIds)
+        case .projectsReordered(let e):
+            // M3 of `goal-mac-parity-2026-05-18.md`: apply daemon-
+            // authoritative project order. Active project stays
+            // selected through the rebuild.
+            applyProjectsReorder(newOrder: e.projectIds)
         }
     }
 
@@ -1120,6 +1137,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 isActive: isActive,
                 statusColor: pillStatusColor(for: session),
                 hasBadge: session.liveHasNotification,
+                tabID: session.id,
                 onSelect: { [weak self] idx in
                     self?.selectTab(at: idx)
                 },
@@ -1134,6 +1152,92 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
 
         rebuildWindowMenu()
+    }
+
+    /// M2 of `goal-mac-parity-2026-05-18.md`: handle a tab pill drop
+    /// inside the active project's strip. The pill identifies itself
+    /// by daemon-assigned id (pasteboard `roostTabID`); the strip's
+    /// hit-test produces a raw target index. We resolve both back to
+    /// our local model, compute the final insert index via the
+    /// shared `ReorderMath`, and fire `ReorderTabs` to the daemon.
+    /// The local order does *not* change here — we wait for the
+    /// `.tabsReordered` event to apply, matching the cross-cutting
+    /// "WatchEvents-only mutation" invariant.
+    @MainActor
+    private func handleTabDrop(sourceTabID: Int64, rawTargetIdx: Int) {
+        guard let activeProjectID,
+              daemonReachable
+        else { return }
+        let projectTabs = tabsForActiveProject()
+        guard let sourceIdx = projectTabs.firstIndex(where: { $0.id == sourceTabID })
+        else { return }
+
+        let mapped = computeInsertIdx(sourceIdx: sourceIdx, rawTargetIdx: rawTargetIdx)
+        if mapped.isNoop { return }
+
+        // Build the new id sequence: remove the source, insert at the
+        // mapped index. Tabs without daemon ids skip out — they're
+        // mid-OpenTab and can't be reordered yet, but they keep
+        // their relative position in the array (the daemon-side
+        // reorder only operates on persisted ids).
+        var ids: [Int64] = projectTabs.compactMap { $0.id }
+        guard let sourceIDIdx = ids.firstIndex(of: sourceTabID) else { return }
+        let source = ids.remove(at: sourceIDIdx)
+        let clamped = min(max(mapped.index, 0), ids.count)
+        ids.insert(source, at: clamped)
+
+        let socket = socketPath
+        let projectID = activeProjectID
+        Task {
+            await reorderTabs(socketPath: socket, projectID: projectID, tabIDs: ids)
+        }
+    }
+
+    /// Apply a daemon-authoritative tab order to the local model. Called
+    /// from the `.tabsReordered` event arm — every reorder, whether
+    /// driven by a Mac UI drag or a sibling `roost-cli-rs tab reorder`,
+    /// flows through this single point. Out-of-order ids (not in
+    /// `newOrder`) keep their relative position at the tail.
+    @MainActor
+    private func applyTabsReorder(projectID: Int64, newOrder: [Int64]) {
+        let positions = tabs.indices.filter { tabs[$0].projectID == projectID }
+        if positions.isEmpty { return }
+        let projectTabs = positions.map { tabs[$0] }
+        let byID: [Int64: TabSession] = Dictionary(
+            uniqueKeysWithValues: projectTabs.compactMap { session in
+                session.id.map { ($0, session) }
+            }
+        )
+        let listed = newOrder.compactMap { byID[$0] }
+        let unlisted = projectTabs.filter { session in
+            guard let id = session.id else { return true }
+            return !newOrder.contains(id)
+        }
+        let finalOrder = listed + unlisted
+        for (i, pos) in positions.enumerated() where i < finalOrder.count {
+            tabs[pos] = finalOrder[i]
+        }
+        if projectID == activeProjectID {
+            rebuildTabBar()
+        }
+    }
+
+    /// Apply a daemon-authoritative project order. Mac's longstanding
+    /// stance (App.swift:680) keeps active state local-authoritative;
+    /// here we reverse it for projects-reordered specifically because
+    /// drag-reorder is a cross-client signal a CLI mutation might
+    /// arrive without a corresponding outbound RPC. We snapshot the
+    /// active project id so the row stays selected through the shuffle
+    /// (mirrors Linux `apply_sidebar_order` invariant from M10).
+    @MainActor
+    private func applyProjectsReorder(newOrder: [Int64]) {
+        let byID = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, $0) })
+        let listed = newOrder.compactMap { byID[$0] }
+        let unlisted = projects.filter { p in !newOrder.contains(p.id) }
+        let combined = listed + unlisted
+        guard combined.map({ $0.id }) != projects.map({ $0.id }) else { return }
+        projects = combined
+        rebuildSidebar()
     }
 
     /// Rename the tab at the given index in the active project.
@@ -1882,6 +1986,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 final class TabPillView: NSView {
     private let index: Int
     private let isActive: Bool
+    /// Daemon-assigned tab id, or `nil` between OpenTab and the
+    /// daemon's reply. Used by M2's drag source: pasteboard payload
+    /// is the tab id so the destination can resolve the source row
+    /// independent of any intervening order changes. Pre-id pills
+    /// drop their drag silently.
+    fileprivate let tabID: Int64?
     private let onSelect: @MainActor (Int) -> Void
     private let onClose: @MainActor (Int) -> Void
     private let onRename: @MainActor (Int) -> Void
@@ -1889,18 +1999,26 @@ final class TabPillView: NSView {
     private let label: NSTextField
     private let closeButton: NSButton
 
+    /// M2 drag-source state. `mouseDown` records the event so
+    /// `mouseDragged` can use it as the dragging session's seed event;
+    /// `isDragging` debounces (re-entrant drag is a no-op).
+    private var mouseDownEvent: NSEvent?
+    private var isDragging = false
+
     init(
         index: Int,
         title: String,
         isActive: Bool,
         statusColor: NSColor? = nil,
         hasBadge: Bool = false,
+        tabID: Int64? = nil,
         onSelect: @escaping @MainActor (Int) -> Void,
         onClose: @escaping @MainActor (Int) -> Void,
         onRename: @escaping @MainActor (Int) -> Void
     ) {
         self.index = index
         self.isActive = isActive
+        self.tabID = tabID
         self.onSelect = onSelect
         self.onClose = onClose
         self.onRename = onRename
@@ -2005,14 +2123,54 @@ final class TabPillView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
     /// Single-click anywhere on the pill (except over the close
-    /// glyph) selects the tab. `mouseDown` short-circuits AppKit's
-    /// drag tracking, which is what we want — clicks shouldn't have
-    /// to wait for a drag-threshold timeout to fire.
+    /// glyph) selects the tab. We fire `onSelect` immediately on
+    /// `mouseDown` so the tab becomes active right away — pre-M2
+    /// behavior. M2 layers drag-source on top: `mouseDragged` starts
+    /// a dragging session when the cursor moves past a small
+    /// threshold, and `mouseUp` is a no-op for the click path
+    /// (which already fired in `mouseDown`).
     override func mouseDown(with event: NSEvent) {
-        // The close button intercepts its own clicks via the
-        // NSButton's hit-testing; if the event reaches the pill it
-        // wasn't over the close button.
+        mouseDownEvent = event
+        isDragging = false
         onSelect(index)
+    }
+
+    /// Begin a dragging session once the user drags more than ~3 pts
+    /// from the mouse-down origin. Pasteboard payload is the tab id
+    /// (M2's `roostTabID` UTI) so `TabBarStackView` can resolve the
+    /// source row independent of intervening order changes. Pills
+    /// that haven't received their daemon id yet (still mid-OpenTab)
+    /// quietly skip the drag.
+    override func mouseDragged(with event: NSEvent) {
+        guard !isDragging,
+              let downEvent = mouseDownEvent,
+              let tabID = tabID
+        else { return }
+        let dx = event.locationInWindow.x - downEvent.locationInWindow.x
+        let dy = event.locationInWindow.y - downEvent.locationInWindow.y
+        if (dx * dx) + (dy * dy) < 9 { return }  // 3pt threshold
+        isDragging = true
+
+        let item = NSPasteboardItem()
+        item.setString(String(tabID), forType: .roostTabID)
+        let draggingItem = NSDraggingItem(pasteboardWriter: item)
+        draggingItem.setDraggingFrame(bounds, contents: snapshotImage())
+        beginDraggingSession(with: [draggingItem], event: downEvent, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        mouseDownEvent = nil
+        isDragging = false
+    }
+
+    /// Snapshot the pill's current rendering so the drag image looks
+    /// like the pill the user grabbed. AppKit's
+    /// `dataWithPDF(inside:)` is the path used by every TextEdit / Mail
+    /// snippet drag — works for any layer-backed NSView regardless of
+    /// subview composition.
+    private func snapshotImage() -> NSImage {
+        let data = self.dataWithPDF(inside: bounds)
+        return NSImage(data: data) ?? NSImage(size: bounds.size)
     }
 
     @objc private func closeClicked() {
@@ -2055,6 +2213,17 @@ final class TabPillView: NSView {
 
     @objc private func closeFromMenu(_ sender: NSMenuItem) {
         onClose(index)
+    }
+}
+
+extension TabPillView: NSDraggingSource {
+    nonisolated func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        // Only allow drops inside the same app — cross-app pill drags
+        // aren't a thing.
+        context == .withinApplication ? .move : []
     }
 }
 
@@ -2155,6 +2324,69 @@ extension RoostApp: NSOutlineViewDataSource {
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         false
+    }
+
+    // MARK: - M3 drag-and-drop
+
+    /// Emit a `roostProjectID` pasteboard item carrying the project id
+    /// when the user starts dragging a sidebar row. The drop target
+    /// resolves this back to a local row position; we don't carry the
+    /// row index because the displayed order may change mid-drag if
+    /// a sibling client reorders.
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        pasteboardWriterForItem item: Any
+    ) -> NSPasteboardWriting? {
+        guard let row = item as? ProjectRowItem else { return nil }
+        let writer = NSPasteboardItem()
+        writer.setString(String(row.project.id), forType: .roostProjectID)
+        return writer
+    }
+
+    /// Accept drops between top-level rows only. NSOutlineView
+    /// proposes `.on item` drops by default — clamp to `.above index`
+    /// so the user can't accidentally drop a project onto another
+    /// project's row (which would visually be a no-op anyway, but the
+    /// move arrow looks confusing).
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        validateDrop info: any NSDraggingInfo,
+        proposedItem item: Any?,
+        proposedChildIndex index: Int
+    ) -> NSDragOperation {
+        guard item == nil, index >= 0 else { return [] }
+        guard info.draggingPasteboard.types?.contains(.roostProjectID) == true else { return [] }
+        outlineView.setDropItem(nil, dropChildIndex: index)
+        return .move
+    }
+
+    /// Resolve the drop to a final order and fire `ReorderProjects`.
+    /// Local mutation is *not* applied here — the `.projectsReordered`
+    /// event arm is the single source of truth (cross-cutting
+    /// "WatchEvents-only mutation" invariant from the goal doc).
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        acceptDrop info: any NSDraggingInfo,
+        item: Any?,
+        childIndex index: Int
+    ) -> Bool {
+        guard let idStr = info.draggingPasteboard.string(forType: .roostProjectID),
+              let sourceID = Int64(idStr),
+              let sourceIdx = projects.firstIndex(where: { $0.id == sourceID })
+        else { return false }
+        let mapped = computeInsertIdx(sourceIdx: sourceIdx, rawTargetIdx: index)
+        if mapped.isNoop { return false }
+
+        var ids = projects.map { $0.id }
+        let source = ids.remove(at: sourceIdx)
+        let clamped = min(max(mapped.index, 0), ids.count)
+        ids.insert(source, at: clamped)
+
+        let socket = socketPath
+        Task {
+            await reorderProjects(socketPath: socket, projectIDs: ids)
+        }
+        return true
     }
 }
 
