@@ -73,3 +73,20 @@ func pathDisplay_emptyPathIsEmpty() {
     // helper should be transparent for that — no crash, returns "".
     #expect(pathDisplay("", home: "/home/charliek", max: 48) == "")
 }
+
+@Test
+func pathDisplay_zeroMaxReturnsEmpty() {
+    // CodeRabbit-flagged guard (PR #67): `max <= 0` must not trap.
+    // Returning "" is the documented behavior — "render zero
+    // characters."
+    #expect(pathDisplay("/a/b/c", home: "", max: 0) == "")
+    #expect(pathDisplay("/home/charliek/foo", home: "/home/charliek", max: 0) == "")
+}
+
+@Test
+func pathDisplay_negativeMaxReturnsEmpty() {
+    // Same guard, but with a negative value — used to drive a runtime
+    // trap via `Collection.suffix(max - 1)` on the truncate branch.
+    #expect(pathDisplay("/a/b/c", home: "", max: -5) == "")
+    #expect(pathDisplay("/long/path", home: "", max: Int.min) == "")
+}
