@@ -13,7 +13,7 @@
 //! calls the reorder RPCs.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::Context;
@@ -55,8 +55,22 @@ struct ProjectUi {
     /// starts; cleared on cancel/commit.
     sidebar_entry: gtk4::Entry,
     tab_view: TabView,
+    /// AdwTabBar — held so the M9 rename popover can anchor here
+    /// (under the selected pill) instead of at the bottom of the
+    /// TabView's terminal area.
+    tab_bar: libadwaita::TabBar,
     /// Tab id → (TerminalView, TabSession).
     tabs: RefCell<HashMap<i64, TabUi>>,
+    /// M9.5: tab ids whose `attach_existing_tab` is in flight (the
+    /// async `TabSession::spawn` hasn't yet resolved, so the entry
+    /// isn't in `tabs` yet). Checked alongside `tabs` in the dedupe
+    /// guard so a Cmd+T's optimistic attach can't race against the
+    /// WatchEvents `TabOpenedEvent` arm into a double-spawn. Each
+    /// entry is inserted synchronously at the top of
+    /// `attach_existing_tab` and removed once the session resolves
+    /// (success or failure), so a failed attach doesn't leave the
+    /// id permanently marked.
+    pending_attaches: RefCell<HashSet<i64>>,
 }
 
 #[allow(dead_code)] // view + session held to keep the TerminalView + StreamPty alive for the tab's lifetime.
@@ -120,6 +134,15 @@ pub struct App {
     /// to that baseline. Applied to every TerminalView via
     /// `apply_font_size_to_all`.
     current_font_size_pt: RefCell<f64>,
+    /// Tab ids whose close was triggered by the daemon (the user
+    /// typed `exit`, or a CLI `tab close`, or another client's
+    /// CloseTab RPC). The connect_close_page handler installed on
+    /// every AdwTabView would otherwise fire `close_tab_async` here
+    /// — a redundant RPC that returns `NotFound` because the daemon
+    /// already deleted the tab. M9.5: mark in the set before
+    /// calling `close_page`, check + remove in the close-page
+    /// handler to skip the redundant RPC.
+    server_driven_closes: RefCell<HashSet<i64>>,
 }
 
 /// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
@@ -182,6 +205,16 @@ impl App {
             .default_height(700)
             .title("Roost (Linux)")
             .build();
+
+        // M9.5: force the libadwaita color scheme to dark. The Go
+        // binary does the same on its `adw::StyleManager` (a
+        // terminal-app convention: the chrome around the terminal
+        // looks weird in light mode because the terminal area itself
+        // is always dark from the bundled roost-dark theme).
+        // `ForceDark` (rather than `PreferDark`) means the user's
+        // system pref doesn't flip us back to light on a
+        // light-mode-system Mac dev host.
+        libadwaita::StyleManager::default().set_color_scheme(libadwaita::ColorScheme::ForceDark);
 
         // Install the bundled chrome stylesheet on the default
         // display. `load_from_string` is infallible in current
@@ -263,9 +296,14 @@ impl App {
             .vexpand(true)
             .build();
 
+        // `pill` for the libadwaita rounded-rect look; drop the
+        // `flat` class so the button reads as a discrete affordance
+        // with a visible chip rather than text-only. Matches the
+        // Go binary's `+ Project` button which renders with the
+        // default libadwaita button background. M9.5.
         let new_project_button = gtk4::Button::builder()
             .label("+ Project")
-            .css_classes(["roost-add-project", "flat"])
+            .css_classes(["roost-add-project", "pill"])
             .margin_top(4)
             .margin_bottom(8)
             .margin_start(8)
@@ -320,6 +358,7 @@ impl App {
             font_family: cfg.font_family.clone(),
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
+            server_driven_closes: RefCell::new(HashSet::new()),
         });
 
         // Sidebar row selection → switch active project.
@@ -714,9 +753,28 @@ impl App {
             let project_id = project.id;
             move |tv, page| {
                 let tab_id = parse_tab_id_from_page(page);
+                tracing::debug!(project_id, ?tab_id, "close-page signal");
                 tv.close_page_finish(page, true);
+                // Drop the local TabUi entry so cwd / state tracking
+                // for the now-dead tab is freed and the headerbar
+                // subtitle / rollup recompute don't try to look it
+                // up. Snapshot the project ref out of the borrow
+                // before touching `tabs` so we don't deadlock with
+                // any subsequent borrow inside `close_tab_async`.
                 if let Some(tab_id) = tab_id {
-                    app.close_tab_async(project_id, tab_id);
+                    if let Some(ui) = app.projects.borrow().get(&project_id) {
+                        ui.tabs.borrow_mut().remove(&tab_id);
+                    }
+                    let already_server_driven =
+                        drain_server_driven_marker(&app.server_driven_closes, tab_id);
+                    if !already_server_driven {
+                        // User-initiated close (× click or Cmd+W)
+                        // — tell the daemon. Server-driven closes
+                        // (shell exit, CLI tab close from another
+                        // client) skip this RPC since the daemon
+                        // already deleted the tab.
+                        app.close_tab_async(project_id, tab_id);
+                    }
                 }
                 glib::Propagation::Stop
             }
@@ -775,7 +833,9 @@ impl App {
                 sidebar_label: label,
                 sidebar_entry: entry,
                 tab_view,
+                tab_bar,
                 tabs: RefCell::new(HashMap::new()),
+                pending_attaches: RefCell::new(HashSet::new()),
             },
         );
     }
@@ -804,6 +864,11 @@ impl App {
             ui.sidebar_name_stack.set_visible_child_name("label");
             ui.sidebar_entry.set_text("");
         }
+        drop(projects);
+        // M9.5: post-cancel, focus goes back to the terminal so the
+        // user can resume typing instead of being stranded on the
+        // sidebar row.
+        self.focus_active_terminal();
     }
 
     /// Commit a rename: fire `RenameProject` RPC and flip the Stack
@@ -820,6 +885,11 @@ impl App {
             ui.sidebar_name_stack.set_visible_child_name("label");
         }
         drop(projects);
+        // M9.5: post-commit, focus goes back to the terminal even
+        // when the rename was a no-op (empty string) or the RPC is
+        // still in flight. Avoids the dead-end where the entry has
+        // disappeared but the row still owns keyboard focus.
+        self.focus_active_terminal();
         let trimmed = new_name.trim().to_string();
         if trimmed.is_empty() {
             return; // empty rename = no-op
@@ -958,14 +1028,19 @@ impl App {
             .text(&current_title)
             .activates_default(true)
             .build();
-        let popover = gtk4::Popover::builder().has_arrow(true).build();
+        let popover = gtk4::Popover::builder()
+            .has_arrow(true)
+            .position(gtk4::PositionType::Bottom)
+            .build();
         popover.set_child(Some(&entry));
-        // Anchor the popover at the TabView — adw::TabView doesn't
-        // expose the individual pill widget, so the popover
-        // positions above whichever pill is currently selected,
-        // which after the `set_selected_page` call above is the
-        // tab being edited.
-        popover.set_parent(&ui.tab_view);
+        // Anchor at the AdwTabBar (the pill strip), positioned
+        // pointing-down from the tab strip. M9.5: pre-fix, the
+        // anchor was the TabView itself — whose visual centre is
+        // the terminal area — so the popover floated halfway down
+        // the window. AdwTabBar doesn't expose the individual
+        // pill, but its widget bounds are the strip itself, so a
+        // popover anchored here lands just below the pills.
+        popover.set_parent(&ui.tab_bar);
 
         let app = self.clone();
         let popover_for_commit = popover.clone();
@@ -1036,6 +1111,24 @@ impl App {
         self.sidebar.select_row(Some(&ui.sidebar_row));
         drop(projects);
         *self.active_project_id.borrow_mut() = project_id;
+        // M9.5: clicking a project shouldn't leave focus on the
+        // sidebar row — the user wants to type into the terminal
+        // immediately, not navigate the project list. Hand focus to
+        // the active tab's TerminalView. Matches Mac UI behaviour
+        // (`selectProject(id:)` ends with `terminalView.window?.makeFirstResponder`).
+        self.focus_active_terminal();
+    }
+
+    /// Move keyboard focus to the active project's active tab's
+    /// TerminalView. No-op if there is no active tab (e.g. the
+    /// workspace just emptied). Used by `set_active_project`,
+    /// `commit_rename_project`, `cancel_rename_project` and the
+    /// post-attach hook so post-chrome-interaction the user can
+    /// resume typing without an extra mouse click.
+    fn focus_active_terminal(self: &Rc<Self>) {
+        if let Some(view) = self.active_terminal_view() {
+            view.widget().grab_focus();
+        }
     }
 
     /// Recompute the headerbar subtitle from the active project's
@@ -1063,6 +1156,16 @@ impl App {
             .spawn(async move { client.open_tab(project_id, &cwd, 80, 24).await })
             .await
             .context("open_tab join")??;
+        // Optimistic attach: needed because bootstrap calls this
+        // BEFORE WatchEvents subscribes, so the daemon's
+        // TabOpenedEvent for this RPC has no subscriber yet.
+        // `attach_existing_tab` dedupes against the WatchEvents
+        // replay via the `ProjectUi.pending_attaches` set —
+        // inserted synchronously at the top of the attach path,
+        // removed once the async session resolves. The set closes
+        // the race window where the optimistic attach + the
+        // WatchEvents arm would both spawn StreamPty sessions for
+        // the same tab.
         self.attach_existing_tab(tab);
         Ok(())
     }
@@ -1080,9 +1183,19 @@ impl App {
             );
             return;
         };
-        if ui.tabs.borrow().contains_key(&tab.id) {
+        // M9.5: synchronously dedupe against BOTH the live tabs map
+        // AND the pending-attach set. The async TabSession::spawn
+        // below doesn't populate `ui.tabs` until it resolves, so a
+        // bare `tabs.contains_key` check race-passes when Cmd+T's
+        // optimistic attach + WatchEvents TabOpened both fire for
+        // the same tab. Inserting into `pending_attaches` here
+        // (synchronous, before the await) closes the race — the
+        // second caller sees the marker and returns.
+        if is_already_attached_or_pending(&ui.tabs.borrow(), &ui.pending_attaches.borrow(), tab.id)
+        {
             return;
         }
+        ui.pending_attaches.borrow_mut().insert(tab.id);
         // Use the *live* font size (post-FontIncrease/Decrease) so a
         // tab opened after the user has zoomed in matches the
         // existing tabs, rather than snapping back to the config
@@ -1124,15 +1237,48 @@ impl App {
         let project_id = tab.project_id;
         let terminal_for_drain = terminal.clone();
         let tab_cwd = tab.cwd.clone();
+        let page_for_cleanup = page.clone();
         glib::spawn_future_local(async move {
+            // Helper that clears the pending-attach marker AND tears
+            // down the orphaned AdwTabPage on failure. Without the
+            // page teardown, a failed attach would leave a dead pill
+            // in the TabView with no session backing it. Without
+            // clearing the pending marker, the id would be
+            // permanently dedupe'd and the next user attempt would
+            // be silently dropped.
+            let fail_cleanup = || {
+                let projects = app_for_attach.projects.borrow();
+                if let Some(ui) = projects.get(&project_id) {
+                    ui.pending_attaches.borrow_mut().remove(&tab_id);
+                    // Mark the tab as server-driven so the close-page
+                    // signal handler skips the CloseTab RPC. The
+                    // daemon still has the tab — we're only tearing
+                    // down the orphaned UI page after a local
+                    // StreamPty attach failure (transient daemon
+                    // hiccup, resource limit). Sending CloseTab here
+                    // would let a recoverable failure nuke persisted
+                    // daemon state. CodeRabbit caught this on PR #64.
+                    app_for_attach
+                        .server_driven_closes
+                        .borrow_mut()
+                        .insert(tab_id);
+                    // libadwaita's internal `page_belongs_to_this_view`
+                    // check handles the case where the page is already
+                    // gone; calling close_page on a stranger is a
+                    // silent no-op.
+                    ui.tab_view.close_page(&page_for_cleanup);
+                }
+            };
             let session = match session_handle.await {
                 Ok(Ok(s)) => Rc::new(s),
                 Ok(Err(err)) => {
                     tracing::warn!(?err, tab_id, "StreamPty spawn failed");
+                    fail_cleanup();
                     return;
                 }
                 Err(join_err) => {
                     tracing::warn!(?join_err, tab_id, "StreamPty join failed");
+                    fail_cleanup();
                     return;
                 }
             };
@@ -1142,6 +1288,10 @@ impl App {
             });
             let projects = app_for_attach.projects.borrow();
             if let Some(ui) = projects.get(&project_id) {
+                // Clear the pending marker *before* inserting the real
+                // entry into `tabs` so the dedupe guard's next-call
+                // semantics flip cleanly: "in flight" → "live".
+                ui.pending_attaches.borrow_mut().remove(&tab_id);
                 ui.tabs.borrow_mut().insert(
                     tab_id,
                     TabUi {
@@ -1171,6 +1321,7 @@ impl App {
             // `vt_write` unchanged so libghostty owns the rendering
             // state.
             let app_for_osc = app_for_attach.clone();
+            let app_for_exit = app_for_attach.clone();
             glib::spawn_future_local(async move {
                 let mut scanner = roost_osc::OscScanner::new();
                 while let Some(msg) = output_rx.recv().await {
@@ -1183,11 +1334,46 @@ impl App {
                             terminal_for_drain.vt_write(&data);
                         }
                         TabOutput::Exit { status, reason } => {
-                            tracing::info!(status, %reason, "PTY exited");
+                            tracing::info!(tab_id, status, %reason, "PTY exited");
+                            // M9.5: close the page directly from the
+                            // drain task on PTY exit. Mirrors the Go
+                            // binary's `sess.onPTYExit = func() {
+                            // view.ClosePage(page) }` pattern — a
+                            // unified close path through the
+                            // close-page signal handler instead of
+                            // round-tripping through the daemon's
+                            // TabDeletedEvent. The
+                            // `connect_close_page` handler installed
+                            // in `add_project_ui` does the actual
+                            // removal + CloseTab RPC.
+                            //
+                            // Deferred via `idle_add_local_once` so
+                            // the close_page emission lands on a
+                            // fresh main-loop iteration, outside the
+                            // current `spawn_future_local` poll —
+                            // GTK signal dispatch from inside an
+                            // in-flight future was where the previous
+                            // implementation (close_page in
+                            // TabDeleted handler) silently failed to
+                            // fire the close-page signal.
+                            let app = app_for_exit.clone();
+                            glib::idle_add_local_once(move || {
+                                app.close_page_for_tab(project_id, tab_id);
+                            });
                             break;
                         }
                         TabOutput::Error(reason) => {
                             tracing::warn!(reason, "PTY stream error");
+                            // Same close-on-stream-error path. The
+                            // error usually means the daemon dropped
+                            // the StreamPty — no live PTY to close
+                            // remotely, but we still need to remove
+                            // the UI page so the user isn't left
+                            // looking at a dead tab.
+                            let app = app_for_exit.clone();
+                            glib::idle_add_local_once(move || {
+                                app.close_page_for_tab(project_id, tab_id);
+                            });
                             break;
                         }
                     }
@@ -1251,7 +1437,7 @@ impl App {
                 // this on PR #63.
                 let was_active = *self.active_project_id.borrow() == d.project_id;
                 if was_active {
-                    let fallback = projects.keys().copied().min();
+                    let fallback = pick_next_active_project(&projects);
                     drop(projects);
                     match fallback {
                         Some(pid) => {
@@ -1264,6 +1450,18 @@ impl App {
                             *self.active_project_id.borrow_mut() = 0;
                             self.window_title.set_title("Roost");
                             self.window_title.set_subtitle("");
+                            // M9.5: workspace is empty — close the
+                            // window. Matches the Mac UI's M5 cascade
+                            // and the Go binary's
+                            // `len(a.projectViews) == 0 → win.Close()`
+                            // (cmd/roost/app.go). libadwaita's default
+                            // `applicationShouldTerminateAfterLastWindowClosed`
+                            // shape means closing the only window
+                            // also exits the application, so the user
+                            // typing `exit` in their last visible tab
+                            // ends the GTK session — parity with the
+                            // other two UIs.
+                            self.window.close();
                         }
                     }
                 }
@@ -1274,12 +1472,57 @@ impl App {
                 }
             }
             EventKind::TabDeleted(d) => {
+                tracing::debug!(tab_id = d.tab_id, "TabDeleted event");
+                // M9.5: the AdwTabView page removal happens in the
+                // PTY-exit drain (calls `close_page_for_tab` →
+                // `tab_view.close_page` → close-page signal →
+                // handler runs close_page_finish + CloseTab RPC).
+                // By the time this event arrives, the page is either
+                // already gone (us being the originator) or owned by
+                // another client (cross-client convergence path).
+                //
+                // For cross-client convergence: another client's
+                // CLI `tab close` or X click fires CloseTab on the
+                // daemon, daemon broadcasts TabDeleted, we receive
+                // it here, our page is still around, we close it.
+                //
+                // For the originator path: our drain already closed
+                // the page; `ui.tabs` no longer has the entry; the
+                // close-page handler removed it. This arm becomes
+                // a no-op then.
                 let projects = self.projects.borrow();
-                for ui in projects.values() {
-                    let mut tabs = ui.tabs.borrow_mut();
-                    if let Some(tab_ui) = tabs.remove(&d.tab_id) {
-                        ui.tab_view.close_page(&tab_ui.page);
+                let mut found = false;
+                for (_project_id, ui) in projects.iter() {
+                    let still_has_entry = ui.tabs.borrow().contains_key(&d.tab_id);
+                    if still_has_entry {
+                        found = true;
+                        // Cross-client: mark as server-driven so the
+                        // resulting close-page handler skips the
+                        // redundant CloseTab RPC, then route through
+                        // the same `close_page` pathway as the local
+                        // PTY-exit case.
+                        self.server_driven_closes.borrow_mut().insert(d.tab_id);
+                        let page = ui.tabs.borrow().get(&d.tab_id).map(|t| t.page.clone());
+                        let tab_view = ui.tab_view.clone();
+                        if let Some(page) = page {
+                            // No `page.parent()` gating — AdwTabPage's
+                            // parent() doesn't reliably report
+                            // "still in the view", so the previous
+                            // guard misleadingly skipped real closes.
+                            // libadwaita's internal `page_belongs_to_this_view`
+                            // check inside `adw_tab_view_close_page`
+                            // handles dedupe if the page is genuinely
+                            // gone.
+                            tab_view.close_page(&page);
+                        }
+                        break;
                     }
+                }
+                if !found {
+                    tracing::debug!(
+                        tab_id = d.tab_id,
+                        "TabDeleted: no UI mapping (already closed locally or unknown id)"
+                    );
                 }
             }
             EventKind::TabTitle(t) => {
@@ -1463,6 +1706,17 @@ impl App {
 
         let controller = gtk4::ShortcutController::new();
         controller.set_scope(gtk4::ShortcutScope::Global);
+        // M9.5: fire shortcuts during the CAPTURE phase so they get
+        // first crack at the keystroke, BEFORE the focused
+        // TerminalView's `EventControllerKey` consumes it. Default
+        // is Bubble (post-widget), which let `Cmd+N` flow through
+        // libghostty's key encoder into the PTY as a Kitty-protocol
+        // escape sequence — the shell rendered the sequence as
+        // garbled text and the keybind never fired. Matches the
+        // Mac UI's `NSMenu performKeyEquivalent` priority (menu
+        // fires before responder chain) and the Go binary's same
+        // pattern on its window-scoped ShortcutController.
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
         for (accel, action) in bindings {
             let trigger = build_shortcut_trigger(&accel);
@@ -1700,10 +1954,26 @@ impl App {
             .spawn(async move { client.create_project("", &cwd_owned).await })
             .await
             .context("create_project join")??;
-        // WatchEvents will also deliver ProjectCreated; the
-        // `add_project_ui` idempotent check prevents duplicate rows.
+        // Race note: WatchEvents will also deliver ProjectCreated and
+        // call `add_project_ui` from `handle_event`. Calling it here
+        // optimistically is safe — unlike `attach_existing_tab` (which
+        // checks `ui.tabs` before an *async* StreamPty spawn that
+        // populates the map), `add_project_ui` is synchronous and
+        // dedupes at the top via `projects.contains_key(&id)` *before*
+        // any widget construction. The second caller hits the guard
+        // and returns cleanly. We keep the optimistic call here for
+        // the UX: `set_active_project(project.id)` selects the new
+        // project immediately on RPC return, rather than waiting for
+        // the WatchEvents round-trip (which doesn't itself flip the
+        // active selection).
         self.add_project_ui(&project);
         self.set_active_project(project.id);
+        // M9.5: seed the new project with a default tab so the user
+        // lands inside a shell. Mac UI + Go binary do this same
+        // dance — clicking "+ Project" with no follow-up never
+        // makes sense, and a bare project with no tabs renders an
+        // empty terminal pane (the bug reported).
+        self.open_new_tab_in(project.id).await?;
         Ok(())
     }
 
@@ -1790,18 +2060,42 @@ impl App {
         self.window.present();
     }
 
-    /// Fire CloseTab on the daemon for the given tab. Async so we
-    /// don't block the GTK main loop.
+    /// M9.5: close an AdwTabPage by tab id. Routes through the
+    /// `tab_view.close_page` → close-page signal handler set up in
+    /// `add_project_ui`, which performs the actual page removal +
+    /// the CloseTab RPC. Used by the PTY-exit drain (shell typed
+    /// `exit` or process died) and by the cross-client TabDeleted
+    /// handler. Called via `glib::idle_add_local_once` from the
+    /// drain so the close_page emission lands on a fresh main-loop
+    /// iteration, outside the in-flight `spawn_future_local`.
+    fn close_page_for_tab(self: &Rc<Self>, project_id: i64, tab_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        // Snapshot the page + tab_view out of the borrow so the
+        // close_page call below can fire the close-page signal
+        // synchronously without us holding any borrow on App state.
+        let page = ui.tabs.borrow().get(&tab_id).map(|t| t.page.clone());
+        let tab_view = ui.tab_view.clone();
+        drop(projects);
+        if let Some(page) = page {
+            tracing::debug!(project_id, tab_id, "close_page_for_tab");
+            tab_view.close_page(&page);
+        }
+    }
+
+    /// Fire `CloseTab` on the daemon for `tab_id`. Async so we don't
+    /// block the GTK main loop.
     ///
     /// `NotFound` is treated as an expected race: when the daemon
     /// cascade-deletes a tab (M5 shell-exit cascade, project delete,
-    /// CLI `tab close`), the resulting `TabDeletedEvent` lands in
-    /// `handle_event::TabDeleted` which calls `tab_view.close_page`
-    /// → which fires the `close-page` signal → which invokes this
-    /// method. By that time the daemon-side tab is already gone, so
-    /// the RPC's `NotFound` is the expected steady state, not a bug
-    /// to log. Other status codes (Internal, FailedPrecondition,
-    /// etc.) still surface as warnings.
+    /// CLI `tab close`, another client's close), the resulting
+    /// `TabDeletedEvent` may race this RPC. By the time the RPC
+    /// lands, the daemon-side tab is already gone, so `NotFound` is
+    /// the expected steady state, not a bug to log. Other status
+    /// codes (Internal, FailedPrecondition, etc.) still surface as
+    /// warnings.
     fn close_tab_async(self: &Rc<Self>, _project_id: i64, tab_id: i64) {
         let Some(mut client) = self.client.borrow().clone() else {
             return;
@@ -1911,6 +2205,39 @@ fn tilde_abbreviate_with_home(path: &str, home: &str) -> String {
     path.to_string()
 }
 
+/// M9.5 dedupe rule for `attach_existing_tab`: skip the spawn if
+/// the tab id is already either fully attached (`tabs`) or
+/// in-flight (`pending_attaches`). The pending set covers the
+/// async window between the optimistic RPC-return attach and the
+/// WatchEvents `TabOpened` arm — without it, both paths
+/// race-pass the `tabs.contains_key` check and double-spawn.
+fn is_already_attached_or_pending<T>(
+    tabs: &HashMap<i64, T>,
+    pending: &HashSet<i64>,
+    tab_id: i64,
+) -> bool {
+    tabs.contains_key(&tab_id) || pending.contains(&tab_id)
+}
+
+/// M9.5 cascade rule for `ProjectDeleted`: when the active
+/// project was the one deleted, the lowest-id remaining project
+/// becomes active. Returns `None` when the workspace is empty
+/// (caller closes the window). Lowest-id (not last-active, not
+/// random) so the choice is deterministic across UI clients.
+fn pick_next_active_project<T>(projects: &HashMap<i64, T>) -> Option<i64> {
+    projects.keys().copied().min()
+}
+
+/// M9.5 one-shot test-and-drain for the server-driven-close
+/// marker. Returns true if the marker was set (caller should
+/// skip the CloseTab RPC); also clears the marker so a second
+/// close attempt without re-insertion WILL send the RPC. The
+/// drain semantics matter — a leftover marker would silently
+/// swallow a legitimate user-driven close.
+fn drain_server_driven_marker(set: &RefCell<HashSet<i64>>, tab_id: i64) -> bool {
+    set.borrow_mut().remove(&tab_id)
+}
+
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
@@ -1955,7 +2282,12 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 
 #[cfg(test)]
 mod tests {
-    use super::tilde_abbreviate_with_home;
+    use super::{
+        drain_server_driven_marker, is_already_attached_or_pending, pick_next_active_project,
+        tilde_abbreviate_with_home,
+    };
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
 
     /// `tilde_abbreviate_with_home` is the headerbar-subtitle (M2)
     /// helper that also powers the OSC 7 tab-pill label. Keep its
@@ -1982,5 +2314,82 @@ mod tests {
             tilde_abbreviate_with_home("/Users/testbed", home),
             "/Users/testbed"
         );
+    }
+
+    /// `is_already_attached_or_pending` is the dedupe rule that
+    /// guards `attach_existing_tab` against the M9.5 Cmd+T
+    /// double-spawn race. Pin the EITHER/OR semantics so a future
+    /// "optimisation" that drops one of the two checks regresses
+    /// the race fix.
+    #[test]
+    fn dedupe_skips_when_already_attached_or_pending() {
+        let mut tabs: HashMap<i64, ()> = HashMap::new();
+        let mut pending: HashSet<i64> = HashSet::new();
+
+        // Neither set contains the id → don't skip (proceed to spawn).
+        assert!(!is_already_attached_or_pending(&tabs, &pending, 7));
+
+        // Live tab → skip.
+        tabs.insert(7, ());
+        assert!(is_already_attached_or_pending(&tabs, &pending, 7));
+        tabs.clear();
+
+        // In-flight tab (between the optimistic attach and
+        // session_handle.await resolving) → skip.
+        pending.insert(7);
+        assert!(is_already_attached_or_pending(&tabs, &pending, 7));
+
+        // Belt-and-braces: both sets carrying the id → skip.
+        tabs.insert(7, ());
+        assert!(is_already_attached_or_pending(&tabs, &pending, 7));
+
+        // Unrelated id → don't skip.
+        assert!(!is_already_attached_or_pending(&tabs, &pending, 99));
+    }
+
+    /// `pick_next_active_project` encodes the M9.5 cascade rule:
+    /// lowest remaining id when the active project was deleted,
+    /// `None` when the workspace is empty (caller closes the
+    /// window). Pin "lowest id" so a future change to "last
+    /// active" or "random" breaks loudly.
+    #[test]
+    fn next_active_picks_lowest_id_or_none_when_empty() {
+        let empty: HashMap<i64, ()> = HashMap::new();
+        assert_eq!(pick_next_active_project(&empty), None);
+
+        let mut projects: HashMap<i64, ()> = HashMap::new();
+        projects.insert(3, ());
+        projects.insert(7, ());
+        projects.insert(2, ());
+        assert_eq!(pick_next_active_project(&projects), Some(2));
+
+        let mut single: HashMap<i64, ()> = HashMap::new();
+        single.insert(42, ());
+        assert_eq!(pick_next_active_project(&single), Some(42));
+    }
+
+    /// `drain_server_driven_marker` is one-shot: it returns
+    /// whether the marker was present AND clears it. A leftover
+    /// marker would silently swallow the next user-driven close
+    /// (× button or Cmd+W). Also pins that an unrelated id
+    /// doesn't return true — that would skip a legitimate RPC.
+    #[test]
+    fn server_driven_marker_drains_on_first_check() {
+        let set: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
+        set.borrow_mut().insert(5);
+
+        // First check: marker present, returns true, drains.
+        assert!(drain_server_driven_marker(&set, 5));
+        assert!(!set.borrow().contains(&5));
+
+        // Second check on the same id: marker gone, returns
+        // false — caller now correctly sends the CloseTab RPC.
+        assert!(!drain_server_driven_marker(&set, 5));
+
+        // Unrelated id: never present, returns false.
+        set.borrow_mut().insert(5);
+        assert!(!drain_server_driven_marker(&set, 99));
+        // The unrelated query didn't drain the real marker.
+        assert!(set.borrow().contains(&5));
     }
 }
