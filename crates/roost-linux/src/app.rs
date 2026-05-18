@@ -6,11 +6,14 @@
 //! one per project, swapped when the sidebar selection changes.
 //! Mirrors the Go binary's `cmd/roost/app.go` widget tree shape.
 //!
-//! Reorder is wired RPC-side via commit 3 (ReorderTabs /
-//! ReorderProjects); the gtk4-rs drag-source / drop-target hookups
-//! land in a follow-up commit. Today the Linux UI converges via
-//! WatchEvents whenever any client (CLI, Mac, or another Linux UI)
-//! calls the reorder RPCs.
+//! M10: drag-to-reorder. Sidebar uses `gtk::DragSource` per row +
+//! a single `gtk::DropTarget` on the listbox; motion live-shuffles
+//! rows under the cursor, drop fires `ReorderProjects`. Tab pills
+//! ride AdwTabBar's built-in drag — we just observe
+//! `connect_page_reordered` and fire `ReorderTabs`. All ordering is
+//! daemon-authoritative: drop persists, then the WatchEvents
+//! `Projects/TabsReordered` arm re-applies the canonical order so
+//! cross-client UIs converge.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -143,6 +146,22 @@ pub struct App {
     /// calling `close_page`, check + remove in the close-page
     /// handler to skip the redundant RPC.
     server_driven_closes: RefCell<HashSet<i64>>,
+    /// M10: project id of the row currently being dragged (`None`
+    /// when no drag is in progress). Read by the sidebar drop
+    /// target's motion handler to know which row to live-shuffle.
+    /// Set in the drag-source's drag-begin, cleared in drag-end.
+    dragged_project_id: RefCell<Option<i64>>,
+    /// M10: snapshot of the sidebar order taken at drag-begin.
+    /// Drag-end rolls back to this if the drop didn't persist
+    /// (drag cancelled outside the sidebar, or `ReorderProjects`
+    /// RPC failed). Mirrors the Go binary's `dragOriginalOrder`.
+    drag_original_order: RefCell<Vec<i64>>,
+    /// M10: set true once `ReorderProjects` persists (or a no-op
+    /// drop is acknowledged). Drag-end consults this to decide
+    /// whether to roll back. Distinct from `gdk::DragAction::MOVE`
+    /// completion since GTK's "drop succeeded" signal covers
+    /// transport, not our application-level persistence.
+    drop_occurred: RefCell<bool>,
 }
 
 /// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
@@ -359,7 +378,16 @@ impl App {
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
             server_driven_closes: RefCell::new(HashSet::new()),
+            dragged_project_id: RefCell::new(None),
+            drag_original_order: RefCell::new(Vec::new()),
+            drop_occurred: RefCell::new(false),
         });
+        // M10: a single drop target on the sidebar listbox owns the
+        // motion (live-shuffle) + drop (persist) handling for all
+        // project rows. Per-row drag sources are wired inside
+        // `add_project_ui`. Mirrors the Go binary's
+        // `installSidebarDropTarget` (cmd/roost/app.go:1011).
+        app_struct.install_sidebar_drop_target();
 
         // Sidebar row selection → switch active project.
         sidebar.connect_row_selected({
@@ -680,6 +708,10 @@ impl App {
         row.set_child(Some(&name_stack));
         row.set_widget_name(&format!("project-{}", project.id));
         self.sidebar.append(&row);
+        // M10: wire the drag-source so this row can be picked up
+        // and reordered. The matching listbox-level drop target
+        // is installed once in App::new.
+        self.install_row_drag_source(&row, project.id);
 
         // M9: commit the rename on Enter. WatchEvents
         // `ProjectRenamedEvent` is the authoritative state — we
@@ -777,6 +809,27 @@ impl App {
                     }
                 }
                 glib::Propagation::Stop
+            }
+        });
+        // M10: AdwTabBar handles the drag UX itself (built-in
+        // GTK4 capability). We just listen for the completed
+        // reorder and fire `ReorderTabs` RPC so the daemon
+        // persists the new order; the WatchEvents `TabsReordered`
+        // arm handles cross-client convergence. Mirrors the Go
+        // binary's `persistTabOrder` (cmd/roost/app.go:1061).
+        tab_view.connect_page_reordered({
+            let app = self.clone();
+            let project_id = project.id;
+            move |tv, _moved_page, _new_idx| {
+                let n = tv.n_pages();
+                let mut ordered = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    let page = tv.nth_page(i);
+                    if let Some(tab_id) = parse_tab_id_from_page(&page) {
+                        ordered.push(tab_id);
+                    }
+                }
+                app.reorder_tabs_async(project_id, ordered);
             }
         });
         // Switching tabs within a project updates the headerbar
@@ -1549,12 +1602,16 @@ impl App {
                     }
                 }
             }
-            EventKind::ProjectsReordered(_r) => {
-                // Sidebar row order rebuild. Cheap to defer to
-                // commit 11's polish pass when the row widgets get a
-                // dedicated `ProjectRow` type. Today the order
-                // matters less because there's no drag-source on the
-                // sidebar yet.
+            EventKind::ProjectsReordered(r) => {
+                // M10: apply the daemon's authoritative project
+                // order. Idempotent if our local listbox already
+                // matches (selection-sort no-op). Fires on:
+                //   - our own drag-drop persisting (we already
+                //     have the right order; this is a confirm),
+                //   - a CLI or sibling-UI calling ReorderProjects,
+                //   - a server-side cascade (none today, but the
+                //     invariant is the same).
+                self.apply_sidebar_order(&r.project_ids);
             }
             EventKind::TabCwd(c) => {
                 let projects = self.projects.borrow();
@@ -2119,6 +2176,264 @@ impl App {
             }
         });
     }
+
+    /// M10: read the current visual order of project ids by
+    /// walking the sidebar's rows. Each row's `widget_name` is
+    /// `"project-<id>"` (set in `add_project_ui`). Mirrors the Go
+    /// binary's `sidebarOrder` (cmd/roost/app.go:989).
+    fn sidebar_order(&self) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut i: i32 = 0;
+        while let Some(row) = self.sidebar.row_at_index(i) {
+            if let Some(rest) = row.widget_name().strip_prefix("project-") {
+                if let Ok(id) = rest.parse::<i64>() {
+                    ids.push(id);
+                }
+            }
+            i += 1;
+        }
+        ids
+    }
+
+    /// M10: rebuild the sidebar listbox so rows match `ordered_ids`.
+    /// Selection-sort: walks the target and remove/inserts any
+    /// out-of-place row. Active selection is restored at the end
+    /// (Remove clears selection in SelectionBrowse mode, which
+    /// would otherwise jump the active project mid-rebuild).
+    /// Used on rollback (drag cancelled) and on inbound
+    /// `ProjectsReordered` events. Verbatim port of the Go
+    /// binary's `applySidebarOrder` (cmd/roost/app.go:957).
+    fn apply_sidebar_order(self: &Rc<Self>, ordered_ids: &[i64]) {
+        let prev_active = *self.active_project_id.borrow();
+        let projects = self.projects.borrow();
+        for (i, id) in ordered_ids.iter().enumerate() {
+            let Some(ui) = projects.get(id) else { continue };
+            if ui.sidebar_row.index() != i as i32 {
+                self.sidebar.remove(&ui.sidebar_row);
+                self.sidebar.insert(&ui.sidebar_row, i as i32);
+            }
+        }
+        if let Some(ui) = projects.get(&prev_active) {
+            self.sidebar.select_row(Some(&ui.sidebar_row));
+        }
+    }
+
+    /// M10: live-shuffle the dragged row toward `raw_target_idx`
+    /// during drag-motion. Pure visual feedback; persistence
+    /// happens later in the drop handler. No-op when the drop
+    /// would land on the source's own slot. Mirrors the Go
+    /// binary's `shuffleSidebarToward` (cmd/roost/app.go:907).
+    fn shuffle_sidebar_toward(self: &Rc<Self>, src_id: i64, raw_target_idx: usize) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&src_id) else {
+            return;
+        };
+        let source_idx = ui.sidebar_row.index();
+        if source_idx < 0 {
+            return;
+        }
+        let Some(insert_idx) = compute_insert_idx(source_idx as usize, raw_target_idx) else {
+            return;
+        };
+        // Preserve active selection across the remove/insert.
+        // Removing the selected row clears selection in
+        // SelectionBrowse mode, which would otherwise switch
+        // projects when the user drags the active row.
+        let prev_active = *self.active_project_id.borrow();
+        self.sidebar.remove(&ui.sidebar_row);
+        self.sidebar.insert(&ui.sidebar_row, insert_idx as i32);
+        if let Some(active_ui) = projects.get(&prev_active) {
+            self.sidebar.select_row(Some(&active_ui.sidebar_row));
+        }
+    }
+
+    /// M10: turn a pointer y-coordinate (in the listbox's coord
+    /// space) into a raw insertion index for the visual order.
+    /// When the pointer is over a row, the index is the row's
+    /// index if y is above the row's midline, else row_index + 1.
+    /// When the pointer is in empty space below the last row, we
+    /// return the row count ("insert at end"). Mirrors the Go
+    /// binary's `rawTargetForY` (cmd/roost/app.go:1044).
+    fn raw_target_for_y(&self, y: f64) -> usize {
+        if let Some(row) = self.sidebar.row_at_y(y as i32) {
+            let mut idx = row.index();
+            if let Some(bounds) = row.compute_bounds(&self.sidebar) {
+                let mid = bounds.y() as f64 + bounds.height() as f64 / 2.0;
+                if y >= mid {
+                    idx += 1;
+                }
+            }
+            return idx.max(0) as usize;
+        }
+        self.sidebar_order().len()
+    }
+
+    /// M10: attach a `gtk::DragSource` to a project row so it can
+    /// be picked up. Dragged content is the project's int64 id.
+    /// Visual feedback: the source row dims to 40% opacity while
+    /// the drag is in flight (Go binary path; CSS `:drop(active)`
+    /// styling was unreliable in our environment so we set
+    /// opacity directly). The drop target on the listbox handles
+    /// motion + persistence; this side just publishes the
+    /// payload and tracks rollback snapshot.
+    fn install_row_drag_source(self: &Rc<Self>, row: &gtk4::ListBoxRow, project_id: i64) {
+        let src = gtk4::DragSource::new();
+        src.set_actions(gtk4::gdk::DragAction::MOVE);
+        // Suppress the drag while the user is renaming inline —
+        // the entry needs to keep focus + own mouse input. We
+        // detect "renaming" by checking the row's name-stack's
+        // visible child (set by M9's begin_rename_project).
+        let row_for_prepare = row.clone();
+        src.connect_prepare(move |_, _, _| {
+            if let Some(stack) = row_for_prepare
+                .child()
+                .and_then(|c| c.downcast::<gtk4::Stack>().ok())
+            {
+                if stack.visible_child_name().as_deref() == Some("entry") {
+                    return None;
+                }
+            }
+            Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
+                project_id,
+            )))
+        });
+        let row_for_begin = row.clone();
+        let app_for_begin = self.clone();
+        src.connect_drag_begin(move |_, _| {
+            row_for_begin.set_opacity(0.4);
+            *app_for_begin.dragged_project_id.borrow_mut() = Some(project_id);
+            *app_for_begin.drag_original_order.borrow_mut() = app_for_begin.sidebar_order();
+            *app_for_begin.drop_occurred.borrow_mut() = false;
+        });
+        let row_for_end = row.clone();
+        let app_for_end = self.clone();
+        src.connect_drag_end(move |_, _, _| {
+            row_for_end.set_opacity(1.0);
+            if !*app_for_end.drop_occurred.borrow() {
+                let snapshot = app_for_end.drag_original_order.borrow().clone();
+                app_for_end.apply_sidebar_order(&snapshot);
+            }
+            *app_for_end.dragged_project_id.borrow_mut() = None;
+            app_for_end.drag_original_order.borrow_mut().clear();
+            *app_for_end.drop_occurred.borrow_mut() = false;
+        });
+        row.add_controller(src);
+    }
+
+    /// M10: wire the listbox-level drop target. Motion live-
+    /// shuffles the dragged row to the insertion point implied
+    /// by the pointer y; drop persists the resulting order via
+    /// `ReorderProjects` RPC (or skips the write when the order
+    /// is unchanged). Rollback on RPC failure restores the
+    /// drag-begin snapshot. Called once from `App::new`.
+    fn install_sidebar_drop_target(self: &Rc<Self>) {
+        let dst = gtk4::DropTarget::new(glib::types::Type::I64, gtk4::gdk::DragAction::MOVE);
+        let app_for_motion = self.clone();
+        dst.connect_motion(move |_, _, y| {
+            if let Some(src_id) = *app_for_motion.dragged_project_id.borrow() {
+                let raw = app_for_motion.raw_target_for_y(y);
+                app_for_motion.shuffle_sidebar_toward(src_id, raw);
+            }
+            gtk4::gdk::DragAction::MOVE
+        });
+        let app_for_drop = self.clone();
+        dst.connect_drop(move |_, value, _, _| {
+            // The payload value is the project id we set in
+            // `connect_prepare`. We don't strictly need to read
+            // it here — the dragged id is also in
+            // `dragged_project_id` — but failing the type check
+            // is a quick way to reject foreign content (e.g. a
+            // file drop from the file manager).
+            if value.get::<i64>().is_err() {
+                return false;
+            }
+            let current = app_for_drop.sidebar_order();
+            let original = app_for_drop.drag_original_order.borrow().clone();
+            if current == original {
+                // Unchanged drop is still a successful drop —
+                // drag-end mustn't roll back.
+                *app_for_drop.drop_occurred.borrow_mut() = true;
+                return true;
+            }
+            // Mark as persisted optimistically; rollback below
+            // on RPC error reverts both the visual order AND
+            // clears the flag so the drag-end roll-back logic
+            // isn't double-fired.
+            *app_for_drop.drop_occurred.borrow_mut() = true;
+            app_for_drop.reorder_projects_async(current, original);
+            true
+        });
+        self.sidebar.add_controller(dst);
+    }
+
+    /// M10: fire `ReorderProjects` RPC. On error, roll the
+    /// sidebar back to `snapshot` so the visual order doesn't
+    /// diverge from the daemon's persisted order. Mirrors the
+    /// Go binary's drop handler error path
+    /// (cmd/roost/app.go:1028-1032). The double-spawn
+    /// (`glib::spawn_future_local` wrapping `rt.spawn`) bridges
+    /// the tokio gRPC future back to the GTK main loop so the
+    /// rollback runs on the right thread — same pattern as
+    /// `attach_existing_tab`.
+    fn reorder_projects_async(self: &Rc<Self>, ordered_ids: Vec<i64>, snapshot: Vec<i64>) {
+        let Some(mut client) = self.client.borrow().clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            let handle = rt.spawn(async move {
+                client
+                    .inner()
+                    .reorder_projects(tonic::Request::new(
+                        roost_proto::v1::ReorderProjectsRequest {
+                            project_ids: ordered_ids,
+                        },
+                    ))
+                    .await
+            });
+            match handle.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(?err, "ReorderProjects RPC failed");
+                    app.apply_sidebar_order(&snapshot);
+                }
+                Err(join_err) => {
+                    // Tokio task panic / cancellation. Rare, but
+                    // without the rollback the sidebar would stay
+                    // visually diverged from the daemon until the
+                    // next `ProjectsReordered` event arrives.
+                    tracing::warn!(?join_err, "ReorderProjects task join failed");
+                    app.apply_sidebar_order(&snapshot);
+                }
+            }
+        });
+    }
+
+    /// M10: fire `ReorderTabs` RPC. Fire-and-forget — on success
+    /// the daemon broadcasts `TabsReorderedEvent` and the
+    /// WatchEvents arm re-applies the order; on failure we log
+    /// and let the user retry. (AdwTabView's built-in drag
+    /// already completed the visual move; reverting it would be
+    /// jarring for a transient daemon hiccup.)
+    fn reorder_tabs_async(self: &Rc<Self>, project_id: i64, ordered_ids: Vec<i64>) {
+        let Some(mut client) = self.client.borrow().clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        rt.spawn(async move {
+            let res = client
+                .inner()
+                .reorder_tabs(tonic::Request::new(roost_proto::v1::ReorderTabsRequest {
+                    project_id,
+                    tab_ids: ordered_ids,
+                }))
+                .await;
+            if let Err(err) = res {
+                tracing::warn!(?err, project_id, "ReorderTabs RPC failed");
+            }
+        });
+    }
 }
 
 fn stack_name(project_id: i64) -> String {
@@ -2228,6 +2543,28 @@ fn pick_next_active_project<T>(projects: &HashMap<i64, T>) -> Option<i64> {
     projects.keys().copied().min()
 }
 
+/// M10 sidebar-reorder pure math. Given a source row sitting at
+/// `source_idx` and the user's desired insertion point in the
+/// *with-source* visual order (`raw_target_idx`), return the
+/// listbox `Insert` position the row should be moved to. Returns
+/// `None` when the move would be a no-op (the drag lands on the
+/// source's own slot — either side of itself). Off-by-one is
+/// load-bearing here: when `raw_target_idx > source_idx`, removing
+/// the source first shifts every later index down by one, so the
+/// insert position is `raw_target_idx - 1`. Verbatim port of the
+/// Go binary's `computeInsertIdx` (cmd/roost/app.go:936); the
+/// table-driven test below mirrors `TestComputeInsertIdx` in
+/// `cmd/roost/sidebar_reorder_test.go`.
+fn compute_insert_idx(source_idx: usize, raw_target_idx: usize) -> Option<usize> {
+    if raw_target_idx == source_idx || raw_target_idx == source_idx + 1 {
+        return None;
+    }
+    if raw_target_idx > source_idx {
+        return Some(raw_target_idx - 1);
+    }
+    Some(raw_target_idx)
+}
+
 /// M9.5 one-shot test-and-drain for the server-driven-close
 /// marker. Returns true if the marker was set (caller should
 /// skip the CloseTab RPC); also clears the marker so a second
@@ -2283,8 +2620,8 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_server_driven_marker, is_already_attached_or_pending, pick_next_active_project,
-        tilde_abbreviate_with_home,
+        compute_insert_idx, drain_server_driven_marker, is_already_attached_or_pending,
+        pick_next_active_project, tilde_abbreviate_with_home,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
@@ -2366,6 +2703,53 @@ mod tests {
         let mut single: HashMap<i64, ()> = HashMap::new();
         single.insert(42, ());
         assert_eq!(pick_next_active_project(&single), Some(42));
+    }
+
+    /// `compute_insert_idx` is the off-by-one math for sidebar
+    /// drag-reorder. The raw target index is computed with the
+    /// source row still in place; when we remove-then-insert
+    /// past the source, every index after the source shifts
+    /// down by one. Table mirrors the Go binary's
+    /// `TestComputeInsertIdx` (cmd/roost/sidebar_reorder_test.go)
+    /// — same source-position × raw-target matrix so the two
+    /// UIs stay byte-for-byte equivalent on the reorder math.
+    #[test]
+    fn compute_insert_idx_matches_go_table() {
+        // (source_idx, raw_target_idx, expected) where expected
+        // is `None` for a no-op or `Some(insert_idx)`.
+        let cases: &[(usize, usize, Option<usize>)] = &[
+            // Source at 0 in a list of 4. rawTarget covers 0..=4.
+            (0, 0, None),
+            (0, 1, None),
+            (0, 2, Some(1)),
+            (0, 3, Some(2)),
+            (0, 4, Some(3)),
+            // Source at 1.
+            (1, 0, Some(0)),
+            (1, 1, None),
+            (1, 2, None),
+            (1, 3, Some(2)),
+            (1, 4, Some(3)),
+            // Source at 2.
+            (2, 0, Some(0)),
+            (2, 1, Some(1)),
+            (2, 2, None),
+            (2, 3, None),
+            (2, 4, Some(3)),
+            // Source at 3 (last). Tail-drop is a no-op.
+            (3, 0, Some(0)),
+            (3, 1, Some(1)),
+            (3, 2, Some(2)),
+            (3, 3, None),
+            (3, 4, None),
+        ];
+        for &(src, raw, want) in cases {
+            let got = compute_insert_idx(src, raw);
+            assert_eq!(
+                got, want,
+                "compute_insert_idx(src={src}, raw={raw}) = {got:?}, want {want:?}"
+            );
+        }
     }
 
     /// `drain_server_driven_marker` is one-shot: it returns
