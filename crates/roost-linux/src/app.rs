@@ -27,6 +27,7 @@ use roost_common::default_socket_path;
 use roost_proto::v1::event::Kind as EventKind;
 use roost_proto::v1::{Project, Tab};
 
+use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::client::RoostClient;
 use crate::config::RoostConfig;
 use crate::events;
@@ -40,6 +41,19 @@ use crate::theme::Theme;
 struct ProjectUi {
     name: String,
     sidebar_row: gtk4::ListBoxRow,
+    /// M9: sidebar row's swap-target. Two children — a `gtk::Label`
+    /// (visible by default) and a `gtk::Entry` (rename-mode). M8's
+    /// context-menu Rename / `KeybindAction::RenameProject` /
+    /// double-click flip the visible child to the entry; Enter
+    /// commits via `RenameProject` RPC, Escape cancels.
+    sidebar_name_stack: gtk4::Stack,
+    /// Label child of `sidebar_name_stack`. Updated on
+    /// `ProjectRenamedEvent` and at project rename commit.
+    sidebar_label: gtk4::Label,
+    /// Entry child of `sidebar_name_stack`. Visible only during
+    /// inline rename. Populated with the current name when rename
+    /// starts; cleared on cancel/commit.
+    sidebar_entry: gtk4::Entry,
     tab_view: TabView,
     /// Tab id → (TerminalView, TabSession).
     tabs: RefCell<HashMap<i64, TabUi>>,
@@ -95,8 +109,17 @@ pub struct App {
     theme: Theme,
     /// Optional font-family override from config.
     font_family: Option<String>,
-    /// Optional font-size override from config (points).
+    /// Optional font-size override from config (points). Snapshot
+    /// of the value read at boot; the live size (with FontIncrease /
+    /// FontDecrease / FontReset adjustments) lives in
+    /// `current_font_size_pt`.
     font_size_pt: Option<f64>,
+    /// Live font size for the active session. Starts at
+    /// `font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT)` and shifts by
+    /// ±1 on each FontIncrease / FontDecrease; FontReset snaps back
+    /// to that baseline. Applied to every TerminalView via
+    /// `apply_font_size_to_all`.
+    current_font_size_pt: RefCell<f64>,
 }
 
 /// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
@@ -296,6 +319,7 @@ impl App {
             theme,
             font_family: cfg.font_family.clone(),
             font_size_pt: cfg.font_size,
+            current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
         });
 
         // Sidebar row selection → switch active project.
@@ -428,6 +452,58 @@ impl App {
                 }
             });
             app.add_action(&focus_action);
+
+            // M8: context-menu actions for sidebar rows. Detailed
+            // action syntax `app.rename-project(42)` carries the
+            // project id as the action target; the popover menu
+            // model constructs the detailed-name string.
+            let rename_action =
+                gtk4::gio::SimpleAction::new("rename-project", Some(&i64::static_variant_type()));
+            let app_for_rename = app_struct.clone();
+            rename_action.connect_activate(move |_, target| {
+                if let Some(pid) = target.and_then(|t| t.get::<i64>()) {
+                    app_for_rename.begin_rename_project(pid);
+                }
+            });
+            app.add_action(&rename_action);
+
+            let delete_action =
+                gtk4::gio::SimpleAction::new("delete-project", Some(&i64::static_variant_type()));
+            let app_for_delete = app_struct.clone();
+            delete_action.connect_activate(move |_, target| {
+                if let Some(pid) = target.and_then(|t| t.get::<i64>()) {
+                    app_for_delete.confirm_and_delete_project(pid);
+                }
+            });
+            app.add_action(&delete_action);
+
+            // M8: per-tab context menu actions (Rename / Close).
+            // Tab id is the action target.
+            let rename_tab_action =
+                gtk4::gio::SimpleAction::new("rename-tab", Some(&i64::static_variant_type()));
+            let app_for_rename_tab = app_struct.clone();
+            rename_tab_action.connect_activate(move |_, target| {
+                if let Some(tab_id) = target.and_then(|t| t.get::<i64>()) {
+                    // Resolve the tab's project_id by scanning.
+                    let project_id = app_for_rename_tab.project_for_tab(tab_id);
+                    if let Some(pid) = project_id {
+                        app_for_rename_tab.begin_rename_tab(pid, tab_id);
+                    }
+                }
+            });
+            app.add_action(&rename_tab_action);
+
+            let close_tab_action =
+                gtk4::gio::SimpleAction::new("close-tab", Some(&i64::static_variant_type()));
+            let app_for_close = app_struct.clone();
+            close_tab_action.connect_activate(move |_, target| {
+                if let Some(tab_id) = target.and_then(|t| t.get::<i64>()) {
+                    if let Some(pid) = app_for_close.project_for_tab(tab_id) {
+                        app_for_close.close_tab_async(pid, tab_id);
+                    }
+                }
+            });
+            app.add_action(&close_tab_action);
         }
 
         app_struct.window.present();
@@ -535,6 +611,10 @@ impl App {
         if projects.contains_key(&project.id) {
             return;
         }
+        // M9: row child is a `gtk::Stack` of [Label, Entry] so the
+        // M8 context menu / KeybindAction::RenameProject /
+        // double-click can flip to the entry without reparenting
+        // widgets at click time. Default visible child = label.
         let label = gtk4::Label::builder()
             .label(&project.name)
             .halign(gtk4::Align::Start)
@@ -543,10 +623,88 @@ impl App {
             .margin_start(12)
             .margin_end(12)
             .build();
+        let entry = gtk4::Entry::builder()
+            .margin_top(2)
+            .margin_bottom(2)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        let name_stack = gtk4::Stack::builder()
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .transition_duration(120)
+            .build();
+        name_stack.add_named(&label, Some("label"));
+        name_stack.add_named(&entry, Some("entry"));
+        name_stack.set_visible_child_name("label");
+
         let row = gtk4::ListBoxRow::new();
-        row.set_child(Some(&label));
+        row.set_child(Some(&name_stack));
         row.set_widget_name(&format!("project-{}", project.id));
         self.sidebar.append(&row);
+
+        // M9: commit the rename on Enter. WatchEvents
+        // `ProjectRenamedEvent` is the authoritative state — we
+        // fire the RPC and let the event update the label, so a
+        // concurrent CLI rename can't lose data.
+        entry.connect_activate({
+            let app = self.clone();
+            let project_id = project.id;
+            move |entry| {
+                let new_name = entry.text().to_string();
+                app.commit_rename_project(project_id, new_name);
+            }
+        });
+        // M9: Escape cancels inline rename. AdwTabView's Escape
+        // doesn't reach us; install a key controller on the entry.
+        let entry_keys = gtk4::EventControllerKey::new();
+        entry_keys.connect_key_pressed({
+            let app = self.clone();
+            let project_id = project.id;
+            move |_, key, _, _| {
+                if key == gtk4::gdk::Key::Escape {
+                    app.cancel_rename_project(project_id);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        entry.add_controller(entry_keys);
+
+        // M8: right-click → context menu (Rename / Delete). Plain
+        // `connect_button_press_event` isn't a thing in gtk4-rs;
+        // use a GestureClick configured for button 3.
+        let row_click = gtk4::GestureClick::builder()
+            .button(gtk4::gdk::BUTTON_SECONDARY)
+            .build();
+        row_click.connect_pressed({
+            let app = self.clone();
+            let project_id = project.id;
+            let row_weak = row.downgrade();
+            move |gesture, _n, x, y| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                let Some(row) = row_weak.upgrade() else {
+                    return;
+                };
+                app.show_project_context_menu(project_id, &row, x, y);
+            }
+        });
+        row.add_controller(row_click);
+
+        // M9: double-click also enters rename mode (matches the Go
+        // binary). Button 1 (primary) double-press.
+        let row_dblclick = gtk4::GestureClick::builder()
+            .button(gtk4::gdk::BUTTON_PRIMARY)
+            .build();
+        row_dblclick.connect_pressed({
+            let app = self.clone();
+            let project_id = project.id;
+            move |_, n, _, _| {
+                if n == 2 {
+                    app.begin_rename_project(project_id);
+                }
+            }
+        });
+        row.add_controller(row_dblclick);
 
         let tab_view = TabView::new();
         // Hook "close-page" so the daemon learns about the close,
@@ -575,8 +733,32 @@ impl App {
                 }
             }
         });
+        // M8: per-tab context menu (right-click a pill). AdwTabView
+        // calls `setup-menu` with the page being right-clicked (or
+        // `None` when the menu is being torn down) and expects us
+        // to populate `tab_view.menu_model()` via `set_menu_model`.
+        // The model uses detailed-action syntax to carry the tab id.
+        let initial_menu = build_tab_context_menu(0);
+        tab_view.set_menu_model(Some(&initial_menu));
+        tab_view.connect_setup_menu(move |tv, page| {
+            // `page == None` fires on close; nothing to do.
+            let Some(page) = page else { return };
+            if let Some(tab_id) = parse_tab_id_from_page(page) {
+                let model = build_tab_context_menu(tab_id);
+                tv.set_menu_model(Some(&model));
+            }
+        });
 
-        let tab_bar = libadwaita::TabBar::builder().view(&tab_view).build();
+        // `autohide(false)`: libadwaita defaults to hiding the tab bar
+        // when there's only one page (iOS-style minimal chrome). Both
+        // the Go GTK binary and the Mac UI always show the strip, so
+        // single-tab projects still get a visible tab pill + `×`
+        // close affordance. Without this, users see only the
+        // terminal area until a second tab is opened.
+        let tab_bar = libadwaita::TabBar::builder()
+            .view(&tab_view)
+            .autohide(false)
+            .build();
         let project_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         project_box.append(&tab_bar);
         project_box.append(&tab_view);
@@ -589,10 +771,249 @@ impl App {
             ProjectUi {
                 name: project.name.clone(),
                 sidebar_row: row,
+                sidebar_name_stack: name_stack,
+                sidebar_label: label,
+                sidebar_entry: entry,
                 tab_view,
                 tabs: RefCell::new(HashMap::new()),
             },
         );
+    }
+
+    // ----- M8 + M9: rename / delete project flow -------------------
+
+    /// Open the inline rename entry on `project_id`'s sidebar row.
+    /// Idempotent — calling while already in rename mode keeps the
+    /// entry visible and re-focuses it.
+    fn begin_rename_project(self: &Rc<Self>, project_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        ui.sidebar_entry.set_text(&ui.name);
+        ui.sidebar_name_stack.set_visible_child_name("entry");
+        ui.sidebar_entry.grab_focus();
+        ui.sidebar_entry.select_region(0, -1);
+    }
+
+    /// Cancel an in-progress inline rename — flip the Stack back to
+    /// the label, drop the entry text.
+    fn cancel_rename_project(self: &Rc<Self>, project_id: i64) {
+        let projects = self.projects.borrow();
+        if let Some(ui) = projects.get(&project_id) {
+            ui.sidebar_name_stack.set_visible_child_name("label");
+            ui.sidebar_entry.set_text("");
+        }
+    }
+
+    /// Commit a rename: fire `RenameProject` RPC and flip the Stack
+    /// back to the label. The label text updates via the
+    /// WatchEvents `ProjectRenamedEvent` arm, not optimistically —
+    /// keeps a single source of truth and matches the
+    /// cross-cutting "WatchEvents-only mutation" invariant in
+    /// `goal-linux-gtk-parity-2026-05-17.md`.
+    fn commit_rename_project(self: &Rc<Self>, project_id: i64, new_name: String) {
+        // Always flip back to label first so the user gets feedback
+        // even when the RPC is in flight.
+        let projects = self.projects.borrow();
+        if let Some(ui) = projects.get(&project_id) {
+            ui.sidebar_name_stack.set_visible_child_name("label");
+        }
+        drop(projects);
+        let trimmed = new_name.trim().to_string();
+        if trimmed.is_empty() {
+            return; // empty rename = no-op
+        }
+        let Some(mut client) = self.client.borrow().clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        rt.spawn(async move {
+            if let Err(err) = client
+                .inner()
+                .rename_project(tonic::Request::new(roost_proto::v1::RenameProjectRequest {
+                    project_id,
+                    name: trimmed,
+                }))
+                .await
+            {
+                tracing::warn!(?err, project_id, "RenameProject RPC failed");
+            }
+        });
+    }
+
+    /// Show the right-click context menu for a sidebar row at the
+    /// click coordinates. Two items: Rename (flips Stack to entry)
+    /// and Delete (pops `adw::AlertDialog`, then fires
+    /// `DeleteProject` on confirm).
+    fn show_project_context_menu(
+        self: &Rc<Self>,
+        project_id: i64,
+        row: &gtk4::ListBoxRow,
+        x: f64,
+        y: f64,
+    ) {
+        let menu = gtk4::gio::Menu::new();
+        menu.append(
+            Some("Rename"),
+            Some(&format!("app.rename-project({project_id})")),
+        );
+        menu.append(
+            Some("Delete"),
+            Some(&format!("app.delete-project({project_id})")),
+        );
+        let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(row);
+        popover.set_has_arrow(false);
+        let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover.set_pointing_to(Some(&rect));
+        // Ensure the popover is freed when dismissed (default popovers
+        // can leak references if their parent outlives them).
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+    }
+
+    /// Confirm + delete a project via `gtk::AlertDialog`. Confirmation
+    /// is required because DeleteProject cascades to delete every
+    /// tab in the project. `adw::AlertDialog` doesn't ship in
+    /// libadwaita 0.8 (added in 0.10); the gtk-4.10 alert dialog
+    /// covers the same surface area and lands in the same pixel
+    /// position.
+    fn confirm_and_delete_project(self: &Rc<Self>, project_id: i64) {
+        let name = self
+            .projects
+            .borrow()
+            .get(&project_id)
+            .map(|ui| ui.name.clone())
+            .unwrap_or_else(|| format!("project {project_id}"));
+        let dialog = gtk4::AlertDialog::builder()
+            .modal(true)
+            .message("Delete project?")
+            .detail(format!(
+                "“{name}” and all of its tabs will be deleted. This cannot be undone."
+            ))
+            .buttons(["Cancel", "Delete"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let app = self.clone();
+        let parent = self.window.clone();
+        dialog.choose(
+            Some(&parent),
+            None::<&gtk4::gio::Cancellable>,
+            move |result| {
+                match result {
+                    Ok(1) => {
+                        let Some(mut client) = app.client.borrow().clone() else {
+                            return;
+                        };
+                        let rt = app.rt.clone();
+                        rt.spawn(async move {
+                            if let Err(err) = client
+                                .inner()
+                                .delete_project(tonic::Request::new(
+                                    roost_proto::v1::DeleteProjectRequest { project_id },
+                                ))
+                                .await
+                            {
+                                tracing::warn!(?err, project_id, "DeleteProject RPC failed");
+                            }
+                        });
+                    }
+                    // Cancel (0), Dismissed, or any other result is
+                    // the happy abort path.
+                    _ => {}
+                }
+            },
+        );
+    }
+
+    // ----- M8 + M9: rename / close tab flow ------------------------
+
+    /// Open the inline rename popover for `(project_id, tab_id)`.
+    /// Inline rename for tabs uses a `gtk::Popover` pointing at the
+    /// tab pill (the Go binary's pattern) rather than `connect_setup_menu`
+    /// (which is the per-page context menu, not an inline-edit hook).
+    fn begin_rename_tab(self: &Rc<Self>, project_id: i64, tab_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let tabs = ui.tabs.borrow();
+        let Some(tab_ui) = tabs.get(&tab_id) else {
+            return;
+        };
+        let current_title = tab_ui.page.title().to_string();
+
+        // Select the target tab first. AdwTabView positions the
+        // popover above the currently-selected pill (the only
+        // pill-locating affordance the public API gives us), so if
+        // the rename was invoked from a background tab's context
+        // menu, the popover would otherwise float over the wrong
+        // pill while the RPC silently renames the background tab.
+        // CodeRabbit caught this on PR #63.
+        ui.tab_view.set_selected_page(&tab_ui.page);
+
+        let entry = gtk4::Entry::builder()
+            .text(&current_title)
+            .activates_default(true)
+            .build();
+        let popover = gtk4::Popover::builder().has_arrow(true).build();
+        popover.set_child(Some(&entry));
+        // Anchor the popover at the TabView — adw::TabView doesn't
+        // expose the individual pill widget, so the popover
+        // positions above whichever pill is currently selected,
+        // which after the `set_selected_page` call above is the
+        // tab being edited.
+        popover.set_parent(&ui.tab_view);
+
+        let app = self.clone();
+        let popover_for_commit = popover.clone();
+        entry.connect_activate(move |entry| {
+            let new_title = entry.text().to_string();
+            popover_for_commit.popdown();
+            app.commit_rename_tab(tab_id, new_title);
+        });
+        let popover_for_cancel = popover.clone();
+        let entry_keys = gtk4::EventControllerKey::new();
+        entry_keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Escape {
+                popover_for_cancel.popdown();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        entry.add_controller(entry_keys);
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    }
+
+    /// Commit a tab rename. Same one-way-data-flow rule as
+    /// `commit_rename_project`: fire `SetTabTitle` RPC, let the
+    /// WatchEvents `TabTitle` event update the page's title.
+    fn commit_rename_tab(self: &Rc<Self>, tab_id: i64, new_title: String) {
+        let trimmed = new_title.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(mut client) = self.client.borrow().clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        rt.spawn(async move {
+            if let Err(err) = client
+                .inner()
+                .set_tab_title(tonic::Request::new(roost_proto::v1::SetTabTitleRequest {
+                    tab_id,
+                    title: trimmed,
+                }))
+                .await
+            {
+                tracing::warn!(?err, tab_id, "SetTabTitle RPC failed");
+            }
+        });
     }
 
     /// Set the active project — show its TabView in the stack and
@@ -662,10 +1083,14 @@ impl App {
         if ui.tabs.borrow().contains_key(&tab.id) {
             return;
         }
+        // Use the *live* font size (post-FontIncrease/Decrease) so a
+        // tab opened after the user has zoomed in matches the
+        // existing tabs, rather than snapping back to the config
+        // baseline.
         let terminal = Rc::new(TerminalView::with_theme_and_font(
             self.theme.clone(),
             self.font_family.as_deref(),
-            self.font_size_pt,
+            Some(*self.current_font_size_pt.borrow()),
         ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
         let Some(mut client_for_session) = self.client.borrow().clone() else {
@@ -792,11 +1217,15 @@ impl App {
                 let mut projects = self.projects.borrow_mut();
                 if let Some(ui) = projects.get_mut(&r.project_id) {
                     ui.name = r.name.clone();
-                    if let Some(child) = ui.sidebar_row.child() {
-                        if let Some(label) = child.downcast_ref::<gtk4::Label>() {
-                            label.set_text(&r.name);
-                        }
-                    }
+                    // M9: update the Stack's label child directly
+                    // rather than hunting it through `sidebar_row.child()`.
+                    // If the user is currently mid-rename (Stack
+                    // showing the entry), the label text still
+                    // updates but the visible child stays on entry —
+                    // honours "do not clobber in-progress edits"
+                    // (per `goal-linux-gtk-parity-2026-05-17.md` M9
+                    // race-guard).
+                    ui.sidebar_label.set_text(&r.name);
                     if *self.active_project_id.borrow() == r.project_id {
                         self.window_title.set_title(&r.name);
                     }
@@ -812,6 +1241,31 @@ impl App {
                             .child_by_name(&stack_name(d.project_id))
                             .expect("tab stack child for project"),
                     );
+                }
+                // If the deleted project was the active one, follow-up
+                // actions (NewTab, RenameProject, DeleteProject) would
+                // keep targeting a dead id until some later Active
+                // event repaired it. Reset active selection here:
+                // pick the first remaining project, or clear to 0
+                // when the workspace is now empty. CodeRabbit caught
+                // this on PR #63.
+                let was_active = *self.active_project_id.borrow() == d.project_id;
+                if was_active {
+                    let fallback = projects.keys().copied().min();
+                    drop(projects);
+                    match fallback {
+                        Some(pid) => {
+                            // `set_active_project` short-circuits when
+                            // `active == requested`, so clear first.
+                            *self.active_project_id.borrow_mut() = 0;
+                            self.set_active_project(pid);
+                        }
+                        None => {
+                            *self.active_project_id.borrow_mut() = 0;
+                            self.window_title.set_title("Roost");
+                            self.window_title.set_subtitle("");
+                        }
+                    }
                 }
             }
             EventKind::TabOpened(opened) => {
@@ -1052,11 +1506,36 @@ impl App {
                     }
                 });
             }
+            KeybindAction::RenameProject => {
+                let pid = *self.active_project_id.borrow();
+                if pid != 0 {
+                    self.begin_rename_project(pid);
+                }
+            }
+            KeybindAction::RenameTab => {
+                let pid = *self.active_project_id.borrow();
+                if let Some(tab_id) = self.active_tab_id(pid) {
+                    self.begin_rename_tab(pid, tab_id);
+                }
+            }
+            KeybindAction::DeleteProject => {
+                let pid = *self.active_project_id.borrow();
+                if pid != 0 {
+                    self.confirm_and_delete_project(pid);
+                }
+            }
             KeybindAction::CycleTabPrev => self.cycle_tab(-1),
             KeybindAction::CycleTabNext => self.cycle_tab(1),
             KeybindAction::Copy => self.copy_active_selection(),
             KeybindAction::Paste => self.paste_into_active(),
             KeybindAction::ToggleSidebar => self.toggle_sidebar(),
+            KeybindAction::FontIncrease => self.adjust_font_size(1.0),
+            KeybindAction::FontDecrease => self.adjust_font_size(-1.0),
+            KeybindAction::FontReset => {
+                let baseline = self.font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT);
+                *self.current_font_size_pt.borrow_mut() = baseline;
+                self.apply_font_size_to_all(baseline);
+            }
             KeybindAction::SwitchProject(n) => self.switch_project_by_index(n as usize),
             KeybindAction::SwitchTab(n) => self.switch_tab_by_index(n as usize),
             KeybindAction::Unbind => {
@@ -1072,6 +1551,19 @@ impl App {
         let ui = projects.get(&project_id)?;
         let page = ui.tab_view.selected_page()?;
         parse_tab_id_from_page(&page)
+    }
+
+    /// Resolve a tab id to its parent project id by scanning. M8's
+    /// per-tab context-menu actions get the tab id from the action
+    /// target but need the project id to dispatch close / rename.
+    fn project_for_tab(self: &Rc<Self>, tab_id: i64) -> Option<i64> {
+        let projects = self.projects.borrow();
+        for (project_id, ui) in projects.iter() {
+            if ui.tabs.borrow().contains_key(&tab_id) {
+                return Some(*project_id);
+            }
+        }
+        None
     }
 
     fn cycle_tab(self: &Rc<Self>, delta: i32) {
@@ -1107,6 +1599,37 @@ impl App {
     fn paste_into_active(self: &Rc<Self>) {
         if let Some(view) = self.active_terminal_view() {
             view.paste_from_clipboard();
+        }
+    }
+
+    /// Shift the live font size by `delta` points (clamped to a
+    /// sane 6..72 range), then reapply to every TerminalView. The
+    /// daemon doesn't know or care about font size — it's purely
+    /// a UI concern — so no RPC fires.
+    fn adjust_font_size(self: &Rc<Self>, delta: f64) {
+        let mut size = self.current_font_size_pt.borrow_mut();
+        let new = (*size + delta).clamp(6.0, 72.0);
+        if (new - *size).abs() < 0.01 {
+            return;
+        }
+        *size = new;
+        let new = *size;
+        drop(size);
+        self.apply_font_size_to_all(new);
+    }
+
+    /// Push `size_pt` to every TerminalView in every project. Reuses
+    /// each view's existing `apply_font` path so cell metrics get
+    /// remeasured + a redraw is queued automatically.
+    fn apply_font_size_to_all(self: &Rc<Self>, size_pt: f64) {
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            let tabs = ui.tabs.borrow();
+            for tab_ui in tabs.values() {
+                tab_ui
+                    .view
+                    .apply_font(self.font_family.as_deref(), Some(size_pt));
+            }
         }
     }
 
@@ -1391,6 +1914,17 @@ fn tilde_abbreviate_with_home(path: &str, home: &str) -> String {
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
+}
+
+/// Build the per-tab right-click menu model (Rename / Close) with
+/// detailed action names carrying `tab_id` as the parameter. The
+/// resulting model is fed to `adw::TabView::set_menu_model` from
+/// `connect_setup_menu`.
+fn build_tab_context_menu(tab_id: i64) -> gtk4::gio::Menu {
+    let menu = gtk4::gio::Menu::new();
+    menu.append(Some("Rename"), Some(&format!("app.rename-tab({tab_id})")));
+    menu.append(Some("Close"), Some(&format!("app.close-tab({tab_id})")));
+    menu
 }
 
 /// Convert our `Accel` to a `gtk::ShortcutTrigger` that the GTK
