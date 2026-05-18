@@ -738,7 +738,16 @@ impl App {
             }
         });
 
-        let tab_bar = libadwaita::TabBar::builder().view(&tab_view).build();
+        // `autohide(false)`: libadwaita defaults to hiding the tab bar
+        // when there's only one page (iOS-style minimal chrome). Both
+        // the Go GTK binary and the Mac UI always show the strip, so
+        // single-tab projects still get a visible tab pill + `×`
+        // close affordance. Without this, users see only the
+        // terminal area until a second tab is opened.
+        let tab_bar = libadwaita::TabBar::builder()
+            .view(&tab_view)
+            .autohide(false)
+            .build();
         let project_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         project_box.append(&tab_bar);
         project_box.append(&tab_view);
