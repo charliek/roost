@@ -581,6 +581,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         projects.removeAll { $0.id == id }
     }
 
+    /// Append `snap` to `projects` and rebuild the sidebar unless a row
+    /// with the same id already exists. Insert-only — never replaces an
+    /// existing row; use `.projectRenamed` for in-place updates. Both
+    /// the optimistic `newProject` unary response and the `.projectCreated`
+    /// WatchEvents handler funnel through here so they can't insert
+    /// duplicate rows when they race (issue #57).
+    @MainActor
+    private func insertProjectLocallyIfMissing(_ snap: ProjectSnapshot) {
+        guard !projects.contains(where: { $0.id == snap.id }) else { return }
+        projects.append(snap)
+        rebuildSidebar()
+    }
+
     /// Dispatch one event from the WatchEvents stream. Anything not
     /// surfaced visually in M1 is logged and dropped — later
     /// milestones (M3 tab strip, Phase 6b notifications) light up
@@ -590,11 +603,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         switch kind {
         case .projectCreated(let e):
             let p = e.project
-            let snap = ProjectSnapshot(id: p.id, name: p.name, cwd: p.cwd)
-            if !projects.contains(where: { $0.id == snap.id }) {
-                projects.append(snap)
-                rebuildSidebar()
-            }
+            insertProjectLocallyIfMissing(ProjectSnapshot(id: p.id, name: p.name, cwd: p.cwd))
         case .projectRenamed(let e):
             if let idx = projects.firstIndex(where: { $0.id == e.projectID }) {
                 projects[idx] = ProjectSnapshot(
@@ -841,8 +850,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             let created = await createProject(socketPath: socketPath, name: "", cwd: "")
             await MainActor.run { [weak self] in
                 guard let self, let created else { return }
-                self.projects.append(created)
-                self.rebuildSidebar()
+                // MUST precede selectProject: selectProject ->
+                // openNewTab doesn't check list membership and will
+                // RPC OpenTab for a ghost id if the row isn't here yet.
+                self.insertProjectLocallyIfMissing(created)
                 self.selectProject(id: created.id)
             }
         }
