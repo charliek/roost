@@ -3,9 +3,37 @@
 **Set**: 2026-05-17
 **Owner**: Charlie Knudsen
 **Co-author / executor**: Claude (Opus 4.7)
-**Status**: ⏳ scoped, not started
+**Status**: ✅ closed — M1–M10 + M9.5 lifecycle hardening all merged on `feature/rust-port` by 2026-05-18. M11 (user-supplied theme overrides) explicitly dropped after the user confirmed bundled theme parity is sufficient.
 **Predecessors**: [`phase-7-linux-ui.md`](phase-7-linux-ui.md) (closed PR #50 squash `421b384`); [`phase-7-5-polish-and-gaps.md`](phase-7-5-polish-and-gaps.md) (this goal supersedes it — see "What's superseded vs carried forward" below).
-**Successor**: [`phase-8-bundling.md`](phase-8-bundling.md) — the gate for `feature/rust-port → main`. This goal doesn't block Phase 8 but should land before so the bundled DMG / AppImage ships with the parity-feeling Linux UI.
+**Successor**: [`goal-mac-parity-2026-05-18.md`](goal-mac-parity-2026-05-18.md) — the symmetric audit on the Mac Swift UI, then [`phase-8-bundling.md`](phase-8-bundling.md) for the `feature/rust-port → main` merge.
+
+## Closure summary (2026-05-18)
+
+All planned milestones either landed or were deliberately scoped out:
+
+| Milestone | Status | PR | Notes |
+|---|---|---|---|
+| M1 — PTY spawn fix + multi-project bootstrap attach | ✅ landed | #51-#56 (per-milestone series, merged into `feature/rust-port`) | Diagnosed as Workspace-open orphan-purge interaction; fix preserves M5 cascade. |
+| M2 — Window subtitle (live cwd via OSC 7) | ✅ landed | per-milestone PR | |
+| M3 — CSS port + sidebar visual baseline | ✅ landed | per-milestone PR | |
+| M4 — Sidebar footer `+ Project` button | ✅ landed | per-milestone PR | |
+| M5 — Headerbar buttons (folder picker, sidebar toggle, `+ Tab`) | ✅ landed | per-milestone PR | Embedded SVGs (no GResource); GLib log filter for cosmetic warning. |
+| M6 — Linux event handler completion | ✅ landed | per-milestone PR | Linux honors `ActiveChanged` / `HookActiveChanged` (Mac deliberately ignores these). |
+| M7 — Status indicator icons + sidebar rollup stripes | ✅ landed | per-milestone PR | Rollup priority: `NEEDS_INPUT > ERROR > RUNNING > IDLE > NONE`. |
+| M8 — Right-click context menus + new keybind actions | ✅ landed | #63 | Adds RenameProject/RenameTab/DeleteProject actions; `adw::AlertDialog` confirms. |
+| M9 — Inline rename via `gtk::Stack` + `gtk::Popover` | ✅ landed | #63 | WatchEvents-only mutation, no optimistic local writes. |
+| M9.5 — Lifecycle hardening (race fixes, focus polish, Go-parity chrome) | ✅ landed | #64 → squash `2029577` | Cmd+T double-spawn race, `exit`-doesn't-close, headerbar icons on dark theme, ForceDark scheme, focus return after rename. |
+| M10 — Drag-to-reorder (sidebar projects + tabs) | ✅ landed | #66 → squash `5768943` | Live-shuffle sidebar via `gtk::DragSource`/`DropTarget`; `connect_page_reordered` for tabs; `ProjectsReordered` event wired. |
+| M11 — User theme overrides | 🪦 dropped | — | All 7 bundled palettes already at parity in Linux UI; selection via `theme = <name>` in `config.conf` covers the actual use case. Mac and Go also lack user-supplied overrides. |
+
+**What's next for the rust-port branch:**
+
+1. **[Mac UI parity push](goal-mac-parity-2026-05-18.md)** — the Mac Swift UI predates the Linux parity work and lags on tab/sidebar drag-reorder, headerbar buttons, live cwd subtitle, inline rename, tab pill right-click, and sidebar rollup stripes. Audit findings + milestone plan live in that goal doc.
+2. **[Phase 8 bundling](phase-8-bundling.md)** — the merge-to-`main` gate. Mac DMG + Linux AppImage. Does not block on Mac parity, but the user wants both UIs polished before the bundled artifacts go out.
+
+---
+
+## Original goal (preserved for context)
 
 **Cross-cutting invariant (new, applies to every UI track)**: UI state mutations always reconcile through `WatchEvents`; UIs never speculate locally. The optimistic-append double-render that produced Mac issue [#57](https://github.com/charliek/roost/issues/57) is the canonical anti-pattern. Every milestone that mutates `projects` / `tabs` collections must follow this rule. The existing GTK attach-dedupe guard at `crates/roost-linux/src/app.rs::attach_existing_tab` (`if tabs.contains_key(&tab.id) { return; }`) is the reference pattern.
 

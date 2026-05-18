@@ -24,8 +24,9 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 | [6b](phase-6b-mac-osc-notifications.md) | Mac OSC + notifications (the differentiator) | ✅ done (P4–P9 closed on `feature/rust-port`) | yes |
 | [7](phase-7-linux-ui.md) | Linux UI (gtk4-rs + Cairo + Pango) | ✅ done (commits 0–11 + follow-up landed via PR #50, squash `421b384`, 2026-05-17) | yes |
 | [7.5](phase-7-5-polish-and-gaps.md) | Linux/Mac polish + automation gaps (drag-reorder, CSS, icons, theme overrides, `tab snapshot`, etc.) | 🪦 superseded by [Linux GTK parity goal](goal-linux-gtk-parity-2026-05-17.md) (carried tracks A/B1/D); B2/C/E filed below | n/a |
-| [7.5b](goal-linux-gtk-parity-2026-05-17.md) | Linux GTK parity (port chrome + UX from Go GTK binary to gtk4-rs Rust UI) | ⏳ scoped, not started | yes |
-| [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG + notarytool; Linux AppImage) | ⏳ pending | yes |
+| [7.5b](goal-linux-gtk-parity-2026-05-17.md) | Linux GTK parity (port chrome + UX from Go GTK binary to gtk4-rs Rust UI) | ✅ closed — M1–M10 + M9.5 landed by 2026-05-18 via PRs #51–#64, #66 (M11 user-theme-overrides dropped after parity check) | yes |
+| [7.5c](goal-mac-parity-2026-05-18.md) | Mac UI parity (drag-reorder, inline rename, live cwd subtitle, sidebar rollup, tab pill right-click; headerbar deferred to user-eval at M7) | ⏳ scoped, not started — next push before Phase 8 | yes |
+| [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG + notarytool; Linux AppImage) | ⏳ pending — gated on Mac parity per user preference | yes |
 | [9](phase-9-cutover.md) | Cutover (delete `cmd/`, `internal/`, Go-specific make targets) | ⏳ pending | **destructive — separate PR** |
 
 ## High-level shape (target)

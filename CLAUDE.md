@@ -8,7 +8,7 @@ This file remains authoritative for the **current** Go + GTK4 implementation tha
 
 ## Branch policy
 
-The long-lived refactor branch is `feature/rust-port`. Polish PRs from short-lived `polish/*` topic branches merge into it (squash-merge, auto-merge gated on `ci.yml` + `refactor.yml` green via branch protection). Current merge-to-`main` exit bar is **Phase 8 (bundling)** — see [`plans/README.md`](plans/README.md) status snapshot and [`plans/phase-8-bundling.md`](plans/phase-8-bundling.md). Phases 0–7 closed on the branch as of 2026-05-17 (PR #50, squash `421b384`); Phase 7.5 polish/automation-gaps and Phase 8 bundling remain before the merge.
+The long-lived refactor branch is `feature/rust-port`. Polish PRs from short-lived `polish/*` topic branches merge into it (squash-merge, auto-merge gated on `ci.yml` + `refactor.yml` green via branch protection). Current merge-to-`main` exit bar is **Phase 8 (bundling)** — see [`plans/README.md`](plans/README.md) status snapshot and [`plans/phase-8-bundling.md`](plans/phase-8-bundling.md). Phases 0–7 closed via PR #50 (squash `421b384`, 2026-05-17); the Linux GTK parity push ([`plans/goal-linux-gtk-parity-2026-05-17.md`](plans/goal-linux-gtk-parity-2026-05-17.md)) closed 2026-05-18 (M11 user theme overrides dropped). Next polish push is the Mac UI parity goal ([`plans/goal-mac-parity-2026-05-18.md`](plans/goal-mac-parity-2026-05-18.md)), then Phase 8 bundling, then the Phase 9 cutover.
 
 `claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor branch and is **frozen** at `00b3d10`. Do not start new work on it.
 
