@@ -701,21 +701,33 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
         case .tabCwd(let e):
             // OSC 7 changed cwd. Same flow — update + rebuild
-            // when the affected tab is in the active project.
+            // when the affected tab is in the active project. Refresh
+            // the window subtitle when the change is on the *active*
+            // tab so the headerbar tracks `cd` in real time, matching
+            // `cmd/roost/app.go::updateHeader`.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
                 session.liveCwd = e.cwd
                 if session.projectID == activeProjectID {
                     rebuildTabBar()
+                    if let activeProjectID,
+                       activeSessionByProject[activeProjectID] === session
+                    {
+                        updateWindowTitle()
+                    }
                 }
             }
         case .tabState(let e):
             // TabState updates light up the status-dot slot M3's
-            // TabPillView reserved. Stash and rebuild.
+            // TabPillView reserved. Stash and rebuild. Also rebuild
+            // the sidebar so M6's per-project rollup stripe picks up
+            // the new state — `viewFor:item:` recomputes the rollup
+            // from `tabs` on every reload.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
                 session.liveState = Int32(e.state.rawValue)
                 if session.projectID == activeProjectID {
                     rebuildTabBar()
                 }
+                rebuildSidebar()
             }
         case .tabNotification(let e):
             // Phase 6a P7: mirror has_pending onto the matching
@@ -741,8 +753,22 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 title: e.title,
                 body: e.body
             )
-        case .tabsReordered, .projectsReordered, .hookActive:
-            // Reorder + hookActive are out of scope for this goal.
+        case .hookActive(let e):
+            // M6 of `goal-mac-parity-2026-05-18.md`: hookActive suppresses
+            // the per-tab agent state from the sidebar rollup. The pill
+            // dot still tracks the raw state — only the project-level
+            // rollup demotes. Mirrors Linux `crates/roost-linux/src/rollup.rs`
+            // semantics; the Go binary doesn't have this suppression at
+            // all (deliberate extension past Go-parity).
+            if let session = tabs.first(where: { $0.id == e.tabID }) {
+                session.hookActive = e.active
+                rebuildSidebar()
+            }
+        case .tabsReordered, .projectsReordered:
+            // M2 / M3 of `goal-mac-parity-2026-05-18.md` wire these.
+            // Until then Mac keeps its local-authoritative stance:
+            // reorder events arriving without a matching outbound RPC
+            // have nowhere to land.
             break
         }
     }
@@ -1063,6 +1089,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
         }
         rebuildTabBar()
+        // The subtitle tracks the active tab's live cwd, so switching
+        // tabs within a project has to refresh it. rebuildSidebar (the
+        // other call site that triggers updateWindowTitle) only fires
+        // when projects mutate, not tab focus.
+        updateWindowTitle()
     }
 
     @MainActor
@@ -1094,12 +1125,29 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 },
                 onClose: { [weak self] idx in
                     self?.closeTab(at: idx)
+                },
+                onRename: { [weak self] idx in
+                    self?.renameTab(at: idx)
                 }
             )
             tabBar.insertArrangedSubview(pill, at: tabBar.arrangedSubviews.count - 1)
         }
 
         rebuildWindowMenu()
+    }
+
+    /// Rename the tab at the given index in the active project.
+    /// Wired from `TabPillView`'s right-click "Rename…" menu (M4 of
+    /// `goal-mac-parity-2026-05-18.md`). Focuses the target tab first
+    /// because the existing rename flow (`renameActiveTab`) operates
+    /// on the active session. M5 will replace the modal with an inline
+    /// label↔entry stack; until then the alert is the rename UX.
+    @MainActor
+    private func renameTab(at indexInActiveProject: Int) {
+        let projectTabs = tabsForActiveProject()
+        guard projectTabs.indices.contains(indexInActiveProject) else { return }
+        selectTab(at: indexInActiveProject)
+        renameActiveTab(nil)
     }
 
     /// Close the tab at the given index in the active project. The
@@ -1488,22 +1536,29 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// Mirror the active project's identity in the window chrome: the
-    /// title becomes the project name and the subtitle becomes its cwd,
-    /// matching the libadwaita `AdwWindowTitle` pattern the Go binary
-    /// uses for the same window. Falls back to the plain product name
-    /// before bootstrap has resolved a project.
+    /// title becomes the project name; the subtitle becomes the live
+    /// cwd of the active tab (falling back to the project's static cwd
+    /// before any tab is open or OSC 7 has fired). Matches the
+    /// libadwaita `AdwWindowTitle` pattern the Go binary uses for the
+    /// same window — see `cmd/roost/app.go::updateHeader` for the
+    /// reference, which reads `sess.lastPWD` populated by OSC 7.
     @MainActor
     private func updateWindowTitle() {
         guard let window else { return }
-        if let activeProjectID,
-           let project = projects.first(where: { $0.id == activeProjectID })
-        {
-            window.title = project.name.isEmpty ? "Roost" : project.name
-            window.subtitle = project.cwd
-        } else {
+        guard let activeProjectID,
+              let project = projects.first(where: { $0.id == activeProjectID })
+        else {
             window.title = "Roost"
             window.subtitle = ""
+            return
         }
+        window.title = project.name.isEmpty ? "Roost" : project.name
+
+        let activeSession = activeSessionByProject[activeProjectID]
+        let liveCwd = activeSession?.liveCwd ?? ""
+        let cwd = liveCwd.isEmpty ? project.cwd : liveCwd
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        window.subtitle = cwd.isEmpty ? "" : pathDisplay(cwd, home: home, max: 48)
     }
 
     /// Phase 6a M6: resolve the user's requested font into an
@@ -1540,32 +1595,27 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         return "Tab \(index + 1)"
     }
 
-    /// Tilde-abbreviate `$HOME` prefixes in a path. Matches the Go
-    /// binary's `cmd/roost/path_display.go::tildeAbbreviate`.
+    /// Tilde-abbreviate `$HOME` prefixes in a path. Thin wrapper around
+    /// the testable `pathDisplay` free function — `Int.max` disables the
+    /// rune-budget so pill labels rely on AppKit's tail-truncation for
+    /// width fitting (the window subtitle bounds the budget separately
+    /// via `updateWindowTitle`).
     private func tildeAbbreviate(_ path: String) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        if path == home { return "~" }
-        if path.hasPrefix(home + "/") {
-            return "~" + path.dropFirst(home.count)
-        }
-        return path
+        return pathDisplay(path, home: home, max: Int.max)
     }
 
     /// Resolve the status-dot color for a tab pill based on
-    /// `liveState`. The proto's `TabState` enum: 0=NONE,
-    /// 1=RUNNING (green), 2=NEEDS_INPUT (yellow), 3=IDLE (gray),
-    /// 4=ERROR (red). Returns nil for NONE / unknown — TabPillView
-    /// then draws no dot (M3's empty slot).
+    /// `liveState`. The proto's `TabState` enum is: 0=Unspecified,
+    /// 1=None, 2=Running, 3=NeedsInput, 4=Idle (matches
+    /// `proto/roost.proto`'s `TabState`). The dot picks the same
+    /// palette as the M6 sidebar rollup so the two indicators agree:
+    /// running → blue, needs-input → orange, idle → gray. None /
+    /// unknown → no dot (M3's empty slot).
     @MainActor
     private func pillStatusColor(for session: TabSession) -> NSColor? {
         guard let state = session.liveState else { return nil }
-        switch state {
-        case 1: return .systemGreen
-        case 2: return .systemYellow
-        case 3: return .systemGray
-        case 4: return .systemRed
-        default: return nil
-        }
+        return RollupState(matchingProto: Int(state)).nsColor
     }
 
     // MARK: - Keybind table → NSMenuItem (Phase 6a P1)
@@ -1834,6 +1884,7 @@ final class TabPillView: NSView {
     private let isActive: Bool
     private let onSelect: @MainActor (Int) -> Void
     private let onClose: @MainActor (Int) -> Void
+    private let onRename: @MainActor (Int) -> Void
 
     private let label: NSTextField
     private let closeButton: NSButton
@@ -1845,12 +1896,14 @@ final class TabPillView: NSView {
         statusColor: NSColor? = nil,
         hasBadge: Bool = false,
         onSelect: @escaping @MainActor (Int) -> Void,
-        onClose: @escaping @MainActor (Int) -> Void
+        onClose: @escaping @MainActor (Int) -> Void,
+        onRename: @escaping @MainActor (Int) -> Void
     ) {
         self.index = index
         self.isActive = isActive
         self.onSelect = onSelect
         self.onClose = onClose
+        self.onRename = onRename
 
         self.label = NSTextField(labelWithString: title)
         self.label.font = .systemFont(
@@ -1965,6 +2018,44 @@ final class TabPillView: NSView {
     @objc private func closeClicked() {
         onClose(index)
     }
+
+    /// Right-click context menu (M4 of `goal-mac-parity-2026-05-18.md`).
+    /// AppKit calls `menu(for:)` on every right-click; returning a
+    /// per-call NSMenu instead of installing one statically keeps the
+    /// item targets fresh — each menu holds a reference to *this*
+    /// pill's index even after the strip rebuilds. The Go binary doesn't
+    /// have a tab-pill menu (sidebar-only); we extend Mac slightly past
+    /// Go parity here because cmux + Linux M8 do this and the user has
+    /// been training the muscle memory.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu()
+
+        let rename = NSMenuItem(
+            title: "Rename…",
+            action: #selector(renameFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        rename.target = self
+        menu.addItem(rename)
+
+        let close = NSMenuItem(
+            title: "Close Tab",
+            action: #selector(closeFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        close.target = self
+        menu.addItem(close)
+
+        return menu
+    }
+
+    @objc private func renameFromMenu(_ sender: NSMenuItem) {
+        onRename(index)
+    }
+
+    @objc private func closeFromMenu(_ sender: NSMenuItem) {
+        onClose(index)
+    }
 }
 
 // MARK: - Sidebar NSOutlineView data source + delegate
@@ -1979,8 +2070,16 @@ final class TabPillView: NSView {
 final class ProjectRowCellView: NSTableCellView {
     /// Phase 6a P7: small accent-tinted dot in the right column
     /// when any tab in the project has a pending notification.
-    /// Hidden by default; `configure(with:notifying:)` flips it.
+    /// Hidden by default; `configure(with:notifying:rollup:)` flips it.
     private let badgeDot: NSView
+
+    /// M6 of `goal-mac-parity-2026-05-18.md`: 3px stripe on the
+    /// leading edge colored by the per-project rollup. Hidden when
+    /// the rollup is `.none`. The Go binary's GTK row uses a CSS
+    /// `box-shadow: inset 3px 0 0 <color>`; we reproduce the same
+    /// visual with an explicit NSView so the row owns the rendering
+    /// (NSTableCellView styling can be subtle).
+    private let stripe: NSView
 
     init() {
         let field = NSTextField(labelWithString: "")
@@ -1999,12 +2098,24 @@ final class ProjectRowCellView: NSTableCellView {
         dot.isHidden = true
         self.badgeDot = dot
 
+        let stripe = NSView()
+        stripe.translatesAutoresizingMaskIntoConstraints = false
+        stripe.wantsLayer = true
+        stripe.isHidden = true
+        self.stripe = stripe
+
         super.init(frame: .zero)
+        addSubview(stripe)
         addSubview(field)
         addSubview(dot)
         textField = field
         NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            stripe.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stripe.topAnchor.constraint(equalTo: topAnchor),
+            stripe.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stripe.widthAnchor.constraint(equalToConstant: 3),
+
+            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             field.trailingAnchor.constraint(equalTo: dot.leadingAnchor, constant: -6),
             field.centerYAnchor.constraint(equalTo: centerYAnchor),
 
@@ -2018,9 +2129,15 @@ final class ProjectRowCellView: NSTableCellView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
-    func configure(with project: ProjectSnapshot, notifying: Bool) {
+    func configure(with project: ProjectSnapshot, notifying: Bool, rollup: RollupState) {
         textField?.stringValue = project.name
         badgeDot.isHidden = !notifying
+        if let color = rollup.nsColor {
+            stripe.layer?.backgroundColor = color.cgColor
+            stripe.isHidden = false
+        } else {
+            stripe.isHidden = true
+        }
     }
 }
 
@@ -2051,9 +2168,17 @@ extension RoostApp: NSOutlineViewDelegate {
         let cell = ProjectRowCellView()
         // Phase 6a P7 per-project rollup: badge the sidebar row
         // if ANY tab in this project has a pending notification.
-        let notifying = tabs
-            .contains { $0.projectID == row.project.id && $0.liveHasNotification }
-        cell.configure(with: row.project, notifying: notifying)
+        let projectTabs = tabs.filter { $0.projectID == row.project.id }
+        let notifying = projectTabs.contains { $0.liveHasNotification }
+        // M6 of `goal-mac-parity-2026-05-18.md`: per-project rollup
+        // stripe colored by the highest-priority tab state. Computed
+        // on every reload — bounded by N tabs in the project.
+        let pairs: [(state: TabAgentState, hookActive: Bool)] = projectTabs.map {
+            (state: TabAgentState.fromProto(Int($0.liveState ?? 0)),
+             hookActive: $0.hookActive)
+        }
+        let rollup = projectRollup(tabs: pairs)
+        cell.configure(with: row.project, notifying: notifying, rollup: rollup)
         return cell
     }
 
