@@ -362,12 +362,49 @@ impl Roost for RoostService {
             debug!(tab_id, "client input stream closed");
         });
 
+        // Drop guard: if the gRPC client disconnects without the PTY
+        // exiting (e.g., Mac UI ⌘Q while the shell is still alive),
+        // the `stream!` future below is dropped without hitting the
+        // Exit branch. Without cleanup, the tab row would persist as
+        // an orphan, breaking M5's empty-project cascade for any new
+        // tab opened in the same project on the next session — see
+        // issue #59. The guard calls `close_tab` unconditionally on
+        // drop; if the Exit branch already ran, that call returns
+        // `TabNotFound` and we tolerate it.
+        struct CleanupOnDrop {
+            tab_id: i64,
+            workspace: Arc<Workspace>,
+            ptys: Arc<PtySupervisor>,
+        }
+        impl Drop for CleanupOnDrop {
+            fn drop(&mut self) {
+                match self.workspace.close_tab(self.tab_id) {
+                    Ok(()) => {
+                        debug!(tab_id = self.tab_id, "stream_pty drop: cleaned up orphan tab");
+                    }
+                    Err(WorkspaceError::TabNotFound(_)) => {
+                        // Exit branch already cleaned up — fine.
+                    }
+                    Err(err) => {
+                        warn!(tab_id = self.tab_id, ?err, "stream_pty drop: close_tab failed");
+                    }
+                }
+                self.ptys.close(self.tab_id);
+            }
+        }
+        let cleanup = CleanupOnDrop {
+            tab_id,
+            workspace: workspace.clone(),
+            ptys: ptys.clone(),
+        };
+
         // Capture clones for the stream closure. `workspace_for_exit`
         // is used to cascade-delete the tab row when the PTY exits
         // — see the Exit branch below.
         let workspace_for_exit = workspace.clone();
         let ptys_for_exit = ptys.clone();
         let outbound = stream! {
+            let _cleanup = cleanup; // moved into the generator; drops with it
             loop {
                 tokio::select! {
                     Some(bytes) = handle.output_rx.recv() => {
