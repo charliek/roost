@@ -130,17 +130,46 @@ impl App {
         let window_title = WindowTitle::new("Roost", "connecting…");
         header.set_title_widget(Some(&window_title));
 
-        // Sidebar — single-level ListBox of projects.
+        // Sidebar: vertical Box of [section header] / [scrolled project
+        // list] / [`+ Project` footer button]. Matches the Go binary's
+        // `cmd/roost/app.go` sidebar layout verbatim — header label,
+        // list, button — so users moving between the two UIs find the
+        // same affordances in the same places.
+        let sidebar_header = gtk4::Label::builder()
+            .label("Projects")
+            .halign(gtk4::Align::Start)
+            .css_classes(["sidebar-section-header"])
+            .build();
+
         let sidebar = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Browse)
             .css_classes(["navigation-sidebar"])
+            .vexpand(true)
             .build();
         let sidebar_scroll = gtk4::ScrolledWindow::builder()
             .child(&sidebar)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vexpand(true)
+            .build();
+
+        let new_project_button = gtk4::Button::builder()
+            .label("+ Project")
+            .css_classes(["roost-add-project", "flat"])
+            .margin_top(4)
+            .margin_bottom(8)
+            .margin_start(8)
+            .margin_end(8)
+            .halign(gtk4::Align::Fill)
+            .build();
+
+        let sidebar_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
             .width_request(220)
             .build();
+        sidebar_box.append(&sidebar_header);
+        sidebar_box.append(&sidebar_scroll);
+        sidebar_box.append(&new_project_button);
 
         // Right pane: a Stack of per-project AdwTabView widgets.
         let tab_stack = gtk4::Stack::builder().hexpand(true).vexpand(true).build();
@@ -150,7 +179,7 @@ impl App {
             .resize_start_child(false)
             .shrink_start_child(false)
             .position(220)
-            .start_child(&sidebar_scroll)
+            .start_child(&sidebar_box)
             .end_child(&tab_stack)
             .build();
 
@@ -198,6 +227,22 @@ impl App {
                     }
                     let _ = pid;
                 }
+            }
+        });
+
+        // Sidebar footer button → fire the same `create_new_project`
+        // path the `Ctrl+Shift+N` keybind uses. Mac UI parity: both
+        // ⌘N and the sidebar `+ Project` button route through the
+        // identical RPC sequence (CreateProject → OpenTab → attach).
+        new_project_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| {
+                let app = app.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(err) = app.create_new_project().await {
+                        tracing::warn!(?err, "new_project (sidebar button) failed");
+                    }
+                });
             }
         });
 
