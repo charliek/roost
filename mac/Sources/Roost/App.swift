@@ -70,6 +70,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var activeProjectID: Int64?
     private var activeSessionByProject: [Int64: TabSession] = [:]
 
+    /// M5 of `goal-mac-parity-2026-05-18.md`: cell views per project,
+    /// reused across `reloadData` so inline rename's typing buffer
+    /// survives a sibling-driven sidebar refresh. The Mac UI grows
+    /// at most one row per project the user creates — bounded, and
+    /// purged on `.projectDeleted`.
+    private var projectRowCellViews: [Int64: ProjectRowCellView] = [:]
+
+    /// Tab-pill rename popover (M5). At most one popover is up at a
+    /// time; the field is the popover's editable input.
+    private var renamePopover: NSPopover?
+    private var renamePopoverTabID: Int64?
+
     private var socketPath: String = ""
     private var daemonReachable: Bool = false
 
@@ -590,6 +602,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         tabs.removeAll { $0.projectID == id }
         activeSessionByProject.removeValue(forKey: id)
         projects.removeAll { $0.id == id }
+        // M5 of `goal-mac-parity-2026-05-18.md`: drop the cached cell
+        // view for this project so the per-project map doesn't grow
+        // unbounded. If the row was being edited at the moment of
+        // delete the entry just vanishes — no orphan edit state.
+        projectRowCellViews.removeValue(forKey: id)
     }
 
     /// Append `snap` to `projects` and rebuild the sidebar unless a row
@@ -918,37 +935,77 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func renameProjectFromMenu(_ sender: NSMenuItem) {
         guard let project = projectForClickedSidebarRow() else { return }
-        let id = project.id
+        beginRenameProject(id: project.id)
+    }
 
-        let alert = NSAlert()
-        alert.messageText = "Rename Project"
-        alert.informativeText = "Choose a new name for \(project.name)."
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        input.stringValue = project.name
-        alert.accessoryView = input
-        alert.window.initialFirstResponder = input
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-        let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !newName.isEmpty, newName != project.name else { return }
+    /// M5 of `goal-mac-parity-2026-05-18.md`: flip the project's
+    /// sidebar row into inline-edit mode. Enter commits via
+    /// `RenameProject` RPC; Escape (or click-away) cancels and
+    /// restores the displayed name from the model. Mid-edit
+    /// `ProjectRenamedEvent` arrivals for this project leave the
+    /// typing buffer alone (race guard lives on
+    /// `ProjectRowCellView.isEditing`).
+    @MainActor
+    private func beginRenameProject(id: Int64) {
+        guard let outline = projectsOutlineView,
+              let idx = projects.firstIndex(where: { $0.id == id })
+        else { return }
+        ensureSidebarVisible()
+        // Trigger a viewFor:item: call for this row so the cached
+        // cell view is in the hierarchy. `makeIfNecessary: true`
+        // is what asks AppKit to materialize a row that may be
+        // offscreen / not realized yet.
+        guard let cell = outline.view(
+            atColumn: 0,
+            row: idx,
+            makeIfNecessary: true
+        ) as? ProjectRowCellView else { return }
 
-        let socketPath = self.socketPath
-        Task { [weak self] in
-            await renameProject(socketPath: socketPath, projectID: id, name: newName)
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                if let idx = self.projects.firstIndex(where: { $0.id == id }) {
-                    self.projects[idx] = ProjectSnapshot(
-                        id: id,
-                        name: newName,
-                        cwd: self.projects[idx].cwd
-                    )
-                    self.rebuildSidebar()
-                }
+        let initial = projects[idx].name
+        cell.beginEdit(
+            initial: initial,
+            onCommit: { [weak self] newName in
+                self?.commitRenameProject(id: id, newName: newName)
+            },
+            onCancel: { [weak self] in
+                self?.cancelRenameProject(id: id)
             }
+        )
+    }
+
+    @MainActor
+    private func commitRenameProject(id: Int64, newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let idx = projects.firstIndex(where: { $0.id == id }) else { return }
+        // Empty / unchanged name is treated as cancel — the existing
+        // displayed label re-renders on the next `configure()`.
+        let current = projects[idx].name
+        guard !trimmed.isEmpty, trimmed != current else {
+            rebuildSidebar()
+            return
         }
+
+        // Optimistic local update — mirrors the pre-M5 NSAlert flow.
+        // `.projectRenamed` event arrives next and reconciles if
+        // anything drifts.
+        projects[idx] = ProjectSnapshot(
+            id: id,
+            name: trimmed,
+            cwd: projects[idx].cwd
+        )
+        rebuildSidebar()
+
+        let socket = socketPath
+        Task {
+            await renameProject(socketPath: socket, projectID: id, name: trimmed)
+        }
+    }
+
+    @MainActor
+    private func cancelRenameProject(id: Int64) {
+        // Nothing model-wise to do — the next configure() call resyncs
+        // textField.stringValue from `projects[id].name`.
+        rebuildSidebar()
     }
 
     @objc @MainActor
@@ -1402,9 +1459,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // M3: reveal the sidebar so the user sees the project row
         // their rename will affect. Mirrors Go `app.go:1975`.
         ensureSidebarVisible()
-        let placeholder = NSMenuItem()
-        placeholder.tag = Int(id)
-        renameProjectFromMenu(placeholder)
+        // M5 of `goal-mac-parity-2026-05-18.md`: route through the
+        // shared inline-rename flow. The pre-M5 implementation
+        // wrapped `renameProjectFromMenu` with a placeholder
+        // NSMenuItem so it could reuse the modal alert — that path
+        // is gone now (NSAlert replaced with inline edit), so call
+        // beginRenameProject directly.
+        beginRenameProject(id: id)
     }
 
     // MARK: - Menu installation
@@ -1794,11 +1855,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: next)
     }
 
-    /// Rename the active tab via an NSAlert + text field, the same
-    /// idiom `renameProjectFromMenu` uses. On commit the daemon
-    /// sets the per-tab `user_titled` lock so shell-emitted OSC 1/2
-    /// stops overwriting. ⌘R by default (Mac convention "rename" —
-    /// also matches Go binary's `cmd/roost/app.go::renameActiveTab`).
+    /// Rename the active tab. M5 of `goal-mac-parity-2026-05-18.md`
+    /// replaced the pre-existing NSAlert with an NSPopover anchored
+    /// to the active pill — same UX as the Go binary's tab rename
+    /// (`cmd/roost/app.go::renameActiveTab`) and Linux M9. Mirrors
+    /// the popover-over-the-strip pattern documented at Linux
+    /// `crates/roost-linux/src/app.rs:1057-1119`.
+    /// On commit the daemon sets the per-tab `user_titled` lock so
+    /// shell-emitted OSC 1/2 stops overwriting. ⌘R by default.
     @objc @MainActor
     private func renameActiveTab(_ sender: Any?) {
         guard let activeProjectID,
@@ -1810,31 +1874,91 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let projectTabs = tabsForActiveProject()
         let index = projectTabs.firstIndex(where: { $0 === session }) ?? 0
         let currentTitle = pillLabel(for: session, index: index)
+        beginRenameActiveTab(tabID: tabID, currentTitle: currentTitle, atIndex: index)
+    }
 
-        let alert = NSAlert()
-        alert.messageText = "Rename Tab"
-        alert.informativeText = "Choose a new name for this tab. The shell can no longer change it after this."
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        input.stringValue = currentTitle
-        alert.accessoryView = input
-        alert.window.initialFirstResponder = input
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-        let newTitle = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !newTitle.isEmpty, newTitle != currentTitle else { return }
+    /// Mount the rename popover anchored to the active tab's pill
+    /// (or, when the pill isn't in the strip yet, the `+ Tab` button —
+    /// the strip is never empty while a tab is active, so this is a
+    /// belt-and-suspenders fallback). The popover lifetime is bounded
+    /// by `renamePopover` — closing it (Escape, focus-loss, Enter)
+    /// nils both `renamePopover` and `renamePopoverTabID`.
+    @MainActor
+    private func beginRenameActiveTab(tabID: Int64, currentTitle: String, atIndex: Int) {
+        // Tear down any existing popover before showing a new one —
+        // Cmd+R while a popover is up shouldn't stack popovers.
+        renamePopover?.performClose(nil)
+        renamePopover = nil
+        renamePopoverTabID = nil
 
-        // Optimistic local update so the pill flips immediately. The
-        // daemon's TabTitleChangedEvent will reconcile if anything
-        // drifts (shouldn't happen since the daemon accepts blindly).
-        session.liveTitle = newTitle
-        rebuildTabBar()
-
-        let socketPath = self.socketPath
-        Task {
-            await setTabTitle(socketPath: socketPath, tabID: tabID, title: newTitle)
+        guard let tabBar else { return }
+        let pills = tabBar.arrangedSubviews.compactMap { $0 as? TabPillView }
+        let anchor: NSView
+        if pills.indices.contains(atIndex) {
+            anchor = pills[atIndex]
+        } else if let addBtn = addTabButton {
+            anchor = addBtn
+        } else {
+            return
         }
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = RenamePopoverController(
+            initial: currentTitle,
+            onCommit: { [weak self] text in
+                self?.commitRenameTab(
+                    tabID: tabID,
+                    newTitle: text,
+                    initialTitle: currentTitle
+                )
+            },
+            onCancel: { [weak self] in
+                self?.cancelRenameTab()
+            }
+        )
+        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
+        renamePopover = popover
+        renamePopoverTabID = tabID
+    }
+
+    @MainActor
+    private func commitRenameTab(tabID: Int64, newTitle: String, initialTitle: String) {
+        defer {
+            renamePopover?.performClose(nil)
+            renamePopover = nil
+            renamePopoverTabID = nil
+        }
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard tabs.contains(where: { $0.id == tabID }) else { return }
+        // CodeRabbit on PR #69: compare against the popover's *initial*
+        // text, not `session.liveTitle`. The popover prefills from
+        // `pillLabel(for:index:)`, which falls back to the
+        // tilde-abbreviated cwd or "Tab N" when liveTitle is empty;
+        // pressing Enter without edits in that state would otherwise
+        // commit + set the daemon's `user_titled` lock against a
+        // value the user never typed. Empty + unchanged are cancel.
+        guard !trimmed.isEmpty, trimmed != initialTitle else { return }
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return }
+
+        // Optimistic local update so the pill flips immediately —
+        // matches the pre-M5 NSAlert flow.
+        session.liveTitle = trimmed
+        if session.projectID == activeProjectID {
+            rebuildTabBar()
+        }
+
+        let socket = socketPath
+        Task {
+            await setTabTitle(socketPath: socket, tabID: tabID, title: trimmed)
+        }
+    }
+
+    @MainActor
+    private func cancelRenameTab() {
+        renamePopover?.performClose(nil)
+        renamePopover = nil
+        renamePopoverTabID = nil
     }
 
     // MARK: - Sidebar toggle (M3)
@@ -2251,7 +2375,7 @@ extension TabPillView: NSDraggingSource {
 /// through that outlet rather than holding a separate `NSTextField`
 /// reference.
 @MainActor
-final class ProjectRowCellView: NSTableCellView {
+final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
     /// Phase 6a P7: small accent-tinted dot in the right column
     /// when any tab in the project has a pending notification.
     /// Hidden by default; `configure(with:notifying:rollup:)` flips it.
@@ -2264,6 +2388,16 @@ final class ProjectRowCellView: NSTableCellView {
     /// visual with an explicit NSView so the row owns the rendering
     /// (NSTableCellView styling can be subtle).
     private let stripe: NSView
+
+    /// M5 of `goal-mac-parity-2026-05-18.md`: true while the user is
+    /// typing into the row's `textField` after a context-menu Rename.
+    /// `configure(...)` skips overwriting `stringValue` while editing
+    /// so a sibling `roost-cli-rs project rename` arriving mid-edit
+    /// doesn't clobber the user's in-progress text. Mirrors Linux M9
+    /// (`crates/roost-linux/src/app.rs::commit_rename_project`).
+    private(set) var isEditing = false
+    private var onCommit: (@MainActor (String) -> Void)?
+    private var onCancel: (@MainActor () -> Void)?
 
     init() {
         let field = NSTextField(labelWithString: "")
@@ -2314,7 +2448,15 @@ final class ProjectRowCellView: NSTableCellView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
     func configure(with project: ProjectSnapshot, notifying: Bool, rollup: RollupState) {
-        textField?.stringValue = project.name
+        // M5 race guard: while the user is editing this row, never
+        // overwrite the textField from the model. A `.projectRenamed`
+        // event arriving for *this* project mid-edit updates the model
+        // (so cancel/commit pick up the new name when the user
+        // eventually exits edit mode) but leaves the typing buffer
+        // alone.
+        if !isEditing {
+            textField?.stringValue = project.name
+        }
         badgeDot.isHidden = !notifying
         if let color = rollup.nsColor {
             stripe.layer?.backgroundColor = color.cgColor
@@ -2322,6 +2464,83 @@ final class ProjectRowCellView: NSTableCellView {
         } else {
             stripe.isHidden = true
         }
+    }
+
+    /// Begin inline rename. The row's `textField` flips to an editable
+    /// bezeled style, the user's caret is placed inside, and text is
+    /// pre-selected so they can type to replace. Enter fires `onCommit`,
+    /// Escape fires `onCancel`. Both transitions end the edit
+    /// synchronously (the displayed `stringValue` will then re-sync
+    /// from the model on the next `configure(...)`).
+    func beginEdit(
+        initial: String,
+        onCommit: @escaping @MainActor (String) -> Void,
+        onCancel: @escaping @MainActor () -> Void
+    ) {
+        guard let field = textField, !isEditing else { return }
+        isEditing = true
+        self.onCommit = onCommit
+        self.onCancel = onCancel
+        field.stringValue = initial
+        field.isEditable = true
+        field.isSelectable = true
+        field.drawsBackground = true
+        field.backgroundColor = .textBackgroundColor
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.delegate = self
+        window?.makeFirstResponder(field)
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.selectAll(nil)
+        }
+    }
+
+    private func endEdit() {
+        guard isEditing, let field = textField else { return }
+        isEditing = false
+        field.isEditable = false
+        field.isSelectable = false
+        field.drawsBackground = false
+        field.isBezeled = false
+        field.delegate = nil
+        onCommit = nil
+        onCancel = nil
+    }
+
+    /// NSControlTextEditingDelegate hook for Enter / Escape.
+    /// `insertNewline:` fires for Enter; `cancelOperation:` for Escape.
+    /// Returning `true` tells AppKit we handled the command so the
+    /// underlying NSTextView doesn't also process it.
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            let text = textField?.stringValue ?? ""
+            let commit = onCommit
+            endEdit()
+            commit?(text)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            let cancel = onCancel
+            endEdit()
+            cancel?()
+            return true
+        }
+        return false
+    }
+
+    /// Treat focus-loss as "cancel": the user clicked away without
+    /// pressing Enter. Linux M9 treats it the same way to avoid silent
+    /// commits — better to lose typing the user didn't confirm than
+    /// surprise them with a rename they didn't intend.
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard isEditing else { return }
+        let cancel = onCancel
+        endEdit()
+        cancel?()
     }
 }
 
@@ -2417,7 +2636,16 @@ extension RoostApp: NSOutlineViewDelegate {
         item: Any
     ) -> NSView? {
         guard let row = item as? ProjectRowItem else { return nil }
-        let cell = ProjectRowCellView()
+        // M5 of `goal-mac-parity-2026-05-18.md`: reuse cell views per
+        // project so inline rename's typing buffer survives reload.
+        // Map keyed by project id — purged in `.projectDeleted` arm.
+        let cell: ProjectRowCellView
+        if let existing = projectRowCellViews[row.project.id] {
+            cell = existing
+        } else {
+            cell = ProjectRowCellView()
+            projectRowCellViews[row.project.id] = cell
+        }
         // Phase 6a P7 per-project rollup: badge the sidebar row
         // if ANY tab in this project has a pending notification.
         let projectTabs = tabs.filter { $0.projectID == row.project.id }
