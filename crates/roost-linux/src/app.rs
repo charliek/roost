@@ -2392,9 +2392,20 @@ impl App {
                     ))
                     .await
             });
-            if let Ok(Err(err)) = handle.await {
-                tracing::warn!(?err, "ReorderProjects RPC failed");
-                app.apply_sidebar_order(&snapshot);
+            match handle.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(?err, "ReorderProjects RPC failed");
+                    app.apply_sidebar_order(&snapshot);
+                }
+                Err(join_err) => {
+                    // Tokio task panic / cancellation. Rare, but
+                    // without the rollback the sidebar would stay
+                    // visually diverged from the daemon until the
+                    // next `ProjectsReordered` event arrives.
+                    tracing::warn!(?join_err, "ReorderProjects task join failed");
+                    app.apply_sidebar_order(&snapshot);
+                }
             }
         });
     }
