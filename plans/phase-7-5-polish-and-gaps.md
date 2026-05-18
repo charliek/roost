@@ -36,7 +36,7 @@ Same process as the predecessor polish goals: long-lived `feature/rust-port`, sh
 | Branch model | `polish/*` topic branches → `feature/rust-port` (same as M-/P-series predecessors). |
 | CI gates | macOS-only required (the 4 above). Linux jobs informational until commit 8-equivalent surface mass. |
 | PR shape | One topic branch per milestone, **not** one mega-PR. Phase 7's "one PR with multiple commits" approach worked but ran ~3500 LOC + multiple bug fixes mid-stream; the smaller-PR cadence keeps CodeRabbit's review surface tighter and lets the user merge per-track. |
-| Ordering | Tracks are independent. A and B are the user-visible wins; C improves CI's test reach; D is polish completeness; E is cross-platform parity. |
+| Ordering | Tracks A, B, C, E are independent of each other. **A3 depends on D** (A3's rollup CSS class + AdwTabPage indicator icon consume `TabStateChangedEvent`, which Track D wires up); land D before or alongside A3. A and B are the user-visible wins; C improves CI's test reach; D is polish completeness + a prereq for A3; E is cross-platform parity. |
 | Stop condition | Once Tracks A + B + (optionally D) close, the Linux UI looks + behaves like the Go binary at the parity level the user signed off on. C + E can stretch into Phase 8 or beyond without blocking. |
 
 ## Branch shape
@@ -120,9 +120,11 @@ PR target: `feature/rust-port`. Branch: `polish/linux-headerbar-icons`.
 
 PR target: `feature/rust-port`. Branch: `polish/linux-status-indicators`.
 
+**Depends on Track D** (the `TabStateChangedEvent` handler that A3 consumes lives there). Land D first, or stack A3 on top of D's branch. Without D, the events arrive at `handle_event` but fall through the catch-all `_ =>` arm.
+
 **Scope:**
 1. Embed the 3 status SVGs from `cmd/roost/icon_*.svg` via `include_bytes!` and wrap each in a `gio::BytesIcon`. Mirror the Go binary's `cmd/roost/indicator.go` cache.
-2. On every `TabStateChangedEvent` (wired up in Track D's `polish/linux-event-completion`), call `tab_ui.page.set_indicator_icon(Some(&icon))` with the matching SVG.
+2. On every `TabStateChangedEvent` (routed by Track D's `polish/linux-event-completion`), call `tab_ui.page.set_indicator_icon(Some(&icon))` with the matching SVG.
 3. On every `TabState` change, update the **project's** rollup CSS class on the sidebar row:
    * Any tab with `RUNNING` → `roost-rollup-running` on the row.
    * Any tab with `NEEDS_INPUT` → `roost-rollup-needs-input` (precedence over running).
