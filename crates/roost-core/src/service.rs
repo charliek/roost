@@ -380,13 +380,20 @@ impl Roost for RoostService {
             fn drop(&mut self) {
                 match self.workspace.close_tab(self.tab_id) {
                     Ok(()) => {
-                        debug!(tab_id = self.tab_id, "stream_pty drop: cleaned up orphan tab");
+                        debug!(
+                            tab_id = self.tab_id,
+                            "stream_pty drop: cleaned up orphan tab"
+                        );
                     }
                     Err(WorkspaceError::TabNotFound(_)) => {
                         // Exit branch already cleaned up — fine.
                     }
                     Err(err) => {
-                        warn!(tab_id = self.tab_id, ?err, "stream_pty drop: close_tab failed");
+                        warn!(
+                            tab_id = self.tab_id,
+                            ?err,
+                            "stream_pty drop: close_tab failed"
+                        );
                     }
                 }
                 self.ptys.close(self.tab_id);
