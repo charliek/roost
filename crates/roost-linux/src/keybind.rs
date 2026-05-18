@@ -17,6 +17,19 @@ pub enum KeybindAction {
     NewTab,
     CloseTab,
     NewProject,
+    /// M8: rename the active project — flips its sidebar row's
+    /// `gtk::Stack` to the inline `gtk::Entry` (M9). Default
+    /// `ctrl+shift+r`.
+    RenameProject,
+    /// M8: rename the active tab — opens a `gtk::Popover` over the
+    /// pill with an inline `gtk::Entry` (M9). Default `ctrl+r`.
+    RenameTab,
+    /// M8: delete the active project (with an `adw::AlertDialog`
+    /// confirmation, since this cascades to delete every tab in the
+    /// project). No default trigger — advanced users bind via
+    /// `~/.config/roost/config.conf` so a stray keypress can't
+    /// dataloss.
+    DeleteProject,
     CycleTabPrev,
     CycleTabNext,
     Copy,
@@ -37,6 +50,9 @@ impl KeybindAction {
             "new_tab" => Some(Self::NewTab),
             "close_tab" => Some(Self::CloseTab),
             "new_project" => Some(Self::NewProject),
+            "rename_project" => Some(Self::RenameProject),
+            "rename_tab" => Some(Self::RenameTab),
+            "delete_project" => Some(Self::DeleteProject),
             "cycle_tab_prev" => Some(Self::CycleTabPrev),
             "cycle_tab_next" => Some(Self::CycleTabNext),
             "copy" => Some(Self::Copy),
@@ -128,6 +144,9 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
     add(&mut out, "ctrl+shift+t", KeybindAction::NewTab);
     add(&mut out, "ctrl+shift+w", KeybindAction::CloseTab);
     add(&mut out, "ctrl+shift+n", KeybindAction::NewProject);
+    add(&mut out, "ctrl+r", KeybindAction::RenameTab);
+    add(&mut out, "ctrl+shift+r", KeybindAction::RenameProject);
+    // DeleteProject: no default trigger — see KeybindAction docs.
     add(
         &mut out,
         "ctrl+shift+bracketleft",
@@ -224,6 +243,43 @@ mod tests {
     fn parser_rejects_empty_and_unknown() {
         assert!(parse_trigger("").is_none());
         assert!(parse_trigger("ctrl+").is_none());
+    }
+
+    #[test]
+    fn m8_rename_actions_parse() {
+        // M8 added three new action names; pin them so a future rename
+        // (or accidental removal) of one of the strings breaks loudly.
+        assert_eq!(
+            KeybindAction::from_name("rename_project"),
+            Some(KeybindAction::RenameProject)
+        );
+        assert_eq!(
+            KeybindAction::from_name("rename_tab"),
+            Some(KeybindAction::RenameTab)
+        );
+        assert_eq!(
+            KeybindAction::from_name("delete_project"),
+            Some(KeybindAction::DeleteProject)
+        );
+    }
+
+    #[test]
+    fn default_bindings_include_m8_rename() {
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // Ctrl+R → RenameTab (M8 default).
+        let ctrl_r = parse_trigger("ctrl+r").unwrap();
+        assert_eq!(defaults.get(&ctrl_r), Some(&KeybindAction::RenameTab));
+        // Ctrl+Shift+R → RenameProject.
+        let ctrl_shift_r = parse_trigger("ctrl+shift+r").unwrap();
+        assert_eq!(
+            defaults.get(&ctrl_shift_r),
+            Some(&KeybindAction::RenameProject)
+        );
+        // DeleteProject has no default trigger; nothing in the map
+        // should resolve to it.
+        assert!(!defaults
+            .values()
+            .any(|a| matches!(a, KeybindAction::DeleteProject)));
     }
 
     #[test]
