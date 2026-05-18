@@ -40,8 +40,11 @@ tabbar tab:checked {
  * inset is used instead of border-left because libadwaita reserves
  * the row's leading margin for the selection state — a real border
  * would shift the label. needs-input wins; running is informational;
- * idle is muted. error mirrors the per-tab indicator. The "none"
- * state has no class, no stripe.
+ * idle is muted. The "none" state has no class, no stripe. The
+ * daemon's TabState enum (proto/roost.proto) has no ERROR variant,
+ * matching the Go binary; if the daemon grows one later, add a
+ * `.roost-rollup-error` rule alongside these three and the matching
+ * `RollupState::Error` variant in `rollup.rs`.
  *
  * Colors mirror the per-tab indicator SVGs (cmd/roost/indicator.go).
  * Hard-coded rather than @accent_bg_color etc. because the indicator
@@ -51,9 +54,6 @@ listbox.navigation-sidebar > row.roost-rollup-running {
 }
 listbox.navigation-sidebar > row.roost-rollup-needs-input {
   box-shadow: inset 3px 0 0 #f0a040;
-}
-listbox.navigation-sidebar > row.roost-rollup-error {
-  box-shadow: inset 3px 0 0 #cc372e;
 }
 listbox.navigation-sidebar > row.roost-rollup-idle {
   box-shadow: inset 3px 0 0 #7a7a7a;

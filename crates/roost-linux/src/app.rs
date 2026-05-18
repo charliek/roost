@@ -31,6 +31,7 @@ use crate::client::RoostClient;
 use crate::config::RoostConfig;
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
+use crate::rollup::{project_rollup, RollupState, TabState};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
@@ -54,6 +55,15 @@ struct TabUi {
     /// `TabSession.liveCwd` field. Updated at attach time and on
     /// every `TabCwdChangedEvent` (OSC 7).
     cwd: RefCell<String>,
+    /// Latest agent state from `TabStateChangedEvent`. Drives the
+    /// per-tab indicator icon (M7) and feeds the project rollup CSS
+    /// stripe via `crate::rollup::project_rollup`.
+    state: RefCell<TabState>,
+    /// Whether the daemon-side Claude hook owns this tab's
+    /// notification surface. Toggled by `HookActiveChangedEvent`;
+    /// when true, the rollup aggregation suppresses this tab's
+    /// state so the hook's own UI surface isn't duplicated.
+    hook_active: RefCell<bool>,
 }
 
 pub struct App {
@@ -107,6 +117,14 @@ const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
     include_bytes!("resources/icons/sidebar-show-symbolic.svg");
 const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
 
+/// Per-tab status indicator icons (M7). Vendored from cmd/roost
+/// alongside the chrome icons so the GTK app doesn't depend on any
+/// system icon-theme search path for these — same trade-off as the
+/// M5 chrome icons.
+const ICON_RUNNING: &[u8] = include_bytes!("resources/icons/icon_running.svg");
+const ICON_NEEDS_INPUT: &[u8] = include_bytes!("resources/icons/icon_needs_input.svg");
+const ICON_IDLE: &[u8] = include_bytes!("resources/icons/icon_idle.svg");
+
 /// Wrap an embedded SVG in a `gio::BytesIcon` so it can drive a
 /// `gtk::Image` regardless of the user's icon-theme search path.
 /// libadwaita's symbolic icons are tiny SVGs (~1 KB each), so the
@@ -114,6 +132,20 @@ const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-sym
 fn embedded_icon(bytes: &'static [u8]) -> gtk4::gio::BytesIcon {
     let glib_bytes = glib::Bytes::from_static(bytes);
     gtk4::gio::BytesIcon::new(&glib_bytes)
+}
+
+/// Apply the per-tab status indicator icon to `page`. Mirrors the
+/// Go binary's `cmd/roost/indicator.go` cache. `TabState::None`
+/// clears the indicator (`set_indicator_icon(None)`); the other
+/// three pick the matching SVG.
+fn apply_indicator_icon(page: &libadwaita::TabPage, state: TabState) {
+    let icon: Option<gtk4::gio::BytesIcon> = match state {
+        TabState::None => None,
+        TabState::Running => Some(embedded_icon(ICON_RUNNING)),
+        TabState::NeedsInput => Some(embedded_icon(ICON_NEEDS_INPUT)),
+        TabState::Idle => Some(embedded_icon(ICON_IDLE)),
+    };
+    page.set_indicator_icon(icon.as_ref().map(|i| i.upcast_ref::<gtk4::gio::Icon>()));
 }
 
 impl App {
@@ -692,6 +724,12 @@ impl App {
                         session: session.clone(),
                         page: page_for_future.clone(),
                         cwd: RefCell::new(tab_cwd),
+                        // Fresh tabs start in `None` until the daemon
+                        // emits a `TabStateChangedEvent`. `hook_active`
+                        // defaults to false; the daemon owns that flag
+                        // and broadcasts changes via `HookActiveChangedEvent`.
+                        state: RefCell::new(TabState::None),
+                        hook_active: RefCell::new(false),
                     },
                 );
             }
@@ -857,11 +895,106 @@ impl App {
             EventKind::Notification(n) => {
                 self.fire_desktop_notification(n.tab_id, &n.title, &n.body);
             }
-            _ => {
-                // TabState, HookActive, Active — currently informational
-                // only on the Linux UI. Status-icon polish on the tab
-                // page comes in commit 11.
+            EventKind::TabState(s) => {
+                // M6: per-tab agent state. Update both the per-tab
+                // indicator icon (M7) and the project rollup CSS.
+                let state = TabState::from_proto(s.state);
+                let mut affected_project: Option<i64> = None;
+                {
+                    let projects = self.projects.borrow();
+                    for (project_id, ui) in projects.iter() {
+                        let tabs = ui.tabs.borrow();
+                        if let Some(tab_ui) = tabs.get(&s.tab_id) {
+                            *tab_ui.state.borrow_mut() = state;
+                            apply_indicator_icon(&tab_ui.page, state);
+                            affected_project = Some(*project_id);
+                            break;
+                        }
+                    }
+                }
+                if let Some(project_id) = affected_project {
+                    self.refresh_rollup_for(project_id);
+                }
+                tracing::debug!(tab_id = s.tab_id, ?state, "TabState applied");
             }
+            EventKind::HookActive(h) => {
+                // M6: suppress this tab from the rollup while the
+                // Claude hook owns the surface. Indicator icon stays
+                // mapped to the underlying state — the hook usually
+                // pulses its own visual; we just don't double-promote
+                // via the sidebar stripe.
+                let mut affected_project: Option<i64> = None;
+                {
+                    let projects = self.projects.borrow();
+                    for (project_id, ui) in projects.iter() {
+                        let tabs = ui.tabs.borrow();
+                        if let Some(tab_ui) = tabs.get(&h.tab_id) {
+                            *tab_ui.hook_active.borrow_mut() = h.active;
+                            affected_project = Some(*project_id);
+                            break;
+                        }
+                    }
+                }
+                if let Some(project_id) = affected_project {
+                    self.refresh_rollup_for(project_id);
+                }
+                tracing::debug!(
+                    tab_id = h.tab_id,
+                    hook_active = h.active,
+                    "HookActive applied"
+                );
+            }
+            EventKind::Active(a) => {
+                // M6: daemon-driven active selection (e.g. a CLI
+                // `tab focus` from a sibling terminal). Sync the GTK
+                // UI's notion so cross-client convergence works.
+                // Zero values mean "no selection" (e.g. last tab
+                // closed); skip in that case rather than dropping
+                // the user's current focus.
+                if a.project_id != 0 {
+                    self.set_active_project(a.project_id);
+                }
+                if a.tab_id != 0 {
+                    let projects = self.projects.borrow();
+                    if let Some(ui) = projects.get(&a.project_id) {
+                        if let Some(tab_ui) = ui.tabs.borrow().get(&a.tab_id) {
+                            ui.tab_view.set_selected_page(&tab_ui.page);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recompute the sidebar rollup CSS stripe for `project_id` from
+    /// its tabs' current `(state, hook_active)`. Drops every
+    /// `roost-rollup-*` class on the row first, then applies the
+    /// active one (or none, if the rollup is `RollupState::None`).
+    /// Called whenever a `TabStateChangedEvent` or
+    /// `HookActiveChangedEvent` arrives for one of the project's tabs.
+    fn refresh_rollup_for(self: &Rc<Self>, project_id: i64) {
+        // Same try_borrow pattern as `active_tab_cwd`: this can be
+        // invoked from a TabState / HookActive handler that already
+        // sits inside a synchronously-fired AdwTabView signal, so a
+        // bare `borrow()` can panic. Skipping the refresh in that
+        // case is safe — the next state change will recompute.
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let Ok(tabs) = ui.tabs.try_borrow() else {
+            return;
+        };
+        let pairs: Vec<(TabState, bool)> = tabs
+            .values()
+            .map(|t| (*t.state.borrow(), *t.hook_active.borrow()))
+            .collect();
+        let rollup = project_rollup(&pairs);
+        for cls in RollupState::all_classes() {
+            ui.sidebar_row.remove_css_class(cls);
+        }
+        if let Some(cls) = rollup.css_class() {
+            ui.sidebar_row.add_css_class(cls);
         }
     }
 
@@ -1183,10 +1316,24 @@ fn active_tab_cwd(ui: &ProjectUi) -> String {
     // adw::TabView::selected_page returns the currently focused tab.
     // We resolve that back through `parse_tab_id_from_page` (same
     // path the close-page handler uses) to find the matching TabUi.
+    //
+    // Use `try_borrow` here: AdwTabView fires `selected_page_notify`
+    // synchronously during operations like `tab_view.append`,
+    // `set_selected_page`, and `close_page`, and the caller may
+    // already hold a borrow of `ui.tabs` (e.g. the `TabDeleted`
+    // arm holds `borrow_mut` while it calls `close_page`). Returning
+    // an empty subtitle when a borrow is contended is the right
+    // graceful-degrade — the very next non-contended notify or
+    // event will recompute. The previous version's bare `.borrow()`
+    // panicked under exactly this re-entrant signal pattern.
     if let Some(page) = ui.tab_view.selected_page() {
         if let Some(tab_id) = parse_tab_id_from_page(&page) {
-            if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
-                return tilde_abbreviate(&tab_ui.cwd.borrow());
+            if let Ok(tabs) = ui.tabs.try_borrow() {
+                if let Some(tab_ui) = tabs.get(&tab_id) {
+                    return tilde_abbreviate(&tab_ui.cwd.borrow());
+                }
+            } else {
+                return String::new();
             }
         }
     }
@@ -1199,7 +1346,9 @@ fn active_tab_cwd(ui: &ProjectUi) -> String {
     // this on PR #61.
     let pages = ui.tab_view.pages();
     let n = pages.n_items();
-    let tabs = ui.tabs.borrow();
+    let Ok(tabs) = ui.tabs.try_borrow() else {
+        return String::new();
+    };
     for i in 0..n {
         let Some(obj) = pages.item(i) else { continue };
         let Ok(page) = obj.downcast::<libadwaita::TabPage>() else {
