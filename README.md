@@ -4,7 +4,7 @@ A macOS + Linux desktop terminal multiplexer for AI coding agents. Sidebar of pr
 
 ## Direction
 
-Roost is undergoing an architectural refactor toward a Rust daemon (`roost-core`) with native UIs — Swift + AppKit on macOS, Rust + gtk4-rs on Linux — communicating over a gRPC contract on a Unix domain socket. The current Go + GTK4 binary on `main` continues to build and ship throughout. See [docs/development/vision.md](docs/development/vision.md) for the target architecture and phased rollout, and the `claude/discuss-architecture-refactor-cjU3E` branch for the in-progress work.
+Roost is undergoing an architectural refactor toward a Rust daemon (`roost-core`) with native UIs — Swift + AppKit on macOS, Rust + gtk4-rs on Linux — communicating over a gRPC contract on a Unix domain socket. The current Go + GTK4 binary on `main` continues to build and ship throughout. See [docs/development/vision.md](docs/development/vision.md) for the target architecture and phased rollout, and the long-lived `feature/rust-port` branch for in-progress work. Phases 0–7 closed as of 2026-05-17; Phase 7.5 (polish + automation gaps) and Phase 8 (bundling) remain on the branch before the eventual merge to `main` per the milestone schedule in [`plans/README.md`](plans/README.md).
 
 ## Quick start
 

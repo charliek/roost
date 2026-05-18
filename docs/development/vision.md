@@ -78,8 +78,9 @@ Each phase is a commit (or small PR) on the refactor branch, with explicit exit 
 | 5. Mac UI MVP | Single-tab AppKit window backed by `roost-core` | Type into a bash session in a Mac window. **Architecture proof point.** |
 | 6a. Mac structural | Multi-tab, sidebar, projects, persistence, menus, shortcuts, focus | Structural feature parity |
 | 6b. Mac OSC + notifications | Core-side OSC scanning, `set_hook_active` semantics, `claude-hook` | Mac feature parity with the current Go binary |
-| 7. Linux Rust UI | `linux/` crate, gtk4-rs, tonic client, Cairo+Pango cell renderer | Linux feature parity |
-| 8. Bundling | Mac `.app` + notarytool + DMG; Linux AppImage | Tagged-release CI produces downloadable artifacts |
+| 7. Linux Rust UI | `crates/roost-linux/`, gtk4-rs, tonic client, Cairo+Pango cell renderer | ✅ closed 2026-05-17 (PR #50, squash `421b384`) |
+| 7.5. Linux/Mac polish + automation gaps | Drag-to-reorder UI, CSS port, headerbar icons, AdwTabPage status indicators, `tab snapshot` RPC, `roost-cli-rs watch`, wide-char width | Optional cleanup pass; see [`plans/phase-7-5-polish-and-gaps.md`](../../plans/phase-7-5-polish-and-gaps.md) |
+| 8. Bundling | Mac `.app` + notarytool + DMG; Linux AppImage | Tagged-release CI produces downloadable artifacts. **Gates `feature/rust-port → main`.** |
 | 9. Cutover | Delete `cmd/`, `internal/`, Go-specific Make targets and CI jobs | `main` builds Rust + Swift only |
 
 ## Decision log

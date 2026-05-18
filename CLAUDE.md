@@ -8,7 +8,7 @@ This file remains authoritative for the **current** Go + GTK4 implementation tha
 
 ## Branch policy
 
-The long-lived refactor branch is `feature/rust-port`. Polish PRs from short-lived `polish/*` topic branches merge into it (squash-merge, auto-merge gated on `ci.yml` + `refactor.yml` green via branch protection). When `feature/rust-port` is "shown enough polish to be the direction forward" — see [`plans/goal-rust-port-polish-2026-05-16.md`](plans/goal-rust-port-polish-2026-05-16.md) for the milestone schedule and exit bar — it merges to `main` as a single large merge.
+The long-lived refactor branch is `feature/rust-port`. Polish PRs from short-lived `polish/*` topic branches merge into it (squash-merge, auto-merge gated on `ci.yml` + `refactor.yml` green via branch protection). Current merge-to-`main` exit bar is **Phase 8 (bundling)** — see [`plans/README.md`](plans/README.md) status snapshot and [`plans/phase-8-bundling.md`](plans/phase-8-bundling.md). Phases 0–7 closed on the branch as of 2026-05-17 (PR #50, squash `421b384`); Phase 7.5 polish/automation-gaps and Phase 8 bundling remain before the merge.
 
 `claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor branch and is **frozen** at `00b3d10`. Do not start new work on it.
 

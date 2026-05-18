@@ -3,7 +3,7 @@
 **Set**: 2026-05-17
 **Owner**: Charlie Knudsen
 **Co-author / executor**: Claude (Opus 4.7)
-**Status**: 🚧 in flight — M0 (this goal doc) landing first.
+**Status**: ✅ closed — all M1–M6 landed on `feature/rust-port` by 2026-05-17, plus three post-goal fixes (orphan-tab purge, cursor-on-focus override, OSC UTF-8 multibyte) and the Swift OSC + KeyEncoder test additions.
 **Predecessors**: [`goal-rust-port-polish-2026-05-16.md`](goal-rust-port-polish-2026-05-16.md), [`goal-phase-6-complete-2026-05-16.md`](goal-phase-6-complete-2026-05-16.md). Both closed; this goal is the next polish push.
 
 ## Problem
@@ -113,10 +113,20 @@ This is a goal doc, not a phase doc, on the same precedent as the two predecesso
 
 ## Milestone log
 
-* M0 — 🚧 in progress (this commit).
-* M1 — pending.
-* M2 — pending.
-* M3 — pending.
-* M4 — pending.
-* M5 — pending.
-* M6 — pending (blocked on M1 for snap-on-keystroke hook).
+* M0 — ✅ goal doc landed.
+* M1 — ✅ libghostty-vt key encoder bridge — merged via PR #42 (`235ce43`).
+* M2 — ✅ cursor rendering — merged via PR #43 (`f983cec`).
+* M3 — ✅ sidebar toggle + auto-open + UserDefaults persistence — merged via PR #44 (`25ef079`).
+* M4 — ✅ cycle prev/next tab + rename tab handlers — merged via PR #45 (`dc533f0`).
+* M5 — ✅ PTY-exit cascade — merged via PR #46 (`38dce69`).
+* M6 — ✅ scrollback — 2000-row buffer, wheel handler, snap-on-keystroke — merged via PR #47 (`d294cc6`).
+
+### Post-goal fixes on `feature/rust-port` (2026-05-17)
+
+These addressed dogfooding bugs surfaced after the goal's milestones landed; flagged here so the audit trail stays connected to this goal:
+
+* `234378e` (PR #49) — Daemon orphan-tab purge at startup. Fixed the M5 cascade misfire where stale tab rows from prior daemon sessions persisted in SQLite and prevented project-delete cascades from firing.
+* `5009a0c` (PR #48) — `KeyEncoder` keep UTF-8 buffer alive across `encode()` (fix dropped chars). M1 follow-up: the original M1 had a lifetime bug where `set_utf8`'s `withCString` pointer dangled by the time libghostty consumed it.
+* `266dea7` (PR #51) — Cursor: show in focused view regardless of DECTCEM. Deliberate cmux-style divergence from strict DECTCEM compliance. M2 follow-up; relevant for the gtk4-rs cursor draw in Phase 7 commit 4 (mirrors the same behavior, inline-commented).
+* `aebd408` (PR #52) — Tab pills: fix UTF-8 in titles + horizontal scroll on overflow. Two dogfooding bugs combined: OscScanner buffered body bytes as Latin-1 (mangling emoji); NSStackView grew the window per new tab.
+* `b5b7838` (PR #53) — Swift OscScanner + KeyEncoder coverage (49 new tests). Regression guard for the M1 UTF-8 lifetime bug + the OSC UTF-8 fix. 8 → 57 tests across the Swift target.
