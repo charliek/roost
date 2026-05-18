@@ -144,7 +144,16 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
     add(&mut out, "ctrl+shift+t", KeybindAction::NewTab);
     add(&mut out, "ctrl+shift+w", KeybindAction::CloseTab);
     add(&mut out, "ctrl+shift+n", KeybindAction::NewProject);
-    add(&mut out, "ctrl+r", KeybindAction::RenameTab);
+    // RenameTab: no default trigger on Linux — `Ctrl+R` would shadow
+    // bash/readline's reverse-history-search, and a window-global
+    // shortcut controller (`gtk::ShortcutScope::Global`) means it
+    // would steal the keystroke from the focused terminal. Users
+    // wanting a binding add one in `~/.config/roost/config.conf`,
+    // e.g. `keybind = ctrl+shift+r = rename_tab`. Rename is still
+    // reachable via right-click → Rename (M8) and double-click on
+    // the tab pill (M9). CodeRabbit caught this on PR #63. The
+    // M9.5 platform-detect follow-up adds `super+r` on macOS where
+    // shell shortcuts use Ctrl not Cmd.
     add(&mut out, "ctrl+shift+r", KeybindAction::RenameProject);
     // DeleteProject: no default trigger — see KeybindAction docs.
     add(
@@ -264,19 +273,28 @@ mod tests {
     }
 
     #[test]
-    fn default_bindings_include_m8_rename() {
+    fn default_bindings_m8_actions() {
         let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
-        // Ctrl+R → RenameTab (M8 default).
-        let ctrl_r = parse_trigger("ctrl+r").unwrap();
-        assert_eq!(defaults.get(&ctrl_r), Some(&KeybindAction::RenameTab));
-        // Ctrl+Shift+R → RenameProject.
+        // Ctrl+Shift+R → RenameProject. The window-global shortcut
+        // controller takes priority over the terminal, so anything
+        // that conflicts with bash/readline (Ctrl+R reverse-search,
+        // Ctrl+W word-delete, etc.) must NOT be a default. Project
+        // rename's `Ctrl+Shift+R` is safe because shells don't bind
+        // shifted control keys.
         let ctrl_shift_r = parse_trigger("ctrl+shift+r").unwrap();
         assert_eq!(
             defaults.get(&ctrl_shift_r),
             Some(&KeybindAction::RenameProject)
         );
-        // DeleteProject has no default trigger; nothing in the map
-        // should resolve to it.
+        // RenameTab has no default trigger on Linux — the obvious
+        // `Ctrl+R` collides with bash/readline reverse-history-search.
+        // The M9.5 platform-detect follow-up adds `super+r` on macOS
+        // where shell shortcuts use Ctrl not Cmd; this assertion
+        // pins the deliberate Linux gap.
+        assert!(!defaults
+            .values()
+            .any(|a| matches!(a, KeybindAction::RenameTab)));
+        // DeleteProject has no default trigger either.
         assert!(!defaults
             .values()
             .any(|a| matches!(a, KeybindAction::DeleteProject)));

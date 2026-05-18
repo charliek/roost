@@ -934,16 +934,26 @@ impl App {
         };
         let current_title = tab_ui.page.title().to_string();
 
+        // Select the target tab first. AdwTabView positions the
+        // popover above the currently-selected pill (the only
+        // pill-locating affordance the public API gives us), so if
+        // the rename was invoked from a background tab's context
+        // menu, the popover would otherwise float over the wrong
+        // pill while the RPC silently renames the background tab.
+        // CodeRabbit caught this on PR #63.
+        ui.tab_view.set_selected_page(&tab_ui.page);
+
         let entry = gtk4::Entry::builder()
             .text(&current_title)
             .activates_default(true)
             .build();
         let popover = gtk4::Popover::builder().has_arrow(true).build();
         popover.set_child(Some(&entry));
-        // Anchor the popover at the tab page — adw::TabView doesn't
-        // expose the individual pill widget, so anchor at the
-        // TabView itself; the popover positions itself above the
-        // selected tab in practice.
+        // Anchor the popover at the TabView — adw::TabView doesn't
+        // expose the individual pill widget, so the popover
+        // positions above whichever pill is currently selected,
+        // which after the `set_selected_page` call above is the
+        // tab being edited.
         popover.set_parent(&ui.tab_view);
 
         let app = self.clone();
@@ -1216,6 +1226,31 @@ impl App {
                             .child_by_name(&stack_name(d.project_id))
                             .expect("tab stack child for project"),
                     );
+                }
+                // If the deleted project was the active one, follow-up
+                // actions (NewTab, RenameProject, DeleteProject) would
+                // keep targeting a dead id until some later Active
+                // event repaired it. Reset active selection here:
+                // pick the first remaining project, or clear to 0
+                // when the workspace is now empty. CodeRabbit caught
+                // this on PR #63.
+                let was_active = *self.active_project_id.borrow() == d.project_id;
+                if was_active {
+                    let fallback = projects.keys().copied().min();
+                    drop(projects);
+                    match fallback {
+                        Some(pid) => {
+                            // `set_active_project` short-circuits when
+                            // `active == requested`, so clear first.
+                            *self.active_project_id.borrow_mut() = 0;
+                            self.set_active_project(pid);
+                        }
+                        None => {
+                            *self.active_project_id.borrow_mut() = 0;
+                            self.window_title.set_title("Roost");
+                            self.window_title.set_subtitle("");
+                        }
+                    }
                 }
             }
             EventKind::TabOpened(opened) => {
