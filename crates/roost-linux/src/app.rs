@@ -242,17 +242,23 @@ impl App {
 
         for project in &projects {
             self.add_project_ui(project);
+            // Attach existing tabs for every project, not just the
+            // first one. Persisted state across daemon restarts (or
+            // cross-client opens) puts tabs in any project; pre-fix
+            // the GTK UI only hydrated the first project's tabs and
+            // silently dropped the rest. Mac UI hydrates all.
+            for tab in &project.tabs {
+                self.attach_existing_tab(tab.clone());
+            }
         }
         // Open a tab in the first project so the user lands inside
-        // a shell — same shape as the Mac UI's bootstrap.
+        // a shell — same shape as the Mac UI's bootstrap. Only fires
+        // when the first project has no tabs, so a workspace that
+        // was empty on disk gets a usable terminal on first boot.
         if let Some(first) = projects.first() {
             self.set_active_project(first.id);
             if first.tabs.is_empty() {
                 self.open_new_tab_in(first.id).await?;
-            } else {
-                for tab in &first.tabs {
-                    self.attach_existing_tab(tab.clone());
-                }
             }
         }
 

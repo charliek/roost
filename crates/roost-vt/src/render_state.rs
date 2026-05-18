@@ -280,13 +280,21 @@ impl RenderState {
     /// libghostty's contract says they're safe to re-bind via the next
     /// `_next` call without reallocation.
     pub fn walk(&mut self, terminal: &Terminal, mut f: impl FnMut(u32, Cell)) -> Result<()> {
-        // Rebind the row iterator to this frame's state.
+        // Rebind the row iterator to this frame's state. The C signature
+        // expects `GhosttyRenderStateRowIterator*` (pointer-to-handle slot),
+        // not the handle's value — the function writes into the slot to
+        // re-anchor the pre-allocated iterator at the new frame. Passing
+        // `self.row_iter as *mut _` would point at the iterator's IMPL
+        // and corrupt its internal state, leaving `..._next` returning
+        // false on every row (silent: no error, just zero cells walked).
+        // Mirrors `mac/Sources/Roost/RenderState.swift::walk`'s
+        // `withUnsafeMutablePointer(to: &self.rowIter)` pattern.
         // SAFETY: state + iter handles non-null per constructor.
         let rc = unsafe {
             sys::ghostty_render_state_get(
                 self.handle,
                 sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
-                self.row_iter as *mut _,
+                (&mut self.row_iter) as *mut _ as *mut _,
             )
         };
         Error::from_result(rc)?;
@@ -299,13 +307,15 @@ impl RenderState {
         let mut row_idx: u32 = 0;
         // SAFETY: iter handle non-null.
         while unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
-            // Bind this row's cells to row_cells.
+            // Bind this row's cells to row_cells. Same pointer-to-slot
+            // semantics as the row iterator above — pass `&mut`, not the
+            // handle value.
             // SAFETY: iter + cells handles non-null.
             let rc = unsafe {
                 sys::ghostty_render_state_row_get(
                     self.row_iter,
                     sys::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                    self.row_cells as *mut _,
+                    (&mut self.row_cells) as *mut _ as *mut _,
                 )
             };
             if Error::from_result(rc).is_err() {
@@ -427,5 +437,66 @@ impl Drop for RenderState {
             sys::ghostty_render_state_row_iterator_free(self.row_iter);
             sys::ghostty_render_state_free(self.handle);
         }
+    }
+}
+
+#[cfg(all(test, feature = "ffi"))]
+mod tests {
+    use super::*;
+    use crate::{Terminal, TerminalOptions};
+
+    /// Regression test for the row-iterator binding bug fixed in M1 of
+    /// `polish/gtk-parity`. Pre-fix, `walk` passed the iterator handle's
+    /// VALUE as the `out` pointer to `ghostty_render_state_get`, which
+    /// corrupted the iterator's internal state and caused every
+    /// subsequent `..._row_iterator_next` to return `false` — silently
+    /// yielding zero cells walked even after `vt_write` fed bytes in.
+    /// Symptom in the GTK Linux UI: terminal area blank with the cursor
+    /// visible but no glyphs. Cross-check against the Mac UI, where
+    /// `RenderState.walk` correctly passes `&self.rowIter`.
+    #[test]
+    fn walk_yields_cells_after_vt_write() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("Terminal::new");
+        // ASCII "hello" — exactly 5 visible cells at columns 0..5 on row 0.
+        terminal.vt_write(b"hello");
+
+        let mut render_state = RenderState::new().expect("RenderState::new");
+        render_state.update(&terminal).expect("update");
+
+        let mut total_cells = 0u32;
+        let mut visible: Vec<(u32, u16, String)> = Vec::new();
+        render_state
+            .walk(&terminal, |row, cell| {
+                total_cells += 1;
+                if !cell.text.is_empty() && cell.text != " " {
+                    visible.push((row, cell.col, cell.text.clone()));
+                }
+            })
+            .expect("walk");
+
+        // 80 cols × 24 rows = 1920 cells walked.
+        assert_eq!(
+            total_cells, 1920,
+            "walk visited {} cells but expected 1920 (80×24); \
+             pre-fix this was 0 due to the row-iterator pointer-indirection bug",
+            total_cells
+        );
+
+        // "hello" should land at (0, 0)..(0, 4).
+        let glyphs: String = visible
+            .iter()
+            .filter(|(row, _, _)| *row == 0)
+            .map(|(_, _, t)| t.as_str())
+            .collect();
+        assert_eq!(
+            glyphs, "hello",
+            "row 0 visible glyphs should be \"hello\", got {:?}",
+            visible
+        );
     }
 }
