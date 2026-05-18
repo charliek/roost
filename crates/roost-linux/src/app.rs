@@ -766,7 +766,7 @@ impl App {
                         ui.tabs.borrow_mut().remove(&tab_id);
                     }
                     let already_server_driven =
-                        app.server_driven_closes.borrow_mut().remove(&tab_id);
+                        drain_server_driven_marker(&app.server_driven_closes, tab_id);
                     if !already_server_driven {
                         // User-initiated close (× click or Cmd+W)
                         // — tell the daemon. Server-driven closes
@@ -1191,7 +1191,7 @@ impl App {
         // the same tab. Inserting into `pending_attaches` here
         // (synchronous, before the await) closes the race — the
         // second caller sees the marker and returns.
-        if ui.tabs.borrow().contains_key(&tab.id) || ui.pending_attaches.borrow().contains(&tab.id)
+        if is_already_attached_or_pending(&ui.tabs.borrow(), &ui.pending_attaches.borrow(), tab.id)
         {
             return;
         }
@@ -1250,6 +1250,18 @@ impl App {
                 let projects = app_for_attach.projects.borrow();
                 if let Some(ui) = projects.get(&project_id) {
                     ui.pending_attaches.borrow_mut().remove(&tab_id);
+                    // Mark the tab as server-driven so the close-page
+                    // signal handler skips the CloseTab RPC. The
+                    // daemon still has the tab — we're only tearing
+                    // down the orphaned UI page after a local
+                    // StreamPty attach failure (transient daemon
+                    // hiccup, resource limit). Sending CloseTab here
+                    // would let a recoverable failure nuke persisted
+                    // daemon state. CodeRabbit caught this on PR #64.
+                    app_for_attach
+                        .server_driven_closes
+                        .borrow_mut()
+                        .insert(tab_id);
                     // libadwaita's internal `page_belongs_to_this_view`
                     // check handles the case where the page is already
                     // gone; calling close_page on a stranger is a
@@ -1425,7 +1437,7 @@ impl App {
                 // this on PR #63.
                 let was_active = *self.active_project_id.borrow() == d.project_id;
                 if was_active {
-                    let fallback = projects.keys().copied().min();
+                    let fallback = pick_next_active_project(&projects);
                     drop(projects);
                     match fallback {
                         Some(pid) => {
@@ -2193,6 +2205,39 @@ fn tilde_abbreviate_with_home(path: &str, home: &str) -> String {
     path.to_string()
 }
 
+/// M9.5 dedupe rule for `attach_existing_tab`: skip the spawn if
+/// the tab id is already either fully attached (`tabs`) or
+/// in-flight (`pending_attaches`). The pending set covers the
+/// async window between the optimistic RPC-return attach and the
+/// WatchEvents `TabOpened` arm — without it, both paths
+/// race-pass the `tabs.contains_key` check and double-spawn.
+fn is_already_attached_or_pending<T>(
+    tabs: &HashMap<i64, T>,
+    pending: &HashSet<i64>,
+    tab_id: i64,
+) -> bool {
+    tabs.contains_key(&tab_id) || pending.contains(&tab_id)
+}
+
+/// M9.5 cascade rule for `ProjectDeleted`: when the active
+/// project was the one deleted, the lowest-id remaining project
+/// becomes active. Returns `None` when the workspace is empty
+/// (caller closes the window). Lowest-id (not last-active, not
+/// random) so the choice is deterministic across UI clients.
+fn pick_next_active_project<T>(projects: &HashMap<i64, T>) -> Option<i64> {
+    projects.keys().copied().min()
+}
+
+/// M9.5 one-shot test-and-drain for the server-driven-close
+/// marker. Returns true if the marker was set (caller should
+/// skip the CloseTab RPC); also clears the marker so a second
+/// close attempt without re-insertion WILL send the RPC. The
+/// drain semantics matter — a leftover marker would silently
+/// swallow a legitimate user-driven close.
+fn drain_server_driven_marker(set: &RefCell<HashSet<i64>>, tab_id: i64) -> bool {
+    set.borrow_mut().remove(&tab_id)
+}
+
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
@@ -2237,7 +2282,12 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 
 #[cfg(test)]
 mod tests {
-    use super::tilde_abbreviate_with_home;
+    use super::{
+        drain_server_driven_marker, is_already_attached_or_pending, pick_next_active_project,
+        tilde_abbreviate_with_home,
+    };
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
 
     /// `tilde_abbreviate_with_home` is the headerbar-subtitle (M2)
     /// helper that also powers the OSC 7 tab-pill label. Keep its
@@ -2264,5 +2314,82 @@ mod tests {
             tilde_abbreviate_with_home("/Users/testbed", home),
             "/Users/testbed"
         );
+    }
+
+    /// `is_already_attached_or_pending` is the dedupe rule that
+    /// guards `attach_existing_tab` against the M9.5 Cmd+T
+    /// double-spawn race. Pin the EITHER/OR semantics so a future
+    /// "optimisation" that drops one of the two checks regresses
+    /// the race fix.
+    #[test]
+    fn dedupe_skips_when_already_attached_or_pending() {
+        let mut tabs: HashMap<i64, ()> = HashMap::new();
+        let mut pending: HashSet<i64> = HashSet::new();
+
+        // Neither set contains the id → don't skip (proceed to spawn).
+        assert!(!is_already_attached_or_pending(&tabs, &pending, 7));
+
+        // Live tab → skip.
+        tabs.insert(7, ());
+        assert!(is_already_attached_or_pending(&tabs, &pending, 7));
+        tabs.clear();
+
+        // In-flight tab (between the optimistic attach and
+        // session_handle.await resolving) → skip.
+        pending.insert(7);
+        assert!(is_already_attached_or_pending(&tabs, &pending, 7));
+
+        // Belt-and-braces: both sets carrying the id → skip.
+        tabs.insert(7, ());
+        assert!(is_already_attached_or_pending(&tabs, &pending, 7));
+
+        // Unrelated id → don't skip.
+        assert!(!is_already_attached_or_pending(&tabs, &pending, 99));
+    }
+
+    /// `pick_next_active_project` encodes the M9.5 cascade rule:
+    /// lowest remaining id when the active project was deleted,
+    /// `None` when the workspace is empty (caller closes the
+    /// window). Pin "lowest id" so a future change to "last
+    /// active" or "random" breaks loudly.
+    #[test]
+    fn next_active_picks_lowest_id_or_none_when_empty() {
+        let empty: HashMap<i64, ()> = HashMap::new();
+        assert_eq!(pick_next_active_project(&empty), None);
+
+        let mut projects: HashMap<i64, ()> = HashMap::new();
+        projects.insert(3, ());
+        projects.insert(7, ());
+        projects.insert(2, ());
+        assert_eq!(pick_next_active_project(&projects), Some(2));
+
+        let mut single: HashMap<i64, ()> = HashMap::new();
+        single.insert(42, ());
+        assert_eq!(pick_next_active_project(&single), Some(42));
+    }
+
+    /// `drain_server_driven_marker` is one-shot: it returns
+    /// whether the marker was present AND clears it. A leftover
+    /// marker would silently swallow the next user-driven close
+    /// (× button or Cmd+W). Also pins that an unrelated id
+    /// doesn't return true — that would skip a legitimate RPC.
+    #[test]
+    fn server_driven_marker_drains_on_first_check() {
+        let set: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
+        set.borrow_mut().insert(5);
+
+        // First check: marker present, returns true, drains.
+        assert!(drain_server_driven_marker(&set, 5));
+        assert!(!set.borrow().contains(&5));
+
+        // Second check on the same id: marker gone, returns
+        // false — caller now correctly sends the CloseTab RPC.
+        assert!(!drain_server_driven_marker(&set, 5));
+
+        // Unrelated id: never present, returns false.
+        set.borrow_mut().insert(5);
+        assert!(!drain_server_driven_marker(&set, 99));
+        // The unrelated query didn't drain the real marker.
+        assert!(set.borrow().contains(&5));
     }
 }
