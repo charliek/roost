@@ -1907,7 +1907,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         popover.contentViewController = RenamePopoverController(
             initial: currentTitle,
             onCommit: { [weak self] text in
-                self?.commitRenameTab(tabID: tabID, newTitle: text)
+                self?.commitRenameTab(
+                    tabID: tabID,
+                    newTitle: text,
+                    initialTitle: currentTitle
+                )
             },
             onCancel: { [weak self] in
                 self?.cancelRenameTab()
@@ -1919,16 +1923,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func commitRenameTab(tabID: Int64, newTitle: String) {
+    private func commitRenameTab(tabID: Int64, newTitle: String, initialTitle: String) {
         defer {
             renamePopover?.performClose(nil)
             renamePopover = nil
             renamePopoverTabID = nil
         }
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard tabs.contains(where: { $0.id == tabID }) else { return }
+        // CodeRabbit on PR #69: compare against the popover's *initial*
+        // text, not `session.liveTitle`. The popover prefills from
+        // `pillLabel(for:index:)`, which falls back to the
+        // tilde-abbreviated cwd or "Tab N" when liveTitle is empty;
+        // pressing Enter without edits in that state would otherwise
+        // commit + set the daemon's `user_titled` lock against a
+        // value the user never typed. Empty + unchanged are cancel.
+        guard !trimmed.isEmpty, trimmed != initialTitle else { return }
         guard let session = tabs.first(where: { $0.id == tabID }) else { return }
-        let previous = session.liveTitle ?? ""
-        guard !trimmed.isEmpty, trimmed != previous else { return }
 
         // Optimistic local update so the pill flips immediately —
         // matches the pre-M5 NSAlert flow.
