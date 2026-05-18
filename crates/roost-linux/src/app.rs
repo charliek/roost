@@ -84,6 +84,13 @@ pub struct App {
     font_size_pt: Option<f64>,
 }
 
+/// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
+/// kept in sync verbatim with the Go binary so the two UIs feel
+/// identical. Loaded once at App::new and applied via the display's
+/// shared style context so it composes with the user's libadwaita
+/// theme rather than replacing it.
+const STYLE_CSS: &str = include_str!("resources/style.css");
+
 impl App {
     /// Build the window + start the daemon bootstrap. Returns an
     /// `Rc<App>` so closures can hold references back into the App
@@ -95,6 +102,25 @@ impl App {
             .default_height(700)
             .title("Roost (Linux)")
             .build();
+
+        // Install the bundled chrome stylesheet on the default
+        // display. `load_from_string` is infallible in current
+        // gtk4-rs (parse warnings go through the GLib log writer,
+        // not a Rust Result), so the only failure mode is a missing
+        // `gdk::Display::default()` — vanishingly unlikely outside
+        // GTK-not-initialised contexts and we fall back to the
+        // unstyled defaults if it ever does happen.
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let provider = gtk4::CssProvider::new();
+            provider.load_from_string(STYLE_CSS);
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        } else {
+            tracing::warn!("no default GDK display; skipping chrome CSS load");
+        }
 
         let header = HeaderBar::new();
         // `adw::WindowTitle` is the libadwaita 1.x analog of NSWindow's
