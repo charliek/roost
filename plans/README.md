@@ -23,7 +23,8 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 | [6a](phase-6a-mac-structural.md) | Mac structural parity (multi-tab, sidebar, projects, persistence, menus) | ✅ done (M1–M7 + P1–P3 closed on `feature/rust-port`) | yes |
 | [6b](phase-6b-mac-osc-notifications.md) | Mac OSC + notifications (the differentiator) | ✅ done (P4–P9 closed on `feature/rust-port`) | yes |
 | [7](phase-7-linux-ui.md) | Linux UI (gtk4-rs + Cairo + Pango) | ✅ done (commits 0–11 + follow-up landed via PR #50, squash `421b384`, 2026-05-17) | yes |
-| [7.5](phase-7-5-polish-and-gaps.md) | Linux/Mac polish + automation gaps (drag-reorder, CSS, icons, theme overrides, `tab snapshot`, etc.) | ⏳ scoped | yes |
+| [7.5](phase-7-5-polish-and-gaps.md) | Linux/Mac polish + automation gaps (drag-reorder, CSS, icons, theme overrides, `tab snapshot`, etc.) | 🪦 superseded by [Linux GTK parity goal](goal-linux-gtk-parity-2026-05-17.md) (carried tracks A/B1/D); B2/C/E filed below | n/a |
+| [7.5b](goal-linux-gtk-parity-2026-05-17.md) | Linux GTK parity (port chrome + UX from Go GTK binary to gtk4-rs Rust UI) | ⏳ scoped, not started | yes |
 | [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG + notarytool; Linux AppImage) | ⏳ pending | yes |
 | [9](phase-9-cutover.md) | Cutover (delete `cmd/`, `internal/`, Go-specific make targets) | ⏳ pending | **destructive — separate PR** |
 
@@ -55,7 +56,7 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 * [`goal-mac-polish-cursor-keys-2026-05-17.md`](goal-mac-polish-cursor-keys-2026-05-17.md) — M1–M6 (libghostty key-encoder bridge, cursor rendering, sidebar toggle, cycle/rename tab, PTY-exit cascade, scrollback) + the post-goal fixes for orphan-tab purge, cursor-on-focus override, OSC UTF-8.
 * **Phase 7 (Linux UI)** — see [`phase-7-linux-ui.md`](phase-7-linux-ui.md). Landed via PR #50 squash `421b384`. Carries: `roost-vt` safe API, `roost-osc` shared crate, daemon `ReorderTabs`/`ReorderProjects` RPCs, Cairo+Pango cell renderer, StreamPty round-trip, full key encoder, scrollback + selection + clipboard, sidebar + AdwTabView + WatchEvents, keybind config, OSC + notifications, themes + config + focus-tab action.
 
-Active goal: [`phase-7-5-polish-and-gaps.md`](phase-7-5-polish-and-gaps.md) — Linux + Mac visual polish, drag-to-reorder UI, automation API gaps, deferred cross-platform items. Optional; can be skipped if the user wants to jump straight to Phase 8.
+Active goal: [`goal-linux-gtk-parity-2026-05-17.md`](goal-linux-gtk-parity-2026-05-17.md) — bring the gtk4-rs Linux UI up to visual + UX parity with the Go GTK binary the user is happy with. M1 (PTY spawn + multi-project attach) is the BLOCKER; M2–M10 are chrome / status / context-menu / rename / drag-reorder work. This goal supersedes Phase 7.5; uncarried tracks (B2 Mac drag-reorder, C automation API, E cross-platform polish) are tracked in the [Open questions / Follow-up tracks](#follow-up-tracks-from-the-superseded-phase-75) section below.
 
 Next phase after that: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + Linux AppImage. The user's stated gate for `feature/rust-port → main` is "Phase 8 first so users pulling `main` get an installable artifact rather than source-only" (decision 2026-05-17).
 
@@ -79,3 +80,17 @@ Next phase after that: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + L
 * Whether to keep `roost-cli-rs` as the transitional binary name through Phase 8 or rename to `roost-cli` earlier with a Go-side compatibility shim. See [DL-9 in vision.md](../docs/development/vision.md#dl-9-new-rust-cli-lands-under-a-transitional-binary-name).
 * Whether the SQLite database file should keep its current path across the cutover. The schema ports byte-for-byte (DL-7) but a user's existing `roost.db` will continue to be read by both binaries until Phase 9 deletes the Go reader. No issues anticipated.
 * CodeRabbit reviews each refactor commit; small follow-up commits to address actionable items are part of every phase's working budget.
+
+### Follow-up tracks from the superseded Phase 7.5
+
+When the [Linux GTK parity goal](goal-linux-gtk-parity-2026-05-17.md) closes, these tracks from the old [Phase 7.5](phase-7-5-polish-and-gaps.md) doc still need homes:
+
+* **B2 — Mac drag-reorder UI** — Mac is structurally complete; this is Mac-only polish. File as `polish/mac-reorder-drag` if/when the user wants it.
+* **C1 — `tab snapshot` RPC** — for CI to verify renderer state headlessly. Architecture choice pending (daemon-side libghostty parse vs UI-side StreamPty extension vs ring buffer). Could fold into Phase 8 or be a separate goal.
+* **C2 — `roost-cli-rs watch` for WatchEvents** — debug subcommand. Small; could land any time.
+* **C3 — Surface daemon `NotFound` from `tab send`** — CLI swallows the error today.
+* **C4 — Daemon-side `tracing::info!` for `fire_notification`** — one-liner.
+* **E1 — Wide-char width** (CJK + emoji); affects both UIs.
+* **E2 — IME composition** (`markedText` pattern); affects both UIs.
+* **E3 — Mouse encoder** for xterm mouse-tracking apps (`htop -mouse`, `vim` with `set mouse=a`).
+* **E4 — `macos-option-as-alt` config setting** — one-line plumbing through `mac/Sources/Roost/KeyEncoder.swift`.

@@ -1,11 +1,11 @@
 # Phase 7.5 — Polish + Automation Gaps
 
-**Status**: ⏳ scoped, not started
+**Status**: 🪦 superseded 2026-05-17 by [`goal-linux-gtk-parity-2026-05-17.md`](goal-linux-gtk-parity-2026-05-17.md) — see "What's superseded vs carried forward" in the successor doc for the per-track mapping. Tracks A, B1, D carried into the new goal as M3/M5/M7/M9/M4/M10/M6. Tracks B2 (Mac drag-reorder), C (automation API gaps), and E (cross-platform polish: wide-char width, IME, mouse encoder, option-as-alt) are out of scope for the parity goal and are filed as separate follow-up homes in [`README.md`](README.md).
 **Set**: 2026-05-17
 **Owner**: Charlie Knudsen
 **Co-author / executor**: Claude (Opus 4.7)
 **Predecessor**: [`phase-7-linux-ui.md`](phase-7-linux-ui.md) — closed 2026-05-17 via PR #50 squash `421b384`
-**Successor**: [`phase-8-bundling.md`](phase-8-bundling.md) — the gate for `feature/rust-port → main`
+**Successor**: [`goal-linux-gtk-parity-2026-05-17.md`](goal-linux-gtk-parity-2026-05-17.md) (this doc's replacement); then [`phase-8-bundling.md`](phase-8-bundling.md) — the gate for `feature/rust-port → main`
 
 ## Problem
 
