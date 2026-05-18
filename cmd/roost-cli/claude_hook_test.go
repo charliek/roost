@@ -87,7 +87,7 @@ func TestClaudeHookSessionStartSetsHookActive(t *testing.T) {
 	t.Setenv("ROOST_TAB_ID", "7")
 
 	withStdin(t, "{}", func() {
-		cmdClaudeHook([]string{"session-start"})
+		runClaudeHook([]string{"session-start"})
 	})
 	waitForCalls(t, h, 1)
 
@@ -102,7 +102,7 @@ func TestClaudeHookPromptSubmitClearsAndRuns(t *testing.T) {
 	t.Setenv("ROOST_TAB_ID", "5")
 
 	withStdin(t, "{}", func() {
-		cmdClaudeHook([]string{"prompt-submit"})
+		runClaudeHook([]string{"prompt-submit"})
 	})
 	waitForCalls(t, h, 2)
 
@@ -120,7 +120,7 @@ func TestClaudeHookNotificationFiresStateAndBanner(t *testing.T) {
 	t.Setenv("ROOST_TAB_ID", "9")
 
 	withStdin(t, `{"message":"need permission to write"}`, func() {
-		cmdClaudeHook([]string{"notification"})
+		runClaudeHook([]string{"notification"})
 	})
 	waitForCalls(t, h, 2)
 
@@ -138,7 +138,7 @@ func TestClaudeHookStopSetsIdleAndBanner(t *testing.T) {
 	t.Setenv("ROOST_TAB_ID", "3")
 
 	withStdin(t, "{}", func() {
-		cmdClaudeHook([]string{"stop"})
+		runClaudeHook([]string{"stop"})
 	})
 	waitForCalls(t, h, 2)
 
@@ -156,7 +156,7 @@ func TestClaudeHookSessionEndCleansUp(t *testing.T) {
 	t.Setenv("ROOST_TAB_ID", "11")
 
 	withStdin(t, "{}", func() {
-		cmdClaudeHook([]string{"session-end"})
+		runClaudeHook([]string{"session-end"})
 	})
 	waitForCalls(t, h, 3)
 
@@ -177,12 +177,38 @@ func TestClaudeHookMissingTabIDIsSilentNoOp(t *testing.T) {
 	t.Setenv("ROOST_TAB_ID", "")
 
 	withStdin(t, "{}", func() {
-		cmdClaudeHook([]string{"notification"})
+		runClaudeHook([]string{"notification"})
 	})
 	// Wait briefly to ensure no calls land.
 	time.Sleep(150 * time.Millisecond)
 	if len(h.snapshot()) != 0 {
 		t.Fatalf("expected no IPC calls without ROOST_TAB_ID, got %v", h.snapshot())
+	}
+}
+
+func TestClaudeHookUnknownEventIsSilent(t *testing.T) {
+	h := startFakeServer(t)
+	t.Setenv("ROOST_TAB_ID", "5")
+
+	withStdin(t, "{}", func() {
+		runClaudeHook([]string{"bogus-event"})
+	})
+	time.Sleep(100 * time.Millisecond)
+	if got := h.snapshot(); len(got) != 0 {
+		t.Errorf("expected no IPC calls for unknown event; got %v", got)
+	}
+}
+
+func TestClaudeHookEmptyArgsIsSilent(t *testing.T) {
+	h := startFakeServer(t)
+	t.Setenv("ROOST_TAB_ID", "5")
+
+	withStdin(t, "{}", func() {
+		runClaudeHook(nil)
+	})
+	time.Sleep(100 * time.Millisecond)
+	if got := h.snapshot(); len(got) != 0 {
+		t.Errorf("expected no IPC calls when args is nil; got %v", got)
 	}
 }
 

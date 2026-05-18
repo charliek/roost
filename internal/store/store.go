@@ -41,7 +41,7 @@ type Tab struct {
 	CreatedAt   time.Time
 	LastActive  time.Time
 	// UserTitled is true once the user explicitly renamed the tab (Cmd-R
-	// popover or `roost-cli set-title`). While set, OSC 1/2 writes from
+	// popover or `roost-cli tab set-title`). While set, OSC 1/2 writes from
 	// the shell are suppressed by UpdateTabTitleIfNotUserSet. v1 has no
 	// in-app way to clear the lock.
 	UserTitled bool

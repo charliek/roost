@@ -19,10 +19,10 @@ OSC 9 disambiguation: bodies starting with a digit followed by `;` (or only digi
 A notification has four places it can show up. They are independent — clearing one does not clear the others, except where noted.
 
 1. **Pending-attention badge on the tab.** The built-in libadwaita "needs attention" pulse (a subtle dot / underline). Set when a notification arrives for a non-focused tab; cleared when you select that tab.
-2. **Sticky agent-state indicator on the tab.** A small colored circle next to the title — blue (running), orange (needs your input), gray (idle / turn complete), or none. State only changes from agent hook events (`roost-cli claude-hook ...` or future equivalents); it survives focus events.
+2. **Sticky agent-state indicator on the tab.** A small colored circle next to the title — blue (running), orange (needs your input), gray (idle / turn complete), or none. State only changes from agent hook events (`roost-cli claude hook ...` or future equivalents); it survives focus events.
 3. **Project rollup stripe on the sidebar row.** A 3px left-edge color stripe colored by the highest-severity state across the project's tabs. **needs-input wins** because the most actionable signal should dominate — a project with one blocked tab and four running tabs flags the user, not "busy."
 4. **Desktop notification banner.**
-   - macOS: shells out to `terminal-notifier` (Homebrew). Click the banner → `roost-cli tab focus --tab N` runs → window raises and the right tab becomes active. Without `terminal-notifier` installed, banners are silent no-ops; in-app indicators still work. (Distribution will declare it as a Homebrew dependency.)
+   - macOS: shells out to `terminal-notifier` (Homebrew). Click the banner → `roost-cli tab focus N` runs → window raises and the right tab becomes active. Without `terminal-notifier` installed, banners are silent no-ops; in-app indicators still work. (Distribution will declare it as a Homebrew dependency.)
    - Linux: `gio.Notification` → freedesktop notification daemon over DBus, with a default action wired to the in-process `app.tab-focus` GIO action. Clicking the banner focuses the tab in-process — no IPC round-trip needed.
 
 If the target tab *is* the currently focused one and the window is active, the badge and the desktop banner are both suppressed — you're already looking at it. State indicators still update.
@@ -58,21 +58,21 @@ When a structured hook session is driving a tab (e.g. Claude Code with `roost-cl
 From inside a Roost tab:
 
 ```bash
-roost-cli notify --title "Build done" --body "tests pass"
+roost-cli notify "Build done" "tests pass"
 ```
 
 From outside Roost, target a specific tab:
 
 ```bash
 ROOST_SOCKET="$HOME/Library/Application Support/Roost/roost.sock" \
-  roost-cli notify --title "From CI" --body "deploy ready" --tab 3
+  roost-cli notify "From CI" "deploy ready" --tab 3
 ```
 
 Manually drive the agent-state indicator (e.g. for a non-Claude agent):
 
 ```bash
-roost-cli tab set-state --tab 3 --state needs_input
-roost-cli tab set-state --tab 3 --state idle
+roost-cli tab set-state needs_input --tab 3
+roost-cli tab set-state idle --tab 3
 ```
 
 OSC 9 from any shell inside a Roost tab:
