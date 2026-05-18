@@ -63,6 +63,11 @@ pub struct App {
     client: RefCell<Option<RoostClient>>,
     rt: Handle,
     sidebar: gtk4::ListBox,
+    /// The whole sidebar container — header label + scrolled list +
+    /// footer `+ Project` button. Hidden as a unit by
+    /// `toggle_sidebar`; otherwise the header / button would remain
+    /// visible while only the list collapses.
+    sidebar_box: gtk4::Box,
     /// `gtk::Stack` of TabView widgets, one entry per project id.
     /// Switching the sidebar selection flips the visible child.
     tab_stack: gtk4::Stack,
@@ -90,6 +95,26 @@ pub struct App {
 /// shared style context so it composes with the user's libadwaita
 /// theme rather than replacing it.
 const STYLE_CSS: &str = include_str!("resources/style.css");
+
+/// Bundled chrome icons. Vendored from `cmd/roost/icons/` (which in
+/// turn comes from upstream Adwaita) so the GTK app doesn't depend
+/// on the user's system `adwaita-icon-theme` being installed —
+/// matches the Go binary's icons.gresource approach but skips the
+/// gresource compilation step (one less build-tool dependency) by
+/// embedding the SVGs directly into the binary via `include_bytes!`.
+const ICON_FOLDER_SYMBOLIC: &[u8] = include_bytes!("resources/icons/folder-symbolic.svg");
+const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
+    include_bytes!("resources/icons/sidebar-show-symbolic.svg");
+const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
+
+/// Wrap an embedded SVG in a `gio::BytesIcon` so it can drive a
+/// `gtk::Image` regardless of the user's icon-theme search path.
+/// libadwaita's symbolic icons are tiny SVGs (~1 KB each), so the
+/// `glib::Bytes::from_static` allocation is free at runtime.
+fn embedded_icon(bytes: &'static [u8]) -> gtk4::gio::BytesIcon {
+    let glib_bytes = glib::Bytes::from_static(bytes);
+    gtk4::gio::BytesIcon::new(&glib_bytes)
+}
 
 impl App {
     /// Build the window + start the daemon bootstrap. Returns an
@@ -129,6 +154,34 @@ impl App {
         // two-line title format and the Go binary's `HeaderBar.WindowTitle`.
         let window_title = WindowTitle::new("Roost", "connecting…");
         header.set_title_widget(Some(&window_title));
+
+        // Headerbar buttons: folder picker (left) + sidebar toggle
+        // (left) + `+ Tab` (right). Matches the Go binary's
+        // `cmd/roost/app.go` chrome — same icons, same positions.
+        // Wired below after `app_struct` exists so the handlers can
+        // capture an `Rc<App>` clone.
+        let folder_button = gtk4::Button::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(ICON_FOLDER_SYMBOLIC)))
+            .css_classes(["flat"])
+            .tooltip_text("New project from folder…")
+            .build();
+        let sidebar_toggle_button = gtk4::Button::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(
+                ICON_SIDEBAR_SHOW_SYMBOLIC,
+            )))
+            .css_classes(["flat"])
+            .tooltip_text("Toggle sidebar")
+            .build();
+        let new_tab_button = gtk4::Button::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(
+                ICON_TAB_NEW_SYMBOLIC,
+            )))
+            .css_classes(["flat"])
+            .tooltip_text("New tab")
+            .build();
+        header.pack_start(&folder_button);
+        header.pack_start(&sidebar_toggle_button);
+        header.pack_end(&new_tab_button);
 
         // Sidebar: vertical Box of [section header] / [scrolled project
         // list] / [`+ Project` footer button]. Matches the Go binary's
@@ -201,6 +254,7 @@ impl App {
             client: RefCell::new(None),
             rt: rt.clone(),
             sidebar: sidebar.clone(),
+            sidebar_box: sidebar_box.clone(),
             tab_stack: tab_stack.clone(),
             window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
@@ -241,6 +295,75 @@ impl App {
                 glib::spawn_future_local(async move {
                     if let Err(err) = app.create_new_project().await {
                         tracing::warn!(?err, "new_project (sidebar button) failed");
+                    }
+                });
+            }
+        });
+
+        // Headerbar buttons.
+        // - Folder picker: pop a FileChooser, then create a project
+        //   with the chosen cwd. Mirrors `cmd/roost/app.go`'s
+        //   "new project from folder" path.
+        folder_button.connect_clicked({
+            let app = app_struct.clone();
+            move |btn| {
+                let parent = btn
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                let mut builder = gtk4::FileChooserNative::builder()
+                    .title("Choose project folder")
+                    .action(gtk4::FileChooserAction::SelectFolder)
+                    .modal(true)
+                    .accept_label("Open")
+                    .cancel_label("Cancel");
+                if let Some(parent) = parent.as_ref() {
+                    builder = builder.transient_for(parent);
+                }
+                let dialog = builder.build();
+                let app = app.clone();
+                let dialog_handle = dialog.clone();
+                dialog.connect_response(move |dialog, response| {
+                    if response == gtk4::ResponseType::Accept {
+                        if let Some(folder) = dialog.file().and_then(|f| f.path()) {
+                            let path = folder.to_string_lossy().to_string();
+                            let app = app.clone();
+                            glib::spawn_future_local(async move {
+                                if let Err(err) =
+                                    app.create_new_project_with_cwd(&path).await
+                                {
+                                    tracing::warn!(
+                                        ?err,
+                                        path = %path,
+                                        "folder-picker new_project failed"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    dialog.destroy();
+                });
+                dialog_handle.show();
+            }
+        });
+        // - Sidebar toggle: route through the existing ToggleSidebar
+        //   action so both the keybind and the button share one
+        //   code path.
+        sidebar_toggle_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| app.toggle_sidebar()
+        });
+        // - `+ Tab`: open a tab in the currently active project.
+        new_tab_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| {
+                let pid = *app.active_project_id.borrow();
+                if pid == 0 {
+                    return;
+                }
+                let app = app.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(err) = app.open_new_tab_in(pid).await {
+                        tracing::warn!(?err, project_id = pid, "new_tab (headerbar) failed");
                     }
                 });
             }
@@ -859,13 +982,12 @@ impl App {
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {
-        // The sidebar lives inside the Paned's start child. Toggle
-        // its visibility — Paned auto-adjusts the divider position.
-        let visible = self.sidebar.is_visible();
-        self.sidebar.set_visible(!visible);
-        if let Some(scroll) = self.sidebar.parent() {
-            scroll.set_visible(!visible);
-        }
+        // Hide the entire sidebar container — header + list + footer
+        // button — so the Paned divider snaps to the left edge. Pre-M5
+        // we toggled only the list, leaving the Projects header and
+        // `+ Project` button orphaned in a thin strip.
+        let visible = self.sidebar_box.is_visible();
+        self.sidebar_box.set_visible(!visible);
     }
 
     fn switch_project_by_index(self: &Rc<Self>, n: usize) {
@@ -899,13 +1021,21 @@ impl App {
     }
 
     async fn create_new_project(self: &Rc<Self>) -> anyhow::Result<()> {
+        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        self.create_new_project_with_cwd(&cwd).await
+    }
+
+    /// Variant that lets the caller pin the project's cwd — used by
+    /// the headerbar folder-picker button (M5) where the user picks
+    /// a directory before the project exists.
+    async fn create_new_project_with_cwd(self: &Rc<Self>, cwd: &str) -> anyhow::Result<()> {
         let Some(mut client) = self.client.borrow().clone() else {
             return Ok(());
         };
         let rt = self.rt.clone();
-        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let cwd_owned = cwd.to_string();
         let project = rt
-            .spawn(async move { client.create_project("", &cwd).await })
+            .spawn(async move { client.create_project("", &cwd_owned).await })
             .await
             .context("create_project join")??;
         // WatchEvents will also deliver ProjectCreated; the

@@ -21,6 +21,7 @@ mod tab_session;
 mod terminal_view;
 mod theme;
 
+use gtk4::glib::{self, LogLevel, LogWriterOutput};
 use libadwaita::prelude::*;
 use libadwaita::Application;
 use tracing_subscriber::EnvFilter;
@@ -29,10 +30,35 @@ use crate::app::App;
 
 const APP_ID: &str = "com.charliek.roost.linux";
 
+/// Drop the cosmetic `g_settings_schema_source_lookup: assertion
+/// 'source != NULL' failed` GLib warning that fires on macOS
+/// Homebrew GTK4 when libadwaita queries a missing GSettings schema
+/// at startup. Harmless — the schema is only used by the system
+/// dark-mode preference — but the line crowds out real diagnostics.
+/// Same workaround as the Go binary's `cmd/roost/loghandler.go`.
+fn install_log_filter() {
+    glib::log_set_writer_func(|level, fields| {
+        // Walk the field set looking for the MESSAGE entry; suppress
+        // the cosmetic settings-schema warning, otherwise fall through
+        // to GLib's default writer.
+        for field in fields {
+            if field.key() == "MESSAGE" {
+                if let Some(msg) = field.value_str() {
+                    if msg.contains("g_settings_schema_source_lookup") {
+                        return LogWriterOutput::Handled;
+                    }
+                }
+            }
+        }
+        glib::log_writer_default(level, fields)
+    });
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    install_log_filter();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
