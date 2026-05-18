@@ -423,7 +423,7 @@ func (a *App) handleEvent(ev core.Event) {
 		// The notification flag flipped. handleNotification calls
 		// SetNeedsAttention(true) directly when a fresh notification
 		// arrives; this case handles the clear path so a hook event
-		// (claude-hook prompt-submit) or an explicit
+		// (claude hook prompt-submit) or an explicit
 		// tab.clear_notification can also turn the pulse off without
 		// requiring the user to focus the tab.
 		if !a.ws.HasNotification(ev.TabID) {

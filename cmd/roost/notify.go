@@ -74,8 +74,7 @@ func sendMacNotification(notifier, cliPath string, tabID int64, title, body stri
 	// we just skip -execute rather than passing a malformed empty
 	// command.
 	if cliPath != "" {
-		execCmd := fmt.Sprintf("%s tab focus --tab %d", quoteForExecute(cliPath), tabID)
-		args = append(args, "-execute", execCmd)
+		args = append(args, "-execute", notifierExecCmd(cliPath, tabID))
 	}
 	cmd := exec.Command(notifier, args...)
 	if err := cmd.Start(); err != nil {
@@ -83,6 +82,15 @@ func sendMacNotification(notifier, cliPath string, tabID int64, title, body stri
 		return
 	}
 	go func() { _ = cmd.Wait() }()
+}
+
+// notifierExecCmd builds the terminal-notifier `-execute` command line
+// for click-through. The argv form must match the roost-cli surface;
+// today that's `<cli> tab focus <id>` (positional). Tests lock the
+// exact spelling so a future surface change can't silently break
+// click-through.
+func notifierExecCmd(cliPath string, tabID int64) string {
+	return fmt.Sprintf("%s tab focus %d", quoteForExecute(cliPath), tabID)
 }
 
 // quoteForExecute single-quotes a path if it contains shell-meaningful

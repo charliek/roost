@@ -25,7 +25,7 @@ The terminal engine is [libghostty-vt](https://ghostty.org), the parser/screen-s
 
 ```bash
 # From inside any Roost tab — fires a notification on this tab.
-roost-cli notify --title "Build done" --body "tests pass"
+roost-cli notify "Build done" "tests pass"
 ```
 
 If the tab is not currently focused you will see:

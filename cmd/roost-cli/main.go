@@ -1,178 +1,128 @@
 // Command roost-cli is the companion CLI for the Roost GUI app. It
 // talks to the running app over the Unix socket exposed by the GUI's
-// internal/ipc server. Intended to be invoked from inside a Roost tab
-// (typically by Claude Code hooks).
+// internal/ipc server.
 //
-// Usage:
+// Surface:
 //
-//	roost-cli notify --title "Build done" [--body "..."] [--tab <id>]
-//	roost-cli set-title "my-tab"
+//	roost-cli notify TITLE [BODY] [--tab ID]
 //	roost-cli identify
+//	roost-cli tab list
+//	roost-cli tab focus [TAB_ID]
+//	roost-cli tab set-title TITLE [--tab ID]
+//	roost-cli tab set-state STATE [--tab ID]
+//	roost-cli claude install [--force]
+//	roost-cli claude hook EVENT       (reads JSON on stdin)
+//	roost-cli version
+//	roost-cli completion bash|zsh|fish|powershell
 //
-// Tab id falls back to $ROOST_TAB_ID when --tab is not given. Socket
-// path falls back to $ROOST_SOCKET, then the platform default.
+// Persistent flags: --socket, --json, --timeout, -v.
+//
+// `claude hook` is special: see the hook fast-path in main() and the
+// XXX comments on runClaudeHook.
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"os"
-	"strconv"
-	"time"
 
-	"github.com/charliek/roost/internal/config"
-	"github.com/charliek/roost/internal/ipc"
+	"github.com/spf13/pflag"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage(os.Stderr)
-		os.Exit(2)
-	}
-
-	switch os.Args[1] {
-	case "notify":
-		os.Exit(cmdNotify(os.Args[2:]))
-	case "set-title":
-		os.Exit(cmdSetTitle(os.Args[2:]))
-	case "identify":
-		os.Exit(cmdIdentify(os.Args[2:]))
-	case "tab":
-		os.Exit(cmdTab(os.Args[2:]))
-	case "claude-hook":
-		os.Exit(cmdClaudeHook(os.Args[2:]))
-	case "claude":
-		os.Exit(cmdClaude(os.Args[2:]))
-	case "-h", "--help", "help":
-		usage(os.Stdout)
+	// HOOK FAST-PATH: detect `claude hook` invocations and handle them
+	// before cobra ever sees the args. This guarantees the strict
+	// invariants (always exit 0, always emit `{}`, suppress all
+	// errors) regardless of what flags Claude passes — cobra would
+	// reject unknown flags during parsing and break the contract.
+	//
+	// We fall through to cobra only when --help/-h is present so help
+	// works, and when the args don't match the hook shape.
+	if hookArgs, ok := detectHookFastPath(os.Args[1:]); ok {
+		runClaudeHook(hookArgs)
 		os.Exit(0)
-	default:
-		fmt.Fprintf(os.Stderr, "roost: unknown command %q\n\n", os.Args[1])
-		usage(os.Stderr)
-		os.Exit(2)
 	}
-}
 
-func usage(w *os.File) {
-	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  roost-cli notify --title TITLE [--body BODY] [--tab ID]")
-	fmt.Fprintln(w, "  roost-cli set-title --title TITLE [--tab ID]")
-	fmt.Fprintln(w, "  roost-cli identify")
-	fmt.Fprintln(w, "  roost-cli tab focus [--tab ID]")
-	fmt.Fprintln(w, "  roost-cli tab list [--json]")
-	fmt.Fprintln(w, "  roost-cli tab set-state --state STATE [--tab ID]")
-	fmt.Fprintln(w, "  roost-cli claude install [--force]")
-	fmt.Fprintln(w, "  roost-cli claude-hook EVENT     (reads JSON from stdin)")
-}
-
-func cmdNotify(args []string) int {
-	fs := flag.NewFlagSet("notify", flag.ContinueOnError)
-	title := fs.String("title", "", "notification title (required)")
-	body := fs.String("body", "", "notification body")
-	tab := fs.Int64("tab", tabIDFromEnv(), "tab id (defaults to $ROOST_TAB_ID)")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *title == "" {
-		fmt.Fprintln(os.Stderr, "roost notify: --title is required")
-		return 2
-	}
-	params, _ := json.Marshal(ipc.NotifyParams{TabID: *tab, Title: *title, Body: *body})
-	return doRPC(ipc.MethodNotificationCreate, params)
-}
-
-func cmdSetTitle(args []string) int {
-	fs := flag.NewFlagSet("set-title", flag.ContinueOnError)
-	title := fs.String("title", "", "new tab title (required)")
-	tab := fs.Int64("tab", tabIDFromEnv(), "tab id (defaults to $ROOST_TAB_ID)")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *title == "" && len(fs.Args()) > 0 {
-		*title = fs.Arg(0) // allow positional shorthand: roost set-title "Foo"
-	}
-	if *title == "" {
-		fmt.Fprintln(os.Stderr, "roost set-title: title is required (use --title or pass positionally)")
-		return 2
-	}
-	params, _ := json.Marshal(ipc.SetTitleParams{TabID: *tab, Title: *title})
-	return doRPC(ipc.MethodTabSetTitle, params)
-}
-
-func cmdIdentify(_ []string) int {
-	return doRPC(ipc.MethodSystemIdentify, json.RawMessage(`{}`))
-}
-
-func doRPC(method string, params json.RawMessage) int {
-	socket := socketPath()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	resp, err := ipc.Dial(ctx, socket, ipc.Request{
-		ID:     "1",
-		Method: method,
-		Params: params,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "roost: connect %s: %v\n", socket, err)
-		return 1
-	}
-	if !resp.OK {
-		if resp.Error != nil {
-			fmt.Fprintf(os.Stderr, "roost: %s: %s\n", resp.Error.Code, resp.Error.Message)
-		} else {
-			fmt.Fprintln(os.Stderr, "roost: request failed")
+	if err := rootCmd.Execute(); err != nil {
+		// Cobra has SilenceErrors=true, so we own the rendering.
+		// Classify the error to pick the right exit code:
+		//   - help requested → 0
+		//   - usage / parse error → 2
+		//   - runtime error → 1
+		switch {
+		case errors.Is(err, pflag.ErrHelp):
+			os.Exit(0)
+		case errors.Is(err, errUsage):
+			if clientCtx.JSON {
+				_ = outputError(err)
+			} else {
+				fmt.Fprintf(os.Stderr, "roost-cli: %v\n", err)
+			}
+			os.Exit(2)
+		default:
+			if clientCtx.JSON {
+				_ = outputError(err)
+			} else {
+				fmt.Fprintf(os.Stderr, "roost-cli: %v\n", err)
+			}
+			os.Exit(1)
 		}
-		return 1
 	}
-	if resp.Result != nil {
-		out, _ := json.MarshalIndent(resp.Result, "", "  ")
-		fmt.Println(string(out))
-	}
-	return 0
 }
 
-func tabIDFromEnv() int64 {
-	v := os.Getenv("ROOST_TAB_ID")
-	if v == "" {
-		return 0
-	}
-	id, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return id
-}
-
-// socketPath resolves the socket address: $ROOST_SOCKET wins; otherwise
-// the platform-default path under config.Paths.RuntimeDir. Fatal on
-// resolution failure — used by the user-facing CLI verbs where exiting
-// non-zero is the right signal.
+// detectHookFastPath scans args (NOT including os.Args[0]) for the
+// `claude hook` shape, walking past any optional root flags that
+// might appear before the subcommand.
 //
-// Hook paths must use lookupSocketPath instead: claude-hook is required
-// to exit 0 silently when anything is misconfigured, so a fatal here
-// would surface as a hook failure to the user.
-func socketPath() string {
-	p, err := lookupSocketPath()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "roost: config.Resolve: %v\n", err)
-		os.Exit(1)
+// Returns (hook event args, true) on a match, ([], false) otherwise.
+//
+// Falls through to cobra (returns false) when --help or -h appears
+// anywhere in the original args, so `roost-cli claude hook --help`
+// produces help instead of the silent {} output.
+func detectHookFastPath(args []string) ([]string, bool) {
+	for _, a := range args {
+		if a == "--help" || a == "-h" {
+			return nil, false
+		}
 	}
-	return p
+
+	i := 0
+	// Skip optional root flags. Keep this list in sync with root.go's
+	// PersistentFlags. Unknown tokens here cause us to abort the
+	// fast-path and fall through to cobra, which will error properly.
+	for i < len(args) {
+		switch args[i] {
+		case "--json":
+			i++
+		case "--socket", "--timeout":
+			// "--name VALUE" form; need at least one more arg.
+			if i+1 >= len(args) {
+				return nil, false
+			}
+			i += 2
+		case "-v", "-vv", "-vvv", "--verbose":
+			i++
+		default:
+			// "--name=VALUE" form for --socket / --timeout.
+			if hasFlagPrefix(args[i], "--socket=") || hasFlagPrefix(args[i], "--timeout=") {
+				i++
+				continue
+			}
+			// Anything else: hopefully the subcommand. Stop scanning.
+			goto done
+		}
+	}
+done:
+
+	if i+1 >= len(args) {
+		return nil, false
+	}
+	if args[i] != "claude" || args[i+1] != "hook" {
+		return nil, false
+	}
+	return args[i+2:], true
 }
 
-// lookupSocketPath is the non-fatal variant of socketPath. Returns an
-// error rather than calling os.Exit so callers in the hook path can
-// fail soft.
-func lookupSocketPath() (string, error) {
-	if v := os.Getenv("ROOST_SOCKET"); v != "" {
-		return v, nil
-	}
-	p, err := config.Resolve()
-	if err != nil {
-		return "", err
-	}
-	return p.SocketPath(), nil
+func hasFlagPrefix(arg, prefix string) bool {
+	return len(arg) >= len(prefix) && arg[:len(prefix)] == prefix
 }

@@ -67,7 +67,7 @@ Goroutines marshal back to the main thread via `glib.IdleAdd`. The shortcut cont
 ```mermaid
 flowchart LR
     Sender["roost-cli notify"]
-    Hook["roost-cli claude-hook"]
+    Hook["roost-cli claude hook"]
     OSC["printf '\\033]9;...'"]
     Pump["Session.pumpPTY (goroutine)"]
     Scanner["osc.Scanner"]
@@ -89,14 +89,14 @@ flowchart LR
     App --> Banner
 ```
 
-Three input paths (`roost-cli notify`, `roost-cli claude-hook`, OSC 9/777) converge on `core.Workspace`. The Workspace emits four event kinds the UI cares about:
+Three input paths (`roost-cli notify`, `roost-cli claude hook`, OSC 9/777) converge on `core.Workspace`. The Workspace emits four event kinds the UI cares about:
 
 - `EventNotification` — drives the desktop banner and the `SetNeedsAttention` pulse.
 - `EventTabNotificationChanged` — fires when the per-tab pending-attention flag flips. Today consumed only for symmetry; future surfaces (sidebar dot count, etc.) layer on top.
 - `EventTabStateChanged` — drives the per-tab indicator icon and the project rollup stripe recompute.
 - `EventTabDeleted` — carries `ProjectID` so the rollup stripe can be recomputed without a separate lookup.
 
-The App subscribes once and marshals each event to the main thread via `coreglib.IdleAdd` before touching widgets. Banners on macOS go through `terminal-notifier` (`-execute "roost-cli tab focus --tab N"` for click-through, `-group roost.tab.<id>` for supersede); on Linux a `gio.SimpleAction` wires the banner's default action to in-process `App.FocusTab`.
+The App subscribes once and marshals each event to the main thread via `coreglib.IdleAdd` before touching widgets. Banners on macOS go through `terminal-notifier` (`-execute "roost-cli tab focus N"` for click-through, `-group roost.tab.<id>` for supersede); on Linux a `gio.SimpleAction` wires the banner's default action to in-process `App.FocusTab`.
 
 OSC suppression: when a tab has an active hook session (`system.set_hook_active`), the OSC scanner's `OnNotification` callback drops raw OSC 9/777 from inside the agent. Hook events are the trusted channel; OSC is the fallback for tools that can't be modified.
 

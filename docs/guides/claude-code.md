@@ -4,7 +4,7 @@ Wire Claude Code's hook system to Roost so each tab gets a sticky agent-state in
 
 ## How it works
 
-Roost ships a `roost-cli claude-hook EVENT` subcommand that Claude Code invokes for each lifecycle event. The hook reads Claude's JSON payload from stdin, looks up `$ROOST_TAB_ID` (auto-set in every Roost tab), and tells the GUI:
+Roost ships a `roost-cli claude hook EVENT` subcommand that Claude Code invokes for each lifecycle event. The hook reads Claude's JSON payload from stdin, looks up `$ROOST_TAB_ID` (auto-set in every Roost tab), and tells the GUI:
 
 | Hook event         | What Roost does                                                   |
 |--------------------|-------------------------------------------------------------------|
