@@ -1108,8 +1108,20 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // StreamPty streams shut down before the daemon cascade-deletes
         // their rows. Without this the daemon-side CloseTab would race
         // the project DELETE — harmless but noisy in the logs.
+        //
+        // Round-3 R5 (CodeRabbit on PR #72): mirror the tabPillViews
+        // cleanup that `removeProjectLocally` does — cancel any
+        // mid-edit pill so its NSTextField stops being first responder
+        // before the view goes away, and drop the cache entry so a
+        // future tab id reuse can't resurrect stale pill state.
         let condemned = tabs.filter { $0.projectID == id }
         for session in condemned {
+            if let tabID = session.id, let pill = tabPillViews[tabID], pill.isEditing {
+                pill.endEdit()
+            }
+            if let tabID = session.id {
+                tabPillViews.removeValue(forKey: tabID)
+            }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
         }
