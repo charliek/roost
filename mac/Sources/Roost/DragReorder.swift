@@ -78,3 +78,49 @@ final class TabBarStackView: NSStackView {
         return pills.count
     }
 }
+
+/// Round-3 R1: AppKit's drag delivery walks
+/// `NSScrollView → NSClipView → documentView`. The clip view does not
+/// forward `draggingEntered` / `performDragOperation` to its
+/// documentView by default, so the underlying `TabBarStackView`'s
+/// drag-destination overrides never fired for drops on the
+/// scrolled-content region — drag visual worked but drop never landed.
+/// This thin subclass registers the same pasteboard type at the
+/// scroll-view layer and forwards drag-destination events down to the
+/// document view (the `TabBarStackView`) so its existing handlers run.
+@MainActor
+final class TabBarScrollView: NSScrollView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.roostTabID])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingPasteboard.types?.contains(.roostTabID) == true
+        else { return [] }
+        _ = (documentView as? TabBarStackView)?.draggingEntered(sender)
+        return .move
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingPasteboard.types?.contains(.roostTabID) == true
+        else { return [] }
+        _ = (documentView as? TabBarStackView)?.draggingUpdated(sender)
+        return .move
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        (documentView as? TabBarStackView)?.performDragOperation(sender) ?? false
+    }
+
+    override func draggingExited(_ sender: (any NSDraggingInfo)?) {
+        (documentView as? TabBarStackView)?.draggingExited(sender)
+    }
+
+    override func concludeDragOperation(_ sender: (any NSDraggingInfo)?) {
+        (documentView as? TabBarStackView)?.concludeDragOperation(sender)
+    }
+}

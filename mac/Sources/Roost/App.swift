@@ -77,10 +77,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// purged on `.projectDeleted`.
     private var projectRowCellViews: [Int64: ProjectRowCellView] = [:]
 
-    /// Tab-pill rename popover (M5). At most one popover is up at a
-    /// time; the field is the popover's editable input.
-    private var renamePopover: NSPopover?
-    private var renamePopoverTabID: Int64?
+    /// Round-3 R5: cached tab pill views keyed by daemon tab id, so
+    /// the pill survives `rebuildTabBar` while the user is mid-inline-
+    /// rename. Mirrors the sidebar `projectRowCellViews` pattern.
+    /// Purged on `.tabDeleted` + `closeTab` + project deletion.
+    private var tabPillViews: [Int64: TabPillView] = [:]
 
     /// Round-2 F6: drop-indicator state for sidebar drag-reorder.
     /// `nil` means no drag in progress. Non-nil values are the
@@ -427,11 +428,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // view; its intrinsic content size grows with its arranged
         // subviews, and the scroll view exposes whatever fits in the
         // pane's width.
-        let tabScroll = NSScrollView()
+        //
+        // Round-3 R1: use `TabBarScrollView` (a thin subclass) so drag
+        // events delivered to the scroll-view layer are forwarded to
+        // the `TabBarStackView` document view. Without this, AppKit's
+        // drag walk stops at the clip view and the stack view's
+        // `performDragOperation` never fires. Elasticity is `.none`
+        // because the rubber-band responder on the edges can swallow
+        // drop events along the strip's margins.
+        let tabScroll = TabBarScrollView()
         tabScroll.translatesAutoresizingMaskIntoConstraints = false
         tabScroll.hasHorizontalScroller = false
         tabScroll.hasVerticalScroller = false
-        tabScroll.horizontalScrollElasticity = .allowed
+        tabScroll.horizontalScrollElasticity = .none
         tabScroll.verticalScrollElasticity = .none
         tabScroll.borderType = .noBorder
         tabScroll.drawsBackground = false
@@ -444,9 +453,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         pane.addSubview(terminalContainer)
 
         NSLayoutConstraint.activate([
-            tabScroll.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
-            tabScroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            tabScroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
+            // Round-3 R3: match the Go GTK binary's implicit-zero
+            // outer spacing — tab bar pinned to pane edges, terminal
+            // flush against the scroll view + window edges. The 24pt
+            // pill height inside the strip stays the same; only the
+            // outer container paddings change.
+            tabScroll.topAnchor.constraint(equalTo: pane.topAnchor),
+            tabScroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            tabScroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             tabScroll.heightAnchor.constraint(equalToConstant: tabBarHeight),
 
             // Document view's height matches the scroll view's content
@@ -466,11 +480,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // reflows its cell grid in `setFrameSize`. `terminalSize`
             // (the 80x24 cell-grid intrinsic) is preserved as the
             // floor so the terminal can't be squeezed below a
-            // minimal usable shape.
-            terminalContainer.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
-            terminalContainer.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
-            terminalContainer.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16),
-            terminalContainer.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -16),
+            // minimal usable shape. The min-width keeps a hard floor
+            // at very narrow window widths; the user will still see a
+            // small right-edge gap there until they widen the window.
+            //
+            // Re-anchored to `tabScroll.bottomAnchor` rather than the
+            // raw `tabBar.bottomAnchor` so the intent — "terminal sits
+            // flush against the strip" — is robust to changes in pill
+            // height. They produce the same Y in current layout.
+            terminalContainer.topAnchor.constraint(equalTo: tabScroll.bottomAnchor),
+            terminalContainer.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            terminalContainer.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            terminalContainer.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
             terminalContainer.widthAnchor.constraint(
                 greaterThanOrEqualToConstant: terminalSize.width
             ),
@@ -626,6 +647,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func removeProjectLocally(id: Int64) {
         let condemned = tabs.filter { $0.projectID == id }
         for session in condemned {
+            // Round-3 R5: cancel mid-edit on each condemned pill so
+            // its NSTextField stops being first responder before the
+            // view is torn down.
+            if let tabID = session.id, let pill = tabPillViews[tabID], pill.isEditing {
+                pill.endEdit()
+            }
+            if let tabID = session.id {
+                tabPillViews.removeValue(forKey: tabID)
+            }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
         }
@@ -711,7 +741,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             guard let session = tabs.first(where: { $0.id == e.tabID }) else { break }
             let projectID = session.projectID
             let wasActive = activeSessionByProject[projectID] === session
+            // Round-3 R5: cancel any in-progress inline rename on the
+            // condemned pill before dropping the cached view. The
+            // edit's first responder is the pill's NSTextField — if
+            // we drop the view while it's first responder, AppKit
+            // walks the chain looking for a successor and the focus
+            // ends up at the window root instead of the terminal.
+            if let id = session.id, let pill = tabPillViews[id], pill.isEditing {
+                pill.endEdit()
+            }
             tabs.removeAll { $0 === session }
+            if let id = session.id {
+                tabPillViews.removeValue(forKey: id)
+            }
             if wasActive {
                 activeSessionByProject.removeValue(forKey: projectID)
             }
@@ -1150,7 +1192,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         else { return }
         let session = projectTabs[activeTabIndexInProject]
 
+        // Round-3 R5: cancel any in-progress inline rename so its
+        // first-responder NSTextField doesn't get orphaned by the
+        // view teardown below.
+        if let id = session.id, let pill = tabPillViews[id], pill.isEditing {
+            pill.endEdit()
+        }
         tabs.removeAll { $0 === session }
+        if let id = session.id {
+            tabPillViews.removeValue(forKey: id)
+        }
         activeSessionByProject.removeValue(forKey: activeProjectID)
         session.terminalView.removeFromSuperview()
         session.close(socketPath: socketPath)
@@ -1213,6 +1264,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
         }
         rebuildTabBar()
+        // Round-3 R2: keep the active pill visible when the strip
+        // overflows horizontally. Only the tab-selection path scrolls
+        // — `rebuildTabBar` is invoked for many unrelated state arms
+        // (notifications, cwd, title, reorder), and scrolling on each
+        // would jump the strip on sibling state changes.
+        scrollActiveTabIntoView()
         // The subtitle tracks the active tab's live cwd, so switching
         // tabs within a project has to refresh it. rebuildSidebar (the
         // other call site that triggers updateWindowTitle) only fires
@@ -1220,17 +1277,52 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         updateWindowTitle()
     }
 
+    /// Pure helper extracted so unit tests can hit the pill-index math
+    /// without an AppKit dependency. Returns the index of `active`
+    /// inside `tabs` (the active project's tab list in display order),
+    /// or `nil` if not present.
+    @MainActor
+    static func activeTabIndex(tabs: [TabSession], active: TabSession?) -> Int? {
+        guard let active else { return nil }
+        return tabs.firstIndex(where: { $0 === active })
+    }
+
+    /// Scroll the active tab pill into the visible region of the
+    /// horizontally-scrollable strip. Called from `selectTab(at:)`
+    /// only — never from `rebuildTabBar`, which fires for many
+    /// state-change arms that shouldn't jolt the scroll position.
+    /// `layoutSubtreeIfNeeded()` settles pill frames synchronously
+    /// (otherwise the freshly-rebuilt strip's geometry is still
+    /// pending and `scrollToVisible` lands on the wrong rect).
+    @MainActor
+    private func scrollActiveTabIntoView() {
+        guard let tabBar,
+              let activeProjectID,
+              let active = activeSessionByProject[activeProjectID]
+        else { return }
+        let projectTabs = tabsForActiveProject()
+        guard let activeIdx = Self.activeTabIndex(tabs: projectTabs, active: active)
+        else { return }
+        let pills = tabBar.arrangedSubviews.compactMap { $0 as? TabPillView }
+        guard pills.indices.contains(activeIdx) else { return }
+        tabBar.layoutSubtreeIfNeeded()
+        pills[activeIdx].scrollToVisible(pills[activeIdx].bounds)
+    }
+
     @MainActor
     private func rebuildTabBar() {
         guard let tabBar = tabBar, let addTabButton = addTabButton else { return }
-        for view in tabBar.arrangedSubviews where view !== addTabButton {
-            tabBar.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
 
         let projectTabs = tabsForActiveProject()
         let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
 
+        // Round-3 R5: build the desired pill list, reusing cached
+        // pill views per daemon tab id. Pills without a daemon id
+        // (mid-OpenTab) are created fresh each rebuild — they can't
+        // participate in inline rename anyway. Reuse via `configure(...)`
+        // lets an in-progress rename survive a sibling-driven rebuild.
+        var desired: [TabPillView] = []
+        desired.reserveCapacity(projectTabs.count)
         for (index, session) in projectTabs.enumerated() {
             let isActive = session === activeSession
             // Phase 6a P6 label: prefer title (OSC 0/1/2) if set,
@@ -1238,24 +1330,81 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // This is the visible payoff for P4 + P5 + P6 — the
             // pill stops saying "Tab N" once the shell emits OSCs.
             let pillTitle = pillLabel(for: session, index: index)
-            let pill = TabPillView(
-                index: index,
-                title: pillTitle,
-                isActive: isActive,
-                statusColor: pillStatusColor(for: session),
-                hasBadge: session.liveHasNotification,
-                tabID: session.id,
-                onSelect: { [weak self] idx in
-                    self?.selectTab(at: idx)
-                },
-                onClose: { [weak self] idx in
-                    self?.closeTab(at: idx)
-                },
-                onRename: { [weak self] idx in
-                    self?.renameTab(at: idx)
+            let statusColor = pillStatusColor(for: session)
+            let hasBadge = session.liveHasNotification
+            let select: @MainActor (Int) -> Void = { [weak self] idx in
+                self?.selectTab(at: idx)
+            }
+            let close: @MainActor (Int) -> Void = { [weak self] idx in
+                self?.closeTab(at: idx)
+            }
+            let rename: @MainActor (Int) -> Void = { [weak self] idx in
+                self?.renameTab(at: idx)
+            }
+
+            let pill: TabPillView
+            if let id = session.id, let cached = tabPillViews[id] {
+                cached.configure(
+                    index: index,
+                    title: pillTitle,
+                    isActive: isActive,
+                    statusColor: statusColor,
+                    hasBadge: hasBadge,
+                    tabID: id,
+                    onSelect: select,
+                    onClose: close,
+                    onRename: rename
+                )
+                pill = cached
+            } else {
+                pill = TabPillView(
+                    index: index,
+                    title: pillTitle,
+                    isActive: isActive,
+                    statusColor: statusColor,
+                    hasBadge: hasBadge,
+                    tabID: session.id,
+                    onSelect: select,
+                    onClose: close,
+                    onRename: rename
+                )
+                if let id = session.id {
+                    tabPillViews[id] = pill
                 }
-            )
-            tabBar.insertArrangedSubview(pill, at: tabBar.arrangedSubviews.count - 1)
+            }
+            desired.append(pill)
+        }
+
+        // Purge cached pills whose tab no longer exists in the active
+        // project. The map is bounded by daemon tab ids so this stays
+        // tiny; the only growth path is `OpenTab` adding entries.
+        let activeIDs: Set<Int64> = Set(projectTabs.compactMap { $0.id })
+        for staleID in tabPillViews.keys where !activeIDs.contains(staleID) {
+            tabPillViews.removeValue(forKey: staleID)
+        }
+
+        // Rebuild the arranged-subview order. Pulling reused pills
+        // off the stack via `removeArrangedSubview` keeps them alive
+        // (no `removeFromSuperview`) so subsequent insert places the
+        // same instance in its new slot. Fresh pills come in via
+        // `insertArrangedSubview` for the first time.
+        let desiredSet = Set(desired.map { ObjectIdentifier($0) })
+        for view in tabBar.arrangedSubviews
+        where view !== addTabButton
+            && !desiredSet.contains(ObjectIdentifier(view))
+        {
+            tabBar.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        // Move existing reused pills out of the arranged set (they'll
+        // be re-inserted at the correct position below). This keeps
+        // the views alive — `removeArrangedSubview` does not call
+        // `removeFromSuperview` for unanchored arranged children.
+        for pill in desired where tabBar.arrangedSubviews.contains(pill) {
+            tabBar.removeArrangedSubview(pill)
+        }
+        for (slot, pill) in desired.enumerated() {
+            tabBar.insertArrangedSubview(pill, at: slot)
         }
 
         rebuildWindowMenu()
@@ -1398,7 +1547,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let session = projectTabs[indexInActiveProject]
         let wasActive = activeSessionByProject[activeProjectID] === session
 
+        // Round-3 R5: cancel any mid-edit so the pill's NSTextField
+        // stops being first responder before we tear the view down.
+        if let id = session.id, let pill = tabPillViews[id], pill.isEditing {
+            pill.endEdit()
+        }
         tabs.removeAll { $0 === session }
+        if let id = session.id {
+            tabPillViews.removeValue(forKey: id)
+        }
         if wasActive {
             activeSessionByProject.removeValue(forKey: activeProjectID)
         }
@@ -1937,58 +2094,33 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         beginRenameActiveTab(tabID: tabID, currentTitle: currentTitle, atIndex: index)
     }
 
-    /// Mount the rename popover anchored to the active tab's pill
-    /// (or, when the pill isn't in the strip yet, the `+ Tab` button —
-    /// the strip is never empty while a tab is active, so this is a
-    /// belt-and-suspenders fallback). The popover lifetime is bounded
-    /// by `renamePopover` — closing it (Escape, focus-loss, Enter)
-    /// nils both `renamePopover` and `renamePopoverTabID`.
+    /// Round-3 R5: flip the cached pill into inline edit mode. The
+    /// popover-based round-2 implementation was replaced with this
+    /// inline flow for symmetry with the sidebar's label↔entry
+    /// rename. Edit lifetime is bounded by the pill's own `isEditing`
+    /// flag; the commit/cancel callbacks pop us back into normal
+    /// mode and return focus to the terminal.
     @MainActor
     private func beginRenameActiveTab(tabID: Int64, currentTitle: String, atIndex: Int) {
-        // Tear down any existing popover before showing a new one —
-        // Cmd+R while a popover is up shouldn't stack popovers.
-        renamePopover?.performClose(nil)
-        renamePopover = nil
-        renamePopoverTabID = nil
-
-        guard let tabBar else { return }
-        let pills = tabBar.arrangedSubviews.compactMap { $0 as? TabPillView }
-        let anchor: NSView
-        if pills.indices.contains(atIndex) {
-            anchor = pills[atIndex]
-        } else if let addBtn = addTabButton {
-            anchor = addBtn
-        } else {
-            return
-        }
-
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.contentViewController = RenamePopoverController(
+        guard let pill = tabPillViews[tabID] else { return }
+        pill.beginEdit(
             initial: currentTitle,
-            onCommit: { [weak self] text in
+            onCommit: { [weak self] newTitle, initialTitle in
                 self?.commitRenameTab(
                     tabID: tabID,
-                    newTitle: text,
-                    initialTitle: currentTitle
+                    newTitle: newTitle,
+                    initialTitle: initialTitle
                 )
             },
             onCancel: { [weak self] in
                 self?.cancelRenameTab()
             }
         )
-        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
-        renamePopover = popover
-        renamePopoverTabID = tabID
     }
 
     @MainActor
     private func commitRenameTab(tabID: Int64, newTitle: String, initialTitle: String) {
-        defer {
-            renamePopover?.performClose(nil)
-            renamePopover = nil
-            renamePopoverTabID = nil
-        }
+        defer { focusActiveTerminal() }
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard tabs.contains(where: { $0.id == tabID }) else { return }
         // CodeRabbit on PR #69: compare against the popover's *initial*
@@ -1998,7 +2130,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // pressing Enter without edits in that state would otherwise
         // commit + set the daemon's `user_titled` lock against a
         // value the user never typed. Empty + unchanged are cancel.
-        guard !trimmed.isEmpty, trimmed != initialTitle else { return }
+        guard !trimmed.isEmpty, trimmed != initialTitle else {
+            // No-op commit — rebuild to resync the pill's label
+            // (`isEditing` is already false from `endEdit`).
+            if let session = tabs.first(where: { $0.id == tabID }),
+               session.projectID == activeProjectID
+            {
+                rebuildTabBar()
+            }
+            return
+        }
         guard let session = tabs.first(where: { $0.id == tabID }) else { return }
 
         // Optimistic local update so the pill flips immediately —
@@ -2016,9 +2157,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func cancelRenameTab() {
-        renamePopover?.performClose(nil)
-        renamePopover = nil
-        renamePopoverTabID = nil
+        // Round-3 R5: the pill already returned to non-edit mode via
+        // `endEdit`. Re-render so the label re-syncs from the model
+        // (the user may have typed something we never committed),
+        // then return focus to the terminal — sidebar rename has the
+        // same explicit `focusActiveTerminal()` call on cancel.
+        rebuildTabBar()
+        focusActiveTerminal()
     }
 
     // MARK: - Sidebar toggle (M3)
@@ -2182,21 +2327,60 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 /// `onClose(index)`. The status-dot slot draws nothing in M3 — it
 /// goes live in Phase 6b when `TabStateChangedEvent` lands.
 @MainActor
-final class TabPillView: NSView {
-    private let index: Int
-    private let isActive: Bool
+final class TabPillView: NSView, NSTextFieldDelegate {
+    /// Round-3 R5: position-and-callback state is mutable so a single
+    /// pill instance can be reused across `rebuildTabBar` cycles
+    /// (caching pills per tabID lets in-progress inline rename survive
+    /// sibling-driven strip rebuilds, mirroring the sidebar's
+    /// `projectRowCellViews` pattern).
+    fileprivate var index: Int
+    private var isActive: Bool
     /// Daemon-assigned tab id, or `nil` between OpenTab and the
     /// daemon's reply. Used by M2's drag source: pasteboard payload
     /// is the tab id so the destination can resolve the source row
     /// independent of any intervening order changes. Pre-id pills
     /// drop their drag silently.
-    fileprivate let tabID: Int64?
-    private let onSelect: @MainActor (Int) -> Void
-    private let onClose: @MainActor (Int) -> Void
-    private let onRename: @MainActor (Int) -> Void
+    fileprivate var tabID: Int64?
+    private var onSelect: @MainActor (Int) -> Void
+    private var onClose: @MainActor (Int) -> Void
+    private var onRename: @MainActor (Int) -> Void
 
     private let label: NSTextField
     private let closeButton: NSButton
+    private let statusSlot: NSView
+    private let badgeDot: NSView
+
+    /// Round-3 R5: edit-mode swap. In normal mode the label's trailing
+    /// anchor leaves room for closeButton / badgeDot; while editing,
+    /// it pins to the pill's trailing edge so the bezeled field uses
+    /// the full pill width. `labelTrailingEdit` is `lazy` because the
+    /// pill's trailingAnchor isn't valid until after `super.init`.
+    private var labelTrailingNormal: NSLayoutConstraint!
+    private lazy var labelTrailingEdit: NSLayoutConstraint = label.trailingAnchor
+        .constraint(equalTo: trailingAnchor, constant: -8)
+
+    /// Round-3 R5: force the pill to a usable minimum width while
+    /// editing. The label's intrinsic content size shrinks to its
+    /// (possibly short) initial title in bezeled mode; without this
+    /// the field shows as a sliver too narrow to read or type into.
+    /// 220pt is wide enough for a typical tab title and matches the
+    /// rename popover's previous content width.
+    private lazy var pillEditMinWidth: NSLayoutConstraint = widthAnchor
+        .constraint(greaterThanOrEqualToConstant: 220)
+
+    /// Round-3 R5: inline rename state. `isEditing == true` blocks
+    /// `configure(...)` from overwriting `label.stringValue` (race
+    /// guard against sibling-driven rebuilds) and short-circuits the
+    /// mouseDown/Dragged/Up drag plumbing so the editable field
+    /// handles clicks normally.
+    private(set) var isEditing = false
+    private var onCommit: (@MainActor (String) -> Void)?
+    private var onCancel: (@MainActor () -> Void)?
+
+    /// Test-only accessor for the label's displayed string. Used by
+    /// the inline-rename race-guard tests to peek at the typing
+    /// buffer without an NSWindow.
+    internal var editBufferTextForTesting: String { label.stringValue }
 
     /// M2 drag-source state. `mouseDown` records the event so
     /// `mouseDragged` can use it as the dragging session's seed event;
@@ -2222,29 +2406,25 @@ final class TabPillView: NSView {
         self.onClose = onClose
         self.onRename = onRename
 
-        self.label = NSTextField(labelWithString: title)
-        self.label.font = .systemFont(
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(
             ofSize: 12,
             weight: isActive ? .medium : .regular
         )
-        self.label.textColor = isActive ? .labelColor : .secondaryLabelColor
-        self.label.lineBreakMode = .byTruncatingTail
-        self.label.maximumNumberOfLines = 1
-        self.label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = isActive ? .labelColor : .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.usesSingleLineMode = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        self.label = label
 
-        self.closeButton = NSButton(title: "×", target: nil, action: nil)
-        self.closeButton.isBordered = false
-        self.closeButton.font = .systemFont(ofSize: 13, weight: .regular)
-        self.closeButton.contentTintColor = .secondaryLabelColor
-        self.closeButton.isHidden = !isActive
-        self.closeButton.translatesAutoresizingMaskIntoConstraints = false
-
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.cornerRadius = 6
-        layer?.backgroundColor = (isActive
-            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
-            : NSColor.clear).cgColor
+        let closeButton = NSButton(title: "×", target: nil, action: nil)
+        closeButton.isBordered = false
+        closeButton.font = .systemFont(ofSize: 13, weight: .regular)
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.isHidden = !isActive
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        self.closeButton = closeButton
 
         // Status-dot slot — reserves 10pt on the leading edge so
         // the label position is stable when the dot turns on. P6
@@ -2256,6 +2436,8 @@ final class TabPillView: NSView {
             statusSlot.layer?.backgroundColor = color.cgColor
             statusSlot.layer?.cornerRadius = 5
         }
+        self.statusSlot = statusSlot
+
         // Phase 6a P7: trailing accent-dot badge. Visible only on
         // inactive notified pills (active pills are about to be
         // cleared by the focus path; no need to badge the one the
@@ -2268,6 +2450,25 @@ final class TabPillView: NSView {
         badgeDot.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
         badgeDot.layer?.cornerRadius = 4
         badgeDot.isHidden = !(hasBadge && !isActive)
+        self.badgeDot = badgeDot
+
+        super.init(frame: .zero)
+
+        // Trailing constraint for normal mode — built after super.init
+        // because it could conceivably need self-relative anchors in
+        // the future. `labelTrailingEdit` is constructed lazily on
+        // first access (see property declaration).
+        self.labelTrailingNormal = label.trailingAnchor.constraint(
+            lessThanOrEqualTo: closeButton.leadingAnchor,
+            constant: -6
+        )
+
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.backgroundColor = (isActive
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
+            : NSColor.clear).cgColor
+
         addSubview(statusSlot)
         addSubview(label)
         addSubview(closeButton)
@@ -2308,18 +2509,171 @@ final class TabPillView: NSView {
             badgeDot.widthAnchor.constraint(equalToConstant: 8),
             badgeDot.heightAnchor.constraint(equalToConstant: 8),
 
-            // Trailing padding for the label — same fixed -28
-            // either way now so the slot is always available for
-            // either close button (active) or badge (notified).
-            label.trailingAnchor.constraint(
-                lessThanOrEqualTo: trailingAnchor,
-                constant: -28
-            ),
+            // Round-3 R5: label's trailing constraint is one of two
+            // swappable constraints — normal mode leaves room for
+            // closeButton + badgeDot, edit mode pins to the pill's
+            // trailing edge so the bezeled field fills the width.
+            labelTrailingNormal,
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    /// Round-3 R5: update the mutable state of a cached pill to
+    /// reflect new daemon-side state. Called from `rebuildTabBar`
+    /// when the strip is re-rendered without destroying the
+    /// underlying pill view (so an in-progress inline rename can
+    /// keep its typing buffer through unrelated rebuilds).
+    func configure(
+        index: Int,
+        title: String,
+        isActive: Bool,
+        statusColor: NSColor?,
+        hasBadge: Bool,
+        tabID: Int64?,
+        onSelect: @escaping @MainActor (Int) -> Void,
+        onClose: @escaping @MainActor (Int) -> Void,
+        onRename: @escaping @MainActor (Int) -> Void
+    ) {
+        self.index = index
+        self.isActive = isActive
+        self.tabID = tabID
+        self.onSelect = onSelect
+        self.onClose = onClose
+        self.onRename = onRename
+
+        // Race guard: while editing, the label IS the typing buffer.
+        // Sibling-driven `setTabTitle` events that race the user's
+        // typing must NOT clobber it. The mid-edit rebuild happens
+        // legitimately for unrelated reasons (notifications, cwd,
+        // sibling state) — the model carries the new title, but
+        // the displayed `stringValue` stays as the user types.
+        if !isEditing {
+            label.stringValue = title
+            label.font = .systemFont(
+                ofSize: 12,
+                weight: isActive ? .medium : .regular
+            )
+            label.textColor = isActive ? .labelColor : .secondaryLabelColor
+        }
+
+        layer?.backgroundColor = (isActive
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
+            : NSColor.clear).cgColor
+
+        if let color = statusColor {
+            statusSlot.layer?.backgroundColor = color.cgColor
+            statusSlot.layer?.cornerRadius = 5
+        } else {
+            statusSlot.layer?.backgroundColor = NSColor.clear.cgColor
+        }
+
+        if !isEditing {
+            closeButton.isHidden = !isActive
+            badgeDot.isHidden = !(hasBadge && !isActive)
+        }
+    }
+
+    /// Round-3 R5: flip the pill into editable mode. The label
+    /// becomes a bezeled NSTextField, closeButton + badgeDot hide
+    /// to free the trailing slot, and the label's trailing anchor
+    /// swaps to the pill edge so the entry spans the full width.
+    /// `initial` is captured + threaded through to `onCommit` so the
+    /// commit handler's no-op detection (round-2 CR-fix) compares
+    /// against the actually-displayed text instead of `liveTitle`.
+    @MainActor
+    func beginEdit(
+        initial: String,
+        onCommit: @escaping @MainActor (String, String) -> Void,
+        onCancel: @escaping @MainActor () -> Void
+    ) {
+        guard !isEditing else { return }
+        isEditing = true
+        let initialTitle = initial
+        self.onCommit = { committed in onCommit(committed, initialTitle) }
+        self.onCancel = onCancel
+
+        // Hide the trailing-slot competitors. `statusSlot` is leading
+        // and doesn't compete for width, so it stays.
+        closeButton.isHidden = true
+        badgeDot.isHidden = true
+
+        labelTrailingNormal.isActive = false
+        labelTrailingEdit.isActive = true
+        pillEditMinWidth.isActive = true
+
+        label.stringValue = initial
+        label.isEditable = true
+        label.isSelectable = true
+        label.drawsBackground = true
+        label.backgroundColor = .textBackgroundColor
+        label.isBezeled = true
+        label.bezelStyle = .squareBezel
+        label.delegate = self
+        window?.makeFirstResponder(label)
+        if let editor = label.currentEditor() as? NSTextView {
+            editor.selectAll(nil)
+        }
+    }
+
+    /// End edit mode without firing commit/cancel callbacks (those
+    /// are called from the Enter / Escape / focus-loss paths). The
+    /// next `configure(...)` call from `rebuildTabBar` re-syncs the
+    /// label text + closeButton/badgeDot visibility.
+    @MainActor
+    func endEdit() {
+        guard isEditing else { return }
+        isEditing = false
+        label.isEditable = false
+        label.isSelectable = false
+        label.drawsBackground = false
+        label.isBezeled = false
+        label.delegate = nil
+        onCommit = nil
+        onCancel = nil
+        labelTrailingEdit.isActive = false
+        labelTrailingNormal.isActive = true
+        pillEditMinWidth.isActive = false
+        closeButton.isHidden = !isActive
+        badgeDot.isHidden = true  // next configure() re-sets correctly
+    }
+
+    /// NSControlTextEditingDelegate hook for Enter / Escape. Matches
+    /// `ProjectRowCellView`'s pattern — Enter commits, Escape cancels,
+    /// both transitions end the edit synchronously before invoking
+    /// the callback so a re-entrant rebuild observes `isEditing ==
+    /// false`.
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            let committed = label.stringValue
+            let commit = onCommit
+            endEdit()
+            commit?(committed)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            let cancel = onCancel
+            endEdit()
+            cancel?()
+            return true
+        }
+        return false
+    }
+
+    /// Focus-loss == cancel, matching the sidebar's policy. Better
+    /// to lose typing the user didn't confirm than to surprise them
+    /// with a commit they didn't intend.
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard isEditing else { return }
+        let cancel = onCancel
+        endEdit()
+        cancel?()
+    }
 
     /// `mouseDown` only captures the event for the drag-start path;
     /// the click action (`onSelect`) is deferred to `mouseUp` so that
@@ -2330,7 +2684,15 @@ final class TabPillView: NSView {
     /// canonical pattern for "draggable button-like view" is to track
     /// mouseDown → mouseDragged (start drag at threshold) → mouseUp
     /// (fire click if no drag happened).
+    ///
+    /// Round-3 R5: bypass the drag plumbing while editing so the
+    /// bezeled NSTextField handles clicks for caret placement and
+    /// text selection.
     override func mouseDown(with event: NSEvent) {
+        if isEditing {
+            super.mouseDown(with: event)
+            return
+        }
         mouseDownEvent = event
         isDragging = false
     }
@@ -2342,6 +2704,10 @@ final class TabPillView: NSView {
     /// that haven't received their daemon id yet (still mid-OpenTab)
     /// quietly skip the drag.
     override func mouseDragged(with event: NSEvent) {
+        if isEditing {
+            super.mouseDragged(with: event)
+            return
+        }
         guard !isDragging,
               let downEvent = mouseDownEvent,
               let tabID = tabID
@@ -2364,6 +2730,10 @@ final class TabPillView: NSView {
     /// which intercepts the rest of the event stream; this `mouseUp`
     /// only runs for plain clicks.
     override func mouseUp(with event: NSEvent) {
+        if isEditing {
+            super.mouseUp(with: event)
+            return
+        }
         let wasClick = !isDragging && mouseDownEvent != nil
         mouseDownEvent = nil
         isDragging = false
