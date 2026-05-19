@@ -82,6 +82,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var renamePopover: NSPopover?
     private var renamePopoverTabID: Int64?
 
+    /// Round-2 F6: drop-indicator state for sidebar drag-reorder.
+    /// `nil` means no drag in progress. Non-nil values are the
+    /// `proposedChildIndex` AppKit reports — drop will land above the
+    /// project at that index, or after the last project if index ==
+    /// projects.count. Cleared on `acceptDrop` and on session-end
+    /// callbacks.
+    private var dropIndicatorIndex: Int?
+
     private var socketPath: String = ""
     private var daemonReachable: Bool = false
 
@@ -492,6 +500,28 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
         tabs.removeAll()
         activeSessionByProject.removeAll()
+    }
+
+    /// Round-2 fix: AppKit doesn't always restore first responder to
+    /// the terminal view when the app regains focus (e.g. after
+    /// switching apps, or after the rename popover closes). Without
+    /// terminal-as-first-responder, ⌘V / ⌘C / ⌘X / ⌘A fall through to
+    /// `NSText.paste(_:)` / `NSText.copy(_:)` etc. with no target
+    /// and become no-ops. Snapping focus back here covers the
+    /// common case without needing a click into the terminal area.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        focusActiveTerminal()
+    }
+
+    /// Make the active project's terminal view the window's first
+    /// responder. No-op if the workspace hasn't bootstrapped yet or
+    /// the active project has no live tab. Safe to call repeatedly.
+    @MainActor
+    private func focusActiveTerminal() {
+        guard let activeProjectID,
+              let session = activeSessionByProject[activeProjectID]
+        else { return }
+        window?.makeFirstResponder(session.terminalView)
     }
 
     // MARK: - Workspace bootstrap
@@ -982,6 +1012,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let current = projects[idx].name
         guard !trimmed.isEmpty, trimmed != current else {
             rebuildSidebar()
+            // Round-2 polish: focus returns to the terminal so the
+            // user can resume typing immediately after Escape /
+            // unchanged-Enter, matching the popover behavior they
+            // already liked for tab rename.
+            focusActiveTerminal()
             return
         }
 
@@ -994,6 +1029,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             cwd: projects[idx].cwd
         )
         rebuildSidebar()
+        // Round-2 polish: focus back to the terminal so the user can
+        // type immediately after committing the rename.
+        focusActiveTerminal()
 
         let socket = socketPath
         Task {
@@ -1006,6 +1044,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // Nothing model-wise to do — the next configure() call resyncs
         // textField.stringValue from `projects[id].name`.
         rebuildSidebar()
+        // Round-2 polish: focus back to the terminal on Escape too.
+        focusActiveTerminal()
     }
 
     @objc @MainActor
@@ -1076,6 +1116,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             theme: activeTheme,
             font: activeFont
         )
+        // Round-2 polish: pre-seed `liveCwd` from the project's cwd
+        // so the new pill renders the tilde-abbreviated path on
+        // frame 1, instead of flashing "Tab N" while waiting for the
+        // shell's OSC 7. OSC 7 will refine if the shell starts in a
+        // different directory. Matches the Go binary's behavior.
+        if let project = projects.first(where: { $0.id == projectID }),
+           !project.cwd.isEmpty
+        {
+            session.liveCwd = project.cwd
+        }
         tabs.append(session)
 
         let projectTabs = tabsForActiveProject()
@@ -1314,16 +1364,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Rename the tab at the given index in the active project.
     /// Wired from `TabPillView`'s right-click "Rename…" menu (M4 of
-    /// `goal-mac-parity-2026-05-18.md`). Focuses the target tab first
-    /// because the existing rename flow (`renameActiveTab`) operates
-    /// on the active session. M5 will replace the modal with an inline
-    /// label↔entry stack; until then the alert is the rename UX.
+    /// `goal-mac-parity-2026-05-18.md`).
+    ///
+    /// Round-2 fix: open the popover directly on the right-clicked
+    /// pill rather than routing through `selectTab → rebuildTabBar
+    /// → renameActiveTab`. The previous chain rebuilt the strip
+    /// mid-action, leaving the popover trying to anchor against a
+    /// pill whose window-side layout hadn't settled, and the menu
+    /// item appeared to do nothing.
     @MainActor
     private func renameTab(at indexInActiveProject: Int) {
         let projectTabs = tabsForActiveProject()
         guard projectTabs.indices.contains(indexInActiveProject) else { return }
-        selectTab(at: indexInActiveProject)
-        renameActiveTab(nil)
+        let session = projectTabs[indexInActiveProject]
+        guard let tabID = session.id else { return }
+        let currentTitle = pillLabel(for: session, index: indexInActiveProject)
+        beginRenameActiveTab(
+            tabID: tabID,
+            currentTitle: currentTitle,
+            atIndex: indexInActiveProject
+        )
     }
 
     /// Close the tab at the given index in the active project. The
@@ -2261,17 +2321,18 @@ final class TabPillView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
-    /// Single-click anywhere on the pill (except over the close
-    /// glyph) selects the tab. We fire `onSelect` immediately on
-    /// `mouseDown` so the tab becomes active right away — pre-M2
-    /// behavior. M2 layers drag-source on top: `mouseDragged` starts
-    /// a dragging session when the cursor moves past a small
-    /// threshold, and `mouseUp` is a no-op for the click path
-    /// (which already fired in `mouseDown`).
+    /// `mouseDown` only captures the event for the drag-start path;
+    /// the click action (`onSelect`) is deferred to `mouseUp` so that
+    /// a drag isn't mis-fired as a click. This was the round-1 M2
+    /// drag bug: firing `onSelect` here triggered `selectTab` →
+    /// `rebuildTabBar`, which destroyed this view before
+    /// `mouseDragged` could begin a dragging session. AppKit's
+    /// canonical pattern for "draggable button-like view" is to track
+    /// mouseDown → mouseDragged (start drag at threshold) → mouseUp
+    /// (fire click if no drag happened).
     override func mouseDown(with event: NSEvent) {
         mouseDownEvent = event
         isDragging = false
-        onSelect(index)
     }
 
     /// Begin a dragging session once the user drags more than ~3 pts
@@ -2297,9 +2358,18 @@ final class TabPillView: NSView {
         beginDraggingSession(with: [draggingItem], event: downEvent, source: self)
     }
 
+    /// Click action fires on `mouseUp` rather than `mouseDown` (see
+    /// `mouseDown` comment) — only when no drag took place. A drag
+    /// that begins via `mouseDragged` calls `beginDraggingSession`,
+    /// which intercepts the rest of the event stream; this `mouseUp`
+    /// only runs for plain clicks.
     override func mouseUp(with event: NSEvent) {
+        let wasClick = !isDragging && mouseDownEvent != nil
         mouseDownEvent = nil
         isDragging = false
+        if wasClick {
+            onSelect(index)
+        }
     }
 
     /// Snapshot the pill's current rendering so the drag image looks
@@ -2374,6 +2444,22 @@ extension TabPillView: NSDraggingSource {
 /// targets for selection-state color flips, so we wire our label
 /// through that outlet rather than holding a separate `NSTextField`
 /// reference.
+/// Indicator position for `ProjectRowCellView.setDropIndicator(_:)`.
+/// Round-2 F6: AppKit's built-in NSOutlineView drop indicator is too
+/// subtle on the dark theme — the user reported it was hard to tell
+/// where a dragged project would land. The cell view paints its own
+/// 2pt accent band when set.
+enum DropIndicator {
+    /// No indicator.
+    case none
+    /// 2pt accent band along the cell's top edge — drop will land
+    /// above this row.
+    case above
+    /// 2pt accent band along the cell's bottom edge — used only for
+    /// the last row when the drop is past the end of the list.
+    case below
+}
+
 @MainActor
 final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
     /// Phase 6a P7: small accent-tinted dot in the right column
@@ -2399,6 +2485,12 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
     private var onCommit: (@MainActor (String) -> Void)?
     private var onCancel: (@MainActor () -> Void)?
 
+    /// Round-2 F6: 2pt accent bands toggled by `setDropIndicator(_:)`
+    /// to give a visible cue during sidebar drag-reorder. AppKit's
+    /// built-in indicator is too subtle on the dark theme.
+    private let dropTopBand: NSView
+    private let dropBottomBand: NSView
+
     init() {
         let field = NSTextField(labelWithString: "")
         field.translatesAutoresizingMaskIntoConstraints = false
@@ -2422,10 +2514,26 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         stripe.isHidden = true
         self.stripe = stripe
 
+        let top = NSView()
+        top.translatesAutoresizingMaskIntoConstraints = false
+        top.wantsLayer = true
+        top.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        top.isHidden = true
+        self.dropTopBand = top
+
+        let bottom = NSView()
+        bottom.translatesAutoresizingMaskIntoConstraints = false
+        bottom.wantsLayer = true
+        bottom.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        bottom.isHidden = true
+        self.dropBottomBand = bottom
+
         super.init(frame: .zero)
         addSubview(stripe)
         addSubview(field)
         addSubview(dot)
+        addSubview(top)
+        addSubview(bottom)
         textField = field
         NSLayoutConstraint.activate([
             stripe.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -2441,11 +2549,30 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
             dot.widthAnchor.constraint(equalToConstant: 8),
             dot.heightAnchor.constraint(equalToConstant: 8),
+
+            top.leadingAnchor.constraint(equalTo: leadingAnchor),
+            top.trailingAnchor.constraint(equalTo: trailingAnchor),
+            top.topAnchor.constraint(equalTo: topAnchor),
+            top.heightAnchor.constraint(equalToConstant: 2),
+
+            bottom.leadingAnchor.constraint(equalTo: leadingAnchor),
+            bottom.trailingAnchor.constraint(equalTo: trailingAnchor),
+            bottom.bottomAnchor.constraint(equalTo: bottomAnchor),
+            bottom.heightAnchor.constraint(equalToConstant: 2),
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    /// Round-2 F6: toggle the 2pt accent band that marks this row as
+    /// the drop target during sidebar drag-reorder. Cheap visual cue
+    /// added because AppKit's built-in NSOutlineView drop indicator
+    /// is too subtle on the dark theme.
+    func setDropIndicator(_ position: DropIndicator) {
+        dropTopBand.isHidden = position != .above
+        dropBottomBand.isHidden = position != .below
+    }
 
     func configure(with project: ProjectSnapshot, notifying: Bool, rollup: RollupState) {
         // M5 race guard: while the user is editing this row, never
@@ -2582,16 +2709,58 @@ extension RoostApp: NSOutlineViewDataSource {
     /// so the user can't accidentally drop a project onto another
     /// project's row (which would visually be a no-op anyway, but the
     /// move arrow looks confusing).
+    ///
+    /// Round-2 F6: also drive the custom drop indicator on
+    /// `ProjectRowCellView` — `setDropIndicator(_:)` paints a 2pt
+    /// accent band so the user sees where the drop will land.
+    /// AppKit's built-in indicator is too subtle on dark theme.
     func outlineView(
         _ outlineView: NSOutlineView,
         validateDrop info: any NSDraggingInfo,
         proposedItem item: Any?,
         proposedChildIndex index: Int
     ) -> NSDragOperation {
-        guard item == nil, index >= 0 else { return [] }
-        guard info.draggingPasteboard.types?.contains(.roostProjectID) == true else { return [] }
+        guard item == nil, index >= 0 else {
+            updateDropIndicator(to: nil)
+            return []
+        }
+        guard info.draggingPasteboard.types?.contains(.roostProjectID) == true else {
+            updateDropIndicator(to: nil)
+            return []
+        }
         outlineView.setDropItem(nil, dropChildIndex: index)
+        updateDropIndicator(to: index)
         return .move
+    }
+
+    /// Toggle the custom drop indicator bands on the cached
+    /// `ProjectRowCellView`s. Clears the previous indicator before
+    /// setting the new one so transitioning between rows during a
+    /// drag never leaves two indicators visible. `nil` clears
+    /// everything (used on drop / drag-end / drag-exit).
+    @MainActor
+    private func updateDropIndicator(to newIndex: Int?) {
+        // Clear the previous indicator if it's different from the new
+        // target. Walking the small cache map is cheap.
+        if dropIndicatorIndex != newIndex {
+            for cell in projectRowCellViews.values {
+                cell.setDropIndicator(.none)
+            }
+        }
+        dropIndicatorIndex = newIndex
+        guard let newIndex else { return }
+        if newIndex < projects.count {
+            // Drop above the project at this index.
+            if let cell = projectRowCellViews[projects[newIndex].id] {
+                cell.setDropIndicator(.above)
+            }
+        } else if let last = projects.last,
+                  let cell = projectRowCellViews[last.id]
+        {
+            // Drop past the last row — paint the indicator on the
+            // bottom edge of the final cell.
+            cell.setDropIndicator(.below)
+        }
     }
 
     /// Resolve the drop to a final order and fire `ReorderProjects`.
@@ -2604,6 +2773,7 @@ extension RoostApp: NSOutlineViewDataSource {
         item: Any?,
         childIndex index: Int
     ) -> Bool {
+        defer { updateDropIndicator(to: nil) }
         guard let idStr = info.draggingPasteboard.string(forType: .roostProjectID),
               let sourceID = Int64(idStr),
               let sourceIdx = projects.firstIndex(where: { $0.id == sourceID })
@@ -2626,6 +2796,19 @@ extension RoostApp: NSOutlineViewDataSource {
             await reorderProjects(socketPath: socket, projectIDs: ids)
         }
         return true
+    }
+
+    /// Round-2 F6: clear the drop indicator when the drag ends — fires
+    /// even when the user releases outside the outline view (cancelled
+    /// drag). Without this, a cancelled drag would leave a stray
+    /// indicator band visible until the next drag.
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        draggingSession session: NSDraggingSession,
+        endedAt screenPoint: NSPoint,
+        operation: NSDragOperation
+    ) {
+        updateDropIndicator(to: nil)
     }
 }
 

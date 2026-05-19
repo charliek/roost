@@ -210,8 +210,15 @@ func defaultBindingsMac() -> [String: [String]] {
             "\(primary)+shift+braceright",
             "\(primary)+shift+bracketright",
         ],
-        KeybindAction.paste:         ["\(clipboardMod)+v", "ctrl+shift+v"],
-        KeybindAction.copy:          ["\(clipboardMod)+c", "ctrl+shift+c"],
+        // Round-2 F3 fix: Mac uses ⌘C / ⌘V exclusively for the
+        // system clipboard. The pre-fix `ctrl+shift+v` / `ctrl+shift+c`
+        // entries (Linux conventions inherited verbatim) caused the
+        // Edit menu's keyEquivalent to land on the wrong accel
+        // depending on dictionary iteration order, breaking ⌘V/⌘C
+        // for the user. Mac users don't expect those triggers; drop
+        // them. Users who want them can still bind via config.
+        KeybindAction.paste:         ["\(clipboardMod)+v"],
+        KeybindAction.copy:          ["\(clipboardMod)+c"],
         KeybindAction.newProject:    ["\(projectMod)+n"],
         KeybindAction.renameProject: ["\(projectMod)+shift+r"],
         KeybindAction.toggleSidebar: ["\(projectMod)+b"],
