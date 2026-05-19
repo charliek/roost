@@ -40,6 +40,9 @@ enum KeybindAction {
     static let copy          = "copy"
     static let newProject    = "new_project"
     static let renameProject = "rename_project"
+    /// Round-4 R3: ⌘⇧W (Mac) / Alt+Shift+W (Linux) close the active
+    /// project; confirms with an NSAlert when the project has 2+ tabs.
+    static let closeProject  = "close_project"
     static let fontIncrease  = "font_increase"
     static let fontDecrease  = "font_decrease"
     static let fontReset     = "font_reset"
@@ -61,7 +64,7 @@ enum KeybindAction {
     /// preserves the default rather than silently dropping it).
     static let knownStaticActions: Set<String> = [
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
-        paste, copy, newProject, renameProject,
+        paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
         jumpToUnread,
     ]
@@ -221,6 +224,7 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.copy:          ["\(clipboardMod)+c"],
         KeybindAction.newProject:    ["\(projectMod)+n"],
         KeybindAction.renameProject: ["\(projectMod)+shift+r"],
+        KeybindAction.closeProject:  ["\(projectMod)+shift+w"],
         KeybindAction.toggleSidebar: ["\(projectMod)+b"],
         // ⌘⇧U — cmux's "jump to latest unread" convention.
         KeybindAction.jumpToUnread:  ["\(primary)+shift+u"],

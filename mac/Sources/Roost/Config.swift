@@ -25,12 +25,21 @@ struct RoostConfig: Sendable {
     var themeName: String?
     var fontFamily: String?
     var fontSize: CGFloat?
+    /// Round-4 R4: per-pill width bounds for the tab strip. `nil`
+    /// falls back to the compiled-in defaults (80 / 220). A user
+    /// who writes `tab-min-width = 0` or `tab-max-width = 0` in
+    /// their config disables that bound — handy if you want the
+    /// pre-round-4 behavior where pills grow to fit their title.
+    var tabMinWidth: CGFloat?
+    var tabMaxWidth: CGFloat?
     var keybinds: [Keybind] = []
 
     static let empty = RoostConfig(
         themeName: nil,
         fontFamily: nil,
         fontSize: nil,
+        tabMinWidth: nil,
+        tabMaxWidth: nil,
         keybinds: []
     )
 
@@ -79,6 +88,17 @@ func parse(_ text: String) -> RoostConfig {
         case "font-size":
             if let n = Double(value), n > 0 {
                 cfg.fontSize = CGFloat(n)
+            }
+        case "tab-min-width":
+            // Negative values are nonsense; 0 means "no floor".
+            if let n = Double(value), n >= 0 {
+                cfg.tabMinWidth = CGFloat(n)
+            }
+        case "tab-max-width":
+            // 0 means "no cap" — pills grow to fit their title
+            // (pre-round-4 behavior).
+            if let n = Double(value), n >= 0 {
+                cfg.tabMaxWidth = CGFloat(n)
             }
         case "keybind":
             // `keybind = <trigger> = <action>`. The outer split on

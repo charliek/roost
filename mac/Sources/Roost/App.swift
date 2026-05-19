@@ -1103,17 +1103,46 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        deleteProjectByID(id: id)
+    }
 
-        // Close every UI-side TabSession in this project so the
-        // StreamPty streams shut down before the daemon cascade-deletes
-        // their rows. Without this the daemon-side CloseTab would race
-        // the project DELETE — harmless but noisy in the logs.
-        //
-        // Round-3 R5 (CodeRabbit on PR #72): mirror the tabPillViews
-        // cleanup that `removeProjectLocally` does — cancel any
-        // mid-edit pill so its NSTextField stops being first responder
-        // before the view goes away, and drop the cache entry so a
-        // future tab id reuse can't resurrect stale pill state.
+    /// Round-4 R3: ⌘⇧W close-project handler. Targets the *active*
+    /// project (which is what the user sees in the terminal area).
+    /// Confirms when the project has 2+ tabs — single-tab projects
+    /// are typically a freshly-created empty workspace and the
+    /// confirmation would be friction.
+    @objc @MainActor
+    private func closeActiveProject(_ sender: Any?) {
+        guard let activeProjectID,
+              let project = projects.first(where: { $0.id == activeProjectID })
+        else { return }
+        let projectTabs = tabsForActiveProject()
+        if projectTabs.count > 1 {
+            let alert = NSAlert()
+            alert.messageText = "Close \(project.name)?"
+            alert.informativeText =
+                "This will close \(projectTabs.count) tabs in this project. The action can't be undone."
+            alert.addButton(withTitle: "Close Project")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        deleteProjectByID(id: activeProjectID)
+    }
+
+    /// Shared delete-after-confirmation path used by both
+    /// `deleteProjectFromMenu` (sidebar right-click) and round-4 R3's
+    /// `closeActiveProject` (⌘⇧W). Closes every UI-side TabSession in
+    /// the project so the StreamPty streams shut down before the
+    /// daemon cascade-deletes their rows, then fires the daemon RPC
+    /// and resyncs the sidebar.
+    ///
+    /// Round-3 R5 invariants preserved: cancel any mid-edit pill so
+    /// its NSTextField stops being first responder before the view
+    /// goes away, and drop the cache entry so a future tab id reuse
+    /// can't resurrect stale pill state.
+    @MainActor
+    private func deleteProjectByID(id: Int64) {
         let condemned = tabs.filter { $0.projectID == id }
         for session in condemned {
             if let tabID = session.id, let pill = tabPillViews[tabID], pill.isEditing {
@@ -1376,6 +1405,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     statusColor: statusColor,
                     hasBadge: hasBadge,
                     tabID: session.id,
+                    minWidth: config.tabMinWidth ?? 80,
+                    maxWidth: config.tabMaxWidth ?? 220,
                     onSelect: select,
                     onClose: close,
                     onRename: rename
@@ -1433,9 +1464,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// "WatchEvents-only mutation" invariant.
     @MainActor
     private func handleTabDrop(sourceTabID: Int64, rawTargetIdx: Int) {
+        // R1 TRACE — remove after verification
+        r1Trace(
+            "handleTabDrop ENTRY sourceTabID=\(sourceTabID) rawTargetIdx=\(rawTargetIdx)"
+            + " activeProjectID=\(activeProjectID.map { "\($0)" } ?? "nil")"
+            + " daemonReachable=\(daemonReachable)"
+        )
         guard let activeProjectID,
               daemonReachable
-        else { return }
+        else {
+            r1Trace("handleTabDrop BAILED — no activeProjectID or daemon unreachable")
+            return
+        }
         let projectTabs = tabsForActiveProject()
         // CodeRabbit on PR #68: the reorder math and the daemon-bound
         // id sequence must live in the same index space. `projectTabs`
@@ -1448,14 +1488,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             guard let id = session.id else { return nil }
             return (visualIdx: idx, id: id)
         }
+        r1Trace(
+            "handleTabDrop projectTabs.count=\(projectTabs.count)"
+            + " persisted=\(String(describing: persisted.map { ($0.visualIdx, $0.id) }))"
+        )
         guard let sourcePersistedIdx = persisted.firstIndex(where: { $0.id == sourceTabID })
-        else { return }
+        else {
+            r1Trace("handleTabDrop BAILED — source tab id \(sourceTabID) not in persisted set")
+            return
+        }
         let rawTargetPersistedIdx = persisted.reduce(into: 0) { count, entry in
             if entry.visualIdx < rawTargetIdx { count += 1 }
         }
         let mapped = computeInsertIdx(
             sourceIdx: sourcePersistedIdx,
             rawTargetIdx: rawTargetPersistedIdx
+        )
+        r1Trace(
+            "handleTabDrop sourcePersistedIdx=\(sourcePersistedIdx)"
+            + " rawTargetPersistedIdx=\(rawTargetPersistedIdx) mapped.index=\(mapped.index)"
+            + " mapped.isNoop=\(mapped.isNoop)"
         )
         if mapped.isNoop { return }
 
@@ -1468,6 +1520,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let source = ids.remove(at: sourcePersistedIdx)
         let clamped = min(max(mapped.index, 0), ids.count)
         ids.insert(source, at: clamped)
+        r1Trace("handleTabDrop firing reorderTabs ids=\(String(describing: ids))")
 
         let socket = socketPath
         let projectID = activeProjectID
@@ -1789,6 +1842,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         renameProjectItem.target = self
         bind(renameProjectItem, to: KeybindAction.renameProject)
         fileMenu.addItem(renameProjectItem)
+        let closeProjectItem = NSMenuItem(
+            title: "Close Project",
+            action: #selector(closeActiveProject(_:)),
+            keyEquivalent: ""
+        )
+        closeProjectItem.target = self
+        bind(closeProjectItem, to: KeybindAction.closeProject)
+        fileMenu.addItem(closeProjectItem)
         fileMenu.addItem(.separator())
         // M4: cycle prev / next within the active project's tabs.
         // ⌘⇧[ / ⌘⇧]; wraps at ends. Matches Go cycle_tab_prev /
@@ -2079,8 +2140,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let active = activeSessionByProject[activeProjectID]
         let currentIdx = projectTabs.firstIndex(where: { $0 === active }) ?? 0
         let n = projectTabs.count
-        // ((i + delta) % n + n) % n for negative-safe modulo.
-        let next = ((currentIdx + delta) % n + n) % n
+        // Round-4 R2: clamp at endpoints instead of wrapping. ⌘⇧[ on
+        // the first tab is a no-op; ⌘⇧] on the last tab is a no-op.
+        let next = max(0, min(n - 1, currentIdx + delta))
+        guard next != currentIdx else { return }
         selectTab(at: next)
     }
 
@@ -2407,6 +2470,14 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         statusColor: NSColor? = nil,
         hasBadge: Bool = false,
         tabID: Int64? = nil,
+        // Round-4 R4: per-pill width bounds for the strip's
+        // Ghostty-style shrink-and-truncate behavior. Both default
+        // to nil, meaning "use the compiled-in defaults" (80 / 220).
+        // A `0` value at the config layer disables that bound;
+        // by the time it reaches here, callers should have already
+        // resolved 0 → nil so unbound axes simply pass nothing.
+        minWidth: CGFloat? = 80,
+        maxWidth: CGFloat? = 220,
         onSelect: @escaping @MainActor (Int) -> Void,
         onClose: @escaping @MainActor (Int) -> Void,
         onRename: @escaping @MainActor (Int) -> Void
@@ -2492,7 +2563,24 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
 
-        NSLayoutConstraint.activate([
+        // Round-4 R4: pill width bounds (Ghostty-style shrink-and-
+        // truncate). Activated only when the corresponding bound is
+        // non-nil; nil/`0` means "let the pill grow with its content"
+        // (pre-round-4 behavior). The edit-mode 220pt min from round
+        // 3 (`pillEditMinWidth`) coexists fine: greaterThanOrEqual.
+        var widthConstraints: [NSLayoutConstraint] = []
+        if let minW = minWidth, minW > 0 {
+            widthConstraints.append(
+                widthAnchor.constraint(greaterThanOrEqualToConstant: minW)
+            )
+        }
+        if let maxW = maxWidth, maxW > 0 {
+            widthConstraints.append(
+                widthAnchor.constraint(lessThanOrEqualToConstant: maxW)
+            )
+        }
+
+        NSLayoutConstraint.activate(widthConstraints + [
             heightAnchor.constraint(equalToConstant: 24),
 
             statusSlot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
@@ -2733,6 +2821,8 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         item.setString(String(tabID), forType: .roostTabID)
         let draggingItem = NSDraggingItem(pasteboardWriter: item)
         draggingItem.setDraggingFrame(bounds, contents: snapshotImage())
+        // R1 TRACE — remove after verification
+        r1Trace("source pill.beginDraggingSession tabID=\(tabID) bounds=\(NSStringFromRect(bounds))")
         beginDraggingSession(with: [draggingItem], event: downEvent, source: self)
     }
 
@@ -2815,6 +2905,26 @@ extension TabPillView: NSDraggingSource {
         // Only allow drops inside the same app — cross-app pill drags
         // aren't a thing.
         context == .withinApplication ? .move : []
+    }
+
+    /// R1 TRACE — remove after verification.
+    /// AppKit calls this on the drag SOURCE when the session ends.
+    /// `operation` reflects what the destination's
+    /// `performDragOperation` returned — `.move` for success,
+    /// `[]` for "destination didn't accept".
+    nonisolated func draggingSession(
+        _ session: NSDraggingSession,
+        endedAt screenPoint: NSPoint,
+        operation: NSDragOperation
+    ) {
+        let point = screenPoint
+        let op = operation.rawValue
+        Task { @MainActor in
+            r1Trace(
+                "source pill.draggingSession ENDED screenPoint=\(NSStringFromPoint(point))"
+                + " operation=\(op)"
+            )
+        }
     }
 }
 
