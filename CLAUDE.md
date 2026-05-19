@@ -79,6 +79,12 @@ If you need a new dependency, prefer pure-Go. cgo is permitted in the two packag
 - Default to no comments. Add a comment only when the WHY is non-obvious — a hidden constraint, a workaround, a tricky invariant. Don't comment what well-named code already says.
 - No `// TODO: ...` left in committed code. Either do it, file an issue, or leave a `// XXX:` for known dead-ends.
 
+## Troubleshooting
+
+- **Daemon log**: `/private/tmp/roost-core.log` (default path on macOS; tail with `tail -f /private/tmp/roost-core.log` while reproducing). The path comes from `tracing-appender` in `crates/roost-core/src/main.rs`; verify in a running session with `lsof -p $(pgrep -f roost-core) | grep log`.
+- **Mac UI logs**: `log show --predicate 'process == "Roost"' --info --last 60s`. Note that `NSLog`/`os_log` redacts string interpolations as `<private>` by default; for diagnostics that need raw values, write to a file directly (the round-4 R1 trace pattern in `mac/Sources/Roost/DragReorder.swift::r1Trace` is the template).
+- **Claude integration testing**: see [docs/development/claude-testing.md](docs/development/claude-testing.md) for end-to-end test instructions covering tab state, notification banners, sidebar rollup, and the hook lifecycle.
+
 ## Build
 
 - `go build` does NOT build libghostty-vt. Run `./build/build.sh` for a full build.

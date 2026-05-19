@@ -1893,7 +1893,14 @@ impl App {
             .selected_page()
             .map(|p| ui.tab_view.page_position(&p))
             .unwrap_or(0);
-        let target = ((current + delta).rem_euclid(n)) as u32;
+        // Round-4 R2 (Mac parity): clamp at endpoints instead of
+        // wrapping. Ctrl+Shift+[ on the first tab is a no-op;
+        // Ctrl+Shift+] on the last tab is a no-op.
+        let target_signed = current + delta;
+        if target_signed < 0 || target_signed >= n {
+            return;
+        }
+        let target = target_signed as u32;
         if let Some(obj) = pages.item(target) {
             if let Ok(page) = obj.downcast::<libadwaita::TabPage>() {
                 ui.tab_view.set_selected_page(&page);

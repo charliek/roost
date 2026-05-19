@@ -11,8 +11,8 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 | `Cmd-T`          | New tab                                         |
 | `Cmd-W`          | Close the active tab                            |
 | `Cmd-R`          | Rename the active tab                           |
-| `Cmd-Shift-]`    | Cycle to the next tab                           |
-| `Cmd-Shift-[`    | Cycle to the previous tab                       |
+| `Cmd-Shift-]`    | Cycle to the next tab (stops at the last tab; no wrap-around) |
+| `Cmd-Shift-[`    | Cycle to the previous tab (stops at the first tab; no wrap-around) |
 | `Ctrl-1` … `Ctrl-9` | Switch to tab at position 1 .. 9             |
 
 ### Project management
@@ -21,6 +21,7 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 |----------------------|----------------------------------------------|
 | `Cmd-N`              | Create a new project (`untitled`, `untitled 2`, …) |
 | `Cmd-Shift-R`        | Rename the active project                   |
+| `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
 
@@ -54,8 +55,8 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Ctrl-T`         | New tab                                         |
 | `Ctrl-W`         | Close the active tab                            |
 | `Alt-R`          | Rename the active tab                           |
-| `Ctrl-Shift-]`   | Cycle to the next tab                           |
-| `Ctrl-Shift-[`   | Cycle to the previous tab                       |
+| `Ctrl-Shift-]`   | Cycle to the next tab (stops at the last tab; no wrap-around) |
+| `Ctrl-Shift-[`   | Cycle to the previous tab (stops at the first tab; no wrap-around) |
 | `Ctrl-1` … `Ctrl-9` | Switch to tab at position 1 .. 9             |
 
 ### Project management
@@ -64,6 +65,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 |----------------------|----------------------------------------------|
 | `Alt-N`              | Create a new project (`untitled`, `untitled 2`, …) |
 | `Alt-Shift-R`        | Rename the active project                   |
+| `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
 
@@ -187,6 +189,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
 | `new_project`         | `super+n` / `alt+n`                                    |
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
+| `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |

@@ -8,6 +8,24 @@
 // from `TabPillView` instances.
 
 import AppKit
+import Foundation
+
+// R1 TRACE — remove after verification. Appends to a file because
+// macOS OSLog redacts string interpolations as `<private>` and we
+// need the raw values visible to diagnose the round-3 drag-drop bug.
+@MainActor
+internal func r1Trace(_ message: String) {
+    let line = "\(Date()) \(message)\n"
+    guard let data = line.data(using: .utf8) else { return }
+    let path = "/tmp/roost-r1-trace.log"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(data)
+        try? fh.close()
+    } else {
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+}
 
 extension NSPasteboard.PasteboardType {
     /// Pasteboard payload carrying a tab id as a UTF-8 stringified
@@ -47,7 +65,9 @@ final class TabBarStackView: NSStackView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        sender.draggingPasteboard.types?.contains(.roostTabID) == true ? .move : []
+        let hasType = sender.draggingPasteboard.types?.contains(.roostTabID) == true
+        r1Trace("stack.draggingEntered hasType=\(hasType)")
+        return hasType ? .move : []
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
@@ -55,11 +75,23 @@ final class TabBarStackView: NSStackView {
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        // R1 TRACE — remove after verification
+        r1Trace(
+            "stack.performDragOperation pasteboardTypes=\(String(describing: sender.draggingPasteboard.types ?? []))"
+            + " draggingLocation(window)=\(NSStringFromPoint(sender.draggingLocation))"
+        )
         guard let idStr = sender.draggingPasteboard.string(forType: .roostTabID),
               let id = Int64(idStr)
-        else { return false }
+        else {
+            r1Trace("stack.performDragOperation BAILED — bad pasteboard payload")
+            return false
+        }
         let local = convert(sender.draggingLocation, from: nil)
         let rawTarget = hitTestRawTargetIdx(at: local)
+        r1Trace(
+            "stack.performDragOperation id=\(id) local=\(NSStringFromPoint(local))"
+            + " rawTarget=\(rawTarget) onDropTab=\(onDropTab == nil ? "nil" : "set")"
+        )
         onDropTab?(id, rawTarget)
         return true
     }
@@ -72,9 +104,20 @@ final class TabBarStackView: NSStackView {
     /// button is *not* a pill; it's filtered out by type.
     private func hitTestRawTargetIdx(at point: NSPoint) -> Int {
         let pills = arrangedSubviews.compactMap { $0 as? TabPillView }
+        // R1 TRACE — remove after verification
         for (i, pill) in pills.enumerated() {
-            if point.x < pill.frame.midX { return i }
+            r1Trace(
+                "stack.hitTest pill[\(i)] frame=\(NSStringFromRect(pill.frame))"
+                + " midX=\(pill.frame.midX) drop.x=\(point.x)"
+            )
         }
+        for (i, pill) in pills.enumerated() {
+            if point.x < pill.frame.midX {
+                r1Trace("stack.hitTest -> \(i) (left half of pill[\(i)])")
+                return i
+            }
+        }
+        r1Trace("stack.hitTest -> \(pills.count) (past all pills)")
         return pills.count
     }
 }
@@ -99,8 +142,12 @@ final class TabBarScrollView: NSScrollView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingPasteboard.types?.contains(.roostTabID) == true
-        else { return [] }
+        let hasType = sender.draggingPasteboard.types?.contains(.roostTabID) == true
+        r1Trace(
+            "scroll.draggingEntered hasType=\(hasType)"
+            + " docViewClass=\(String(describing: type(of: documentView as Any)))"
+        )
+        guard hasType else { return [] }
         _ = (documentView as? TabBarStackView)?.draggingEntered(sender)
         return .move
     }
@@ -113,7 +160,14 @@ final class TabBarScrollView: NSScrollView {
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        (documentView as? TabBarStackView)?.performDragOperation(sender) ?? false
+        // R1 TRACE — remove after verification
+        r1Trace(
+            "scroll.performDragOperation forwarding to docView="
+            + "\(String(describing: type(of: documentView as Any)))"
+        )
+        let result = (documentView as? TabBarStackView)?.performDragOperation(sender) ?? false
+        r1Trace("scroll.performDragOperation result=\(result)")
+        return result
     }
 
     override func draggingExited(_ sender: (any NSDraggingInfo)?) {

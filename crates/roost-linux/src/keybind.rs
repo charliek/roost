@@ -187,7 +187,14 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &format!("{project_mod}+shift+r"),
         KeybindAction::RenameProject,
     );
-    // DeleteProject: no default trigger — see KeybindAction docs.
+    // Round-4 R3: Mac=⌘⇧W, Linux=Alt+Shift+W. Both surfaces use
+    // `project_mod+shift+w` to keep parity with the project-action
+    // group (new_project=alt+n, rename_project=alt+shift+r on Linux).
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+w"),
+        KeybindAction::DeleteProject,
+    );
 
     // Cycle prev/next: Shift+[ and Shift+] map to bracketleft/right on
     // most US layouts; some layouts emit braceleft/right after Shift.
@@ -389,11 +396,21 @@ mod tests {
             defaults.get(&rename_project_trigger),
             Some(&KeybindAction::RenameProject)
         );
-        // DeleteProject has no default trigger — would cascade-delete
-        // every tab in the project, so users opt in via config.
-        assert!(!defaults
-            .values()
-            .any(|a| matches!(a, KeybindAction::DeleteProject)));
+        // Round-4 R3: DeleteProject now defaults to `project_mod+shift+w`
+        // (Alt+Shift+W on Linux, Cmd+Shift+W on macOS) — paired with a
+        // 2+-tab confirmation dialog in the dispatcher so single-tab
+        // accidental ⌘⇧W stays cheap. Pre-round-4 this had no default
+        // trigger; users now opt OUT by adding
+        // `keybind = alt+shift+w = unbind` to their config.
+        let close_project_trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+w").unwrap()
+        } else {
+            parse_trigger("alt+shift+w").unwrap()
+        };
+        assert_eq!(
+            defaults.get(&close_project_trigger),
+            Some(&KeybindAction::DeleteProject)
+        );
     }
 
     #[test]
