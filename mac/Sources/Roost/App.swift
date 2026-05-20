@@ -58,6 +58,28 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// written on every toggle. Default = true (visible) for new users.
     private static let sidebarVisibleDefaultsKey = "RoostSidebarVisible"
 
+    /// Round-6 R6.B: persisted sidebar width, plus the clamp bounds
+    /// used by the `NSSplitViewDelegate` callbacks. Width survives
+    /// quit/relaunch via `UserDefaults`. Bounds: 160pt floor (any
+    /// narrower and the "Untitled N" rows truncate awkwardly under
+    /// the body font), 400pt cap (past that the terminal grid
+    /// shrinks too aggressively on a 1200pt window).
+    static let sidebarMinWidth: CGFloat = 160
+    static let sidebarMaxWidth: CGFloat = 400
+    private static let sidebarWidthDefaultsKey = "RoostSidebarWidth"
+
+    /// Round-6 R6.B: gate the `splitViewDidResizeSubviews` save
+    /// path. NSSplitView fires the resize-did callback DURING the
+    /// initial layout pass, before our width constraints + the
+    /// `setPosition(_:ofDividerAt:)` call in
+    /// `applicationDidFinishLaunching` have settled — without this
+    /// flag, that first callback would persist whatever
+    /// NSSplitView's auto-layout picked (often > sidebarMaxWidth)
+    /// to UserDefaults, polluting the saved value before the user
+    /// has even seen the window. Flipped to `true` at the very end
+    /// of `applicationDidFinishLaunching`.
+    private var sidebarPersistenceActive = false
+
     /// Workspace model. `projects` mirrors the daemon's project list
     /// in display order; `tabs` is a flat list of every open
     /// TabSession across all projects, filtered into the tab bar by
@@ -207,7 +229,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             font: activeFont
         )
         let terminalSize = metricsProbe.intrinsicContentSize
-        let sidebarWidth: CGFloat = 220
+        // Round-6 R6.B: load the user's last sidebar width (clamped
+        // to the configured min/max). `UserDefaults.double(forKey:)`
+        // returns 0 when the key is absent; the ternary below treats
+        // 0 as "first launch, use default 220pt".
+        let storedSidebarWidth = UserDefaults.standard.double(forKey: Self.sidebarWidthDefaultsKey)
+        let sidebarWidth: CGFloat = {
+            let candidate = storedSidebarWidth > 0 ? CGFloat(storedSidebarWidth) : 220
+            return max(Self.sidebarMinWidth, min(Self.sidebarMaxWidth, candidate))
+        }()
         let tabBarHeight: CGFloat = 32
         let defaultContentWidth: CGFloat = 1100
         let defaultContentHeight: CGFloat = 700
@@ -235,6 +265,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         split.isVertical = true
         split.dividerStyle = .thin
         split.translatesAutoresizingMaskIntoConstraints = false
+        // Round-6 R6.B: NSSplitViewDelegate callbacks clamp the
+        // user's interactive drag to [sidebarMinWidth, sidebarMaxWidth]
+        // and persist the result via `splitViewDidResizeSubviews`.
+        split.delegate = self
 
         let sidebar = makeSidebarPane(width: sidebarWidth)
         let content = makeContentPane(
@@ -269,6 +303,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
+
+        // Round-6 R6.B: seat the divider at the persisted (or
+        // default) sidebar width AFTER the window has been ordered
+        // front and the initial layout pass has settled. Calling
+        // `setPosition` earlier (right after `addArrangedSubview`)
+        // happens before the split view has a meaningful frame in
+        // the window's coord space, so the position is silently
+        // discarded.
+        let initialSidebarWidth = sidebarWidth
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let split = self.sidebarPane?.superview as? NSSplitView {
+                split.setPosition(initialSidebarWidth, ofDividerAt: 0)
+            }
+            // Now that the splitter is at its intended position,
+            // enable the persistence callback. Any `frame.width`
+            // we save from here on reflects a real user drag, not
+            // the pre-settle default NSSplitView picks.
+            self.sidebarPersistenceActive = true
+        }
 
         Task { [weak self] in
             let outcome = await runIdentify(socketPath: socketPath)
@@ -367,8 +421,30 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         addProject.translatesAutoresizingMaskIntoConstraints = false
         pane.addSubview(addProject)
 
+        // Round-6 R6.B: preferred width constraint at `.defaultHigh`
+        // priority. NSSplitView's `setHoldingPriority(.defaultHigh,
+        // forSubviewAt: 0)` resists resize against constraints
+        // weaker than its holding priority and yields against ones
+        // stronger — pairing them at the same priority makes the
+        // sidebar hold this width across window resizes while still
+        // allowing the user's interactive drag (which goes through
+        // NSSplitView's gesture pipeline, not Auto Layout) to
+        // override. Without this constraint, NSSplitView picks an
+        // arbitrary default (often half the window width).
+        let preferredWidth = pane.widthAnchor.constraint(equalToConstant: width)
+        preferredWidth.priority = .defaultHigh
+
         NSLayoutConstraint.activate([
-            pane.widthAnchor.constraint(greaterThanOrEqualToConstant: width),
+            // Hard bounds for the divider drag: never narrower than
+            // `sidebarMinWidth` (the body-font label legibility
+            // floor) nor wider than `sidebarMaxWidth`.
+            pane.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.sidebarMinWidth),
+            pane.widthAnchor.constraint(lessThanOrEqualToConstant: Self.sidebarMaxWidth),
+            // Preferred width — anchors NSSplitView's auto-layout
+            // pick. Initial position is also set explicitly via
+            // `setPosition(_:ofDividerAt:)` after the window orders
+            // front (see applicationDidFinishLaunching).
+            preferredWidth,
 
             header.topAnchor.constraint(equalTo: pane.topAnchor, constant: 12),
             header.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 16),
@@ -379,7 +455,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             scrollView.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: addProject.topAnchor, constant: -8),
 
-            addProject.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12),
+            // Round-6 R6.A: center the + New Project footer button.
+            // A single full-width footer affordance reads cleaner as
+            // a primary action when centered (Calendar, Safari follow
+            // the same pattern). HIG permits both; left-anchored
+            // becomes ambiguous when the sidebar is wider than its
+            // default 220pt (round-6 R6.B adds resize).
+            addProject.centerXAnchor.constraint(equalTo: pane.centerXAnchor),
             addProject.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -12),
         ])
 
@@ -405,6 +487,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onDropTab = { [weak self] sourceTabID, rawTargetIdx in
             self?.handleTabDrop(sourceTabID: sourceTabID, rawTargetIdx: rawTargetIdx)
+        }
+        // Round-6 R6.C: flush any rebuild that was postponed while a
+        // drag was in flight. The flag inside the stack view tracks
+        // whether `rebuildTabBar` early-returned; the actual rebuild
+        // re-fires here once `isDragInProgress` is false.
+        tabBar.onDragEnded = { [weak self] in
+            self?.rebuildTabBar()
         }
 
         // "+" is a plain bordered button to the right of the pills.
@@ -1382,6 +1471,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func rebuildTabBar() {
         guard let tabBar = tabBar, let addTabButton = addTabButton else { return }
+
+        // Round-6 R6.C: postpone rebuilds while a drag is in flight.
+        // The placeholder NSView in `arrangedSubviews` is transient
+        // visual state; if a sibling-client `TabsReorderedEvent`
+        // arrives mid-drag and we rebuild now, we'd yank pills out
+        // from under the user's cursor. `TabBarStackView.teardownPlaceholder`
+        // calls `onDragEnded` which re-fires `rebuildTabBar` after
+        // the drag ends; the rebuild is idempotent against the
+        // daemon's snapshot so we don't lose state.
+        if tabBar.isDragInProgress {
+            tabBar.rebuildPending = true
+            return
+        }
 
         let projectTabs = tabsForActiveProject()
         let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
@@ -2422,7 +2524,11 @@ final class TabPillView: NSView, NSTextFieldDelegate {
     /// is the tab id so the destination can resolve the source row
     /// independent of any intervening order changes. Pre-id pills
     /// drop their drag silently.
-    fileprivate var tabID: Int64?
+    /// Round-6 R6.C: `internal` (was `fileprivate`) so
+    /// `TabBarStackView` in `DragReorder.swift` can resolve the
+    /// source pill from a pasteboard payload when setting up the
+    /// drop placeholder.
+    internal var tabID: Int64?
     private var onSelect: @MainActor (Int) -> Void
     private var onClose: @MainActor (Int) -> Void
     private var onRename: @MainActor (Int) -> Void
@@ -3331,6 +3437,56 @@ extension RoostApp: NSOutlineViewDelegate {
         let projectID = projects[row].id
         guard projectID != activeProjectID else { return }
         selectProject(id: projectID)
+    }
+}
+
+extension RoostApp: NSSplitViewDelegate {
+    /// Round-6 R6.B: clamp + persist the sidebar pane's width.
+    /// `splitViewDidResizeSubviews` fires on every divider drag
+    /// (live, not on mouse-up) so the saved value tracks the user's
+    /// final position. Skip when the sidebar is hidden so a `⌘B`
+    /// toggle-collapse doesn't overwrite the saved width with `0`.
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        // Round-6 R6.B: skip the persistence save until launch has
+        // fully settled. NSSplitView fires this during initial
+        // layout before our setPosition + width constraints have
+        // taken effect; persisting that pre-settle width would
+        // pollute the saved value with NSSplitView's auto-picked
+        // default.
+        guard sidebarPersistenceActive else { return }
+        guard let sidebar = sidebarPane, !sidebar.isHidden else { return }
+        let w = sidebar.frame.width
+        // Double-check the saved width is within [min, max] — even
+        // post-launch, a transient layout pass can yield a value
+        // slightly outside the bounds before constraints reconcile.
+        guard w >= Self.sidebarMinWidth, w <= Self.sidebarMaxWidth else { return }
+        UserDefaults.standard.set(Double(w), forKey: Self.sidebarWidthDefaultsKey)
+    }
+
+    /// Lower bound for the interactive divider drag. AppKit calls
+    /// this every frame during drag; `max(proposed, ours)` honors
+    /// both AppKit's geometry (window-edge insets, etc.) and our
+    /// `sidebarMinWidth` floor without ever inverting the bounds.
+    /// CR on PR #75: returning a fixed constant could exceed
+    /// AppKit's proposed max on narrow windows and cause jitter.
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMinCoordinate proposedMinimumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        max(proposedMinimumPosition, Self.sidebarMinWidth)
+    }
+
+    /// Upper bound for the interactive divider drag. Symmetric to
+    /// the lower bound above — `min(proposed, ours)` so a window
+    /// narrower than `sidebarMaxWidth` doesn't get our 400pt cap
+    /// pushed past the right edge.
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        min(proposedMaximumPosition, Self.sidebarMaxWidth)
     }
 }
 
