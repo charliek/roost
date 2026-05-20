@@ -1127,18 +1127,29 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         else { return }
         let socket = socketPath
         let projectName = project.name
-        let localCount = tabsForActiveProject().count
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Round-5 (CR on #74): when the daemon RPC fails we
+            // can't trust the local count — sibling-attached tabs
+            // are invisible to the Mac UI. A nil response means
+            // "unknown"; conservatively confirm rather than silently
+            // delete a project that might have many daemon-side
+            // tabs.
             let daemonCount = await daemonTabCount(
                 socketPath: socket,
                 projectID: activeProjectID
-            ) ?? localCount
-            if daemonCount > 1 {
+            )
+            let shouldConfirm = daemonCount.map { $0 > 1 } ?? true
+            if shouldConfirm {
                 let alert = NSAlert()
                 alert.messageText = "Close \(projectName)?"
-                alert.informativeText =
-                    "This will close \(daemonCount) tabs in this project. The action can't be undone."
+                if let daemonCount {
+                    alert.informativeText =
+                        "This will close \(daemonCount) tabs in this project. The action can't be undone."
+                } else {
+                    alert.informativeText =
+                        "The daemon's tab count is unavailable. Closing may close multiple tabs in this project. The action can't be undone."
+                }
                 alert.addButton(withTitle: "Close Project")
                 alert.addButton(withTitle: "Cancel")
                 alert.alertStyle = .warning
