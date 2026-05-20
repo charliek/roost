@@ -213,7 +213,17 @@ final class TabBarStackView: NSStackView {
     /// can flush a pending rebuild. `commit` is purely informational
     /// today; if a future revision needs to know "did this end at a
     /// drop or a cancel", that's the signal.
+    ///
+    /// CR on PR #75: only fire `onDragEnded` when an actual tab drag
+    /// was in flight. `TabBarScrollView` forwards drag-exit / conclude
+    /// events to us indiscriminately; if some non-tab drag drove
+    /// `draggingExited` we'd otherwise trigger a spurious
+    /// `rebuildTabBar()` via the callback.
     private func teardownPlaceholder(commit: Bool) {
+        let hadActiveDrag = isDragInProgress
+            || dropPlaceholder != nil
+            || hiddenSource != nil
+
         if let placeholder = dropPlaceholder {
             removeArrangedSubview(placeholder)
             placeholder.removeFromSuperview()
@@ -233,11 +243,14 @@ final class TabBarStackView: NSStackView {
         hiddenSource = nil
         isDragInProgress = false
 
-        // Drain a deferred rebuild that arrived mid-drag.
+        // Drain a deferred rebuild that arrived mid-drag. Also fire
+        // `onDragEnded` on the happy-path end-of-drag — but skip it
+        // entirely when no drag was active, so non-tab forwarded
+        // events don't spam `rebuildTabBar()`.
         if rebuildPending {
             rebuildPending = false
             onDragEnded?()
-        } else {
+        } else if hadActiveDrag {
             onDragEnded?()
         }
         _ = commit

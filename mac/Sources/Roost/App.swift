@@ -3464,24 +3464,29 @@ extension RoostApp: NSSplitViewDelegate {
     }
 
     /// Lower bound for the interactive divider drag. AppKit calls
-    /// this every frame during drag; returning `sidebarMinWidth`
-    /// stops the user from dragging the divider past the floor.
+    /// this every frame during drag; `max(proposed, ours)` honors
+    /// both AppKit's geometry (window-edge insets, etc.) and our
+    /// `sidebarMinWidth` floor without ever inverting the bounds.
+    /// CR on PR #75: returning a fixed constant could exceed
+    /// AppKit's proposed max on narrow windows and cause jitter.
     func splitView(
         _ splitView: NSSplitView,
         constrainMinCoordinate proposedMinimumPosition: CGFloat,
         ofSubviewAt dividerIndex: Int
     ) -> CGFloat {
-        Self.sidebarMinWidth
+        max(proposedMinimumPosition, Self.sidebarMinWidth)
     }
 
     /// Upper bound for the interactive divider drag. Symmetric to
-    /// the lower bound above.
+    /// the lower bound above — `min(proposed, ours)` so a window
+    /// narrower than `sidebarMaxWidth` doesn't get our 400pt cap
+    /// pushed past the right edge.
     func splitView(
         _ splitView: NSSplitView,
         constrainMaxCoordinate proposedMaximumPosition: CGFloat,
         ofSubviewAt dividerIndex: Int
     ) -> CGFloat {
-        Self.sidebarMaxWidth
+        min(proposedMaximumPosition, Self.sidebarMaxWidth)
     }
 }
 

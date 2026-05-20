@@ -26,28 +26,25 @@ func dragInProgressFlagStartsFalse() {
 
 @MainActor
 @Test
-func onDragEndedFiresAfterDragExited() {
-    // Simulate the drag-cancel path: `draggingExited` is called when
-    // the cursor leaves the strip's bounds without a drop. The flag
-    // should reset to false and `onDragEnded` should fire so the App
-    // can flush a pending rebuild.
+func dragExitedWithoutActiveDragDoesNotFireOnDragEnded() {
+    // CR on PR #75: `TabBarScrollView` forwards drag-exit /
+    // conclude events indiscriminately, including non-tab drags
+    // that never installed our placeholder. The teardown path must
+    // be a no-op (no `onDragEnded`, no rebuild) when there was no
+    // tab drag in flight.
     let stack = TabBarStackView()
     var endedCount = 0
     stack.onDragEnded = { endedCount += 1 }
 
-    // `draggingExited` is the public AppKit entry point we want to
-    // verify; it routes to `teardownPlaceholder(commit: false)`
-    // which clears state and fires the callback even if no
-    // placeholder was installed (idempotent teardown).
     stack.draggingExited(nil)
 
     #expect(stack.isDragInProgress == false)
-    #expect(endedCount == 1)
+    #expect(endedCount == 0)
 }
 
 @MainActor
 @Test
-func onDragEndedFiresAfterConcludeDragOperation() {
+func concludeDragWithoutActiveDragDoesNotFireOnDragEnded() {
     let stack = TabBarStackView()
     var endedCount = 0
     stack.onDragEnded = { endedCount += 1 }
@@ -55,15 +52,17 @@ func onDragEndedFiresAfterConcludeDragOperation() {
     stack.concludeDragOperation(nil)
 
     #expect(stack.isDragInProgress == false)
-    #expect(endedCount == 1)
+    #expect(endedCount == 0)
 }
 
 @MainActor
 @Test
-func rebuildPendingFlagFlipsExternallyAndResetsOnDragEnd() {
+func rebuildPendingFlagAlwaysFlushesEvenWithoutActiveDrag() {
     // The App's `rebuildTabBar` sets `rebuildPending = true` when
-    // it early-returns during a drag. `teardownPlaceholder` should
-    // reset it back to false so the next rebuild starts clean.
+    // it early-returns during a drag. The pending-rebuild branch
+    // must drain regardless of whether `hadActiveDrag` is true —
+    // otherwise a deferred rebuild could be lost if the drag state
+    // already cleared by another code path.
     let stack = TabBarStackView()
     stack.rebuildPending = true
 
