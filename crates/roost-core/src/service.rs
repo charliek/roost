@@ -263,12 +263,19 @@ impl Roost for RoostService {
         req: Request<ReorderTabsRequest>,
     ) -> Result<Response<ReorderTabsResponse>, Status> {
         let r = req.into_inner();
-        self.workspace
+        // Round-5 (R1 fix): the workspace accepts partial reorder
+        // lists and returns the full final order; log both so the
+        // daemon log distinguishes "client sent N ids → daemon now
+        // has M ordered" (M >= N when the caller had a partial view).
+        let requested = r.tab_ids.len();
+        let final_order = self
+            .workspace
             .reorder_tabs(r.project_id, &r.tab_ids)
             .map_err(map_err)?;
         info!(
             project_id = r.project_id,
-            tab_count = r.tab_ids.len(),
+            requested_count = requested,
+            final_count = final_order.len(),
             "tabs reordered"
         );
         Ok(Response::new(ReorderTabsResponse {}))
