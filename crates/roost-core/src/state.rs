@@ -366,11 +366,18 @@ impl Workspace {
     }
 
     /// Persist a new tab ordering inside `project_id` and emit a
-    /// `TabsReorderedEvent`. Same validation contract as
-    /// [`Self::reorder_projects`]; ids that aren't in the project (or
-    /// are duplicated, or the length doesn't match) come back as a
-    /// `Store` error.
-    pub fn reorder_tabs(&self, project_id: i64, ordered_ids: &[i64]) -> Result<(), WorkspaceError> {
+    /// `TabsReorderedEvent` with the FULL final order. Accepts a
+    /// partial `ordered_ids` (subset of the project's tabs); ids not
+    /// listed keep their existing position — see [`Store::reorder_tabs`]
+    /// for the interleaving semantics. Round-5 (R1 fix): returns the
+    /// full final order so the service layer can log the right tab
+    /// count and so the broadcast event carries authoritative state
+    /// for clients that hold a partial view.
+    pub fn reorder_tabs(
+        &self,
+        project_id: i64,
+        ordered_ids: &[i64],
+    ) -> Result<Vec<i64>, WorkspaceError> {
         let mut store = self.store.lock().unwrap();
         // Confirm the project exists; map missing to a precise error
         // so callers see ProjectNotFound rather than a generic store
@@ -379,17 +386,17 @@ impl Workspace {
         if !projects.iter().any(|p| p.id == project_id) {
             return Err(WorkspaceError::ProjectNotFound(project_id));
         }
-        store.reorder_tabs(project_id, ordered_ids).map_err(wrap)?;
+        let final_order = store.reorder_tabs(project_id, ordered_ids).map_err(wrap)?;
         drop(store);
         let _ = self.events.send(Event {
             kind: Some(roost_proto::v1::event::Kind::TabsReordered(
                 TabsReorderedEvent {
                     project_id,
-                    tab_ids: ordered_ids.to_vec(),
+                    tab_ids: final_order.clone(),
                 },
             )),
         });
-        Ok(())
+        Ok(final_order)
     }
 
     pub fn open_tab(
@@ -1061,7 +1068,8 @@ mod tests {
         let t3 = ws.open_tab(p.id, "/tmp", "").unwrap();
 
         let mut rx = ws.subscribe();
-        ws.reorder_tabs(p.id, &[t3.id, t1.id, t2.id]).unwrap();
+        let final_order = ws.reorder_tabs(p.id, &[t3.id, t1.id, t2.id]).unwrap();
+        assert_eq!(final_order, vec![t3.id, t1.id, t2.id]);
 
         let snap = ws.snapshot();
         let proj = snap.iter().find(|x| x.id == p.id).unwrap();
@@ -1074,6 +1082,39 @@ mod tests {
             }) => {
                 assert_eq!(e.project_id, p.id);
                 assert_eq!(e.tab_ids, vec![t3.id, t1.id, t2.id]);
+            }
+            other => panic!("expected TabsReordered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reorder_tabs_partial_keeps_unmentioned_tabs_in_place() {
+        // Round-5 (R1 fix): when the caller only knows about a
+        // subset of the project's tabs (Mac UI scenario), the daemon
+        // shuffles the listed ids within their existing slots and
+        // leaves unmentioned tabs at their absolute positions. The
+        // broadcast event carries the FULL final order so clients
+        // with a partial view can apply it without losing track of
+        // tabs they don't own.
+        let ws = Workspace::new();
+        let p = ws.create_project("p", "/tmp").unwrap();
+        let t1 = ws.open_tab(p.id, "/tmp", "").unwrap();
+        let t2 = ws.open_tab(p.id, "/tmp", "").unwrap();
+        let t3 = ws.open_tab(p.id, "/tmp", "").unwrap();
+        let t4 = ws.open_tab(p.id, "/tmp", "").unwrap();
+
+        let mut rx = ws.subscribe();
+        // Only mention t1 + t3 — slots 0 and 2 — but swap their order.
+        // Final order: [t3, t2, t1, t4].
+        let final_order = ws.reorder_tabs(p.id, &[t3.id, t1.id]).unwrap();
+        assert_eq!(final_order, vec![t3.id, t2.id, t1.id, t4.id]);
+
+        match rx.try_recv() {
+            Ok(Event {
+                kind: Some(roost_proto::v1::event::Kind::TabsReordered(e)),
+            }) => {
+                assert_eq!(e.project_id, p.id);
+                assert_eq!(e.tab_ids, vec![t3.id, t2.id, t1.id, t4.id]);
             }
             other => panic!("expected TabsReordered, got {other:?}"),
         }

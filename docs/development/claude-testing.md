@@ -105,7 +105,7 @@ Pre-req: focus a *different* tab in the same project so the test tab is inactive
 The daemon writes to `/private/tmp/roost-core.log` (default on
 macOS). Tail it while driving the above tests:
 
-```
+```bash
 tail -f /private/tmp/roost-core.log
 ```
 
@@ -120,14 +120,14 @@ RPC at all.
 To wire the actual Claude Code CLI so it drives these events
 automatically when you run a session:
 
-```
+```bash
 roost-cli-rs claude install
 ```
 
 This writes `~/.config/roost/claude-settings.json` with hook
 commands for each lifecycle event, then prints an alias line:
 
-```
+```bash
 alias claude='claude --settings ~/.config/roost/claude-settings.json'
 ```
 

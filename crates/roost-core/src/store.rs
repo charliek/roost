@@ -207,7 +207,7 @@ impl Store {
     pub fn reorder_projects(&mut self, ordered_ids: &[i64]) -> StoreResult<()> {
         let tx = self.conn.transaction()?;
         let existing = collect_ids(&tx, "SELECT id FROM project", [])?;
-        validate_reorder(ordered_ids, &existing)?;
+        validate_full_reorder(ordered_ids, &existing)?;
 
         {
             let mut stmt = tx.prepare("UPDATE project SET position = ? WHERE id = ?")?;
@@ -329,24 +329,68 @@ impl Store {
         Ok(n)
     }
 
-    pub fn reorder_tabs(&mut self, project_id: i64, ordered_ids: &[i64]) -> StoreResult<()> {
+    /// Persist a tab order. Accepts a PARTIAL list: ids not in
+    /// `ordered_ids` keep their existing absolute position; ids that
+    /// ARE in `ordered_ids` get reshuffled into the slots they
+    /// currently occupy collectively, in the order they appear in
+    /// `ordered_ids`. Returns the full final order (ALL tabs in the
+    /// project, ordered by their new position).
+    ///
+    /// Round-5 (R1 fix for Mac drag-reorder): the previous behavior
+    /// required `ordered_ids.len() == project_tab_count`, which broke
+    /// the Mac UI's drag-reorder. The Mac UI deliberately doesn't
+    /// attach to every daemon tab on launch (App.swift:781), so its
+    /// `ReorderTabs` payload is always a subset. The new semantics
+    /// match the docstring already shipped at
+    /// `mac/Sources/Roost/RoostClient.swift:417-418` ("missing tabs
+    /// keep their existing position").
+    pub fn reorder_tabs(&mut self, project_id: i64, ordered_ids: &[i64]) -> StoreResult<Vec<i64>> {
         let tx = self.conn.transaction()?;
-        let existing = collect_ids(
-            &tx,
-            "SELECT id FROM tab WHERE project_id = ?",
-            params![project_id],
-        )?;
-        validate_reorder(ordered_ids, &existing)?;
+        let existing_ordered: Vec<i64> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM tab WHERE project_id = ? ORDER BY position ASC")?;
+            let mut rows = stmt.query(params![project_id])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(row.get(0)?);
+            }
+            out
+        };
+        let existing_set: std::collections::HashSet<i64> =
+            existing_ordered.iter().copied().collect();
+        validate_reorder(ordered_ids, &existing_set)?;
+
+        // Interleave: walk the existing order; at each slot whose id
+        // appears in `ordered_ids`, place the next id from
+        // `ordered_ids`. Slots holding non-listed ids stay put. This
+        // preserves the absolute positions of tabs the caller didn't
+        // mention while letting the caller reorder the subset they
+        // do know about — matching the Mac UI's "I only see 3 tabs
+        // out of 5; please reorder my 3 within their existing
+        // positions" expectation.
+        let listed_set: std::collections::HashSet<i64> = ordered_ids.iter().copied().collect();
+        let mut ordered_iter = ordered_ids.iter();
+        let mut final_order: Vec<i64> = Vec::with_capacity(existing_ordered.len());
+        for id in &existing_ordered {
+            if listed_set.contains(id) {
+                // `unwrap()` is safe: `ordered_iter`'s length equals
+                // `listed_set`'s cardinality, and we hit one slot per
+                // listed id exactly once during this walk.
+                final_order.push(*ordered_iter.next().unwrap());
+            } else {
+                final_order.push(*id);
+            }
+        }
 
         {
             let mut stmt =
                 tx.prepare("UPDATE tab SET position = ? WHERE id = ? AND project_id = ?")?;
-            for (i, id) in ordered_ids.iter().enumerate() {
+            for (i, id) in final_order.iter().enumerate() {
                 stmt.execute(params![i as i32, id, project_id])?;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(final_order)
     }
 }
 
@@ -379,7 +423,39 @@ fn collect_ids<P: rusqlite::Params>(
     Ok(out)
 }
 
+/// Validate a (possibly partial) reorder list used by `reorder_tabs`.
+/// Round-5 (R1 fix): `ordered.len() <= existing.len()` — partial
+/// lists are accepted; unmentioned ids keep their position. Unknown
+/// ids and duplicates still rejected. Over-counts remain a mismatch.
 fn validate_reorder(ordered: &[i64], existing: &std::collections::HashSet<i64>) -> StoreResult<()> {
+    if ordered.len() > existing.len() {
+        return Err(StoreError::ReorderCountMismatch {
+            expected: existing.len(),
+            got: ordered.len(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for id in ordered {
+        if !existing.contains(id) {
+            return Err(StoreError::ReorderUnknownId(*id));
+        }
+        if !seen.insert(*id) {
+            return Err(StoreError::ReorderDuplicateId(*id));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a full-list reorder for `reorder_projects`. Projects
+/// require the complete list because their reorder writes position
+/// 0..N-1 in one pass — leaving any project unmentioned would create
+/// duplicate positions. The tab path solves this via interleaving;
+/// projects don't need that capability (the Mac/Linux UIs always know
+/// the full project list from `listProjects` on launch).
+fn validate_full_reorder(
+    ordered: &[i64],
+    existing: &std::collections::HashSet<i64>,
+) -> StoreResult<()> {
     if ordered.len() != existing.len() {
         return Err(StoreError::ReorderCountMismatch {
             expected: existing.len(),
@@ -477,7 +553,8 @@ mod tests {
         let b = store.create_tab(p.id, "/b").unwrap();
         let c = store.create_tab(p.id, "/c").unwrap();
 
-        store.reorder_tabs(p.id, &[c.id, a.id, b.id]).unwrap();
+        let final_order = store.reorder_tabs(p.id, &[c.id, a.id, b.id]).unwrap();
+        assert_eq!(final_order, vec![c.id, a.id, b.id]);
 
         let tabs = store.list_tabs(p.id).unwrap();
         assert_eq!(
@@ -491,13 +568,46 @@ mod tests {
     }
 
     #[test]
-    fn reorder_tabs_rejects_mismatch() {
+    fn reorder_tabs_accepts_partial_list() {
+        // Round-5 (R1 fix): the Mac UI doesn't always know about
+        // every daemon-side tab in a project, so it sends only the
+        // subset it sees. The store must accept that and leave
+        // unmentioned tabs at their existing positions.
+        let mut store = Store::in_memory().unwrap();
+        let p = store.create_project("p", "/tmp").unwrap();
+        let a = store.create_tab(p.id, "/a").unwrap(); // position 0
+        let b = store.create_tab(p.id, "/b").unwrap(); // position 1
+        let c = store.create_tab(p.id, "/c").unwrap(); // position 2
+        let d = store.create_tab(p.id, "/d").unwrap(); // position 3
+
+        // Reorder only a + c — semantically: "swap them within their
+        // own slots". b at pos 1 and d at pos 3 are untouched.
+        // Slots holding listed ids are 0 (a) and 2 (c); place c at
+        // slot 0 and a at slot 2.
+        let final_order = store.reorder_tabs(p.id, &[c.id, a.id]).unwrap();
+        assert_eq!(final_order, vec![c.id, b.id, a.id, d.id]);
+
+        let tabs = store.list_tabs(p.id).unwrap();
+        assert_eq!(
+            tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![c.id, b.id, a.id, d.id]
+        );
+        assert_eq!(
+            tabs.iter().map(|t| t.position).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn reorder_tabs_rejects_over_count() {
+        // The opposite direction — sending MORE ids than the project
+        // has — remains a count mismatch.
         let mut store = Store::in_memory().unwrap();
         let p = store.create_project("p", "/tmp").unwrap();
         let a = store.create_tab(p.id, "/a").unwrap();
-        let _b = store.create_tab(p.id, "/b").unwrap();
+        let b = store.create_tab(p.id, "/b").unwrap();
 
-        let err = store.reorder_tabs(p.id, &[a.id]).unwrap_err();
+        let err = store.reorder_tabs(p.id, &[a.id, b.id, 999]).unwrap_err();
         assert!(matches!(err, StoreError::ReorderCountMismatch { .. }));
     }
 }

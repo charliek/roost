@@ -279,6 +279,36 @@ struct ProjectSnapshot: Sendable, Hashable {
     let cwd: String
 }
 
+/// Round-5 (CR on #73): fetch the daemon-authoritative tab count
+/// for a single project. Used by `closeActiveProject` to decide
+/// whether to show the confirmation dialog — the Mac UI's local
+/// tab list is incomplete (sibling-client tabs aren't attached by
+/// the Mac UI; see App.swift around line 781), so the local count
+/// can under-report and skip the confirmation when 2+ tabs exist
+/// daemon-side. Returns `nil` on any error so the caller can fall
+/// back conservatively.
+func daemonTabCount(socketPath: String, projectID: Int64) async -> Int? {
+    do {
+        return try await withGRPCClient(
+            transport: .http2NIOPosix(
+                target: .unixDomainSocket(path: socketPath, authority: udsAuthority),
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let roost = Roost_V1_Roost.Client(wrapping: client)
+            let response = try await roost.listTabs(.with { _ in })
+            return response.projects
+                .first(where: { $0.id == projectID })?
+                .tabs.count
+        }
+    } catch {
+        FileHandle.standardError.write(
+            Data("[Roost.mac] daemonTabCount failed: \(error)\n".utf8)
+        )
+        return nil
+    }
+}
+
 /// Fetch the full project list (without tabs — see comment on
 /// `ProjectSnapshot`). One round-trip; returns `[]` on any error so
 /// the caller can decide whether to surface a UI state.

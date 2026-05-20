@@ -91,13 +91,40 @@ func parse(_ text: String) -> RoostConfig {
             }
         case "tab-min-width":
             // Negative values are nonsense; 0 means "no floor".
+            // Round-5 (CR on #73): reject min > max to avoid an
+            // unsatisfiable Auto Layout constraint pair. `0` on
+            // either side means "unbounded", so 0 max never
+            // conflicts with any min.
             if let n = Double(value), n >= 0 {
+                if let max = cfg.tabMaxWidth, max > 0, CGFloat(n) > max {
+                    // Skip the parse — keep the existing max as the
+                    // tighter bound; user's max wins because writing
+                    // them in this order suggests they wanted that
+                    // cap to be authoritative.
+                    NSLog(
+                        "roost-mac: ignoring tab-min-width=%@ (>tab-max-width=%@)",
+                        "\(n)",
+                        "\(max)"
+                    )
+                    continue
+                }
                 cfg.tabMinWidth = CGFloat(n)
             }
         case "tab-max-width":
             // 0 means "no cap" — pills grow to fit their title
             // (pre-round-4 behavior).
+            // Round-5 (CR on #73): reject max < min for the same
+            // reason. Same rule: skip the parse so the existing
+            // floor stays authoritative.
             if let n = Double(value), n >= 0 {
+                if n > 0, let min = cfg.tabMinWidth, CGFloat(n) < min {
+                    NSLog(
+                        "roost-mac: ignoring tab-max-width=%@ (<tab-min-width=%@)",
+                        "\(n)",
+                        "\(min)"
+                    )
+                    continue
+                }
                 cfg.tabMaxWidth = CGFloat(n)
             }
         case "keybind":

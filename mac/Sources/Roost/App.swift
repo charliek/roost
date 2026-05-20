@@ -1111,23 +1111,52 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Confirms when the project has 2+ tabs — single-tab projects
     /// are typically a freshly-created empty workspace and the
     /// confirmation would be friction.
+    ///
+    /// Round-5 (CR on #73): query the *daemon* for the
+    /// authoritative tab count instead of trusting
+    /// `tabsForActiveProject()`. The Mac UI deliberately doesn't
+    /// attach to sibling-client tabs (App.swift:781 area), so its
+    /// local count can under-report and skip the confirmation when
+    /// the project actually has 2+ daemon-side tabs. On daemon
+    /// failure (unreachable, etc.) fall back to the local count —
+    /// at worst we show a needless confirmation.
     @objc @MainActor
     private func closeActiveProject(_ sender: Any?) {
         guard let activeProjectID,
               let project = projects.first(where: { $0.id == activeProjectID })
         else { return }
-        let projectTabs = tabsForActiveProject()
-        if projectTabs.count > 1 {
-            let alert = NSAlert()
-            alert.messageText = "Close \(project.name)?"
-            alert.informativeText =
-                "This will close \(projectTabs.count) tabs in this project. The action can't be undone."
-            alert.addButton(withTitle: "Close Project")
-            alert.addButton(withTitle: "Cancel")
-            alert.alertStyle = .warning
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let socket = socketPath
+        let projectName = project.name
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Round-5 (CR on #74): when the daemon RPC fails we
+            // can't trust the local count — sibling-attached tabs
+            // are invisible to the Mac UI. A nil response means
+            // "unknown"; conservatively confirm rather than silently
+            // delete a project that might have many daemon-side
+            // tabs.
+            let daemonCount = await daemonTabCount(
+                socketPath: socket,
+                projectID: activeProjectID
+            )
+            let shouldConfirm = daemonCount.map { $0 > 1 } ?? true
+            if shouldConfirm {
+                let alert = NSAlert()
+                alert.messageText = "Close \(projectName)?"
+                if let daemonCount {
+                    alert.informativeText =
+                        "This will close \(daemonCount) tabs in this project. The action can't be undone."
+                } else {
+                    alert.informativeText =
+                        "The daemon's tab count is unavailable. Closing may close multiple tabs in this project. The action can't be undone."
+                }
+                alert.addButton(withTitle: "Close Project")
+                alert.addButton(withTitle: "Cancel")
+                alert.alertStyle = .warning
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+            self.deleteProjectByID(id: activeProjectID)
         }
-        deleteProjectByID(id: activeProjectID)
     }
 
     /// Shared delete-after-confirmation path used by both
@@ -1464,18 +1493,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// "WatchEvents-only mutation" invariant.
     @MainActor
     private func handleTabDrop(sourceTabID: Int64, rawTargetIdx: Int) {
-        // R1 TRACE — remove after verification
-        r1Trace(
-            "handleTabDrop ENTRY sourceTabID=\(sourceTabID) rawTargetIdx=\(rawTargetIdx)"
-            + " activeProjectID=\(activeProjectID.map { "\($0)" } ?? "nil")"
-            + " daemonReachable=\(daemonReachable)"
-        )
         guard let activeProjectID,
               daemonReachable
-        else {
-            r1Trace("handleTabDrop BAILED — no activeProjectID or daemon unreachable")
-            return
-        }
+        else { return }
         let projectTabs = tabsForActiveProject()
         // CodeRabbit on PR #68: the reorder math and the daemon-bound
         // id sequence must live in the same index space. `projectTabs`
@@ -1488,26 +1508,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             guard let id = session.id else { return nil }
             return (visualIdx: idx, id: id)
         }
-        r1Trace(
-            "handleTabDrop projectTabs.count=\(projectTabs.count)"
-            + " persisted=\(String(describing: persisted.map { ($0.visualIdx, $0.id) }))"
-        )
         guard let sourcePersistedIdx = persisted.firstIndex(where: { $0.id == sourceTabID })
-        else {
-            r1Trace("handleTabDrop BAILED — source tab id \(sourceTabID) not in persisted set")
-            return
-        }
+        else { return }
         let rawTargetPersistedIdx = persisted.reduce(into: 0) { count, entry in
             if entry.visualIdx < rawTargetIdx { count += 1 }
         }
         let mapped = computeInsertIdx(
             sourceIdx: sourcePersistedIdx,
             rawTargetIdx: rawTargetPersistedIdx
-        )
-        r1Trace(
-            "handleTabDrop sourcePersistedIdx=\(sourcePersistedIdx)"
-            + " rawTargetPersistedIdx=\(rawTargetPersistedIdx) mapped.index=\(mapped.index)"
-            + " mapped.isNoop=\(mapped.isNoop)"
         )
         if mapped.isNoop { return }
 
@@ -1520,7 +1528,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let source = ids.remove(at: sourcePersistedIdx)
         let clamped = min(max(mapped.index, 0), ids.count)
         ids.insert(source, at: clamped)
-        r1Trace("handleTabDrop firing reorderTabs ids=\(String(describing: ids))")
 
         let socket = socketPath
         let projectID = activeProjectID
@@ -2821,8 +2828,6 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         item.setString(String(tabID), forType: .roostTabID)
         let draggingItem = NSDraggingItem(pasteboardWriter: item)
         draggingItem.setDraggingFrame(bounds, contents: snapshotImage())
-        // R1 TRACE — remove after verification
-        r1Trace("source pill.beginDraggingSession tabID=\(tabID) bounds=\(NSStringFromRect(bounds))")
         beginDraggingSession(with: [draggingItem], event: downEvent, source: self)
     }
 
@@ -2907,25 +2912,6 @@ extension TabPillView: NSDraggingSource {
         context == .withinApplication ? .move : []
     }
 
-    /// R1 TRACE — remove after verification.
-    /// AppKit calls this on the drag SOURCE when the session ends.
-    /// `operation` reflects what the destination's
-    /// `performDragOperation` returned — `.move` for success,
-    /// `[]` for "destination didn't accept".
-    nonisolated func draggingSession(
-        _ session: NSDraggingSession,
-        endedAt screenPoint: NSPoint,
-        operation: NSDragOperation
-    ) {
-        let point = screenPoint
-        let op = operation.rawValue
-        Task { @MainActor in
-            r1Trace(
-                "source pill.draggingSession ENDED screenPoint=\(NSStringFromPoint(point))"
-                + " operation=\(op)"
-            )
-        }
-    }
 }
 
 // MARK: - Sidebar NSOutlineView data source + delegate
