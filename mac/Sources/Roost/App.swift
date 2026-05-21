@@ -232,7 +232,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // Round-6 R6.B: load the user's last sidebar width (clamped
         // to the configured min/max). `UserDefaults.double(forKey:)`
         // returns 0 when the key is absent; the ternary below treats
-        // 0 as "first launch, use default 220pt".
+        // 0 as "first launch, use default 220pt" — matching the
+        // pre-round-6 fixed default. A stored value outside the
+        // [min, max] band is clamped (which is also the implicit
+        // recovery path for a previously-saved out-of-range width).
         let storedSidebarWidth = UserDefaults.standard.double(forKey: Self.sidebarWidthDefaultsKey)
         let sidebarWidth: CGFloat = {
             let candidate = storedSidebarWidth > 0 ? CGFloat(storedSidebarWidth) : 220
@@ -434,12 +437,30 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let preferredWidth = pane.widthAnchor.constraint(equalToConstant: width)
         preferredWidth.priority = .defaultHigh
 
+        // Round-7 R7.A: min/max constraints sit just above
+        // NSSplitView's default arranged-subview priority (.defaultHigh
+        // = 750) so they win against passive layout, but stay below
+        // `.required` so the implicit 0-width override produced by
+        // `sidebarPane.isHidden = true` can collapse the pane to 0.
+        // The hard [min, max] bounds for the interactive divider drag
+        // are still enforced by `splitView(_:constrainMin/MaxCoordinate:
+        // ofSubviewAt:)` — no escape hatch there.
+        let minWidth = pane.widthAnchor.constraint(
+            greaterThanOrEqualToConstant: Self.sidebarMinWidth
+        )
+        minWidth.priority = NSLayoutConstraint.Priority(
+            NSLayoutConstraint.Priority.defaultHigh.rawValue + 1
+        )
+        let maxWidth = pane.widthAnchor.constraint(
+            lessThanOrEqualToConstant: Self.sidebarMaxWidth
+        )
+        maxWidth.priority = NSLayoutConstraint.Priority(
+            NSLayoutConstraint.Priority.defaultHigh.rawValue + 1
+        )
+
         NSLayoutConstraint.activate([
-            // Hard bounds for the divider drag: never narrower than
-            // `sidebarMinWidth` (the body-font label legibility
-            // floor) nor wider than `sidebarMaxWidth`.
-            pane.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.sidebarMinWidth),
-            pane.widthAnchor.constraint(lessThanOrEqualToConstant: Self.sidebarMaxWidth),
+            minWidth,
+            maxWidth,
             // Preferred width — anchors NSSplitView's auto-layout
             // pick. Initial position is also set explicitly via
             // `setPosition(_:ofDividerAt:)` after the window orders
@@ -487,13 +508,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onDropTab = { [weak self] sourceTabID, rawTargetIdx in
             self?.handleTabDrop(sourceTabID: sourceTabID, rawTargetIdx: rawTargetIdx)
-        }
-        // Round-6 R6.C: flush any rebuild that was postponed while a
-        // drag was in flight. The flag inside the stack view tracks
-        // whether `rebuildTabBar` early-returned; the actual rebuild
-        // re-fires here once `isDragInProgress` is false.
-        tabBar.onDragEnded = { [weak self] in
-            self?.rebuildTabBar()
         }
 
         // "+" is a plain bordered button to the right of the pills.
@@ -1471,19 +1485,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func rebuildTabBar() {
         guard let tabBar = tabBar, let addTabButton = addTabButton else { return }
-
-        // Round-6 R6.C: postpone rebuilds while a drag is in flight.
-        // The placeholder NSView in `arrangedSubviews` is transient
-        // visual state; if a sibling-client `TabsReorderedEvent`
-        // arrives mid-drag and we rebuild now, we'd yank pills out
-        // from under the user's cursor. `TabBarStackView.teardownPlaceholder`
-        // calls `onDragEnded` which re-fires `rebuildTabBar` after
-        // the drag ends; the rebuild is idempotent against the
-        // daemon's snapshot so we don't lose state.
-        if tabBar.isDragInProgress {
-            tabBar.rebuildPending = true
-            return
-        }
 
         let projectTabs = tabsForActiveProject()
         let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
@@ -3137,22 +3138,24 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
             top.leadingAnchor.constraint(equalTo: leadingAnchor),
             top.trailingAnchor.constraint(equalTo: trailingAnchor),
             top.topAnchor.constraint(equalTo: topAnchor),
-            top.heightAnchor.constraint(equalToConstant: 2),
+            top.heightAnchor.constraint(equalToConstant: 3),
 
             bottom.leadingAnchor.constraint(equalTo: leadingAnchor),
             bottom.trailingAnchor.constraint(equalTo: trailingAnchor),
             bottom.bottomAnchor.constraint(equalTo: bottomAnchor),
-            bottom.heightAnchor.constraint(equalToConstant: 2),
+            bottom.heightAnchor.constraint(equalToConstant: 3),
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
-    /// Round-2 F6: toggle the 2pt accent band that marks this row as
+    /// Round-2 F6: toggle the 3pt accent band that marks this row as
     /// the drop target during sidebar drag-reorder. Cheap visual cue
     /// added because AppKit's built-in NSOutlineView drop indicator
-    /// is too subtle on the dark theme.
+    /// is too subtle on the dark theme. Round-7 R7.C bumped the band
+    /// from 2pt → 3pt so it matches the tab strip's drop indicator
+    /// line — same width, same `controlAccentColor`, uniform UX.
     func setDropIndicator(_ position: DropIndicator) {
         dropTopBand.isHidden = position != .above
         dropBottomBand.isHidden = position != .below
@@ -3487,6 +3490,16 @@ extension RoostApp: NSSplitViewDelegate {
         ofSubviewAt dividerIndex: Int
     ) -> CGFloat {
         min(proposedMaximumPosition, Self.sidebarMaxWidth)
+    }
+
+    /// Round-7 R7.A: hide the sidebar/content divider while the
+    /// sidebar pane is collapsed via `⌘B`. Without this, NSSplitView
+    /// keeps the 1pt divider visible as a seam against the window's
+    /// left edge even when the pane's frame has fully collapsed.
+    /// AppKit consults this on every layout pass.
+    func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
+        guard dividerIndex == 0 else { return false }
+        return sidebarPane?.isHidden ?? false
     }
 }
 
