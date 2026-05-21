@@ -38,49 +38,33 @@ final class TabBarStackView: NSStackView {
     /// + no-op flag.
     var onDropTab: (@MainActor (Int64, Int) -> Void)?
 
-    /// Round-6 R6.C: notify the App when an interactive drag ends so
-    /// it can flush a `rebuildPending` if a sibling-client event
-    /// arrived mid-drag. Fires for BOTH accepted drops (after
-    /// `performDragOperation`) and cancelled drops (after
-    /// `draggingExited`). Cheap idempotent callback.
-    var onDragEnded: (@MainActor () -> Void)?
+    // MARK: - Round-7 R7.B — drop indicator line
 
-    // MARK: - Round-6 R6.C — live-shift drop placeholder
+    /// Thin vertical accent bar shown at the would-land slot during
+    /// an active drag. Pills don't move during the drag — the source
+    /// stays visible and the floating drag snapshot AppKit provides
+    /// in `beginDraggingSession` is the only "I'm being moved" cue.
+    /// This replaces R6.C's live-shift placeholder; with stable pill
+    /// frames, the hit-test stays consistent across pointer movement,
+    /// avoiding the jitter that made R6.C effectively unusable.
+    private var dropIndicator: NSView?
 
-    /// Round-6 R6.C: transparent NSView inserted into
-    /// `arrangedSubviews` at the would-land slot during an active
-    /// drag. Width matches the hidden source pill so the gap the
-    /// user sees is the same size as the pill that will land there.
-    /// Pills around the gap slide via NSStackView's natural layout,
-    /// animated through `NSAnimationContext.runAnimationGroup`.
-    private var dropPlaceholder: NSView?
+    /// Last-known left-edge X of the indicator in stack-local
+    /// coordinates. `nil` when no indicator is shown. Tracked so
+    /// `draggingUpdated` can skip frame writes when the slot hasn't
+    /// crossed.
+    private var dropIndicatorX: CGFloat?
 
-    /// The placeholder's last-known slot inside `arrangedSubviews`.
-    /// Used by `draggingUpdated` to short-circuit when the cursor
-    /// hasn't crossed a slot boundary — without this we'd remove +
-    /// re-insert on every mouse-move event, which both wastes work
-    /// and double-triggers the animation timing.
-    private var dropPlaceholderIndex: Int?
-
-    /// The source pill we hid at drag-start. Held weakly so a
-    /// `rebuildTabBar` that swaps the pill cache out from under us
-    /// (shouldn't happen with R6.C's rebuild postponement, but
-    /// defensively) doesn't leave a dangling reference. Cleared on
-    /// `concludeDragOperation` / `draggingExited`.
-    private weak var hiddenSource: TabPillView?
-
-    /// Round-6 R6.C: true between `draggingEntered` and the matching
-    /// `concludeDragOperation` / `draggingExited`. The App's
-    /// `rebuildTabBar` checks this flag and postpones rebuilds while
-    /// a drag is in flight — otherwise a sibling-client
-    /// `TabsReorderedEvent` arriving mid-drag would yank pills out
-    /// of `arrangedSubviews` while the placeholder is still in
-    /// place, and the user's drag would visually break.
-    private(set) var isDragInProgress = false
-
-    /// Set by `rebuildTabBar` when it skips a rebuild during a drag.
-    /// `onDragEnded` reads it and asks the App to flush.
-    var rebuildPending = false
+    /// Indicator dimensions: 3pt wide × 32pt tall. Width matches
+    /// R7.C's sidebar accent band for visual consistency across the
+    /// two drop surfaces; height fills the full strip so the
+    /// 4pt above and below the 24pt drag snapshot stay visible as
+    /// "ears" — without them the snapshot occluded the indicator
+    /// on right-to-left drags (AppKit's drag image is rendered in
+    /// an overlay above the app, so subview z-order can't lift
+    /// the indicator on top of it).
+    static let indicatorWidth: CGFloat = 3
+    static let indicatorHeight: CGFloat = 32
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -93,22 +77,21 @@ final class TabBarStackView: NSStackView {
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
         guard sender.draggingPasteboard.types?.contains(.roostTabID) == true
         else { return [] }
-        installPlaceholder(for: sender)
+        let local = convert(sender.draggingLocation, from: nil)
+        showIndicator(forCursorX: local.x)
         return .move
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
         guard sender.draggingPasteboard.types?.contains(.roostTabID) == true
         else { return [] }
-        movePlaceholder(for: sender)
+        let local = convert(sender.draggingLocation, from: nil)
+        showIndicator(forCursorX: local.x)
         return .move
     }
 
     override func draggingExited(_ sender: (any NSDraggingInfo)?) {
-        // Drag left the strip entirely (cursor moved away, or
-        // dropped past the scroll view's bounds). Roll back the
-        // placeholder; no reorder fires.
-        teardownPlaceholder(commit: false)
+        removeIndicator()
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
@@ -116,199 +99,140 @@ final class TabBarStackView: NSStackView {
               let id = Int64(idStr)
         else { return false }
         let local = convert(sender.draggingLocation, from: nil)
-        // Same hit-test the visual placeholder follows — the daemon's
-        // canonical drop slot must agree with what the user saw on
-        // screen. `slotsForHitTest` skips the hidden source pill so
-        // the indices line up with what `computeInsertIdx` expects.
-        let rawTarget = hitTestRawTargetIdx(at: local)
+        let rawTarget = hitTestRawTargetIdx(at: local.x)
         onDropTab?(id, rawTarget)
         return true
     }
 
     override func concludeDragOperation(_ sender: (any NSDraggingInfo)?) {
-        // `performDragOperation` fired the RPC asynchronously; the
-        // daemon's `TabsReorderedEvent` arm will trigger
-        // `rebuildTabBar` and re-seat the (no-longer-hidden) pill at
-        // its new slot. Either way, clean up the placeholder and
-        // restore the source pill's visibility here.
-        teardownPlaceholder(commit: true)
+        removeIndicator()
     }
 
-    // MARK: - Placeholder lifecycle
+    // MARK: - Indicator lifecycle
 
-    /// Find the dragged pill in `arrangedSubviews`, hide it, and
-    /// insert a transparent placeholder at the would-land slot.
-    /// Called from `draggingEntered`. No-op if a placeholder is
-    /// already present (re-entry during a single drag).
-    private func installPlaceholder(for sender: any NSDraggingInfo) {
-        guard dropPlaceholder == nil else { return }
-        guard let idStr = sender.draggingPasteboard.string(forType: .roostTabID),
-              let sourceID = Int64(idStr)
-        else { return }
-        let pills = arrangedSubviews.compactMap { $0 as? TabPillView }
-        let source = pills.first(where: { $0.tabID == sourceID })
-
-        // Hide the source pill — the floating drag-snapshot
-        // already shows the user what they're moving. The
-        // placeholder takes its place in the layout.
-        if let source {
-            source.isHidden = true
-            hiddenSource = source
-        }
-
-        // Build the placeholder. Width matches the hidden source's
-        // current frame so the gap is exactly pill-sized; height
-        // matches the pill's 24pt intrinsic height. Transparent
-        // background — we don't want any visual chrome inside the
-        // gap.
-        let placeholder = NSView()
-        placeholder.translatesAutoresizingMaskIntoConstraints = false
-        let pillWidth = source?.frame.width ?? 120
-        NSLayoutConstraint.activate([
-            placeholder.widthAnchor.constraint(equalToConstant: pillWidth),
-            placeholder.heightAnchor.constraint(equalToConstant: 24),
-        ])
-        dropPlaceholder = placeholder
-
-        // Compute the initial slot. `hitTestRawTargetIdx` operates
-        // in the "slots-for-drop" coordinate system: the hidden
-        // source is excluded so indices reflect what the user
-        // actually sees.
-        let local = convert(sender.draggingLocation, from: nil)
-        let slot = hitTestRawTargetIdx(at: local)
-        let insertIndex = clampedInsertIndex(slot)
-        insertArrangedSubview(placeholder, at: insertIndex)
-        dropPlaceholderIndex = insertIndex
-
-        isDragInProgress = true
-    }
-
-    /// Move the placeholder to the slot under the cursor. No-op if
-    /// the slot hasn't actually changed since last update.
-    private func movePlaceholder(for sender: any NSDraggingInfo) {
-        guard let placeholder = dropPlaceholder else { return }
-        let local = convert(sender.draggingLocation, from: nil)
-        let slot = hitTestRawTargetIdx(at: local)
-        let nextIndex = clampedInsertIndex(slot)
-        guard nextIndex != dropPlaceholderIndex else { return }
-        dropPlaceholderIndex = nextIndex
-
-        // Animate the reposition. `allowsImplicitAnimation = true`
-        // is what lets NSStackView's frame updates ride a CABasic
-        // position transition without per-pill explicit declarations.
-        // 0.15s ease-out matches macOS sheet/popover timing — quick
-        // enough that fast drags don't feel sluggish, slow enough
-        // that the eye can track the gap.
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            ctx.allowsImplicitAnimation = true
-            removeArrangedSubview(placeholder)
-            insertArrangedSubview(placeholder, at: nextIndex)
-        }
-    }
-
-    /// Remove the placeholder, restore the source pill (if still
-    /// hidden), reset drag state, and fire `onDragEnded` so the App
-    /// can flush a pending rebuild. `commit` is purely informational
-    /// today; if a future revision needs to know "did this end at a
-    /// drop or a cancel", that's the signal.
+    /// Lazily create the indicator NSView (or move the existing one)
+    /// and snap its frame to the would-land slot under the cursor.
+    /// Called from both `draggingEntered` (first frame of the drag)
+    /// and `draggingUpdated` (each subsequent frame). No animation —
+    /// instant snap, intentional. Animations on a 3pt bar add no
+    /// perceptual value and reintroduce the timing-overlap class of
+    /// bugs that R6.C suffered from.
     ///
-    /// CR on PR #75: only fire `onDragEnded` when an actual tab drag
-    /// was in flight. `TabBarScrollView` forwards drag-exit / conclude
-    /// events to us indiscriminately; if some non-tab drag drove
-    /// `draggingExited` we'd otherwise trigger a spurious
-    /// `rebuildTabBar()` via the callback.
-    private func teardownPlaceholder(commit: Bool) {
-        let hadActiveDrag = isDragInProgress
-            || dropPlaceholder != nil
-            || hiddenSource != nil
-
-        if let placeholder = dropPlaceholder {
-            removeArrangedSubview(placeholder)
-            placeholder.removeFromSuperview()
+    /// Exposed at `internal` for `DragIndicatorTests` so the
+    /// lifecycle can be exercised without mocking `NSDraggingInfo`.
+    func showIndicator(forCursorX cursorX: CGFloat) {
+        let x = dropIndicatorXForCursor(cursorX)
+        if let existing = dropIndicator {
+            if x == dropIndicatorX { return }
+            // Disable CALayer implicit animation so the indicator
+            // snaps instantly across slots. Without this the frame
+            // change schedules a 0.25s position animation which
+            // visually lags behind a fast cursor.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            existing.frame = indicatorRect(forX: x)
+            CATransaction.commit()
+            dropIndicatorX = x
+            return
         }
-        dropPlaceholder = nil
-        dropPlaceholderIndex = nil
-
-        // Restore the source pill's visibility. After
-        // `performDragOperation` returns true the daemon's reorder
-        // event arm will fire `rebuildTabBar` which `configure`s
-        // the cached pill back to `isHidden = false` anyway — but
-        // doing it here too means there's no flicker frame between
-        // teardown and rebuild.
-        if let source = hiddenSource {
-            source.isHidden = false
-        }
-        hiddenSource = nil
-        isDragInProgress = false
-
-        // Drain a deferred rebuild that arrived mid-drag. Also fire
-        // `onDragEnded` on the happy-path end-of-drag — but skip it
-        // entirely when no drag was active, so non-tab forwarded
-        // events don't spam `rebuildTabBar()`.
-        if rebuildPending {
-            rebuildPending = false
-            onDragEnded?()
-        } else if hadActiveDrag {
-            onDragEnded?()
-        }
-        _ = commit
+        let indicator = NSView()
+        indicator.wantsLayer = true
+        indicator.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        indicator.layer?.cornerRadius = Self.indicatorWidth / 2
+        indicator.frame = indicatorRect(forX: x)
+        addSubview(indicator)
+        dropIndicator = indicator
+        dropIndicatorX = x
     }
+
+    /// Tear down the indicator. Called from `draggingExited` (cursor
+    /// left the strip) and `concludeDragOperation` (drop committed).
+    /// Idempotent so non-tab drag traffic forwarded through
+    /// `TabBarScrollView` can call us safely.
+    func removeIndicator() {
+        dropIndicator?.removeFromSuperview()
+        dropIndicator = nil
+        dropIndicatorX = nil
+    }
+
+    /// Indicator frame for a given left-edge X. Vertically centers
+    /// the 24pt indicator inside whatever height the strip is at
+    /// (32pt today; `max(0, …)` keeps the math safe if a future
+    /// layout shrinks below 24pt).
+    private func indicatorRect(forX x: CGFloat) -> NSRect {
+        let y = max(0, (bounds.height - Self.indicatorHeight) / 2)
+        return NSRect(x: x, y: y, width: Self.indicatorWidth, height: Self.indicatorHeight)
+    }
+
+    // MARK: - Position math
+
+    /// Compute the indicator's left-edge X in stack-local coords
+    /// given the cursor X. Slot threshold mirrors
+    /// `hitTestRawTargetIdx`: left half of pill[i] = slot i, right
+    /// half = slot i+1.
+    ///
+    /// Anchoring:
+    /// - Slot 0 (drop before the leading pill): flush against
+    ///   pill 0's leading edge — the indicator's right edge sits
+    ///   at `pill.frame.minX`.
+    /// - Slot i where 0 < i < N (between two pills): centered in
+    ///   the inter-pill spacing.
+    /// - Slot N (past every pill, before the `+ Tab` button):
+    ///   flush after the trailing pill's edge — the indicator's
+    ///   left edge sits at `last.frame.maxX + indicatorWidth`.
+    func dropIndicatorXForCursor(_ cursorX: CGFloat) -> CGFloat {
+        let frames = arrangedSubviews.compactMap { ($0 as? TabPillView)?.frame }
+        return Self.dropIndicatorX(
+            forCursorX: cursorX,
+            pillFrames: frames,
+            indicatorWidth: Self.indicatorWidth
+        )
+    }
+
+    /// Pure function form of `dropIndicatorXForCursor` used by the
+    /// instance method and exposed at `internal` so the unit tests
+    /// in `DragIndicatorTests` can drive the slot-threshold math
+    /// without spinning up NSStackView layout. See the instance
+    /// method's doc comment for the anchoring rules.
+    static func dropIndicatorX(
+        forCursorX cursorX: CGFloat,
+        pillFrames: [CGRect],
+        indicatorWidth: CGFloat
+    ) -> CGFloat {
+        for (i, frame) in pillFrames.enumerated() {
+            if cursorX < frame.midX {
+                if i == 0 {
+                    // Slot 0: indicator flush against pill 0's
+                    // leading edge. Clamp to 0 so the leading
+                    // 3pt isn't clipped by the scroll view's
+                    // clip view when pill 0 sits flush at x=0.
+                    return max(0, frame.minX - indicatorWidth)
+                }
+                let center = (pillFrames[i - 1].maxX + frame.minX) / 2
+                return center - indicatorWidth / 2
+            }
+        }
+        if let last = pillFrames.last { return last.maxX + indicatorWidth }
+        return 0
+    }
+
+    /// True when an indicator NSView is currently installed. Used by
+    /// tests to verify the lifecycle without exposing the NSView
+    /// itself.
+    var isDropIndicatorActive: Bool { dropIndicator != nil }
 
     // MARK: - Hit test
 
-    /// Walk the visible slots (pills + placeholder, excluding the
-    /// hidden source) left-to-right and return the index the user's
-    /// drop point lands at. Mid-slot is the threshold — drops in
-    /// the left half of slot `i` land at raw target `i`; drops in
-    /// the right half land at `i + 1`. Tail drops past every slot
-    /// return `slots.count`.
-    ///
-    /// During a drag, the placeholder counts as a slot (it
-    /// represents where the source will land) and the hidden source
-    /// pill is skipped (the user no longer sees it). Outside a
-    /// drag, this collapses to "iterate pills" — same as the
-    /// pre-R6.C implementation.
-    private func hitTestRawTargetIdx(at point: NSPoint) -> Int {
-        let slots: [NSView] = arrangedSubviews.compactMap { view in
-            if let pill = view as? TabPillView {
-                return pill.isHidden ? nil : pill
-            }
-            if view === dropPlaceholder { return view }
-            return nil
+    /// Walk visible pill midpoints left-to-right and return the
+    /// drop slot for the cursor. Pre-round-6 form — no placeholder
+    /// or hidden-source bookkeeping because the source pill stays
+    /// visible during the drag.
+    private func hitTestRawTargetIdx(at cursorX: CGFloat) -> Int {
+        let pills = arrangedSubviews.compactMap { $0 as? TabPillView }
+        for (i, pill) in pills.enumerated() {
+            if cursorX < pill.frame.midX { return i }
         }
-        for (i, slot) in slots.enumerated() {
-            if point.x < slot.frame.midX { return i }
-        }
-        return slots.count
-    }
-
-    /// Translate a "slot among visible slots" index into an
-    /// `insertArrangedSubview(at:)` index that walks the full
-    /// `arrangedSubviews` array (which includes the trailing `+ Tab`
-    /// button + potentially the hidden source pill). Without this,
-    /// inserting at slot N from a hit-test would skip past the
-    /// trailing affordance and land in the wrong spot.
-    private func clampedInsertIndex(_ slot: Int) -> Int {
-        // Walk arrangedSubviews; count visible pills until we've
-        // passed `slot` of them. Insertion happens BEFORE the
-        // (slot)-th visible pill.
-        var visibleSeen = 0
-        for (i, view) in arrangedSubviews.enumerated() {
-            if let pill = view as? TabPillView, !pill.isHidden {
-                if visibleSeen == slot { return i }
-                visibleSeen += 1
-            } else if view === dropPlaceholder {
-                // Skip the placeholder itself when counting (we're
-                // about to re-insert it, so it doesn't occupy a slot
-                // for the purpose of this calculation).
-                continue
-            }
-        }
-        // Past every visible pill — insert before the trailing
-        // affordance (`+ Tab` button is the last arranged subview).
-        return max(0, arrangedSubviews.count - 1)
+        return pills.count
     }
 }
 
