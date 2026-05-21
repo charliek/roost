@@ -88,14 +88,16 @@ private let threePillFrames: [CGRect] = [
 @Test
 func cursorLeftOfPill0MidLandsAtLeadingEdge() {
     // Cursor in the left half of pill 0 (x < 40) → slot 0. The
-    // indicator is flush against pill 0's leading edge — right edge
-    // at `pill.frame.minX = 0`, left edge at `0 - indicatorWidth = -3`.
+    // indicator is flush against pill 0's leading edge — clamped
+    // to x=0 (rather than `pill.frame.minX - indicatorWidth = -3`)
+    // so the scroll view's clip view doesn't crop the leading
+    // 3pt off the indicator when pill 0 sits flush at x=0.
     let x = TabBarStackView.dropIndicatorX(
         forCursorX: 20,
         pillFrames: threePillFrames,
         indicatorWidth: TabBarStackView.indicatorWidth
     )
-    #expect(x == -TabBarStackView.indicatorWidth)
+    #expect(x == 0)
 }
 
 @MainActor
@@ -155,6 +157,8 @@ func emptyStackReturnsZero() {
 @MainActor
 @Test
 func singlePillLeftOfMidLandsAtLeadingEdge() {
+    // Pill 0 inset 10pt from the leading edge: 10 - 3 = 7, well
+    // above the 0-clamp, so the indicator lands at x=7.
     let pill = CGRect(x: 10, y: 4, width: 80, height: 24) // midX = 50
     let x = TabBarStackView.dropIndicatorX(
         forCursorX: 30,

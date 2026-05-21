@@ -55,12 +55,16 @@ final class TabBarStackView: NSStackView {
     /// crossed.
     private var dropIndicatorX: CGFloat?
 
-    /// Indicator dimensions: 3pt wide × 24pt tall. Width matches
+    /// Indicator dimensions: 3pt wide × 32pt tall. Width matches
     /// R7.C's sidebar accent band for visual consistency across the
-    /// two drop surfaces; height matches the 24pt pill so the
-    /// indicator sits cell-aligned inside the 32pt strip.
+    /// two drop surfaces; height fills the full strip so the
+    /// 4pt above and below the 24pt drag snapshot stay visible as
+    /// "ears" — without them the snapshot occluded the indicator
+    /// on right-to-left drags (AppKit's drag image is rendered in
+    /// an overlay above the app, so subview z-order can't lift
+    /// the indicator on top of it).
     static let indicatorWidth: CGFloat = 3
-    static let indicatorHeight: CGFloat = 24
+    static let indicatorHeight: CGFloat = 32
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -120,7 +124,14 @@ final class TabBarStackView: NSStackView {
         let x = dropIndicatorXForCursor(cursorX)
         if let existing = dropIndicator {
             if x == dropIndicatorX { return }
+            // Disable CALayer implicit animation so the indicator
+            // snaps instantly across slots. Without this the frame
+            // change schedules a 0.25s position animation which
+            // visually lags behind a fast cursor.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             existing.frame = indicatorRect(forX: x)
+            CATransaction.commit()
             dropIndicatorX = x
             return
         }
@@ -190,7 +201,13 @@ final class TabBarStackView: NSStackView {
     ) -> CGFloat {
         for (i, frame) in pillFrames.enumerated() {
             if cursorX < frame.midX {
-                if i == 0 { return frame.minX - indicatorWidth }
+                if i == 0 {
+                    // Slot 0: indicator flush against pill 0's
+                    // leading edge. Clamp to 0 so the leading
+                    // 3pt isn't clipped by the scroll view's
+                    // clip view when pill 0 sits flush at x=0.
+                    return max(0, frame.minX - indicatorWidth)
+                }
                 let center = (pillFrames[i - 1].maxX + frame.minX) / 2
                 return center - indicatorWidth / 2
             }

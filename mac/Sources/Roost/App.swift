@@ -80,6 +80,30 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// of `applicationDidFinishLaunching`.
     private var sidebarPersistenceActive = false
 
+    /// Round-7 R7.A: references to the sidebar pane's width
+    /// constraints so `toggleSidebar` can deactivate the `>= min`
+    /// floor during a programmatic collapse. NSSplitView's
+    /// `setPosition(0, …)` is otherwise clamped by either the
+    /// constraint or the `constrainMinCoordinate` delegate; this
+    /// flow opts out of both for the ⌘B-driven collapse without
+    /// loosening the interactive-drag bounds.
+    private var sidebarMinWidthConstraint: NSLayoutConstraint?
+    private var sidebarMaxWidthConstraint: NSLayoutConstraint?
+    private var sidebarPreferredWidthConstraint: NSLayoutConstraint?
+
+    /// Round-7 R7.A: while `sidebarCollapsingProgrammatically` is
+    /// true, `constrainMinCoordinate` returns 0 instead of
+    /// `sidebarMinWidth` so `setPosition(0, …)` can collapse the
+    /// pane all the way. Reset to false on the next runloop pass.
+    private var sidebarCollapsingProgrammatically = false
+
+    /// Round-7 R7.A: width to restore when ⌘B re-opens the sidebar.
+    /// Captured at collapse-time from `sidebarPane.frame.width` so
+    /// the user lands at exactly the width they had before pressing
+    /// ⌘B. Falls back to 220pt for the very first restore (i.e.
+    /// the app launched with the sidebar already hidden).
+    private var sidebarRestoreWidth: CGFloat = 220
+
     /// Workspace model. `projects` mirrors the daemon's project list
     /// in display order; `tabs` is a flat list of every open
     /// TabSession across all projects, filtered into the tab bar by
@@ -284,12 +308,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         split.addArrangedSubview(content)
         split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
         self.sidebarPane = sidebar
+        // Round-6 R6.B / Round-7 R7.A: remember the launch-time
+        // restore width so toggling back from a fresh-launch
+        // collapsed state lands at the user's last expanded width.
+        self.sidebarRestoreWidth = sidebarWidth
         // Restore the user's last-known toggle state (M3). UserDefaults
         // returns `false` for an unset key, so we read it back as
         // Optional<Bool>-shaped to distinguish "not set" (default
         // visible) from "explicitly false" (user hid it).
         let stored = UserDefaults.standard.object(forKey: Self.sidebarVisibleDefaultsKey) as? Bool
-        sidebar.isHidden = stored == false
+        let startsCollapsed = stored == false
 
         let root = NSView(frame: window.contentRect(forFrameRect: window.frame))
         root.addSubview(split)
@@ -318,7 +346,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if let split = self.sidebarPane?.superview as? NSSplitView {
-                split.setPosition(initialSidebarWidth, ofDividerAt: 0)
+                if startsCollapsed {
+                    // Round-7 R7.A: launch into the collapsed state.
+                    // Same path as `toggleSidebar`'s collapse arm —
+                    // deactivate `>= min` so setPosition(0) sticks.
+                    self.sidebarPreferredWidthConstraint?.constant = 0
+                    self.sidebarMinWidthConstraint?.isActive = false
+                    self.sidebarMaxWidthConstraint?.isActive = false
+                    self.sidebarCollapsingProgrammatically = true
+                    split.setPosition(0, ofDividerAt: 0)
+                    self.sidebarCollapsingProgrammatically = false
+                } else {
+                    split.setPosition(initialSidebarWidth, ofDividerAt: 0)
+                }
             }
             // Now that the splitter is at its intended position,
             // enable the persistence callback. Any `frame.width`
@@ -381,6 +421,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         outline.registerForDraggedTypes([.roostProjectID])
         outline.setDraggingSourceOperationMask(.move, forLocal: true)
         outline.setDraggingSourceOperationMask([], forLocal: false)
+        // Round-7 R7.C-extra: suppress AppKit's built-in thin-blue
+        // outline around the whole outline view during a drop. Our
+        // `ProjectRowCellView.setDropIndicator` accent band is the
+        // user-visible cue; the AppKit indicator both duplicates
+        // this and wraps the entire scrollable area in a single
+        // outline that's visually noisy in dark theme.
+        outline.draggingDestinationFeedbackStyle = .none
 
         // Right-click context menu — items target `clickedRow` so the
         // same NSMenu serves every project row without bespoke
@@ -437,26 +484,23 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let preferredWidth = pane.widthAnchor.constraint(equalToConstant: width)
         preferredWidth.priority = .defaultHigh
 
-        // Round-7 R7.A: min/max constraints sit just above
-        // NSSplitView's default arranged-subview priority (.defaultHigh
-        // = 750) so they win against passive layout, but stay below
-        // `.required` so the implicit 0-width override produced by
-        // `sidebarPane.isHidden = true` can collapse the pane to 0.
-        // The hard [min, max] bounds for the interactive divider drag
-        // are still enforced by `splitView(_:constrainMin/MaxCoordinate:
-        // ofSubviewAt:)` — no escape hatch there.
+        // Round-7 R7.A: store the min/max width constraints by
+        // reference so `toggleSidebar` can deactivate `>= min`
+        // during a programmatic collapse — NSSplitView can't shrink
+        // the pane below 160 while that constraint is active, and
+        // the priority-dance approach (constraint at .defaultHigh+1,
+        // hoping the implicit 0-width override wins) is unreliable
+        // on macOS. Direct deactivate/reactivate is explicit and
+        // robust.
         let minWidth = pane.widthAnchor.constraint(
             greaterThanOrEqualToConstant: Self.sidebarMinWidth
-        )
-        minWidth.priority = NSLayoutConstraint.Priority(
-            NSLayoutConstraint.Priority.defaultHigh.rawValue + 1
         )
         let maxWidth = pane.widthAnchor.constraint(
             lessThanOrEqualToConstant: Self.sidebarMaxWidth
         )
-        maxWidth.priority = NSLayoutConstraint.Priority(
-            NSLayoutConstraint.Priority.defaultHigh.rawValue + 1
-        )
+        self.sidebarMinWidthConstraint = minWidth
+        self.sidebarMaxWidthConstraint = maxWidth
+        self.sidebarPreferredWidthConstraint = preferredWidth
 
         NSLayoutConstraint.activate([
             minWidth,
@@ -2353,17 +2397,43 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     // MARK: - Sidebar toggle (M3)
 
-    /// `toggle_sidebar` action handler. Flips `sidebarPane.isHidden`
-    /// (NSSplitView collapses hidden arranged subviews automatically),
-    /// then writes the new state to UserDefaults so it survives across
-    /// launches. Bound to ⌘B by default in `Keybind.swift`, overrideable
+    /// `toggle_sidebar` action handler. Round-7 R7.A: collapse via
+    /// `setPosition(_:ofDividerAt:)` plus deactivating the `>= min`
+    /// width constraint, rather than `isHidden = true` (which left
+    /// the pane occupying its constrained width and the divider
+    /// visible). The interactive-drag bounds are unchanged — they're
+    /// only consulted while `sidebarCollapsingProgrammatically` is
+    /// false. Bound to ⌘B by default in `Keybind.swift`, overrideable
     /// via the config file's `keybind = … = toggle_sidebar` line.
     @objc @MainActor
     private func toggleSidebar(_ sender: Any?) {
-        guard let sidebarPane else { return }
-        let nextHidden = !sidebarPane.isHidden
-        sidebarPane.isHidden = nextHidden
-        UserDefaults.standard.set(!nextHidden, forKey: Self.sidebarVisibleDefaultsKey)
+        guard let sidebarPane,
+              let split = sidebarPane.superview as? NSSplitView
+        else { return }
+        let currentWidth = sidebarPane.frame.width
+        let isCurrentlyCollapsed = currentWidth < 1
+        if isCurrentlyCollapsed {
+            // Restore.
+            let restore = sidebarRestoreWidth > 0 ? sidebarRestoreWidth : 220
+            sidebarMinWidthConstraint?.isActive = true
+            sidebarMaxWidthConstraint?.isActive = true
+            sidebarPreferredWidthConstraint?.constant = restore
+            split.setPosition(restore, ofDividerAt: 0)
+            UserDefaults.standard.set(true, forKey: Self.sidebarVisibleDefaultsKey)
+        } else {
+            // Collapse.
+            sidebarRestoreWidth = currentWidth
+            sidebarPreferredWidthConstraint?.constant = 0
+            sidebarMinWidthConstraint?.isActive = false
+            sidebarMaxWidthConstraint?.isActive = false
+            // Bypass `constrainMinCoordinate`'s 160pt floor for this
+            // one programmatic setPosition call. The flag is reset
+            // synchronously after the call returns.
+            sidebarCollapsingProgrammatically = true
+            split.setPosition(0, ofDividerAt: 0)
+            sidebarCollapsingProgrammatically = false
+            UserDefaults.standard.set(false, forKey: Self.sidebarVisibleDefaultsKey)
+        }
     }
 
     /// Force the sidebar visible without toggling. Called from the
@@ -2373,11 +2443,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `selectProject` (the ⌘1-9 switcher reveals the focused project),
     /// and `beginRenameActiveProject` (M4 hookup — rename popover
     /// needs the row visible to anchor against).
+    ///
+    /// Round-7 R7.A: collapse is now a width-0 state, not
+    /// `isHidden = true`. Delegate to `toggleSidebar` when the pane
+    /// is currently collapsed so we reuse the restore path
+    /// (constraint reactivation + `setPosition`).
     @MainActor
     private func ensureSidebarVisible() {
-        guard let sidebarPane, sidebarPane.isHidden else { return }
-        sidebarPane.isHidden = false
-        UserDefaults.standard.set(true, forKey: Self.sidebarVisibleDefaultsKey)
+        guard let sidebarPane else { return }
+        guard sidebarPane.frame.width < 1 else { return }
+        toggleSidebar(nil)
     }
 
     // MARK: - Jump to next unread (Phase 6a P7)
@@ -3457,11 +3532,13 @@ extension RoostApp: NSSplitViewDelegate {
         // pollute the saved value with NSSplitView's auto-picked
         // default.
         guard sidebarPersistenceActive else { return }
-        guard let sidebar = sidebarPane, !sidebar.isHidden else { return }
+        guard let sidebar = sidebarPane else { return }
         let w = sidebar.frame.width
-        // Double-check the saved width is within [min, max] — even
-        // post-launch, a transient layout pass can yield a value
-        // slightly outside the bounds before constraints reconcile.
+        // Round-7 R7.A: skip persistence while the pane is in the
+        // ⌘B-collapsed state (frame.width = 0). The user's
+        // pre-collapse width is held in `sidebarRestoreWidth` and
+        // already persisted at the moment the user dragged the
+        // divider before pressing ⌘B.
         guard w >= Self.sidebarMinWidth, w <= Self.sidebarMaxWidth else { return }
         UserDefaults.standard.set(Double(w), forKey: Self.sidebarWidthDefaultsKey)
     }
@@ -3472,12 +3549,21 @@ extension RoostApp: NSSplitViewDelegate {
     /// `sidebarMinWidth` floor without ever inverting the bounds.
     /// CR on PR #75: returning a fixed constant could exceed
     /// AppKit's proposed max on narrow windows and cause jitter.
+    ///
+    /// Round-7 R7.A: when `sidebarCollapsingProgrammatically` is
+    /// true (the brief window inside `toggleSidebar`'s collapse
+    /// path), return 0 so `setPosition(0, …)` can land the divider
+    /// flush against the window's leading edge. The flag flips
+    /// back to false synchronously after the setPosition call so
+    /// the user's next interactive drag still honors the 160pt
+    /// floor.
     func splitView(
         _ splitView: NSSplitView,
         constrainMinCoordinate proposedMinimumPosition: CGFloat,
         ofSubviewAt dividerIndex: Int
     ) -> CGFloat {
-        max(proposedMinimumPosition, Self.sidebarMinWidth)
+        if sidebarCollapsingProgrammatically { return 0 }
+        return max(proposedMinimumPosition, Self.sidebarMinWidth)
     }
 
     /// Upper bound for the interactive divider drag. Symmetric to
@@ -3493,13 +3579,22 @@ extension RoostApp: NSSplitViewDelegate {
     }
 
     /// Round-7 R7.A: hide the sidebar/content divider while the
-    /// sidebar pane is collapsed via `⌘B`. Without this, NSSplitView
-    /// keeps the 1pt divider visible as a seam against the window's
-    /// left edge even when the pane's frame has fully collapsed.
-    /// AppKit consults this on every layout pass.
+    /// sidebar pane is collapsed via ⌘B (frame.width == 0). Without
+    /// this, NSSplitView keeps the 1pt divider visible as a seam
+    /// against the window's left edge even when the pane has fully
+    /// collapsed. AppKit consults this on every layout pass.
     func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
         guard dividerIndex == 0 else { return false }
-        return sidebarPane?.isHidden ?? false
+        return (sidebarPane?.frame.width ?? 1) < 1
+    }
+
+    /// Round-7 R7.A: marks the sidebar (subview 0) as collapsible
+    /// so NSSplitView treats the `setPosition(0, …)` call as a
+    /// proper collapse — without this, NSSplitView may snap the
+    /// divider back to the constrainMin floor on the next layout
+    /// pass. Required for the ⌘B collapse to stick.
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        return subview === sidebarPane
     }
 }
 
