@@ -15,7 +15,8 @@ For the durable design rationale (why two languages, why proto, why local UDS) s
 | Daemon | `roost-core` (Rust, `tonic` server) | (same) |
 | PTY supervision | `portable-pty` inside `roost-core` | (same) |
 | Persistence | `rusqlite` inside `roost-core` | (same) |
-| OSC routing | `roost-osc` crate inside the daemon | (same) |
+| OSC scanning | `roost-osc` scanner running inside the UI | (same) |
+| OSC routing + suppression | `roost-core` (decides whether to fire a notification) | (same) |
 | Companion CLI | `roost-cli-rs` (transitional name) | (same) |
 
 The UIs are written separately and idiomatic to their platform; only the proto bindings are shared between them.
@@ -79,7 +80,7 @@ Both UI toolkits (AppKit, GTK4) are single-threaded. Widget operations must run 
 | `libghostty-vt` terminal handle | Main thread only |
 | gRPC stream pumps (`StreamPty`, `WatchEvents`) | Background; results marshalled to main |
 | PTY read/write (inside `roost-core`) | Tokio task per tab |
-| OSC scanner (inside `roost-core`) | Same task as the PTY pump |
+| OSC scanner (inside each UI, fed from the `StreamPty` byte stream) | Main thread (Mac) / GTK main (Linux) |
 | SQLite writes (`rusqlite`) | Serialized inside `roost-core` |
 | tonic server handlers | Tokio worker pool |
 
@@ -87,9 +88,10 @@ The UIs marshal stream events to the main thread via `glib.IdleAdd` on Linux and
 
 ## Boundaries
 
-- The UIs talk to `roost-core` over gRPC only — never read the SQLite database, never touch `libghostty-vt` initialization, never hold daemon state.
+- The UIs talk to `roost-core` over gRPC only — never read the SQLite database, never hold daemon state.
 - `libghostty-vt` lives inside each UI for VT parsing + rendering. The daemon doesn't parse VT — it shuttles bytes.
-- OSC routing sits in the daemon (`roost-osc`) because the per-tab `set_hook_active` suppression rule depends on cross-client state.
+- OSC scanning lives in the UI (the shared `roost-osc` crate, or `OscScanner.swift` on macOS) because OSC parsing has to walk the same byte stream the VT parser does. The UI upcalls each OSC event into the daemon via `ReportOsc`.
+- OSC routing + suppression sits in the daemon. The per-tab `set_hook_active` suppression rule depends on cross-client state, so the daemon decides whether each `ReportOsc` upcall fires a notification.
 - The legacy Go `cmd/` + `internal/` tree is unaffected by the Rust workspace and builds independently via `build/build.sh` until the Phase 9 cutover.
 
 See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

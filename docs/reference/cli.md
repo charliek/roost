@@ -127,7 +127,7 @@ roost-cli-rs project reorder --order 1,3,2
 
 ## `claude install`
 
-Generates `~/.config/claude/settings.json` (or the per-project file) and prints a bash alias snippet to stdout. See the [Claude Code Hooks](../guides/claude-code.md) guide for the full workflow.
+Writes `~/.config/roost/claude-settings.json` pointing at this binary's `claude-hook` subcommand for each Claude Code lifecycle event, then prints a bash alias snippet (`alias claude='claude --settings ...'`) to stdout. See the [Claude Code Hooks](../guides/claude-code.md) guide for the full workflow.
 
 ```bash
 roost-cli-rs claude install >> ~/.bashrc
