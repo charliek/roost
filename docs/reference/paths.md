@@ -10,35 +10,40 @@ This is a deliberate divergence from Apple's HIG on macOS: Roost matches the con
 
 ### macOS
 
-| Path                                                | Purpose                                                    |
-|-----------------------------------------------------|------------------------------------------------------------|
-| `~/.config/roost/config.conf`                       | User-editable config; see [Config keys](#config-keys) below |
-| `~/Library/Application Support/Roost/roost.db`      | SQLite database (projects, tabs, scrollback off)           |
-| `~/Library/Application Support/Roost/roost.db-wal`  | SQLite write-ahead log (auto-created)                      |
-| `~/Library/Application Support/Roost/roost.db-shm`  | SQLite shared memory (auto-created)                        |
-| `~/Library/Application Support/Roost/roost.sock`    | Unix socket the GUI listens on                             |
+| Path | Purpose |
+|---|---|
+| `~/.config/roost/config.conf` | User-editable config; see [Config keys](#config-keys) below |
+| `~/Library/Application Support/roost/roost.db` | SQLite database (projects, tabs) |
+| `~/Library/Application Support/roost/roost.db-wal` | SQLite write-ahead log (auto-created) |
+| `~/Library/Application Support/roost/roost.db-shm` | SQLite shared memory (auto-created) |
+| `~/Library/Caches/roost/roost.sock` | Unix socket the daemon listens on |
+
+The legacy Go binary used `~/Library/Application Support/Roost/` (capital `R`) for both state and socket. The Rust path lowercases the directory and moves the socket to `~/Library/Caches/roost/` to follow Apple's convention that sockets are caches, not user data.
 
 ### Linux
 
 Linux follows XDG conventions for everything:
 
-| Path                                  | Purpose                                                    |
-|---------------------------------------|------------------------------------------------------------|
-| `$XDG_CONFIG_HOME/roost/config.conf`  | User-editable config; defaults to `~/.config/roost/`        |
-| `$XDG_DATA_HOME/roost/roost.db`       | SQLite database; defaults to `~/.local/share/roost/`        |
-| `$XDG_RUNTIME_DIR/roost/roost.sock`   | Unix socket; falls back to data dir when `XDG_RUNTIME_DIR` is unset |
+| Path | Purpose |
+|---|---|
+| `$XDG_CONFIG_HOME/roost/config.conf` | User-editable config; defaults to `~/.config/roost/` |
+| `$XDG_DATA_HOME/roost/roost.db` | SQLite database; defaults to `~/.local/share/roost/` |
+| `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |
 
 The directories are created at first launch with mode `0700`.
 
 ### Migrating from a pre-cutover macOS install
 
-Before this version Roost stored its config at `~/Library/Application Support/Roost/config.toml`. On startup the new build logs a one-shot warning when that legacy file exists and the new path does not:
+If you previously ran the Go binary, its state at `~/Library/Application Support/Roost/` (capital `R`) is untouched by the Rust binary. The Rust binary writes a fresh SQLite database at `~/Library/Application Support/roost/roost.db` (lowercase `r`) on first launch.
+
+To carry over your projects and tabs from the Go binary, copy the database before launching the Rust binary for the first time — the schema ports byte-for-byte (see [Vision → DL-7](../development/vision.md#dl-7-sqlite-migrations-port-byte-for-byte)):
 
 ```bash
-mv ~/Library/Application\ Support/Roost/config.toml ~/.config/roost/config.conf
+mkdir -p ~/Library/Application\ Support/roost
+cp ~/Library/Application\ Support/Roost/roost.db ~/Library/Application\ Support/roost/roost.db
 ```
 
-Roost does not auto-move the file — moving and renaming a user-edited file silently is the kind of thing that loses changes, so a warning + manual move is the cutover path.
+Roost does not auto-move the file — moving user state across binaries silently is the kind of thing that loses work.
 
 ## Config keys
 
@@ -82,28 +87,29 @@ When Roost spawns a tab's shell, it injects:
 |-----------------|----------------------------------------------------------------------|
 | `TERM`          | Set to `xterm-256color`                                              |
 | `COLORTERM`     | Set to `truecolor`                                                   |
-| `ROOST_TAB_ID`  | Integer tab id (used by `roost-cli` to route notifications)          |
+| `ROOST_TAB_ID`  | Integer tab id (used by `roost-cli-rs` to route notifications)          |
 | `ROOST_SOCKET`  | Absolute path to the Unix socket                                     |
 
 Existing environment is inherited verbatim before these are set.
 
 ## Environment variables Roost reads
 
-`roost-cli` reads:
+`roost-cli-rs` reads:
 
-| Variable        | Effect                                                               |
-|-----------------|----------------------------------------------------------------------|
-| `ROOST_SOCKET`  | Override the socket the CLI dials                                    |
-| `ROOST_TAB_ID`  | Default tab id when `--tab` is not given                             |
+| Variable | Effect |
+|---|---|
+| `ROOST_SOCKET` | Override the socket the CLI dials |
+| `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
+| `ROOST_PROJECT_ID` | Default project id, set by the UI |
 
-The GUI does not currently honour any environment override for paths; if you need a different location, modify `internal/config` and rebuild.
+The daemon does not currently honour any environment override for the database or socket paths; if you need a different location, modify `crates/roost-common/src/lib.rs` and rebuild.
 
 ## Inspecting the database
 
 Use any SQLite client. The schema is small:
 
 ```bash
-sqlite3 "$HOME/Library/Application Support/Roost/roost.db"
+sqlite3 "$HOME/Library/Application Support/roost/roost.db"
 ```
 
 ```sql
@@ -121,10 +127,10 @@ To wipe Roost's persistent state and start fresh:
 
 ```bash
 # macOS
-rm "$HOME/Library/Application Support/Roost/roost.db"*
+rm "$HOME/Library/Application Support/roost/roost.db"*
 
 # Linux (uses XDG_DATA_HOME with the spec-default fallback)
 rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/roost.db"*
 ```
 
-Relaunch `roost`. It will recreate the schema and a `default` project + tab.
+Relaunch the UI. The daemon will recreate the schema and a default project + tab.
