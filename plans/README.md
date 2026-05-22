@@ -25,7 +25,7 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 | [7](phase-7-linux-ui.md) | Linux UI (gtk4-rs + Cairo + Pango) | ✅ done (commits 0–11 + follow-up landed via PR #50, squash `421b384`, 2026-05-17) | yes |
 | [7.5](phase-7-5-polish-and-gaps.md) | Linux/Mac polish + automation gaps (drag-reorder, CSS, icons, theme overrides, `tab snapshot`, etc.) | 🪦 superseded by [Linux GTK parity goal](goal-linux-gtk-parity-2026-05-17.md) (carried tracks A/B1/D); B2/C/E filed below | n/a |
 | [7.5b](goal-linux-gtk-parity-2026-05-17.md) | Linux GTK parity (port chrome + UX from Go GTK binary to gtk4-rs Rust UI) | ✅ closed — M1–M10 + M9.5 landed by 2026-05-18 via PRs #51–#64, #66 (M11 user-theme-overrides dropped after parity check) | yes |
-| [7.5c](goal-mac-parity-2026-05-18.md) | Mac UI parity (drag-reorder, inline rename, live cwd subtitle, sidebar rollup, tab pill right-click; headerbar deferred to user-eval at M7) | ⏳ scoped, not started — next push before Phase 8 | yes |
+| [7.5c](goal-mac-parity-2026-05-18.md) | Mac UI parity (drag-reorder, inline rename, live cwd subtitle, sidebar rollup, tab pill right-click; headerbar deferred to user-eval at M7) | ✅ closed 2026-05-22 — M1–M6 + R1–R7 polish landed via PRs #67–#76; M7 headerbar dropped after user-eval | yes |
 | [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG + notarytool; Linux AppImage) | ⏳ pending — gated on Mac parity per user preference | yes |
 | [9](phase-9-cutover.md) | Cutover (delete `cmd/`, `internal/`, Go-specific make targets) | ⏳ pending | **destructive — separate PR** |
 
@@ -57,17 +57,17 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 * [`goal-mac-polish-cursor-keys-2026-05-17.md`](goal-mac-polish-cursor-keys-2026-05-17.md) — M1–M6 (libghostty key-encoder bridge, cursor rendering, sidebar toggle, cycle/rename tab, PTY-exit cascade, scrollback) + the post-goal fixes for orphan-tab purge, cursor-on-focus override, OSC UTF-8.
 * **Phase 7 (Linux UI)** — see [`phase-7-linux-ui.md`](phase-7-linux-ui.md). Landed via PR #50 squash `421b384`. Carries: `roost-vt` safe API, `roost-osc` shared crate, daemon `ReorderTabs`/`ReorderProjects` RPCs, Cairo+Pango cell renderer, StreamPty round-trip, full key encoder, scrollback + selection + clipboard, sidebar + AdwTabView + WatchEvents, keybind config, OSC + notifications, themes + config + focus-tab action.
 
-Active goal: [`goal-linux-gtk-parity-2026-05-17.md`](goal-linux-gtk-parity-2026-05-17.md) — bring the gtk4-rs Linux UI up to visual + UX parity with the Go GTK binary the user is happy with. M1 (PTY spawn + multi-project attach) is the BLOCKER; M2–M10 are chrome / status / context-menu / rename / drag-reorder work. This goal supersedes Phase 7.5; uncarried tracks (B2 Mac drag-reorder, C automation API, E cross-platform polish) are tracked in the [Open questions / Follow-up tracks](#follow-up-tracks-from-the-superseded-phase-75) section below.
+Both UI parity goals are closed: [Linux GTK parity](goal-linux-gtk-parity-2026-05-17.md) on 2026-05-18 (M1–M10 + M9.5; M11 user-theme-overrides dropped) and [Mac UI parity](goal-mac-parity-2026-05-18.md) on 2026-05-22 (M1–M6 + R1–R7 polish rounds; M7 headerbar dropped after user-eval).
 
-Next phase after that: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + Linux AppImage. The user's stated gate for `feature/rust-port → main` is "Phase 8 first so users pulling `main` get an installable artifact rather than source-only" (decision 2026-05-17).
+Next gate: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + Linux AppImage. The user's stated gate for `feature/rust-port → main` is "Phase 8 first so users pulling `main` get an installable artifact rather than source-only" (decision 2026-05-17).
 
-## Status snapshot (2026-05-17, end of day)
+## Status snapshot (2026-05-22)
 
 * Phases 0–7 landed and merged-ready on `feature/rust-port`.
-* Phase 7 closure: gtk4-rs Linux UI builds + runs on Mac Homebrew GTK4 + libadwaita with full feature surface; cross-client convergence with the Swift Mac UI verified end-to-end via `roost-cli-rs`. Daemon orphan-tab purge (`234378e`), Mac UI cursor-on-focus override (`266dea7`), OSC UTF-8 multibyte fix (`aebd408`), Swift OscScanner+KeyEncoder regression tests (`b5b7838`) all merged before Phase 7 PR.
-* Local Phase 7 worktree torn down. Local branch refs cleaned up. `feature/rust-port` is at `421b384`.
+* Both UI parity goals closed: Linux GTK parity 2026-05-18 (PRs #51–#64, #66; M11 dropped); Mac UI parity 2026-05-22 (PRs #67–#76; M7 dropped). Cross-client convergence between the Swift Mac UI, Rust gtk4-rs Linux UI, and `roost-cli-rs` verified end-to-end.
+* `feature/rust-port` is at `9c36ba0` (R7 sidebar collapse + drop indicator fixes).
 * macOS 26 arm64e-only SDK workaround is in both `build/build.sh` (from `f6e0d64` on main) and `third_party/ghostty/build.sh` — both Zig 0.15.2 + Ghostty SHA toolchains build on macOS 26 hosts.
-* Two ghostty builds (`build/build.sh` for Go cgo, `third_party/ghostty/build.sh` for Rust bindgen + Swift) coexist and must pin the same SHA. They collapse in Phase 9.
+* Two libghostty-vt builds (`build/build.sh` for Go cgo, `third_party/ghostty/build.sh` for Rust bindgen + Swift) coexist and must pin the same SHA. They collapse in Phase 9.
 * `feature/rust-port → main` deferred until Phase 8 lands (user decision 2026-05-17): merging now would put source-only Rust+Swift code on `main` without an installable artifact.
 
 ## How to use these documents

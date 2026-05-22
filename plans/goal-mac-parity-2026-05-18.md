@@ -1,11 +1,29 @@
 # Goal — Mac UI parity (close gaps surfaced after Linux GTK parity push)
 
 **Set**: 2026-05-18
+**Closed**: 2026-05-22
 **Owner**: Charlie Knudsen
 **Co-author / executor**: Claude (Opus 4.7)
-**Status**: ⏳ scoped, not started
+**Status**: ✅ closed
 **Predecessors**: [`goal-linux-gtk-parity-2026-05-17.md`](goal-linux-gtk-parity-2026-05-17.md) (closed 2026-05-18 — Linux GTK is now the polished reference; Mac UI is the lagging surface).
-**Successor**: [`phase-8-bundling.md`](phase-8-bundling.md) — the `feature/rust-port → main` merge gate. This goal does not formally block Phase 8 but the user wants both UIs polished before the bundled DMG/AppImage goes out.
+**Successor**: [`phase-8-bundling.md`](phase-8-bundling.md) — the `feature/rust-port → main` merge gate.
+
+## Closure (2026-05-22)
+
+M1–M6 shipped; M7 (headerbar) dropped after user evaluation — Mac's existing inline `+ Tab` button, ⌘B sidebar toggle, and `File → Open Folder…` menu item are enough; an NSToolbar would have duplicated the affordances. Seven polish rounds (R1–R7) followed M1–M6 to settle drag/drop, inline rename, scroll-to-visible, pill width bounds, the resizable sidebar, and the `⌘B` collapse + drop-indicator UX.
+
+| Milestone | Status | PR(s) |
+|---|---|---|
+| M1 — Live cwd subtitle | ✅ shipped | #67 |
+| M2 — Tab drag-to-reorder | ✅ shipped | #68, polish in #71, #72, #74, #75, #76 |
+| M3 — Sidebar drag-to-reorder | ✅ shipped | #68, polish in #71 |
+| M4 — Tab pill right-click menu | ✅ shipped | #67, polish in #71 |
+| M5 — Inline rename | ✅ shipped | #69, polish in #71, #72 |
+| M6 — Sidebar rollup stripes | ✅ shipped | #67 |
+| M7 — Headerbar | 🪦 dropped (user-eval) | — |
+| R1–R7 polish rounds | ✅ shipped | #71, #72, #73, #74, #75, #76 |
+
+**Next gate**: Phase 8 bundling. The Mac UI is feature-complete against the Go binary and the Linux gtk4-rs UI as of this closure.
 
 ## Context
 
