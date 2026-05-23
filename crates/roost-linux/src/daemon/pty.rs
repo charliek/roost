@@ -272,13 +272,36 @@ impl PtySupervisor {
             killer: Mutex::new(killer),
         };
         // Promote the slot from pending → sessions atomically.
-        // After this point the SlotGuard must NOT roll back; the
-        // session owns the slot.
+        // If `close(tab_id)` ran while we were building the PTY it
+        // removed our entry from `pending` as a cancellation
+        // signal. Detect that here, kill the freshly-spawned
+        // child, and don't insert into `sessions`. The killer was
+        // moved into the wait task already, so we reach for the
+        // copy we stashed in `session` below — actually the
+        // session struct already holds the killer, so we tear it
+        // back down by invoking `killer.kill()` and dropping
+        // `session` (which drops the input/resize channels, the
+        // writer task exits, and the wait task reaps once the
+        // SIGTERM/SIGKILL lands).
         {
             let mut sessions = self.sessions.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
+            if !pending.remove(&tab_id) {
+                // Cancelled by close(). Kill the child rather than
+                // returning a usable receiver.
+                drop(pending);
+                drop(sessions);
+                if let Ok(mut killer) = session.killer.lock() {
+                    let _ = killer.kill();
+                }
+                drop(session);
+                // SlotGuard is no longer needed — pending was
+                // already cleared by close(); we already cleaned
+                // up the child.
+                slot.armed = false;
+                return Err(PtyError::Cancelled(tab_id).into());
+            }
             sessions.insert(tab_id, session);
-            pending.remove(&tab_id);
         }
         slot.armed = false;
 
@@ -323,7 +346,17 @@ impl PtySupervisor {
         // from the killer impl. The waiter task spawned at
         // `spawn()` time reaps the child via `child.wait()` once
         // the kill signal lands.
-        let session = self.sessions.lock().unwrap().remove(&tab_id);
+        //
+        // Also cancel any in-flight spawn for the same tab_id by
+        // removing the entry from `pending`. spawn() re-checks
+        // pending at promotion time; if the slot is gone it kills
+        // the freshly-spawned child rather than installing it.
+        // CR-flagged on PR #78 (`0555dd42` → `653e080`).
+        let (session, was_pending) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap();
+            (sessions.remove(&tab_id), pending.remove(&tab_id))
+        };
         if let Some(session) = session {
             if let Ok(mut killer) = session.killer.lock() {
                 if let Err(err) = killer.kill() {
@@ -337,6 +370,8 @@ impl PtySupervisor {
                     }
                 }
             }
+        } else if was_pending {
+            debug!(tab_id, "close() cancelled in-flight spawn");
         }
     }
 
@@ -418,4 +453,6 @@ pub enum PtyError {
     Closed(i64),
     #[error("tab {0} already has a live pty session")]
     DuplicateTab(i64),
+    #[error("spawn for tab {0} cancelled by close()")]
+    Cancelled(i64),
 }
