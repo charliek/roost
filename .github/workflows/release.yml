@@ -18,8 +18,9 @@ on:
     tags:
       - 'v*'
 
+# Least privilege: default read; only the release-writing jobs get contents:write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   version-check:
@@ -45,6 +46,8 @@ jobs:
   create-release:
     needs: version-check
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -76,6 +79,8 @@ jobs:
 
   linux:
     needs: create-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -150,7 +155,9 @@ jobs:
 
   mac:
     needs: create-release
-    runs-on: macos-latest   # arm64
+    runs-on: macos-15   # arm64 — pinned for reproducible release builds
+    permissions:
+      contents: write
     env:
       # Surfaced from secrets; empty when unset → ad-hoc signing + no notarization.
       ROOST_DEVELOPER_ID_IDENTITY: ${{ secrets.ROOST_DEVELOPER_ID_IDENTITY }}

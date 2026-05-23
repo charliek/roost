@@ -198,7 +198,19 @@ TS_FLAG=""
 if [ "${SIGN_IDENTITY}" != "-" ]; then
   TS_FLAG="--timestamp"
 fi
-if command -v codesign >/dev/null 2>&1 && [ -f "${ENT_FILE}" ]; then
+if [ ! -f "${ENT_FILE}" ]; then
+  echo "==> No entitlements file at ${ENT_FILE}; skipping codesign"
+elif ! command -v codesign >/dev/null 2>&1; then
+  # codesign absent (no Xcode CLT). Honor the fail-hard intent above: a missing
+  # signer would silently ship an unsigned bundle, so error out unless the
+  # operator explicitly opts into an unsigned build.
+  if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+    echo "==> warn: codesign not found; ROOST_ALLOW_UNSIGNED=1 set, shipping unsigned"
+  else
+    echo "error: codesign not found (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
+    exit 1
+  fi
+else
   if [ "${SIGN_IDENTITY}" = "-" ]; then
     echo "==> Ad-hoc codesign (set ROOST_DEVELOPER_ID_IDENTITY for a notarizable build)"
   else
@@ -224,8 +236,6 @@ if command -v codesign >/dev/null 2>&1 && [ -f "${ENT_FILE}" ]; then
   }
   codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl"
   codesign_or_die "${APP_DIR}"
-elif [ ! -f "${ENT_FILE}" ]; then
-  echo "==> No entitlements file at ${ENT_FILE}; skipping codesign"
 fi
 
 echo "==> Bundled: ${APP_DIR}"
