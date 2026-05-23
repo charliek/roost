@@ -70,6 +70,16 @@ final class TabSession {
     private var outputDrainTask: Task<Void, Never>?
     private var keystrokeContinuation: AsyncStream<PtyClientEvent>.Continuation?
 
+    /// True when this TabSession is *attached* to a tab opened by
+    /// another client (e.g. `roostctl tab open` over IPC) rather
+    /// than spawned from the UI's own `openNewTab`. `close()`
+    /// then skips the `closeShellTab` RPC so quitting the UI
+    /// doesn't silently kill an externally-spawned shell. The
+    /// attaching caller (`App.swift::handleEvent`'s
+    /// `.tabOpened` arm) is responsible for whatever close
+    /// semantics it wants.
+    private var skipCloseRPC: Bool = false
+
     /// Last cols/rows we sent through `runShellSession`'s resize
     /// channel. Used to deduplicate resize events that fall within
     /// a single live-resize gesture (NSView `setFrameSize` can fire
@@ -186,6 +196,69 @@ final class TabSession {
         }
     }
 
+    /// Attach to a workspace tab that was opened by a different
+    /// client (e.g. `roostctl tab open` over IPC). Mirrors
+    /// `start()` but skips the `LocalClient.openTab` call — the
+    /// workspace tab + supervisor PTY already exist, and we just
+    /// plug a TerminalView in front of the running session.
+    ///
+    /// `tabID` is pre-known (came from the `.tabOpened` event).
+    /// `closeOwnedByExternal` controls whether tearing down this
+    /// TabSession also closes the workspace tab: pass `false` for
+    /// externally-opened tabs so e.g. quitting the UI doesn't
+    /// silently kill `roostctl`-spawned shells.
+    func attach(
+        socketPath: String,
+        tabID: Int64,
+        closeOwnedByExternal: Bool = true
+    ) {
+        self.id = tabID
+        let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
+        let (output, oCont) = AsyncStream<Data>.makeStream()
+        self.keystrokeContinuation = kCont
+        self.skipCloseRPC = closeOwnedByExternal
+
+        terminalView.onKey = { [weak self] data in
+            self?.keystrokeContinuation?.yield(.input(data))
+        }
+        terminalView.onResize = { [weak self] cols, rows in
+            self?.resize(cols: cols, rows: rows)
+        }
+        let socket = socketPath
+        terminalView.onOsc = { [weak self] cmd, payload in
+            guard let self, let tabID = self.id else { return }
+            Task.detached {
+                await reportOsc(
+                    socketPath: socket,
+                    tabID: tabID,
+                    oscCommand: cmd,
+                    payload: payload
+                )
+            }
+        }
+
+        outputDrainTask = Task { @MainActor [weak self] in
+            for await chunk in output {
+                self?.terminalView.appendBytes(chunk)
+            }
+        }
+
+        let cols = self.initialCols
+        let rows = self.initialRows
+        sessionTask = Task {
+            await attachShellSession(
+                socketPath: socketPath,
+                tabID: tabID,
+                cols: cols,
+                rows: rows,
+                keystrokes: keystrokes
+            ) { data in
+                oCont.yield(data)
+            }
+            oCont.finish()
+        }
+    }
+
     /// Tear down the session. Closes the keystroke stream (which
     /// ends `runShellSession`'s writer loop), cancels the session
     /// task, and fires a best-effort `closeShellTab` if we know
@@ -198,10 +271,17 @@ final class TabSession {
         sessionTask = nil
         outputDrainTask?.cancel()
         outputDrainTask = nil
+        let skipRPC = skipCloseRPC
         if let id = self.id {
             self.id = nil
-            Task.detached {
-                await closeShellTab(socketPath: socketPath, tabID: id)
+            // For externally-opened tabs (`skipCloseRPC == true`),
+            // don't fire the LocalClient.closeTab RPC — the
+            // opening client (`roostctl`, Claude hook) owns the
+            // tab's lifetime. We just detach the UI view.
+            if !skipRPC {
+                Task.detached {
+                    await closeShellTab(socketPath: socketPath, tabID: id)
+                }
             }
         }
     }

@@ -20,6 +20,7 @@
 // Workspace becomes the source of truth and the daemon goes
 // quiet.
 
+import Darwin
 import Foundation
 
 @MainActor
@@ -50,7 +51,22 @@ final class RoostBackend {
     /// the M6 stale-socket recovery is safe (no live writer can
     /// race the unlink); without it, `EADDRINUSE` surfaces as
     /// `.alreadyBound` so we don't steal someone else's socket.
+    /// One-shot SIGPIPE-to-SIG_IGN installer. Without this, writing
+    /// to a Unix-domain socket whose peer has closed its end
+    /// raises SIGPIPE and terminates the process. The IPC server's
+    /// `writeAll` already checks for `EPIPE` on Darwin.write
+    /// failures, so ignoring SIGPIPE leaves all error handling in
+    /// the user-space code path. CR-flagged on
+    /// `mac/Sources/Roost/IPCServer.swift:263`.
+    nonisolated(unsafe) private static var sigpipeInstalled = false
+    private static func ignoreSigpipe() {
+        guard !sigpipeInstalled else { return }
+        sigpipeInstalled = true
+        signal(SIGPIPE, SIG_IGN)
+    }
+
     func start(profile: BundleProfile, holdsSingleInstanceLock: Bool = false) {
+        Self.ignoreSigpipe()
         if started { return }
         started = true
         self.holdsSingleInstanceLock = holdsSingleInstanceLock

@@ -989,18 +989,43 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-        case .tabOpened, .active:
+        case .tabOpened(let e):
             // Cross-client `tab.open` (e.g. `roostctl tab open`)
-            // produces a workspace tab the UI doesn't yet hold a
-            // TabSession for. Surfacing it in the strip would
-            // require an "attach to existing tab" path through
-            // `TabSession.start` that skips `LocalClient.openTab`
-            // (since the workspace tab already exists) — that's
-            // separate-slice work. For now we drop the event.
-            // `.active` is workspace-driven active-selection: the
-            // UI's local active state is authoritative within the
-            // UI, so we drop this too.
-            NSLog("roost-mac: tab event ignored: %@", "\(kind)")
+            // produces a workspace tab we don't yet hold a
+            // TabSession for. Materialize one and attach it to
+            // the existing supervisor PTY so the tab shows up in
+            // the UI strip + OSC scanning runs against its
+            // output stream (matches the GTK side's auto-attach
+            // behavior). UI-driven `openNewTab` calls already
+            // inserted the matching TabSession before this event
+            // arrives; the dedupe check below prevents double
+            // attaches in that case.
+            let newTab = e.tab
+            if tabs.contains(where: { $0.id == newTab.id }) {
+                break
+            }
+            let session = TabSession(
+                projectID: newTab.projectID,
+                cols: 80,
+                rows: 24,
+                theme: activeTheme,
+                font: activeFont
+            )
+            session.liveTitle = newTab.title
+            session.liveCwd = newTab.cwd.isEmpty ? nil : newTab.cwd
+            tabs.append(session)
+            session.attach(socketPath: socketPath, tabID: newTab.id)
+            // If the new tab is in the currently-displayed
+            // project, refresh the strip so the user sees it.
+            if newTab.projectID == activeProjectID {
+                rebuildTabBar()
+            }
+            rebuildSidebar()
+        case .active:
+            // `.active` is workspace-driven active-selection;
+            // the UI's local active state is authoritative
+            // within the UI, so we drop this.
+            break
         case .tabTitle(let e):
             // Phase 6a P6: OSC 0/1/2 changed a tab's title. Mirror
             // into the matching TabSession so rebuildTabBar uses

@@ -234,6 +234,100 @@ private final class TabIDBox {
     var id: Int64?
 }
 
+/// Attach to a workspace tab that was opened by a *different*
+/// client (e.g. `roostctl tab open`) — the workspace + PTY
+/// already exist, so we skip the `openTab` call and just plug a
+/// keystroke/output pump into the running supervisor session.
+/// Mirrors `runShellSession` for everything *after* the open.
+///
+/// Returns when either the keystroke stream finishes or the
+/// supervisor's `tabExited` fires for this tab id. Unlike
+/// `runShellSession`, we do NOT call `localClient.closeTab` on
+/// exit — the tab's owner (whatever opened it) is responsible
+/// for the close, and tearing it down from the UI would surprise
+/// `roostctl` callers who expect their tab to outlive a UI
+/// inspection.
+func attachShellSession(
+    socketPath: String,
+    tabID: Int64,
+    cols: UInt16 = 80,
+    rows: UInt16 = 24,
+    keystrokes: AsyncStream<PtyClientEvent>,
+    onOutput: @escaping @Sendable (Data) -> Void
+) async {
+    // Set up the supervisor subscription synchronously on the
+    // main actor so we don't miss bytes between subscribe and
+    // the first drain iteration.
+    let setupResult: (UUID, AsyncStream<Void>, AsyncStream<Void>.Continuation)?
+    setupResult = await MainActor.run {
+        () -> (UUID, AsyncStream<Void>, AsyncStream<Void>.Continuation)? in
+        guard let supervisor = RoostBackend.shared.supervisor else { return nil }
+        // The tab must already exist in the supervisor (the
+        // cross-client `tab.open` IPC op went through the same
+        // LocalClient.openTab path on its way in, which spawned
+        // the PTY). If not, bail — the caller will have already
+        // logged the missing-tab case.
+        guard supervisor.has(tabID) else { return nil }
+
+        let (exitStream, exitCont) = AsyncStream<Void>.makeStream()
+        let token = supervisor.subscribe { event in
+            MainActor.assumeIsolated {
+                switch event {
+                case .bytes(let id, let data) where id == tabID:
+                    onOutput(data)
+                case .tabExited(let id, _) where id == tabID:
+                    exitCont.yield(())
+                    exitCont.finish()
+                default:
+                    break
+                }
+            }
+        }
+        return (token, exitStream, exitCont)
+    }
+
+    guard let (token, exitStream, exitContinuation) = setupResult else {
+        return
+    }
+
+    // Wire the initial size to the existing PTY in case the
+    // attaching UI's cell grid differs from whatever the tab was
+    // opened with.
+    await MainActor.run {
+        try? RoostBackend.shared.localClient?.resizeTab(tabID, cols: cols, rows: rows)
+    }
+
+    await withTaskGroup(of: Void.self) { group in
+        group.addTask {
+            for await _ in exitStream { return }
+        }
+        group.addTask {
+            for await event in keystrokes {
+                await MainActor.run {
+                    guard let localClient = RoostBackend.shared.localClient else { return }
+                    do {
+                        switch event {
+                        case .input(let data):
+                            _ = try localClient.writeTab(tabID, data: data)
+                        case .resize(let cols, let rows):
+                            try localClient.resizeTab(tabID, cols: cols, rows: rows)
+                        }
+                    } catch {
+                        RoostLogger.shared.warn("attached pty event failed (tab \(tabID)): \(error)")
+                    }
+                }
+            }
+            exitContinuation.finish()
+        }
+        _ = await group.next()
+        group.cancelAll()
+    }
+
+    await MainActor.run {
+        RoostBackend.shared.supervisor?.unsubscribe(token: token)
+    }
+}
+
 /// Best-effort tab close. Used when the UI closes a tab so the
 /// supervisor reaps the child immediately rather than waiting for
 /// the keystroke stream to drain. In-process this is a direct

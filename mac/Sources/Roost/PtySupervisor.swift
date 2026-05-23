@@ -309,9 +309,12 @@ final class PtySupervisor {
     /// Write `data` to the tab's PTY. Caller is on the main
     /// actor; the actual `write(2)` is short-blocking but the
     /// dispatch through this method preserves ordering.
-    /// Throws on negative `write(2)` return — CR-flagged that
-    /// the prior version returned -1 as a signed byte count and
-    /// hid IO errors.
+    ///
+    /// Loops on partial writes + retries on `EINTR`. Throws on
+    /// any other negative `write(2)` return (the previous
+    /// single-call version returned -1 as a signed byte count
+    /// and hid IO errors, and dropped tail bytes on partial
+    /// writes — both CR-flagged).
     @discardableResult
     func write(tabID: Int64, data: Data) throws -> Int {
         guard let session = sessions[tabID] else {
@@ -319,14 +322,28 @@ final class PtySupervisor {
         }
         if data.isEmpty { return 0 }
         let masterFD = session.masterFD
-        let result: Int = data.withUnsafeBytes { raw -> Int in
-            guard let p = raw.baseAddress else { return 0 }
-            return Darwin.write(masterFD, p, raw.count)
+        let total = data.count
+        let written: Int = try data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            var offset = 0
+            while offset < total {
+                let remaining = total - offset
+                let n = Darwin.write(masterFD, base.advanced(by: offset), remaining)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    throw PtyError.writeFailed(tabID: tabID, errno: errno)
+                }
+                if n == 0 {
+                    // 0 from write() on a PTY master fd is
+                    // unusual; treat as a writer disconnect
+                    // (peer closed slave) rather than spinning.
+                    break
+                }
+                offset += n
+            }
+            return offset
         }
-        if result < 0 {
-            throw PtyError.writeFailed(tabID: tabID, errno: errno)
-        }
-        return result
+        return written
     }
 
     func resize(tabID: Int64, cols: UInt16, rows: UInt16) throws {

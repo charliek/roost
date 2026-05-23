@@ -184,6 +184,15 @@ struct IPCRequest: Codable, Sendable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Reject unknown top-level keys to match the Rust side's
+        // `#[serde(deny_unknown_fields)]` on `RawRequest`. Without
+        // this check, a malformed client could pass on macOS and
+        // fail on the Rust side for the same request — the kind
+        // of cross-platform skew CR flagged. The op-specific
+        // params struct already gets the same treatment via
+        // `IPCHandlerImpl.decodeParams(expected:)`.
+        let allowed: Set<String> = ["id", "op", "params"]
+        try Self.rejectUnknownKeys(in: c, allowed: allowed)
         self.id = try decodeStringInt64(c, .id)
         self.op = try c.decode(String.self, forKey: .op)
         self.params = try c.decodeIfPresent(AnyCodable.self, forKey: .params)
@@ -194,6 +203,23 @@ struct IPCRequest: Codable, Sendable {
         try encodeStringInt64(&c, .id, id)
         try c.encode(op, forKey: .op)
         try c.encodeIfPresent(params, forKey: .params)
+    }
+
+    private static func rejectUnknownKeys(
+        in container: KeyedDecodingContainer<CodingKeys>,
+        allowed: Set<String>
+    ) throws {
+        let present = Set(container.allKeys.map(\.stringValue))
+        let unknown = present.subtracting(allowed)
+        if !unknown.isEmpty {
+            let joined = unknown.sorted().joined(separator: ", ")
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "unknown request fields: \(joined)"
+                )
+            )
+        }
     }
 }
 
