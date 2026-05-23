@@ -50,6 +50,35 @@ mod ffi {
 
         println!("cargo:rerun-if-changed={}", header.display());
         println!("cargo:rerun-if-changed={}", lib_archive.display());
+
+        // Two link directives because they serve different
+        // consumers:
+        //
+        // 1. `rustc-link-arg=<full path to libghostty-vt.a>` is
+        //    consumed ONLY by `roost-vt`'s own artifacts (its
+        //    tests + any roost-vt-direct binaries). Forces the
+        //    test binary to link the static archive even though
+        //    macOS `ld` would otherwise prefer the sibling
+        //    `libghostty-vt.dylib` in `<out>/lib/` when both
+        //    are in the search path. Without this, `cargo test
+        //    -p roost-vt --features ffi` produced a binary
+        //    referencing `@rpath/libghostty-vt.dylib` that
+        //    failed at runtime with `Library not loaded` (GitHub
+        //    issue #81 tracks the prior breakage).
+        //
+        // 2. `rustc-link-lib=static=ghostty-vt` (paired with the
+        //    link-search line below) is the standard form that
+        //    propagates downstream — `roost-linux`'s binary
+        //    inherits this directive and links libghostty-vt
+        //    into its own final image. macOS `ld` treats
+        //    `static=` as a no-op flag (`-Bstatic/-Bdynamic`
+        //    are GNU extensions), but the `-lghostty-vt` it
+        //    emits + the search path is enough for downstream
+        //    binaries to pick up the archive. The Mac Swift
+        //    UI uses a parallel positional-archive trick on
+        //    its `linkerSettings`; documented in
+        //    `mac/Package.swift`.
+        println!("cargo:rustc-link-arg={}", lib_archive.display());
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
         println!("cargo:rustc-link-lib=static=ghostty-vt");
 

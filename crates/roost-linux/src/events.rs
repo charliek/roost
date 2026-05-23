@@ -1,46 +1,38 @@
-//! WatchEvents → GTK bridge.
+//! Workspace event → GTK bridge.
 //!
-//! Subscribes to the daemon's server-streaming `WatchEvents` RPC on
-//! a tokio task and pushes each event into an unbounded channel that
-//! the GTK main loop drains via `glib::spawn_future_local`. Mirrors
-//! `mac/Sources/Roost/RoostClient.swift::watchEvents` 1:1.
+//! Daemon-removal refactor M3b: replaces the gRPC `WatchEvents` stream
+//! with an in-process subscription to [`crate::daemon::Workspace`]'s
+//! broadcast channel. Events flow to the GTK main loop via an
+//! unbounded mpsc channel that `glib::spawn_future_local` drains.
 
-use anyhow::Context;
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
-use tonic::Request;
 
-use roost_proto::v1::{Event, WatchEventsRequest};
+use roost_linux::daemon::{Workspace, WorkspaceEvent};
 
-use crate::client::RoostClient;
+pub type EventSender = mpsc::UnboundedSender<WorkspaceEvent>;
+#[allow(dead_code)]
+pub type EventReceiver = mpsc::UnboundedReceiver<WorkspaceEvent>;
 
-pub type EventSender = mpsc::UnboundedSender<Event>;
-#[allow(dead_code)] // re-surfaces if the App ever owns the receiver directly.
-pub type EventReceiver = mpsc::UnboundedReceiver<Event>;
-
-/// Open a `WatchEvents` server-stream and forward every event into
-/// `tx`. Returns Ok once the stream ends naturally (daemon shutdown)
-/// or an Err on transport / stream errors so the caller can log +
-/// optionally retry.
-pub async fn subscribe(client: &mut RoostClient, tx: EventSender) -> anyhow::Result<()> {
-    let mut stream = client
-        .inner()
-        .watch_events(Request::new(WatchEventsRequest { tab_id_filter: 0 }))
-        .await
-        .context("WatchEvents RPC failed")?
-        .into_inner();
-
-    while let Some(msg) = stream.message().await.transpose() {
-        match msg {
+/// Subscribe to `workspace`'s broadcast and forward each event into
+/// `tx`. Returns Ok when the broadcast closes (workspace dropped) or
+/// the receiver is dropped. Logs and continues on `Lagged`.
+pub async fn subscribe(workspace: Arc<Workspace>, tx: EventSender) -> Result<()> {
+    let mut rx = workspace.subscribe();
+    loop {
+        match rx.recv().await {
             Ok(event) => {
                 if tx.send(event).is_err() {
-                    // GTK side dropped the receiver — stop draining.
                     return Ok(());
                 }
             }
-            Err(status) => {
-                anyhow::bail!("watch_events stream error: {status}");
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!(dropped = n, "workspace event subscriber lagged");
             }
+            Err(RecvError::Closed) => return Ok(()),
         }
     }
-    Ok(())
 }

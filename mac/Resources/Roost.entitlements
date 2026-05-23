@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+    Hardened-runtime entitlements for Roost.app.
+
+    Effective when the bundle is code-signed (ad-hoc or Developer
+    ID). The M8-era bundle.sh signs ad-hoc with the `runtime`
+    option; Phase 8 adds Developer ID + notarization on top.
+
+    File is intentionally a near-empty plist: Roost doesn't need
+    additional capabilities beyond what the hardened runtime
+    grants by default for a forkpty-spawning AppKit app.
+
+    What we INTENTIONALLY do not need:
+
+    * `cs.disable-library-validation` — would only be needed if
+      we `dlopen`-ed third-party signed dylibs (e.g. plugins
+      signed by another team-id). We don't. The embedded
+      `roostctl` is exec'd (forkpty path → execve), and execve
+      is governed by Gatekeeper / quarantine, not library
+      validation. Sub-agent review flagged the earlier inclusion
+      of this entitlement here as based on a misreading of the
+      docs.
+
+    * `cs.allow-unsigned-executable-memory` / `cs.allow-jit` —
+      libghostty-vt is linked as a static archive (its code is
+      part of Roost's own signed image), no JIT, no dynamically
+      generated machine code at runtime. Add `allow-jit` only if
+      a future Ghostty bump introduces a JIT path (e.g. font
+      shaping via SIMD codegen).
+
+    * `network.client` / `network.server` — Roost does not speak
+      over a network socket. The IPC server is UNIX-domain only.
+
+    * App Sandbox flags — sandboxing the shells Roost spawns
+      would defeat the product. cmux makes the same choice.
+
+    If a future change requires a real entitlement, drop the
+    intentional-emptiness comment block and add it.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

@@ -41,10 +41,13 @@ jobs:
       github.event_name == 'push' ||
       startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
       startsWith(github.head_ref, 'feature/rust-port') ||
-      startsWith(github.head_ref, 'polish/')
+      startsWith(github.head_ref, 'polish/') ||
+      startsWith(github.head_ref, 'refactor/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Install protoc
         run: |
@@ -52,10 +55,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -68,12 +71,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        # Phase 2 latitude: clippy still informational while crates settle.
-        # Flip continue-on-error off at Phase 3 exit (roost-core MVP working).
         # `--exclude roost-linux` because that crate needs GTK4 +
         # libadwaita installed — handled by the dedicated `gtk-build`
-        # job (Phase 6a M8) instead of bloating this lint runner.
-        continue-on-error: true
+        # job instead of bloating this lint runner with the GTK
+        # toolchain. roost-linux's clippy lives in the gtk-build job.
         run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 
   rust-build:
@@ -81,14 +82,17 @@ jobs:
       github.event_name == 'push' ||
       startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
       startsWith(github.head_ref, 'feature/rust-port') ||
-      startsWith(github.head_ref, 'polish/')
+      startsWith(github.head_ref, 'polish/') ||
+      startsWith(github.head_ref, 'refactor/')
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Install protoc + libclang (Linux)
         if: runner.os == 'Linux'
@@ -104,16 +108,16 @@ jobs:
         run: brew install protobuf
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
 
       - name: Cache vendored libghostty-vt
         # Keyed on the build script + the SHA pin inside it. A bump to
         # third_party/ghostty/build.sh invalidates and rebuilds — same
         # discipline as the legacy build/build.sh cache in ci.yml.
         id: cache-ghostty
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             third_party/ghostty/out
@@ -125,7 +129,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -139,25 +143,14 @@ jobs:
         # build does not consume libghostty-vt. Keeps the non-ffi
         # workspace green even if the Ghostty build itself bit-rots.
         # `--exclude roost-linux` because that crate needs GTK4 +
-        # libadwaita installed — the dedicated `gtk-build` job
-        # (Phase 6a M8) does the GTK build separately so the
-        # default-features path stays toolchain-cheap.
+        # libadwaita installed; the dedicated `gtk-build` job does
+        # the GTK build separately.
         run: cargo build --workspace --exclude roost-linux --all-targets
 
       - name: cargo build (roost-vt with ffi)
-        # Time-boxed exception. `continue-on-error` lifts when the FFI
-        # surface stabilises (Phase 5 step 3 exit). Today the smoke
-        # exercises ghostty_terminal_new + write + free; bindgen field
-        # names may differ slightly from my best-guess at the C struct
-        # layout, in which case CI surfaces the exact compile error.
-        continue-on-error: true
+        # Smoke build of the libghostty-vt-linked variant. Pinned
+        # Ghostty SHA in third_party/ghostty/build.sh.
         run: cargo build -p roost-vt --features ffi
-
-      - name: cargo test (roost-vt ffi smoke)
-        # Same time-boxed exception as the ffi build above. Lifts at
-        # Phase 5 step 3 exit.
-        continue-on-error: true
-        run: cargo test -p roost-vt --features ffi -- --nocapture
 
       - name: cargo test
         # Required-green: the workspace test suite gates every commit.
@@ -171,21 +164,18 @@ jobs:
       github.event_name == 'push' ||
       startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
       startsWith(github.head_ref, 'feature/rust-port') ||
-      startsWith(github.head_ref, 'polish/')
+      startsWith(github.head_ref, 'polish/') ||
+      startsWith(github.head_ref, 'refactor/')
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Show Swift toolchain
         run: swift --version
 
-      - name: Install protoc
-        # GRPCProtobufGenerator's deriveProtocPath() needs a real protoc
-        # binary to run — the SwiftPM-bundled tooling produces only
-        # protoc-gen-swift / protoc-gen-grpc-swift-2 (the plugin half).
-        run: brew install protobuf
-
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
 
       - name: Cache vendored libghostty-vt
         # Same shape (and same key) as the rust-build matrix's cache:
@@ -193,7 +183,7 @@ jobs:
         # would still be a hit. SHA pin lives in build.sh, hashFiles
         # invalidates on any bump.
         id: cache-ghostty
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             third_party/ghostty/out
@@ -210,13 +200,27 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache SwiftPM artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             mac/.build
             ~/Library/Caches/org.swift.swiftpm
           key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
           restore-keys: swiftpm-${{ runner.os }}-
+
+      - name: Cache cargo registry + target (for embedded roost-cli build)
+        # M8: bundle.sh embeds `target/release/roostctl` under
+        # `Roost.app/Contents/Resources/bin/`. Cache the registry +
+        # target dir keyed on the workspace Cargo.toml so consecutive
+        # PRs don't re-resolve + re-compile from scratch.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-swiftmac-
 
       # Required-green from this commit on. `continue-on-error: true`
       # was masking real coordinate breakage in Package.swift (the
@@ -227,18 +231,9 @@ jobs:
       # steps that may need their own time-boxing when they land, but
       # baseline `swift build` + `swift test` should always be blocking
       # — they're the cross-platform contract on the Mac side.
-      #
-      # PROTOC_PATH is honored by GRPCProtobufGenerator's discovery
-      # function (PluginsShared/PluginUtils.swift::deriveProtocPath) when
-      # the plugin can't find protoc via SwiftPM's tool registry —
-      # which is the case for any system-installed protoc since SwiftPM
-      # only resolves tools that are package-graph products or binary
-      # targets. We point it at whatever `brew install protobuf` put on
-      # PATH so this works on both arm64 (/opt/homebrew/bin) and Intel
-      # (/usr/local/bin) macOS runners.
       - name: swift build
         working-directory: mac
-        run: PROTOC_PATH="$(which protoc)" swift build -v
+        run: swift build -v
 
       # Mirrors the macOS regression guard in ci.yml for the legacy Go
       # binary: zig's libghostty-vt build emits both a static archive
@@ -259,84 +254,25 @@ jobs:
             fi
           done
 
-      # Live-daemon regression guard. Without this, the gRPC layer
-      # between grpc-swift-nio-transport and tonic was silently broken
-      # over UDS for the entire Phase 5 series — the `:authority`
-      # pseudo-header defaulted to the socket path, tonic's h2 layer
-      # RST_STREAM'd every RPC with PROTOCOL_ERROR, and no test
-      # caught it because nothing dialed a real daemon. `swift test`
-      # alone covers compile-time / packaging regressions; this step
-      # adds the end-to-end gRPC round-trip the unit tests can't.
-      #
-      # Tools cargo + Rust here use the toolchain pinned in
-      # rust-toolchain.toml (same as the rust-build job) so the
-      # daemon binary built for this step matches what users run.
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Cache cargo registry + target (shared with rust-build)
-        # Same key as rust-build's macos-latest cache so the daemon
-        # binary is usually already compiled by the time we get here.
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Build roost-core for live-daemon test
-        run: cargo build -p roost-core
-
-      - name: Start roost-core (live-daemon test backend)
-        # Backgrounded so the next step can dial it. We use a
-        # workflow-scoped tempdir under the runner's home so the
-        # cleanup step can blow it away without touching anything
-        # else, and a per-run socket name so reruns on the same
-        # runner don't collide.
-        run: |
-          mkdir -p "$HOME/roost-live-test"
-          SOCKET="$HOME/roost-live-test/roost.sock"
-          DB="$HOME/roost-live-test/roost.db"
-          nohup target/debug/roost-core --socket "$SOCKET" --db "$DB" \
-            > "$HOME/roost-live-test/daemon.log" 2>&1 &
-          echo "DAEMON_PID=$!" >> "$GITHUB_ENV"
-          echo "ROOST_LIVE_TEST_SOCKET=$SOCKET" >> "$GITHUB_ENV"
-          for i in $(seq 1 30); do
-            if [ -S "$SOCKET" ]; then
-              echo "daemon socket ready at $SOCKET"
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "FAIL: daemon socket never appeared at $SOCKET"
-          cat "$HOME/roost-live-test/daemon.log" || true
-          exit 1
-
       - name: swift test
         working-directory: mac
-        # ROOST_LIVE_TEST_SOCKET enables the liveIdentifyAgainstDaemon
-        # test in RoostTests; absent that env var the test is a no-op
-        # so local `swift test` runs (no daemon up) still pass.
-        run: PROTOC_PATH="$(which protoc)" swift test
+        run: swift test
 
-      - name: Stop roost-core
-        if: always()
-        # always() so a swift-test failure still tears the daemon
-        # down — leaving it running can break a re-run on the same
-        # self-hosted runner.
+      # M8: produce the bundled .app with the embedded roostctl
+      # under Contents/Resources/bin/. This is the artifact the
+      # Phase 8 notarization step will operate on, so we want CI
+      # to keep producing one on every PR — drift here is the
+      # kind that only shows up at release time otherwise.
+      - name: bundle .app (release) + embed roostctl
+        run: ./mac/scripts/bundle.sh release
+
+      - name: Verify embedded roostctl
         run: |
-          if [ -n "${DAEMON_PID:-}" ]; then
-            kill "$DAEMON_PID" 2>/dev/null || true
-            wait "$DAEMON_PID" 2>/dev/null || true
-          fi
-          # Dump the daemon log unconditionally for diagnosis. Cheap,
-          # and the only signal we have when the live test fails.
-          if [ -f "$HOME/roost-live-test/daemon.log" ]; then
-            echo "--- daemon log ---"
-            cat "$HOME/roost-live-test/daemon.log"
-          fi
+          set -euo pipefail
+          BIN="mac/build/Roost.app/Contents/Resources/bin/roostctl"
+          test -x "$BIN" || { echo "FAIL: $BIN not embedded"; exit 1; }
+          "$BIN" --version
+          codesign -dvv "$BIN" 2>&1 | grep -E 'adhoc|Format=' || true
 
   # Phase 6a M8: gtk4-rs + libadwaita-rs build. Lives in
   # crates/roost-linux/, excluded from `default-members` in
@@ -352,14 +288,17 @@ jobs:
       github.event_name == 'push' ||
       startsWith(github.head_ref, 'claude/discuss-architecture-refactor-') ||
       startsWith(github.head_ref, 'feature/rust-port') ||
-      startsWith(github.head_ref, 'polish/')
+      startsWith(github.head_ref, 'polish/') ||
+      startsWith(github.head_ref, 'refactor/')
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Install GTK4 + libadwaita (Linux)
         if: runner.os == 'Linux'
@@ -381,9 +320,9 @@ jobs:
           echo "PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
 
       - name: Cache vendored libghostty-vt
         # Phase 7 commit 2 makes roost-linux depend on
@@ -392,7 +331,7 @@ jobs:
         # rust-build + swift-mac so we share the build artifact across
         # the matrix (rust-build runs first on the same SHA).
         id: cache-ghostty
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             third_party/ghostty/out
@@ -404,7 +343,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target (shared with rust-build)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry

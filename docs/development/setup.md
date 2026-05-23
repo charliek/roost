@@ -2,7 +2,7 @@
 
 Roost has two active development surfaces on the `feature/rust-port` branch:
 
-1. The Rust workspace at `crates/` (daemon `roost-core`, CLI `roost-cli-rs`, Linux UI `roost-linux`, plus shared crates).
+1. The Rust workspace at `crates/` (`roost-ipc`, `roost-vt`, `roost-osc`, `roost-cli`, `roost-linux`).
 2. The Swift package at `mac/` (the macOS UI, `Roost.app`).
 
 Both link the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`. For iterating on the legacy Go binary still shipping from `main`, see [Legacy → Development setup](../reference/legacy-go/development-setup.md).
@@ -13,8 +13,7 @@ Both link the same vendored `libghostty-vt` static archive built from `third_par
 |---|---|
 | `mise` | Provisions Rust 1.85.0 + Zig 0.15.x at the pinned versions |
 | Xcode Command Line Tools | Builds the Mac UI (SwiftPM) |
-| GTK4 + libadwaita dev packages | Builds the Linux UI (Linux only) |
-| `protoc` | Generates Rust + Swift bindings from `proto/roost.proto` |
+| GTK4 + libadwaita dev packages | Builds the Linux UI (Linux + macOS dev) |
 | `uv` | Builds the documentation site |
 
 See [Installation](../getting-started/installation.md) for the per-platform package commands.
@@ -26,9 +25,8 @@ git clone https://github.com/charliek/roost.git
 cd roost
 mise install                           # Rust + Zig
 ./third_party/ghostty/build.sh         # libghostty-vt — only needs Zig
-~/.cargo/bin/cargo build --workspace   # all crates except roost-linux
-~/.cargo/bin/cargo build -p roost-linux  # opt in once GTK is installed
-PROTOC_PATH=$(which protoc) ./mac/scripts/bundle.sh debug
+~/.cargo/bin/cargo build --workspace   # all Rust crates
+./mac/scripts/bundle.sh debug          # macOS .app bundle
 ```
 
 `third_party/ghostty/build.sh` is the only step that needs Zig. After it finishes, normal Rust + Swift workflows work without invoking Zig again.
@@ -37,17 +35,24 @@ PROTOC_PATH=$(which protoc) ./mac/scripts/bundle.sh debug
 
 | Goal | Command |
 |---|---|
-| Rebuild + run the daemon | `~/.cargo/bin/cargo run -p roost-core` |
 | Run the Linux UI | `~/.cargo/bin/cargo run -p roost-linux` |
-| Run the Mac UI | `PROTOC_PATH=$(which protoc) ./mac/scripts/bundle.sh debug && open mac/build/Roost.app` |
-| Smoke-test the CLI | `~/.cargo/bin/cargo run -p roost-cli-rs -- identify` |
-| Rust unit tests | `~/.cargo/bin/cargo test --workspace` |
-| Mac unit tests | `cd mac && PROTOC_PATH=$(which protoc) swift test` |
+| Run the Mac UI | `./mac/scripts/bundle.sh debug && open mac/build/Roost.app` |
+| Smoke-test the CLI | `~/.cargo/bin/cargo run -p roost-cli -- identify` |
+| Rust unit tests | `~/.cargo/bin/cargo test --workspace --exclude roost-linux` |
+| Linux UI tests | `~/.cargo/bin/cargo test -p roost-linux` (needs GTK) |
+| Mac unit tests | `cd mac && swift test` |
 | Rust formatting | `~/.cargo/bin/cargo fmt --all` |
 | Rust lint | `~/.cargo/bin/cargo clippy --workspace --all-targets` |
 | Build the docs site | `make docs` (or `make docs-serve` for live-reload at `http://127.0.0.1:7070`) |
 
-The daemon socket lives at `~/Library/Caches/roost/roost.sock` on macOS and `$XDG_RUNTIME_DIR/roost/roost.sock` on Linux. The daemon log is written via `tracing-appender` to `/private/tmp/roost-core.log` on macOS (verify with `lsof -p $(pgrep -f roost-core) | grep log` when in doubt).
+The IPC sockets live at:
+
+| OS | Mac UI socket | Linux UI socket |
+|---|---|---|
+| macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` |
+| Linux | n/a | `$XDG_RUNTIME_DIR/roost-gtk/roost.sock` (falls back to `$HOME/.local/state/roost-gtk/` if unset) |
+
+The UI's log file is `~/Library/Logs/Roost/roost.log` (Mac) and `$XDG_STATE_HOME/roost-gtk/roost.log` (Linux). `roostctl --help` and `docs/reference/ipc.md` document the wire surface.
 
 ## Tests
 
@@ -55,12 +60,13 @@ Rust tests live next to the code they exercise. Major coverage:
 
 | Crate | What's covered |
 |---|---|
-| `roost-common` | Path resolution, socket discovery |
+| `roost-ipc` | Frame reader/writer, JSON wire vectors, target selection (probe alive + env precedence) |
 | `roost-osc` | OSC 9 / 777 streaming parser, ST terminator, hook suppression |
-| `roost-core` | Workspace event emission, reorder math, rollup priority, hook-active state |
-| `roost-vt` | FFI smoke tests against the vendored `libghostty-vt` archive |
+| `roost-vt` | FFI smoke tests against the vendored `libghostty-vt` archive (gated on `--features ffi`) |
+| `roost-linux` | Workspace state machine, PTY supervisor, IPC dispatch, single-instance flock |
+| `roost-cli` | Escape decoder, shell quoter, target arg mapping |
 
-Mac tests are under `mac/Tests/RoostTests/`; they cover the renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).
+Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state machine, PTY supervisor lifecycle, IPC server framing, single-instance flock, renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).
 
 ## Documentation site
 
@@ -94,5 +100,5 @@ The full set is in `CLAUDE.md` at the repo root. Highlights:
 - Concrete types until duplication forces an interface — no premature `Manager` / `Coordinator` abstractions.
 - Errors are returned, not logged-and-swallowed. Log at the boundary that handles them.
 - Default to no comments. Add one when the *why* is non-obvious (a hidden constraint, a workaround, a tricky invariant).
-- UI calls happen on the main thread; background work marshals via `glib.IdleAdd` (Linux) or `DispatchQueue.main` / `@MainActor` (macOS).
-- The proto schema is the durable boundary — change `proto/roost.proto` first, regenerate, then change the consumers.
+- UI calls happen on the main thread; background work marshals via `glib::idle_add` (Linux) or `DispatchQueue.main` / `@MainActor` (macOS).
+- The JSON IPC schema is the durable boundary — change `crates/roost-ipc/src/messages.rs`, update vectors under `tests/ipc-vectors/`, and bump the Swift mirror in `mac/Sources/Roost/IPCMessages.swift` in the same commit.

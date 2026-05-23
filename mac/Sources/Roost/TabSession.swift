@@ -1,47 +1,49 @@
 // One terminal tab in the Mac UI.
 //
-// Phase 6a step 1: per-tab state lives here so the window can hold
-// many of these and swap which one's `terminalView` is visible.
+// Per-tab state lives here so the window can hold many of these and
+// swap which one's `terminalView` is visible.
 //
 // Each TabSession owns:
 //   * A `TerminalView` (the libghostty-vt-backed renderer + key
 //     responder for this tab).
-//   * A long-running gRPC `StreamPty` task driven by
-//     `runShellSession`. Output drains onto the main actor and
-//     into the view; keystrokes captured by `TerminalView.keyDown`
-//     flow back out via the keystroke `AsyncStream`.
-//   * The daemon-assigned tab id, populated asynchronously once
-//     `OpenTab` returns. `id` is `nil` between session start and
-//     the daemon's reply; closing during that window can't issue
-//     a `CloseTab` RPC, but the daemon will reap the PTY when our
-//     StreamPty stream ends regardless.
+//   * A long-running `Task` driven by `runShellSession`. Output
+//     drains onto the main actor and into the view; keystrokes
+//     captured by `TerminalView.keyDown` flow back out via the
+//     keystroke `AsyncStream`.
+//   * The workspace-assigned tab id, populated asynchronously once
+//     `LocalClient.openTab` returns. `id` is `nil` between session
+//     start and that reply; closing during that window can't fire
+//     `closeShellTab`, but the supervisor's drain task tears the
+//     PTY down regardless when the keystroke stream finishes.
 //
 // Threading: the session is constructed and torn down on the main
-// actor. The two AsyncStreams bridge across the gRPC background
-// task — the same pattern documented in `RoostApp.startShellSession`
-// before the multi-tab refactor: nothing non-Sendable crosses the
-// boundary because both stream continuations are themselves Sendable.
+// actor. The two AsyncStreams bridge across the supervisor's
+// background DispatchSourceRead queue and the main actor — both
+// stream continuations are themselves Sendable so nothing
+// non-Sendable crosses the boundary.
 
 import AppKit
 import Foundation
 
 @MainActor
 final class TabSession {
-    /// Initial cell-grid size used to spawn the daemon-side PTY. The
+    /// Initial cell-grid size used to spawn the PTY. The
     /// live grid follows `terminalView.cols / rows`, which update on
     /// window resize (Phase 6a M3 / step 2g).
     let initialCols: UInt16
     let initialRows: UInt16
     let terminalView: TerminalView
 
-    /// Daemon-assigned tab id. `nil` until `OpenTab` returns; the
-    /// `onIDAssigned` callback passed to `start` fires once it's set.
+    /// Workspace-assigned tab id. `nil` until `LocalClient.openTab`
+    /// returns; the `onIDAssigned` callback passed to `start` fires
+    /// once it's set.
     private(set) var id: Int64?
 
-    /// Live tab metadata mirrored from `TabTitleChangedEvent` /
-    /// `TabCwdChangedEvent` / `TabStateChangedEvent` (Phase 6a P6).
-    /// `nil` when the daemon hasn't emitted yet; the tab pill
-    /// falls back to "Tab N" labels until cwd / title arrive.
+    /// Live tab metadata mirrored from `RoostEvent.tabTitle` /
+    /// `RoostEvent.tabCwd` / `RoostEvent.tabState` (which the
+    /// `Workspace.subscribe` bridge produces). `nil` when no event
+    /// has fired yet; the tab pill falls back to "Tab N" labels
+    /// until cwd / title arrive.
     var liveTitle: String?
     var liveCwd: String?
     var liveState: Int32?
@@ -61,17 +63,28 @@ final class TabSession {
 
     /// Project the tab belongs to. Set at construction so the window
     /// can filter tabs by project before `start()` ever runs — the
-    /// daemon enforces the same id on `OpenTab`.
+    /// workspace enforces the same id on `openTab`.
     let projectID: Int64
 
     private var sessionTask: Task<Void, Never>?
     private var outputDrainTask: Task<Void, Never>?
     private var keystrokeContinuation: AsyncStream<PtyClientEvent>.Continuation?
 
-    /// Last cols/rows we sent to the daemon. Used to deduplicate
-    /// resize events that fall within a single live-resize gesture
-    /// (NSView `setFrameSize` can fire dozens of times for one
-    /// drag, but the grid metric is stable in chunks).
+    /// True when this TabSession is *attached* to a tab opened by
+    /// another client (e.g. `roostctl tab open` over IPC) rather
+    /// than spawned from the UI's own `openNewTab`. `close()`
+    /// then skips the `closeShellTab` RPC so quitting the UI
+    /// doesn't silently kill an externally-spawned shell. The
+    /// attaching caller (`App.swift::handleEvent`'s
+    /// `.tabOpened` arm) is responsible for whatever close
+    /// semantics it wants.
+    private var skipCloseRPC: Bool = false
+
+    /// Last cols/rows we sent through `runShellSession`'s resize
+    /// channel. Used to deduplicate resize events that fall within
+    /// a single live-resize gesture (NSView `setFrameSize` can fire
+    /// dozens of times for one drag, but the grid metric is stable
+    /// in chunks).
     private var lastSentCols: UInt16
     private var lastSentRows: UInt16
 
@@ -109,16 +122,18 @@ final class TabSession {
         keystrokeContinuation?.yield(.resize(cols: cols, rows: rows))
     }
 
-    /// Spin up the StreamPty session. Safe to call once per
-    /// TabSession; calling twice on the same instance is undefined
-    /// (would leak the first task). The window-level code only ever
-    /// calls this in the same turn the TabSession is allocated.
+    /// Spin up the PTY session. Safe to call once per TabSession;
+    /// calling twice on the same instance is undefined (would leak
+    /// the first task). The window-level code only ever calls this
+    /// in the same turn the TabSession is allocated.
     ///
-    /// `onIDAssigned` lets the window splice the new tab into the tab
-    /// bar with its real daemon id. Fires on the main actor.
+    /// `onIDAssigned` lets the window splice the new tab into the
+    /// tab bar with its real workspace-assigned id. Fires on the
+    /// main actor.
     func start(
         socketPath: String,
         title: String,
+        cwd: String = "",
         onIDAssigned: @escaping @MainActor (Int64) -> Void
     ) {
         let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
@@ -131,12 +146,12 @@ final class TabSession {
         terminalView.onResize = { [weak self] cols, rows in
             self?.resize(cols: cols, rows: rows)
         }
-        // Phase 6a P6: each OSC event the scanner lifts out of the
-        // PTY byte stream goes straight to the daemon's ReportOsc
-        // handler. `tabID` may still be nil when the very first
-        // PTY bytes arrive (OpenTab hasn't returned yet) — skip
-        // in that case; the next chunk will catch any subsequent
-        // OSCs.
+        // Each OSC event the scanner lifts out of the PTY byte
+        // stream routes through `reportOsc`, which calls
+        // `LocalClient.applyOSC` in-process. `tabID` may still be
+        // nil when the very first PTY bytes arrive (openTab hasn't
+        // returned yet) — skip in that case; the next chunk will
+        // catch any subsequent OSCs.
         let socket = socketPath
         terminalView.onOsc = { [weak self] cmd, payload in
             guard let self, let tabID = self.id else { return }
@@ -163,6 +178,7 @@ final class TabSession {
             await runShellSession(
                 socketPath: socketPath,
                 projectID: projectID,
+                cwd: cwd,
                 cols: cols,
                 rows: rows,
                 title: title,
@@ -180,9 +196,73 @@ final class TabSession {
         }
     }
 
+    /// Attach to a workspace tab that was opened by a different
+    /// client (e.g. `roostctl tab open` over IPC). Mirrors
+    /// `start()` but skips the `LocalClient.openTab` call — the
+    /// workspace tab + supervisor PTY already exist, and we just
+    /// plug a TerminalView in front of the running session.
+    ///
+    /// `tabID` is pre-known (came from the `.tabOpened` event).
+    /// `closeOwnedByExternal` controls whether tearing down this
+    /// TabSession also closes the workspace tab: pass `false` for
+    /// externally-opened tabs so e.g. quitting the UI doesn't
+    /// silently kill `roostctl`-spawned shells.
+    func attach(
+        socketPath: String,
+        tabID: Int64,
+        closeOwnedByExternal: Bool = true
+    ) {
+        self.id = tabID
+        let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
+        let (output, oCont) = AsyncStream<Data>.makeStream()
+        self.keystrokeContinuation = kCont
+        self.skipCloseRPC = closeOwnedByExternal
+
+        terminalView.onKey = { [weak self] data in
+            self?.keystrokeContinuation?.yield(.input(data))
+        }
+        terminalView.onResize = { [weak self] cols, rows in
+            self?.resize(cols: cols, rows: rows)
+        }
+        let socket = socketPath
+        terminalView.onOsc = { [weak self] cmd, payload in
+            guard let self, let tabID = self.id else { return }
+            Task.detached {
+                await reportOsc(
+                    socketPath: socket,
+                    tabID: tabID,
+                    oscCommand: cmd,
+                    payload: payload
+                )
+            }
+        }
+
+        outputDrainTask = Task { @MainActor [weak self] in
+            for await chunk in output {
+                self?.terminalView.appendBytes(chunk)
+            }
+        }
+
+        let cols = self.initialCols
+        let rows = self.initialRows
+        sessionTask = Task {
+            await attachShellSession(
+                socketPath: socketPath,
+                tabID: tabID,
+                cols: cols,
+                rows: rows,
+                keystrokes: keystrokes
+            ) { data in
+                oCont.yield(data)
+            }
+            oCont.finish()
+        }
+    }
+
     /// Tear down the session. Closes the keystroke stream (which
-    /// ends the StreamPty writer), cancels the gRPC task, and fires
-    /// a best-effort `CloseTab` RPC to the daemon if we know our id.
+    /// ends `runShellSession`'s writer loop), cancels the session
+    /// task, and fires a best-effort `closeShellTab` if we know
+    /// our id (`LocalClient.closeTab` is in-process and idempotent).
     func close(socketPath: String) {
         keystrokeContinuation?.finish()
         keystrokeContinuation = nil
@@ -191,10 +271,17 @@ final class TabSession {
         sessionTask = nil
         outputDrainTask?.cancel()
         outputDrainTask = nil
+        let skipRPC = skipCloseRPC
         if let id = self.id {
             self.id = nil
-            Task.detached {
-                await closeShellTab(socketPath: socketPath, tabID: id)
+            // For externally-opened tabs (`skipCloseRPC == true`),
+            // don't fire the LocalClient.closeTab RPC — the
+            // opening client (`roostctl`, Claude hook) owns the
+            // tab's lifetime. We just detach the UI view.
+            if !skipRPC {
+                Task.detached {
+                    await closeShellTab(socketPath: socketPath, tabID: id)
+                }
             }
         }
     }

@@ -145,6 +145,22 @@ maybe_arm64_sdk_shim
 zig build -Demit-lib-vt=true -Doptimize=ReleaseFast --prefix "${OUT_DIR}"
 popd >/dev/null
 
+# zig emits BOTH `libghostty-vt.a` and `libghostty-vt.dylib` (plus
+# version-suffixed aliases) into ${OUT_DIR}/lib/. Roost links only
+# the static archive — the Swift Mac UI passes it positionally
+# (`mac/Package.swift::linkerSettings`); the Rust crates use
+# `cargo:rustc-link-arg=<full-path-to-.a>` for the same reason
+# (`crates/roost-vt/build.rs`). The dylib is never consumed, but
+# leaving it alongside the .a makes macOS `ld` silently prefer
+# the dylib on any `-L<dir> -lghostty-vt` form and embed an
+# `@rpath/libghostty-vt.dylib` load command that fails at runtime
+# (no LC_RPATH is set anywhere). Delete the dylib aliases right
+# after the zig step so the only artifact left in lib/ is the
+# static archive. The xcframework directory still carries its own
+# .a files for iOS / mac-arm64+x86_64 packaging; leave it alone.
+echo "==> Removing unused libghostty-vt dylibs"
+rm -f "${OUT_DIR}"/lib/libghostty-vt*.dylib
+
 missing_header=0
 missing_archive=0
 [ -f "${OUT_DIR}/include/ghostty/vt.h" ] || missing_header=1

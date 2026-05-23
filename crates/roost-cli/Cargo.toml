@@ -1,0 +1,34 @@
+[package]
+name        = "roost-cli"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Shell-integration CLI for the Roost UIs (notify, set-title, focus, claude-hook). Talks JSON over a Unix-domain socket directly to the Mac / Linux UI process."
+
+[[bin]]
+# `roostctl` is the post-M5 binary name. The previous transitional
+# name `roost-cli-rs` survives only in plans/* and the historical
+# commit messages.
+name = "roostctl"
+path = "src/main.rs"
+
+[dependencies]
+roost-ipc = { path = "../roost-ipc" }
+
+tokio   = { workspace = true }
+anyhow  = { workspace = true }
+clap    = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Used by the `claude-hook` subcommand to parse Claude's JSON payload
+# from stdin + by `tab send --bytes-base64` for the base64 decode
+# step.
+serde_json = "1"
+base64     = "0.22"
+
+[lints]
+workspace = true

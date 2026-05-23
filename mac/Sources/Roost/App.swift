@@ -1,20 +1,23 @@
-// Roost Mac client — Phase 6a step 2b: sidebar + multi-project.
+// Roost Mac client — top-level AppKit app + view-model glue.
 //
-// The window splits horizontally into a project sidebar (left) and the
-// existing tab-bar + terminal area (right). Each project owns its own
-// set of `TabSession`s; switching the sidebar selection rebuilds the
-// tab bar with only that project's tabs.
+// The window splits horizontally into a project sidebar (left) and
+// the tab-bar + terminal area (right). Each project owns its own
+// set of `TabSession`s; switching the sidebar selection rebuilds
+// the tab bar with only that project's tabs.
 //
-// Project lifecycle is end-to-end against the daemon's new RPCs:
-//   * `+ New Project` at the bottom of the sidebar → CreateProject;
-//   * right-click on a project row → Rename / Delete (Delete cascades
-//     the project's tabs daemon-side, which we mirror locally before
-//     refreshing the sidebar);
-//   * the File menu gains "New Project" (⌘N).
+// Project lifecycle calls go through the in-process `LocalClient`
+// (see `RoostClient.swift`'s thin wrappers around
+// `RoostBackend.shared.localClient`):
+//   * `+ New Project` at the bottom of the sidebar → `createProject`.
+//   * Right-click a project row → Rename / Delete (Delete cascades
+//     the project's tabs in `Workspace.deleteProject`, which we
+//     mirror locally before refreshing the sidebar).
+//   * The File menu gains "New Project" (⌘N).
 //
-// WatchEvents subscription for cross-client convergence is the
-// follow-up slice; everything in this commit reads daemon state via
-// `listProjects` on launch and otherwise drives mutations directly.
+// Cross-client convergence (e.g. when `roostctl` mutates the
+// workspace from another shell) flows through `RoostEvent` via
+// `watchEvents`, which subscribes to `Workspace.subscribe` and
+// converts each event for `handleEvent` below.
 
 import AppKit
 import Foundation
@@ -138,6 +141,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var dropIndicatorIndex: Int?
 
     private var socketPath: String = ""
+
+    /// M4c: the single-instance flock held for the lifetime of the
+    /// process. Released when the holder is dropped (the lock fd is
+    /// closed in `SingleInstance.deinit`), which happens at app
+    /// shutdown.
+    private var singleInstance: SingleInstance?
     private var daemonReachable: Bool = false
 
     /// User config (Phase 6a M6). Resolved once on launch from
@@ -182,7 +191,64 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let socketPath = Self.defaultSocketPath()
+        // M4b3a (daemon-removal refactor): stand up the
+        // post-daemon backend immediately — Workspace +
+        // PtySupervisor + IPC server. The IPC socket goes live
+        // before any UI work so `roostctl` invocations during
+        // app launch don't race the bind.
+        let profile = BundleProfile.mac()
+
+        // M4c: file logger goes live before any other startup work
+        // so the early logs land in roost.log alongside the os.Logger
+        // output. Idempotent — `attach` swaps the handle without
+        // dropping queued writes.
+        RoostLogger.shared.attach(path: profile.logPath)
+
+        // M4c: single-instance enforcement. Two Mac UIs cannot share
+        // an IPC socket; the second launch detects the live lock,
+        // logs the holder PID, and exits 0. `ROOST_ALLOW_MULTI=1`
+        // bypasses for dev / test workflows (Xcode debug, swift test).
+        //
+        // `holdsSingleInstanceLock` is forwarded to RoostBackend so
+        // M6's stale-socket recovery (IPCServer.bindWithRecovery)
+        // only fires when we genuinely own the flock; on the
+        // ROOST_ALLOW_MULTI bypass we surface .alreadyBound on
+        // EADDRINUSE rather than unlinking the live other instance.
+        var holdsLock = false
+        do {
+            switch try SingleInstance.acquire(lockPath: profile.lockPath) {
+            case .acquired(let lock):
+                self.singleInstance = lock
+                holdsLock = true
+                RoostLogger.shared.info(
+                    "single-instance: acquired lock at \(profile.lockPath)"
+                )
+            case .alreadyHeld(let pid):
+                RoostLogger.shared.info(
+                    "single-instance: lock at \(profile.lockPath) already held by pid \(pid); exiting"
+                )
+                NSApp.terminate(nil)
+                return
+            case .bypassed:
+                RoostLogger.shared.info(
+                    "single-instance: bypassed via ROOST_ALLOW_MULTI=1"
+                )
+            }
+        } catch {
+            // Lock fd open / write failed for a reason other than
+            // contention. Log and continue — better to start with no
+            // single-instance guard than to refuse to launch.
+            RoostLogger.shared.error(
+                "single-instance: acquire failed: \(error); continuing without enforcement"
+            )
+        }
+
+        RoostBackend.shared.start(
+            profile: profile,
+            holdsSingleInstanceLock: holdsLock
+        )
+
+        let socketPath = profile.socketPath
         self.socketPath = socketPath
 
         // Phase 6a M6: read user config + resolve theme + font
@@ -743,10 +809,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 let stream = watchEvents(socketPath: socketPath)
                 for await event in stream {
                     if Task.isCancelled { return }
-                    let kind = event.kind
                     await MainActor.run { [weak self] in
-                        guard let self else { return }
-                        if let kind { self.handleEvent(kind) }
+                        self?.handleEvent(event)
                     }
                 }
                 // Stream ended — resync from scratch and try again.
@@ -834,7 +898,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// milestones (M3 tab strip, Phase 6b notifications) light up
     /// the remaining cases.
     @MainActor
-    private func handleEvent(_ kind: Roost_V1_Event.OneOf_Kind) {
+    private func handleEvent(_ kind: RoostEvent) {
         switch kind {
         case .projectCreated(let e):
             let p = e.project
@@ -879,12 +943,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 window?.close()
             }
         case .tabDeleted(let e):
-            // Headless `tab close` (M4) or any external `CloseTab`
-            // call kills the daemon-side PTY; the Mac UI's
-            // StreamPty for that tab receives PtyExit and the
-            // TabSession's session task exits, but we still hold
-            // the reference in `tabs` until we hear this event.
-            // Tear it down now so the tab strip converges.
+            // Headless `roostctl tab close` or any other `tab.close`
+            // RPC kills the PTY in-process; the supervisor's drain
+            // task emits `.tabExited` → workspace emits
+            // `.tabClosed` → we land here. The Mac UI still holds
+            // the TabSession reference in `tabs` until this event;
+            // tear it down now so the tab strip converges.
             guard let session = tabs.first(where: { $0.id == e.tabID }) else { break }
             let projectID = session.projectID
             let wasActive = activeSessionByProject[projectID] === session
@@ -906,16 +970,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
-            // M5: project-level cascade lives daemon-side now
-            // (state.rs::close_tab cascades to delete_project when
-            // the parent project is empty). The Mac UI's local `tabs`
-            // list omits headless-CLI-opened tabs, so a UI-side empty
-            // check could delete a project the daemon thinks still
-            // has tabs — moved the policy to the authoritative side.
-            // We just handle local cleanup here; the daemon's
-            // ProjectDeletedEvent (when cascaded) lands in the
-            // `.projectDeleted` arm below and closes the window if
-            // the workspace is empty.
+            // Project-level cascade lives in `Workspace.closeTab`
+            // (it deletes the parent project when its last tab is
+            // closed). The Mac UI's local `tabs` list omits any
+            // tabs opened externally via `roostctl tab open`, so a
+            // UI-side empty check could under-count and delete a
+            // project the workspace thinks still has tabs — the
+            // workspace is authoritative. We just handle local
+            // cleanup here; the cascade's `.projectDeleted` event
+            // lands in the arm below and closes the window if the
+            // workspace is empty.
             if projectID == activeProjectID {
                 rebuildTabBar()
                 if wasActive {
@@ -925,17 +989,43 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-        case .tabOpened, .active:
-            // Cross-client `OpenTab` produces a daemon-side tab the
-            // UI doesn't yet hold a TabSession for. Surfacing it in
-            // the strip would require an "attach to existing tab"
-            // path through `TabSession.start` that skips the
-            // OpenTab RPC (since the daemon tab already exists) —
-            // separate-slice work. For now we drop the event.
-            // `Active` is daemon-driven active selection: the UI's
-            // local active state is authoritative within the UI,
-            // so we drop this too.
-            NSLog("roost-mac: watchEvents tab event ignored: %@", "\(kind)")
+        case .tabOpened(let e):
+            // Cross-client `tab.open` (e.g. `roostctl tab open`)
+            // produces a workspace tab we don't yet hold a
+            // TabSession for. Materialize one and attach it to
+            // the existing supervisor PTY so the tab shows up in
+            // the UI strip + OSC scanning runs against its
+            // output stream (matches the GTK side's auto-attach
+            // behavior). UI-driven `openNewTab` calls already
+            // inserted the matching TabSession before this event
+            // arrives; the dedupe check below prevents double
+            // attaches in that case.
+            let newTab = e.tab
+            if tabs.contains(where: { $0.id == newTab.id }) {
+                break
+            }
+            let session = TabSession(
+                projectID: newTab.projectID,
+                cols: 80,
+                rows: 24,
+                theme: activeTheme,
+                font: activeFont
+            )
+            session.liveTitle = newTab.title
+            session.liveCwd = newTab.cwd.isEmpty ? nil : newTab.cwd
+            tabs.append(session)
+            session.attach(socketPath: socketPath, tabID: newTab.id)
+            // If the new tab is in the currently-displayed
+            // project, refresh the strip so the user sees it.
+            if newTab.projectID == activeProjectID {
+                rebuildTabBar()
+            }
+            rebuildSidebar()
+        case .active:
+            // `.active` is workspace-driven active-selection;
+            // the UI's local active state is authoritative
+            // within the UI, so we drop this.
+            break
         case .tabTitle(let e):
             // Phase 6a P6: OSC 0/1/2 changed a tab's title. Mirror
             // into the matching TabSession so rebuildTabBar uses
@@ -983,7 +1073,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // already aggregates per-tab; per-project rollup
             // happens in `pillBadgeForProject` at render time.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
-                session.liveHasNotification = e.hasPending_p
+                session.liveHasNotification = e.hasPending
                 if session.projectID == activeProjectID {
                     rebuildTabBar()
                 }
@@ -1375,16 +1465,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             theme: activeTheme,
             font: activeFont
         )
-        // Round-2 polish: pre-seed `liveCwd` from the project's cwd
-        // so the new pill renders the tilde-abbreviated path on
-        // frame 1, instead of flashing "Tab N" while waiting for the
-        // shell's OSC 7. OSC 7 will refine if the shell starts in a
-        // different directory. Matches the Go binary's behavior.
-        if let project = projects.first(where: { $0.id == projectID }),
-           !project.cwd.isEmpty
-        {
-            session.liveCwd = project.cwd
+        // Derive the starting cwd: prefer the project's cwd; fall
+        // back to $HOME so opening a tab from a project with no
+        // cwd doesn't drop the shell at `/` (which is what
+        // Finder-launched Roost.app inherits). The Go binary did
+        // the same priority; the daemon-era cwd defaulting lived
+        // in `roost-core/src/state.rs::ensure_default_project`
+        // before the inline-core refactor and got lost in the M4
+        // port.
+        let projectCwd = projects.first(where: { $0.id == projectID })?.cwd ?? ""
+        let cwd: String
+        if !projectCwd.isEmpty {
+            cwd = projectCwd
+        } else {
+            cwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
         }
+        // Pre-seed `liveCwd` so the new pill renders the
+        // tilde-abbreviated path on frame 1, instead of flashing
+        // "Tab N" while waiting for the shell's OSC 7. OSC 7 will
+        // refine if the shell starts in a different directory.
+        session.liveCwd = cwd.isEmpty ? nil : cwd
         tabs.append(session)
 
         let projectTabs = tabsForActiveProject()
@@ -1393,10 +1493,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: insertedIndex)
 
         let title = "roost-mac \(insertedIndex + 1)"
-        session.start(socketPath: socketPath, title: title) { [weak self] _ in
+        session.start(socketPath: socketPath, title: title, cwd: cwd) { [weak self] _ in
             // The id is now known; keep the window menu in sync so its
             // tag-driven ⌘1..⌘9 routes to the current tab order.
+            // Also rebuild the tab bar so the pill that was created
+            // pre-id at `openNewTab` time gets re-cached against its
+            // (now-known) tab id. Without this rebuild,
+            // `tabPillViews[id]` never gets populated for the newly
+            // opened tab, and ⌘R (renameActiveTab) silently no-ops
+            // because `tabPillViews[tabID]` returns nil.
             self?.rebuildWindowMenu()
+            self?.rebuildTabBar()
         }
     }
 
@@ -2563,17 +2670,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Resolve the same default socket path as `roost-core`'s
-    /// `default_socket_path` for macOS — always
-    /// `~/Library/Caches/roost/roost.sock` when `HOME` is set;
-    /// `/tmp/roost.sock` only as a last resort.
+    /// Resolve the same default socket path as `roost-common`'s Mac
+    /// bundle profile — always `~/Library/Caches/Roost/roost.sock`
+    /// when `HOME` is set; `/tmp/Roost/roost.sock` only as a last
+    /// resort. Capital `Roost` since M1 of the daemon-removal
+    /// refactor; pre-M1 stale state under lowercase `roost/` is
+    /// intentionally not migrated.
     nonisolated static func defaultSocketPath(
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
-        if let home = env["HOME"], !home.isEmpty, home.hasPrefix("/") {
-            return "\(home)/Library/Caches/roost/roost.sock"
-        }
-        return "/tmp/roost.sock"
+        BundleProfile.mac(environment: env).socketPath
     }
 }
 

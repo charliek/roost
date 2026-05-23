@@ -6,23 +6,29 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 publish.workspace      = true
-description = "Roost Linux UI — gtk4-rs + libadwaita-rs over the roost-core gRPC contract."
+description = "Roost Linux UI — gtk4-rs + libadwaita-rs. Owns its PTY supervisor + state + JSON IPC server (M3+)."
 
-# Phase 6a M8 (initial spike): single-window Identify against the
-# daemon. Cell renderer / sidebar / tab bar / StreamPty round-trip
-# are Phase 7 follow-up slices. The spike's primary purpose is to
-# prove the gtk4-rs + libadwaita-rs toolchain builds end-to-end —
-# both on Linux (the eventual production target) and on macOS via
-# Homebrew GTK4 so cross-platform development happens on a single
-# Mac.
+# M3 of the daemon-removal refactor (2026-05-23): roost-linux is no
+# longer a gRPC client of roost-core. It owns its PTY supervisor,
+# its workspace state, and serves the post-refactor JSON IPC over a
+# Unix socket. `lib.rs` exposes the testable surface; the
+# `roost-linux` bin is a thin wrapper that wires the gtk4-rs
+# application onto the library.
+
+[lib]
+name = "roost_linux"
+path = "src/lib.rs"
 
 [[bin]]
 name = "roost-linux"
 path = "src/main.rs"
 
 [dependencies]
-roost-proto  = { path = "../roost-proto" }
-roost-common = { path = "../roost-common" }
+# `BundleProfile` lives in roost-ipc::paths post-M7 (was previously
+# re-exported by roost-common, which we just deleted). The Linux UI
+# pulls it from there along with the IPC client/server types it
+# already used.
+roost-ipc    = { path = "../roost-ipc" }
 # Phase 7 commit 2: pull in the safe-API wrappers landed in commit 1.
 # Linking `--features ffi` brings in libghostty-vt's static archive,
 # so the gtk-build CI job now needs the third_party/ghostty/build.sh
@@ -30,34 +36,40 @@ roost-common = { path = "../roost-common" }
 # under third_party/ghostty/out/lib/ must exist before `cargo build -p
 # roost-linux`.
 roost-vt     = { path = "../roost-vt", features = ["ffi"] }
-# Phase 7 commit 2: the OSC scanner moved out of roost-core. Both the
-# daemon and roost-linux consume it from here. Mac UI keeps its
-# hand-rolled Swift port (vision DL-5: no cross-language FFI tax for
-# ~230 LOC of pure-data parsing).
+# Phase 7 commit 2: the OSC scanner moved out of roost-core. Both
+# the (now-defunct) daemon and roost-linux consume it from here.
+# Mac UI keeps its hand-rolled Swift port (vision DL-5).
 roost-osc    = { path = "../roost-osc" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# PTY supervisor copied from roost-core/src/pty.rs at M3a.
+portable-pty = { workspace = true }
+
+# State persistence via state.json (M3a): atomic write + reload.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Single-instance flock-based lock (M3a).
+fs2 = "0.4"
+
+tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
-tonic = "0.12"
 anyhow = "1"
+thiserror = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # gtk4-rs + libadwaita-rs. The `v4_12` feature on gtk4 enables the
-# 4.12+ APIs the Phase 7 step plan refers to (adw::NavigationSplitView
-# in particular, which lands in 4.10 but only stabilizes on the gtk4
-# crate side at 4.12). libadwaita's `v1_4` feature gates the
-# AdwApplicationWindow + AdwHeaderBar combination this spike uses.
+# 4.12+ APIs the Phase 7 step plan refers to. libadwaita's `v1_4`
+# feature gates the AdwApplicationWindow + AdwHeaderBar combination
+# this UI uses.
 gtk4 = { version = "0.10", features = ["v4_12"] }
 libadwaita = { version = "0.8", features = ["v1_4"] }
 glib = "0.21"
-# Phase 7 commit 4: Cairo + Pango for the cell renderer. gtk4-rs's
-# `gtk::DrawingArea::set_draw_func` callback hands us a Cairo context
-# directly; `pangocairo` is what bridges Pango layouts to Cairo for
-# text rendering. pangocairo-rs uses raw FFI for
-# `pango_cairo_context_set_font_options` so the `internal/pangoextra`
-# workaround the Go binary needs doesn't apply here (DL-6).
+# Cairo + Pango for the cell renderer.
 pangocairo = "0.21"
-# Phase 7 commit 9: AccelMods bitflags for the keybind table.
+# AccelMods bitflags for the keybind table.
 bitflags = "2"
+
+[dev-dependencies]
+tempfile = "3"

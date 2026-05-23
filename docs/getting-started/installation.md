@@ -1,15 +1,26 @@
 # Installation
 
-Roost is a Rust gRPC daemon (`roost-core`) paired with a native UI on each platform:
+Roost ships a native UI on each platform. Each UI embeds the
+workspace + PTY supervisor in-process and serves a JSON IPC
+socket for external tooling (`roostctl`, Claude Code hooks):
 
 | Platform | UI | How it builds |
 |---|---|---|
 | macOS | Swift + AppKit (`Roost.app`) | SwiftPM via `mac/scripts/bundle.sh` |
 | Linux | Rust + gtk4-rs (`roost-linux`) | `cargo build -p roost-linux` |
 
-The daemon, the Linux UI, the companion CLI, and the `libghostty-vt` FFI all live in one Cargo workspace under `crates/`. The Swift UI is its own SwiftPM package under `mac/` and links the same vendored `libghostty-vt` static archive.
+The Linux UI, the `roostctl` CLI, the JSON IPC crate, and the
+`libghostty-vt` FFI all live in one Cargo workspace under
+`crates/`. The Swift UI is its own SwiftPM package under `mac/`
+and links the same vendored `libghostty-vt` static archive.
 
-The CLI is named `roost-cli-rs` during the transition; it renames to `roost-cli` in the Phase 9 cutover. The legacy Go + GTK4 binary still ships from `main` — see [Legacy → Installation](../reference/legacy-go/installation.md) for that build path.
+`mac/scripts/bundle.sh` embeds `target/<config>/roostctl` under
+`Roost.app/Contents/Resources/bin/roostctl` so a packaged .app is
+self-contained for `claude install`.
+
+The legacy Go + GTK4 binary still ships from `main` — see
+[Legacy → Installation](../reference/legacy-go/installation.md)
+for that build path.
 
 ## Prerequisites
 
@@ -53,7 +64,7 @@ Build `libghostty-vt` once (idempotent on cache hit):
 Build the daemon and CLI:
 
 ```bash
-~/.cargo/bin/cargo build --release -p roost-core -p roost-cli-rs
+~/.cargo/bin/cargo build --release -p roost-cli
 ```
 
 Bundle the Mac `.app`:
@@ -112,7 +123,7 @@ Build everything. `roost-linux` requires the GTK4 + libadwaita system packages a
 
 ```bash
 ~/.cargo/bin/cargo build --release \
-  -p roost-core -p roost-cli-rs -p roost-linux
+  -p roost-cli -p roost-linux
 ```
 
 Run the Linux UI:
@@ -123,10 +134,10 @@ Run the Linux UI:
 
 ## CLI on PATH
 
-Install `roost-cli-rs` so it's reachable from any shell (Claude Code hooks call it without a full path):
+Install `roostctl` so it's reachable from any shell (Claude Code hooks call it without a full path):
 
 ```bash
-sudo install -m 755 target/release/roost-cli-rs /usr/local/bin/roost-cli-rs
+sudo install -m 755 target/release/roostctl /usr/local/bin/roostctl
 ```
 
 ## Verifying the install
@@ -134,7 +145,7 @@ sudo install -m 755 target/release/roost-cli-rs /usr/local/bin/roost-cli-rs
 With the UI running:
 
 ```bash
-~/.cargo/bin/cargo run --release -p roost-cli-rs -- identify
+~/.cargo/bin/cargo run --release -p roostctl -- identify
 ```
 
 Prints a JSON object with the daemon socket path, PID, and active project / tab IDs. If you see a connection error, the UI isn't running or the socket path is wrong — see [Paths & Environment](../reference/paths.md).

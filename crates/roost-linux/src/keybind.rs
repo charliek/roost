@@ -468,7 +468,7 @@ mod tests {
         };
         let user = vec![(platform_default.into(), "unbind".into())];
         let map = canonicalize_bindings(defaults, user, |_| {});
-        assert!(map.get(&parse_trigger(platform_default).unwrap()).is_none());
+        assert!(!map.contains_key(&parse_trigger(platform_default).unwrap()));
     }
 
     #[test]

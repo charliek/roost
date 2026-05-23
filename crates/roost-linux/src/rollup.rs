@@ -26,18 +26,16 @@ pub enum TabState {
 }
 
 impl TabState {
-    /// Map the proto integer (`TabState` enum from `roost.proto`) to
-    /// our local enum. Anything unknown (0 / out-of-range) collapses
-    /// to `None`.
-    pub fn from_proto(value: i32) -> Self {
+    /// Map the roost-ipc `TabState` enum to our local enum. The
+    /// workspace is the source of truth post-M3b; the legacy proto
+    /// integer mapping (`from_proto`) is gone with the daemon.
+    pub fn from_ipc(value: roost_ipc::messages::TabState) -> Self {
+        use roost_ipc::messages::TabState as Ipc;
         match value {
-            2 => Self::Running,
-            3 => Self::NeedsInput,
-            4 => Self::Idle,
-            // 0 (Unspecified) and 1 (None) both map to None — the
-            // proto's `Unspecified` is just an initial value the
-            // daemon may not have set yet.
-            _ => Self::None,
+            Ipc::Running => Self::Running,
+            Ipc::NeedsInput => Self::NeedsInput,
+            Ipc::Idle => Self::Idle,
+            Ipc::None => Self::None,
         }
     }
 }
@@ -178,14 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn from_proto_maps_correctly() {
-        assert_eq!(TabState::from_proto(0), TabState::None); // Unspecified
-        assert_eq!(TabState::from_proto(1), TabState::None);
-        assert_eq!(TabState::from_proto(2), TabState::Running);
-        assert_eq!(TabState::from_proto(3), TabState::NeedsInput);
-        assert_eq!(TabState::from_proto(4), TabState::Idle);
-        // Unknown values collapse to None (defensive default).
-        assert_eq!(TabState::from_proto(99), TabState::None);
+    fn from_ipc_maps_correctly() {
+        use roost_ipc::messages::TabState as Ipc;
+        assert_eq!(TabState::from_ipc(Ipc::None), TabState::None);
+        assert_eq!(TabState::from_ipc(Ipc::Running), TabState::Running);
+        assert_eq!(TabState::from_ipc(Ipc::NeedsInput), TabState::NeedsInput);
+        assert_eq!(TabState::from_ipc(Ipc::Idle), TabState::Idle);
     }
 
     #[test]

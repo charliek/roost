@@ -53,7 +53,7 @@ REPO_ROOT="$(cd "${MAC_DIR}/.." && pwd)"
 
 VERSION="${ROOST_VERSION:-0.1.0}"
 APP_NAME="Roost"
-BUNDLE_ID="com.charliek.roost"
+BUNDLE_ID="ai.stridelabs.Roost"
 TEMPLATE_PLIST="${MAC_DIR}/Resources/Info.plist.template"
 ICON_SRC="${MAC_DIR}/Resources/AppIcon.icns"
 
@@ -67,17 +67,6 @@ if [ ! -f "${REPO_ROOT}/third_party/ghostty/out/lib/libghostty-vt.a" ]; then
   echo "error: libghostty-vt static archive not built." >&2
   echo "       Run: ${REPO_ROOT}/third_party/ghostty/build.sh" >&2
   exit 1
-fi
-
-# `protoc` has to be discoverable for `GRPCProtobufGenerator` — the
-# Mac README enforces the same env var when calling `swift run`.
-if [ -z "${PROTOC_PATH:-}" ]; then
-  if command -v protoc >/dev/null 2>&1; then
-    export PROTOC_PATH="$(command -v protoc)"
-  else
-    echo "error: protoc not found. Install via: brew install protobuf" >&2
-    exit 1
-  fi
 fi
 
 echo "==> Building Roost (${CONFIG}) from SwiftPM"
@@ -114,10 +103,15 @@ printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 # Resource bundles SwiftPM emits — Bundle.module reads from these,
 # so the .app needs to ship them alongside the binary. The
 # `Roost_Roost.bundle` carries our theme files (Resources/themes/).
-# `swift-crypto_*` bundles ship with the gRPC SSL deps; benign to
-# include and missing them produces a runtime error inside grpc.
+#
+# Discover the SwiftPM bin path dynamically. The prior hardcoded
+# `arm64-apple-macosx` path failed on Intel macOS runners
+# (Phase 8 release-CI matrix includes x86_64). `swift build
+# --show-bin-path` prints the exact directory containing the
+# built artifacts for the current toolchain + target triple +
+# config.
 echo "==> Copying SwiftPM resource bundles"
-BUILD_BUNDLES_DIR="${MAC_DIR}/.build/arm64-apple-macosx/${CONFIG}"
+BUILD_BUNDLES_DIR="$(cd "${MAC_DIR}" && swift build -c "${CONFIG}" --show-bin-path)"
 for bundle in "${BUILD_BUNDLES_DIR}"/*.bundle; do
   [ -d "${bundle}" ] || continue
   cp -R "${bundle}" "${APP_DIR}/Contents/Resources/"
@@ -133,9 +127,96 @@ else
   echo "==> No mac/Resources/AppIcon.icns; bundle ships without a custom icon"
 fi
 
+# M8: embed roostctl under Contents/Resources/bin/ so `claude
+# install` invoked from inside Roost.app writes hook paths that
+# point at the bundled binary, not a dev-machine target/ path.
+# The CLI build is fast and tracked through the same Cargo cache as
+# any cargo build invocation; rebuilding here keeps the bundle in
+# lockstep with whatever roost-cli source the developer has
+# checked out.
+# Discover `cargo` on PATH instead of hardcoding ~/.cargo/bin/cargo.
+# Phase 8 release runners may have cargo at a different prefix
+# (toolchain managed by mise / rustup / system package). Falling
+# back to the literal path preserves the prior behavior for the
+# common dev case.
+CARGO_BIN="$(command -v cargo || true)"
+if [ -z "${CARGO_BIN}" ] && [ -x "${HOME}/.cargo/bin/cargo" ]; then
+  CARGO_BIN="${HOME}/.cargo/bin/cargo"
+fi
+if [ -z "${CARGO_BIN}" ]; then
+  echo "error: cargo not found on PATH or at ~/.cargo/bin/cargo" >&2
+  exit 1
+fi
+
+CARGO_PROFILE_FLAG="--release"
+CARGO_PROFILE_DIR="release"
+if [ "${CONFIG}" = "debug" ]; then
+  CARGO_PROFILE_FLAG=""
+  CARGO_PROFILE_DIR="debug"
+fi
+echo "==> Building roostctl (cargo build -p roost-cli --${CARGO_PROFILE_DIR})"
+(
+  cd "${REPO_ROOT}"
+  # shellcheck disable=SC2086
+  "${CARGO_BIN}" build -p roost-cli ${CARGO_PROFILE_FLAG}
+)
+
+# Respect CARGO_TARGET_DIR for the artifact-discovery step. Shared
+# caches (e.g. sccache + CI matrices that fan out across configs)
+# routinely override the default `<repo>/target/` location.
+CARGO_TARGET="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+ROOSTCTL_SRC="${CARGO_TARGET}/${CARGO_PROFILE_DIR}/roostctl"
+if [ ! -x "${ROOSTCTL_SRC}" ]; then
+  echo "error: cargo build did not produce ${ROOSTCTL_SRC}" >&2
+  exit 1
+fi
+mkdir -p "${APP_DIR}/Contents/Resources/bin"
+cp "${ROOSTCTL_SRC}" "${APP_DIR}/Contents/Resources/bin/roostctl"
+chmod +x "${APP_DIR}/Contents/Resources/bin/roostctl"
+echo "    Embedded: ${APP_DIR}/Contents/Resources/bin/roostctl"
+
+# Phase 8 (notarization) will replace these ad-hoc signatures
+# with Developer-ID-signed binaries + a notarized DMG. Until then
+# we ad-hoc sign with the embedded entitlements so the local
+# launcher stack sees a consistent signature pair on the .app and
+# the embedded helper.
+#
+# Failure handling: a botched signature is a release-blocking
+# issue (Gatekeeper rejects the app, notarization will fail,
+# user-installed copies can become quarantined). Default is fail
+# hard; the `ROOST_ALLOW_UNSIGNED=1` env var bypasses for the
+# rare dev case where Xcode CLT codesign is missing. Sub-agent
+# review flagged that the prior `|| echo warn ... (continuing)`
+# silently masked CI signature regressions.
+ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
+if command -v codesign >/dev/null 2>&1 && [ -f "${ENT_FILE}" ]; then
+  echo "==> Ad-hoc codesign (Phase 8 will replace with Developer ID)"
+  codesign_or_die() {
+    local target="$1"
+    if codesign --force --sign - \
+         --entitlements "${ENT_FILE}" \
+         --options runtime \
+         "${target}"
+    then
+      return 0
+    fi
+    if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+      echo "    warn: codesign(${target}) failed; ROOST_ALLOW_UNSIGNED=1 set, continuing"
+      return 0
+    fi
+    echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
+    exit 1
+  }
+  codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl"
+  codesign_or_die "${APP_DIR}"
+elif [ ! -f "${ENT_FILE}" ]; then
+  echo "==> No entitlements file at ${ENT_FILE}; skipping codesign"
+fi
+
 echo "==> Bundled: ${APP_DIR}"
 echo "    Bundle ID:    ${BUNDLE_ID}"
 echo "    Version:      ${VERSION}"
 echo "    Executable:   ${APP_DIR}/Contents/MacOS/${APP_NAME}"
+echo "    Embedded CLI: ${APP_DIR}/Contents/Resources/bin/roostctl"
 echo
 echo "Launch with: open '${APP_DIR}'"
