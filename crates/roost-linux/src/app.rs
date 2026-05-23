@@ -24,14 +24,13 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
+use roost_ipc::messages::{Project, Tab};
 use tokio::runtime::Handle;
 
-use roost_common::{BundleProfile, BundleProfileKind};
-use roost_proto::v1::event::Kind as EventKind;
-use roost_proto::v1::{Project, Tab};
+use roost_linux::daemon::WorkspaceEvent;
+use roost_linux::local_client::LocalClient;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
-use crate::client::RoostClient;
 use crate::config::RoostConfig;
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
@@ -101,7 +100,7 @@ pub struct App {
     window: ApplicationWindow,
     /// `None` before `bootstrap()` connects; closures that need the
     /// client must read this and bail (no-op) if `None`.
-    client: RefCell<Option<RoostClient>>,
+    client: RefCell<Option<LocalClient>>,
     rt: Handle,
     sidebar: gtk4::ListBox,
     /// The whole sidebar container — header label + scrolled list +
@@ -217,7 +216,7 @@ impl App {
     /// Build the window + start the daemon bootstrap. Returns an
     /// `Rc<App>` so closures can hold references back into the App
     /// for event dispatch.
-    pub fn new(app: &libadwaita::Application, rt: Handle) -> Rc<Self> {
+    pub fn new(app: &libadwaita::Application, rt: Handle, client: LocalClient) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
             .default_width(1100)
@@ -365,7 +364,7 @@ impl App {
 
         let app_struct = Rc::new(App {
             window,
-            client: RefCell::new(None),
+            client: RefCell::new(Some(client)),
             rt: rt.clone(),
             sidebar: sidebar.clone(),
             sidebar_box: sidebar_box.clone(),
@@ -588,44 +587,43 @@ impl App {
         app_struct
     }
 
-    /// One-shot bootstrap: connect, identify, build initial project
-    /// list, subscribe to WatchEvents, open a tab in the first
-    /// project if none exist.
+    /// One-shot bootstrap: build initial project list from the
+    /// in-process workspace, subscribe to its event broadcast, open
+    /// a tab in the first project if none exist.
+    ///
+    /// M3b: no daemon round-trip. The workspace was opened at
+    /// `main()` time before the UI thread booted; we just snapshot
+    /// it and subscribe.
     async fn bootstrap(self: &Rc<Self>) -> anyhow::Result<()> {
-        let socket = BundleProfile::resolve(BundleProfileKind::Gtk)
-            .context("resolve gtk bundle profile")?
-            .socket_path;
-        let rt = self.rt.clone();
-        let client = rt
-            .spawn(async move { RoostClient::connect(socket).await })
-            .await
-            .context("connect join")??;
-        *self.client.borrow_mut() = Some(client.clone());
+        let client = {
+            let borrow = self.client.borrow();
+            borrow
+                .as_ref()
+                .cloned()
+                .context("LocalClient missing from App construction")?
+        };
 
-        let mut client_for_setup = client.clone();
-        let (id, projects) = rt
-            .spawn(async move {
-                let id = client_for_setup.identify().await?;
-                let projects = client_for_setup.list_projects().await?;
-                anyhow::Ok((id, projects))
+        let rt = self.rt.clone();
+        let projects = rt
+            .spawn({
+                let client = client.clone();
+                async move { client.list_projects().await }
             })
             .await
-            .context("setup join")??;
+            .context("list_projects join")??;
 
-        // Transitional title until `set_active_project` lands the
-        // first project's name. The subtitle holds the daemon version
-        // so the user can confirm the round-trip succeeded at a glance.
         self.window_title.set_title("Roost");
-        self.window_title
-            .set_subtitle(&format!("daemon v{}", id.daemon_version));
+        self.window_title.set_subtitle("");
 
         // Materialize the project list. If empty, create a default
         // "roost-linux" project so the user has something to look at.
         let projects = if projects.is_empty() {
-            let mut client_for_create = client.clone();
             let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             let project = rt
-                .spawn(async move { client_for_create.create_project("roost-linux", &cwd).await })
+                .spawn({
+                    let client = client.clone();
+                    async move { client.create_project("roost-linux", &cwd).await }
+                })
                 .await
                 .context("create_project join")??;
             vec![project]
@@ -635,19 +633,15 @@ impl App {
 
         for project in &projects {
             self.add_project_ui(project);
-            // Attach existing tabs for every project, not just the
-            // first one. Persisted state across daemon restarts (or
-            // cross-client opens) puts tabs in any project; pre-fix
-            // the GTK UI only hydrated the first project's tabs and
-            // silently dropped the rest. Mac UI hydrates all.
+            // M3b: tabs do NOT survive UI quits (no-session-restore
+            // goal). At bootstrap there are never any tabs to
+            // hydrate — the snapshot's `tabs` is always empty.
+            // Keep the iterate-and-attach loop in case a future
+            // change re-enables tab restore.
             for tab in &project.tabs {
                 self.attach_existing_tab(tab.clone());
             }
         }
-        // Open a tab in the first project so the user lands inside
-        // a shell — same shape as the Mac UI's bootstrap. Only fires
-        // when the first project has no tabs, so a workspace that
-        // was empty on disk gets a usable terminal on first boot.
         if let Some(first) = projects.first() {
             self.set_active_project(first.id);
             if first.tabs.is_empty() {
@@ -655,13 +649,14 @@ impl App {
             }
         }
 
-        // Subscribe to WatchEvents and drain on the GTK main loop.
+        // Subscribe to the workspace event broadcast; drain on the
+        // GTK main loop.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         {
-            let mut client_for_watch = client.clone();
+            let workspace = client.workspace.clone();
             rt.spawn(async move {
-                if let Err(err) = events::subscribe(&mut client_for_watch, tx).await {
-                    tracing::warn!(?err, "WatchEvents stream ended with error");
+                if let Err(err) = events::subscribe(workspace, tx).await {
+                    tracing::warn!(?err, "workspace event subscription ended with error");
                 }
             });
         }
@@ -949,20 +944,13 @@ impl App {
         if trimmed.is_empty() {
             return; // empty rename = no-op
         }
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
         let rt = self.rt.clone();
         rt.spawn(async move {
-            if let Err(err) = client
-                .inner()
-                .rename_project(tonic::Request::new(roost_proto::v1::RenameProjectRequest {
-                    project_id,
-                    name: trimmed,
-                }))
-                .await
-            {
-                tracing::warn!(?err, project_id, "RenameProject RPC failed");
+            if let Err(err) = client.rename_project(project_id, &trimmed).await {
+                tracing::warn!(?err, project_id, "rename_project failed");
             }
         });
     }
@@ -1029,19 +1017,13 @@ impl App {
             move |result| {
                 match result {
                     Ok(1) => {
-                        let Some(mut client) = app.client.borrow().clone() else {
+                        let Some(client) = app.client.borrow().clone() else {
                             return;
                         };
                         let rt = app.rt.clone();
                         rt.spawn(async move {
-                            if let Err(err) = client
-                                .inner()
-                                .delete_project(tonic::Request::new(
-                                    roost_proto::v1::DeleteProjectRequest { project_id },
-                                ))
-                                .await
-                            {
-                                tracing::warn!(?err, project_id, "DeleteProject RPC failed");
+                            if let Err(err) = client.delete_project(project_id).await {
+                                tracing::warn!(?err, project_id, "delete_project failed");
                             }
                         });
                     }
@@ -1128,20 +1110,13 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
         let rt = self.rt.clone();
         rt.spawn(async move {
-            if let Err(err) = client
-                .inner()
-                .set_tab_title(tonic::Request::new(roost_proto::v1::SetTabTitleRequest {
-                    tab_id,
-                    title: trimmed,
-                }))
-                .await
-            {
-                tracing::warn!(?err, tab_id, "SetTabTitle RPC failed");
+            if let Err(err) = client.set_tab_title(tab_id, &trimmed).await {
+                tracing::warn!(?err, tab_id, "set_tab_title failed");
             }
         });
     }
@@ -1202,25 +1177,24 @@ impl App {
     /// OpenTab RPC → on success, attach the tab to the project's
     /// TabView.
     async fn open_new_tab_in(self: &Rc<Self>, project_id: i64) -> anyhow::Result<()> {
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return Ok(());
         };
         let rt = self.rt.clone();
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        let tab = rt
+        let (tab, _rx) = rt
             .spawn(async move { client.open_tab(project_id, &cwd, 80, 24).await })
             .await
             .context("open_tab join")??;
-        // Optimistic attach: needed because bootstrap calls this
-        // BEFORE WatchEvents subscribes, so the daemon's
-        // TabOpenedEvent for this RPC has no subscriber yet.
-        // `attach_existing_tab` dedupes against the WatchEvents
-        // replay via the `ProjectUi.pending_attaches` set —
-        // inserted synchronously at the top of the attach path,
-        // removed once the async session resolves. The set closes
-        // the race window where the optimistic attach + the
-        // WatchEvents arm would both spawn StreamPty sessions for
-        // the same tab.
+        // Optimistic attach: the workspace's TabOpened event also
+        // arrives via the events subscription; the
+        // `ProjectUi.pending_attaches` synchronous insert below
+        // closes that race. We drop the broadcast receiver returned
+        // by `client.open_tab` here because `attach_existing_tab`
+        // re-subscribes via `PtySupervisor::subscribe_output` — the
+        // window between spawn returning and subscribe_output
+        // running is single-digit microseconds in-process, well
+        // inside the broadcast channel's per-subscriber buffer.
         self.attach_existing_tab(tab);
         Ok(())
     }
@@ -1261,16 +1235,18 @@ impl App {
             Some(*self.current_font_size_pt.borrow()),
         ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
-        let Some(mut client_for_session) = self.client.borrow().clone() else {
+        let Some(client_for_session) = self.client.borrow().clone() else {
             return;
         };
         let tab_id = tab.id;
         let rt = self.rt.clone();
-        // Spawn the StreamPty session on the tokio runtime; bridging
-        // back to GTK happens via the unbounded mpsc.
-        let session_handle = rt.spawn(async move {
-            TabSession::spawn(&mut client_for_session, tab_id, 80, 24, output_tx).await
-        });
+        // M3b: subscribe to the in-process PtySupervisor. The
+        // attach is synchronous (no gRPC dial), but we still hop
+        // through `rt.spawn` so the drain task it kicks off lands
+        // on the tokio runtime rather than the glib main loop.
+        let supervisor = client_for_session.supervisor.clone();
+        let session_handle =
+            rt.spawn(async move { TabSession::attach(supervisor, tab_id, output_tx) });
 
         let page: libadwaita::TabPage = ui.tab_view.append(terminal.widget());
         let page_for_future = page.clone();
@@ -1442,62 +1418,48 @@ impl App {
         drop(projects);
     }
 
-    /// Dispatch a daemon Event. Cross-client convergence: a CLI
-    /// `tab open / close / reorder` reflects here within ~1s.
-    fn handle_event(self: &Rc<Self>, event: roost_proto::v1::Event) {
-        let Some(kind) = event.kind else {
-            return;
-        };
-        match kind {
-            EventKind::ProjectCreated(p) => {
-                if let Some(project) = p.project {
-                    self.add_project_ui(&project);
-                }
+    /// Dispatch a workspace event onto the GTK widget tree. M3b:
+    /// these are emitted in-process by [`Workspace`] mutations and
+    /// the only convergence path is roostctl → workspace → here.
+    /// There is no cross-client coordination; we are the only
+    /// consumer.
+    fn handle_event(self: &Rc<Self>, event: WorkspaceEvent) {
+        match event {
+            WorkspaceEvent::ProjectCreated(project) => {
+                self.add_project_ui(&project);
             }
-            EventKind::ProjectRenamed(r) => {
+            WorkspaceEvent::ProjectRenamed { project_id, name } => {
                 let mut projects = self.projects.borrow_mut();
-                if let Some(ui) = projects.get_mut(&r.project_id) {
-                    ui.name = r.name.clone();
-                    // M9: update the Stack's label child directly
-                    // rather than hunting it through `sidebar_row.child()`.
-                    // If the user is currently mid-rename (Stack
-                    // showing the entry), the label text still
-                    // updates but the visible child stays on entry —
-                    // honours "do not clobber in-progress edits"
-                    // (per `goal-linux-gtk-parity-2026-05-17.md` M9
-                    // race-guard).
-                    ui.sidebar_label.set_text(&r.name);
-                    if *self.active_project_id.borrow() == r.project_id {
-                        self.window_title.set_title(&r.name);
+                if let Some(ui) = projects.get_mut(&project_id) {
+                    ui.name = name.clone();
+                    // M9: update the Stack's label child directly.
+                    // If the user is mid-rename (Stack showing the
+                    // entry), the label text still updates but the
+                    // visible child stays on entry — "do not clobber
+                    // in-progress edits."
+                    ui.sidebar_label.set_text(&name);
+                    if *self.active_project_id.borrow() == project_id {
+                        self.window_title.set_title(&name);
                     }
                 }
             }
-            EventKind::ProjectDeleted(d) => {
+            WorkspaceEvent::ProjectDeleted { project_id } => {
                 let mut projects = self.projects.borrow_mut();
-                if let Some(ui) = projects.remove(&d.project_id) {
+                if let Some(ui) = projects.remove(&project_id) {
                     self.sidebar.remove(&ui.sidebar_row);
                     self.tab_stack.remove(
                         &self
                             .tab_stack
-                            .child_by_name(&stack_name(d.project_id))
+                            .child_by_name(&stack_name(project_id))
                             .expect("tab stack child for project"),
                     );
                 }
-                // If the deleted project was the active one, follow-up
-                // actions (NewTab, RenameProject, DeleteProject) would
-                // keep targeting a dead id until some later Active
-                // event repaired it. Reset active selection here:
-                // pick the first remaining project, or clear to 0
-                // when the workspace is now empty. CodeRabbit caught
-                // this on PR #63.
-                let was_active = *self.active_project_id.borrow() == d.project_id;
+                let was_active = *self.active_project_id.borrow() == project_id;
                 if was_active {
                     let fallback = pick_next_active_project(&projects);
                     drop(projects);
                     match fallback {
                         Some(pid) => {
-                            // `set_active_project` short-circuits when
-                            // `active == requested`, so clear first.
                             *self.active_project_id.borrow_mut() = 0;
                             self.set_active_project(pid);
                         }
@@ -1505,162 +1467,84 @@ impl App {
                             *self.active_project_id.borrow_mut() = 0;
                             self.window_title.set_title("Roost");
                             self.window_title.set_subtitle("");
-                            // M9.5: workspace is empty — close the
-                            // window. Matches the Mac UI's M5 cascade
-                            // and the Go binary's
-                            // `len(a.projectViews) == 0 → win.Close()`
-                            // (cmd/roost/app.go). libadwaita's default
-                            // `applicationShouldTerminateAfterLastWindowClosed`
-                            // shape means closing the only window
-                            // also exits the application, so the user
-                            // typing `exit` in their last visible tab
-                            // ends the GTK session — parity with the
-                            // other two UIs.
                             self.window.close();
                         }
                     }
                 }
             }
-            EventKind::TabOpened(opened) => {
-                if let Some(tab) = opened.tab {
-                    self.attach_existing_tab(tab);
-                }
+            WorkspaceEvent::TabOpened(tab) => {
+                self.attach_existing_tab(tab);
             }
-            EventKind::TabDeleted(d) => {
-                tracing::debug!(tab_id = d.tab_id, "TabDeleted event");
-                // M9.5: the AdwTabView page removal happens in the
-                // PTY-exit drain (calls `close_page_for_tab` →
-                // `tab_view.close_page` → close-page signal →
-                // handler runs close_page_finish + CloseTab RPC).
-                // By the time this event arrives, the page is either
-                // already gone (us being the originator) or owned by
-                // another client (cross-client convergence path).
-                //
-                // For cross-client convergence: another client's
-                // CLI `tab close` or X click fires CloseTab on the
-                // daemon, daemon broadcasts TabDeleted, we receive
-                // it here, our page is still around, we close it.
-                //
-                // For the originator path: our drain already closed
-                // the page; `ui.tabs` no longer has the entry; the
-                // close-page handler removed it. This arm becomes
-                // a no-op then.
+            WorkspaceEvent::TabClosed { tab_id } => {
+                tracing::debug!(tab_id, "tab.closed event");
                 let projects = self.projects.borrow();
                 let mut found = false;
                 for (_project_id, ui) in projects.iter() {
-                    let still_has_entry = ui.tabs.borrow().contains_key(&d.tab_id);
+                    let still_has_entry = ui.tabs.borrow().contains_key(&tab_id);
                     if still_has_entry {
                         found = true;
-                        // Cross-client: mark as server-driven so the
-                        // resulting close-page handler skips the
-                        // redundant CloseTab RPC, then route through
-                        // the same `close_page` pathway as the local
-                        // PTY-exit case.
-                        self.server_driven_closes.borrow_mut().insert(d.tab_id);
-                        let page = ui.tabs.borrow().get(&d.tab_id).map(|t| t.page.clone());
+                        self.server_driven_closes.borrow_mut().insert(tab_id);
+                        let page = ui.tabs.borrow().get(&tab_id).map(|t| t.page.clone());
                         let tab_view = ui.tab_view.clone();
                         if let Some(page) = page {
-                            // No `page.parent()` gating — AdwTabPage's
-                            // parent() doesn't reliably report
-                            // "still in the view", so the previous
-                            // guard misleadingly skipped real closes.
-                            // libadwaita's internal `page_belongs_to_this_view`
-                            // check inside `adw_tab_view_close_page`
-                            // handles dedupe if the page is genuinely
-                            // gone.
                             tab_view.close_page(&page);
                         }
                         break;
                     }
                 }
                 if !found {
-                    tracing::debug!(
-                        tab_id = d.tab_id,
-                        "TabDeleted: no UI mapping (already closed locally or unknown id)"
-                    );
+                    tracing::debug!(tab_id, "tab.closed: no UI mapping (already closed locally)");
                 }
             }
-            EventKind::TabTitle(t) => {
+            WorkspaceEvent::TabTitleChanged { tab_id, title } => {
                 let projects = self.projects.borrow();
                 for ui in projects.values() {
-                    if let Some(tab_ui) = ui.tabs.borrow().get(&t.tab_id) {
-                        tab_ui.page.set_title(&t.title);
+                    if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                        tab_ui.page.set_title(&title);
                     }
                 }
             }
-            EventKind::TabsReordered(r) => {
-                let projects = self.projects.borrow();
-                if let Some(ui) = projects.get(&r.project_id) {
-                    // Rebuild the page order. Build a tab_id → page
-                    // map first, then call set_page() / append in the
-                    // target order. adw::TabView doesn't expose a
-                    // direct reorder API, so we use `reorder_page` to
-                    // walk each target slot.
-                    let tabs = ui.tabs.borrow();
-                    for (target_index, tab_id) in r.tab_ids.iter().enumerate() {
-                        if let Some(tab_ui) = tabs.get(tab_id) {
-                            ui.tab_view.reorder_page(&tab_ui.page, target_index as i32);
-                        }
-                    }
-                }
-            }
-            EventKind::ProjectsReordered(r) => {
-                // M10: apply the daemon's authoritative project
-                // order. Idempotent if our local listbox already
-                // matches (selection-sort no-op). Fires on:
-                //   - our own drag-drop persisting (we already
-                //     have the right order; this is a confirm),
-                //   - a CLI or sibling-UI calling ReorderProjects,
-                //   - a server-side cascade (none today, but the
-                //     invariant is the same).
-                self.apply_sidebar_order(&r.project_ids);
-            }
-            EventKind::TabCwd(c) => {
+            WorkspaceEvent::TabCwdChanged { tab_id, cwd } => {
                 let projects = self.projects.borrow();
                 for ui in projects.values() {
-                    if let Some(tab_ui) = ui.tabs.borrow().get(&c.tab_id) {
-                        // Mirror the Mac UI's tilde abbreviation so
-                        // the pill label doesn't bloat with full
-                        // home-prefixed paths.
-                        let label = tilde_abbreviate(&c.cwd);
-                        // OSC 7 doesn't override an OSC 0/1/2 title;
-                        // only update the label when the page still
-                        // shows a daemon-default tab title.
+                    if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                        let label = tilde_abbreviate(&cwd);
                         let current = tab_ui.page.title().to_string();
                         if current.starts_with("Tab ") {
                             tab_ui.page.set_title(&label);
                         }
-                        // Persist for headerbar subtitle. M2 will
-                        // surface this through `refresh_window_subtitle`.
-                        *tab_ui.cwd.borrow_mut() = c.cwd.clone();
+                        *tab_ui.cwd.borrow_mut() = cwd.clone();
                     }
                 }
                 drop(projects);
                 self.refresh_window_subtitle();
             }
-            EventKind::TabNotification(n) => {
-                // Light up the page's "needs attention" indicator so
-                // inactive tabs surface the pending notification.
+            WorkspaceEvent::TabNotification {
+                tab_id,
+                has_pending,
+            } => {
                 let projects = self.projects.borrow();
                 for ui in projects.values() {
-                    if let Some(tab_ui) = ui.tabs.borrow().get(&n.tab_id) {
-                        tab_ui.page.set_needs_attention(n.has_pending);
+                    if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                        tab_ui.page.set_needs_attention(has_pending);
                     }
                 }
             }
-            EventKind::Notification(n) => {
-                self.fire_desktop_notification(n.tab_id, &n.title, &n.body);
+            WorkspaceEvent::NotificationFired {
+                tab_id,
+                title,
+                body,
+            } => {
+                self.fire_desktop_notification(tab_id, &title, &body);
             }
-            EventKind::TabState(s) => {
-                // M6: per-tab agent state. Update both the per-tab
-                // indicator icon (M7) and the project rollup CSS.
-                let state = TabState::from_proto(s.state);
+            WorkspaceEvent::TabStateChanged { tab_id, state } => {
+                let state = TabState::from_ipc(state);
                 let mut affected_project: Option<i64> = None;
                 {
                     let projects = self.projects.borrow();
                     for (project_id, ui) in projects.iter() {
                         let tabs = ui.tabs.borrow();
-                        if let Some(tab_ui) = tabs.get(&s.tab_id) {
+                        if let Some(tab_ui) = tabs.get(&tab_id) {
                             *tab_ui.state.borrow_mut() = state;
                             apply_indicator_icon(&tab_ui.page, state);
                             affected_project = Some(*project_id);
@@ -1671,21 +1555,16 @@ impl App {
                 if let Some(project_id) = affected_project {
                     self.refresh_rollup_for(project_id);
                 }
-                tracing::debug!(tab_id = s.tab_id, ?state, "TabState applied");
+                tracing::debug!(tab_id, ?state, "tab.state_changed applied");
             }
-            EventKind::HookActive(h) => {
-                // M6: suppress this tab from the rollup while the
-                // Claude hook owns the surface. Indicator icon stays
-                // mapped to the underlying state — the hook usually
-                // pulses its own visual; we just don't double-promote
-                // via the sidebar stripe.
+            WorkspaceEvent::HookActiveChanged { tab_id, active } => {
                 let mut affected_project: Option<i64> = None;
                 {
                     let projects = self.projects.borrow();
                     for (project_id, ui) in projects.iter() {
                         let tabs = ui.tabs.borrow();
-                        if let Some(tab_ui) = tabs.get(&h.tab_id) {
-                            *tab_ui.hook_active.borrow_mut() = h.active;
+                        if let Some(tab_ui) = tabs.get(&tab_id) {
+                            *tab_ui.hook_active.borrow_mut() = active;
                             affected_project = Some(*project_id);
                             break;
                         }
@@ -1694,26 +1573,16 @@ impl App {
                 if let Some(project_id) = affected_project {
                     self.refresh_rollup_for(project_id);
                 }
-                tracing::debug!(
-                    tab_id = h.tab_id,
-                    hook_active = h.active,
-                    "HookActive applied"
-                );
+                tracing::debug!(tab_id, hook_active = active, "hook_active.changed applied");
             }
-            EventKind::Active(a) => {
-                // M6: daemon-driven active selection (e.g. a CLI
-                // `tab focus` from a sibling terminal). Sync the GTK
-                // UI's notion so cross-client convergence works.
-                // Zero values mean "no selection" (e.g. last tab
-                // closed); skip in that case rather than dropping
-                // the user's current focus.
-                if a.project_id != 0 {
-                    self.set_active_project(a.project_id);
+            WorkspaceEvent::ActiveChanged { project_id, tab_id } => {
+                if project_id != 0 {
+                    self.set_active_project(project_id);
                 }
-                if a.tab_id != 0 {
+                if tab_id != 0 {
                     let projects = self.projects.borrow();
-                    if let Some(ui) = projects.get(&a.project_id) {
-                        if let Some(tab_ui) = ui.tabs.borrow().get(&a.tab_id) {
+                    if let Some(ui) = projects.get(&project_id) {
+                        if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
                             ui.tab_view.set_selected_page(&tab_ui.page);
                         }
                     }
@@ -2011,7 +1880,7 @@ impl App {
     /// the headerbar folder-picker button (M5) where the user picks
     /// a directory before the project exists.
     async fn create_new_project_with_cwd(self: &Rc<Self>, cwd: &str) -> anyhow::Result<()> {
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return Ok(());
         };
         let rt = self.rt.clone();
@@ -2068,15 +1937,15 @@ impl App {
             }
             E::ColorQuery(n) => (n as u32, "?".to_string()),
         };
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
-        let rt = self.rt.clone();
-        rt.spawn(async move {
-            if let Err(err) = client.report_osc(tab_id, command, &payload).await {
-                tracing::warn!(?err, tab_id, command, "ReportOsc failed");
-            }
-        });
+        // M3b: OSC routing no longer round-trips through a daemon.
+        // `LocalClient::apply_osc` updates the in-process workspace
+        // directly; the event broadcast handler picks up the
+        // resulting `TabCwdChanged` / `TabTitleChanged` /
+        // `NotificationFired` events on the GTK main loop.
+        client.apply_osc(tab_id, command, &payload);
     }
 
     /// Fire a desktop notification via `gio::Notification`. On Linux
@@ -2163,24 +2032,24 @@ impl App {
     /// codes (Internal, FailedPrecondition, etc.) still surface as
     /// warnings.
     fn close_tab_async(self: &Rc<Self>, _project_id: i64, tab_id: i64) {
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
         let rt = self.rt.clone();
         rt.spawn(async move {
-            match client
-                .inner()
-                .close_tab(tonic::Request::new(roost_proto::v1::CloseTabRequest {
-                    tab_id,
-                }))
-                .await
-            {
+            match client.close_tab(tab_id).await {
                 Ok(_) => {}
-                Err(status) if status.code() == tonic::Code::NotFound => {
-                    tracing::debug!(tab_id, "CloseTab: tab already deleted server-side");
-                }
                 Err(err) => {
-                    tracing::warn!(?err, tab_id, "CloseTab RPC failed");
+                    // The "tab already gone" case surfaces as a
+                    // `not-found` WorkspaceError, wrapped in anyhow.
+                    // Treat it as info, not warn — common during a
+                    // close-on-PTY-exit race where the supervisor
+                    // already removed the session.
+                    if err.to_string().contains("not found") {
+                        tracing::debug!(tab_id, "close_tab: tab already gone");
+                    } else {
+                        tracing::warn!(?err, tab_id, "close_tab failed");
+                    }
                 }
             }
         });
@@ -2385,34 +2254,21 @@ impl App {
     /// rollback runs on the right thread — same pattern as
     /// `attach_existing_tab`.
     fn reorder_projects_async(self: &Rc<Self>, ordered_ids: Vec<i64>, snapshot: Vec<i64>) {
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
         let rt = self.rt.clone();
         let app = self.clone();
         glib::spawn_future_local(async move {
-            let handle = rt.spawn(async move {
-                client
-                    .inner()
-                    .reorder_projects(tonic::Request::new(
-                        roost_proto::v1::ReorderProjectsRequest {
-                            project_ids: ordered_ids,
-                        },
-                    ))
-                    .await
-            });
+            let handle = rt.spawn(async move { client.reorder_projects(ordered_ids).await });
             match handle.await {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
-                    tracing::warn!(?err, "ReorderProjects RPC failed");
+                    tracing::warn!(?err, "reorder_projects failed");
                     app.apply_sidebar_order(&snapshot);
                 }
                 Err(join_err) => {
-                    // Tokio task panic / cancellation. Rare, but
-                    // without the rollback the sidebar would stay
-                    // visually diverged from the daemon until the
-                    // next `ProjectsReordered` event arrives.
-                    tracing::warn!(?join_err, "ReorderProjects task join failed");
+                    tracing::warn!(?join_err, "reorder_projects task join failed");
                     app.apply_sidebar_order(&snapshot);
                 }
             }
@@ -2426,20 +2282,14 @@ impl App {
     /// already completed the visual move; reverting it would be
     /// jarring for a transient daemon hiccup.)
     fn reorder_tabs_async(self: &Rc<Self>, project_id: i64, ordered_ids: Vec<i64>) {
-        let Some(mut client) = self.client.borrow().clone() else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
         let rt = self.rt.clone();
         rt.spawn(async move {
-            let res = client
-                .inner()
-                .reorder_tabs(tonic::Request::new(roost_proto::v1::ReorderTabsRequest {
-                    project_id,
-                    tab_ids: ordered_ids,
-                }))
-                .await;
+            let res = client.reorder_tabs(project_id, ordered_ids).await;
             if let Err(err) = res {
-                tracing::warn!(?err, project_id, "ReorderTabs RPC failed");
+                tracing::warn!(?err, project_id, "reorder_tabs failed");
             }
         });
     }

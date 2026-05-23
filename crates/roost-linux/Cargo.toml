@@ -24,11 +24,10 @@ name = "roost-linux"
 path = "src/main.rs"
 
 [dependencies]
-# M3a (daemon-removal refactor sub-split): the new daemon/ modules
-# under src/daemon/, src/ipc.rs, and src/single_instance.rs live
-# alongside the existing gRPC client. M3b will rewire app.rs and
-# delete client.rs; tonic/proto/roost-proto stay until then.
-roost-proto  = { path = "../roost-proto" }
+# roost-common stays through M7 as a thin compatibility shim for
+# `BundleProfile` (which still has a few daemon-era consumers).
+# `roost-proto` and `tonic` are gone — the Linux UI no longer
+# speaks gRPC. `prost` falls out with `tonic`.
 roost-common = { path = "../roost-common" }
 roost-ipc    = { path = "../roost-ipc" }
 # Phase 7 commit 2: pull in the safe-API wrappers landed in commit 1.
@@ -56,7 +55,6 @@ fs2 = "0.4"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
-tonic = "0.12"
 anyhow = "1"
 thiserror = { workspace = true }
 tracing = "0.1"

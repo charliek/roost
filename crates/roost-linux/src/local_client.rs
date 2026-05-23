@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use roost_ipc::messages::{Project, Tab};
+use tokio::sync::broadcast;
 
-use crate::daemon::{PtySupervisor, Workspace};
+use crate::daemon::{PtyOutputEvent, PtySupervisor, Workspace};
 
 /// In-process workspace + PTY supervisor handle.
 #[derive(Clone)]
@@ -70,19 +71,30 @@ impl LocalClient {
         Ok(self.workspace.reorder_tabs(project_id, &tab_ids)?)
     }
 
-    /// Open a tab and spawn the shell. Used by Cmd+T / + button.
-    pub async fn open_tab(&self, project_id: i64, cwd: &str, cols: u32, rows: u32) -> Result<Tab> {
+    /// Open a tab and spawn the shell. Returns the tab snapshot
+    /// plus a `broadcast::Receiver` subscribed BEFORE the supervisor's
+    /// reader task started producing — `TabSession::attach_with_receiver`
+    /// consumes it, no early-byte loss.
+    pub async fn open_tab(
+        &self,
+        project_id: i64,
+        cwd: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(Tab, broadcast::Receiver<PtyOutputEvent>)> {
         let tab = self.workspace.open_tab(project_id, cwd, "")?;
         let cols = if cols == 0 { 80 } else { cols as u16 };
         let rows = if rows == 0 { 24 } else { rows as u16 };
-        if let Err(err) = self
+        match self
             .supervisor
             .spawn(tab.id, cwd, &[], cols, rows, &self.socket_path)
         {
-            let _ = self.workspace.close_tab(tab.id);
-            return Err(anyhow::anyhow!("pty spawn failed: {err:?}"));
+            Ok(rx) => Ok((tab, rx)),
+            Err(err) => {
+                let _ = self.workspace.close_tab(tab.id);
+                Err(anyhow::anyhow!("pty spawn failed: {err:?}"))
+            }
         }
-        Ok(tab)
     }
 
     pub async fn close_tab(&self, tab_id: i64) -> Result<()> {
