@@ -70,6 +70,38 @@ struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
+/// Dead-channel `Session` used to reserve a slot under the
+/// `sessions` lock while the caller of `spawn()` builds the real
+/// session. Any concurrent caller hitting the placeholder's
+/// channels will see `Closed` / `Lagged` errors and surface a
+/// `PtyError::Closed` to the workspace — that's the right
+/// behavior: the slot is owned but not yet usable.
+fn placeholder_session() -> Session {
+    let (input_tx, _input_rx) = mpsc::channel::<Vec<u8>>(1);
+    let (resize_tx, _resize_rx) = mpsc::channel::<PtySize>(1);
+    let (output_tx, _drop_rx) = broadcast::channel::<PtyOutputEvent>(1);
+    Session {
+        input_tx,
+        resize_tx,
+        output_tx,
+        killer: Mutex::new(Box::new(NoopKiller)),
+    }
+}
+
+/// `ChildKiller` impl for the placeholder slot. `kill()` is a
+/// no-op because there's no real child yet; if the placeholder
+/// somehow gets `close()`d we just drop it.
+#[derive(Debug)]
+struct NoopKiller;
+impl ChildKiller for NoopKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(NoopKiller)
+    }
+}
+
 impl Default for PtySupervisor {
     fn default() -> Self {
         Self::new()
@@ -125,13 +157,45 @@ impl PtySupervisor {
         rows: u16,
         socket_path: &std::path::Path,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
-        // Reject duplicates up front. Silently replacing an existing
-        // session would orphan its PTY child and broadcast channel.
-        // The workspace's contract is that the caller owns the
-        // ordering: `close(tab_id)` before any re-spawn.
-        if self.sessions.lock().unwrap().contains_key(&tab_id) {
-            return Err(PtyError::DuplicateTab(tab_id).into());
+        // Reserve the slot atomically under the lock so two
+        // concurrent `spawn(tab_id, ...)` calls cannot both pass the
+        // duplicate check, create two PTYs, and then have the second
+        // insert orphan the first. CR-flagged race on PR #78.
+        //
+        // Strategy: insert a placeholder Session whose channels
+        // immediately drop (so any racing `write`/`resize` sees
+        // `Closed` and surfaces it to the caller) under the lock,
+        // then build the real one outside the lock, and replace the
+        // placeholder at the end. On spawn failure we explicitly
+        // remove the placeholder so the slot doesn't leak.
+        let placeholder_id = {
+            let mut sessions = self.sessions.lock().unwrap();
+            if sessions.contains_key(&tab_id) {
+                return Err(PtyError::DuplicateTab(tab_id).into());
+            }
+            sessions.insert(tab_id, placeholder_session());
+            tab_id
+        };
+        // Roll the placeholder back on early-return paths via this
+        // guard. RAII gives us crash-safety without dotting `remove`
+        // calls through every `?`.
+        struct SlotGuard<'a> {
+            sup: &'a PtySupervisor,
+            tab_id: i64,
+            armed: bool,
         }
+        impl Drop for SlotGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = self.sup.sessions.lock().unwrap().remove(&self.tab_id);
+                }
+            }
+        }
+        let mut slot = SlotGuard {
+            sup: self,
+            tab_id: placeholder_id,
+            armed: true,
+        };
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -224,7 +288,11 @@ impl PtySupervisor {
             output_tx,
             killer: Mutex::new(killer),
         };
+        // Replace the placeholder atomically. From this point the
+        // SlotGuard must NOT roll back — the real session owns the
+        // slot now.
         self.sessions.lock().unwrap().insert(tab_id, session);
+        slot.armed = false;
 
         Ok(early_rx)
     }

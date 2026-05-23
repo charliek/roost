@@ -20,6 +20,11 @@ pub struct FrameReader<R> {
     pending: Vec<u8>,
     /// Read-buffer scratch.
     scratch: Vec<u8>,
+    /// Bytes in `pending` that have already been scanned for `\n`
+    /// on a prior iteration without finding one. The next scan
+    /// starts at this offset to avoid O(n²) behavior on fragmented
+    /// large frames — CR-flagged on PR #78.
+    scan_cursor: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -30,6 +35,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             // 64 KiB is a comfortable default for typical tab.write
             // payloads; the buffer will grow if needed.
             scratch: vec![0u8; 64 * 1024],
+            scan_cursor: 0,
         }
     }
 
@@ -40,13 +46,21 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         use tokio::io::AsyncReadExt;
 
         loop {
-            // Look for a newline in what we already have.
-            if let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            // Scan only the bytes added since the last fruitless
+            // pass. Adding `scan_cursor` to the found position
+            // converts back to an absolute offset within `pending`.
+            if let Some(rel) = self.pending[self.scan_cursor..]
+                .iter()
+                .position(|&b| b == b'\n')
+            {
+                let pos = self.scan_cursor + rel;
                 let mut line = self.pending.split_off(pos + 1);
                 std::mem::swap(&mut line, &mut self.pending);
                 // `line` now holds everything up to and including `\n`;
                 // `self.pending` holds the rest. Drop the trailing `\n`.
                 line.pop();
+                // Reset the cursor: the next line starts fresh.
+                self.scan_cursor = 0;
                 if line.len() > MAX_FRAME_BYTES {
                     return Err(Error::FrameTooLarge);
                 }
@@ -60,6 +74,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             if self.pending.len() > MAX_FRAME_BYTES {
                 return Err(Error::FrameTooLarge);
             }
+
+            // We've now scanned everything currently in `pending`;
+            // advance the cursor so the next iteration only looks
+            // at freshly-read bytes.
+            self.scan_cursor = self.pending.len();
 
             // Pull more from the underlying reader.
             let n = self.inner.read(&mut self.scratch).await?;

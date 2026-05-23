@@ -47,6 +47,8 @@ pub enum TargetError {
     NoLiveTarget { tried: Vec<PathBuf> },
     #[error("path resolution failed: {0}")]
     Path(#[from] anyhow::Error),
+    #[error("unknown ROOST_BUNDLE_PROFILE value {0:?} (expected `mac` or `gtk`)")]
+    UnknownProfile(String),
 }
 
 /// Resolved target — a socket path plus the profile kind that
@@ -112,7 +114,15 @@ impl TargetSelector {
                         kind: Some(BundleProfileKind::Gtk),
                     });
                 }
-                _ => {}
+                "" => {
+                    // Empty string is the launchd-inherited
+                    // empty-env case; fall through to auto-detect
+                    // so a sandboxed process with no profile set
+                    // can still discover one.
+                }
+                other => {
+                    return Err(TargetError::UnknownProfile(other.to_string()));
+                }
             }
         }
 

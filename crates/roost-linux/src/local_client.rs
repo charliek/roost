@@ -140,11 +140,14 @@ impl LocalClient {
 }
 
 fn parse_osc7_path(payload: &str) -> Option<String> {
-    // OSC 7 carries `file://host/abs/path`. We don't validate the
-    // host portion — anything between `file://` and the next `/` is
-    // dropped.
+    // OSC 7 carries `file://host/abs/path`. The path portion starts
+    // at the FIRST `/` after the host (or at index 0 if the host is
+    // empty, e.g. `file:///tmp`). A malformed payload with no `/`
+    // after the host returns None — the previous implementation's
+    // `unwrap_or(0)` would have returned the host segment itself as
+    // a "path," writing `host` into the workspace's cwd. CR-flagged.
     let after_scheme = payload.strip_prefix("file://")?;
-    let path_start = after_scheme.find('/').unwrap_or(0);
+    let path_start = after_scheme.find('/')?;
     Some(after_scheme[path_start..].to_string())
 }
 
@@ -178,6 +181,14 @@ mod tests {
     #[test]
     fn osc7_handles_empty_host() {
         assert_eq!(parse_osc7_path("file:///tmp"), Some("/tmp".into()));
+    }
+
+    #[test]
+    fn osc7_returns_none_for_host_without_path() {
+        // `file://host` (no path after host) must not return "host"
+        // as the path — that's the CR-flagged regression. Returns
+        // None so the workspace cwd is left unchanged.
+        assert_eq!(parse_osc7_path("file://host"), None);
     }
 
     #[test]

@@ -43,9 +43,13 @@ async fn pty_echo_emits_bytes_and_exit() {
     assert!(saw_bytes, "expected at least one chunk of PTY output");
     assert_eq!(exit_status, Some(0), "expected clean exit");
 
-    // Lifecycle channel should also have an Exit event.
+    // Lifecycle channel should also have an Exit event. Use the
+    // same 5s budget as the output polling above — on slow CI
+    // runners the reap can land well after the byte stream
+    // closes.
+    let life_deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut life_status = None;
-    for _ in 0..20 {
+    while std::time::Instant::now() < life_deadline {
         match lifecycle.try_recv() {
             Ok(SupervisorEvent::TabExited { tab_id: 7, status }) => {
                 life_status = Some(status);
@@ -127,10 +131,11 @@ async fn duplicate_spawn_for_same_tab_id_is_rejected() {
     );
 
     // Closing the original lets a subsequent spawn succeed.
+    // `close()` removes the session from the map synchronously
+    // before invoking the killer, so the slot is free immediately
+    // — no `sleep()` needed. Pre-fix this test used a 50ms wait
+    // that's flaky on slow CI runners; CR-flagged on PR #78.
     sup.close(42);
-    // Give the supervisor a moment to drop the session entry from
-    // the kill path.
-    sleep(Duration::from_millis(50)).await;
     let _second = sup
         .spawn(
             42,

@@ -111,10 +111,13 @@ fn request_vectors_have_required_envelope_shape() {
         if !stem.ends_with(".request") {
             continue;
         }
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(v.is_object(), "{} is not a JSON object", path.display());
-        let obj = v.as_object().unwrap();
+        let raw =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: read: {e}", path.display()));
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: parse: {e}", path.display()));
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("{}: not a JSON object", path.display()));
         assert!(
             obj.get("id").map(|v| v.is_string()).unwrap_or(false),
             "{}: missing string `id`",
@@ -136,9 +139,13 @@ fn event_vectors_have_required_envelope_shape() {
         if !stem.ends_with(".event") {
             continue;
         }
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let obj = v.as_object().unwrap();
+        let raw =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: read: {e}", path.display()));
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: parse: {e}", path.display()));
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("{}: not a JSON object", path.display()));
         assert!(
             obj.get("event").map(|v| v.is_string()).unwrap_or(false),
             "{}: missing string `event`",

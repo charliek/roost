@@ -7,11 +7,12 @@
 //! variant can land later if a use case shows up.
 //!
 //! Each request gets a monotonically-increasing id. Responses are
-//! matched by id; an out-of-order response (rare in the one-shot
-//! sequential case, but the server may emit `events.subscribe` push
-//! envelopes mid-stream) is surfaced as an error in M2 (the client
-//! does not subscribe to events). Future event-aware clients can
-//! consume the [`IpcClient::recv_raw_frame`] helper.
+//! matched by id; unsolicited event envelopes mid-stream (the server
+//! may emit them after `events.subscribe` lands a real implementation
+//! — M0/M3a stub never sends any) are silently dropped by the M2
+//! client. Future event-aware clients can extend [`IpcClient`] with
+//! a frame-level read helper rather than going through
+//! [`IpcClient::call_raw`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -54,7 +55,7 @@ impl IpcClient {
     /// `serde_json::json!({})` for empty.
     ///
     /// Returns the raw `result` value on success. Maps the
-    /// server-side error envelope into [`Error::Server`].
+    /// server-side error envelope into [`ClientError::Server`].
     pub async fn call_raw<P: Serialize>(
         &mut self,
         op: &str,

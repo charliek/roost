@@ -98,10 +98,17 @@ async fn max_frame_minus_one_succeeds() {
     let writer_payload = payload.clone();
     let writer = tokio::spawn(async move {
         let mut a = a;
-        write_frame(&mut a, &writer_payload).await.unwrap();
-        a.shutdown().await.unwrap();
+        write_frame(&mut a, &writer_payload)
+            .await
+            .map_err(|e| format!("write_frame: {e}"))?;
+        a.shutdown().await.map_err(|e| format!("shutdown: {e}"))?;
+        Ok::<_, String>(())
     });
     let line = reader.read_line().await.unwrap().unwrap();
-    assert_eq!(line.len(), MAX_FRAME_BYTES - 1);
-    writer.await.unwrap();
+    // Compare full byte contents, not just length — a wrong byte
+    // at the boundary would otherwise slip through silently.
+    assert_eq!(line, payload, "boundary frame bytes diverged");
+    // Surface writer-side errors; previously the JoinHandle was
+    // dropped and any write failure would have been silent.
+    writer.await.expect("writer join").expect("writer io");
 }
