@@ -1,0 +1,47 @@
+# nfpm config for the Roost Linux .deb.
+#
+# Built by linux/scripts/build-deb.sh, which stages the binaries into ./dist/
+# and sets ROOST_VERSION + ROOST_ARCH. nfpm expands ${ENV} in this file at
+# package time. Paths are relative to the repo root (build-deb.sh runs there).
+#
+# Output: roost_${ROOST_VERSION}_${ROOST_ARCH}.deb  (matches apt-charliek glob
+# "roost_*.deb").
+name: roost
+arch: ${ROOST_ARCH}
+version: ${ROOST_VERSION}
+platform: linux
+section: utils
+priority: optional
+maintainer: Charlie Knudsen <charlie.knudsen@gmail.com>
+vendor: Stride Labs
+homepage: https://github.com/charliek/roost
+license: MIT
+description: |
+  Multi-project terminal multiplexer for AI coding agents.
+  Roost is a cross-platform desktop terminal multiplexer built around
+  libghostty-vt: a sidebar of projects, tabs per project, one terminal per tab,
+  with notification routing for AI coding agents (Claude Code, Codex). Ships the
+  gtk4-rs UI (roost) plus the roostctl CLI for shell + hook integration.
+
+depends:
+  - libgtk-4-1 (>= 4.10)
+  - libadwaita-1-0 (>= 1.4)
+  - libc6 (>= 2.31)
+recommends:
+  - fonts-noto-color-emoji
+
+contents:
+  - src: ./dist/roost
+    dst: /usr/bin/roost
+  - src: ./dist/roostctl
+    dst: /usr/bin/roostctl
+  - src: ./packaging/roost.desktop
+    dst: /usr/share/applications/ai.stridelabs.Roost.gtk.desktop
+  - src: ./packaging/icons/hicolor/256x256/apps/roost.png
+    dst: /usr/share/icons/hicolor/256x256/apps/roost.png
+  - src: ./packaging/icons/hicolor/512x512/apps/roost.png
+    dst: /usr/share/icons/hicolor/512x512/apps/roost.png
+  - src: ./packaging/copyright
+    dst: /usr/share/doc/roost/copyright
+  - src: ./README.md
+    dst: /usr/share/doc/roost/README.md

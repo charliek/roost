@@ -1,6 +1,6 @@
 [package]
 name        = "roost-linux"
-version     = "0.1.0"
+version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -11,16 +11,17 @@ description = "Roost Linux UI — gtk4-rs + libadwaita-rs. Owns its PTY supervis
 # M3 of the daemon-removal refactor (2026-05-23): roost-linux is no
 # longer a gRPC client of roost-core. It owns its PTY supervisor,
 # its workspace state, and serves the post-refactor JSON IPC over a
-# Unix socket. `lib.rs` exposes the testable surface; the
-# `roost-linux` bin is a thin wrapper that wires the gtk4-rs
-# application onto the library.
+# Unix socket. `lib.rs` exposes the testable surface; the `roost`
+# bin is a thin wrapper that wires the gtk4-rs application onto the
+# library. (The crate/package stays `roost-linux`; only the produced
+# binary is named `roost` — `roost` = GUI, `roostctl` = CLI on $PATH.)
 
 [lib]
 name = "roost_linux"
 path = "src/lib.rs"
 
 [[bin]]
-name = "roost-linux"
+name = "roost"
 path = "src/main.rs"
 
 [dependencies]
