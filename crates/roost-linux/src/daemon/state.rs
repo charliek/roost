@@ -124,6 +124,13 @@ pub enum WorkspaceEvent {
     ProjectsReordered {
         project_ids: Vec<i64>,
     },
+    /// Full-state recovery snapshot. Minted by the event bridge
+    /// (`events::subscribe`) when the broadcast channel reports
+    /// `Lagged`, so the UI reconciles against ground truth instead
+    /// of applying deltas on top of a diverged base. Each `Project`
+    /// carries its live tabs; the active tab is the one with
+    /// `is_active == true`.
+    Resync(Vec<Project>),
 }
 
 pub struct Workspace {
@@ -230,6 +237,12 @@ impl Workspace {
             p.tabs.sort_by_key(|t| (t.position, t.id));
         }
         out
+    }
+
+    /// Build a `Resync` event carrying the current full snapshot.
+    /// The event bridge sends this on broadcast `Lagged`.
+    pub fn resync_event(&self) -> WorkspaceEvent {
+        WorkspaceEvent::Resync(self.snapshot())
     }
 
     pub fn active(&self) -> (i64, i64) {
