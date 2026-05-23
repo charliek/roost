@@ -703,7 +703,7 @@ impl Workspace {
         // Compute the full post-reorder order for the event
         // payload: supplied prefix + sorted unlisted (matches
         // Mac's `Workspace.tabsReordered` payload shape).
-        let final_order: Vec<i64> = tab_ids.iter().copied().chain(unlisted.into_iter()).collect();
+        let final_order: Vec<i64> = tab_ids.iter().copied().chain(unlisted).collect();
         let snapshot = inner.snapshot_for_persist();
         drop(inner);
         self.persist_async(snapshot);
@@ -741,11 +741,7 @@ impl Workspace {
                 next_pos += 1;
             }
         }
-        let final_order: Vec<i64> = project_ids
-            .iter()
-            .copied()
-            .chain(unlisted.into_iter())
-            .collect();
+        let final_order: Vec<i64> = project_ids.iter().copied().chain(unlisted).collect();
         let snapshot = inner.snapshot_for_persist();
         drop(inner);
         self.persist_async(snapshot);

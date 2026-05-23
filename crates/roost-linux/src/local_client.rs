@@ -75,6 +75,17 @@ impl LocalClient {
     /// plus a `broadcast::Receiver` subscribed BEFORE the supervisor's
     /// reader task started producing — `TabSession::attach_with_receiver`
     /// consumes it, no early-byte loss.
+    pub async fn resize_tab(&self, tab_id: i64, cols: u32, rows: u32) -> Result<()> {
+        // Same validation as `open_tab` — caller-supplied dims via
+        // `roostctl tab resize` or via UI live-resize.
+        let cols = pty_dim(cols, 80, "cols")?;
+        let rows = pty_dim(rows, 24, "rows")?;
+        self.supervisor
+            .resize(tab_id, cols, rows)
+            .await
+            .map_err(|e| anyhow::anyhow!("pty resize failed: {e:?}"))
+    }
+
     pub async fn open_tab(
         &self,
         project_id: i64,
@@ -99,8 +110,14 @@ impl LocalClient {
                 .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()))
         };
         let tab = self.workspace.open_tab(project_id, &resolved_cwd, "")?;
-        let cols = if cols == 0 { 80 } else { cols as u16 };
-        let rows = if rows == 0 { 24 } else { rows as u16 };
+        // Clamp + validate PTY dims. Zero → terminal default; values
+        // exceeding u16 surface as a clear error rather than
+        // silently truncating via `as u16` (CR-flagged: a CLI
+        // caller passing `--cols 100000` would land with cols=34464
+        // and a wildly-misshapen grid). Mirrors the Mac side's
+        // `IPCHandlerImpl.ipcDim` validation.
+        let cols = pty_dim(cols, 80, "cols")?;
+        let rows = pty_dim(rows, 24, "rows")?;
         match self
             .supervisor
             .spawn(tab.id, &resolved_cwd, &[], cols, rows, &self.socket_path)
@@ -165,6 +182,19 @@ fn parse_osc7_path(payload: &str) -> Option<String> {
     let after_scheme = payload.strip_prefix("file://")?;
     let path_start = after_scheme.find('/')?;
     Some(after_scheme[path_start..].to_string())
+}
+
+/// Validate + clamp a caller-supplied PTY dimension. Zero → the
+/// supplied default; values exceeding `u16::MAX` return an error
+/// instead of truncating via `as u16` (which would silently
+/// produce e.g. cols=34464 for cols=100000). Mirrors the Rust
+/// IPC handler's `u16::try_from` validation in `crates/roost-
+/// linux/src/ipc.rs`.
+fn pty_dim(value: u32, default: u16, field: &str) -> Result<u16> {
+    if value == 0 {
+        return Ok(default);
+    }
+    u16::try_from(value).map_err(|_| anyhow::anyhow!("{field} out of u16 range: {value}"))
 }
 
 fn parse_notification_payload(command: u32, payload: &str) -> (String, String) {

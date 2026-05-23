@@ -45,7 +45,7 @@ jobs:
       startsWith(github.head_ref, 'refactor/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install protoc
         run: |
@@ -53,10 +53,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -88,7 +88,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install protoc + libclang (Linux)
         if: runner.os == 'Linux'
@@ -104,16 +104,16 @@ jobs:
         run: brew install protobuf
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
 
       - name: Cache vendored libghostty-vt
         # Keyed on the build script + the SHA pin inside it. A bump to
         # third_party/ghostty/build.sh invalidates and rebuilds — same
         # discipline as the legacy build/build.sh cache in ci.yml.
         id: cache-ghostty
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             third_party/ghostty/out
@@ -125,7 +125,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -164,12 +164,12 @@ jobs:
       startsWith(github.head_ref, 'refactor/')
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Show Swift toolchain
         run: swift --version
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
 
       - name: Cache vendored libghostty-vt
         # Same shape (and same key) as the rust-build matrix's cache:
@@ -177,7 +177,7 @@ jobs:
         # would still be a hit. SHA pin lives in build.sh, hashFiles
         # invalidates on any bump.
         id: cache-ghostty
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             third_party/ghostty/out
@@ -194,7 +194,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache SwiftPM artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             mac/.build
@@ -207,7 +207,7 @@ jobs:
         # `Roost.app/Contents/Resources/bin/`. Cache the registry +
         # target dir keyed on the workspace Cargo.toml so consecutive
         # PRs don't re-resolve + re-compile from scratch.
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -290,7 +290,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install GTK4 + libadwaita (Linux)
         if: runner.os == 'Linux'
@@ -312,9 +312,9 @@ jobs:
           echo "PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
 
       - name: Cache vendored libghostty-vt
         # Phase 7 commit 2 makes roost-linux depend on
@@ -323,7 +323,7 @@ jobs:
         # rust-build + swift-mac so we share the build artifact across
         # the matrix (rust-build runs first on the same SHA).
         id: cache-ghostty
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             third_party/ghostty/out
@@ -335,7 +335,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target (shared with rust-build)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
