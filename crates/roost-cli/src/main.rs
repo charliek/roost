@@ -723,17 +723,23 @@ fn claude_install(force: bool) -> Result<()> {
     eprintln!("# Fish/zsh: adapt the alias syntax for your shell.");
     println!();
     println!("# Roost: route Claude Code hooks to the running UI.");
-    // Inherited from the pre-M5 CLI, the previous form was
-    // `alias claude='claude --settings '<quoted_path>`. The trailing
-    // close-quote before the path produced visibly broken output
-    // when `quote_for_shell` returned a single-quoted string (e.g. a
-    // path with spaces ended up as `'claude --settings ''has space'`
-    // — bash's quote-concat rescues most cases but the shape misleads
-    // anyone reading the output). Switch to a double-quoted outer
-    // wrapper so the inner single-quoting from `quote_for_shell`
-    // composes correctly without quote stacking.
-    let settings_quoted = quote_for_shell(&settings_path.to_string_lossy());
-    println!("alias claude=\"claude --settings {settings_quoted}\"");
+    // Form is `alias claude='claude --settings '<quoted_path>`.
+    // The trailing close-quote before the path looks weird but is
+    // correct bash quote-concat: the single-quoted prefix
+    // `'claude --settings '` is adjacent-concatenated with
+    // `quote_for_shell`'s result (also single-quoted when needed),
+    // producing one alias value. A double-quoted outer wrapper
+    // (the M4c-polish "fix" that this comment reverts) re-exposes
+    // `$`, backticks, and backslashes in the path to shell
+    // expansion before the inner single quotes can protect them —
+    // sub-agent review of M6-M9 caught a working
+    // `alias claude="claude --settings '/has \`whoami\`/y'"`
+    // example that expanded `whoami` to `charliek`. The
+    // adjacent-quote form is safe; keep it.
+    println!(
+        "alias claude='claude --settings '{}",
+        quote_for_shell(&settings_path.to_string_lossy())
+    );
     Ok(())
 }
 

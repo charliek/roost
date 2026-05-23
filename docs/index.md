@@ -10,7 +10,7 @@ A legacy Go + GTK4 binary still ships from `main` while the Rust path comes up t
 
 - One window with a project sidebar and per-project tabs.
 - One libghostty-vt terminal per tab, persistent across restarts.
-- Companion CLI (`roost-cli-rs`) for firing notifications from inside a tab.
+- Companion CLI (`roostctl`) for firing notifications from inside a tab.
 - OSC 9 / OSC 777 fallback so non-CLI tools still trigger notifications.
 - Native desktop notifications when a non-focused tab pings you.
 
@@ -27,7 +27,7 @@ A legacy Go + GTK4 binary still ships from `main` while the Rust path comes up t
 
 ```bash
 # From inside any Roost tab — fires a notification on this tab.
-roost-cli-rs notify --title "Build done" --body "tests pass"
+roostctl notify --title "Build done" --body "tests pass"
 ```
 
 If the tab is not currently focused you'll see:
@@ -41,6 +41,6 @@ If the tab is not currently focused you'll see:
 - [First Run](getting-started/first-run.md) — what happens on launch and where state lives.
 - [Keybindings](getting-started/keybindings.md) — tab and project switching, platform-native modifiers.
 - [Notifications](guides/notifications.md) — how the notification pipeline works.
-- [Claude Code Hooks](guides/claude-code.md) — wire `roost-cli-rs notify` into Claude.
+- [Claude Code Hooks](guides/claude-code.md) — wire `roostctl notify` into Claude.
 - [Architecture](reference/architecture.md) — how the daemon, UIs, and CLI fit together.
 - [Vision](development/vision.md) — the durable design decisions and migration path.

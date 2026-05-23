@@ -1,13 +1,20 @@
-# `roost-cli-rs`
+# `roostctl`
 
-Companion CLI for the running Roost UI. Talks to `roost-core` over a Unix socket using gRPC (via `tonic`). Intended to be invoked from inside a Roost tab — typically by Claude Code hooks — but works from any shell that can reach the socket.
+Shell-integration CLI for the running Roost UI. Talks JSON over
+a Unix-domain socket directly to the UI process — no daemon.
+Intended to be invoked from inside a Roost tab (typically by
+Claude Code hooks) but works from any shell that can reach the
+socket. See [`docs/reference/ipc.md`](ipc.md) for the wire
+format.
 
-The binary is named `roost-cli-rs` during the transition; it renames to canonical `roost-cli` in the Phase 9 cutover. For the legacy Go CLI that ships from `main`, see [Legacy → CLI](legacy-go/cli.md).
+Crate: `crates/roost-cli` (binary `roostctl`). For the legacy
+Go CLI that ships from `main`, see
+[Legacy → CLI](legacy-go/cli.md).
 
 ## Usage
 
 ```text
-roost-cli-rs [--socket <PATH>] <COMMAND>
+roostctl [--socket <PATH>] <COMMAND>
 ```
 
 | Command | Purpose |
@@ -29,8 +36,8 @@ roost-cli-rs [--socket <PATH>] <COMMAND>
 ## `notify`
 
 ```bash
-roost-cli-rs notify --title "Build done" --body "tests pass"
-roost-cli-rs notify --tab 3 --title "From CI" --body "deploy ready"
+roostctl notify --title "Build done" --body "tests pass"
+roostctl notify --tab 3 --title "From CI" --body "deploy ready"
 ```
 
 | Flag | Type | Default | Description |
@@ -44,8 +51,8 @@ roost-cli-rs notify --tab 3 --title "From CI" --body "deploy ready"
 Set a tab's display title. Persists across restarts and locks the tab against subsequent OSC 1/2 escapes from the shell.
 
 ```bash
-roost-cli-rs set-title --title "build-watcher"
-roost-cli-rs set-title --title "deploy" --tab 3
+roostctl set-title --title "build-watcher"
+roostctl set-title --title "deploy" --tab 3
 ```
 
 | Flag | Type | Default | Description |
@@ -56,7 +63,7 @@ roost-cli-rs set-title --title "deploy" --tab 3
 ## `identify`
 
 ```bash
-roost-cli-rs identify
+roostctl identify
 ```
 
 ```json
@@ -74,8 +81,8 @@ Useful for verifying the socket is reachable and the env vars are wired correctl
 ## `tab focus`
 
 ```bash
-roost-cli-rs tab focus               # focus the calling shell's tab
-roost-cli-rs tab focus --tab 7
+roostctl tab focus               # focus the calling shell's tab
+roostctl tab focus --tab 7
 ```
 
 Raises the window, switches the active project, selects the tab. Used as the click-through target for desktop banners.
@@ -83,8 +90,8 @@ Raises the window, switches the active project, selects the tab. Used as the cli
 ## `tab list`
 
 ```bash
-roost-cli-rs tab list
-roost-cli-rs tab list --json
+roostctl tab list
+roostctl tab list --json
 ```
 
 Default output is a human-readable tree; `--json` prints the raw response. Each tab carries `id`, `title`, `agent_state`, `has_notification`, and `is_active`.
@@ -92,8 +99,8 @@ Default output is a human-readable tree; `--json` prints the raw response. Each 
 ## `tab set-state`
 
 ```bash
-roost-cli-rs tab set-state --state running
-roost-cli-rs tab set-state --tab 3 --state idle
+roostctl tab set-state --state running
+roostctl tab set-state --tab 3 --state idle
 ```
 
 | Flag | Type | Default | Description |
@@ -106,21 +113,21 @@ roost-cli-rs tab set-state --tab 3 --state idle
 Tab lifecycle and I/O for automation. `tab send` needs an existing live PTY (a UI must have already attached); errors with `NotFound` otherwise. `--bytes` accepts Rust string-escape sequences (`\n`, `\r`, `\x1b`, …); pass `--raw` to disable escape decoding.
 
 ```bash
-roost-cli-rs tab open --project-id 1 --cwd ~/projects/roost
-roost-cli-rs tab close --tab 5
-roost-cli-rs tab send --tab 5 --bytes 'ls -la\n'
-roost-cli-rs tab resize --tab 5 --cols 120 --rows 40
-roost-cli-rs tab reorder --project-id 1 --order 3,5,7
+roostctl tab open --project-id 1 --cwd ~/projects/roost
+roostctl tab close --tab 5
+roostctl tab send --tab 5 --bytes 'ls -la\n'
+roostctl tab resize --tab 5 --cols 120 --rows 40
+roostctl tab reorder --project-id 1 --order 3,5,7
 ```
 
 ## `project` subcommands
 
 ```bash
-roost-cli-rs project list
-roost-cli-rs project create --name "scratch" --cwd ~
-roost-cli-rs project rename --project-id 1 --name "main"
-roost-cli-rs project delete --project-id 2
-roost-cli-rs project reorder --order 1,3,2
+roostctl project list
+roostctl project create --name "scratch" --cwd ~
+roostctl project rename --project-id 1 --name "main"
+roostctl project delete --project-id 2
+roostctl project reorder --order 1,3,2
 ```
 
 `project delete` cascades to the project's tabs. `project reorder` is the same shape as `tab reorder` — any id not in `--order` keeps its prior position.
@@ -130,8 +137,8 @@ roost-cli-rs project reorder --order 1,3,2
 Writes `~/.config/roost/claude-settings.json` pointing at this binary's `claude-hook` subcommand for each Claude Code lifecycle event, then prints a bash alias snippet (`alias claude='claude --settings ...'`) to stdout. See the [Claude Code Hooks](../guides/claude-code.md) guide for the full workflow.
 
 ```bash
-roost-cli-rs claude install >> ~/.bashrc
-roost-cli-rs claude install --force   # overwrite an existing file
+roostctl claude install >> ~/.bashrc
+roostctl claude install --force   # overwrite an existing file
 ```
 
 ## `claude-hook`

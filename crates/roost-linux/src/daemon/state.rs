@@ -420,7 +420,17 @@ impl Workspace {
             cwd: cwd.to_string(),
             state: TabState::None,
             has_notification: false,
-            user_titled: !title.is_empty(),
+            // Always start with user_titled=false. The caller-
+            // supplied `title` is a placeholder (e.g. UI's
+            // "roost-mac N" / CLI's "roostctl" default) that
+            // shell-side OSC 0/1/2 emissions should be allowed to
+            // overwrite. Only an explicit user rename via
+            // `set_tab_title` flips this to true. The previous
+            // `!title.is_empty()` policy locked every newly-opened
+            // tab to its placeholder, preventing shell prompts
+            // like `👻 /tmp` from ever appearing in the tab bar.
+            // Mirrors the Mac fix in `mac/Sources/Roost/Workspace.swift`.
+            user_titled: false,
             position,
             created_at: now,
             last_active: now,
