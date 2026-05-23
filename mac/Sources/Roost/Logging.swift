@@ -44,6 +44,12 @@ final class RoostLogger: @unchecked Sendable {
             if !FileManager.default.fileExists(atPath: path) {
                 FileManager.default.createFile(atPath: path, contents: nil)
             }
+            // ARC-driven deinit on the prior FileHandle closes its
+            // fd, but we close explicitly so the lifecycle is visible
+            // at the call site rather than depending on the ARC
+            // ordering when `self.fileHandle = handle` runs. Matches
+            // the "idempotent" promise in the doc comment.
+            try? self.fileHandle?.close()
             let handle = FileHandle(forWritingAtPath: path)
             _ = try? handle?.seekToEnd()
             self.fileHandle = handle

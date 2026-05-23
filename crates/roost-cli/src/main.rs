@@ -698,10 +698,17 @@ fn claude_install(force: bool) -> Result<()> {
     eprintln!("# Fish/zsh: adapt the alias syntax for your shell.");
     println!();
     println!("# Roost: route Claude Code hooks to the running UI.");
-    println!(
-        "alias claude='claude --settings '{}",
-        quote_for_shell(&settings_path.to_string_lossy())
-    );
+    // Inherited from the pre-M5 CLI, the previous form was
+    // `alias claude='claude --settings '<quoted_path>`. The trailing
+    // close-quote before the path produced visibly broken output
+    // when `quote_for_shell` returned a single-quoted string (e.g. a
+    // path with spaces ended up as `'claude --settings ''has space'`
+    // — bash's quote-concat rescues most cases but the shape misleads
+    // anyone reading the output). Switch to a double-quoted outer
+    // wrapper so the inner single-quoting from `quote_for_shell`
+    // composes correctly without quote stacking.
+    let settings_quoted = quote_for_shell(&settings_path.to_string_lossy());
+    println!("alias claude=\"claude --settings {settings_quoted}\"");
     Ok(())
 }
 

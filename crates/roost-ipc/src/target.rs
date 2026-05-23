@@ -143,8 +143,12 @@ impl TargetSelector {
             });
         }
 
-        let mac_alive = probe_socket(&mac_path).await;
-        let gtk_alive = probe_socket(&gtk_path).await;
+        // Probe both candidates in parallel so the cold-path cost
+        // is one 50ms timeout, not two. `tokio::join!` polls both
+        // futures concurrently on the current task — no extra
+        // executor work.
+        let (mac_alive, gtk_alive) =
+            tokio::join!(probe_socket(&mac_path), probe_socket(&gtk_path));
         match (mac_alive, gtk_alive) {
             (true, false) => Ok(ResolvedTarget {
                 socket_path: mac_path,
