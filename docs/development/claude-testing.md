@@ -106,12 +106,11 @@ There is no shared daemon. Watch the running UI's log while driving the
 above tests:
 
 ```bash
-# macOS (Swift Roost.app) — file appender
+# macOS (Swift Roost.app)
 tail -f ~/Library/Logs/Roost/roost.log
 
-# Linux (gtk4-rs roost) — logs to stdout (no file). Run it from a
-# terminal, or follow the journal if launched from the .desktop entry:
-journalctl --user -f
+# Linux (gtk4-rs roost) — also tees to stdout
+tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/roost/roost.log"
 ```
 
 Each CLI command above lands as a corresponding log entry —

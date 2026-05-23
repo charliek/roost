@@ -52,7 +52,7 @@ The IPC sockets live at:
 | macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` (Gtk dev profile) |
 | Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` (falls back to `/tmp/roost-<uid>/roost.sock` if `XDG_RUNTIME_DIR` is unset) |
 
-The **Mac** app writes a log file at `~/Library/Logs/Roost/roost.log`. The **Linux** UI (`roost-linux`) logs to **stdout** (`tracing_subscriber::fmt`; no file) — run `roost` from a terminal or `journalctl --user -f` if launched from the `.desktop` entry. `roostctl --help` and `docs/reference/ipc.md` document the wire surface.
+Both UIs write a log file **and** tee to stdout: the Mac app to `~/Library/Logs/Roost/roost.log`, the Linux UI (`roost-linux`) to `$XDG_STATE_HOME/roost/roost.log` (default `~/.local/state/roost/roost.log`). On macOS the Gtk dev profile uses a distinct `~/Library/Logs/Roost-gtk/roost.log`, so the Swift app and `roost-linux` don't clobber each other when run side by side. `roostctl --help` and `docs/reference/ipc.md` document the wire surface.
 
 ## Tests
 
