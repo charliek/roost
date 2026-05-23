@@ -16,7 +16,7 @@
 //!   subscriber for now, but the design pre-bakes the multi-sub
 //!   path that M3+ doesn't need yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
@@ -51,6 +51,12 @@ pub enum SupervisorEvent {
 
 pub struct PtySupervisor {
     sessions: Mutex<HashMap<i64, Session>>,
+    /// Tab ids whose `spawn()` is in flight — the PTY has not yet
+    /// been created but the slot is reserved so a concurrent
+    /// `spawn(tab_id, ...)` rejects with `DuplicateTab` instead of
+    /// racing the first one. Cleaned up on every `spawn()` exit
+    /// path via `SlotGuard`.
+    pending: Mutex<HashSet<i64>>,
     /// One broadcast channel for supervisor-level events. The
     /// `Workspace` subscribes once at startup.
     lifecycle: broadcast::Sender<SupervisorEvent>,
@@ -70,38 +76,6 @@ struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
-/// Dead-channel `Session` used to reserve a slot under the
-/// `sessions` lock while the caller of `spawn()` builds the real
-/// session. Any concurrent caller hitting the placeholder's
-/// channels will see `Closed` / `Lagged` errors and surface a
-/// `PtyError::Closed` to the workspace — that's the right
-/// behavior: the slot is owned but not yet usable.
-fn placeholder_session() -> Session {
-    let (input_tx, _input_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (resize_tx, _resize_rx) = mpsc::channel::<PtySize>(1);
-    let (output_tx, _drop_rx) = broadcast::channel::<PtyOutputEvent>(1);
-    Session {
-        input_tx,
-        resize_tx,
-        output_tx,
-        killer: Mutex::new(Box::new(NoopKiller)),
-    }
-}
-
-/// `ChildKiller` impl for the placeholder slot. `kill()` is a
-/// no-op because there's no real child yet; if the placeholder
-/// somehow gets `close()`d we just drop it.
-#[derive(Debug)]
-struct NoopKiller;
-impl ChildKiller for NoopKiller {
-    fn kill(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        Box::new(NoopKiller)
-    }
-}
-
 impl Default for PtySupervisor {
     fn default() -> Self {
         Self::new()
@@ -113,6 +87,7 @@ impl PtySupervisor {
         let (lifecycle, _rx) = broadcast::channel(64);
         Self {
             sessions: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashSet::new()),
             lifecycle,
         }
     }
@@ -157,28 +132,36 @@ impl PtySupervisor {
         rows: u16,
         socket_path: &std::path::Path,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
-        // Reserve the slot atomically under the lock so two
-        // concurrent `spawn(tab_id, ...)` calls cannot both pass the
-        // duplicate check, create two PTYs, and then have the second
-        // insert orphan the first. CR-flagged race on PR #78.
+        // Reserve the slot atomically. Two concurrent
+        // `spawn(tab_id, ...)` calls used to be racy: the first
+        // would `contains_key` and the second would do the same
+        // before either could `insert`, then both PTYs would
+        // create and the second `insert` would orphan the first.
         //
-        // Strategy: insert a placeholder Session whose channels
-        // immediately drop (so any racing `write`/`resize` sees
-        // `Closed` and surfaces it to the caller) under the lock,
-        // then build the real one outside the lock, and replace the
-        // placeholder at the end. On spawn failure we explicitly
-        // remove the placeholder so the slot doesn't leak.
-        let placeholder_id = {
-            let mut sessions = self.sessions.lock().unwrap();
-            if sessions.contains_key(&tab_id) {
+        // Strategy: hold a `pending` set alongside `sessions` and
+        // atomically check both before reserving the slot in
+        // `pending`. We build the PTY without the lock held (the
+        // operations involve OS calls and tokio spawns that don't
+        // belong under a Mutex), then promote the slot from
+        // `pending` to `sessions` once everything is built. A
+        // `SlotGuard` removes the pending entry on any early
+        // exit. `subscribe_output` returns None while the slot is
+        // pending (no Session exists yet) — that's the same
+        // behavior as "tab doesn't exist yet."
+        //
+        // CR on PR #78 specifically flagged that the previous
+        // placeholder-Session approach leaked a stale broadcast
+        // sender to subscribers who raced the swap. The
+        // pending-set design has no such hazard because the
+        // Session entry only ever exists with its REAL channels.
+        {
+            let sessions = self.sessions.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap();
+            if sessions.contains_key(&tab_id) || pending.contains(&tab_id) {
                 return Err(PtyError::DuplicateTab(tab_id).into());
             }
-            sessions.insert(tab_id, placeholder_session());
-            tab_id
-        };
-        // Roll the placeholder back on early-return paths via this
-        // guard. RAII gives us crash-safety without dotting `remove`
-        // calls through every `?`.
+            pending.insert(tab_id);
+        }
         struct SlotGuard<'a> {
             sup: &'a PtySupervisor,
             tab_id: i64,
@@ -187,13 +170,13 @@ impl PtySupervisor {
         impl Drop for SlotGuard<'_> {
             fn drop(&mut self) {
                 if self.armed {
-                    let _ = self.sup.sessions.lock().unwrap().remove(&self.tab_id);
+                    let _ = self.sup.pending.lock().unwrap().remove(&self.tab_id);
                 }
             }
         }
         let mut slot = SlotGuard {
             sup: self,
-            tab_id: placeholder_id,
+            tab_id,
             armed: true,
         };
 
@@ -288,10 +271,15 @@ impl PtySupervisor {
             output_tx,
             killer: Mutex::new(killer),
         };
-        // Replace the placeholder atomically. From this point the
-        // SlotGuard must NOT roll back — the real session owns the
-        // slot now.
-        self.sessions.lock().unwrap().insert(tab_id, session);
+        // Promote the slot from pending → sessions atomically.
+        // After this point the SlotGuard must NOT roll back; the
+        // session owns the slot.
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap();
+            sessions.insert(tab_id, session);
+            pending.remove(&tab_id);
+        }
         slot.armed = false;
 
         Ok(early_rx)
