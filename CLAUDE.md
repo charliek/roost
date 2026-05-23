@@ -19,16 +19,23 @@ for the JSON IPC wire format.
 
 ## Branch policy
 
-The long-lived refactor branch is `feature/rust-port`. Polish PRs from
-short-lived `polish/*` topic branches merge into it (squash-merge,
-auto-merge gated on `ci.yml` + `refactor.yml` green via branch
-protection). The next merge-to-`main` exit bar is **Phase 8
-(bundling)** — see [`plans/README.md`](plans/README.md) status snapshot
-and [`plans/phase-8-bundling.md`](plans/phase-8-bundling.md).
+`main` is the primary branch — the Rust + Swift port is the direction
+(the `feature/rust-port` refactor branch merged into `main` and is
+retired). Topic branches (`polish/*`, `refactor/*`, feature branches)
+open PRs into `main`. **Merges are manual**: CI must be green, then the
+committer merges — no auto-merge (the repo's `allow_auto_merge` is off;
+use `/merge-pr`). The single required check is **`ci-success`** from
+`.github/workflows/ci.yml` (rust/swift/gtk, path-filtered so jobs run
+only when relevant code changes). The legacy Go CI
+(`.github/workflows/go-legacy.yml`) runs only on Go-file changes and is
+not required.
 
-`claude/discuss-architecture-refactor-cjU3E` is the predecessor
-refactor branch and is **frozen** at `00b3d10`. Do not start new work
-on it.
+The legacy Go code (`cmd/`, `internal/`, `go.mod`, `build/`) is retained
+but secondary; it is removed in the **GODELETE** step once Rust/Swift
+parity is confirmed — see [`plans/GODELETE.md`](plans/GODELETE.md).
+
+`claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor
+branch and is **frozen** at `00b3d10`. Do not start new work on it.
 
 ## What this is
 

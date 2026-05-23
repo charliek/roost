@@ -26,20 +26,20 @@ verify any UI change in the area, or to demo the integration.
 
 ## CLI cheatsheet
 
-Pre-req: `roost-cli-rs tab list` to find a tab id. Either `export ROOST_TAB_ID=<id>` or pass `--tab <id>` explicitly to each command. (When a shell is running inside a Roost tab, `ROOST_TAB_ID` is set automatically.)
+Pre-req: `roostctl tab list` to find a tab id. Either `export ROOST_TAB_ID=<id>` or pass `--tab <id>` explicitly to each command. (When a shell is running inside a Roost tab, `ROOST_TAB_ID` is set automatically.)
 
 | Command | Effect |
 |---|---|
-| `roost-cli-rs tab list` | Print all tabs grouped by project + their current state. |
-| `roost-cli-rs tab set-state --state STATE --tab N` | Set state. `STATE ∈ {none, running, needs_input, idle}`. |
-| `roost-cli-rs notify --title "Hi" --body "..." --tab N` | Fire a desktop banner + set the pill badge. |
-| `roost-cli-rs tab clear-notification --tab N` | Clear the pill badge (state unchanged). |
-| `roost-cli-rs tab focus --tab N` | Equivalent to clicking the pill; clears the badge as a side effect. |
-| `ROOST_TAB_ID=N roost-cli-rs claude-hook session-start` | Engages `hook_active` suppression on the tab. (OSC 9/777 from the shell becomes a no-op; only `create-notification` RPCs emit banners.) |
-| `echo '{"message":"need input"}' \| ROOST_TAB_ID=N roost-cli-rs claude-hook notification` | Sets `needs_input` + fires "Claude Code" banner. |
-| `ROOST_TAB_ID=N roost-cli-rs claude-hook stop` | Sets `idle` + fires "Turn complete" banner. |
-| `ROOST_TAB_ID=N roost-cli-rs claude-hook session-end` | Releases `hook_active` + sets `none`. |
-| `ROOST_TAB_ID=N roost-cli-rs claude-hook prompt-submit` | Sets `running` + clears pending notification. |
+| `roostctl tab list` | Print all tabs grouped by project + their current state. |
+| `roostctl tab set-state --state STATE --tab N` | Set state. `STATE ∈ {none, running, needs_input, idle}`. |
+| `roostctl notify --title "Hi" --body "..." --tab N` | Fire a desktop banner + set the pill badge. |
+| `roostctl tab clear-notification --tab N` | Clear the pill badge (state unchanged). |
+| `roostctl tab focus --tab N` | Equivalent to clicking the pill; clears the badge as a side effect. |
+| `ROOST_TAB_ID=N roostctl claude-hook session-start` | Engages `hook_active` suppression on the tab. (OSC 9/777 from the shell becomes a no-op; only `create-notification` RPCs emit banners.) |
+| `echo '{"message":"need input"}' \| ROOST_TAB_ID=N roostctl claude-hook notification` | Sets `needs_input` + fires "Claude Code" banner. |
+| `ROOST_TAB_ID=N roostctl claude-hook stop` | Sets `idle` + fires "Turn complete" banner. |
+| `ROOST_TAB_ID=N roostctl claude-hook session-end` | Releases `hook_active` + sets `none`. |
+| `ROOST_TAB_ID=N roostctl claude-hook prompt-submit` | Sets `running` + clears pending notification. |
 
 ## Test checklist
 
@@ -70,9 +70,9 @@ Pre-req: focus a *different* tab in the same project so the test tab is inactive
 
 1. With 2+ tabs in a project, set Tab A `running` and Tab B `needs_input`.
    → Sidebar stripe = amber (`needs_input` wins).
-2. `ROOST_TAB_ID=<Tab B id> roost-cli-rs claude-hook session-start`.
+2. `ROOST_TAB_ID=<Tab B id> roostctl claude-hook session-start`.
    → Sidebar stripe drops to **blue** (Tab B's `needs_input` is now suppressed in rollup; Tab A's `running` becomes max).
-3. `ROOST_TAB_ID=<Tab B id> roost-cli-rs claude-hook session-end`.
+3. `ROOST_TAB_ID=<Tab B id> roostctl claude-hook session-end`.
    → Stripe back to amber. Tab B's state goes to `none`.
 
 ### T4 — project-row badge (separate from per-tab badge)
@@ -85,35 +85,40 @@ Pre-req: focus a *different* tab in the same project so the test tab is inactive
 
 ### T5 — end-to-end Claude lifecycle simulation
 
-1. `ROOST_TAB_ID=N roost-cli-rs claude-hook session-start`.
+1. `ROOST_TAB_ID=N roostctl claude-hook session-start`.
    → No visible change (Claude hook engages silently).
    → Internally: `hook_active=true` so OSC 9/777 from the shell is now suppressed.
-2. `ROOST_TAB_ID=N roost-cli-rs claude-hook prompt-submit`.
+2. `ROOST_TAB_ID=N roostctl claude-hook prompt-submit`.
    → Pill dot blue; sidebar stripe blue (no other tabs with higher-priority state).
    → Any prior pending notification is cleared.
-3. `echo '{"message":"choose a path"}' | ROOST_TAB_ID=N roost-cli-rs claude-hook notification`.
+3. `echo '{"message":"choose a path"}' | ROOST_TAB_ID=N roostctl claude-hook notification`.
    → Pill dot amber; banner "Claude Code: choose a path";
      sidebar stripe NOT updated (hook-active demotes this tab in rollup).
 4. Click the banner → focuses Tab N. Pill badge clears.
-5. `ROOST_TAB_ID=N roost-cli-rs claude-hook stop`.
+5. `ROOST_TAB_ID=N roostctl claude-hook stop`.
    → Pill dot gray; banner "Claude Code: Turn complete".
-6. `ROOST_TAB_ID=N roost-cli-rs claude-hook session-end`.
+6. `ROOST_TAB_ID=N roostctl claude-hook session-end`.
    → Pill dot disappears; sidebar stripe drops to next-highest-priority tab in the project (or hides).
 
-### T6 — daemon log inspection
+### T6 — UI log inspection
 
-The daemon writes to `/private/tmp/roost-core.log` (default on
-macOS). Tail it while driving the above tests:
+There is no shared daemon — each UI writes its own log. Tail it
+while driving the above tests:
 
 ```bash
-tail -f /private/tmp/roost-core.log
+# macOS (Swift Roost.app)
+tail -f ~/Library/Logs/Roost/roost.log
+
+# Linux (gtk4-rs roost) — $XDG_STATE_HOME/roost-gtk/roost.log,
+# defaulting to ~/.local/state/roost-gtk/roost.log
+tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/roost-gtk/roost.log"
 ```
 
 Each CLI command above lands as a corresponding log entry —
 `set_tab_state`, `set_hook_active`, `tab_notification`,
 `create_notification`. If the UI doesn't react to an expected
-event, the log line tells you whether the daemon received the
-RPC at all.
+event, the log line tells you whether the UI received the
+IPC request at all.
 
 ## Permanent hook setup (Claude Code)
 
@@ -121,7 +126,7 @@ To wire the actual Claude Code CLI so it drives these events
 automatically when you run a session:
 
 ```bash
-roost-cli-rs claude install
+roostctl claude install
 ```
 
 This writes `~/.config/roost/claude-settings.json` with hook

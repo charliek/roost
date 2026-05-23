@@ -1,6 +1,6 @@
 # Roost — Design Document
 
-> See [vision.md](vision.md) for the target architecture this codebase is migrating toward (Rust core + native Mac/Linux UIs over a gRPC contract). This document remains authoritative for the current Go + GTK4 implementation on `main` until the cutover described there.
+> **Historical.** This document captures the original Go + GTK4 design. Roost has since shipped its current architecture — two native UIs (Swift + AppKit `Roost.app` on macOS, Rust + gtk4-rs `roost` on Linux) with no daemon; each UI embeds the workspace, PTY supervisor, and a newline-delimited JSON IPC server in-process; persistence is a small `state.json`; the CLI is `roostctl`. There is no gRPC and no separate `roost-core` daemon. For the current architecture and the rationale behind the cutover, see [vision.md](vision.md); for the IPC wire format see [IPC](../reference/ipc.md). This page is retained for historical context only.
 
 A Mac + Linux terminal multiplexer for AI coding agents, built as a single Go + GTK4 codebase using libghostty as the rendering engine. Similar in shape to cmux, but cross-platform and scoped tighter.
 

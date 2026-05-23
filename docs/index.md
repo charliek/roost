@@ -2,9 +2,21 @@
 
 Roost is a desktop terminal multiplexer for AI coding agents. It runs on macOS and Linux, presents a sidebar of projects with tabs inside each project, and notifies you when an agent in a tab needs your attention.
 
-The terminal engine is [libghostty-vt](https://ghostty.org), the parser/screen-state library extracted from Ghostty. The core daemon (`roost-core`) is written in Rust; each platform has a native UI — Swift + AppKit on macOS (`Roost.app`), Rust + gtk4-rs on Linux. The wire contract between the daemon and UIs is defined in `proto/roost.proto` and runs over a Unix domain socket. Persistence is SQLite via `rusqlite`.
+The terminal engine is [libghostty-vt](https://ghostty.org), the parser/screen-state library extracted from Ghostty. Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost`). There is no daemon: each UI embeds the workspace, the PTY supervisor, and a JSON IPC server in-process. External tooling (`roostctl`, Claude Code hooks) reaches the running UI over a Unix domain socket speaking newline-delimited JSON; see [IPC](reference/ipc.md) for the wire format. Persistence is a small `state.json` written atomically.
 
-A legacy Go + GTK4 binary still ships from `main` while the Rust path comes up to full feature parity. See [Legacy (Go prototype)](reference/legacy-go/index.md) if you're running that binary.
+A legacy Go + GTK4 prototype is retained for reference. See [Legacy (Go prototype)](reference/legacy-go/index.md) if you're running that binary.
+
+## Install
+
+Linux (Ubuntu Noble / Pop!\_OS 24.04+) via apt — add the `apt.stridelabs.ai` repo once, then:
+
+```bash
+sudo apt install roost
+```
+
+macOS — download `Roost-<version>.dmg` from the [latest GitHub release](https://github.com/charliek/roost/releases) and drag `Roost.app` into `/Applications`.
+
+Building from source instead? See [Installation](getting-started/installation.md).
 
 ## What it does
 
@@ -37,10 +49,10 @@ If the tab is not currently focused you'll see:
 
 ## Next steps
 
-- [Installation](getting-started/installation.md) — toolchain, building the daemon + UI, verifying the install.
+- [Installation](getting-started/installation.md) — apt + DMG, plus the from-source toolchain and how to verify the install.
 - [First Run](getting-started/first-run.md) — what happens on launch and where state lives.
 - [Keybindings](getting-started/keybindings.md) — tab and project switching, platform-native modifiers.
 - [Notifications](guides/notifications.md) — how the notification pipeline works.
 - [Claude Code Hooks](guides/claude-code.md) — wire `roostctl notify` into Claude.
-- [Architecture](reference/architecture.md) — how the daemon, UIs, and CLI fit together.
+- [Architecture](reference/architecture.md) — how the UIs, IPC socket, and CLI fit together.
 - [Vision](development/vision.md) — the durable design decisions and migration path.

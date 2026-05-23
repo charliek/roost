@@ -85,9 +85,10 @@ Each phase is a commit (or small PR) on the refactor branch, with explicit exit 
 | 6b. Mac OSC + notifications | OSC scanning, `set_hook_active` semantics, `claude-hook` | ✅ done |
 | 7. Linux Rust UI | `crates/roost-linux/`, gtk4-rs, Cairo + Pango cell renderer | ✅ done |
 | 7.5. Linux/Mac polish | Drag-reorder, CSS, headerbar, status indicators | ✅ done |
-| **M0–M9. Inline-core refactor** | **Collapse the daemon into each UI in-process; replace gRPC with JSON IPC over UDS; rename CLI to `roostctl`; delete `roost-core`, `roost-proto`, `roost-common`, `roost-smoke`** | **🚧 in flight on `refactor/inline-core`; M0–M9 complete pending sign-off (PR #78)** |
-| 8. Bundling | Mac `.app` + notarytool + DMG; Linux AppImage | ⏳ pending — gates `feature/rust-port → main` |
-| 9. Cutover | Delete `cmd/`, `internal/`, Go-specific Make targets and CI jobs | ⏳ pending |
+| **M0–M9. Inline-core refactor** | **Collapse the daemon into each UI in-process; replace gRPC with JSON IPC over UDS; rename CLI to `roostctl`; delete `roost-core`, `roost-proto`, `roost-common`, `roost-smoke`** | ✅ done (PR #78) |
+| 8. Bundling | Mac `.app` + DMG; Linux `.deb` via apt-charliek | ✅ done — v0.0.1 (`.deb` not AppImage; DMG ad-hoc-signed pending Apple creds, [#83](https://github.com/charliek/roost/issues/83)) |
+| 9. Cutover to main | Merge `feature/rust-port` → `main`; rust-primary CI; docs reoriented | ✅ done 2026-05-23 |
+| GODELETE | Delete `cmd/`, `internal/`, `go.mod`, `build/`, `go-legacy.yml` (the Go code) | ⏳ pending — after Rust/Swift parity (see `plans/GODELETE.md`) |
 
 ## Decision log
 
@@ -115,7 +116,7 @@ Considered and rejected: Rust + gtk4-rs on Mac. This still requires hand-rolled 
 
 ### DL-6: gtk4-rs does not need a `pangoextra` workaround
 
-The current code carries `internal/pangoextra` because `gotk4`'s `pangocairo.ContextSetFontOptions` expects `cairo.FontOptions` to follow the gextras "record" struct convention while gotk4's cairo package uses a raw native pointer. `gtk4-rs` calls `pango_cairo_context_set_font_options` directly via raw FFI and does not have this mismatch. The workaround dies with the Go code in Phase 9.
+The current code carries `internal/pangoextra` because `gotk4`'s `pangocairo.ContextSetFontOptions` expects `cairo.FontOptions` to follow the gextras "record" struct convention while gotk4's cairo package uses a raw native pointer. `gtk4-rs` calls `pango_cairo_context_set_font_options` directly via raw FFI and does not have this mismatch. The workaround dies with the Go code in GODELETE.
 
 ### DL-7: No tab persistence (revised 2026-05-23)
 
@@ -131,17 +132,17 @@ The transitional name `roost-cli-rs` and the Phase 9 rename both fell into the M
 
 ### DL-10: Ghostty SHA pinned in two places during the transition
 
-`build/build.sh` (current) and `third_party/ghostty/build.sh` (new) both pin the same Ghostty commit. Bumps must move both in lockstep until Phase 9. Cross-link comments at the top of each script make this explicit.
+`build/build.sh` (legacy Go cgo) and `third_party/ghostty/build.sh` (Rust + Swift) both pin the same Ghostty commit. Bumps must move both in lockstep until GODELETE retires `build/build.sh` with the Go code. Cross-link comments at the top of each script make this explicit.
 
 ## Relationship to existing docs
 
 | Document | Role |
 |---|---|
-| [`docs/development/spec.md`](spec.md) | Original design spec for the **current Go + GTK4 implementation**. Authoritative for `main` until Phase 9. |
+| [`docs/development/spec.md`](spec.md) | Original design spec for the **legacy Go + GTK4 implementation**. Historical; retained until GODELETE. |
 | [`docs/reference/architecture.md`](../reference/architecture.md) | Package layout and threading contract for the **post-M0–M9 inline-core implementation** (refactor branch). |
 | `docs/development/vision.md` (this file) | The **target** architecture. Every refactor PR cites it. |
 | [`docs/reference/ipc.md`](../reference/ipc.md) | JSON IPC wire format spec — canonical. |
 | [`docs/archive/roost.proto`](../archive/roost.proto) | Historical reference for the pre-rewrite gRPC contract. |
-| `CLAUDE.md` | Project conventions enforced by review. The post-M0–M9 sections describe the in-process architecture; references to the Go binary remain accurate until Phase 9. |
+| `CLAUDE.md` | Project conventions enforced by review. Describes the in-process Rust/Swift architecture; references to the legacy Go binary remain accurate until GODELETE. |
 
-After Phase 9 cutover, `spec.md` and the legacy architecture diagrams move to `docs/historical/` with a one-line note at the top.
+After GODELETE, `spec.md` and the legacy architecture diagrams move to `docs/historical/` with a one-line note at the top.

@@ -1,5 +1,28 @@
 # Installation
 
+## Shipping builds
+
+Most people want a released build, not a source checkout.
+
+Linux (Ubuntu Noble / Pop!\_OS 24.04+) — add the `apt.stridelabs.ai`
+apt repo once, then:
+
+```bash
+sudo apt install roost
+```
+
+For a one-off install without adding the repo, grab the `.deb` from
+the [latest GitHub release](https://github.com/charliek/roost/releases)
+and `sudo apt install ./roost_<version>_<arch>.deb`.
+
+macOS — download `Roost-<version>.dmg` from the
+[latest GitHub release](https://github.com/charliek/roost/releases),
+open it, and drag `Roost.app` into `/Applications`.
+
+The rest of this page covers building from source.
+
+## Building from source
+
 Roost ships a native UI on each platform. Each UI embeds the
 workspace + PTY supervisor in-process and serves a JSON IPC
 socket for external tooling (`roostctl`, Claude Code hooks):
@@ -26,9 +49,8 @@ for that build path.
 
 | Tool | Purpose | Pinned version |
 |---|---|---|
-| Rust | Daemon, CLI, Linux UI | 1.85.0 (via `mise`) |
+| Rust | CLI + Linux UI | 1.85.0 (via `mise`) |
 | Zig | Builds `libghostty-vt` from the vendored Ghostty source | 0.15.x (via `mise`) |
-| `protoc` | Generates Rust + Swift bindings from `proto/roost.proto` | any recent |
 | Xcode Command Line Tools | Builds the Mac UI | macOS only |
 | GTK4 + libadwaita dev packages | Linker dependencies for the Linux UI | Linux only |
 | `mise` | Manages the pinned Rust + Zig versions | any |
@@ -38,7 +60,7 @@ for that build path.
 Install system packages:
 
 ```bash
-brew install mise protobuf
+brew install mise
 ```
 
 Recommended: JetBrains Mono — the default font Roost looks for.
@@ -61,20 +83,18 @@ Build `libghostty-vt` once (idempotent on cache hit):
 ./third_party/ghostty/build.sh
 ```
 
-Build the daemon and CLI:
+Build the `roostctl` CLI:
 
 ```bash
 ~/.cargo/bin/cargo build --release -p roost-cli
 ```
 
-Bundle the Mac `.app`:
+Bundle the Mac `.app` (this builds and embeds `roostctl` for you):
 
 ```bash
-PROTOC_PATH=$(which protoc) ./mac/scripts/bundle.sh release
+./mac/scripts/bundle.sh release
 open mac/build/Roost.app
 ```
-
-The daemon starts on demand the first time the UI connects.
 
 ### macOS 26 (Tahoe) `libghostty-vt` shim
 
@@ -88,8 +108,7 @@ System packages:
 sudo apt update
 sudo apt install -y \
   build-essential git curl pkgconf \
-  libgtk-4-dev libadwaita-1-dev \
-  protobuf-compiler
+  libgtk-4-dev libadwaita-1-dev
 ```
 
 Recommended font:
@@ -119,7 +138,7 @@ Build `libghostty-vt`:
 ./third_party/ghostty/build.sh
 ```
 
-Build everything. `roost-linux` requires the GTK4 + libadwaita system packages above; `cargo build` without `-p` skips it so contributors who only iterate on the daemon don't need GTK installed.
+Build the Linux UI and CLI. `roost-linux` requires the GTK4 + libadwaita system packages above; `cargo build` without `-p` skips it so contributors who only iterate on the CLI or IPC crates don't need GTK installed.
 
 ```bash
 ~/.cargo/bin/cargo build --release \
@@ -148,7 +167,7 @@ With the UI running:
 ~/.cargo/bin/cargo run --release -p roostctl -- identify
 ```
 
-Prints a JSON object with the daemon socket path, PID, and active project / tab IDs. If you see a connection error, the UI isn't running or the socket path is wrong — see [Paths & Environment](../reference/paths.md).
+Prints a JSON object with the running UI's socket path, PID, and active project / tab IDs. If you see a connection error, the UI isn't running or the socket path is wrong — see [Paths & Environment](../reference/paths.md).
 
 ## Updating
 

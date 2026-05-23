@@ -2,15 +2,21 @@
 
 This directory tracks the multi-phase migration of Roost from a single Go + GTK4 binary to two native UIs (Swift + AppKit on macOS, Rust + gtk4-rs on Linux) that each embed the workspace + PTY supervisor in-process and serve a JSON IPC socket for external tooling. The pre-2026-05-23 portion of the migration went through a Rust gRPC daemon (`roost-core`); the post-2026-05-23 [`refactor/inline-core` branch](humming-inventing-flame.md) collapsed the daemon back into each UI process and replaced the gRPC contract with newline-delimited JSON.
 
-**Current head**: `refactor/inline-core` (PR #78). M0–M9 of the daemon-removal plan have landed; the branch is ready-for-review pending sign-off. Once it squash-merges into `feature/rust-port`, the daemon-era phase files below stay as historical context but `roost-core`, `roost-proto`, `roost-common`, `roost-smoke` and the `proto/` directory no longer exist on the branch.
+**Current head**: `main`. The daemon-removal refactor (M0–M9, PR #78), Phase 8 bundling (v0.0.1 — DMG + `.deb` via apt), and the Phase 9 **cutover to main** have all landed; `feature/rust-port` is retired. `roost-core`, `roost-proto`, `roost-common`, `roost-smoke` and `proto/` no longer exist. The daemon-era phase files below stay as historical context. The only remaining migration step is [`GODELETE`](GODELETE.md) — removing the legacy Go code, deferred until parity is confirmed.
 
 See [`docs/development/vision.md`](../docs/development/vision.md) for the target architecture and the durable design choices (decision log). This index summarizes each phase; the per-phase files in this directory contain the detailed step lists, exit criteria, and commit log.
 
 ## Branch policy
 
-Active refactor work lives on the long-lived `feature/rust-port` branch; the predecessor `claude/discuss-architecture-refactor-cjU3E` is frozen at `00b3d10`. Polish PRs ship from short-lived `polish/*` topic branches that squash-merge into `feature/rust-port` with auto-merge gated on the 3 required macOS CI checks (`test (macos-latest)`, `rust-build (macos-latest)`, `swift-mac`); Linux jobs run informationally. New Rust/Swift/proto code lands in new top-level directories (`proto/`, `crates/`, `mac/`, `linux/`, `third_party/ghostty/`); existing `cmd/` and `internal/` Go code stays in place until the Phase 9 cutover. Both the legacy CI workflow (`.github/workflows/ci.yml`) and the refactor CI workflow (`.github/workflows/refactor.yml`) must stay green on every commit.
-
-**Mergeability into `main`.** Through Phase 8 the refactor is purely additive: every commit on the branch leaves the Go binary buildable and shippable on `main`. The branch can be merged to `main` at any phase boundary without breaking the live Go program. The Phase 9 commit deletes `cmd/` and `internal/` and is destructive — it must land separately, after the Rust/Swift surface has reached feature parity and bundled binaries are ready.
+`main` is the primary branch (post-cutover). Topic branches (`polish/*`,
+`refactor/*`, feature branches) open PRs into `main`. **Merges are manual**: CI
+must be green, then the committer merges (no auto-merge — the repo's
+`allow_auto_merge` is off). The single required check is **`ci-success`** from
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (rust/swift/gtk,
+path-filtered). The legacy Go CI ([`go-legacy.yml`](../.github/workflows/go-legacy.yml))
+runs only on Go-file changes and is not required. The legacy `cmd/` + `internal/`
+Go code stays in place until [`GODELETE`](GODELETE.md). The predecessor
+`claude/discuss-architecture-refactor-cjU3E` is frozen at `00b3d10`.
 
 ## Phase index
 
@@ -28,8 +34,9 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 | [7.5](phase-7-5-polish-and-gaps.md) | Linux/Mac polish + automation gaps (drag-reorder, CSS, icons, theme overrides, `tab snapshot`, etc.) | 🪦 superseded by [Linux GTK parity goal](goal-linux-gtk-parity-2026-05-17.md) (carried tracks A/B1/D); B2/C/E filed below | n/a |
 | [7.5b](goal-linux-gtk-parity-2026-05-17.md) | Linux GTK parity (port chrome + UX from Go GTK binary to gtk4-rs Rust UI) | ✅ closed — M1–M10 + M9.5 landed by 2026-05-18 via PRs #51–#64, #66 (M11 user-theme-overrides dropped after parity check) | yes |
 | [7.5c](goal-mac-parity-2026-05-18.md) | Mac UI parity (drag-reorder, inline rename, live cwd subtitle, sidebar rollup, tab pill right-click; headerbar deferred to user-eval at M7) | ✅ closed 2026-05-22 — M1–M6 + R1–R7 polish landed via PRs #67–#76; M7 headerbar dropped after user-eval | yes |
-| [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG + notarytool; Linux AppImage) | ⏳ pending — gated on Mac parity per user preference | yes |
-| [9](phase-9-cutover.md) | Cutover (delete `cmd/`, `internal/`, Go-specific make targets) | ⏳ pending | **destructive — separate PR** |
+| [8](phase-8-bundling.md) | Bundling (Mac `.app` + DMG; Linux `.deb` via apt-charliek) | ✅ done — v0.0.1 shipped 2026-05-23 (`.deb` not AppImage; DMG ad-hoc-signed pending Apple creds, [#83](https://github.com/charliek/roost/issues/83)) | yes |
+| [9](phase-9-cutover.md) | Cutover to main (merge `feature/rust-port` → `main`; rust-primary CI; docs reoriented) | ✅ done 2026-05-23 (merge commit) | done |
+| [GODELETE](GODELETE.md) | Remove the legacy Go code (`cmd/`, `internal/`, `go.mod`, `build/`, `go-legacy.yml`) | ⏳ pending — after Rust/Swift parity + sign-off | **destructive — own PR** |
 
 ## High-level shape (target)
 
@@ -61,7 +68,7 @@ Active refactor work lives on the long-lived `feature/rust-port` branch; the pre
 
 Both UI parity goals are closed: [Linux GTK parity](goal-linux-gtk-parity-2026-05-17.md) on 2026-05-18 (M1–M10 + M9.5; M11 user-theme-overrides dropped) and [Mac UI parity](goal-mac-parity-2026-05-18.md) on 2026-05-22 (M1–M6 + R1–R7 polish rounds; M7 headerbar dropped after user-eval).
 
-Next gate: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + Linux AppImage. The user's stated gate for `feature/rust-port → main` is "Phase 8 first so users pulling `main` get an installable artifact rather than source-only" (decision 2026-05-17).
+Phase 8 (bundling) shipped v0.0.1 on 2026-05-23 (Mac DMG + Linux `.deb` via apt-charliek), which was the user's stated gate for `feature/rust-port → main`. The cutover to `main` then landed (Phase 9). Next and final migration step: **[`GODELETE`](GODELETE.md)** — remove the legacy Go code once parity is confirmed.
 
 ## Status snapshot (2026-05-22)
 
@@ -70,7 +77,7 @@ Next gate: **Phase 8 (bundling)** — notarized Mac `.app` + DMG + Linux AppImag
 * `feature/rust-port` is at `9c36ba0` (R7 sidebar collapse + drop indicator fixes).
 * macOS 26 arm64e-only SDK workaround is in both `build/build.sh` (from `f6e0d64` on main) and `third_party/ghostty/build.sh` — both Zig 0.15.2 + Ghostty SHA toolchains build on macOS 26 hosts.
 * Two libghostty-vt builds (`build/build.sh` for Go cgo, `third_party/ghostty/build.sh` for Rust bindgen + Swift) coexist and must pin the same SHA. They collapse in Phase 9.
-* `feature/rust-port → main` deferred until Phase 8 lands (user decision 2026-05-17): merging now would put source-only Rust+Swift code on `main` without an installable artifact.
+* `feature/rust-port → main` landed 2026-05-23 once Phase 8 shipped v0.0.1 (DMG + apt `.deb`); `main` is now rust-primary. Remaining migration step: [`GODELETE`](GODELETE.md) (remove the legacy Go code, after parity).
 
 ## How to use these documents
 

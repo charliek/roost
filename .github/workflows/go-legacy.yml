@@ -1,0 +1,155 @@
+name: Legacy Go CI
+
+# The pre-rewrite Go + GTK4 binary (cmd/, internal/). Path-filtered so it runs
+# ONLY when Go code changes — it does not gate rust/swift work. Removed wholesale
+# in the GODELETE phase (see plans/GODELETE.md). NOT a required check.
+
+on:
+  push:
+    branches: [main]
+    paths: &gopaths
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'build/**'
+      - '.github/workflows/go-legacy.yml'
+  pull_request:
+    branches: [main]
+    paths: *gopaths
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gtk4 libadwaita pkgconf gobject-introspection
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            libpango1.0-dev libcairo2-dev \
+            pkgconf gobject-introspection libgirepository1.0-dev
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache Go modules + build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: gomod-${{ runner.os }}-
+
+      - name: Cache libghostty-vt
+        id: cache-libghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/out
+            build/ghostty-src
+          key: libghostty-${{ runner.os }}-${{ hashFiles('build/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-libghostty.outputs.cache-hit != 'true'
+        run: ./build/build.sh libghostty
+
+      - name: Vet + test + build
+        run: |
+          go vet ./...
+          go test ./...
+          go build ./cmd/roost ./cmd/roost-cli
+
+      - name: Assert no dynamic ghostty-vt link (macOS regression guard)
+        if: runner.os == 'macOS'
+        run: |
+          if otool -L ./roost | grep -q '@rpath/libghostty-vt'; then
+            echo "FAIL: roost is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in build/build.sh."
+            otool -L ./roost
+            exit 1
+          fi
+
+      - name: Assert no dynamic ghostty-vt link (Linux regression guard)
+        if: runner.os == 'Linux'
+        run: |
+          if ldd ./roost | grep -q libghostty-vt; then
+            echo "FAIL: roost is dynamically linked to libghostty-vt; the cgo directive in internal/ghostty/terminal.go is supposed to statically link the .a."
+            ldd ./roost
+            exit 1
+          fi
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-race-ubuntu-${{ hashFiles('**/go.sum') }}
+          restore-keys: gomod-race-ubuntu-
+      - name: Race detector on non-cgo packages
+        run: go test -race ./internal/ipc/ ./internal/osc/ ./internal/core/ ./internal/store/ ./internal/config/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GTK4 + libadwaita dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            libpango1.0-dev libcairo2-dev \
+            pkgconf gobject-introspection libgirepository1.0-dev
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache Go modules + build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomod-lint-ubuntu-${{ hashFiles('**/go.sum') }}
+          restore-keys: gomod-lint-ubuntu-
+
+      - name: Cache libghostty-vt (shares Linux test job's key)
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/out
+            build/ghostty-src
+          key: libghostty-Linux-${{ hashFiles('build/build.sh') }}
+
+      - name: Build libghostty-vt (only on cache miss)
+        run: |
+          if [ ! -f build/out/lib/libghostty-vt.a ]; then
+            ./build/build.sh libghostty
+          fi
+
+      - run: golangci-lint run ./...

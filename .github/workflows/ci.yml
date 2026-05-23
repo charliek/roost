@@ -1,149 +1,287 @@
 name: CI
 
+# Primary CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
+# `changes` job (path filter) gates the rust/swift/gtk jobs so they run only when
+# code that impacts them changes; `ci-success` is the single aggregated required
+# check (stable regardless of which jobs run). The legacy Go CI lives in
+# go-legacy.yml, path-filtered to Go files.
+
 on:
   push:
-    branches: [main, 'feature/*', 'claude/discuss-architecture-refactor-*']
+    branches: [main]
   pull_request:
-    branches: [main, 'feature/*', 'claude/discuss-architecture-refactor-*']
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      mac: ${{ steps.filter.outputs.mac }}
+      linux: ${{ steps.filter.outputs.linux }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rustcore: &rustcore
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'mise.toml'
+              - 'crates/**'
+              - 'third_party/ghostty/**'
+            rust:
+              - *rustcore
+            mac:
+              - *rustcore
+              - 'mac/**'
+            linux:
+              - *rustcore
+              - 'linux/**'
+            ci:
+              - '.github/workflows/ci.yml'
+
+  rust-lint:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-lint-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # `--exclude roost-linux` because that crate needs GTK4 + libadwaita
+        # installed — handled by the dedicated `gtk-build` job instead of
+        # bloating this lint runner with the GTK toolchain.
+        run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
+
+  rust-build:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      # Both platforms install the full GTK4 + libadwaita stack so that
-      # cmd/roost builds on each. gotk4-adwaita is pinned to a commit
-      # that targets libadwaita 1.5 symbols, which matches Ubuntu 24.04
-      # / Pop!_OS noble's apt candidate. macOS Homebrew ships a newer
-      # libadwaita but the binding only uses the 1.5 surface, so this
-      # works on both.
-      - name: Install system deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install gtk4 libadwaita pkgconf gobject-introspection
-      - name: Install system deps (Linux)
+      - name: Install libclang (Linux)
         if: runner.os == 'Linux'
+        # libclang-dev is needed by bindgen when roost-vt is built with
+        # `--features ffi`. macOS gets it via Xcode's command-line tools.
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev \
-            libpango1.0-dev libcairo2-dev \
-            pkgconf gobject-introspection libgirepository1.0-dev
+          sudo apt-get install -y libclang-dev
 
-      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Cache Go modules + build cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
         with:
           path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-            ~/Library/Caches/go-build
-          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: gomod-${{ runner.os }}-
-
-      - name: Cache libghostty-vt
-        id: cache-libghostty
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            build/out
-            build/ghostty-src
-          key: libghostty-${{ runner.os }}-${{ hashFiles('build/build.sh') }}
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
 
       - name: Build libghostty-vt
-        if: steps.cache-libghostty.outputs.cache-hit != 'true'
-        run: ./build/build.sh libghostty
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
 
-      - name: Vet + test + build
-        run: |
-          go vet ./...
-          go test ./...
-          go build ./cmd/roost ./cmd/roost-cli
-
-      - name: Assert no dynamic ghostty-vt link (macOS regression guard)
-        if: runner.os == 'macOS'
-        run: |
-          if otool -L ./roost | grep -q '@rpath/libghostty-vt'; then
-            echo "FAIL: roost is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in build/build.sh."
-            otool -L ./roost
-            exit 1
-          fi
-
-      - name: Assert no dynamic ghostty-vt link (Linux regression guard)
-        if: runner.os == 'Linux'
-        run: |
-          if ldd ./roost | grep -q libghostty-vt; then
-            echo "FAIL: roost is dynamically linked to libghostty-vt; the cgo directive in internal/ghostty/terminal.go is supposed to statically link the .a."
-            ldd ./roost
-            exit 1
-          fi
-
-  race:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
         with:
           path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: gomod-race-ubuntu-${{ hashFiles('**/go.sum') }}
-          restore-keys: gomod-race-ubuntu-
-      - name: Race detector on non-cgo packages
-        run: go test -race ./internal/ipc/ ./internal/osc/ ./internal/core/ ./internal/store/ ./internal/config/
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
 
-  lint:
-    runs-on: ubuntu-latest
+      - name: cargo build (workspace, default features)
+        # Default features: roost-vt's `ffi` feature is OFF, so this build does
+        # not consume libghostty-vt. `--exclude roost-linux` (GTK toolchain
+        # lives in gtk-build).
+        run: cargo build --workspace --exclude roost-linux --all-targets
+
+      - name: cargo build (roost-vt with ffi)
+        run: cargo build -p roost-vt --features ffi
+
+      - name: cargo test
+        run: cargo test --workspace --exclude roost-linux
+
+  swift-mac:
+    needs: changes
+    if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      # Lint runs cgo preprocessing across the whole module, including
-      # cmd/roost (gotk4 + gotk4-adwaita) and internal/pangoextra
-      # (pangocairo via pkg-config), so we need the full GTK4 +
-      # libadwaita dev headers, not just Pango/Cairo.
-      - name: Install GTK4 + libadwaita dev headers
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            mac/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
+          restore-keys: swiftpm-${{ runner.os }}-
+
+      - name: Cache cargo registry + target (for embedded roost-cli build)
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-swiftmac-
+
+      - name: swift build
+        working-directory: mac
+        run: swift build -v
+
+      - name: Assert no dynamic ghostty-vt link (regression guard)
+        working-directory: mac
+        run: |
+          # shellcheck disable=SC2044  # binary names are fixed ('Roost'/'RoostPackageTests'), no spaces
+          for bin in $(find .build -type f -perm -u+x -name 'Roost' -o -name 'RoostPackageTests'); do
+            if otool -L "$bin" 2>/dev/null | grep -q '@rpath/libghostty-vt'; then
+              echo "FAIL: $bin is dynamically linked to libghostty-vt; reintroduces the dyld @rpath bug fixed in Package.swift's positional-archive linkerSettings."
+              otool -L "$bin"
+              exit 1
+            fi
+          done
+
+      - name: swift test
+        working-directory: mac
+        run: swift test
+
+      - name: bundle .app (release) + embed roostctl
+        run: ./mac/scripts/bundle.sh release
+
+      - name: Verify embedded roostctl
+        run: |
+          set -euo pipefail
+          BIN="mac/build/Roost.app/Contents/Resources/bin/roostctl"
+          test -x "$BIN" || { echo "FAIL: $BIN not embedded"; exit 1; }
+          "$BIN" --version
+          codesign -dvv "$BIN" 2>&1 | grep -E 'adhoc|Format=' || true
+
+  gtk-build:
+    needs: changes
+    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GTK4 + libadwaita
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev \
-            libpango1.0-dev libcairo2-dev \
-            pkgconf gobject-introspection libgirepository1.0-dev
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            pkg-config \
+            libclang-dev
 
-      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Cache Go modules + build cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
         with:
           path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: gomod-lint-ubuntu-${{ hashFiles('**/go.sum') }}
-          restore-keys: gomod-lint-ubuntu-
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
 
-      - name: Cache libghostty-vt (shares Linux test job's key)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
         with:
           path: |
-            build/out
-            build/ghostty-src
-          key: libghostty-Linux-${{ hashFiles('build/build.sh') }}
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
 
-      - name: Build libghostty-vt (only on cache miss)
+      - name: cargo build -p roost-linux
+        run: cargo build -p roost-linux
+
+  # Single required check. Always runs; passes iff no gated job failed (skipped
+  # jobs are fine — that's the path-filter doing its job).
+  ci-success:
+    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no required job failed
         run: |
-          if [ ! -f build/out/lib/libghostty-vt.a ]; then
-            ./build/build.sh libghostty
-          fi
-
-      - run: golangci-lint run ./...
+          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }}"
+          echo "job results: ${results}"
+          for r in ${results}; do
+            if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then
+              echo "::error::a CI job failed (${results})"
+              exit 1
+            fi
+          done
+          echo "all good"

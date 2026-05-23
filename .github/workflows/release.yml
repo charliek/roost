@@ -4,8 +4,7 @@ name: Release
 #   * Roost-<version>.dmg                       (macOS, arm64)
 #   * roost_<version>_amd64.deb / _arm64.deb    (Linux, native per-arch)
 # then fires repository_dispatch at charliek/apt-charliek so the .deb lands in
-# the apt repo. Action SHAs + the GTK / ghostty-cache patterns mirror
-# refactor.yml.
+# the apt repo. The GTK / ghostty-cache patterns mirror ci.yml.
 #
 # Mac signing/notarization is GATED on secrets and inert until they're added:
 #   ROOST_DEVELOPER_ID_IDENTITY, MACOS_CERTIFICATE_P12_BASE64,
@@ -26,7 +25,7 @@ jobs:
   version-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Assert tag matches [workspace.package] version
@@ -49,7 +48,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Create (or reuse) the GitHub Release
@@ -89,7 +88,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -118,13 +117,13 @@ jobs:
           nfpm --version
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
+      - uses: jdx/mise-action@v4
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v5
         with:
           path: |
             third_party/ghostty/out
@@ -136,7 +135,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache cargo registry + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -163,18 +162,18 @@ jobs:
       ROOST_DEVELOPER_ID_IDENTITY: ${{ secrets.ROOST_DEVELOPER_ID_IDENTITY }}
       HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
+      - uses: jdx/mise-action@v4
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v5
         with:
           path: |
             third_party/ghostty/out
@@ -186,7 +185,7 @@ jobs:
         run: ./third_party/ghostty/build.sh
 
       - name: Cache SwiftPM artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v5
         with:
           path: |
             mac/.build
@@ -195,7 +194,7 @@ jobs:
           restore-keys: swiftpm-release-${{ runner.os }}-
 
       - name: Cache cargo registry + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry

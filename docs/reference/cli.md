@@ -21,7 +21,7 @@ roostctl [--socket <PATH>] <COMMAND>
 |---|---|
 | `notify` | Fire a notification on a tab |
 | `set-title` | Rename a tab (locks it from OSC overwrites) |
-| `identify` | Print daemon identity (socket, PID, active tab, version) |
+| `identify` | Print the running UI's identity (socket, PID, active tab, version) |
 | `tab focus` | Focus a tab (raises window, switches project, selects tab) |
 | `tab list` | List every tab grouped by project |
 | `tab set-state` | Set the per-tab agent state |
@@ -31,7 +31,7 @@ roostctl [--socket <PATH>] <COMMAND>
 | `claude install` | Generate Claude Code hook settings + print the alias snippet |
 | `claude-hook` | Internal: invoked by Claude on each hook event |
 
-`--socket` overrides `ROOST_SOCKET`; one of the two must resolve to a reachable daemon socket.
+`--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket.
 
 ## `notify`
 
@@ -68,7 +68,7 @@ roostctl identify
 
 ```json
 {
-  "socket": "/Users/charliek/Library/Caches/roost/roost.sock",
+  "socket": "/Users/charliek/Library/Caches/Roost/roost.sock",
   "pid": 14138,
   "version": "0.1.0",
   "active_project_id": 1,
@@ -149,7 +149,7 @@ Internal: invoked by Claude Code via the generated settings file. Reads the hook
 
 | Variable | Effect |
 |---|---|
-| `ROOST_SOCKET` | Override the daemon socket the CLI dials |
+| `ROOST_SOCKET` | Override the UI socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
 | `ROOST_PROJECT_ID` | The project id this tab lives in (auto-set, available to scripts) |
 | `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
