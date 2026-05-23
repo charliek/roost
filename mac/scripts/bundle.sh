@@ -74,7 +74,11 @@ pushd "${MAC_DIR}" >/dev/null
 swift build -c "${CONFIG}" --product Roost
 popd >/dev/null
 
-SWIFT_BUILD_BIN="${MAC_DIR}/.build/arm64-apple-macosx/${CONFIG}/Roost"
+# Discover the SwiftPM bin path dynamically (same call reused for the resource
+# bundles below) rather than hardcoding `arm64-apple-macosx`, so the script
+# works regardless of the toolchain's target triple.
+SWIFT_BIN_DIR="$(cd "${MAC_DIR}" && swift build -c "${CONFIG}" --show-bin-path)"
+SWIFT_BUILD_BIN="${SWIFT_BIN_DIR}/Roost"
 if [ ! -x "${SWIFT_BUILD_BIN}" ]; then
   echo "error: swift build did not produce ${SWIFT_BUILD_BIN}" >&2
   exit 1
@@ -111,8 +115,7 @@ printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 # built artifacts for the current toolchain + target triple +
 # config.
 echo "==> Copying SwiftPM resource bundles"
-BUILD_BUNDLES_DIR="$(cd "${MAC_DIR}" && swift build -c "${CONFIG}" --show-bin-path)"
-for bundle in "${BUILD_BUNDLES_DIR}"/*.bundle; do
+for bundle in "${SWIFT_BIN_DIR}"/*.bundle; do
   [ -d "${bundle}" ] || continue
   cp -R "${bundle}" "${APP_DIR}/Contents/Resources/"
 done
@@ -175,27 +178,39 @@ cp "${ROOSTCTL_SRC}" "${APP_DIR}/Contents/Resources/bin/roostctl"
 chmod +x "${APP_DIR}/Contents/Resources/bin/roostctl"
 echo "    Embedded: ${APP_DIR}/Contents/Resources/bin/roostctl"
 
-# Phase 8 (notarization) will replace these ad-hoc signatures
-# with Developer-ID-signed binaries + a notarized DMG. Until then
-# we ad-hoc sign with the embedded entitlements so the local
-# launcher stack sees a consistent signature pair on the .app and
-# the embedded helper.
+# Signing. When ROOST_DEVELOPER_ID_IDENTITY is set (release CI, or a dev who
+# holds the cert) we sign with that Developer ID + a secure `--timestamp` so the
+# bundle can be notarized. Otherwise we fall back to ad-hoc (`-`) signing: fine
+# for local launch, but Gatekeeper will warn and notarization is impossible.
+# The inner→outer order (embedded roostctl first, then the .app) is required —
+# codesign seals nested code into the outer signature.
 #
-# Failure handling: a botched signature is a release-blocking
-# issue (Gatekeeper rejects the app, notarization will fail,
-# user-installed copies can become quarantined). Default is fail
-# hard; the `ROOST_ALLOW_UNSIGNED=1` env var bypasses for the
-# rare dev case where Xcode CLT codesign is missing. Sub-agent
-# review flagged that the prior `|| echo warn ... (continuing)`
-# silently masked CI signature regressions.
+# Failure handling: a botched signature is release-blocking (Gatekeeper reject,
+# notarization fail, quarantined installs). Default is fail hard; the
+# `ROOST_ALLOW_UNSIGNED=1` env var bypasses for the rare dev case where Xcode
+# CLT codesign is missing.
 ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
+SIGN_IDENTITY="${ROOST_DEVELOPER_ID_IDENTITY:--}"
+# `--timestamp` only with a real identity; ad-hoc signing can't be timestamped.
+# Kept as a plain (unquoted-on-use) string so it expands to nothing when empty —
+# bash 3.2-safe (no empty-array expansion under `set -u`).
+TS_FLAG=""
+if [ "${SIGN_IDENTITY}" != "-" ]; then
+  TS_FLAG="--timestamp"
+fi
 if command -v codesign >/dev/null 2>&1 && [ -f "${ENT_FILE}" ]; then
-  echo "==> Ad-hoc codesign (Phase 8 will replace with Developer ID)"
+  if [ "${SIGN_IDENTITY}" = "-" ]; then
+    echo "==> Ad-hoc codesign (set ROOST_DEVELOPER_ID_IDENTITY for a notarizable build)"
+  else
+    echo "==> Developer ID codesign (identity: ${SIGN_IDENTITY})"
+  fi
   codesign_or_die() {
     local target="$1"
-    if codesign --force --sign - \
+    # shellcheck disable=SC2086  # TS_FLAG must word-split (empty => no flag)
+    if codesign --force --sign "${SIGN_IDENTITY}" \
          --entitlements "${ENT_FILE}" \
          --options runtime \
+         ${TS_FLAG} \
          "${target}"
     then
       return 0

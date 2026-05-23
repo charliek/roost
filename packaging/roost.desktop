@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Roost
+GenericName=Terminal Multiplexer
+Comment=Multi-project terminal multiplexer for AI coding agents
+Exec=roost %F
+Icon=roost
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;multiplexer;tabs;claude;codex;
+StartupNotify=true
+StartupWMClass=ai.stridelabs.Roost.gtk

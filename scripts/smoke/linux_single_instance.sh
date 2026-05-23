@@ -3,28 +3,28 @@
 # GTK Linux UI's single-instance enforcement.
 #
 # Pre-req:
-#   cargo build -p roost-linux       # debug binary at target/debug/roost-linux
+#   cargo build -p roost-linux       # debug binary at target/debug/roost
 #   DISPLAY=:0 (or any live X / Wayland session)
 #
 # What this checks:
-#   1. First launch produces exactly one roost-linux process.
+#   1. First launch produces exactly one roost process.
 #   2. Second launch returns quickly (does not stay running) — the
 #      flock guard in single_instance.rs rejects it.
 #
-# Run after a clean state (no other roost-linux running). Exits
+# Run after a clean state (no other roost running). Exits
 # non-zero on assertion failure; the first launch is left running
 # unless CLEANUP=1 is set.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="${REPO_ROOT}/target/debug/roost-linux"
+BIN="${REPO_ROOT}/target/debug/roost"
 
 if [ ! -x "${BIN}" ]; then
-    BIN="${REPO_ROOT}/target/release/roost-linux"
+    BIN="${REPO_ROOT}/target/release/roost"
 fi
 if [ ! -x "${BIN}" ]; then
-    echo "FAIL: roost-linux not built — run \`cargo build -p roost-linux\` first" >&2
+    echo "FAIL: roost not built — run \`cargo build -p roost-linux\` first" >&2
     exit 1
 fi
 
@@ -42,7 +42,7 @@ trap cleanup EXIT
 
 # Pre-flight.
 if pgrep -f "${BIN}" >/dev/null 2>&1; then
-    echo "FAIL: a roost-linux process is already running; quit it first" >&2
+    echo "FAIL: a roost process is already running; quit it first" >&2
     pgrep -af "${BIN}"
     exit 1
 fi

@@ -43,3 +43,7 @@ coverage.html
 # Phase 6a M7: Roost.app bundle output
 /mac/build/
 
+# Phase 8: Linux .deb build staging + output
+/dist/
+/out/
+
