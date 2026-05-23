@@ -1,0 +1,274 @@
+name: Release
+
+# Phase 8 bundling. A tag push `v*` builds + uploads the release artifacts:
+#   * Roost-<version>.dmg                       (macOS, arm64)
+#   * roost_<version>_amd64.deb / _arm64.deb    (Linux, native per-arch)
+# then fires repository_dispatch at charliek/apt-charliek so the .deb lands in
+# the apt repo. The GTK / ghostty-cache patterns mirror ci.yml.
+#
+# Mac signing/notarization is GATED on secrets and inert until they're added:
+#   ROOST_DEVELOPER_ID_IDENTITY, MACOS_CERTIFICATE_P12_BASE64,
+#   MACOS_CERTIFICATE_PASSWORD, APPLE_ID, APPLE_TEAM_ID,
+#   APPLE_APP_SPECIFIC_PASSWORD. Without them the DMG ships ad-hoc-signed
+#   (Gatekeeper requires right-click → Open).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege: default read; only the release-writing jobs get contents:write.
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Assert tag matches [workspace.package] version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tag_ver="${tag#v}"
+          base_ver="${tag_ver%%-*}"   # strip any -rc1/-beta suffix
+          cargo_ver="$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "tag=${tag} (base ${base_ver})  Cargo.toml workspace version=${cargo_ver}"
+          if [ "${base_ver}" != "${cargo_ver}" ]; then
+            echo "::error::tag ${tag} does not match [workspace.package] version ${cargo_ver}. Bump Cargo.toml before tagging."
+            exit 1
+          fi
+
+  create-release:
+    needs: version-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Create (or reuse) the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          pre=""
+          case "${tag}" in *-*) pre="--prerelease";; esac
+          # Pull this tag's section out of CHANGELOG.md (## <tag> … up to the
+          # next ## v…). Field match so a trailing "— <date>" doesn't break it.
+          notes="$(awk -v tag="${tag}" '
+            $1=="##" && $2==tag {flag=1; next}
+            /^## v/ {if(flag) exit}
+            flag {print}
+          ' CHANGELOG.md || true)"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists — reusing."
+            exit 0
+          fi
+          if [ -n "${notes}" ]; then
+            printf '%s\n' "${notes}" | gh release create "${tag}" --title "${tag}" --notes-file - ${pre}
+          else
+            gh release create "${tag}" --title "${tag}" --generate-notes ${pre}
+          fi
+
+  linux:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GTK4 + libadwaita + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            pkg-config \
+            libclang-dev
+
+      - name: Install nfpm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="2.46.3"
+          case "${{ matrix.arch }}" in
+            amd64) nfpm_arch="x86_64" ;;
+            arm64) nfpm_arch="arm64" ;;
+          esac
+          url="https://github.com/goreleaser/nfpm/releases/download/v${ver}/nfpm_${ver}_Linux_${nfpm_arch}.tar.gz"
+          curl -fsSL "${url}" -o /tmp/nfpm.tgz
+          sudo tar -C /usr/local/bin -xzf /tmp/nfpm.tgz nfpm
+          nfpm --version
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-release-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Build .deb
+        run: ./linux/scripts/build-deb.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Upload .deb to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" out/*.deb --clobber
+
+  mac:
+    needs: create-release
+    runs-on: macos-15   # arm64 — pinned for reproducible release builds
+    permissions:
+      contents: write
+    env:
+      # Surfaced from secrets; empty when unset → ad-hoc signing + no notarization.
+      ROOST_DEVELOPER_ID_IDENTITY: ${{ secrets.ROOST_DEVELOPER_ID_IDENTITY }}
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            mac/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-release-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
+          restore-keys: swiftpm-release-${{ runner.os }}-
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+
+      # Inert until the cert secret exists. When added, imports the Developer ID
+      # Application cert into a throwaway keychain so codesign can use it.
+      - name: Import Developer ID certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          kc="$RUNNER_TEMP/roost-signing.keychain-db"
+          kp="$(openssl rand -base64 24)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # Prepend our keychain to the user search list, keeping the existing
+          # ones; the command substitution must word-split into separate paths.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Bundle Roost.app
+        run: ROOST_VERSION="${GITHUB_REF_NAME#v}" ./mac/scripts/bundle.sh release
+
+      - name: Make DMG
+        run: ./mac/scripts/make-dmg.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Notarize + staple (skipped without credentials)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./mac/scripts/notarize.sh "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg"
+
+      - name: Note signing status
+        if: env.HAS_CERT != 'true'
+        run: |
+          echo "::notice::Roost-${GITHUB_REF_NAME#v}.dmg is UNSIGNED (no Apple Developer ID yet). To open: right-click → Open, or 'xattr -dr com.apple.quarantine /Applications/Roost.app'."
+
+      - name: Upload DMG to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" --clobber
+
+  dispatch-apt-charliek:
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch apt-charliek publish
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          TOKEN_SET: ${{ secrets.APT_DISPATCH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          case "${tag}" in
+            *-*) echo "::notice::${tag} is a prerelease — skipping apt-charliek dispatch (include_prerelease:false)."; exit 0 ;;
+          esac
+          if [ "${TOKEN_SET}" != "true" ]; then
+            echo "::warning::APT_DISPATCH_TOKEN not set — skipping dispatch. apt-charliek self-heals on its next publish run (collect-debs.sh re-scans every package)."
+            exit 0
+          fi
+          gh api repos/charliek/apt-charliek/dispatches --method POST \
+            -f event_type=publish \
+            -F "client_payload[package]=roost" \
+            -F "client_payload[tag]=${tag}"
+          echo "::notice::Dispatched apt-charliek publish for roost ${tag} — watch https://github.com/charliek/apt-charliek/actions"

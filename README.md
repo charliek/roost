@@ -1,40 +1,67 @@
 # Roost
 
-A macOS + Linux desktop terminal multiplexer for AI coding agents. Sidebar of projects on the left, tabs per project, one libghostty-vt terminal per tab. Companion CLI surfaces notifications when an agent in a tab needs attention.
+A macOS + Linux desktop terminal multiplexer for AI coding agents. Sidebar of
+projects on the left, tabs per project, one libghostty-vt terminal per tab. The
+`roostctl` companion CLI surfaces notifications when an agent in a tab needs
+attention.
 
-## Quick start
+Two native UIs — **Swift + AppKit on macOS** (`Roost.app`) and **Rust + gtk4-rs
+on Linux** (`roost`) — each embed the workspace + PTY supervisor + a JSON-IPC
+server **in-process** (no daemon). External tooling (`roostctl`, Claude Code
+hooks) talks to the running UI over newline-delimited JSON on a Unix-domain
+socket; the wire contract is in [`docs/reference/ipc.md`](docs/reference/ipc.md).
+
+## Install
+
+**Linux (Ubuntu 24.04+ / Pop!_OS 24.04+)** — via the apt repo:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | sudo tee /etc/apt/sources.list.d/apt-charliek.list
+sudo apt update
+sudo apt install roost          # installs the `roost` UI + the `roostctl` CLI
+```
+
+**macOS** — download `Roost-<version>.dmg` from the
+[latest release](https://github.com/charliek/roost/releases/latest) and drag
+Roost to Applications. (The DMG is currently ad-hoc-signed pending an Apple
+Developer account, so first launch is right-click → Open.)
+
+## Build from source
 
 ```bash
 git clone https://github.com/charliek/roost
 cd roost
-mise install                  # provisions Go 1.24 + Zig 0.15.2
-make libghostty               # clones Ghostty at the pinned SHA, builds libghostty-vt
-make build                    # produces ./roost and ./roost-cli
-./roost
+mise install                          # Rust (rust-toolchain.toml) + Zig 0.15.x
+./third_party/ghostty/build.sh        # clones Ghostty at the pinned SHA, builds libghostty-vt
+
+# Linux UI (needs: sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config):
+cargo build --release -p roost-linux -p roost-cli   # → target/release/{roost,roostctl}
+./linux/scripts/build-deb.sh 0.0.1-dev              # …or build an installable .deb
+
+# macOS UI (needs: brew install gtk4 libadwaita):
+cd mac && swift build                 # or: ./mac/scripts/bundle.sh release  → mac/build/Roost.app
 ```
-
-System packages:
-
-- macOS: `brew install gtk4 libadwaita pkgconf gobject-introspection`
-- Ubuntu / Debian: `sudo apt install libgtk-4-dev libadwaita-1-dev pkgconf gobject-introspection libgirepository1.0-dev`
 
 ## Documentation
 
-The full documentation site lives under `docs/` and builds with `mkdocs-material`:
+The full site lives under `docs/` and builds with `mkdocs-material` (`make docs-serve` → http://127.0.0.1:7070):
 
-```bash
-make docs-serve               # http://127.0.0.1:7070
-```
-
-Highlights:
-
-- [Installation](docs/getting-started/installation.md) — system packages and first build
-- [First Run](docs/getting-started/first-run.md) — what happens on launch and where state lives
-- [Keybindings](docs/getting-started/keybindings.md) — tab and project switching, clipboard, mouse, scrollback, platform-native modifiers
-- [Working Directory Tracking](docs/guides/cwd-tracking.md) — one-line shell snippet that makes the header subtitle and tab labels follow `cd`
-- [Notifications](docs/guides/notifications.md) — how `roost-cli` and OSC fallbacks surface in the UI
+- [Installation](docs/getting-started/installation.md) — toolchain + build
+- [First Run](docs/getting-started/first-run.md) — launch behavior + where state lives
+- [Keybindings](docs/getting-started/keybindings.md) — tab/project switching, clipboard, mouse, scrollback
+- [Working Directory Tracking](docs/guides/cwd-tracking.md) — shell snippet so the header + tab labels follow `cd`
+- [Notifications](docs/guides/notifications.md) — how `roostctl` + OSC fallbacks surface in the UI
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
-- [Architecture](docs/reference/architecture.md) — package layout and threading contract
-- [Design Spec](docs/development/spec.md) — original design rationale
+- [Architecture](docs/reference/architecture.md) — package layout + threading contract
 
 `CLAUDE.md` at the repo root captures the project conventions enforced by review.
+
+## Legacy (Go)
+
+The original Go + GTK4 implementation (`cmd/`, `internal/`, `go.mod`) is retained
+for now and still builds (`mise install && make build` → `./roost ./roost-cli`),
+but the Rust/Swift port above is the path forward. The Go code is slated for
+removal once parity is confirmed — see [`plans/GODELETE.md`](plans/GODELETE.md).
+Its docs live under the "Legacy (Go prototype)" section of the docs site.

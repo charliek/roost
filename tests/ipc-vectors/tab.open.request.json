@@ -1,0 +1,12 @@
+{
+  "id": "2",
+  "op": "tab.open",
+  "params": {
+    "project_id": "1",
+    "cwd": "",
+    "argv": ["/bin/zsh"],
+    "cols": 120,
+    "rows": 30,
+    "title": ""
+  }
+}

@@ -11,8 +11,8 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 | `Cmd-T`          | New tab                                         |
 | `Cmd-W`          | Close the active tab                            |
 | `Cmd-R`          | Rename the active tab                           |
-| `Cmd-Shift-]`    | Cycle to the next tab                           |
-| `Cmd-Shift-[`    | Cycle to the previous tab                       |
+| `Cmd-Shift-]`    | Cycle to the next tab (stops at the last tab; no wrap-around) |
+| `Cmd-Shift-[`    | Cycle to the previous tab (stops at the first tab; no wrap-around) |
 | `Ctrl-1` … `Ctrl-9` | Switch to tab at position 1 .. 9             |
 
 ### Project management
@@ -21,6 +21,7 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 |----------------------|----------------------------------------------|
 | `Cmd-N`              | Create a new project (`untitled`, `untitled 2`, …) |
 | `Cmd-Shift-R`        | Rename the active project                   |
+| `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
 
@@ -54,8 +55,8 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Ctrl-T`         | New tab                                         |
 | `Ctrl-W`         | Close the active tab                            |
 | `Alt-R`          | Rename the active tab                           |
-| `Ctrl-Shift-]`   | Cycle to the next tab                           |
-| `Ctrl-Shift-[`   | Cycle to the previous tab                       |
+| `Ctrl-Shift-]`   | Cycle to the next tab (stops at the last tab; no wrap-around) |
+| `Ctrl-Shift-[`   | Cycle to the previous tab (stops at the first tab; no wrap-around) |
 | `Ctrl-1` … `Ctrl-9` | Switch to tab at position 1 .. 9             |
 
 ### Project management
@@ -64,6 +65,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 |----------------------|----------------------------------------------|
 | `Alt-N`              | Create a new project (`untitled`, `untitled 2`, …) |
 | `Alt-Shift-R`        | Rename the active project                   |
+| `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
 
@@ -134,7 +136,7 @@ The sidebar still supports mouse-driven rename: double-click a project row to re
 
 If you close the last tab in a project, Roost closes that project too. The "Are you sure?" confirmation dialog only appears for explicit close-project actions (the sidebar X button or the right-click menu); `Cmd-W` / `Ctrl-W` on the final tab closes the project silently.
 
-Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roost-cli set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.
+Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roost-cli-rs set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.
 
 ## Custom keybindings
 
@@ -187,6 +189,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
 | `new_project`         | `super+n` / `alt+n`                                    |
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
+| `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |

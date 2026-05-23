@@ -2,43 +2,59 @@
 
 Roost resolves all of its filesystem state once at startup. Other components read the paths from this resolution; nothing should derive its own.
 
+Each UI owns its own `BundleProfile` — two variants, `Mac` (Swift `Roost.app`, `CFBundleIdentifier ai.stridelabs.Roost`) and `Gtk` (gtk4-rs `roost-linux`, app id `ai.stridelabs.Roost.gtk`). There is no shared daemon; the profile a UI resolves determines the socket `roostctl` dials. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. The two implementations are tested in lockstep.
+
+The profile defaults to:
+
+| Binary       | Default profile | Override |
+|--------------|------------------|----------|
+| Swift `Roost.app` | `Mac` | n/a (the app picks `Mac` directly) |
+| `roost-linux`     | `Gtk` | `ROOST_BUNDLE_PROFILE=mac` to dial a `Mac`-profile UI |
+| `roostctl` (binary from the `roost-cli` crate) | `Mac` | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,gtk}` |
+
 ## File locations
 
-The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). The state files (database, socket) follow each platform's native convention.
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost` or `Roost-gtk`.
 
-This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/Roost/`.
+This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/<app_label>/` and the socket lives in `~/Library/Caches/<app_label>/`.
 
-### macOS
+### macOS — `Mac` profile (Swift `Roost.app`)
 
-| Path                                                | Purpose                                                    |
-|-----------------------------------------------------|------------------------------------------------------------|
-| `~/.config/roost/config.conf`                       | User-editable config; see [Config keys](#config-keys) below |
-| `~/Library/Application Support/Roost/roost.db`      | SQLite database (projects, tabs, scrollback off)           |
-| `~/Library/Application Support/Roost/roost.db-wal`  | SQLite write-ahead log (auto-created)                      |
-| `~/Library/Application Support/Roost/roost.db-shm`  | SQLite shared memory (auto-created)                        |
-| `~/Library/Application Support/Roost/roost.sock`    | Unix socket the GUI listens on                             |
+| Path | Purpose |
+|---|---|
+| `~/.config/roost/config.conf` | User-editable config; see [Config keys](#config-keys) below |
+| `~/Library/Application Support/Roost/state.json` | UI-owned workspace state (projects, tabs) |
+| `~/Library/Caches/Roost/roost.sock` | Unix socket the UI listens on |
+| `~/Library/Caches/Roost/roost.lock` | flock-based single-instance lock |
+| `~/Library/Logs/Roost/roost.log` | App log |
+
+### macOS — `Gtk` profile (`cargo run -p roost-linux` dev mode)
+
+Same shape as the `Mac` profile with `Roost-gtk` in place of `Roost`:
+
+| Path | Purpose |
+|---|---|
+| `~/Library/Application Support/Roost-gtk/state.json` | GTK-app workspace state |
+| `~/Library/Caches/Roost-gtk/roost.sock` | GTK-app Unix socket |
+| `~/Library/Caches/Roost-gtk/roost.lock` | GTK-app single-instance lock |
+| `~/Library/Logs/Roost-gtk/roost.log` | GTK-app log |
 
 ### Linux
 
-Linux follows XDG conventions for everything:
+Linux follows XDG conventions for everything. There is only one UI variant on Linux — both `Mac` and `Gtk` profile kinds resolve to the same XDG paths.
 
-| Path                                  | Purpose                                                    |
-|---------------------------------------|------------------------------------------------------------|
-| `$XDG_CONFIG_HOME/roost/config.conf`  | User-editable config; defaults to `~/.config/roost/`        |
-| `$XDG_DATA_HOME/roost/roost.db`       | SQLite database; defaults to `~/.local/share/roost/`        |
-| `$XDG_RUNTIME_DIR/roost/roost.sock`   | Unix socket; falls back to data dir when `XDG_RUNTIME_DIR` is unset |
+| Path | Purpose |
+|---|---|
+| `$XDG_CONFIG_HOME/roost/config.conf` | User-editable config; defaults to `~/.config/roost/` |
+| `$XDG_DATA_HOME/roost/state.json` | UI-owned workspace state; defaults to `~/.local/share/roost/` |
+| `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |
+| `$XDG_STATE_HOME/roost/roost.log` | App log; falls back to `~/.local/state/roost/` |
 
 The directories are created at first launch with mode `0700`.
 
-### Migrating from a pre-cutover macOS install
+### No migration from pre-rewrite lowercase paths
 
-Before this version Roost stored its config at `~/Library/Application Support/Roost/config.toml`. On startup the new build logs a one-shot warning when that legacy file exists and the new path does not:
-
-```bash
-mv ~/Library/Application\ Support/Roost/config.toml ~/.config/roost/config.conf
-```
-
-Roost does not auto-move the file — moving and renaming a user-edited file silently is the kind of thing that loses changes, so a warning + manual move is the cutover path.
+Pre-rewrite builds stored their state under lowercase `~/Library/Application Support/roost/` and `~/Library/Caches/roost/`. The current builds use capital `Roost`. There is no auto-migration — state in the lowercase directories is intentionally orphaned, and the legacy Go build's SQLite database is not migrated into `state.json`. Start empty.
 
 ## Config keys
 
@@ -82,49 +98,36 @@ When Roost spawns a tab's shell, it injects:
 |-----------------|----------------------------------------------------------------------|
 | `TERM`          | Set to `xterm-256color`                                              |
 | `COLORTERM`     | Set to `truecolor`                                                   |
-| `ROOST_TAB_ID`  | Integer tab id (used by `roost-cli` to route notifications)          |
+| `ROOST_TAB_ID`  | Integer tab id (used by `roostctl` to route notifications)              |
 | `ROOST_SOCKET`  | Absolute path to the Unix socket                                     |
 
 Existing environment is inherited verbatim before these are set.
 
 ## Environment variables Roost reads
 
-`roost-cli` reads:
+`roostctl` reads:
 
-| Variable        | Effect                                                               |
-|-----------------|----------------------------------------------------------------------|
-| `ROOST_SOCKET`  | Override the socket the CLI dials                                    |
-| `ROOST_TAB_ID`  | Default tab id when `--tab` is not given                             |
+| Variable | Effect |
+|---|---|
+| `ROOST_SOCKET` | Override the socket the CLI dials |
+| `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
+| `ROOST_PROJECT_ID` | Default project id, set by the UI |
 
-The GUI does not currently honour any environment override for paths; if you need a different location, modify `internal/config` and rebuild.
-
-## Inspecting the database
-
-Use any SQLite client. The schema is small:
-
-```bash
-sqlite3 "$HOME/Library/Application Support/Roost/roost.db"
-```
-
-```sql
-.schema project
-.schema tab
-SELECT id, name, cwd FROM project ORDER BY position;
-SELECT id, project_id, cwd, title FROM tab ORDER BY project_id, position;
-```
-
-The `command` column on `tab` is reserved for future "task tabs" (auto-launched commands) and is always NULL in the current build.
+`roostctl` also honours `ROOST_BUNDLE_PROFILE=mac|gtk` to pick which UI's socket it dials by default (useful when a Mac `Roost.app` and a GTK dev UI both run on macOS).
 
 ## Resetting state
 
 To wipe Roost's persistent state and start fresh:
 
 ```bash
-# macOS
-rm "$HOME/Library/Application Support/Roost/roost.db"*
+# macOS — Mac profile (Swift Roost.app)
+rm "$HOME/Library/Application Support/Roost/state.json"
+
+# macOS — Gtk dev profile (cargo run -p roost-linux on Mac)
+rm "$HOME/Library/Application Support/Roost-gtk/state.json"
 
 # Linux (uses XDG_DATA_HOME with the spec-default fallback)
-rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/roost.db"*
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/state.json"
 ```
 
-Relaunch `roost`. It will recreate the schema and a `default` project + tab.
+`state.json` is the UI-owned persistent store. Relaunch the UI — it will recreate default state on first run.

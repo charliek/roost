@@ -98,13 +98,23 @@ nav:
       - Working Directory Tracking: guides/cwd-tracking.md
   - Reference:
       - CLI: reference/cli.md
+      - IPC: reference/ipc.md
       - Paths & Environment: reference/paths.md
       - Themes: reference/themes.md
       - Fonts: reference/fonts.md
+      - Tab Strip: reference/tab-strip.md
       - Architecture: reference/architecture.md
+      - Legacy (Go prototype):
+          - Overview: reference/legacy-go/index.md
+          - Installation: reference/legacy-go/installation.md
+          - CLI: reference/legacy-go/cli.md
+          - Architecture: reference/legacy-go/architecture.md
+          - Development setup: reference/legacy-go/development-setup.md
+          - Design Spec (historical): development/spec.md
   - Development:
+      - Vision: development/vision.md
       - Setup: development/setup.md
-      - Design Spec: development/spec.md
+      - Claude integration testing: development/claude-testing.md
 
 extra:
   social:

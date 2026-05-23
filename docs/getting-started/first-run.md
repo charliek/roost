@@ -6,12 +6,12 @@ The first launch of Roost creates its data directory, opens a single window, and
 
 Top to bottom, left to right:
 
-| Area              | Contents                                                          |
-|-------------------|-------------------------------------------------------------------|
-| Header bar        | Window title and the **+ tab** button                              |
-| Sidebar (left)    | List of projects, with a **+ Project** button at the bottom        |
-| Tab bar (right)   | Tabs for the currently selected project                            |
-| Terminal surface  | One libghostty-vt terminal hosted on a `GtkDrawingArea`            |
+| Area | Contents |
+|---|---|
+| Title bar | Window title (active tab's cwd) |
+| Sidebar (left) | List of projects, with a **+ New Project** button at the bottom |
+| Tab strip (right) | Tabs for the currently selected project, with a trailing **+** button |
+| Terminal surface | One libghostty-vt terminal per tab (Core Graphics on macOS, Cairo + Pango on Linux) |
 
 Click a project in the sidebar to switch its tab strip into the right pane. Click a tab to swap the terminal surface to that tab's session.
 
@@ -21,22 +21,22 @@ On first launch Roost creates a project named `default` with one tab. The tab's 
 
 ## Persistence
 
-Every project, tab, working directory, and tab title is persisted to a SQLite database. When you relaunch Roost, all of those come back. Each tab spawns a fresh shell at its saved working directory — Roost never re-runs your last command on its own.
+Every project, tab, working directory, and tab title is persisted to a small `state.json` file written atomically by the UI. When you relaunch Roost, all of those come back. Each tab spawns a fresh shell at its saved working directory — Roost never re-runs your last command on its own.
 
 | State                | Persisted? | Notes                                                  |
 |----------------------|------------|--------------------------------------------------------|
 | Project name + cwd   | Yes        | Sidebar order is preserved                             |
 | Tab order, cwd       | Yes        | Tab strip order is preserved per project               |
-| Tab title (OSC 0/1/2)| Yes        | Updated live as the shell sets it; locked once you rename via `Cmd-R` / `Alt-R` or `roost-cli set-title` |
+| Tab title (OSC 0/1/2)| Yes        | Updated live as the shell sets it; locked once you rename via `Cmd-R` / `Alt-R` or `roostctl set-title` |
 | Scrollback           | No         | Lost on shell exit; surface restart is fresh           |
 | Last command         | No (not auto-restarted) | Use shell history (`up arrow`) to re-run    |
 
 ## Where state lives
 
-The user-editable config file lives under XDG on both platforms (`~/.config/roost/config.conf`); state files (the SQLite database and the IPC socket) follow each platform's native convention:
+The user-editable config file lives under XDG on both platforms (`~/.config/roost/config.conf`); state files (`state.json` and the IPC socket) follow each platform's native convention:
 
-- macOS: `~/.config/roost/config.conf` (config) plus `~/Library/Application Support/Roost/` (data + socket)
-- Linux: `~/.config/roost/config.conf` (config), `~/.local/share/roost/` (data), and `$XDG_RUNTIME_DIR/roost/` (socket)
+- macOS: `~/.config/roost/config.conf` (config), `~/Library/Application Support/Roost/state.json` (data), and `~/Library/Caches/Roost/roost.sock` (socket)
+- Linux: `~/.config/roost/config.conf` (config), `~/.local/share/roost/state.json` (data), and `$XDG_RUNTIME_DIR/roost/roost.sock` (socket)
 
 See [Paths & Environment](../reference/paths.md) for the full layout.
 
@@ -58,4 +58,4 @@ See [Paths & Environment](../reference/paths.md) for the full layout.
 
 - [Keybindings](keybindings.md) — how to drive Roost without the mouse
 - [Working Directory Tracking](../guides/cwd-tracking.md) — make the header subtitle and tab labels follow `cd`
-- [Notifications](../guides/notifications.md) — how `roost-cli` and OSC sequences surface in the UI
+- [Notifications](../guides/notifications.md) — how `roostctl` and OSC sequences surface in the UI

@@ -1,4 +1,4 @@
-Bundled icons under symbolic/ are copied unmodified from the GNOME
+Bundled icons under scalable/ are copied unmodified from the GNOME
 Adwaita icon theme, version 50.0:
 
     https://gitlab.gnome.org/GNOME/adwaita-icon-theme
@@ -17,7 +17,7 @@ icons themselves; the rest of Roost is unaffected.
 
 Files:
 
-  symbolic/places/folder-symbolic.svg
-  symbolic/actions/sidebar-show-symbolic.svg
-  symbolic/actions/sidebar-show-right-symbolic.svg
-  symbolic/actions/tab-new-symbolic.svg
+  scalable/places/folder-symbolic.svg
+  scalable/actions/sidebar-show-symbolic.svg
+  scalable/actions/sidebar-show-right-symbolic.svg
+  scalable/actions/tab-new-symbolic.svg

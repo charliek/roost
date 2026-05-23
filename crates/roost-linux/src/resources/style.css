@@ -1,0 +1,67 @@
+/* Roost gtk4-rs UI overrides. Ported from cmd/roost/style.css to keep
+ * the Linux Rust UI visually equivalent to the Go binary the user is
+ * happy with. Targets libadwaita 1.x; revisit on major bumps.
+ *
+ * Keep this small — every rule is a surface that can fight a future
+ * libadwaita restyle. Class names match the Go binary verbatim so
+ * users browsing one codebase find the same rules in the other. */
+
+/* Sidebar selection: libadwaita's default selection is faint; promote
+ * it to the accent color so the active project clearly pops. */
+listbox.navigation-sidebar > row:selected {
+  background: @accent_bg_color;
+  color: @accent_fg_color;
+}
+listbox.navigation-sidebar > row:selected:hover {
+  background: shade(@accent_bg_color, 1.05);
+}
+listbox.navigation-sidebar > row:hover:not(:selected) {
+  background: alpha(currentColor, 0.06);
+}
+
+/* Tab bar: subtle accent tint on the checked tab. Only restyle the
+ * tab body — leave the close button + indicator dot to libadwaita. */
+tabbar tab:checked {
+  background: alpha(@accent_bg_color, 0.18);
+}
+
+/* Sidebar section header above the project list. */
+.sidebar-section-header {
+  padding: 8px 12px 4px;
+  font-size: 0.78em;
+  font-weight: bold;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+/* Project row agent-state rollup: a 3px left-edge stripe coloured by
+ * the highest-severity state across the project's tabs. box-shadow
+ * inset is used instead of border-left because libadwaita reserves
+ * the row's leading margin for the selection state — a real border
+ * would shift the label. needs-input wins; running is informational;
+ * idle is muted. The "none" state has no class, no stripe. The
+ * daemon's TabState enum (proto/roost.proto) has no ERROR variant,
+ * matching the Go binary; if the daemon grows one later, add a
+ * `.roost-rollup-error` rule alongside these three and the matching
+ * `RollupState::Error` variant in `rollup.rs`.
+ *
+ * Colors mirror the per-tab indicator SVGs (cmd/roost/indicator.go).
+ * Hard-coded rather than @accent_bg_color etc. because the indicator
+ * meaning is semantic, not theme-dependent. */
+listbox.navigation-sidebar > row.roost-rollup-running {
+  box-shadow: inset 3px 0 0 #5fa3f0;
+}
+listbox.navigation-sidebar > row.roost-rollup-needs-input {
+  box-shadow: inset 3px 0 0 #f0a040;
+}
+listbox.navigation-sidebar > row.roost-rollup-idle {
+  box-shadow: inset 3px 0 0 #7a7a7a;
+}
+
+/* Drag-to-reorder feedback lives in app.rs: the dragged row's opacity
+ * is set directly via gtk_widget_set_opacity in the drag-source
+ * setup. CSS-based styling of the source row was tried in the Go
+ * binary (multiple variants of background, box-shadow, outline) but
+ * did not render reliably during a drag; the opacity API takes a
+ * different code path and applies cleanly. */

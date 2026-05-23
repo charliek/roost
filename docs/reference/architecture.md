@@ -1,109 +1,106 @@
 # Architecture
 
-Roost is one binary with a strictly layered package structure. The UI talks to a workspace coordinator, which owns persistence and emits events. PTY supervision and the libghostty-vt cgo boundary live in their own packages and never touch the UI layer.
+Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed the workspace + PTY supervisor in-process. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+
+For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md). For the legacy Go binary's architecture see [Legacy → Architecture](legacy-go/architecture.md).
 
 ## Stack
 
-| Layer                  | Implementation                                       |
-|------------------------|------------------------------------------------------|
-| UI                     | GTK4 + libadwaita via `diamondburned/gotk4`          |
-| Renderer               | Cairo + Pango drawing into a `GtkDrawingArea`        |
-| State / persistence    | `internal/core` + `internal/store` (modernc/sqlite)  |
-| Terminal engine        | `internal/ghostty` (cgo wrapper around libghostty-vt) |
-| PTY                    | `internal/pty` (creack/pty)                          |
-| OSC fallback           | `internal/osc` (streaming Go scanner)                |
-| IPC                    | `internal/ipc` (Unix socket, JSON-RPC)               |
-| Companion CLI          | `cmd/roost-cli`                                      |
+| Layer | macOS | Linux |
+|---|---|---|
+| Window + chrome | Swift + AppKit | Rust + gtk4-rs + libadwaita |
+| Renderer | Core Graphics over libghostty-vt cell grid | Cairo + Pango over libghostty-vt cell grid |
+| Terminal engine | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) |
+| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-linux/src/daemon/state.rs` |
+| PTY supervisor | `mac/Sources/Roost/PtySupervisor.swift` (forkpty + DispatchSourceRead) | `crates/roost-linux/src/daemon/pty.rs` (`portable-pty` + tokio tasks) |
+| Persistence | `state.json` via tmp + fsync + `replaceItemAt` | `state.json` via tmp + fsync + rename + parent-dir fsync |
+| IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |
+| IPC wire types | `mac/Sources/Roost/IPCMessages.swift` (Codable) | `crates/roost-ipc/src/messages.rs` (serde) |
+| OSC scanning | `mac/Sources/Roost/OscScanner.swift` per `TerminalView` | `roost-osc` crate per per-tab drain task |
+| Single-instance | `mac/Sources/Roost/SingleInstance.swift` (flock via `@_silgen_name`) | `crates/roost-linux/src/single_instance.rs` (`fs2::FileExt::try_lock_exclusive`) |
+| Shell-integration CLI | `roostctl` (binary from `crates/roost-cli`) — same binary on both platforms | (same) |
 
-## Package layout
+The UIs are written separately and idiomatic to their platform; only the JSON IPC wire format is shared between them (via the `roost-ipc` crate on the Rust side + its hand-mirrored Swift counterpart in `IPCMessages.swift`).
+
+## Repository layout
 
 ```text
-cmd/
-  roost/                # GUI binary
-    main.go             # entry, config + store + workspace + GTK app bootstrap
-    app.go              # App struct: owns sessions map, sidebar, tab views, IPC handler
-    session.go          # Session: PTY + libghostty terminal + render state + DrawingArea
-    render.go           # Cairo cell drawing + selection overlay
-    input.go            # GDK key event → libghostty key encoder → PTY bytes
-    keymap.go           # GDK keyval → ghostty.Key + ghostty.Mods (pure Go, no cgo)
-    selection.go        # Stable selection model + ribbon-rect math for the renderer
-    notify.go           # Desktop notification (gio on Linux, osascript on macOS)
-    loghandler.go       # slog filter for noisy GLib theme warnings
-  roost-cli/            # Companion CLI binary
-    main.go             # notify, set-title, identify
-internal/
-  core/                 # Project + Tab models, Workspace coordinator, event channel
-  store/                # SQLite schema + migrations + CRUD
-  config/               # Cross-platform path resolution
-  ghostty/              # cgo bindings to libghostty-vt
-  pangoextra/           # cgo wrapper for Pango/Cairo font options
-  pty/                  # creack/pty wrapper
-  osc/                  # OSC 9 / OSC 777 streaming parser
-  ipc/                  # Unix socket protocol + server + client helper
-build/
-  build.sh              # zig build for libghostty-vt + go build
+crates/
+  roost-ipc/              # JSON wire format, framing, client, server, paths, target picker
+  roost-vt/               # libghostty-vt FFI wrapper (--features ffi)
+  roost-osc/              # OSC scanner + state machine
+  roost-cli/              # roostctl binary
+  roost-linux/            # Linux UI (gtk4-rs) — embeds Workspace + PtySupervisor + IPC server
+mac/
+  Sources/Roost/          # Swift Mac UI — embeds Workspace + PtySupervisor + IPC server
+  Resources/              # themes, Info.plist.template, Roost.entitlements
+  Tests/RoostTests/       # swift-testing test suite
+  scripts/bundle.sh       # SwiftPM → .app bundle + embedded roostctl + ad-hoc codesign
+docs/
+  reference/ipc.md        # JSON IPC wire spec — canonical
+  archive/roost.proto     # Historical reference (the pre-M7 gRPC schema)
+third_party/ghostty/      # Vendored libghostty-vt build
+cmd/, internal/, build/   # Legacy Go binary — see Legacy section, deleted in Phase 9
 ```
 
-## Threading contract
+## Hot path
 
-GTK4 is strictly single-threaded. Widget operations must run on the main thread.
-
-| Layer                                  | Thread                                       |
-|----------------------------------------|----------------------------------------------|
-| GTK widgets, draw functions, input     | Main thread only                              |
-| `ghostty_terminal_vt_write`            | **Main thread**                               |
-| `ghostty_render_state_update` and walk | **Main thread**                               |
-| `KeyEncoder` / `MouseEncoder` (encode + `setopt_from_terminal`) | **Main thread** (same handle reused per session) |
-| `EncodePaste` / `CopyViewportSelection` | **Main thread**                               |
-| Per-tab PTY `Read` / `Write`           | One goroutine per tab                         |
-| OSC scanner (parses notifications)     | Same goroutine as the PTY pump                |
-| SQLite writes                          | Goroutine-safe (database/sql handles locking) |
-| IPC server (Unix socket)               | Goroutines per connection                     |
-
-Goroutines marshal back to the main thread via `glib.IdleAdd`. The shortcut controller runs in GTK's *capture* phase so app-level keybindings fire before the focused terminal sees the event.
-
-## Event flow: a notification
+PTY bytes flow `kernel → master fd → in-process drain task → libghostty-vt vt_write → renderer`. Everything is in the same process; the IPC socket carries only control messages (`tab.open`, `tab.write`, `events.subscribe`, etc.) and event broadcasts. The renderer never sees the wire.
 
 ```mermaid
 flowchart LR
-    Sender["roost-cli notify"]
-    Hook["roost-cli claude-hook"]
-    OSC["printf '\\033]9;...'"]
-    Pump["Session.pumpPTY (goroutine)"]
-    Scanner["osc.Scanner"]
-    IPC["ipc.Server"]
-    WS["core.Workspace<br/>(state + events)"]
-    App["App.handleEvent<br/>(main thread)"]
-    Indicator["AdwTabPage.SetIndicatorIcon<br/>state colored circle"]
-    Badge["AdwTabPage.SetNeedsAttention<br/>pulse"]
-    Stripe["projectRow rollup stripe"]
-    Banner["terminal-notifier (mac)<br/>gio.Notification (Linux)"]
+    CLI["roostctl notify"]
+    Hook["roostctl claude-hook"]
+    OSC["printf '\\033]9;…'"]
+    PTY["PTY supervisor<br/>(in-process)"]
+    Workspace["Workspace<br/>(in-process)"]
+    Scanner["OSC scanner<br/>(per TerminalView)"]
+    UI["UI event handler<br/>(main thread)"]
+    Indicator["per-tab indicator"]
+    Stripe["sidebar rollup stripe"]
+    Banner["desktop notification"]
+    IPC["JSON IPC server"]
 
-    Sender --> IPC --> WS
+    CLI --> IPC
     Hook --> IPC
-    OSC --> Pump --> Scanner --> WS
-    WS --> App
-    App --> Indicator
-    App --> Badge
-    App --> Stripe
-    App --> Banner
+    IPC --> Workspace
+    OSC --> PTY --> Scanner --> Workspace
+    Workspace --> UI
+    UI --> Indicator
+    UI --> Stripe
+    UI --> Banner
 ```
 
-Three input paths (`roost-cli notify`, `roost-cli claude-hook`, OSC 9/777) converge on `core.Workspace`. The Workspace emits four event kinds the UI cares about:
+The wire surface is small enough to inspect by hand:
 
-- `EventNotification` — drives the desktop banner and the `SetNeedsAttention` pulse.
-- `EventTabNotificationChanged` — fires when the per-tab pending-attention flag flips. Today consumed only for symmetry; future surfaces (sidebar dot count, etc.) layer on top.
-- `EventTabStateChanged` — drives the per-tab indicator icon and the project rollup stripe recompute.
-- `EventTabDeleted` — carries `ProjectID` so the rollup stripe can be recomputed without a separate lookup.
+```bash
+echo '{"id":"1","op":"identify","params":{}}' | nc -U ~/Library/Caches/Roost/roost.sock
+```
 
-The App subscribes once and marshals each event to the main thread via `coreglib.IdleAdd` before touching widgets. Banners on macOS go through `terminal-notifier` (`-execute "roost-cli tab focus --tab N"` for click-through, `-group roost.tab.<id>` for supersede); on Linux a `gio.SimpleAction` wires the banner's default action to in-process `App.FocusTab`.
+## Threading
 
-OSC suppression: when a tab has an active hook session (`system.set_hook_active`), the OSC scanner's `OnNotification` callback drops raw OSC 9/777 from inside the agent. Hook events are the trusted channel; OSC is the fallback for tools that can't be modified.
+Both UI toolkits (AppKit, GTK4) are single-threaded. Widget operations and `libghostty-vt` calls must run on the main thread.
+
+| Layer | Thread |
+|---|---|
+| UI widgets, draw, input | Main thread only |
+| `libghostty-vt` terminal handle + `vt_write` | Main thread only |
+| PTY read (master fd) | `DispatchSourceRead` background queue (Mac) / dedicated tokio task (Linux) |
+| PTY write | Main thread (`LocalClient.writeTab`) |
+| OSC dispatch | Main thread (hopped from the read queue) |
+| IPC accept loop | Detached `Task` (Mac) / tokio task (Linux) — never blocks main |
+| IPC handler dispatch | Per-connection `Task` (Mac) / tokio task (Linux); mutations hop to main |
+| `state.json` writes | Main thread (small; atomic via tmp + rename) |
+
+The Mac PTY read path uses a dedicated pattern: the `DispatchSourceRead` closure is installed via a `nonisolated static` helper so Swift 6 doesn't infer `@MainActor` isolation on the closure body (which would trip `dispatch_assert_queue(main)` from the dispatch worker thread). Bytes bridge to the main actor through a `Sendable AsyncStream<InternalEvent>` that a drain `Task { @MainActor in ... }` consumes — see `mac/Sources/Roost/PtySupervisor.swift` for the comment block that walks through this.
 
 ## Boundaries
 
-- The UI layer (`cmd/roost`) calls `core.Workspace` only — never `internal/store` directly. This preserves the option of moving the workspace into a separate daemon process later.
-- cgo lives in `internal/ghostty` (libghostty-vt embedding) and `internal/pangoextra` (a small wrapper for `pango_cairo_context_set_font_options`, present only because gotk4's binding for the same call crashes). Every other package is pure Go.
-- Per-tab Sessions are independent: closing one cannot affect another's pump or libghostty terminal.
+- Each UI process owns its workspace, PTY supervisor, and IPC server. There is no separate daemon. State is in memory + the bundle-profile `state.json` file.
+- `libghostty-vt` lives inside each UI for VT parsing + rendering.
+- OSC scanning lives in the UI (`OscScanner.swift` on macOS, `roost-osc` crate on Linux) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
+- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket (`~/Library/Caches/Roost/roost.sock` for Mac, `$XDG_RUNTIME_DIR/roost-gtk/roost.sock` for Linux). `roostctl --target {mac,gtk}` routes to the right one; `roostctl` with no `--target` auto-detects via a parallel `connect()` probe of both candidate sockets.
+- Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on a pidfile next to the socket. Second launches read the holder PID and exit 0. `ROOST_ALLOW_MULTI=1` bypasses for dev/test workflows.
+- The legacy Go `cmd/` + `internal/` tree is unaffected by the Rust workspace and builds independently via `build/build.sh` until the Phase 9 cutover.
 
-See [Design Spec](../development/spec.md) for the rationale behind these choices.
+See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for Roost.app — Phase 6a M7.
+
+  `mac/scripts/bundle.sh` copies this file into the .app bundle and
+  substitutes @VERSION@ with the value of `mac/Package.swift`'s
+  product version (or the goal-doc default 0.1.0 until we cut a real
+  release tag in Phase 8).
+
+  Out of scope for M7 (separate Phase 8 work):
+    * Code-signing certificate / `LSApplicationCategoryType`
+    * Sparkle auto-update keys (SUFeedURL, etc.)
+    * Hardened-runtime entitlements
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.stridelabs.Roost</string>
+  <key>CFBundleName</key>
+  <string>Roost</string>
+  <key>CFBundleDisplayName</key>
+  <string>Roost</string>
+  <key>CFBundleExecutable</key>
+  <string>Roost</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>15.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+  <key>LSUIElement</key>
+  <false/>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>
+</dict>
+</plist>

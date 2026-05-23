@@ -1,0 +1,33 @@
+[package]
+name        = "roost-vt"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Safe Rust wrapper over libghostty-vt's C API (VT parse, OSC, screen state)."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# When enabled, build.rs invokes bindgen and links the static archive at
+# third_party/ghostty/out/lib/libghostty-vt.a. The default (no feature)
+# compiles a stub so the workspace can `cargo check` without the vendored
+# archive being present — useful in CI before the libghostty-vt build job
+# has run, and on developer machines that haven't built it yet.
+default = []
+# Pulling bindgen in via the feature (rather than always) means the
+# default build doesn't pay bindgen's compile cost. Matches the runtime
+# gate in build.rs (CARGO_FEATURE_FFI).
+ffi     = ["dep:bindgen"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true, optional = true }
+
+[lints]
+workspace = true

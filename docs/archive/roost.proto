@@ -1,0 +1,485 @@
+// Roost IPC protocol.
+//
+// Single source of truth for the wire contract between roost-core (Rust
+// daemon) and the native UIs (Swift/AppKit on macOS, Rust/gtk4-rs on Linux).
+//
+// Transport: gRPC over Unix domain socket. Local IPC only — there is no
+// remote / network deployment. The socket path is resolved by
+// `roost_common::default_socket_path` (and the Swift companion in
+// mac/Sources/Roost/App.swift::defaultSocketPath); both implementations
+// must stay in lockstep:
+//
+//   * macOS:        ~/Library/Caches/roost/roost.sock
+//   * Linux (XDG):  $XDG_RUNTIME_DIR/roost/roost.sock
+//   * Linux (else): /tmp/roost-<uid>/roost.sock
+//
+// Schema evolution: additive changes only. Deprecate fields rather than
+// renumber. Bump proto/CHANGELOG.md on every change. Once Phase 5 ships,
+// breaking changes require coordinated client+daemon releases.
+//
+// Hot path: PTY bytes flow core->UI as gRPC server-streams via StreamPty;
+// the UI parses VT and renders in-process. OSC events detected during VT
+// parse upcall to ReportOsc. Renderer state never crosses the wire.
+
+syntax = "proto3";
+
+package roost.v1;
+
+// =============================================================================
+// Service
+// =============================================================================
+
+service Roost {
+  // ---- Identity / handshake ----
+  rpc Identify(IdentifyRequest) returns (IdentifyResponse);
+
+  // ---- Tab lifecycle ----
+  rpc OpenTab(OpenTabRequest) returns (OpenTabResponse);
+  rpc CloseTab(CloseTabRequest) returns (CloseTabResponse);
+  rpc ListTabs(ListTabsRequest) returns (ListTabsResponse);
+
+  // ---- Headless tab IO (Phase 6a M4) ----
+  // Write bytes into / resize the PTY of an existing tab without
+  // attaching a StreamPty client. Lets headless tools (CLI / CI /
+  // future automation) drive a tab that a UI already has on screen
+  // — input is fed through the daemon's `PtySupervisor`, and the
+  // UI's existing `StreamPty` output stream surfaces the shell's
+  // response. Errors with NotFound if no PTY exists for the tab
+  // (i.e. no UI has attached + spawned the shell yet).
+  rpc TabWrite(TabWriteRequest) returns (TabWriteResponse);
+  rpc TabResize(TabResizeRequest) returns (TabResizeResponse);
+
+  // ---- Project lifecycle ----
+  // The default project is auto-created by `OpenTab` when the client
+  // passes `project_id = 0` and no projects exist. These RPCs let
+  // a UI manage the project list explicitly: a sidebar that adds /
+  // renames / removes projects without going through a tab.
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
+  rpc RenameProject(RenameProjectRequest) returns (RenameProjectResponse);
+  rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
+
+  // ---- Reordering (Phase 7 commit 3) ----
+  // Persist a new ordering for tabs inside a project (or projects in
+  // the sidebar). The request carries the full target order; the
+  // daemon writes the `position` column and emits the matching
+  // `TabsReorderedEvent` / `ProjectsReorderedEvent` so peer clients
+  // converge. Any id missing from the request keeps its prior
+  // position. The Linux UI's drag handlers consume these; the Mac UI
+  // can wire them as a follow-up.
+  rpc ReorderTabs(ReorderTabsRequest) returns (ReorderTabsResponse);
+  rpc ReorderProjects(ReorderProjectsRequest) returns (ReorderProjectsResponse);
+
+  // ---- Terminal stream ----
+  // Bidirectional. Client opens with PtyAttach{tab_id}, then sends
+  // PtyInput / PtyResize. Server streams PtyOutput until the PTY exits,
+  // then sends PtyExit and closes the stream.
+  rpc StreamPty(stream PtyClientMessage) returns (stream PtyServerMessage);
+
+  // ---- Workspace events (server-streams everything that mutates state) ----
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+
+  // ---- Control (mirrors current internal/ipc methods) ----
+  rpc CreateNotification(CreateNotificationRequest) returns (CreateNotificationResponse);
+  rpc SetTabTitle(SetTabTitleRequest) returns (SetTabTitleResponse);
+  rpc FocusTab(FocusTabRequest) returns (FocusTabResponse);
+  rpc SetTabState(SetTabStateRequest) returns (SetTabStateResponse);
+  rpc ClearTabNotification(ClearTabNotificationRequest) returns (ClearTabNotificationResponse);
+  rpc SetHookActive(SetHookActiveRequest) returns (SetHookActiveResponse);
+
+  // ---- OSC upcall ----
+  // The UI parses VT and reports OSC sequences back to core for routing.
+  // Core decides whether to fire a notification, update CWD, etc.
+  rpc ReportOsc(ReportOscRequest) returns (ReportOscResponse);
+}
+
+// =============================================================================
+// Common types
+// =============================================================================
+
+enum TabState {
+  TAB_STATE_UNSPECIFIED = 0;
+  TAB_STATE_NONE        = 1;  // no agent activity
+  TAB_STATE_RUNNING     = 2;  // agent is working
+  TAB_STATE_NEEDS_INPUT = 3;  // agent is waiting on the user
+  TAB_STATE_IDLE        = 4;  // agent finished, no pending input
+}
+
+message Project {
+  int64  id          = 1;
+  string name        = 2;
+  string cwd         = 3;
+  int32  position    = 4;
+  int64  created_at  = 5;  // unix seconds
+  repeated Tab tabs  = 6;
+}
+
+message Tab {
+  int64    id              = 1;
+  int64    project_id      = 2;
+  string   title           = 3;
+  string   cwd             = 4;
+  TabState state           = 5;
+  bool     has_notification = 6;
+  bool     is_active       = 7;
+  bool     user_titled     = 8;  // manual rename locks against OSC 1/2
+  int32    position        = 9;
+  int64    created_at      = 10;
+  int64    last_active     = 11;
+  // True while a hook session (e.g. the Claude Code hook) owns the
+  // tab's notification surface; raw OSC 9/777 from the shell is
+  // suppressed in that mode. Exposed in snapshots so a UI joining
+  // mid-session can render the suppression state without polling.
+  bool     hook_active     = 12;
+}
+
+// =============================================================================
+// Identity / handshake
+// =============================================================================
+
+message IdentifyRequest {
+  // Optional client identification for debugging in `roost-core` logs.
+  string client_name    = 1;  // e.g. "roost-mac", "roost-linux", "roost-cli-rs"
+  string client_version = 2;
+}
+
+message IdentifyResponse {
+  string socket_path        = 1;
+  int32  pid                = 2;
+  int64  active_project_id  = 3;
+  int64  active_tab_id      = 4;
+  string daemon_version     = 5;
+  uint32 protocol_version   = 6;  // bumps on breaking schema change
+}
+
+// =============================================================================
+// Tab lifecycle
+// =============================================================================
+
+message OpenTabRequest {
+  int64  project_id = 1;
+  string cwd        = 2;  // empty = use project's default cwd
+  // Argument vector to spawn for the tab's PTY. Empty = the user's
+  // $SHELL. We deliberately do NOT take an opaque command string here —
+  // a single string forces the daemon into shell parsing and turns
+  // client-supplied commands into a shell-injection footgun. Clients
+  // that genuinely want shell-style word-splitting can pass
+  // `["sh", "-c", "...command line..."]` explicitly.
+  repeated string argv = 3;
+  uint32 cols       = 4;
+  uint32 rows       = 5;
+  string title      = 6;  // empty = derive from cwd
+}
+
+message OpenTabResponse {
+  Tab tab = 1;
+}
+
+message CloseTabRequest {
+  int64 tab_id = 1;
+}
+
+message CloseTabResponse {}
+
+message ListTabsRequest {}
+
+message ListTabsResponse {
+  repeated Project projects = 1;
+}
+
+// Headless write into a tab's PTY — Phase 6a M4. Body bytes are sent
+// through the daemon's `PtySupervisor::write`, identical to what
+// `StreamPty`'s PtyInput would do, but without spawning a new PTY or
+// attaching a stream. Errors with NotFound if the tab has no live
+// PTY session (no UI has attached yet).
+message TabWriteRequest {
+  int64 tab_id = 1;
+  bytes data   = 2;
+}
+
+message TabWriteResponse {}
+
+// Headless resize of a tab's PTY — Phase 6a M4. Same semantics as
+// PtyResize on the StreamPty stream, but issued out-of-band. Useful
+// for `roost-cli-rs tab resize` and for future automation that wants
+// to pin a tab to a particular cell grid without dragging a window.
+message TabResizeRequest {
+  int64  tab_id = 1;
+  uint32 cols   = 2;
+  uint32 rows   = 3;
+}
+
+message TabResizeResponse {}
+
+// =============================================================================
+// Project lifecycle
+// =============================================================================
+
+message CreateProjectRequest {
+  string name = 1;  // empty = daemon picks "Untitled <n>"
+  string cwd  = 2;
+}
+
+message CreateProjectResponse {
+  Project project = 1;
+}
+
+message RenameProjectRequest {
+  int64  project_id = 1;
+  string name       = 2;
+}
+
+message RenameProjectResponse {}
+
+message DeleteProjectRequest {
+  int64 project_id = 1;
+  // Tabs in the project cascade-delete; clients see `TabDeletedEvent`
+  // for each one before the `ProjectDeletedEvent` arrives.
+}
+
+message DeleteProjectResponse {}
+
+message ReorderTabsRequest {
+  int64           project_id = 1;
+  // New order, in display order (index 0 = leftmost / first). Any tab
+  // in the project not listed here keeps its existing position
+  // relative to the others. Ids not belonging to `project_id` are
+  // rejected with INVALID_ARGUMENT.
+  repeated int64  tab_ids    = 2;
+}
+
+message ReorderTabsResponse {}
+
+message ReorderProjectsRequest {
+  // New order, in sidebar display order (index 0 = topmost). Any
+  // project not listed here keeps its existing position. Ids that
+  // don't exist are rejected with INVALID_ARGUMENT.
+  repeated int64  project_ids = 1;
+}
+
+message ReorderProjectsResponse {}
+
+// =============================================================================
+// PTY stream
+// =============================================================================
+
+message PtyClientMessage {
+  oneof kind {
+    PtyAttach attach = 1;
+    PtyInput  input  = 2;
+    PtyResize resize = 3;
+  }
+}
+
+message PtyAttach {
+  int64  tab_id = 1;
+  uint32 cols   = 2;  // resync on attach
+  uint32 rows   = 3;
+}
+
+message PtyInput {
+  bytes data = 1;
+}
+
+message PtyResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message PtyServerMessage {
+  oneof kind {
+    PtyOutput output = 1;
+    PtyExit   exit   = 2;
+  }
+}
+
+message PtyOutput {
+  bytes data = 1;
+}
+
+message PtyExit {
+  int32 status = 1;
+  string reason = 2;  // human-readable exit reason; empty on normal exit
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+
+message WatchEventsRequest {
+  // If set, only events for this tab are streamed. Zero = all events.
+  int64 tab_id_filter = 1;
+}
+
+// All workspace mutations clients need to converge on daemon state arrive
+// through this stream. A client that subscribes mid-session calls
+// `ListTabs` once, then keeps state in sync purely from these events —
+// no polling.
+message Event {
+  oneof kind {
+    NotificationEvent       notification        = 1;
+    TabStateChangedEvent    tab_state           = 2;
+    TabNotificationEvent    tab_notification    = 3;
+    TabDeletedEvent         tab_deleted         = 4;
+    ProjectsReorderedEvent  projects_reordered  = 5;
+    TabsReorderedEvent      tabs_reordered      = 6;
+    TabTitleChangedEvent    tab_title           = 7;
+    TabCwdChangedEvent      tab_cwd             = 8;
+    TabOpenedEvent          tab_opened          = 9;
+    ActiveChangedEvent      active              = 10;
+    HookActiveChangedEvent  hook_active         = 11;
+    ProjectCreatedEvent     project_created     = 12;
+    ProjectRenamedEvent     project_renamed     = 13;
+    ProjectDeletedEvent     project_deleted     = 14;
+  }
+}
+
+message NotificationEvent {
+  int64  tab_id = 1;
+  string title  = 2;
+  string body   = 3;
+}
+
+message TabStateChangedEvent {
+  int64    tab_id = 1;
+  TabState state  = 2;
+}
+
+message TabNotificationEvent {
+  int64 tab_id      = 1;
+  bool  has_pending = 2;
+}
+
+message TabDeletedEvent {
+  int64 tab_id = 1;
+}
+
+message ProjectsReorderedEvent {
+  repeated int64 project_ids = 1;
+}
+
+message TabsReorderedEvent {
+  int64           project_id = 1;
+  repeated int64  tab_ids    = 2;
+}
+
+message TabTitleChangedEvent {
+  int64  tab_id = 1;
+  string title  = 2;
+}
+
+message TabCwdChangedEvent {
+  int64  tab_id = 1;
+  string cwd    = 2;
+}
+
+// Emitted when a new tab is opened (by any client). The tab payload is the
+// freshly-created snapshot — a UI can splice it directly into its model.
+message TabOpenedEvent {
+  Tab tab = 1;
+}
+
+// Emitted when the active (project, tab) selection changes. Either ID may
+// be 0 if no tabs remain (e.g. last tab closed).
+message ActiveChangedEvent {
+  int64 project_id = 1;
+  int64 tab_id     = 2;
+}
+
+// Emitted when a tab's hook-active state flips. Mirrors `Tab.hook_active`
+// for clients that want to react without re-snapshotting.
+message HookActiveChangedEvent {
+  int64 tab_id = 1;
+  bool  active = 2;
+}
+
+// Emitted when a new project is created (by any client). The project
+// payload is the freshly-created snapshot with its `tabs` field empty.
+message ProjectCreatedEvent {
+  Project project = 1;
+}
+
+// Emitted when a project is renamed.
+message ProjectRenamedEvent {
+  int64  project_id = 1;
+  string name       = 2;
+}
+
+// Emitted after a project is deleted. Per-tab `TabDeletedEvent`s fire
+// for each child tab first, then this event arrives. A UI tracking
+// projects can react on this event alone to drop the project from its
+// model; tabs are guaranteed already-deleted by the time it arrives.
+message ProjectDeletedEvent {
+  int64 project_id = 1;
+}
+
+// =============================================================================
+// Control RPCs
+// =============================================================================
+
+message CreateNotificationRequest {
+  int64  tab_id = 1;
+  string title  = 2;
+  string body   = 3;
+}
+
+message CreateNotificationResponse {}
+
+message SetTabTitleRequest {
+  int64  tab_id = 1;
+  string title  = 2;
+}
+
+message SetTabTitleResponse {}
+
+message FocusTabRequest {
+  int64 tab_id = 1;
+}
+
+message FocusTabResponse {
+  int64 previous_project_id = 1;
+  int64 previous_tab_id     = 2;
+}
+
+message SetTabStateRequest {
+  int64    tab_id = 1;
+  TabState state  = 2;
+}
+
+message SetTabStateResponse {}
+
+message ClearTabNotificationRequest {
+  int64 tab_id = 1;
+}
+
+message ClearTabNotificationResponse {}
+
+message SetHookActiveRequest {
+  int64 tab_id = 1;
+  bool  active = 2;
+}
+
+message SetHookActiveResponse {}
+
+// =============================================================================
+// OSC upcall
+//
+// The UI parses VT bytes in-process. When it detects an OSC sequence relevant
+// to roost-core's routing logic (notifications, cwd, title), it calls
+// ReportOsc. Core decides what to do — emit a NotificationEvent, fire the
+// hook-suppression rule, update tab CWD, etc.
+//
+// OSC commands of interest:
+//   0  / 1 / 2 -> title (handled mostly UI-side; reported only when locking applies)
+//   7          -> cwd (file://host/path URI)
+//   9          -> macOS-style notification (Title only)
+//   99         -> Apple notification with id (rare)
+//   777        -> notify;Title;Body (xterm extension widely used by agents)
+// =============================================================================
+
+message ReportOscRequest {
+  int64  tab_id      = 1;
+  uint32 osc_command = 2;  // 0, 1, 2, 7, 9, 99, 777, ...
+  string payload     = 3;  // semicolon-separated arguments per OSC convention
+}
+
+message ReportOscResponse {}

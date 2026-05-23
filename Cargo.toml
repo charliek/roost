@@ -1,0 +1,85 @@
+# Roost Cargo workspace.
+#
+# Post-M7 layout:
+#   * roost-ipc   — JSON IPC wire format, framing, client + server,
+#                   bundle-profile path resolution, target selection.
+#   * roost-vt    — libghostty-vt FFI wrapper with optional `--features ffi`.
+#   * roost-osc   — OSC scanner that lifts (command, payload) pairs out of
+#                   PTY byte streams. Used by both the Linux UI and the
+#                   roost-osc test fixtures.
+#   * roost-linux — gtk4-rs + libadwaita Linux UI. Embeds the workspace,
+#                   PTY supervisor, and IPC server in-process.
+#   * roost-cli   — shell-integration CLI; binary is `roostctl`.
+#
+# `roost-linux` is in `default-members`: the workspace builds the whole
+# product by default. Contributors on Mac without GTK installed get a
+# clear error from the GTK pkg-config probe at build time (Homebrew:
+# `brew install gtk4 libadwaita`; apt: `apt install libgtk-4-dev
+# libadwaita-1-dev`).
+#
+# The pre-M7 daemon-era crates (roost-core, roost-proto, roost-common,
+# roost-smoke) are gone; `proto/roost.proto` has moved to
+# `docs/archive/roost.proto` as historical reference.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/roost-ipc",
+    "crates/roost-vt",
+    "crates/roost-osc",
+    "crates/roost-cli",
+    "crates/roost-linux",
+]
+
+[workspace.package]
+# Single source of truth for the release version. Tag pushes (`v0.0.1`)
+# assert `${tag#v}` matches this in the release workflow; the .deb + .app
+# read it via $ROOST_VERSION at packaging time. Bump here before tagging.
+version       = "0.0.1"
+edition       = "2021"
+rust-version  = "1.85"
+license       = "MIT"
+repository    = "https://github.com/charliek/roost"
+publish       = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+needless_collect = "warn"
+needless_pass_by_value = "warn"
+
+[workspace.dependencies]
+# Async runtime + utilities
+tokio        = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "sync", "process", "signal", "time", "rt"] }
+tokio-stream = { version = "0.1",  features = ["sync"] }
+tokio-util   = { version = "0.7",  features = ["compat"] }
+futures      = "0.3"
+async-stream = "0.3"
+
+# Errors / logging
+thiserror = "1.0"
+anyhow    = "1.0"
+tracing   = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# PTY
+portable-pty = "0.8"
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# FFI / build
+bindgen = "0.70"
+cc      = "1.0"
+
+# Misc
+percent-encoding = "2.3"
+
+[profile.release]
+lto         = "thin"
+codegen-units = 1
+strip       = "debuginfo"
+
+[profile.dev]
+debug = "limited"
