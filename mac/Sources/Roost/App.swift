@@ -182,7 +182,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let socketPath = Self.defaultSocketPath()
+        // M4b3a (daemon-removal refactor): stand up the
+        // post-daemon backend immediately — Workspace +
+        // PtySupervisor + IPC server. The IPC socket goes live
+        // before any UI work so `roostctl` invocations during
+        // app launch don't race the bind.
+        let profile = BundleProfile.mac()
+        RoostBackend.shared.start(profile: profile)
+
+        let socketPath = profile.socketPath
         self.socketPath = socketPath
 
         // Phase 6a M6: read user config + resolve theme + font
