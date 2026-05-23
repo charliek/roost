@@ -29,6 +29,7 @@ use tokio::runtime::Handle;
 
 use roost_linux::daemon::WorkspaceEvent;
 use roost_linux::local_client::LocalClient;
+use roost_linux::reconcile;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::config::RoostConfig;
@@ -161,6 +162,13 @@ pub struct App {
     /// completion since GTK's "drop succeeded" signal covers
     /// transport, not our application-level persistence.
     drop_occurred: RefCell<bool>,
+    /// True while `reconcile_to_snapshot` is applying programmatic
+    /// tab reorders. The `connect_page_reordered` handler checks this
+    /// and skips firing a `ReorderTabs` RPC, so a resync that
+    /// re-sorts pills doesn't echo spurious mutations back to the
+    /// workspace. (The same primitive will gate applying a remote
+    /// reorder when cross-client convergence lands.)
+    suppress_tab_reorder_echo: RefCell<bool>,
 }
 
 /// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
@@ -380,6 +388,7 @@ impl App {
             dragged_project_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
             drop_occurred: RefCell::new(false),
+            suppress_tab_reorder_echo: RefCell::new(false),
         });
         // M10: a single drop target on the sidebar listbox owns the
         // motion (live-shuffle) + drop (persist) handling for all
@@ -818,6 +827,11 @@ impl App {
             let app = self.clone();
             let project_id = project.id;
             move |tv, _moved_page, _new_idx| {
+                // Skip the echo when the reorder is our own
+                // programmatic resync, not a user drag.
+                if *app.suppress_tab_reorder_echo.borrow() {
+                    return;
+                }
                 let n = tv.n_pages();
                 let mut ordered = Vec::with_capacity(n as usize);
                 for i in 0..n {
@@ -1483,22 +1497,7 @@ impl App {
             }
             WorkspaceEvent::TabClosed { tab_id } => {
                 tracing::debug!(tab_id, "tab.closed event");
-                let projects = self.projects.borrow();
-                let mut found = false;
-                for (_project_id, ui) in projects.iter() {
-                    let still_has_entry = ui.tabs.borrow().contains_key(&tab_id);
-                    if still_has_entry {
-                        found = true;
-                        self.server_driven_closes.borrow_mut().insert(tab_id);
-                        let page = ui.tabs.borrow().get(&tab_id).map(|t| t.page.clone());
-                        let tab_view = ui.tab_view.clone();
-                        if let Some(page) = page {
-                            tab_view.close_page(&page);
-                        }
-                        break;
-                    }
-                }
-                if !found {
+                if !self.close_tab_page(tab_id) {
                     tracing::debug!(tab_id, "tab.closed: no UI mapping (already closed locally)");
                 }
             }
@@ -1605,7 +1604,181 @@ impl App {
                 // events on the UI side rather than risk
                 // double-applying a local reorder.
             }
+            WorkspaceEvent::Resync(projects) => {
+                self.reconcile_to_snapshot(projects);
+            }
         }
+    }
+
+    /// Mark `tab_id` server-driven and close its `AdwTabPage`. The
+    /// `connect_close_page` handler then drops the `TabUi` entry and
+    /// skips the redundant `CloseTab` RPC. Returns whether a UI
+    /// mapping was found. Shared by the `TabClosed` event arm and
+    /// `reconcile_to_snapshot`.
+    fn close_tab_page(self: &Rc<Self>, tab_id: i64) -> bool {
+        let target = {
+            let projects = self.projects.borrow();
+            projects.values().find_map(|ui| {
+                ui.tabs
+                    .borrow()
+                    .get(&tab_id)
+                    .map(|t| (ui.tab_view.clone(), t.page.clone()))
+            })
+        };
+        let Some((tab_view, page)) = target else {
+            return false;
+        };
+        self.server_driven_closes.borrow_mut().insert(tab_id);
+        tab_view.close_page(&page);
+        true
+    }
+
+    /// Full-state reconcile after a broadcast `Lagged` (issue #79).
+    /// Diffs the live UI against `snapshot` (ground truth) via the
+    /// pure `reconcile::plan` and applies only the delta — surviving
+    /// tabs keep their live `TerminalView` (no teardown/rebuild, so
+    /// no scrollback loss).
+    ///
+    /// A tab present in the snapshot but absent from the UI (its
+    /// `TabOpened` was among the dropped events) re-attaches via
+    /// `PtySupervisor::subscribe_output`, so its terminal renders
+    /// only from the subscribe point forward — earlier output is
+    /// unrecoverable. Inherent to a degraded-recovery path; surviving
+    /// tabs are unaffected.
+    fn reconcile_to_snapshot(self: &Rc<Self>, snapshot: Vec<Project>) {
+        // 1. Read current UI membership and build the plan. Include
+        //    in-flight attaches so a mid-attach tab isn't double-added.
+        let current = {
+            let projects = self.projects.borrow();
+            let mut project_ids = Vec::new();
+            let mut tabs = Vec::new();
+            for (pid, ui) in projects.iter() {
+                project_ids.push(*pid);
+                for tid in ui.tabs.borrow().keys() {
+                    tabs.push((*tid, *pid));
+                }
+                for tid in ui.pending_attaches.borrow().iter() {
+                    tabs.push((*tid, *pid));
+                }
+            }
+            reconcile::CurrentView { project_ids, tabs }
+        };
+        let plan = reconcile::plan(&current, &snapshot);
+        tracing::info!(
+            add_projects = plan.projects_to_add.len(),
+            remove_projects = plan.projects_to_remove.len(),
+            add_tabs = plan.tabs_to_add.len(),
+            remove_tabs = plan.tabs_to_remove.len(),
+            "resync reconcile"
+        );
+
+        // 2. Remove stale projects (cascades their tabs).
+        for pid in &plan.projects_to_remove {
+            let removed = self.projects.borrow_mut().remove(pid);
+            if let Some(ui) = removed {
+                self.sidebar.remove(&ui.sidebar_row);
+                if let Some(child) = self.tab_stack.child_by_name(&stack_name(*pid)) {
+                    self.tab_stack.remove(&child);
+                }
+            }
+            if *self.active_project_id.borrow() == *pid {
+                *self.active_project_id.borrow_mut() = 0;
+            }
+        }
+
+        // 3. Remove stale tabs from surviving projects.
+        for tid in &plan.tabs_to_remove {
+            self.close_tab_page(*tid);
+        }
+
+        // 4. Add new projects, then 5. their/other new tabs.
+        for pid in &plan.projects_to_add {
+            if let Some(project) = snapshot.iter().find(|p| p.id == *pid) {
+                self.add_project_ui(project);
+            }
+        }
+        for tid in &plan.tabs_to_add {
+            if let Some(tab) = snapshot
+                .iter()
+                .flat_map(|p| p.tabs.iter())
+                .find(|t| t.id == *tid)
+            {
+                self.attach_existing_tab(tab.clone());
+            }
+        }
+
+        // 6. Update surviving tabs' fields from the snapshot.
+        let mut affected: HashSet<i64> = HashSet::new();
+        {
+            let projects = self.projects.borrow();
+            for project in &snapshot {
+                let Some(ui) = projects.get(&project.id) else {
+                    continue;
+                };
+                let tabs = ui.tabs.borrow();
+                for tab in &project.tabs {
+                    let Some(tab_ui) = tabs.get(&tab.id) else {
+                        continue;
+                    };
+                    let label = if tab.title.is_empty() {
+                        format!("Tab {}", tab.id)
+                    } else {
+                        tab.title.clone()
+                    };
+                    tab_ui.page.set_title(&label);
+                    let state = TabState::from_ipc(tab.state);
+                    *tab_ui.state.borrow_mut() = state;
+                    apply_indicator_icon(&tab_ui.page, state);
+                    *tab_ui.cwd.borrow_mut() = tab.cwd.clone();
+                    tab_ui.page.set_needs_attention(tab.has_notification);
+                    *tab_ui.hook_active.borrow_mut() = tab.hook_active;
+                    affected.insert(project.id);
+                }
+            }
+        }
+        for pid in &affected {
+            self.refresh_rollup_for(*pid);
+        }
+
+        // 7. Reorder the sidebar to the snapshot order.
+        self.apply_sidebar_order(&plan.project_order);
+
+        // 8. Reorder surviving tab pills to the snapshot order.
+        //    Best-effort: tabs still mid-attach append and settle on a
+        //    later reorder. Suppress the `connect_page_reordered` echo
+        //    so these programmatic moves don't fire ReorderTabs RPCs.
+        *self.suppress_tab_reorder_echo.borrow_mut() = true;
+        {
+            let projects = self.projects.borrow();
+            for (pid, tab_ids) in &plan.tab_order {
+                let Some(ui) = projects.get(pid) else {
+                    continue;
+                };
+                let tabs = ui.tabs.borrow();
+                let mut pos = 0;
+                for tid in tab_ids {
+                    if let Some(tab_ui) = tabs.get(tid) {
+                        ui.tab_view.reorder_page(&tab_ui.page, pos);
+                        pos += 1;
+                    }
+                }
+            }
+        }
+        *self.suppress_tab_reorder_echo.borrow_mut() = false;
+
+        // 9. Restore active selection from the snapshot.
+        if plan.active_project != 0 {
+            self.set_active_project(plan.active_project);
+            if plan.active_tab != 0 {
+                let projects = self.projects.borrow();
+                if let Some(ui) = projects.get(&plan.active_project) {
+                    if let Some(tab_ui) = ui.tabs.borrow().get(&plan.active_tab) {
+                        ui.tab_view.set_selected_page(&tab_ui.page);
+                    }
+                }
+            }
+        }
+        self.refresh_window_subtitle();
     }
 
     /// Recompute the sidebar rollup CSS stripe for `project_id` from

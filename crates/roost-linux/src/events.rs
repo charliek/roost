@@ -19,7 +19,14 @@ pub type EventReceiver = mpsc::UnboundedReceiver<WorkspaceEvent>;
 
 /// Subscribe to `workspace`'s broadcast and forward each event into
 /// `tx`. Returns Ok when the broadcast closes (workspace dropped) or
-/// the receiver is dropped. Logs and continues on `Lagged`.
+/// the receiver is dropped.
+///
+/// On `Lagged` the subscriber has missed `n` events and can no longer
+/// trust incremental state, so it forwards a full-state
+/// [`WorkspaceEvent::Resync`] for the UI to reconcile against rather
+/// than silently applying later deltas on top of a diverged base.
+/// Buffered pre-snapshot events that the loop subsequently replays are
+/// harmless because every UI event handler is idempotent.
 pub async fn subscribe(workspace: Arc<Workspace>, tx: EventSender) -> Result<()> {
     let mut rx = workspace.subscribe();
     loop {
@@ -30,7 +37,10 @@ pub async fn subscribe(workspace: Arc<Workspace>, tx: EventSender) -> Result<()>
                 }
             }
             Err(RecvError::Lagged(n)) => {
-                tracing::warn!(dropped = n, "workspace event subscriber lagged");
+                tracing::warn!(dropped = n, "workspace event subscriber lagged; resyncing");
+                if tx.send(workspace.resync_event()).is_err() {
+                    return Ok(());
+                }
             }
             Err(RecvError::Closed) => return Ok(()),
         }
