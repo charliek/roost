@@ -18,7 +18,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
@@ -28,6 +30,10 @@ use tracing::{debug, error, warn};
 const PTY_OUTPUT_BROADCAST_CAPACITY: usize = 256;
 const PTY_INPUT_CHANNEL_CAPACITY: usize = 64;
 const PTY_OUTPUT_CHUNK_SIZE: usize = 4096;
+/// Grace period after SIGHUP before `close()` escalates to SIGKILL.
+/// Matches the Mac side's 20×10ms teardown window in
+/// `PtySupervisor.swift`.
+const KILL_GRACE: Duration = Duration::from_millis(200);
 
 /// What a subscriber gets back from `PtySupervisor::subscribe`.
 #[derive(Debug, Clone)]
@@ -50,7 +56,7 @@ pub enum SupervisorEvent {
 }
 
 pub struct PtySupervisor {
-    sessions: Mutex<HashMap<i64, Session>>,
+    sessions: Arc<Mutex<HashMap<i64, Session>>>,
     /// Tab ids whose `spawn()` is in flight — the PTY has not yet
     /// been created but the slot is reserved so a concurrent
     /// `spawn(tab_id, ...)` rejects with `DuplicateTab` instead of
@@ -74,6 +80,14 @@ struct Session {
     /// sender side, which would leave long-running shells alive
     /// indefinitely until app exit).
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// Child pid, captured before the child moved into the wait
+    /// task. `close()` uses it to SIGKILL-escalate if SIGHUP is
+    /// ignored.
+    pid: Option<u32>,
+    /// Set true by the wait task once `child.wait()` returns (the
+    /// child is reaped). `close()`'s SIGKILL watchdog reads this to
+    /// skip force-killing an already-dead child.
+    reaped: Arc<AtomicBool>,
 }
 
 impl Default for PtySupervisor {
@@ -86,7 +100,7 @@ impl PtySupervisor {
     pub fn new() -> Self {
         let (lifecycle, _rx) = broadcast::channel(64);
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             pending: Mutex::new(HashSet::new()),
             lifecycle,
         }
@@ -197,6 +211,12 @@ impl PtySupervisor {
         // the shell rather than waiting for it to notice the
         // dropped input channel.
         let killer = child.clone_killer();
+        // Captured before the child moves into the wait task so
+        // `close()` can SIGKILL-escalate by pid if SIGHUP is ignored.
+        let pid = child.process_id();
+        // Shared with the wait task; flipped true once the child is
+        // reaped so the SIGKILL watchdog can stand down.
+        let reaped = Arc::new(AtomicBool::new(false));
 
         // Drop the slave end now that the shell has it.
         drop(pair.slave);
@@ -249,20 +269,26 @@ impl PtySupervisor {
         // per-tab consumers and the workspace converge.
         let output_tx_exit = output_tx.clone();
         let lifecycle_tx = self.lifecycle.clone();
-        tokio::task::spawn_blocking(move || match child.wait() {
-            Ok(status) => {
-                let code = status.exit_code() as i32;
-                let _ = output_tx_exit.send(PtyOutputEvent::Exit(code));
-                let _ = lifecycle_tx.send(SupervisorEvent::TabExited {
-                    tab_id,
-                    status: code,
-                });
-            }
-            Err(err) => {
-                error!(tab_id, ?err, "child.wait failed");
-                let _ = output_tx_exit.send(PtyOutputEvent::Exit(-1));
-                let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status: -1 });
-            }
+        let sessions_for_reap = self.sessions.clone();
+        let reaped_for_wait = reaped.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = match child.wait() {
+                Ok(status) => status.exit_code() as i32,
+                Err(err) => {
+                    error!(tab_id, ?err, "child.wait failed");
+                    -1
+                }
+            };
+            // Mark reaped first so a concurrent `close()` SIGKILL
+            // watchdog stands down, then publish exit and drop the
+            // dead session so later writes get `NotFound` instead of
+            // silently succeeding against a closed PTY.
+            reaped_for_wait.store(true, Ordering::SeqCst);
+            let _ = output_tx_exit.send(PtyOutputEvent::Exit(status));
+            let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
+            // Tab ids are allocated monotonically (`Workspace::alloc_id`),
+            // so this can never evict a newer same-id session.
+            sessions_for_reap.lock().unwrap().remove(&tab_id);
         });
 
         let session = Session {
@@ -270,6 +296,8 @@ impl PtySupervisor {
             resize_tx,
             output_tx,
             killer: Mutex::new(killer),
+            pid,
+            reaped,
         };
         // Promote the slot from pending → sessions atomically.
         // If `close(tab_id)` ran while we were building the PTY it
@@ -279,10 +307,10 @@ impl PtySupervisor {
         // moved into the wait task already, so we reach for the
         // copy we stashed in `session` below — actually the
         // session struct already holds the killer, so we tear it
-        // back down by invoking `killer.kill()` and dropping
+        // back down via `terminate_child` (SIGHUP→SIGKILL) and drop
         // `session` (which drops the input/resize channels, the
         // writer task exits, and the wait task reaps once the
-        // SIGTERM/SIGKILL lands).
+        // signal lands).
         {
             let mut sessions = self.sessions.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
@@ -291,9 +319,7 @@ impl PtySupervisor {
                 // returning a usable receiver.
                 drop(pending);
                 drop(sessions);
-                if let Ok(mut killer) = session.killer.lock() {
-                    let _ = killer.kill();
-                }
+                terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
                 drop(session);
                 // SlotGuard is no longer needed — pending was
                 // already cleared by close(); we already cleaned
@@ -358,18 +384,7 @@ impl PtySupervisor {
             (sessions.remove(&tab_id), pending.remove(&tab_id))
         };
         if let Some(session) = session {
-            if let Ok(mut killer) = session.killer.lock() {
-                if let Err(err) = killer.kill() {
-                    // `kill()` returns ESRCH when the child is
-                    // already gone — treat as success, the wait
-                    // task has already (or will) emit Exit.
-                    let already_gone =
-                        err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(3);
-                    if !already_gone {
-                        warn!(tab_id, ?err, "pty kill failed");
-                    }
-                }
-            }
+            terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
         } else if was_pending {
             debug!(tab_id, "close() cancelled in-flight spawn");
         }
@@ -378,6 +393,50 @@ impl PtySupervisor {
     pub fn has(&self, tab_id: i64) -> bool {
         self.sessions.lock().unwrap().contains_key(&tab_id)
     }
+}
+
+/// Terminate a PTY child the way the Mac side does: SIGHUP first (via
+/// portable-pty's killer, which sends SIGHUP on Unix), then a SIGKILL
+/// fallback after a grace period if the child ignored the hangup.
+///
+/// Without the fallback a shell that traps/ignores SIGHUP outlives
+/// `close()` indefinitely: portable-pty's *cloned* `ChildKiller` only
+/// sends SIGHUP — the SIGKILL escalation that lives in
+/// `std::process::Child::kill` is bypassed by the clone.
+fn terminate_child(
+    killer: &Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    pid: Option<u32>,
+    reaped: Arc<AtomicBool>,
+    tab_id: i64,
+) {
+    if let Ok(mut killer) = killer.lock() {
+        if let Err(err) = killer.kill() {
+            // ESRCH (raw 3) / NotFound: child already gone — the wait
+            // task has or will emit Exit. Anything else is a real
+            // failure worth logging.
+            let already_gone =
+                err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(3);
+            if !already_gone {
+                warn!(tab_id, ?err, "pty SIGHUP failed");
+            }
+        }
+    }
+    let Some(pid) = pid else { return };
+    // Detached watchdog: if the wait task hasn't reaped the child
+    // within the grace window it ignored SIGHUP — force-kill. A plain
+    // `std::thread` (not tokio) keeps `close()` callable from any
+    // context regardless of runtime. SIGKILL against an
+    // exited-but-unreaped zombie is harmless; the wait task reaps it.
+    // PID reuse inside the short window is negligible and gated by
+    // `reaped`.
+    std::thread::spawn(move || {
+        std::thread::sleep(KILL_GRACE);
+        if !reaped.load(Ordering::SeqCst) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    });
 }
 
 fn build_command(

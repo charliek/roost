@@ -23,13 +23,14 @@ mod theme;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use gtk4::glib::{self, LogWriterOutput};
 use libadwaita::prelude::*;
 use libadwaita::Application;
 use tracing_subscriber::EnvFilter;
 
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
-use roost_ipc::IpcServer;
+use roost_ipc::{IpcClient, IpcServer};
 use roost_linux::daemon::{PtySupervisor, Workspace};
 use roost_linux::ipc::IpcHandler;
 use roost_linux::local_client::LocalClient;
@@ -75,10 +76,38 @@ fn main() -> anyhow::Result<()> {
     let _lock = match single_instance::acquire(&lock_path) {
         Ok(lock) => lock,
         Err(single_instance::AcquireError::AlreadyHeld(pid)) => {
-            eprintln!(
-                "Roost (GTK) is already running (pid {pid}); exiting.\nLock: {}",
-                lock_path.display()
-            );
+            // Another instance holds the lock. Ask it to raise its
+            // window via `app.activate` over IPC, then exit. The
+            // tokio runtime isn't built yet here, so spin up a tiny
+            // current-thread one just for this call. If the dial or
+            // send fails (socket missing, instance shutting down),
+            // fall back to the diagnostic message. (#6)
+            let socket_path = profile.socket_path.clone();
+            let activated = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .map(|rt| {
+                    rt.block_on(async move {
+                        match IpcClient::connect(&socket_path).await {
+                            Ok(mut client) => client
+                                .call_raw(
+                                    roost_ipc::messages::ops::APP_ACTIVATE,
+                                    serde_json::json!({}),
+                                )
+                                .await
+                                .is_ok(),
+                            Err(_) => false,
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            if !activated {
+                eprintln!(
+                    "Roost (GTK) is already running (pid {pid}); exiting.\nLock: {}",
+                    lock_path.display()
+                );
+            }
             return Ok(());
         }
         Err(other) => return Err(anyhow::anyhow!("single_instance lock failed: {other}")),
@@ -95,45 +124,55 @@ fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(Workspace::open(profile.state_json_path()));
     let supervisor = Arc::new(PtySupervisor::new());
 
-    // Bind the JSON IPC server before any UI surface exists so
-    // `roostctl identify` immediately after launch can succeed.
+    // Activation bridge: a second launch dials `app.activate`; the
+    // handler forwards a unit here for the GTK thread to raise the
+    // window (#6).
+    let (activate_tx, activate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    // Bind the JSON IPC server *synchronously* before any UI surface
+    // exists, so `roostctl identify` right after launch succeeds. The
+    // single-instance flock is already held, so the stale socket is
+    // safe to remove and the bind should succeed; if it fails,
+    // `roostctl` and Claude hooks would have no socket to reach —
+    // fail startup rather than run half-wired (#7).
     let socket_path = profile.socket_path.clone();
-    {
-        let workspace = workspace.clone();
-        let supervisor = supervisor.clone();
-        let socket_path = socket_path.clone();
-        let app_label = profile.app_label.to_string();
-        let app_id = profile.app_id.to_string();
-        rt_handle.spawn(async move {
-            let handler = IpcHandler::new(
-                workspace,
-                supervisor,
-                socket_path.clone(),
-                app_label,
-                app_id,
-            );
-            match IpcServer::bind(&socket_path, handler).await {
-                Ok(server) => {
-                    if let Err(err) = server.run().await {
-                        tracing::warn!(?err, "ipc server exited with error");
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "failed to bind ipc server");
-                }
-            }
-        });
-    }
+    let server = {
+        let handler = IpcHandler::new(
+            workspace.clone(),
+            supervisor.clone(),
+            socket_path.clone(),
+            profile.app_label.to_string(),
+            profile.app_id.to_string(),
+        )
+        .with_activate(activate_tx);
+        rt_handle
+            .block_on(IpcServer::bind(&socket_path, handler))
+            .context("bind IPC server")?
+    };
+    rt_handle.spawn(async move {
+        if let Err(err) = server.run().await {
+            tracing::warn!(?err, "ipc server exited with error");
+        }
+    });
 
     let client = LocalClient::new(workspace, supervisor, socket_path);
 
     let app = Application::builder().application_id(APP_ID).build();
     let client_for_activate = client.clone();
+    // `connect_activate` is `Fn`, but the activate receiver isn't
+    // Clone and is consumed once. Wrap it so the first (only) GTK
+    // activation hands it to the App; any later activation gets None.
+    let activate_rx = std::cell::RefCell::new(Some(activate_rx));
     app.connect_activate(move |app| {
         // The App handle is reference-counted via `Rc`; we hand the
         // outer LocalClient to it so the bootstrap futures stay
         // alive for the lifetime of the application.
-        let _ = App::new(app, rt_handle.clone(), client_for_activate.clone());
+        let _ = App::new(
+            app,
+            rt_handle.clone(),
+            client_for_activate.clone(),
+            activate_rx.borrow_mut().take(),
+        );
     });
 
     let exit_code = app.run_with_args::<&str>(&[]);

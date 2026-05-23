@@ -8,10 +8,10 @@
 //!
 //! Each request gets a monotonically-increasing id. Responses are
 //! matched by id; unsolicited event envelopes mid-stream (the server
-//! may emit them after `events.subscribe` lands a real implementation
-//! — M0/M3a stub never sends any) are silently dropped by the M2
-//! client. Future event-aware clients can extend [`IpcClient`] with
-//! a frame-level read helper rather than going through
+//! may emit them once `events.subscribe` is implemented — today it
+//! returns `not-implemented`, so none are sent) are silently dropped
+//! by this client. Future event-aware clients can extend [`IpcClient`]
+//! with a frame-level read helper rather than going through
 //! [`IpcClient::call_raw`].
 
 use std::path::Path;

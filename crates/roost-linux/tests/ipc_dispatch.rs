@@ -131,6 +131,40 @@ async fn unknown_op_returns_unknown_op_error() {
     }
 }
 
+/// #80/#9: `events.subscribe` returns `not-implemented` rather than a
+/// false `{}` ACK — the server never pushes events yet, so a client
+/// must learn it can't subscribe and fall back (e.g. poll tab.list).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_subscribe_returns_not_implemented() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    let err = client
+        .call_raw(ops::EVENTS_SUBSCRIBE, serde_json::json!({}))
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "not-implemented"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without

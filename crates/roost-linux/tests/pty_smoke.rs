@@ -147,3 +147,102 @@ async fn duplicate_spawn_for_same_tab_id_is_rejected() {
         )
         .expect("post-close spawn");
 }
+
+/// #80 A1: once the child exits, the wait task must remove the
+/// session so a subsequent `write` returns `NotFound` rather than
+/// silently succeeding against a dead PTY.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_after_exit_returns_not_found() {
+    let sup = PtySupervisor::new();
+    let socket = std::path::PathBuf::from("/tmp/roost-pty-after-exit.sock");
+    let mut output = sup
+        .spawn(
+            7,
+            "/tmp",
+            &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            80,
+            24,
+            &socket,
+        )
+        .expect("spawn");
+
+    // Wait for the child to exit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match output.try_recv() {
+            Ok(PtyOutputEvent::Exit(_)) => break,
+            Ok(_) => {}
+            Err(TryRecvError::Closed) => break, // senders gone → child exited
+            Err(TryRecvError::Empty) => {
+                assert!(std::time::Instant::now() < deadline, "child never exited");
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(other) => panic!("output recv error: {other:?}"),
+        }
+    }
+
+    // The wait task removes the dead session right after publishing
+    // Exit; poll until the write is rejected with NotFound.
+    let probe_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match sup.write(7, b"x".to_vec()).await {
+            Err(roost_linux::daemon::PtyError::NotFound(7)) => break,
+            other => {
+                assert!(
+                    std::time::Instant::now() < probe_deadline,
+                    "write to a dead tab never became NotFound: {other:?}"
+                );
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// #80 A2: a shell that ignores SIGHUP must still be reaped by
+/// `close()`'s SIGKILL escalation. Without the fallback, `close()`
+/// only delivers SIGHUP (portable-pty's cloned killer) and the child
+/// would outlive it, so `TabExited` would never arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_force_kills_sighup_ignoring_child() {
+    let sup = PtySupervisor::new();
+    let mut lifecycle = sup.subscribe_lifecycle();
+    let socket = std::path::PathBuf::from("/tmp/roost-pty-sighup.sock");
+    let _output = sup
+        .spawn(
+            7,
+            "/tmp",
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "trap '' HUP; sleep 30".into(),
+            ],
+            80,
+            24,
+            &socket,
+        )
+        .expect("spawn");
+
+    // Let the shell install the trap before we signal it.
+    sleep(Duration::from_millis(200)).await;
+    sup.close(7);
+
+    // The SIGKILL fallback (~200ms grace) must reap the child well
+    // inside this budget; without it the `sleep 30` would outlast it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        match lifecycle.try_recv() {
+            Ok(SupervisorEvent::TabExited { tab_id: 7, .. }) => {
+                exited = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => sleep(Duration::from_millis(20)).await,
+            Err(other) => panic!("lifecycle recv error: {other:?}"),
+        }
+    }
+    assert!(
+        exited,
+        "SIGHUP-ignoring child was not force-killed within the grace window"
+    );
+}

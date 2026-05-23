@@ -156,10 +156,27 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
         let request: RawRequest = match serde_json::from_slice(&line) {
             Ok(r) => r,
             Err(e) => {
-                // Best-effort error envelope. If we can't parse the
-                // envelope itself we don't know the id, so we send id=0.
+                // `RawRequest` is `deny_unknown_fields`, so a request
+                // carrying a valid `id` alongside an otherwise
+                // malformed envelope (extra field, wrong-typed param,
+                // ...) fails the typed decode and would lose the id.
+                // Peel `id` from the raw JSON so the error reply lands
+                // at the id the client is matching on, not id=0.
+                // Truly un-parseable input falls back to id=0. The
+                // extra parse only runs on the error path. (#80)
+                // `id` is string-encoded on the wire (string_int64),
+                // so peel it as a string and parse; tolerate a bare
+                // JSON number too.
+                let id = serde_json::from_slice::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .and_then(|id| {
+                        id.as_i64()
+                            .or_else(|| id.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0);
                 let body = serde_json::to_vec(&Response::err(
-                    0,
+                    id,
                     "parse-error",
                     format!("envelope decode failed: {e}"),
                 ))?;

@@ -224,7 +224,12 @@ impl App {
     /// Build the window + start the daemon bootstrap. Returns an
     /// `Rc<App>` so closures can hold references back into the App
     /// for event dispatch.
-    pub fn new(app: &libadwaita::Application, rt: Handle, client: LocalClient) -> Rc<Self> {
+    pub fn new(
+        app: &libadwaita::Application,
+        rt: Handle,
+        client: LocalClient,
+        activate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    ) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
             .default_width(1100)
@@ -582,6 +587,18 @@ impl App {
         }
 
         app_struct.window.present();
+
+        // #6: a second launch that loses the single-instance flock
+        // dials `app.activate`; the IPC handler forwards a unit here.
+        // Raise + focus the window on the GTK main thread.
+        if let Some(mut activate_rx) = activate_rx {
+            let window = app_struct.window.clone();
+            glib::spawn_future_local(async move {
+                while activate_rx.recv().await.is_some() {
+                    window.present();
+                }
+            });
+        }
 
         // Boot the daemon round-trip + WatchEvents subscription on
         // the GTK main loop's async executor.
