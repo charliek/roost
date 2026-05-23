@@ -12,20 +12,18 @@ async fn pty_echo_emits_bytes_and_exit() {
     let sup = PtySupervisor::new();
     let mut lifecycle = sup.subscribe_lifecycle();
     let socket = std::path::PathBuf::from("/tmp/roost-pty-smoke.sock");
-    sup.spawn(
-        7,
-        "/tmp",
-        &["/bin/sh".into(), "-c".into(), "printf 'hi\\n'".into()],
-        80,
-        24,
-        &socket,
-    )
-    .expect("spawn");
-
-    // Subscribe to output AFTER spawn; some output may arrive
-    // before we subscribe — that's fine, the exit event is what
-    // we rely on for completion.
-    let mut output = sup.subscribe_output(7).expect("subscribe");
+    // `spawn` returns a Receiver subscribed BEFORE the reader task
+    // starts producing — no risk of losing early bytes/exit events.
+    let mut output = sup
+        .spawn(
+            7,
+            "/tmp",
+            &["/bin/sh".into(), "-c".into(), "printf 'hi\\n'".into()],
+            80,
+            24,
+            &socket,
+        )
+        .expect("spawn");
 
     // Pump until we see Exit.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -67,10 +65,10 @@ async fn pty_injects_roost_env_vars() {
     // and ROOST_SOCKET in the listed env.
     let sup = PtySupervisor::new();
     let socket = std::path::PathBuf::from("/tmp/roost-pty-env.sock");
-    sup.spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
+    let mut output = sup
+        .spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
         .expect("spawn");
 
-    let mut output = sup.subscribe_output(99).expect("subscribe");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut collected = Vec::new();
     while std::time::Instant::now() < deadline {
@@ -90,4 +88,57 @@ async fn pty_injects_roost_env_vars() {
         text.contains("ROOST_SOCKET=/tmp/roost-pty-env.sock"),
         "expected ROOST_SOCKET in env, got:\n{text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_spawn_for_same_tab_id_is_rejected() {
+    let sup = PtySupervisor::new();
+    let socket = std::path::PathBuf::from("/tmp/roost-pty-dup.sock");
+    let _first = sup
+        .spawn(
+            42,
+            "/tmp",
+            &["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+            80,
+            24,
+            &socket,
+        )
+        .expect("first spawn");
+
+    let err = sup
+        .spawn(
+            42,
+            "/tmp",
+            &["/bin/sh".into(), "-c".into(), "true".into()],
+            80,
+            24,
+            &socket,
+        )
+        .expect_err("duplicate spawn must error");
+    // The error is anyhow-wrapped, so we walk the source chain to
+    // assert the underlying PtyError variant rather than scraping
+    // the Display string.
+    let pty_err = err
+        .downcast_ref::<roost_linux::daemon::PtyError>()
+        .expect("expected PtyError in anyhow chain");
+    assert!(
+        matches!(pty_err, roost_linux::daemon::PtyError::DuplicateTab(42)),
+        "expected DuplicateTab(42), got {pty_err:?}"
+    );
+
+    // Closing the original lets a subsequent spawn succeed.
+    sup.close(42);
+    // Give the supervisor a moment to drop the session entry from
+    // the kill path.
+    sleep(Duration::from_millis(50)).await;
+    let _second = sup
+        .spawn(
+            42,
+            "/tmp",
+            &["/bin/sh".into(), "-c".into(), "true".into()],
+            80,
+            24,
+            &socket,
+        )
+        .expect("post-close spawn");
 }

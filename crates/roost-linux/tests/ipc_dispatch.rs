@@ -38,10 +38,7 @@ async fn identify_create_project_open_tab_list() {
         let _ = server.run().await;
     });
 
-    // Give the server a tick to start accepting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut client = IpcClient::connect(&server_socket).await.expect("connect");
+    let mut client = connect_with_retry(&server_socket).await;
 
     // identify
     let id: IdentifyResult = client
@@ -123,9 +120,7 @@ async fn unknown_op_returns_unknown_op_error() {
     tokio::spawn(async move {
         let _ = server.run().await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut client = IpcClient::connect(&server_socket).await.expect("connect");
+    let mut client = connect_with_retry(&server_socket).await;
     let err = client
         .call_raw("not.a.real.op", serde_json::json!({}))
         .await
@@ -134,4 +129,29 @@ async fn unknown_op_returns_unknown_op_error() {
         roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "unknown-op"),
         other => panic!("expected Server error, got {other:?}"),
     }
+}
+
+/// Connect to a freshly-bound server with bounded retries instead of
+/// a flat sleep. CI runners under load can take more than 50ms to
+/// schedule the accept loop; a bounded retry is robust without
+/// slowing the happy path.
+async fn connect_with_retry(socket_path: &std::path::Path) -> IpcClient {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut backoff = Duration::from_millis(5);
+    let mut last_err: Option<roost_ipc::Error> = None;
+    while std::time::Instant::now() < deadline {
+        match IpcClient::connect(socket_path).await {
+            Ok(c) => return c,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(100));
+            }
+        }
+    }
+    panic!(
+        "could not connect to {} within 2s: {:?}",
+        socket_path.display(),
+        last_err
+    );
 }

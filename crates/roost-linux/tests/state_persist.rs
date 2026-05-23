@@ -10,11 +10,11 @@ fn projects_and_next_id_survive_reopen() {
     let dir = tempdir().unwrap();
     let state_path = dir.path().join("state.json");
 
-    let project_id = {
+    let (project_id, first_tab_id) = {
         let ws = Workspace::open(state_path.clone());
         let p = ws.create_project("Roost", "/tmp").unwrap();
-        let _t = ws.open_tab(p.id, "/tmp", "shell").unwrap();
-        p.id
+        let t = ws.open_tab(p.id, "/tmp", "shell").unwrap();
+        (p.id, t.id)
         // ws drops here; state.json should be on disk.
     };
 
@@ -28,10 +28,19 @@ fn projects_and_next_id_survive_reopen() {
     // Tabs are NOT restored — the no-session-restore goal.
     assert!(p.tabs.is_empty(), "expected tabs to NOT be restored");
 
-    // New tab id allocations should not collide with the
-    // previously-issued ones.
+    // New tab id allocations must advance past the previous tab's
+    // id so we don't collide with the legacy tab the user might
+    // still see references to (e.g. in a hook config). The check
+    // against project_id alone wasn't strong enough — open_tab
+    // already returns ids greater than any project id in practice,
+    // so the meaningful invariant is "ids monotonically advance."
     let next_tab = ws2.open_tab(project_id, "/", "").unwrap();
-    assert!(next_tab.id > project_id, "ids should advance");
+    assert!(
+        next_tab.id > first_tab_id,
+        "ids must advance past the previous tab ({}), got {}",
+        first_tab_id,
+        next_tab.id,
+    );
 }
 
 #[test]

@@ -42,11 +42,35 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        // Best-effort unlink. We don't error here — the flock is
-        // already released by the file drop, which is the signal
-        // that matters. Leaving the file behind across a clean
-        // shutdown means the next launch overwrites it.
-        let _ = std::fs::remove_file(&self.path);
+        // Drop releases the flock via `_file`'s File drop — that's
+        // the only signal that matters for "this instance is gone."
+        //
+        // We deliberately do NOT unlink the lock file here, because
+        // the file handle is dropped AFTER this body returns (drop
+        // order: fields drop in declaration order *after* the drop
+        // impl runs, with `_file` listed first → released first,
+        // but `remove_file(&path)` still risks racing with another
+        // process that has already opened the file by name).
+        //
+        // Stale lock files left behind after a clean exit are
+        // harmless: the next `acquire()` overwrites the PID
+        // contents after successfully taking the flock. Callers
+        // that want explicit cleanup can call `release()`.
+    }
+}
+
+impl InstanceLock {
+    /// Explicit consuming cleanup: drop the file handle (releases
+    /// the flock), then unlink the lock file. Safe because the
+    /// flock is gone before we touch the path.
+    pub fn release(self) -> std::io::Result<()> {
+        let path = self.path.clone();
+        drop(self);
+        match std::fs::remove_file(&path) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -147,9 +171,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let first = acquire(dir.path().join("roost.lock")).unwrap();
         drop(first);
-        // The file is unlinked on drop; a fresh acquire creates it.
+        // Drop releases the flock; the file may or may not still
+        // exist (we no longer unlink on Drop because that races
+        // with concurrent acquires by name). Either way the next
+        // acquire takes the flock cleanly.
         let second = acquire(dir.path().join("roost.lock")).unwrap();
         assert!(second.lock_path().exists());
+    }
+
+    #[test]
+    fn release_unlinks_the_lock_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roost.lock");
+        let lock = acquire(&path).unwrap();
+        assert!(path.exists());
+        lock.release().unwrap();
+        assert!(!path.exists(), "release() must unlink the lock file");
     }
 
     #[test]

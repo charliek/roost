@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 
 use anyhow::Context;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, warn};
 
@@ -60,6 +60,14 @@ struct Session {
     input_tx: mpsc::Sender<Vec<u8>>,
     resize_tx: mpsc::Sender<PtySize>,
     output_tx: broadcast::Sender<PtyOutputEvent>,
+    /// Sendable kill handle obtained from
+    /// `portable_pty::Child::clone_killer` before the child was
+    /// moved into the wait task. `close()` invokes this to actively
+    /// terminate the child rather than waiting for it to exit on
+    /// its own (the legacy daemon's `close()` only dropped the
+    /// sender side, which would leave long-running shells alive
+    /// indefinitely until app exit).
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
 impl Default for PtySupervisor {
@@ -94,13 +102,20 @@ impl PtySupervisor {
             .map(|s| s.output_tx.subscribe())
     }
 
-    /// Spawn a shell for `tab_id`. See `crates/roost-core/src/pty.rs`
-    /// for the legacy daemon docstring; semantics here are unchanged
-    /// except for the env injection and the broadcast output channel.
+    /// Spawn a shell for `tab_id`.
+    ///
+    /// Returns a `broadcast::Receiver` subscribed *before* the PTY
+    /// reader task starts producing — early subscribers cannot lose
+    /// initial output. Late subscribers can still call
+    /// [`Self::subscribe_output`].
     ///
     /// `socket_path` is the absolute path to the IPC socket, injected
     /// into the child as `ROOST_SOCKET` so `roostctl` invoked from
     /// inside the tab dials the right UI.
+    ///
+    /// Errors:
+    /// * [`PtyError::DuplicateTab`] — `tab_id` already has a live
+    ///   session. Caller must `close()` the prior session first.
     pub fn spawn(
         &self,
         tab_id: i64,
@@ -109,7 +124,15 @@ impl PtySupervisor {
         cols: u16,
         rows: u16,
         socket_path: &std::path::Path,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
+        // Reject duplicates up front. Silently replacing an existing
+        // session would orphan its PTY child and broadcast channel.
+        // The workspace's contract is that the caller owns the
+        // ordering: `close(tab_id)` before any re-spawn.
+        if self.sessions.lock().unwrap().contains_key(&tab_id) {
+            return Err(PtyError::DuplicateTab(tab_id).into());
+        }
+
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -122,12 +145,21 @@ impl PtySupervisor {
 
         let cmd = build_command(cwd, argv, tab_id, socket_path);
         let mut child = pair.slave.spawn_command(cmd).context("spawn shell")?;
+        // Sendable killer handle taken before the child moves into
+        // the wait task — `close()` uses it to actively terminate
+        // the shell rather than waiting for it to notice the
+        // dropped input channel.
+        let killer = child.clone_killer();
 
         // Drop the slave end now that the shell has it.
         drop(pair.slave);
 
-        let (output_tx, _output_rx) =
+        let (output_tx, _drop_rx) =
             broadcast::channel::<PtyOutputEvent>(PTY_OUTPUT_BROADCAST_CAPACITY);
+        // Subscribe BEFORE we spawn the reader task. Returning this
+        // to the caller guarantees no Bytes/Exit event between
+        // spawn and caller-subscribe can be lost.
+        let early_rx = output_tx.subscribe();
         let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(PTY_INPUT_CHANNEL_CAPACITY);
         let (resize_tx, mut resize_rx) = mpsc::channel::<PtySize>(8);
 
@@ -190,10 +222,11 @@ impl PtySupervisor {
             input_tx,
             resize_tx,
             output_tx,
+            killer: Mutex::new(killer),
         };
         self.sessions.lock().unwrap().insert(tab_id, session);
 
-        Ok(())
+        Ok(early_rx)
     }
 
     pub async fn write(&self, tab_id: i64, data: Vec<u8>) -> Result<(), PtyError> {
@@ -228,10 +261,27 @@ impl PtySupervisor {
     }
 
     pub fn close(&self, tab_id: i64) {
-        // Dropping the senders signals the shell to exit on the next
-        // read/write. The blocking workers spawned at `spawn()` time
-        // clean themselves up.
-        let _ = self.sessions.lock().unwrap().remove(&tab_id);
+        // Take the session out under the lock; release the lock
+        // before invoking the killer to keep the critical section
+        // short and to avoid any chance of re-entering the lock
+        // from the killer impl. The waiter task spawned at
+        // `spawn()` time reaps the child via `child.wait()` once
+        // the kill signal lands.
+        let session = self.sessions.lock().unwrap().remove(&tab_id);
+        if let Some(session) = session {
+            if let Ok(mut killer) = session.killer.lock() {
+                if let Err(err) = killer.kill() {
+                    // `kill()` returns ESRCH when the child is
+                    // already gone — treat as success, the wait
+                    // task has already (or will) emit Exit.
+                    let already_gone =
+                        err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(3);
+                    if !already_gone {
+                        warn!(tab_id, ?err, "pty kill failed");
+                    }
+                }
+            }
+        }
     }
 
     pub fn has(&self, tab_id: i64) -> bool {
@@ -310,4 +360,6 @@ pub enum PtyError {
     NotFound(i64),
     #[error("pty for tab {0} is closed")]
     Closed(i64),
+    #[error("tab {0} already has a live pty session")]
+    DuplicateTab(i64),
 }

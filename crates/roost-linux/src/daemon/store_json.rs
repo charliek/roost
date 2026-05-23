@@ -97,6 +97,33 @@ pub fn persist_state(path: &Path, snapshot: &SnapshotFile) -> std::io::Result<()
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename itself is durable.
+    // Without this, a crash between the rename returning and the
+    // filesystem flushing the directory metadata could lose the
+    // rename (leaving state.json pointing at the previous inode).
+    // POSIX requires fsync(dir) after rename for atomic-write
+    // protocols; ext4 + apfs both honor it.
+    if let Some(parent) = path.parent() {
+        match OpenOptions::new().read(true).open(parent) {
+            Ok(dir) => {
+                if let Err(err) = dir.sync_all() {
+                    // Some filesystems (e.g. tmpfs on Linux) reject
+                    // fsync on directories with EINVAL. Treat that
+                    // as success — the rename itself is still
+                    // atomic, we just can't force a sync.
+                    if err.kind() != std::io::ErrorKind::InvalidInput {
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Parent vanished between rename and reopen —
+                // shouldn't happen in practice, but a missing
+                // parent at this stage isn't a write failure.
+            }
+            Err(err) => return Err(err),
+        }
+    }
     Ok(())
 }
 

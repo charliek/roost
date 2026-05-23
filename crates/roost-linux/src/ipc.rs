@@ -283,7 +283,9 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
 
 fn pty_err(e: crate::daemon::PtyError) -> HandlerError {
     match e {
-        crate::daemon::PtyError::NotFound(_) => HandlerError::not_found(e.to_string()),
-        crate::daemon::PtyError::Closed(_) => HandlerError::not_found(e.to_string()),
+        crate::daemon::PtyError::NotFound(_) | crate::daemon::PtyError::Closed(_) => {
+            HandlerError::not_found(e.to_string())
+        }
+        crate::daemon::PtyError::DuplicateTab(_) => HandlerError::invalid_param(e.to_string()),
     }
 }
