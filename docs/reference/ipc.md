@@ -45,9 +45,12 @@ The socket path is the bundle profile's `socket_path` (see
 * **Unknown fields:** strict on the **server** side (rejected with
   `unknown-field` error). Permissive on the **client** side (clients
   ignore unknown fields so the server can add fields without breaking
-  older clients). Swift's `Codable` is permissive by default; Rust's
-  `serde` is strict by default — both languages match the policy with
-  their respective defaults.
+  older clients). Swift's `Codable` is permissive by default and the
+  client-side request encoders match that policy unchanged. On Rust,
+  `serde` is permissive by default — server-side request structs in
+  `roost-ipc` carry `#[serde(deny_unknown_fields)]` to opt in to the
+  strict server policy; client-side response structs do not, matching
+  the client-side permissive policy.
 * **Concurrency:** the server is single-actor — every request is
   dispatched onto the UI's main thread (Swift `@MainActor`; gtk4 glib
   main loop). Responses are delivered in completion order, which is
