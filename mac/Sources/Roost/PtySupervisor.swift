@@ -58,6 +58,36 @@ final class PtySupervisor {
         let masterFD: Int32
         let childPID: pid_t
         let source: DispatchSourceRead
+        /// Drains `InternalEvent`s from the read source's background
+        /// queue onto the main actor. Cancelling cancels iteration
+        /// (the continuation finishes naturally on EOF / error).
+        let drainTask: Task<Void, Never>
+        /// Sendable handle that the read-source closure pushes
+        /// events onto. Owned by the session so a teardown can
+        /// `.finish()` it deterministically.
+        let signalContinuation: AsyncStream<InternalEvent>.Continuation
+    }
+
+    /// Sendable bridge between the DispatchSourceRead's background
+    /// queue and the `@MainActor` drain task. We can't capture
+    /// `self` (a `@MainActor` class) into the source closure
+    /// without Swift 6's runtime isolation check firing
+    /// `dispatch_assert_queue(main)` on the read queue — see the
+    /// stack trace in the M4c-validation crash report (`bug_type:
+    /// 309`, queue `ai.stridelabs.Roost.pty.tab-N`). Routing every
+    /// event through this value-type stream means the source
+    /// closure only captures `Sendable` values (the continuation,
+    /// `tabID`, `masterFD`), avoiding the actor capture.
+    private enum InternalEvent: Sendable {
+        case bytes(Data)
+        case eof
+        case readError(Int32)
+        /// Yielded by `teardown` after its background reap loop
+        /// finishes. The drain task uses this to emit `.tabExited`
+        /// with the actual exit status (a `.eof`-driven path would
+        /// instead go through `reapAndCleanup`, which is a no-op if
+        /// the session was already removed from the map).
+        case forcedExit(Int32)
     }
 
     private var sessions: [Int64: Session] = [:]
@@ -178,55 +208,64 @@ final class PtySupervisor {
         free(cwdCopy)
 
         // PARENT: install the read source on a background queue,
-        // hop to main for every chunk + exit.
+        // bridge each read result to the main actor through a
+        // `Sendable` AsyncStream. See `InternalEvent`'s doc comment
+        // for why we can't capture `self` into the source closure
+        // directly under Swift 6 strict concurrency.
         let queue = DispatchQueue(
             label: "ai.stridelabs.Roost.pty.tab-\(tabID)",
             qos: .userInteractive
         )
         let source = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: queue)
-        let session = Session(masterFD: masterFD, childPID: pid, source: source)
-        sessions[tabID] = session
-        pending.remove(tabID)
+        let (signalStream, signalCont) = AsyncStream<InternalEvent>.makeStream()
 
-        let supervisor = self
-        source.setEventHandler {
-            // Read up to 4 KiB; the source fires once per
-            // readable-state notification, but the queue is
-            // serial so back-to-back fires can drain.
-            let cap = 4096
-            var buf = [UInt8](repeating: 0, count: cap)
-            let n = buf.withUnsafeMutableBufferPointer { ptr -> Int in
-                Darwin.read(masterFD, ptr.baseAddress, cap)
-            }
-            if n > 0 {
-                let chunk = Data(buf.prefix(n))
-                Task { @MainActor in
-                    supervisor.emit(.bytes(tabID: tabID, data: chunk))
-                }
-            } else if n == 0 {
-                // EOF — child closed the slave. Reap below via
-                // the cancel handler.
-                Task { @MainActor in
-                    supervisor.reapAndCleanup(tabID: tabID, expectedPID: pid)
-                }
-            } else {
-                // n < 0: classify the errno. EAGAIN / EWOULDBLOCK
-                // / EINTR are transient — the read source will
-                // re-fire on the next readable notification.
-                // Anything else (EBADF, EIO, etc.) is terminal:
-                // reap the child and tear the session down.
-                // CR-flagged on PR #78 — the old code only
-                // checked EBADF.
-                switch errno {
-                case EAGAIN, EWOULDBLOCK, EINTR:
-                    break
-                default:
-                    Task { @MainActor in
-                        supervisor.reapAndCleanup(tabID: tabID, expectedPID: pid)
-                    }
+        // Install the event handler via a `nonisolated` static
+        // helper. Critical: defining the closure literal here
+        // (inside this `@MainActor` method) makes Swift infer
+        // `@MainActor` isolation on the closure even though
+        // `setEventHandler`'s parameter is `@convention(block)`.
+        // That inferred isolation later trips
+        // `dispatch_assert_queue(main)` when the closure runs on
+        // the Dispatch worker thread. Defining the closure inside
+        // a `nonisolated static` method instead breaks the
+        // inheritance chain.
+        PtySupervisor.installReadHandler(
+            source: source,
+            masterFD: masterFD,
+            signalCont: signalCont
+        )
+
+        // Drain on the main actor. `Task { @MainActor in ... }` is
+        // constructed here in `spawn` (which is itself `@MainActor`),
+        // so the capture of `self` happens on the right actor — no
+        // boundary-crossing runtime check, and the iteration body
+        // runs on main where `emit` and `reapAndCleanup` belong.
+        let drainTask = Task { @MainActor [weak self] in
+            for await event in signalStream {
+                guard let self else { return }
+                switch event {
+                case .bytes(let data):
+                    self.emit(.bytes(tabID: tabID, data: data))
+                case .eof, .readError:
+                    self.reapAndCleanup(tabID: tabID, expectedPID: pid)
+                case .forcedExit(let status):
+                    // teardown() already removed the session from
+                    // the map and reaped the child; we just need to
+                    // emit so subscribers see the close.
+                    self.emit(.tabExited(tabID: tabID, status: status))
                 }
             }
         }
+
+        let session = Session(
+            masterFD: masterFD,
+            childPID: pid,
+            source: source,
+            drainTask: drainTask,
+            signalContinuation: signalCont
+        )
+        sessions[tabID] = session
+        pending.remove(tabID)
         source.resume()
     }
 
@@ -294,6 +333,61 @@ final class PtySupervisor {
         sessions[tabID] != nil
     }
 
+    // MARK: Read-source helpers
+
+    /// Install the DispatchSourceRead's event handler. Declared
+    /// `nonisolated static` so the closure literal inside doesn't
+    /// inherit `@MainActor` isolation from the enclosing call site
+    /// — see the doc comment in `spawn(...)` for the
+    /// `dispatch_assert_queue(main)` crash that motivated this
+    /// extraction.
+    nonisolated private static func installReadHandler(
+        source: DispatchSourceRead,
+        masterFD: Int32,
+        signalCont: AsyncStream<InternalEvent>.Continuation
+    ) {
+        source.setEventHandler {
+            Self.handleReadSourceEvent(
+                masterFD: masterFD,
+                signalCont: signalCont
+            )
+        }
+    }
+
+    /// Nonisolated helper that the DispatchSourceRead event handler
+    /// trampolines into. Reads up to 4 KiB from `masterFD` and
+    /// yields the result onto the InternalEvent stream the drain
+    /// task is iterating.
+    nonisolated private static func handleReadSourceEvent(
+        masterFD: Int32,
+        signalCont: AsyncStream<InternalEvent>.Continuation
+    ) {
+        let cap = 4096
+        var buf = [UInt8](repeating: 0, count: cap)
+        let n = buf.withUnsafeMutableBufferPointer { ptr -> Int in
+            Darwin.read(masterFD, ptr.baseAddress, cap)
+        }
+        if n > 0 {
+            signalCont.yield(.bytes(Data(buf.prefix(n))))
+        } else if n == 0 {
+            // EOF — child closed the slave. Drain task will call
+            // reapAndCleanup on receipt of `.eof`.
+            signalCont.yield(.eof)
+            signalCont.finish()
+        } else {
+            // n < 0: EAGAIN / EWOULDBLOCK / EINTR are transient
+            // (the source re-fires on the next readable
+            // notification). Anything else is terminal.
+            switch errno {
+            case EAGAIN, EWOULDBLOCK, EINTR:
+                break
+            default:
+                signalCont.yield(.readError(errno))
+                signalCont.finish()
+            }
+        }
+    }
+
     // MARK: Internal
 
     private func reapAndCleanup(tabID: Int64, expectedPID: pid_t) {
@@ -308,15 +402,24 @@ final class PtySupervisor {
 
     private func teardown(session: Session, tabID: Int64) {
         // The blocking reap loop (waitpid + usleep) used to run
-        // inline on `@MainActor`, which would freeze the GTK/AppKit
+        // inline on `@MainActor`, which would freeze the AppKit
         // main loop for up to ~200ms (or longer if a SIGKILL
         // fallback is needed). Move it to a background DispatchQueue
         // and hop back to the main actor to emit `tabExited`.
-        // CR-flagged on PR #78.
+        //
+        // The background block does NOT capture `self` — instead it
+        // yields the exit signal onto the same `signalContinuation`
+        // the read source uses, and the existing drain task
+        // (`@MainActor`-isolated) calls `emit(.tabExited(...))`.
+        // Same rationale as the read source: avoid Swift 6's
+        // `dispatch_assert_queue(main)` runtime check that fires
+        // when a `@MainActor` reference is captured into a
+        // non-isolated dispatch closure.
         session.source.cancel()
         let masterFD = session.masterFD
         let childPID = session.childPID
-        let supervisor = self
+        let signalCont = session.signalContinuation
+        let drainTask = session.drainTask
         DispatchQueue.global(qos: .userInitiated).async {
             kill(childPID, SIGHUP)
             var status: Int32 = 0
@@ -338,10 +441,11 @@ final class PtySupervisor {
                 waitpid(childPID, &status, 0)
             }
             Darwin.close(masterFD)
-            let exit = exitStatus(status)
-            Task { @MainActor in
-                supervisor.emit(.tabExited(tabID: tabID, status: exit))
-            }
+            // Signal the drain task to emit .tabExited with the
+            // real status before letting the stream end.
+            signalCont.yield(.forcedExit(exitStatus(status)))
+            signalCont.finish()
+            _ = drainTask
         }
     }
 

@@ -408,8 +408,31 @@ struct AnyCodable: Codable, @unchecked Sendable {
     private static func encodeValue(
         _ value: Any, into c: inout SingleValueEncodingContainer
     ) throws {
+        // CRITICAL: NSNumber must be disambiguated BEFORE the
+        // `as? Bool` / `as? Int64` cascade, because
+        // `JSONSerialization.jsonObject(...)` boxes JSON numbers
+        // as `NSNumber`, and in Swift `NSNumber(value: 1) as? Bool`
+        // returns `Optional(true)` (the polymorphic NSNumber
+        // bridges to either Bool, Int, Double, etc. — the first
+        // `as?` cast wins regardless of the underlying type). The
+        // classic symptom is `protocol_version: 1` serializing as
+        // `"protocol_version": true` on the wire, which the
+        // strict-typed Rust client then rejects with
+        // `invalid type: boolean true, expected u32`. We use
+        // `CFGetTypeID` against `CFBooleanGetTypeID()` to
+        // distinguish "actually a Bool" from "an integer that
+        // bridges to Bool".
         if value is NSNull {
             try c.encodeNil()
+        } else if let n = value as? NSNumber {
+            let typeID = CFGetTypeID(n)
+            if typeID == CFBooleanGetTypeID() {
+                try c.encode(n.boolValue)
+            } else if CFNumberIsFloatType(n) {
+                try c.encode(n.doubleValue)
+            } else {
+                try c.encode(n.int64Value)
+            }
         } else if let b = value as? Bool {
             try c.encode(b)
         } else if let i = value as? Int64 {
