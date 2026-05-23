@@ -360,7 +360,8 @@ impl Workspace {
                 let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
                 let fallback_tab = inner
                     .tabs
-                    .values().find(|t| t.project_id == fallback_project)
+                    .values()
+                    .find(|t| t.project_id == fallback_project)
                     .map(|t| t.id)
                     .unwrap_or(0);
                 inner.active_project_id = fallback_project;
@@ -468,7 +469,8 @@ impl Workspace {
             if inner.active_tab_id == tab_id {
                 let next = inner
                     .tabs
-                    .values().find(|t| t.project_id == row.project_id)
+                    .values()
+                    .find(|t| t.project_id == row.project_id)
                     .or_else(|| inner.tabs.values().next())
                     .map(|t| (t.project_id, t.id))
                     .unwrap_or((row.project_id, 0));
