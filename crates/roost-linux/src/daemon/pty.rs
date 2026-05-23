@@ -55,6 +55,14 @@ pub enum SupervisorEvent {
     TabExited { tab_id: i64, status: i32 },
 }
 
+/// A command on a tab's single writer channel. Input and resize share
+/// one FIFO so they reach the PTY in submission order end-to-end —
+/// the writer loop applies them in the exact order they were sent (#80).
+enum WriterCmd {
+    Input(Vec<u8>),
+    Resize(PtySize),
+}
+
 pub struct PtySupervisor {
     sessions: Arc<Mutex<HashMap<i64, Session>>>,
     /// Tab ids whose `spawn()` is in flight — the PTY has not yet
@@ -69,8 +77,9 @@ pub struct PtySupervisor {
 }
 
 struct Session {
-    input_tx: mpsc::Sender<Vec<u8>>,
-    resize_tx: mpsc::Sender<PtySize>,
+    /// Unified input+resize command channel — one FIFO, so commands
+    /// reach the PTY in submission order through the writer loop.
+    cmd_tx: mpsc::Sender<WriterCmd>,
     output_tx: broadcast::Sender<PtyOutputEvent>,
     /// Sendable kill handle obtained from
     /// `portable_pty::Child::clone_killer` before the child was
@@ -204,6 +213,18 @@ impl PtySupervisor {
             })
             .context("openpty failed")?;
 
+        // Acquire the master reader + writer BEFORE spawning the
+        // child, so `spawn_command` becomes the last fallible step.
+        // If these fail, the PTY tears down with no child to orphan.
+        // Doing them *after* the spawn (as before) could return an
+        // error while a live shell had no wait task installed — that
+        // PTY would escape supervisor control entirely (#80).
+        let reader_handle = pair
+            .master
+            .try_clone_reader()
+            .context("master.try_clone_reader")?;
+        let writer = pair.master.take_writer().context("master.take_writer")?;
+
         let cmd = build_command(cwd, argv, tab_id, socket_path);
         let mut child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         // Sendable killer handle taken before the child moves into
@@ -227,38 +248,37 @@ impl PtySupervisor {
         // to the caller guarantees no Bytes/Exit event between
         // spawn and caller-subscribe can be lost.
         let early_rx = output_tx.subscribe();
-        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(PTY_INPUT_CHANNEL_CAPACITY);
-        let (resize_tx, mut resize_rx) = mpsc::channel::<PtySize>(8);
+        // One command channel for input + resize so they apply to the
+        // PTY in submission order (#80).
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(PTY_INPUT_CHANNEL_CAPACITY);
 
         let master = pair.master;
 
         // Reader: blocking read off the master fd, push to broadcast.
-        let reader_handle = master
-            .try_clone_reader()
-            .context("master.try_clone_reader")?;
         tokio::task::spawn_blocking({
             let output_tx = output_tx.clone();
             move || pty_reader_loop(reader_handle, &output_tx, tab_id)
         });
 
-        // Writer + resizer.
-        let writer = master.take_writer().context("master.take_writer")?;
+        // Writer + resizer: a single ordered loop over the unified
+        // command stream, so a resize never reorders relative to the
+        // input bytes submitted around it (and keystrokes never
+        // reorder relative to each other).
         tokio::spawn(async move {
             let mut writer = writer;
-            loop {
-                tokio::select! {
-                    Some(data) = input_rx.recv() => {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    WriterCmd::Input(data) => {
                         if let Err(err) = tokio::task::block_in_place(|| writer.write_all(&data)) {
                             warn!(tab_id, ?err, "pty write failed");
                             break;
                         }
                     }
-                    Some(size) = resize_rx.recv() => {
+                    WriterCmd::Resize(size) => {
                         if let Err(err) = tokio::task::block_in_place(|| master.resize(size)) {
                             warn!(tab_id, ?err, "pty resize failed");
                         }
                     }
-                    else => break,
                 }
             }
             debug!(tab_id, "pty input loop ended");
@@ -286,14 +306,23 @@ impl PtySupervisor {
             reaped_for_wait.store(true, Ordering::SeqCst);
             let _ = output_tx_exit.send(PtyOutputEvent::Exit(status));
             let _ = lifecycle_tx.send(SupervisorEvent::TabExited { tab_id, status });
-            // Tab ids are allocated monotonically (`Workspace::alloc_id`),
-            // so this can never evict a newer same-id session.
-            sessions_for_reap.lock().unwrap().remove(&tab_id);
+            // Only remove the session if THIS waiter still owns it.
+            // `close()` frees the slot synchronously, so the same
+            // tab_id can be re-spawned before a stale waiter fires;
+            // matching the per-spawn `reaped` identity prevents
+            // evicting a newer live session (#80).
+            let mut sessions = sessions_for_reap.lock().unwrap();
+            let owns = sessions
+                .get(&tab_id)
+                .map(|s| Arc::ptr_eq(&s.reaped, &reaped_for_wait))
+                .unwrap_or(false);
+            if owns {
+                sessions.remove(&tab_id);
+            }
         });
 
         let session = Session {
-            input_tx,
-            resize_tx,
+            cmd_tx,
             output_tx,
             killer: Mutex::new(killer),
             pid,
@@ -339,10 +368,12 @@ impl PtySupervisor {
             let sessions = self.sessions.lock().unwrap();
             sessions
                 .get(&tab_id)
-                .map(|s| s.input_tx.clone())
+                .map(|s| s.cmd_tx.clone())
                 .ok_or(PtyError::NotFound(tab_id))?
         };
-        tx.send(data).await.map_err(|_| PtyError::Closed(tab_id))?;
+        tx.send(WriterCmd::Input(data))
+            .await
+            .map_err(|_| PtyError::Closed(tab_id))?;
         Ok(())
     }
 
@@ -351,15 +382,15 @@ impl PtySupervisor {
             let sessions = self.sessions.lock().unwrap();
             sessions
                 .get(&tab_id)
-                .map(|s| s.resize_tx.clone())
+                .map(|s| s.cmd_tx.clone())
                 .ok_or(PtyError::NotFound(tab_id))?
         };
-        tx.send(PtySize {
+        tx.send(WriterCmd::Resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
-        })
+        }))
         .await
         .map_err(|_| PtyError::Closed(tab_id))?;
         Ok(())

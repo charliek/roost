@@ -376,6 +376,13 @@ pub struct EventsSubscribeParams {
     pub tab_id_filter: i64,
 }
 
+/// `app.activate` carries no params. Declared (empty + strict) so the
+/// handler validates the envelope like every other op rather than
+/// ACK-ing arbitrary payloads (#80).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppActivateParams {}
+
 // ============================================================================
 // Event data types
 // ============================================================================

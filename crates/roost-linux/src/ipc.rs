@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, NotificationCreateParams, ProjectCreateParams,
+    ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     TabClearNotificationParams, TabCloseParams, TabFocusParams, TabFocusResult, TabListResult,
     TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
@@ -280,6 +281,9 @@ async fn dispatch(
             Ok(serde_json::json!({}))
         }
         ops::APP_ACTIVATE => {
+            // Validate the envelope like every other op (rejects
+            // unknown fields) rather than ACK-ing arbitrary payloads.
+            let _p: AppActivateParams = decode(params)?;
             // Second-launch window raise (#6). Best-effort: forward a
             // unit to the GTK main thread if wired. A dropped receiver
             // (window gone) or a headless handler is a no-op.

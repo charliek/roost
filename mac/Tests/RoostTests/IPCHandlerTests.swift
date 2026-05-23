@@ -138,6 +138,8 @@ struct IPCHandlerDispatchTests {
         let projects = (listed?.value as? [String: Any])?["projects"] as? [[String: Any]]
         #expect(projects?.count == 1)
         #expect(projects?.first?["name"] as? String == "proj")
-        #expect(projects?.first?["tabs"] as? [[String: Any]] != nil)
+        // A freshly created project has no tabs; this also asserts the
+        // `tabs` key encodes as a (here empty) array.
+        #expect((projects?.first?["tabs"] as? [[String: Any]])?.isEmpty == true)
     }
 }
