@@ -247,15 +247,6 @@ jobs:
             fi
           done
 
-      # M3b of the daemon-removal refactor (2026-05-23): the
-      # `liveIdentifyAgainstDaemon` Swift test was a regression guard
-      # for the gRPC `:authority` UDS edge case. With the Linux UI
-      # off gRPC (M3b) and the Mac UI moving off it next (M4), the
-      # test is on borrowed time. M3b skips the daemon-startup + env
-      # injection here; M4 deletes the dormant Swift test method
-      # entirely. `swift test` still runs all the other tests
-      # (renderer, OSC scanner, etc.) with `ROOST_LIVE_TEST_SOCKET`
-      # unset, so the live-daemon test method no-ops itself.
       - name: swift test
         working-directory: mac
         run: swift test
