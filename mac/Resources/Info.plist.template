@@ -19,7 +19,7 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleIdentifier</key>
-  <string>com.charliek.roost</string>
+  <string>ai.stridelabs.Roost</string>
   <key>CFBundleName</key>
   <string>Roost</string>
   <key>CFBundleDisplayName</key>

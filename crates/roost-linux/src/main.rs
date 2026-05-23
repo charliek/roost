@@ -29,7 +29,12 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 
-const APP_ID: &str = "com.charliek.roost.linux";
+// Matches `BundleProfile::gtk().app_id` (roost-common). The Linux UI
+// is the only consumer of the GTK profile; keeping the constant
+// duplicated here lets `Application::builder().application_id(...)`
+// run before tokio/profile resolution. The pair is asserted in
+// roost-common's unit tests.
+const APP_ID: &str = "ai.stridelabs.Roost.gtk";
 
 /// Drop the cosmetic `g_settings_schema_source_lookup: assertion
 /// 'source != NULL' failed` GLib warning that fires on macOS

@@ -2563,17 +2563,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Resolve the same default socket path as `roost-core`'s
-    /// `default_socket_path` for macOS — always
-    /// `~/Library/Caches/roost/roost.sock` when `HOME` is set;
-    /// `/tmp/roost.sock` only as a last resort.
+    /// Resolve the same default socket path as `roost-common`'s Mac
+    /// bundle profile — always `~/Library/Caches/Roost/roost.sock`
+    /// when `HOME` is set; `/tmp/Roost/roost.sock` only as a last
+    /// resort. Capital `Roost` since M1 of the daemon-removal
+    /// refactor; pre-M1 stale state under lowercase `roost/` is
+    /// intentionally not migrated.
     nonisolated static func defaultSocketPath(
         environment env: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
-        if let home = env["HOME"], !home.isEmpty, home.hasPrefix("/") {
-            return "\(home)/Library/Caches/roost/roost.sock"
-        }
-        return "/tmp/roost.sock"
+        BundleProfile.mac(environment: env).socketPath
     }
 }
 

@@ -26,7 +26,7 @@ use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
 use tokio::runtime::Handle;
 
-use roost_common::default_socket_path;
+use roost_common::{BundleProfile, BundleProfileKind};
 use roost_proto::v1::event::Kind as EventKind;
 use roost_proto::v1::{Project, Tab};
 
@@ -592,7 +592,9 @@ impl App {
     /// list, subscribe to WatchEvents, open a tab in the first
     /// project if none exist.
     async fn bootstrap(self: &Rc<Self>) -> anyhow::Result<()> {
-        let socket = default_socket_path().context("default_socket_path")?;
+        let socket = BundleProfile::resolve(BundleProfileKind::Gtk)
+            .context("resolve gtk bundle profile")?
+            .socket_path;
         let rt = self.rt.clone();
         let client = rt
             .spawn(async move { RoostClient::connect(socket).await })

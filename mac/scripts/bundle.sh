@@ -53,7 +53,7 @@ REPO_ROOT="$(cd "${MAC_DIR}/.." && pwd)"
 
 VERSION="${ROOST_VERSION:-0.1.0}"
 APP_NAME="Roost"
-BUNDLE_ID="com.charliek.roost"
+BUNDLE_ID="ai.stridelabs.Roost"
 TEMPLATE_PLIST="${MAC_DIR}/Resources/Info.plist.template"
 ICON_SRC="${MAC_DIR}/Resources/AppIcon.icns"
 
