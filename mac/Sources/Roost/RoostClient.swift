@@ -167,9 +167,7 @@ func runShellSession(
         } catch {
             supervisor.unsubscribe(token: token)
             exitCont.finish()
-            FileHandle.standardError.write(
-                Data("[Roost.mac] openTab failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("openTab failed: \(error)")
             return (nil, nil)
         }
     }
@@ -201,9 +199,7 @@ func runShellSession(
                             try localClient.resizeTab(tabID, cols: cols, rows: rows)
                         }
                     } catch {
-                        FileHandle.standardError.write(
-                            Data("[Roost.mac] pty event failed (tab \(tabID)): \(error)\n".utf8)
-                        )
+                        RoostLogger.shared.warn("pty event failed (tab \(tabID)): \(error)")
                     }
                 }
             }
@@ -246,9 +242,7 @@ func closeShellTab(socketPath: String, tabID: Int64) async {
         do {
             try RoostBackend.shared.localClient?.closeTab(tabID)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] closeTab(\(tabID)) failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("closeTab(\(tabID)) failed: \(error)")
         }
     }
 }
@@ -304,9 +298,7 @@ func setTabTitle(socketPath: String, tabID: Int64, title: String) async {
         do {
             try RoostBackend.shared.localClient?.setTabTitle(tabID, title: title)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] setTabTitle(\(tabID)) failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("setTabTitle(\(tabID)) failed: \(error)")
         }
     }
 }
@@ -316,9 +308,7 @@ func renameProject(socketPath: String, projectID: Int64, name: String) async {
         do {
             try RoostBackend.shared.localClient?.renameProject(projectID, name: name)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] renameProject(\(projectID)) failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("renameProject(\(projectID)) failed: \(error)")
         }
     }
 }
@@ -331,9 +321,7 @@ func reorderTabs(socketPath: String, projectID: Int64, tabIDs: [Int64]) async {
         do {
             try RoostBackend.shared.localClient?.reorderTabs(projectID: projectID, tabIDs: tabIDs)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] reorderTabs(\(projectID)) failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("reorderTabs(\(projectID)) failed: \(error)")
         }
     }
 }
@@ -343,9 +331,7 @@ func reorderProjects(socketPath: String, projectIDs: [Int64]) async {
         do {
             try RoostBackend.shared.localClient?.reorderProjects(projectIDs)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] reorderProjects failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("reorderProjects failed: \(error)")
         }
     }
 }
@@ -400,9 +386,7 @@ func clearTabNotification(socketPath: String, tabID: Int64) async {
         do {
             try RoostBackend.shared.localClient?.clearTabNotification(tabID)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] clearTabNotification(\(tabID)) failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("clearTabNotification(\(tabID)) failed: \(error)")
         }
     }
 }
@@ -436,9 +420,7 @@ func deleteProject(socketPath: String, projectID: Int64) async {
         do {
             _ = try RoostBackend.shared.localClient?.deleteProject(projectID)
         } catch {
-            FileHandle.standardError.write(
-                Data("[Roost.mac] deleteProject(\(projectID)) failed: \(error)\n".utf8)
-            )
+            RoostLogger.shared.warn("deleteProject(\(projectID)) failed: \(error)")
         }
     }
 }

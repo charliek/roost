@@ -138,6 +138,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var dropIndicatorIndex: Int?
 
     private var socketPath: String = ""
+
+    /// M4c: the single-instance flock held for the lifetime of the
+    /// process. Released when the holder is dropped (the lock fd is
+    /// closed in `SingleInstance.deinit`), which happens at app
+    /// shutdown.
+    private var singleInstance: SingleInstance?
     private var daemonReachable: Bool = false
 
     /// User config (Phase 6a M6). Resolved once on launch from
@@ -188,6 +194,44 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // before any UI work so `roostctl` invocations during
         // app launch don't race the bind.
         let profile = BundleProfile.mac()
+
+        // M4c: file logger goes live before any other startup work
+        // so the early logs land in roost.log alongside the os.Logger
+        // output. Idempotent — `attach` swaps the handle without
+        // dropping queued writes.
+        RoostLogger.shared.attach(path: profile.logPath)
+
+        // M4c: single-instance enforcement. Two Mac UIs cannot share
+        // an IPC socket; the second launch detects the live lock,
+        // logs the holder PID, and exits 0. `ROOST_ALLOW_MULTI=1`
+        // bypasses for dev / test workflows (Xcode debug, swift test).
+        do {
+            switch try SingleInstance.acquire(lockPath: profile.lockPath) {
+            case .acquired(let lock):
+                self.singleInstance = lock
+                RoostLogger.shared.info(
+                    "single-instance: acquired lock at \(profile.lockPath)"
+                )
+            case .alreadyHeld(let pid):
+                RoostLogger.shared.info(
+                    "single-instance: lock at \(profile.lockPath) already held by pid \(pid); exiting"
+                )
+                NSApp.terminate(nil)
+                return
+            case .bypassed:
+                RoostLogger.shared.info(
+                    "single-instance: bypassed via ROOST_ALLOW_MULTI=1"
+                )
+            }
+        } catch {
+            // Lock fd open / write failed for a reason other than
+            // contention. Log and continue — better to start with no
+            // single-instance guard than to refuse to launch.
+            RoostLogger.shared.error(
+                "single-instance: acquire failed: \(error); continuing without enforcement"
+            )
+        }
+
         RoostBackend.shared.start(profile: profile)
 
         let socketPath = profile.socketPath

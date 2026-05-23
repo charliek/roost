@@ -40,6 +40,17 @@ struct BundleProfile: Sendable {
     /// `roost.log` path inside `logDir`.
     var logPath: String { (logDir as NSString).appendingPathComponent("roost.log") }
 
+    /// `roost.lock` lives next to the socket so the single-instance
+    /// flock and the IPC socket share a parent directory. M4c
+    /// added the lock for Mac; the Linux side keeps its lock under
+    /// the state dir per `crates/roost-linux/src/single_instance.rs`
+    /// — the two paths differ deliberately to avoid a cross-platform
+    /// `~/Library/Caches` vs. `$XDG_RUNTIME_DIR` symlink dance.
+    var lockPath: String {
+        let parent = (socketPath as NSString).deletingLastPathComponent
+        return (parent as NSString).appendingPathComponent("roost.lock")
+    }
+
     /// Resolve a profile by kind using the host's environment.
     ///
     /// Falls back to `/tmp/<appLabel>/...` when `HOME` is missing or
