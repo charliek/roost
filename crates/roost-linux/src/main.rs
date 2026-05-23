@@ -28,7 +28,7 @@ use libadwaita::prelude::*;
 use libadwaita::Application;
 use tracing_subscriber::EnvFilter;
 
-use roost_common::{BundleProfile, BundleProfileKind};
+use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcServer;
 use roost_linux::daemon::{PtySupervisor, Workspace};
 use roost_linux::ipc::IpcHandler;

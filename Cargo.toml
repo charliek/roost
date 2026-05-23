@@ -1,46 +1,34 @@
 # Roost Cargo workspace.
 #
-# Hosts the new architecture's Rust code: the Linux UI (roost-linux,
-# embeds the workspace + PTY supervisor in-process post-M3), the
-# shell-integration CLI (roost-cli, binary `roostctl`), the JSON IPC
-# crate (roost-ipc), and the libghostty-vt FFI wrapper (roost-vt) plus
-# its OSC helper (roost-osc). The legacy gRPC daemon (roost-core),
-# proto bindings (roost-proto), smoke-test client (roost-smoke), and
-# shared shim (roost-common) are scheduled for deletion in M7 — they
-# remain workspace members until then so `cargo build` keeps working
-# on every commit during the refactor.
+# Post-M7 layout:
+#   * roost-ipc   — JSON IPC wire format, framing, client + server,
+#                   bundle-profile path resolution, target selection.
+#   * roost-vt    — libghostty-vt FFI wrapper with optional `--features ffi`.
+#   * roost-osc   — OSC scanner that lifts (command, payload) pairs out of
+#                   PTY byte streams. Used by both the Linux UI and the
+#                   roost-osc test fixtures.
+#   * roost-linux — gtk4-rs + libadwaita Linux UI. Embeds the workspace,
+#                   PTY supervisor, and IPC server in-process.
+#   * roost-cli   — shell-integration CLI; binary is `roostctl`.
 #
-# The legacy Go code under cmd/ + internal/ is unaffected by this
-# workspace and continues to build via build/build.sh + Makefile until
-# the Phase 9 cutover described in docs/development/vision.md.
+# `roost-linux` is in `default-members`: the workspace builds the whole
+# product by default. Contributors on Mac without GTK installed get a
+# clear error from the GTK pkg-config probe at build time (Homebrew:
+# `brew install gtk4 libadwaita`; apt: `apt install libgtk-4-dev
+# libadwaita-1-dev`).
+#
+# The pre-M7 daemon-era crates (roost-core, roost-proto, roost-common,
+# roost-smoke) are gone; `proto/roost.proto` has moved to
+# `docs/archive/roost.proto` as historical reference.
 
 [workspace]
 resolver = "2"
 members = [
-    "crates/roost-proto",
-    "crates/roost-common",
     "crates/roost-ipc",
     "crates/roost-vt",
     "crates/roost-osc",
-    "crates/roost-core",
-    "crates/roost-smoke",
     "crates/roost-cli",
     "crates/roost-linux",
-]
-# `roost-linux` requires GTK4 + libadwaita system libs at build time
-# (Homebrew on macOS, apt on Linux). The default `cargo build` (no
-# `-p`) excludes it so contributors who don't want to install GTK can
-# still iterate on the daemon / proto / Mac side. `cargo build -p
-# roost-linux` opts in. CI's `gtk-build` job builds it explicitly.
-default-members = [
-    "crates/roost-proto",
-    "crates/roost-common",
-    "crates/roost-ipc",
-    "crates/roost-vt",
-    "crates/roost-osc",
-    "crates/roost-core",
-    "crates/roost-smoke",
-    "crates/roost-cli",
 ]
 
 [workspace.package]
@@ -65,12 +53,6 @@ tokio-util   = { version = "0.7",  features = ["compat"] }
 futures      = "0.3"
 async-stream = "0.3"
 
-# gRPC
-tonic        = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
-tonic-build  = { version = "0.12", default-features = false, features = ["prost"] }
-prost        = "0.13"
-prost-types  = "0.13"
-
 # Errors / logging
 thiserror = "1.0"
 anyhow    = "1.0"
@@ -83,16 +65,9 @@ portable-pty = "0.8"
 # CLI parsing
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# UDS support helpers
-hyper-util = { version = "0.1", features = ["tokio"] }
-tower      = { version = "0.5", features = ["util"] }
-
 # FFI / build
 bindgen = "0.70"
 cc      = "1.0"
-
-# Persistence
-rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Misc
 percent-encoding = "2.3"

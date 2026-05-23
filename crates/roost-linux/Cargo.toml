@@ -24,11 +24,10 @@ name = "roost-linux"
 path = "src/main.rs"
 
 [dependencies]
-# roost-common stays through M7 as a thin compatibility shim for
-# `BundleProfile` (which still has a few daemon-era consumers).
-# `roost-proto` and `tonic` are gone — the Linux UI no longer
-# speaks gRPC. `prost` falls out with `tonic`.
-roost-common = { path = "../roost-common" }
+# `BundleProfile` lives in roost-ipc::paths post-M7 (was previously
+# re-exported by roost-common, which we just deleted). The Linux UI
+# pulls it from there along with the IPC client/server types it
+# already used.
 roost-ipc    = { path = "../roost-ipc" }
 # Phase 7 commit 2: pull in the safe-API wrappers landed in commit 1.
 # Linking `--features ffi` brings in libghostty-vt's static archive,

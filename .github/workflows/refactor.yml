@@ -69,12 +69,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        # Phase 2 latitude: clippy still informational while crates settle.
-        # Flip continue-on-error off at Phase 3 exit (roost-core MVP working).
         # `--exclude roost-linux` because that crate needs GTK4 +
         # libadwaita installed — handled by the dedicated `gtk-build`
-        # job (Phase 6a M8) instead of bloating this lint runner.
-        continue-on-error: true
+        # job instead of bloating this lint runner with the GTK
+        # toolchain. roost-linux's clippy lives in the gtk-build job.
         run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 
   rust-build:
@@ -141,25 +139,14 @@ jobs:
         # build does not consume libghostty-vt. Keeps the non-ffi
         # workspace green even if the Ghostty build itself bit-rots.
         # `--exclude roost-linux` because that crate needs GTK4 +
-        # libadwaita installed — the dedicated `gtk-build` job
-        # (Phase 6a M8) does the GTK build separately so the
-        # default-features path stays toolchain-cheap.
+        # libadwaita installed; the dedicated `gtk-build` job does
+        # the GTK build separately.
         run: cargo build --workspace --exclude roost-linux --all-targets
 
       - name: cargo build (roost-vt with ffi)
-        # Time-boxed exception. `continue-on-error` lifts when the FFI
-        # surface stabilises (Phase 5 step 3 exit). Today the smoke
-        # exercises ghostty_terminal_new + write + free; bindgen field
-        # names may differ slightly from my best-guess at the C struct
-        # layout, in which case CI surfaces the exact compile error.
-        continue-on-error: true
+        # Smoke build of the libghostty-vt-linked variant. Pinned
+        # Ghostty SHA in third_party/ghostty/build.sh.
         run: cargo build -p roost-vt --features ffi
-
-      - name: cargo test (roost-vt ffi smoke)
-        # Same time-boxed exception as the ffi build above. Lifts at
-        # Phase 5 step 3 exit.
-        continue-on-error: true
-        run: cargo test -p roost-vt --features ffi -- --nocapture
 
       - name: cargo test
         # Required-green: the workspace test suite gates every commit.
