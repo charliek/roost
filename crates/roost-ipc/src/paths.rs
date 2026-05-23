@@ -182,10 +182,7 @@ fn valid_home() -> anyhow::Result<PathBuf> {
     let raw = std::env::var_os("HOME").context("$HOME not set")?;
     let p = PathBuf::from(&raw);
     if p.as_os_str().is_empty() || !p.is_absolute() {
-        anyhow::bail!(
-            "$HOME is not an absolute non-empty path (got {:?})",
-            raw
-        );
+        anyhow::bail!("$HOME is not an absolute non-empty path (got {:?})", raw);
     }
     Ok(p)
 }

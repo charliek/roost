@@ -92,10 +92,7 @@ fn every_vector_round_trips_through_serde_json() {
             }
         };
         if reparsed != value {
-            errors.push(format!(
-                "{}: decode→encode→decode drift",
-                path.display()
-            ));
+            errors.push(format!("{}: decode→encode→decode drift", path.display()));
         }
     }
     if !errors.is_empty() {

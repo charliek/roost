@@ -34,8 +34,8 @@ pub mod target;
 mod client;
 mod server;
 
-pub use client::IpcClient;
-pub use server::{Handler, IpcServer};
+pub use client::{ClientError, IpcClient};
+pub use server::{Handler, HandlerError, IpcServer};
 
 /// The wire-format protocol version. M0 ships `1`.
 pub const PROTOCOL_VERSION: u32 = 1;
