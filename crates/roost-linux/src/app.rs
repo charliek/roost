@@ -1796,14 +1796,15 @@ impl App {
     /// daemon doesn't know or care about font size — it's purely
     /// a UI concern — so no RPC fires.
     fn adjust_font_size(self: &Rc<Self>, delta: f64) {
-        let mut size = self.current_font_size_pt.borrow_mut();
-        let new = (*size + delta).clamp(6.0, 72.0);
-        if (new - *size).abs() < 0.01 {
-            return;
-        }
-        *size = new;
-        let new = *size;
-        drop(size);
+        let new = {
+            let mut size = self.current_font_size_pt.borrow_mut();
+            let new = (*size + delta).clamp(6.0, 72.0);
+            if (new - *size).abs() < 0.01 {
+                return;
+            }
+            *size = new;
+            new
+        };
         self.apply_font_size_to_all(new);
     }
 
@@ -2470,9 +2471,8 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
     gtk4::ShortcutTrigger::parse_string(&s).unwrap_or_else(|| {
         // Parse fail = a programmer error in the binding table.
         // Fall back to a never-firing trigger built by GTK itself.
-        let fallback = gtk4::ShortcutTrigger::parse_string("<Control><Shift>F24")
-            .expect("fallback shortcut trigger parse");
-        fallback
+        gtk4::ShortcutTrigger::parse_string("<Control><Shift>F24")
+            .expect("fallback shortcut trigger parse")
     })
 }
 

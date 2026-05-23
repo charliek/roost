@@ -112,7 +112,7 @@ impl LocalClient {
     /// updates state locally with no round-trip.
     pub fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
         match command {
-            0 | 1 | 2 => {
+            0..=2 => {
                 // Title set from the shell. OSC-from-shell path
                 // never overrides a manual rename.
                 let _ = self.workspace.set_tab_title_from_osc(tab_id, payload);
