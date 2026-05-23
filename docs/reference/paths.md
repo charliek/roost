@@ -144,14 +144,17 @@ The `command` column on `tab` is reserved for future "task tabs" (auto-launched 
 To wipe Roost's persistent state and start fresh:
 
 ```bash
-# macOS — Mac profile
+# macOS — Mac profile (Swift Roost.app)
 rm "$HOME/Library/Application Support/Roost/roost.db"*
+rm "$HOME/Library/Application Support/Roost/state.json"
 
-# macOS — Gtk dev profile
+# macOS — Gtk dev profile (cargo run -p roost-linux on Mac)
 rm "$HOME/Library/Application Support/Roost-gtk/roost.db"*
+rm "$HOME/Library/Application Support/Roost-gtk/state.json"
 
 # Linux (uses XDG_DATA_HOME with the spec-default fallback)
 rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/roost.db"*
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/state.json"
 ```
 
-Relaunch the UI. The daemon will recreate the schema and a default project + tab.
+`roost.db*` is the pre-M7 SQLite database (still present while the daemon is alive); `state.json` is the M3-onwards UI-owned persistent state. Relaunch the UI — it will recreate default state on first run.
