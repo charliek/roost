@@ -179,6 +179,10 @@ extension Workspace.Event {
             return .hookActive(.init(tabID: tabID, active: active))
         case .notificationFired(let tabID, let title, let body):
             return .notification(.init(tabID: tabID, title: title, body: body))
+        case .tabsReordered(let projectID, let tabIDs):
+            return .tabsReordered(.init(projectID: projectID, tabIds: tabIDs))
+        case .projectsReordered(let projectIDs):
+            return .projectsReordered(.init(projectIds: projectIDs))
         }
     }
 }

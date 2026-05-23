@@ -123,6 +123,8 @@ private func label(for event: Workspace.Event) -> String {
     case .tabNotification: return "tabNotification"
     case .hookActiveChanged: return "hookActiveChanged"
     case .notificationFired: return "notificationFired"
+    case .tabsReordered: return "tabsReordered"
+    case .projectsReordered: return "projectsReordered"
     }
 }
 

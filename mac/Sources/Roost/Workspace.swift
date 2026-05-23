@@ -64,6 +64,13 @@ final class Workspace {
         case activeChanged(projectID: Int64, tabID: Int64)
         case hookActiveChanged(tabID: Int64, active: Bool)
         case notificationFired(tabID: Int64, title: String, body: String)
+        /// Fired after `reorderTabs`. The `tabIDs` payload is the
+        /// post-reorder display order (the `tabIDs` argument
+        /// followed by any unlisted siblings in their prior order).
+        case tabsReordered(projectID: Int64, tabIDs: [Int64])
+        /// Fired after `reorderProjects`. `projectIDs` is the
+        /// post-reorder sidebar order.
+        case projectsReordered(projectIDs: [Int64])
     }
 
     enum WorkspaceError: Error, CustomStringConvertible {
@@ -265,6 +272,11 @@ final class Workspace {
             next += 1
         }
         persist()
+        // The post-reorder display order is the supplied prefix
+        // followed by any unlisted tabs (in their prior order).
+        // App.swift's `.tabsReordered` handler applies the same
+        // order via `applyTabsReorder`.
+        emit(.tabsReordered(projectID: projectID, tabIDs: tabIDs + unlisted))
     }
 
     func reorderProjects(_ projectIDs: [Int64]) throws {
@@ -287,6 +299,7 @@ final class Workspace {
             next += 1
         }
         persist()
+        emit(.projectsReordered(projectIDs: projectIDs + unlisted))
     }
 
     // MARK: Tab mutators

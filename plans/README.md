@@ -1,6 +1,8 @@
 # Roost refactor plan
 
-This directory tracks the multi-phase migration of Roost from a single Go + GTK4 binary toward a Rust core daemon (`roost-core`) plus native UIs (Swift + AppKit on macOS, Rust + gtk4-rs on Linux) communicating over a `.proto`-defined gRPC contract on a Unix domain socket.
+This directory tracks the multi-phase migration of Roost from a single Go + GTK4 binary to two native UIs (Swift + AppKit on macOS, Rust + gtk4-rs on Linux) that each embed the workspace + PTY supervisor in-process and serve a JSON IPC socket for external tooling. The pre-2026-05-23 portion of the migration went through a Rust gRPC daemon (`roost-core`); the post-2026-05-23 [`refactor/inline-core` branch](humming-inventing-flame.md) collapsed the daemon back into each UI process and replaced the gRPC contract with newline-delimited JSON.
+
+**Current head**: `refactor/inline-core` (PR #78). M0–M9 of the daemon-removal plan have landed; the branch is ready-for-review pending sign-off. Once it squash-merges into `feature/rust-port`, the daemon-era phase files below stay as historical context but `roost-core`, `roost-proto`, `roost-common`, `roost-smoke` and the `proto/` directory no longer exist on the branch.
 
 See [`docs/development/vision.md`](../docs/development/vision.md) for the target architecture and the durable design choices (decision log). This index summarizes each phase; the per-phase files in this directory contain the detailed step lists, exit criteria, and commit log.
 

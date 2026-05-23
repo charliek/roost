@@ -1,20 +1,23 @@
-// Roost Mac client — Phase 6a step 2b: sidebar + multi-project.
+// Roost Mac client — top-level AppKit app + view-model glue.
 //
-// The window splits horizontally into a project sidebar (left) and the
-// existing tab-bar + terminal area (right). Each project owns its own
-// set of `TabSession`s; switching the sidebar selection rebuilds the
-// tab bar with only that project's tabs.
+// The window splits horizontally into a project sidebar (left) and
+// the tab-bar + terminal area (right). Each project owns its own
+// set of `TabSession`s; switching the sidebar selection rebuilds
+// the tab bar with only that project's tabs.
 //
-// Project lifecycle is end-to-end against the daemon's new RPCs:
-//   * `+ New Project` at the bottom of the sidebar → CreateProject;
-//   * right-click on a project row → Rename / Delete (Delete cascades
-//     the project's tabs daemon-side, which we mirror locally before
-//     refreshing the sidebar);
-//   * the File menu gains "New Project" (⌘N).
+// Project lifecycle calls go through the in-process `LocalClient`
+// (see `RoostClient.swift`'s thin wrappers around
+// `RoostBackend.shared.localClient`):
+//   * `+ New Project` at the bottom of the sidebar → `createProject`.
+//   * Right-click a project row → Rename / Delete (Delete cascades
+//     the project's tabs in `Workspace.deleteProject`, which we
+//     mirror locally before refreshing the sidebar).
+//   * The File menu gains "New Project" (⌘N).
 //
-// WatchEvents subscription for cross-client convergence is the
-// follow-up slice; everything in this commit reads daemon state via
-// `listProjects` on launch and otherwise drives mutations directly.
+// Cross-client convergence (e.g. when `roostctl` mutates the
+// workspace from another shell) flows through `RoostEvent` via
+// `watchEvents`, which subscribes to `Workspace.subscribe` and
+// converts each event for `handleEvent` below.
 
 import AppKit
 import Foundation
@@ -940,12 +943,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 window?.close()
             }
         case .tabDeleted(let e):
-            // Headless `tab close` (M4) or any external `CloseTab`
-            // call kills the daemon-side PTY; the Mac UI's
-            // StreamPty for that tab receives PtyExit and the
-            // TabSession's session task exits, but we still hold
-            // the reference in `tabs` until we hear this event.
-            // Tear it down now so the tab strip converges.
+            // Headless `roostctl tab close` or any other `tab.close`
+            // RPC kills the PTY in-process; the supervisor's drain
+            // task emits `.tabExited` → workspace emits
+            // `.tabClosed` → we land here. The Mac UI still holds
+            // the TabSession reference in `tabs` until this event;
+            // tear it down now so the tab strip converges.
             guard let session = tabs.first(where: { $0.id == e.tabID }) else { break }
             let projectID = session.projectID
             let wasActive = activeSessionByProject[projectID] === session
@@ -967,16 +970,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
-            // M5: project-level cascade lives daemon-side now
-            // (state.rs::close_tab cascades to delete_project when
-            // the parent project is empty). The Mac UI's local `tabs`
-            // list omits headless-CLI-opened tabs, so a UI-side empty
-            // check could delete a project the daemon thinks still
-            // has tabs — moved the policy to the authoritative side.
-            // We just handle local cleanup here; the daemon's
-            // ProjectDeletedEvent (when cascaded) lands in the
-            // `.projectDeleted` arm below and closes the window if
-            // the workspace is empty.
+            // Project-level cascade lives in `Workspace.closeTab`
+            // (it deletes the parent project when its last tab is
+            // closed). The Mac UI's local `tabs` list omits any
+            // tabs opened externally via `roostctl tab open`, so a
+            // UI-side empty check could under-count and delete a
+            // project the workspace thinks still has tabs — the
+            // workspace is authoritative. We just handle local
+            // cleanup here; the cascade's `.projectDeleted` event
+            // lands in the arm below and closes the window if the
+            // workspace is empty.
             if projectID == activeProjectID {
                 rebuildTabBar()
                 if wasActive {
@@ -987,16 +990,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 }
             }
         case .tabOpened, .active:
-            // Cross-client `OpenTab` produces a daemon-side tab the
-            // UI doesn't yet hold a TabSession for. Surfacing it in
-            // the strip would require an "attach to existing tab"
-            // path through `TabSession.start` that skips the
-            // OpenTab RPC (since the daemon tab already exists) —
+            // Cross-client `tab.open` (e.g. `roostctl tab open`)
+            // produces a workspace tab the UI doesn't yet hold a
+            // TabSession for. Surfacing it in the strip would
+            // require an "attach to existing tab" path through
+            // `TabSession.start` that skips `LocalClient.openTab`
+            // (since the workspace tab already exists) — that's
             // separate-slice work. For now we drop the event.
-            // `Active` is daemon-driven active selection: the UI's
-            // local active state is authoritative within the UI,
-            // so we drop this too.
-            NSLog("roost-mac: watchEvents tab event ignored: %@", "\(kind)")
+            // `.active` is workspace-driven active-selection: the
+            // UI's local active state is authoritative within the
+            // UI, so we drop this too.
+            NSLog("roost-mac: tab event ignored: %@", "\(kind)")
         case .tabTitle(let e):
             // Phase 6a P6: OSC 0/1/2 changed a tab's title. Mirror
             // into the matching TabSession so rebuildTabBar uses
