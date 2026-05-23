@@ -1,0 +1,188 @@
+//! CLI-side target selection for `roostctl`.
+//!
+//! `roostctl` can dial either the Mac Swift UI or the GTK UI. With
+//! both running on the same Mac, the CLI needs to be told which to
+//! talk to. Resolution order (highest precedence first):
+//!
+//! 1. `--socket <path>` (explicit path).
+//! 2. `ROOST_SOCKET` env var.
+//! 3. `--target {mac,gtk}` shortcut (resolves to that profile's
+//!    canonical socket path).
+//! 4. `ROOST_BUNDLE_PROFILE` env var (same effect as `--target`).
+//! 5. Auto-detect: probe both known socket paths. If exactly one is
+//!    listening, use it. If both are listening, return
+//!    [`TargetError::Ambiguous`]. If neither, return
+//!    [`TargetError::NoLiveTarget`].
+//!
+//! The auto-detect probe must be cheap and fast — it's on the hot
+//! path for every CLI invocation. Implementation: `connect()` with a
+//! short timeout (~50ms per profile) and immediately close on
+//! success.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use tokio::net::UnixStream;
+use tokio::time::timeout;
+
+use crate::paths::{BundleProfile, BundleProfileKind};
+
+/// CLI inputs to target resolution. All fields optional.
+#[derive(Debug, Default, Clone)]
+pub struct TargetSelector {
+    /// `--socket <path>` value. Highest precedence.
+    pub socket_override: Option<PathBuf>,
+    /// `--target {mac,gtk}` value.
+    pub kind_override: Option<BundleProfileKind>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TargetError {
+    #[error(
+        "two Roost UIs are running (mac + gtk); pass --target mac|gtk or set \
+         ROOST_BUNDLE_PROFILE"
+    )]
+    Ambiguous,
+    #[error("no Roost UI is running (tried {tried:?})")]
+    NoLiveTarget { tried: Vec<PathBuf> },
+    #[error("path resolution failed: {0}")]
+    Path(#[from] anyhow::Error),
+}
+
+/// Resolved target — a socket path plus the profile kind that
+/// produced it (or `None` if the path came from `--socket` /
+/// `ROOST_SOCKET` directly).
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub socket_path: PathBuf,
+    pub kind: Option<BundleProfileKind>,
+}
+
+impl TargetSelector {
+    /// Resolve to a socket path.
+    ///
+    /// `probe_alive` controls whether the auto-detect step actually
+    /// dials the candidate sockets. Pass `true` for `roostctl`
+    /// commands that need to actually talk to a UI; pass `false` for
+    /// commands like `claude-hook session-start` that should exit 0
+    /// even when no UI is running (the hook silently no-ops).
+    pub async fn resolve(&self, probe_alive: bool) -> Result<ResolvedTarget, TargetError> {
+        // 1. --socket
+        if let Some(p) = &self.socket_override {
+            return Ok(ResolvedTarget {
+                socket_path: p.clone(),
+                kind: None,
+            });
+        }
+
+        // 2. ROOST_SOCKET
+        if let Some(env) = std::env::var_os("ROOST_SOCKET") {
+            let p = PathBuf::from(env);
+            if !p.as_os_str().is_empty() {
+                return Ok(ResolvedTarget {
+                    socket_path: p,
+                    kind: None,
+                });
+            }
+        }
+
+        // 3. --target
+        if let Some(kind) = self.kind_override {
+            let p = BundleProfile::for_kind(kind)?;
+            return Ok(ResolvedTarget {
+                socket_path: p.socket_path,
+                kind: Some(kind),
+            });
+        }
+
+        // 4. ROOST_BUNDLE_PROFILE
+        if let Ok(raw) = std::env::var("ROOST_BUNDLE_PROFILE") {
+            match raw.trim() {
+                "mac" => {
+                    let p = BundleProfile::for_kind(BundleProfileKind::Mac)?;
+                    return Ok(ResolvedTarget {
+                        socket_path: p.socket_path,
+                        kind: Some(BundleProfileKind::Mac),
+                    });
+                }
+                "gtk" => {
+                    let p = BundleProfile::for_kind(BundleProfileKind::Gtk)?;
+                    return Ok(ResolvedTarget {
+                        socket_path: p.socket_path,
+                        kind: Some(BundleProfileKind::Gtk),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // 5. Auto-detect.
+        let mac = BundleProfile::mac()?;
+        let gtk = BundleProfile::gtk()?;
+        let mac_path = mac.socket_path.clone();
+        let gtk_path = gtk.socket_path.clone();
+
+        if !probe_alive {
+            // Without a probe, prefer the Mac socket. Callers in
+            // probe_alive=false mode (Claude hooks) tolerate
+            // "no live target" silently — they just no-op when the
+            // dial fails downstream.
+            return Ok(ResolvedTarget {
+                socket_path: mac_path,
+                kind: Some(BundleProfileKind::Mac),
+            });
+        }
+
+        let mac_alive = probe_socket(&mac_path).await;
+        let gtk_alive = probe_socket(&gtk_path).await;
+        match (mac_alive, gtk_alive) {
+            (true, false) => Ok(ResolvedTarget {
+                socket_path: mac_path,
+                kind: Some(BundleProfileKind::Mac),
+            }),
+            (false, true) => Ok(ResolvedTarget {
+                socket_path: gtk_path,
+                kind: Some(BundleProfileKind::Gtk),
+            }),
+            (true, true) => Err(TargetError::Ambiguous),
+            (false, false) => Err(TargetError::NoLiveTarget {
+                tried: vec![mac_path, gtk_path],
+            }),
+        }
+    }
+}
+
+/// Cheap liveness probe — `connect` with a short timeout.
+async fn probe_socket(path: &std::path::Path) -> bool {
+    matches!(
+        timeout(Duration::from_millis(50), UnixStream::connect(path)).await,
+        Ok(Ok(_))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn probe_returns_false_for_missing_socket() {
+        // `/tmp/roost-ipc-test-missing-XXXX` is guaranteed to not
+        // exist; the probe should return false within the timeout.
+        let p = std::path::PathBuf::from(format!(
+            "/tmp/roost-ipc-test-missing-{}",
+            std::process::id()
+        ));
+        assert!(!probe_socket(&p).await);
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_path_short_circuits_resolution() {
+        let sel = TargetSelector {
+            socket_override: Some(PathBuf::from("/tmp/probe.sock")),
+            kind_override: None,
+        };
+        let res = sel.resolve(false).await.expect("resolve");
+        assert_eq!(res.socket_path, PathBuf::from("/tmp/probe.sock"));
+        assert_eq!(res.kind, None);
+    }
+}

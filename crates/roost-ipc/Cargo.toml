@@ -1,0 +1,33 @@
+[package]
+name          = "roost-ipc"
+version       = "0.1.0"
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+publish       = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core serde + JSON for the wire format.
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+
+# Base64 for binary-fidelity byte payloads.
+base64      = "0.22"
+
+# Async + UDS for framing and the (in-process) server/client.
+tokio       = { workspace = true }
+
+# Errors.
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+
+# Logging.
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3.10"

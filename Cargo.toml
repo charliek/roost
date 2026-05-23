@@ -16,6 +16,7 @@ resolver = "2"
 members = [
     "crates/roost-proto",
     "crates/roost-common",
+    "crates/roost-ipc",
     "crates/roost-vt",
     "crates/roost-osc",
     "crates/roost-core",
@@ -31,6 +32,7 @@ members = [
 default-members = [
     "crates/roost-proto",
     "crates/roost-common",
+    "crates/roost-ipc",
     "crates/roost-vt",
     "crates/roost-osc",
     "crates/roost-core",
