@@ -1,43 +1,32 @@
 // swift-tools-version: 6.0
 //
-// Roost Mac UI — Phase 2 SwiftPM skeleton.
+// Roost Mac UI — daemon-removal refactor (M4b3b onwards).
 //
-// This package builds the Swift Mac client as an executable. Phase 5
-// converts it to an Xcode project for proper .app bundling + notarization;
-// for the skeleton stage SwiftPM is the simplest CI-friendly path.
-//
-// Dependencies are declared on grpc-swift v2 + the NIO HTTP/2 transport so
-// the Mac CI job exercises full Swift package resolution. Swift bindings
-// for the proto schema are generated at every `swift build` by the
-// `GRPCSwiftProtobufGenerator` SwiftPM build plugin from
-// `grpc-swift-protobuf` — see Sources/Roost/Proto/ for the symlinked
-// .proto and the plugin's config. Nothing generated lives in VCS.
+// Phase 2 set this up as a SwiftPM skeleton that pulled in
+// grpc-swift v2 + grpc-swift-protobuf + grpc-swift-nio-transport +
+// the GRPCProtobufGenerator plugin so the UI could dial the
+// `roost-core` daemon over a Unix-domain socket. M4b3b ripped the
+// gRPC stack out: the workspace, PTY supervisor, and IPC server
+// all live in-process, and the JSON IPC server (Sources/Roost/
+// IPCServer.swift) serves any external clients (roostctl, Claude
+// hooks). No proto codegen, no daemon dependency, no `protoc`
+// precheck — `swift build` works against a stock toolchain.
 
 import PackageDescription
 
 let package = Package(
     name: "Roost",
     platforms: [
-        // grpc-swift-nio-transport's HTTP2ClientTransport.Posix +
-        // .unixDomainSocket(path:) target are gated to macOS 15+.
-        // Bumping the minimum platform is cheaper than scattering
-        // `@available(macOS 15, *)` annotations across every call site.
+        // Tier-1 macOS for the in-process Workspace + AppKit
+        // ergonomics. Bumping the minimum platform is cheaper than
+        // scattering `@available(macOS 15, *)` annotations across
+        // every call site.
         .macOS(.v15),
     ],
     products: [
         .executable(name: "Roost", targets: ["Roost"]),
     ],
-    dependencies: [
-        // grpc-swift v2 lives across three packages. Note the `-2` suffix
-        // on the core URL — `https://github.com/grpc/grpc-swift.git`
-        // (without the suffix) still points at v1, and pulling both
-        // results in SwiftPM's "multiple similar targets" duplication
-        // error since the product names overlap. Lock to the 2.x line.
-        .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.0.0"),
-        .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", from: "2.0.0"),
-        .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.0.0"),
-        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.27.0"),
-    ],
+    dependencies: [],
     targets: [
         // libghostty-vt's C API exposed to Swift as `CGhosttyVT`.
         //
@@ -83,21 +72,16 @@ let package = Package(
             name: "Roost",
             dependencies: [
                 .target(name: "CGhosttyVT"),
-                .product(name: "GRPCCore", package: "grpc-swift-2"),
-                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
-                // Posix variant is the one that exposes Unix-domain-socket
-                // targets (`HTTP2ClientTransport.Posix(target:
-                // .unixDomainSocket(...), ...)`). The TransportServices
-                // variant — Apple's Network.framework backend — doesn't
-                // support UDS.
-                .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
-                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             path: "Sources/Roost",
             exclude: [
-                // Phase 5 adds the AppKit window + cell renderer; .xib /
-                // .storyboard resources will land in this exclude list when
-                // they do.
+                // Phase 2 stub directory for the grpc-swift-protobuf
+                // generator plugin. M4b3b removed the plugin; the
+                // directory is empty (or holds a dangling symlink
+                // from the gRPC era). Excluded explicitly so SwiftPM
+                // doesn't trip on the leftover artifacts in a stale
+                // checkout. The directory itself is deleted by M4b3b
+                // in the same commit.
             ],
             // Phase 6a M6: bundled theme files lifted from the Go binary
             // at `cmd/roost/themes/`. SwiftPM exposes them via
@@ -127,21 +111,6 @@ let package = Package(
             // static linking and side-steps dyld entirely.
             linkerSettings: [
                 .unsafeFlags(["../third_party/ghostty/out/lib/libghostty-vt.a"]),
-            ],
-            plugins: [
-                // Generates Swift bindings + client stubs from
-                // Sources/Roost/Proto/roost.proto (a symlink to the
-                // canonical proto/roost.proto at the repo root) at
-                // `swift build` time. Configured by
-                // Sources/Roost/Proto/grpc-swift-proto-generator-config.json
-                // (note the `-swift-` infix — the plugin target is
-                // `GRPCProtobufGenerator` but the config filename
-                // it scans for is `grpc-swift-proto-generator-config.json`,
-                // a deliberate decoupling on the plugin author's side).
-                .plugin(
-                    name: "GRPCProtobufGenerator",
-                    package: "grpc-swift-protobuf"
-                ),
             ]
         ),
         .testTarget(

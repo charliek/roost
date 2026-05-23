@@ -182,12 +182,6 @@ jobs:
       - name: Show Swift toolchain
         run: swift --version
 
-      - name: Install protoc
-        # GRPCProtobufGenerator's deriveProtocPath() needs a real protoc
-        # binary to run — the SwiftPM-bundled tooling produces only
-        # protoc-gen-swift / protoc-gen-grpc-swift-2 (the plugin half).
-        run: brew install protobuf
-
       - uses: jdx/mise-action@v2
 
       - name: Cache vendored libghostty-vt
@@ -230,18 +224,9 @@ jobs:
       # steps that may need their own time-boxing when they land, but
       # baseline `swift build` + `swift test` should always be blocking
       # — they're the cross-platform contract on the Mac side.
-      #
-      # PROTOC_PATH is honored by GRPCProtobufGenerator's discovery
-      # function (PluginsShared/PluginUtils.swift::deriveProtocPath) when
-      # the plugin can't find protoc via SwiftPM's tool registry —
-      # which is the case for any system-installed protoc since SwiftPM
-      # only resolves tools that are package-graph products or binary
-      # targets. We point it at whatever `brew install protobuf` put on
-      # PATH so this works on both arm64 (/opt/homebrew/bin) and Intel
-      # (/usr/local/bin) macOS runners.
       - name: swift build
         working-directory: mac
-        run: PROTOC_PATH="$(which protoc)" swift build -v
+        run: swift build -v
 
       # Mirrors the macOS regression guard in ci.yml for the legacy Go
       # binary: zig's libghostty-vt build emits both a static archive
@@ -273,7 +258,7 @@ jobs:
       # unset, so the live-daemon test method no-ops itself.
       - name: swift test
         working-directory: mac
-        run: PROTOC_PATH="$(which protoc)" swift test
+        run: swift test
 
   # Phase 6a M8: gtk4-rs + libadwaita-rs build. Lives in
   # crates/roost-linux/, excluded from `default-members` in

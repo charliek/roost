@@ -751,10 +751,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 let stream = watchEvents(socketPath: socketPath)
                 for await event in stream {
                     if Task.isCancelled { return }
-                    let kind = event.kind
                     await MainActor.run { [weak self] in
-                        guard let self else { return }
-                        if let kind { self.handleEvent(kind) }
+                        self?.handleEvent(event)
                     }
                 }
                 // Stream ended — resync from scratch and try again.
@@ -842,7 +840,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// milestones (M3 tab strip, Phase 6b notifications) light up
     /// the remaining cases.
     @MainActor
-    private func handleEvent(_ kind: Roost_V1_Event.OneOf_Kind) {
+    private func handleEvent(_ kind: RoostEvent) {
         switch kind {
         case .projectCreated(let e):
             let p = e.project
@@ -991,7 +989,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // already aggregates per-tab; per-project rollup
             // happens in `pillBadgeForProject` at render time.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
-                session.liveHasNotification = e.hasPending_p
+                session.liveHasNotification = e.hasPending
                 if session.projectID == activeProjectID {
                     rebuildTabBar()
                 }

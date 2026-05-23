@@ -69,17 +69,6 @@ if [ ! -f "${REPO_ROOT}/third_party/ghostty/out/lib/libghostty-vt.a" ]; then
   exit 1
 fi
 
-# `protoc` has to be discoverable for `GRPCProtobufGenerator` — the
-# Mac README enforces the same env var when calling `swift run`.
-if [ -z "${PROTOC_PATH:-}" ]; then
-  if command -v protoc >/dev/null 2>&1; then
-    export PROTOC_PATH="$(command -v protoc)"
-  else
-    echo "error: protoc not found. Install via: brew install protobuf" >&2
-    exit 1
-  fi
-fi
-
 echo "==> Building Roost (${CONFIG}) from SwiftPM"
 pushd "${MAC_DIR}" >/dev/null
 swift build -c "${CONFIG}" --product Roost
@@ -114,8 +103,6 @@ printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 # Resource bundles SwiftPM emits — Bundle.module reads from these,
 # so the .app needs to ship them alongside the binary. The
 # `Roost_Roost.bundle` carries our theme files (Resources/themes/).
-# `swift-crypto_*` bundles ship with the gRPC SSL deps; benign to
-# include and missing them produces a runtime error inside grpc.
 echo "==> Copying SwiftPM resource bundles"
 BUILD_BUNDLES_DIR="${MAC_DIR}/.build/arm64-apple-macosx/${CONFIG}"
 for bundle in "${BUILD_BUNDLES_DIR}"/*.bundle; do
