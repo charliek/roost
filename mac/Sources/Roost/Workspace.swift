@@ -209,9 +209,17 @@ final class Workspace {
 
         var activeChanged = false
         if activeProjectID == projectID || cascaded.contains(activeTabID) {
-            let fallbackProject = projects.keys.sorted().first ?? 0
+            // Pick the first project + its first tab IN DISPLAY ORDER,
+            // not by id. Falling back by id ignores user-driven
+            // sidebar reorders; CR-flagged on PR #78.
+            let fallbackProject = projects.values
+                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+                .first
+                .map { $0.id } ?? 0
             let fallbackTab = tabs.values
-                .first { $0.projectId == fallbackProject }
+                .filter { $0.projectId == fallbackProject }
+                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+                .first
                 .map { $0.id } ?? 0
             activeProjectID = fallbackProject
             activeTabID = fallbackTab
@@ -319,9 +327,13 @@ final class Workspace {
         }
         var activeChanged = false
         if activeTabID == tabID {
-            let next = tabs.values
-                .first { $0.projectId == row.projectId }
-                ?? tabs.values.first
+            // Pick the next tab in DISPLAY ORDER (position-sorted),
+            // not dictionary order. CR-flagged on PR #78.
+            let siblingsInProject = tabs.values
+                .filter { $0.projectId == row.projectId }
+                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+            let next = siblingsInProject.first
+                ?? tabs.values.sorted { ($0.position, $0.id) < ($1.position, $1.id) }.first
             activeProjectID = next?.projectId ?? row.projectId
             activeTabID = next?.id ?? 0
             activeChanged = true
@@ -475,7 +487,13 @@ final class Workspace {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(snapshot) + Data([0x0a])
-        // Write + fsync.
+        // Remove any stale tmp so a shorter new JSON can't leave
+        // trailing bytes from a previous attempt — CR-flagged on
+        // PR #78. The rename below is atomic, so the only window
+        // where a half-written tmp could be promoted is between
+        // writeFile and rename in the next write cycle. Truncating
+        // first eliminates that window.
+        try? FileManager.default.removeItem(at: tmp)
         FileManager.default.createFile(atPath: tmp.path, contents: nil)
         let handle = try FileHandle(forWritingTo: tmp)
         try handle.write(contentsOf: data)

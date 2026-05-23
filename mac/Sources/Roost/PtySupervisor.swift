@@ -133,17 +133,6 @@ final class PtySupervisor {
         let cwdCopy = strdup(cwd)
         let cArgv = buildArgv(argv: argv)
         let cEnv = buildEnv(tabID: tabID, socketPath: socketPath)
-        defer {
-            // The parent process leaks these buffers — we don't
-            // call free() because libc owns the strings post-fork
-            // and the parent has no further use for them. Keeping
-            // them alive until execve is the safe choice; total
-            // leak per spawn is ~few KiB. Real cleanup would
-            // require a custom child-side execve wrapper that
-            // releases after success, but that adds complexity
-            // for no observable benefit.
-            _ = (cwdCopy, cArgv, cEnv)
-        }
 
         // forkpty allocates a PTY, forks, and dup2()s the slave
         // onto stdin/stdout/stderr in the child. We supply the
@@ -151,6 +140,9 @@ final class PtySupervisor {
         var masterFD: Int32 = -1
         let pid = forkpty(&masterFD, nil, nil, &winsize)
         if pid < 0 {
+            freeNullTerminated(cArgv)
+            freeNullTerminated(cEnv)
+            free(cwdCopy)
             throw PtyError.forkpty(errno: errno)
         }
 
@@ -158,6 +150,11 @@ final class PtySupervisor {
             // CHILD: chdir + execve. ONLY async-signal-safe
             // calls here. No Swift String / Dictionary / new
             // allocations until execve replaces the image.
+            // The child inherited the parent's COW pages, so
+            // `cwdCopy` / `cArgv` / `cEnv` are valid pointers
+            // into the child's own address space. We don't free
+            // them in the child — execve replaces the whole
+            // image including the heap.
             if let cwdCopy = cwdCopy, cwdCopy.pointee != 0 {
                 _ = Darwin.chdir(cwdCopy)
             }
@@ -168,6 +165,14 @@ final class PtySupervisor {
             // "command not found").
             _exit(127)
         }
+
+        // PARENT: free our copies of argv/env/cwd. The child has
+        // its own COW pages so the parent's free here doesn't
+        // affect it — and execve replaces the child's image
+        // anyway shortly. CR-flagged leak on PR #78.
+        freeNullTerminated(cArgv)
+        freeNullTerminated(cEnv)
+        free(cwdCopy)
 
         // PARENT: install the read source on a background queue,
         // hop to main for every chunk + exit.
@@ -284,38 +289,42 @@ final class PtySupervisor {
     }
 
     private func teardown(session: Session, tabID: Int64) {
+        // The blocking reap loop (waitpid + usleep) used to run
+        // inline on `@MainActor`, which would freeze the GTK/AppKit
+        // main loop for up to ~200ms (or longer if a SIGKILL
+        // fallback is needed). Move it to a background DispatchQueue
+        // and hop back to the main actor to emit `tabExited`.
+        // CR-flagged on PR #78.
         session.source.cancel()
-        // SIGHUP first — the conventional "controlling terminal
-        // went away" signal that well-behaved shells respect.
-        kill(session.childPID, SIGHUP)
-        var status: Int32 = 0
-        var reaped = false
-        // Brief polling waitpid loop. 200ms total cap; on most
-        // shells the SIGHUP closes them in <10ms.
-        for _ in 0..<20 {
-            let rc = waitpid(session.childPID, &status, WNOHANG)
-            if rc == session.childPID {
-                reaped = true
-                break
+        let masterFD = session.masterFD
+        let childPID = session.childPID
+        let supervisor = self
+        DispatchQueue.global(qos: .userInitiated).async {
+            kill(childPID, SIGHUP)
+            var status: Int32 = 0
+            var reaped = false
+            for _ in 0..<20 {
+                let rc = waitpid(childPID, &status, WNOHANG)
+                if rc == childPID {
+                    reaped = true
+                    break
+                }
+                if rc < 0 && errno == ECHILD {
+                    reaped = true
+                    break
+                }
+                usleep(10_000)
             }
-            if rc < 0 && errno == ECHILD {
-                // Already reaped (likely by the read-source EOF
-                // path). Treat as success.
-                reaped = true
-                break
+            if !reaped {
+                kill(childPID, SIGKILL)
+                waitpid(childPID, &status, 0)
             }
-            // 10ms sleep.
-            usleep(10_000)
+            Darwin.close(masterFD)
+            let exit = exitStatus(status)
+            Task { @MainActor in
+                supervisor.emit(.tabExited(tabID: tabID, status: exit))
+            }
         }
-        if !reaped {
-            // SIGKILL fallback. Blocking waitpid this time since
-            // SIGKILL is uninterruptible.
-            kill(session.childPID, SIGKILL)
-            waitpid(session.childPID, &status, 0)
-        }
-        Darwin.close(session.masterFD)
-        let exit = exitStatus(status)
-        emit(.tabExited(tabID: tabID, status: exit))
     }
 
     /// Build the NULL-terminated argv array. Empty input falls
@@ -378,4 +387,13 @@ private func strerrorString(_ code: Int32) -> String {
         return s
     }
     return "errno \(code)"
+}
+
+/// Free each `strdup`'d entry in a NULL-terminated argv/env
+/// array. The terminator nil itself isn't freed — it's just an
+/// `Optional<UnsafeMutablePointer<CChar>>` sentinel.
+private func freeNullTerminated(_ buf: [UnsafeMutablePointer<CChar>?]) {
+    for ptr in buf {
+        if let ptr = ptr { free(ptr) }
+    }
 }

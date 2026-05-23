@@ -106,9 +106,21 @@ async fn dispatch(
                 .map_err(ws_err)?;
             // Spawn the PTY. Use the tab's cwd, the requested argv,
             // and a sensible default winsize when the caller doesn't
-            // provide one.
-            let cols = if p.cols == 0 { 80 } else { p.cols as u16 };
-            let rows = if p.rows == 0 { 24 } else { p.rows as u16 };
+            // provide one. Reject out-of-range cols/rows with
+            // `invalid-param` instead of silently truncating —
+            // CR-flagged on PR #78.
+            let cols = if p.cols == 0 {
+                80u16
+            } else {
+                u16::try_from(p.cols)
+                    .map_err(|_| HandlerError::invalid_param("cols out of u16 range"))?
+            };
+            let rows = if p.rows == 0 {
+                24u16
+            } else {
+                u16::try_from(p.rows)
+                    .map_err(|_| HandlerError::invalid_param("rows out of u16 range"))?
+            };
             if let Err(err) =
                 h.supervisor
                     .spawn(tab.id, &tab.cwd, &p.argv, cols, rows, &h.socket_path)
@@ -156,8 +168,12 @@ async fn dispatch(
         }
         ops::TAB_RESIZE => {
             let p: TabResizeParams = decode(params)?;
+            let cols = u16::try_from(p.cols)
+                .map_err(|_| HandlerError::invalid_param("cols out of u16 range"))?;
+            let rows = u16::try_from(p.rows)
+                .map_err(|_| HandlerError::invalid_param("rows out of u16 range"))?;
             h.supervisor
-                .resize(p.tab_id, p.cols as u16, p.rows as u16)
+                .resize(p.tab_id, cols, rows)
                 .await
                 .map_err(pty_err)?;
             Ok(serde_json::json!({}))
