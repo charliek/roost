@@ -164,19 +164,30 @@ fn resolve_paths(_app_label: &str) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)
     };
     let state = match xdg_data_home() {
         Some(dir) => dir.join("roost"),
-        None => {
-            let home = std::env::var_os("HOME").context("$HOME not set")?;
-            PathBuf::from(home).join(".local/share/roost")
-        }
+        None => valid_home()?.join(".local/share/roost"),
     };
     let log = match xdg_state_home() {
         Some(dir) => dir.join("roost"),
-        None => {
-            let home = std::env::var_os("HOME").context("$HOME not set")?;
-            PathBuf::from(home).join(".local/state/roost")
-        }
+        None => valid_home()?.join(".local/state/roost"),
     };
     Ok((socket, state, log))
+}
+
+/// Read `$HOME` and ensure it's non-empty and absolute. The plain
+/// `std::env::var_os` would silently yield `""` or a relative path
+/// from a misconfigured launchd / container env, producing unusable
+/// paths like `.local/share/roost` (no leading slash).
+#[cfg(not(target_os = "macos"))]
+fn valid_home() -> anyhow::Result<PathBuf> {
+    let raw = std::env::var_os("HOME").context("$HOME not set")?;
+    let p = PathBuf::from(&raw);
+    if p.as_os_str().is_empty() || !p.is_absolute() {
+        anyhow::bail!(
+            "$HOME is not an absolute non-empty path (got {:?})",
+            raw
+        );
+    }
+    Ok(p)
 }
 
 #[cfg(not(target_os = "macos"))]

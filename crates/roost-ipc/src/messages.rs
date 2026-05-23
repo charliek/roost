@@ -154,8 +154,14 @@ impl Response {
 /// `events.subscribe`. (`events.subscribe` is stubbed in M0 — it
 /// replies success but the server never emits events on the
 /// connection. M2 wires up the type system; M3+ implement the push.)
+///
+/// Permissive by default (no `deny_unknown_fields`) so future
+/// server-side additions to the event envelope itself don't break
+/// older clients. The inner `data` is a free-form `Value` so
+/// per-event additions are already forward-compatible. The
+/// server-side strictness lives on the *request* path, not on the
+/// event-push path which is server→client only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EventEnvelope {
     pub event: String,
     pub data: serde_json::Value,
@@ -690,8 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn event_envelope_rejects_unknown_fields() {
-        let bad = r#"{"event":"tab.opened","data":{},"extra":1}"#;
-        assert!(serde_json::from_str::<EventEnvelope>(bad).is_err());
+    fn event_envelope_is_permissive_to_unknown_top_level_fields() {
+        // EventEnvelope is server→client only; clients should ignore
+        // unknown top-level fields so the server can add new fields
+        // forward-compatibly. Server-side strictness lives on the
+        // request path, not here.
+        let extra = r#"{"event":"tab.opened","data":{},"extra":1}"#;
+        let parsed: EventEnvelope = serde_json::from_str(extra).unwrap();
+        assert_eq!(parsed.event, "tab.opened");
     }
 }

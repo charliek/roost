@@ -68,9 +68,34 @@ fn every_vector_round_trips_through_serde_json() {
                 continue;
             }
         };
-        let re_encoded = serde_json::to_value(&value).expect("re-encode");
-        if re_encoded != value {
-            errors.push(format!("{}: round-trip drift", path.display()));
+        // Actually exercise the serializer: encode the parsed Value
+        // back to compact JSON (the wire form), parse it again, and
+        // assert the two parses are semantically equal. This catches
+        // any value that round-trips lossy through the serializer
+        // (e.g. NaN/Infinity, which serde_json rejects at encode
+        // time). Byte-equal vs. the source file would require the
+        // fixtures to be in the canonical compact wire form, but
+        // they're intentionally pretty-printed for human readers —
+        // semantic equality is the meaningful contract for the IPC.
+        let encoded = match serde_json::to_string(&value) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("{}: re-encode: {e}", path.display()));
+                continue;
+            }
+        };
+        let reparsed: serde_json::Value = match serde_json::from_str(&encoded) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(format!("{}: re-parse after encode: {e}", path.display()));
+                continue;
+            }
+        };
+        if reparsed != value {
+            errors.push(format!(
+                "{}: decode→encode→decode drift",
+                path.display()
+            ));
         }
     }
     if !errors.is_empty() {

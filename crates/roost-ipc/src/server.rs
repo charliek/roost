@@ -171,8 +171,25 @@ async fn serve_connection<H: Handler>(stream: UnixStream, handler: Arc<H>) -> Re
         let body = match serde_json::to_vec(&response) {
             Ok(b) => b,
             Err(e) => {
-                warn!(error = %e, "failed to serialize response");
-                continue;
+                // Surface the failure to the client rather than
+                // dropping the request on the floor — the original
+                // handler result was unrepresentable (e.g. a value
+                // containing a non-finite float), but the client
+                // still deserves a reply at this id so its read
+                // loop unblocks.
+                warn!(error = %e, id, op = %op, "response serialization failed; sending fallback");
+                let fallback = Response::err(
+                    id,
+                    "internal",
+                    format!("response serialization failed: {e}"),
+                );
+                match serde_json::to_vec(&fallback) {
+                    Ok(b) => b,
+                    Err(e2) => {
+                        warn!(error = %e2, id, "fallback response also failed to serialize; closing connection");
+                        return Ok(());
+                    }
+                }
             }
         };
         write_frame(&mut w, &body).await?;

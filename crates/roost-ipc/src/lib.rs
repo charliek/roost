@@ -65,15 +65,27 @@ pub enum Error {
 
 impl Error {
     /// Stable kebab-case code surfaced over the wire in the response
-    /// envelope's `error.code` field.
+    /// envelope's `error.code` field. Every value here MUST appear in
+    /// the published catalogue in `docs/reference/ipc.md`; undocumented
+    /// codes are collapsed to one of the documented ones rather than
+    /// leaked to clients.
+    ///
+    /// Io / UnexpectedEof → `internal` because a transport-level failure
+    /// is almost always going to close the connection too — the code is
+    /// only useful for debugging in logs, and `internal` is the catch-
+    /// all the spec already documents.
+    ///
+    /// InvalidId → `invalid-param`. The id is a request parameter (the
+    /// envelope's `id` field); `invalid-param` is the documented code
+    /// for malformed input.
     pub fn code(&self) -> &'static str {
         match self {
             Error::FrameTooLarge => "frame-too-large",
             Error::Parse(_) => "parse-error",
-            Error::Io(_) => "io-error",
-            Error::UnexpectedEof => "io-error",
+            Error::Io(_) => "internal",
+            Error::UnexpectedEof => "internal",
             Error::UnknownOp(_) => "unknown-op",
-            Error::InvalidId(_) => "invalid-id",
+            Error::InvalidId(_) => "invalid-param",
         }
     }
 }
