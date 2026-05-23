@@ -116,9 +116,20 @@ async fn dispatch(
                 // PTY spawn failed — roll back the tab so the
                 // workspace doesn't carry a phantom.
                 let _ = h.workspace.close_tab(tab.id);
+                // A `Cancelled` here means the user (or another
+                // caller) closed the same tab id between our
+                // workspace insert and the supervisor's promote.
+                // Surface that as `not-found` so the client sees
+                // the same code as any other "tab gone" path
+                // rather than misclassifying it as a server fault.
+                if let Some(crate::daemon::PtyError::Cancelled(_)) =
+                    err.downcast_ref::<crate::daemon::PtyError>()
+                {
+                    return Err(HandlerError::not_found(err.to_string()));
+                }
                 return Err(HandlerError::new(
                     "internal",
-                    format!("pty spawn failed: {err:?}"),
+                    format!("pty spawn failed: {err}"),
                 ));
             }
             encode(&TabOpenResult { tab })
