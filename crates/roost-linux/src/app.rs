@@ -1288,6 +1288,12 @@ impl App {
         let project_id = tab.project_id;
         let terminal_for_drain = terminal.clone();
         let tab_cwd = tab.cwd.clone();
+        // Carry the snapshot's accumulated metadata onto the attach so
+        // a resync (or any non-fresh tab) reflects ground truth. Fresh
+        // tabs from `tab.open` carry defaults, so this is a no-op there.
+        let tab_state = TabState::from_ipc(tab.state);
+        let tab_has_notification = tab.has_notification;
+        let tab_hook_active = tab.hook_active;
         let page_for_cleanup = page.clone();
         glib::spawn_future_local(async move {
             // Helper that clears the pending-attach marker AND tears
@@ -1350,16 +1356,23 @@ impl App {
                         session: session.clone(),
                         page: page_for_future.clone(),
                         cwd: RefCell::new(tab_cwd),
-                        // Fresh tabs start in `None` until the daemon
-                        // emits a `TabStateChangedEvent`. `hook_active`
-                        // defaults to false; the daemon owns that flag
-                        // and broadcasts changes via `HookActiveChangedEvent`.
-                        state: RefCell::new(TabState::None),
-                        hook_active: RefCell::new(false),
+                        // Seeded from the snapshot `Tab`: fresh tabs from
+                        // `tab.open` carry `None` / `false`; a resync
+                        // carries the accumulated state. Subsequent
+                        // `TabStateChanged` / `HookActiveChanged` events
+                        // keep these current.
+                        state: RefCell::new(tab_state),
+                        hook_active: RefCell::new(tab_hook_active),
                     },
                 );
             }
             drop(projects);
+            // Reflect the snapshot's indicator / attention state on the
+            // freshly-attached page (no-op for fresh tabs), then refresh
+            // the rollup so a restored notification/state shows up.
+            apply_indicator_icon(&page_for_future, tab_state);
+            page_for_future.set_needs_attention(tab_has_notification);
+            app_for_attach.refresh_rollup_for(project_id);
             // Update the headerbar subtitle if this tab belongs to
             // the active project; cheap idempotent refresh.
             app_for_attach.refresh_window_subtitle();
@@ -1704,6 +1717,25 @@ impl App {
                 .find(|t| t.id == *tid)
             {
                 self.attach_existing_tab(tab.clone());
+            }
+        }
+
+        // 5.5 Sync surviving projects' names (a dropped ProjectRenamed
+        //     would otherwise leave the sidebar label stale). Mirrors
+        //     the `ProjectRenamed` arm.
+        {
+            let active = *self.active_project_id.borrow();
+            let mut projects = self.projects.borrow_mut();
+            for project in &snapshot {
+                if let Some(ui) = projects.get_mut(&project.id) {
+                    if ui.name != project.name {
+                        ui.name = project.name.clone();
+                        ui.sidebar_label.set_text(&project.name);
+                        if active == project.id {
+                            self.window_title.set_title(&project.name);
+                        }
+                    }
+                }
             }
         }
 
