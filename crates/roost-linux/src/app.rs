@@ -1594,6 +1594,17 @@ impl App {
                     }
                 }
             }
+            WorkspaceEvent::TabsReordered { .. } | WorkspaceEvent::ProjectsReordered { .. } => {
+                // M9 polish: reorder events are emitted by the
+                // workspace post-mutation, but the GTK UI's own
+                // drag-reorder path already updates the AdwTabBar /
+                // sidebar inline before firing the `reorder_tabs` /
+                // `reorder_projects` RPC. Cross-client convergence
+                // (e.g. `roostctl tab reorder` from another shell)
+                // is a follow-up slice — for now we drop these
+                // events on the UI side rather than risk
+                // double-applying a local reorder.
+            }
         }
     }
 

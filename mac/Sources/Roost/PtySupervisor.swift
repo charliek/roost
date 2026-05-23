@@ -256,18 +256,40 @@ final class PtySupervisor {
         // boundary-crossing runtime check, and the iteration body
         // runs on main where `emit` and `reapAndCleanup` belong.
         let drainTask = Task { @MainActor [weak self] in
+            // `emittedExit` guards against double `.tabExited`
+            // emission when both an EOF and a teardown-initiated
+            // forced exit race onto the stream. AsyncStream
+            // guarantees FIFO delivery of yields, so the drain
+            // can simply remember whether it already saw a
+            // terminal event. Without this guard, sub-agent
+            // review of M6-M9 flagged the scenario where the
+            // read source yields `.eof`, the drain processes it
+            // (reapAndCleanup emits `.tabExited(status: 0)`),
+            // and a subsequent teardown's bg-reap yield of
+            // `.forcedExit(-1)` would emit a second
+            // `.tabExited(-1)`.
+            var emittedExit = false
             for await event in signalStream {
                 guard let self else { return }
                 switch event {
                 case .bytes(let data):
                     self.emit(.bytes(tabID: tabID, data: data))
                 case .eof, .readError:
-                    self.reapAndCleanup(tabID: tabID, expectedPID: pid)
+                    // reapAndCleanup returns true iff it emitted
+                    // `.tabExited` (false when the session was
+                    // already removed by a racing close()).
+                    if self.reapAndCleanup(tabID: tabID, expectedPID: pid) {
+                        emittedExit = true
+                    }
                 case .forcedExit(let status):
-                    // teardown() already removed the session from
-                    // the map and reaped the child; we just need to
-                    // emit so subscribers see the close.
-                    self.emit(.tabExited(tabID: tabID, status: status))
+                    // teardown() already removed the session
+                    // from the map and reaped the child; emit so
+                    // subscribers see the close — but only if a
+                    // racing EOF didn't already emit.
+                    if !emittedExit {
+                        self.emit(.tabExited(tabID: tabID, status: status))
+                        emittedExit = true
+                    }
                 }
             }
         }
@@ -405,14 +427,19 @@ final class PtySupervisor {
 
     // MARK: Internal
 
-    private func reapAndCleanup(tabID: Int64, expectedPID: pid_t) {
+    /// Returns true iff this call actually emitted `.tabExited`
+    /// (and therefore the caller should consider the exit signal
+    /// "delivered" for double-emit suppression).
+    @discardableResult
+    private func reapAndCleanup(tabID: Int64, expectedPID: pid_t) -> Bool {
         guard let session = sessions[tabID], session.childPID == expectedPID else {
-            return
+            return false
         }
         sessions.removeValue(forKey: tabID)
         let status = reapChild(pid: expectedPID)
         Darwin.close(session.masterFD)
         emit(.tabExited(tabID: tabID, status: status))
+        return true
     }
 
     private func teardown(session: Session, tabID: Int64) {

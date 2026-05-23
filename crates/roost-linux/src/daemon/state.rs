@@ -111,6 +111,19 @@ pub enum WorkspaceEvent {
         title: String,
         body: String,
     },
+    /// Fired after `reorder_tabs`. `tab_ids` is the post-reorder
+    /// display order — the supplied prefix followed by any
+    /// unlisted siblings in their prior position order. Mirrors
+    /// the Mac side's `Workspace.Event.tabsReordered`.
+    TabsReordered {
+        project_id: i64,
+        tab_ids: Vec<i64>,
+    },
+    /// Fired after `reorder_projects`. `project_ids` is the
+    /// post-reorder sidebar order.
+    ProjectsReordered {
+        project_ids: Vec<i64>,
+    },
 }
 
 pub struct Workspace {
@@ -681,15 +694,23 @@ impl Workspace {
             .map(|t| t.id)
             .collect();
         unlisted.sort_by_key(|tid| inner.tabs.get(tid).map(|r| r.position).unwrap_or(0));
-        for tid in unlisted {
-            if let Some(row) = inner.tabs.get_mut(&tid) {
+        for tid in &unlisted {
+            if let Some(row) = inner.tabs.get_mut(tid) {
                 row.position = next_pos;
                 next_pos += 1;
             }
         }
+        // Compute the full post-reorder order for the event
+        // payload: supplied prefix + sorted unlisted (matches
+        // Mac's `Workspace.tabsReordered` payload shape).
+        let final_order: Vec<i64> = tab_ids.iter().copied().chain(unlisted.into_iter()).collect();
         let snapshot = inner.snapshot_for_persist();
         drop(inner);
         self.persist_async(snapshot);
+        let _ = self.events.send(WorkspaceEvent::TabsReordered {
+            project_id,
+            tab_ids: final_order,
+        });
         Ok(())
     }
 
@@ -714,15 +735,23 @@ impl Workspace {
             .map(|p| p.id)
             .collect();
         unlisted.sort_by_key(|pid| inner.projects.get(pid).map(|r| r.position).unwrap_or(0));
-        for pid in unlisted {
-            if let Some(row) = inner.projects.get_mut(&pid) {
+        for pid in &unlisted {
+            if let Some(row) = inner.projects.get_mut(pid) {
                 row.position = next_pos;
                 next_pos += 1;
             }
         }
+        let final_order: Vec<i64> = project_ids
+            .iter()
+            .copied()
+            .chain(unlisted.into_iter())
+            .collect();
         let snapshot = inner.snapshot_for_persist();
         drop(inner);
         self.persist_async(snapshot);
+        let _ = self.events.send(WorkspaceEvent::ProjectsReordered {
+            project_ids: final_order,
+        });
         Ok(())
     }
 

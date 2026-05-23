@@ -149,24 +149,42 @@ cp "${ROOSTCTL_SRC}" "${APP_DIR}/Contents/Resources/bin/roostctl"
 chmod +x "${APP_DIR}/Contents/Resources/bin/roostctl"
 echo "    Embedded: ${APP_DIR}/Contents/Resources/bin/roostctl"
 
-# Phase 8 (notarization) will replace these ad-hoc signatures with
-# Developer-ID-signed binaries + a notarized DMG. Until then we
-# ad-hoc sign with the embedded entitlements so the local launcher
-# stack at least sees a consistent signature pair on the .app and
+# Phase 8 (notarization) will replace these ad-hoc signatures
+# with Developer-ID-signed binaries + a notarized DMG. Until then
+# we ad-hoc sign with the embedded entitlements so the local
+# launcher stack sees a consistent signature pair on the .app and
 # the embedded helper.
+#
+# Failure handling: a botched signature is a release-blocking
+# issue (Gatekeeper rejects the app, notarization will fail,
+# user-installed copies can become quarantined). Default is fail
+# hard; the `ROOST_ALLOW_UNSIGNED=1` env var bypasses for the
+# rare dev case where Xcode CLT codesign is missing. Sub-agent
+# review flagged that the prior `|| echo warn ... (continuing)`
+# silently masked CI signature regressions.
 ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
 if command -v codesign >/dev/null 2>&1 && [ -f "${ENT_FILE}" ]; then
   echo "==> Ad-hoc codesign (Phase 8 will replace with Developer ID)"
-  codesign --force --sign - \
-    --entitlements "${ENT_FILE}" \
-    --options runtime \
-    "${APP_DIR}/Contents/Resources/bin/roostctl" 2>/dev/null || \
-    echo "    warn: failed to sign embedded roostctl (continuing)"
-  codesign --force --sign - \
-    --entitlements "${ENT_FILE}" \
-    --options runtime \
-    "${APP_DIR}" 2>/dev/null || \
-    echo "    warn: failed to sign Roost.app (continuing)"
+  codesign_or_die() {
+    local target="$1"
+    if codesign --force --sign - \
+         --entitlements "${ENT_FILE}" \
+         --options runtime \
+         "${target}"
+    then
+      return 0
+    fi
+    if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+      echo "    warn: codesign(${target}) failed; ROOST_ALLOW_UNSIGNED=1 set, continuing"
+      return 0
+    fi
+    echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
+    exit 1
+  }
+  codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl"
+  codesign_or_die "${APP_DIR}"
+elif [ ! -f "${ENT_FILE}" ]; then
+  echo "==> No entitlements file at ${ENT_FILE}; skipping codesign"
 fi
 
 echo "==> Bundled: ${APP_DIR}"
