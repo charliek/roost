@@ -147,8 +147,7 @@ impl TargetSelector {
         // is one 50ms timeout, not two. `tokio::join!` polls both
         // futures concurrently on the current task — no extra
         // executor work.
-        let (mac_alive, gtk_alive) =
-            tokio::join!(probe_socket(&mac_path), probe_socket(&gtk_path));
+        let (mac_alive, gtk_alive) = tokio::join!(probe_socket(&mac_path), probe_socket(&gtk_path));
         match (mac_alive, gtk_alive) {
             (true, false) => Ok(ResolvedTarget {
                 socket_path: mac_path,

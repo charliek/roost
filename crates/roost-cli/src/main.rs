@@ -41,10 +41,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, TabState,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     TabClearNotificationParams, TabCloseParams, TabFocusParams, TabListResult, TabOpenParams,
     TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams,
+    TabSetTitleParams, TabState, TabWriteParams,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -222,7 +222,11 @@ enum TabCmd {
     Send {
         #[arg(long, env = "ROOST_TAB_ID")]
         tab: Option<i64>,
-        #[arg(long, conflicts_with = "bytes_base64", required_unless_present = "bytes_base64")]
+        #[arg(
+            long,
+            conflicts_with = "bytes_base64",
+            required_unless_present = "bytes_base64"
+        )]
         bytes: Option<String>,
         /// Base64-encoded payload. Mutually exclusive with
         /// `--bytes`. Unblocks raw-byte transfers that the
@@ -293,7 +297,11 @@ async fn main() -> Result<()> {
             client
                 .call::<_, serde_json::Value>(
                     ops::NOTIFICATION_CREATE,
-                    NotificationCreateParams { tab_id, title, body },
+                    NotificationCreateParams {
+                        tab_id,
+                        title,
+                        body,
+                    },
                 )
                 .await?;
         }
@@ -374,13 +382,19 @@ async fn main() -> Result<()> {
             let resp: ProjectCreateResult = client
                 .call(ops::PROJECT_CREATE, ProjectCreateParams { name, cwd })
                 .await?;
-            println!("created project {} — {}", resp.project.id, resp.project.name);
+            println!(
+                "created project {} — {}",
+                resp.project.id, resp.project.name
+            );
         }
         Cmd::Project(ProjectCmd::Rename { id, name }) => {
             client
                 .call::<_, serde_json::Value>(
                     ops::PROJECT_RENAME,
-                    ProjectRenameParams { project_id: id, name },
+                    ProjectRenameParams {
+                        project_id: id,
+                        name,
+                    },
                 )
                 .await?;
         }
@@ -431,15 +445,20 @@ async fn main() -> Result<()> {
                 .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
                 .await?;
         }
-        Cmd::Tab(TabCmd::Send { tab, bytes, bytes_base64, raw }) => {
+        Cmd::Tab(TabCmd::Send {
+            tab,
+            bytes,
+            bytes_base64,
+            raw,
+        }) => {
             let tab_id = resolve_tab(&mut client, tab).await?;
             let data = if let Some(b64) = bytes_base64 {
                 BASE64_STANDARD
                     .decode(b64.as_bytes())
                     .map_err(|e| anyhow!("--bytes-base64 decode failed: {e}"))?
             } else {
-                let s = bytes
-                    .ok_or_else(|| anyhow!("tab send requires --bytes or --bytes-base64"))?;
+                let s =
+                    bytes.ok_or_else(|| anyhow!("tab send requires --bytes or --bytes-base64"))?;
                 if raw {
                     s.into_bytes()
                 } else {
@@ -447,10 +466,7 @@ async fn main() -> Result<()> {
                 }
             };
             client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_WRITE,
-                    TabWriteParams { tab_id, data },
-                )
+                .call::<_, serde_json::Value>(ops::TAB_WRITE, TabWriteParams { tab_id, data })
                 .await?;
         }
         Cmd::Tab(TabCmd::Resize { tab, cols, rows }) => {
@@ -466,7 +482,10 @@ async fn main() -> Result<()> {
             client
                 .call::<_, serde_json::Value>(
                     ops::TAB_REORDER,
-                    TabReorderParams { project_id, tab_ids: order },
+                    TabReorderParams {
+                        project_id,
+                        tab_ids: order,
+                    },
                 )
                 .await?;
         }
@@ -545,7 +564,10 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
             let _ = client
                 .call::<_, serde_json::Value>(
                     ops::TAB_SET_HOOK_ACTIVE,
-                    TabSetHookActiveParams { tab_id, active: true },
+                    TabSetHookActiveParams {
+                        tab_id,
+                        active: true,
+                    },
                 )
                 .await;
         }
@@ -618,7 +640,10 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
             let _ = client
                 .call::<_, serde_json::Value>(
                     ops::TAB_SET_HOOK_ACTIVE,
-                    TabSetHookActiveParams { tab_id, active: false },
+                    TabSetHookActiveParams {
+                        tab_id,
+                        active: false,
+                    },
                 )
                 .await;
             let _ = client
@@ -855,7 +880,10 @@ mod tests {
     #[test]
     fn quote_for_shell_passes_safe_strings() {
         assert_eq!(quote_for_shell("simple"), "simple");
-        assert_eq!(quote_for_shell("/usr/local/bin/roostctl"), "/usr/local/bin/roostctl");
+        assert_eq!(
+            quote_for_shell("/usr/local/bin/roostctl"),
+            "/usr/local/bin/roostctl"
+        );
     }
 
     #[test]
