@@ -41,7 +41,11 @@ fn current(project_ids: &[i64], tabs: &[(i64, i64)]) -> CurrentView {
 
 #[test]
 fn identical_state_yields_empty_membership_delta() {
-    let snapshot = vec![project(1, 0, vec![tab(10, 1, 0, true), tab(11, 1, 1, false)])];
+    let snapshot = vec![project(
+        1,
+        0,
+        vec![tab(10, 1, 0, true), tab(11, 1, 1, false)],
+    )];
     let cur = current(&[1], &[(10, 1), (11, 1)]);
 
     let p = plan(&cur, &snapshot);
