@@ -40,6 +40,7 @@ final class PtySupervisor {
         case ttySize(errno: Int32)
         case duplicateTab(Int64)
         case notFound(Int64)
+        case writeFailed(tabID: Int64, errno: Int32)
 
         var description: String {
             switch self {
@@ -47,6 +48,8 @@ final class PtySupervisor {
             case .ttySize(let e): return "TIOCSWINSZ failed: \(strerrorString(e))"
             case .duplicateTab(let id): return "tab \(id) already has a live pty"
             case .notFound(let id): return "no pty for tab \(id)"
+            case .writeFailed(let id, let e):
+                return "write to pty tab \(id) failed: \(strerrorString(e))"
             }
         }
     }
@@ -207,10 +210,17 @@ final class PtySupervisor {
                     supervisor.reapAndCleanup(tabID: tabID, expectedPID: pid)
                 }
             } else {
-                // Errors (EAGAIN/EINTR/etc). The read source will
-                // re-fire when the next byte is available. EBADF
-                // means the master was closed under us; cancel.
-                if errno == EBADF {
+                // n < 0: classify the errno. EAGAIN / EWOULDBLOCK
+                // / EINTR are transient — the read source will
+                // re-fire on the next readable notification.
+                // Anything else (EBADF, EIO, etc.) is terminal:
+                // reap the child and tear the session down.
+                // CR-flagged on PR #78 — the old code only
+                // checked EBADF.
+                switch errno {
+                case EAGAIN, EWOULDBLOCK, EINTR:
+                    break
+                default:
                     Task { @MainActor in
                         supervisor.reapAndCleanup(tabID: tabID, expectedPID: pid)
                     }
@@ -223,16 +233,24 @@ final class PtySupervisor {
     /// Write `data` to the tab's PTY. Caller is on the main
     /// actor; the actual `write(2)` is short-blocking but the
     /// dispatch through this method preserves ordering.
+    /// Throws on negative `write(2)` return — CR-flagged that
+    /// the prior version returned -1 as a signed byte count and
+    /// hid IO errors.
     @discardableResult
     func write(tabID: Int64, data: Data) throws -> Int {
         guard let session = sessions[tabID] else {
             throw PtyError.notFound(tabID)
         }
         if data.isEmpty { return 0 }
-        return data.withUnsafeBytes { raw -> Int in
+        let masterFD = session.masterFD
+        let result: Int = data.withUnsafeBytes { raw -> Int in
             guard let p = raw.baseAddress else { return 0 }
-            return Darwin.write(session.masterFD, p, raw.count)
+            return Darwin.write(masterFD, p, raw.count)
         }
+        if result < 0 {
+            throw PtyError.writeFailed(tabID: tabID, errno: errno)
+        }
+        return result
     }
 
     func resize(tabID: Int64, cols: UInt16, rows: UInt16) throws {

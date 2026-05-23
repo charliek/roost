@@ -91,16 +91,21 @@ final class IPCServer {
     }
 
     /// Begin accepting connections on a background queue.
-    /// Returns immediately.
+    /// Returns immediately. The accept loop runs on a detached
+    /// task so it cannot block the main actor — CR-flagged on
+    /// PR #78.
     nonisolated func start() {
-        Task.detached { [weak self] in
-            await self?.acceptLoop()
+        // Snapshot the actor-owned fields onto the detached task.
+        let fdTask = Task { @MainActor in self.listenFD }
+        let handlerTask = Task { @MainActor in self.handler }
+        Task.detached {
+            let listenFD = await fdTask.value
+            let handler = await handlerTask.value
+            IPCServer.acceptLoop(listenFD: listenFD, handler: handler)
         }
     }
 
-    private func acceptLoop() {
-        let listenFD = self.listenFD
-        let handler = self.handler
+    private nonisolated static func acceptLoop(listenFD: Int32, handler: IPCHandler) {
         while listenFD >= 0 {
             let conn = accept(listenFD, nil, nil)
             if conn < 0 {
@@ -123,13 +128,43 @@ final class IPCServer {
                 guard let line = try reader.readLine() else { return }
                 let response = await IPCServer.dispatch(line: line, handler: handler)
                 let body = try JSONEncoder().encode(response) + Data([0x0a])
-                _ = body.withUnsafeBytes { buf in
-                    Darwin.write(fd, buf.baseAddress, buf.count)
+                if !writeAll(fd: fd, data: body) {
+                    // Partial-write retry exhausted or hard error
+                    // — bail; the client will reconnect.
+                    return
                 }
             } catch {
                 NSLog("ipc: connection error: \(error)")
                 return
             }
+        }
+    }
+
+    /// Write `data` in full, retrying on EINTR and handling
+    /// partial writes by advancing the offset. Returns false on
+    /// unrecoverable error. CR-flagged the prior single-write
+    /// call on PR #78.
+    private nonisolated static func writeAll(fd: Int32, data: Data) -> Bool {
+        var offset = 0
+        let total = data.count
+        return data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return true }
+            while offset < total {
+                let remaining = total - offset
+                let written = Darwin.write(fd, base.advanced(by: offset), remaining)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    NSLog("ipc: write failed: \(errno)")
+                    return false
+                }
+                if written == 0 {
+                    // 0 from write() on a regular fd is unusual;
+                    // treat as a peer disconnect.
+                    return false
+                }
+                offset += written
+            }
+            return true
         }
     }
 

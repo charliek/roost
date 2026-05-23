@@ -115,7 +115,11 @@ impl IpcClient {
         params: P,
     ) -> Result<R, ClientError> {
         let raw = self.call_raw(op, params).await?;
-        serde_json::from_value(raw).map_err(|e| ClientError::Io(Error::from(e)))
+        // Decoding the result is schema/protocol drift — not a
+        // transport failure. Surface it as `Protocol` so callers
+        // can distinguish "the wire died" from "the server sent
+        // something we couldn't parse." CR-flagged on PR #78.
+        serde_json::from_value(raw).map_err(|e| ClientError::Protocol(Error::from(e)))
     }
 
     /// Convenience: send an `identify` request and decode the result.
@@ -133,6 +137,12 @@ impl IpcClient {
 pub enum ClientError {
     #[error(transparent)]
     Io(#[from] Error),
+    /// Schema / decode failure. Distinct from `Io` so callers can
+    /// distinguish "the wire died" from "the server sent
+    /// something I couldn't parse." Typically indicates client +
+    /// server schema drift.
+    #[error("protocol error: {0}")]
+    Protocol(Error),
     #[error("server returned error: {code} — {message}")]
     Server { code: String, message: String },
     #[error("response id mismatch: expected {expected}, got {got}")]

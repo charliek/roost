@@ -103,6 +103,14 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Resu
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(Error::FrameTooLarge);
     }
+    // Reject payloads that contain a raw LF — those would split
+    // into multiple logical frames on the reader side and break
+    // the wire contract. Production callers feed `serde_json::to_vec`
+    // output, which escapes embedded newlines, so this rejects
+    // only buggy callers. CR-flagged on PR #78.
+    if bytes.contains(&b'\n') {
+        return Err(Error::EmbeddedNewline);
+    }
     w.write_all(bytes).await?;
     w.write_all(b"\n").await?;
     w.flush().await?;
@@ -218,6 +226,15 @@ mod tests {
         match write_frame(&mut buf, &oversized).await {
             Err(Error::FrameTooLarge) => {}
             other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_rejects_embedded_newline() {
+        let mut buf = Vec::<u8>::new();
+        match write_frame(&mut buf, b"line one\nline two").await {
+            Err(Error::EmbeddedNewline) => {}
+            other => panic!("expected EmbeddedNewline, got {other:?}"),
         }
     }
 }

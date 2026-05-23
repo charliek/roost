@@ -61,6 +61,8 @@ pub enum Error {
     UnknownOp(String),
     #[error("invalid id: {0}")]
     InvalidId(String),
+    #[error("payload contains a literal newline (use a non-newline encoding)")]
+    EmbeddedNewline,
 }
 
 impl Error {
@@ -86,6 +88,7 @@ impl Error {
             Error::UnexpectedEof => "internal",
             Error::UnknownOp(_) => "unknown-op",
             Error::InvalidId(_) => "invalid-param",
+            Error::EmbeddedNewline => "internal",
         }
     }
 }

@@ -262,33 +262,6 @@ jobs:
             fi
           done
 
-      # Live-daemon regression guard. Without this, the gRPC layer
-      # between grpc-swift-nio-transport and tonic was silently broken
-      # over UDS for the entire Phase 5 series — the `:authority`
-      # pseudo-header defaulted to the socket path, tonic's h2 layer
-      # RST_STREAM'd every RPC with PROTOCOL_ERROR, and no test
-      # caught it because nothing dialed a real daemon. `swift test`
-      # alone covers compile-time / packaging regressions; this step
-      # adds the end-to-end gRPC round-trip the unit tests can't.
-      #
-      # Tools cargo + Rust here use the toolchain pinned in
-      # rust-toolchain.toml (same as the rust-build job) so the
-      # daemon binary built for this step matches what users run.
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Cache cargo registry + target (shared with rust-build)
-        # Same key as rust-build's macos-latest cache so the daemon
-        # binary is usually already compiled by the time we get here.
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
-
       # M3b of the daemon-removal refactor (2026-05-23): the
       # `liveIdentifyAgainstDaemon` Swift test was a regression guard
       # for the gRPC `:authority` UDS edge case. With the Linux UI

@@ -499,11 +499,19 @@ final class Workspace {
         try handle.write(contentsOf: data)
         try handle.synchronize()
         try handle.close()
-        // Atomic rename.
+        // Atomic swap via `replaceItemAt`. Avoids the
+        // remove-then-move window in which a crash would leave
+        // `state.json` missing entirely. CR-flagged on PR #78.
         if FileManager.default.fileExists(atPath: path) {
-            try FileManager.default.removeItem(at: url)
+            _ = try FileManager.default.replaceItemAt(
+                url,
+                withItemAt: tmp,
+                backupItemName: nil,
+                options: []
+            )
+        } else {
+            try FileManager.default.moveItem(at: tmp, to: url)
         }
-        try FileManager.default.moveItem(at: tmp, to: url)
     }
 
     struct SnapshotFile: Codable, Equatable, Sendable {

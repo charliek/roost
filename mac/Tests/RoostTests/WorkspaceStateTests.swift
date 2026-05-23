@@ -138,10 +138,10 @@ struct WorkspaceStatePersistenceTests {
         let path = tempPath()
         defer { try? FileManager.default.removeItem(atPath: path) }
 
-        let (projectID, firstTabID) = await { () -> (Int64, Int64) in
+        let (projectID, firstTabID): (Int64, Int64) = try await {
             let ws = await Workspace(statePath: path)
             let p = await ws.createProject(name: "Roost", cwd: "/tmp")
-            let t = try! await ws.openTab(projectID: p.id, cwd: "/tmp", title: "shell")
+            let t = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "shell")
             return (p.id, t.id)
         }()
 

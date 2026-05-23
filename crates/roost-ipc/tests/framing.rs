@@ -36,20 +36,17 @@ async fn round_trip_one_frame_over_uds() {
 // non-JSON payloads to the same stream.
 
 #[tokio::test]
-async fn embedded_newline_in_payload_is_split_by_framer() {
-    let (mut a, b) = pair().await;
-    let mut reader = FrameReader::new(b);
-
-    // The framer treats `\n` as a delimiter regardless of what
-    // precedes it. Writing the literal `hello\nworld\n` produces TWO
-    // frames: `hello` and `world`.
-    write_frame(&mut a, b"hello\nworld").await.unwrap();
-    a.shutdown().await.unwrap();
-
-    let first = reader.read_line().await.unwrap().unwrap();
-    let second = reader.read_line().await.unwrap().unwrap();
-    assert_eq!(first, b"hello".to_vec());
-    assert_eq!(second, b"world".to_vec());
+async fn write_frame_rejects_embedded_newline() {
+    // M3b CR follow-up: write_frame validates that the payload
+    // does not contain a literal `\n`. Production callers feed
+    // `serde_json::to_vec` output (which escapes newlines), so
+    // this rejection only catches buggy callers that would
+    // otherwise emit multiple logical frames in one write.
+    let (mut a, _b) = pair().await;
+    match write_frame(&mut a, b"hello\nworld").await {
+        Err(roost_ipc::Error::EmbeddedNewline) => {}
+        other => panic!("expected EmbeddedNewline, got {other:?}"),
+    }
 }
 
 #[tokio::test]
