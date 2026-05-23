@@ -24,26 +24,80 @@ final class IPCServer {
     private let socketPath: String
     private let handler: IPCHandler
 
-    init(socketPath: String, handler: IPCHandler) throws {
+    /// Bind a fresh server at `socketPath`.
+    ///
+    /// `recoverStaleSocket` is the M6 stale-socket recovery flag.
+    /// The TOCTOU-safe protocol is:
+    ///
+    ///   1. Caller holds the `SingleInstance` flock (M4c).
+    ///   2. We try to `bind` the socket.
+    ///   3. If `EADDRINUSE`, the previous instance was probably
+    ///      killed with -9 and left the socket on disk. With the
+    ///      flock held, no live writer can race us — we probe the
+    ///      path with `connect()`. If the connect *succeeds*
+    ///      anyway, surface `.alreadyBound` (something is listening
+    ///      that we didn't expect; better to error than steal it).
+    ///      Otherwise unlink and retry the bind once.
+    ///
+    /// Pass `false` only from contexts that don't hold the lock —
+    /// e.g. tests, or the `ROOST_ALLOW_MULTI=1` bypass path. In
+    /// those cases we surface `.alreadyBound` on contention rather
+    /// than unlinking a possibly-live socket.
+    init(socketPath: String, handler: IPCHandler, recoverStaleSocket: Bool = false) throws {
         self.socketPath = socketPath
         self.handler = handler
 
-        // DO NOT auto-unlink an existing socket before bind. During
-        // the M4b3a parallel-run window, the daemon owns
-        // `roost.sock` and the gRPC client dials it; if we unlink
-        // here we steal the path and break the daemon. Instead we
-        // try to bind, and if `EADDRINUSE` comes back we surface
-        // it to the caller (`RoostBackend.start` logs + skips).
-        // M6 adds the flock-based stale-socket recovery for the
-        // post-daemon world.
-        //
-        // Make sure the parent directory exists.
         let parent = (socketPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(
             atPath: parent,
             withIntermediateDirectories: true
         )
 
+        self.listenFD = try Self.bindWithRecovery(
+            socketPath: socketPath,
+            recoverStaleSocket: recoverStaleSocket
+        )
+    }
+
+    private static func bindWithRecovery(
+        socketPath: String,
+        recoverStaleSocket: Bool
+    ) throws -> Int32 {
+        switch try tryBindOnce(socketPath: socketPath) {
+        case .ok(let fd):
+            return fd
+        case .addrInUse:
+            if !recoverStaleSocket {
+                throw IPCServerError.alreadyBound(path: socketPath)
+            }
+            // The flock holder said "stale socket is safe to clean".
+            // First, sanity-check that no live listener is there
+            // via a connect() probe. If something answers, bail —
+            // we'd be stealing a live UI's socket.
+            if Self.connectProbe(socketPath: socketPath) {
+                throw IPCServerError.alreadyBound(path: socketPath)
+            }
+            try? FileManager.default.removeItem(atPath: socketPath)
+            switch try tryBindOnce(socketPath: socketPath) {
+            case .ok(let fd):
+                return fd
+            case .addrInUse:
+                // Two bind attempts in a row hitting EADDRINUSE with
+                // the flock held is genuinely surprising — surface it
+                // rather than retrying forever.
+                throw IPCServerError.alreadyBound(path: socketPath)
+            }
+        }
+    }
+
+    /// Single bind attempt. Returns `.addrInUse` for the recoverable
+    /// case; throws for anything else.
+    private enum BindOutcome {
+        case ok(Int32)
+        case addrInUse
+    }
+
+    private static func tryBindOnce(socketPath: String) throws -> BindOutcome {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         if fd < 0 {
             throw IPCServerError.socketCreate(errno: errno)
@@ -74,7 +128,7 @@ final class IPCServer {
             let e = errno
             Darwin.close(fd)
             if e == EADDRINUSE {
-                throw IPCServerError.alreadyBound(path: socketPath)
+                return .addrInUse
             }
             throw IPCServerError.bind(path: socketPath, errno: e)
         }
@@ -86,7 +140,41 @@ final class IPCServer {
         }
 
         chmod(socketPath, 0o600)
-        self.listenFD = fd
+        return .ok(fd)
+    }
+
+    /// Brief `connect()` probe — returns true if a live listener is
+    /// answering on `socketPath`. Used by the stale-socket recovery
+    /// path to refuse to unlink an actually-alive socket. No timeout
+    /// is set; UNIX domain `connect()` either succeeds immediately
+    /// or fails with `ECONNREFUSED` (no listener queued for accept)
+    /// or `ENOENT` (path gone).
+    private static func connectProbe(socketPath: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 { return false }
+        defer { Darwin.close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(socketPath.utf8)
+        if pathBytes.count >= MemoryLayout.size(ofValue: addr.sun_path) {
+            return false
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count + 1) { c in
+                for (i, b) in pathBytes.enumerated() {
+                    c[i] = CChar(b)
+                }
+                c[pathBytes.count] = 0
+            }
+        }
+
+        let rc = withUnsafePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return rc == 0
     }
 
     deinit {

@@ -32,14 +32,28 @@ final class RoostBackend {
     private var ipcServer: IPCServer?
     private var started = false
 
+    /// True iff the caller has confirmed (via M4c's
+    /// `SingleInstance.acquire(...).acquired`) that we own the
+    /// flock at the bundle profile's lock path. When set, the
+    /// IPC server is allowed to recover a stale socket left by a
+    /// previously kill -9'd instance (M6).
+    private var holdsSingleInstanceLock = false
+
     private init() {}
 
     /// Stand up the in-process workspace + PTY supervisor and bind
     /// the JSON IPC server on `profile.socketPath`. Idempotent —
     /// safe to call from `applicationDidFinishLaunching` once.
-    func start(profile: BundleProfile) {
+    ///
+    /// Pass `holdsSingleInstanceLock: true` iff the caller already
+    /// acquired the M4c `SingleInstance` flock. With the lock held
+    /// the M6 stale-socket recovery is safe (no live writer can
+    /// race the unlink); without it, `EADDRINUSE` surfaces as
+    /// `.alreadyBound` so we don't steal someone else's socket.
+    func start(profile: BundleProfile, holdsSingleInstanceLock: Bool = false) {
         if started { return }
         started = true
+        self.holdsSingleInstanceLock = holdsSingleInstanceLock
 
         let workspace = Workspace(statePath: profile.stateJSONPath)
         let supervisor = PtySupervisor()
@@ -80,7 +94,11 @@ final class RoostBackend {
                 appLabel: profile.appLabel,
                 appID: profile.appID
             )
-            let server = try IPCServer(socketPath: profile.socketPath, handler: handler)
+            let server = try IPCServer(
+                socketPath: profile.socketPath,
+                handler: handler,
+                recoverStaleSocket: holdsSingleInstanceLock
+            )
             server.start()
             self.ipcServer = server
             NSLog("roost-ipc: server bound at \(profile.socketPath)")

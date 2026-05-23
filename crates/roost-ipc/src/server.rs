@@ -97,9 +97,16 @@ impl<H: Handler> IpcServer<H> {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
 
-        // Remove a stale socket if present. The full TOCTOU-safe
-        // single-instance protocol lives in M6 (with a flock); M2 is
-        // a thin baseline.
+        // Remove a stale socket if present. Safe because the caller
+        // already holds the `SingleInstance` flock (acquired in
+        // `roost-linux/src/main.rs` before this bind path is
+        // reached, since M3b), so no live writer can race the
+        // unlink. The Mac side does the equivalent dance in
+        // `mac/Sources/Roost/IPCServer.swift::bindWithRecovery`
+        // (M6); it gates the unlink on the flock state rather than
+        // doing it unconditionally because Mac's `IPCServer` is
+        // sometimes constructed from contexts that don't own the
+        // lock (tests, `ROOST_ALLOW_MULTI=1`).
         remove_socket_if_present(&socket_path).await?;
 
         let listener = UnixListener::bind(&socket_path)

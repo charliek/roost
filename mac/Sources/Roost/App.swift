@@ -205,10 +205,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // an IPC socket; the second launch detects the live lock,
         // logs the holder PID, and exits 0. `ROOST_ALLOW_MULTI=1`
         // bypasses for dev / test workflows (Xcode debug, swift test).
+        //
+        // `holdsSingleInstanceLock` is forwarded to RoostBackend so
+        // M6's stale-socket recovery (IPCServer.bindWithRecovery)
+        // only fires when we genuinely own the flock; on the
+        // ROOST_ALLOW_MULTI bypass we surface .alreadyBound on
+        // EADDRINUSE rather than unlinking the live other instance.
+        var holdsLock = false
         do {
             switch try SingleInstance.acquire(lockPath: profile.lockPath) {
             case .acquired(let lock):
                 self.singleInstance = lock
+                holdsLock = true
                 RoostLogger.shared.info(
                     "single-instance: acquired lock at \(profile.lockPath)"
                 )
@@ -232,7 +240,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             )
         }
 
-        RoostBackend.shared.start(profile: profile)
+        RoostBackend.shared.start(
+            profile: profile,
+            holdsSingleInstanceLock: holdsLock
+        )
 
         let socketPath = profile.socketPath
         self.socketPath = socketPath
