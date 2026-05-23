@@ -103,8 +103,15 @@ printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 # Resource bundles SwiftPM emits — Bundle.module reads from these,
 # so the .app needs to ship them alongside the binary. The
 # `Roost_Roost.bundle` carries our theme files (Resources/themes/).
+#
+# Discover the SwiftPM bin path dynamically. The prior hardcoded
+# `arm64-apple-macosx` path failed on Intel macOS runners
+# (Phase 8 release-CI matrix includes x86_64). `swift build
+# --show-bin-path` prints the exact directory containing the
+# built artifacts for the current toolchain + target triple +
+# config.
 echo "==> Copying SwiftPM resource bundles"
-BUILD_BUNDLES_DIR="${MAC_DIR}/.build/arm64-apple-macosx/${CONFIG}"
+BUILD_BUNDLES_DIR="$(cd "${MAC_DIR}" && swift build -c "${CONFIG}" --show-bin-path)"
 for bundle in "${BUILD_BUNDLES_DIR}"/*.bundle; do
   [ -d "${bundle}" ] || continue
   cp -R "${bundle}" "${APP_DIR}/Contents/Resources/"
@@ -127,19 +134,38 @@ fi
 # any cargo build invocation; rebuilding here keeps the bundle in
 # lockstep with whatever roost-cli source the developer has
 # checked out.
-echo "==> Building roostctl (cargo build -p roost-cli --${CARGO_PROFILE:-release})"
+# Discover `cargo` on PATH instead of hardcoding ~/.cargo/bin/cargo.
+# Phase 8 release runners may have cargo at a different prefix
+# (toolchain managed by mise / rustup / system package). Falling
+# back to the literal path preserves the prior behavior for the
+# common dev case.
+CARGO_BIN="$(command -v cargo || true)"
+if [ -z "${CARGO_BIN}" ] && [ -x "${HOME}/.cargo/bin/cargo" ]; then
+  CARGO_BIN="${HOME}/.cargo/bin/cargo"
+fi
+if [ -z "${CARGO_BIN}" ]; then
+  echo "error: cargo not found on PATH or at ~/.cargo/bin/cargo" >&2
+  exit 1
+fi
+
 CARGO_PROFILE_FLAG="--release"
 CARGO_PROFILE_DIR="release"
 if [ "${CONFIG}" = "debug" ]; then
   CARGO_PROFILE_FLAG=""
   CARGO_PROFILE_DIR="debug"
 fi
+echo "==> Building roostctl (cargo build -p roost-cli --${CARGO_PROFILE_DIR})"
 (
   cd "${REPO_ROOT}"
   # shellcheck disable=SC2086
-  ~/.cargo/bin/cargo build -p roost-cli ${CARGO_PROFILE_FLAG}
+  "${CARGO_BIN}" build -p roost-cli ${CARGO_PROFILE_FLAG}
 )
-ROOSTCTL_SRC="${REPO_ROOT}/target/${CARGO_PROFILE_DIR}/roostctl"
+
+# Respect CARGO_TARGET_DIR for the artifact-discovery step. Shared
+# caches (e.g. sccache + CI matrices that fan out across configs)
+# routinely override the default `<repo>/target/` location.
+CARGO_TARGET="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+ROOSTCTL_SRC="${CARGO_TARGET}/${CARGO_PROFILE_DIR}/roostctl"
 if [ ! -x "${ROOSTCTL_SRC}" ]; then
   echo "error: cargo build did not produce ${ROOSTCTL_SRC}" >&2
   exit 1
