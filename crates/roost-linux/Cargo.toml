@@ -44,6 +44,9 @@ roost-osc    = { path = "../roost-osc" }
 
 # PTY supervisor copied from roost-core/src/pty.rs at M3a.
 portable-pty = { workspace = true }
+# `close()` escalates SIGHUP→SIGKILL for shells that ignore the
+# hangup; portable-pty's cloned ChildKiller only sends SIGHUP.
+libc = "0.2"
 
 # State persistence via state.json (M3a): atomic write + reload.
 serde       = { version = "1", features = ["derive"] }

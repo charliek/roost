@@ -34,11 +34,23 @@ pub enum TabOutput {
     Error(String),
 }
 
-/// Per-tab handle. Holds an `Arc<PtySupervisor>` so input/resize
-/// calls route to the right session.
+/// A command queued onto a tab's serial PTY channel. Input and
+/// resize share one channel so they apply in submission order.
+enum PtyCommand {
+    Input(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Per-tab handle. Owns the sender of a per-tab serial command
+/// channel; a single drain task applies each command to the
+/// supervisor in submission order so keystrokes never reorder.
 pub struct TabSession {
+    // Handle identity. Captured into the drain task at construction
+    // rather than read per-call, so it's no longer referenced after
+    // attach — retained for diagnostics / external lookup.
+    #[allow(dead_code)]
     pub tab_id: i64,
-    supervisor: Arc<PtySupervisor>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<PtyCommand>,
 }
 
 impl TabSession {
@@ -76,7 +88,30 @@ impl TabSession {
                 }
             }
         });
-        Self { tab_id, supervisor }
+
+        // Single serial drain task: applies input/resize to the
+        // supervisor in the exact order they were submitted. The
+        // shared channel guarantees keystrokes (and resizes relative
+        // to them) never reorder. Ends when the last `cmd_tx` drops
+        // (TabSession dropped).
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PtyCommand>();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    PtyCommand::Input(data) => {
+                        if let Err(err) = supervisor.write(tab_id, data).await {
+                            tracing::warn!(?err, tab_id, "pty write failed");
+                        }
+                    }
+                    PtyCommand::Resize { cols, rows } => {
+                        if let Err(err) = supervisor.resize(tab_id, cols, rows).await {
+                            tracing::warn!(?err, tab_id, "pty resize failed");
+                        }
+                    }
+                }
+            }
+        });
+        Self { tab_id, cmd_tx }
     }
 
     /// Subscribe lazily by tab_id (used when reattaching to an
@@ -99,23 +134,65 @@ impl TabSession {
         if data.is_empty() {
             return;
         }
-        let supervisor = self.supervisor.clone();
-        let tab_id = self.tab_id;
-        tokio::spawn(async move {
-            if let Err(err) = supervisor.write(tab_id, data).await {
-                tracing::warn!(?err, tab_id, "pty write failed");
-            }
-        });
+        // Enqueue on the per-tab serial channel. `unbounded_send`
+        // never blocks the GTK main thread and preserves submission
+        // order; the prior per-call `tokio::spawn` could reorder
+        // keystrokes under the multi-thread runtime.
+        let _ = self.cmd_tx.send(PtyCommand::Input(data));
     }
 
     #[allow(dead_code)]
     pub fn send_resize(&self, cols: u16, rows: u16) {
-        let supervisor = self.supervisor.clone();
-        let tab_id = self.tab_id;
-        tokio::spawn(async move {
-            if let Err(err) = supervisor.resize(tab_id, cols, rows).await {
-                tracing::warn!(?err, tab_id, "pty resize failed");
+        let _ = self.cmd_tx.send(PtyCommand::Resize { cols, rows });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// #80 A3: rapid `send_input` calls must reach the PTY in
+    /// submission order. The PTY line discipline echoes each byte we
+    /// write in the order the kernel received it, so the echoed
+    /// stream is a faithful witness of write order. The old per-call
+    /// `tokio::spawn` could reorder these under the multi-thread
+    /// runtime; the single serial drain channel cannot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn send_input_preserves_submission_order() {
+        let supervisor = Arc::new(PtySupervisor::new());
+        let socket = std::path::PathBuf::from("/tmp/roost-tabsession-order.sock");
+        let rx_pty = supervisor
+            .spawn(1, "/tmp", &["/bin/cat".into()], 80, 24, &socket)
+            .expect("spawn");
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Keep `session` alive: it owns the serial channel's sender,
+        // and dropping it would end the drain task.
+        let session = TabSession::attach_with_receiver(supervisor.clone(), 1, rx_pty, out_tx);
+
+        for d in b'0'..=b'9' {
+            session.send_input(vec![d]);
+        }
+
+        let mut seen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && seen.len() < 10 {
+            match out_rx.try_recv() {
+                Ok(TabOutput::Bytes(b)) => {
+                    for c in b {
+                        if c.is_ascii_digit() {
+                            seen.push(c as char);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("output channel closed early: {e:?}"),
             }
-        });
+        }
+        supervisor.close(1);
+        assert_eq!(seen, "0123456789", "send_input reordered keystrokes");
     }
 }

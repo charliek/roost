@@ -82,9 +82,16 @@ actor IPCHandlerImpl: IPCHandler {
             try await self.notificationCreate(params: params)
             return AnyCodable([:] as [String: Any])
         case "events.subscribe":
-            // Stubbed per spec — no event push from M0/M3a/M4
-            // unless a consumer needs it. Replies OK.
-            return AnyCodable([:] as [String: Any])
+            // Honest failure rather than a false ACK: the server never
+            // pushes events on the connection yet, so a client that
+            // "subscribed" would wait forever. Surface not-implemented
+            // so it can fall back (e.g. poll tab.list). Mirrors the
+            // Rust handler; real streaming lands with its first
+            // consumer. (#9)
+            throw IPCHandlerError(
+                code: "not-implemented",
+                message: "events.subscribe is not yet implemented"
+            )
         default:
             throw IPCHandlerError.unknownOp(op)
         }

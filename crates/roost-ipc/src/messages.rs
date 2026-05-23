@@ -376,6 +376,13 @@ pub struct EventsSubscribeParams {
     pub tab_id_filter: i64,
 }
 
+/// `app.activate` carries no params. Declared (empty + strict) so the
+/// handler validates the envelope like every other op rather than
+/// ACK-ing arbitrary payloads (#80).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppActivateParams {}
+
 // ============================================================================
 // Event data types
 // ============================================================================
@@ -484,6 +491,9 @@ pub mod ops {
     pub const TAB_SET_HOOK_ACTIVE: &str = "tab.set_hook_active";
     pub const NOTIFICATION_CREATE: &str = "notification.create";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    /// Raise + focus the running UI window. Sent by a second launch
+    /// that loses the single-instance flock; takes no params (#6).
+    pub const APP_ACTIVATE: &str = "app.activate";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

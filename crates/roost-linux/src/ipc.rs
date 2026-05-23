@@ -18,11 +18,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, NotificationCreateParams, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    TabClearNotificationParams, TabCloseParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
-    TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
+    ProjectReorderParams, TabClearNotificationParams, TabCloseParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -40,6 +40,10 @@ pub struct IpcHandler {
     /// App label / app id pair from the active bundle profile.
     pub app_label: String,
     pub app_id: String,
+    /// Set by the running UI: `app.activate` forwards a unit here for
+    /// the GTK main thread to raise + focus the window (#6). `None`
+    /// in headless contexts (tests); `app.activate` is then a no-op.
+    activate_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl IpcHandler {
@@ -56,7 +60,16 @@ impl IpcHandler {
             socket_path,
             app_label: app_label.into(),
             app_id: app_id.into(),
+            activate_tx: None,
         }
+    }
+
+    /// Wire the activation channel so `app.activate` raises the
+    /// running window. The UI installs the sender; the matching
+    /// receiver is drained on the GTK main thread (#6).
+    pub fn with_activate(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
+        self.activate_tx = Some(tx);
+        self
     }
 }
 
@@ -266,11 +279,29 @@ async fn dispatch(
                 .map_err(ws_err)?;
             Ok(serde_json::json!({}))
         }
-        ops::EVENTS_SUBSCRIBE => {
-            // M0/M3a stub: reply OK without ever pushing events on
-            // the connection. The full subscribe wiring lands when
-            // a CLI consumer needs events (post-M5 at the earliest).
+        ops::APP_ACTIVATE => {
+            // Validate the envelope like every other op (rejects
+            // unknown fields) rather than ACK-ing arbitrary payloads.
+            let _p: AppActivateParams = decode(params)?;
+            // Second-launch window raise (#6). Best-effort: forward a
+            // unit to the GTK main thread if wired. A dropped receiver
+            // (window gone) or a headless handler is a no-op.
+            if let Some(tx) = &h.activate_tx {
+                let _ = tx.send(());
+            }
             Ok(serde_json::json!({}))
+        }
+        ops::EVENTS_SUBSCRIBE => {
+            // Honest failure rather than a false ACK: the server never
+            // pushes events on the connection yet, so a client that
+            // "subscribed" would wait forever. Surface not-implemented
+            // so it can fall back (e.g. poll `tab.list`). Real
+            // streaming lands with its first consumer — the planned
+            // `roostctl watch` (#9).
+            Err(HandlerError::new(
+                "not-implemented",
+                "events.subscribe is not yet implemented",
+            ))
         }
         other => Err(HandlerError::unknown_op(other)),
     }

@@ -64,6 +64,10 @@ struct Inner {
     next_id: i64,
     active_project_id: i64,
     active_tab_id: i64,
+    /// Monotonic commit counter, bumped each time a persistable
+    /// snapshot is taken (under this lock). Tags each snapshot so
+    /// `persist()` can drop stale out-of-order writes (#80).
+    persist_seq: u64,
 }
 
 /// Workspace event channel. Server-push subscribers in `ipc.rs`
@@ -135,10 +139,25 @@ pub enum WorkspaceEvent {
 
 pub struct Workspace {
     inner: Mutex<Inner>,
+    /// Workspace event channel. Mutators publish on this **while
+    /// still holding `inner`**, so broadcast order matches commit
+    /// order: a fast subscriber must never observe an event sequence
+    /// that contradicts the committed state (e.g. `TabClosed` before
+    /// the `TabOpened` of the same tab when two mutators race). #80.
+    /// `broadcast::Sender::send` is synchronous and non-blocking — it
+    /// wakes receivers but never runs them inline — so holding the
+    /// std `Mutex` across it cannot deadlock. Durability
+    /// (`persist`) deliberately runs *after* the lock drops.
     events: broadcast::Sender<WorkspaceEvent>,
     /// Where to write the `state.json` file. `None` means the
     /// in-memory variant (used by tests).
     state_path: Option<PathBuf>,
+    /// Guards `state.json` writes and tracks the highest commit seq
+    /// already persisted. `persist()` serializes on this and skips
+    /// any snapshot older than what's on disk, so a slow earlier
+    /// commit can't clobber a newer one when writes race. The seq is
+    /// assigned under `inner`, so it reflects commit order (#80).
+    persist_guard: Mutex<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +182,7 @@ impl Workspace {
             inner: Mutex::new(Inner::default()),
             events: tx,
             state_path: None,
+            persist_guard: Mutex::new(0),
         }
     }
 
@@ -205,6 +225,7 @@ impl Workspace {
             inner: Mutex::new(inner),
             events: tx,
             state_path: Some(state_path),
+            persist_guard: Mutex::new(0),
         }
     }
 
@@ -262,17 +283,17 @@ impl Workspace {
                 active_changed = true;
             }
             let (apid, atid) = (inner.active_project_id, inner.active_tab_id);
-            drop(inner);
             if active_changed {
                 let _ = self.events.send(WorkspaceEvent::ActiveChanged {
                     project_id: apid,
                     tab_id: atid,
                 });
             }
+            drop(inner);
             return id;
         }
         let id = inner.alloc_id();
-        let position = inner.projects.len() as i32;
+        let position = inner.next_project_position();
         let now = unix_now();
         inner.projects.insert(
             id,
@@ -285,7 +306,7 @@ impl Workspace {
             },
         );
         inner.active_project_id = id;
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let project = Project {
             id,
             name: "Default".into(),
@@ -294,20 +315,20 @@ impl Workspace {
             created_at: now,
             tabs: vec![],
         };
-        drop(inner);
-        self.persist_async(snapshot);
         let _ = self.events.send(WorkspaceEvent::ProjectCreated(project));
         let _ = self.events.send(WorkspaceEvent::ActiveChanged {
             project_id: id,
             tab_id: 0,
         });
+        drop(inner);
+        self.persist(seq, snapshot);
         id
     }
 
     pub fn create_project(&self, name: &str, cwd: &str) -> Result<Project, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.alloc_id();
-        let position = inner.projects.len() as i32;
+        let position = inner.next_project_position();
         let chosen_name = if name.is_empty() {
             format!("Untitled {}", inner.projects.len() + 1)
         } else {
@@ -321,8 +342,7 @@ impl Workspace {
             created_at: unix_now(),
         };
         inner.projects.insert(id, row.clone());
-        let snapshot = inner.snapshot_for_persist();
-        drop(inner);
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let project = Project {
             id: row.id,
@@ -332,10 +352,11 @@ impl Workspace {
             created_at: row.created_at,
             tabs: vec![],
         };
-        self.persist_async(snapshot);
         let _ = self
             .events
             .send(WorkspaceEvent::ProjectCreated(project.clone()));
+        drop(inner);
+        self.persist(seq, snapshot);
         Ok(project)
     }
 
@@ -346,14 +367,13 @@ impl Workspace {
             .get_mut(&project_id)
             .ok_or(WorkspaceError::ProjectNotFound(project_id))?;
         row.name = name.to_string();
-        let snapshot = inner.snapshot_for_persist();
-        drop(inner);
-
-        self.persist_async(snapshot);
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let _ = self.events.send(WorkspaceEvent::ProjectRenamed {
             project_id,
             name: name.to_string(),
         });
+        drop(inner);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -363,61 +383,60 @@ impl Workspace {
     /// is the caller's responsibility — the workspace doesn't own
     /// a `PtySupervisor` reference.
     pub fn delete_project(&self, project_id: i64) -> Result<Vec<i64>, WorkspaceError> {
-        let (deleted_tab_ids, active_now) = {
-            let mut inner = self.inner.lock().unwrap();
-            if !inner.projects.contains_key(&project_id) {
-                return Err(WorkspaceError::ProjectNotFound(project_id));
-            }
-            let tab_ids: Vec<i64> = inner
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.projects.contains_key(&project_id) {
+            return Err(WorkspaceError::ProjectNotFound(project_id));
+        }
+        let tab_ids: Vec<i64> = inner
+            .tabs
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .map(|t| t.id)
+            .collect();
+        for tid in &tab_ids {
+            inner.tabs.remove(tid);
+        }
+        inner.projects.remove(&project_id);
+
+        // Adjust active selection if it points at the deleted
+        // project or one of its tabs.
+        let mut active_changed = false;
+        if inner.active_project_id == project_id || tab_ids.contains(&inner.active_tab_id) {
+            let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
+            let fallback_tab = inner
                 .tabs
                 .values()
-                .filter(|t| t.project_id == project_id)
+                .find(|t| t.project_id == fallback_project)
                 .map(|t| t.id)
-                .collect();
-            for tid in &tab_ids {
-                inner.tabs.remove(tid);
-            }
-            inner.projects.remove(&project_id);
-
-            // Adjust active selection if it points at the deleted
-            // project or one of its tabs.
-            let mut active_changed = false;
-            if inner.active_project_id == project_id || tab_ids.contains(&inner.active_tab_id) {
-                let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
-                let fallback_tab = inner
-                    .tabs
-                    .values()
-                    .find(|t| t.project_id == fallback_project)
-                    .map(|t| t.id)
-                    .unwrap_or(0);
-                inner.active_project_id = fallback_project;
-                inner.active_tab_id = fallback_tab;
-                active_changed = true;
-            }
-            let active = if active_changed {
-                Some((inner.active_project_id, inner.active_tab_id))
-            } else {
-                None
-            };
-            let snapshot = inner.snapshot_for_persist();
-            drop(inner);
-            self.persist_async(snapshot);
-            (tab_ids, active)
+                .unwrap_or(0);
+            inner.active_project_id = fallback_project;
+            inner.active_tab_id = fallback_tab;
+            active_changed = true;
+        }
+        let active = if active_changed {
+            Some((inner.active_project_id, inner.active_tab_id))
+        } else {
+            None
         };
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
-        for tid in &deleted_tab_ids {
+        // Publish under the lock (TabClosed* → ProjectDeleted →
+        // ActiveChanged) so order matches commit order.
+        for tid in &tab_ids {
             let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id: *tid });
         }
         let _ = self
             .events
             .send(WorkspaceEvent::ProjectDeleted { project_id });
-        if let Some((pid, tid)) = active_now {
+        if let Some((pid, tid)) = active {
             let _ = self.events.send(WorkspaceEvent::ActiveChanged {
                 project_id: pid,
                 tab_id: tid,
             });
         }
-        Ok(deleted_tab_ids)
+        drop(inner);
+        self.persist(seq, snapshot);
+        Ok(tab_ids)
     }
 
     /// Open a new tab in `project_id`. Returns the wire-format
@@ -429,11 +448,7 @@ impl Workspace {
         }
         let id = inner.alloc_id();
         let now = unix_now();
-        let position = inner
-            .tabs
-            .values()
-            .filter(|t| t.project_id == project_id)
-            .count() as i32;
+        let position = inner.next_tab_position(project_id);
         let derived_title = if title.is_empty() {
             derive_title(cwd)
         } else {
@@ -466,8 +481,7 @@ impl Workspace {
         // New tabs steal the active selection.
         inner.active_project_id = project_id;
         inner.active_tab_id = id;
-        let snapshot = inner.snapshot_for_persist();
-        drop(inner);
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let tab = Tab {
             id: row.id,
@@ -483,55 +497,53 @@ impl Workspace {
             last_active: row.last_active,
             hook_active: row.hook_active,
         };
-        self.persist_async(snapshot);
         let _ = self.events.send(WorkspaceEvent::TabOpened(tab.clone()));
         let _ = self.events.send(WorkspaceEvent::ActiveChanged {
             project_id,
             tab_id: id,
         });
+        drop(inner);
+        self.persist(seq, snapshot);
         Ok(tab)
     }
 
     pub fn close_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
-        let active_now = {
-            let mut inner = self.inner.lock().unwrap();
-            let row = inner
+        let mut inner = self.inner.lock().unwrap();
+        let row = inner
+            .tabs
+            .remove(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        // If we closed the active tab, fall back to any tab in
+        // the same project, otherwise any tab anywhere.
+        let mut changed = false;
+        if inner.active_tab_id == tab_id {
+            let next = inner
                 .tabs
-                .remove(&tab_id)
-                .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-            // If we closed the active tab, fall back to any tab in
-            // the same project, otherwise any tab anywhere.
-            let mut changed = false;
-            if inner.active_tab_id == tab_id {
-                let next = inner
-                    .tabs
-                    .values()
-                    .find(|t| t.project_id == row.project_id)
-                    .or_else(|| inner.tabs.values().next())
-                    .map(|t| (t.project_id, t.id))
-                    .unwrap_or((row.project_id, 0));
-                inner.active_project_id = next.0;
-                inner.active_tab_id = next.1;
-                changed = true;
-            }
-            let active = if changed {
-                Some((inner.active_project_id, inner.active_tab_id))
-            } else {
-                None
-            };
-            let snapshot = inner.snapshot_for_persist();
-            drop(inner);
-            self.persist_async(snapshot);
-            active
+                .values()
+                .find(|t| t.project_id == row.project_id)
+                .or_else(|| inner.tabs.values().next())
+                .map(|t| (t.project_id, t.id))
+                .unwrap_or((row.project_id, 0));
+            inner.active_project_id = next.0;
+            inner.active_tab_id = next.1;
+            changed = true;
+        }
+        let active = if changed {
+            Some((inner.active_project_id, inner.active_tab_id))
+        } else {
+            None
         };
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id });
-        if let Some((pid, tid)) = active_now {
+        if let Some((pid, tid)) = active {
             let _ = self.events.send(WorkspaceEvent::ActiveChanged {
                 project_id: pid,
                 tab_id: tid,
             });
         }
+        drop(inner);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -543,11 +555,11 @@ impl Workspace {
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.title = title.to_string();
         row.user_titled = true;
-        drop(inner);
         let _ = self.events.send(WorkspaceEvent::TabTitleChanged {
             tab_id,
             title: title.to_string(),
         });
+        drop(inner);
         Ok(())
     }
 
@@ -563,11 +575,11 @@ impl Workspace {
             return Ok(());
         }
         row.title = title.to_string();
-        drop(inner);
         let _ = self.events.send(WorkspaceEvent::TabTitleChanged {
             tab_id,
             title: title.to_string(),
         });
+        drop(inner);
         Ok(())
     }
 
@@ -578,11 +590,11 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.cwd = cwd.to_string();
-        drop(inner);
         let _ = self.events.send(WorkspaceEvent::TabCwdChanged {
             tab_id,
             cwd: cwd.to_string(),
         });
+        drop(inner);
         Ok(())
     }
 
@@ -593,10 +605,10 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.state = state;
-        drop(inner);
         let _ = self
             .events
             .send(WorkspaceEvent::TabStateChanged { tab_id, state });
+        drop(inner);
         Ok(())
     }
 
@@ -611,11 +623,11 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.has_notification = has_pending;
-        drop(inner);
         let _ = self.events.send(WorkspaceEvent::TabNotification {
             tab_id,
             has_pending,
         });
+        drop(inner);
         Ok(())
     }
 
@@ -626,10 +638,10 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.hook_active = active;
-        drop(inner);
         let _ = self
             .events
             .send(WorkspaceEvent::HookActiveChanged { tab_id, active });
+        drop(inner);
         Ok(())
     }
 
@@ -643,11 +655,11 @@ impl Workspace {
         let prev = (inner.active_project_id, inner.active_tab_id);
         inner.active_project_id = row.project_id;
         inner.active_tab_id = row.id;
-        drop(inner);
         let _ = self.events.send(WorkspaceEvent::ActiveChanged {
             project_id: row.project_id,
             tab_id: row.id,
         });
+        drop(inner);
         Ok(prev)
     }
 
@@ -658,9 +670,11 @@ impl Workspace {
         body: &str,
     ) -> Result<(), WorkspaceError> {
         // Drop a 'lookup' error if the tab is gone — useful for
-        // hook tools that race tab close.
-        let exists = self.inner.lock().unwrap().tabs.contains_key(&tab_id);
-        if !exists {
+        // hook tools that race tab close. Hold the lock across the
+        // existence check + publish so the event can't be reordered
+        // past a concurrent close of the same tab.
+        let inner = self.inner.lock().unwrap();
+        if !inner.tabs.contains_key(&tab_id) {
             return Err(WorkspaceError::TabNotFound(tab_id));
         }
         let _ = self.events.send(WorkspaceEvent::NotificationFired {
@@ -668,6 +682,7 @@ impl Workspace {
             title: title.to_string(),
             body: body.to_string(),
         });
+        drop(inner);
         Ok(())
     }
 
@@ -717,13 +732,13 @@ impl Workspace {
         // payload: supplied prefix + sorted unlisted (matches
         // Mac's `Workspace.tabsReordered` payload shape).
         let final_order: Vec<i64> = tab_ids.iter().copied().chain(unlisted).collect();
-        let snapshot = inner.snapshot_for_persist();
-        drop(inner);
-        self.persist_async(snapshot);
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let _ = self.events.send(WorkspaceEvent::TabsReordered {
             project_id,
             tab_ids: final_order,
         });
+        drop(inner);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -755,12 +770,12 @@ impl Workspace {
             }
         }
         let final_order: Vec<i64> = project_ids.iter().copied().chain(unlisted).collect();
-        let snapshot = inner.snapshot_for_persist();
-        drop(inner);
-        self.persist_async(snapshot);
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let _ = self.events.send(WorkspaceEvent::ProjectsReordered {
             project_ids: final_order,
         });
+        drop(inner);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -791,18 +806,26 @@ impl Workspace {
         }
     }
 
-    fn persist_async(&self, snapshot: SnapshotFile) {
+    /// Persist `snapshot` to `state.json`, tagged with its commit
+    /// `seq`. Runs synchronously on the caller's thread (the inner
+    /// lock is already released; writes are small atomic renames).
+    /// `persist_guard` serializes concurrent writers and drops any
+    /// snapshot older than the newest already on disk, so a slow
+    /// earlier commit can never clobber a newer one (#80).
+    fn persist(&self, seq: u64, snapshot: SnapshotFile) {
         let Some(path) = self.state_path.clone() else {
             return; // in-memory variant; no persistence
         };
-        // Persistence runs on the caller's thread. The mutation
-        // lock is already released; tokio main-thread doesn't block
-        // the IPC accept loop because writes are atomic-rename and
-        // small. If it becomes a hot path the future-proof move is
-        // to spawn a single dedicated writer task.
+        let mut last = self.persist_guard.lock().unwrap();
+        if seq <= *last {
+            return; // a newer commit already persisted; this write is stale
+        }
         if let Err(err) = persist_state(&path, &snapshot) {
             warn!(?err, "failed to persist state.json");
         }
+        // Advance past this seq even on write failure: an older
+        // snapshot must never win, and there is no retry of `seq`.
+        *last = seq;
     }
 }
 
@@ -818,8 +841,35 @@ impl Inner {
         self.next_id
     }
 
-    fn snapshot_for_persist(&self) -> SnapshotFile {
-        SnapshotFile {
+    /// Next free project position: `max(position) + 1`, or 0 when
+    /// empty. `len()` would collide after a delete-then-create
+    /// because positions are sparse, not dense (#80).
+    fn next_project_position(&self) -> i32 {
+        self.projects
+            .values()
+            .map(|p| p.position)
+            .max()
+            .map_or(0, |m| m + 1)
+    }
+
+    /// Next free tab position within `project_id`: `max(position) + 1`,
+    /// or 0 when the project has no tabs. See `next_project_position`.
+    fn next_tab_position(&self, project_id: i64) -> i32 {
+        self.tabs
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .map(|t| t.position)
+            .max()
+            .map_or(0, |m| m + 1)
+    }
+
+    /// Snapshot the persistable state plus a fresh commit sequence.
+    /// The seq is assigned here — under the `inner` lock the caller
+    /// holds — so it strictly reflects commit order; `persist()` uses
+    /// it to drop stale out-of-order writes (#80).
+    fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
+        self.persist_seq += 1;
+        let snapshot = SnapshotFile {
             next_id: self.next_id,
             projects: self
                 .projects
@@ -832,7 +882,8 @@ impl Inner {
                     created_at: p.created_at,
                 })
                 .collect(),
-        }
+        };
+        (snapshot, self.persist_seq)
     }
 }
 
@@ -916,6 +967,30 @@ mod tests {
     }
 
     #[test]
+    fn position_is_max_plus_one_after_delete() {
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap();
+        let b = ws.create_project("b", "").unwrap();
+        let c = ws.create_project("c", "").unwrap();
+        assert_eq!((a.position, b.position, c.position), (0, 1, 2));
+
+        // Delete the middle project, then create a new one. The old
+        // `len()` rule would reuse position 2 (colliding with c); the
+        // fix must hand out max(0, 2) + 1 = 3.
+        ws.delete_project(b.id).unwrap();
+        let d = ws.create_project("d", "").unwrap();
+        assert_eq!(d.position, 3, "new project position collided after delete");
+
+        // Same invariant for tabs within a project.
+        let t0 = ws.open_tab(a.id, "/", "t0").unwrap();
+        let t1 = ws.open_tab(a.id, "/", "t1").unwrap();
+        assert_eq!((t0.position, t1.position), (0, 1));
+        ws.close_tab(t0.id).unwrap();
+        let t2 = ws.open_tab(a.id, "/", "t2").unwrap();
+        assert_eq!(t2.position, 2, "new tab position collided after close");
+    }
+
+    #[test]
     fn reorder_tabs_partial_keeps_unlisted() {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
@@ -927,5 +1002,45 @@ mod tests {
         let projects = ws.snapshot();
         let tabs: Vec<i64> = projects[0].tabs.iter().map(|t| t.id).collect();
         assert_eq!(tabs, vec![c, a, b]);
+    }
+
+    #[test]
+    fn persist_drops_stale_out_of_order_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+
+        // A newer commit (seq 2) lands first, then a slower earlier
+        // commit (seq 1) races in. The stale write must be dropped so
+        // the newest snapshot stays on disk (#80).
+        ws.persist(
+            2,
+            SnapshotFile {
+                next_id: 99,
+                projects: vec![],
+            },
+        );
+        ws.persist(
+            1,
+            SnapshotFile {
+                next_id: 5,
+                projects: vec![],
+            },
+        );
+        assert_eq!(
+            read_state(&path).unwrap().unwrap().next_id,
+            99,
+            "stale snapshot overwrote the newer one"
+        );
+
+        // A genuinely newer commit (seq 3) still applies.
+        ws.persist(
+            3,
+            SnapshotFile {
+                next_id: 200,
+                projects: vec![],
+            },
+        );
+        assert_eq!(read_state(&path).unwrap().unwrap().next_id, 200);
     }
 }
