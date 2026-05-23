@@ -64,6 +64,10 @@ struct Inner {
     next_id: i64,
     active_project_id: i64,
     active_tab_id: i64,
+    /// Monotonic commit counter, bumped each time a persistable
+    /// snapshot is taken (under this lock). Tags each snapshot so
+    /// `persist()` can drop stale out-of-order writes (#80).
+    persist_seq: u64,
 }
 
 /// Workspace event channel. Server-push subscribers in `ipc.rs`
@@ -143,11 +147,17 @@ pub struct Workspace {
     /// `broadcast::Sender::send` is synchronous and non-blocking — it
     /// wakes receivers but never runs them inline — so holding the
     /// std `Mutex` across it cannot deadlock. Durability
-    /// (`persist_async`) deliberately runs *after* the lock drops.
+    /// (`persist`) deliberately runs *after* the lock drops.
     events: broadcast::Sender<WorkspaceEvent>,
     /// Where to write the `state.json` file. `None` means the
     /// in-memory variant (used by tests).
     state_path: Option<PathBuf>,
+    /// Guards `state.json` writes and tracks the highest commit seq
+    /// already persisted. `persist()` serializes on this and skips
+    /// any snapshot older than what's on disk, so a slow earlier
+    /// commit can't clobber a newer one when writes race. The seq is
+    /// assigned under `inner`, so it reflects commit order (#80).
+    persist_guard: Mutex<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -172,6 +182,7 @@ impl Workspace {
             inner: Mutex::new(Inner::default()),
             events: tx,
             state_path: None,
+            persist_guard: Mutex::new(0),
         }
     }
 
@@ -214,6 +225,7 @@ impl Workspace {
             inner: Mutex::new(inner),
             events: tx,
             state_path: Some(state_path),
+            persist_guard: Mutex::new(0),
         }
     }
 
@@ -294,7 +306,7 @@ impl Workspace {
             },
         );
         inner.active_project_id = id;
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let project = Project {
             id,
             name: "Default".into(),
@@ -309,7 +321,7 @@ impl Workspace {
             tab_id: 0,
         });
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         id
     }
 
@@ -330,7 +342,7 @@ impl Workspace {
             created_at: unix_now(),
         };
         inner.projects.insert(id, row.clone());
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let project = Project {
             id: row.id,
@@ -344,7 +356,7 @@ impl Workspace {
             .events
             .send(WorkspaceEvent::ProjectCreated(project.clone()));
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(project)
     }
 
@@ -355,13 +367,13 @@ impl Workspace {
             .get_mut(&project_id)
             .ok_or(WorkspaceError::ProjectNotFound(project_id))?;
         row.name = name.to_string();
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let _ = self.events.send(WorkspaceEvent::ProjectRenamed {
             project_id,
             name: name.to_string(),
         });
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -406,7 +418,7 @@ impl Workspace {
         } else {
             None
         };
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         // Publish under the lock (TabClosed* → ProjectDeleted →
         // ActiveChanged) so order matches commit order.
@@ -423,7 +435,7 @@ impl Workspace {
             });
         }
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(tab_ids)
     }
 
@@ -469,7 +481,7 @@ impl Workspace {
         // New tabs steal the active selection.
         inner.active_project_id = project_id;
         inner.active_tab_id = id;
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let tab = Tab {
             id: row.id,
@@ -491,7 +503,7 @@ impl Workspace {
             tab_id: id,
         });
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(tab)
     }
 
@@ -521,7 +533,7 @@ impl Workspace {
         } else {
             None
         };
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id });
         if let Some((pid, tid)) = active {
@@ -531,7 +543,7 @@ impl Workspace {
             });
         }
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -720,13 +732,13 @@ impl Workspace {
         // payload: supplied prefix + sorted unlisted (matches
         // Mac's `Workspace.tabsReordered` payload shape).
         let final_order: Vec<i64> = tab_ids.iter().copied().chain(unlisted).collect();
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let _ = self.events.send(WorkspaceEvent::TabsReordered {
             project_id,
             tab_ids: final_order,
         });
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -758,12 +770,12 @@ impl Workspace {
             }
         }
         let final_order: Vec<i64> = project_ids.iter().copied().chain(unlisted).collect();
-        let snapshot = inner.snapshot_for_persist();
+        let (snapshot, seq) = inner.snapshot_for_persist();
         let _ = self.events.send(WorkspaceEvent::ProjectsReordered {
             project_ids: final_order,
         });
         drop(inner);
-        self.persist_async(snapshot);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -794,18 +806,26 @@ impl Workspace {
         }
     }
 
-    fn persist_async(&self, snapshot: SnapshotFile) {
+    /// Persist `snapshot` to `state.json`, tagged with its commit
+    /// `seq`. Runs synchronously on the caller's thread (the inner
+    /// lock is already released; writes are small atomic renames).
+    /// `persist_guard` serializes concurrent writers and drops any
+    /// snapshot older than the newest already on disk, so a slow
+    /// earlier commit can never clobber a newer one (#80).
+    fn persist(&self, seq: u64, snapshot: SnapshotFile) {
         let Some(path) = self.state_path.clone() else {
             return; // in-memory variant; no persistence
         };
-        // Persistence runs on the caller's thread. The mutation
-        // lock is already released; tokio main-thread doesn't block
-        // the IPC accept loop because writes are atomic-rename and
-        // small. If it becomes a hot path the future-proof move is
-        // to spawn a single dedicated writer task.
+        let mut last = self.persist_guard.lock().unwrap();
+        if seq <= *last {
+            return; // a newer commit already persisted; this write is stale
+        }
         if let Err(err) = persist_state(&path, &snapshot) {
             warn!(?err, "failed to persist state.json");
         }
+        // Advance past this seq even on write failure: an older
+        // snapshot must never win, and there is no retry of `seq`.
+        *last = seq;
     }
 }
 
@@ -843,8 +863,13 @@ impl Inner {
             .map_or(0, |m| m + 1)
     }
 
-    fn snapshot_for_persist(&self) -> SnapshotFile {
-        SnapshotFile {
+    /// Snapshot the persistable state plus a fresh commit sequence.
+    /// The seq is assigned here — under the `inner` lock the caller
+    /// holds — so it strictly reflects commit order; `persist()` uses
+    /// it to drop stale out-of-order writes (#80).
+    fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
+        self.persist_seq += 1;
+        let snapshot = SnapshotFile {
             next_id: self.next_id,
             projects: self
                 .projects
@@ -857,7 +882,8 @@ impl Inner {
                     created_at: p.created_at,
                 })
                 .collect(),
-        }
+        };
+        (snapshot, self.persist_seq)
     }
 }
 
@@ -976,5 +1002,45 @@ mod tests {
         let projects = ws.snapshot();
         let tabs: Vec<i64> = projects[0].tabs.iter().map(|t| t.id).collect();
         assert_eq!(tabs, vec![c, a, b]);
+    }
+
+    #[test]
+    fn persist_drops_stale_out_of_order_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+
+        // A newer commit (seq 2) lands first, then a slower earlier
+        // commit (seq 1) races in. The stale write must be dropped so
+        // the newest snapshot stays on disk (#80).
+        ws.persist(
+            2,
+            SnapshotFile {
+                next_id: 99,
+                projects: vec![],
+            },
+        );
+        ws.persist(
+            1,
+            SnapshotFile {
+                next_id: 5,
+                projects: vec![],
+            },
+        );
+        assert_eq!(
+            read_state(&path).unwrap().unwrap().next_id,
+            99,
+            "stale snapshot overwrote the newer one"
+        );
+
+        // A genuinely newer commit (seq 3) still applies.
+        ws.persist(
+            3,
+            SnapshotFile {
+                next_id: 200,
+                projects: vec![],
+            },
+        );
+        assert_eq!(read_state(&path).unwrap().unwrap().next_id, 200);
     }
 }
