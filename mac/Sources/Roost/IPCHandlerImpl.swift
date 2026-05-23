@@ -29,6 +29,13 @@ actor IPCHandlerImpl: IPCHandler {
     func handle(op: String, params: AnyCodable?) async throws -> AnyCodable? {
         switch op {
         case "identify":
+            // `identify` params are optional — just validate that
+            // any provided keys are part of the documented set.
+            _ = try decodeParams(
+                params,
+                as: IPCIdentifyParams.self,
+                expected: ["client_name", "client_version"]
+            )
             return try await encodeResult(self.identify())
         case "tab.open":
             return try await encodeResult(self.tabOpen(params: params))
@@ -103,7 +110,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabOpen(params: AnyCodable?) async throws -> IPCTabOpenResult {
-        let p = try decodeParams(params, as: IPCTabOpenParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabOpenParams.self,
+            expected: ["project_id", "cwd", "argv", "cols", "rows", "title"]
+        )
         var projectID = p.projectID
         if projectID == 0 {
             projectID = client.workspace.ensureDefaultProject(cwd: p.cwd)
@@ -127,7 +137,9 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabClose(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabCloseParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabCloseParams.self, expected: ["tab_id"]
+        )
         do {
             try client.closeTab(p.tabID)
         } catch let err as Workspace.WorkspaceError {
@@ -157,7 +169,9 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabWrite(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabWriteParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabWriteParams.self, expected: ["tab_id", "data"]
+        )
         do {
             _ = try client.writeTab(p.tabID, data: p.data)
         } catch let err as PtySupervisor.PtyError {
@@ -167,7 +181,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabResize(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabResizeParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabResizeParams.self,
+            expected: ["tab_id", "cols", "rows"]
+        )
         let cols = try ipcDim(p.cols, defaultValue: 0, field: "cols")
         let rows = try ipcDim(p.rows, defaultValue: 0, field: "rows")
         do {
@@ -181,7 +198,9 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func projectCreate(params: AnyCodable?) async throws -> IPCProjectCreateResult {
-        let p = try decodeParams(params, as: IPCProjectCreateParams.self)
+        let p = try decodeParams(
+            params, as: IPCProjectCreateParams.self, expected: ["name", "cwd"]
+        )
         let project = client.createProject(name: p.name, cwd: p.cwd)
         return IPCProjectCreateResult(
             project: IPCProject(
@@ -197,7 +216,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func projectRename(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCProjectRenameParams.self)
+        let p = try decodeParams(
+            params, as: IPCProjectRenameParams.self,
+            expected: ["project_id", "name"]
+        )
         do {
             try client.renameProject(p.projectID, name: p.name)
         } catch let err as Workspace.WorkspaceError {
@@ -207,7 +229,9 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func projectDelete(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCProjectDeleteParams.self)
+        let p = try decodeParams(
+            params, as: IPCProjectDeleteParams.self, expected: ["project_id"]
+        )
         do {
             _ = try client.deleteProject(p.projectID)
         } catch let err as Workspace.WorkspaceError {
@@ -217,7 +241,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabReorder(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabReorderParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabReorderParams.self,
+            expected: ["project_id", "tab_ids"]
+        )
         do {
             try client.reorderTabs(projectID: p.projectID, tabIDs: p.tabIDs)
         } catch let err as Workspace.WorkspaceError {
@@ -227,7 +254,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func projectReorder(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCProjectReorderParams.self)
+        let p = try decodeParams(
+            params, as: IPCProjectReorderParams.self,
+            expected: ["project_ids"]
+        )
         do {
             try client.reorderProjects(p.projectIDs)
         } catch let err as Workspace.WorkspaceError {
@@ -237,7 +267,9 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabFocus(params: AnyCodable?) async throws -> IPCTabFocusResult {
-        let p = try decodeParams(params, as: IPCTabFocusParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabFocusParams.self, expected: ["tab_id"]
+        )
         do {
             let prev = try client.focusTab(p.tabID)
             return IPCTabFocusResult(
@@ -251,7 +283,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabSetTitle(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabSetTitleParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabSetTitleParams.self,
+            expected: ["tab_id", "title"]
+        )
         do {
             try client.setTabTitle(p.tabID, title: p.title)
         } catch let err as Workspace.WorkspaceError {
@@ -261,7 +296,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabSetState(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabSetStateParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabSetStateParams.self,
+            expected: ["tab_id", "state"]
+        )
         let state: Workspace.TabState
         switch p.state {
         case .none: state = .none
@@ -278,7 +316,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabClearNotification(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabClearNotificationParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabClearNotificationParams.self,
+            expected: ["tab_id"]
+        )
         do {
             try client.clearTabNotification(p.tabID)
         } catch let err as Workspace.WorkspaceError {
@@ -288,7 +329,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func tabSetHookActive(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCTabSetHookActiveParams.self)
+        let p = try decodeParams(
+            params, as: IPCTabSetHookActiveParams.self,
+            expected: ["tab_id", "active"]
+        )
         do {
             try client.setTabHookActive(p.tabID, active: p.active)
         } catch let err as Workspace.WorkspaceError {
@@ -298,7 +342,10 @@ actor IPCHandlerImpl: IPCHandler {
 
     @MainActor
     private func notificationCreate(params: AnyCodable?) async throws {
-        let p = try decodeParams(params, as: IPCNotificationCreateParams.self)
+        let p = try decodeParams(
+            params, as: IPCNotificationCreateParams.self,
+            expected: ["tab_id", "title", "body"]
+        )
         do {
             try client.fireNotification(p.tabID, title: p.title, body: p.body)
         } catch let err as Workspace.WorkspaceError {
@@ -309,8 +356,29 @@ actor IPCHandlerImpl: IPCHandler {
 
 // MARK: - Param decoding helpers
 
-private func decodeParams<T: Decodable>(_ params: AnyCodable?, as: T.Type) throws -> T {
+private func decodeParams<T: Decodable>(
+    _ params: AnyCodable?,
+    as: T.Type,
+    expected: Set<String>
+) throws -> T {
     let raw = params?.value ?? [String: Any]()
+    // Strict server policy (matches `roost-ipc::messages`'s
+    // `#[serde(deny_unknown_fields)]` on every request struct):
+    // reject params containing fields the op doesn't recognize.
+    // Swift's `JSONDecoder` silently ignores unknown keys, which
+    // would hide caller-side typos and let the Mac IPC diverge
+    // from the documented wire contract. CR (codex) flagged this
+    // on PR #78.
+    if let dict = raw as? [String: Any] {
+        let extras = Set(dict.keys).subtracting(expected)
+        if !extras.isEmpty {
+            let joined = extras.sorted().joined(separator: ", ")
+            throw IPCHandlerError(
+                code: "unknown-field",
+                message: "unknown params: \(joined)"
+            )
+        }
+    }
     do {
         let data = try JSONSerialization.data(withJSONObject: raw, options: [])
         return try JSONDecoder().decode(T.self, from: data)

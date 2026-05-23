@@ -67,7 +67,12 @@ final class RoostBackend {
             )
         }
 
-        // Construct + start the IPC server.
+        // Construct + start the IPC server. If the canonical
+        // socket path is already in use (the daemon owns it
+        // during the M4b3a parallel-run window) we log + skip
+        // rather than steal the path out from under it. CR
+        // (codex) flagged that the prior auto-unlink-before-bind
+        // behavior would break gRPC bootstrap.
         do {
             let handler = IPCHandlerImpl(
                 client: client,
@@ -79,6 +84,14 @@ final class RoostBackend {
             server.start()
             self.ipcServer = server
             NSLog("roost-ipc: server bound at \(profile.socketPath)")
+        } catch let err as IPCServerError {
+            if case .alreadyBound = err {
+                NSLog(
+                    "roost-ipc: socket at \(profile.socketPath) already in use; assuming daemon is running, skipping IPC server bind (M4b3a transitional state)"
+                )
+            } else {
+                NSLog("roost-ipc: failed to bind IPC server at \(profile.socketPath): \(err)")
+            }
         } catch {
             NSLog("roost-ipc: failed to bind IPC server at \(profile.socketPath): \(error)")
         }

@@ -28,12 +28,15 @@ final class IPCServer {
         self.socketPath = socketPath
         self.handler = handler
 
-        // Best-effort: nuke a stale socket from a prior run. The
-        // flock-based single-instance lock in main is the
-        // authoritative "is anyone alive?" check; if we're here,
-        // we own the slot and any leftover socket file is stale.
-        try? FileManager.default.removeItem(atPath: socketPath)
-
+        // DO NOT auto-unlink an existing socket before bind. During
+        // the M4b3a parallel-run window, the daemon owns
+        // `roost.sock` and the gRPC client dials it; if we unlink
+        // here we steal the path and break the daemon. Instead we
+        // try to bind, and if `EADDRINUSE` comes back we surface
+        // it to the caller (`RoostBackend.start` logs + skips).
+        // M6 adds the flock-based stale-socket recovery for the
+        // post-daemon world.
+        //
         // Make sure the parent directory exists.
         let parent = (socketPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(
@@ -70,6 +73,9 @@ final class IPCServer {
         if bindResult < 0 {
             let e = errno
             Darwin.close(fd)
+            if e == EADDRINUSE {
+                throw IPCServerError.alreadyBound(path: socketPath)
+            }
             throw IPCServerError.bind(path: socketPath, errno: e)
         }
 
@@ -279,6 +285,7 @@ enum IPCServerError: Error, CustomStringConvertible {
     case socketCreate(errno: Int32)
     case pathTooLong(String)
     case bind(path: String, errno: Int32)
+    case alreadyBound(path: String)
     case listen(errno: Int32)
     case read(errno: Int32)
     case frameTooLarge
@@ -288,6 +295,7 @@ enum IPCServerError: Error, CustomStringConvertible {
         case .socketCreate(let e): return "socket() failed: \(strerrorString(e))"
         case .pathTooLong(let p): return "socket path too long: \(p)"
         case .bind(let p, let e): return "bind(\(p)) failed: \(strerrorString(e))"
+        case .alreadyBound(let p): return "socket already in use: \(p)"
         case .listen(let e): return "listen() failed: \(strerrorString(e))"
         case .read(let e): return "read() failed: \(strerrorString(e))"
         case .frameTooLarge: return "frame larger than \(ipcMaxFrameBytes) bytes"
