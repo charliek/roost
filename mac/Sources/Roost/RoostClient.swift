@@ -101,6 +101,7 @@ enum PtyClientEvent: Sendable {
 func runShellSession(
     socketPath: String,
     projectID: Int64 = 0,
+    cwd: String = "",
     cols: UInt16 = 80,
     rows: UInt16 = 24,
     title: String = "roost-mac",
@@ -155,7 +156,7 @@ func runShellSession(
         do {
             let tab = try localClient.openTab(
                 projectID: projectID,
-                cwd: "",
+                cwd: cwd,
                 argv: [],
                 cols: cols,
                 rows: rows,

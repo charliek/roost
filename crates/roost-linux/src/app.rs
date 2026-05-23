@@ -1181,7 +1181,13 @@ impl App {
             return Ok(());
         };
         let rt = self.rt.clone();
-        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        // Empty cwd here delegates resolution to
+        // `LocalClient::open_tab`, which prefers the project's
+        // stored cwd, then $HOME, then `/`. CR (M4b3b review)
+        // flagged the pre-existing HOME-only path: a project
+        // pinned to a directory should open its tabs there, not
+        // bounce them to the user's home.
+        let cwd = String::new();
         let (tab, _rx) = rt
             .spawn(async move { client.open_tab(project_id, &cwd, 80, 24).await })
             .await

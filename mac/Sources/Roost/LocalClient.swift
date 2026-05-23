@@ -74,11 +74,31 @@ final class LocalClient {
         rows: UInt16 = 24,
         title: String = ""
     ) throws -> Workspace.Tab {
-        let tab = try workspace.openTab(projectID: projectID, cwd: cwd, title: title)
+        // Resolve the starting cwd: caller-supplied → project's cwd
+        // → $HOME. Ensures `roostctl tab open --project-id N`
+        // (which omits --cwd) lands in the project's directory or
+        // at minimum the user's home, not Finder's `/`. The Mac UI
+        // already does the same fallback in `openNewTab`; this
+        // covers the IPC entry point (which `roostctl` uses).
+        let resolvedCwd: String
+        if !cwd.isEmpty {
+            resolvedCwd = cwd
+        } else if let project = workspace.snapshot().first(where: { $0.id == projectID }),
+                  !project.cwd.isEmpty {
+            resolvedCwd = project.cwd
+        } else {
+            resolvedCwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
+        }
+
+        let tab = try workspace.openTab(
+            projectID: projectID,
+            cwd: resolvedCwd,
+            title: title
+        )
         do {
             try supervisor.spawn(
                 tabID: tab.id,
-                cwd: cwd,
+                cwd: resolvedCwd,
                 argv: argv,
                 cols: cols,
                 rows: rows,
@@ -143,8 +163,20 @@ final class LocalClient {
             // Shell-set title; respects a prior manual rename.
             try? workspace.setTabTitleFromOSC(tabID, title: payload)
         case 7:
-            // OSC 7: `file://host/path` cwd.
-            if let path = parseOSC7Path(payload) {
+            // OSC 7: cwd. The OSC scanner has already decoded
+            // `file://host/path` → `/path` (see `OscEvent.asReport`'s
+            // `.pwd` branch in `OscScanner.swift`), so `payload`
+            // here is already a plain path. The earlier `if let
+            // path = parseOSC7Path(payload)` re-parse expected
+            // `file://...` and silently dropped the event because
+            // the path no longer had that prefix. Pass through
+            // verbatim — but defensively re-run `parseOSC7Path`
+            // for the (theoretical) case where some external IPC
+            // caller sends an unparsed URI through `tab.set_cwd`
+            // or similar; the helper is idempotent on already-
+            // parsed paths via the nil-on-no-scheme guard.
+            let path = parseOSC7Path(payload) ?? payload
+            if !path.isEmpty {
                 try? workspace.setTabCwd(tabID, cwd: path)
             }
         case 9, 99, 777:

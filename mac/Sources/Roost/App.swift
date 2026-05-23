@@ -1440,16 +1440,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             theme: activeTheme,
             font: activeFont
         )
-        // Round-2 polish: pre-seed `liveCwd` from the project's cwd
-        // so the new pill renders the tilde-abbreviated path on
-        // frame 1, instead of flashing "Tab N" while waiting for the
-        // shell's OSC 7. OSC 7 will refine if the shell starts in a
-        // different directory. Matches the Go binary's behavior.
-        if let project = projects.first(where: { $0.id == projectID }),
-           !project.cwd.isEmpty
-        {
-            session.liveCwd = project.cwd
+        // Derive the starting cwd: prefer the project's cwd; fall
+        // back to $HOME so opening a tab from a project with no
+        // cwd doesn't drop the shell at `/` (which is what
+        // Finder-launched Roost.app inherits). The Go binary did
+        // the same priority; the daemon-era cwd defaulting lived
+        // in `roost-core/src/state.rs::ensure_default_project`
+        // before the inline-core refactor and got lost in the M4
+        // port.
+        let projectCwd = projects.first(where: { $0.id == projectID })?.cwd ?? ""
+        let cwd: String
+        if !projectCwd.isEmpty {
+            cwd = projectCwd
+        } else {
+            cwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
         }
+        // Pre-seed `liveCwd` so the new pill renders the
+        // tilde-abbreviated path on frame 1, instead of flashing
+        // "Tab N" while waiting for the shell's OSC 7. OSC 7 will
+        // refine if the shell starts in a different directory.
+        session.liveCwd = cwd.isEmpty ? nil : cwd
         tabs.append(session)
 
         let projectTabs = tabsForActiveProject()
@@ -1458,10 +1468,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: insertedIndex)
 
         let title = "roost-mac \(insertedIndex + 1)"
-        session.start(socketPath: socketPath, title: title) { [weak self] _ in
+        session.start(socketPath: socketPath, title: title, cwd: cwd) { [weak self] _ in
             // The id is now known; keep the window menu in sync so its
             // tag-driven ⌘1..⌘9 routes to the current tab order.
+            // Also rebuild the tab bar so the pill that was created
+            // pre-id at `openNewTab` time gets re-cached against its
+            // (now-known) tab id. Without this rebuild,
+            // `tabPillViews[id]` never gets populated for the newly
+            // opened tab, and ⌘R (renameActiveTab) silently no-ops
+            // because `tabPillViews[tabID]` returns nil.
             self?.rebuildWindowMenu()
+            self?.rebuildTabBar()
         }
     }
 

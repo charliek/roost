@@ -312,6 +312,16 @@ final class Workspace {
         let position = Int32(tabs.values.lazy.filter { $0.projectId == projectID }.count)
         let derivedTitle = title.isEmpty ? deriveTitle(cwd: cwd) : title
         let now = unixNow()
+        // Always start with userTitled=false. The caller-supplied
+        // `title` is a *placeholder* (e.g. "roost-mac 1", or the
+        // CLI's "roostctl" default) that the shell's OSC 0/1/2
+        // emissions should be allowed to overwrite. Only an
+        // explicit user rename via Cmd+R / `setTabTitle` sets
+        // userTitled=true, which then locks against further OSC
+        // overwrites. The pre-fix `!title.isEmpty` policy locked
+        // every newly-opened tab to its placeholder, preventing
+        // shell prompts like `👻 /tmp` from ever appearing in the
+        // tab bar.
         let tab = Tab(
             id: id,
             projectId: projectID,
@@ -319,7 +329,7 @@ final class Workspace {
             cwd: cwd,
             state: .none,
             hasNotification: false,
-            userTitled: !title.isEmpty,
+            userTitled: false,
             position: position,
             createdAt: now,
             lastActive: now,

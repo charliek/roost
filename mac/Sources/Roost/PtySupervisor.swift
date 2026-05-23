@@ -163,7 +163,22 @@ final class PtySupervisor {
         // after fork. `strdup` and `Dictionary` traversal here run
         // in the parent, which is multithreaded-safe; the child
         // then only calls `chdir` / `execve` (both safe).
-        let cwdCopy = strdup(cwd)
+        //
+        // If the caller passed an empty cwd (or one we can't
+        // resolve), fall back to $HOME. Otherwise the child
+        // inherits whatever process cwd Roost.app was launched
+        // with — `/` for Finder-launched bundles, or the dev's
+        // checkout root for `swift run`. Both are user-hostile
+        // defaults; tabs should open in the user's home like the
+        // pre-refactor Go binary and like a fresh interactive
+        // shell.
+        let resolvedCwd: String
+        if cwd.isEmpty {
+            resolvedCwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
+        } else {
+            resolvedCwd = cwd
+        }
+        let cwdCopy = strdup(resolvedCwd)
         let cArgv = buildArgv(argv: argv)
         let cEnv = buildEnv(tabID: tabID, socketPath: socketPath)
 

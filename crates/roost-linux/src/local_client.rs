@@ -82,12 +82,28 @@ impl LocalClient {
         cols: u32,
         rows: u32,
     ) -> Result<(Tab, broadcast::Receiver<PtyOutputEvent>)> {
-        let tab = self.workspace.open_tab(project_id, cwd, "")?;
+        // Resolve cwd: caller-supplied → project's cwd → $HOME →
+        // "/". Matches the Mac side's `LocalClient.openTab`
+        // fallback. Both the UI's open-new-tab path and the
+        // `roostctl tab open` IPC call site land here, so the
+        // fallback is centralized.
+        let resolved_cwd: String = if !cwd.is_empty() {
+            cwd.to_string()
+        } else {
+            let projects = self.workspace.snapshot();
+            projects
+                .into_iter()
+                .find(|p| p.id == project_id)
+                .map(|p| p.cwd)
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()))
+        };
+        let tab = self.workspace.open_tab(project_id, &resolved_cwd, "")?;
         let cols = if cols == 0 { 80 } else { cols as u16 };
         let rows = if rows == 0 { 24 } else { rows as u16 };
         match self
             .supervisor
-            .spawn(tab.id, cwd, &[], cols, rows, &self.socket_path)
+            .spawn(tab.id, &resolved_cwd, &[], cols, rows, &self.socket_path)
         {
             Ok(rx) => Ok((tab, rx)),
             Err(err) => {

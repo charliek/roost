@@ -123,6 +123,7 @@ final class TabSession {
     func start(
         socketPath: String,
         title: String,
+        cwd: String = "",
         onIDAssigned: @escaping @MainActor (Int64) -> Void
     ) {
         let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
@@ -167,6 +168,7 @@ final class TabSession {
             await runShellSession(
                 socketPath: socketPath,
                 projectID: projectID,
+                cwd: cwd,
                 cols: cols,
                 rows: rows,
                 title: title,
