@@ -1,25 +1,24 @@
-//! Roost Linux UI — library surface (M3a).
+//! Roost Linux UI — library surface.
 //!
-//! Phase 6a M3a (daemon-removal refactor): the new infrastructure
-//! for the post-daemon Linux UI lives here — the PTY supervisor,
-//! workspace state machine, JSON IPC server, and single-instance
-//! lock. M3b rewires the gtk4-rs UI (`app.rs`, `tab_session.rs`)
-//! to consume these modules and deletes the gRPC client.
+//! Phase 6a M3a (daemon-removal refactor): the post-daemon
+//! infrastructure for the Linux UI — PTY supervisor, workspace
+//! state, JSON IPC server, single-instance lock, and the
+//! `LocalClient` adapter that the gtk4-rs UI will consume in M3b.
 //!
-//! This split keeps the workspace buildable across the refactor:
-//! M3a adds the modules without consumers; M3b flips the
-//! consumers. The legacy modules (`app`, `tab_session`,
-//! `terminal_view`, etc.) stay declared in `main.rs` only — they
-//! still talk gRPC to `roost-core` through M3a and switch over in
-//! M3b.
+//! The legacy gRPC client (`client`), the gRPC-bound `tab_session`,
+//! and the gRPC-bound `events` modules still live in the bin's
+//! own module tree (declared in `main.rs`) through M3a. M3b
+//! rewires `app.rs` onto `daemon` + `local_client` and drops those
+//! gRPC modules along with `tonic`/`roost-proto`.
 //!
 //! Test surface: `crates/roost-linux/tests/*.rs` consumes
-//! [`daemon::Workspace`], [`daemon::PtySupervisor`], and
-//! [`ipc::IpcHandler`] without needing a glib main loop or a GTK
-//! display.
+//! [`daemon::Workspace`], [`daemon::PtySupervisor`],
+//! [`ipc::IpcHandler`], and [`local_client::LocalClient`] without
+//! needing a glib main loop or a GTK display.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod daemon;
 pub mod ipc;
+pub mod local_client;
 pub mod single_instance;
