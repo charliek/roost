@@ -120,9 +120,59 @@ else
   echo "==> No mac/Resources/AppIcon.icns; bundle ships without a custom icon"
 fi
 
+# M8: embed roostctl under Contents/Resources/bin/ so `claude
+# install` invoked from inside Roost.app writes hook paths that
+# point at the bundled binary, not a dev-machine target/ path.
+# The CLI build is fast and tracked through the same Cargo cache as
+# any cargo build invocation; rebuilding here keeps the bundle in
+# lockstep with whatever roost-cli source the developer has
+# checked out.
+echo "==> Building roostctl (cargo build -p roost-cli --${CARGO_PROFILE:-release})"
+CARGO_PROFILE_FLAG="--release"
+CARGO_PROFILE_DIR="release"
+if [ "${CONFIG}" = "debug" ]; then
+  CARGO_PROFILE_FLAG=""
+  CARGO_PROFILE_DIR="debug"
+fi
+(
+  cd "${REPO_ROOT}"
+  # shellcheck disable=SC2086
+  ~/.cargo/bin/cargo build -p roost-cli ${CARGO_PROFILE_FLAG}
+)
+ROOSTCTL_SRC="${REPO_ROOT}/target/${CARGO_PROFILE_DIR}/roostctl"
+if [ ! -x "${ROOSTCTL_SRC}" ]; then
+  echo "error: cargo build did not produce ${ROOSTCTL_SRC}" >&2
+  exit 1
+fi
+mkdir -p "${APP_DIR}/Contents/Resources/bin"
+cp "${ROOSTCTL_SRC}" "${APP_DIR}/Contents/Resources/bin/roostctl"
+chmod +x "${APP_DIR}/Contents/Resources/bin/roostctl"
+echo "    Embedded: ${APP_DIR}/Contents/Resources/bin/roostctl"
+
+# Phase 8 (notarization) will replace these ad-hoc signatures with
+# Developer-ID-signed binaries + a notarized DMG. Until then we
+# ad-hoc sign with the embedded entitlements so the local launcher
+# stack at least sees a consistent signature pair on the .app and
+# the embedded helper.
+ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
+if command -v codesign >/dev/null 2>&1 && [ -f "${ENT_FILE}" ]; then
+  echo "==> Ad-hoc codesign (Phase 8 will replace with Developer ID)"
+  codesign --force --sign - \
+    --entitlements "${ENT_FILE}" \
+    --options runtime \
+    "${APP_DIR}/Contents/Resources/bin/roostctl" 2>/dev/null || \
+    echo "    warn: failed to sign embedded roostctl (continuing)"
+  codesign --force --sign - \
+    --entitlements "${ENT_FILE}" \
+    --options runtime \
+    "${APP_DIR}" 2>/dev/null || \
+    echo "    warn: failed to sign Roost.app (continuing)"
+fi
+
 echo "==> Bundled: ${APP_DIR}"
 echo "    Bundle ID:    ${BUNDLE_ID}"
 echo "    Version:      ${VERSION}"
 echo "    Executable:   ${APP_DIR}/Contents/MacOS/${APP_NAME}"
+echo "    Embedded CLI: ${APP_DIR}/Contents/Resources/bin/roostctl"
 echo
 echo "Launch with: open '${APP_DIR}'"

@@ -202,6 +202,20 @@ jobs:
           key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
           restore-keys: swiftpm-${{ runner.os }}-
 
+      - name: Cache cargo registry + target (for embedded roost-cli build)
+        # M8: bundle.sh embeds `target/release/roostctl` under
+        # `Roost.app/Contents/Resources/bin/`. Cache the registry +
+        # target dir keyed on the workspace Cargo.toml so consecutive
+        # PRs don't re-resolve + re-compile from scratch.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-swiftmac-
+
       # Required-green from this commit on. `continue-on-error: true`
       # was masking real coordinate breakage in Package.swift (the
       # initial grpc-swift v2 wiring landed with the wrong package URL
@@ -237,6 +251,22 @@ jobs:
       - name: swift test
         working-directory: mac
         run: swift test
+
+      # M8: produce the bundled .app with the embedded roostctl
+      # under Contents/Resources/bin/. This is the artifact the
+      # Phase 8 notarization step will operate on, so we want CI
+      # to keep producing one on every PR — drift here is the
+      # kind that only shows up at release time otherwise.
+      - name: bundle .app (release) + embed roostctl
+        run: ./mac/scripts/bundle.sh release
+
+      - name: Verify embedded roostctl
+        run: |
+          set -euo pipefail
+          BIN="mac/build/Roost.app/Contents/Resources/bin/roostctl"
+          test -x "$BIN" || { echo "FAIL: $BIN not embedded"; exit 1; }
+          "$BIN" --version
+          codesign -dvv "$BIN" 2>&1 | grep -E 'adhoc|Format=' || true
 
   # Phase 6a M8: gtk4-rs + libadwaita-rs build. Lives in
   # crates/roost-linux/, excluded from `default-members` in

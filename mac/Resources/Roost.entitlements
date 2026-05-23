@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+    Hardened-runtime entitlements for Roost.app.
+
+    Effective only when the bundle is code-signed with a Developer ID
+    certificate (Phase 8 follow-up; the M8-era bundle.sh ships the
+    .app unsigned and ad-hoc). Listed here so we have a target file
+    when notarization wiring lands.
+
+    Why each flag:
+
+    * `cs.disable-library-validation` — Roost embeds `roostctl` under
+      `Contents/Resources/bin/roostctl`. Without this entitlement,
+      `Roost` (signed) cannot exec `roostctl` (also signed, but with
+      its own team-id signature) under hardened runtime. The
+      equivalent flag is what cmux uses for its embedded helper
+      tools.
+
+    * `cs.allow-unsigned-executable-memory` — libghostty-vt is
+      vendored as a static archive and linked into the Roost binary
+      at build time; its code segments are part of the Roost
+      executable's own signed image. No JIT, no dynamically generated
+      machine code at runtime. The flag is kept off here, but if a
+      future Ghostty bump introduces a JIT-style path (e.g. font
+      shaping via SIMD codegen) we'd add `com.apple.security.cs.
+      allow-jit` here.
+
+    * No `network.client` / `network.server` — Roost does not speak
+      over a network socket. The IPC server is UNIX-domain only.
+
+    * No file-access entitlements — the App Sandbox is intentionally
+      not enabled. Roost spawns shells that need broad filesystem
+      access (the whole point); sandboxing those shells defeats the
+      product. cmux makes the same choice.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
