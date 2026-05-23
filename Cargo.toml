@@ -1,11 +1,14 @@
 # Roost Cargo workspace.
 #
-# Hosts the new architecture's Rust code: the daemon (roost-core), the
-# Linux UI (roost-linux, lands in Phase 7), the Rust shell-integration
-# CLI (roost-cli-rs, transitional name; renamed to roost-cli in the
-# Phase 9 cutover), the smoke-test client (roost-smoke), the generated
-# proto bindings (roost-proto), and the libghostty-vt FFI wrapper
-# (roost-vt).
+# Hosts the new architecture's Rust code: the Linux UI (roost-linux,
+# embeds the workspace + PTY supervisor in-process post-M3), the
+# shell-integration CLI (roost-cli, binary `roostctl`), the JSON IPC
+# crate (roost-ipc), and the libghostty-vt FFI wrapper (roost-vt) plus
+# its OSC helper (roost-osc). The legacy gRPC daemon (roost-core),
+# proto bindings (roost-proto), smoke-test client (roost-smoke), and
+# shared shim (roost-common) are scheduled for deletion in M7 — they
+# remain workspace members until then so `cargo build` keeps working
+# on every commit during the refactor.
 #
 # The legacy Go code under cmd/ + internal/ is unaffected by this
 # workspace and continues to build via build/build.sh + Makefile until
@@ -21,7 +24,7 @@ members = [
     "crates/roost-osc",
     "crates/roost-core",
     "crates/roost-smoke",
-    "crates/roost-cli-rs",
+    "crates/roost-cli",
     "crates/roost-linux",
 ]
 # `roost-linux` requires GTK4 + libadwaita system libs at build time
@@ -37,7 +40,7 @@ default-members = [
     "crates/roost-osc",
     "crates/roost-core",
     "crates/roost-smoke",
-    "crates/roost-cli-rs",
+    "crates/roost-cli",
 ]
 
 [workspace.package]

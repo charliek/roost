@@ -11,7 +11,7 @@ The profile defaults to:
 | Swift `Roost.app` | `Mac` | n/a (the app picks `Mac` directly) |
 | `roost-linux`     | `Gtk` | `ROOST_BUNDLE_PROFILE=mac` to dial a `Mac`-profile daemon |
 | `roost-core` (daemon, removed in M7) | `Mac` | `ROOST_BUNDLE_PROFILE=gtk` |
-| `roost-cli-rs` / `roostctl` | `Mac` | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` |
+| `roostctl` (binary from the `roost-cli` crate) | `Mac` | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,gtk}` |
 
 ## File locations
 
@@ -105,14 +105,14 @@ When Roost spawns a tab's shell, it injects:
 |-----------------|----------------------------------------------------------------------|
 | `TERM`          | Set to `xterm-256color`                                              |
 | `COLORTERM`     | Set to `truecolor`                                                   |
-| `ROOST_TAB_ID`  | Integer tab id (used by `roost-cli-rs` to route notifications)          |
+| `ROOST_TAB_ID`  | Integer tab id (used by `roostctl` to route notifications)              |
 | `ROOST_SOCKET`  | Absolute path to the Unix socket                                     |
 
 Existing environment is inherited verbatim before these are set.
 
 ## Environment variables Roost reads
 
-`roost-cli-rs` reads:
+`roostctl` reads:
 
 | Variable | Effect |
 |---|---|
