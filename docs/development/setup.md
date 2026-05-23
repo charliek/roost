@@ -49,10 +49,10 @@ The IPC sockets live at:
 
 | OS | Mac UI socket | Linux UI socket |
 |---|---|---|
-| macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` |
-| Linux | n/a | `$XDG_RUNTIME_DIR/roost-gtk/roost.sock` (falls back to `$HOME/.local/state/roost-gtk/` if unset) |
+| macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` (Gtk dev profile) |
+| Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` (falls back to `/tmp/roost-<uid>/roost.sock` if `XDG_RUNTIME_DIR` is unset) |
 
-The UI's log file is `~/Library/Logs/Roost/roost.log` (Mac) and `$XDG_STATE_HOME/roost-gtk/roost.log` (Linux). `roostctl --help` and `docs/reference/ipc.md` document the wire surface.
+The **Mac** app writes a log file at `~/Library/Logs/Roost/roost.log`. The **Linux** UI (`roost-linux`) logs to **stdout** (`tracing_subscriber::fmt`; no file) — run `roost` from a terminal or `journalctl --user -f` if launched from the `.desktop` entry. `roostctl --help` and `docs/reference/ipc.md` document the wire surface.
 
 ## Tests
 

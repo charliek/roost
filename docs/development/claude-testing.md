@@ -102,16 +102,16 @@ Pre-req: focus a *different* tab in the same project so the test tab is inactive
 
 ### T6 — UI log inspection
 
-There is no shared daemon — each UI writes its own log. Tail it
-while driving the above tests:
+There is no shared daemon. Watch the running UI's log while driving the
+above tests:
 
 ```bash
-# macOS (Swift Roost.app)
+# macOS (Swift Roost.app) — file appender
 tail -f ~/Library/Logs/Roost/roost.log
 
-# Linux (gtk4-rs roost) — $XDG_STATE_HOME/roost-gtk/roost.log,
-# defaulting to ~/.local/state/roost-gtk/roost.log
-tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/roost-gtk/roost.log"
+# Linux (gtk4-rs roost) — logs to stdout (no file). Run it from a
+# terminal, or follow the journal if launched from the .desktop entry:
+journalctl --user -f
 ```
 
 Each CLI command above lands as a corresponding log entry —

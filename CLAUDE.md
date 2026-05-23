@@ -61,8 +61,10 @@ See `docs/development/spec.md` for the design doc and
   src/daemon/pty.rs`). One PTY per tab.
 - External tools dial the running UI process at the bundle profile's
   socket path (`~/Library/Caches/Roost/roost.sock` for Mac,
-  `$XDG_RUNTIME_DIR/Roost-gtk/roost.sock` for Linux). The wire format
-  is newline-delimited JSON; see `docs/reference/ipc.md`.
+  `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux — fallback
+  `/tmp/roost-<uid>/roost.sock`). On macOS the Gtk dev profile uses
+  `Roost-gtk` in place of `Roost`. The wire format is newline-delimited
+  JSON; see `docs/reference/ipc.md`.
 
 ## Threading (critical)
 
@@ -144,9 +146,14 @@ wrapper small.
   `<private>` by default; the file appender uses `privacy: .public`
   to defeat that. For raw values without redaction, prefer the file
   log.
-- **Linux UI logs**: `$XDG_STATE_HOME/roost-gtk/roost.log` (default
-  `~/.local/state/roost-gtk/roost.log`). Tail with `tail -f` while
-  reproducing.
+- **Linux UI logs**: `roost-linux` logs to **stdout** via
+  `tracing_subscriber::fmt()` (`crates/roost-linux/src/main.rs`); set
+  `RUST_LOG=info,roost_ipc=debug` to adjust. There is **no file log**
+  today — run `roost` from a terminal to see output, or
+  `journalctl --user -f` if it was started from the `.desktop` entry.
+  (The profile reserves `log_dir` at `$XDG_STATE_HOME/roost/` but no
+  file appender is wired yet — a follow-up for `tail -f` parity with
+  the Mac app.)
 - **IPC wire trace**: launch the UI with `RUST_LOG=roost_ipc=debug`
   (Linux) or `OS_ACTIVITY_MODE=disable` + `swift run` (Mac) to see
   per-frame logging. The wire format is human-readable JSON; `nc -U`

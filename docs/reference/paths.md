@@ -37,7 +37,7 @@ Same shape as the `Mac` profile with `Roost-gtk` in place of `Roost`:
 | `~/Library/Application Support/Roost-gtk/state.json` | GTK-app workspace state |
 | `~/Library/Caches/Roost-gtk/roost.sock` | GTK-app Unix socket |
 | `~/Library/Caches/Roost-gtk/roost.lock` | GTK-app single-instance lock |
-| `~/Library/Logs/Roost-gtk/roost.log` | GTK-app log |
+| `~/Library/Logs/Roost-gtk/` | reserved log dir — `roost-linux` logs to **stdout**, no file appender yet |
 
 ### Linux
 
@@ -48,7 +48,7 @@ Linux follows XDG conventions for everything. There is only one UI variant on Li
 | `$XDG_CONFIG_HOME/roost/config.conf` | User-editable config; defaults to `~/.config/roost/` |
 | `$XDG_DATA_HOME/roost/state.json` | UI-owned workspace state; defaults to `~/.local/share/roost/` |
 | `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |
-| `$XDG_STATE_HOME/roost/roost.log` | App log; falls back to `~/.local/state/roost/` |
+| `$XDG_STATE_HOME/roost/` | reserved log dir (falls back to `~/.local/state/roost/`) — `roost-linux` logs to **stdout**, no file appender yet |
 
 The directories are created at first launch with mode `0700`.
 
