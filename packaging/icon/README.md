@@ -57,6 +57,68 @@ Run on **macOS** to refresh `AppIcon.icns` (`iconutil` is macOS-only; on Linux
 the script writes the PNGs and skips the `.icns`). On a Mac dev box the wrapper
 adds Homebrew's `lib` to the dyld path so cairosvg finds `libcairo`.
 
+## macOS glass icon: how it works (and the gotchas)
+
+macOS 26 (Tahoe) renders every Dock / Cmd-Tab icon on a system "glass tile" and
+masks it to one squircle. How you *ship* the icon decides whether it **fills**
+that tile or gets **inset** on it (a gray frame around the art). The points
+below are non-obvious and cost real iteration to pin down — read them before
+touching the Mac icon.
+
+### What does NOT work (don't re-try these)
+
+- **A loose `.icns`** (what we shipped before Tahoe): treated as a legacy icon
+  and inset on the tile → gray frame. Independent of the art — full-bleed vs.
+  inset, rounded vs. square corners are all still framed.
+- **A classic compiled `.appiconset` catalog**: also inset. Compiling alone
+  isn't enough; the *source format* is what matters.
+
+### What works
+
+A compiled **Icon Composer `.icon`** catalog (the format ghostty/cmux ship).
+Tahoe then fills the tile edge-to-edge and applies the glass treatment (sheen,
+depth, automatic dark-mode + user-tinted variants). `generate_icons.py` authors
+the `.icon` *source* from the SVG (`mac/AppIcon.icon/` — a solid Roost-Violet
+fill + the white owl as a foreground layer); `mac/scripts/bundle.sh` compiles
+it. `CFBundleIconName=AppIcon` (Info.plist) routes the OS to the catalog.
+
+### actool gotchas
+
+- **Pass the `.icon` as a direct input**, not nested in an `.xcassets`:
+  `actool mac/AppIcon.icon --compile <out> --platform macosx --app-icon AppIcon
+  --minimum-deployment-target <ver> --output-partial-info-plist <out>/p.plist`.
+  Nesting `AppIcon.icon` inside `Assets.xcassets` silently emits an empty
+  partial plist and **no `Assets.car`**.
+- **Needs Xcode 26+.** The `.icon` format is new in the Tahoe-era Xcode; bare
+  Command Line Tools have no `actool`, and older Xcode won't understand it.
+  `bundle.sh` falls back to the flat `.icns` when `actool` is missing (bundle
+  still launches, just framed on Tahoe). The release workflow runs on
+  `macos-26` so Xcode 26 is present.
+- **Min-deployment can stay low.** Compiling at `LSMinimumSystemVersion` (15.0)
+  still yields the glass-capable catalog — the glass is applied by the *end
+  user's* Tahoe OS at render time, so the app keeps its 15.0 floor.
+
+### Verifying a Mac icon change (the cache trap)
+
+LaunchServices/iconservices caches the Dock icon per bundle-id **and** path.
+Rebuilding `mac/build/Roost.app` in place and relaunching keeps showing the
+**stale** icon — it looks like the change failed when it didn't. To actually
+see a changed icon, launch a copy under a *fresh* bundle id:
+
+```sh
+cp -R mac/build/Roost.app /tmp/RoostVerify.app
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ai.stridelabs.RoostVerify" \
+  /tmp/RoostVerify.app/Contents/Info.plist
+codesign --force --deep --sign - /tmp/RoostVerify.app
+open /tmp/RoostVerify.app          # then look at the Dock
+```
+
+### The fallback chain
+
+`mac/AppIcon.icon` (glass, Tahoe) → `mac/Resources/AppIcon.icns` (flat, pre-
+Tahoe or no-`actool` builds) → Linux uses the hicolor PNGs above (no glass tile
+there, so the flat full-bleed violet owl is correct).
+
 ## Brand palette (first pass — "twilight owl")
 
 Roost is the nocturnal sibling to lumen's daytime blue (`#2E5AAB`) — a violet
