@@ -79,11 +79,6 @@ impl NotificationInbox {
         self.records.retain(|r| r.tab_id != tab_id);
     }
 
-    /// Empty the inbox ("Clear All Notifications").
-    pub fn clear(&mut self) {
-        self.records.clear();
-    }
-
     /// Front-to-back (newest first) for rendering.
     pub fn snapshot(&self) -> &[NotificationRecord] {
         &self.records
@@ -182,11 +177,12 @@ mod tests {
     }
 
     #[test]
-    fn clear_empties_everything() {
+    fn remove_all_leaves_empty() {
         let mut inbox = NotificationInbox::new();
         inbox.upsert(rec(1, "a"));
         inbox.upsert(rec(2, "b"));
-        inbox.clear();
+        inbox.remove(1);
+        inbox.remove(2);
         assert!(inbox.is_empty());
         assert_eq!(inbox.count(), 0);
         assert!(inbox.tab_ids().is_empty());

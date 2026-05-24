@@ -73,11 +73,12 @@ func removeDropsOnlyThatTab() {
 }
 
 @Test
-func clearEmptiesEverything() {
+func removeAllLeavesEmpty() {
     var inbox = NotificationInbox()
     inbox.upsert(rec(1))
     inbox.upsert(rec(2))
-    inbox.clear()
+    inbox.remove(1)
+    inbox.remove(2)
     #expect(inbox.isEmpty)
     #expect(inbox.count == 0)
     #expect(inbox.tabIDs.isEmpty)

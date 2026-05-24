@@ -2056,6 +2056,11 @@ impl App {
             self.refresh_rollup_for(*pid);
         }
 
+        // 6.5 Reconcile inbox membership from the snapshot's
+        //     notification flags — a dropped edge would otherwise leave
+        //     the inbox + bell badge stale while the dot above is fixed.
+        self.reconcile_inbox_from_snapshot(&snapshot);
+
         // 7. Reorder the sidebar to the snapshot order.
         self.apply_sidebar_order(&plan.project_order);
 
@@ -2513,9 +2518,13 @@ impl App {
     }
 
     /// "Clear All Notifications": clear each pending tab's notification
-    /// (fires the false-edge → inbox remove + tab-badge clear), then
-    /// empty the inbox + refresh the header badge so the UI converges
-    /// immediately.
+    /// through the workspace. Each clear emits the `TabNotification`
+    /// false-edge, which is the single source of truth — its handler
+    /// drops the inbox row, refreshes the header badge, and clears the
+    /// tab's needs-attention. Driving removal only off that edge (no
+    /// parallel local clear) keeps list == indicators == badge even if
+    /// a clear fails: that tab stays pending rather than the UI
+    /// desyncing from the workspace.
     fn clear_all_notifications(self: &Rc<Self>) {
         let tab_ids = self.notification_inbox.borrow().tab_ids();
         if let Some(client) = self.client.borrow().clone() {
@@ -2523,7 +2532,58 @@ impl App {
                 let _ = client.workspace.set_tab_has_notification(*tab_id, false);
             }
         }
-        self.notification_inbox.borrow_mut().clear();
+    }
+
+    /// Reconcile inbox membership from a workspace snapshot during
+    /// resync. The live `NotificationFired` / `TabNotification` edges
+    /// normally drive the inbox, but the broadcast lag that triggers a
+    /// resync can drop an edge — leaving the inbox + bell badge stale
+    /// while `reconcile_to_snapshot` corrects the per-tab dot. Bring
+    /// membership back in line with the authoritative `has_notification`
+    /// flags. Best-effort: the message body rode the lost event, so a
+    /// recovered row shows its title only.
+    fn reconcile_inbox_from_snapshot(self: &Rc<Self>, snapshot: &[Project]) {
+        let pending: HashSet<i64> = snapshot
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter(|t| t.has_notification)
+            .map(|t| t.id)
+            .collect();
+        // Drop rows for tabs no longer pending (cleared or closed).
+        let stale: Vec<i64> = self
+            .notification_inbox
+            .borrow()
+            .tab_ids()
+            .into_iter()
+            .filter(|id| !pending.contains(id))
+            .collect();
+        {
+            let mut inbox = self.notification_inbox.borrow_mut();
+            for id in stale {
+                inbox.remove(id);
+            }
+        }
+        // Add rows for pending tabs missing from the inbox.
+        let existing: HashSet<i64> = self
+            .notification_inbox
+            .borrow()
+            .tab_ids()
+            .into_iter()
+            .collect();
+        for tab_id in pending {
+            if !existing.contains(&tab_id) {
+                if let Some((project_id, title)) = self.inbox_title_for(tab_id) {
+                    self.notification_inbox
+                        .borrow_mut()
+                        .upsert(NotificationRecord::new(
+                            tab_id,
+                            project_id,
+                            title,
+                            String::new(),
+                        ));
+                }
+            }
+        }
         self.refresh_notif_badge();
     }
 

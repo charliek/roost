@@ -62,11 +62,6 @@ struct NotificationInbox {
         records.removeAll { $0.tabID == tabID }
     }
 
-    /// Empty the inbox ("Clear All Notifications").
-    mutating func clear() {
-        records.removeAll()
-    }
-
     /// Front-to-back (newest first) for rendering.
     func snapshot() -> [NotificationRecord] {
         records

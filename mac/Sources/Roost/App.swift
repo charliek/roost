@@ -942,24 +942,21 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// "Clear All Notifications": clear each pending tab's notification
-    /// (which fires the false-edge → inbox remove + dot clear), then
-    /// empty the inbox + refresh the badge directly so the UI converges
-    /// immediately without waiting on the round-trip.
+    /// through the workspace. Each clear emits the `tab.notification`
+    /// false-edge, which is the single source of truth — its handler
+    /// drops the inbox row, refreshes the Dock badge, and rebuilds the
+    /// dot. Driving removal only off that edge (no parallel local clear)
+    /// keeps list == dots == badge even if a clear fails: that tab
+    /// simply stays pending rather than the UI desyncing from the
+    /// workspace.
     @MainActor
     private func clearAllNotifications() {
         let socket = socketPath
         for tabID in notificationInbox.tabIDs {
-            if let session = tabs.first(where: { $0.id == tabID }) {
-                session.liveHasNotification = false
-            }
             Task.detached {
                 await clearTabNotification(socketPath: socket, tabID: tabID)
             }
         }
-        notificationInbox.clear()
-        refreshDockBadge()
-        rebuildTabBar()
-        rebuildSidebar()
     }
 
     /// Bring `tabID`'s tab forward: switch project if needed, select the
