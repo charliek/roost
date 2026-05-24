@@ -191,12 +191,61 @@ struct WorkspaceStatePersistenceTests {
         #expect(p.id == projectID)
         #expect(p.name == "Roost")
         #expect(p.cwd == "/tmp")
-        // Tabs are NOT restored.
+        // Tabs come back as restore *descriptors*, not live tabs —
+        // the live `tabs` map is empty until the UI re-opens them.
         let tabsInProject = await ws2.tabs(in: p.id)
         #expect(tabsInProject.isEmpty)
         // Ids advance past the previously-issued tab id.
         let nextTab = try await ws2.openTab(projectID: projectID, cwd: "/", title: "")
         #expect(nextTab.id > firstTabID)
+    }
+
+    @Test func persistRestoreRoundTripsTabLayout() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let projectID: Int64 = try await {
+            let ws = await Workspace(statePath: path)
+            let p = await ws.createProject(name: "p", cwd: "/proj")
+            _ = try await ws.openTab(projectID: p.id, cwd: "/a", title: "atab")
+            let b = try await ws.openTab(projectID: p.id, cwd: "/b", title: "btab")
+            _ = try await ws.openTab(projectID: p.id, cwd: "/c", title: "ctab")
+            // Select the middle tab so restore picks it by position.
+            _ = try await ws.focusTab(b.id)
+            return p.id
+        }()
+
+        let ws2 = await Workspace(statePath: path)
+        // Restored tabs are descriptors, not live tabs.
+        let live = await ws2.tabs(in: projectID)
+        #expect(live.isEmpty)
+        let restore = try #require(await ws2.takeRestoreLayout())
+        #expect(restore.activeProjectID == projectID)
+        #expect(restore.activeTabPosition == 1, "tab 'b' is at position 1")
+        let rp = try #require(restore.projects.first { $0.projectID == projectID })
+        #expect(rp.tabs.map(\.cwd) == ["/a", "/b", "/c"])
+        #expect(rp.tabs[1].title == "btab")
+        // `takeRestoreLayout` is one-shot.
+        let again = await ws2.takeRestoreLayout()
+        #expect(again == nil)
+    }
+
+    @Test func legacyStateWithoutTabsLoadsWithDefaults() async {
+        // A state.json written by a build predating tab persistence
+        // (no `tabs` / `active_*` keys) must still load — those fields
+        // default to empty / 0 rather than failing to decode.
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let legacy = """
+        {"next_id":5,"projects":[{"id":1,"name":"Old","cwd":"/tmp","position":0,"created_at":1}]}
+        """
+        try? legacy.write(toFile: path, atomically: true, encoding: .utf8)
+        let ws = await Workspace(statePath: path)
+        let projects = await ws.snapshot()
+        #expect(projects.count == 1)
+        let restore = await ws.takeRestoreLayout()
+        #expect(restore?.activeProjectID == 0)
+        #expect(restore?.projects.first?.tabs.isEmpty == true)
     }
 
     @Test func corruptedStateStartsEmpty() async {

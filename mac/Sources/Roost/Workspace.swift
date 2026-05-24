@@ -97,6 +97,20 @@ final class Workspace {
     private(set) var activeTabID: Int64 = 0
     private let statePath: String?
     private var observers: [UUID: @Sendable (Event) -> Void] = [:]
+    /// One-shot tab layout loaded from `state.json` at init, drained
+    /// by the app bootstrap via `takeRestoreLayout()`. Kept out of
+    /// the live `tabs` map — the live tabs are the fresh shells the
+    /// UI re-opens from these descriptors.
+    private var restoreLayout: RestoreLayout?
+    /// Last time a cwd/OSC-title change persisted. These fire per
+    /// shell prompt / `cd`, so they're throttled (`persistThrottled`)
+    /// to avoid an fsync per change; `nil` means "never". Mirrors the
+    /// Rust `last_meta_persist`.
+    private var lastMetaPersist: Date?
+    /// Leading-edge throttle window for chatty shell-driven persists.
+    /// The in-memory value stays current; the next layout mutation
+    /// flushes it, so the worst case is this much staleness on disk.
+    private static let metaPersistMinInterval: TimeInterval = 1.0
 
     // MARK: Init
 
@@ -106,9 +120,12 @@ final class Workspace {
     }
 
     /// Open or create the workspace backed by `state.json` at
-    /// `statePath`. Reads existing projects + next_id. Tabs are
-    /// intentionally NOT restored (the no-session-restore goal).
-    /// Corrupt or absent file → start empty (warn-log).
+    /// `statePath`. Reads existing projects + next_id, and loads each
+    /// project's persisted tab layout into a one-shot `restoreLayout`
+    /// (drained by the app bootstrap via `takeRestoreLayout` to
+    /// re-open fresh shells in their saved dirs). The layout is NOT
+    /// inserted as live tabs. Corrupt or absent file → start empty
+    /// (warn-log).
     init(statePath: String) {
         self.statePath = statePath
         if let snapshot = Self.readSnapshot(at: statePath) {
@@ -122,7 +139,28 @@ final class Workspace {
                     createdAt: p.createdAt
                 )
             }
+            self.restoreLayout = RestoreLayout(
+                projects: snapshot.projects.map { p in
+                    RestoreProject(
+                        projectID: p.id,
+                        tabs: p.tabs
+                            .sorted { $0.position < $1.position }
+                            .map { RestoreTab(cwd: $0.cwd, title: $0.title) }
+                    )
+                },
+                activeProjectID: snapshot.activeProjectID,
+                activeTabPosition: snapshot.activeTabPosition
+            )
         }
+    }
+
+    /// Take the one-shot tab layout loaded from `state.json` at init.
+    /// Returns `nil` for the in-memory variant and after the first
+    /// call. The app bootstrap calls this once to re-open each
+    /// project's saved tabs as fresh shells.
+    func takeRestoreLayout() -> RestoreLayout? {
+        defer { restoreLayout = nil }
+        return restoreLayout
     }
 
     // MARK: Subscribe
@@ -414,6 +452,8 @@ final class Workspace {
         t.userTitled = true
         tabs[tabID] = t
         emit(.tabTitleChanged(tabID: tabID, title: title))
+        // Manual rename is deliberate + infrequent — persist now.
+        persist()
     }
 
     /// OSC 0/1/2 title — respects a prior manual rename.
@@ -423,6 +463,8 @@ final class Workspace {
         t.title = title
         tabs[tabID] = t
         emit(.tabTitleChanged(tabID: tabID, title: title))
+        // Shell-driven (OSC titles can fire per prompt) — throttle.
+        persistThrottled()
     }
 
     func setTabCwd(_ tabID: Int64, cwd: String) throws {
@@ -430,6 +472,10 @@ final class Workspace {
         t.cwd = cwd
         tabs[tabID] = t
         emit(.tabCwdChanged(tabID: tabID, cwd: cwd))
+        // Shell-driven (OSC 7 fires per `cd`) — throttle so a `cd`
+        // loop doesn't fsync per change; the new cwd is in memory and
+        // the next layout mutation flushes it.
+        persistThrottled()
     }
 
     func setTabState(_ tabID: Int64, state: TabState) throws {
@@ -458,6 +504,11 @@ final class Workspace {
         let prev = (activeProjectID, activeTabID)
         activeProjectID = row.projectId
         activeTabID = row.id
+        // Persist the active selection so it survives a relaunch
+        // (restored by position). Skip when unchanged.
+        if prev != (row.projectId, row.id) {
+            persist()
+        }
         emit(.activeChanged(projectID: row.projectId, tabID: row.id))
         return prev
     }
@@ -496,25 +547,55 @@ final class Workspace {
 
     private func persist() {
         guard let statePath else { return }
+        // Active tab restored by position, not id (ids aren't stable
+        // across a fresh-shell restore).
+        let activeTabPosition = tabs[activeTabID]?.position ?? 0
         let snapshot = SnapshotFile(
             nextID: nextID,
             projects: projects.values
                 .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
                 .map { p in
-                    SnapshotFile.ProjectSnapshot(
+                    let projectTabs = tabs.values
+                        .filter { $0.projectId == p.id }
+                        .sorted { $0.position < $1.position }
+                        .map {
+                            SnapshotFile.TabSnapshot(
+                                title: $0.title,
+                                cwd: $0.cwd,
+                                position: $0.position
+                            )
+                        }
+                    return SnapshotFile.ProjectSnapshot(
                         id: p.id,
                         name: p.name,
                         cwd: p.cwd,
                         position: p.position,
-                        createdAt: p.createdAt
+                        createdAt: p.createdAt,
+                        tabs: projectTabs
                     )
-                }
+                },
+            activeProjectID: activeProjectID,
+            activeTabPosition: activeTabPosition
         )
         do {
             try Self.write(snapshot: snapshot, to: statePath)
         } catch {
             NSLog("workspace: failed to persist state.json: \(error)")
         }
+    }
+
+    /// Persist for chatty shell-driven changes (cwd / OSC title):
+    /// at most once per `metaPersistMinInterval` (leading edge). The
+    /// in-memory value is always current; the next layout mutation
+    /// flushes any throttled change. Mirrors the Rust
+    /// `take_throttled_persist`.
+    private func persistThrottled() {
+        let now = Date()
+        if let last = lastMetaPersist, now.timeIntervalSince(last) < Self.metaPersistMinInterval {
+            return
+        }
+        lastMetaPersist = now
+        persist()
     }
 
     private static func readSnapshot(at path: String) -> SnapshotFile? {
@@ -580,6 +661,25 @@ final class Workspace {
     struct SnapshotFile: Codable, Equatable, Sendable {
         let nextID: Int64
         let projects: [ProjectSnapshot]
+        /// Project to re-select on relaunch (`0` = no preference →
+        /// first project). Mirrors the Rust `SnapshotFile`.
+        let activeProjectID: Int64
+        /// Position of the active tab within `activeProjectID`. Tab
+        /// ids aren't stable across a fresh-shell restore, so the
+        /// selection is restored by position.
+        let activeTabPosition: Int32
+
+        init(
+            nextID: Int64,
+            projects: [ProjectSnapshot],
+            activeProjectID: Int64 = 0,
+            activeTabPosition: Int32 = 0
+        ) {
+            self.nextID = nextID
+            self.projects = projects
+            self.activeProjectID = activeProjectID
+            self.activeTabPosition = activeTabPosition
+        }
 
         struct ProjectSnapshot: Codable, Equatable, Sendable {
             let id: Int64
@@ -587,17 +687,94 @@ final class Workspace {
             let cwd: String
             let position: Int32
             let createdAt: Int64
+            /// This project's tab layout, in display order. Defaulted
+            /// so a file from an older build (no `tabs` key) loads.
+            let tabs: [TabSnapshot]
+
+            init(
+                id: Int64,
+                name: String,
+                cwd: String,
+                position: Int32,
+                createdAt: Int64,
+                tabs: [TabSnapshot] = []
+            ) {
+                self.id = id
+                self.name = name
+                self.cwd = cwd
+                self.position = position
+                self.createdAt = createdAt
+                self.tabs = tabs
+            }
 
             enum CodingKeys: String, CodingKey {
-                case id, name, cwd, position
+                case id, name, cwd, position, tabs
                 case createdAt = "created_at"
             }
+
+            // Custom decode so a missing `tabs` key (legacy file or
+            // the other UI predating tab persistence) defaults to []
+            // rather than throwing — matches Rust's `#[serde(default)]`.
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                id = try c.decode(Int64.self, forKey: .id)
+                name = try c.decode(String.self, forKey: .name)
+                cwd = try c.decode(String.self, forKey: .cwd)
+                position = try c.decode(Int32.self, forKey: .position)
+                createdAt = try c.decode(Int64.self, forKey: .createdAt)
+                tabs = try c.decodeIfPresent([TabSnapshot].self, forKey: .tabs) ?? []
+            }
+        }
+
+        /// A persisted tab's layout: enough to re-open a fresh shell
+        /// in the right place, but no live state.
+        struct TabSnapshot: Codable, Equatable, Sendable {
+            let title: String
+            let cwd: String
+            let position: Int32
         }
 
         enum CodingKeys: String, CodingKey {
             case nextID = "next_id"
             case projects
+            case activeProjectID = "active_project_id"
+            case activeTabPosition = "active_tab_position"
         }
+
+        // Custom decode so missing `tabs` / `active_*` keys default
+        // instead of throwing (cross-version + legacy compatibility).
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            nextID = try c.decode(Int64.self, forKey: .nextID)
+            projects = try c.decodeIfPresent([ProjectSnapshot].self, forKey: .projects) ?? []
+            activeProjectID = try c.decodeIfPresent(Int64.self, forKey: .activeProjectID) ?? 0
+            activeTabPosition = try c.decodeIfPresent(Int32.self, forKey: .activeTabPosition) ?? 0
+        }
+    }
+
+    // MARK: Restore layout
+
+    /// A persisted tab's layout, surfaced to the app bootstrap. A
+    /// descriptor (cwd + title), not a live tab — the UI re-opens it
+    /// as a fresh shell via the normal open path. Mirrors the Rust
+    /// `RestoreTab`.
+    struct RestoreTab: Sendable, Equatable {
+        let cwd: String
+        let title: String
+    }
+
+    struct RestoreProject: Sendable, Equatable {
+        let projectID: Int64
+        /// Tabs in display (position) order.
+        let tabs: [RestoreTab]
+    }
+
+    struct RestoreLayout: Sendable, Equatable {
+        let projects: [RestoreProject]
+        /// Project to re-select (`0` = no preference → first project).
+        let activeProjectID: Int64
+        /// Position of the active tab within the active project.
+        let activeTabPosition: Int32
     }
 }
 
