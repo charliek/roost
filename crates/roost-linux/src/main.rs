@@ -16,6 +16,7 @@ mod config;
 mod events;
 mod key_encoder;
 mod keybind;
+mod notification_inbox;
 mod palette;
 mod palette_ui;
 mod rollup;

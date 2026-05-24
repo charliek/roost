@@ -113,9 +113,29 @@ listbox.navigation-sidebar > row.roost-rollup-idle {
   color: #ffffff;
   font-size: 14px;
 }
+.command-palette-card .palette-subtitle {
+  color: #9e9e9e;
+  font-size: 12px;
+}
 .command-palette-card .palette-shortcut {
   color: #9e9e9e;
   font-size: 12px;
+}
+
+/* HeaderBar notifications button: a bell with a small count badge
+ * overlaid top-right. The badge is a GtkLabel inside a GtkOverlay; the
+ * button stays flat to match the other headerbar chrome. Hidden as a
+ * unit when the inbox is empty (app.rs toggles visibility). */
+.roost-notif-badge {
+  background-color: #e0533d;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: bold;
+  border-radius: 8px;
+  padding: 0 4px;
+  margin: 2px;
+  min-width: 12px;
+  min-height: 12px;
 }
 
 /* Drag-to-reorder feedback lives in app.rs: the dragged row's opacity
