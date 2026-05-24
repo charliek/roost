@@ -164,6 +164,21 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// an empty key equivalent (effectively unbound).
     private var keybinds: [Accel: String] = [:]
     private var activeTheme: Theme = .fallback
+    /// Name of the active theme (the bundled file name, e.g. `Dracula`,
+    /// `roost-dark`). `activeTheme` is a nameless value struct, so we
+    /// track the name separately to pre-highlight the live theme in the
+    /// palette and to express revert-by-name. Not persisted — relaunch
+    /// re-reads `config.conf`.
+    private var activeThemeName: String = "roost-dark"
+
+    /// Command palette (Cmd+Shift+P). Nil when closed. `paletteOpen`
+    /// gates app shortcuts (defense-in-depth in `validateMenuItem`) and
+    /// the focus-snap in `applicationDidBecomeActive` while it's up.
+    /// `themeNameAtOpen` is the theme to restore if a live preview is
+    /// dismissed without confirming.
+    private var palette: PalettePanel?
+    private var paletteOpen = false
+    private var themeNameAtOpen: String?
     private var activeFont: NSFont = .monospacedSystemFont(
         ofSize: 14,
         weight: .regular
@@ -257,7 +272,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // `.monospacedSystemFont(ofSize: 14)` unless the user
         // overrides `font-family` / `font-size`.
         self.config = RoostConfig.load()
-        self.activeTheme = Theme.loadBundled(name: config.themeName ?? "roost-dark")
+        self.activeThemeName = config.themeName ?? "roost-dark"
+        self.activeTheme = Theme.loadBundled(name: activeThemeName)
         self.activeFont = resolveFont(
             family: config.fontFamily,
             size: config.fontSize ?? 14
@@ -747,6 +763,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// and become no-ops. Snapping focus back here covers the
     /// common case without needing a click into the terminal area.
     func applicationDidBecomeActive(_ notification: Notification) {
+        // While the palette is up it owns focus (its text field); don't
+        // yank first responder back to the terminal on reactivation.
+        guard !paletteOpen else { return }
         focusActiveTerminal()
     }
 
@@ -759,6 +778,177 @@ final class RoostApp: NSObject, NSApplicationDelegate {
               let session = activeSessionByProject[activeProjectID]
         else { return }
         window?.makeFirstResponder(session.terminalView)
+    }
+
+    /// Switch the active theme at runtime and broadcast it to every
+    /// open terminal (all tabs, all projects — `tabs` is the flat
+    /// list). Not persisted: `config.conf` still wins on next launch.
+    /// Resolves the palette once and reuses it across terminals so
+    /// live-preview arrowing stays cheap. New tabs read `activeTheme`
+    /// on spawn, so both confirm and revert propagate forward.
+    @MainActor
+    private func setActiveTheme(_ theme: Theme, name: String) {
+        activeTheme = theme
+        activeThemeName = name
+        let resolved = theme.resolved()
+        for session in tabs {
+            session.terminalView.setTheme(theme, resolved: resolved)
+        }
+    }
+
+    // MARK: - Command palette (Cmd+Shift+P)
+
+    @objc @MainActor
+    private func showCommandPalette(_ sender: Any?) {
+        guard palette == nil, let window else { return }
+        themeNameAtOpen = activeThemeName
+        paletteOpen = true
+
+        let root = PaletteFrame(
+            id: "commands",
+            placeholder: "Execute a command…",
+            items: paletteCommandItems()
+        )
+        let behavior = PaletteBehavior(onConfirm: { [weak self] item in
+            self?.confirmPaletteCommand(item) ?? .close
+        })
+        let panel = PalettePanel(
+            parent: window,
+            contentRegion: terminalContainer,
+            root: root,
+            behavior: behavior
+        ) { [weak self] in
+            self?.dismissPalette()
+        }
+        palette = panel
+        panel.present()
+    }
+
+    /// Panel teardown callback: clear state, re-key the main window,
+    /// then restore terminal focus (order matters — focus won't take on
+    /// a non-key window).
+    @MainActor
+    private func dismissPalette() {
+        palette = nil
+        paletteOpen = false
+        window?.makeKeyAndOrderFront(nil)
+        focusActiveTerminal()
+    }
+
+    @MainActor
+    private func confirmPaletteCommand(_ item: PaletteItem) -> PaletteOutcome {
+        if item.id == PaletteCommands.selectThemeID {
+            return .push(themeFrame(), themeBehavior())
+        }
+        runCommand(item.id)
+        return .close
+    }
+
+    /// Curated first-cut command list. Ids are `KeybindAction` ids
+    /// (except `selectTheme`), so they dispatch through `runCommand`
+    /// and show their shortcut. Indexed switch actions, clipboard, and
+    /// `command_palette` itself are intentionally excluded.
+    @MainActor
+    private func paletteCommandItems() -> [PaletteItem] {
+        PaletteCommands.specs.map { id, title in
+            PaletteItem(id: id, title: title, trailingText: shortcutText(for: id))
+        }
+    }
+
+    /// Map the active theme list onto palette items, pre-highlighting
+    /// the live theme. Names are shown verbatim (so `roost-dark` stays
+    /// lowercase) to keep `id == bundled file name`.
+    @MainActor
+    private func themeFrame() -> PaletteFrame {
+        let names = Theme.bundledNames()
+        let items = names.map { PaletteItem(id: $0, title: $0) }
+        let selection = names.firstIndex(of: activeThemeName) ?? 0
+        return PaletteFrame(
+            id: "themes",
+            placeholder: "Select a theme…",
+            items: items,
+            selection: selection
+        )
+    }
+
+    @MainActor
+    private func themeBehavior() -> PaletteBehavior {
+        PaletteBehavior(
+            onHighlight: { [weak self] item in self?.previewTheme(name: item.id) },
+            onConfirm: { _ in .close },  // highlight already applied it; just close
+            onCancel: { [weak self] in self?.revertTheme() }
+        )
+    }
+
+    @MainActor
+    private func previewTheme(name: String) {
+        guard name != activeThemeName else { return }  // skip redundant re-apply
+        setActiveTheme(Theme.loadBundled(name: name), name: name)
+    }
+
+    @MainActor
+    private func revertTheme() {
+        guard let name = themeNameAtOpen, name != activeThemeName else { return }
+        setActiveTheme(Theme.loadBundled(name: name), name: name)
+    }
+
+    /// Dispatch a palette command through the same handlers the menu
+    /// uses, so there's a single code path. New tabs/projects etc. land
+    /// exactly as if the shortcut was pressed.
+    @MainActor
+    private func runCommand(_ id: String) {
+        switch id {
+        case KeybindAction.newTab:        newTab(nil)
+        case KeybindAction.closeTab:      closeActiveTab(nil)
+        case KeybindAction.renameTab:     renameActiveTab(nil)
+        case KeybindAction.cycleTabNext:  cycleTabNext(nil)
+        case KeybindAction.cycleTabPrev:  cycleTabPrev(nil)
+        case KeybindAction.newProject:    newProject(nil)
+        case KeybindAction.renameProject: renameActiveProject(nil)
+        case KeybindAction.closeProject:  closeActiveProject(nil)
+        case KeybindAction.toggleSidebar: toggleSidebar(nil)
+        case KeybindAction.jumpToUnread:  jumpToUnread(nil)
+        case KeybindAction.fontIncrease:  fontIncrease(nil)
+        case KeybindAction.fontDecrease:  fontDecrease(nil)
+        case KeybindAction.fontReset:     fontReset(nil)
+        default:
+            NSLog("roost-mac: palette runCommand got unknown id %@", id)
+        }
+    }
+
+    /// Render an action's keybind as a glyph string ("⌘⇧P") for the
+    /// palette's right-hand hint. Nil when the action is unbound.
+    @MainActor
+    private func shortcutText(for action: String) -> String? {
+        let (key, mods) = accel(for: action)
+        if key.isEmpty { return nil }
+        var s = ""
+        if mods.contains(.control) { s += "⌃" }
+        if mods.contains(.option) { s += "⌥" }
+        if mods.contains(.shift) { s += "⇧" }
+        if mods.contains(.command) { s += "⌘" }
+        switch key {
+        case "\r": s += "⏎"
+        case "\u{1b}": s += "⎋"
+        case "\t": s += "⇥"
+        case " ": s += "␣"
+        default: s += key.uppercased()
+        }
+        return s
+    }
+
+    /// Defense-in-depth shortcut gate: while the palette is open and
+    /// capturing keystrokes, don't let Roost's own command shortcuts
+    /// (⌘T, ⌘W, …) fire from the still-live main menu. Only items
+    /// targeting `self` route here — clipboard (NSText) and Quit
+    /// (NSApplication) are validated elsewhere and stay live. The
+    /// palette toggle itself stays enabled (re-press is a no-op).
+    @objc @MainActor
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if paletteOpen, menuItem.action != #selector(showCommandPalette(_:)) {
+            return false
+        }
+        return true
     }
 
     // MARK: - Workspace bootstrap
@@ -2140,6 +2330,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // View menu (P2 font zoom) — same keybind-table lookup.
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "View")
+        let paletteItem = NSMenuItem(
+            title: "Command Palette…",
+            action: #selector(showCommandPalette(_:)),
+            keyEquivalent: ""
+        )
+        paletteItem.target = self
+        bind(paletteItem, to: KeybindAction.commandPalette)
+        viewMenu.addItem(paletteItem)
+        viewMenu.addItem(.separator())
         let zoomInItem = NSMenuItem(
             title: "Zoom In",
             action: #selector(fontIncrease(_:)),

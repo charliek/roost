@@ -51,6 +51,11 @@ enum KeybindAction {
     /// action; not present on the Go binary (cmux-inspired
     /// ⌘⇧U convention).
     static let jumpToUnread  = "jump_to_unread"
+    /// Cmd+Shift+P command palette. Mac-only for now — there's no
+    /// Go/Linux counterpart yet, so this breaks the otherwise-lockstep
+    /// namespace deliberately; add the peer action when Linux grows a
+    /// palette.
+    static let commandPalette = "command_palette"
     static let unbind        = "unbind"
 
     /// `switch_project_N` (1..9). Defined as a function rather than
@@ -66,7 +71,7 @@ enum KeybindAction {
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
         paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
-        jumpToUnread,
+        jumpToUnread, commandPalette,
     ]
 
     /// True if `action` is a recognized name (including the
@@ -228,6 +233,8 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.toggleSidebar: ["\(projectMod)+b"],
         // ⌘⇧U — cmux's "jump to latest unread" convention.
         KeybindAction.jumpToUnread:  ["\(primary)+shift+u"],
+        // ⌘⇧P — VS Code / Zed command-palette convention.
+        KeybindAction.commandPalette: ["\(primary)+shift+p"],
         // Browser-style font sizing. + and = both bind because
         // cmd-+ on US layouts is really cmd-shift-=, and many
         // users hit cmd-= without the shift.
