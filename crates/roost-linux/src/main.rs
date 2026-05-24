@@ -225,6 +225,19 @@ fn main() -> anyhow::Result<()> {
         );
     });
 
+    // Persist + fsync the tab layout on clean exit. `connect_shutdown`
+    // fires when the GApplication main loop terminates — i.e. when the
+    // last window closes, covering the window X button, Cmd+Q, AND the
+    // empty-workspace internal `window.close()` (ProjectDeleted arm in
+    // app.rs). `flush()` freezes further persistence afterward, so the
+    // PTY-exit cascade that the closing window triggers can't overwrite
+    // the flushed layout. Missed only on a hard kill / crash, where
+    // best-effort staleness is acceptable.
+    let client_for_shutdown = client.clone();
+    app.connect_shutdown(move |_| {
+        client_for_shutdown.workspace.flush();
+    });
+
     let exit_code = app.run_with_args::<&str>(&[]);
     rt.shutdown_background();
     std::process::exit(exit_code.into());

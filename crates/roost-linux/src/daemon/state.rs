@@ -23,8 +23,8 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use roost_ipc::messages::{Project, Tab, TabState};
 use tokio::sync::broadcast;
@@ -72,20 +72,7 @@ struct Inner {
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
     persist_seq: u64,
-    /// Last time a cwd/OSC-title change persisted the layout. These
-    /// fire per shell prompt / `cd`, so they're throttled (see
-    /// `should_persist_meta_now`) to avoid an fsync per keystroke;
-    /// `None` means "never", so the first change always persists.
-    last_meta_persist: Option<Instant>,
 }
-
-/// Minimum gap between layout persists driven by chatty shell output
-/// (OSC 7 cwd, OSC 0/1/2 title). The in-memory state is always
-/// current; the latest value is flushed by the next layout mutation
-/// (open/close/reorder) or the next change past this window, so the
-/// worst case is up to this much staleness on disk — acceptable for
-/// session restore, and it keeps a `cd` loop from fsync-storming.
-const META_PERSIST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// A persisted project's tab layout, surfaced to the UI bootstrap.
 /// These are descriptors (cwd + title), not live tabs — the UI
@@ -206,6 +193,13 @@ pub struct Workspace {
     /// out of `inner.tabs` — the live tabs are the fresh shells the
     /// UI re-opens from these descriptors.
     restore_layout: Mutex<Option<RestoreLayout>>,
+    /// Set by `flush()` on clean exit, *after* it writes the final
+    /// layout. Once set, `persist()` is a no-op so a teardown-induced
+    /// PTY-exit cascade (the window closing kills its shells) can't
+    /// race in and overwrite the flushed layout with an empty one.
+    /// Lock-free because `persist()` runs after the `inner` lock drops
+    /// — it can't read a field guarded by that lock.
+    shutting_down: AtomicBool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -232,6 +226,7 @@ impl Workspace {
             state_path: None,
             persist_guard: Mutex::new(0),
             restore_layout: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -307,6 +302,7 @@ impl Workspace {
             state_path: Some(state_path),
             persist_guard: Mutex::new(0),
             restore_layout: Mutex::new(Some(restore)),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -366,19 +362,17 @@ impl Workspace {
         let mut inner = self.inner.lock().unwrap();
         if let Some(p) = inner.projects.values().next() {
             let id = p.id;
-            let mut active_changed = false;
+            let mut events = Vec::new();
             if inner.active_project_id == 0 {
                 inner.active_project_id = id;
-                active_changed = true;
-            }
-            let (apid, atid) = (inner.active_project_id, inner.active_tab_id);
-            if active_changed {
-                let _ = self.events.send(WorkspaceEvent::ActiveChanged {
-                    project_id: apid,
-                    tab_id: atid,
+                events.push(WorkspaceEvent::ActiveChanged {
+                    project_id: inner.active_project_id,
+                    tab_id: inner.active_tab_id,
                 });
             }
-            drop(inner);
+            // No inline write here (as before): the only mutation is
+            // the active selection, which `flush()` captures on exit.
+            self.commit(inner, events, Persist::Skip);
             return id;
         }
         let id = inner.alloc_id();
@@ -395,7 +389,6 @@ impl Workspace {
             },
         );
         inner.active_project_id = id;
-        let (snapshot, seq) = inner.snapshot_for_persist();
         let project = Project {
             id,
             name: "Default".into(),
@@ -404,13 +397,14 @@ impl Workspace {
             created_at: now,
             tabs: vec![],
         };
-        let _ = self.events.send(WorkspaceEvent::ProjectCreated(project));
-        let _ = self.events.send(WorkspaceEvent::ActiveChanged {
-            project_id: id,
-            tab_id: 0,
-        });
-        drop(inner);
-        self.persist(seq, snapshot);
+        let events = vec![
+            WorkspaceEvent::ProjectCreated(project),
+            WorkspaceEvent::ActiveChanged {
+                project_id: id,
+                tab_id: 0,
+            },
+        ];
+        self.commit(inner, events, Persist::Write);
         id
     }
 
@@ -431,7 +425,6 @@ impl Workspace {
             created_at: unix_now(),
         };
         inner.projects.insert(id, row.clone());
-        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let project = Project {
             id: row.id,
@@ -441,11 +434,11 @@ impl Workspace {
             created_at: row.created_at,
             tabs: vec![],
         };
-        let _ = self
-            .events
-            .send(WorkspaceEvent::ProjectCreated(project.clone()));
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::ProjectCreated(project.clone())],
+            Persist::Write,
+        );
         Ok(project)
     }
 
@@ -456,13 +449,14 @@ impl Workspace {
             .get_mut(&project_id)
             .ok_or(WorkspaceError::ProjectNotFound(project_id))?;
         row.name = name.to_string();
-        let (snapshot, seq) = inner.snapshot_for_persist();
-        let _ = self.events.send(WorkspaceEvent::ProjectRenamed {
-            project_id,
-            name: name.to_string(),
-        });
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::ProjectRenamed {
+                project_id,
+                name: name.to_string(),
+            }],
+            Persist::Write,
+        );
         Ok(())
     }
 
@@ -507,24 +501,20 @@ impl Workspace {
         } else {
             None
         };
-        let (snapshot, seq) = inner.snapshot_for_persist();
 
-        // Publish under the lock (TabClosed* → ProjectDeleted →
-        // ActiveChanged) so order matches commit order.
-        for tid in &tab_ids {
-            let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id: *tid });
-        }
-        let _ = self
-            .events
-            .send(WorkspaceEvent::ProjectDeleted { project_id });
+        // Commit order: TabClosed* → ProjectDeleted → ActiveChanged.
+        let mut events: Vec<WorkspaceEvent> = tab_ids
+            .iter()
+            .map(|tid| WorkspaceEvent::TabClosed { tab_id: *tid })
+            .collect();
+        events.push(WorkspaceEvent::ProjectDeleted { project_id });
         if let Some((pid, tid)) = active {
-            let _ = self.events.send(WorkspaceEvent::ActiveChanged {
+            events.push(WorkspaceEvent::ActiveChanged {
                 project_id: pid,
                 tab_id: tid,
             });
         }
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(inner, events, Persist::Write);
         Ok(tab_ids)
     }
 
@@ -570,7 +560,6 @@ impl Workspace {
         // New tabs steal the active selection.
         inner.active_project_id = project_id;
         inner.active_tab_id = id;
-        let (snapshot, seq) = inner.snapshot_for_persist();
 
         let tab = Tab {
             id: row.id,
@@ -586,13 +575,17 @@ impl Workspace {
             last_active: row.last_active,
             hook_active: row.hook_active,
         };
-        let _ = self.events.send(WorkspaceEvent::TabOpened(tab.clone()));
-        let _ = self.events.send(WorkspaceEvent::ActiveChanged {
-            project_id,
-            tab_id: id,
-        });
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(
+            inner,
+            vec![
+                WorkspaceEvent::TabOpened(tab.clone()),
+                WorkspaceEvent::ActiveChanged {
+                    project_id,
+                    tab_id: id,
+                },
+            ],
+            Persist::Write,
+        );
         Ok(tab)
     }
 
@@ -657,22 +650,19 @@ impl Workspace {
         } else {
             None
         };
-        let (snapshot, seq) = inner.snapshot_for_persist();
 
-        let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id });
+        // Commit order: TabClosed → ProjectDeleted? → ActiveChanged?.
+        let mut events = vec![WorkspaceEvent::TabClosed { tab_id }];
         if project_emptied {
-            let _ = self
-                .events
-                .send(WorkspaceEvent::ProjectDeleted { project_id });
+            events.push(WorkspaceEvent::ProjectDeleted { project_id });
         }
         if let Some((pid, tid)) = active {
-            let _ = self.events.send(WorkspaceEvent::ActiveChanged {
+            events.push(WorkspaceEvent::ActiveChanged {
                 project_id: pid,
                 tab_id: tid,
             });
         }
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(inner, events, Persist::Write);
         Ok(())
     }
 
@@ -684,15 +674,14 @@ impl Workspace {
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.title = title.to_string();
         row.user_titled = true;
-        let _ = self.events.send(WorkspaceEvent::TabTitleChanged {
-            tab_id,
-            title: title.to_string(),
-        });
-        // A manual rename is a deliberate, infrequent action — persist
-        // immediately (no throttle) so it survives a relaunch.
-        let (snapshot, seq) = inner.snapshot_for_persist();
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabTitleChanged {
+                tab_id,
+                title: title.to_string(),
+            }],
+            Persist::Write,
+        );
         Ok(())
     }
 
@@ -708,17 +697,16 @@ impl Workspace {
             return Ok(());
         }
         row.title = title.to_string();
-        let _ = self.events.send(WorkspaceEvent::TabTitleChanged {
-            tab_id,
-            title: title.to_string(),
-        });
-        // Shell-driven; throttle the persist (OSC titles can fire per
-        // prompt). See `META_PERSIST_MIN_INTERVAL`.
-        let persist = inner.take_throttled_persist();
-        drop(inner);
-        if let Some((snapshot, seq)) = persist {
-            self.persist(seq, snapshot);
-        }
+        // Shell-driven (OSC titles fire per prompt) but the write is
+        // cheap now (no fsync until flush()), so write through.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabTitleChanged {
+                tab_id,
+                title: title.to_string(),
+            }],
+            Persist::Write,
+        );
         Ok(())
     }
 
@@ -729,18 +717,17 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.cwd = cwd.to_string();
-        let _ = self.events.send(WorkspaceEvent::TabCwdChanged {
-            tab_id,
-            cwd: cwd.to_string(),
-        });
-        // Shell-driven (OSC 7 fires per `cd`); throttle the persist so
-        // a `cd` loop doesn't fsync per change. The new cwd is already
-        // in memory and the next layout mutation flushes it.
-        let persist = inner.take_throttled_persist();
-        drop(inner);
-        if let Some((snapshot, seq)) = persist {
-            self.persist(seq, snapshot);
-        }
+        // Shell-driven (OSC 7 fires per `cd`) but write-through: each
+        // change lands in the page cache without an fsync, so a `cd`
+        // loop is cheap and the latest cwd is always on disk.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabCwdChanged {
+                tab_id,
+                cwd: cwd.to_string(),
+            }],
+            Persist::Write,
+        );
         Ok(())
     }
 
@@ -751,10 +738,12 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.state = state;
-        let _ = self
-            .events
-            .send(WorkspaceEvent::TabStateChanged { tab_id, state });
-        drop(inner);
+        // Run-state isn't in the persisted snapshot — emit only.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabStateChanged { tab_id, state }],
+            Persist::Skip,
+        );
         Ok(())
     }
 
@@ -769,11 +758,15 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.has_notification = has_pending;
-        let _ = self.events.send(WorkspaceEvent::TabNotification {
-            tab_id,
-            has_pending,
-        });
-        drop(inner);
+        // Notification flag isn't in the persisted snapshot — emit only.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabNotification {
+                tab_id,
+                has_pending,
+            }],
+            Persist::Skip,
+        );
         Ok(())
     }
 
@@ -784,10 +777,12 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         row.hook_active = active;
-        let _ = self
-            .events
-            .send(WorkspaceEvent::HookActiveChanged { tab_id, active });
-        drop(inner);
+        // Hook-active flag isn't in the persisted snapshot — emit only.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::HookActiveChanged { tab_id, active }],
+            Persist::Skip,
+        );
         Ok(())
     }
 
@@ -805,18 +800,18 @@ impl Workspace {
         // (restored by position). Skip when unchanged — focusing the
         // already-active tab shouldn't churn the file.
         let persist = if prev != (row.project_id, row.id) {
-            Some(inner.snapshot_for_persist())
+            Persist::Write
         } else {
-            None
+            Persist::Skip
         };
-        let _ = self.events.send(WorkspaceEvent::ActiveChanged {
-            project_id: row.project_id,
-            tab_id: row.id,
-        });
-        drop(inner);
-        if let Some((snapshot, seq)) = persist {
-            self.persist(seq, snapshot);
-        }
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::ActiveChanged {
+                project_id: row.project_id,
+                tab_id: row.id,
+            }],
+            persist,
+        );
         Ok(prev)
     }
 
@@ -834,12 +829,16 @@ impl Workspace {
         if !inner.tabs.contains_key(&tab_id) {
             return Err(WorkspaceError::TabNotFound(tab_id));
         }
-        let _ = self.events.send(WorkspaceEvent::NotificationFired {
-            tab_id,
-            title: title.to_string(),
-            body: body.to_string(),
-        });
-        drop(inner);
+        // Transient notification — nothing persisted, emit only.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::NotificationFired {
+                tab_id,
+                title: title.to_string(),
+                body: body.to_string(),
+            }],
+            Persist::Skip,
+        );
         Ok(())
     }
 
@@ -889,13 +888,14 @@ impl Workspace {
         // payload: supplied prefix + sorted unlisted (matches
         // Mac's `Workspace.tabsReordered` payload shape).
         let final_order: Vec<i64> = tab_ids.iter().copied().chain(unlisted).collect();
-        let (snapshot, seq) = inner.snapshot_for_persist();
-        let _ = self.events.send(WorkspaceEvent::TabsReordered {
-            project_id,
-            tab_ids: final_order,
-        });
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabsReordered {
+                project_id,
+                tab_ids: final_order,
+            }],
+            Persist::Write,
+        );
         Ok(())
     }
 
@@ -927,12 +927,13 @@ impl Workspace {
             }
         }
         let final_order: Vec<i64> = project_ids.iter().copied().chain(unlisted).collect();
-        let (snapshot, seq) = inner.snapshot_for_persist();
-        let _ = self.events.send(WorkspaceEvent::ProjectsReordered {
-            project_ids: final_order,
-        });
-        drop(inner);
-        self.persist(seq, snapshot);
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::ProjectsReordered {
+                project_ids: final_order,
+            }],
+            Persist::Write,
+        );
         Ok(())
     }
 
@@ -966,10 +967,18 @@ impl Workspace {
     /// Persist `snapshot` to `state.json`, tagged with its commit
     /// `seq`. Runs synchronously on the caller's thread (the inner
     /// lock is already released; writes are small atomic renames).
-    /// `persist_guard` serializes concurrent writers and drops any
-    /// snapshot older than the newest already on disk, so a slow
-    /// earlier commit can never clobber a newer one (#80).
-    fn persist(&self, seq: u64, snapshot: SnapshotFile) {
+    /// `sync` forces an `fsync` (the clean-exit `flush()` path);
+    /// during the session it's `false` — write-through into the page
+    /// cache, no disk barrier. `persist_guard` serializes concurrent
+    /// writers and drops any snapshot older than the newest already
+    /// on disk, so a slow earlier commit can never clobber a newer
+    /// one (#80).
+    fn persist(&self, seq: u64, snapshot: SnapshotFile, sync: bool) {
+        // Frozen by `flush()` on clean exit: ignore any later write so
+        // a teardown cascade can't overwrite the flushed layout.
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
         let Some(path) = self.state_path.clone() else {
             return; // in-memory variant; no persistence
         };
@@ -977,13 +986,69 @@ impl Workspace {
         if seq <= *last {
             return; // a newer commit already persisted; this write is stale
         }
-        if let Err(err) = persist_state(&path, &snapshot) {
+        if let Err(err) = persist_state(&path, &snapshot, sync) {
             warn!(?err, "failed to persist state.json");
         }
         // Advance past this seq even on write failure: an older
         // snapshot must never win, and there is no retry of `seq`.
         *last = seq;
     }
+
+    /// Persist the current layout with `fsync` and then freeze further
+    /// persistence. Call once on a clean exit (each UI wires it into
+    /// its app-quit hook). The `fsync` re-asserts physical durability
+    /// at quit time — belt-and-suspenders, since the session's
+    /// write-through already left the latest layout in the page cache,
+    /// readable by a relaunch even without it. Setting `shutting_down`
+    /// *after* the write means `flush`'s own `persist` isn't blocked
+    /// while every subsequent one is, so a teardown-induced PTY-exit
+    /// cascade can't clobber the flushed layout. Idempotent: a second
+    /// call is a no-op (the freeze short-circuits its `persist`).
+    pub fn flush(&self) {
+        let (snapshot, seq) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.snapshot_for_persist()
+        };
+        self.persist(seq, snapshot, true);
+        self.shutting_down.store(true, Ordering::Relaxed);
+    }
+
+    /// Centralize the mutate → emit → persist tail shared by every
+    /// mutator (#80). Snapshots **under the lock** when `persist` is
+    /// `Persist::Write` (so the seq reflects commit order), then sends
+    /// every event **while still holding the lock** (broadcast order
+    /// matches commit order — a fast subscriber can't observe a
+    /// contradicting sequence), and only after dropping the lock does
+    /// it write to disk (no I/O under the lock). `Persist::Skip` is
+    /// for state that isn't part of the persisted snapshot (tab
+    /// run-state, notification flags) — emit only.
+    fn commit(
+        &self,
+        mut inner: MutexGuard<'_, Inner>,
+        events: Vec<WorkspaceEvent>,
+        persist: Persist,
+    ) {
+        let to_write = match persist {
+            Persist::Skip => None,
+            Persist::Write => Some(inner.snapshot_for_persist()),
+        };
+        for ev in events {
+            let _ = self.events.send(ev);
+        }
+        drop(inner);
+        if let Some((snapshot, seq)) = to_write {
+            self.persist(seq, snapshot, false);
+        }
+    }
+}
+
+/// Whether a `commit()` should write `state.json`. `Write` for layout
+/// changes (projects/tabs/order/active selection); `Skip` for state
+/// that isn't in the persisted snapshot (run-state, notification +
+/// hook flags) — those emit an event but never touch disk.
+enum Persist {
+    Skip,
+    Write,
 }
 
 impl Default for Workspace {
@@ -1078,22 +1143,6 @@ impl Inner {
                 .collect(),
         };
         (snapshot, self.persist_seq)
-    }
-
-    /// For chatty shell-driven changes (cwd / OSC title): take a
-    /// persist snapshot iff at least `META_PERSIST_MIN_INTERVAL` has
-    /// elapsed since the last such persist. Returns `None` to skip
-    /// (the in-memory value is still current; the next mutation
-    /// flushes it). Leading-edge throttle — see the const's doc.
-    fn take_throttled_persist(&mut self) -> Option<(SnapshotFile, u64)> {
-        let now = Instant::now();
-        match self.last_meta_persist {
-            Some(last) if now.duration_since(last) < META_PERSIST_MIN_INTERVAL => None,
-            _ => {
-                self.last_meta_persist = Some(now);
-                Some(self.snapshot_for_persist())
-            }
-        }
     }
 }
 
@@ -1278,6 +1327,7 @@ mod tests {
                 next_id: 99,
                 ..Default::default()
             },
+            false,
         );
         ws.persist(
             1,
@@ -1285,6 +1335,7 @@ mod tests {
                 next_id: 5,
                 ..Default::default()
             },
+            false,
         );
         assert_eq!(
             read_state(&path).unwrap().unwrap().next_id,
@@ -1299,6 +1350,7 @@ mod tests {
                 next_id: 200,
                 ..Default::default()
             },
+            false,
         );
         assert_eq!(read_state(&path).unwrap().unwrap().next_id, 200);
     }
@@ -1402,27 +1454,47 @@ mod tests {
     }
 
     #[test]
-    fn rapid_cwd_changes_are_throttled() {
-        // OSC 7 fires per `cd`; the leading-edge throttle persists the
-        // first change immediately and coalesces an instant second
-        // (within `META_PERSIST_MIN_INTERVAL`), so only "/first"
-        // reaches disk. The two calls below are microseconds apart.
+    fn cwd_changes_write_through() {
+        // No throttle: every `set_tab_cwd` writes through, so a reopen
+        // sees the LATEST cwd (last write wins), not a coalesced
+        // earlier one. The two calls below are microseconds apart.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let tid = {
+        {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
             let tid = ws.open_tab(pid, "/start", "").unwrap().id;
             ws.set_tab_cwd(tid, "/first").unwrap();
             ws.set_tab_cwd(tid, "/second").unwrap();
-            tid
-        };
-        let _ = tid;
+        }
         let ws2 = Workspace::open(path);
         let restore = ws2.take_restore_layout().unwrap();
         assert_eq!(
-            restore.projects[0].tabs[0].cwd, "/first",
-            "second rapid cwd change should have been throttled off disk"
+            restore.projects[0].tabs[0].cwd, "/second",
+            "the latest cwd must reach disk (write-through, no throttle)"
+        );
+    }
+
+    #[test]
+    fn flush_freezes_further_persistence() {
+        // flush() writes the current layout (with fsync) and then
+        // freezes: a subsequent mutation must NOT reach disk, so a
+        // teardown PTY-exit cascade can't clobber the flushed layout.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/").unwrap().id;
+            let tid = ws.open_tab(pid, "/flushed", "").unwrap().id;
+            ws.flush();
+            // Frozen — this write is a no-op.
+            ws.set_tab_cwd(tid, "/after-flush").unwrap();
+        }
+        let ws2 = Workspace::open(path);
+        let restore = ws2.take_restore_layout().unwrap();
+        assert_eq!(
+            restore.projects[0].tabs[0].cwd, "/flushed",
+            "a post-flush mutation must not have reached disk"
         );
     }
 }
