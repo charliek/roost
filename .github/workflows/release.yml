@@ -154,7 +154,11 @@ jobs:
 
   mac:
     needs: create-release
-    runs-on: macos-15   # arm64 — pinned for reproducible release builds
+    runs-on: macos-26   # arm64 — pinned; ships Xcode 26 by default, which
+                        # actool needs to compile mac/AppIcon.icon (the Tahoe
+                        # glass icon). On older Xcode, bundle.sh still builds but
+                        # falls back to the flat (framed) .icns. See
+                        # packaging/icon/README.md.
     permissions:
       contents: write
     env:
