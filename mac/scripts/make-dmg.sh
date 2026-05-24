@@ -31,6 +31,34 @@ STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT
 cp -R "${APP_DIR}" "${STAGING}/Roost.app"
 
+# First-launch note for the ad-hoc / non-notarized interim (issue #83). It sits
+# beside Roost.app in the mounted DMG so the Gatekeeper-bypass step is visible
+# before the user hits the wall. Gated on ROOST_DEVELOPER_ID_IDENTITY (the same
+# signal bundle.sh uses to pick ad-hoc vs Developer ID): once a real identity is
+# present the build is on the notarization path and the note is omitted.
+if [ -z "${ROOST_DEVELOPER_ID_IDENTITY:-}" ]; then
+  cat > "${STAGING}/FIRST-LAUNCH.txt" <<'EOF'
+Roost — first launch on macOS
+
+Roost is ad-hoc-signed but not yet notarized (pending an Apple Developer
+account), so macOS Gatekeeper blocks the first launch. You only need to do
+this once.
+
+Easiest (works on every supported macOS): after dragging Roost into the
+Applications folder, run this once in Terminal, then open Roost normally:
+
+    xattr -dr com.apple.quarantine /Applications/Roost.app
+
+Or via the GUI (macOS 15+): double-click Roost, dismiss the "Apple could not
+verify…" warning, then open System Settings -> Privacy & Security, scroll to
+the message about Roost, and click "Open Anyway". The older right-click -> Open
+shortcut no longer bypasses Gatekeeper on macOS 15+ (Roost's minimum).
+
+Once a notarized build ships, this goes away and Roost opens with a normal
+double-click.
+EOF
+fi
+
 make_with_hdiutil() {
   ln -s /Applications "${STAGING}/Applications"
   hdiutil create \

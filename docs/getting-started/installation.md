@@ -19,6 +19,29 @@ macOS — download `Roost-<version>.dmg` from the
 [latest GitHub release](https://github.com/charliek/roost/releases),
 open it, and drag `Roost.app` into `/Applications`.
 
+### First launch on macOS
+
+Roost is currently **ad-hoc-signed but not yet notarized** (pending an Apple
+Developer account — see [#83](https://github.com/charliek/roost/issues/83)), so
+macOS Gatekeeper blocks the first launch. You only have to clear this once.
+
+**Easiest (works on every supported macOS):** after dragging Roost to
+`/Applications`, run this once in Terminal, then open Roost normally:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Roost.app
+```
+
+**Or via the GUI (macOS 15+):** double-click Roost, dismiss the "Apple could not
+verify…" warning, then open **System Settings → Privacy & Security**, scroll to
+the message about Roost, and click **Open Anyway** (it may ask for Touch ID or
+your password). Note that the older right-click → Open shortcut no longer
+bypasses Gatekeeper on macOS 15+ (Roost's minimum), so use one of the two paths
+above.
+
+Once a notarized build ships, this step goes away — Roost will open with a
+normal double-click.
+
 The rest of this page covers building from source.
 
 ## Building from source

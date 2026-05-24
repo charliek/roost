@@ -246,12 +246,38 @@ jobs:
       - name: Note signing status
         if: env.HAS_CERT != 'true'
         run: |
-          echo "::notice::Roost-${GITHUB_REF_NAME#v}.dmg is UNSIGNED (no Apple Developer ID yet). To open: right-click → Open, or 'xattr -dr com.apple.quarantine /Applications/Roost.app'."
+          echo "::notice::Roost-${GITHUB_REF_NAME#v}.dmg is UNSIGNED (no Apple Developer ID yet). First launch: run 'xattr -dr com.apple.quarantine /Applications/Roost.app', or System Settings > Privacy & Security > Open Anyway."
 
       - name: Upload DMG to the Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" --clobber
+
+      # Interim only: while the DMG is ad-hoc-signed (no Developer ID), append
+      # the Gatekeeper-bypass instructions to the release body so downloaders
+      # see them at the earliest touchpoint. Self-disables via HAS_CERT once
+      # notarization secrets land. A sentinel marker keeps re-runs idempotent.
+      - name: Append macOS first-launch note to release body
+        if: env.HAS_CERT != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          marker="<!-- roost-macos-firstlaunch -->"
+          body="$(gh release view "${tag}" --json body -q .body)"
+          case "${body}" in
+            *"${marker}"*) echo "First-launch note already present — skipping."; exit 0 ;;
+          esac
+          {
+            printf '%s\n\n' "${body}"
+            printf '%s\n' "${marker}"
+            printf '### macOS first launch\n\n'
+            printf 'The macOS DMG is ad-hoc-signed but not yet notarized (pending an Apple Developer account), so Gatekeeper blocks the first launch. Clear it once after dragging Roost to Applications:\n\n'
+            printf '```\nxattr -dr com.apple.quarantine /Applications/Roost.app\n```\n\n'
+            printf 'Or, on macOS 15+, use **System Settings → Privacy & Security → Open Anyway**. Full details: [Installation → First launch on macOS](https://github.com/charliek/roost/blob/main/docs/getting-started/installation.md#first-launch-on-macos).\n'
+          } > "${RUNNER_TEMP}/relbody.md"
+          gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/relbody.md"
 
   dispatch-apt-charliek:
     needs: linux
