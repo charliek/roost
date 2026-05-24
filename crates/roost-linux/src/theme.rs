@@ -70,6 +70,16 @@ impl Theme {
     pub fn roost_dark() -> Self {
         Self::load_bundled("roost-dark")
     }
+
+    /// Bundled theme names, **sorted** — feeds the command palette's
+    /// "Select Theme…" list. Names are returned verbatim (so
+    /// `roost-dark` stays lowercase) and match the `load_bundled` keys
+    /// 1:1. Mirrors the Mac UI's `Theme.bundledNames()`.
+    pub fn bundled_names() -> Vec<String> {
+        let mut names: Vec<String> = BUNDLED_THEMES.iter().map(|(n, _)| n.to_string()).collect();
+        names.sort();
+        names
+    }
 }
 
 impl Default for Theme {
@@ -214,6 +224,20 @@ mod tests {
     fn hex_short_form_expands() {
         let rgb = parse_hex("#fff").unwrap();
         assert_eq!(rgb, ColorRgb::new(0xff, 0xff, 0xff));
+    }
+
+    #[test]
+    fn bundled_names_sorted_and_verbatim() {
+        let names = Theme::bundled_names();
+        assert!(names.contains(&"roost-dark".to_string()));
+        assert!(names.contains(&"Dracula".to_string()));
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "bundled_names must be sorted");
+        // Every name round-trips through load_bundled (palette ids).
+        for name in &names {
+            let _ = Theme::load_bundled(name);
+        }
     }
 
     #[test]
