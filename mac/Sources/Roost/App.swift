@@ -812,7 +812,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let behavior = PaletteBehavior(onConfirm: { [weak self] item in
             self?.confirmPaletteCommand(item) ?? .close
         })
-        let panel = PalettePanel(parent: window, root: root, behavior: behavior) { [weak self] in
+        let panel = PalettePanel(
+            parent: window,
+            contentRegion: terminalContainer,
+            root: root,
+            behavior: behavior
+        ) { [weak self] in
             self?.dismissPalette()
         }
         palette = panel

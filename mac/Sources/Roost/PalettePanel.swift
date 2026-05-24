@@ -47,17 +47,25 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let onDismiss: () -> Void
 
     private weak var hostWindow: NSWindow?
+    /// The terminal/content area (right of the sidebar). The card is
+    /// centered over this and pinned just under the tab bar.
+    private weak var contentRegion: NSView?
     private let field = NSTextField()
     private let table = NSTableView()
     private let card = NSView()
+    private var cardCenterX: NSLayoutConstraint!
+    private var cardTop: NSLayoutConstraint!
     private var isClosing = false
 
-    private static let cardWidth: CGFloat = 640
-    private static let cardHeight: CGFloat = 420
-    private static let rowHeight: CGFloat = 34
+    private static let cardWidth: CGFloat = 660
+    private static let cardHeight: CGFloat = 440
+    private static let rowHeight: CGFloat = 32
+    /// Gap below the tab bar (~1cm) so the card floats under the tabs.
+    private static let topGap: CGFloat = 30
 
     init(
         parent: NSWindow,
+        contentRegion: NSView?,
         root: PaletteFrame,
         behavior: PaletteBehavior,
         onDismiss: @escaping () -> Void
@@ -66,6 +74,7 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         self.behaviors = [root.id: behavior]
         self.onDismiss = onDismiss
         self.hostWindow = parent
+        self.contentRegion = contentRegion
         super.init(
             contentRect: parent.frame,
             styleMask: [.borderless],
@@ -89,39 +98,46 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func buildViews() {
         let backdrop = BackdropView()
         backdrop.wantsLayer = true
-        backdrop.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.35).cgColor
+        // Light dim — enough to set the palette apart without washing
+        // out the card behind it.
+        backdrop.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
         backdrop.onClickOutsideCard = { [weak self] in self?.dismiss(confirmed: false) }
         backdrop.card = card
         contentView = backdrop
 
         card.translatesAutoresizingMaskIntoConstraints = false
         card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor(srgbRed: 0.14, green: 0.14, blue: 0.155, alpha: 1).cgColor
+        // Lighter than the terminal so white text reads crisply (Zed).
+        card.layer?.backgroundColor = NSColor(srgbRed: 0.18, green: 0.18, blue: 0.20, alpha: 1).cgColor
         card.layer?.cornerRadius = 10
         card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         card.shadow = {
             let s = NSShadow()
-            s.shadowColor = NSColor.black.withAlphaComponent(0.5)
-            s.shadowBlurRadius = 30
+            s.shadowColor = NSColor.black.withAlphaComponent(0.55)
+            s.shadowBlurRadius = 34
             s.shadowOffset = NSSize(width: 0, height: -10)
             return s
         }()
         backdrop.addSubview(card)
+        cardCenterX = card.centerXAnchor.constraint(equalTo: backdrop.centerXAnchor)
+        cardTop = card.topAnchor.constraint(equalTo: backdrop.topAnchor, constant: 100)
+        let cardHeight = card.heightAnchor.constraint(equalToConstant: Self.cardHeight)
+        cardHeight.priority = .defaultHigh  // shrink on short windows
         NSLayoutConstraint.activate([
-            card.centerXAnchor.constraint(equalTo: backdrop.centerXAnchor),
-            // Slightly above center, Spotlight-style.
-            card.centerYAnchor.constraint(equalTo: backdrop.centerYAnchor, constant: 60),
+            cardCenterX,
+            cardTop,
             card.widthAnchor.constraint(equalToConstant: Self.cardWidth),
-            card.heightAnchor.constraint(equalToConstant: Self.cardHeight),
+            cardHeight,
+            card.bottomAnchor.constraint(lessThanOrEqualTo: backdrop.bottomAnchor, constant: -16),
         ])
 
         field.translatesAutoresizingMaskIntoConstraints = false
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = .systemFont(ofSize: 18, weight: .regular)
-        field.textColor = .labelColor
+        field.font = .systemFont(ofSize: 17, weight: .regular)
+        field.textColor = .white
         field.placeholderString = state.current.placeholder
         field.delegate = self
         field.cell?.usesSingleLineMode = true
@@ -138,7 +154,10 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         table.headerView = nil
         table.backgroundColor = .clear
         table.rowHeight = Self.rowHeight
-        table.selectionHighlightStyle = .none  // custom row highlight
+        // `.regular` (not `.none`) so selection state actually drives
+        // `drawSelection` — `.none` suppressed it, which made arrow-key
+        // moves invisible. PaletteRowView draws a custom neutral fill.
+        table.selectionHighlightStyle = .regular
         table.intercellSpacing = NSSize(width: 0, height: 2)
         table.dataSource = self
         table.delegate = self
@@ -176,6 +195,7 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func present() {
         guard let parent = hostWindow else { return }
         setFrame(parent.frame, display: true)
+        layoutCard()
         parent.addChildWindow(self, ordered: .above)
         makeKeyAndOrderFront(nil)
         makeFirstResponder(field)
@@ -189,6 +209,26 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     @objc private func parentFrameChanged() {
         guard let parent = hostWindow else { return }
         setFrame(parent.frame, display: true)
+        layoutCard()
+    }
+
+    /// Center the card over the content region (right of the sidebar)
+    /// and pin its top just under the tab bar. Falls back to
+    /// window-centered/top if the region isn't laid out yet. The panel
+    /// is borderless with `frame == host.frame`, so the host view's
+    /// window coords map straight into the backdrop's coordinate space.
+    private func layoutCard() {
+        guard let backdrop = contentView else { return }
+        if let region = contentRegion, region.window != nil {
+            let r = region.convert(region.bounds, to: nil)
+            if r.width > 1, r.height > 1 {
+                cardCenterX.constant = r.midX - backdrop.bounds.midX
+                cardTop.constant = max(backdrop.bounds.height - r.maxY + Self.topGap, 24)
+                return
+            }
+        }
+        cardCenterX.constant = 0
+        cardTop.constant = 100
     }
 
     /// Tear down. When not confirmed, fire `onCancel` for every frame
@@ -348,13 +388,19 @@ private final class BackdropView: NSView {
 
 // MARK: - Row + cell
 
-/// Accent-tinted selection fill (system blue is too loud over the dark
-/// card; matches the active tab pill's subtle accent wash).
+/// Neutral light-gray selection fill (Zed-style). Always drawn as
+/// "emphasized" because the text field — not the table — is first
+/// responder, so the default unemphasized (dim gray) look never applies.
 private final class PaletteRowView: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { true }
+        set {}
+    }
+
     override func drawSelection(in dirtyRect: NSRect) {
         guard isSelected else { return }
-        NSColor.controlAccentColor.withAlphaComponent(0.28).setFill()
-        let r = bounds.insetBy(dx: 4, dy: 0)
+        NSColor.white.withAlphaComponent(0.13).setFill()
+        let r = bounds.insetBy(dx: 6, dy: 1)
         NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6).fill()
     }
 }
@@ -393,20 +439,21 @@ private final class PaletteCellView: NSView {
         trailing.stringValue = match.item.trailingText ?? ""
     }
 
-    /// Bold the matched characters so the fuzzy hit is visible.
+    /// White base text with the fuzzy-matched characters in blue
+    /// (Zed-style) so the hit pops as you type.
     private func highlighted(_ text: String, ranges: [Range<Int>]) -> NSAttributedString {
         let base = NSMutableAttributedString(
             string: text,
             attributes: [
                 .font: NSFont.systemFont(ofSize: 14),
-                .foregroundColor: NSColor.labelColor,
+                .foregroundColor: NSColor.white,
             ]
         )
         let ns = text as NSString
         for r in ranges where r.lowerBound >= 0 && r.upperBound <= ns.length {
             base.addAttributes(
                 [
-                    .font: NSFont.systemFont(ofSize: 14, weight: .bold),
+                    .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
                     .foregroundColor: NSColor.controlAccentColor,
                 ],
                 range: NSRange(location: r.lowerBound, length: r.count)
