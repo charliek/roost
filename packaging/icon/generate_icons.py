@@ -164,6 +164,10 @@ def build_icon_composer(owl: Image.Image, bg: tuple[int, int, int]) -> None:
     from the SVG with one command. 1024 = Icon Composer's design canvas; the
     owl rides on a transparent canvas so the fill paints the tile background.
     """
+    # Rebuild from scratch so a changed layer set (e.g. a future richer icon)
+    # can't leave stale PNGs behind in the committed bundle.
+    if ICON_COMPOSER_OUT.exists():
+        shutil.rmtree(ICON_COMPOSER_OUT)
     assets = ICON_COMPOSER_OUT / "Assets"
     assets.mkdir(parents=True, exist_ok=True)
     compose(owl, 1024, bg, transparent=True).save(assets / "owl.png", "PNG")
