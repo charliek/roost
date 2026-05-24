@@ -112,7 +112,7 @@ on the main thread.
 | GTK4 (Linux)         | `gtk4-rs` + `libadwaita-rs`                                    | Sys deps from Homebrew on Mac dev, apt on Linux.                                                     |
 | AppKit (Mac)         | stdlib / direct                                                | SwiftPM executable target.                                                                            |
 | PTY                  | `forkpty(3)` (Swift, Mac) / `portable-pty` (Rust, Linux)       | Mac uses raw C; Linux uses a maintained safe-API crate. Both spawn one PTY per tab.                  |
-| Persistence          | `state.json` (atomic tmp + fsync + rename)                     | No SQLite. Projects + next_id only — tabs don't survive UI quits.                                    |
+| Persistence          | `state.json` (atomic tmp + fsync + rename)                     | No SQLite. Projects, next_id, and per-project tab **layout** (title+cwd+position) + active selection — relaunch re-opens prior tabs as fresh shells in their dirs (no process/scrollback). |
 | libghostty-vt        | cgo via `roost-vt` (`--features ffi`)                          | Pinned Ghostty SHA in `third_party/ghostty/build.sh`.                                                |
 | JSON IPC             | `roost-ipc` (server + client + framing + paths + target picker) | Newline-delimited JSON, 16 MiB frame cap; client + server share the wire-types module.               |
 

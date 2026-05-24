@@ -27,7 +27,7 @@ use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
 use roost_ipc::messages::{Project, Tab};
 use tokio::runtime::Handle;
 
-use roost_linux::daemon::WorkspaceEvent;
+use roost_linux::daemon::{RestoreTab, WorkspaceEvent};
 use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
@@ -756,20 +756,50 @@ impl App {
 
         for project in &projects {
             self.add_project_ui(project);
-            // M3b: tabs do NOT survive UI quits (no-session-restore
-            // goal). At bootstrap there are never any tabs to
-            // hydrate — the snapshot's `tabs` is always empty.
-            // Keep the iterate-and-attach loop in case a future
-            // change re-enables tab restore.
-            for tab in &project.tabs {
-                self.attach_existing_tab(tab.clone());
+        }
+
+        // Session-layout restore: re-open each project's persisted
+        // tabs as fresh shells in their saved directories.
+        // `take_restore_layout` is one-shot (the descriptors are NOT
+        // live tabs — `list_projects` above returns no tabs at boot).
+        // A project with no saved tabs — or a `state.json` from a
+        // build predating tab persistence — seeds one default tab.
+        let restore = client.workspace.take_restore_layout();
+        for project in &projects {
+            let saved: &[RestoreTab] = restore
+                .as_ref()
+                .and_then(|r| r.projects.iter().find(|p| p.project_id == project.id))
+                .map(|p| p.tabs.as_slice())
+                .unwrap_or(&[]);
+            for (cwd, title) in restore_open_specs(saved) {
+                // Handle a failed tab open per-tab rather than `?`-ing
+                // out: one stale cwd / PTY spawn failure must not abort
+                // the whole bootstrap (and the workspace subscription
+                // isn't installed yet, so a bubbled error would leave
+                // startup half-built). Log + continue. #95 review.
+                if let Err(err) = self.open_tab_in_with(project.id, &cwd, &title).await {
+                    tracing::warn!(
+                        project_id = project.id,
+                        cwd = %cwd,
+                        ?err,
+                        "restore: failed to open a saved tab; continuing"
+                    );
+                }
             }
         }
-        if let Some(first) = projects.first() {
-            self.set_active_project(first.id);
-            if first.tabs.is_empty() {
-                self.open_new_tab_in(first.id).await?;
-            }
+
+        // Restore the active project + active tab selection. Fall
+        // back to the first project when the saved active id is gone
+        // (or unset, e.g. a legacy state.json).
+        let active_project = restore
+            .as_ref()
+            .map(|r| r.active_project_id)
+            .filter(|pid| projects.iter().any(|p| p.id == *pid))
+            .or_else(|| projects.first().map(|p| p.id));
+        if let Some(pid) = active_project {
+            self.set_active_project(pid);
+            let active_pos = restore.as_ref().map(|r| r.active_tab_position).unwrap_or(0);
+            self.select_tab_by_position(pid, active_pos);
         }
 
         // Subscribe to the workspace event broadcast; drain on the
@@ -1305,21 +1335,37 @@ impl App {
     /// OpenTab RPC → on success, attach the tab to the project's
     /// TabView.
     async fn open_new_tab_in(self: &Rc<Self>, project_id: i64) -> anyhow::Result<()> {
+        // Empty cwd + title delegates resolution to
+        // `LocalClient::open_tab`, which prefers the project's
+        // stored cwd, then $HOME, then `/`, and derives the title.
+        // CR (M4b3b review) flagged the pre-existing HOME-only path:
+        // a project pinned to a directory should open its tabs
+        // there, not bounce them to the user's home.
+        self.open_tab_in_with(project_id, "", "").await.map(|_| ())
+    }
+
+    /// Open a tab in `project_id` starting at `cwd` with placeholder
+    /// `title` (both empty → resolved/derived by `LocalClient::open_tab`),
+    /// then attach it in the UI. Returns the new tab id. Shared by
+    /// the new-tab path (empty cwd/title) and session restore (which
+    /// passes each saved tab's cwd + title).
+    async fn open_tab_in_with(
+        self: &Rc<Self>,
+        project_id: i64,
+        cwd: &str,
+        title: &str,
+    ) -> anyhow::Result<i64> {
         let Some(client) = self.client.borrow().clone() else {
-            return Ok(());
+            return Ok(0);
         };
         let rt = self.rt.clone();
-        // Empty cwd here delegates resolution to
-        // `LocalClient::open_tab`, which prefers the project's
-        // stored cwd, then $HOME, then `/`. CR (M4b3b review)
-        // flagged the pre-existing HOME-only path: a project
-        // pinned to a directory should open its tabs there, not
-        // bounce them to the user's home.
-        let cwd = String::new();
+        let cwd = cwd.to_string();
+        let title = title.to_string();
         let (tab, _rx) = rt
-            .spawn(async move { client.open_tab(project_id, &cwd, 80, 24).await })
+            .spawn(async move { client.open_tab(project_id, &cwd, &title, 80, 24).await })
             .await
             .context("open_tab join")??;
+        let tab_id = tab.id;
         // Optimistic attach: the workspace's TabOpened event also
         // arrives via the events subscription; the
         // `ProjectUi.pending_attaches` synchronous insert below
@@ -1330,7 +1376,42 @@ impl App {
         // running is single-digit microseconds in-process, well
         // inside the broadcast channel's per-subscriber buffer.
         self.attach_existing_tab(tab);
-        Ok(())
+        Ok(tab_id)
+    }
+
+    /// Select the tab at `position` (0-based; equals open order, so
+    /// it matches the saved layout's position) in `project_id`'s
+    /// `AdwTabView`, syncing the workspace's active selection. Used at
+    /// bootstrap to restore the saved active tab. `attach_existing_tab`
+    /// appends each page synchronously, so the pages are present here
+    /// even though the rest of the attach completes asynchronously.
+    fn select_tab_by_position(self: &Rc<Self>, project_id: i64, position: i32) {
+        let page = {
+            let projects = self.projects.borrow();
+            let Some(ui) = projects.get(&project_id) else {
+                return;
+            };
+            let n = ui.tab_view.n_pages();
+            if n == 0 {
+                return;
+            }
+            let page = ui.tab_view.nth_page(position.clamp(0, n - 1));
+            ui.tab_view.set_selected_page(&page);
+            page
+        };
+        if let Some(tab_id) = parse_tab_id_from_page(&page) {
+            if let Some(client) = self.client.borrow().clone() {
+                // Sync the workspace's active selection. Emits
+                // `ActiveChanged`, but the event subscription isn't
+                // draining yet (set up after bootstrap), so it's a
+                // no-op for the UI here.
+                let _ = client.workspace.focus_tab(tab_id);
+            }
+        }
+        // `set_active_project` (above) focused whatever page was
+        // selected before this; hand keyboard focus to the restored
+        // tab's terminal so relaunch lands input on it. #95 review.
+        self.focus_active_terminal();
     }
 
     /// Wrap an existing daemon tab in UI: TerminalView + TabSession +
@@ -2919,6 +3000,22 @@ fn pick_next_active_project<T>(projects: &HashMap<i64, T>) -> Option<i64> {
     projects.keys().copied().min()
 }
 
+/// Session-restore rule: the `(cwd, title)` specs to open for a
+/// project. Each saved tab maps to one spec; a project with **no**
+/// saved tabs seeds a single default tab (empty cwd + title →
+/// resolved/derived by the open path). Pure so the seed-one-when-empty
+/// rule is unit-tested without the GTK bootstrap.
+fn restore_open_specs(saved: &[RestoreTab]) -> Vec<(String, String)> {
+    if saved.is_empty() {
+        vec![(String::new(), String::new())]
+    } else {
+        saved
+            .iter()
+            .map(|t| (t.cwd.clone(), t.title.clone()))
+            .collect()
+    }
+}
+
 /// M10 sidebar-reorder pure math. Given a source row sitting at
 /// `source_idx` and the user's desired insertion point in the
 /// *with-source* visual order (`raw_target_idx`), return the
@@ -3020,10 +3117,38 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 mod tests {
     use super::{
         compute_insert_idx, drain_server_driven_marker, is_already_attached_or_pending,
-        pick_next_active_project, tilde_abbreviate_with_home,
+        pick_next_active_project, restore_open_specs, tilde_abbreviate_with_home, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    /// `restore_open_specs` encodes the seed-one-when-empty rule: a
+    /// project with saved tabs re-opens exactly those (cwd + title in
+    /// order); a project with none seeds a single default tab.
+    #[test]
+    fn restore_open_specs_seeds_one_when_empty() {
+        assert_eq!(
+            restore_open_specs(&[]),
+            vec![(String::new(), String::new())]
+        );
+        let saved = vec![
+            RestoreTab {
+                cwd: "/a".into(),
+                title: "first".into(),
+            },
+            RestoreTab {
+                cwd: "/b".into(),
+                title: "second".into(),
+            },
+        ];
+        assert_eq!(
+            restore_open_specs(&saved),
+            vec![
+                ("/a".to_string(), "first".to_string()),
+                ("/b".to_string(), "second".to_string()),
+            ]
+        );
+    }
 
     /// `tilde_abbreviate_with_home` is the headerbar-subtitle (M2)
     /// helper that also powers the OSC 7 tab-pill label. Keep its

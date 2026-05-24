@@ -975,12 +975,54 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     fetched = [created]
                 }
             }
+            // Take the persisted tab layout (one-shot) to re-open each
+            // project's prior tabs as fresh shells in their saved dirs.
+            let restore = await MainActor.run { RoostBackend.shared.workspace?.takeRestoreLayout() }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.projects = fetched
                 self.rebuildSidebar()
-                if let first = self.projects.first {
-                    self.selectProject(id: first.id)
+
+                // Determine the active project + tab index up-front so
+                // the right tab can be focused in the workspace as it's
+                // opened. Fall back to the first project (tab 0) when
+                // the saved active id is gone/unset.
+                let activeID: Int64?
+                let activePos: Int
+                if let r = restore, self.projects.contains(where: { $0.id == r.activeProjectID }) {
+                    activeID = r.activeProjectID
+                    activePos = Int(r.activeTabPosition)
+                } else {
+                    activeID = self.projects.first?.id
+                    activePos = 0
+                }
+
+                // Re-open each project's saved tabs (position order,
+                // saved cwd + title). A project with no saved tabs —
+                // or a state.json predating tab persistence — seeds a
+                // single tab. Eager (not lazy-on-select) so `tab list`
+                // and screenshots reflect every project's tabs, and so
+                // the GTK + Mac builds restore identically.
+                for project in self.projects {
+                    let saved = restore?.projects
+                        .first(where: { $0.projectID == project.id })?.tabs ?? []
+                    let specs: [(cwd: String, title: String)] =
+                        saved.isEmpty ? [("", "")] : saved.map { ($0.cwd, $0.title) }
+                    for (idx, spec) in specs.enumerated() {
+                        let isActive = project.id == activeID && idx == activePos
+                        self.openTab(
+                            inProject: project.id,
+                            cwd: spec.cwd,
+                            title: spec.title,
+                            focusInWorkspaceWhenReady: isActive
+                        )
+                    }
+                }
+
+                // Restore the UI active project + tab selection.
+                if let pid = activeID {
+                    self.selectProject(id: pid)
+                    self.selectTabByPosition(in: pid, position: Int32(activePos))
                 }
                 self.subscribeToEvents()
             }
@@ -1651,6 +1693,31 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func openNewTab() {
         guard daemonReachable, let projectID = activeProjectID else { return }
+        // Title numbering is 1-based within the active project.
+        let title = "roost-mac \(tabsForActiveProject().count + 1)"
+        guard let session = openTab(inProject: projectID, cwd: "", title: title) else { return }
+        let projectTabs = tabsForActiveProject()
+        let insertedIndex = projectTabs.firstIndex(where: { $0 === session })
+            ?? max(0, projectTabs.count - 1)
+        rebuildTabBar()
+        selectTab(at: insertedIndex)
+    }
+
+    /// Open a tab in `projectID` starting at `cwd` (empty → the
+    /// project's cwd, then $HOME, so a Finder-launched app doesn't
+    /// drop the shell at `/`) with placeholder `title`, append + start
+    /// its session. Does NOT change the active selection or rebuild the
+    /// tab bar — the caller decides whether to focus it. Returns the
+    /// new session. Shared by `openNewTab` (active project) and session
+    /// restore (which passes each saved tab's cwd + title).
+    @discardableResult
+    private func openTab(
+        inProject projectID: Int64,
+        cwd: String,
+        title: String,
+        focusInWorkspaceWhenReady: Bool = false
+    ) -> TabSession? {
+        guard daemonReachable else { return nil }
         let session = TabSession(
             projectID: projectID,
             cols: 80,
@@ -1658,46 +1725,55 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             theme: activeTheme,
             font: activeFont
         )
-        // Derive the starting cwd: prefer the project's cwd; fall
-        // back to $HOME so opening a tab from a project with no
-        // cwd doesn't drop the shell at `/` (which is what
-        // Finder-launched Roost.app inherits). The Go binary did
-        // the same priority; the daemon-era cwd defaulting lived
-        // in `roost-core/src/state.rs::ensure_default_project`
-        // before the inline-core refactor and got lost in the M4
-        // port.
-        let projectCwd = projects.first(where: { $0.id == projectID })?.cwd ?? ""
-        let cwd: String
-        if !projectCwd.isEmpty {
-            cwd = projectCwd
+        let resolvedCwd: String
+        if !cwd.isEmpty {
+            resolvedCwd = cwd
         } else {
-            cwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
+            let projectCwd = projects.first(where: { $0.id == projectID })?.cwd ?? ""
+            resolvedCwd = projectCwd.isEmpty
+                ? (ProcessInfo.processInfo.environment["HOME"] ?? "")
+                : projectCwd
         }
         // Pre-seed `liveCwd` so the new pill renders the
         // tilde-abbreviated path on frame 1, instead of flashing
         // "Tab N" while waiting for the shell's OSC 7. OSC 7 will
         // refine if the shell starts in a different directory.
-        session.liveCwd = cwd.isEmpty ? nil : cwd
+        session.liveCwd = resolvedCwd.isEmpty ? nil : resolvedCwd
         tabs.append(session)
-
-        let projectTabs = tabsForActiveProject()
-        let insertedIndex = projectTabs.count - 1
-        rebuildTabBar()
-        selectTab(at: insertedIndex)
-
-        let title = "roost-mac \(insertedIndex + 1)"
-        session.start(socketPath: socketPath, title: title, cwd: cwd) { [weak self] _ in
+        session.start(socketPath: socketPath, title: title, cwd: resolvedCwd) { [weak self] tabID in
             // The id is now known; keep the window menu in sync so its
             // tag-driven ⌘1..⌘9 routes to the current tab order.
             // Also rebuild the tab bar so the pill that was created
-            // pre-id at `openNewTab` time gets re-cached against its
-            // (now-known) tab id. Without this rebuild,
-            // `tabPillViews[id]` never gets populated for the newly
-            // opened tab, and ⌘R (renameActiveTab) silently no-ops
-            // because `tabPillViews[tabID]` returns nil.
+            // pre-id gets re-cached against its (now-known) tab id.
+            // Without this rebuild, `tabPillViews[id]` never gets
+            // populated for the newly opened tab, and ⌘R
+            // (renameActiveTab) silently no-ops because
+            // `tabPillViews[tabID]` returns nil.
             self?.rebuildWindowMenu()
             self?.rebuildTabBar()
+            // Restore: sync the WORKSPACE's active selection to this
+            // tab once its real id exists, so the next persist (and
+            // IPC `identify`) record the restored active tab, not the
+            // last-opened one. The UI selection is set separately by
+            // `selectTabByPosition`. #95 review.
+            if focusInWorkspaceWhenReady {
+                _ = try? RoostBackend.shared.workspace?.focusTab(tabID)
+            }
         }
+        return session
+    }
+
+    /// Select the tab at `position` (0-based; equals open order, so it
+    /// matches the saved layout's position) within `projectID`, when
+    /// it is the active project. Used at bootstrap to restore the
+    /// saved active tab. Sessions are appended in open order, so the
+    /// index lines up with the persisted position.
+    private func selectTabByPosition(in projectID: Int64, position: Int32) {
+        guard activeProjectID == projectID else { return }
+        let projectTabs = tabsForActiveProject()
+        guard !projectTabs.isEmpty else { return }
+        let idx = min(Int(max(0, position)), projectTabs.count - 1)
+        selectTab(at: idx)
     }
 
     @MainActor
@@ -1725,10 +1801,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let remaining = tabsForActiveProject()
         if remaining.isEmpty {
+            // The closed tab was the project's last. `session.close`
+            // routes through `Workspace.closeTab`, which now cascades:
+            // it deletes the empty project and emits `.projectDeleted`,
+            // handled in `handleEvent` (fall back to another project,
+            // or close the window when the workspace is empty). Don't
+            // respawn a tab here — that would resurrect the project the
+            // cascade is removing.
             rebuildTabBar()
-            if daemonReachable {
-                openNewTab()
-            }
             return
         }
 
@@ -2083,8 +2163,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let remaining = tabsForActiveProject()
         if remaining.isEmpty {
+            // Closed the project's last tab via the pill ×. Mirror
+            // `closeActiveTabImpl`: `session.close` routes through
+            // `Workspace.closeTab`, whose cascade deletes the empty
+            // project and emits `.projectDeleted` (handled in
+            // `handleEvent` — fall back to another project, or close
+            // the window when the workspace empties). Don't respawn a
+            // tab here; that would resurrect the project being removed.
             rebuildTabBar()
-            if daemonReachable { openNewTab() }
             return
         }
         rebuildTabBar()

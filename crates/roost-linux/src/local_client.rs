@@ -90,6 +90,7 @@ impl LocalClient {
         &self,
         project_id: i64,
         cwd: &str,
+        title: &str,
         cols: u32,
         rows: u32,
     ) -> Result<(Tab, broadcast::Receiver<PtyOutputEvent>)> {
@@ -109,7 +110,7 @@ impl LocalClient {
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()))
         };
-        let tab = self.workspace.open_tab(project_id, &resolved_cwd, "")?;
+        let tab = self.workspace.open_tab(project_id, &resolved_cwd, title)?;
         // Clamp + validate PTY dims. Zero → terminal default; values
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
