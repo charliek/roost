@@ -343,6 +343,12 @@ async fn dispatch(
                 .await
                 .map_err(|_| HandlerError::new("internal", "UI dropped screenshot reply"))?
                 .map_err(|m| HandlerError::new("internal", m))?;
+            // Preflight the 16 MiB IPC frame cap: the response rides one
+            // newline-delimited JSON frame, and `png` dominates it once
+            // base64-expanded (~4/3). Fail with a structured error here
+            // rather than letting the oversized frame fail late during
+            // transport (`frame-too-large` on the wire).
+            screenshot_frame_guard(png.len())?;
             encode(&ScreenshotResult {
                 png,
                 width,
@@ -384,6 +390,24 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, HandlerError> {
     serde_json::to_value(value).map_err(|e| HandlerError::new("internal", e.to_string()))
+}
+
+/// Reject a screenshot whose base64-encoded PNG would overflow the IPC
+/// frame cap. base64 expands by 4/3 (`ceil(n/3)*4`); a small margin
+/// covers the JSON envelope (`id` / `ok` / `result` / dims).
+fn screenshot_frame_guard(png_len: usize) -> Result<(), HandlerError> {
+    const ENVELOPE_MARGIN: usize = 1024;
+    let encoded = (png_len + 2) / 3 * 4;
+    if encoded + ENVELOPE_MARGIN > roost_ipc::MAX_FRAME_BYTES {
+        return Err(HandlerError::new(
+            "internal",
+            format!(
+                "screenshot too large: {encoded} base64 bytes exceeds the {} byte IPC frame cap (try --scale 1)",
+                roost_ipc::MAX_FRAME_BYTES
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn ws_err(e: WorkspaceError) -> HandlerError {

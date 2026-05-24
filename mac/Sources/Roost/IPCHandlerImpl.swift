@@ -423,6 +423,17 @@ actor IPCHandlerImpl: IPCHandler {
         guard let png = rep.representation(using: .png, properties: [:]) else {
             throw IPCHandlerError.internalError("PNG encoding failed")
         }
+        // Preflight the 16 MiB IPC frame cap: the response rides one
+        // newline-delimited JSON frame and `png` dominates it once
+        // base64-expanded (~4/3). Fail with a structured error here
+        // rather than writing an oversized frame the client rejects.
+        let encodedLen = (png.count + 2) / 3 * 4
+        if encodedLen + 1024 > ipcMaxFrameBytes {
+            throw IPCHandlerError.internalError(
+                "screenshot too large: \(encodedLen) base64 bytes exceeds the "
+                    + "\(ipcMaxFrameBytes) byte IPC frame cap (try --scale 1)"
+            )
+        }
         return IPCScreenshotResult(
             png: png,
             width: UInt32(pixelsWide),

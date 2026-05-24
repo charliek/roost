@@ -122,7 +122,8 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Pixel multiplier: `1` (logical size) or `2` (super-sampled).
-        #[arg(long, default_value_t = 1)]
+        /// Out-of-range values are rejected by clap with exit code 2.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
         scale: u32,
     },
     /// Claude Code hook entry point. Reads the JSON event payload
@@ -502,9 +503,7 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Cmd::Screenshot { out, scale } => {
-            if !(1..=2).contains(&scale) {
-                return Err(anyhow!("--scale must be 1 or 2, got {scale}"));
-            }
+            // `scale` range is enforced by clap's value_parser (exit 2).
             let resp: ScreenshotResult = client
                 .call(ops::SCREENSHOT, ScreenshotParams { scale })
                 .await?;
