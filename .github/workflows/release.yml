@@ -243,22 +243,36 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: ./mac/scripts/notarize.sh "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg"
 
-      - name: Note signing status
-        if: env.HAS_CERT != 'true'
+      # What governs Gatekeeper on a downloaded DMG is whether it's *notarized*
+      # (a stapled ticket) — not whether a signing cert exists. A Developer-ID-
+      # signed but un-notarized DMG is still blocked. So detect the real artifact
+      # state with `stapler validate` and gate the first-launch guidance on it;
+      # this can't drift out of sync with notarize.sh's credential checks.
+      - name: Detect DMG notarization status
+        id: dmg_notarized
         run: |
-          echo "::notice::Roost-${GITHUB_REF_NAME#v}.dmg is UNSIGNED (no Apple Developer ID yet). First launch: run 'xattr -dr com.apple.quarantine /Applications/Roost.app', or System Settings > Privacy & Security > Open Anyway."
+          if xcrun stapler validate "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" >/dev/null 2>&1; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Note signing status
+        if: steps.dmg_notarized.outputs.value != 'true'
+        run: |
+          echo "::notice::Roost-${GITHUB_REF_NAME#v}.dmg is NOT notarized — Gatekeeper blocks first launch. Clear it with 'xattr -dr com.apple.quarantine /Applications/Roost.app', or System Settings > Privacy & Security > Open Anyway."
 
       - name: Upload DMG to the Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" --clobber
 
-      # Interim only: while the DMG is ad-hoc-signed (no Developer ID), append
-      # the Gatekeeper-bypass instructions to the release body so downloaders
-      # see them at the earliest touchpoint. Self-disables via HAS_CERT once
-      # notarization secrets land. A sentinel marker keeps re-runs idempotent.
+      # Interim only: while the DMG isn't notarized, append the Gatekeeper-bypass
+      # instructions to the release body so downloaders see them at the earliest
+      # touchpoint. Gated on the stapled-ticket check above, so it self-disables
+      # once notarization lands. A sentinel marker keeps re-runs idempotent.
       - name: Append macOS first-launch note to release body
-        if: env.HAS_CERT != 'true'
+        if: steps.dmg_notarized.outputs.value != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -273,7 +287,7 @@ jobs:
             printf '%s\n\n' "${body}"
             printf '%s\n' "${marker}"
             printf '### macOS first launch\n\n'
-            printf 'The macOS DMG is ad-hoc-signed but not yet notarized (pending an Apple Developer account), so Gatekeeper blocks the first launch. Clear it once after dragging Roost to Applications:\n\n'
+            printf 'The macOS DMG is not yet notarized (pending an Apple Developer account), so Gatekeeper blocks the first launch. Clear it once after dragging Roost to Applications:\n\n'
             printf '```\nxattr -dr com.apple.quarantine /Applications/Roost.app\n```\n\n'
             printf 'Or, on macOS 15+, use **System Settings → Privacy & Security → Open Anyway**. Full details: [Installation → First launch on macOS](https://github.com/charliek/roost/blob/main/docs/getting-started/installation.md#first-launch-on-macos).\n'
           } > "${RUNNER_TEMP}/relbody.md"
