@@ -25,8 +25,12 @@ sudo apt install roost          # installs the `roost` UI + the `roostctl` CLI
 
 **macOS** — download `Roost-<version>.dmg` from the
 [latest release](https://github.com/charliek/roost/releases/latest) and drag
-Roost to Applications. (The DMG is currently ad-hoc-signed pending an Apple
-Developer account, so first launch is right-click → Open.)
+Roost to Applications. The DMG is currently ad-hoc-signed pending an Apple
+Developer account, so clear Gatekeeper once on first launch — run `xattr -dr
+com.apple.quarantine /Applications/Roost.app`, or use System Settings → Privacy
+& Security → **Open Anyway**. See
+[Installation → First launch on macOS](docs/getting-started/installation.md#first-launch-on-macos)
+for details.
 
 ## Build from source
 

@@ -29,8 +29,9 @@ else
   echo "==> notarize: no credentials set — skipping (DMG ships UNSIGNED)."
   echo "    To enable: set ROOST_NOTARY_PROFILE, or APPLE_ID + APPLE_TEAM_ID +"
   echo "    APPLE_APP_SPECIFIC_PASSWORD, then re-run."
-  echo "    Until then, users open it via right-click → Open, or:"
+  echo "    Until then, users clear Gatekeeper once after install with:"
   echo "      xattr -dr com.apple.quarantine /Applications/Roost.app"
+  echo "    (or System Settings > Privacy & Security > Open Anyway)."
   exit 0
 fi
 
