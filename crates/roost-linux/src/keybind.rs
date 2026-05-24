@@ -46,6 +46,10 @@ pub enum KeybindAction {
     /// Default `primary+0`. Resets to the config-file default
     /// (or `cell_metrics::DEFAULT_FONT_SIZE_PT` if no config).
     FontReset,
+    /// Open the command palette (VS Code / Zed–style `Cmd+Shift+P`
+    /// overlay). Default `projectMod+shift+p` — Cmd+Shift+P on
+    /// macOS-GTK, Alt+Shift+P on Linux.
+    CommandPalette,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
     /// `switch_project_N` where N is 1..=9.
@@ -72,6 +76,7 @@ impl KeybindAction {
             "font_increase" => Some(Self::FontIncrease),
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
+            "command_palette" => Some(Self::CommandPalette),
             "unbind" => Some(Self::Unbind),
             other => {
                 if let Some(n) = other.strip_prefix("switch_project_") {
@@ -237,6 +242,15 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &mut out,
         &format!("{project_mod}+b"),
         KeybindAction::ToggleSidebar,
+    );
+
+    // Command palette: Cmd+Shift+P on macOS-GTK, Alt+Shift+P on Linux
+    // (mirrors the Swift app's Cmd+Shift+P). No existing default uses
+    // `…+shift+p`, so no collision.
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+p"),
+        KeybindAction::CommandPalette,
     );
 
     // Browser-style font sizing on the active terminal. `Cmd-+` on
@@ -411,6 +425,22 @@ mod tests {
             defaults.get(&close_project_trigger),
             Some(&KeybindAction::DeleteProject)
         );
+    }
+
+    #[test]
+    fn command_palette_action_and_default() {
+        assert_eq!(
+            KeybindAction::from_name("command_palette"),
+            Some(KeybindAction::CommandPalette)
+        );
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // projectMod+shift+p: Cmd+Shift+P on macOS, Alt+Shift+P on Linux.
+        let trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+p").unwrap()
+        } else {
+            parse_trigger("alt+shift+p").unwrap()
+        };
+        assert_eq!(defaults.get(&trigger), Some(&KeybindAction::CommandPalette));
     }
 
     #[test]

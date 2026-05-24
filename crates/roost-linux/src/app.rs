@@ -35,6 +35,8 @@ use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::config::RoostConfig;
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
+use crate::palette::{command_items, PaletteCommands, PaletteFrame, PaletteItem};
+use crate::palette_ui::{PaletteBehavior, PaletteOutcome, PaletteOverlay, TOP_GAP};
 use crate::rollup::{project_rollup, RollupState, TabState};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
@@ -122,8 +124,24 @@ pub struct App {
     active_project_id: RefCell<i64>,
     /// Resolved theme from `~/.config/roost/config.conf` (or the
     /// bundled `roost-dark` fallback). Passed to each new
-    /// TerminalView so cells use the same palette.
-    theme: Theme,
+    /// TerminalView so cells use the same palette. `RefCell` because
+    /// the command palette swaps it live (Select Theme…); new tabs
+    /// read the current value at spawn so confirm + revert propagate
+    /// forward. Not persisted — `config.conf` wins on relaunch.
+    theme: RefCell<Theme>,
+    /// Name of the live theme, kept alongside `theme` so the palette
+    /// can pre-highlight the active row and express revert-by-name.
+    /// Seeded from `cfg.theme_name` (or `roost-dark`).
+    active_theme_name: RefCell<String>,
+    /// Theme name captured when the palette opened, restored on
+    /// dismiss-without-confirm so an in-flight live preview reverts.
+    /// `None` while the palette is closed.
+    theme_name_at_open: RefCell<Option<String>>,
+    /// `gtk::Overlay` wrapping the content below the header, so the
+    /// command palette card can float centered over the whole window.
+    content_overlay: gtk4::Overlay,
+    /// The open command palette overlay, or `None` when closed.
+    palette: RefCell<Option<crate::palette_ui::PaletteOverlay>>,
     /// Optional font-family override from config.
     font_family: Option<String>,
     /// Optional font-size override from config (points). Snapshot
@@ -414,14 +432,23 @@ impl App {
             .end_child(&tab_stack)
             .build();
 
+        // Wrap the content below the header in a `gtk::Overlay` so the
+        // command palette card can float centered over the whole
+        // window (sidebar + tabs), pinned just under the tab bar.
+        let content_overlay = gtk4::Overlay::builder().child(&paned).build();
+
         let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         outer.append(&header);
-        outer.append(&paned);
+        outer.append(&content_overlay);
         window.set_content(Some(&outer));
 
         // Load + apply user config now so the first TerminalView
         // gets the right theme + font.
         let cfg = RoostConfig::load_default();
+        let active_theme_name = cfg
+            .theme_name
+            .clone()
+            .unwrap_or_else(|| "roost-dark".into());
         let theme = match cfg.theme_name.as_deref() {
             Some(name) => Theme::load_bundled(name),
             None => Theme::roost_dark(),
@@ -437,7 +464,11 @@ impl App {
             window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
-            theme,
+            theme: RefCell::new(theme),
+            active_theme_name: RefCell::new(active_theme_name),
+            theme_name_at_open: RefCell::new(None),
+            content_overlay: content_overlay.clone(),
+            palette: RefCell::new(None),
             font_family: cfg.font_family.clone(),
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
@@ -1333,7 +1364,7 @@ impl App {
         // existing tabs, rather than snapping back to the config
         // baseline.
         let terminal = Rc::new(TerminalView::with_theme_and_font(
-            self.theme.clone(),
+            self.theme.borrow().clone(),
             self.font_family.as_deref(),
             Some(*self.current_font_size_pt.borrow()),
         ));
@@ -1966,7 +1997,16 @@ impl App {
     }
 
     fn dispatch_action(self: &Rc<Self>, action: KeybindAction) {
+        // While the palette is open it owns the keyboard; suppress every
+        // other shortcut so e.g. Cmd+T can't fire underneath it. The
+        // palette toggle itself stays live (re-press is a no-op since
+        // `show_command_palette` guards on an already-open palette).
+        // GTK analog of the Swift app's `validateMenuItem` gate.
+        if action != KeybindAction::CommandPalette && self.palette.borrow().is_some() {
+            return;
+        }
         match action {
+            KeybindAction::CommandPalette => self.show_command_palette(),
             KeybindAction::NewTab => {
                 let pid = *self.active_project_id.borrow();
                 if pid == 0 {
@@ -2126,6 +2166,177 @@ impl App {
                     .apply_font(self.font_family.as_deref(), Some(size_pt));
             }
         }
+    }
+
+    /// Switch the active theme at runtime and broadcast it to every
+    /// open terminal (all tabs, all projects). Not persisted:
+    /// `config.conf` still wins on next launch. New tabs read
+    /// `self.theme` at spawn, so both confirm and revert propagate
+    /// forward. Mirrors the Mac UI's `setActiveTheme`.
+    fn set_active_theme(self: &Rc<Self>, theme: Theme, name: String) {
+        *self.active_theme_name.borrow_mut() = name;
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            let tabs = ui.tabs.borrow();
+            for tab_ui in tabs.values() {
+                tab_ui.view.set_theme(&theme);
+            }
+        }
+        drop(projects);
+        *self.theme.borrow_mut() = theme;
+    }
+
+    // ----- Command palette (Cmd+Shift+P / Alt+Shift+P) -------------
+
+    /// Open the command palette over the content overlay. Captures the
+    /// theme active at open (for revert), builds the curated command
+    /// frame with shortcut hints, and presents. No-op if already open.
+    fn show_command_palette(self: &Rc<Self>) {
+        if self.palette.borrow().is_some() {
+            return;
+        }
+        *self.theme_name_at_open.borrow_mut() = Some(self.active_theme_name.borrow().clone());
+
+        // Reverse map (action → shortcut label) from the canonicalized
+        // bindings, so each command row shows its keybind hint. First
+        // accel per action wins; sorted for a deterministic choice when
+        // an action has multiple triggers (e.g. font_increase).
+        let cfg = RoostConfig::load_default();
+        let mut bindings = canonicalize_bindings(default_bindings(), cfg.keybinds.clone(), |_| {})
+            .into_iter()
+            .collect::<Vec<_>>();
+        bindings.sort_by(|a, b| {
+            (a.0.modifiers.bits(), &a.0.key).cmp(&(b.0.modifiers.bits(), &b.0.key))
+        });
+        let mut reverse: HashMap<KeybindAction, Accel> = HashMap::new();
+        for (accel, action) in bindings {
+            reverse.entry(action).or_insert(accel);
+        }
+        let items = command_items(|action| reverse.get(&action).and_then(accel_label));
+        let root = PaletteFrame::new("commands", "Execute a command…", items);
+
+        let weak = Rc::downgrade(self);
+        let behavior = PaletteBehavior::new(move |item| match weak.upgrade() {
+            Some(app) => app.confirm_palette_command(item),
+            None => PaletteOutcome::Close,
+        });
+
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    /// Top margin pinning the card under the tab bar: the active
+    /// project's tab-bar height (falling back to ~46px before it's
+    /// allocated) plus the visual gap.
+    fn palette_top_margin(self: &Rc<Self>) -> i32 {
+        let pid = *self.active_project_id.borrow();
+        let projects = self.projects.borrow();
+        let bar_h = projects
+            .get(&pid)
+            .map(|ui| ui.tab_bar.height())
+            .filter(|h| *h > 0)
+            .unwrap_or(46);
+        bar_h + TOP_GAP
+    }
+
+    /// Palette teardown callback: clear the handle + the captured
+    /// open-theme, then return focus to the active terminal.
+    fn dismiss_palette(self: &Rc<Self>) {
+        *self.palette.borrow_mut() = None;
+        *self.theme_name_at_open.borrow_mut() = None;
+        self.focus_active_terminal();
+    }
+
+    /// Confirm a root-frame command. `select_theme` drills into the
+    /// theme list; every other id is a `KeybindAction` dispatched
+    /// through the same path as its shortcut — deferred to an idle tick
+    /// so the palette tears down (and its focus-out fires) *before* the
+    /// command runs, letting focus-grabbing commands (rename) win.
+    fn confirm_palette_command(self: &Rc<Self>, item: &PaletteItem) -> PaletteOutcome {
+        if item.id == PaletteCommands::SELECT_THEME_ID {
+            return PaletteOutcome::Push(self.theme_frame(), self.theme_behavior());
+        }
+        let id = item.id.clone();
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(app) = weak.upgrade() {
+                app.run_command(&id);
+            }
+        });
+        PaletteOutcome::Close
+    }
+
+    /// Dispatch a palette command id through the keybind path. Runs
+    /// after the palette has closed, so the open-palette gate in
+    /// `dispatch_action` is already clear.
+    fn run_command(self: &Rc<Self>, id: &str) {
+        match KeybindAction::from_name(id) {
+            Some(action) => self.dispatch_action(action),
+            None => tracing::warn!(id, "palette run_command: unknown id"),
+        }
+    }
+
+    /// Build the theme sub-frame: bundled names verbatim, pre-selecting
+    /// the live theme.
+    fn theme_frame(self: &Rc<Self>) -> PaletteFrame {
+        let names = Theme::bundled_names();
+        let active = self.active_theme_name.borrow().clone();
+        let selection = names.iter().position(|n| *n == active).unwrap_or(0);
+        let items = names
+            .into_iter()
+            .map(|n| PaletteItem::new(n.clone(), n))
+            .collect();
+        PaletteFrame::new("themes", "Select a theme…", items).with_selection(selection)
+    }
+
+    /// Theme sub-frame behavior: arrowing previews live, Enter keeps
+    /// (highlight already applied it), Esc/dismiss reverts.
+    fn theme_behavior(self: &Rc<Self>) -> PaletteBehavior {
+        let weak_highlight = Rc::downgrade(self);
+        let weak_cancel = Rc::downgrade(self);
+        PaletteBehavior::new(|_| PaletteOutcome::Close)
+            .on_highlight(move |item| {
+                if let Some(app) = weak_highlight.upgrade() {
+                    app.preview_theme(&item.id);
+                }
+            })
+            .on_cancel(move || {
+                if let Some(app) = weak_cancel.upgrade() {
+                    app.revert_theme();
+                }
+            })
+    }
+
+    /// Apply `name` to every terminal as a live preview (skip if it's
+    /// already active).
+    fn preview_theme(self: &Rc<Self>, name: &str) {
+        if *self.active_theme_name.borrow() == name {
+            return;
+        }
+        self.set_active_theme(Theme::load_bundled(name), name.to_string());
+    }
+
+    /// Revert to the theme captured when the palette opened.
+    fn revert_theme(self: &Rc<Self>) {
+        let Some(name) = self.theme_name_at_open.borrow().clone() else {
+            return;
+        };
+        if *self.active_theme_name.borrow() == name {
+            return;
+        }
+        self.set_active_theme(Theme::load_bundled(&name), name);
     }
 
     fn active_terminal_view(self: &Rc<Self>) -> Option<Rc<TerminalView>> {
@@ -2754,6 +2965,30 @@ fn build_tab_context_menu(tab_id: i64) -> gtk4::gio::Menu {
     menu.append(Some("Rename"), Some(&format!("app.rename-tab({tab_id})")));
     menu.append(Some("Close"), Some(&format!("app.close-tab({tab_id})")));
     menu
+}
+
+/// Render an `Accel` as a platform-appropriate shortcut label (Cmd
+/// glyphs on macOS, `Alt+Shift+P` text on Linux) for the palette's
+/// right-hand hint. `None` when the accel can't be parsed. Routes
+/// through `accelerator_parse` + `accelerator_get_label` so GTK owns
+/// the platform formatting.
+fn accel_label(accel: &Accel) -> Option<String> {
+    let mut s = String::new();
+    if accel.modifiers.contains(AccelMods::CTRL) {
+        s.push_str("<Control>");
+    }
+    if accel.modifiers.contains(AccelMods::SHIFT) {
+        s.push_str("<Shift>");
+    }
+    if accel.modifiers.contains(AccelMods::ALT) {
+        s.push_str("<Alt>");
+    }
+    if accel.modifiers.contains(AccelMods::SUPER) {
+        s.push_str("<Meta>");
+    }
+    s.push_str(&accel.key);
+    let (key, mods) = gtk4::accelerator_parse(&s)?;
+    Some(gtk4::accelerator_get_label(key, mods).to_string())
 }
 
 /// Convert our `Accel` to a `gtk::ShortcutTrigger` that the GTK

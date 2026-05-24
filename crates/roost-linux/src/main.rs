@@ -16,6 +16,8 @@ mod config;
 mod events;
 mod key_encoder;
 mod keybind;
+mod palette;
+mod palette_ui;
 mod rollup;
 mod tab_session;
 mod terminal_view;

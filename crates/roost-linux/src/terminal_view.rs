@@ -322,6 +322,24 @@ impl TerminalView {
         self.widget.queue_draw();
     }
 
+    /// Swap the live theme on this terminal. Re-pushes the palette +
+    /// chrome colors into libghostty (the same calls `with_theme` makes
+    /// at creation, safe to re-call at runtime) so SGR-indexed cells
+    /// (`ls --color`, htop) recolor, stores the new theme so the paint
+    /// pass picks up the default fg/bg/cursor/selection, and queues a
+    /// redraw. Drives the command palette's live theme preview.
+    pub fn set_theme(&self, theme: &Theme) {
+        {
+            let mut s = self.state.borrow_mut();
+            let _ = s.terminal.set_color_background(theme.background);
+            let _ = s.terminal.set_color_foreground(theme.foreground);
+            let _ = s.terminal.set_color_cursor(theme.cursor);
+            let _ = s.terminal.set_color_palette(&theme.palette);
+            s.theme = theme.clone();
+        }
+        self.widget.queue_draw();
+    }
+
     /// Feed VT bytes into the terminal. Triggers a redraw so the new
     /// state is on screen by the next frame.
     pub fn vt_write(&self, bytes: &[u8]) {
