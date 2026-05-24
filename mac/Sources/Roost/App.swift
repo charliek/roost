@@ -1725,10 +1725,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let remaining = tabsForActiveProject()
         if remaining.isEmpty {
+            // The closed tab was the project's last. `session.close`
+            // routes through `Workspace.closeTab`, which now cascades:
+            // it deletes the empty project and emits `.projectDeleted`,
+            // handled in `handleEvent` (fall back to another project,
+            // or close the window when the workspace is empty). Don't
+            // respawn a tab here — that would resurrect the project the
+            // cascade is removing.
             rebuildTabBar()
-            if daemonReachable {
-                openNewTab()
-            }
             return
         }
 
@@ -2083,8 +2087,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let remaining = tabsForActiveProject()
         if remaining.isEmpty {
+            // Closed the project's last tab via the pill ×. Mirror
+            // `closeActiveTabImpl`: `session.close` routes through
+            // `Workspace.closeTab`, whose cascade deletes the empty
+            // project and emits `.projectDeleted` (handled in
+            // `handleEvent` — fall back to another project, or close
+            // the window when the workspace empties). Don't respawn a
+            // tab here; that would resurrect the project being removed.
             rebuildTabBar()
-            if daemonReachable { openNewTab() }
             return
         }
         rebuildTabBar()

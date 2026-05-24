@@ -33,6 +33,10 @@ final class RoostBackend {
     private(set) var localClient: LocalClient?
     private var ipcServer: IPCServer?
     private var started = false
+    /// Token for the process-wide PTY-exit subscription installed in
+    /// `start`. Kept alive for the backend's lifetime (the whole
+    /// process), so it's never explicitly unsubscribed.
+    private var supervisorExitToken: UUID?
 
     /// The main UI window, registered by `RoostApp` once it's built.
     /// Weak so the backend singleton never keeps a closed window
@@ -95,6 +99,35 @@ final class RoostBackend {
         self.workspace = workspace
         self.supervisor = supervisor
         self.localClient = client
+
+        // Shell-exit → close the tab, deterministically, for *every*
+        // tab whose child process dies — UI-spawned (`runShellSession`)
+        // or externally-opened via `roostctl tab open`
+        // (`attachShellSession`). Without this, an exited shell could
+        // linger as a dead tab: `runShellSession` closes its own tab on
+        // exit but `attachShellSession` deliberately doesn't, and the
+        // round-trip was async. Routing every `.tabExited` through
+        // `closeTab` here mirrors the GTK side's
+        // `TabOutput::Exit → close_page_for_tab` path, and the
+        // cascade in `Workspace.closeTab` then closes the project when
+        // it was the last tab. `closeTab` is idempotent — a racing
+        // close (e.g. `runShellSession`'s own teardown) throws
+        // `tabNotFound`, which we swallow.
+        //
+        // The supervisor fires this handler from its `@MainActor`
+        // `emit`, so the body runs on the main actor; `@Sendable`
+        // hides that from the compiler — `assumeIsolated` documents
+        // the invariant (same pattern as `runShellSession`).
+        supervisorExitToken = supervisor.subscribe { event in
+            MainActor.assumeIsolated {
+                guard case .tabExited(let tabID, _) = event else { return }
+                do {
+                    try client.closeTab(tabID)
+                } catch {
+                    // Already gone (idempotent close race) — expected.
+                }
+            }
+        }
 
         // Best-effort: ensure the parent dirs exist before
         // bind/state writes try to. Workspace already does this

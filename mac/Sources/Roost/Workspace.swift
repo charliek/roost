@@ -344,25 +344,65 @@ final class Workspace {
         return tab
     }
 
+    /// Close a tab. When it was the project's **last** tab, the
+    /// project is closed too (mirrors `deleteProject`'s cascade) so a
+    /// project can never linger with zero live tabs. The event order
+    /// in that case is `tabClosed → projectDeleted → activeChanged`,
+    /// matching `deleteProject`; App.swift's `.projectDeleted` arm
+    /// then falls back to another project or closes the window when
+    /// the workspace is empty.
     func closeTab(_ tabID: Int64) throws {
         guard let row = tabs.removeValue(forKey: tabID) else {
             throw WorkspaceError.tabNotFound(tabID)
         }
+        let projectID = row.projectId
+
+        // Last tab in the project? Cascade-close the project. Inlined
+        // rather than delegating to `deleteProject` so the already-
+        // removed tab isn't re-emitted.
+        let projectEmptied = projects[projectID] != nil
+            && !tabs.values.contains { $0.projectId == projectID }
+        if projectEmptied {
+            projects.removeValue(forKey: projectID)
+        }
+
+        // Reassign the active selection if it pointed at the closed
+        // tab (or, when the project went away, at that project).
         var activeChanged = false
-        if activeTabID == tabID {
-            // Pick the next tab in DISPLAY ORDER (position-sorted),
-            // not dictionary order. CR-flagged on PR #78.
-            let siblingsInProject = tabs.values
-                .filter { $0.projectId == row.projectId }
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
-            let next = siblingsInProject.first
-                ?? tabs.values.sorted { ($0.position, $0.id) < ($1.position, $1.id) }.first
-            activeProjectID = next?.projectId ?? row.projectId
-            activeTabID = next?.id ?? 0
+        if activeTabID == tabID || (projectEmptied && activeProjectID == projectID) {
+            if projectEmptied {
+                // Project gone: fall back to another project's first
+                // tab, both in DISPLAY ORDER (not dictionary order).
+                let fallbackProject = projects.values
+                    .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+                    .first
+                    .map { $0.id } ?? 0
+                let fallbackTab = tabs.values
+                    .filter { $0.projectId == fallbackProject }
+                    .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+                    .first
+                    .map { $0.id } ?? 0
+                activeProjectID = fallbackProject
+                activeTabID = fallbackTab
+            } else {
+                // Project survives: fall back to a sibling tab in
+                // display order, else any tab anywhere. CR-flagged on
+                // PR #78 (display order, not dictionary order).
+                let siblingsInProject = tabs.values
+                    .filter { $0.projectId == projectID }
+                    .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+                let next = siblingsInProject.first
+                    ?? tabs.values.sorted { ($0.position, $0.id) < ($1.position, $1.id) }.first
+                activeProjectID = next?.projectId ?? projectID
+                activeTabID = next?.id ?? 0
+            }
             activeChanged = true
         }
         persist()
         emit(.tabClosed(tabID: tabID))
+        if projectEmptied {
+            emit(.projectDeleted(projectID: projectID))
+        }
         if activeChanged {
             emit(.activeChanged(projectID: activeProjectID, tabID: activeTabID))
         }

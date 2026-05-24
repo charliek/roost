@@ -55,6 +55,43 @@ struct WorkspaceStateTests {
         #expect(snap.isEmpty)
     }
 
+    @Test func closeLastTabDeletesProject() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/", title: "only")
+        let captured = EventCapture()
+        await ws.subscribe { event in captured.append(label(for: event)) }
+        try await ws.closeTab(t.id)
+        // The only project is gone with its last tab.
+        let snap = await ws.snapshot()
+        #expect(snap.isEmpty)
+        // Event order: tabClosed → projectDeleted → activeChanged.
+        #expect(captured.snapshot() == ["tabClosed", "projectDeleted", "activeChanged"])
+        let active = await (ws.activeProjectID, ws.activeTabID)
+        #expect(active.0 == 0)
+        #expect(active.1 == 0)
+    }
+
+    @Test func closeLastTabOfInactiveProjectKeepsActive() async throws {
+        // Closing a non-active project's last tab deletes that project
+        // but must not steal the active selection from elsewhere.
+        let ws = await Workspace()
+        let a = await ws.createProject(name: "a", cwd: "/")
+        let aTab = try await ws.openTab(projectID: a.id, cwd: "/", title: "a1")
+        let b = await ws.createProject(name: "b", cwd: "/")
+        let bTab = try await ws.openTab(projectID: b.id, cwd: "/", title: "b1")
+        // Make project A active, then close project B's last tab.
+        _ = try await ws.focusTab(aTab.id)
+        try await ws.closeTab(bTab.id)
+        let snap = await ws.snapshot()
+        #expect(snap.count == 1)
+        #expect(snap.first?.id == a.id)
+        // Active stays on A; no spurious reassignment.
+        let active = await (ws.activeProjectID, ws.activeTabID)
+        #expect(active.0 == a.id)
+        #expect(active.1 == aTab.id)
+    }
+
     @Test func setTabTitleLocksAgainstOSC() async throws {
         let ws = await Workspace()
         let p = await ws.createProject(name: "p", cwd: "/")
