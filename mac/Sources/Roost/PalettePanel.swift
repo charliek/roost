@@ -103,9 +103,11 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func buildViews() {
         let backdrop = BackdropView()
         backdrop.wantsLayer = true
-        // Light dim — enough to set the palette apart without washing
-        // out the card behind it.
-        backdrop.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        // Fully transparent: the terminal stays visible as-is behind the
+        // palette (no dim). The card's shadow + border keep it distinct.
+        // The view still hit-tests clicks (opacity doesn't affect that),
+        // so click-outside-to-dismiss keeps working.
+        backdrop.layer?.backgroundColor = NSColor.clear.cgColor
         backdrop.onClickOutsideCard = { [weak self] in self?.dismiss(confirmed: false) }
         backdrop.card = card
         contentView = backdrop
