@@ -53,15 +53,17 @@ func libghosttyVtRoundTrip() {
 /// real behavior so the rest of the feature can rely on it — and would
 /// fail loudly if a future Ghostty bump made palette set write-once.
 @Test @MainActor
-func themeAppliesAfterVtWrite() {
+func themeAppliesAfterVtWrite() throws {
     var opts = GhosttyTerminalOptions()
     opts.cols = 80
     opts.rows = 24
     opts.max_scrollback = 0
 
-    var term: GhosttyTerminal?
-    #expect(ghostty_terminal_new(nil, &term, opts).rawValue == 0)
-    guard let term else { return }
+    var maybeTerm: GhosttyTerminal?
+    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    // Fail loudly rather than silently passing if the out-handle is nil
+    // despite a success rc.
+    let term = try #require(maybeTerm, "ghostty_terminal_new returned success but term is nil")
     defer { ghostty_terminal_free(term) }
 
     // Simulate a live session: SGR red text + a newline, so the

@@ -8,32 +8,32 @@ import Testing
 private func noWarn(_: String, _: String, _: String) {}
 
 @Test
-func commandPaletteBoundToSuperShiftPByDefault() {
+func commandPaletteBoundToSuperShiftPByDefault() throws {
     let table = canonicalizeBindings(defaults: defaultBindingsMac(), user: [], warn: noWarn)
-    let accel = try! #require(triggerToAccel("super+shift+p"))
+    let accel = try #require(triggerToAccel("super+shift+p"))
     #expect(table[accel] == KeybindAction.commandPalette)
 }
 
 @Test
-func userCanUnbindCommandPalette() {
+func userCanUnbindCommandPalette() throws {
     let table = canonicalizeBindings(
         defaults: defaultBindingsMac(),
         user: [Keybind(trigger: "super+shift+p", action: KeybindAction.unbind)],
         warn: noWarn
     )
-    let accel = try! #require(triggerToAccel("super+shift+p"))
+    let accel = try #require(triggerToAccel("super+shift+p"))
     #expect(table[accel] == nil)
 }
 
 @Test
-func unknownActionTypoKeepsTheDefault() {
+func unknownActionTypoKeepsTheDefault() throws {
     // A user typo must not erase the default it collides with.
     let table = canonicalizeBindings(
         defaults: defaultBindingsMac(),
         user: [Keybind(trigger: "super+t", action: "nwe_tab")],
         warn: noWarn
     )
-    let accel = try! #require(triggerToAccel("super+t"))
+    let accel = try #require(triggerToAccel("super+t"))
     #expect(table[accel] == KeybindAction.newTab)
 }
 
