@@ -1,18 +1,21 @@
 """Generate Roost app-icon assets from the owl SVG.
 
-Renders the owl via cairosvg, recolors the body to the brand color (keeping the
-SVG's baked yellow irises + white pupils), composes it on a white rounded-square,
-and writes every packaging target in one run:
+Renders the owl via cairosvg as a white silhouette (keeping the SVG's baked
+yellow irises + white pupils), composes it full-bleed on a Roost-Violet rounded
+square, and writes every packaging target in one run:
 
   - packaging/icons/hicolor/256x256/apps/roost.png   (Linux .deb hicolor)
   - packaging/icons/hicolor/512x512/apps/roost.png   (Linux .deb hicolor)
-  - mac/Resources/AppIcon.icns                        (macOS .app — needs iconutil)
+  - mac/AppIcon.icon/                                 (macOS Tahoe glass icon —
+        Icon Composer source; bundle.sh compiles it with actool)
+  - mac/Resources/AppIcon.icns                        (macOS flat fallback for
+        pre-Tahoe / no-actool builds — needs iconutil)
 
 The color is a CLI arg, not a code edit, so iterating between versions is one
 command. See ./regenerate.sh and ./README.md.
 
 Roost brand palette (first pass — "twilight owl"):
-  Roost Violet #6C4FD6 (default body)   Twilight #4B36A6
+  Roost Violet #6C4FD6 (default background)   Twilight #4B36A6
   Amber #F4B63F (echoes the owl's eyes)  Ink #1B1830   Mist #F1EEFB
 
 Usage:
@@ -22,6 +25,7 @@ Usage:
 
 import argparse
 import io
+import json
 import shutil
 import subprocess
 import sys
@@ -37,16 +41,20 @@ REF_DIR = ICON_DIR / "reference"
 
 HICOLOR = ROOT / "packaging" / "icons" / "hicolor"
 ICNS_OUT = ROOT / "mac" / "Resources" / "AppIcon.icns"
+ICON_COMPOSER_OUT = ROOT / "mac" / "AppIcon.icon"
 
-DEFAULT_COLOR = "#6C4FD6"  # Roost Violet
-DEFAULT_BG = "#FFFFFF"
+DEFAULT_COLOR = "#FFFFFF"  # owl body — white, sits on the violet background
+DEFAULT_BG = "#6C4FD6"     # Roost Violet — the icon background
 
-# Apple's rounded-rect icon grid: ~10% transparent margin, corner radius ~22.37%
-# of the rounded square's side. Linux desktops don't mask, so the same shape
-# reads fine there too — one consistent icon across platforms.
-MARGIN_PCT = 0.085
+# Full-bleed: the rounded square fills the whole canvas (no transparent margin).
+# macOS 26 (Tahoe) masks every icon to its own squircle and draws a system tile
+# behind it — any transparent margin lets that tile show through as a gray frame,
+# so we fill edge-to-edge. The baked CORNER_PCT rounding is what Linux (which
+# doesn't mask) renders; on Tahoe the system re-masks the corners. ~22.37%
+# matches Apple's icon-grid corner radius.
+MARGIN_PCT = 0.0
 CORNER_PCT = 0.2237
-OWL_PAD_PCT = 0.17  # padding of the owl inside the rounded square
+OWL_PAD_PCT = 0.085  # padding of the owl inside the square (small = big owl)
 
 
 def hex_to_rgb(s: str) -> tuple[int, int, int]:
@@ -141,6 +149,41 @@ def build_icns(owl: Image.Image, bg: tuple[int, int, int], transparent: bool) ->
     print(f"  wrote {ICNS_OUT.relative_to(ROOT)}")
 
 
+def build_icon_composer(owl: Image.Image, bg: tuple[int, int, int]) -> None:
+    """Write the AppIcon.icon (Icon Composer) source bundle for the Mac app.
+
+    macOS 26 (Tahoe) masks every Dock/Cmd-Tab icon to its own squircle and
+    draws a glass tile behind it. A loose .icns is treated as legacy and gets
+    *inset* on that tile — a gray frame around our art. Only a compiled .icon
+    catalog fills the tile edge-to-edge (what ghostty/cmux ship). We emit the
+    .icon *source* here — a solid brand-color fill with the white owl as the
+    foreground layer; mac/scripts/bundle.sh compiles it with `actool` into the
+    Assets.car the app ships. The Linux PNGs are unaffected (no such tile).
+
+    Hand-authored JSON (not Icon Composer.app) so the whole icon regenerates
+    from the SVG with one command. 1024 = Icon Composer's design canvas; the
+    owl rides on a transparent canvas so the fill paints the tile background.
+    """
+    assets = ICON_COMPOSER_OUT / "Assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    compose(owl, 1024, bg, transparent=True).save(assets / "owl.png", "PNG")
+    r, g, b = bg
+    icon = {
+        "fill": {"solid": f"srgb:{r / 255:.5f},{g / 255:.5f},{b / 255:.5f},1.00000"},
+        "groups": [
+            {
+                "layers": [{"image-name": "owl.png", "name": "owl"}],
+                "shadow": {"kind": "neutral", "opacity": 0.5},
+                "translucency": {"enabled": True, "value": 0.5},
+            }
+        ],
+        "supported-platforms": {"circles": ["watchOS"], "squares": "shared"},
+    }
+    (ICON_COMPOSER_OUT / "icon.json").write_text(json.dumps(icon, indent=2) + "\n")
+    print(f"  wrote {(ICON_COMPOSER_OUT / 'icon.json').relative_to(ROOT)}")
+    print(f"  wrote {(assets / 'owl.png').relative_to(ROOT)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate Roost icon assets.")
     ap.add_argument("--color", default=DEFAULT_COLOR, help="owl body color (#RRGGBB)")
@@ -168,6 +211,8 @@ def main() -> None:
     write_png(compose(owl, 512, bg, args.transparent),
               HICOLOR / "512x512" / "apps" / "roost.png")
     build_icns(owl, bg, args.transparent)
+    if not args.transparent:
+        build_icon_composer(owl, bg)
     print("Done.")
 
 
