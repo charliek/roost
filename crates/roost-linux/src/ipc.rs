@@ -22,8 +22,8 @@ use roost_ipc::messages::{
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
     TabCloseParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult,
-    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
-    TabWriteParams,
+    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 

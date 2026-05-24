@@ -255,8 +255,12 @@ fn render_window_png(
 
     // Explicit viewport at the scaled bounds. Passing `None` would render
     // at the node's natural (1x) bounds, ignoring the scale transform.
-    let viewport =
-        gtk4::graphene::Rect::new(0.0, 0.0, logical_w as f32 * scale_f, logical_h as f32 * scale_f);
+    let viewport = gtk4::graphene::Rect::new(
+        0.0,
+        0.0,
+        logical_w as f32 * scale_f,
+        logical_h as f32 * scale_f,
+    );
     let texture = renderer.render_texture(&node, Some(&viewport));
 
     // `glib::Bytes` is not `Send`; flatten to `Vec<u8>` here on the main
