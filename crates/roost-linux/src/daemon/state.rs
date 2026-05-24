@@ -13,14 +13,18 @@
 //!   `tokio::sync::broadcast` channel. The IPC server's
 //!   `events.subscribe` op (stubbed in M0; wired later) will convert
 //!   these into `roost_ipc::messages::EventEnvelope`.
-//! * **Pre-restart**: orphan tab purging from the legacy daemon is
-//!   gone — under the new model, tabs do not persist across UI
-//!   quits (the workspace only persists projects + the next-id
-//!   counter; tabs come back empty per the no-restore goal).
+//! * **Session layout**: the workspace persists each project's tab
+//!   layout (title + cwd + position) plus the active selection, so a
+//!   relaunch re-opens the prior tabs as fresh shells in their saved
+//!   directories. Live state (process, scrollback) is not restored.
+//!   `open()` loads the layout into a one-shot `restore_layout` the UI
+//!   bootstrap drains via `take_restore_layout`; it is kept out of the
+//!   live `tabs` map (those are the re-opened fresh shells).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use roost_ipc::messages::{Project, Tab, TabState};
 use tokio::sync::broadcast;
@@ -68,6 +72,44 @@ struct Inner {
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
     persist_seq: u64,
+    /// Last time a cwd/OSC-title change persisted the layout. These
+    /// fire per shell prompt / `cd`, so they're throttled (see
+    /// `should_persist_meta_now`) to avoid an fsync per keystroke;
+    /// `None` means "never", so the first change always persists.
+    last_meta_persist: Option<Instant>,
+}
+
+/// Minimum gap between layout persists driven by chatty shell output
+/// (OSC 7 cwd, OSC 0/1/2 title). The in-memory state is always
+/// current; the latest value is flushed by the next layout mutation
+/// (open/close/reorder) or the next change past this window, so the
+/// worst case is up to this much staleness on disk — acceptable for
+/// session restore, and it keeps a `cd` loop from fsync-storming.
+const META_PERSIST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// A persisted project's tab layout, surfaced to the UI bootstrap.
+/// These are descriptors (cwd + title), not live tabs — the UI
+/// re-opens them as fresh shells via the normal open path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreLayout {
+    pub projects: Vec<RestoreProject>,
+    /// Project to re-select (`0` = no preference → first project).
+    pub active_project_id: i64,
+    /// Position of the active tab within the active project.
+    pub active_tab_position: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreProject {
+    pub project_id: i64,
+    /// Tabs in display (position) order.
+    pub tabs: Vec<RestoreTab>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreTab {
+    pub cwd: String,
+    pub title: String,
 }
 
 /// Workspace event channel. Server-push subscribers in `ipc.rs`
@@ -158,6 +200,12 @@ pub struct Workspace {
     /// commit can't clobber a newer one when writes race. The seq is
     /// assigned under `inner`, so it reflects commit order (#80).
     persist_guard: Mutex<u64>,
+    /// One-shot tab layout loaded from `state.json` at `open` time,
+    /// awaiting hydration by the UI bootstrap (`take_restore_layout`).
+    /// `None` for the in-memory variant and after it's taken. Kept
+    /// out of `inner.tabs` — the live tabs are the fresh shells the
+    /// UI re-opens from these descriptors.
+    restore_layout: Mutex<Option<RestoreLayout>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +231,7 @@ impl Workspace {
             events: tx,
             state_path: None,
             persist_guard: Mutex::new(0),
+            restore_layout: Mutex::new(None),
         }
     }
 
@@ -206,6 +255,40 @@ impl Workspace {
             next_id: snapshot.next_id.max(1),
             ..Inner::default()
         };
+
+        // Build the one-shot restore layout (tab descriptors) BEFORE
+        // moving the projects into `inner`. These are NOT inserted as
+        // live tabs — the UI bootstrap re-opens them as fresh shells
+        // via `take_restore_layout` + the normal open path.
+        let restore = RestoreLayout {
+            active_project_id: snapshot.active_project_id,
+            active_tab_position: snapshot.active_tab_position,
+            projects: snapshot
+                .projects
+                .iter()
+                .map(|p| {
+                    let mut tabs: Vec<(i32, RestoreTab)> = p
+                        .tabs
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.position,
+                                RestoreTab {
+                                    cwd: t.cwd.clone(),
+                                    title: t.title.clone(),
+                                },
+                            )
+                        })
+                        .collect();
+                    tabs.sort_by_key(|(pos, _)| *pos);
+                    RestoreProject {
+                        project_id: p.id,
+                        tabs: tabs.into_iter().map(|(_, t)| t).collect(),
+                    }
+                })
+                .collect(),
+        };
+
         for p in snapshot.projects {
             inner.projects.insert(
                 p.id,
@@ -218,15 +301,21 @@ impl Workspace {
                 },
             );
         }
-        // Tabs are intentionally NOT restored from the snapshot
-        // file (the no-session-restore goal). state.json only
-        // carries projects + next_id.
         Self {
             inner: Mutex::new(inner),
             events: tx,
             state_path: Some(state_path),
             persist_guard: Mutex::new(0),
+            restore_layout: Mutex::new(Some(restore)),
         }
+    }
+
+    /// Take the one-shot tab layout loaded from `state.json` at
+    /// `open` time. Returns `None` for the in-memory variant and on
+    /// every call after the first. The UI bootstrap calls this once
+    /// to re-open each project's saved tabs as fresh shells.
+    pub fn take_restore_layout(&self) -> Option<RestoreLayout> {
+        self.restore_layout.lock().unwrap().take()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent> {
@@ -507,23 +596,58 @@ impl Workspace {
         Ok(tab)
     }
 
+    /// Close a tab. If it was the project's **last** tab, the
+    /// project is closed too (mirrors `delete_project`'s cascade) so
+    /// a project can never linger with zero live tabs. The event
+    /// order in that case is `TabClosed → ProjectDeleted →
+    /// ActiveChanged`, matching `delete_project`; both UIs already
+    /// converge on `ProjectDeleted` (remove the sidebar row, pick a
+    /// fallback project, or close the window when none remain).
     pub fn close_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .remove(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        // If we closed the active tab, fall back to any tab in
-        // the same project, otherwise any tab anywhere.
+        let project_id = row.project_id;
+
+        // Last tab in the project? Cascade-close the project. Inlined
+        // rather than calling `delete_project` so the event order is
+        // exactly TabClosed → ProjectDeleted → ActiveChanged (the tab
+        // is already removed; `delete_project` would re-emit it).
+        let project_emptied = inner.projects.contains_key(&project_id)
+            && !inner.tabs.values().any(|t| t.project_id == project_id);
+        if project_emptied {
+            inner.projects.remove(&project_id);
+        }
+
+        // Reassign the active selection if it pointed at the closed
+        // tab (or, when the project went away, at that project).
         let mut changed = false;
-        if inner.active_tab_id == tab_id {
-            let next = inner
-                .tabs
-                .values()
-                .find(|t| t.project_id == row.project_id)
-                .or_else(|| inner.tabs.values().next())
-                .map(|t| (t.project_id, t.id))
-                .unwrap_or((row.project_id, 0));
+        if inner.active_tab_id == tab_id
+            || (project_emptied && inner.active_project_id == project_id)
+        {
+            let next = if project_emptied {
+                // Project gone: fall back to another project's tab.
+                let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
+                let fallback_tab = inner
+                    .tabs
+                    .values()
+                    .find(|t| t.project_id == fallback_project)
+                    .map(|t| t.id)
+                    .unwrap_or(0);
+                (fallback_project, fallback_tab)
+            } else {
+                // Project survives: fall back to a sibling tab, else
+                // any tab anywhere.
+                inner
+                    .tabs
+                    .values()
+                    .find(|t| t.project_id == project_id)
+                    .or_else(|| inner.tabs.values().next())
+                    .map(|t| (t.project_id, t.id))
+                    .unwrap_or((project_id, 0))
+            };
             inner.active_project_id = next.0;
             inner.active_tab_id = next.1;
             changed = true;
@@ -536,6 +660,11 @@ impl Workspace {
         let (snapshot, seq) = inner.snapshot_for_persist();
 
         let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id });
+        if project_emptied {
+            let _ = self
+                .events
+                .send(WorkspaceEvent::ProjectDeleted { project_id });
+        }
         if let Some((pid, tid)) = active {
             let _ = self.events.send(WorkspaceEvent::ActiveChanged {
                 project_id: pid,
@@ -559,7 +688,11 @@ impl Workspace {
             tab_id,
             title: title.to_string(),
         });
+        // A manual rename is a deliberate, infrequent action — persist
+        // immediately (no throttle) so it survives a relaunch.
+        let (snapshot, seq) = inner.snapshot_for_persist();
         drop(inner);
+        self.persist(seq, snapshot);
         Ok(())
     }
 
@@ -579,7 +712,13 @@ impl Workspace {
             tab_id,
             title: title.to_string(),
         });
+        // Shell-driven; throttle the persist (OSC titles can fire per
+        // prompt). See `META_PERSIST_MIN_INTERVAL`.
+        let persist = inner.take_throttled_persist();
         drop(inner);
+        if let Some((snapshot, seq)) = persist {
+            self.persist(seq, snapshot);
+        }
         Ok(())
     }
 
@@ -594,7 +733,14 @@ impl Workspace {
             tab_id,
             cwd: cwd.to_string(),
         });
+        // Shell-driven (OSC 7 fires per `cd`); throttle the persist so
+        // a `cd` loop doesn't fsync per change. The new cwd is already
+        // in memory and the next layout mutation flushes it.
+        let persist = inner.take_throttled_persist();
         drop(inner);
+        if let Some((snapshot, seq)) = persist {
+            self.persist(seq, snapshot);
+        }
         Ok(())
     }
 
@@ -655,11 +801,22 @@ impl Workspace {
         let prev = (inner.active_project_id, inner.active_tab_id);
         inner.active_project_id = row.project_id;
         inner.active_tab_id = row.id;
+        // Persist the active selection so it survives a relaunch
+        // (restored by position). Skip when unchanged — focusing the
+        // already-active tab shouldn't churn the file.
+        let persist = if prev != (row.project_id, row.id) {
+            Some(inner.snapshot_for_persist())
+        } else {
+            None
+        };
         let _ = self.events.send(WorkspaceEvent::ActiveChanged {
             project_id: row.project_id,
             tab_id: row.id,
         });
         drop(inner);
+        if let Some((snapshot, seq)) = persist {
+            self.persist(seq, snapshot);
+        }
         Ok(prev)
     }
 
@@ -866,24 +1023,77 @@ impl Inner {
     /// Snapshot the persistable state plus a fresh commit sequence.
     /// The seq is assigned here — under the `inner` lock the caller
     /// holds — so it strictly reflects commit order; `persist()` uses
-    /// it to drop stale out-of-order writes (#80).
+    /// it to drop stale out-of-order writes (#80). Each project
+    /// carries its tab layout (title + cwd + position) so a relaunch
+    /// can re-open the tabs in their saved directories.
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
+        use crate::daemon::store_json::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
+        // Active tab restored by its DENSE index within the active
+        // project's display-ordered tabs — not the raw `position`
+        // field, which goes sparse after a mid-project close and
+        // wouldn't match the re-opened tabs' contiguous 0..n indices
+        // on restore (the UI selects the nth tab). #95 review.
+        let active_tab_position = self
+            .tabs
+            .get(&self.active_tab_id)
+            .map(|active| {
+                let mut siblings: Vec<&TabRow> = self
+                    .tabs
+                    .values()
+                    .filter(|t| t.project_id == active.project_id)
+                    .collect();
+                siblings.sort_by_key(|t| (t.position, t.id));
+                siblings.iter().position(|t| t.id == active.id).unwrap_or(0) as i32
+            })
+            .unwrap_or(0);
         let snapshot = SnapshotFile {
             next_id: self.next_id,
+            active_project_id: self.active_project_id,
+            active_tab_position,
             projects: self
                 .projects
                 .values()
-                .map(|p| crate::daemon::store_json::ProjectSnapshot {
-                    id: p.id,
-                    name: p.name.clone(),
-                    cwd: p.cwd.clone(),
-                    position: p.position,
-                    created_at: p.created_at,
+                .map(|p| {
+                    let mut tabs: Vec<TabSnapshot> = self
+                        .tabs
+                        .values()
+                        .filter(|t| t.project_id == p.id)
+                        .map(|t| TabSnapshot {
+                            title: t.title.clone(),
+                            cwd: t.cwd.clone(),
+                            position: t.position,
+                        })
+                        .collect();
+                    tabs.sort_by_key(|t| t.position);
+                    ProjectSnapshot {
+                        id: p.id,
+                        name: p.name.clone(),
+                        cwd: p.cwd.clone(),
+                        position: p.position,
+                        created_at: p.created_at,
+                        tabs,
+                    }
                 })
                 .collect(),
         };
         (snapshot, self.persist_seq)
+    }
+
+    /// For chatty shell-driven changes (cwd / OSC title): take a
+    /// persist snapshot iff at least `META_PERSIST_MIN_INTERVAL` has
+    /// elapsed since the last such persist. Returns `None` to skip
+    /// (the in-memory value is still current; the next mutation
+    /// flushes it). Leading-edge throttle — see the const's doc.
+    fn take_throttled_persist(&mut self) -> Option<(SnapshotFile, u64)> {
+        let now = Instant::now();
+        match self.last_meta_persist {
+            Some(last) if now.duration_since(last) < META_PERSIST_MIN_INTERVAL => None,
+            _ => {
+                self.last_meta_persist = Some(now);
+                Some(self.snapshot_for_persist())
+            }
+        }
     }
 }
 
@@ -933,6 +1143,55 @@ mod tests {
         // The remaining tab is now active. It's the one we did not close.
         assert_ne!(atid_after, atid_before);
         assert_eq!(atid_after, t1);
+    }
+
+    #[test]
+    fn close_last_tab_deletes_project() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let t = ws.open_tab(pid, "/", "only").unwrap().id;
+        let mut rx = ws.subscribe();
+        ws.close_tab(t).unwrap();
+        // The project is gone with its last tab, so the only-project
+        // workspace is now empty.
+        assert!(ws.snapshot().is_empty());
+        // Event order: TabClosed → ProjectDeleted → ActiveChanged.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabClosed { tab_id }) if tab_id == t
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ProjectDeleted { project_id }) if project_id == pid
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ActiveChanged {
+                project_id: 0,
+                tab_id: 0
+            })
+        ));
+        // Active selection cleared to (0, 0) since nothing remains.
+        assert_eq!(ws.active(), (0, 0));
+    }
+
+    #[test]
+    fn close_last_tab_of_inactive_project_keeps_active() {
+        // Closing a non-active project's last tab deletes that project
+        // but must not steal the active selection from elsewhere.
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap().id;
+        let a_tab = ws.open_tab(a, "/", "a1").unwrap().id;
+        let b = ws.create_project("b", "").unwrap().id;
+        let b_tab = ws.open_tab(b, "/", "b1").unwrap().id;
+        // Make project A active, then close project B's last tab.
+        ws.focus_tab(a_tab).unwrap();
+        ws.close_tab(b_tab).unwrap();
+        let snap = ws.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, a);
+        // Active stays on A; no spurious reassignment.
+        assert_eq!(ws.active(), (a, a_tab));
     }
 
     #[test]
@@ -1017,14 +1276,14 @@ mod tests {
             2,
             SnapshotFile {
                 next_id: 99,
-                projects: vec![],
+                ..Default::default()
             },
         );
         ws.persist(
             1,
             SnapshotFile {
                 next_id: 5,
-                projects: vec![],
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -1038,9 +1297,132 @@ mod tests {
             3,
             SnapshotFile {
                 next_id: 200,
-                projects: vec![],
+                ..Default::default()
             },
         );
         assert_eq!(read_state(&path).unwrap().unwrap().next_id, 200);
+    }
+
+    #[test]
+    fn persist_restore_round_trips_tab_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let pid = {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/proj").unwrap().id;
+            let _a = ws.open_tab(pid, "/a", "atab").unwrap().id;
+            let b = ws.open_tab(pid, "/b", "btab").unwrap().id;
+            let _c = ws.open_tab(pid, "/c", "ctab").unwrap().id;
+            // Select the middle tab so restore picks it by position.
+            ws.focus_tab(b).unwrap();
+            pid
+        };
+
+        let ws2 = Workspace::open(path);
+        // The reloaded workspace exposes the layout as restore
+        // descriptors, NOT as live tabs.
+        assert!(
+            ws2.snapshot().iter().all(|p| p.tabs.is_empty()),
+            "restored tabs must be descriptors, not live tabs"
+        );
+        let restore = ws2.take_restore_layout().expect("layout present");
+        assert_eq!(restore.active_project_id, pid);
+        assert_eq!(restore.active_tab_position, 1, "tab 'b' is at position 1");
+        let rp = restore
+            .projects
+            .iter()
+            .find(|p| p.project_id == pid)
+            .expect("project in layout");
+        assert_eq!(
+            rp.tabs.iter().map(|t| t.cwd.as_str()).collect::<Vec<_>>(),
+            vec!["/a", "/b", "/c"]
+        );
+        assert_eq!(rp.tabs[1].title, "btab");
+        // `take_restore_layout` is one-shot.
+        assert!(ws2.take_restore_layout().is_none());
+    }
+
+    #[test]
+    fn active_tab_position_is_dense_index_not_raw_position() {
+        // After a mid-project close, positions go sparse (0,1,2 → 1,2).
+        // The persisted active_tab_position must be the DENSE index
+        // among the surviving tabs (what the UI selects on restore),
+        // not the raw `position` field. #95 review.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/").unwrap().id;
+            let a = ws.open_tab(pid, "/a", "a").unwrap().id; // position 0
+            let _b = ws.open_tab(pid, "/b", "b").unwrap().id; // position 1
+            let c = ws.open_tab(pid, "/c", "c").unwrap().id; // position 2
+            ws.close_tab(a).unwrap(); // removes position 0 → surviving positions 1,2
+            ws.focus_tab(c).unwrap(); // active = c (raw position 2, dense index 1)
+        }
+        let ws2 = Workspace::open(path);
+        let restore = ws2.take_restore_layout().unwrap();
+        assert_eq!(
+            restore.active_tab_position, 1,
+            "active tab is the 2nd surviving tab → dense index 1, not raw position 2"
+        );
+        // And the surviving tabs are /b, /c in order.
+        assert_eq!(
+            restore.projects[0]
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/b", "/c"]
+        );
+    }
+
+    #[test]
+    fn restore_layout_reflects_persisted_tab_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/").unwrap().id;
+            let a = ws.open_tab(pid, "/a", "a").unwrap().id;
+            let b = ws.open_tab(pid, "/b", "b").unwrap().id;
+            let c = ws.open_tab(pid, "/c", "c").unwrap().id;
+            // Reorder to c, a, b — restore must reflect the new order.
+            ws.reorder_tabs(pid, &[c, a, b]).unwrap();
+        }
+        let ws2 = Workspace::open(path);
+        let restore = ws2.take_restore_layout().unwrap();
+        assert_eq!(
+            restore.projects[0]
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/c", "/a", "/b"]
+        );
+    }
+
+    #[test]
+    fn rapid_cwd_changes_are_throttled() {
+        // OSC 7 fires per `cd`; the leading-edge throttle persists the
+        // first change immediately and coalesces an instant second
+        // (within `META_PERSIST_MIN_INTERVAL`), so only "/first"
+        // reaches disk. The two calls below are microseconds apart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let tid = {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/").unwrap().id;
+            let tid = ws.open_tab(pid, "/start", "").unwrap().id;
+            ws.set_tab_cwd(tid, "/first").unwrap();
+            ws.set_tab_cwd(tid, "/second").unwrap();
+            tid
+        };
+        let _ = tid;
+        let ws2 = Workspace::open(path);
+        let restore = ws2.take_restore_layout().unwrap();
+        assert_eq!(
+            restore.projects[0].tabs[0].cwd, "/first",
+            "second rapid cwd change should have been throttled off disk"
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! `Workspace` persistence round-trip. Open against a tempfile,
-//! mutate, drop, re-open — projects + next_id must survive (tabs
-//! intentionally do not).
+//! mutate, drop, re-open — projects + next_id must survive. Tabs
+//! survive as restore *descriptors* (the layout the UI re-opens as
+//! fresh shells), not as live tabs in the workspace.
 
 use roost_linux::daemon::Workspace;
 use tempfile::tempdir;
@@ -25,8 +26,21 @@ fn projects_and_next_id_survive_reopen() {
     assert_eq!(p.id, project_id);
     assert_eq!(p.name, "Roost");
     assert_eq!(p.cwd, "/tmp");
-    // Tabs are NOT restored — the no-session-restore goal.
-    assert!(p.tabs.is_empty(), "expected tabs to NOT be restored");
+    // Tabs are not LIVE after reopen — they come back as restore
+    // descriptors the UI re-opens as fresh shells, kept out of the
+    // live snapshot.
+    assert!(
+        p.tabs.is_empty(),
+        "live snapshot must carry no tabs at boot"
+    );
+    let restore = ws2.take_restore_layout().expect("layout present");
+    let rp = restore
+        .projects
+        .iter()
+        .find(|rp| rp.project_id == project_id)
+        .expect("project in restore layout");
+    assert_eq!(rp.tabs.len(), 1, "the saved tab survives as a descriptor");
+    assert_eq!(rp.tabs[0].cwd, "/tmp");
 
     // New tab id allocations must advance past the previous tab's
     // id so we don't collide with the legacy tab the user might

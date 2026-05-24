@@ -10,5 +10,7 @@ pub mod state;
 pub mod store_json;
 
 pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, SupervisorEvent};
-pub use state::{Workspace, WorkspaceError, WorkspaceEvent};
+pub use state::{
+    RestoreLayout, RestoreProject, RestoreTab, Workspace, WorkspaceError, WorkspaceEvent,
+};
 pub use store_json::{persist_state, read_state, SnapshotFile};
