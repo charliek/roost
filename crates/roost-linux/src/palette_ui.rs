@@ -455,24 +455,42 @@ impl PaletteInner {
 }
 
 /// Build one list row: a title label with Pango markup for the matched
-/// ranges + an optional right-aligned shortcut hint.
+/// ranges, an optional second line (subtitle — the notification message
+/// body), and an optional right-aligned shortcut/time hint.
 fn build_row(item: &PaletteItem, ranges: &[Range<usize>]) -> gtk4::ListBoxRow {
     let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+
+    // Title + optional subtitle stacked vertically so a two-line
+    // notification row (message under "<project> · <tab>") reads
+    // cleanly while plain command rows stay single-line.
+    let text_col = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    text_col.set_hexpand(true);
 
     let title = gtk4::Label::builder()
         .use_markup(true)
         .xalign(0.0)
-        .hexpand(true)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .css_classes(["palette-title"])
         .build();
     title.set_markup(&markup_for(&item.title, ranges));
-    hbox.append(&title);
+    text_col.append(&title);
+
+    if let Some(subtitle) = &item.subtitle {
+        let sub = gtk4::Label::builder()
+            .label(subtitle)
+            .xalign(0.0)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(["palette-subtitle"])
+            .build();
+        text_col.append(&sub);
+    }
+    hbox.append(&text_col);
 
     if let Some(trailing) = &item.trailing_text {
         let shortcut = gtk4::Label::builder()
             .label(trailing)
             .xalign(1.0)
+            .valign(gtk4::Align::Center)
             .css_classes(["palette-shortcut"])
             .build();
         hbox.append(&shortcut);

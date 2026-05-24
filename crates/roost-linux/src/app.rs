@@ -35,6 +35,9 @@ use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::config::RoostConfig;
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
+use crate::notification_inbox::{
+    compose_title, relative_time, NotificationInbox, NotificationRecord,
+};
 use crate::palette::{command_items, PaletteCommands, PaletteFrame, PaletteItem};
 use crate::palette_ui::{PaletteBehavior, PaletteOutcome, PaletteOverlay, TOP_GAP};
 use crate::rollup::{project_rollup, RollupState, TabState};
@@ -142,6 +145,14 @@ pub struct App {
     content_overlay: gtk4::Overlay,
     /// The open command palette overlay, or `None` when closed.
     palette: RefCell<Option<crate::palette_ui::PaletteOverlay>>,
+    /// Live inbox of pending agent notifications, surfaced through the
+    /// command palette ("View Notifications") + the HeaderBar button.
+    /// Membership is driven off the `has_notification` edges in
+    /// `handle_event`; see `notification_inbox::NotificationInbox`.
+    notification_inbox: RefCell<NotificationInbox>,
+    /// Count badge overlaid on the HeaderBar notifications bell. Hidden
+    /// at zero; `refresh_notif_badge` keeps it in sync with the inbox.
+    notif_badge: gtk4::Label,
     /// Optional font-family override from config.
     font_family: Option<String>,
     /// Optional font-size override from config (points). Snapshot
@@ -206,6 +217,7 @@ const ICON_FOLDER_SYMBOLIC: &[u8] = include_bytes!("resources/icons/folder-symbo
 const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
     include_bytes!("resources/icons/sidebar-show-symbolic.svg");
 const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
+const ICON_BELL_SYMBOLIC: &[u8] = include_bytes!("resources/icons/bell-symbolic.svg");
 
 /// Per-tab status indicator icons (M7). Vendored from cmd/roost
 /// alongside the chrome icons so the GTK app doesn't depend on any
@@ -370,9 +382,31 @@ impl App {
             .css_classes(["flat"])
             .tooltip_text("New tab")
             .build();
+        // Notifications bell with an overlaid count badge. GTK has no
+        // cross-project ambient signal today (the rollup is
+        // `TabState`-driven + hook_active-suppressed, and
+        // `set_needs_attention` only shows in the active project's tab
+        // bar) — this button fills that gap. Click opens the palette
+        // directly on the notifications list.
+        let notif_badge = gtk4::Label::builder()
+            .css_classes(["roost-notif-badge"])
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Start)
+            .visible(false)
+            .build();
+        let notif_overlay = gtk4::Overlay::builder()
+            .child(&gtk4::Image::from_gicon(&embedded_icon(ICON_BELL_SYMBOLIC)))
+            .build();
+        notif_overlay.add_overlay(&notif_badge);
+        let notif_button = gtk4::Button::builder()
+            .child(&notif_overlay)
+            .css_classes(["flat"])
+            .tooltip_text("Notifications")
+            .build();
         header.pack_start(&folder_button);
         header.pack_start(&sidebar_toggle_button);
         header.pack_end(&new_tab_button);
+        header.pack_end(&notif_button);
 
         // Sidebar: vertical Box of [section header] / [scrolled project
         // list] / [`+ Project` footer button]. Matches the Go binary's
@@ -469,6 +503,8 @@ impl App {
             theme_name_at_open: RefCell::new(None),
             content_overlay: content_overlay.clone(),
             palette: RefCell::new(None),
+            notification_inbox: RefCell::new(NotificationInbox::new()),
+            notif_badge: notif_badge.clone(),
             font_family: cfg.font_family.clone(),
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
@@ -592,6 +628,11 @@ impl App {
                     }
                 });
             }
+        });
+        // - Bell: open the palette directly on the notifications list.
+        notif_button.connect_clicked({
+            let app = app_struct.clone();
+            move |_| app.show_notifications_palette()
         });
 
         // Install keybinds at window scope so shortcuts fire even
@@ -1682,8 +1723,27 @@ impl App {
                             .expect("tab stack child for project"),
                     );
                 }
+                drop(projects);
+                // Drop any inbox rows for the deleted project's tabs.
+                let stale: Vec<i64> = self
+                    .notification_inbox
+                    .borrow()
+                    .snapshot()
+                    .iter()
+                    .filter(|r| r.project_id == project_id)
+                    .map(|r| r.tab_id)
+                    .collect();
+                if !stale.is_empty() {
+                    let mut inbox = self.notification_inbox.borrow_mut();
+                    for tab_id in stale {
+                        inbox.remove(tab_id);
+                    }
+                    drop(inbox);
+                    self.refresh_notif_badge();
+                }
                 let was_active = *self.active_project_id.borrow() == project_id;
                 if was_active {
+                    let projects = self.projects.borrow();
                     let fallback = pick_next_active_project(&projects);
                     drop(projects);
                     match fallback {
@@ -1708,6 +1768,10 @@ impl App {
                 if !self.close_tab_page(tab_id) {
                     tracing::debug!(tab_id, "tab.closed: no UI mapping (already closed locally)");
                 }
+                // A closed tab can't hold a pending notification — drop
+                // its inbox row to preserve "row exists iff pending".
+                self.notification_inbox.borrow_mut().remove(tab_id);
+                self.refresh_notif_badge();
             }
             WorkspaceEvent::TabTitleChanged { tab_id, title } => {
                 let projects = self.projects.borrow();
@@ -1742,12 +1806,37 @@ impl App {
                         tab_ui.page.set_needs_attention(has_pending);
                     }
                 }
+                drop(projects);
+                // Inbox false-edge: clearing a tab's notification
+                // (focus / prompt-submit / session-end / explicit clear)
+                // drops its row + updates the badge, keeping the list ==
+                // tab indicators == badge.
+                if !has_pending {
+                    self.notification_inbox.borrow_mut().remove(tab_id);
+                    self.refresh_notif_badge();
+                }
             }
             WorkspaceEvent::NotificationFired {
                 tab_id,
                 title,
                 body,
             } => {
+                // Live-inbox upsert: compose a project-forward row
+                // ("<project> · <tab>", body) keyed by tab id for dedup
+                // + jump. The `TabNotification` true-edge fires
+                // alongside this and marks the tab; the false-edge
+                // removes the row.
+                if let Some((project_id, row_title)) = self.inbox_title_for(tab_id) {
+                    self.notification_inbox
+                        .borrow_mut()
+                        .upsert(NotificationRecord::new(
+                            tab_id,
+                            project_id,
+                            row_title,
+                            body.clone(),
+                        ));
+                    self.refresh_notif_badge();
+                }
                 self.fire_desktop_notification(tab_id, &title, &body);
             }
             WorkspaceEvent::TabStateChanged { tab_id, state } => {
@@ -1966,6 +2055,11 @@ impl App {
         for pid in &affected {
             self.refresh_rollup_for(*pid);
         }
+
+        // 6.5 Reconcile inbox membership from the snapshot's
+        //     notification flags — a dropped edge would otherwise leave
+        //     the inbox + bell badge stale while the dot above is fixed.
+        self.reconcile_inbox_from_snapshot(&snapshot);
 
         // 7. Reorder the sidebar to the snapshot order.
         self.apply_sidebar_order(&plan.project_order);
@@ -2293,7 +2387,13 @@ impl App {
         for (accel, action) in bindings {
             reverse.entry(action).or_insert(accel);
         }
-        let items = command_items(|action| reverse.get(&action).and_then(accel_label));
+        // Notification commands lead the list (multi-project triage is
+        // the point); built dynamically so "View Notifications" carries
+        // the live pending count.
+        let mut items = self.notification_command_items();
+        items.extend(command_items(|action| {
+            reverse.get(&action).and_then(accel_label)
+        }));
         let root = PaletteFrame::new("commands", "Execute a command…", items);
 
         let weak = Rc::downgrade(self);
@@ -2316,6 +2416,226 @@ impl App {
             },
         );
         *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    // MARK: notification inbox
+
+    /// Open the palette directly on the notifications list (the
+    /// HeaderBar bell). Same surface as "View Notifications", just
+    /// entered as the root frame so Esc closes rather than popping.
+    fn show_notifications_palette(self: &Rc<Self>) {
+        if self.palette.borrow().is_some() {
+            return;
+        }
+        let root = self.notifications_frame();
+        let behavior = self.notifications_behavior();
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    /// The two notification root commands. Built dynamically (not in
+    /// `PaletteCommands::SPECS`) so "View Notifications" can show the
+    /// live pending count.
+    fn notification_command_items(self: &Rc<Self>) -> Vec<PaletteItem> {
+        let count = self.notification_inbox.borrow().count();
+        let view_title = if count > 0 {
+            format!("View Notifications ({count})")
+        } else {
+            "View Notifications".to_string()
+        };
+        vec![
+            PaletteItem::new(PaletteCommands::VIEW_NOTIFICATIONS_ID, view_title),
+            PaletteItem::new(
+                PaletteCommands::CLEAR_NOTIFICATIONS_ID,
+                "Clear All Notifications",
+            ),
+        ]
+    }
+
+    /// Build the notifications sub-frame from the live inbox snapshot.
+    /// Each row encodes its tab id as `notif:<id>` (parsed on confirm to
+    /// jump). An empty inbox shows a single non-actionable row.
+    fn notifications_frame(self: &Rc<Self>) -> PaletteFrame {
+        let inbox = self.notification_inbox.borrow();
+        let items: Vec<PaletteItem> = if inbox.is_empty() {
+            vec![PaletteItem::new("notif:none", "No notifications")]
+        } else {
+            inbox
+                .snapshot()
+                .iter()
+                .map(|r| {
+                    let trailing = relative_time(r.at.elapsed().as_secs());
+                    let subtitle = if r.body.is_empty() {
+                        None
+                    } else {
+                        Some(r.body.clone())
+                    };
+                    PaletteItem::new(format!("notif:{}", r.tab_id), r.title.clone())
+                        .with_subtitle(subtitle)
+                        .with_trailing(Some(trailing))
+                })
+                .collect()
+        };
+        PaletteFrame::new("notifications", "Jump to a notification…", items)
+    }
+
+    /// Confirm on a notification row → focus that project + tab (which
+    /// clears the tab's notification → drops the row). The "No
+    /// notifications" sentinel is a no-op. Deferred to an idle tick so
+    /// the palette tears down before the focus/present runs (mirrors the
+    /// command path).
+    fn notifications_behavior(self: &Rc<Self>) -> PaletteBehavior {
+        let weak = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            let Some(app) = weak.upgrade() else {
+                return PaletteOutcome::Close;
+            };
+            match notif_tab_id(&item.id) {
+                Some(tab_id) => {
+                    let weak2 = Rc::downgrade(&app);
+                    glib::idle_add_local_once(move || {
+                        if let Some(app) = weak2.upgrade() {
+                            app.focus_tab_by_id(tab_id);
+                        }
+                    });
+                    PaletteOutcome::Close
+                }
+                None => PaletteOutcome::None, // "No notifications" sentinel
+            }
+        })
+    }
+
+    /// "Clear All Notifications": clear each pending tab's notification
+    /// through the workspace. Each clear emits the `TabNotification`
+    /// false-edge, which is the single source of truth — its handler
+    /// drops the inbox row, refreshes the header badge, and clears the
+    /// tab's needs-attention. Driving removal only off that edge (no
+    /// parallel local clear) keeps list == indicators == badge even if
+    /// a clear fails: that tab stays pending rather than the UI
+    /// desyncing from the workspace.
+    fn clear_all_notifications(self: &Rc<Self>) {
+        let tab_ids = self.notification_inbox.borrow().tab_ids();
+        if let Some(client) = self.client.borrow().clone() {
+            for tab_id in &tab_ids {
+                let _ = client.workspace.set_tab_has_notification(*tab_id, false);
+            }
+        }
+    }
+
+    /// Reconcile inbox membership from a workspace snapshot during
+    /// resync. The live `NotificationFired` / `TabNotification` edges
+    /// normally drive the inbox, but the broadcast lag that triggers a
+    /// resync can drop an edge — leaving the inbox + bell badge stale
+    /// while `reconcile_to_snapshot` corrects the per-tab dot. Bring
+    /// membership back in line with the authoritative `has_notification`
+    /// flags. Best-effort: the message body rode the lost event, so a
+    /// recovered row shows its title only.
+    fn reconcile_inbox_from_snapshot(self: &Rc<Self>, snapshot: &[Project]) {
+        let pending: HashSet<i64> = snapshot
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter(|t| t.has_notification)
+            .map(|t| t.id)
+            .collect();
+        // Drop rows for tabs no longer pending (cleared or closed).
+        let stale: Vec<i64> = self
+            .notification_inbox
+            .borrow()
+            .tab_ids()
+            .into_iter()
+            .filter(|id| !pending.contains(id))
+            .collect();
+        {
+            let mut inbox = self.notification_inbox.borrow_mut();
+            for id in stale {
+                inbox.remove(id);
+            }
+        }
+        // Add rows for pending tabs missing from the inbox.
+        let existing: HashSet<i64> = self
+            .notification_inbox
+            .borrow()
+            .tab_ids()
+            .into_iter()
+            .collect();
+        for tab_id in pending {
+            if !existing.contains(&tab_id) {
+                if let Some((project_id, title)) = self.inbox_title_for(tab_id) {
+                    self.notification_inbox
+                        .borrow_mut()
+                        .upsert(NotificationRecord::new(
+                            tab_id,
+                            project_id,
+                            title,
+                            String::new(),
+                        ));
+                }
+            }
+        }
+        self.refresh_notif_badge();
+    }
+
+    /// Compose the inbox row title for `tab_id`: `(project_id,
+    /// "<project> · <tab>")`.
+    ///
+    /// Prefers the live UI mapping (its AdwTabPage title reflects OSC
+    /// title changes). Falls back to the workspace when the UI hasn't
+    /// registered the tab's `TabUi` yet — `attach_existing_tab`
+    /// populates `ui.tabs` only after its async block resolves, so a
+    /// notification firing in that window would otherwise be dropped
+    /// from the inbox (breaking the "row iff pending" invariant). The
+    /// workspace always has the tab here (notify requires it to exist).
+    fn inbox_title_for(self: &Rc<Self>, tab_id: i64) -> Option<(i64, String)> {
+        {
+            let projects = self.projects.borrow();
+            for (project_id, ui) in projects.iter() {
+                if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                    let tab_label = tab_ui.page.title().to_string();
+                    return Some((*project_id, compose_title(&ui.name, &tab_label)));
+                }
+            }
+        }
+        let client = self.client.borrow().clone()?;
+        let tab = client.workspace.tab(tab_id).ok()?;
+        let project_name = client
+            .workspace
+            .snapshot()
+            .into_iter()
+            .find(|p| p.id == tab.project_id)
+            .map(|p| p.name)
+            .unwrap_or_default();
+        let tab_label = if !tab.title.is_empty() {
+            tab.title
+        } else if !tab.cwd.is_empty() {
+            tilde_abbreviate(&tab.cwd)
+        } else {
+            "Tab".to_string()
+        };
+        Some((tab.project_id, compose_title(&project_name, &tab_label)))
+    }
+
+    /// Mirror the inbox count onto the HeaderBar bell's badge. Hidden at
+    /// zero so the bell reads as "nothing pending".
+    fn refresh_notif_badge(self: &Rc<Self>) {
+        let count = self.notification_inbox.borrow().count();
+        if count > 0 {
+            self.notif_badge.set_text(&count.to_string());
+            self.notif_badge.set_visible(true);
+        } else {
+            self.notif_badge.set_visible(false);
+        }
     }
 
     /// Top margin pinning the card under the tab bar: the active
@@ -2348,6 +2668,13 @@ impl App {
     fn confirm_palette_command(self: &Rc<Self>, item: &PaletteItem) -> PaletteOutcome {
         if item.id == PaletteCommands::SELECT_THEME_ID {
             return PaletteOutcome::Push(self.theme_frame(), self.theme_behavior());
+        }
+        if item.id == PaletteCommands::VIEW_NOTIFICATIONS_ID {
+            return PaletteOutcome::Push(self.notifications_frame(), self.notifications_behavior());
+        }
+        if item.id == PaletteCommands::CLEAR_NOTIFICATIONS_ID {
+            self.clear_all_notifications();
+            return PaletteOutcome::Close;
         }
         let id = item.id.clone();
         let weak = Rc::downgrade(self);
@@ -2589,8 +2916,15 @@ impl App {
         if let Some(ui) = projects.get(&project_id) {
             ui.tab_view.set_selected_page(&page);
         }
+        drop(projects);
         // Bring the window forward.
         self.window.present();
+        // Parity with Mac's `selectTab`: focusing a tab clears its
+        // pending notification, which drops the inbox row + the tab's
+        // needs-attention badge via the `TabNotification` false-edge.
+        if let Some(client) = self.client.borrow().clone() {
+            let _ = client.workspace.set_tab_has_notification(tab_id, false);
+        }
     }
 
     /// M9.5: close an AdwTabPage by tab id. Routes through the
@@ -2897,6 +3231,13 @@ fn stack_name(project_id: i64) -> String {
     format!("project-{project_id}")
 }
 
+/// Parse a notification row's item id (`notif:<tab_id>`) into the tab
+/// id. Returns `None` for the `notif:none` sentinel and any malformed
+/// id, so the confirm handler treats those as no-ops.
+fn notif_tab_id(item_id: &str) -> Option<i64> {
+    item_id.strip_prefix("notif:").and_then(|s| s.parse().ok())
+}
+
 /// Tilde-abbreviated cwd of `ui`'s currently selected tab (or the
 /// first tab if no selection exists yet). Empty string when the
 /// project has no attached tabs — caller uses that as the "subtitle
@@ -3117,10 +3458,24 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 mod tests {
     use super::{
         compute_insert_idx, drain_server_driven_marker, is_already_attached_or_pending,
-        pick_next_active_project, restore_open_specs, tilde_abbreviate_with_home, RestoreTab,
+        notif_tab_id, pick_next_active_project, restore_open_specs, tilde_abbreviate_with_home,
+        RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    /// The notification-row id parser: `notif:<tab>` → the tab id; the
+    /// `notif:none` empty sentinel + malformed ids → `None` (so confirm
+    /// treats them as no-ops rather than jumping to a bogus tab).
+    #[test]
+    fn notif_tab_id_parses_only_well_formed_ids() {
+        assert_eq!(notif_tab_id("notif:42"), Some(42));
+        assert_eq!(notif_tab_id("notif:-3"), Some(-3));
+        assert_eq!(notif_tab_id("notif:none"), None);
+        assert_eq!(notif_tab_id("notif:"), None);
+        assert_eq!(notif_tab_id("new_tab"), None);
+        assert_eq!(notif_tab_id("notif:1.5"), None);
+    }
 
     /// `restore_open_specs` encodes the seed-one-when-empty rule: a
     /// project with saved tabs re-opens exactly those (cwd + title in

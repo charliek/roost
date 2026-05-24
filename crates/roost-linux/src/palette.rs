@@ -18,6 +18,9 @@ use crate::keybind::KeybindAction;
 pub struct PaletteItem {
     pub id: String,
     pub title: String,
+    /// Optional second line under the title (the notification list uses
+    /// it for the message body). `None` keeps the row single-line.
+    pub subtitle: Option<String>,
     /// Right-aligned hint, e.g. a shortcut like "Alt+Shift+P".
     pub trailing_text: Option<String>,
 }
@@ -27,8 +30,14 @@ impl PaletteItem {
         Self {
             id: id.into(),
             title: title.into(),
+            subtitle: None,
             trailing_text: None,
         }
+    }
+
+    pub fn with_subtitle(mut self, subtitle: Option<String>) -> Self {
+        self.subtitle = subtitle;
+        self
     }
 
     pub fn with_trailing(mut self, trailing: Option<String>) -> Self {
@@ -146,6 +155,13 @@ pub struct PaletteCommands;
 
 impl PaletteCommands {
     pub const SELECT_THEME_ID: &'static str = "select_theme";
+
+    /// Palette-only drill-in into the live notification inbox. Like
+    /// `SELECT_THEME_ID`, not a `KeybindAction` — built dynamically in
+    /// `App::command_items` so its title can carry the live count.
+    pub const VIEW_NOTIFICATIONS_ID: &'static str = "view_notifications";
+    /// Palette-only command: empty the inbox + clear all pending dots.
+    pub const CLEAR_NOTIFICATIONS_ID: &'static str = "clear_notifications";
 
     pub const SPECS: &'static [(&'static str, &'static str)] = &[
         (Self::SELECT_THEME_ID, "Select Theme…"),
@@ -545,6 +561,38 @@ mod tests {
         assert!(PaletteCommands::SPECS
             .iter()
             .all(|(id, _)| *id != "close_project"));
+    }
+
+    #[test]
+    fn item_subtitle_round_trips() {
+        // Plain items have no subtitle; `with_subtitle` sets it and
+        // leaves the title/id intact (the notification list relies on
+        // this for the two-line body row).
+        let plain = PaletteItem::new("a", "Title");
+        assert_eq!(plain.subtitle, None);
+        let withsub = PaletteItem::new("notif:7", "roost · claude")
+            .with_subtitle(Some("needs your input".to_string()))
+            .with_trailing(Some("2m".to_string()));
+        assert_eq!(withsub.id, "notif:7");
+        assert_eq!(withsub.title, "roost · claude");
+        assert_eq!(withsub.subtitle.as_deref(), Some("needs your input"));
+        assert_eq!(withsub.trailing_text.as_deref(), Some("2m"));
+        // A `None` subtitle keeps the row single-line.
+        let cleared = withsub.with_subtitle(None);
+        assert_eq!(cleared.subtitle, None);
+    }
+
+    #[test]
+    fn notification_command_ids_are_not_keybinds() {
+        // The two notification commands are palette-only sentinels (like
+        // select_theme), built dynamically rather than via SPECS, so
+        // they must not collide with the keybind namespace.
+        assert!(KeybindAction::from_name(PaletteCommands::VIEW_NOTIFICATIONS_ID).is_none());
+        assert!(KeybindAction::from_name(PaletteCommands::CLEAR_NOTIFICATIONS_ID).is_none());
+        assert!(PaletteCommands::SPECS
+            .iter()
+            .all(|(id, _)| *id != PaletteCommands::VIEW_NOTIFICATIONS_ID
+                && *id != PaletteCommands::CLEAR_NOTIFICATIONS_ID));
     }
 
     #[test]

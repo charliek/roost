@@ -65,6 +65,8 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private static let cardWidth: CGFloat = 660
     private static let cardHeight: CGFloat = 440
     private static let rowHeight: CGFloat = 32
+    /// Taller row for two-line notification entries (title + body).
+    private static let subtitleRowHeight: CGFloat = 48
     /// Gap below the tab bar (~1cm) so the card floats under the tabs.
     private static let topGap: CGFloat = 30
 
@@ -382,6 +384,14 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         true
     }
+
+    /// Notification rows carry a `subtitle` (the message body) and need
+    /// a second line; command/theme rows stay at the compact height.
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        let matches = state.matches
+        guard row < matches.count else { return Self.rowHeight }
+        return matches[row].item.subtitle == nil ? Self.rowHeight : Self.subtitleRowHeight
+    }
 }
 
 // MARK: - Backdrop
@@ -424,24 +434,40 @@ private final class PaletteRowView: NSTableRowView {
 private final class PaletteCellView: NSView {
     static let id = NSUserInterfaceItemIdentifier("PaletteCell")
     private let title = NSTextField(labelWithString: "")
+    private let subtitle = NSTextField(labelWithString: "")
     private let trailing = NSTextField(labelWithString: "")
+    /// Title above subtitle. An NSStackView collapses to just the title
+    /// when the subtitle is hidden, so single-line command/theme rows
+    /// stay centered while notification rows show the two-line body.
+    private let textColumn = NSStackView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         identifier = Self.id
-        title.translatesAutoresizingMaskIntoConstraints = false
         title.lineBreakMode = .byTruncatingTail
+        subtitle.lineBreakMode = .byTruncatingTail
+        subtitle.font = .systemFont(ofSize: 12)
+        subtitle.textColor = paletteMutedColor
         trailing.translatesAutoresizingMaskIntoConstraints = false
         trailing.font = .systemFont(ofSize: 12)
         trailing.textColor = paletteMutedColor
         trailing.alignment = .right
         trailing.setContentHuggingPriority(.required, for: .horizontal)
-        addSubview(title)
+        trailing.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        textColumn.translatesAutoresizingMaskIntoConstraints = false
+        textColumn.orientation = .vertical
+        textColumn.alignment = .leading
+        textColumn.spacing = 2
+        textColumn.addArrangedSubview(title)
+        textColumn.addArrangedSubview(subtitle)
+
+        addSubview(textColumn)
         addSubview(trailing)
         NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            title.centerYAnchor.constraint(equalTo: centerYAnchor),
-            trailing.leadingAnchor.constraint(greaterThanOrEqualTo: title.trailingAnchor, constant: 8),
+            textColumn.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            textColumn.centerYAnchor.constraint(equalTo: centerYAnchor),
+            textColumn.trailingAnchor.constraint(lessThanOrEqualTo: trailing.leadingAnchor, constant: -8),
             trailing.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             trailing.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -453,6 +479,13 @@ private final class PaletteCellView: NSView {
     func configure(_ match: PaletteMatch) {
         title.attributedStringValue = highlighted(match.item.title, ranges: match.ranges)
         trailing.stringValue = match.item.trailingText ?? ""
+        if let body = match.item.subtitle {
+            subtitle.stringValue = body
+            subtitle.isHidden = false
+        } else {
+            subtitle.stringValue = ""
+            subtitle.isHidden = true
+        }
     }
 
     /// White base text with the fuzzy-matched characters in blue

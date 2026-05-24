@@ -127,6 +127,13 @@ private func contiguousRanges(_ offsets: [Int]) -> [Range<Int>] {
 enum PaletteCommands {
     static let selectThemeID = "select_theme"
 
+    /// Palette-only drill-in into the live notification inbox. Like
+    /// `selectThemeID`, not a `KeybindAction` — built dynamically in
+    /// `paletteCommandItems()` so its title can carry the live count.
+    static let viewNotificationsID = "view_notifications"
+    /// Palette-only command: empty the inbox + clear all pending dots.
+    static let clearNotificationsID = "clear_notifications"
+
     static let specs: [(id: String, title: String)] = [
         (selectThemeID, "Select Theme…"),
         (KeybindAction.newTab, "New Tab"),

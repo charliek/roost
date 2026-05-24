@@ -197,6 +197,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `notification(e)` case routes `NotificationEvent`s here.
     private let desktopNotifications = DesktopNotifications()
 
+    /// Live inbox of pending agent notifications, surfaced through the
+    /// command palette ("View Notifications") and the Dock badge.
+    /// Membership is driven off the `has_notification` edges in
+    /// `handleEvent`; see `NotificationInbox`.
+    private var notificationInbox = NotificationInbox()
+
     nonisolated static func main() {
         let app = NSApplication.shared
         let delegate = RoostApp()
@@ -306,21 +312,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // + M3 selectTab paths.
         desktopNotifications.requestAuthorization()
         desktopNotifications.onActivate = { [weak self] tabID in
-            guard let self else { return }
-            guard let session = self.tabs.first(where: { $0.id == tabID }) else {
-                return
-            }
-            // Switch project first if needed, then focus the tab
-            // within it. selectProject is idempotent when the id
-            // matches.
-            if session.projectID != self.activeProjectID {
-                self.selectProject(id: session.projectID)
-            }
-            let projectTabs = self.tabs.filter { $0.projectID == session.projectID }
-            if let idx = projectTabs.firstIndex(where: { $0 === session }) {
-                self.selectTab(at: idx)
-            }
-            NSApp.activate(ignoringOtherApps: true)
+            self?.focusTab(tabID: tabID)
         }
 
         // Probe the cell-grid intrinsic size so the right pane reserves
@@ -837,22 +829,40 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func confirmPaletteCommand(_ item: PaletteItem) -> PaletteOutcome {
-        if item.id == PaletteCommands.selectThemeID {
+        switch item.id {
+        case PaletteCommands.selectThemeID:
             return .push(themeFrame(), themeBehavior())
+        case PaletteCommands.viewNotificationsID:
+            return .push(notificationsFrame(), notificationsBehavior())
+        case PaletteCommands.clearNotificationsID:
+            clearAllNotifications()
+            return .close
+        default:
+            runCommand(item.id)
+            return .close
         }
-        runCommand(item.id)
-        return .close
     }
 
     /// Curated first-cut command list. Ids are `KeybindAction` ids
-    /// (except `selectTheme`), so they dispatch through `runCommand`
-    /// and show their shortcut. Indexed switch actions, clipboard, and
-    /// `command_palette` itself are intentionally excluded.
+    /// (except `selectTheme` + the notification commands), so they
+    /// dispatch through `runCommand` and show their shortcut. Indexed
+    /// switch actions, clipboard, and `command_palette` itself are
+    /// intentionally excluded.
+    ///
+    /// The two notification commands lead the list (multi-project triage
+    /// is the point) and are built here rather than in `specs` so "View
+    /// Notifications" can carry the live pending count.
     @MainActor
     private func paletteCommandItems() -> [PaletteItem] {
-        PaletteCommands.specs.map { id, title in
+        var items: [PaletteItem] = []
+        let count = notificationInbox.count
+        let viewTitle = count > 0 ? "View Notifications (\(count))" : "View Notifications"
+        items.append(PaletteItem(id: PaletteCommands.viewNotificationsID, title: viewTitle))
+        items.append(PaletteItem(id: PaletteCommands.clearNotificationsID, title: "Clear All Notifications"))
+        items.append(contentsOf: PaletteCommands.specs.map { id, title in
             PaletteItem(id: id, title: title, trailingText: shortcutText(for: id))
-        }
+        })
+        return items
     }
 
     /// Map the active theme list onto palette items, pre-highlighting
@@ -878,6 +888,101 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             onConfirm: { _ in .close },  // highlight already applied it; just close
             onCancel: { [weak self] in self?.revertTheme() }
         )
+    }
+
+    // MARK: - Notification inbox
+
+    /// Build the notifications sub-frame from the live inbox snapshot.
+    /// Each row encodes its tab id as `"notif:<id>"` (parsed on confirm
+    /// to jump). An empty inbox shows a single non-actionable row.
+    @MainActor
+    private func notificationsFrame() -> PaletteFrame {
+        let records = notificationInbox.snapshot()
+        let items: [PaletteItem]
+        if records.isEmpty {
+            items = [PaletteItem(id: "notif:none", title: "No notifications")]
+        } else {
+            items = records.map { r in
+                PaletteItem(
+                    id: "notif:\(r.tabID)",
+                    title: r.title,
+                    subtitle: r.body.isEmpty ? nil : r.body,
+                    trailingText: relativeTimeLabel(from: r.at)
+                )
+            }
+        }
+        return PaletteFrame(
+            id: "notifications",
+            placeholder: "Jump to a notification…",
+            items: items
+        )
+    }
+
+    /// Confirm on a notification row → focus that project + tab. The
+    /// "No notifications" sentinel is a no-op (stay open). Focusing
+    /// clears the tab's `has_notification`, which drives the inbox
+    /// false-edge → the row + badge clear (see `selectTab`).
+    @MainActor
+    private func notificationsBehavior() -> PaletteBehavior {
+        PaletteBehavior(onConfirm: { [weak self] item in
+            guard let self else { return .close }
+            guard let tabID = Self.tabID(fromNotifItemID: item.id) else {
+                return .none  // "No notifications" sentinel
+            }
+            self.focusTab(tabID: tabID)
+            return .close
+        })
+    }
+
+    /// Parse `"notif:<id>"` → the tab id, or nil for the sentinel /
+    /// malformed ids.
+    private static func tabID(fromNotifItemID id: String) -> Int64? {
+        guard let raw = id.split(separator: ":", maxSplits: 1).last else { return nil }
+        return Int64(raw)
+    }
+
+    /// "Clear All Notifications": clear each pending tab's notification
+    /// through the workspace. Each clear emits the `tab.notification`
+    /// false-edge, which is the single source of truth — its handler
+    /// drops the inbox row, refreshes the Dock badge, and rebuilds the
+    /// dot. Driving removal only off that edge (no parallel local clear)
+    /// keeps list == dots == badge even if a clear fails: that tab
+    /// simply stays pending rather than the UI desyncing from the
+    /// workspace.
+    @MainActor
+    private func clearAllNotifications() {
+        let socket = socketPath
+        for tabID in notificationInbox.tabIDs {
+            Task.detached {
+                await clearTabNotification(socketPath: socket, tabID: tabID)
+            }
+        }
+    }
+
+    /// Bring `tabID`'s tab forward: switch project if needed, select the
+    /// tab within it, and activate the app. Shared by the OS-banner
+    /// click handler and the inbox jump.
+    @MainActor
+    private func focusTab(tabID: Int64) {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return }
+        // selectProject is idempotent when the id already matches.
+        if session.projectID != activeProjectID {
+            selectProject(id: session.projectID)
+        }
+        let projectTabs = tabs.filter { $0.projectID == session.projectID }
+        if let idx = projectTabs.firstIndex(where: { $0 === session }) {
+            selectTab(at: idx)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Mirror the inbox count onto the Dock tile badge. `nil` at zero so
+    /// the badge disappears entirely (AppKit shows nothing for an empty
+    /// label).
+    @MainActor
+    private func refreshDockBadge() {
+        let count = notificationInbox.count
+        NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
     }
 
     @MainActor
@@ -1101,10 +1206,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
             if let tabID = session.id {
                 tabPillViews.removeValue(forKey: tabID)
+                notificationInbox.remove(tabID)
             }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
         }
+        refreshDockBadge()
         tabs.removeAll { $0.projectID == id }
         activeSessionByProject.removeValue(forKey: id)
         projects.removeAll { $0.id == id }
@@ -1185,6 +1292,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // the TabSession reference in `tabs` until this event;
             // tear it down now so the tab strip converges.
             guard let session = tabs.first(where: { $0.id == e.tabID }) else { break }
+            // A closed tab can't hold a pending notification — drop its
+            // inbox row to preserve "row exists iff tab has pending".
+            notificationInbox.remove(e.tabID)
+            refreshDockBadge()
             let projectID = session.projectID
             let wasActive = activeSessionByProject[projectID] === session
             // Round-3 R5: cancel any in-progress inline rename on the
@@ -1314,7 +1425,34 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 }
                 rebuildSidebar()  // sidebar's per-project rollup
             }
+            // Inbox false-edge: clearing a tab's notification (focus,
+            // prompt-submit, session-end, explicit clear) drops its row
+            // + updates the Dock badge, keeping list == dots == badge.
+            if !e.hasPending {
+                notificationInbox.remove(e.tabID)
+                refreshDockBadge()
+            }
         case .notification(let e):
+            // Live-inbox upsert: compose a project-forward row from the
+            // model (title = "<project> · <tab>", subtitle = message),
+            // keyed by tab id for dedup + jump. The `.tabNotification`
+            // true-edge fires alongside this and lights the dot; the
+            // false-edge (clear/focus/close) removes the row.
+            if let session = tabs.first(where: { $0.id == e.tabID }) {
+                let projectName = projects.first(where: { $0.id == session.projectID })?.name ?? "Project"
+                let projectTabs = tabs.filter { $0.projectID == session.projectID }
+                let index = projectTabs.firstIndex(where: { $0 === session }) ?? 0
+                notificationInbox.upsert(NotificationRecord(
+                    tabID: e.tabID,
+                    projectID: session.projectID,
+                    title: NotificationInbox.composeTitle(
+                        project: projectName,
+                        tab: pillLabel(for: session, index: index)
+                    ),
+                    body: e.body
+                ))
+                refreshDockBadge()
+            }
             // Phase 6a P8: route the daemon-emitted notification
             // to a macOS banner via UNUserNotificationCenter.
             // The daemon already applied hook_active suppression
@@ -1651,10 +1789,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
             if let tabID = session.id {
                 tabPillViews.removeValue(forKey: tabID)
+                notificationInbox.remove(tabID)
             }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
         }
+        refreshDockBadge()
         tabs.removeAll { $0.projectID == id }
         activeSessionByProject.removeValue(forKey: id)
 
@@ -1790,6 +1930,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // view teardown below.
         if let id = session.id, let pill = tabPillViews[id], pill.isEditing {
             pill.endEdit()
+        }
+        if let id = session.id {
+            notificationInbox.remove(id)
+            refreshDockBadge()
         }
         tabs.removeAll { $0 === session }
         if let id = session.id {
@@ -2150,6 +2294,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // stops being first responder before we tear the view down.
         if let id = session.id, let pill = tabPillViews[id], pill.isEditing {
             pill.endEdit()
+        }
+        if let id = session.id {
+            notificationInbox.remove(id)
+            refreshDockBadge()
         }
         tabs.removeAll { $0 === session }
         if let id = session.id {
