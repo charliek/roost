@@ -108,7 +108,7 @@ Roost is a local desktop app. UDS gets us filesystem permissions for free, no po
 
 ### DL-4: Each UI owns its own workspace (revised 2026-05-23)
 
-The pre-rewrite design had a shared `roost-core` daemon owning workspace state in SQLite; UIs were thin gRPC clients. In practice the realistic deployment is one user, one UI process, plus occasional control-plane callers (`roostctl`, Claude hooks). Collapsing the workspace into each UI removes the gRPC pump, removes SQLite, removes cross-process serialization, and removes the entire "cross-client convergence" rabbit hole that the daemon-era code spent significant effort on. State persistence is a small `state.json` atomically rewritten via tmp + fsync + rename (Linux) / `replaceItemAt` (Mac); tabs are intentionally not persisted (they don't survive UI quits, by design — see DL-7).
+The pre-rewrite design had a shared `roost-core` daemon owning workspace state in SQLite; UIs were thin gRPC clients. In practice the realistic deployment is one user, one UI process, plus occasional control-plane callers (`roostctl`, Claude hooks). Collapsing the workspace into each UI removes the gRPC pump, removes SQLite, removes cross-process serialization, and removes the entire "cross-client convergence" rabbit hole that the daemon-era code spent significant effort on. State persistence is a small `state.json` atomically rewritten via tmp + fsync + rename (Linux) / `replaceItemAt` (Mac); it carries the projects plus each project's tab **layout** (title + cwd + position), so a relaunch re-opens the prior tabs as fresh shells in their saved directories — no live process or scrollback is restored (see DL-7).
 
 ### DL-5: Two languages, not Rust everywhere
 
@@ -118,9 +118,11 @@ Considered and rejected: Rust + gtk4-rs on Mac. This still requires hand-rolled 
 
 The current code carries `internal/pangoextra` because `gotk4`'s `pangocairo.ContextSetFontOptions` expects `cairo.FontOptions` to follow the gextras "record" struct convention while gotk4's cairo package uses a raw native pointer. `gtk4-rs` calls `pango_cairo_context_set_font_options` directly via raw FFI and does not have this mismatch. The workaround dies with the Go code in GODELETE.
 
-### DL-7: No tab persistence (revised 2026-05-23)
+### DL-7: Tabs persist as layout, not live state (revised 2026-05-24)
 
-Original DL-7 said "SQLite migrations port byte-for-byte" so existing Go-binary users could point a new build at their `roost.db` without a wipe. The inline-core refactor moved persistence to a tiny `state.json` carrying only projects + the monotonic `next_id`. Tabs intentionally don't survive UI quits: every fresh launch starts with no tabs, and `openNewTab` creates one. The reason: the daemon-era `StreamPty` re-spawned the shell on attach, so "preserved" tabs would just be fresh shells with stale ids — preservation was already a fiction. A Go-binary user migrating to the new build loses their tab list (which would have been re-spawned anyway) and keeps their project list (still serialized to the same place).
+History: the original DL-7 said "SQLite migrations port byte-for-byte" so Go-binary users could point a new build at their `roost.db`. The 2026-05-23 inline-core refactor moved persistence to a tiny `state.json` carrying only projects + the monotonic `next_id`, and tabs did **not** survive a UI quit (every launch started empty and seeded one tab).
+
+Revised 2026-05-24: `state.json` now also stores each project's tab **layout** — `{title, cwd, position}` per tab, plus the active project + active tab position. On relaunch each project re-opens its prior tabs as **fresh shells** in their saved directories (a project with no saved tabs, or a `state.json` from an older build, seeds one tab). What is *not* restored: the live process and scrollback — "preserving" those was always a fiction since the daemon-era `StreamPty` re-spawned the shell on attach anyway. So restore is deliberately layout-only: same project + tab count, same directories, fresh shells. The `tabs` array and `active_*` fields are additive + defaulted, so a file written by one build (or the other UI) still loads in the other. Coupled with the last-tab cascade (closing a project's last tab closes the project; emptying the workspace quits), this gives a predictable relaunch: you get back the projects and tabs you left, in the directories you left them.
 
 ### DL-8: OSC routing is the differentiator
 

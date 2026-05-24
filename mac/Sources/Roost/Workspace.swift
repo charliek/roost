@@ -7,8 +7,10 @@
 //
 // Mirrors `crates/roost-linux/src/daemon/state.rs` semantically:
 // in-memory `BTreeMap`-style storage, atomic write via tmp +
-// rename, tabs do not survive UI quits (no-session-restore
-// goal), corrupt state.json → start empty.
+// rename, corrupt state.json → start empty. Persists each project's
+// tab layout (title + cwd + position) + the active selection, loaded
+// at init into a one-shot `restoreLayout` the app bootstrap drains to
+// re-open the prior tabs as fresh shells (no live process/scrollback).
 //
 // Threading: the workspace is `@MainActor`. PTY callbacks that
 // need to mutate state hop here via `Task { @MainActor in ... }`.
