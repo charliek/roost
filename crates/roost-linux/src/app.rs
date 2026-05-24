@@ -2446,18 +2446,43 @@ impl App {
         self.refresh_notif_badge();
     }
 
-    /// Compose the inbox row title for `tab_id`: locate its project +
-    /// tab and return `(project_id, "<project> · <tab>")`, or `None` if
-    /// the tab has no UI mapping.
+    /// Compose the inbox row title for `tab_id`: `(project_id,
+    /// "<project> · <tab>")`.
+    ///
+    /// Prefers the live UI mapping (its AdwTabPage title reflects OSC
+    /// title changes). Falls back to the workspace when the UI hasn't
+    /// registered the tab's `TabUi` yet — `attach_existing_tab`
+    /// populates `ui.tabs` only after its async block resolves, so a
+    /// notification firing in that window would otherwise be dropped
+    /// from the inbox (breaking the "row iff pending" invariant). The
+    /// workspace always has the tab here (notify requires it to exist).
     fn inbox_title_for(self: &Rc<Self>, tab_id: i64) -> Option<(i64, String)> {
-        let projects = self.projects.borrow();
-        for (project_id, ui) in projects.iter() {
-            if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
-                let tab_label = tab_ui.page.title().to_string();
-                return Some((*project_id, compose_title(&ui.name, &tab_label)));
+        {
+            let projects = self.projects.borrow();
+            for (project_id, ui) in projects.iter() {
+                if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
+                    let tab_label = tab_ui.page.title().to_string();
+                    return Some((*project_id, compose_title(&ui.name, &tab_label)));
+                }
             }
         }
-        None
+        let client = self.client.borrow().clone()?;
+        let tab = client.workspace.tab(tab_id).ok()?;
+        let project_name = client
+            .workspace
+            .snapshot()
+            .into_iter()
+            .find(|p| p.id == tab.project_id)
+            .map(|p| p.name)
+            .unwrap_or_default();
+        let tab_label = if !tab.title.is_empty() {
+            tab.title
+        } else if !tab.cwd.is_empty() {
+            tilde_abbreviate(&tab.cwd)
+        } else {
+            "Tab".to_string()
+        };
+        Some((tab.project_id, compose_title(&project_name, &tab_label)))
     }
 
     /// Mirror the inbox count onto the HeaderBar bell's badge. Hidden at
