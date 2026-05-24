@@ -3,10 +3,14 @@
 //! M3 of the daemon-removal refactor. Replaces the legacy
 //! SQLite-backed `Store` with a single JSON file per profile.
 //!
-//! On-disk schema is intentionally narrow: only projects + the
-//! monotonically-increasing id counter. Tabs do not persist
-//! across UI quits — the "no session restore" goal in the
-//! refactor plan.
+//! On-disk schema: the monotonically-increasing id counter, the
+//! projects, and — per project — the **layout** of its tabs
+//! (title + cwd + position, no live process/scrollback). On
+//! relaunch the UI re-opens each project's tabs as **fresh shells**
+//! in their saved directories; this reverses the original
+//! "no session restore" goal (vision.md DL-7). The `tabs` array and
+//! the `active_*` selection fields are `#[serde(default)]` so a file
+//! written by an older build (or the other UI) still loads.
 //!
 //! Atomic write protocol: write to `state.json.tmp`, `fsync`,
 //! rename over `state.json`. Killing the process mid-write either
@@ -25,6 +29,15 @@ pub struct SnapshotFile {
     pub next_id: i64,
     #[serde(default)]
     pub projects: Vec<ProjectSnapshot>,
+    /// Project to re-select on relaunch. `0` (the default) means
+    /// "no preference" — the UI falls back to the first project.
+    #[serde(default)]
+    pub active_project_id: i64,
+    /// Position of the active tab within `active_project_id`. Tab
+    /// ids are not stable across restore (fresh shells), so the
+    /// selection is restored by position, not id.
+    #[serde(default)]
+    pub active_tab_position: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +47,20 @@ pub struct ProjectSnapshot {
     pub cwd: String,
     pub position: i32,
     pub created_at: i64,
+    /// Layout of this project's tabs, in display order. Defaulted so
+    /// a file from an older build (no `tabs` key) loads as "no saved
+    /// tabs" → the UI seeds a single tab on restore.
+    #[serde(default)]
+    pub tabs: Vec<TabSnapshot>,
+}
+
+/// A persisted tab's layout: enough to re-open a fresh shell in the
+/// right place, but no live state (no id, process, or scrollback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabSnapshot {
+    pub title: String,
+    pub cwd: String,
+    pub position: i32,
 }
 
 /// Read `state.json` at `path`. Returns:
@@ -155,17 +182,51 @@ mod tests {
         let p = dir.path().join("state.json");
         let snap = SnapshotFile {
             next_id: 42,
+            active_project_id: 1,
+            active_tab_position: 1,
             projects: vec![ProjectSnapshot {
                 id: 1,
                 name: "Roost".into(),
                 cwd: "/tmp".into(),
                 position: 0,
                 created_at: 1_700_000_000,
+                tabs: vec![
+                    TabSnapshot {
+                        title: "shell".into(),
+                        cwd: "/tmp".into(),
+                        position: 0,
+                    },
+                    TabSnapshot {
+                        title: "logs".into(),
+                        cwd: "/var/log".into(),
+                        position: 1,
+                    },
+                ],
             }],
         };
         persist_state(&p, &snap).unwrap();
         let back = read_state(&p).unwrap().expect("present");
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn legacy_file_without_tabs_loads_with_defaults() {
+        // A state.json written by a build predating tab persistence
+        // has no `tabs` / `active_*` keys. It must still load, with
+        // those fields defaulted (empty tabs, active selection 0).
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        std::fs::write(
+            &p,
+            br#"{"next_id":5,"projects":[{"id":1,"name":"Old","cwd":"/tmp","position":0,"created_at":1}]}"#,
+        )
+        .unwrap();
+        let back = read_state(&p).unwrap().expect("present");
+        assert_eq!(back.next_id, 5);
+        assert_eq!(back.active_project_id, 0);
+        assert_eq!(back.active_tab_position, 0);
+        assert_eq!(back.projects.len(), 1);
+        assert!(back.projects[0].tabs.is_empty());
     }
 
     #[test]
@@ -185,7 +246,7 @@ mod tests {
             &p,
             &SnapshotFile {
                 next_id: 1,
-                projects: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -193,7 +254,7 @@ mod tests {
             &p,
             &SnapshotFile {
                 next_id: 2,
-                projects: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
