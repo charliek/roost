@@ -12,6 +12,11 @@
 
 import AppKit
 
+/// Readable medium-gray for secondary text (placeholder + unselected
+/// shortcut hints), à la Zed. Light enough to read on the card; dim
+/// enough to stay secondary to the white row titles.
+private let paletteMutedColor = NSColor(white: 0.62, alpha: 1.0)
+
 /// What confirming an item does. Built by the caller (RoostApp) as part
 /// of each frame's behavior; kept out of the pure `PaletteState`.
 enum PaletteOutcome {
@@ -138,7 +143,7 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         field.focusRingType = .none
         field.font = .systemFont(ofSize: 17, weight: .regular)
         field.textColor = .white
-        field.placeholderString = state.current.placeholder
+        field.placeholderAttributedString = Self.placeholder(state.current.placeholder)
         field.delegate = self
         field.cell?.usesSingleLineMode = true
         field.cell?.wraps = false
@@ -212,22 +217,22 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         layoutCard()
     }
 
-    /// Center the card over the content region (right of the sidebar)
-    /// and pin its top just under the tab bar. Falls back to
-    /// window-centered/top if the region isn't laid out yet. The panel
-    /// is borderless with `frame == host.frame`, so the host view's
-    /// window coords map straight into the backdrop's coordinate space.
+    /// Center the card over the whole window, with its top pinned just
+    /// under the tab bar. The vertical anchor is derived from the
+    /// content region (terminal area, whose top edge sits below the tab
+    /// bar); horizontal stays window-centered. The panel is borderless
+    /// with `frame == host.frame`, so the host view's window coords map
+    /// straight into the backdrop's coordinate space.
     private func layoutCard() {
         guard let backdrop = contentView else { return }
+        cardCenterX.constant = 0
         if let region = contentRegion, region.window != nil {
             let r = region.convert(region.bounds, to: nil)
-            if r.width > 1, r.height > 1 {
-                cardCenterX.constant = r.midX - backdrop.bounds.midX
+            if r.height > 1 {
                 cardTop.constant = max(backdrop.bounds.height - r.maxY + Self.topGap, 24)
                 return
             }
         }
-        cardCenterX.constant = 0
         cardTop.constant = 100
     }
 
@@ -291,7 +296,7 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// Re-render the field + table for the current frame and fire the
     /// highlight preview for the selected row.
     private func syncUI() {
-        field.placeholderString = state.current.placeholder
+        field.placeholderAttributedString = Self.placeholder(state.current.placeholder)
         if field.stringValue != state.current.query {
             field.stringValue = state.current.query
         }
@@ -311,6 +316,15 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func fireHighlight() {
         guard let item = state.selectedItem else { return }
         behaviors[state.current.id]?.onHighlight?(item)
+    }
+
+    /// Colored placeholder (NSTextField's default placeholder color is
+    /// too dim on the card).
+    private static func placeholder(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .foregroundColor: paletteMutedColor,
+            .font: NSFont.systemFont(ofSize: 17, weight: .regular),
+        ])
     }
 
     // MARK: - NSTextFieldDelegate
@@ -417,7 +431,7 @@ private final class PaletteCellView: NSView {
         title.lineBreakMode = .byTruncatingTail
         trailing.translatesAutoresizingMaskIntoConstraints = false
         trailing.font = .systemFont(ofSize: 12)
-        trailing.textColor = .secondaryLabelColor
+        trailing.textColor = paletteMutedColor
         trailing.alignment = .right
         trailing.setContentHuggingPriority(.required, for: .horizontal)
         addSubview(title)
