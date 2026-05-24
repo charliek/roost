@@ -738,6 +738,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Persist + fsync the tab layout BEFORE any teardown, so we
+        // capture the full in-memory layout. This fires on Cmd+Q, menu
+        // Quit, the red close button (applicationShouldTerminateAfter-
+        // LastWindowClosed == true), and the empty-workspace
+        // window?.close() path. flush() then freezes further
+        // persistence so the tab-close loop below (which can drive
+        // PTY-exit closes back through the workspace) can't overwrite
+        // the flushed layout with an empty one.
+        RoostBackend.shared.workspace?.flush()
         eventsTask?.cancel()
         eventsTask = nil
         for tab in tabs {

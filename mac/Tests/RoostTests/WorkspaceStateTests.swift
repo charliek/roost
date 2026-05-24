@@ -271,4 +271,46 @@ struct WorkspaceStatePersistenceTests {
         let bakData = try Data(contentsOf: URL(fileURLWithPath: path + ".bak"))
         #expect(String(data: bakData, encoding: .utf8)?.contains("first") == true)
     }
+
+    @Test func cwdChangesWriteThrough() async throws {
+        // No throttle: every setTabCwd writes through, so a reopen sees
+        // the LATEST cwd (last write wins), not a coalesced earlier one.
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let ws = await Workspace(statePath: path)
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/start", title: "")
+        try await ws.setTabCwd(t.id, cwd: "/first")
+        try await ws.setTabCwd(t.id, cwd: "/second")
+
+        let ws2 = await Workspace(statePath: path)
+        let restore = try #require(await ws2.takeRestoreLayout())
+        #expect(
+            restore.projects.first?.tabs.first?.cwd == "/second",
+            "the latest cwd must reach disk (write-through, no throttle)"
+        )
+    }
+
+    @Test func flushFreezesFurtherPersistence() async throws {
+        // flush() writes the current layout (with fsync) and then
+        // freezes: a subsequent mutation must NOT reach disk, so a
+        // teardown cascade can't clobber the flushed layout.
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let ws = await Workspace(statePath: path)
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/flushed", title: "")
+        await ws.flush()
+        // Frozen — this write must be a no-op.
+        try await ws.setTabCwd(t.id, cwd: "/after-flush")
+
+        let ws2 = await Workspace(statePath: path)
+        let restore = try #require(await ws2.takeRestoreLayout())
+        #expect(
+            restore.projects.first?.tabs.first?.cwd == "/flushed",
+            "a post-flush mutation must not have reached disk"
+        )
+    }
 }
