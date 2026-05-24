@@ -146,14 +146,14 @@ wrapper small.
   `<private>` by default; the file appender uses `privacy: .public`
   to defeat that. For raw values without redaction, prefer the file
   log.
-- **Linux UI logs**: `roost-linux` logs to **stdout** via
-  `tracing_subscriber::fmt()` (`crates/roost-linux/src/main.rs`); set
-  `RUST_LOG=info,roost_ipc=debug` to adjust. There is **no file log**
-  today — run `roost` from a terminal to see output, or
-  `journalctl --user -f` if it was started from the `.desktop` entry.
-  (The profile reserves `log_dir` at `$XDG_STATE_HOME/roost/` but no
-  file appender is wired yet — a follow-up for `tail -f` parity with
-  the Mac app.)
+- **Linux UI logs**: `roost-linux` writes `$XDG_STATE_HOME/roost/roost.log`
+  (default `~/.local/state/roost/roost.log`) **and** tees to stdout
+  (synchronous file appender in `crates/roost-linux/src/main.rs`, so
+  entries survive a crash). `tail -f` it while reproducing; set
+  `RUST_LOG=info,roost_ipc=debug` to adjust. On macOS the Gtk dev
+  profile writes `~/Library/Logs/Roost-gtk/roost.log` — a **distinct**
+  file from the Swift app's `~/Library/Logs/Roost/roost.log`, so both UIs
+  can run side by side without clobbering each other's log.
 - **IPC wire trace**: launch the UI with `RUST_LOG=roost_ipc=debug`
   (Linux) or `OS_ACTIVITY_MODE=disable` + `swift run` (Mac) to see
   per-frame logging. The wire format is human-readable JSON; `nc -U`

@@ -23,11 +23,17 @@ mod theme;
 
 use std::sync::Arc;
 
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::sync::Mutex;
+
 use anyhow::Context;
 use gtk4::glib::{self, LogWriterOutput};
 use libadwaita::prelude::*;
 use libadwaita::Application;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter};
 
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcClient, IpcServer};
@@ -61,13 +67,45 @@ fn install_log_filter() {
     });
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+/// Initialize logging: always to stdout, and additionally tee to
+/// `<log_dir>/roost.log` when that file can be opened (parity with the Mac
+/// app's file log, so `tail -f` works on Linux too). Writes synchronously
+/// (append mode) so entries hit disk immediately — important for tailing a
+/// live session and for keeping logs after a crash. Best-effort: if the log
+/// file can't be opened we fall back to stdout-only rather than refusing to
+/// launch.
+fn init_logging(log_dir: &Path) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+
+    let file_layer = match std::fs::create_dir_all(log_dir).and_then(|()| {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("roost.log"))
+    }) {
+        // ANSI stripped for the file; `Mutex<File>` serializes line writes.
+        Ok(file) => Some(fmt::layer().with_ansi(false).with_writer(Mutex::new(file))),
+        Err(e) => {
+            eprintln!(
+                "roost: file log disabled ({}: {e}); logging to stdout only",
+                log_dir.join("roost.log").display()
+            );
+            None
+        }
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer()) // stdout
+        .with(file_layer) // Option<Layer> is a no-op when None
         .init();
+}
+
+fn main() -> anyhow::Result<()> {
+    let profile = BundleProfile::resolve(BundleProfileKind::Gtk)?;
+    init_logging(&profile.log_dir);
     install_log_filter();
 
-    let profile = BundleProfile::resolve(BundleProfileKind::Gtk)?;
     let lock_path = profile.lock_path();
 
     // M3b: single-instance via flock-on-pidfile. The Mac side will
