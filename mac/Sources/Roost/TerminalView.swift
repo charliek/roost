@@ -269,9 +269,9 @@ final class TerminalView: NSView {
         // M6 only changed the canvas + selection colors at draw time;
         // this closes the SGR-cell gap so `ls --color`, `git diff`,
         // `htop` etc. all flip with the active theme. Mirrors the
-        // Go binary's `internal/ghostty/terminal.go::SetTheme`. MUST
-        // run before any `ghostty_terminal_vt_write` so the very
-        // first frame paints with the right colors.
+        // Go binary's `internal/ghostty/terminal.go::SetTheme`. Done
+        // here so the very first frame paints with the right colors;
+        // `setTheme(_:)` re-applies the same way for live theme swaps.
         Theme.apply(theme, to: handle!)
 
         // goal-mac-polish-cursor-keys M1: real key encoder bridge.
@@ -318,6 +318,27 @@ final class TerminalView: NSView {
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             ghostty_terminal_vt_write(terminal, base, data.count)
+        }
+        needsDisplay = true
+    }
+
+    /// Swap the active theme on a live terminal. Repaints the canvas /
+    /// selection / cursor (which read `self.theme` directly in
+    /// `draw(_:)`) and re-applies the fg/bg/cursor + palette into
+    /// libghostty-vt so SGR-indexed cells recolor too. Safe mid-session
+    /// (see `themeAppliesAfterVtWrite`). The two-arg form lets a caller
+    /// reuse a pre-`resolved()` palette across many terminals (the live
+    /// preview broadcasts to every open tab on each keypress).
+    @MainActor
+    func setTheme(_ theme: Theme) {
+        setTheme(theme, resolved: theme.resolved())
+    }
+
+    @MainActor
+    func setTheme(_ theme: Theme, resolved: Theme.Resolved) {
+        self.theme = theme
+        if let terminal {
+            Theme.apply(resolved, to: terminal)
         }
         needsDisplay = true
     }

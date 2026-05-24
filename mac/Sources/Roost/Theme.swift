@@ -136,53 +136,76 @@ private func parse(_ text: String) throws -> Theme {
 // MARK: - libghostty-vt application (Phase 6a P3)
 
 extension Theme {
-    /// Push this theme's foreground / background / cursor + 256-color
-    /// palette into a libghostty-vt terminal. Mirrors the Go binary's
-    /// `internal/ghostty/terminal.go::SetTheme`. MUST be called after
-    /// `ghostty_terminal_new` and BEFORE any `ghostty_terminal_vt_write`
-    /// so the very first frame paints with the right colors.
-    ///
-    /// libghostty-vt's `GHOSTTY_TERMINAL_OPT_COLOR_*` options take an
-    /// owning pointer to a `GhosttyColorRgb` (or `[256]GhosttyColorRgb`
-    /// for the palette). The pointers are read synchronously inside
-    /// the call — we don't have to keep the local storage alive past
-    /// the call returning.
+    /// Colors pre-converted to libghostty's RGB structs. Converting the
+    /// 256-entry palette runs `NSColor.usingColorSpace(.sRGB)` 256 times;
+    /// the command palette's live theme preview broadcasts one theme to
+    /// every open terminal on each arrow keypress, so we resolve once
+    /// (`resolved()`) and reuse the result per terminal rather than
+    /// re-converting N times.
+    struct Resolved {
+        var foreground: GhosttyColorRgb
+        var background: GhosttyColorRgb
+        var cursor: GhosttyColorRgb
+        var palette: [GhosttyColorRgb]  // exactly 256 entries
+    }
+
     @MainActor
-    static func apply(_ theme: Theme, to terminal: GhosttyTerminal) {
-        var fg = ghosttyColor(theme.foreground)
-        _ = ghostty_terminal_set(
-            terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
-            &fg
-        )
-        var bg = ghosttyColor(theme.background)
-        _ = ghostty_terminal_set(
-            terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND,
-            &bg
-        )
-        var cursor = ghosttyColor(theme.cursor)
-        _ = ghostty_terminal_set(
-            terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_CURSOR,
-            &cursor
-        )
-        // The palette is a contiguous 256-entry C array — fill a
-        // local fixed-size buffer and pass its base pointer. The 256
-        // count matches libghostty's signature exactly; sending fewer
-        // is undefined behaviour per the header docs.
+    func resolved() -> Resolved {
         var palette = [GhosttyColorRgb](repeating: ghosttyColor(.black), count: 256)
-        for i in 0..<min(theme.palette.count, 256) {
-            palette[i] = ghosttyColor(theme.palette[i])
+        for i in 0..<min(self.palette.count, 256) {
+            palette[i] = ghosttyColor(self.palette[i])
         }
+        return Resolved(
+            foreground: ghosttyColor(foreground),
+            background: ghosttyColor(background),
+            cursor: ghosttyColor(cursor),
+            palette: palette
+        )
+    }
+
+    /// Push fg / bg / cursor + 256-color palette into a libghostty-vt
+    /// terminal. Mirrors the Go binary's
+    /// `internal/ghostty/terminal.go::SetTheme`.
+    ///
+    /// Safe to call at any point in a terminal's life, including after
+    /// `ghostty_terminal_vt_write` — the command palette's live theme
+    /// preview relies on this, and `themeAppliesAfterVtWrite` pins it.
+    /// The palette set preserves any per-index OSC overrides a program
+    /// applied, so OSC-overridden / truecolor cells keep their colors.
+    ///
+    /// libghostty-vt's `GHOSTTY_TERMINAL_OPT_COLOR_*` options take a
+    /// pointer to a `GhosttyColorRgb` (or `[256]GhosttyColorRgb` for the
+    /// palette), read synchronously inside the call — the local storage
+    /// doesn't need to outlive the call.
+    @MainActor
+    static func apply(_ colors: Resolved, to terminal: GhosttyTerminal) {
+        func set(_ option: GhosttyTerminalOption, _ value: UnsafeMutableRawPointer, _ what: StaticString) {
+            let rc = ghostty_terminal_set(terminal, option, value)
+            if rc.rawValue != 0 {
+                NSLog("roost-mac: ghostty_terminal_set(%@) failed rc=%d", "\(what)", rc.rawValue)
+            }
+        }
+        var fg = colors.foreground
+        set(GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg, "foreground")
+        var bg = colors.background
+        set(GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg, "background")
+        var cursor = colors.cursor
+        set(GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor, "cursor")
+        // The palette is a contiguous 256-entry C array; pass its base
+        // pointer. The 256 count matches libghostty's signature exactly;
+        // sending fewer is undefined behaviour per the header docs.
+        var palette = colors.palette
         palette.withUnsafeMutableBufferPointer { buf in
             guard let base = buf.baseAddress else { return }
-            _ = ghostty_terminal_set(
-                terminal,
-                GHOSTTY_TERMINAL_OPT_COLOR_PALETTE,
-                UnsafeMutableRawPointer(base)
-            )
+            set(GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, UnsafeMutableRawPointer(base), "palette")
         }
+    }
+
+    /// Convenience for the single-terminal path (terminal init): resolve
+    /// the theme's colors and apply them in one step.
+    @MainActor
+    static func apply(_ theme: Theme, to terminal: GhosttyTerminal) {
+        apply(theme.resolved(), to: terminal)
     }
 }
 
