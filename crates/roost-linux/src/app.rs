@@ -772,7 +772,19 @@ impl App {
                 .map(|p| p.tabs.as_slice())
                 .unwrap_or(&[]);
             for (cwd, title) in restore_open_specs(saved) {
-                self.open_tab_in_with(project.id, &cwd, &title).await?;
+                // Handle a failed tab open per-tab rather than `?`-ing
+                // out: one stale cwd / PTY spawn failure must not abort
+                // the whole bootstrap (and the workspace subscription
+                // isn't installed yet, so a bubbled error would leave
+                // startup half-built). Log + continue. #95 review.
+                if let Err(err) = self.open_tab_in_with(project.id, &cwd, &title).await {
+                    tracing::warn!(
+                        project_id = project.id,
+                        cwd = %cwd,
+                        ?err,
+                        "restore: failed to open a saved tab; continuing"
+                    );
+                }
             }
         }
 
@@ -1396,6 +1408,10 @@ impl App {
                 let _ = client.workspace.focus_tab(tab_id);
             }
         }
+        // `set_active_project` (above) focused whatever page was
+        // selected before this; hand keyboard focus to the restored
+        // tab's terminal so relaunch lands input on it. #95 review.
+        self.focus_active_terminal();
     }
 
     /// Wrap an existing daemon tab in UI: TerminalView + TabSession +

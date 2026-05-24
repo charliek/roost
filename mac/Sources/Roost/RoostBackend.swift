@@ -123,8 +123,13 @@ final class RoostBackend {
                 guard case .tabExited(let tabID, _) = event else { return }
                 do {
                     try client.closeTab(tabID)
+                } catch Workspace.WorkspaceError.tabNotFound {
+                    // Already gone: the idempotent close race (e.g.
+                    // `runShellSession`'s own teardown beat us). Expected.
                 } catch {
-                    // Already gone (idempotent close race) — expected.
+                    // A real cleanup failure would otherwise leave a
+                    // dead tab/project stuck with no trace — log it.
+                    NSLog("roost-backend: closeTab(\(tabID)) failed after PTY exit: \(error)")
                 }
             }
         }

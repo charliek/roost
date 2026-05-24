@@ -1029,12 +1029,23 @@ impl Inner {
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
         use crate::daemon::store_json::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
-        // Active tab restored by position, not id (ids aren't stable
-        // across a fresh-shell restore).
+        // Active tab restored by its DENSE index within the active
+        // project's display-ordered tabs — not the raw `position`
+        // field, which goes sparse after a mid-project close and
+        // wouldn't match the re-opened tabs' contiguous 0..n indices
+        // on restore (the UI selects the nth tab). #95 review.
         let active_tab_position = self
             .tabs
             .get(&self.active_tab_id)
-            .map(|t| t.position)
+            .map(|active| {
+                let mut siblings: Vec<&TabRow> = self
+                    .tabs
+                    .values()
+                    .filter(|t| t.project_id == active.project_id)
+                    .collect();
+                siblings.sort_by_key(|t| (t.position, t.id));
+                siblings.iter().position(|t| t.id == active.id).unwrap_or(0) as i32
+            })
             .unwrap_or(0);
         let snapshot = SnapshotFile {
             next_id: self.next_id,
@@ -1329,6 +1340,40 @@ mod tests {
         assert_eq!(rp.tabs[1].title, "btab");
         // `take_restore_layout` is one-shot.
         assert!(ws2.take_restore_layout().is_none());
+    }
+
+    #[test]
+    fn active_tab_position_is_dense_index_not_raw_position() {
+        // After a mid-project close, positions go sparse (0,1,2 → 1,2).
+        // The persisted active_tab_position must be the DENSE index
+        // among the surviving tabs (what the UI selects on restore),
+        // not the raw `position` field. #95 review.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/").unwrap().id;
+            let a = ws.open_tab(pid, "/a", "a").unwrap().id; // position 0
+            let _b = ws.open_tab(pid, "/b", "b").unwrap().id; // position 1
+            let c = ws.open_tab(pid, "/c", "c").unwrap().id; // position 2
+            ws.close_tab(a).unwrap(); // removes position 0 → surviving positions 1,2
+            ws.focus_tab(c).unwrap(); // active = c (raw position 2, dense index 1)
+        }
+        let ws2 = Workspace::open(path);
+        let restore = ws2.take_restore_layout().unwrap();
+        assert_eq!(
+            restore.active_tab_position, 1,
+            "active tab is the 2nd surviving tab → dense index 1, not raw position 2"
+        );
+        // And the surviving tabs are /b, /c in order.
+        assert_eq!(
+            restore.projects[0]
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/b", "/c"]
+        );
     }
 
     #[test]

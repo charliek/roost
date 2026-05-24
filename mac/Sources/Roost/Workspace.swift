@@ -549,9 +549,18 @@ final class Workspace {
 
     private func persist() {
         guard let statePath else { return }
-        // Active tab restored by position, not id (ids aren't stable
-        // across a fresh-shell restore).
-        let activeTabPosition = tabs[activeTabID]?.position ?? 0
+        // Active tab restored by its DENSE index within the active
+        // project's display-ordered tabs — not the raw `position`
+        // field, which goes sparse after a mid-project close and
+        // wouldn't match the re-opened tabs' contiguous 0..n indices
+        // on restore (the UI selects the nth tab). #95 review.
+        let activeTabPosition: Int32 = {
+            guard let active = tabs[activeTabID] else { return 0 }
+            let siblings = tabs.values
+                .filter { $0.projectId == active.projectId }
+                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+            return Int32(siblings.firstIndex { $0.id == active.id } ?? 0)
+        }()
         let snapshot = SnapshotFile(
             nextID: nextID,
             projects: projects.values
