@@ -220,6 +220,55 @@ fn apply_indicator_icon(page: &libadwaita::TabPage, state: TabState) {
     page.set_indicator_icon(icon.as_ref().map(|i| i.upcast_ref::<gtk4::gio::Icon>()));
 }
 
+/// Render `window` (sidebar + tabs + active terminal) to PNG bytes, at
+/// `scale`x pixels. Returns `(png, width, height)`. Called on the GTK
+/// main thread from the `app.screenshot` drain loop. Renders through the
+/// window's own `GskRenderer`, so the bundled dark theme + CSS apply
+/// exactly as on screen — and, because it re-renders the widget tree
+/// rather than the display, it works even when the window is unfocused
+/// or occluded.
+fn render_window_png(
+    window: &ApplicationWindow,
+    scale: u32,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    let logical_w = window.width();
+    let logical_h = window.height();
+    if logical_w <= 0 || logical_h <= 0 {
+        return Err("window not realized (zero size)".into());
+    }
+    let scale_f = scale as f32;
+
+    // `renderer()` is `None` until the surface is realized — never
+    // unwrap; an early/unrealized window is a graceful error, not a panic.
+    let renderer = window
+        .native()
+        .and_then(|n| n.renderer())
+        .ok_or_else(|| "window renderer not ready".to_string())?;
+
+    let paintable = gtk4::WidgetPaintable::new(Some(window));
+    let snapshot = gtk4::Snapshot::new();
+    snapshot.scale(scale_f, scale_f);
+    paintable.snapshot(&snapshot, logical_w as f64, logical_h as f64);
+    let node = snapshot
+        .to_node()
+        .ok_or_else(|| "empty snapshot (nothing to render)".to_string())?;
+
+    // Explicit viewport at the scaled bounds. Passing `None` would render
+    // at the node's natural (1x) bounds, ignoring the scale transform.
+    let viewport = gtk4::graphene::Rect::new(
+        0.0,
+        0.0,
+        logical_w as f32 * scale_f,
+        logical_h as f32 * scale_f,
+    );
+    let texture = renderer.render_texture(&node, Some(&viewport));
+
+    // `glib::Bytes` is not `Send`; flatten to `Vec<u8>` here on the main
+    // thread before it crosses the reply channel back to the IPC handler.
+    let png = texture.save_to_png_bytes().to_vec();
+    Ok((png, texture.width() as u32, texture.height() as u32))
+}
+
 impl App {
     /// Build the window + start the daemon bootstrap. Returns an
     /// `Rc<App>` so closures can hold references back into the App
@@ -229,6 +278,9 @@ impl App {
         rt: Handle,
         client: LocalClient,
         activate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+        screenshot_rx: Option<
+            tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::ScreenshotRequest>,
+        >,
     ) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
@@ -596,6 +648,20 @@ impl App {
             glib::spawn_future_local(async move {
                 while activate_rx.recv().await.is_some() {
                     window.present();
+                }
+            });
+        }
+
+        // `app.screenshot`: the IPC handler forwards a render request +
+        // a oneshot reply channel here. Render synchronously on the main
+        // thread (GTK + the renderer are main-thread-only) and reply with
+        // the PNG bytes.
+        if let Some(mut screenshot_rx) = screenshot_rx {
+            let window = app_struct.window.clone();
+            glib::spawn_future_local(async move {
+                while let Some(req) = screenshot_rx.recv().await {
+                    let result = render_window_png(&window, req.scale);
+                    let _ = req.reply.send(result);
                 }
             });
         }

@@ -20,11 +20,25 @@ use std::sync::Arc;
 use roost_ipc::messages::{
     ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, TabClearNotificationParams, TabCloseParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
+    TabCloseParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult,
+    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
+
+/// The reply half of a [`ScreenshotRequest`]: `(png_bytes, width,
+/// height)` on success, an error message on failure.
+type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
+
+/// A request from the IPC handler (tokio worker thread) to the GTK
+/// main thread to render the window to a PNG. The main thread renders
+/// synchronously and sends the result back over `reply`. This is the
+/// bidirectional sibling of the fire-and-forget `activate_tx` channel.
+pub struct ScreenshotRequest {
+    pub scale: u32,
+    pub reply: ScreenshotReply,
+}
 
 use crate::daemon::state::WorkspaceError;
 use crate::daemon::{PtySupervisor, Workspace};
@@ -44,6 +58,10 @@ pub struct IpcHandler {
     /// the GTK main thread to raise + focus the window (#6). `None`
     /// in headless contexts (tests); `app.activate` is then a no-op.
     activate_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Set by the running UI: `app.screenshot` forwards a render
+    /// request here and awaits the PNG bytes back. `None` in headless
+    /// contexts (tests); `app.screenshot` then errors with `internal`.
+    screenshot_tx: Option<tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>>,
 }
 
 impl IpcHandler {
@@ -61,6 +79,7 @@ impl IpcHandler {
             app_label: app_label.into(),
             app_id: app_id.into(),
             activate_tx: None,
+            screenshot_tx: None,
         }
     }
 
@@ -69,6 +88,17 @@ impl IpcHandler {
     /// receiver is drained on the GTK main thread (#6).
     pub fn with_activate(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
         self.activate_tx = Some(tx);
+        self
+    }
+
+    /// Wire the screenshot channel so `app.screenshot` can render the
+    /// window. The UI installs the sender; the matching receiver is
+    /// drained on the GTK main thread, which does the actual render.
+    pub fn with_screenshot(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>,
+    ) -> Self {
+        self.screenshot_tx = Some(tx);
         self
     }
 }
@@ -291,6 +321,41 @@ async fn dispatch(
             }
             Ok(serde_json::json!({}))
         }
+        ops::SCREENSHOT => {
+            let p: ScreenshotParams = decode(params)?;
+            if !(1..=2).contains(&p.scale) {
+                return Err(HandlerError::invalid_param(format!(
+                    "scale must be 1 or 2, got {}",
+                    p.scale
+                )));
+            }
+            let tx = h
+                .screenshot_tx
+                .as_ref()
+                .ok_or_else(|| HandlerError::new("internal", "no UI window to capture"))?;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(ScreenshotRequest {
+                scale: p.scale,
+                reply: reply_tx,
+            })
+            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
+            let (png, width, height) = reply_rx
+                .await
+                .map_err(|_| HandlerError::new("internal", "UI dropped screenshot reply"))?
+                .map_err(|m| HandlerError::new("internal", m))?;
+            // Preflight the 16 MiB IPC frame cap: the response rides one
+            // newline-delimited JSON frame, and `png` dominates it once
+            // base64-expanded (~4/3). Fail with a structured error here
+            // rather than letting the oversized frame fail late during
+            // transport (`frame-too-large` on the wire).
+            screenshot_frame_guard(png.len())?;
+            encode(&ScreenshotResult {
+                png,
+                width,
+                height,
+                scale: p.scale,
+            })
+        }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -325,6 +390,24 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, HandlerError> {
     serde_json::to_value(value).map_err(|e| HandlerError::new("internal", e.to_string()))
+}
+
+/// Reject a screenshot whose base64-encoded PNG would overflow the IPC
+/// frame cap. base64 expands by 4/3 (`ceil(n/3)*4`); a small margin
+/// covers the JSON envelope (`id` / `ok` / `result` / dims).
+fn screenshot_frame_guard(png_len: usize) -> Result<(), HandlerError> {
+    const ENVELOPE_MARGIN: usize = 1024;
+    let encoded = (png_len + 2) / 3 * 4;
+    if encoded + ENVELOPE_MARGIN > roost_ipc::MAX_FRAME_BYTES {
+        return Err(HandlerError::new(
+            "internal",
+            format!(
+                "screenshot too large: {encoded} base64 bytes exceeds the {} byte IPC frame cap (try --scale 1)",
+                roost_ipc::MAX_FRAME_BYTES
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn ws_err(e: WorkspaceError) -> HandlerError {

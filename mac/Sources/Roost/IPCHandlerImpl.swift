@@ -10,6 +10,7 @@
 // `dispatch()` — same op names, same error code mapping, same
 // envelope semantics.
 
+import AppKit
 import Foundation
 
 actor IPCHandlerImpl: IPCHandler {
@@ -81,6 +82,8 @@ actor IPCHandlerImpl: IPCHandler {
         case "notification.create":
             try await self.notificationCreate(params: params)
             return AnyCodable([:] as [String: Any])
+        case "app.screenshot":
+            return try await encodeResult(self.screenshotCapture(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -359,6 +362,85 @@ actor IPCHandlerImpl: IPCHandler {
             throw mapWorkspace(err)
         }
     }
+
+    // MARK: screenshot
+
+    /// Render the whole window (sidebar + tab bar + active terminal)
+    /// to a PNG in-process. `cacheDisplay(in:to:)` re-invokes each
+    /// view's `draw(_:)` into an off-screen bitmap, so this works on
+    /// the non-layer-backed `TerminalView` and regardless of whether
+    /// the window is focused, occluded, or offscreen — the whole point
+    /// versus OS screen capture.
+    @MainActor
+    private func screenshotCapture(params: AnyCodable?) async throws -> IPCScreenshotResult {
+        let p = try decodeParams(
+            params, as: IPCScreenshotParams.self, expected: ["scale"]
+        )
+        guard (1...2).contains(p.scale) else {
+            throw IPCHandlerError.invalidParam("scale must be 1 or 2, got \(p.scale)")
+        }
+        guard let window = RoostBackend.shared.mainWindow else {
+            throw IPCHandlerError.internalError("no UI window to capture")
+        }
+        if window.isMiniaturized {
+            throw IPCHandlerError.internalError("window is minimized; cannot capture")
+        }
+        guard let contentView = window.contentView else {
+            throw IPCHandlerError.internalError("window has no content view")
+        }
+        let bounds = contentView.bounds
+        let pixelsWide = Int((bounds.width * CGFloat(p.scale)).rounded())
+        let pixelsHigh = Int((bounds.height * CGFloat(p.scale)).rounded())
+        guard pixelsWide > 0, pixelsHigh > 0 else {
+            throw IPCHandlerError.internalError("window has zero size")
+        }
+        guard
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: pixelsWide,
+                pixelsHigh: pixelsHigh,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            )
+        else {
+            throw IPCHandlerError.internalError("failed to allocate bitmap rep")
+        }
+        // A point-sized rep over a pixel-sized buffer makes AppKit
+        // super-sample `draw(_:)` across the larger grid — this is the
+        // supported lever for crisp 2x (the no-arg
+        // `bitmapImageRepForCachingDisplay` would render at 1x points).
+        rep.size = bounds.size
+        // Draw under the window's appearance so the dark chrome
+        // resolves correctly even though we render off-screen.
+        window.effectiveAppearance.performAsCurrentDrawingAppearance {
+            contentView.cacheDisplay(in: bounds, to: rep)
+        }
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            throw IPCHandlerError.internalError("PNG encoding failed")
+        }
+        // Preflight the 16 MiB IPC frame cap: the response rides one
+        // newline-delimited JSON frame and `png` dominates it once
+        // base64-expanded (~4/3). Fail with a structured error here
+        // rather than writing an oversized frame the client rejects.
+        let encodedLen = (png.count + 2) / 3 * 4
+        if encodedLen + 1024 > ipcMaxFrameBytes {
+            throw IPCHandlerError.internalError(
+                "screenshot too large: \(encodedLen) base64 bytes exceeds the "
+                    + "\(ipcMaxFrameBytes) byte IPC frame cap (try --scale 1)"
+            )
+        }
+        return IPCScreenshotResult(
+            png: png,
+            width: UInt32(pixelsWide),
+            height: UInt32(pixelsHigh),
+            scale: p.scale
+        )
+    }
 }
 
 // MARK: - Param decoding helpers
@@ -531,6 +613,53 @@ private struct IPCTabWriteParams: Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(String(tabID), forKey: .tabID)
         try c.encode(data.base64EncodedString(), forKey: .data)
+    }
+}
+
+private struct IPCScreenshotParams: Codable {
+    var scale: UInt32 = 1
+    enum CodingKeys: String, CodingKey { case scale }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.scale = try c.decodeIfPresent(UInt32.self, forKey: .scale) ?? 1
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(scale, forKey: .scale)
+    }
+}
+
+private struct IPCScreenshotResult: Codable {
+    let png: Data
+    let width: UInt32
+    let height: UInt32
+    let scale: UInt32
+    enum CodingKeys: String, CodingKey { case png, width, height, scale }
+    init(png: Data, width: UInt32, height: UInt32, scale: UInt32) {
+        self.png = png
+        self.width = width
+        self.height = height
+        self.scale = scale
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let b64 = try c.decode(String.self, forKey: .png)
+        guard let d = Data(base64Encoded: b64) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .png, in: c, debugDescription: "png must be base64"
+            )
+        }
+        self.png = d
+        self.width = try c.decode(UInt32.self, forKey: .width)
+        self.height = try c.decode(UInt32.self, forKey: .height)
+        self.scale = try c.decode(UInt32.self, forKey: .scale)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(png.base64EncodedString(), forKey: .png)
+        try c.encode(width, forKey: .width)
+        try c.encode(height, forKey: .height)
+        try c.encode(scale, forKey: .scale)
     }
 }
 

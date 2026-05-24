@@ -383,6 +383,41 @@ pub struct EventsSubscribeParams {
 #[serde(deny_unknown_fields)]
 pub struct AppActivateParams {}
 
+/// `app.screenshot` request. `scale` is the pixel multiplier — `1`
+/// renders at logical window size (the default; already the resolution
+/// a vision model consumes after its own downsample), `2` super-samples
+/// for a human zooming in. The UI rejects anything outside `1..=2`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenshotParams {
+    #[serde(default = "default_screenshot_scale")]
+    pub scale: u32,
+}
+
+fn default_screenshot_scale() -> u32 {
+    1
+}
+
+impl Default for ScreenshotParams {
+    fn default() -> Self {
+        Self {
+            scale: default_screenshot_scale(),
+        }
+    }
+}
+
+/// `app.screenshot` response. `png` is the raw PNG bytes (base64 on the
+/// wire); `width`/`height` are the pixel dimensions actually rendered
+/// (== logical size × `scale`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenshotResult {
+    #[serde(with = "bytes_base64")]
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub scale: u32,
+}
+
 // ============================================================================
 // Event data types
 // ============================================================================
@@ -494,6 +529,10 @@ pub mod ops {
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";
+    /// Render the running UI's whole window (sidebar + tabs + active
+    /// terminal) to a PNG, in-process. Returns the bytes base64-encoded
+    /// so an agent can `see` the live UI without OS screen capture.
+    pub const SCREENSHOT: &str = "app.screenshot";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -695,6 +734,27 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"data\":\"aGVsbG8K\""), "got: {json}");
         round_trip(&p);
+    }
+
+    #[test]
+    fn screenshot_params_default_scale_is_one() {
+        let p: ScreenshotParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.scale, 1);
+        assert_eq!(ScreenshotParams::default().scale, 1);
+        round_trip(&ScreenshotParams { scale: 2 });
+    }
+
+    #[test]
+    fn screenshot_result_round_trip() {
+        let r = ScreenshotResult {
+            png: b"\x89PNG\r\n\x1a\n".to_vec(),
+            width: 2800,
+            height: 1800,
+            scale: 2,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"png\":\"iVBORw0KGgo=\""), "got: {json}");
+        round_trip(&r);
     }
 
     #[test]

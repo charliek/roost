@@ -20,6 +20,7 @@
 // Workspace becomes the source of truth and the daemon goes
 // quiet.
 
+import AppKit
 import Darwin
 import Foundation
 
@@ -32,6 +33,18 @@ final class RoostBackend {
     private(set) var localClient: LocalClient?
     private var ipcServer: IPCServer?
     private var started = false
+
+    /// The main UI window, registered by `RoostApp` once it's built.
+    /// Weak so the backend singleton never keeps a closed window
+    /// alive. The `app.screenshot` IPC handler reads this on the main
+    /// actor to render the live UI in-process.
+    private(set) weak var mainWindow: NSWindow?
+
+    /// Called by `RoostApp` after the window is created. Lets the IPC
+    /// handler reach the window without the handler holding AppKit refs.
+    func registerWindow(_ window: NSWindow) {
+        self.mainWindow = window
+    }
 
     /// True iff the caller has confirmed (via M4c's
     /// `SingleInstance.acquire(...).acquired`) that we own the

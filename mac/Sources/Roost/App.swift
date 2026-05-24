@@ -400,6 +400,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
+        // Hand the window to the IPC-facing backend so the
+        // `app.screenshot` handler can render it in-process.
+        RoostBackend.shared.registerWindow(window)
 
         // Round-6 R6.B: seat the divider at the persisted (or
         // default) sidebar width AFTER the window has been ordered

@@ -19,6 +19,7 @@
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
 //!   roostctl project {list,create,rename,delete,reorder}
+//!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!
@@ -31,7 +32,7 @@
 //!
 //! See `crates/roost-ipc/src/target.rs` for resolution logic.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -42,9 +43,9 @@ use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    TabClearNotificationParams, TabCloseParams, TabFocusParams, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabState, TabWriteParams,
+    ScreenshotParams, ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabFocusParams,
+    TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -113,6 +114,18 @@ enum Cmd {
     /// Project subcommands.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Capture a PNG of the running UI's whole window (sidebar, tabs,
+    /// active terminal), rendered in-process. Writes to `--out` if
+    /// given, otherwise raw PNG bytes to stdout.
+    Screenshot {
+        /// File to write the PNG to. Omit to stream raw bytes to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Pixel multiplier: `1` (logical size) or `2` (super-sampled).
+        /// Out-of-range values are rejected by clap with exit code 2.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
+        scale: u32,
+    },
     /// Claude Code hook entry point. Reads the JSON event payload
     /// from stdin (Claude's contract), dispatches state +
     /// notification ops to the running UI, and ALWAYS exits 0 with
@@ -488,6 +501,33 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await?;
+        }
+        Cmd::Screenshot { out, scale } => {
+            // `scale` range is enforced by clap's value_parser (exit 2).
+            let resp: ScreenshotResult = client
+                .call(ops::SCREENSHOT, ScreenshotParams { scale })
+                .await?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &resp.png)
+                        .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+                    eprintln!(
+                        "wrote {} ({}x{} @ {}x, {} bytes)",
+                        path.display(),
+                        resp.width,
+                        resp.height,
+                        resp.scale,
+                        resp.png.len()
+                    );
+                }
+                None => {
+                    // Raw PNG to stdout — never `println!`, which would
+                    // append a newline and corrupt the binary stream.
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(&resp.png)?;
+                    stdout.flush()?;
+                }
+            }
         }
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. } | Cmd::Claude(_) => unreachable!(),
