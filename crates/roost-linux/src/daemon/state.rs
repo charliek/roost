@@ -507,23 +507,58 @@ impl Workspace {
         Ok(tab)
     }
 
+    /// Close a tab. If it was the project's **last** tab, the
+    /// project is closed too (mirrors `delete_project`'s cascade) so
+    /// a project can never linger with zero live tabs. The event
+    /// order in that case is `TabClosed → ProjectDeleted →
+    /// ActiveChanged`, matching `delete_project`; both UIs already
+    /// converge on `ProjectDeleted` (remove the sidebar row, pick a
+    /// fallback project, or close the window when none remain).
     pub fn close_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .remove(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        // If we closed the active tab, fall back to any tab in
-        // the same project, otherwise any tab anywhere.
+        let project_id = row.project_id;
+
+        // Last tab in the project? Cascade-close the project. Inlined
+        // rather than calling `delete_project` so the event order is
+        // exactly TabClosed → ProjectDeleted → ActiveChanged (the tab
+        // is already removed; `delete_project` would re-emit it).
+        let project_emptied = inner.projects.contains_key(&project_id)
+            && !inner.tabs.values().any(|t| t.project_id == project_id);
+        if project_emptied {
+            inner.projects.remove(&project_id);
+        }
+
+        // Reassign the active selection if it pointed at the closed
+        // tab (or, when the project went away, at that project).
         let mut changed = false;
-        if inner.active_tab_id == tab_id {
-            let next = inner
-                .tabs
-                .values()
-                .find(|t| t.project_id == row.project_id)
-                .or_else(|| inner.tabs.values().next())
-                .map(|t| (t.project_id, t.id))
-                .unwrap_or((row.project_id, 0));
+        if inner.active_tab_id == tab_id
+            || (project_emptied && inner.active_project_id == project_id)
+        {
+            let next = if project_emptied {
+                // Project gone: fall back to another project's tab.
+                let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
+                let fallback_tab = inner
+                    .tabs
+                    .values()
+                    .find(|t| t.project_id == fallback_project)
+                    .map(|t| t.id)
+                    .unwrap_or(0);
+                (fallback_project, fallback_tab)
+            } else {
+                // Project survives: fall back to a sibling tab, else
+                // any tab anywhere.
+                inner
+                    .tabs
+                    .values()
+                    .find(|t| t.project_id == project_id)
+                    .or_else(|| inner.tabs.values().next())
+                    .map(|t| (t.project_id, t.id))
+                    .unwrap_or((project_id, 0))
+            };
             inner.active_project_id = next.0;
             inner.active_tab_id = next.1;
             changed = true;
@@ -536,6 +571,11 @@ impl Workspace {
         let (snapshot, seq) = inner.snapshot_for_persist();
 
         let _ = self.events.send(WorkspaceEvent::TabClosed { tab_id });
+        if project_emptied {
+            let _ = self
+                .events
+                .send(WorkspaceEvent::ProjectDeleted { project_id });
+        }
         if let Some((pid, tid)) = active {
             let _ = self.events.send(WorkspaceEvent::ActiveChanged {
                 project_id: pid,
@@ -933,6 +973,55 @@ mod tests {
         // The remaining tab is now active. It's the one we did not close.
         assert_ne!(atid_after, atid_before);
         assert_eq!(atid_after, t1);
+    }
+
+    #[test]
+    fn close_last_tab_deletes_project() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let t = ws.open_tab(pid, "/", "only").unwrap().id;
+        let mut rx = ws.subscribe();
+        ws.close_tab(t).unwrap();
+        // The project is gone with its last tab, so the only-project
+        // workspace is now empty.
+        assert!(ws.snapshot().is_empty());
+        // Event order: TabClosed → ProjectDeleted → ActiveChanged.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabClosed { tab_id }) if tab_id == t
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ProjectDeleted { project_id }) if project_id == pid
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ActiveChanged {
+                project_id: 0,
+                tab_id: 0
+            })
+        ));
+        // Active selection cleared to (0, 0) since nothing remains.
+        assert_eq!(ws.active(), (0, 0));
+    }
+
+    #[test]
+    fn close_last_tab_of_inactive_project_keeps_active() {
+        // Closing a non-active project's last tab deletes that project
+        // but must not steal the active selection from elsewhere.
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap().id;
+        let a_tab = ws.open_tab(a, "/", "a1").unwrap().id;
+        let b = ws.create_project("b", "").unwrap().id;
+        let b_tab = ws.open_tab(b, "/", "b1").unwrap().id;
+        // Make project A active, then close project B's last tab.
+        ws.focus_tab(a_tab).unwrap();
+        ws.close_tab(b_tab).unwrap();
+        let snap = ws.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, a);
+        // Active stays on A; no spurious reassignment.
+        assert_eq!(ws.active(), (a, a_tab));
     }
 
     #[test]
