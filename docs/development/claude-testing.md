@@ -35,6 +35,7 @@ Pre-req: `roostctl tab list` to find a tab id. Either `export ROOST_TAB_ID=<id>`
 | `roostctl notify --title "Hi" --body "..." --tab N` | Fire a desktop banner + set the pill badge. |
 | `roostctl tab clear-notification --tab N` | Clear the pill badge (state unchanged). |
 | `roostctl tab focus --tab N` | Equivalent to clicking the pill; clears the badge as a side effect. |
+| `roostctl screenshot --out /tmp/shot.png` | Render the whole window to a PNG in-process (no OS screen capture) — read it back to *see* the UI state you just drove. Add `--scale 2` for a crisper image. |
 | `ROOST_TAB_ID=N roostctl claude-hook session-start` | Engages `hook_active` suppression on the tab. (OSC 9/777 from the shell becomes a no-op; only `create-notification` RPCs emit banners.) |
 | `echo '{"message":"need input"}' \| ROOST_TAB_ID=N roostctl claude-hook notification` | Sets `needs_input` + fires "Claude Code" banner. |
 | `ROOST_TAB_ID=N roostctl claude-hook stop` | Sets `idle` + fires "Turn complete" banner. |
@@ -118,6 +119,22 @@ Each CLI command above lands as a corresponding log entry —
 `create_notification`. If the UI doesn't react to an expected
 event, the log line tells you whether the UI received the
 IPC request at all.
+
+### T7 — visual verification via screenshot
+
+Instead of (or alongside) reading the log, capture the live UI as a PNG
+and inspect it directly. The UI renders its own window in-process, so
+this works even when the window is unfocused or behind other windows —
+no OS screen-capture permission needed.
+
+1. Drive a visible change, e.g. `tab set-state --state needs_input --tab N`.
+2. `roostctl screenshot --out /tmp/roost.png` (add `--scale 2` for a
+   crisper image; target a specific UI with `--target mac` / `--target gtk`).
+3. Open `/tmp/roost.png` — confirm the pill dot color, sidebar stripe,
+   and badge match what the state change should produce.
+
+This is the fastest way for an automated agent to *see* the result of a
+UI edit rather than infer it from log lines.
 
 ## Permanent hook setup (Claude Code)
 

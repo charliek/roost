@@ -167,6 +167,12 @@ fn main() -> anyhow::Result<()> {
     // window (#6).
     let (activate_tx, activate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    // Screenshot bridge: `app.screenshot` forwards a render request
+    // here; the GTK main thread renders the window and replies with
+    // the PNG bytes over the request's oneshot.
+    let (screenshot_tx, screenshot_rx) =
+        tokio::sync::mpsc::unbounded_channel::<roost_linux::ipc::ScreenshotRequest>();
+
     // Bind the JSON IPC server *synchronously* before any UI surface
     // exists, so `roostctl identify` right after launch succeeds. The
     // single-instance flock is already held, so the stale socket is
@@ -182,7 +188,8 @@ fn main() -> anyhow::Result<()> {
             profile.app_label.to_string(),
             profile.app_id.to_string(),
         )
-        .with_activate(activate_tx);
+        .with_activate(activate_tx)
+        .with_screenshot(screenshot_tx);
         rt_handle
             .block_on(IpcServer::bind(&socket_path, handler))
             .context("bind IPC server")?
@@ -201,6 +208,7 @@ fn main() -> anyhow::Result<()> {
     // Clone and is consumed once. Wrap it so the first (only) GTK
     // activation hands it to the App; any later activation gets None.
     let activate_rx = std::cell::RefCell::new(Some(activate_rx));
+    let screenshot_rx = std::cell::RefCell::new(Some(screenshot_rx));
     app.connect_activate(move |app| {
         // The App handle is reference-counted via `Rc`; we hand the
         // outer LocalClient to it so the bootstrap futures stay
@@ -210,6 +218,7 @@ fn main() -> anyhow::Result<()> {
             rt_handle.clone(),
             client_for_activate.clone(),
             activate_rx.borrow_mut().take(),
+            screenshot_rx.borrow_mut().take(),
         );
     });
 

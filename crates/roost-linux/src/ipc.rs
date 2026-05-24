@@ -20,11 +20,25 @@ use std::sync::Arc;
 use roost_ipc::messages::{
     ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, TabClearNotificationParams, TabCloseParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
+    TabCloseParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult,
+    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
+
+/// The reply half of a [`ScreenshotRequest`]: `(png_bytes, width,
+/// height)` on success, an error message on failure.
+type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
+
+/// A request from the IPC handler (tokio worker thread) to the GTK
+/// main thread to render the window to a PNG. The main thread renders
+/// synchronously and sends the result back over `reply`. This is the
+/// bidirectional sibling of the fire-and-forget `activate_tx` channel.
+pub struct ScreenshotRequest {
+    pub scale: u32,
+    pub reply: ScreenshotReply,
+}
 
 use crate::daemon::state::WorkspaceError;
 use crate::daemon::{PtySupervisor, Workspace};
@@ -44,6 +58,10 @@ pub struct IpcHandler {
     /// the GTK main thread to raise + focus the window (#6). `None`
     /// in headless contexts (tests); `app.activate` is then a no-op.
     activate_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Set by the running UI: `app.screenshot` forwards a render
+    /// request here and awaits the PNG bytes back. `None` in headless
+    /// contexts (tests); `app.screenshot` then errors with `internal`.
+    screenshot_tx: Option<tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>>,
 }
 
 impl IpcHandler {
@@ -61,6 +79,7 @@ impl IpcHandler {
             app_label: app_label.into(),
             app_id: app_id.into(),
             activate_tx: None,
+            screenshot_tx: None,
         }
     }
 
@@ -69,6 +88,17 @@ impl IpcHandler {
     /// receiver is drained on the GTK main thread (#6).
     pub fn with_activate(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
         self.activate_tx = Some(tx);
+        self
+    }
+
+    /// Wire the screenshot channel so `app.screenshot` can render the
+    /// window. The UI installs the sender; the matching receiver is
+    /// drained on the GTK main thread, which does the actual render.
+    pub fn with_screenshot(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>,
+    ) -> Self {
+        self.screenshot_tx = Some(tx);
         self
     }
 }
@@ -290,6 +320,35 @@ async fn dispatch(
                 let _ = tx.send(());
             }
             Ok(serde_json::json!({}))
+        }
+        ops::SCREENSHOT => {
+            let p: ScreenshotParams = decode(params)?;
+            if !(1..=2).contains(&p.scale) {
+                return Err(HandlerError::invalid_param(format!(
+                    "scale must be 1 or 2, got {}",
+                    p.scale
+                )));
+            }
+            let tx = h
+                .screenshot_tx
+                .as_ref()
+                .ok_or_else(|| HandlerError::new("internal", "no UI window to capture"))?;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(ScreenshotRequest {
+                scale: p.scale,
+                reply: reply_tx,
+            })
+            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
+            let (png, width, height) = reply_rx
+                .await
+                .map_err(|_| HandlerError::new("internal", "UI dropped screenshot reply"))?
+                .map_err(|m| HandlerError::new("internal", m))?;
+            encode(&ScreenshotResult {
+                png,
+                width,
+                height,
+                scale: p.scale,
+            })
         }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never

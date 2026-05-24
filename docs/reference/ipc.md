@@ -276,6 +276,37 @@ Request:
 
 Response: `{}`.
 
+### `app.screenshot`
+
+Render the running UI's whole window (sidebar + tab bar + active
+terminal) to a PNG, **in-process** — the UI re-draws its own view tree
+rather than capturing the screen, so it needs no screen-recording
+permission and works even when the window is unfocused, occluded, or
+offscreen. Backs `roostctl screenshot`.
+
+Request:
+```json
+{"params": {"scale": 1}}
+```
+
+`scale` is the pixel multiplier — `1` (default) renders at logical
+window size, `2` super-samples. Values outside `1..=2` are rejected
+with `invalid-param`.
+
+Response:
+```json
+{"png": "<base64-png>", "width": 1100, "height": 700, "scale": 1}
+```
+
+`png` is the PNG bytes base64-encoded (see **Bytes payloads** above);
+`width`/`height` are the pixel dimensions actually rendered
+(== logical size × `scale`). The response rides the same 16 MiB frame
+ceiling as every other op — a normal window PNG is well under it.
+
+Errors: `internal` when there is no window to capture, the window is
+minimized (Mac) or not yet realized (Linux), or PNG encoding fails;
+`invalid-param` for an out-of-range `scale`.
+
 ### `events.subscribe`
 
 Opt-in to the event stream. After the response, the server pushes

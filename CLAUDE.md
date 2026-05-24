@@ -161,7 +161,10 @@ wrapper small.
 - **Claude integration testing**: see
   [docs/development/claude-testing.md](docs/development/claude-testing.md)
   for end-to-end test instructions covering tab state, notification
-  banners, sidebar rollup, and the hook lifecycle.
+  banners, sidebar rollup, and the hook lifecycle. To *see* the live
+  UI when verifying a change, `roostctl screenshot --out /tmp/shot.png`
+  renders the running window to a PNG in-process (no OS screen capture;
+  works even when the window is unfocused or occluded).
 
 ## Build
 
