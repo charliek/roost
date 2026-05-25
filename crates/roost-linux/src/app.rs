@@ -33,6 +33,7 @@ use roost_linux::reconcile;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::config::RoostConfig;
+use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
 use crate::notification_inbox::{
@@ -818,7 +819,7 @@ impl App {
                 // the whole bootstrap (and the workspace subscription
                 // isn't installed yet, so a bubbled error would leave
                 // startup half-built). Log + continue. #95 review.
-                if let Err(err) = self.open_tab_in_with(project.id, &cwd, &title).await {
+                if let Err(err) = self.open_tab_in_with(project.id, &cwd, &title, &[]).await {
                     tracing::warn!(
                         project_id = project.id,
                         cwd = %cwd,
@@ -1382,19 +1383,24 @@ impl App {
         // CR (M4b3b review) flagged the pre-existing HOME-only path:
         // a project pinned to a directory should open its tabs
         // there, not bounce them to the user's home.
-        self.open_tab_in_with(project_id, "", "").await.map(|_| ())
+        self.open_tab_in_with(project_id, "", "", &[])
+            .await
+            .map(|_| ())
     }
 
     /// Open a tab in `project_id` starting at `cwd` with placeholder
     /// `title` (both empty → resolved/derived by `LocalClient::open_tab`),
     /// then attach it in the UI. Returns the new tab id. Shared by
-    /// the new-tab path (empty cwd/title) and session restore (which
-    /// passes each saved tab's cwd + title).
+    /// the new-tab path (empty cwd/title/argv) and session restore (which
+    /// passes each saved tab's cwd + title). `argv` runs in place of the
+    /// default `$SHELL` — the launcher passes `$SHELL -i -c '<cmd>'`; an
+    /// empty slice keeps the default shell.
     async fn open_tab_in_with(
         self: &Rc<Self>,
         project_id: i64,
         cwd: &str,
         title: &str,
+        argv: &[String],
     ) -> anyhow::Result<i64> {
         let Some(client) = self.client.borrow().clone() else {
             return Ok(0);
@@ -1402,8 +1408,13 @@ impl App {
         let rt = self.rt.clone();
         let cwd = cwd.to_string();
         let title = title.to_string();
+        let argv = argv.to_vec();
         let (tab, _rx) = rt
-            .spawn(async move { client.open_tab(project_id, &cwd, &title, 80, 24).await })
+            .spawn(async move {
+                client
+                    .open_tab(project_id, &cwd, &title, &argv, 80, 24)
+                    .await
+            })
             .await
             .context("open_tab join")??;
         let tab_id = tab.id;
@@ -2174,14 +2185,19 @@ impl App {
     fn dispatch_action(self: &Rc<Self>, action: KeybindAction) {
         // While the palette is open it owns the keyboard; suppress every
         // other shortcut so e.g. Cmd+T can't fire underneath it. The
-        // palette toggle itself stays live (re-press is a no-op since
-        // `show_command_palette` guards on an already-open palette).
+        // picker toggles themselves stay live (re-press is a no-op since
+        // each `show_*` guards on an already-open palette).
         // GTK analog of the Swift app's `validateMenuItem` gate.
-        if action != KeybindAction::CommandPalette && self.palette.borrow().is_some() {
+        let is_picker_toggle = matches!(
+            action,
+            KeybindAction::CommandPalette | KeybindAction::CommandLauncher
+        );
+        if !is_picker_toggle && self.palette.borrow().is_some() {
             return;
         }
         match action {
             KeybindAction::CommandPalette => self.show_command_palette(),
+            KeybindAction::CommandLauncher => self.show_command_launcher(),
             KeybindAction::NewTab => {
                 let pid = *self.active_project_id.borrow();
                 if pid == 0 {
@@ -2443,6 +2459,116 @@ impl App {
             },
         );
         *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    // MARK: command launcher (Cmd+Shift+T / Alt+Shift+T)
+
+    /// Open the custom command launcher directly on the configured
+    /// command list. Presented as the root frame (so Esc closes), the
+    /// same surface as `show_notifications_palette`. No-op if a palette
+    /// is already open.
+    fn show_command_launcher(self: &Rc<Self>) {
+        if self.palette.borrow().is_some() {
+            return;
+        }
+        // Snapshot the config once and thread it through both the frame
+        // and the behavior, so the row the user sees and the command that
+        // launches are the same entry even if config.conf changes while
+        // the picker is open. Reloading on each open still picks up edits
+        // without a restart (matching `show_command_palette`).
+        let commands = RoostConfig::load_default().commands;
+        let root = self.launcher_frame(&commands);
+        let behavior = self.launcher_behavior(commands);
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    /// Build the launcher frame from a config snapshot's `command =`
+    /// list. An empty list yields the "No commands configured" sentinel.
+    fn launcher_frame(self: &Rc<Self>, commands: &[CustomCommand]) -> PaletteFrame {
+        let items = custom_command::launcher_items(commands);
+        PaletteFrame::new("launcher", "Run a command…", items)
+    }
+
+    /// Confirm on a launcher row → spawn that command in a new tab. The
+    /// row id's index is resolved against the same `commands` snapshot the
+    /// frame was built from. The `launch:none` sentinel (and any stale id)
+    /// is a no-op (stay open). The launch is deferred to an idle tick so
+    /// the palette tears down before the new tab is opened + focused
+    /// (mirrors the notification jump).
+    fn launcher_behavior(self: &Rc<Self>, commands: Vec<CustomCommand>) -> PaletteBehavior {
+        let weak = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            let Some(app) = weak.upgrade() else {
+                return PaletteOutcome::Close;
+            };
+            match custom_command::launch_index(&item.id) {
+                Some(index) if index < commands.len() => {
+                    let cmd = commands[index].clone();
+                    let weak2 = Rc::downgrade(&app);
+                    glib::idle_add_local_once(move || {
+                        if let Some(app) = weak2.upgrade() {
+                            app.launch_command(&cmd);
+                        }
+                    });
+                    PaletteOutcome::Close
+                }
+                _ => PaletteOutcome::None, // sentinel / stale id
+            }
+        })
+    }
+
+    /// Spawn `cmd` in a new tab of the active project, in the active tab's
+    /// live cwd, running it through the user's login shell. Auto-close on
+    /// exit + the non-sticky title are handled by the existing tab
+    /// infrastructure — everything else rides in the argv built by
+    /// `custom_command::launch_argv`.
+    fn launch_command(self: &Rc<Self>, cmd: &CustomCommand) {
+        let pid = *self.active_project_id.borrow();
+        if pid == 0 {
+            return;
+        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let argv = custom_command::launch_argv(&shell, cmd);
+        let cwd = self.active_tab_cwd(pid);
+        let title = cmd.title.clone();
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            // `open_tab_in_with` → `attach_existing_tab` selects + focuses
+            // the new page, so the launched tab is brought forward.
+            if let Err(err) = app.open_tab_in_with(pid, &cwd, &title, &argv).await {
+                tracing::warn!(?err, "command launcher: open_tab failed");
+            }
+        });
+    }
+
+    /// The active tab's live cwd (OSC 7-tracked) in `project_id`, or ""
+    /// when unknown — the open-tab path then falls back to the project
+    /// cwd → `$HOME` → `/`.
+    fn active_tab_cwd(self: &Rc<Self>, project_id: i64) -> String {
+        let Some(tab_id) = self.active_tab_id(project_id) else {
+            return String::new();
+        };
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return String::new();
+        };
+        let tabs = ui.tabs.borrow();
+        tabs.get(&tab_id)
+            .map(|t| t.cwd.borrow().clone())
+            .unwrap_or_default()
     }
 
     /// The two notification root commands. Built dynamically (not in

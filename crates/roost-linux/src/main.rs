@@ -13,6 +13,7 @@
 mod app;
 mod cell_metrics;
 mod config;
+mod custom_command;
 mod events;
 mod key_encoder;
 mod keybind;

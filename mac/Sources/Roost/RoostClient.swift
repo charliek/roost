@@ -105,6 +105,7 @@ func runShellSession(
     cols: UInt16 = 80,
     rows: UInt16 = 24,
     title: String = "roost-mac",
+    argv: [String] = [],
     keystrokes: AsyncStream<PtyClientEvent>,
     onTabOpened: @escaping @Sendable (Int64) -> Void,
     onOutput: @escaping @Sendable (Data) -> Void
@@ -157,7 +158,7 @@ func runShellSession(
             let tab = try localClient.openTab(
                 projectID: projectID,
                 cwd: cwd,
-                argv: [],
+                argv: argv,
                 cols: cols,
                 rows: rows,
                 title: title

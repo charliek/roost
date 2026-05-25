@@ -50,6 +50,10 @@ pub enum KeybindAction {
     /// overlay). Default `projectMod+shift+p` — Cmd+Shift+P on
     /// macOS-GTK, Alt+Shift+P on Linux.
     CommandPalette,
+    /// Open the custom command launcher (config-defined `command =`
+    /// list) on its own picker. Default `projectMod+shift+t` —
+    /// Cmd+Shift+T on macOS-GTK, Alt+Shift+T on Linux.
+    CommandLauncher,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
     /// `switch_project_N` where N is 1..=9.
@@ -77,6 +81,7 @@ impl KeybindAction {
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
             "command_palette" => Some(Self::CommandPalette),
+            "command_launcher" => Some(Self::CommandLauncher),
             "unbind" => Some(Self::Unbind),
             other => {
                 if let Some(n) = other.strip_prefix("switch_project_") {
@@ -251,6 +256,15 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &mut out,
         &format!("{project_mod}+shift+p"),
         KeybindAction::CommandPalette,
+    );
+
+    // Command launcher: Cmd+Shift+T on macOS-GTK, Alt+Shift+T on Linux
+    // (mirrors the Swift app). No existing default uses `…+shift+t`
+    // (NewTab is `primary+t`), so no collision.
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+t"),
+        KeybindAction::CommandLauncher,
     );
 
     // Browser-style font sizing on the active terminal. `Cmd-+` on
@@ -441,6 +455,25 @@ mod tests {
             parse_trigger("alt+shift+p").unwrap()
         };
         assert_eq!(defaults.get(&trigger), Some(&KeybindAction::CommandPalette));
+    }
+
+    #[test]
+    fn command_launcher_action_and_default() {
+        assert_eq!(
+            KeybindAction::from_name("command_launcher"),
+            Some(KeybindAction::CommandLauncher)
+        );
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // projectMod+shift+t: Cmd+Shift+T on macOS, Alt+Shift+T on Linux.
+        let trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+t").unwrap()
+        } else {
+            parse_trigger("alt+shift+t").unwrap()
+        };
+        assert_eq!(
+            defaults.get(&trigger),
+            Some(&KeybindAction::CommandLauncher)
+        );
     }
 
     #[test]
