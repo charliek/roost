@@ -127,41 +127,69 @@ impl TargetSelector {
         }
 
         // 5. Auto-detect.
-        let mac = BundleProfile::mac()?;
-        let gtk = BundleProfile::gtk()?;
-        let mac_path = mac.socket_path.clone();
-        let gtk_path = gtk.socket_path.clone();
+        resolve_auto_detect(probe_alive).await
+    }
+}
 
-        if !probe_alive {
-            // Without a probe, prefer the Mac socket. Callers in
-            // probe_alive=false mode (Claude hooks) tolerate
-            // "no live target" silently — they just no-op when the
-            // dial fails downstream.
+/// Auto-detect step (resolution order #5): probe the known profile
+/// socket paths and pick a live one. Split out of [`TargetSelector::resolve`]
+/// so it can be unit-tested directly — `resolve` consults `ROOST_SOCKET`
+/// / `ROOST_BUNDLE_PROFILE` first, so testing this branch through the
+/// public entry point would depend on the ambient environment.
+async fn resolve_auto_detect(probe_alive: bool) -> Result<ResolvedTarget, TargetError> {
+    let mac = BundleProfile::mac()?;
+    let gtk = BundleProfile::gtk()?;
+    let mac_path = mac.socket_path.clone();
+    let gtk_path = gtk.socket_path.clone();
+
+    // On Linux both profiles resolve to the same XDG socket path —
+    // there is only one UI, and `paths.rs` ignores `app_label` off
+    // macOS. Probing that single path twice would report a phantom
+    // "mac + gtk both running" ambiguity, so collapse to the lone
+    // gtk target (Linux's only UI) before the probe. Keyed off the
+    // resolved paths being equal rather than `cfg!(target_os)` so it
+    // stays correct if the path policy ever changes.
+    if mac_path == gtk_path {
+        if !probe_alive || probe_socket(&gtk_path).await {
             return Ok(ResolvedTarget {
-                socket_path: mac_path,
-                kind: Some(BundleProfileKind::Mac),
-            });
-        }
-
-        // Probe both candidates in parallel so the cold-path cost
-        // is one 50ms timeout, not two. `tokio::join!` polls both
-        // futures concurrently on the current task — no extra
-        // executor work.
-        let (mac_alive, gtk_alive) = tokio::join!(probe_socket(&mac_path), probe_socket(&gtk_path));
-        match (mac_alive, gtk_alive) {
-            (true, false) => Ok(ResolvedTarget {
-                socket_path: mac_path,
-                kind: Some(BundleProfileKind::Mac),
-            }),
-            (false, true) => Ok(ResolvedTarget {
                 socket_path: gtk_path,
                 kind: Some(BundleProfileKind::Gtk),
-            }),
-            (true, true) => Err(TargetError::Ambiguous),
-            (false, false) => Err(TargetError::NoLiveTarget {
-                tried: vec![mac_path, gtk_path],
-            }),
+            });
         }
+        return Err(TargetError::NoLiveTarget {
+            tried: vec![gtk_path],
+        });
+    }
+
+    if !probe_alive {
+        // Without a probe, prefer the Mac socket. Callers in
+        // probe_alive=false mode (Claude hooks) tolerate
+        // "no live target" silently — they just no-op when the
+        // dial fails downstream.
+        return Ok(ResolvedTarget {
+            socket_path: mac_path,
+            kind: Some(BundleProfileKind::Mac),
+        });
+    }
+
+    // Probe both candidates in parallel so the cold-path cost
+    // is one 50ms timeout, not two. `tokio::join!` polls both
+    // futures concurrently on the current task — no extra
+    // executor work.
+    let (mac_alive, gtk_alive) = tokio::join!(probe_socket(&mac_path), probe_socket(&gtk_path));
+    match (mac_alive, gtk_alive) {
+        (true, false) => Ok(ResolvedTarget {
+            socket_path: mac_path,
+            kind: Some(BundleProfileKind::Mac),
+        }),
+        (false, true) => Ok(ResolvedTarget {
+            socket_path: gtk_path,
+            kind: Some(BundleProfileKind::Gtk),
+        }),
+        (true, true) => Err(TargetError::Ambiguous),
+        (false, false) => Err(TargetError::NoLiveTarget {
+            tried: vec![mac_path, gtk_path],
+        }),
     }
 }
 
@@ -197,5 +225,30 @@ mod tests {
         let res = sel.resolve(false).await.expect("resolve");
         assert_eq!(res.socket_path, PathBuf::from("/tmp/probe.sock"));
         assert_eq!(res.kind, None);
+    }
+
+    // On non-macOS the two profiles intentionally share one socket path
+    // (one UI, `app_label` ignored). The auto-detect picker must treat
+    // that as a single gtk target — never as a mac+gtk ambiguity. Calls
+    // `resolve_auto_detect` directly so the assertion is independent of
+    // ambient `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`, which the public
+    // `resolve` consults ahead of auto-detect.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn linux_collapses_identical_profile_paths_to_gtk() {
+        let mac = BundleProfile::mac().expect("mac profile");
+        let gtk = BundleProfile::gtk().expect("gtk profile");
+        assert_eq!(
+            mac.socket_path, gtk.socket_path,
+            "precondition: Linux profiles share one socket path"
+        );
+
+        // probe_alive=false skips the dial, so the result is independent
+        // of whether a UI happens to be running on the test host.
+        let res = resolve_auto_detect(false)
+            .await
+            .expect("resolve must not be ambiguous when paths collapse");
+        assert_eq!(res.kind, Some(BundleProfileKind::Gtk));
+        assert_eq!(res.socket_path, gtk.socket_path);
     }
 }
