@@ -165,6 +165,12 @@ wrapper small.
   UI when verifying a change, `roostctl screenshot --out /tmp/shot.png`
   renders the running window to a PNG in-process (no OS screen capture;
   works even when the window is unfocused or occluded).
+- **Linux UI test harness**: [`tools/linux/`](tools/linux/README.md)
+  drives the GTK app in an automated way on Linux (COSMIC/Wayland) with
+  no image libraries — `/dev/uinput` key/pointer injectors, a stdlib PNG
+  inspect/crop tool, a clipboard reader, and a single-monitor helper for
+  reliable absolute-pointer injection. See its README for the
+  screen↔window coordinate mapping and gotchas.
 
 ## Build
 
