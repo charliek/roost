@@ -12,11 +12,21 @@
 //! the `active_*` selection fields are `#[serde(default)]` so a file
 //! written by an older build (or the other UI) still loads.
 //!
-//! Atomic write protocol: write to `state.json.tmp`, `fsync`,
-//! rename over `state.json`. Killing the process mid-write either
-//! leaves the previous `state.json` intact (tmp not renamed yet)
-//! or the new one (rename atomic). A `.bak` is also kept as a
-//! one-level rollback for diagnostic / "oh no" cases.
+//! Atomic write protocol: write to `state.json.tmp`, rename over
+//! `state.json`. Killing the process mid-write either leaves the
+//! previous `state.json` intact (tmp not renamed yet) or the new one
+//! (rename atomic). A `.bak` is also kept as a one-level rollback for
+//! diagnostic / "oh no" cases.
+//!
+//! Durability is controlled by the `sync` flag. During a session
+//! `persist_state` is called with `sync = false`: the atomic
+//! `tmp + rename` lands in the kernel page cache and is immediately
+//! visible to a relaunched process, but `fsync` is skipped so the
+//! hot path doesn't block on the disk. `fsync` is forced only on a
+//! clean exit (`Workspace::flush`, `sync = true`), which re-asserts
+//! physical durability at quit time. Dropping `fsync` mid-session
+//! costs only power-loss durability within the kernel writeback
+//! window; the atomic rename means the file is never torn.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -88,12 +98,19 @@ pub fn read_state(path: &Path) -> std::io::Result<Option<SnapshotFile>> {
 /// 1. Ensure the parent directory exists.
 /// 2. If `path` exists, copy it to `<path>.bak` (best-effort —
 ///    the previous backup is overwritten).
-/// 3. Write the JSON to `<path>.tmp` and `fsync` the file.
-/// 4. Atomically rename `<path>.tmp` over `path`.
+/// 3. Write the JSON to `<path>.tmp` (and `fsync` the file when
+///    `sync`).
+/// 4. Atomically rename `<path>.tmp` over `path` (and `fsync` the
+///    parent directory when `sync`).
 ///
-/// `fsync` is the durability gate. The rename is atomic on POSIX
-/// filesystems within the same directory.
-pub fn persist_state(path: &Path, snapshot: &SnapshotFile) -> std::io::Result<()> {
+/// The rename is atomic on POSIX filesystems within the same
+/// directory, so the file is never torn regardless of `sync`. With
+/// `sync == false` the write lands in the kernel page cache — visible
+/// to a relaunched process immediately, durable across a clean exit,
+/// but not forced to disk. With `sync == true` both the tmp file and
+/// the parent directory are `fsync`-ed, re-asserting physical
+/// durability (used by `Workspace::flush` on clean exit).
+pub fn persist_state(path: &Path, snapshot: &SnapshotFile, sync: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -116,12 +133,16 @@ pub fn persist_state(path: &Path, snapshot: &SnapshotFile) -> std::io::Result<()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         f.write_all(&bytes)?;
         f.write_all(b"\n")?;
-        // `sync_all` flushes the file's data + metadata. Required
-        // for the durability guarantee: a power loss between write
-        // and rename should still leave `state.json` intact (the
-        // previous version) and the half-written .tmp either
-        // present (we'll discard) or absent.
-        f.sync_all()?;
+        if sync {
+            // `sync_all` flushes the file's data + metadata. Forces
+            // physical durability: a power loss between write and
+            // rename should still leave `state.json` intact (the
+            // previous version) and the half-written .tmp either
+            // present (we'll discard) or absent. Skipped on the hot
+            // path (`sync == false`) — the page cache is enough for
+            // restore across a clean exit.
+            f.sync_all()?;
+        }
     }
     std::fs::rename(&tmp, path)?;
     // fsync the parent directory so the rename itself is durable.
@@ -129,26 +150,28 @@ pub fn persist_state(path: &Path, snapshot: &SnapshotFile) -> std::io::Result<()
     // filesystem flushing the directory metadata could lose the
     // rename (leaving state.json pointing at the previous inode).
     // POSIX requires fsync(dir) after rename for atomic-write
-    // protocols; ext4 + apfs both honor it.
-    if let Some(parent) = path.parent() {
-        match OpenOptions::new().read(true).open(parent) {
-            Ok(dir) => {
-                if let Err(err) = dir.sync_all() {
-                    // Some filesystems (e.g. tmpfs on Linux) reject
-                    // fsync on directories with EINVAL. Treat that
-                    // as success — the rename itself is still
-                    // atomic, we just can't force a sync.
-                    if err.kind() != std::io::ErrorKind::InvalidInput {
-                        return Err(err);
+    // protocols; ext4 + apfs both honor it. Skipped on the hot path.
+    if sync {
+        if let Some(parent) = path.parent() {
+            match OpenOptions::new().read(true).open(parent) {
+                Ok(dir) => {
+                    if let Err(err) = dir.sync_all() {
+                        // Some filesystems (e.g. tmpfs on Linux) reject
+                        // fsync on directories with EINVAL. Treat that
+                        // as success — the rename itself is still
+                        // atomic, we just can't force a sync.
+                        if err.kind() != std::io::ErrorKind::InvalidInput {
+                            return Err(err);
+                        }
                     }
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // Parent vanished between rename and reopen —
+                    // shouldn't happen in practice, but a missing
+                    // parent at this stage isn't a write failure.
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Parent vanished between rename and reopen —
-                // shouldn't happen in practice, but a missing
-                // parent at this stage isn't a write failure.
-            }
-            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -204,7 +227,7 @@ mod tests {
                 ],
             }],
         };
-        persist_state(&p, &snap).unwrap();
+        persist_state(&p, &snap, true).unwrap();
         let back = read_state(&p).unwrap().expect("present");
         assert_eq!(back, snap);
     }
@@ -248,6 +271,7 @@ mod tests {
                 next_id: 1,
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
         persist_state(
@@ -256,6 +280,7 @@ mod tests {
                 next_id: 2,
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
         let bak = with_extension_suffix(&p, "bak");

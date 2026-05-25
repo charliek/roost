@@ -104,15 +104,13 @@ final class Workspace {
     /// the live `tabs` map — the live tabs are the fresh shells the
     /// UI re-opens from these descriptors.
     private var restoreLayout: RestoreLayout?
-    /// Last time a cwd/OSC-title change persisted. These fire per
-    /// shell prompt / `cd`, so they're throttled (`persistThrottled`)
-    /// to avoid an fsync per change; `nil` means "never". Mirrors the
-    /// Rust `last_meta_persist`.
-    private var lastMetaPersist: Date?
-    /// Leading-edge throttle window for chatty shell-driven persists.
-    /// The in-memory value stays current; the next layout mutation
-    /// flushes it, so the worst case is this much staleness on disk.
-    private static let metaPersistMinInterval: TimeInterval = 1.0
+    /// Set by `flush()` on clean exit, *after* it writes the final
+    /// layout. Once set, `persist()` is a no-op so a teardown cascade
+    /// (e.g. `applicationWillTerminate` closing every tab, which can
+    /// drive PTY-exit closes back through the workspace) can't
+    /// overwrite the flushed layout with an empty one. Mirrors the
+    /// Rust `shutting_down`.
+    private var shuttingDown = false
 
     // MARK: Init
 
@@ -221,8 +219,7 @@ final class Workspace {
             createdAt: unixNow()
         )
         projects[id] = project
-        persist()
-        emit(.projectCreated(project))
+        commit([.projectCreated(project)], persist: true)
         return project
     }
 
@@ -232,8 +229,7 @@ final class Workspace {
         }
         p.name = name
         projects[projectID] = p
-        persist()
-        emit(.projectRenamed(projectID: projectID, name: name))
+        commit([.projectRenamed(projectID: projectID, name: name)], persist: true)
     }
 
     /// Delete a project and all its tabs. Returns the cascaded tab
@@ -272,15 +268,13 @@ final class Workspace {
             activeTabID = fallbackTab
             activeChanged = true
         }
-        persist()
-
-        for tid in cascaded {
-            emit(.tabClosed(tabID: tid))
-        }
-        emit(.projectDeleted(projectID: projectID))
+        // Commit order: tabClosed* → projectDeleted → activeChanged?.
+        var events: [Event] = cascaded.map { .tabClosed(tabID: $0) }
+        events.append(.projectDeleted(projectID: projectID))
         if activeChanged {
-            emit(.activeChanged(projectID: activeProjectID, tabID: activeTabID))
+            events.append(.activeChanged(projectID: activeProjectID, tabID: activeTabID))
         }
+        commit(events, persist: true)
         return cascaded
     }
 
@@ -311,12 +305,11 @@ final class Workspace {
             tabs[tid]?.position = next
             next += 1
         }
-        persist()
         // The post-reorder display order is the supplied prefix
         // followed by any unlisted tabs (in their prior order).
         // App.swift's `.tabsReordered` handler applies the same
         // order via `applyTabsReorder`.
-        emit(.tabsReordered(projectID: projectID, tabIDs: tabIDs + unlisted))
+        commit([.tabsReordered(projectID: projectID, tabIDs: tabIDs + unlisted)], persist: true)
     }
 
     func reorderProjects(_ projectIDs: [Int64]) throws {
@@ -338,8 +331,7 @@ final class Workspace {
             projects[pid]?.position = next
             next += 1
         }
-        persist()
-        emit(.projectsReordered(projectIDs: projectIDs + unlisted))
+        commit([.projectsReordered(projectIDs: projectIDs + unlisted)], persist: true)
     }
 
     // MARK: Tab mutators
@@ -378,9 +370,10 @@ final class Workspace {
         tabs[id] = tab
         activeProjectID = projectID
         activeTabID = id
-        persist()
-        emit(.tabOpened(tab))
-        emit(.activeChanged(projectID: projectID, tabID: id))
+        commit(
+            [.tabOpened(tab), .activeChanged(projectID: projectID, tabID: id)],
+            persist: true
+        )
         return tab
     }
 
@@ -438,14 +431,15 @@ final class Workspace {
             }
             activeChanged = true
         }
-        persist()
-        emit(.tabClosed(tabID: tabID))
+        // Commit order: tabClosed → projectDeleted? → activeChanged?.
+        var events: [Event] = [.tabClosed(tabID: tabID)]
         if projectEmptied {
-            emit(.projectDeleted(projectID: projectID))
+            events.append(.projectDeleted(projectID: projectID))
         }
         if activeChanged {
-            emit(.activeChanged(projectID: activeProjectID, tabID: activeTabID))
+            events.append(.activeChanged(projectID: activeProjectID, tabID: activeTabID))
         }
+        commit(events, persist: true)
     }
 
     func setTabTitle(_ tabID: Int64, title: String) throws {
@@ -453,9 +447,7 @@ final class Workspace {
         t.title = title
         t.userTitled = true
         tabs[tabID] = t
-        emit(.tabTitleChanged(tabID: tabID, title: title))
-        // Manual rename is deliberate + infrequent — persist now.
-        persist()
+        commit([.tabTitleChanged(tabID: tabID, title: title)], persist: true)
     }
 
     /// OSC 0/1/2 title — respects a prior manual rename.
@@ -464,41 +456,44 @@ final class Workspace {
         if t.userTitled { return }
         t.title = title
         tabs[tabID] = t
-        emit(.tabTitleChanged(tabID: tabID, title: title))
-        // Shell-driven (OSC titles can fire per prompt) — throttle.
-        persistThrottled()
+        // Shell-driven (OSC titles fire per prompt) but write-through:
+        // each change lands in the page cache with no fsync until
+        // flush(), so it's cheap and the latest title is always on disk.
+        commit([.tabTitleChanged(tabID: tabID, title: title)], persist: true)
     }
 
     func setTabCwd(_ tabID: Int64, cwd: String) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         t.cwd = cwd
         tabs[tabID] = t
-        emit(.tabCwdChanged(tabID: tabID, cwd: cwd))
-        // Shell-driven (OSC 7 fires per `cd`) — throttle so a `cd`
-        // loop doesn't fsync per change; the new cwd is in memory and
-        // the next layout mutation flushes it.
-        persistThrottled()
+        // Shell-driven (OSC 7 fires per `cd`) but write-through: cheap
+        // (no fsync until flush()), so a `cd` loop is fine and the
+        // latest cwd is always on disk (last write wins).
+        commit([.tabCwdChanged(tabID: tabID, cwd: cwd)], persist: true)
     }
 
     func setTabState(_ tabID: Int64, state: TabState) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         t.state = state
         tabs[tabID] = t
-        emit(.tabStateChanged(tabID: tabID, state: state))
+        // Run-state isn't in the persisted snapshot — emit only.
+        commit([.tabStateChanged(tabID: tabID, state: state)], persist: false)
     }
 
     func setTabHasNotification(_ tabID: Int64, hasPending: Bool) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         t.hasNotification = hasPending
         tabs[tabID] = t
-        emit(.tabNotification(tabID: tabID, hasPending: hasPending))
+        // Notification flag isn't in the persisted snapshot — emit only.
+        commit([.tabNotification(tabID: tabID, hasPending: hasPending)], persist: false)
     }
 
     func setTabHookActive(_ tabID: Int64, active: Bool) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         t.hookActive = active
         tabs[tabID] = t
-        emit(.hookActiveChanged(tabID: tabID, active: active))
+        // Hook-active flag isn't in the persisted snapshot — emit only.
+        commit([.hookActiveChanged(tabID: tabID, active: active)], persist: false)
     }
 
     func focusTab(_ tabID: Int64) throws -> (previousProject: Int64, previousTab: Int64) {
@@ -507,17 +502,17 @@ final class Workspace {
         activeProjectID = row.projectId
         activeTabID = row.id
         // Persist the active selection so it survives a relaunch
-        // (restored by position). Skip when unchanged.
-        if prev != (row.projectId, row.id) {
-            persist()
-        }
-        emit(.activeChanged(projectID: row.projectId, tabID: row.id))
+        // (restored by position). Skip when unchanged — focusing the
+        // already-active tab shouldn't churn the file.
+        let changed = prev != (row.projectId, row.id)
+        commit([.activeChanged(projectID: row.projectId, tabID: row.id)], persist: changed)
         return prev
     }
 
     func fireNotification(_ tabID: Int64, title: String, body: String) throws {
         guard tabs[tabID] != nil else { throw WorkspaceError.tabNotFound(tabID) }
-        emit(.notificationFired(tabID: tabID, title: title, body: body))
+        // Transient notification — nothing persisted, emit only.
+        commit([.notificationFired(tabID: tabID, title: title, body: body)], persist: false)
     }
 
     /// Ensure a default project exists; return its id. Used by
@@ -528,15 +523,22 @@ final class Workspace {
         if let first = projects.values.sorted(by: {
             ($0.position, $0.id) < ($1.position, $1.id)
         }).first {
+            var events: [Event] = []
             if activeProjectID == 0 {
                 activeProjectID = first.id
-                emit(.activeChanged(projectID: first.id, tabID: 0))
+                events.append(.activeChanged(projectID: first.id, tabID: 0))
             }
+            // No inline write here (as before): the only mutation is
+            // the active selection, which `flush()` captures on exit.
+            commit(events, persist: false)
             return first.id
         }
+        // `createProject` already persisted; the active-selection
+        // change is emit-only (captured by `flush()` on exit) to
+        // preserve the prior behavior here.
         let project = createProject(name: "Default", cwd: cwd)
         activeProjectID = project.id
-        emit(.activeChanged(projectID: project.id, tabID: 0))
+        commit([.activeChanged(projectID: project.id, tabID: 0)], persist: false)
         return project.id
     }
 
@@ -547,7 +549,35 @@ final class Workspace {
         return nextID
     }
 
-    private func persist() {
+    /// Persist the current layout with `fsync` and then freeze further
+    /// persistence. Call once on a clean exit (App.swift wires it into
+    /// `applicationWillTerminate`). The `fsync` re-asserts physical
+    /// durability at quit time — belt-and-suspenders, since the
+    /// session's write-through already left the latest layout in the
+    /// page cache, readable by a relaunch even without it. Setting
+    /// `shuttingDown` *after* the write means `flush`'s own `persist`
+    /// isn't blocked while every subsequent one is, so a teardown
+    /// cascade can't clobber the flushed layout. Idempotent: a second
+    /// call is a no-op (the freeze short-circuits its `persist`).
+    func flush() {
+        persist(sync: true)
+        shuttingDown = true
+    }
+
+    /// Centralize the mutate → emit → persist tail shared by every
+    /// mutator. No lock to manage (`@MainActor`, single-threaded), so
+    /// this is simply "persist (per policy), then emit". `persist:
+    /// false` is for state that isn't part of the persisted snapshot
+    /// (tab run-state, notification + hook flags) — emit only.
+    private func commit(_ events: [Event], persist shouldPersist: Bool) {
+        if shouldPersist { persist() }
+        for event in events { emit(event) }
+    }
+
+    private func persist(sync: Bool = false) {
+        // Frozen by `flush()` on clean exit: ignore any later write so
+        // a teardown cascade can't overwrite the flushed layout.
+        guard !shuttingDown else { return }
         guard let statePath else { return }
         // Active tab restored by its DENSE index within the active
         // project's display-ordered tabs — not the raw `position`
@@ -589,24 +619,10 @@ final class Workspace {
             activeTabPosition: activeTabPosition
         )
         do {
-            try Self.write(snapshot: snapshot, to: statePath)
+            try Self.write(snapshot: snapshot, to: statePath, sync: sync)
         } catch {
             NSLog("workspace: failed to persist state.json: \(error)")
         }
-    }
-
-    /// Persist for chatty shell-driven changes (cwd / OSC title):
-    /// at most once per `metaPersistMinInterval` (leading edge). The
-    /// in-memory value is always current; the next layout mutation
-    /// flushes any throttled change. Mirrors the Rust
-    /// `take_throttled_persist`.
-    private func persistThrottled() {
-        let now = Date()
-        if let last = lastMetaPersist, now.timeIntervalSince(last) < Self.metaPersistMinInterval {
-            return
-        }
-        lastMetaPersist = now
-        persist()
     }
 
     private static func readSnapshot(at path: String) -> SnapshotFile? {
@@ -623,9 +639,15 @@ final class Workspace {
         }
     }
 
-    /// Atomic write: write to `<path>.tmp`, fsync, rename. Keeps
-    /// `<path>.bak` of the prior version as a one-level rollback.
-    static func write(snapshot: SnapshotFile, to path: String) throws {
+    /// Atomic write: write to `<path>.tmp`, rename over `path`. Keeps
+    /// `<path>.bak` of the prior version as a one-level rollback. The
+    /// rename is atomic, so the file is never torn regardless of
+    /// `sync`. When `sync` is `true` the tmp file is `fsync`-ed before
+    /// the rename (forced physical durability — the clean-exit
+    /// `flush()` path); when `false` the write lands in the page
+    /// cache, visible to a relaunch and durable across a clean exit,
+    /// but not forced to disk (the cheap hot path).
+    static func write(snapshot: SnapshotFile, to path: String, sync: Bool) throws {
         let url = URL(fileURLWithPath: path)
         let parent = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
@@ -652,7 +674,13 @@ final class Workspace {
         FileManager.default.createFile(atPath: tmp.path, contents: nil)
         let handle = try FileHandle(forWritingTo: tmp)
         try handle.write(contentsOf: data)
-        try handle.synchronize()
+        if sync {
+            // Force the tmp file's bytes to disk before the rename so a
+            // power loss can't promote a half-written tmp. Skipped on
+            // the hot path — the page cache suffices for restore across
+            // a clean exit.
+            try handle.synchronize()
+        }
         try handle.close()
         // Atomic swap via `replaceItemAt`. Avoids the
         // remove-then-move window in which a crash would leave
