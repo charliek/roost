@@ -480,6 +480,10 @@ impl App {
         // Load + apply user config now so the first TerminalView
         // gets the right theme + font.
         let cfg = RoostConfig::load_default();
+        crate::cell_metrics::warn_if_primary_family_missing(
+            &window.pango_context(),
+            cfg.font_family.as_deref(),
+        );
         let active_theme_name = cfg
             .theme_name
             .clone()
@@ -1589,6 +1593,28 @@ impl App {
             terminal_for_drain.set_on_input({
                 let session = session.clone();
                 move |bytes| session.send_input(bytes)
+            });
+            // Push grid reflows to the PTY (ioctl TIOCSWINSZ) so a
+            // full-screen TUI fills the window and reflows on resize.
+            // Installing the callback also forces an immediate reflow,
+            // catching the case where the widget's first `resize` signal
+            // fired before this attach future resolved.
+            terminal_for_drain.set_on_resize({
+                let session = session.clone();
+                move |cols, rows| session.send_resize(cols, rows)
+            });
+            // HiDPI diagnostic (no metric-math change — see plan Phase
+            // 5). GTK4's DrawingArea draw `cairo::Context` is pre-scaled
+            // by the device scale factor, so the logical-px cell metrics
+            // render crisply without manual scaling. Log the realized
+            // terminal widget's factor once so a future HiDPI
+            // investigation has the value on hand.
+            static SCALE_LOGGED: std::sync::Once = std::sync::Once::new();
+            SCALE_LOGGED.call_once(|| {
+                tracing::info!(
+                    scale_factor = terminal_for_drain.widget().scale_factor(),
+                    "gtk terminal scale factor"
+                );
             });
             let projects = app_for_attach.projects.borrow();
             if let Some(ui) = projects.get(&project_id) {

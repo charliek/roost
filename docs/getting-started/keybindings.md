@@ -77,8 +77,9 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-V`          | Paste the system clipboard into the active terminal |
 | `Ctrl-Shift-C`   | Same as `Alt-C` (terminal-convention alternate)     |
 | `Ctrl-Shift-V`   | Same as `Alt-V` (terminal-convention alternate)     |
+| Middle-click     | Paste the X11/Wayland PRIMARY selection into the focused terminal |
 
-Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy. Copying also writes to the X11/Wayland PRIMARY clipboard so middle-click paste in other apps works.
+Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy. Copying (or simply finishing a drag-selection) also writes to the X11/Wayland PRIMARY clipboard, so middle-click paste in other apps — and into Roost — works.
 
 ### Font sizing
 

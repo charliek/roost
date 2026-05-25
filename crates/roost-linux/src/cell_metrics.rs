@@ -11,6 +11,7 @@
 //! Mac UI's `TerminalView.updateFont` 1:1.
 
 use gtk4::pango::{self, FontDescription};
+use gtk4::prelude::{FontFamilyExt, FontMapExt};
 
 /// Default font family chain. JetBrains Mono is preferred when
 /// installed; falls through to system monospace via Pango's
@@ -83,6 +84,56 @@ impl CellMetrics {
 
 fn pango_to_px(units: i32) -> f64 {
     units as f64 / pango::SCALE as f64
+}
+
+/// Fontconfig generic aliases. These always resolve to *some* installed
+/// face, so they can never be "missing" — skip them to avoid a false
+/// fallback warning.
+const GENERIC_FAMILIES: &[&str] = &[
+    "monospace",
+    "mono",
+    "sans",
+    "sans-serif",
+    "serif",
+    "system-ui",
+    "cursive",
+    "fantasy",
+    "emoji",
+    "math",
+];
+
+/// Warn once when the configured primary font family is not installed,
+/// so the silent fall-through to `Monospace` is visible in the log.
+/// Diagnostic only — no behavioral change: `Monospace` is a fontconfig
+/// generic that always resolves to a monospace face, so cell alignment
+/// is preserved. Mirrors the Go binary's `pickFontFamily`. `configured`
+/// is the user's comma-separated `font_family` (the first entry is the
+/// primary); `None` means the `DEFAULT_FONT_FAMILY` default applies.
+pub fn warn_if_primary_family_missing(context: &pango::Context, configured: Option<&str>) {
+    let list = configured.unwrap_or(DEFAULT_FONT_FAMILY);
+    let Some(primary) = list
+        .split(',')
+        .map(str::trim)
+        .find(|entry| !entry.is_empty())
+    else {
+        return;
+    };
+    if GENERIC_FAMILIES.contains(&primary.to_ascii_lowercase().as_str()) {
+        return;
+    }
+    let Some(font_map) = context.font_map() else {
+        return;
+    };
+    let installed = font_map
+        .list_families()
+        .iter()
+        .any(|family| family.name().eq_ignore_ascii_case(primary));
+    if !installed {
+        tracing::warn!(
+            requested = primary,
+            "configured font family not installed; falling back to Monospace"
+        );
+    }
 }
 
 /// Build the default monospace font description from the family +

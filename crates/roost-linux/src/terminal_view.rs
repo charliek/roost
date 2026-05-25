@@ -178,6 +178,9 @@ impl TerminalView {
             scroll_accum: 0.0,
             selection: None,
             input_callback: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            on_resize: None,
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -186,6 +189,29 @@ impl TerminalView {
             move |widget, cr, width, height| {
                 let mut s = state.borrow_mut();
                 s.paint(widget, cr, width as f64, height as f64);
+            }
+        });
+
+        // Reflow the cell grid whenever the DrawingArea is reallocated.
+        // The widget reports logical pixels and `CellMetrics` is in the
+        // same logical-pixel space, so the division is consistent (see
+        // the HiDPI note in app.rs `attach`). When the grid dimensions
+        // change we fire `on_resize` so the PTY's `TIOCSWINSZ` tracks
+        // the window; the callback only enqueues on a channel, so
+        // calling it inside the borrow mirrors `input_callback`.
+        widget.connect_resize({
+            let state = state.clone();
+            move |widget, w, h| {
+                let mut s = state.borrow_mut();
+                let changed = s.reflow(w as f64, h as f64, false);
+                if changed {
+                    let (cols, rows) = (s.cols, s.rows);
+                    if let Some(cb) = s.on_resize.as_ref() {
+                        cb(cols, rows);
+                    }
+                }
+                drop(s);
+                widget.queue_draw();
             }
         });
 
@@ -272,7 +298,40 @@ impl TerminalView {
                 widget.queue_draw();
             }
         });
+        // On selection commit, publish to the X11/Wayland PRIMARY
+        // selection so a middle-click paste into another app works
+        // (the convention every Linux terminal honors). PRIMARY has no
+        // macOS analogue, so this is Linux-only.
+        #[cfg(not(target_os = "macos"))]
+        drag.connect_drag_end({
+            let state = state.clone();
+            move |_g, _x, _y| {
+                if let Some(text) = selection_text(&state) {
+                    if let Some(display) = gtk4::gdk::Display::default() {
+                        display.primary_clipboard().set_text(&text);
+                    }
+                }
+            }
+        });
         widget.add_controller(drag);
+
+        // Middle-click pastes the PRIMARY selection into this terminal,
+        // matching Linux terminal convention. Routes through the same
+        // bracketed-paste-aware path as Ctrl+Shift+V. Linux-only.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let middle_click = gtk4::GestureClick::new();
+            middle_click.set_button(gtk4::gdk::BUTTON_MIDDLE);
+            middle_click.connect_pressed({
+                let state = state.clone();
+                move |_gesture, _n_press, _x, _y| {
+                    if let Some(display) = gtk4::gdk::Display::default() {
+                        spawn_paste_from(state.clone(), display.primary_clipboard());
+                    }
+                }
+            });
+            widget.add_controller(middle_click);
+        }
 
         // Cursor blink: toggle every 530ms while the widget exists.
         // Pausing the timer on focus loss is a polish nit deferred to
@@ -318,8 +377,44 @@ impl TerminalView {
         s.font_desc = desc.clone();
         let pango_ctx = self.widget.pango_context();
         s.cell_metrics = CellMetrics::measure(&pango_ctx, &desc);
+        // The new cell pixel size changes how many cells fit; reflow so
+        // libghostty + the PTY learn the new grid. `force` because the
+        // cell metrics changed even when the column/row count happens to
+        // land the same. Fire `on_resize` only when the grid dimensions
+        // actually moved — the PTY only cares about cols/rows.
+        let (w, h) = (self.widget.width(), self.widget.height());
+        if w > 0 && h > 0 && s.reflow(w as f64, h as f64, true) {
+            let (cols, rows) = (s.cols, s.rows);
+            if let Some(cb) = s.on_resize.as_ref() {
+                cb(cols, rows);
+            }
+        }
         drop(s);
         self.widget.queue_draw();
+    }
+
+    /// Install a resize handler, fired with the new `(cols, rows)`
+    /// whenever a reflow changes the grid. Wired by the session attach
+    /// to push the grid through `TabSession::send_resize` →
+    /// `ioctl(TIOCSWINSZ)`. If the widget is already allocated when the
+    /// callback lands (the first `resize` signal can fire before the
+    /// session attaches), force a reflow and push the current grid so
+    /// the PTY starts at the real window size rather than 80×24.
+    pub fn set_on_resize<F>(&self, callback: F)
+    where
+        F: Fn(u16, u16) + 'static,
+    {
+        let mut s = self.state.borrow_mut();
+        s.on_resize = Some(Box::new(callback));
+        let (w, h) = (self.widget.width(), self.widget.height());
+        if w > 0 && h > 0 {
+            s.reflow(w as f64, h as f64, true);
+            let (cols, rows) = (s.cols, s.rows);
+            if let Some(cb) = s.on_resize.as_ref() {
+                cb(cols, rows);
+            }
+        }
+        drop(s);
     }
 
     /// Swap the live theme on this terminal. Re-pushes the palette +
@@ -350,73 +445,19 @@ impl TerminalView {
         self.widget.queue_draw();
     }
 
-    /// Copy the current selection to the system clipboard. Walks the
-    /// libghostty render state, extracts plain text for the selected
-    /// cell range, and pushes to `gdk::Display::clipboard`. No-op if
-    /// the selection is empty.
+    /// Copy the current selection to the system clipboard
+    /// (`gdk::Display::clipboard`). No-op if the selection is empty. On
+    /// Linux the text is also published to the X11/Wayland PRIMARY
+    /// selection so a middle-click paste into another app works.
     pub fn copy_selection_to_clipboard(&self) {
-        let s = self.state.borrow();
-        let Some(sel) = s.selection else {
+        let Some(text) = selection_text(&self.state) else {
             return;
         };
-        if sel.is_empty() {
-            return;
-        }
-        let (sc, sr, ec, er) = sel.normalized();
-        drop(s);
-
-        let mut text = String::new();
-        let mut s = self.state.borrow_mut();
-        // Split-borrow so the walk can hold `&mut render_state` and
-        // `&terminal` simultaneously — both fields of `s` but
-        // Rust's borrow checker can't see through the outer
-        // `&mut TerminalViewState` without destructuring.
-        let TerminalViewState {
-            terminal,
-            render_state,
-            ..
-        } = &mut *s;
-        let _ = render_state.update(terminal);
-        let _ = render_state.walk(terminal, |row, cell| {
-            if row < sr as u32 || row >= er as u32 {
-                return;
-            }
-            let col = cell.col;
-            let in_range = if row == sr as u32 && row == er.saturating_sub(1) as u32 {
-                col >= sc && col < ec
-            } else if row == sr as u32 {
-                col >= sc
-            } else if row == er.saturating_sub(1) as u32 {
-                col < ec
-            } else {
-                true
-            };
-            if !in_range {
-                return;
-            }
-            // Row boundary: when col rolls back to 0 on a new row,
-            // append a newline. (`row` advances per-row, so we just
-            // detect row breaks by tracking the prior row.)
-            if col == 0 && !text.is_empty() {
-                text.push('\n');
-            }
-            if cell.text.is_empty() {
-                text.push(' ');
-            } else {
-                text.push_str(&cell.text);
-            }
-        });
-        drop(s);
-        // Trim trailing whitespace on each line for a cleaner paste.
-        let trimmed = text
-            .lines()
-            .map(|line| line.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !trimmed.is_empty() {
-            if let Some(display) = gtk4::gdk::Display::default() {
-                display.clipboard().set_text(&trimmed);
-            }
+        if let Some(display) = gtk4::gdk::Display::default() {
+            display.clipboard().set_text(&text);
+            // PRIMARY is an X11/Wayland concept with no macOS analogue.
+            #[cfg(not(target_os = "macos"))]
+            display.primary_clipboard().set_text(&text);
         }
     }
 
@@ -430,28 +471,7 @@ impl TerminalView {
         let Some(display) = gtk4::gdk::Display::default() else {
             return;
         };
-        let clipboard = display.clipboard();
-        let state = self.state.clone();
-        glib::spawn_future_local(async move {
-            let Ok(text) = clipboard.read_text_future().await else {
-                return;
-            };
-            let Some(text) = text else { return };
-            let s = state.borrow();
-            let bracketed = s.terminal.mode_get(2004);
-            let bytes = if bracketed {
-                let mut buf = Vec::with_capacity(text.len() + 8);
-                buf.extend_from_slice(b"\x1b[200~");
-                buf.extend_from_slice(text.as_bytes());
-                buf.extend_from_slice(b"\x1b[201~");
-                buf
-            } else {
-                text.as_bytes().to_vec()
-            };
-            if let Some(cb) = s.input_callback.as_ref() {
-                cb(bytes);
-            }
-        });
+        spawn_paste_from(self.state.clone(), display.clipboard());
     }
 
     /// Install a keystroke handler. Called with raw UTF-8 bytes when
@@ -507,26 +527,28 @@ impl TerminalView {
                 // handles modifier conventions, Kitty keyboard
                 // protocol, DECCKM application-mode arrows, etc.
                 let mut s = state.borrow_mut();
-                // Commit 7: snap viewport to bottom on any keystroke
-                // (matches the Go binary's `cmd/roost/input.go:67`).
-                // Clear any active selection — typing intent overrides.
-                if s.scrolled_back {
-                    s.terminal.scroll_viewport(ScrollViewport::Bottom);
-                    s.scrolled_back = false;
-                    s.scroll_accum = 0.0;
-                    widget.queue_draw();
-                }
-                if s.selection.is_some() {
-                    s.selection = None;
-                    widget.queue_draw();
-                }
                 let bytes = {
                     let s_mut: &mut TerminalViewState = &mut s;
                     key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, key, mods)
                 };
+                // Bare modifiers and unmapped chords encode to nothing.
+                // Crucially we must NOT clear the selection here: a copy
+                // shortcut (Alt+C / Ctrl+Shift+C) arrives as its modifier
+                // keypress *first*, and clearing on that would wipe the
+                // selection before the copy action reads it.
                 if bytes.is_empty() {
                     return glib::Propagation::Proceed;
                 }
+                // Real input: typing snaps the viewport back to the
+                // bottom (matches the Go binary's `cmd/roost/input.go:67`)
+                // and clears any active selection — typing overrides it.
+                if s.scrolled_back {
+                    s.terminal.scroll_viewport(ScrollViewport::Bottom);
+                    s.scrolled_back = false;
+                    s.scroll_accum = 0.0;
+                }
+                s.selection = None;
+                widget.queue_draw();
                 if let Some(cb) = s.input_callback.as_ref() {
                     cb(bytes);
                 }
@@ -573,6 +595,16 @@ struct TerminalViewState {
     /// `set_on_input` populates it once the daemon round-trip is
     /// ready.
     input_callback: Option<Box<dyn Fn(Vec<u8>)>>,
+    /// Live cell grid. Reflowed from the widget's pixel size on every
+    /// `resize` signal; seeded with the `DEFAULT_COLS`/`DEFAULT_ROWS`
+    /// the libghostty terminal was allocated with.
+    cols: u16,
+    rows: u16,
+    /// Caller-installed resize handler. Fired (with the new grid) when
+    /// a reflow changes the column/row count so the PTY's window size
+    /// (`TIOCSWINSZ`) tracks the widget. `set_on_resize` populates it
+    /// once the session is attached.
+    on_resize: Option<Box<dyn Fn(u16, u16)>>,
 }
 
 /// Drag-selection state. Anchor = where the mouse-down landed,
@@ -615,6 +647,35 @@ impl Selection {
 }
 
 impl TerminalViewState {
+    /// Recompute the cell grid from the widget's pixel size and push
+    /// the new dimensions into libghostty (cell px included for OSC
+    /// size reports). Returns `true` when the column/row count changed.
+    /// `force` re-pushes to libghostty even when the count is unchanged
+    /// — used after a font-size change (cell px moved) and when a
+    /// resize callback is installed late.
+    fn reflow(&mut self, width_px: f64, height_px: f64, force: bool) -> bool {
+        let cw = self.cell_metrics.cell_width;
+        let ch = self.cell_metrics.cell_height;
+        if cw <= 0.0 || ch <= 0.0 {
+            return false;
+        }
+        let new_cols = (width_px / cw).floor().clamp(1.0, u16::MAX as f64) as u16;
+        let new_rows = (height_px / ch).floor().clamp(1.0, u16::MAX as f64) as u16;
+        let changed = (new_cols, new_rows) != (self.cols, self.rows);
+        if !changed && !force {
+            return false;
+        }
+        self.cols = new_cols;
+        self.rows = new_rows;
+        if let Err(err) =
+            self.terminal
+                .resize(new_cols, new_rows, cw.round() as u32, ch.round() as u32)
+        {
+            tracing::warn!(?err, new_cols, new_rows, "terminal resize failed");
+        }
+        changed
+    }
+
     fn paint(&mut self, widget: &DrawingArea, cr: &cairo::Context, width: f64, height: f64) {
         // Snapshot terminal state for this frame.
         if let Err(err) = self.render_state.update(&self.terminal) {
@@ -741,7 +802,7 @@ impl TerminalViewState {
         cr.rectangle(
             sc as f64 * cell_w,
             sr as f64 * cell_h,
-            ((DEFAULT_COLS as f64) - sc as f64) * cell_w,
+            ((self.cols as f64) - sc as f64) * cell_w,
             cell_h,
         );
         let _ = cr.fill();
@@ -750,7 +811,7 @@ impl TerminalViewState {
             cr.rectangle(
                 0.0,
                 (sr + 1) as f64 * cell_h,
-                DEFAULT_COLS as f64 * cell_w,
+                self.cols as f64 * cell_w,
                 (er.saturating_sub(sr).saturating_sub(1)) as f64 * cell_h,
             );
             let _ = cr.fill();
@@ -946,6 +1007,103 @@ impl TerminalViewState {
 fn set_cairo_color(cr: &cairo::Context, rgb: ColorRgb) {
     let (r, g, b) = rgb.to_f64();
     cr.set_source_rgb(r, g, b);
+}
+
+/// Extract the active selection as plain text (trailing whitespace
+/// trimmed per line), or `None` when there is no non-empty selection.
+/// A free function — shared by the explicit copy path and (on Linux)
+/// the drag-end PRIMARY publish, neither of which can hold an
+/// `&TerminalView`.
+fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
+    let s = state.borrow();
+    let sel = s.selection?;
+    if sel.is_empty() {
+        return None;
+    }
+    let (sc, sr, ec, er) = sel.normalized();
+    drop(s);
+
+    let mut text = String::new();
+    let mut s = state.borrow_mut();
+    // Split-borrow so the walk can hold `&mut render_state` and
+    // `&terminal` simultaneously — both fields of `s` but Rust's
+    // borrow checker can't see through the outer `&mut
+    // TerminalViewState` without destructuring.
+    let TerminalViewState {
+        terminal,
+        render_state,
+        ..
+    } = &mut *s;
+    let _ = render_state.update(terminal);
+    let _ = render_state.walk(terminal, |row, cell| {
+        if row < sr as u32 || row >= er as u32 {
+            return;
+        }
+        let col = cell.col;
+        let in_range = if row == sr as u32 && row == er.saturating_sub(1) as u32 {
+            col >= sc && col < ec
+        } else if row == sr as u32 {
+            col >= sc
+        } else if row == er.saturating_sub(1) as u32 {
+            col < ec
+        } else {
+            true
+        };
+        if !in_range {
+            return;
+        }
+        // Row boundary: when col rolls back to 0 on a new row, append a
+        // newline. (`row` advances per-row, so we detect row breaks by
+        // the column resetting.)
+        if col == 0 && !text.is_empty() {
+            text.push('\n');
+        }
+        if cell.text.is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(&cell.text);
+        }
+    });
+    drop(s);
+    // Trim trailing whitespace on each line for a cleaner paste.
+    let trimmed = text
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Read text from `clipboard` and feed it into the PTY, wrapping in
+/// bracketed-paste escapes when DECSET 2004 is active. Shared by
+/// Ctrl+Shift+V (CLIPBOARD) and, on Linux, middle-click (PRIMARY).
+/// Async because the clipboard read is async; spawned on the GTK main
+/// loop.
+fn spawn_paste_from(state: Rc<RefCell<TerminalViewState>>, clipboard: gtk4::gdk::Clipboard) {
+    glib::spawn_future_local(async move {
+        let Ok(text) = clipboard.read_text_future().await else {
+            return;
+        };
+        let Some(text) = text else { return };
+        let s = state.borrow();
+        let bracketed = s.terminal.mode_get(2004);
+        let bytes = if bracketed {
+            let mut buf = Vec::with_capacity(text.len() + 8);
+            buf.extend_from_slice(b"\x1b[200~");
+            buf.extend_from_slice(text.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+            buf
+        } else {
+            text.as_bytes().to_vec()
+        };
+        if let Some(cb) = s.input_callback.as_ref() {
+            cb(bytes);
+        }
+    });
 }
 
 /// Pure-function variant of `TerminalViewState::cell_at` for use from
