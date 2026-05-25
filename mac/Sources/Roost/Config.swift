@@ -33,6 +33,10 @@ struct RoostConfig: Sendable {
     var tabMinWidth: CGFloat?
     var tabMaxWidth: CGFloat?
     var keybinds: [Keybind] = []
+    /// Launcher entries from repeated `command =` lines, in source
+    /// order (= picker row order). A line missing `label`/`run` is
+    /// skipped (see `parseCommandLine`).
+    var commands: [CustomCommand] = []
 
     static let empty = RoostConfig(
         themeName: nil,
@@ -40,7 +44,8 @@ struct RoostConfig: Sendable {
         fontSize: nil,
         tabMinWidth: nil,
         tabMaxWidth: nil,
-        keybinds: []
+        keybinds: [],
+        commands: []
     )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
@@ -74,8 +79,14 @@ func parse(_ text: String) -> RoostConfig {
         if line.isEmpty || line.hasPrefix("#") { continue }
         guard let eqIdx = line.firstIndex(of: "=") else { continue }
         let key = line[..<eqIdx].trimmingCharacters(in: .whitespaces)
-        let value = line[line.index(after: eqIdx)...]
+        // Value with whitespace trimmed but quotes intact — the
+        // `command` parser does its own quote-aware tokenizing, and
+        // the unconditional quote-strip below would lop the closing
+        // quote off a value like `run="…"`.
+        let rawValue = line[line.index(after: eqIdx)...]
             .trimmingCharacters(in: .whitespaces)
+        let value =
+            rawValue
             // Strip surrounding quotes so a user can write either
             // `font-family = "JetBrains Mono"` or
             // `font-family = JetBrains Mono` and both work.
@@ -146,6 +157,16 @@ func parse(_ text: String) -> RoostConfig {
                 if !t.isEmpty && !a.isEmpty {
                     cfg.keybinds.append(Keybind(trigger: t, action: a))
                 }
+            }
+        case "command":
+            // Launcher entry: `command = label="…" run="…" …`. Parse
+            // the RAW value (quotes intact) since the tokenizer in
+            // `parseCommandLine` handles quoting; a line missing
+            // label/run is skipped, not fatal.
+            if let c = parseCommandLine(rawValue) {
+                cfg.commands.append(c)
+            } else {
+                NSLog("roost-mac: skipping malformed `command =` line (needs label + run)")
             }
         default:
             // Many other keys are valid in the Go binary's config

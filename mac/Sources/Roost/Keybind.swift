@@ -56,6 +56,9 @@ enum KeybindAction {
     /// namespace deliberately; add the peer action when Linux grows a
     /// palette.
     static let commandPalette = "command_palette"
+    /// Cmd+Shift+T custom command launcher. Like `commandPalette`,
+    /// Mac-and-GTK only (no Go counterpart).
+    static let commandLauncher = "command_launcher"
     static let unbind        = "unbind"
 
     /// `switch_project_N` (1..9). Defined as a function rather than
@@ -71,7 +74,7 @@ enum KeybindAction {
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
         paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
-        jumpToUnread, commandPalette,
+        jumpToUnread, commandPalette, commandLauncher,
     ]
 
     /// True if `action` is a recognized name (including the
@@ -235,6 +238,8 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.jumpToUnread:  ["\(primary)+shift+u"],
         // ⌘⇧P — VS Code / Zed command-palette convention.
         KeybindAction.commandPalette: ["\(primary)+shift+p"],
+        // ⌘⇧T — custom command launcher. ⌘T is New Tab; ⌘⇧T is free.
+        KeybindAction.commandLauncher: ["\(primary)+shift+t"],
         // Browser-style font sizing. + and = both bind because
         // cmd-+ on US layouts is really cmd-shift-=, and many
         // users hit cmd-= without the shift.

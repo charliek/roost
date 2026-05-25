@@ -836,6 +836,92 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         focusActiveTerminal()
     }
 
+    // MARK: - Command launcher (Cmd+Shift+T)
+
+    /// Open the custom command launcher directly on the configured
+    /// command list — a dedicated root picker (Esc closes), mirroring
+    /// `showCommandPalette` but with the launcher frame + behavior.
+    /// No-op if a palette is already open.
+    @objc @MainActor
+    private func showCommandLauncher(_ sender: Any?) {
+        guard palette == nil, let window else { return }
+        paletteOpen = true
+        let panel = PalettePanel(
+            parent: window,
+            contentRegion: terminalContainer,
+            root: launcherFrame(),
+            behavior: launcherBehavior()
+        ) { [weak self] in
+            self?.dismissPalette()
+        }
+        palette = panel
+        panel.present()
+    }
+
+    /// Build the launcher frame from the (freshly reloaded) config's
+    /// `command =` list — matching how `showCommandPalette` reloads
+    /// config on open, so edits appear without an app restart. An empty
+    /// list yields the "No commands configured" sentinel row.
+    @MainActor
+    private func launcherFrame() -> PaletteFrame {
+        let commands = RoostConfig.load().commands
+        return PaletteFrame(
+            id: "launcher",
+            placeholder: "Run a command…",
+            items: launcherItems(commands)
+        )
+    }
+
+    /// Confirm on a launcher row → spawn the command in a new tab. The
+    /// `launch:none` sentinel (and any malformed id) is a no-op (stay
+    /// open). Mac launches directly in the confirm and returns `.close`
+    /// (matches the notification jump's direct `focusTab`).
+    @MainActor
+    private func launcherBehavior() -> PaletteBehavior {
+        PaletteBehavior(onConfirm: { [weak self] item in
+            guard let self else { return .close }
+            guard let index = launchIndex(item.id) else {
+                return .none  // "No commands configured" sentinel
+            }
+            self.launchCommand(at: index)
+            return .close
+        })
+    }
+
+    /// Spawn the launcher command at `index` in a new tab of the active
+    /// project, in the active tab's live cwd, running it through the
+    /// user's login shell. Auto-close on exit + the non-sticky title are
+    /// handled by the existing tab infrastructure — everything else
+    /// rides in the argv built by `launchArgv`. Reloads config so the
+    /// index lines up with the frame the user just saw.
+    @MainActor
+    private func launchCommand(at index: Int) {
+        guard daemonReachable, let projectID = activeProjectID else { return }
+        let commands = RoostConfig.load().commands
+        guard commands.indices.contains(index) else { return }
+        let cmd = commands[index]
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
+        let argv = launchArgv(shell: shell, command: cmd)
+        let cwd = activeLaunchCwd(projectID: projectID)
+        guard let session = openTab(inProject: projectID, cwd: cwd, title: cmd.title, argv: argv)
+        else { return }
+        let projectTabs = tabsForActiveProject()
+        let insertedIndex = projectTabs.firstIndex(where: { $0 === session })
+            ?? max(0, projectTabs.count - 1)
+        rebuildTabBar()
+        selectTab(at: insertedIndex)
+    }
+
+    /// The launch cwd: the active tab's live (OSC 7-tracked) cwd, else
+    /// the project's cwd, else "" (the open-tab path then resolves
+    /// $HOME). Mirrors `updateWindowTitle`'s cwd resolution.
+    @MainActor
+    private func activeLaunchCwd(projectID: Int64) -> String {
+        let liveCwd = activeSessionByProject[projectID]?.liveCwd ?? ""
+        if !liveCwd.isEmpty { return liveCwd }
+        return projects.first(where: { $0.id == projectID })?.cwd ?? ""
+    }
+
     @MainActor
     private func confirmPaletteCommand(_ item: PaletteItem) -> PaletteOutcome {
         switch item.id {
@@ -1059,7 +1145,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// palette toggle itself stays enabled (re-press is a no-op).
     @objc @MainActor
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if paletteOpen, menuItem.action != #selector(showCommandPalette(_:)) {
+        // The picker toggles (palette + launcher) stay live while a
+        // palette is open; both `show*` guard on `palette == nil`, so a
+        // re-press is a harmless no-op.
+        if paletteOpen,
+            menuItem.action != #selector(showCommandPalette(_:)),
+            menuItem.action != #selector(showCommandLauncher(_:))
+        {
             return false
         }
         return true
@@ -1864,6 +1956,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         inProject projectID: Int64,
         cwd: String,
         title: String,
+        argv: [String] = [],
         focusInWorkspaceWhenReady: Bool = false
     ) -> TabSession? {
         guard daemonReachable else { return nil }
@@ -1889,7 +1982,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // refine if the shell starts in a different directory.
         session.liveCwd = resolvedCwd.isEmpty ? nil : resolvedCwd
         tabs.append(session)
-        session.start(socketPath: socketPath, title: title, cwd: resolvedCwd) { [weak self] tabID in
+        session.start(socketPath: socketPath, title: title, cwd: resolvedCwd, argv: argv) { [weak self] tabID in
             // The id is now known; keep the window menu in sync so its
             // tag-driven ⌘1..⌘9 routes to the current tab order.
             // Also rebuild the tab bar so the pill that was created
@@ -2581,6 +2674,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         paletteItem.target = self
         bind(paletteItem, to: KeybindAction.commandPalette)
         viewMenu.addItem(paletteItem)
+        let launcherItem = NSMenuItem(
+            title: "Command Launcher…",
+            action: #selector(showCommandLauncher(_:)),
+            keyEquivalent: ""
+        )
+        launcherItem.target = self
+        bind(launcherItem, to: KeybindAction.commandLauncher)
+        viewMenu.addItem(launcherItem)
         viewMenu.addItem(.separator())
         let zoomInItem = NSMenuItem(
             title: "Zoom In",

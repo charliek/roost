@@ -91,6 +91,7 @@ impl LocalClient {
         project_id: i64,
         cwd: &str,
         title: &str,
+        argv: &[String],
         cols: u32,
         rows: u32,
     ) -> Result<(Tab, broadcast::Receiver<PtyOutputEvent>)> {
@@ -121,7 +122,7 @@ impl LocalClient {
         let rows = pty_dim(rows, 24, "rows")?;
         match self
             .supervisor
-            .spawn(tab.id, &resolved_cwd, &[], cols, rows, &self.socket_path)
+            .spawn(tab.id, &resolved_cwd, argv, cols, rows, &self.socket_path)
         {
             Ok(rx) => Ok((tab, rx)),
             Err(err) => {

@@ -134,6 +134,7 @@ final class TabSession {
         socketPath: String,
         title: String,
         cwd: String = "",
+        argv: [String] = [],
         onIDAssigned: @escaping @MainActor (Int64) -> Void
     ) {
         let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
@@ -182,6 +183,7 @@ final class TabSession {
                 cols: cols,
                 rows: rows,
                 title: title,
+                argv: argv,
                 keystrokes: keystrokes,
                 onTabOpened: { tabID in
                     Task { @MainActor [weak self] in
