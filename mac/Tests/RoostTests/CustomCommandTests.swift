@@ -73,6 +73,16 @@ func multipleEnvPairs() {
 }
 
 @Test
+func envKeyMustBeIdentifier() {
+    // A key that isn't a valid identifier is dropped (it would otherwise
+    // splice into `export K=...` verbatim and inject shell).
+    let c = parseCmd(#"label="a" run="b" env="GOOD=1 bad-key=2 A;rm=3 OK_2=4""#)
+    #expect(c.env.count == 2)
+    #expect(c.env[0] == ("GOOD", "1"))
+    #expect(c.env[1] == ("OK_2", "4"))
+}
+
+@Test
 func unknownKeyIsIgnored() {
     let c = parseCmd(#"label="a" run="b" icon="star" quickkey="1""#)
     #expect(c.label == "a")

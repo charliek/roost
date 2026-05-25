@@ -846,11 +846,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func showCommandLauncher(_ sender: Any?) {
         guard palette == nil, let window else { return }
         paletteOpen = true
+        // Snapshot the config once and thread it through both the frame
+        // and the behavior, so the row the user sees and the command that
+        // launches are guaranteed to be the same entry even if config.conf
+        // changes while the picker is open. Reloading on each open (rather
+        // than caching on App) still picks up edits without a restart,
+        // matching how `showCommandPalette` reads config fresh.
+        let commands = RoostConfig.load().commands
         let panel = PalettePanel(
             parent: window,
             contentRegion: terminalContainer,
-            root: launcherFrame(),
-            behavior: launcherBehavior()
+            root: launcherFrame(commands: commands),
+            behavior: launcherBehavior(commands: commands)
         ) { [weak self] in
             self?.dismissPalette()
         }
@@ -858,48 +865,42 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         panel.present()
     }
 
-    /// Build the launcher frame from the (freshly reloaded) config's
-    /// `command =` list — matching how `showCommandPalette` reloads
-    /// config on open, so edits appear without an app restart. An empty
-    /// list yields the "No commands configured" sentinel row.
+    /// Build the launcher frame from a config snapshot's `command =`
+    /// list. An empty list yields the "No commands configured" sentinel.
     @MainActor
-    private func launcherFrame() -> PaletteFrame {
-        let commands = RoostConfig.load().commands
-        return PaletteFrame(
+    private func launcherFrame(commands: [CustomCommand]) -> PaletteFrame {
+        PaletteFrame(
             id: "launcher",
             placeholder: "Run a command…",
             items: launcherItems(commands)
         )
     }
 
-    /// Confirm on a launcher row → spawn the command in a new tab. The
-    /// `launch:none` sentinel (and any malformed id) is a no-op (stay
-    /// open). Mac launches directly in the confirm and returns `.close`
-    /// (matches the notification jump's direct `focusTab`).
+    /// Confirm on a launcher row → spawn that command in a new tab. The
+    /// row id's index is resolved against the same `commands` snapshot the
+    /// frame was built from. The `launch:none` sentinel (and any stale id)
+    /// is a no-op (stay open). Mac launches directly in the confirm and
+    /// returns `.close` (matches the notification jump's direct `focusTab`).
     @MainActor
-    private func launcherBehavior() -> PaletteBehavior {
+    private func launcherBehavior(commands: [CustomCommand]) -> PaletteBehavior {
         PaletteBehavior(onConfirm: { [weak self] item in
             guard let self else { return .close }
-            guard let index = launchIndex(item.id) else {
-                return .none  // "No commands configured" sentinel
+            guard let index = launchIndex(item.id), commands.indices.contains(index) else {
+                return .none  // "No commands configured" sentinel / stale id
             }
-            self.launchCommand(at: index)
+            self.launchCommand(commands[index])
             return .close
         })
     }
 
-    /// Spawn the launcher command at `index` in a new tab of the active
-    /// project, in the active tab's live cwd, running it through the
-    /// user's login shell. Auto-close on exit + the non-sticky title are
-    /// handled by the existing tab infrastructure — everything else
-    /// rides in the argv built by `launchArgv`. Reloads config so the
-    /// index lines up with the frame the user just saw.
+    /// Spawn `cmd` in a new tab of the active project, in the active tab's
+    /// live cwd, running it through the user's login shell. Auto-close on
+    /// exit + the non-sticky title are handled by the existing tab
+    /// infrastructure — everything else rides in the argv built by
+    /// `launchArgv`.
     @MainActor
-    private func launchCommand(at index: Int) {
+    private func launchCommand(_ cmd: CustomCommand) {
         guard daemonReachable, let projectID = activeProjectID else { return }
-        let commands = RoostConfig.load().commands
-        guard commands.indices.contains(index) else { return }
-        let cmd = commands[index]
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
         let argv = launchArgv(shell: shell, command: cmd)
         let cwd = activeLaunchCwd(projectID: projectID)

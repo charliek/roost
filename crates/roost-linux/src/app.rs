@@ -33,7 +33,7 @@ use roost_linux::reconcile;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::config::RoostConfig;
-use crate::custom_command;
+use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
 use crate::notification_inbox::{
@@ -2471,8 +2471,14 @@ impl App {
         if self.palette.borrow().is_some() {
             return;
         }
-        let root = self.launcher_frame();
-        let behavior = self.launcher_behavior();
+        // Snapshot the config once and thread it through both the frame
+        // and the behavior, so the row the user sees and the command that
+        // launches are the same entry even if config.conf changes while
+        // the picker is open. Reloading on each open still picks up edits
+        // without a restart (matching `show_command_palette`).
+        let commands = RoostConfig::load_default().commands;
+        let root = self.launcher_frame(&commands);
+        let behavior = self.launcher_behavior(commands);
         let top_margin = self.palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
@@ -2489,57 +2495,51 @@ impl App {
         *self.palette.borrow_mut() = Some(overlay);
     }
 
-    /// Build the launcher frame from the (freshly reloaded) config's
-    /// `command =` list — matching how `show_command_palette` reloads
-    /// config on open, so edits appear without an app restart. An empty
-    /// list yields the "No commands configured" sentinel row.
-    fn launcher_frame(self: &Rc<Self>) -> PaletteFrame {
-        let cfg = RoostConfig::load_default();
-        let items = custom_command::launcher_items(&cfg.commands);
+    /// Build the launcher frame from a config snapshot's `command =`
+    /// list. An empty list yields the "No commands configured" sentinel.
+    fn launcher_frame(self: &Rc<Self>, commands: &[CustomCommand]) -> PaletteFrame {
+        let items = custom_command::launcher_items(commands);
         PaletteFrame::new("launcher", "Run a command…", items)
     }
 
-    /// Confirm on a launcher row → spawn the command in a new tab. The
-    /// `launch:none` sentinel (and any malformed id) is a no-op (stay
-    /// open). The launch is deferred to an idle tick so the palette
-    /// tears down before the new tab is opened + focused (mirrors the
-    /// notification jump).
-    fn launcher_behavior(self: &Rc<Self>) -> PaletteBehavior {
+    /// Confirm on a launcher row → spawn that command in a new tab. The
+    /// row id's index is resolved against the same `commands` snapshot the
+    /// frame was built from. The `launch:none` sentinel (and any stale id)
+    /// is a no-op (stay open). The launch is deferred to an idle tick so
+    /// the palette tears down before the new tab is opened + focused
+    /// (mirrors the notification jump).
+    fn launcher_behavior(self: &Rc<Self>, commands: Vec<CustomCommand>) -> PaletteBehavior {
         let weak = Rc::downgrade(self);
         PaletteBehavior::new(move |item| {
             let Some(app) = weak.upgrade() else {
                 return PaletteOutcome::Close;
             };
             match custom_command::launch_index(&item.id) {
-                Some(index) => {
+                Some(index) if index < commands.len() => {
+                    let cmd = commands[index].clone();
                     let weak2 = Rc::downgrade(&app);
                     glib::idle_add_local_once(move || {
                         if let Some(app) = weak2.upgrade() {
-                            app.launch_command(index);
+                            app.launch_command(&cmd);
                         }
                     });
                     PaletteOutcome::Close
                 }
-                None => PaletteOutcome::None, // "No commands configured" sentinel
+                _ => PaletteOutcome::None, // sentinel / stale id
             }
         })
     }
 
-    /// Spawn the launcher command at `index` in a new tab of the active
-    /// project, in the active tab's live cwd, running it through the
-    /// user's login shell. Auto-close on exit + the non-sticky title are
-    /// handled by the existing tab infrastructure — everything else
-    /// rides in the argv built by `custom_command::launch_argv`. Reloads
-    /// config so the index lines up with the frame the user just saw.
-    fn launch_command(self: &Rc<Self>, index: usize) {
+    /// Spawn `cmd` in a new tab of the active project, in the active tab's
+    /// live cwd, running it through the user's login shell. Auto-close on
+    /// exit + the non-sticky title are handled by the existing tab
+    /// infrastructure — everything else rides in the argv built by
+    /// `custom_command::launch_argv`.
+    fn launch_command(self: &Rc<Self>, cmd: &CustomCommand) {
         let pid = *self.active_project_id.borrow();
         if pid == 0 {
             return;
         }
-        let cfg = RoostConfig::load_default();
-        let Some(cmd) = cfg.commands.get(index) else {
-            return;
-        };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let argv = custom_command::launch_argv(&shell, cmd);
         let cwd = self.active_tab_cwd(pid);

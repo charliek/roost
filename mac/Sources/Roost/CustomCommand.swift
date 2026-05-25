@@ -154,14 +154,26 @@ private func tokenizeCommand(_ s: String) -> [String] {
 }
 
 /// Split an `env` value into `K=V` pairs on whitespace. Each pair splits
-/// on its first `=`; entries with an empty key are dropped.
+/// on its first `=`; a pair whose key isn't a valid env-var identifier is
+/// dropped (the value is single-quoted in `launchArgv`, but the key is
+/// spliced into `export K=…` verbatim, so an arbitrary key could inject
+/// shell — reject anything that isn't `[A-Za-z_][A-Za-z0-9_]*`).
 private func parseEnv(_ val: String, into env: inout [(String, String)]) {
     for pair in val.split(whereSeparator: { $0.isWhitespace }) {
         guard let eq = pair.firstIndex(of: "=") else { continue }
         let k = String(pair[..<eq])
         let v = String(pair[pair.index(after: eq)...])
-        if !k.isEmpty {
+        if isValidEnvKey(k) {
             env.append((k, v))
         }
     }
+}
+
+/// A POSIX-ish env-var name: non-empty, first char `[A-Za-z_]`, rest
+/// `[A-Za-z0-9_]`.
+private func isValidEnvKey(_ k: String) -> Bool {
+    func isStart(_ c: Character) -> Bool { c == "_" || (c.isASCII && c.isLetter) }
+    func isRest(_ c: Character) -> Bool { c == "_" || (c.isASCII && (c.isLetter || c.isNumber)) }
+    guard let first = k.first, isStart(first) else { return false }
+    return k.dropFirst().allSatisfy(isRest)
 }

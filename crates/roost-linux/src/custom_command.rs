@@ -158,15 +158,29 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Split an `env` value into `K=V` pairs on whitespace. Each pair splits
-/// on its first `=`; entries with an empty key are dropped.
+/// on its first `=`; a pair whose key isn't a valid env-var identifier is
+/// dropped (the value is single-quoted in `launch_argv`, but the key is
+/// spliced into `export K=…` verbatim, so an arbitrary key could inject
+/// shell — reject anything that isn't `[A-Za-z_][A-Za-z0-9_]*`).
 fn parse_env_into(val: &str, env: &mut Vec<(String, String)>) {
     for pair in val.split_whitespace() {
         if let Some((k, v)) = pair.split_once('=') {
-            if !k.is_empty() {
+            if is_valid_env_key(k) {
                 env.push((k.to_string(), v.to_string()));
             }
         }
     }
+}
+
+/// A POSIX-ish env-var name: non-empty, first char `[A-Za-z_]`, rest
+/// `[A-Za-z0-9_]`.
+fn is_valid_env_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -230,6 +244,20 @@ mod tests {
             vec![
                 ("A".to_string(), "1".to_string()),
                 ("B".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_key_must_be_identifier() {
+        // A key that isn't a valid identifier is dropped (it would
+        // otherwise splice into `export K=…` verbatim and inject shell).
+        let c = cmd(r#"label="a" run="b" env="GOOD=1 bad-key=2 A;rm=3 OK_2=4""#);
+        assert_eq!(
+            c.env,
+            vec![
+                ("GOOD".to_string(), "1".to_string()),
+                ("OK_2".to_string(), "4".to_string()),
             ]
         );
     }
