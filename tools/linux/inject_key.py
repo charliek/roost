@@ -99,6 +99,10 @@ def char_to_chord(ch):
 
 
 def open_device(needed_codes):
+    """Create + register a uinput keyboard advertising `needed_codes`.
+
+    Returns the open fd; the caller issues UI_DEV_DESTROY when done.
+    """
     fd = open("/dev/uinput", "wb", buffering=0)
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_SYN)
@@ -117,6 +121,7 @@ def open_device(needed_codes):
 
 
 def press_chord(fd, codes):
+    """Press `codes` together (in order), then release in reverse."""
     for c in codes:
         emit(fd, EV_KEY, c, 1)
         syn(fd)

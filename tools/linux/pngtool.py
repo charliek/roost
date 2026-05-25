@@ -26,6 +26,11 @@ import struct
 
 
 def load(path):
+    """Decode a PNG to (width, height, bytes_per_pixel, pixel_bytes).
+
+    Reverses each scanline's filter (None/Sub/Up/Average/Paeth) so the
+    returned buffer is raw top-to-bottom rows of `width*bpp` bytes.
+    """
     with open(path, "rb") as f:
         data = f.read()
     assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
