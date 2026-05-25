@@ -41,6 +41,7 @@ use roost_vt::{
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
+use crate::clipboard;
 use crate::key_encoder;
 use crate::theme::Theme;
 
@@ -197,20 +198,19 @@ impl TerminalView {
         // same logical-pixel space, so the division is consistent (see
         // the HiDPI note in app.rs `attach`). When the grid dimensions
         // change we fire `on_resize` so the PTY's `TIOCSWINSZ` tracks
-        // the window; the callback only enqueues on a channel, so
-        // calling it inside the borrow mirrors `input_callback`.
+        // the window. Per the callback invariant on `TerminalViewState`,
+        // clone the callback out and drop the borrow before invoking it.
         widget.connect_resize({
             let state = state.clone();
             move |widget, w, h| {
                 let mut s = state.borrow_mut();
-                let changed = s.reflow(w as f64, h as f64, false);
-                if changed {
-                    let (cols, rows) = (s.cols, s.rows);
-                    if let Some(cb) = s.on_resize.as_ref() {
-                        cb(cols, rows);
-                    }
-                }
+                let fire = s
+                    .reflow(w as f64, h as f64, false)
+                    .then(|| (s.on_resize.clone(), s.cols, s.rows));
                 drop(s);
+                if let Some((Some(cb), cols, rows)) = fire {
+                    cb(cols, rows);
+                }
                 widget.queue_draw();
             }
         });
@@ -248,9 +248,15 @@ impl TerminalView {
             let widget = widget.clone();
             move |_ctrl, _dx, dy| {
                 let mut s = state.borrow_mut();
-                s.handle_scroll(dy);
+                let bytes = s.handle_scroll(dy);
+                let cb = s.input_callback.clone();
                 drop(s);
                 widget.queue_draw();
+                if !bytes.is_empty() {
+                    if let Some(cb) = cb {
+                        cb(bytes);
+                    }
+                }
                 glib::Propagation::Stop
             }
         });
@@ -300,16 +306,14 @@ impl TerminalView {
         });
         // On selection commit, publish to the X11/Wayland PRIMARY
         // selection so a middle-click paste into another app works
-        // (the convention every Linux terminal honors). PRIMARY has no
-        // macOS analogue, so this is Linux-only.
-        #[cfg(not(target_os = "macos"))]
+        // (the convention every Linux terminal honors). `Target::Primary`
+        // is a no-op off Linux, so installing the handler unconditionally
+        // is harmless on macOS.
         drag.connect_drag_end({
             let state = state.clone();
             move |_g, _x, _y| {
                 if let Some(text) = selection_text(&state) {
-                    if let Some(display) = gtk4::gdk::Display::default() {
-                        display.primary_clipboard().set_text(&text);
-                    }
+                    clipboard::write(clipboard::Target::Primary, &text);
                 }
             }
         });
@@ -317,17 +321,19 @@ impl TerminalView {
 
         // Middle-click pastes the PRIMARY selection into this terminal,
         // matching Linux terminal convention. Routes through the same
-        // bracketed-paste-aware path as Ctrl+Shift+V. Linux-only.
-        #[cfg(not(target_os = "macos"))]
+        // bracketed-paste-aware path as Ctrl+Shift+V. The middle-click
+        // paste gesture is a genuinely Linux-only UI convention.
+        #[cfg(target_os = "linux")]
         {
             let middle_click = gtk4::GestureClick::new();
             middle_click.set_button(gtk4::gdk::BUTTON_MIDDLE);
             middle_click.connect_pressed({
                 let state = state.clone();
                 move |_gesture, _n_press, _x, _y| {
-                    if let Some(display) = gtk4::gdk::Display::default() {
-                        spawn_paste_from(state.clone(), display.primary_clipboard());
-                    }
+                    clipboard::read(clipboard::Target::Primary, {
+                        let state = state.clone();
+                        move |text| paste_text_into(&state, text)
+                    });
                 }
             });
             widget.add_controller(middle_click);
@@ -383,13 +389,12 @@ impl TerminalView {
         // land the same. Fire `on_resize` only when the grid dimensions
         // actually moved — the PTY only cares about cols/rows.
         let (w, h) = (self.widget.width(), self.widget.height());
-        if w > 0 && h > 0 && s.reflow(w as f64, h as f64, true) {
-            let (cols, rows) = (s.cols, s.rows);
-            if let Some(cb) = s.on_resize.as_ref() {
-                cb(cols, rows);
-            }
-        }
+        let fire = (w > 0 && h > 0 && s.reflow(w as f64, h as f64, true))
+            .then(|| (s.on_resize.clone(), s.cols, s.rows));
         drop(s);
+        if let Some((Some(cb), cols, rows)) = fire {
+            cb(cols, rows);
+        }
         self.widget.queue_draw();
     }
 
@@ -405,16 +410,18 @@ impl TerminalView {
         F: Fn(u16, u16) + 'static,
     {
         let mut s = self.state.borrow_mut();
-        s.on_resize = Some(Box::new(callback));
+        s.on_resize = Some(Rc::new(callback));
         let (w, h) = (self.widget.width(), self.widget.height());
-        if w > 0 && h > 0 {
+        let fire = if w > 0 && h > 0 {
             s.reflow(w as f64, h as f64, true);
-            let (cols, rows) = (s.cols, s.rows);
-            if let Some(cb) = s.on_resize.as_ref() {
-                cb(cols, rows);
-            }
-        }
+            Some((s.on_resize.clone(), s.cols, s.rows))
+        } else {
+            None
+        };
         drop(s);
+        if let Some((Some(cb), cols, rows)) = fire {
+            cb(cols, rows);
+        }
     }
 
     /// Swap the live theme on this terminal. Re-pushes the palette +
@@ -453,25 +460,23 @@ impl TerminalView {
         let Some(text) = selection_text(&self.state) else {
             return;
         };
-        if let Some(display) = gtk4::gdk::Display::default() {
-            display.clipboard().set_text(&text);
-            // PRIMARY is an X11/Wayland concept with no macOS analogue.
-            #[cfg(not(target_os = "macos"))]
-            display.primary_clipboard().set_text(&text);
-        }
+        clipboard::write(clipboard::Target::Clipboard, &text);
+        // PRIMARY is an X11/Wayland concept; `Target::Primary` no-ops
+        // off Linux.
+        clipboard::write(clipboard::Target::Primary, &text);
     }
 
     /// Read text from the system clipboard and feed it into the PTY.
     /// Wraps the payload in bracketed-paste escapes (`ESC[200~` …
     /// `ESC[201~`) when the terminal has DECSET 2004 active (zsh,
     /// bash with the bracketed-paste plugin, vim insert mode, etc.).
-    /// Async because the clipboard read is async; spawn on the GTK
-    /// main loop via `glib::spawn_future_local`.
+    /// The clipboard read is async; `clipboard::read` hops the result
+    /// back to the GTK main loop before `paste_text_into` runs.
     pub fn paste_from_clipboard(&self) {
-        let Some(display) = gtk4::gdk::Display::default() else {
-            return;
-        };
-        spawn_paste_from(self.state.clone(), display.clipboard());
+        let state = self.state.clone();
+        clipboard::read(clipboard::Target::Clipboard, move |text| {
+            paste_text_into(&state, text)
+        });
     }
 
     /// Install a keystroke handler. Called with raw UTF-8 bytes when
@@ -487,7 +492,7 @@ impl TerminalView {
         // tab is closed + reopened.
         let mut s = self.state.borrow_mut();
         let already_attached = s.input_callback.is_some();
-        s.input_callback = Some(Box::new(callback));
+        s.input_callback = Some(Rc::new(callback));
         drop(s);
         if already_attached {
             return;
@@ -522,34 +527,48 @@ impl TerminalView {
                         _ => {}
                     }
                 }
-                // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
-                // (the safe wrapper landed in commit 1). The encoder
-                // handles modifier conventions, Kitty keyboard
-                // protocol, DECCKM application-mode arrows, etc.
                 let mut s = state.borrow_mut();
-                let bytes = {
-                    let s_mut: &mut TerminalViewState = &mut s;
-                    key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, key, mods)
-                };
-                // Bare modifiers and unmapped chords encode to nothing.
-                // Crucially we must NOT clear the selection here: a copy
-                // shortcut (Alt+C / Ctrl+Shift+C) arrives as its modifier
-                // keypress *first*, and clearing on that would wipe the
-                // selection before the copy action reads it.
-                if bytes.is_empty() {
+                // A bare modifier (incl. the modifier that begins a copy
+                // chord such as Alt+C / Ctrl+Shift+C) must NOT disturb the
+                // selection or the scrollback position: clearing on that
+                // keypress would wipe the selection before the copy action
+                // reads it (the #99 fix).
+                if is_modifier_key(key) {
                     return glib::Propagation::Proceed;
                 }
-                // Real input: typing snaps the viewport back to the
-                // bottom (matches the Go binary's `cmd/roost/input.go:67`)
-                // and clears any active selection — typing overrides it.
+                // A real key: typing snaps the viewport back to the bottom
+                // (matches the Go binary's `cmd/roost/input.go:67`) and
+                // clears any active selection — even when the key encodes
+                // to nothing (dead keys / IME composition / unmapped),
+                // since typing always overrides a selection.
+                let snapped = s.scrolled_back;
                 if s.scrolled_back {
                     s.terminal.scroll_viewport(ScrollViewport::Bottom);
                     s.scrolled_back = false;
                     s.scroll_accum = 0.0;
                 }
-                s.selection = None;
-                widget.queue_draw();
-                if let Some(cb) = s.input_callback.as_ref() {
+                let had_selection = s.selection.take().is_some();
+                // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
+                // (the safe wrapper landed in commit 1). The encoder
+                // handles modifier conventions, Kitty keyboard protocol,
+                // DECCKM application-mode arrows, etc. Split-borrow so the
+                // encoder can take `&mut encoder` + `&terminal` at once.
+                let bytes = {
+                    let s_mut: &mut TerminalViewState = &mut s;
+                    key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, key, mods)
+                };
+                if snapped || had_selection {
+                    widget.queue_draw();
+                }
+                // Clone the callback out and drop the borrow before
+                // invoking, per the callback invariant on
+                // `TerminalViewState`.
+                let cb = s.input_callback.clone();
+                drop(s);
+                if bytes.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(cb) = cb {
                     cb(bytes);
                 }
                 glib::Propagation::Stop
@@ -594,7 +613,12 @@ struct TerminalViewState {
     /// TerminalView can be built before its session is spawned;
     /// `set_on_input` populates it once the daemon round-trip is
     /// ready.
-    input_callback: Option<Box<dyn Fn(Vec<u8>)>>,
+    ///
+    /// Callback invariant: `input_callback` and `on_resize` are cloned
+    /// out and invoked **after** the `state` borrow is dropped, so a
+    /// callback may safely re-enter the view. An `Rc` makes the clone
+    /// cheap (atomic-free, single-threaded GTK).
+    input_callback: Option<Rc<dyn Fn(Vec<u8>)>>,
     /// Live cell grid. Reflowed from the widget's pixel size on every
     /// `resize` signal; seeded with the `DEFAULT_COLS`/`DEFAULT_ROWS`
     /// the libghostty terminal was allocated with.
@@ -603,8 +627,9 @@ struct TerminalViewState {
     /// Caller-installed resize handler. Fired (with the new grid) when
     /// a reflow changes the column/row count so the PTY's window size
     /// (`TIOCSWINSZ`) tracks the widget. `set_on_resize` populates it
-    /// once the session is attached.
-    on_resize: Option<Box<dyn Fn(u16, u16)>>,
+    /// once the session is attached. See the callback invariant on
+    /// `input_callback`.
+    on_resize: Option<Rc<dyn Fn(u16, u16)>>,
 }
 
 /// Drag-selection state. Anchor = where the mouse-down landed,
@@ -834,7 +859,12 @@ impl TerminalViewState {
     ///     encoder. Lets vim / less consume the wheel.
     ///   * Primary screen — local viewport scroll via
     ///     `Terminal::scroll_viewport(Delta)`.
-    fn handle_scroll(&mut self, dy: f64) {
+    ///
+    /// Returns the bytes to feed into the PTY (the alt-screen arrow-key
+    /// encoding); empty for a local scrollback move. The caller
+    /// dispatches them through `input_callback` after dropping the
+    /// borrow, per the callback invariant on `TerminalViewState`.
+    fn handle_scroll(&mut self, dy: f64) -> Vec<u8> {
         // Smooth-scroll accumulator. Trackpad deltas are typically
         // fractional rows; discrete wheels are integers.
         self.scroll_accum += dy;
@@ -846,7 +876,7 @@ impl TerminalViewState {
             self.scroll_accum -= rows as f64;
             rows
         } else {
-            return;
+            return Vec::new();
         };
 
         if self.terminal.active_screen() == ActiveScreen::Alternate {
@@ -858,20 +888,19 @@ impl TerminalViewState {
             };
             let mut event = match roost_vt::KeyEvent::new() {
                 Ok(ev) => ev,
-                Err(_) => return,
+                Err(_) => return Vec::new(),
             };
             event.set_action(roost_vt::key_action::PRESS);
             event.set_key(key);
             event.set_mods(0);
             self.encoder.sync_from_terminal(&self.terminal);
+            let mut out = Vec::new();
             for _ in 0..rows_to_scroll.unsigned_abs() {
                 if let Ok(bytes) = self.encoder.encode(&event) {
-                    if let Some(cb) = self.input_callback.as_ref() {
-                        cb(bytes);
-                    }
+                    out.extend_from_slice(&bytes);
                 }
             }
-            return;
+            return out;
         }
 
         // Primary screen: local scrollback. Negative dy = scroll up
@@ -891,6 +920,7 @@ impl TerminalViewState {
             // path.
             self.scrolled_back = false;
         }
+        Vec::new()
     }
 
     /// Convert widget-pixel `(x, y)` to a (col, row) cell pair,
@@ -1078,32 +1108,28 @@ fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
     }
 }
 
-/// Read text from `clipboard` and feed it into the PTY, wrapping in
-/// bracketed-paste escapes when DECSET 2004 is active. Shared by
-/// Ctrl+Shift+V (CLIPBOARD) and, on Linux, middle-click (PRIMARY).
-/// Async because the clipboard read is async; spawned on the GTK main
-/// loop.
-fn spawn_paste_from(state: Rc<RefCell<TerminalViewState>>, clipboard: gtk4::gdk::Clipboard) {
-    glib::spawn_future_local(async move {
-        let Ok(text) = clipboard.read_text_future().await else {
-            return;
-        };
-        let Some(text) = text else { return };
+/// Feed pasted `text` into the PTY, wrapping in bracketed-paste escapes
+/// (`ESC[200~` … `ESC[201~`) when DECSET 2004 is active. Shared by
+/// Ctrl+Shift+V (CLIPBOARD) and, on Linux, middle-click (PRIMARY); the
+/// async clipboard read lives in `clipboard::read`. Reads the callback
+/// out of the borrow before invoking, per the callback invariant on
+/// `TerminalViewState`.
+fn paste_text_into(state: &Rc<RefCell<TerminalViewState>>, text: String) {
+    let (bracketed, cb) = {
         let s = state.borrow();
-        let bracketed = s.terminal.mode_get(2004);
-        let bytes = if bracketed {
-            let mut buf = Vec::with_capacity(text.len() + 8);
-            buf.extend_from_slice(b"\x1b[200~");
-            buf.extend_from_slice(text.as_bytes());
-            buf.extend_from_slice(b"\x1b[201~");
-            buf
-        } else {
-            text.as_bytes().to_vec()
-        };
-        if let Some(cb) = s.input_callback.as_ref() {
-            cb(bytes);
-        }
-    });
+        (s.terminal.mode_get(2004), s.input_callback.clone())
+    };
+    let Some(cb) = cb else { return };
+    let bytes = if bracketed {
+        let mut buf = Vec::with_capacity(text.len() + 8);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~");
+        buf
+    } else {
+        text.into_bytes()
+    };
+    cb(bytes);
 }
 
 /// Pure-function variant of `TerminalViewState::cell_at` for use from
@@ -1115,4 +1141,33 @@ fn cell_at_inner(x: f64, y: f64, cell_w: f64, cell_h: f64) -> Option<(u16, u16)>
     let col = (x / cell_w).floor().max(0.0) as u16;
     let row = (y / cell_h).floor().max(0.0) as u16;
     Some((col, row))
+}
+
+/// True for bare modifier keypresses (Shift/Ctrl/Alt/Super/etc.) that
+/// should never disturb an active selection or the scrollback position.
+/// Used by the key handler so a real key (including one that encodes to
+/// nothing — dead keys / IME) clears the selection while the modifier
+/// that begins a copy chord does not.
+fn is_modifier_key(key: gtk4::gdk::Key) -> bool {
+    use gtk4::gdk::Key as K;
+    matches!(
+        key,
+        K::Shift_L
+            | K::Shift_R
+            | K::Control_L
+            | K::Control_R
+            | K::Alt_L
+            | K::Alt_R
+            | K::Meta_L
+            | K::Meta_R
+            | K::Super_L
+            | K::Super_R
+            | K::Hyper_L
+            | K::Hyper_R
+            | K::ISO_Level3_Shift
+            | K::ISO_Level5_Shift
+            | K::Caps_Lock
+            | K::Num_Lock
+            | K::Shift_Lock
+    )
 }
