@@ -141,7 +141,6 @@ impl TabSession {
         let _ = self.cmd_tx.send(PtyCommand::Input(data));
     }
 
-    #[allow(dead_code)]
     pub fn send_resize(&self, cols: u16, rows: u16) {
         let _ = self.cmd_tx.send(PtyCommand::Resize { cols, rows });
     }

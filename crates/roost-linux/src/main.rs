@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use gtk4::glib::{self, LogWriterOutput};
@@ -121,25 +122,47 @@ fn main() -> anyhow::Result<()> {
             // Another instance holds the lock. Ask it to raise its
             // window via `app.activate` over IPC, then exit. The
             // tokio runtime isn't built yet here, so spin up a tiny
-            // current-thread one just for this call. If the dial or
-            // send fails (socket missing, instance shutting down),
-            // fall back to the diagnostic message. (#6)
+            // current-thread one just for this call. Bound the whole
+            // round-trip with a 2 s timeout so a wedged IPC server
+            // can't block the second launch indefinitely, and `warn`
+            // on every failure branch (timeout or connect/send error)
+            // so a recurring failure is visible in roost.log rather
+            // than silently swallowed. On any failure, fall through to
+            // the diagnostic message. (#6)
             let socket_path = profile.socket_path.clone();
             let activated = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .ok()
                 .map(|rt| {
-                    rt.block_on(async move {
-                        match IpcClient::connect(&socket_path).await {
-                            Ok(mut client) => client
+                    rt.block_on(async {
+                        let activate = async {
+                            let mut client = IpcClient::connect(&socket_path).await?;
+                            client
                                 .call_raw(
                                     roost_ipc::messages::ops::APP_ACTIVATE,
                                     serde_json::json!({}),
                                 )
-                                .await
-                                .is_ok(),
-                            Err(_) => false,
+                                .await?;
+                            anyhow::Ok(())
+                        };
+                        match tokio::time::timeout(Duration::from_secs(2), activate).await {
+                            Ok(Ok(())) => true,
+                            Ok(Err(err)) => {
+                                tracing::warn!(
+                                    ?err,
+                                    socket = %socket_path.display(),
+                                    "failed to activate running instance"
+                                );
+                                false
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    socket = %socket_path.display(),
+                                    "timed out activating running instance after 2s"
+                                );
+                                false
+                            }
                         }
                     })
                 })
