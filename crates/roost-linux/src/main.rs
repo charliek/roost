@@ -12,6 +12,7 @@
 
 mod app;
 mod cell_metrics;
+mod clipboard;
 mod config;
 mod custom_command;
 mod events;
