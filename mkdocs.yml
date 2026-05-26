@@ -112,7 +112,8 @@ nav:
           - Development setup: reference/legacy-go/development-setup.md
           - Design Spec (historical): development/spec.md
   - Development:
-      - Vision: development/vision.md
+      - Architecture & principles: development/vision.md
+      - Test automation: development/test-automation.md
       - Setup: development/setup.md
       - Claude integration testing: development/claude-testing.md
 

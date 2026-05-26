@@ -13,9 +13,20 @@ IPC socket for external tooling (`roostctl`, Claude hooks). No daemon.
 * IPC + path resolution: `crates/roost-ipc/`.
 * libghostty-vt FFI + OSC: `crates/roost-vt/`, `crates/roost-osc/`.
 
-See [docs/development/vision.md](docs/development/vision.md) for the
-target architecture and phased path; [docs/reference/ipc.md](docs/reference/ipc.md)
-for the JSON IPC wire format.
+**North star.** Every surface — UI clicks, hotkeys, `roostctl`, and Lua
+scripts — routes through **one core: the workspace operation set**; the
+UI is a *reaction* to the core's events, never its own source of truth.
+One contract (`roost-ipc`'s op set), two implementations (Swift + AppKit,
+Rust + GTK) kept at behavioral parity. Optimize for **testability,
+programmability, clean architecture**: adding a capability is "add an op
++ thin adapters", not per-surface logic. When in doubt, ask: *does this
+route through the one op set, keep the UI reactive, and stay at parity
+across both implementations?*
+
+See [docs/development/vision.md](docs/development/vision.md) for the full
+architecture, principles, and decision log;
+[docs/reference/ipc.md](docs/reference/ipc.md) for the JSON IPC wire
+format.
 
 ## Branch policy
 
