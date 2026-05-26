@@ -308,10 +308,7 @@ impl App {
         app: &libadwaita::Application,
         rt: Handle,
         client: LocalClient,
-        activate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
-        screenshot_rx: Option<
-            tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::ScreenshotRequest>,
-        >,
+        ui_rx: Option<tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::UiRequest>>,
     ) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
@@ -717,28 +714,27 @@ impl App {
 
         app_struct.window.present();
 
-        // #6: a second launch that loses the single-instance flock
-        // dials `app.activate`; the IPC handler forwards a unit here.
-        // Raise + focus the window on the GTK main thread.
-        if let Some(mut activate_rx) = activate_rx {
+        // UI bridge: the IPC handler (a tokio worker) forwards every
+        // main-thread-only op here as a `UiRequest`. Drain them on the
+        // GTK main thread and service each — raise the window, render a
+        // screenshot, or walk a tab's render state — replying over the
+        // request's oneshot for the request-reply variants. One loop
+        // replaces the former per-op activate/screenshot/dump drains.
+        if let Some(mut ui_rx) = ui_rx {
+            let app = app_struct.clone();
             let window = app_struct.window.clone();
             glib::spawn_future_local(async move {
-                while activate_rx.recv().await.is_some() {
-                    window.present();
-                }
-            });
-        }
-
-        // `app.screenshot`: the IPC handler forwards a render request +
-        // a oneshot reply channel here. Render synchronously on the main
-        // thread (GTK + the renderer are main-thread-only) and reply with
-        // the PNG bytes.
-        if let Some(mut screenshot_rx) = screenshot_rx {
-            let window = app_struct.window.clone();
-            glib::spawn_future_local(async move {
-                while let Some(req) = screenshot_rx.recv().await {
-                    let result = render_window_png(&window, req.scale);
-                    let _ = req.reply.send(result);
+                use roost_linux::ipc::UiRequest;
+                while let Some(req) = ui_rx.recv().await {
+                    match req {
+                        UiRequest::Activate => window.present(),
+                        UiRequest::Screenshot { scale, reply } => {
+                            let _ = reply.send(render_window_png(&window, scale));
+                        }
+                        UiRequest::Dump { tab_id, reply } => {
+                            let _ = reply.send(app.dump_tab(tab_id));
+                        }
+                    }
                 }
             });
         }
@@ -2907,6 +2903,34 @@ impl App {
         let tab_id = parse_tab_id_from_page(&page)?;
         let view = ui.tabs.borrow().get(&tab_id).map(|t| t.view.clone());
         view
+    }
+
+    /// Find the `TerminalView` for any tab id (not just the active one)
+    /// by scanning every project's tab map. Backs `tab.dump`.
+    fn terminal_view_for(self: &Rc<Self>, tab_id: i64) -> Option<Rc<TerminalView>> {
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                return Some(tab.view.clone());
+            }
+        }
+        None
+    }
+
+    /// Read a tab's terminal viewport as text for the `tab.dump` op.
+    /// Errors (→ `not-found` on the wire) when the tab has no live
+    /// `TerminalView`.
+    fn dump_tab(self: &Rc<Self>, tab_id: i64) -> Result<roost_linux::ipc::DumpData, String> {
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        let d = view.dump();
+        Ok(roost_linux::ipc::DumpData {
+            cols: d.cols,
+            rows: d.rows,
+            cursor: d.cursor.map(|c| (c.row, c.col, c.visible)),
+            rows_text: d.rows_text,
+        })
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {

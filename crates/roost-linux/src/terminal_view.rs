@@ -99,6 +99,24 @@ pub struct TerminalView {
     state: Rc<RefCell<TerminalViewState>>,
 }
 
+/// Text snapshot of a terminal viewport, produced by [`TerminalView::dump`]
+/// for the `tab.dump` IPC op. `rows_text` has one trimmed line per visible
+/// row; `cursor` is `None` when off-viewport.
+pub struct TerminalDump {
+    pub cols: u32,
+    pub rows: u32,
+    pub cursor: Option<DumpCursor>,
+    pub rows_text: Vec<String>,
+}
+
+/// Cursor position inside a [`TerminalDump`] (0-indexed from the top-left).
+#[derive(Clone, Copy)]
+pub struct DumpCursor {
+    pub row: u32,
+    pub col: u32,
+    pub visible: bool,
+}
+
 impl TerminalView {
     pub fn new() -> Self {
         Self::with_theme(Theme::default())
@@ -119,6 +137,12 @@ impl TerminalView {
         let view = Self::with_theme(theme);
         view.apply_font(font_family, font_size_pt);
         view
+    }
+
+    /// Snapshot the live terminal viewport as text for `tab.dump`.
+    /// Main-thread-only — touches the libghostty handle + render state.
+    pub fn dump(&self) -> TerminalDump {
+        self.state.borrow_mut().dump_text()
     }
 
     pub fn with_theme(theme: Theme) -> Self {
@@ -699,6 +723,45 @@ impl TerminalViewState {
             tracing::warn!(?err, new_cols, new_rows, "terminal resize failed");
         }
         changed
+    }
+
+    /// Snapshot the live viewport as text for the `tab.dump` IPC op:
+    /// one trimmed line per row (a blank cell becomes a space so columns
+    /// line up) plus the cursor. Mirrors `paint`'s update→cursor→walk
+    /// but accumulates text instead of drawing. Cells arrive in column
+    /// order across the full grid, so appending reconstructs each row.
+    fn dump_text(&mut self) -> TerminalDump {
+        if let Err(err) = self.render_state.update(&self.terminal) {
+            tracing::warn!(?err, "render_state.update failed for tab.dump");
+        }
+        let cursor = self.render_state.cursor().map(|c| DumpCursor {
+            row: c.row,
+            col: c.col,
+            visible: c.visible,
+        });
+        let mut lines: Vec<String> = vec![String::new(); self.rows as usize];
+        let _ = self.render_state.walk(&self.terminal, |row, cell: Cell| {
+            if let Some(line) = lines.get_mut(row as usize) {
+                if cell.text.is_empty() {
+                    line.push(' ');
+                } else {
+                    line.push_str(&cell.text);
+                }
+            }
+        });
+        for line in &mut lines {
+            // Trim only ASCII spaces (the blank-cell filler above), not
+            // all Unicode whitespace, so the dump matches the Mac
+            // `dumpText` rstrip byte-for-byte (cross-UI parity).
+            let end = line.trim_end_matches(' ').len();
+            line.truncate(end);
+        }
+        TerminalDump {
+            cols: self.cols as u32,
+            rows: self.rows as u32,
+            cursor,
+            rows_text: lines,
+        }
     }
 
     fn paint(&mut self, widget: &DrawingArea, cr: &cairo::Context, width: f64, height: f64) {

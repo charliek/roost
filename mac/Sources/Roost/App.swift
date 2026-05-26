@@ -264,6 +264,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             )
         }
 
+        // Register the UI bridge *before* `start()` binds the IPC
+        // socket, so `RoostBackend.shared.ui` is never nil while the
+        // socket is reachable. The window + tabs are built below, so
+        // bridge-backed ops still surface their own honest errors until
+        // then (`mainWindow` nil → "no window"; no tab → "not-found")
+        // rather than a misleading "no UI attached". Storing `self` is
+        // side-effect-free; `self` is fully initialized as the delegate.
+        RoostBackend.shared.registerUI(self)
         RoostBackend.shared.start(
             profile: profile,
             holdsSingleInstanceLock: holdsLock
@@ -408,9 +416,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
-        // Hand the window to the IPC-facing backend so the
-        // `app.screenshot` handler can render it in-process.
-        RoostBackend.shared.registerWindow(window)
 
         // Round-6 R6.B: seat the divider at the persisted (or
         // default) sidebar width AFTER the window has been ordered
@@ -1077,6 +1082,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if activate {
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    /// Read any tab's terminal viewport as text for the `tab.dump` IPC
+    /// op (not just the active one). `nil` when no `TabSession` holds
+    /// that id. Called on the main actor from `IPCHandlerImpl`.
+    @MainActor
+    func dumpTab(tabID: Int64) -> TerminalView.Dump? {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return nil }
+        return session.terminalView.dumpText()
     }
 
     /// Mirror the inbox count onto the Dock tile badge. `nil` at zero so
@@ -4006,6 +4020,12 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         endEdit()
         cancel?()
     }
+}
+
+extension RoostApp: UiBridge {
+    /// Expose the (private) window to the IPC handler via the bridge.
+    /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
+    var mainWindow: NSWindow? { window }
 }
 
 extension RoostApp: NSOutlineViewDataSource {

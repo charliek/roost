@@ -190,16 +190,11 @@ fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(Workspace::open(profile.state_json_path()));
     let supervisor = Arc::new(PtySupervisor::new());
 
-    // Activation bridge: a second launch dials `app.activate`; the
-    // handler forwards a unit here for the GTK thread to raise the
-    // window (#6).
-    let (activate_tx, activate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-    // Screenshot bridge: `app.screenshot` forwards a render request
-    // here; the GTK main thread renders the window and replies with
-    // the PNG bytes over the request's oneshot.
-    let (screenshot_tx, screenshot_rx) =
-        tokio::sync::mpsc::unbounded_channel::<roost_linux::ipc::ScreenshotRequest>();
+    // UI bridge: ops that must touch GTK / libghostty (activate,
+    // screenshot, dump) forward a `UiRequest` here; the GTK main thread
+    // drains it and services each (replying over the request's oneshot
+    // for the request-reply variants). One channel for all such ops.
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<roost_linux::ipc::UiRequest>();
 
     // Bind the JSON IPC server *synchronously* before any UI surface
     // exists, so `roostctl identify` right after launch succeeds. The
@@ -216,8 +211,7 @@ fn main() -> anyhow::Result<()> {
             profile.app_label.to_string(),
             profile.app_id.to_string(),
         )
-        .with_activate(activate_tx)
-        .with_screenshot(screenshot_tx);
+        .with_ui(ui_tx);
         rt_handle
             .block_on(IpcServer::bind(&socket_path, handler))
             .context("bind IPC server")?
@@ -232,11 +226,10 @@ fn main() -> anyhow::Result<()> {
 
     let app = Application::builder().application_id(APP_ID).build();
     let client_for_activate = client.clone();
-    // `connect_activate` is `Fn`, but the activate receiver isn't
-    // Clone and is consumed once. Wrap it so the first (only) GTK
-    // activation hands it to the App; any later activation gets None.
-    let activate_rx = std::cell::RefCell::new(Some(activate_rx));
-    let screenshot_rx = std::cell::RefCell::new(Some(screenshot_rx));
+    // `connect_activate` is `Fn`, but the UI receiver isn't Clone and is
+    // consumed once. Wrap it so the first (only) GTK activation hands it
+    // to the App; any later activation gets None.
+    let ui_rx = std::cell::RefCell::new(Some(ui_rx));
     app.connect_activate(move |app| {
         // The App handle is reference-counted via `Rc`; we hand the
         // outer LocalClient to it so the bootstrap futures stay
@@ -245,8 +238,7 @@ fn main() -> anyhow::Result<()> {
             app,
             rt_handle.clone(),
             client_for_activate.clone(),
-            activate_rx.borrow_mut().take(),
-            screenshot_rx.borrow_mut().take(),
+            ui_rx.borrow_mut().take(),
         );
     });
 

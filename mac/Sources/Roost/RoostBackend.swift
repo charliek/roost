@@ -24,6 +24,20 @@ import AppKit
 import Darwin
 import Foundation
 
+/// The running UI, as seen by the IPC handler. One seam for every
+/// main-thread-only op so the handler never reaches for `NSApp.delegate`
+/// or pokes AppKit directly. `RoostApp` is the only conformer; the
+/// GTK side's equivalent is the `UiRequest` channel
+/// (`crates/roost-linux/src/ipc.rs`).
+@MainActor
+protocol UiBridge: AnyObject {
+    /// Main window, for whole-window ops (`app.screenshot`).
+    var mainWindow: NSWindow? { get }
+    /// Read a tab's terminal viewport as text (`tab.dump`); `nil` when
+    /// no live tab holds that id.
+    func dumpTab(tabID: Int64) -> TerminalView.Dump?
+}
+
 @MainActor
 final class RoostBackend {
     static let shared = RoostBackend()
@@ -38,16 +52,17 @@ final class RoostBackend {
     /// process), so it's never explicitly unsubscribed.
     private var supervisorExitToken: UUID?
 
-    /// The main UI window, registered by `RoostApp` once it's built.
-    /// Weak so the backend singleton never keeps a closed window
-    /// alive. The `app.screenshot` IPC handler reads this on the main
-    /// actor to render the live UI in-process.
-    private(set) weak var mainWindow: NSWindow?
+    /// The running UI, registered by `RoostApp` once it's built. Weak so
+    /// the backend singleton never keeps a torn-down UI alive. This is
+    /// the single seam the IPC handler uses to reach anything that needs
+    /// the main actor (window render for `app.screenshot`, render-state
+    /// walk for `tab.dump`) — without the handler holding AppKit refs or
+    /// reaching for `NSApp.delegate`.
+    private(set) weak var ui: (any UiBridge)?
 
-    /// Called by `RoostApp` after the window is created. Lets the IPC
-    /// handler reach the window without the handler holding AppKit refs.
-    func registerWindow(_ window: NSWindow) {
-        self.mainWindow = window
+    /// Called by `RoostApp` after the window is created.
+    func registerUI(_ ui: any UiBridge) {
+        self.ui = ui
     }
 
     /// True iff the caller has confirmed (via M4c's
