@@ -10,3 +10,10 @@ docs = [
     "mkdocs-material>=9.6.14",
     "pymdown-extensions>=10.15",
 ]
+test = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tools/roosttest"]
+addopts = "-ra"
