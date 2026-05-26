@@ -113,6 +113,23 @@ class Roost:
     def set_title(self, tab_id: int, title: str) -> None:
         self.call("tab.set_title", {"tab_id": str(tab_id), "title": title})
 
+    def resize(self, tab_id: int, cols: int, rows: int) -> None:
+        self.call("tab.resize", {"tab_id": str(tab_id), "cols": cols, "rows": rows})
+
+    def rename_project(self, project_id: int, name: str) -> None:
+        self.call("project.rename", {"project_id": str(project_id), "name": name})
+
+    def reorder_tabs(self, project_id: int, tab_ids: list[int]) -> None:
+        self.call("tab.reorder", {"project_id": str(project_id),
+                                  "tab_ids": [str(t) for t in tab_ids]})
+
+    def project(self, project_id: int) -> dict | None:
+        return next((p for p in self.list() if int(p["id"]) == project_id), None)
+
+    def project_tab_ids(self, project_id: int) -> list[int]:
+        p = self.project(project_id)
+        return [int(t["id"]) for t in (p["tabs"] if p else [])]
+
     def notify(self, tab_id: int, title: str, body: str = "") -> None:
         self.call("notification.create", {"tab_id": str(tab_id), "title": title, "body": body})
 

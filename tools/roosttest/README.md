@@ -31,6 +31,7 @@ Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
 | `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. |
 | `test_notifications.py` | The multi-project notification inbox: `view_notifications` frame, jump-to-notification (focuses the tab + clears its badge), clear-all. |
 | `test_launcher.py` | The custom-command launcher (Cmd/Alt+Shift+T): lists the seeded commands + activating one spawns a tab that runs it. |
+| `test_terminal.py` | Program-driven terminal behavior: OSC 7 cwd tracking via a real `cd` (skip-guarded for shells without OSC 7). |
 | `fixtures/launcher.conf` | Seed config the harness points the UI at via `ROOST_CONFIG` (see below), giving the launcher tests a deterministic command list. |
 
 The shared `palette` fixture (open from closed, leave closed) lives in
@@ -77,6 +78,20 @@ def test_echo(roost, project):
     roost.wait_text(tab, "X=42")            # waits for the output
     assert "X=42" in roost.dump_text(tab)
 ```
+
+## Out of scope here (use the other harnesses)
+
+Some behavior isn't deterministically drivable through the IPC op set —
+it's pixel- or input- or shell-level. It lives elsewhere, by design:
+
+| Behavior | Why not here | Where |
+|---|---|---|
+| Selection + copy, real clipboard paste | mouse selection + OS clipboard, not IPC | `tools/linux` (uinput inject + clipread) |
+| Live resize / reflow | the UI sizes the grid to the window, so `tab.resize` doesn't pin a size | `tools/uitest` (resize window, check reflow) |
+| Theme color rendering | `tab.dump` is text-only (no color) | `tools/uitest` screenshots |
+| OSC 2 window-title | cwd-derived title + the shell re-emits each prompt overwrites it | `tools/uitest` (visible title) |
+| OSC parsing itself | — | `roost-osc` unit tests (osc2/osc7/osc777) |
+| Sidebar open/close | no IPC-observable state | `tools/uitest`, or add an `identify` field |
 
 See [`docs/development/test-automation.md`](../../docs/development/test-automation.md)
 for the plan (CI tiers, `roostctl wait`, the relationship to
