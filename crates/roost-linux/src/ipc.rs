@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use roost_ipc::messages::{
     ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    PaletteActivateParams, PaletteOpenParams, PaletteQueryParams, PaletteStateResult,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
     TabCloseParams, TabDumpCursor, TabDumpParams, TabDumpResult, TabFocusParams, TabFocusResult,
@@ -46,6 +47,13 @@ type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), 
 /// error message (e.g. tab not found / no live terminal) on failure.
 type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
 
+/// Reply for the `palette.*` [`UiRequest`]s: the resulting palette state.
+/// Shared by all five — each mutating op answers with the state it
+/// produced, so a driver needs no follow-up `palette.state`. Only
+/// `PaletteActivate` ever returns the `Err` arm (no palette open, or no
+/// row with the given id); the rest always answer `Ok`.
+type PaletteReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, String>>;
+
 /// One unit of work the IPC handler (a tokio worker thread) hands to the
 /// GTK main thread — the single seam for anything an op needs to do
 /// against GTK / libghostty, which are main-thread-only. The UI drains
@@ -61,6 +69,19 @@ pub enum UiRequest {
     Screenshot { scale: u32, reply: ScreenshotReply },
     /// Read a tab's terminal viewport as text.
     Dump { tab_id: i64, reply: DumpReply },
+    /// Open a command-palette root frame and reply with its state.
+    /// `kind`: "" / "commands" → command palette; "launcher" → the
+    /// custom-command launcher.
+    PaletteOpen { kind: String, reply: PaletteReply },
+    /// Reply with the current palette state (open?, frame, query, rows).
+    PaletteState { reply: PaletteReply },
+    /// Set the current frame's filter; reply with the filtered state.
+    PaletteQuery { query: String, reply: PaletteReply },
+    /// Activate the visible row with this item id — the same dispatch as
+    /// its keybind — and reply with the resulting state.
+    PaletteActivate { id: String, reply: PaletteReply },
+    /// Dismiss any open palette; reply with the (closed) state.
+    PaletteDismiss { reply: PaletteReply },
 }
 
 use crate::daemon::state::WorkspaceError;
@@ -397,6 +418,57 @@ async fn dispatch(
                 scale: p.scale,
             })
         }
+        ops::PALETTE_OPEN => {
+            let p: PaletteOpenParams = decode(params)?;
+            if !matches!(p.kind.as_str(), "" | "commands" | "launcher") {
+                return Err(HandlerError::invalid_param(format!(
+                    "unknown palette kind {:?} (want \"commands\" or \"launcher\")",
+                    p.kind
+                )));
+            }
+            let state = h
+                .ui_call(|reply| UiRequest::PaletteOpen {
+                    kind: p.kind,
+                    reply,
+                })
+                .await?
+                .map_err(palette_err)?;
+            encode(&state)
+        }
+        ops::PALETTE_STATE => {
+            // Nullary: ignore params (the envelope carries `{}`).
+            let state = h
+                .ui_call(|reply| UiRequest::PaletteState { reply })
+                .await?
+                .map_err(palette_err)?;
+            encode(&state)
+        }
+        ops::PALETTE_QUERY => {
+            let p: PaletteQueryParams = decode(params)?;
+            let state = h
+                .ui_call(|reply| UiRequest::PaletteQuery {
+                    query: p.query,
+                    reply,
+                })
+                .await?
+                .map_err(palette_err)?;
+            encode(&state)
+        }
+        ops::PALETTE_ACTIVATE => {
+            let p: PaletteActivateParams = decode(params)?;
+            let state = h
+                .ui_call(|reply| UiRequest::PaletteActivate { id: p.id, reply })
+                .await?
+                .map_err(palette_err)?;
+            encode(&state)
+        }
+        ops::PALETTE_DISMISS => {
+            let state = h
+                .ui_call(|reply| UiRequest::PaletteDismiss { reply })
+                .await?
+                .map_err(palette_err)?;
+            encode(&state)
+        }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -470,4 +542,11 @@ fn pty_err(e: crate::daemon::PtyError) -> HandlerError {
         | crate::daemon::PtyError::Cancelled(_) => HandlerError::not_found(e.to_string()),
         crate::daemon::PtyError::DuplicateTab(_) => HandlerError::invalid_param(e.to_string()),
     }
+}
+
+/// Map a `palette.activate` failure to the wire. Both cases — no palette
+/// open, or no visible row with the requested id — are "act on something
+/// that isn't there", i.e. `not-found`.
+fn palette_err(msg: String) -> HandlerError {
+    HandlerError::not_found(msg)
 }

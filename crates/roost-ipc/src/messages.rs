@@ -290,6 +290,76 @@ pub struct TabDumpResult {
 }
 
 // ============================================================================
+// Command palette (overlay introspection + drive)
+// ============================================================================
+//
+// The palette is a UI overlay, not workspace state, so these ops route
+// through the UI seam (a `UiRequest` on GTK / the `UiBridge` on Mac)
+// rather than the workspace. They make the palette a driveable, testable
+// command surface: open it, read its rows, filter, and activate a row —
+// where activating dispatches the *same* command an item's keybind would
+// (a command row's id IS the KeybindAction id), so a palette test is also
+// a command-dispatch test. Every op replies with the resulting
+// `PaletteStateResult`, so a driver asserts without a second round-trip.
+
+/// `palette.open` params: which root frame to present. Empty or
+/// `"commands"` opens the command palette; `"launcher"` opens the
+/// custom-command launcher. An unknown kind is rejected `invalid-param`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaletteOpenParams {
+    #[serde(default)]
+    pub kind: String,
+}
+
+/// `palette.query` params: replace the current frame's filter text
+/// (resetting selection to the top match), as if the user typed it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaletteQueryParams {
+    pub query: String,
+}
+
+/// `palette.activate` params: confirm the visible row whose item id
+/// matches — exactly as pressing Enter on it would, running its command
+/// or drilling into its sub-frame. `not-found` if no visible row has
+/// that id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaletteActivateParams {
+    pub id: String,
+}
+
+/// One visible palette row. `id` is the activation key (a KeybindAction
+/// id for command rows; a theme name / notification id in sub-frames).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteItemView {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+}
+
+/// Snapshot of the palette after an op. `open` is false when no palette
+/// is up (the remaining fields are then default/empty). When open,
+/// `frame` is the current frame id (`"commands"` | `"launcher"` |
+/// `"themes"` | `"notifications"`), `query`/`selection` are the live
+/// filter + highlight, and `items` are the filtered rows in display
+/// order. Permissive on the wire for forward-compatible fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteStateResult {
+    pub open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub selection: u32,
+    #[serde(default)]
+    pub items: Vec<PaletteItemView>,
+}
+
+// ============================================================================
 // Project lifecycle
 // ============================================================================
 
@@ -573,6 +643,16 @@ pub mod ops {
     /// so an agent can `see` the live UI without OS screen capture.
     pub const SCREENSHOT: &str = "app.screenshot";
 
+    /// Command-palette overlay: open a root frame, read the current
+    /// frame's rows, set the filter, activate a row (same dispatch as its
+    /// keybind), and dismiss. Each replies with the resulting palette
+    /// state. UI-only — routed through the UI seam, not the workspace.
+    pub const PALETTE_OPEN: &str = "palette.open";
+    pub const PALETTE_STATE: &str = "palette.state";
+    pub const PALETTE_QUERY: &str = "palette.query";
+    pub const PALETTE_ACTIVATE: &str = "palette.activate";
+    pub const PALETTE_DISMISS: &str = "palette.dismiss";
+
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
     pub const EVENT_TAB_STATE_CHANGED: &str = "tab.state_changed";
@@ -814,6 +894,47 @@ mod tests {
             "None cursor must be omitted: {json}"
         );
         round_trip(&no_cursor);
+    }
+
+    #[test]
+    fn palette_round_trips_and_closed_state_is_minimal() {
+        let open: PaletteOpenParams = serde_json::from_str(r#"{"kind":"launcher"}"#).unwrap();
+        assert_eq!(open.kind, "launcher");
+        round_trip(&open);
+        // kind defaults to empty (the command palette) when omitted.
+        round_trip(&PaletteOpenParams::default());
+        round_trip(&PaletteQueryParams {
+            query: "the".into(),
+        });
+        round_trip(&PaletteActivateParams {
+            id: "new_tab".into(),
+        });
+
+        let live = PaletteStateResult {
+            open: true,
+            frame: Some("commands".into()),
+            query: "tab".into(),
+            selection: 2,
+            items: vec![
+                PaletteItemView {
+                    id: "new_tab".into(),
+                    title: "New Tab".into(),
+                    subtitle: None,
+                },
+                PaletteItemView {
+                    id: "n:7".into(),
+                    title: "Build done".into(),
+                    subtitle: Some("exit 0".into()),
+                },
+            ],
+        };
+        round_trip(&live);
+
+        // Closed: `frame` omitted (skip_serializing_if), defaults restore it.
+        let closed = PaletteStateResult::default();
+        let json = serde_json::to_string(&closed).unwrap();
+        assert!(!json.contains("frame"), "closed state omits frame: {json}");
+        round_trip(&closed);
     }
 
     #[test]

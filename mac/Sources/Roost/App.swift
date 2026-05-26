@@ -4026,6 +4026,68 @@ extension RoostApp: UiBridge {
     /// Expose the (private) window to the IPC handler via the bridge.
     /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
     var mainWindow: NSWindow? { window }
+
+    // MARK: command palette — IPC drive surface (palette.* ops)
+    //
+    // The IPC handler reaches the live `PalettePanel` through these (same
+    // file, so the private `showCommandPalette` / `palette` are in
+    // scope). Each holds a local strong ref to the panel before driving
+    // it, since a confirm's dismiss sets `self.palette = nil` mid-call.
+
+    /// `palette.open`: present a root frame (kind pre-validated by the
+    /// IPC layer: "" / "commands" → command palette, "launcher" → the
+    /// custom-command launcher), then read back its state.
+    func openPalette(kind: String) -> PaletteSnapshot {
+        if kind == "launcher" {
+            showCommandLauncher(nil)
+        } else {
+            showCommandPalette(nil)
+        }
+        return paletteSnapshot()
+    }
+
+    /// `palette.state`: snapshot the live palette, or the closed state.
+    func paletteState() -> PaletteSnapshot {
+        paletteSnapshot()
+    }
+
+    /// `palette.query`: set the filter on the open palette (no-op when
+    /// closed), then read back.
+    func paletteQuery(_ text: String) -> PaletteSnapshot {
+        palette?.driveQuery(text)
+        return paletteSnapshot()
+    }
+
+    /// `palette.activate`: confirm the visible row with `id` (the same
+    /// dispatch as its keybind). `nil` (→ `not-found`) when no palette is
+    /// open or no row matches.
+    func paletteActivate(id: String) -> PaletteSnapshot? {
+        guard let panel = palette else { return nil }
+        guard panel.driveActivate(id: id) else { return nil }
+        return paletteSnapshot()
+    }
+
+    /// `palette.dismiss`: close any open palette (no-op when closed),
+    /// then read back the closed state.
+    func dismissPaletteOverlay() -> PaletteSnapshot {
+        palette?.driveDismiss()
+        return paletteSnapshot()
+    }
+
+    /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.
+    private func paletteSnapshot() -> PaletteSnapshot {
+        guard let panel = palette else { return .closed }
+        let s = panel.driveSnapshot()
+        return PaletteSnapshot(
+            open: true,
+            frame: s.frame,
+            query: s.query,
+            selection: s.selection,
+            items: s.items.map {
+                PaletteSnapshot.Item(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+            }
+        )
+    }
 }
 
 extension RoostApp: NSOutlineViewDataSource {

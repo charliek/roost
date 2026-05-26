@@ -148,6 +148,33 @@ class Roost:
         r = self.call("app.screenshot", {"scale": scale})
         return base64.b64decode(r["png"]), r["width"], r["height"]
 
+    # -- command palette --------------------------------------------------
+    # Each op returns the resulting palette state:
+    #   {open: bool, frame?: str, query: str, selection: int,
+    #    items: [{id, title, subtitle?}]}
+    # Activating a row dispatches the same command its keybind would, so
+    # these drive command dispatch, not just the overlay.
+    def palette_open(self, kind: str = "commands") -> dict:
+        return self.call("palette.open", {"kind": kind})
+
+    def palette_state(self) -> dict:
+        return self.call("palette.state")
+
+    def palette_query(self, query: str) -> dict:
+        return self.call("palette.query", {"query": query})
+
+    def palette_activate(self, item_id: str) -> dict:
+        """Confirm the row with `item_id`. Raises RoostError('not-found')
+        if no palette is open or no visible row matches."""
+        return self.call("palette.activate", {"id": item_id})
+
+    def palette_dismiss(self) -> dict:
+        return self.call("palette.dismiss")
+
+    @staticmethod
+    def palette_item_ids(state: dict) -> list[str]:
+        return [it["id"] for it in state.get("items", [])]
+
     # -- waits (poll the op set; no sleeps in tests) ----------------------
     def wait_state(self, tab_id: int, state: str, timeout: float = 5.0) -> None:
         self._wait(lambda: (self.tab(tab_id) or {}).get("state") == state,

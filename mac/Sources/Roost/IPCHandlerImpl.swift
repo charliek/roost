@@ -86,6 +86,16 @@ actor IPCHandlerImpl: IPCHandler {
             return AnyCodable([:] as [String: Any])
         case "app.screenshot":
             return try await encodeResult(self.screenshotCapture(params: params))
+        case "palette.open":
+            return try await encodeResult(self.paletteOpen(params: params))
+        case "palette.state":
+            return try await encodeResult(self.paletteState(params: params))
+        case "palette.query":
+            return try await encodeResult(self.paletteQuery(params: params))
+        case "palette.activate":
+            return try await encodeResult(self.paletteActivate(params: params))
+        case "palette.dismiss":
+            return try await encodeResult(self.paletteDismiss(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -391,6 +401,63 @@ actor IPCHandlerImpl: IPCHandler {
             },
             rowsText: dump.rowsText
         )
+    }
+
+    // MARK: command palette (palette.* ops)
+    //
+    // UI-only ops: routed through the registered `UiBridge`, not the
+    // workspace — the palette is overlay state, not persisted state.
+    // Each returns the resulting `PaletteStateResult` so a driver needs
+    // no follow-up `palette.state`.
+
+    @MainActor
+    private func paletteOpen(params: AnyCodable?) async throws -> IPCPaletteStateResult {
+        let p = try decodeParams(params, as: IPCPaletteOpenParams.self, expected: ["kind"])
+        let kind = p.kind ?? ""
+        guard ["", "commands", "launcher"].contains(kind) else {
+            throw IPCHandlerError.invalidParam(
+                "unknown palette kind \"\(kind)\" (want \"commands\" or \"launcher\")")
+        }
+        let ui = try paletteUI()
+        return IPCPaletteStateResult(ui.openPalette(kind: kind))
+    }
+
+    @MainActor
+    private func paletteState(params: AnyCodable?) async throws -> IPCPaletteStateResult {
+        _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
+        return IPCPaletteStateResult(try paletteUI().paletteState())
+    }
+
+    @MainActor
+    private func paletteQuery(params: AnyCodable?) async throws -> IPCPaletteStateResult {
+        let p = try decodeParams(params, as: IPCPaletteQueryParams.self, expected: ["query"])
+        return IPCPaletteStateResult(try paletteUI().paletteQuery(p.query))
+    }
+
+    @MainActor
+    private func paletteActivate(params: AnyCodable?) async throws -> IPCPaletteStateResult {
+        let p = try decodeParams(params, as: IPCPaletteActivateParams.self, expected: ["id"])
+        guard let snap = try paletteUI().paletteActivate(id: p.id) else {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "no palette open, or no row with id \"\(p.id)\"")
+        }
+        return IPCPaletteStateResult(snap)
+    }
+
+    @MainActor
+    private func paletteDismiss(params: AnyCodable?) async throws -> IPCPaletteStateResult {
+        _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
+        return IPCPaletteStateResult(try paletteUI().dismissPaletteOverlay())
+    }
+
+    /// The registered UI bridge, or `internal` if none (headless).
+    @MainActor
+    private func paletteUI() throws -> any UiBridge {
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI for palette")
+        }
+        return ui
     }
 
     // MARK: screenshot
@@ -814,6 +881,55 @@ private struct IPCTabDumpResult: Codable {
         case rows
         case cursor
         case rowsText = "rows_text"
+    }
+}
+
+/// Params for the nullary palette ops (`palette.state` / `palette.dismiss`):
+/// an empty object. `decodeParams(expected: [])` then rejects any stray
+/// field, matching the strict server policy.
+private struct IPCEmptyParams: Codable {}
+
+private struct IPCPaletteOpenParams: Codable {
+    let kind: String?
+    enum CodingKeys: String, CodingKey { case kind }
+}
+
+private struct IPCPaletteQueryParams: Codable {
+    let query: String
+    enum CodingKeys: String, CodingKey { case query }
+}
+
+private struct IPCPaletteActivateParams: Codable {
+    let id: String
+    enum CodingKeys: String, CodingKey { case id }
+}
+
+private struct IPCPaletteItemView: Codable {
+    let id: String
+    let title: String
+    let subtitle: String?
+    enum CodingKeys: String, CodingKey { case id, title, subtitle }
+}
+
+/// `palette.*` response. Mirrors `roost_ipc::messages::PaletteStateResult`
+/// — `frame` is omitted (Swift drops nil optionals) when the palette is
+/// closed, matching the Rust `skip_serializing_if`.
+private struct IPCPaletteStateResult: Codable {
+    let open: Bool
+    let frame: String?
+    let query: String
+    let selection: Int
+    let items: [IPCPaletteItemView]
+    enum CodingKeys: String, CodingKey { case open, frame, query, selection, items }
+
+    init(_ s: PaletteSnapshot) {
+        self.open = s.open
+        self.frame = s.frame
+        self.query = s.query
+        self.selection = s.selection
+        self.items = s.items.map {
+            IPCPaletteItemView(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+        }
     }
 }
 

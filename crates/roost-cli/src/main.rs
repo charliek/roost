@@ -19,6 +19,7 @@
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
 //!   roostctl project {list,create,rename,delete,reorder}
+//!   roostctl palette {open,state,query,activate,dismiss}
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
@@ -41,7 +42,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
-    IdentifyParams, IdentifyResult, NotificationCreateParams, ProjectCreateParams,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteOpenParams, PaletteQueryParams, PaletteStateResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ScreenshotParams, ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams,
     TabDumpResult, TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams,
@@ -144,6 +146,12 @@ enum Cmd {
     /// Project subcommands.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Command-palette subcommands: drive the overlay (open, inspect,
+    /// filter, activate a row, dismiss). Activating a row runs the same
+    /// command its keybind would — so this is also a command-dispatch
+    /// surface, not just a UI poke.
+    #[command(subcommand)]
+    Palette(PaletteCmd),
     /// Capture a PNG of the running UI's whole window (sidebar, tabs,
     /// active terminal), rendered in-process. Writes to `--out` if
     /// given, otherwise raw PNG bytes to stdout.
@@ -310,6 +318,48 @@ enum TabCmd {
         project_id: i64,
         #[arg(long, value_delimiter = ',')]
         order: Vec<i64>,
+    },
+}
+
+/// `roostctl palette …` — drive the command-palette overlay. Each
+/// subcommand prints the resulting palette state (a `>` marks the
+/// highlighted row); `--json` emits the structured result.
+#[derive(Subcommand, Debug)]
+enum PaletteCmd {
+    /// Open a palette root frame and print its rows.
+    Open {
+        /// Which frame to open: `commands` (default) or `launcher`.
+        #[arg(long, default_value = "commands")]
+        kind: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Print the current palette state (open?, frame, query, rows).
+    State {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Set the current frame's filter (as if typed), print the result.
+    Query {
+        /// The filter text.
+        query: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Activate the row with this item id — the same dispatch as its
+    /// keybind. Errors `not-found` if no palette is open or no row
+    /// matches.
+    Activate {
+        /// The item id (a KeybindAction id like `new_tab`, or a sub-frame
+        /// row id like a theme name).
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Dismiss any open palette.
+    Dismiss {
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -660,10 +710,72 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Palette(PaletteCmd::Open { kind, json }) => {
+            let state: PaletteStateResult = client
+                .call(ops::PALETTE_OPEN, PaletteOpenParams { kind })
+                .await?;
+            print_palette(&state, json)?;
+        }
+        Cmd::Palette(PaletteCmd::State { json }) => {
+            let state: PaletteStateResult = client
+                .call(ops::PALETTE_STATE, serde_json::json!({}))
+                .await?;
+            print_palette(&state, json)?;
+        }
+        Cmd::Palette(PaletteCmd::Query { query, json }) => {
+            let state: PaletteStateResult = client
+                .call(ops::PALETTE_QUERY, PaletteQueryParams { query })
+                .await?;
+            print_palette(&state, json)?;
+        }
+        Cmd::Palette(PaletteCmd::Activate { id, json }) => {
+            let state: PaletteStateResult = client
+                .call(ops::PALETTE_ACTIVATE, PaletteActivateParams { id })
+                .await?;
+            print_palette(&state, json)?;
+        }
+        Cmd::Palette(PaletteCmd::Dismiss { json }) => {
+            let state: PaletteStateResult = client
+                .call(ops::PALETTE_DISMISS, serde_json::json!({}))
+                .await?;
+            print_palette(&state, json)?;
+        }
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. } | Cmd::Claude(_) => unreachable!(),
     }
 
+    Ok(())
+}
+
+/// Render a [`PaletteStateResult`] for the terminal: a header line, then
+/// one row per item with `>` marking the highlighted selection. `--json`
+/// emits the structured result verbatim instead.
+fn print_palette(state: &PaletteStateResult, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(state)?);
+        return Ok(());
+    }
+    if !state.open {
+        println!("palette: closed");
+        return Ok(());
+    }
+    println!(
+        "palette: {} (query {:?}, {} rows)",
+        state.frame.as_deref().unwrap_or("?"),
+        state.query,
+        state.items.len()
+    );
+    for (i, item) in state.items.iter().enumerate() {
+        let marker = if i as u32 == state.selection {
+            '>'
+        } else {
+            ' '
+        };
+        match &item.subtitle {
+            Some(sub) => println!("{marker} {:<24} {}  — {}", item.id, item.title, sub),
+            None => println!("{marker} {:<24} {}", item.id, item.title),
+        }
+    }
     Ok(())
 }
 

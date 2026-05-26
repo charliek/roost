@@ -297,6 +297,54 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         confirm()
     }
 
+    // MARK: - IPC drive surface (palette.* ops)
+    //
+    // The IPC bridge reaches the live panel through these so the same
+    // navigation a user drives by keyboard/mouse is exercisable over the
+    // socket. They go through the same `confirm` / `setQuery` / `dismiss`
+    // a person hits, not a parallel path.
+
+    /// Current frame id + filter + selection + visible rows (display
+    /// order), for `palette.state`.
+    func driveSnapshot() -> (
+        frame: String, query: String, selection: Int,
+        items: [(id: String, title: String, subtitle: String?)]
+    ) {
+        let items = state.matches.map {
+            (id: $0.item.id, title: $0.item.title, subtitle: $0.item.subtitle)
+        }
+        return (state.current.id, state.current.query, state.current.selection, items)
+    }
+
+    /// Set the filter as if typed: re-filter, re-select the top match,
+    /// fire the highlight. Also rewrites the field so the visible query
+    /// matches.
+    func driveQuery(_ text: String) {
+        state.setQuery(text)
+        field.stringValue = text
+        table.reloadData()
+        selectCurrentRow()
+        fireHighlight()
+    }
+
+    /// Select the visible row whose item id matches, then confirm it —
+    /// the same `confirm` a click/Enter runs (push a sub-frame or
+    /// dispatch the command). False if no visible row has that id.
+    func driveActivate(id: String) -> Bool {
+        guard let index = state.matches.firstIndex(where: { $0.item.id == id }) else {
+            return false
+        }
+        state.setSelection(index)
+        confirm()
+        return true
+    }
+
+    /// Dismiss (revert) — the same path Esc-at-root / backdrop click
+    /// takes.
+    func driveDismiss() {
+        dismiss(confirmed: false)
+    }
+
     /// Re-render the field + table for the current frame and fire the
     /// highlight preview for the selected row.
     private func syncUI() {
