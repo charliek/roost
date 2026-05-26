@@ -96,6 +96,14 @@ impl RoostConfig {
 }
 
 fn default_path() -> Option<PathBuf> {
+    // `ROOST_CONFIG` overrides the path with an absolute file — used by
+    // the E2E harness to drive the command launcher off a seeded config
+    // (mirrors `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`). Empty is ignored.
+    if let Some(raw) = std::env::var_os("ROOST_CONFIG") {
+        if !raw.is_empty() {
+            return Some(PathBuf::from(raw));
+        }
+    }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".config/roost/config.conf"))
 }

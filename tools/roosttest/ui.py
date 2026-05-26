@@ -18,6 +18,13 @@ from client import Roost, RoostError
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ("mac", "gtk")
 
+# Seed config the harness points the UI at via ROOST_CONFIG, so the
+# command-launcher tests have a deterministic command list (see
+# fixtures/launcher.conf + test_launcher.py). Applies only to UIs this
+# harness launches; a developer's already-running UI keeps its own config
+# (the launcher tests skip when the seed isn't active).
+SEED_CONFIG = Path(__file__).resolve().parent / "fixtures" / "launcher.conf"
+
 
 def socket_path(target: str) -> Path:
     home = Path.home()
@@ -118,12 +125,15 @@ def launch(target: str) -> None:
         app = REPO_ROOT / "mac/build/Roost.app"
         if not app.is_dir():
             subprocess.run(["./scripts/bundle.sh", "debug"], cwd=REPO_ROOT / "mac", check=True)
-        subprocess.run(["open", str(app)], check=True)
+        # `open --env` injects the seed config into the launched app
+        # (LaunchServices otherwise drops the caller's env).
+        subprocess.run(["open", "--env", f"ROOST_CONFIG={SEED_CONFIG}", str(app)], check=True)
     elif target == "gtk":
         binary = REPO_ROOT / "target/debug/roost"
         if not binary.is_file():
             subprocess.run(["cargo", "build", "-p", "roost-linux"], cwd=REPO_ROOT, check=True)
-        env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn")}
+        env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn"),
+               "ROOST_CONFIG": str(SEED_CONFIG)}
         # Detached: outlive this call; the quit() path SIGTERMs it by pid.
         subprocess.Popen([str(binary)], cwd=REPO_ROOT, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
