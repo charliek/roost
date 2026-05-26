@@ -30,10 +30,13 @@ def test_inbox_lists_pending_via_palette(roost, project, palette):
     b = roost.open_tab(project, cwd="/tmp")
     roost.notify(a, "AlphaBuild", "passed")
     roost.notify(b, "BetaBuild", "failed")
-    _wait(
-        roost,
-        lambda: roost.tab(a).get("has_notification") and roost.tab(b).get("has_notification"),
-        "both tabs notified",
+    # The inbox populates via an event that can lag the workspace badge,
+    # and the frame snapshots its rows at push — so wait until both
+    # register, re-pushing each poll, before reading details.
+    roost._wait(
+        lambda: {f"notif:{a}", f"notif:{b}"} <= set(_inbox_ids(palette)),
+        5.0,
+        "inbox lists both tabs",
     )
 
     palette.palette_open()
@@ -54,8 +57,10 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette):
     a = roost.open_tab(project, cwd="/tmp")
     b = roost.open_tab(project, cwd="/tmp")  # b is active
     roost.notify(a, "JumpMe")
-    _wait(roost, lambda: roost.tab(a).get("has_notification"), "a notified")
     assert roost.identify()["active_tab_id"] == b
+    # Wait until the inbox registers a before navigating to jump (it lags
+    # the badge on Mac; the frame snapshots at push).
+    roost._wait(lambda: f"notif:{a}" in _inbox_ids(palette), 5.0, "inbox registers a")
 
     palette.palette_open()
     palette.palette_activate("view_notifications")
