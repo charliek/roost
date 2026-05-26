@@ -194,6 +194,29 @@ Headless resize of a tab's PTY (issues `TIOCSWINSZ`, which fires
 Request: `{"params": {"tab_id": "3", "cols": 100, "rows": 24}}`.
 Response: `{}`.
 
+### `tab.dump`
+
+Read the tab's live terminal *viewport* as text — the determinism
+backbone for automated tests (assert on exact content instead of
+OCR/pixel-matching a screenshot). Both UIs walk libghostty-vt's render
+state on the main thread. Viewport only for now (scrollback is a planned
+follow-up, so no `scrollback` param is accepted yet).
+
+Request: `{"params": {"tab_id": "3"}}`.
+Response:
+
+```json
+{"cols": 120, "rows": 30,
+ "cursor": {"row": 1, "col": 14, "visible": true},
+ "rows_text": ["/tmp $ echo hi", "hi", "/tmp $", ""]}
+```
+
+`rows_text` has one entry per visible row, trailing blanks trimmed (a
+blank cell renders as a space so columns line up). `cursor` is omitted
+when the cursor is off-viewport. Response is permissive, so per-cell
+color / scrollback fields can be added forward-compatibly. CLI:
+`roostctl tab dump --tab N` (plain rows) / `--json` (full result).
+
 ### `project.create`
 
 Request: `{"params": {"name": "", "cwd": "/tmp"}}`. `name` empty means
