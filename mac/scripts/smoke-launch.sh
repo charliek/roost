@@ -28,6 +28,9 @@ BUILD="${MAC_DIR}/.build"
 quit_app() {
   osascript -e 'tell application "Roost" to quit' 2>/dev/null || true
   pkill -x Roost 2>/dev/null || true
+  # Wait for the process to actually exit so the single-instance lock +
+  # socket are released before we return — don't race a follow-on launch.
+  for _ in $(seq 1 20); do pgrep -x Roost >/dev/null 2>&1 || break; sleep 0.25; done
 }
 
 restore() {
