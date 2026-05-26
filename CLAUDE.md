@@ -176,17 +176,21 @@ wrapper small.
   UI when verifying a change, `roostctl screenshot --out /tmp/shot.png`
   renders the running window to a PNG in-process (no OS screen capture;
   works even when the window is unfocused or occluded).
-- **Automated UI smoke testing**: `tools/uitest/` drives either UI
-  through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|gtk>`) and
+- **Test-harness map**: the harnesses are organized in three layers —
+  see [`tools/README.md`](tools/README.md) (functional / visual /
+  real-input) for which to reach for.
+- **Visual smoke (screenshots)**: `tools/screenshot/` drives either UI
+  through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|gtk>`),
   captures labeled screenshots + a `manifest.md` of per-shot
-  expectations. One harness covers both UIs (shared IPC surface; only
-  launch/quit differ). The Linux low-level input-injection layer below
-  complements it. See [`tools/uitest/README.md`](tools/uitest/README.md).
-- **Linux UI test harness**: [`tools/linux/`](tools/linux/README.md)
-  drives the GTK app in an automated way on Linux (COSMIC/Wayland) with
-  no image libraries — `/dev/uinput` key/pointer injectors, a stdlib PNG
-  inspect/crop tool, a clipboard reader, and a single-monitor helper for
-  reliable absolute-pointer injection. See its README for the
+  expectations, and includes `pngtool.py` (stdlib PNG inspect/crop —
+  cross-platform) for programmatic pixel assertions. One harness covers
+  both UIs. See [`tools/screenshot/README.md`](tools/screenshot/README.md).
+- **Real-input injection (Linux)**: [`tools/input/linux/`](tools/input/linux/README.md)
+  exercises the actual key-encoder + mouse-gesture + clipboard path on
+  Linux (COSMIC/Wayland) with no image libraries — `/dev/uinput`
+  key/pointer injectors, a clipboard reader, and a single-monitor helper
+  for reliable absolute-pointer injection. Linux-only (a Mac CGEvent
+  sibling at `tools/input/mac/` is planned). See its README for the
   screen↔window coordinate mapping and gotchas.
 - **Functional E2E (pytest)**: [`tools/roosttest/`](tools/roosttest/README.md)
   is the primary automated suite — a thin Python IPC client drives a real
@@ -196,7 +200,7 @@ wrapper small.
   not pixels. `make e2e` / `make e2e-gtk` / `make e2e-mac`; runs headless
   in CI (GTK under xvfb, required; macOS GUI-session). This is where new
   cross-cutting behavior gets a regression test; the screenshot
-  (`tools/uitest/`) and input-injection (`tools/linux/`) harnesses cover
+  (`tools/screenshot/`) and input-injection (`tools/input/linux/`) harnesses cover
   what it can't (pixels, real key/pointer events).
 
 ## Build

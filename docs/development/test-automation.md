@@ -114,7 +114,7 @@ across both implementations?*
 | IPC surface | `roost-ipc`: tab/project CRUD, set-state, notify, focus, send, resize, reorder, screenshot, claude-hook, identify | No **content** read (terminal grid), no **wait/subscribe**, no **UI-action** ops (open launcher/palette, copy/paste). |
 | Event stream | UIs consume an **in-process** event bus. `events.subscribe` over the wire is **stubbed not-implemented on both UIs** (`mac/Sources/Roost/IPCHandlerImpl.swift`, `crates/roost-linux/src/ipc.rs`). | External clients can't wait on events yet. |
 | Render state | `roost-vt` `RenderState.walk(|cell| …)` yields `Cell { text: String /*grapheme*/, fg, bg }` + cursor; mirrored 1:1 in `mac/Sources/Roost/RenderState.swift`. Both UIs walk it to draw. | Not exposed over IPC as text. |
-| Tooling | `tools/uitest/` (bash + roostctl, cross-platform smoke; PR #104). `tools/linux/` (Python uinput/PNG/clipboard; PR #103). | Bash can't wait/assert richly; Python harness is Linux-only; two entry points; no CI wiring. |
+| Tooling | `tools/screenshot/` (bash + roostctl, cross-platform smoke; PR #104). `tools/input/linux/` (Python uinput/PNG/clipboard; PR #103). | Bash can't wait/assert richly; Python harness is Linux-only; two entry points; no CI wiring. |
 
 Per the maintainer: **land #103 + #104 as-is** (resolve the trivial
 `CLAUDE.md` bullet conflict), and design the unified harness here. No
@@ -149,7 +149,7 @@ consolidation of those two until this lands.
 |---|---|---|---|
 | **0 — unit/integration** | `cargo test`, `swift test`. Pure logic: state machine, IPC dispatch, OSC, persistence, key-encoder tables. | CI (exists) + local | seconds |
 | **1 — functional E2E** | Launch the **real** app; drive via IPC/Lua; assert via `tab dump` (text) + `tab list` (state) + targeted screenshot color checks. Covers: open project/tab, run a command and read its output, state→color, notification + badge, focus switch, session restore, cascade-close, launcher actions. | **CI on both UIs** (Linux xvfb, macOS GUI session) + local | seconds–low minutes |
-| **2 — real-input smoke** | OS-level key/pointer injection (`tools/linux` uinput; a Mac CGEvent/AppleScript equivalent) exercising the *encoder + gesture* path, verified by screenshot. | **Local only** (Pop!_OS, Mac) | minutes, manual-ish |
+| **2 — real-input smoke** | OS-level key/pointer injection (`tools/input/linux` uinput; a Mac CGEvent/AppleScript equivalent) exercising the *encoder + gesture* path, verified by screenshot. | **Local only** (Pop!_OS, Mac) | minutes, manual-ish |
 
 Tier 1 is the new center of gravity and the CI confidence-builder. Tier 2
 stays local because injecting real input needs privileges/Accessibility
@@ -366,7 +366,7 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
   doesn't need a compositor). Headless Wayland (`weston --backend=headless`
   / `sway --headless`) is a fallback if an X11-only quirk appears.
 - Run: build `roost` + `roostctl`, launch under `ROOST_TEST=1`, run the
-  Tier-1 suite via `tools/uitest/launch.sh gtk` → runner.
+  Tier-1 suite via `tools/screenshot/launch.sh gtk` → runner.
 
 **macOS:**
 - Runner: `macos-latest` (GUI session present; AppKit windows work).
@@ -406,11 +406,11 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
 
 ## 10. Relationship to #103 / #104
 
-- **#104 `tools/uitest/`** (bash smoke): keep. Its scenario *shape*
+- **#104 `tools/screenshot/`** (bash smoke): keep. Its scenario *shape*
   (create project → states → notify → focus → hook → cascade) becomes the
   first Tier-1 cases. The bash version remains a zero-setup smoke until the
   runner supersedes it.
-- **#103 `tools/linux/`** (uinput/PNG/clipboard): keep as the **Tier-2**
+- **#103 `tools/input/linux/`** (uinput/PNG/clipboard): keep as the **Tier-2**
   real-input layer. Its `pngtool` logic informs `roost.pixel`/`find_color`;
   its uinput injector is the Linux half of the Tier-2 smoke. A Mac CGEvent
   equivalent is the other half (later).
@@ -473,7 +473,7 @@ P1 is the linchpin — everything downstream leans on `tab dump` + `wait`.
 When this lands, `CLAUDE.md` Troubleshooting/Testing should tell an agent,
 prescriptively:
 
-- **To verify a change on the live app:** `tools/uitest/launch.sh <mac|gtk>`,
+- **To verify a change on the live app:** `tools/screenshot/launch.sh <mac|gtk>`,
   then drive with `roostctl` (`tab dump` to read content, `wait` to
   synchronize, `screenshot` to see). Never `sleep`.
 - **To run the functional suite:** the one command (`roostctl test …` or
@@ -483,7 +483,7 @@ prescriptively:
   workspace, and the assertion helpers (`dump`, `tab list`, `find_color`).
 - **To add a launcher action:** where actions live and the `roost` Lua API.
 - **Tier map:** 0 = `cargo/swift test`; 1 = functional E2E (CI, both UIs);
-  2 = local real-input (`tools/linux` + Mac equivalent).
+  2 = local real-input (`tools/input/linux` + Mac equivalent).
 
 The guiding rule for these docs: an agent should be able to go from "I
 changed X" to "here's the exact command that proves X still works" without

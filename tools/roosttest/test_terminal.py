@@ -5,9 +5,9 @@ Several program-driven terminal behaviors are NOT cleanly E2E-testable
 through this IPC harness and live elsewhere:
   - OSC 2 window-title: roost derives the tab title from cwd, and the
     shell re-emits its own title each prompt, so a transient OSC 2 is
-    overwritten — verify visually via `tools/uitest` screenshots.
+    overwritten — verify visually via `tools/screenshot` screenshots.
   - Live resize/reflow: the UI sizes the terminal grid to the window, so
-    `tab.resize` doesn't pin a deterministic size — `tools/uitest` (resize
+    `tab.resize` doesn't pin a deterministic size — `tools/screenshot` (resize
     the window, check reflow) is the right tool.
 This file covers the one program→core→UI pipeline that IS deterministic
 where the shell cooperates: OSC 7 cwd tracking via a real `cd`.

@@ -2,7 +2,7 @@
 
 Both UIs speak the same IPC, so the test driver is one client
 parameterized by target; only launch/quit/socket differ per UI (Swift
-`Roost.app` vs the `roost` GTK binary). Mirrors `tools/uitest/lib.sh`.
+`Roost.app` vs the `roost` GTK binary). Mirrors `tools/screenshot/lib.sh`.
 """
 
 from __future__ import annotations
