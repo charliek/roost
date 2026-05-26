@@ -27,19 +27,6 @@ use roost_ipc::messages::{
 };
 use roost_ipc::{Handler, HandlerError};
 
-/// The reply half of a [`ScreenshotRequest`]: `(png_bytes, width,
-/// height)` on success, an error message on failure.
-type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
-
-/// A request from the IPC handler (tokio worker thread) to the GTK
-/// main thread to render the window to a PNG. The main thread renders
-/// synchronously and sends the result back over `reply`. This is the
-/// bidirectional sibling of the fire-and-forget `activate_tx` channel.
-pub struct ScreenshotRequest {
-    pub scale: u32,
-    pub reply: ScreenshotReply,
-}
-
 /// Text snapshot of a tab's terminal viewport, produced on the GTK main
 /// thread for the `tab.dump` op. Neutral (lib-side) types so this crate
 /// stays independent of the bin's `TerminalView`; the UI fills it from
@@ -51,17 +38,29 @@ pub struct DumpData {
     pub rows_text: Vec<String>,
 }
 
-/// The reply half of a [`DumpRequest`]: the viewport text on success, an
+/// Reply for a [`UiRequest::Screenshot`]: `(png_bytes, width, height)`
+/// on success, an error message on failure.
+type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
+
+/// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
 /// error message (e.g. tab not found / no live terminal) on failure.
 type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
 
-/// A request from the IPC handler (tokio worker) to the GTK main thread
-/// to read a tab's terminal viewport as text. Sibling of
-/// [`ScreenshotRequest`]; the main thread walks the render state and
-/// replies over `reply`.
-pub struct DumpRequest {
-    pub tab_id: i64,
-    pub reply: DumpReply,
+/// One unit of work the IPC handler (a tokio worker thread) hands to the
+/// GTK main thread — the single seam for anything an op needs to do
+/// against GTK / libghostty, which are main-thread-only. The UI drains
+/// one channel of these and matches; request-reply variants carry a
+/// `oneshot` the main thread answers on. Adding a UI-touching op is a
+/// new variant here + one arm in the UI's drain loop, instead of a
+/// fresh per-op channel + handler field + setter + receiver + wiring.
+pub enum UiRequest {
+    /// Raise + focus the running window (#6). Fire-and-forget.
+    Activate,
+    /// Render the whole window (sidebar + tabs + active terminal) to a
+    /// PNG.
+    Screenshot { scale: u32, reply: ScreenshotReply },
+    /// Read a tab's terminal viewport as text.
+    Dump { tab_id: i64, reply: DumpReply },
 }
 
 use crate::daemon::state::WorkspaceError;
@@ -78,18 +77,11 @@ pub struct IpcHandler {
     /// App label / app id pair from the active bundle profile.
     pub app_label: String,
     pub app_id: String,
-    /// Set by the running UI: `app.activate` forwards a unit here for
-    /// the GTK main thread to raise + focus the window (#6). `None`
-    /// in headless contexts (tests); `app.activate` is then a no-op.
-    activate_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
-    /// Set by the running UI: `app.screenshot` forwards a render
-    /// request here and awaits the PNG bytes back. `None` in headless
-    /// contexts (tests); `app.screenshot` then errors with `internal`.
-    screenshot_tx: Option<tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>>,
-    /// Set by the running UI: `tab.dump` forwards a viewport-read
-    /// request here and awaits the text back. `None` in headless
-    /// contexts (tests); `tab.dump` then errors with `internal`.
-    dump_tx: Option<tokio::sync::mpsc::UnboundedSender<DumpRequest>>,
+    /// Set by the running UI: ops that must touch GTK / libghostty
+    /// (activate, screenshot, dump) forward a [`UiRequest`] here for the
+    /// main thread to service. `None` in headless contexts (tests), so
+    /// those ops no-op (activate) or error `internal` (screenshot/dump).
+    ui_tx: Option<tokio::sync::mpsc::UnboundedSender<UiRequest>>,
 }
 
 impl IpcHandler {
@@ -106,37 +98,38 @@ impl IpcHandler {
             socket_path,
             app_label: app_label.into(),
             app_id: app_id.into(),
-            activate_tx: None,
-            screenshot_tx: None,
-            dump_tx: None,
+            ui_tx: None,
         }
     }
 
-    /// Wire the activation channel so `app.activate` raises the
-    /// running window. The UI installs the sender; the matching
-    /// receiver is drained on the GTK main thread (#6).
-    pub fn with_activate(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
-        self.activate_tx = Some(tx);
+    /// Wire the UI request channel so main-thread-only ops (activate,
+    /// screenshot, dump) can reach GTK / libghostty. The UI installs the
+    /// sender; the matching receiver is drained on the GTK main thread.
+    pub fn with_ui(mut self, tx: tokio::sync::mpsc::UnboundedSender<UiRequest>) -> Self {
+        self.ui_tx = Some(tx);
         self
     }
 
-    /// Wire the screenshot channel so `app.screenshot` can render the
-    /// window. The UI installs the sender; the matching receiver is
-    /// drained on the GTK main thread, which does the actual render.
-    pub fn with_screenshot(
-        mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>,
-    ) -> Self {
-        self.screenshot_tx = Some(tx);
-        self
-    }
-
-    /// Wire the dump channel so `tab.dump` can read a tab's terminal
-    /// viewport as text. The UI installs the sender; the receiver is
-    /// drained on the GTK main thread, which walks the render state.
-    pub fn with_dump(mut self, tx: tokio::sync::mpsc::UnboundedSender<DumpRequest>) -> Self {
-        self.dump_tx = Some(tx);
-        self
+    /// Hand a request-reply [`UiRequest`] to the GTK main thread and
+    /// await its answer. The outer `Result` reports channel/UI health
+    /// (no UI attached, UI gone, reply dropped); the inner `Result` is
+    /// the op's own outcome, which the caller maps to the right error
+    /// code (e.g. `not-found` for a missing tab). Shared by the
+    /// screenshot + dump arms so the oneshot plumbing lives in one place.
+    async fn ui_call<T>(
+        &self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> UiRequest,
+    ) -> Result<Result<T, String>, HandlerError> {
+        let tx = self
+            .ui_tx
+            .as_ref()
+            .ok_or_else(|| HandlerError::new("internal", "no UI attached"))?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(make(reply_tx))
+            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| HandlerError::new("internal", "UI dropped reply"))
     }
 }
 
@@ -260,19 +253,12 @@ async fn dispatch(
         }
         ops::TAB_DUMP => {
             let p: TabDumpParams = decode(params)?;
-            let tx = h
-                .dump_tx
-                .as_ref()
-                .ok_or_else(|| HandlerError::new("internal", "no UI to read terminal"))?;
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.send(DumpRequest {
-                tab_id: p.tab_id,
-                reply: reply_tx,
-            })
-            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
-            let data = reply_rx
-                .await
-                .map_err(|_| HandlerError::new("internal", "UI dropped dump reply"))?
+            let data = h
+                .ui_call(|reply| UiRequest::Dump {
+                    tab_id: p.tab_id,
+                    reply,
+                })
+                .await?
                 .map_err(HandlerError::not_found)?;
             encode(&TabDumpResult {
                 cols: data.cols,
@@ -375,11 +361,11 @@ async fn dispatch(
             // Validate the envelope like every other op (rejects
             // unknown fields) rather than ACK-ing arbitrary payloads.
             let _p: AppActivateParams = decode(params)?;
-            // Second-launch window raise (#6). Best-effort: forward a
-            // unit to the GTK main thread if wired. A dropped receiver
-            // (window gone) or a headless handler is a no-op.
-            if let Some(tx) = &h.activate_tx {
-                let _ = tx.send(());
+            // Second-launch window raise (#6). Best-effort: forward to
+            // the GTK main thread if wired. A dropped receiver (window
+            // gone) or a headless handler is a no-op.
+            if let Some(tx) = &h.ui_tx {
+                let _ = tx.send(UiRequest::Activate);
             }
             Ok(serde_json::json!({}))
         }
@@ -391,19 +377,12 @@ async fn dispatch(
                     p.scale
                 )));
             }
-            let tx = h
-                .screenshot_tx
-                .as_ref()
-                .ok_or_else(|| HandlerError::new("internal", "no UI window to capture"))?;
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.send(ScreenshotRequest {
-                scale: p.scale,
-                reply: reply_tx,
-            })
-            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
-            let (png, width, height) = reply_rx
-                .await
-                .map_err(|_| HandlerError::new("internal", "UI dropped screenshot reply"))?
+            let (png, width, height) = h
+                .ui_call(|reply| UiRequest::Screenshot {
+                    scale: p.scale,
+                    reply,
+                })
+                .await?
                 .map_err(|m| HandlerError::new("internal", m))?;
             // Preflight the 16 MiB IPC frame cap: the response rides one
             // newline-delimited JSON frame, and `png` dominates it once

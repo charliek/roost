@@ -308,11 +308,7 @@ impl App {
         app: &libadwaita::Application,
         rt: Handle,
         client: LocalClient,
-        activate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
-        screenshot_rx: Option<
-            tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::ScreenshotRequest>,
-        >,
-        dump_rx: Option<tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::DumpRequest>>,
+        ui_rx: Option<tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::UiRequest>>,
     ) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
@@ -718,41 +714,27 @@ impl App {
 
         app_struct.window.present();
 
-        // #6: a second launch that loses the single-instance flock
-        // dials `app.activate`; the IPC handler forwards a unit here.
-        // Raise + focus the window on the GTK main thread.
-        if let Some(mut activate_rx) = activate_rx {
-            let window = app_struct.window.clone();
-            glib::spawn_future_local(async move {
-                while activate_rx.recv().await.is_some() {
-                    window.present();
-                }
-            });
-        }
-
-        // `app.screenshot`: the IPC handler forwards a render request +
-        // a oneshot reply channel here. Render synchronously on the main
-        // thread (GTK + the renderer are main-thread-only) and reply with
-        // the PNG bytes.
-        if let Some(mut screenshot_rx) = screenshot_rx {
-            let window = app_struct.window.clone();
-            glib::spawn_future_local(async move {
-                while let Some(req) = screenshot_rx.recv().await {
-                    let result = render_window_png(&window, req.scale);
-                    let _ = req.reply.send(result);
-                }
-            });
-        }
-
-        // `tab.dump`: the IPC handler forwards a viewport-read request +
-        // a oneshot reply here. Walk the tab's render state synchronously
-        // on the main thread (libghostty handle is main-thread-only) and
-        // reply with the text rows + cursor.
-        if let Some(mut dump_rx) = dump_rx {
+        // UI bridge: the IPC handler (a tokio worker) forwards every
+        // main-thread-only op here as a `UiRequest`. Drain them on the
+        // GTK main thread and service each — raise the window, render a
+        // screenshot, or walk a tab's render state — replying over the
+        // request's oneshot for the request-reply variants. One loop
+        // replaces the former per-op activate/screenshot/dump drains.
+        if let Some(mut ui_rx) = ui_rx {
             let app = app_struct.clone();
+            let window = app_struct.window.clone();
             glib::spawn_future_local(async move {
-                while let Some(req) = dump_rx.recv().await {
-                    let _ = req.reply.send(app.dump_tab(req.tab_id));
+                use roost_linux::ipc::UiRequest;
+                while let Some(req) = ui_rx.recv().await {
+                    match req {
+                        UiRequest::Activate => window.present(),
+                        UiRequest::Screenshot { scale, reply } => {
+                            let _ = reply.send(render_window_png(&window, scale));
+                        }
+                        UiRequest::Dump { tab_id, reply } => {
+                            let _ = reply.send(app.dump_tab(tab_id));
+                        }
+                    }
                 }
             });
         }
