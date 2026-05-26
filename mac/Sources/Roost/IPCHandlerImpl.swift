@@ -51,6 +51,8 @@ actor IPCHandlerImpl: IPCHandler {
         case "tab.resize":
             try await self.tabResize(params: params)
             return AnyCodable([:] as [String: Any])
+        case "tab.dump":
+            return try await encodeResult(self.tabDump(params: params))
         case "project.create":
             return try await encodeResult(self.projectCreate(params: params))
         case "project.rename":
@@ -361,6 +363,34 @@ actor IPCHandlerImpl: IPCHandler {
         } catch let err as Workspace.WorkspaceError {
             throw mapWorkspace(err)
         }
+    }
+
+    // MARK: tab dump
+
+    @MainActor
+    private func tabDump(params: AnyCodable?) async throws -> IPCTabDumpResult {
+        let p = try decodeParams(
+            params, as: IPCTabDumpParams.self, expected: ["tab_id"]
+        )
+        // The IPC handler is already on the main actor; reach the running
+        // app (the NSApplicationDelegate) to read the tab's render state.
+        guard let app = NSApp.delegate as? RoostApp else {
+            throw IPCHandlerError.internalError("no UI to read terminal")
+        }
+        guard let dump = app.dumpTab(tabID: p.tabID) else {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+        return IPCTabDumpResult(
+            cols: dump.cols,
+            rows: dump.rows,
+            cursor: dump.cursor.map {
+                IPCTabDumpCursor(row: $0.row, col: $0.col, visible: $0.visible)
+            },
+            rowsText: dump.rowsText
+        )
     }
 
     // MARK: screenshot
@@ -837,6 +867,47 @@ private struct IPCTabFocusResult: Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(String(previousProjectID), forKey: .previousProjectID)
         try c.encode(String(previousTabID), forKey: .previousTabID)
+    }
+}
+
+private struct IPCTabDumpParams: Codable {
+    let tabID: Int64
+    enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
+            )
+        }
+        self.tabID = v
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+    }
+}
+
+/// Cursor position inside a dumped viewport. Plain JSON numbers (not
+/// string-int64) — these are small viewport coordinates, matching the
+/// Rust `TabDumpCursor`.
+private struct IPCTabDumpCursor: Codable {
+    let row: Int
+    let col: Int
+    let visible: Bool
+}
+
+private struct IPCTabDumpResult: Codable {
+    let cols: Int
+    let rows: Int
+    let cursor: IPCTabDumpCursor?
+    let rowsText: [String]
+    enum CodingKeys: String, CodingKey {
+        case cols
+        case rows
+        case cursor
+        case rowsText = "rows_text"
     }
 }
 

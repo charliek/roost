@@ -595,6 +595,46 @@ final class TerminalView: NSView {
         return trimmed.joined(separator: "\n")
     }
 
+    /// Text snapshot of the full viewport for the `tab.dump` IPC op.
+    struct Dump {
+        struct Cursor {
+            let row: Int
+            let col: Int
+            let visible: Bool
+        }
+        let cols: Int
+        let rows: Int
+        let cursor: Cursor?
+        let rowsText: [String]
+    }
+
+    /// Snapshot the whole viewport as text for `tab.dump`: one rstripped
+    /// line per row (a blank cell becomes a space so columns line up)
+    /// plus the cursor. Mirrors `selectedPlainText` / `draw`'s
+    /// update→walk, but over every row. Main-thread-only — touches the
+    /// libghostty handle + render state.
+    @MainActor
+    func dumpText() -> Dump {
+        if let terminal { renderState.update(terminal: terminal) }
+        let cursorInfo = renderState.cursor()
+        var lines = [String](repeating: "", count: Int(rows))
+        renderState.walk { cell in
+            guard cell.row >= 0, cell.row < lines.count else { return }
+            if let g = cell.glyph {
+                lines[cell.row].append(String(g))
+            } else {
+                lines[cell.row].append(" ")
+            }
+        }
+        let trimmed = lines.map {
+            String($0.reversed().drop(while: { $0 == " " }).reversed())
+        }
+        let cursor = cursorInfo.map {
+            Dump.Cursor(row: Int($0.row), col: Int($0.col), visible: $0.visible)
+        }
+        return Dump(cols: Int(cols), rows: Int(rows), cursor: cursor, rowsText: trimmed)
+    }
+
     /// Ask libghostty-vt whether the shell has enabled bracketed-paste
     /// mode. Defaults to `false` on any FFI hiccup so we don't wrap a
     /// paste in escape sequences a confused shell would echo back at

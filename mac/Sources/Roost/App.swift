@@ -1079,6 +1079,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Read any tab's terminal viewport as text for the `tab.dump` IPC
+    /// op (not just the active one). `nil` when no `TabSession` holds
+    /// that id. Called on the main actor from `IPCHandlerImpl`.
+    @MainActor
+    func dumpTab(tabID: Int64) -> TerminalView.Dump? {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return nil }
+        return session.terminalView.dumpText()
+    }
+
     /// Mirror the inbox count onto the Dock tile badge. `nil` at zero so
     /// the badge disappears entirely (AppKit shows nothing for an empty
     /// label).
