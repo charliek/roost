@@ -148,9 +148,8 @@ fn contiguous_ranges(offsets: &[usize]) -> Vec<Range<usize>> {
 /// is a `KeybindAction` id except `SELECT_THEME_ID` (a palette-only
 /// command that drills into the theme list rather than firing once).
 ///
-/// GTK parity deltas vs the Swift app: GTK has no `jump_to_unread`
-/// action (omitted), and uses `delete_project` where the Mac app says
-/// "Close Project".
+/// This list is kept identical to the Swift app's `PaletteCommands.specs`
+/// (same ids, titles, and order) so the two UIs expose one command set.
 pub struct PaletteCommands;
 
 impl PaletteCommands {
@@ -172,8 +171,9 @@ impl PaletteCommands {
         ("cycle_tab_prev", "Previous Tab"),
         ("new_project", "New Project"),
         ("rename_project", "Rename Project"),
-        ("delete_project", "Delete Project"),
+        ("close_project", "Close Project"),
         ("toggle_sidebar", "Toggle Sidebar"),
+        ("jump_to_unread", "Jump to Unread"),
         ("font_increase", "Increase Font Size"),
         ("font_decrease", "Decrease Font Size"),
         ("font_reset", "Reset Font Size"),
@@ -543,24 +543,24 @@ mod tests {
     }
 
     #[test]
-    fn no_jump_to_unread_on_gtk() {
-        // GTK parity delta: the Mac app has jump_to_unread; GTK omits it.
+    fn has_jump_to_unread() {
+        // Parity with the Mac app (was a GTK gap; ported in P8).
         assert!(PaletteCommands::SPECS
             .iter()
-            .all(|(id, _)| *id != "jump_to_unread"));
+            .any(|(id, _)| *id == "jump_to_unread"));
     }
 
     #[test]
-    fn uses_delete_project_not_close_project() {
-        // GTK parity delta: delete_project, labelled "Delete Project".
+    fn uses_close_project_not_delete_project() {
+        // Unified on "Close Project" across both UIs (was a GTK delta).
         let entry = PaletteCommands::SPECS
             .iter()
-            .find(|(id, _)| *id == "delete_project")
-            .expect("delete_project present");
-        assert_eq!(entry.1, "Delete Project");
+            .find(|(id, _)| *id == "close_project")
+            .expect("close_project present");
+        assert_eq!(entry.1, "Close Project");
         assert!(PaletteCommands::SPECS
             .iter()
-            .all(|(id, _)| *id != "close_project"));
+            .all(|(id, _)| *id != "delete_project"));
     }
 
     #[test]

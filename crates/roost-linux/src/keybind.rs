@@ -24,12 +24,18 @@ pub enum KeybindAction {
     /// M8: rename the active tab — opens a `gtk::Popover` over the
     /// pill with an inline `gtk::Entry` (M9). Default `projectMod+r`.
     RenameTab,
-    /// M8: delete the active project (with an `adw::AlertDialog`
-    /// confirmation, since this cascades to delete every tab in the
-    /// project). No default trigger — advanced users bind via
-    /// `~/.config/roost/config.conf` so a stray keypress can't
-    /// dataloss.
-    DeleteProject,
+    /// M8: close the active project (with an `adw::AlertDialog`
+    /// confirmation, since this cascades to close every tab in the
+    /// project). Default `projectMod+shift+w`. Named "Close" (matching
+    /// the Mac UI): it removes the project + its tabs from the
+    /// workspace; nothing on disk is deleted. The wire op is still
+    /// `project.delete`.
+    CloseProject,
+    /// Focus the next tab with a pending notification — active project
+    /// first (from after the focused tab), then other projects in order.
+    /// A multi-project triage shortcut; default `primary+shift+u`
+    /// (parity with the Mac UI).
+    JumpToUnread,
     CycleTabPrev,
     CycleTabNext,
     Copy,
@@ -71,7 +77,10 @@ impl KeybindAction {
             "new_project" => Some(Self::NewProject),
             "rename_project" => Some(Self::RenameProject),
             "rename_tab" => Some(Self::RenameTab),
-            "delete_project" => Some(Self::DeleteProject),
+            // `delete_project` kept as an alias so any existing config
+            // binding still resolves after the rename to `close_project`.
+            "close_project" | "delete_project" => Some(Self::CloseProject),
+            "jump_to_unread" => Some(Self::JumpToUnread),
             "cycle_tab_prev" => Some(Self::CycleTabPrev),
             "cycle_tab_next" => Some(Self::CycleTabNext),
             "copy" => Some(Self::Copy),
@@ -203,7 +212,15 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
     add(
         &mut out,
         &format!("{project_mod}+shift+w"),
-        KeybindAction::DeleteProject,
+        KeybindAction::CloseProject,
+    );
+    // Jump to the next unread notification. `primary+shift+u`
+    // (Cmd+Shift+U on macOS-GTK, Ctrl+Shift+U on Linux) — parity with
+    // the Mac UI's `jump_to_unread`.
+    add(
+        &mut out,
+        &format!("{primary}+shift+u"),
+        KeybindAction::JumpToUnread,
     );
 
     // Cycle prev/next: Shift+[ and Shift+] map to bracketleft/right on
@@ -388,8 +405,17 @@ mod tests {
             Some(KeybindAction::RenameTab)
         );
         assert_eq!(
+            KeybindAction::from_name("close_project"),
+            Some(KeybindAction::CloseProject)
+        );
+        // `delete_project` stays a back-compat alias for `close_project`.
+        assert_eq!(
             KeybindAction::from_name("delete_project"),
-            Some(KeybindAction::DeleteProject)
+            Some(KeybindAction::CloseProject)
+        );
+        assert_eq!(
+            KeybindAction::from_name("jump_to_unread"),
+            Some(KeybindAction::JumpToUnread)
         );
     }
 
@@ -437,7 +463,17 @@ mod tests {
         };
         assert_eq!(
             defaults.get(&close_project_trigger),
-            Some(&KeybindAction::DeleteProject)
+            Some(&KeybindAction::CloseProject)
+        );
+        // JumpToUnread → primary+shift+u (Cmd/Ctrl+Shift+U), Mac parity.
+        let jump_trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+u").unwrap()
+        } else {
+            parse_trigger("ctrl+shift+u").unwrap()
+        };
+        assert_eq!(
+            defaults.get(&jump_trigger),
+            Some(&KeybindAction::JumpToUnread)
         );
     }
 

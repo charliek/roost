@@ -3204,43 +3204,44 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// via the P1 keybind table.
     @objc @MainActor
     private func jumpToUnread(_ sender: Any?) {
-        // Walk current project first, then other projects, until
-        // we find the first notified tab. Stable iteration order:
-        // `tabs` array order within each project.
+        guard let target = nextUnreadTab(), let tabID = target.id else { return }
+        // Route through the core (like the inbox jump) so `workspace.active()`
+        // — hence identify / tab.focus / the restored selection — tracks the
+        // jump, not just UI selection. The `.active` event drives the project
+        // switch + tab select; clear the tab's notification.
+        _ = try? RoostBackend.shared.localClient?.focusTab(tabID)
+        let socket = socketPath
+        Task.detached { await clearTabNotification(socketPath: socket, tabID: tabID) }
+    }
+
+    /// The next tab with a pending notification: the active project first
+    /// (from after the focused tab, wrapping), then other projects in
+    /// order. `nil` when nothing is pending.
+    @MainActor
+    private func nextUnreadTab() -> TabSession? {
         if let activeID = activeProjectID {
             let activeTabs = tabs.filter { $0.projectID == activeID }
             let activeFocus = activeSessionByProject[activeID]
-            let startIdx: Int
-            if let activeFocus,
-               let i = activeTabs.firstIndex(where: { $0 === activeFocus })
-            {
-                startIdx = i + 1
-            } else {
-                startIdx = 0
-            }
+            let startIdx =
+                activeFocus
+                .flatMap { f in activeTabs.firstIndex(where: { $0 === f }) }
+                .map { $0 + 1 } ?? 0
             for offset in 0..<activeTabs.count {
                 let idx = (startIdx + offset) % activeTabs.count
                 if activeTabs[idx].liveHasNotification {
-                    selectTab(at: idx)
-                    return
+                    return activeTabs[idx]
                 }
             }
         }
-        // Search other projects in order.
         for project in projects where project.id != activeProjectID {
-            let projectTabs = tabs
-                .filter { $0.projectID == project.id }
-            if let first = projectTabs.first(where: { $0.liveHasNotification }) {
-                selectProject(id: project.id)
-                if let idx = tabs
-                    .filter({ $0.projectID == project.id })
-                    .firstIndex(where: { $0 === first })
-                {
-                    selectTab(at: idx)
-                }
-                return
+            if let first = tabs
+                .filter({ $0.projectID == project.id })
+                .first(where: { $0.liveHasNotification })
+            {
+                return first
             }
         }
+        return nil
     }
 
     // MARK: - Font zoom (Phase 6a P2)
