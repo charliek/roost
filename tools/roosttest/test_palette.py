@@ -17,6 +17,9 @@ import uuid
 import pytest
 from client import RoostError
 
+# The shared `palette` fixture (drive from closed, leave closed) lives in
+# conftest.py so the notification + launcher suites reuse it.
+
 # Curated command rows present in BOTH UIs with the same wire id.
 COMMON_COMMAND_IDS = (
     "new_tab",
@@ -30,18 +33,6 @@ COMMON_COMMAND_IDS = (
     "font_reset",
     "select_theme",
 )
-
-
-@pytest.fixture
-def palette(roost):
-    """Drive the palette from a known-closed state, and leave it closed.
-
-    The palette is global UI state (one at a time), so a leaked-open
-    palette from a failed test would wedge the next one. Dismiss on both
-    sides of the test (idempotent — a no-op when already closed)."""
-    roost.palette_dismiss()
-    yield roost
-    roost.palette_dismiss()
 
 
 def test_open_lists_common_commands(palette):
