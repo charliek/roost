@@ -252,6 +252,44 @@ pub struct TabResizeParams {
 }
 
 // ============================================================================
+// Tab content dump (terminal grid → text)
+// ============================================================================
+
+/// `tab.dump` request. Returns the tab's live terminal *viewport* as
+/// text — the determinism backbone for content assertions in automated
+/// tests (assert on exact text instead of OCR / pixel-matching).
+/// Scrollback above the viewport is a planned follow-up; today the dump
+/// is the visible grid only, so no `scrollback` param is accepted yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabDumpParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+}
+
+/// Cursor position within the dumped viewport, 0-indexed from the top-left.
+/// Absent when the cursor is off-viewport or hidden by the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabDumpCursor {
+    pub row: u32,
+    pub col: u32,
+    pub visible: bool,
+}
+
+/// `tab.dump` response. `rows_text` has one entry per visible row with
+/// trailing blanks trimmed, reconstructing what's on screen (a blank
+/// cell renders as a space so columns line up). Permissive on the wire
+/// so per-cell color / scrollback fields can be added forward-compatibly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabDumpResult {
+    pub cols: u32,
+    pub rows: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<TabDumpCursor>,
+    pub rows_text: Vec<String>,
+}
+
+// ============================================================================
 // Project lifecycle
 // ============================================================================
 
@@ -514,6 +552,7 @@ pub mod ops {
     pub const TAB_LIST: &str = "tab.list";
     pub const TAB_WRITE: &str = "tab.write";
     pub const TAB_RESIZE: &str = "tab.resize";
+    pub const TAB_DUMP: &str = "tab.dump";
     pub const PROJECT_CREATE: &str = "project.create";
     pub const PROJECT_RENAME: &str = "project.rename";
     pub const PROJECT_DELETE: &str = "project.delete";
@@ -742,6 +781,39 @@ mod tests {
         assert_eq!(p.scale, 1);
         assert_eq!(ScreenshotParams::default().scale, 1);
         round_trip(&ScreenshotParams { scale: 2 });
+    }
+
+    #[test]
+    fn tab_dump_round_trips_and_cursor_is_optional() {
+        let p: TabDumpParams = serde_json::from_str(r#"{"tab_id":"7"}"#).unwrap();
+        assert_eq!(p.tab_id, 7);
+        round_trip(&p);
+
+        let with_cursor = TabDumpResult {
+            cols: 80,
+            rows: 24,
+            cursor: Some(TabDumpCursor {
+                row: 1,
+                col: 14,
+                visible: true,
+            }),
+            rows_text: vec!["/tmp $ echo hi".into(), "hi".into()],
+        };
+        round_trip(&with_cursor);
+
+        // cursor omitted entirely when None (skip_serializing_if).
+        let no_cursor = TabDumpResult {
+            cols: 80,
+            rows: 24,
+            cursor: None,
+            rows_text: vec![],
+        };
+        let json = serde_json::to_string(&no_cursor).unwrap();
+        assert!(
+            !json.contains("cursor"),
+            "None cursor must be omitted: {json}"
+        );
+        round_trip(&no_cursor);
     }
 
     #[test]

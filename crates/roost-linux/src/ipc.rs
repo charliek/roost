@@ -21,9 +21,9 @@ use roost_ipc::messages::{
     ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
     ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
-    TabCloseParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult,
-    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams,
+    TabCloseParams, TabDumpCursor, TabDumpParams, TabDumpResult, TabFocusParams, TabFocusResult,
+    TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -38,6 +38,30 @@ type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), 
 pub struct ScreenshotRequest {
     pub scale: u32,
     pub reply: ScreenshotReply,
+}
+
+/// Text snapshot of a tab's terminal viewport, produced on the GTK main
+/// thread for the `tab.dump` op. Neutral (lib-side) types so this crate
+/// stays independent of the bin's `TerminalView`; the UI fills it from
+/// `TerminalView::dump`. `cursor` is `(row, col, visible)`.
+pub struct DumpData {
+    pub cols: u32,
+    pub rows: u32,
+    pub cursor: Option<(u32, u32, bool)>,
+    pub rows_text: Vec<String>,
+}
+
+/// The reply half of a [`DumpRequest`]: the viewport text on success, an
+/// error message (e.g. tab not found / no live terminal) on failure.
+type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
+
+/// A request from the IPC handler (tokio worker) to the GTK main thread
+/// to read a tab's terminal viewport as text. Sibling of
+/// [`ScreenshotRequest`]; the main thread walks the render state and
+/// replies over `reply`.
+pub struct DumpRequest {
+    pub tab_id: i64,
+    pub reply: DumpReply,
 }
 
 use crate::daemon::state::WorkspaceError;
@@ -62,6 +86,10 @@ pub struct IpcHandler {
     /// request here and awaits the PNG bytes back. `None` in headless
     /// contexts (tests); `app.screenshot` then errors with `internal`.
     screenshot_tx: Option<tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>>,
+    /// Set by the running UI: `tab.dump` forwards a viewport-read
+    /// request here and awaits the text back. `None` in headless
+    /// contexts (tests); `tab.dump` then errors with `internal`.
+    dump_tx: Option<tokio::sync::mpsc::UnboundedSender<DumpRequest>>,
 }
 
 impl IpcHandler {
@@ -80,6 +108,7 @@ impl IpcHandler {
             app_id: app_id.into(),
             activate_tx: None,
             screenshot_tx: None,
+            dump_tx: None,
         }
     }
 
@@ -99,6 +128,14 @@ impl IpcHandler {
         tx: tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>,
     ) -> Self {
         self.screenshot_tx = Some(tx);
+        self
+    }
+
+    /// Wire the dump channel so `tab.dump` can read a tab's terminal
+    /// viewport as text. The UI installs the sender; the receiver is
+    /// drained on the GTK main thread, which walks the render state.
+    pub fn with_dump(mut self, tx: tokio::sync::mpsc::UnboundedSender<DumpRequest>) -> Self {
+        self.dump_tx = Some(tx);
         self
     }
 }
@@ -220,6 +257,31 @@ async fn dispatch(
                 .await
                 .map_err(pty_err)?;
             Ok(serde_json::json!({}))
+        }
+        ops::TAB_DUMP => {
+            let p: TabDumpParams = decode(params)?;
+            let tx = h
+                .dump_tx
+                .as_ref()
+                .ok_or_else(|| HandlerError::new("internal", "no UI to read terminal"))?;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(DumpRequest {
+                tab_id: p.tab_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
+            let data = reply_rx
+                .await
+                .map_err(|_| HandlerError::new("internal", "UI dropped dump reply"))?
+                .map_err(HandlerError::not_found)?;
+            encode(&TabDumpResult {
+                cols: data.cols,
+                rows: data.rows,
+                cursor: data
+                    .cursor
+                    .map(|(row, col, visible)| TabDumpCursor { row, col, visible }),
+                rows_text: data.rows_text,
+            })
         }
         ops::PROJECT_CREATE => {
             let p: ProjectCreateParams = decode(params)?;

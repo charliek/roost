@@ -312,6 +312,7 @@ impl App {
         screenshot_rx: Option<
             tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::ScreenshotRequest>,
         >,
+        dump_rx: Option<tokio::sync::mpsc::UnboundedReceiver<roost_linux::ipc::DumpRequest>>,
     ) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
@@ -739,6 +740,19 @@ impl App {
                 while let Some(req) = screenshot_rx.recv().await {
                     let result = render_window_png(&window, req.scale);
                     let _ = req.reply.send(result);
+                }
+            });
+        }
+
+        // `tab.dump`: the IPC handler forwards a viewport-read request +
+        // a oneshot reply here. Walk the tab's render state synchronously
+        // on the main thread (libghostty handle is main-thread-only) and
+        // reply with the text rows + cursor.
+        if let Some(mut dump_rx) = dump_rx {
+            let app = app_struct.clone();
+            glib::spawn_future_local(async move {
+                while let Some(req) = dump_rx.recv().await {
+                    let _ = req.reply.send(app.dump_tab(req.tab_id));
                 }
             });
         }
@@ -2907,6 +2921,34 @@ impl App {
         let tab_id = parse_tab_id_from_page(&page)?;
         let view = ui.tabs.borrow().get(&tab_id).map(|t| t.view.clone());
         view
+    }
+
+    /// Find the `TerminalView` for any tab id (not just the active one)
+    /// by scanning every project's tab map. Backs `tab.dump`.
+    fn terminal_view_for(self: &Rc<Self>, tab_id: i64) -> Option<Rc<TerminalView>> {
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                return Some(tab.view.clone());
+            }
+        }
+        None
+    }
+
+    /// Read a tab's terminal viewport as text for the `tab.dump` op.
+    /// Errors (→ `not-found` on the wire) when the tab has no live
+    /// `TerminalView`.
+    fn dump_tab(self: &Rc<Self>, tab_id: i64) -> Result<roost_linux::ipc::DumpData, String> {
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        let d = view.dump();
+        Ok(roost_linux::ipc::DumpData {
+            cols: d.cols,
+            rows: d.rows,
+            cursor: d.cursor.map(|c| (c.row, c.col, c.visible)),
+            rows_text: d.rows_text,
+        })
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {

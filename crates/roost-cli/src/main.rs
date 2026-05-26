@@ -43,9 +43,10 @@ use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ScreenshotParams, ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabFocusParams,
-    TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams,
+    ScreenshotParams, ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams,
+    TabDumpResult, TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams,
+    TabResizeParams, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabState,
+    TabWriteParams,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -259,6 +260,16 @@ enum TabCmd {
         cols: u32,
         #[arg(long)]
         rows: u32,
+    },
+    /// Dump the tab's terminal viewport as text — one line per visible
+    /// row, for content assertions in automated tests. Prints the rows
+    /// to stdout; `--json` emits the full result (dims + cursor + rows).
+    Dump {
+        #[arg(long, env = "ROOST_TAB_ID")]
+        tab: Option<i64>,
+        /// Emit the structured JSON result instead of plain text rows.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Persist a new tab ordering within a project. `--order`
     /// is a comma-separated list of tab ids in the target
@@ -490,6 +501,20 @@ async fn main() -> Result<()> {
                     TabResizeParams { tab_id, cols, rows },
                 )
                 .await?;
+        }
+        Cmd::Tab(TabCmd::Dump { tab, json }) => {
+            let tab_id = resolve_tab(&mut client, tab).await?;
+            let result: TabDumpResult =
+                client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                // Plain text: one line per visible row, reconstructing
+                // the screen for `roostctl tab dump | grep …` assertions.
+                for line in &result.rows_text {
+                    println!("{line}");
+                }
+            }
         }
         Cmd::Tab(TabCmd::Reorder { project_id, order }) => {
             client
