@@ -29,6 +29,20 @@ pub type EventReceiver = mpsc::UnboundedReceiver<WorkspaceEvent>;
 /// harmless because every UI event handler is idempotent.
 pub async fn subscribe(workspace: Arc<Workspace>, tx: EventSender) -> Result<()> {
     let mut rx = workspace.subscribe();
+    // Heal the boot gap. The IPC server binds (and can accept `tab.open`)
+    // before this subscribe is live, so a tab opened in that window has
+    // its `TabOpened` broadcast dropped — there's no receiver yet, so it
+    // isn't even a `Lagged`, it's simply lost, and the UI would never
+    // materialize that tab. Forward a full-state `Resync` as the very
+    // first event, built from a snapshot taken *after* subscribe: the UI
+    // reconciles against current truth and attaches any such tab.
+    // Idempotent — a tab opened between the subscribe and the snapshot is
+    // both in that snapshot and buffered in `rx`, and every UI handler
+    // dedupes (see `attach_existing_tab`). Same machinery as the `Lagged`
+    // arm below, just also at startup.
+    if tx.send(workspace.resync_event()).is_err() {
+        return Ok(());
+    }
     loop {
         match rx.recv().await {
             Ok(event) => {

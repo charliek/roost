@@ -53,13 +53,16 @@ ids into `COMMON_COMMAND_IDS`.
   text; assert exact strings. `run()` waits for the shell prompt before
   sending, and tests assert on a marker that appears only in command
   *output*, never the echoed command.
-- **Startup readiness.** `ui.wait_alive` clears two boot races: the IPC
-  socket answers `identify` before the workspace exists (wait for a
-  tab), and the UI's event subscription starts at the end of bootstrap
-  (a tab opened before then is missed). It round-trips a **probe tab**
-  — open via IPC, require it to materialize a live terminal (`dump`
-  succeeds), then close it — so tests only start once an IPC-opened tab
-  reliably becomes live.
+- **Startup readiness.** `ui.wait_alive` waits past two boot stages: the
+  IPC socket answers `identify` before the workspace exists (wait for a
+  tab), and the event subscription comes up at the end of bootstrap. It
+  round-trips a **probe tab** — open via IPC, require it to materialize a
+  live terminal (`dump` succeeds), then close it — so tests only start
+  once the UI is fully up. A tab opened via IPC *before* the
+  subscription is live no longer races permanently: both UIs reconcile
+  against a snapshot as the subscription's first action
+  (resync-on-subscribe), so the probe is a readiness gate, not a
+  workaround for a dropped event.
 - **Isolation.** Each test gets its own `project` fixture and
   cascade-cleans it.
 
