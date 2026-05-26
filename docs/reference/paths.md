@@ -14,7 +14,7 @@ The profile defaults to:
 
 ## File locations
 
-The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost` or `Roost-gtk`.
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost` or `Roost-gtk`.
 
 This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/<app_label>/` and the socket lives in `~/Library/Caches/<app_label>/`.
 
@@ -60,14 +60,19 @@ Pre-rewrite builds stored their state under lowercase `~/Library/Application Sup
 
 `config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored. Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list.
 
+Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled key is silently ignored.
+
 | Key           | Default                              | Effect                                                 |
 |---------------|--------------------------------------|--------------------------------------------------------|
-| `font_family` | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
-| `font_size`   | `12`                                 | Pango points.                                          |
+| `font-family` | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
+| `font-size`   | `12`                                 | Points.                                                |
 | `theme`       | `roost-dark`                         | Bundled color theme name. See [Themes](themes.md).     |
-| `keybind`     | (built-in defaults; see Keybindings) | Repeatable. `trigger=action`; later lines override.    |
+| `keybind`     | (built-in defaults; see Keybindings) | Repeatable. `<trigger> = <action>`; later lines override. |
+| `command`     | (none)                               | Repeatable. A command-launcher entry (`Cmd/Alt+Shift+T`). See [Command launcher](#command-launcher) below. |
 
-Roost probes the system at startup for each candidate in `font_family` (left-to-right) and picks the first that's installed. Pango's own comma-separated fallback is unreliable on macOS — when the head of the list is missing it can silently fall through to a *proportional* font (Verdana), which produces wide cells with narrow glyphs and huge gaps between letters. The probe avoids that.
+Tab-strip pill widths (`tab-min-width` / `tab-max-width`, macOS) are documented in [Tab Strip](tab-strip.md#config-keys).
+
+Roost probes the system at startup for each candidate in `font-family` (left-to-right) and picks the first that's installed. Pango's own comma-separated fallback is unreliable on macOS — when the head of the list is missing it can silently fall through to a *proportional* font (Verdana), which produces wide cells with narrow glyphs and huge gaps between letters. The probe avoids that.
 
 If none of the requested families exist, Roost falls back to `monospace` and logs a warning at startup:
 
@@ -80,15 +85,38 @@ Successful family selection is logged at debug level only (silent on a normal la
 Example `config.conf`:
 
 ```conf
-font_family = Iosevka, JetBrains Mono, Monaco, monospace
-font_size   = 13
+font-family = Iosevka, JetBrains Mono, Monaco, monospace
+font-size   = 13
 
 # Add a second trigger for new_tab without removing the default Cmd-T.
 keybind = super+j = new_tab
 
 # Disable the default rename-project shortcut.
 keybind = super+shift+r = unbind
+
+# Command-launcher entries (Cmd/Alt+Shift+T).
+command = label="Lazygit" run="lazygit"
+command = label="Logs" run="docker compose logs -f" hold=true
 ```
+
+## Command launcher
+
+Each `command =` line adds an entry to the command launcher
+(`Cmd-Shift-T` / `Alt-Shift-T`). Activating one spawns a new tab in the
+active project and runs the command through your login shell. The value
+is a record of quote-aware `key="value"` tokens:
+
+| Token   | Required | Effect                                                              |
+|---------|----------|---------------------------------------------------------------------|
+| `label` | yes      | The text shown in the launcher list.                                |
+| `run`   | yes      | The shell command to run.                                           |
+| `title` | no       | The tab title (defaults to `label`).                                |
+| `hold`  | no       | `hold=true` keeps the shell open after the command exits (otherwise the tab closes when it finishes). |
+| `env`   | no       | `env="KEY=VALUE"` exported before `run`. Repeat the token for more. |
+
+A line missing `label` or `run` is skipped (logged, not fatal). The
+launcher reads the config fresh each time it opens, so edits take effect
+without a restart.
 
 ## Environment variables Roost sets
 

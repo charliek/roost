@@ -23,7 +23,15 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
+| `Cmd-Shift-U`        | Jump to the next tab with a pending notification (active project first, then others) |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
+
+### Commands
+
+| Shortcut         | Action                                          |
+|------------------|-------------------------------------------------|
+| `Cmd-Shift-P`    | Open the command palette (fuzzy-find + run any command) |
+| `Cmd-Shift-T`    | Open the command launcher (run a configured `command =` entry in a new tab) |
 
 ### Clipboard
 
@@ -67,7 +75,15 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
+| `Ctrl-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
+
+### Commands
+
+| Shortcut         | Action                                          |
+|------------------|-------------------------------------------------|
+| `Alt-Shift-P`    | Open the command palette (fuzzy-find + run any command) |
+| `Alt-Shift-T`    | Open the command launcher (run a configured `command =` entry in a new tab) |
 
 ### Clipboard
 
@@ -137,7 +153,7 @@ The sidebar still supports mouse-driven rename: double-click a project row to re
 
 If you close the last tab in a project, Roost closes that project too. The "Are you sure?" confirmation dialog only appears for explicit close-project actions (the sidebar X button or the right-click menu); `Cmd-W` / `Ctrl-W` on the final tab closes the project silently.
 
-Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roost-cli-rs set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.
+Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roostctl set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.
 
 ## Custom keybindings
 
@@ -192,6 +208,9 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
 | `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |
+| `jump_to_unread`      | `super+shift+u` / `ctrl+shift+u`                       |
+| `command_palette`     | `super+shift+p` / `alt+shift+p`                        |
+| `command_launcher`    | `super+shift+t` / `alt+shift+t`                        |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
 | `font_increase`       | `super+plus`, `super+equal` / `ctrl+plus`, `ctrl+equal` |
