@@ -1,9 +1,14 @@
 # Test automation & scripting architecture (plan)
 
-Status: **active plan** — runner decided (pytest; §7). The north star is
+Status: **largely implemented** (2026-05). The functional E2E harness
+(pytest) is built and headless in CI as [`tools/roosttest/`](../../tools/roosttest/README.md);
+the tooling is reorganized into three layers (see
+[`tools/README.md`](../../tools/README.md)); and `tab.dump`, `wait`, and
+the `palette.*` ops shipped. The plan below is kept as the design
+rationale — the "Gap" entries it lists are mostly closed now. The Lua
+scripting layer (§ below) remains the open piece. The north star is
 canonical in [vision.md](vision.md#the-command-core-north-star); §0 here
-is the testing-lens recap. A few open decisions remain (see
-[Open decisions](#open-decisions)).
+is the testing-lens recap.
 Audience: Claude (primary) + the maintainer. Targets: this Mac, Macs in
 general, the Pop!_OS (COSMIC/Wayland) box, and CI (Linux + macOS runners).
 
@@ -111,14 +116,14 @@ across both implementations?*
 | Layer | What exists | Gap |
 |---|---|---|
 | Unit / integration | `cargo test --workspace` (Rust: IPC, OSC, vt, target picker, persistence) + `swift test` (190 tests: Workspace state machine, IPC dispatch, persistence) | No coverage of the *live* app (PTY, rendering, IPC end-to-end). |
-| IPC surface | `roost-ipc`: tab/project CRUD, set-state, notify, focus, send, resize, reorder, screenshot, claude-hook, identify | No **content** read (terminal grid), no **wait/subscribe**, no **UI-action** ops (open launcher/palette, copy/paste). |
-| Event stream | UIs consume an **in-process** event bus. `events.subscribe` over the wire is **stubbed not-implemented on both UIs** (`mac/Sources/Roost/IPCHandlerImpl.swift`, `crates/roost-linux/src/ipc.rs`). | External clients can't wait on events yet. |
-| Render state | `roost-vt` `RenderState.walk(|cell| …)` yields `Cell { text: String /*grapheme*/, fg, bg }` + cursor; mirrored 1:1 in `mac/Sources/Roost/RenderState.swift`. Both UIs walk it to draw. | Not exposed over IPC as text. |
-| Tooling | `tools/screenshot/` (bash + roostctl, cross-platform smoke; PR #104). `tools/input/linux/` (Python uinput/PNG/clipboard; PR #103). | Bash can't wait/assert richly; Python harness is Linux-only; two entry points; no CI wiring. |
+| IPC surface | `roost-ipc`: tab/project CRUD, set-state, notify, focus, send, resize, reorder, screenshot, claude-hook, identify — **now also `tab.dump` (content), `palette.*` (UI-action), and `roostctl wait`**. | Copy/paste + live `events.subscribe` still unimplemented. |
+| Event stream | UIs consume an **in-process** event bus. `events.subscribe` over the wire is **stubbed not-implemented on both UIs** (`mac/Sources/Roost/IPCHandlerImpl.swift`, `crates/roost-linux/src/ipc.rs`). | External clients can't wait on events yet (the pytest harness condition-waits via polling instead). |
+| Render state | `roost-vt` `RenderState.walk(|cell| …)` yields `Cell { text: String /*grapheme*/, fg, bg }` + cursor; mirrored 1:1 in `mac/Sources/Roost/RenderState.swift`. Both UIs walk it to draw. | **Now exposed over IPC as text via `tab.dump`** (viewport only; scrollback is a follow-up). |
+| Tooling | Three layers (see [`tools/README.md`](../../tools/README.md)): `tools/roosttest/` (pytest, IPC, **in CI**), `tools/screenshot/` (bash + roostctl + pngtool, visual), `tools/input/linux/` (uinput/clipboard, real input). | Real-input (Layer 3) + visual (Layer 2) are local-only; a Mac CGEvent injector is still to come. |
 
-Per the maintainer: **land #103 + #104 as-is** (resolve the trivial
-`CLAUDE.md` bullet conflict), and design the unified harness here. No
-consolidation of those two until this lands.
+This unified design is now realized: the pytest harness (`tools/roosttest/`)
+is Tier 1, and the screenshot + input harnesses are reorganized by layer.
+The Lua scripting substrate below is the remaining piece.
 
 ---
 

@@ -108,7 +108,7 @@ roostctl tab set-state --tab 3 --state idle
 | `--state` | string | required | One of `none`, `running`, `needs_input`, `idle` |
 | `--tab` | int | `$ROOST_TAB_ID` | Target tab id |
 
-## `tab open` / `close` / `send` / `resize` / `reorder`
+## `tab open` / `close` / `send` / `resize` / `reorder` / `dump`
 
 Tab lifecycle and I/O for automation. `tab send` needs an existing live PTY (a UI must have already attached); errors with `NotFound` otherwise. `--bytes` accepts Rust string-escape sequences (`\n`, `\r`, `\x1b`, …); pass `--raw` to disable escape decoding.
 
@@ -118,7 +118,30 @@ roostctl tab close --tab 5
 roostctl tab send --tab 5 --bytes 'ls -la\n'
 roostctl tab resize --tab 5 --cols 120 --rows 40
 roostctl tab reorder --project-id 1 --order 3,5,7
+roostctl tab dump --tab 5          # the visible viewport as text
+roostctl tab dump --tab 5 --json   # full result: dims + cursor + rows
 ```
+
+`tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
+
+## `wait`
+
+Block until a tab reaches a condition, then exit `0` — the no-`sleep` synchronization primitive for scripts and tests. Polls the running UI on an interval; exits non-zero if `--timeout` elapses first. At least one condition is required; when several are given, all must hold.
+
+```bash
+roostctl wait --tab 5 --state idle            # until the agent state is idle
+roostctl wait --tab 5 --text 'BUILD OK'       # until the viewport contains a string
+roostctl wait --tab 5 --gone                  # until the tab is closed
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--state` | string | — | Wait until the tab's agent state equals this (`none`/`running`/`needs_input`/`idle`) |
+| `--text` | string | — | Wait until the viewport (via `tab.dump`) contains this substring. Pick a needle from command *output*, not the echoed command |
+| `--gone` | flag | `false` | Wait until the tab no longer exists |
+| `--timeout` | float | `5.0` | Give up after this many seconds |
+| `--interval-ms` | int | `100` | Poll interval |
+| `--tab` | int | `$ROOST_TAB_ID` | Target tab id |
 
 ## `project` subcommands
 
@@ -144,6 +167,20 @@ roostctl screenshot > shot.png            # raw PNG bytes to stdout
 
 `--scale` is `1` (default, logical window size) or `2`. With `--out` the CLI writes the file and prints the dimensions + byte count to stderr; without it, the raw PNG bytes go to stdout (nothing else is printed, so the stream stays binary-clean). Backed by the `app.screenshot` IPC op — see [ipc.md](ipc.md).
 
+## `palette` subcommands
+
+Drive the command-palette overlay: open it, inspect its rows, filter, activate a row, dismiss. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.
+
+```bash
+roostctl palette open                      # the command palette (or: --kind launcher)
+roostctl palette state                     # current rows / filter / selection
+roostctl palette query theme               # set the filter
+roostctl palette activate new_tab          # confirm the row (runs its command)
+roostctl palette dismiss
+```
+
+`palette activate <id>` errors `not-found` if no palette is open or no visible row has that id. Backed by the `palette.*` IPC ops — see [ipc.md](ipc.md).
+
 ## `claude install`
 
 Writes `~/.config/roost/claude-settings.json` pointing at this binary's `claude-hook` subcommand for each Claude Code lifecycle event, then prints a bash alias snippet (`alias claude='claude --settings ...'`) to stdout. See the [Claude Code Hooks](../guides/claude-code.md) guide for the full workflow.
@@ -166,7 +203,7 @@ Internal: invoked by Claude Code via the generated settings file. Reads the hook
 | `ROOST_PROJECT_ID` | The project id this tab lives in (auto-set, available to scripts) |
 | `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
 
-The first three are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner).
+`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_PROJECT_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac`/`gtk`) — see [Paths & Environment](paths.md).
 
 ## Exit codes
 

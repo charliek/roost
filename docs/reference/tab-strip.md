@@ -31,7 +31,7 @@ tab-min-width = 200
 tab-max-width = 200
 
 # Disable the cap entirely — pills grow to their full title.
-# Useful if you set short, deliberate titles via `roost-cli-rs set-title`.
+# Useful if you set short, deliberate titles via `roostctl set-title`.
 tab-max-width = 0
 ```
 

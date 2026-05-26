@@ -4,7 +4,7 @@ Wire Claude Code's hook system to Roost so each tab gets a sticky agent-state in
 
 ## How it works
 
-Roost ships a `roost-cli-rs claude-hook EVENT` subcommand that Claude Code invokes for each lifecycle event. The hook reads Claude's JSON payload from stdin, looks up `$ROOST_TAB_ID` (auto-set in every Roost tab), and tells the GUI:
+Roost ships a `roostctl claude-hook EVENT` subcommand that Claude Code invokes for each lifecycle event. The hook reads Claude's JSON payload from stdin, looks up `$ROOST_TAB_ID` (auto-set in every Roost tab), and tells the GUI:
 
 | Hook event         | What Roost does                                                   |
 |--------------------|-------------------------------------------------------------------|
@@ -21,13 +21,13 @@ The hook is a silent no-op when run outside a Roost tab (no `$ROOST_TAB_ID`), so
 Inside a Roost tab:
 
 ```bash
-roost-cli-rs claude install
+roostctl claude install
 ```
 
-This writes `~/.config/roost/claude-settings.json` with the five hook entries (each pointing at the absolute path of `roost-cli-rs`) and prints a bash alias snippet to stdout. Add the snippet to your shell rc:
+This writes `~/.config/roost/claude-settings.json` with the five hook entries (each pointing at the absolute path of `roostctl`) and prints a bash alias snippet to stdout. Add the snippet to your shell rc:
 
 ```bash
-roost-cli-rs claude install >> ~/.bashrc
+roostctl claude install >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -42,7 +42,7 @@ alias claude='claude --settings /Users/you/.config/roost/claude-settings.json'
 To overwrite an existing settings file, pass `--force`:
 
 ```bash
-roost-cli-rs claude install --force
+roostctl claude install --force
 ```
 
 To uninstall, remove the alias from your shell rc and delete the file:
@@ -56,7 +56,7 @@ rm ~/.config/roost/claude-settings.json
 Open a fresh Roost tab, source your rc if needed, then:
 
 ```bash
-roost-cli-rs identify
+roostctl identify
 ```
 
 You should see a JSON object describing the running app. If it errors, the GUI isn't running or `ROOST_SOCKET` is unset — re-launch `roost` and try again.
@@ -91,6 +91,6 @@ Roost deliberately doesn't edit your `~/.claude/settings.json`. The alias approa
 - **Hooks don't fire** — check `which claude`. If it points to the real binary instead of the alias, the alias didn't take effect (rc not sourced, or running in a non-interactive shell).
 - **No banners on macOS** — `terminal-notifier` is required. `brew install terminal-notifier`. The in-app tab indicator works without it.
 - **Click-through doesn't focus** — on Linux, your notification daemon must support default actions (mako, dunst, GNOME Shell all do). On Wayland without an XDG-activation token, the window may only request attention rather than raise.
-- **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost. Check `roost-cli-rs identify` and re-source your rc.
+- **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost. Check `roostctl identify` and re-source your rc.
 
 See [Notifications](notifications.md) for the full pipeline architecture.

@@ -330,6 +330,36 @@ Errors: `internal` when there is no window to capture, the window is
 minimized (Mac) or not yet realized (Linux), or PNG encoding fails;
 `invalid-param` for an out-of-range `scale`.
 
+### Command palette (`palette.*`)
+
+Drive the command-palette overlay — open it, read its rows, filter,
+activate a row, dismiss. UI-only: routed to the UI like `app.screenshot`,
+not the workspace. A command row's id **is** its KeybindAction id, so
+activating a row runs the same dispatch its hotkey would; activating a
+sub-frame row (e.g. `select_theme`) drills in. Backs `roostctl palette`.
+
+All five ops reply with the resulting palette state, so a driver needs no
+follow-up `palette.state`:
+
+```json
+{"open": true, "frame": "commands", "query": "tab", "selection": 2,
+ "items": [{"id": "new_tab", "title": "New Tab"},
+           {"id": "select_theme", "title": "Select Theme…"}]}
+```
+
+`open` is false when no palette is up (the other fields are then
+empty/default). When open, `frame` is the current frame id (`commands` |
+`launcher` | `themes` | `notifications`), and `items` are the filtered
+rows in display order (`subtitle` present on rows that have one).
+
+| Op | Request params | Notes |
+|---|---|---|
+| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher. Other values → `invalid-param`. |
+| `palette.state` | `{}` | Read the current state. |
+| `palette.query` | `{"query": "theme"}` | Set the current frame's filter (resets selection to the top match). |
+| `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |
+| `palette.dismiss` | `{}` | Close any open palette. |
+
 ### `events.subscribe`
 
 Opt-in to the event stream. After the response, the server pushes
