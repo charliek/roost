@@ -1415,13 +1415,14 @@ impl App {
     /// OpenTab RPC → on success, attach the tab to the project's
     /// TabView.
     async fn open_new_tab_in(self: &Rc<Self>, project_id: i64) -> anyhow::Result<()> {
-        // Empty cwd + title delegates resolution to
-        // `LocalClient::open_tab`, which prefers the project's
-        // stored cwd, then $HOME, then `/`, and derives the title.
-        // CR (M4b3b review) flagged the pre-existing HOME-only path:
-        // a project pinned to a directory should open its tabs
-        // there, not bounce them to the user's home.
-        self.open_tab_in_with(project_id, "", "", &[])
+        // Inherit the active tab's live (OSC 7-tracked) cwd — the same
+        // resolution the command launcher uses. `active_tab_cwd` returns
+        // "" when unknown, which `LocalClient::open_tab` then resolves to
+        // the project's stored cwd, then $HOME, then `/`. (CR M4b3b: a
+        // project pinned to a directory should open its tabs there, not
+        // bounce them to the user's home.)
+        let cwd = self.active_tab_cwd(project_id);
+        self.open_tab_in_with(project_id, &cwd, "", &[])
             .await
             .map(|_| ())
     }

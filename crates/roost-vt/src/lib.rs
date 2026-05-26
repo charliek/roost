@@ -104,12 +104,18 @@ pub const fn ffi_available() -> bool {
 #[cfg(feature = "ffi")]
 mod key_encoder;
 #[cfg(feature = "ffi")]
+mod mouse_encoder;
+#[cfg(feature = "ffi")]
 mod render_state;
 #[cfg(feature = "ffi")]
 mod terminal;
 
 #[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
+#[cfg(feature = "ffi")]
+pub use mouse_encoder::{
+    mouse_action, mouse_button, MouseAction, MouseButton, MouseEncoder, MouseEvent,
+};
 #[cfg(feature = "ffi")]
 pub use render_state::{Cell, ColorRgb, Colors, CursorInfo, CursorVisualStyle, RenderState};
 #[cfg(feature = "ffi")]

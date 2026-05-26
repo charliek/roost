@@ -30,14 +30,14 @@ use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{
-    DrawingArea, EventControllerFocus, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, GestureDrag,
+    DrawingArea, EventControllerFocus, EventControllerKey, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, GestureDrag,
 };
 use pangocairo::functions as pango_cairo;
 
 use roost_vt::{
-    ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, RenderState,
-    ScrollViewport, Terminal, TerminalOptions,
+    ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, MouseEncoder,
+    MouseEvent, RenderState, ScrollViewport, Terminal, TerminalOptions,
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
@@ -166,6 +166,7 @@ impl TerminalView {
 
         let render_state = RenderState::new().expect("allocate libghostty-vt render state");
         let encoder = KeyEncoder::new().expect("allocate libghostty-vt key encoder");
+        let mouse_encoder = MouseEncoder::new().expect("allocate libghostty-vt mouse encoder");
         // Push the theme's palette + chrome colors into libghostty so
         // SGR cells (`ls --color`, `git diff`, htop, etc.) flip to
         // the theme's reds / greens / etc. Failures are non-fatal:
@@ -194,6 +195,8 @@ impl TerminalView {
             terminal,
             render_state,
             encoder,
+            mouse_encoder,
+            pointer: (0.0, 0.0),
             theme,
             font_desc,
             cell_metrics: metrics,
@@ -261,6 +264,18 @@ impl TerminalView {
         });
         widget.add_controller(focus_ctrl);
 
+        // Pointer tracking: the scroll controller doesn't carry a
+        // position, so keep the latest hover here for the wheel-as-button
+        // reports (which must name the cell under the pointer).
+        let motion_ctrl = EventControllerMotion::new();
+        motion_ctrl.connect_motion({
+            let state = state.clone();
+            move |_ctrl, x, y| {
+                state.borrow_mut().pointer = (x, y);
+            }
+        });
+        widget.add_controller(motion_ctrl);
+
         // Scroll wheel: 3 modes per the Mac UI / Go binary. Discrete
         // notches + smooth scroll both go through the same path; the
         // smooth-scroll accumulator handles trackpad fractional rows.
@@ -270,9 +285,12 @@ impl TerminalView {
         scroll_ctrl.connect_scroll({
             let state = state.clone();
             let widget = widget.clone();
-            move |_ctrl, _dx, dy| {
+            move |ctrl, _dx, dy| {
+                // Modifiers held during the scroll, so mouse-tracking apps
+                // see shift/ctrl+wheel (matches the Mac path).
+                let mods = key_encoder::translate_mods(ctrl.current_event_state());
                 let mut s = state.borrow_mut();
-                let bytes = s.handle_scroll(dy);
+                let bytes = s.handle_scroll(dy, mods);
                 let cb = s.input_callback.clone();
                 drop(s);
                 widget.queue_draw();
@@ -614,6 +632,13 @@ struct TerminalViewState {
     /// Reused across keystrokes; an internal scratch buffer keeps
     /// per-keystroke allocation amortized to zero in the steady state.
     encoder: KeyEncoder,
+    /// Reused across wheel events. Encodes the scroll wheel as button-4/5
+    /// reports when the focused app enables mouse tracking.
+    mouse_encoder: MouseEncoder,
+    /// Last known pointer position in widget pixels, tracked by a motion
+    /// controller. The scroll controller doesn't carry a position, so we
+    /// keep the latest hover here to report the wheel at the right cell.
+    pointer: (f64, f64),
     theme: Theme,
     font_desc: pango::FontDescription,
     cell_metrics: CellMetrics,
@@ -916,18 +941,19 @@ impl TerminalViewState {
 
     /// Handle a single scroll-wheel `dy`. Negative = up (older
     /// history). 3 modes per the Go binary `cmd/roost/session.go`:
-    ///   * Mouse-tracking (DECSET 1000/1002/1003) — defer; commit 7
-    ///     of this plan doesn't enable mouse-tracking encode yet.
+    ///   * Mouse-tracking (DECSET 1000/1002/1003) — encode button-4/5
+    ///     reports via `encode_wheel_buttons`, checked first so a
+    ///     tracking alt-screen app (htop) gets the report.
     ///   * Alt-screen — translate to ArrowUp / ArrowDown via the key
     ///     encoder. Lets vim / less consume the wheel.
     ///   * Primary screen — local viewport scroll via
     ///     `Terminal::scroll_viewport(Delta)`.
     ///
-    /// Returns the bytes to feed into the PTY (the alt-screen arrow-key
+    /// Returns the bytes to feed into the PTY (the mouse / arrow-key
     /// encoding); empty for a local scrollback move. The caller
     /// dispatches them through `input_callback` after dropping the
     /// borrow, per the callback invariant on `TerminalViewState`.
-    fn handle_scroll(&mut self, dy: f64) -> Vec<u8> {
+    fn handle_scroll(&mut self, dy: f64, mods: roost_vt::Mods) -> Vec<u8> {
         // Smooth-scroll accumulator. Trackpad deltas are typically
         // fractional rows; discrete wheels are integers.
         self.scroll_accum += dy;
@@ -941,6 +967,15 @@ impl TerminalViewState {
         } else {
             return Vec::new();
         };
+
+        // Mouse tracking: the app opted into mouse events, so forward the
+        // wheel as button-4 (up) / button-5 (down) reports at the
+        // pointer's cell. Checked *before* alt-screen — a mouse-tracking
+        // alt-screen app (htop) wants the report, not arrow keys. The
+        // encoder honors the negotiated format (X10 / SGR / pixels).
+        if self.terminal.mouse_tracking() {
+            return self.encode_wheel_buttons(rows_to_scroll, mods);
+        }
 
         if self.terminal.active_screen() == ActiveScreen::Alternate {
             // Translate to arrow keys for alt-screen apps.
@@ -984,6 +1019,48 @@ impl TerminalViewState {
             self.scrolled_back = false;
         }
         Vec::new()
+    }
+
+    /// Encode one wheel button-press per scrolled row at the pointer's
+    /// current cell. `rows < 0` is wheel-up (button 4); `rows > 0` is
+    /// wheel-down (button 5). Returns the concatenated reports (empty if
+    /// the encoder declines, e.g. the negotiated format reports nothing).
+    fn encode_wheel_buttons(&mut self, rows: isize, mods: roost_vt::Mods) -> Vec<u8> {
+        let button = if rows < 0 {
+            roost_vt::mouse_button::FOUR // wheel up
+        } else {
+            roost_vt::mouse_button::FIVE // wheel down
+        };
+        let cw = self.cell_metrics.cell_width.max(1.0);
+        let ch = self.cell_metrics.cell_height.max(1.0);
+        let screen_w = (cw * self.cols as f64) as u32;
+        let screen_h = (ch * self.rows as f64) as u32;
+        // Clamp the pointer into the grid so a wheel event just off the
+        // edge still names the last cell, not an out-of-range coordinate.
+        let (px, py) = self.pointer;
+        let x = px.clamp(0.0, (cw * self.cols as f64 - 1.0).max(0.0)) as f32;
+        let y = py.clamp(0.0, (ch * self.rows as f64 - 1.0).max(0.0)) as f32;
+
+        self.mouse_encoder.sync_from_terminal(&self.terminal);
+        self.mouse_encoder
+            .set_size(screen_w, screen_h, cw as u32, ch as u32);
+
+        let mut event = match MouseEvent::new() {
+            Ok(ev) => ev,
+            Err(_) => return Vec::new(),
+        };
+        event.set_action(roost_vt::mouse_action::PRESS);
+        event.set_button(button);
+        event.set_mods(mods);
+        event.set_position(x, y);
+
+        let mut out = Vec::new();
+        for _ in 0..rows.unsigned_abs() {
+            if let Ok(bytes) = self.mouse_encoder.encode(&event) {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
     }
 
     /// Convert widget-pixel `(x, y)` to a (col, row) cell pair,

@@ -122,11 +122,14 @@ final class KeyEncoder {
         ghostty_key_event_set_action(event, action)
         ghostty_key_event_set_key(event, key)
         ghostty_key_event_set_mods(event, mods)
-        // We don't currently track unshifted codepoints from
-        // NSEvent.charactersIgnoringModifiers — pass 0 to let the
-        // encoder derive from key alone. Kitty REPORT_ALTERNATES users
-        // get slightly less faithful reporting until we add that.
-        ghostty_key_event_set_unshifted_codepoint(event, 0)
+        // The unshifted base-layout codepoint (Ctrl+A → "a" = 97). Under
+        // the Kitty keyboard protocol the encoder needs this to build a
+        // CSI-u entry for letter/digit keys — they're not in the
+        // functional `kitty_entries` table, so with 0 the encoder emits
+        // NOTHING for Ctrl+letter (Claude Code / opencode enable Kitty,
+        // so every Ctrl+letter was silently dropped). Legacy mode derives
+        // the C0 byte from the key alone and is unaffected either way.
+        ghostty_key_event_set_unshifted_codepoint(event, Self.unshiftedCodepoint(for: nsEvent))
         // IME composition is handled by NSResponder via interpretKeyEvents
         // → insertText (the path TerminalView doesn't currently wire);
         // when this method runs, we're past composition.
@@ -206,6 +209,28 @@ final class KeyEncoder {
         }
         if filtered.isEmpty { return Data() }
         return Data(String(String.UnicodeScalarView(filtered)).utf8)
+    }
+
+    /// The unshifted base-layout codepoint for `e` — the character the
+    /// key would type with no modifiers held (Ctrl+A → "a" = 97;
+    /// Ctrl+Shift+K → "k" = 107). The libghostty-vt encoder uses this to
+    /// build Kitty CSI-u entries for letter/digit keys. Returns 0 (the
+    /// "absent" sentinel the C API expects) for C0/DEL and the NS-private
+    /// function-key range, which aren't text. Mirrors cmux's
+    /// `unshiftedCodepointFromEvent`.
+    ///
+    /// `characters(byApplyingModifiers: [])` asks AppKit for the
+    /// no-modifier characters, which is the unshifted layout char. For
+    /// non-US layouts cmux additionally consults the TIS layout via
+    /// `KeyboardLayout.character(forKeyCode:)`; that's a possible
+    /// follow-up for exotic layouts but isn't needed for the reported bug.
+    private static func unshiftedCodepoint(for e: NSEvent) -> UInt32 {
+        let s = e.characters(byApplyingModifiers: []) ?? e.charactersIgnoringModifiers
+        guard let scalar = s?.unicodeScalars.first else { return 0 }
+        let v = scalar.value
+        if v < 0x20 || v == 0x7F { return 0 }        // C0 / DEL
+        if v >= 0xF700 && v <= 0xF8FF { return 0 }   // NS private-use fn keys
+        return v
     }
 
     /// Translate NSEvent.modifierFlags to libghostty-vt's mods bitmask.
