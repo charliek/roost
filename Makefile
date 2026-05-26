@@ -60,7 +60,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-mac smoke-gtk smoke-mac
+.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac smoke-gtk smoke-mac
 test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
 
 test-rust:  ## cargo test --workspace
@@ -68,6 +68,15 @@ test-rust:  ## cargo test --workspace
 
 test-mac:  ## swift test (Mac)
 	cd $(MAC_DIR) && swift test
+
+e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk, default gtk; launches the UI)
+	uv run --group test pytest tools/roosttest
+
+e2e-gtk:  ## E2E against the GTK UI
+	uv run --group test pytest tools/roosttest --roost-target gtk
+
+e2e-mac:  ## E2E against the Mac app
+	uv run --group test pytest tools/roosttest --roost-target mac
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 	tools/uitest/smoke.sh gtk
