@@ -9,6 +9,45 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.2 — 2026-05-26
+
+Programmability + automation release: the command palette and a growing set of
+control ops are now driveable over IPC, with an end-to-end test harness
+exercising both UIs — plus boot-reliability and Mac↔GTK parity fixes.
+
+### Features
+
+- **Command palette over IPC** — `palette.open` / `state` / `query` /
+  `activate` / `dismiss` ops + `roostctl palette …`. Activating a row runs the
+  same command its keybind would, so the palette is a scriptable command
+  surface, not just UI.
+- **`tab.dump`** — read a tab's terminal viewport as text (`roostctl tab dump`),
+  the determinism backbone for content assertions.
+- **`roostctl wait`** — block until a tab reaches a state / shows text / is
+  gone; a no-`sleep` synchronization primitive for scripts and tests.
+- **Command launcher** (`Cmd/Alt+Shift+T`), configured via `command =` lines
+  (`label` / `run` / `title` / `hold` / `env`), and **Jump to Unread**
+  (`Cmd/Alt+Shift+U`) — now on both UIs.
+- **`ROOST_CONFIG`** environment variable to read config from an alternate file.
+
+### Fixes
+
+- Boot race: a tab opened via IPC during launch now reliably materializes
+  (resync-on-subscribe) instead of never appearing.
+- The notification jump + focus-tab now update the *core* active tab, so
+  `identify` / `tab.focus` and the restored selection track what's on screen
+  (both UIs).
+- Mac↔GTK parity: one command-palette command set (`close_project`,
+  `jump_to_unread`); Mac `tab.focus` switches the visible tab.
+
+### Tooling & docs
+
+- `tools/roosttest/` — pytest E2E driving a real UI over IPC, headless in CI on
+  both platforms; plus the `tools/screenshot/` (visual) and
+  `tools/input/linux/` (real-input) harnesses, mapped in `tools/README.md`.
+- Reference docs for the IPC ops, CLI, keybindings, and config brought current;
+  architecture + principles in `docs/development/vision.md`.
+
 ## v0.0.1 — 2026-05-23
 
 First packaged release of Roost — a cross-platform (macOS + Linux) desktop
