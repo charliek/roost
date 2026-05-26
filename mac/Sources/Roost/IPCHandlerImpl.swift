@@ -593,22 +593,8 @@ private struct IPCTabOpenResult: Codable {
 }
 
 private struct IPCTabCloseParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-    }
 }
 
 private struct IPCTabListResult: Codable {
@@ -694,30 +680,12 @@ private struct IPCScreenshotResult: Codable {
 }
 
 private struct IPCTabResizeParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     let cols: UInt32
     let rows: UInt32
     enum CodingKeys: String, CodingKey {
         case tabID = "tab_id"
         case cols, rows
-    }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-        self.cols = try c.decode(UInt32.self, forKey: .cols)
-        self.rows = try c.decode(UInt32.self, forKey: .rows)
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-        try c.encode(cols, forKey: .cols)
-        try c.encode(rows, forKey: .rows)
     }
 }
 
@@ -731,162 +699,100 @@ private struct IPCProjectCreateResult: Codable {
 }
 
 private struct IPCProjectRenameParams: Codable {
-    let projectID: Int64
+    @StringInt64 var projectID: Int64
     let name: String
     enum CodingKeys: String, CodingKey {
         case projectID = "project_id"
         case name
     }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .projectID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .projectID, in: c, debugDescription: "project_id must be string int64"
-            )
-        }
-        self.projectID = v
-        self.name = try c.decode(String.self, forKey: .name)
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(projectID), forKey: .projectID)
-        try c.encode(name, forKey: .name)
-    }
 }
 
 private struct IPCProjectDeleteParams: Codable {
-    let projectID: Int64
+    @StringInt64 var projectID: Int64
     enum CodingKeys: String, CodingKey { case projectID = "project_id" }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .projectID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .projectID, in: c, debugDescription: "project_id must be string int64"
-            )
-        }
-        self.projectID = v
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(projectID), forKey: .projectID)
-    }
 }
 
 private struct IPCTabReorderParams: Codable {
-    let projectID: Int64
-    let tabIDs: [Int64]
+    @StringInt64 var projectID: Int64
+    @StringInt64Array var tabIDs: [Int64]
     enum CodingKeys: String, CodingKey {
         case projectID = "project_id"
         case tabIDs = "tab_ids"
     }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .projectID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .projectID, in: c, debugDescription: "project_id must be string int64"
-            )
-        }
-        self.projectID = v
-        let rawIDs = try c.decode([String].self, forKey: .tabIDs)
-        self.tabIDs = try rawIDs.map { s in
-            guard let v = Int64(s) else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .tabIDs, in: c, debugDescription: "tab_ids must be string int64s"
-                )
-            }
-            return v
-        }
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(projectID), forKey: .projectID)
-        try c.encode(tabIDs.map { String($0) }, forKey: .tabIDs)
-    }
 }
 
 private struct IPCProjectReorderParams: Codable {
-    let projectIDs: [Int64]
+    @StringInt64Array var projectIDs: [Int64]
     enum CodingKeys: String, CodingKey { case projectIDs = "project_ids" }
+}
+
+/// Codable wrapper for the wire's string-encoded int64 ids (JSON numbers
+/// lose precision past 2^53). `@StringInt64 var tabID: Int64` + a
+/// `CodingKeys` remap replaces the per-struct hand-rolled string↔Int64
+/// decode/encode. Mirrors the Rust `string_int64` serde module.
+@propertyWrapper
+struct StringInt64: Codable {
+    var wrappedValue: Int64
+    init(wrappedValue: Int64) { self.wrappedValue = wrappedValue }
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let rawIDs = try c.decode([String].self, forKey: .projectIDs)
-        self.projectIDs = try rawIDs.map { s in
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "expected string int64, got \"\(raw)\""
+                ))
+        }
+        self.wrappedValue = v
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(String(wrappedValue))
+    }
+}
+
+/// Same, for the wire's `[String]` id arrays (`tab_ids`, `project_ids`).
+/// Mirrors the Rust `vec_string_int64` serde module.
+@propertyWrapper
+struct StringInt64Array: Codable {
+    var wrappedValue: [Int64]
+    init(wrappedValue: [Int64]) { self.wrappedValue = wrappedValue }
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode([String].self)
+        self.wrappedValue = try raw.map { s in
             guard let v = Int64(s) else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .projectIDs, in: c, debugDescription: "project_ids must be string int64s"
-                )
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: decoder.codingPath,
+                        debugDescription: "expected string int64, got \"\(s)\""
+                    ))
             }
             return v
         }
     }
     func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(projectIDs.map { String($0) }, forKey: .projectIDs)
+        var c = encoder.singleValueContainer()
+        try c.encode(wrappedValue.map { String($0) })
     }
 }
 
 private struct IPCTabFocusParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-    }
 }
 
 private struct IPCTabFocusResult: Codable {
-    let previousProjectID: Int64
-    let previousTabID: Int64
+    @StringInt64 var previousProjectID: Int64
+    @StringInt64 var previousTabID: Int64
     enum CodingKeys: String, CodingKey {
         case previousProjectID = "previous_project_id"
         case previousTabID = "previous_tab_id"
     }
-    init(previousProjectID: Int64, previousTabID: Int64) {
-        self.previousProjectID = previousProjectID
-        self.previousTabID = previousTabID
-    }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.previousProjectID = Int64(try c.decode(String.self, forKey: .previousProjectID)) ?? 0
-        self.previousTabID = Int64(try c.decode(String.self, forKey: .previousTabID)) ?? 0
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(previousProjectID), forKey: .previousProjectID)
-        try c.encode(String(previousTabID), forKey: .previousTabID)
-    }
 }
 
 private struct IPCTabDumpParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-    }
 }
 
 /// Cursor position inside a dumped viewport. Plain JSON numbers (not
@@ -912,96 +818,34 @@ private struct IPCTabDumpResult: Codable {
 }
 
 private struct IPCTabSetTitleParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     let title: String
     enum CodingKeys: String, CodingKey {
         case tabID = "tab_id"
         case title
     }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-        self.title = try c.decode(String.self, forKey: .title)
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-        try c.encode(title, forKey: .title)
-    }
 }
 
 private struct IPCTabSetStateParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     let state: IPCTabState
     enum CodingKeys: String, CodingKey {
         case tabID = "tab_id"
         case state
     }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-        self.state = try c.decode(IPCTabState.self, forKey: .state)
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-        try c.encode(state, forKey: .state)
-    }
 }
 
 private struct IPCTabClearNotificationParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-    }
 }
 
 private struct IPCTabSetHookActiveParams: Codable {
-    let tabID: Int64
+    @StringInt64 var tabID: Int64
     let active: Bool
     enum CodingKeys: String, CodingKey {
         case tabID = "tab_id"
         case active
-    }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
-        self.active = try c.decode(Bool.self, forKey: .active)
-    }
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(String(tabID), forKey: .tabID)
-        try c.encode(active, forKey: .active)
     }
 }
 
