@@ -20,14 +20,21 @@ from client import RoostError
 # The shared `palette` fixture (drive from closed, leave closed) lives in
 # conftest.py so the notification + launcher suites reuse it.
 
-# Curated command rows present in BOTH UIs with the same wire id.
+# Curated command rows present in BOTH UIs with the same wire id. The
+# two UIs are kept at parity, so this is the full command-palette set
+# (minus the dynamic notification rows) — `close_project` + `jump_to_unread`
+# were unified/ported in the P8 parity pass.
 COMMON_COMMAND_IDS = (
     "new_tab",
     "close_tab",
     "rename_tab",
+    "cycle_tab_next",
+    "cycle_tab_prev",
     "new_project",
     "rename_project",
+    "close_project",
     "toggle_sidebar",
+    "jump_to_unread",
     "font_increase",
     "font_decrease",
     "font_reset",

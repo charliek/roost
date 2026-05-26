@@ -2296,12 +2296,13 @@ impl App {
                     self.begin_rename_tab(pid, tab_id);
                 }
             }
-            KeybindAction::DeleteProject => {
+            KeybindAction::CloseProject => {
                 let pid = *self.active_project_id.borrow();
                 if pid != 0 {
                     self.confirm_and_delete_project(pid);
                 }
             }
+            KeybindAction::JumpToUnread => self.jump_to_unread(),
             KeybindAction::CycleTabPrev => self.cycle_tab(-1),
             KeybindAction::CycleTabNext => self.cycle_tab(1),
             KeybindAction::Copy => self.copy_active_selection(),
@@ -3195,6 +3196,27 @@ impl App {
         // pending notification, which drops the inbox row + the tab's
         // needs-attention badge via the `TabNotification` false-edge.
         let _ = client.workspace.set_tab_has_notification(tab_id, false);
+    }
+
+    /// `KeybindAction::JumpToUnread`: focus the next tab with a pending
+    /// notification — preferring the active project (the multi-project
+    /// triage shortcut), else the oldest pending elsewhere. Mirrors the
+    /// Mac app's `jumpToUnread`. The focus clears that tab's badge (via
+    /// `focus_tab_by_id`), so repeating the action walks the inbox.
+    fn jump_to_unread(self: &Rc<Self>) {
+        let active_pid = *self.active_project_id.borrow();
+        let target = {
+            let inbox = self.notification_inbox.borrow();
+            let pending = inbox.snapshot();
+            pending
+                .iter()
+                .find(|r| r.project_id == active_pid)
+                .or_else(|| pending.first())
+                .map(|r| r.tab_id)
+        };
+        if let Some(tab_id) = target {
+            self.focus_tab_by_id(tab_id);
+        }
     }
 
     /// M9.5: close an AdwTabPage by tab id. Routes through the

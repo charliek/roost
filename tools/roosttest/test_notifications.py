@@ -72,6 +72,22 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette):
     _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a badge cleared by jump")
 
 
+def test_jump_to_unread_focuses_notified_tab(roost, project, palette):
+    """`jump_to_unread` (Cmd/Ctrl+Shift+U) focuses the next tab with a
+    pending notification + clears it — a multi-project triage shortcut.
+    Now on both UIs (was Mac-only)."""
+    a = roost.open_tab(project, cwd="/tmp")
+    b = roost.open_tab(project, cwd="/tmp")  # b active
+    roost.notify(a, "Unread")
+    assert roost.identify()["active_tab_id"] == b
+    roost._wait(lambda: f"notif:{a}" in _inbox_ids(palette), 5.0, "inbox registers a")
+
+    palette.palette_open()
+    palette.palette_activate("jump_to_unread")  # → focuses the unread tab
+    _wait(roost, lambda: roost.identify()["active_tab_id"] == a, "jumped to unread a")
+    _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a cleared by jump")
+
+
 def test_clear_all_empties_inbox(roost, project, palette):
     """`clear_notifications` empties the inbox + drops every badge; the
     frame then shows only the empty sentinel."""

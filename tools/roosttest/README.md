@@ -34,7 +34,9 @@ Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
 | `fixtures/launcher.conf` | Seed config the harness points the UI at via `ROOST_CONFIG` (see below), giving the launcher tests a deterministic command list. |
 
 The shared `palette` fixture (open from closed, leave closed) lives in
-`conftest.py`.
+`conftest.py`. The two UIs expose one command set (kept at parity), so
+`test_palette.py`'s `COMMON_COMMAND_IDS` is the full palette command list
+and is asserted present on whichever UI is under test.
 
 ## Seeding config (`ROOST_CONFIG`)
 
@@ -44,21 +46,6 @@ known command list. It applies only to harness-launched UIs — a
 developer's already-running UI keeps its own config, and the launcher
 tests `skip` when the seed isn't active. (`ROOST_CONFIG` is a real
 override on both UIs, mirroring `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`.)
-
-## Known cross-UI parity gap (palette command set)
-
-The two UIs' command palettes don't expose an identical command set, so
-`test_palette.py` asserts only on the ids **common to both** (see
-`COMMON_COMMAND_IDS`):
-
-- Mac lists `close_project` + a Mac-only `jump_to_unread`.
-- GTK lists `delete_project` (different id *and* semantics) and has no
-  jump-to-unread.
-
-This is a product decision (are "close" and "delete" the same action?
-should GTK gain jump-to-unread?), not a wiring bug — left for a
-follow-up rather than silently unified. If it's reconciled, fold those
-ids into `COMMON_COMMAND_IDS`.
 
 ## Determinism notes (why it isn't flaky)
 
