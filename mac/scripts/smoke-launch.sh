@@ -19,20 +19,23 @@ set -euo pipefail
 
 MAC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="${MAC_DIR}/build/Roost.app"
-BIN="${APP}/Contents/MacOS/Roost"
 ROOSTCTL="${APP}/Contents/Resources/bin/roostctl"
 BUILD="${MAC_DIR}/.build"
-APP_PID=""
 
-[ -x "${BIN}" ] || { echo "error: ${BIN} not found — run scripts/bundle.sh first" >&2; exit 1; }
+[ -x "${APP}/Contents/MacOS/Roost" ] \
+  || { echo "error: ${APP} not built — run scripts/bundle.sh first" >&2; exit 1; }
+
+quit_app() {
+  osascript -e 'tell application "Roost" to quit' 2>/dev/null || true
+  pkill -x Roost 2>/dev/null || true
+}
 
 restore() {
-  # Un-hide any bundles we moved, and stop the app we launched.
+  quit_app
   if [ -d "${BUILD}" ]; then
     find "${BUILD}" -maxdepth 4 -name 'Roost_Roost.bundle.smokehidden' -type d 2>/dev/null \
       | while read -r d; do mv "${d}" "${d%.smokehidden}"; done
   fi
-  [ -n "${APP_PID}" ] && kill "${APP_PID}" 2>/dev/null || true
 }
 trap restore EXIT
 
@@ -43,19 +46,17 @@ if [ -d "${BUILD}" ]; then
     | while read -r d; do mv "${d}" "${d}.smokehidden"; done
 fi
 
-osascript -e 'tell application "Roost" to quit' 2>/dev/null || true
-pkill -x Roost 2>/dev/null || true
+quit_app
 sleep 1
 
-# Launch the packaged binary directly; a resource-resolution
-# `fatalError` lands in this log instead of a crash reporter.
-ERRLOG="$(mktemp)"
-"${BIN}" >"${ERRLOG}" 2>&1 &
-APP_PID=$!
+# Launch the way Finder / the e2e harness do (LaunchServices via `open`),
+# NOT by exec'ing the binary directly — a normally-launched .app gets the
+# correct `Bundle.main` (and thus `Contents/Resources`), which a bare
+# `exec` of the inner binary does not on every macOS version.
+open "${APP}"
 
 ok=0
-for _ in $(seq 1 30); do
-  kill -0 "${APP_PID}" 2>/dev/null || break   # process died — launch failed
+for _ in $(seq 1 40); do
   if "${ROOSTCTL}" identify >/dev/null 2>&1; then ok=1; break; fi
   sleep 0.5
 done
@@ -65,9 +66,14 @@ if [ "${ok}" = 1 ]; then
   exit 0
 fi
 
-echo "✗ clean-install launch FAILED: the app did not answer 'identify' with the" >&2
-echo "  build-tree resource bundle hidden — the v0.0.2-class regression where" >&2
-echo "  resources only resolve on the build machine. Captured app output:" >&2
-echo "--------------------------------------------------------------------" >&2
-cat "${ERRLOG}" >&2
+echo "✗ clean-install launch FAILED: the app did not answer 'identify' within 20s with" >&2
+echo "  the build-tree resource bundle hidden — the v0.0.2-class regression where" >&2
+echo "  resources only resolve on the build machine." >&2
+echo "--- app log tail ---" >&2
+tail -12 "${HOME}/Library/Logs/Roost/roost.log" 2>/dev/null >&2 || echo "  (no app log)" >&2
+crash="$(ls -t "${HOME}/Library/Logs/DiagnosticReports/"Roost-*.ips 2>/dev/null | head -1)"
+if [ -n "${crash}" ]; then
+  echo "--- latest crash report (${crash##*/}) ---" >&2
+  grep -iE "termination|exception|fatal|resource_bundle|Roost_Roost" "${crash}" 2>/dev/null | head -8 >&2 || true
+fi
 exit 1

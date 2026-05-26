@@ -31,11 +31,16 @@ extension Bundle {
     /// Falls back to `Bundle.module` for `swift run` / tests, where no
     /// `.app` exists and the build-tree bundle does resolve.
     static var roostResources: Bundle {
-        if let url = Bundle.main.resourceURL?
-            .appendingPathComponent("Roost_Roost.bundle"),
-            let bundle = Bundle(url: url)
-        {
-            return bundle
+        // `resourceURL` is `Contents/Resources` for a normally-launched
+        // `.app`; the explicit `bundleURL/Contents/Resources` candidate
+        // covers direct-exec contexts (e.g. running the binary by path),
+        // where `resourceURL` can resolve elsewhere. First hit wins.
+        for candidate in [
+            Bundle.main.resourceURL?.appendingPathComponent("Roost_Roost.bundle"),
+            Bundle.main.bundleURL
+                .appendingPathComponent("Contents/Resources/Roost_Roost.bundle"),
+        ] {
+            if let url = candidate, let bundle = Bundle(url: url) { return bundle }
         }
         return .module
     }
