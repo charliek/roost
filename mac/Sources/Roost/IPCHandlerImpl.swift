@@ -372,12 +372,12 @@ actor IPCHandlerImpl: IPCHandler {
         let p = try decodeParams(
             params, as: IPCTabDumpParams.self, expected: ["tab_id"]
         )
-        // The IPC handler is already on the main actor; reach the running
-        // app (the NSApplicationDelegate) to read the tab's render state.
-        guard let app = NSApp.delegate as? RoostApp else {
+        // Reach the running UI through the one registered bridge (the
+        // handler is already on the main actor).
+        guard let ui = RoostBackend.shared.ui else {
             throw IPCHandlerError.internalError("no UI to read terminal")
         }
-        guard let dump = app.dumpTab(tabID: p.tabID) else {
+        guard let dump = ui.dumpTab(tabID: p.tabID) else {
             throw IPCHandlerError(
                 code: "not-found",
                 message: "tab \(p.tabID) has no live terminal"
@@ -409,7 +409,7 @@ actor IPCHandlerImpl: IPCHandler {
         guard (1...2).contains(p.scale) else {
             throw IPCHandlerError.invalidParam("scale must be 1 or 2, got \(p.scale)")
         }
-        guard let window = RoostBackend.shared.mainWindow else {
+        guard let window = RoostBackend.shared.ui?.mainWindow else {
             throw IPCHandlerError.internalError("no UI window to capture")
         }
         if window.isMiniaturized {

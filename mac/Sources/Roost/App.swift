@@ -408,9 +408,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
-        // Hand the window to the IPC-facing backend so the
-        // `app.screenshot` handler can render it in-process.
-        RoostBackend.shared.registerWindow(window)
+        // Register as the UI bridge so the IPC handler can reach the
+        // main actor (screenshot render, tab.dump render-state walk)
+        // through one seam.
+        RoostBackend.shared.registerUI(self)
 
         // Round-6 R6.B: seat the divider at the persisted (or
         // default) sidebar width AFTER the window has been ordered
@@ -4015,6 +4016,12 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         endEdit()
         cancel?()
     }
+}
+
+extension RoostApp: UiBridge {
+    /// Expose the (private) window to the IPC handler via the bridge.
+    /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
+    var mainWindow: NSWindow? { window }
 }
 
 extension RoostApp: NSOutlineViewDataSource {
