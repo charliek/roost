@@ -330,6 +330,19 @@ pub struct PaletteActivateParams {
     pub id: String,
 }
 
+/// `palette.state` / `palette.dismiss` carry no params. Declared as
+/// empty + strict structs so the handler validates the envelope like
+/// every other op rather than ACK-ing arbitrary payloads — same
+/// rationale as [`AppActivateParams`]. Distinct types keep each op's
+/// contract its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaletteStateParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaletteDismissParams {}
+
 /// One visible palette row. `id` is the activation key (a KeybindAction
 /// id for command rows; a theme name / notification id in sub-frames).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -909,6 +922,10 @@ mod tests {
         round_trip(&PaletteActivateParams {
             id: "new_tab".into(),
         });
+        round_trip(&PaletteStateParams {});
+        round_trip(&PaletteDismissParams {});
+        // Nullary palette ops reject stray fields (strict envelope).
+        assert!(serde_json::from_str::<PaletteStateParams>(r#"{"x":1}"#).is_err());
 
         let live = PaletteStateResult {
             open: true,

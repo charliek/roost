@@ -19,12 +19,13 @@ use std::sync::Arc;
 
 use roost_ipc::messages::{
     ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
-    PaletteActivateParams, PaletteOpenParams, PaletteQueryParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
-    TabCloseParams, TabDumpCursor, TabDumpParams, TabDumpResult, TabFocusParams, TabFocusResult,
-    TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PaletteQueryParams,
+    PaletteStateParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
+    ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
+    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpCursor, TabDumpParams,
+    TabDumpResult, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult,
+    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -436,7 +437,9 @@ async fn dispatch(
             encode(&state)
         }
         ops::PALETTE_STATE => {
-            // Nullary: ignore params (the envelope carries `{}`).
+            // Nullary, but still validate the envelope (reject stray
+            // fields) like every other op — matches the Mac handler.
+            let _p: PaletteStateParams = decode(params)?;
             let state = h
                 .ui_call(|reply| UiRequest::PaletteState { reply })
                 .await?
@@ -463,6 +466,7 @@ async fn dispatch(
             encode(&state)
         }
         ops::PALETTE_DISMISS => {
+            let _p: PaletteDismissParams = decode(params)?;
             let state = h
                 .ui_call(|reply| UiRequest::PaletteDismiss { reply })
                 .await?
