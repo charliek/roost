@@ -109,6 +109,35 @@ enum Cmd {
     /// Print the running UI's identity (socket, pid, active tab,
     /// version).
     Identify,
+    /// Block until a tab reaches a condition, then exit 0 — the
+    /// no-`sleep` synchronization primitive for scripts + tests. Polls
+    /// the running UI on an interval (event-driven `events.subscribe` is
+    /// a planned upgrade behind this same interface). Exits non-zero if
+    /// `--timeout` elapses first. At least one of `--state` / `--text` /
+    /// `--gone` is required; when several are given, all must hold.
+    Wait {
+        #[arg(long, env = "ROOST_TAB_ID")]
+        tab: Option<i64>,
+        /// Wait until the tab's agent state equals this.
+        #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
+        state: Option<String>,
+        /// Wait until the tab's terminal viewport (via `tab.dump`)
+        /// contains this substring — e.g. a command's expected output.
+        /// Note: the shell echoes the command you `tab send`, so pick a
+        /// needle that appears in the OUTPUT, not in the command text
+        /// itself (else it matches immediately).
+        #[arg(long)]
+        text: Option<String>,
+        /// Wait until the tab no longer exists (closed).
+        #[arg(long, default_value_t = false)]
+        gone: bool,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 5.0)]
+        timeout: f64,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 100)]
+        interval_ms: u64,
+    },
     /// Tab subcommands.
     #[command(subcommand)]
     Tab(TabCmd),
@@ -349,6 +378,65 @@ async fn main() -> Result<()> {
                 resp.ui_version,
                 resp.protocol_version
             );
+        }
+        Cmd::Wait {
+            tab,
+            state,
+            text,
+            gone,
+            timeout,
+            interval_ms,
+        } => {
+            if state.is_none() && text.is_none() && !gone {
+                anyhow::bail!("wait needs at least one of --state, --text, or --gone");
+            }
+            let tab_id = resolve_tab(&mut client, tab).await?;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
+            let interval = std::time::Duration::from_millis(interval_ms.max(10));
+            loop {
+                let list = list_tabs(&mut client).await?;
+                let exists = list
+                    .projects
+                    .iter()
+                    .flat_map(|p| &p.tabs)
+                    .any(|t| t.id == tab_id);
+                // `--gone` is checked alone (it contradicts state/text,
+                // which both require the tab to exist). Otherwise the
+                // tab must exist and every requested condition must hold.
+                let satisfied = if gone {
+                    !exists
+                } else if !exists {
+                    false
+                } else {
+                    let state_ok = match &state {
+                        Some(want) => list
+                            .projects
+                            .iter()
+                            .flat_map(|p| &p.tabs)
+                            .find(|t| t.id == tab_id)
+                            .map(|t| format_state(t.state) == want)
+                            .unwrap_or(false),
+                        None => true,
+                    };
+                    let text_ok = match &text {
+                        Some(needle) => {
+                            let dump: TabDumpResult =
+                                client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
+                            dump.rows_text.join("\n").contains(needle.as_str())
+                        }
+                        None => true,
+                    };
+                    state_ok && text_ok
+                };
+                if satisfied {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out after {timeout}s waiting for tab {tab_id}");
+                }
+                tokio::time::sleep(interval).await;
+            }
         }
         Cmd::Tab(TabCmd::Focus { tab }) => {
             let tab_id = resolve_tab(&mut client, tab).await?;
