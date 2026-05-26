@@ -60,6 +60,40 @@ def test_set_title_locks_against_osc(roost, project):
     assert roost.tab(tab)["user_titled"] is True
 
 
+def test_reorder_tabs_persists_order(roost, project):
+    a = roost.open_tab(project, cwd="/tmp")
+    b = roost.open_tab(project, cwd="/tmp")
+    c = roost.open_tab(project, cwd="/tmp")
+    assert roost.project_tab_ids(project) == [a, b, c]
+    roost.reorder_tabs(project, [c, a, b])
+    roost._wait(
+        lambda: roost.project_tab_ids(project) == [c, a, b],
+        4.0,
+        "tab.reorder updated the workspace order",
+    )
+
+
+def test_rename_project(roost, project):
+    new_name = f"renamed-{uuid.uuid4().hex[:6]}"
+    roost.rename_project(project, new_name)
+    roost._wait(
+        lambda: (roost.project(project) or {}).get("name") == new_name,
+        4.0,
+        "project.rename took",
+    )
+
+
+def test_close_non_last_tab_keeps_project(roost, project):
+    """Closing a non-last tab removes just that tab; the project survives
+    (the complement of cascade-close)."""
+    a = roost.open_tab(project, cwd="/tmp")
+    b = roost.open_tab(project, cwd="/tmp")
+    roost.close_tab(a)
+    roost.wait_gone(a)
+    assert roost.project(project) is not None
+    assert roost.project_tab_ids(project) == [b]
+
+
 def test_cascade_close_removes_project(roost):
     pid = roost.create_project(name=f"pytest-cc-{uuid.uuid4().hex[:6]}", cwd="/tmp")
     tab = roost.open_tab(pid, cwd="/tmp")
