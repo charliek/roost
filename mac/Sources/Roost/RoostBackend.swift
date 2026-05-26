@@ -36,6 +36,38 @@ protocol UiBridge: AnyObject {
     /// Read a tab's terminal viewport as text (`tab.dump`); `nil` when
     /// no live tab holds that id.
     func dumpTab(tabID: Int64) -> TerminalView.Dump?
+
+    // Command-palette drive surface (`palette.*` ops). The GTK side's
+    // equivalent is the `UiRequest::Palette*` arms. Each returns the
+    // resulting palette state; `paletteActivate` returns `nil` when no
+    // palette is open or no visible row matched (→ `not-found`).
+    func openPalette(kind: String) -> PaletteSnapshot
+    func paletteState() -> PaletteSnapshot
+    func paletteQuery(_ text: String) -> PaletteSnapshot
+    func paletteActivate(id: String) -> PaletteSnapshot?
+    func dismissPaletteOverlay() -> PaletteSnapshot
+}
+
+/// A read of the command-palette overlay for the `palette.*` IPC ops,
+/// built by `RoostApp` and mapped to the wire result by the IPC handler.
+/// Mirrors `roost_ipc::messages::PaletteStateResult`. `open == false` is
+/// the closed palette (the other fields are then empty/default).
+struct PaletteSnapshot: Sendable {
+    var open: Bool
+    var frame: String?
+    var query: String
+    var selection: Int
+    var items: [Item]
+
+    struct Item: Sendable {
+        let id: String
+        let title: String
+        let subtitle: String?
+    }
+
+    static let closed = PaletteSnapshot(
+        open: false, frame: nil, query: "", selection: 0, items: []
+    )
 }
 
 @MainActor

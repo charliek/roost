@@ -24,6 +24,12 @@ enum RoostEvent: Sendable {
     case tabsReordered(RoostTabsReorderedEvent)
     case projectsReordered(RoostProjectsReorderedEvent)
     case active(RoostActiveChangedEvent)
+    /// Not a workspace broadcast — synthesized by `watchEvents` as the
+    /// first event after the subscription registers, so the UI reconciles
+    /// against current truth. Heals the boot gap (a tab opened via IPC
+    /// before the subscription was live had its `tabOpened` dropped).
+    /// Mirrors GTK's resync-on-subscribe (`crates/roost-linux/src/events.rs`).
+    case resync
 }
 
 struct RoostProjectCreatedEvent: Sendable {

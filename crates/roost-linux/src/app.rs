@@ -24,7 +24,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
-use roost_ipc::messages::{Project, Tab};
+use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project, Tab};
 use tokio::runtime::Handle;
 
 use roost_linux::daemon::{RestoreTab, WorkspaceEvent};
@@ -40,7 +40,9 @@ use crate::notification_inbox::{
     compose_title, relative_time, NotificationInbox, NotificationRecord,
 };
 use crate::palette::{command_items, PaletteCommands, PaletteFrame, PaletteItem};
-use crate::palette_ui::{PaletteBehavior, PaletteOutcome, PaletteOverlay, TOP_GAP};
+use crate::palette_ui::{
+    PaletteBehavior, PaletteOutcome, PaletteOverlay, PaletteSnapshot, TOP_GAP,
+};
 use crate::rollup::{project_rollup, RollupState, TabState};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
@@ -298,6 +300,27 @@ fn render_window_png(
     // thread before it crosses the reply channel back to the IPC handler.
     let png = texture.save_to_png_bytes().to_vec();
     Ok((png, texture.width() as u32, texture.height() as u32))
+}
+
+/// Map a GTK [`PaletteSnapshot`] to the wire [`PaletteStateResult`] for
+/// an open palette. The closed state (`open: false`) is built directly
+/// as `PaletteStateResult::default()` by the caller.
+fn palette_state_from(s: &PaletteSnapshot) -> PaletteStateResult {
+    PaletteStateResult {
+        open: true,
+        frame: Some(s.frame.clone()),
+        query: s.query.clone(),
+        selection: s.selection as u32,
+        items: s
+            .items
+            .iter()
+            .map(|(id, title, subtitle)| PaletteItemView {
+                id: id.clone(),
+                title: title.clone(),
+                subtitle: subtitle.clone(),
+            })
+            .collect(),
+    }
 }
 
 impl App {
@@ -733,6 +756,21 @@ impl App {
                         }
                         UiRequest::Dump { tab_id, reply } => {
                             let _ = reply.send(app.dump_tab(tab_id));
+                        }
+                        UiRequest::PaletteOpen { kind, reply } => {
+                            let _ = reply.send(Ok(app.ipc_palette_open(&kind)));
+                        }
+                        UiRequest::PaletteState { reply } => {
+                            let _ = reply.send(Ok(app.ipc_palette_state()));
+                        }
+                        UiRequest::PaletteQuery { query, reply } => {
+                            let _ = reply.send(Ok(app.ipc_palette_query(&query)));
+                        }
+                        UiRequest::PaletteActivate { id, reply } => {
+                            let _ = reply.send(app.ipc_palette_activate(&id));
+                        }
+                        UiRequest::PaletteDismiss { reply } => {
+                            let _ = reply.send(Ok(app.ipc_palette_dismiss()));
                         }
                     }
                 }
@@ -2931,6 +2969,68 @@ impl App {
             cursor: d.cursor.map(|c| (c.row, c.col, c.visible)),
             rows_text: d.rows_text,
         })
+    }
+
+    // MARK: command palette — IPC drive surface (palette.* ops)
+    //
+    // These service the `UiRequest::Palette*` arms on the GTK main
+    // thread. Each clones the overlay's `driver()` out of `self.palette`
+    // and drops the borrow *before* driving it, because a confirm's
+    // dismiss path re-borrows `self.palette` (to clear the handle) — see
+    // `PaletteOverlay::driver`.
+
+    /// `palette.open`: present a root frame (kind pre-validated by the
+    /// IPC layer: "" / "commands" → command palette, "launcher" → the
+    /// custom-command launcher), then read back its state.
+    fn ipc_palette_open(self: &Rc<Self>, kind: &str) -> PaletteStateResult {
+        match kind {
+            "launcher" => self.show_command_launcher(),
+            _ => self.show_command_palette(),
+        }
+        self.ipc_palette_state()
+    }
+
+    /// `palette.state`: snapshot the live palette, or the default
+    /// (`open: false`) when none is up.
+    fn ipc_palette_state(self: &Rc<Self>) -> PaletteStateResult {
+        match self.palette.borrow().as_ref() {
+            Some(overlay) => palette_state_from(&overlay.driver().snapshot()),
+            None => PaletteStateResult::default(),
+        }
+    }
+
+    /// `palette.query`: set the filter on the open palette (no-op when
+    /// closed), then read back.
+    fn ipc_palette_query(self: &Rc<Self>, query: &str) -> PaletteStateResult {
+        let driver = self.palette.borrow().as_ref().map(|o| o.driver());
+        if let Some(driver) = driver {
+            driver.set_query(query);
+        }
+        self.ipc_palette_state()
+    }
+
+    /// `palette.activate`: confirm the visible row with `id` (the same
+    /// dispatch as its keybind). Err (→ `not-found`) when no palette is
+    /// open or no row matches.
+    fn ipc_palette_activate(self: &Rc<Self>, id: &str) -> Result<PaletteStateResult, String> {
+        let driver = self.palette.borrow().as_ref().map(|o| o.driver());
+        let Some(driver) = driver else {
+            return Err("no palette open".into());
+        };
+        if !driver.activate(id) {
+            return Err(format!("no palette row with id {id:?}"));
+        }
+        Ok(self.ipc_palette_state())
+    }
+
+    /// `palette.dismiss`: close any open palette (no-op when closed),
+    /// then read back the closed state.
+    fn ipc_palette_dismiss(self: &Rc<Self>) -> PaletteStateResult {
+        let driver = self.palette.borrow().as_ref().map(|o| o.driver());
+        if let Some(driver) = driver {
+            driver.dismiss();
+        }
+        self.ipc_palette_state()
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {

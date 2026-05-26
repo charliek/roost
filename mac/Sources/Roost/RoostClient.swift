@@ -457,6 +457,13 @@ func watchEvents(socketPath: String) -> AsyncStream<RoostEvent> {
                 }
             }
             tokenBox.token = token
+            // The subscription is now live; everything from here is
+            // buffered by the stream. Reconcile first so a tab opened
+            // before this point (boot gap, or a reconnect) still
+            // materializes — see `RoostEvent.resync`. The async-hop
+            // registration above is exactly why a synchronous reconcile
+            // at bootstrap would race; ordering it here can't.
+            continuation.yield(.resync)
         }
         continuation.onTermination = { _ in
             Task { @MainActor in

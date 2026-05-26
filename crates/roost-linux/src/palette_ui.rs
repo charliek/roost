@@ -452,6 +452,105 @@ impl PaletteInner {
             cb();
         }
     }
+
+    // MARK: IPC drive surface (palette.* ops)
+    //
+    // The IPC bridge reaches the live palette through these so the same
+    // navigation a user drives by keyboard/mouse is exercisable over the
+    // socket. They go through `confirm` / `set_query` / `dismiss`, not a
+    // parallel path, so a test drives exactly what a person does.
+
+    /// Current frame id + filter + selection + visible rows (display
+    /// order), for `palette.state`.
+    fn snapshot(&self) -> PaletteSnapshot {
+        let state = self.state.borrow();
+        let frame = state.current();
+        PaletteSnapshot {
+            frame: frame.id.clone(),
+            query: frame.query.clone(),
+            selection: frame.selection,
+            items: state
+                .matches()
+                .into_iter()
+                .map(|m| (m.item.id, m.item.title, m.item.subtitle))
+                .collect(),
+        }
+    }
+
+    /// Set the filter as if typed: re-filter, re-select the top match,
+    /// fire the highlight. Also rewrites the entry text so the visible
+    /// query matches (guarded by `suppress_changed` so the echo is
+    /// ignored).
+    fn drive_query(self: &Rc<Self>, query: &str) {
+        self.state.borrow_mut().set_query(query.to_string());
+        self.suppress_changed.set(true);
+        self.entry.set_text(query);
+        self.suppress_changed.set(false);
+        self.rebuild_rows();
+        self.select_current_row();
+        self.fire_highlight();
+    }
+
+    /// Select the visible row whose item id matches, then confirm it —
+    /// the same `confirm` a click/Enter runs (so it pushes a sub-frame or
+    /// dispatches the command). False if no visible row has that id.
+    fn drive_activate(self: &Rc<Self>, id: &str) -> bool {
+        let index = self
+            .state
+            .borrow()
+            .matches()
+            .iter()
+            .position(|m| m.item.id == id);
+        let Some(index) = index else { return false };
+        self.state.borrow_mut().set_selection(index);
+        self.confirm();
+        true
+    }
+}
+
+/// A read of the live palette frame for the IPC bridge: current frame
+/// id, its filter + highlighted row, and the visible rows as
+/// `(id, title, subtitle)` in display order. GTK-free; `app.rs` maps it
+/// to `roost_ipc::messages::PaletteStateResult`.
+pub struct PaletteSnapshot {
+    pub frame: String,
+    pub query: String,
+    pub selection: usize,
+    pub items: Vec<(String, String, Option<String>)>,
+}
+
+impl PaletteOverlay {
+    /// A handle that drives this palette without holding a borrow of
+    /// `App.palette`. The IPC bridge clones it out, drops the borrow,
+    /// *then* activates/dismisses — `confirm`'s dismiss path re-borrows
+    /// `App.palette` (to clear the handle), so the caller must not still
+    /// hold it. Used only by the `palette.*` ops.
+    pub fn driver(&self) -> PaletteDriver {
+        PaletteDriver {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Drives a live palette over a cloned `Rc<PaletteInner>`. See
+/// [`PaletteOverlay::driver`] for the borrow-safety rationale.
+pub struct PaletteDriver {
+    inner: Rc<PaletteInner>,
+}
+
+impl PaletteDriver {
+    pub fn snapshot(&self) -> PaletteSnapshot {
+        self.inner.snapshot()
+    }
+    pub fn set_query(&self, query: &str) {
+        self.inner.drive_query(query);
+    }
+    pub fn activate(&self, id: &str) -> bool {
+        self.inner.drive_activate(id)
+    }
+    pub fn dismiss(&self) {
+        self.inner.dismiss(false);
+    }
 }
 
 /// Build one list row: a title label with Pango markup for the matched

@@ -28,6 +28,22 @@ Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), a session fixture that ensures the UI is up, `roost` (a client), `project` (a throwaway, cascade-cleaned project). |
 | `test_smoke.py` | The smoke suite: content via `tab.dump`, state progression, notifications, focus, title-lock, cascade-close. |
+| `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. A local `palette` fixture drives from a known-closed state and leaves it closed. |
+
+## Known cross-UI parity gap (palette command set)
+
+The two UIs' command palettes don't expose an identical command set, so
+`test_palette.py` asserts only on the ids **common to both** (see
+`COMMON_COMMAND_IDS`):
+
+- Mac lists `close_project` + a Mac-only `jump_to_unread`.
+- GTK lists `delete_project` (different id *and* semantics) and has no
+  jump-to-unread.
+
+This is a product decision (are "close" and "delete" the same action?
+should GTK gain jump-to-unread?), not a wiring bug — left for a
+follow-up rather than silently unified. If it's reconciled, fold those
+ids into `COMMON_COMMAND_IDS`.
 
 ## Determinism notes (why it isn't flaky)
 
@@ -37,13 +53,16 @@ Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
   text; assert exact strings. `run()` waits for the shell prompt before
   sending, and tests assert on a marker that appears only in command
   *output*, never the echoed command.
-- **Startup readiness.** `ui.wait_alive` clears two boot races: the IPC
-  socket answers `identify` before the workspace exists (wait for a
-  tab), and the UI's event subscription starts at the end of bootstrap
-  (a tab opened before then is missed). It round-trips a **probe tab**
-  — open via IPC, require it to materialize a live terminal (`dump`
-  succeeds), then close it — so tests only start once an IPC-opened tab
-  reliably becomes live.
+- **Startup readiness.** `ui.wait_alive` waits past two boot stages: the
+  IPC socket answers `identify` before the workspace exists (wait for a
+  tab), and the event subscription comes up at the end of bootstrap. It
+  round-trips a **probe tab** — open via IPC, require it to materialize a
+  live terminal (`dump` succeeds), then close it — so tests only start
+  once the UI is fully up. A tab opened via IPC *before* the
+  subscription is live no longer races permanently: both UIs reconcile
+  against a snapshot as the subscription's first action
+  (resync-on-subscribe), so the probe is a readiness gate, not a
+  workaround for a dropped event.
 - **Isolation.** Each test gets its own `project` fixture and
   cascade-cleans it.
 

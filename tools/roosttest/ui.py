@@ -47,17 +47,21 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
     """Block until the UI is *ready to drive*, not merely until the socket
     answers.
 
-    Two startup races to clear:
+    Two startup stages to clear:
       1. The IPC server binds early (so `identify` works the instant the
          process starts), but the workspace + tab machinery come up
          afterward on the UI main loop. Wait until a tab exists.
-      2. The UI's workspace-event subscription starts at the end of
-         bootstrap. A tab opened via IPC before it's live has its
-         `TabOpened` event missed (broadcasts don't replay), so the UI
-         never materializes a live terminal for it (and `tab.dump`
-         returns `not-found` forever). Confirm the subscription is live
-         by round-tripping a probe tab — open it, require it to
-         materialize (dump succeeds), then close it. No fixed sleep.
+      2. The UI's workspace-event subscription comes up at the end of
+         bootstrap. Confirm it's live by round-tripping a probe tab —
+         open it, require it to materialize (dump succeeds), then close
+         it. No fixed sleep.
+
+    A tab opened via IPC *before* the subscription is live no longer
+    races permanently: both UIs reconcile against a full snapshot as the
+    first thing the subscription does (resync-on-subscribe — GTK
+    `events.rs`, Mac `RoostEvent.resync`), so it materializes regardless.
+    This probe is therefore a readiness gate (don't make the first test
+    absorb boot latency), not a workaround for a dropped event.
     """
     deadline = time.monotonic() + timeout
     # (1) booted: at least one tab exists.

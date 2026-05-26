@@ -1252,6 +1252,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     self.selectProject(id: pid)
                     self.selectTabByPosition(in: pid, position: Int32(activePos))
                 }
+                // The subscription emits a `.resync` as its first event,
+                // which reconciles any tab opened during the boot gap —
+                // so no synchronous reconcile here (it would race the
+                // async restore opens above).
                 self.subscribeToEvents()
             }
         }
@@ -1358,6 +1362,53 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         rebuildSidebar()
     }
 
+    /// Materialize a `TabSession` for a workspace tab the UI doesn't yet
+    /// hold and attach it to its supervisor PTY (so it shows in the strip
+    /// and OSC scanning runs against its output). Deduped by id — calling
+    /// it for a tab already shown is a no-op. Shared by the `.tabOpened`
+    /// event arm (cross-client `tab.open`) and the boot-gap reconcile.
+    @MainActor
+    private func attachExistingTab(id: Int64, projectID: Int64, title: String, cwd: String) {
+        guard !tabs.contains(where: { $0.id == id }) else { return }
+        let session = TabSession(
+            projectID: projectID,
+            cols: 80,
+            rows: 24,
+            theme: activeTheme,
+            font: activeFont
+        )
+        session.liveTitle = title
+        session.liveCwd = cwd.isEmpty ? nil : cwd
+        tabs.append(session)
+        session.attach(socketPath: socketPath, tabID: id)
+        if projectID == activeProjectID {
+            rebuildTabBar()
+        }
+        rebuildSidebar()
+    }
+
+    /// Heal the boot gap. The event subscription is callback-based with
+    /// no replay, so a tab opened via IPC between the server binding and
+    /// the subscription registering had its `tabOpened` dropped — the UI
+    /// would never materialize it. Driven by the `.resync` event the
+    /// subscription emits as its first event (so it can't race the async
+    /// restore opens at bootstrap): attach any workspace tab the UI is
+    /// missing. Mirrors GTK's resync-on-subscribe
+    /// (`crates/roost-linux/src/events.rs`); idempotent — a tab opened in
+    /// the sliver between subscribe and the snapshot is just deduped.
+    @MainActor
+    private func attachMissingWorkspaceTabs() {
+        guard let workspace = RoostBackend.shared.workspace else { return }
+        for project in workspace.snapshot() {
+            for tab in workspace.tabs(in: project.id)
+            where !tabs.contains(where: { $0.id == tab.id }) {
+                attachExistingTab(
+                    id: tab.id, projectID: tab.projectId, title: tab.title, cwd: tab.cwd
+                )
+            }
+        }
+    }
+
     /// Dispatch one event from the WatchEvents stream. Anything not
     /// surfaced visually in M1 is logged and dropped — later
     /// milestones (M3 tab strip, Phase 6b notifications) light up
@@ -1459,37 +1510,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 }
             }
         case .tabOpened(let e):
-            // Cross-client `tab.open` (e.g. `roostctl tab open`)
-            // produces a workspace tab we don't yet hold a
-            // TabSession for. Materialize one and attach it to
-            // the existing supervisor PTY so the tab shows up in
-            // the UI strip + OSC scanning runs against its
-            // output stream (matches the GTK side's auto-attach
-            // behavior). UI-driven `openNewTab` calls already
-            // inserted the matching TabSession before this event
-            // arrives; the dedupe check below prevents double
-            // attaches in that case.
+            // Cross-client `tab.open` (e.g. `roostctl tab open`) produces
+            // a workspace tab we don't yet hold a TabSession for; attach
+            // it (matches GTK's auto-attach). UI-driven `openNewTab`
+            // already inserted the matching TabSession before this event
+            // arrives — `attachExistingTab` dedupes by id, so that case
+            // is a no-op here.
             let newTab = e.tab
-            if tabs.contains(where: { $0.id == newTab.id }) {
-                break
-            }
-            let session = TabSession(
+            attachExistingTab(
+                id: newTab.id,
                 projectID: newTab.projectID,
-                cols: 80,
-                rows: 24,
-                theme: activeTheme,
-                font: activeFont
+                title: newTab.title,
+                cwd: newTab.cwd
             )
-            session.liveTitle = newTab.title
-            session.liveCwd = newTab.cwd.isEmpty ? nil : newTab.cwd
-            tabs.append(session)
-            session.attach(socketPath: socketPath, tabID: newTab.id)
-            // If the new tab is in the currently-displayed
-            // project, refresh the strip so the user sees it.
-            if newTab.projectID == activeProjectID {
-                rebuildTabBar()
-            }
-            rebuildSidebar()
         case .active(let e):
             // Workspace-driven active-selection change. The UI is
             // authoritative for focus it initiates itself (pill click,
@@ -1624,6 +1657,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // authoritative project order. Active project stays
             // selected through the rebuild.
             applyProjectsReorder(newOrder: e.projectIds)
+        case .resync:
+            // First event after the subscription registers: attach any
+            // tab opened before it went live (the boot gap).
+            attachMissingWorkspaceTabs()
         }
     }
 
@@ -4026,6 +4063,68 @@ extension RoostApp: UiBridge {
     /// Expose the (private) window to the IPC handler via the bridge.
     /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
     var mainWindow: NSWindow? { window }
+
+    // MARK: command palette — IPC drive surface (palette.* ops)
+    //
+    // The IPC handler reaches the live `PalettePanel` through these (same
+    // file, so the private `showCommandPalette` / `palette` are in
+    // scope). Each holds a local strong ref to the panel before driving
+    // it, since a confirm's dismiss sets `self.palette = nil` mid-call.
+
+    /// `palette.open`: present a root frame (kind pre-validated by the
+    /// IPC layer: "" / "commands" → command palette, "launcher" → the
+    /// custom-command launcher), then read back its state.
+    func openPalette(kind: String) -> PaletteSnapshot {
+        if kind == "launcher" {
+            showCommandLauncher(nil)
+        } else {
+            showCommandPalette(nil)
+        }
+        return paletteSnapshot()
+    }
+
+    /// `palette.state`: snapshot the live palette, or the closed state.
+    func paletteState() -> PaletteSnapshot {
+        paletteSnapshot()
+    }
+
+    /// `palette.query`: set the filter on the open palette (no-op when
+    /// closed), then read back.
+    func paletteQuery(_ text: String) -> PaletteSnapshot {
+        palette?.driveQuery(text)
+        return paletteSnapshot()
+    }
+
+    /// `palette.activate`: confirm the visible row with `id` (the same
+    /// dispatch as its keybind). `nil` (→ `not-found`) when no palette is
+    /// open or no row matches.
+    func paletteActivate(id: String) -> PaletteSnapshot? {
+        guard let panel = palette else { return nil }
+        guard panel.driveActivate(id: id) else { return nil }
+        return paletteSnapshot()
+    }
+
+    /// `palette.dismiss`: close any open palette (no-op when closed),
+    /// then read back the closed state.
+    func dismissPaletteOverlay() -> PaletteSnapshot {
+        palette?.driveDismiss()
+        return paletteSnapshot()
+    }
+
+    /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.
+    private func paletteSnapshot() -> PaletteSnapshot {
+        guard let panel = palette else { return .closed }
+        let s = panel.driveSnapshot()
+        return PaletteSnapshot(
+            open: true,
+            frame: s.frame,
+            query: s.query,
+            selection: s.selection,
+            items: s.items.map {
+                PaletteSnapshot.Item(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+            }
+        )
+    }
 }
 
 extension RoostApp: NSOutlineViewDataSource {

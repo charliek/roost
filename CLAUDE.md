@@ -188,6 +188,16 @@ wrapper small.
   inspect/crop tool, a clipboard reader, and a single-monitor helper for
   reliable absolute-pointer injection. See its README for the
   screen↔window coordinate mapping and gotchas.
+- **Functional E2E (pytest)**: [`tools/roosttest/`](tools/roosttest/README.md)
+  is the primary automated suite — a thin Python IPC client drives a real
+  UI (`--roost-target mac|gtk`) and asserts on the op set (`tab.dump` /
+  `tab.list` / `palette.*` / `identify`), so it exercises exactly what
+  users + `roostctl` drive. No sleeps (condition waits), content via text
+  not pixels. `make e2e` / `make e2e-gtk` / `make e2e-mac`; runs headless
+  in CI (GTK under xvfb, required; macOS GUI-session). This is where new
+  cross-cutting behavior gets a regression test; the screenshot
+  (`tools/uitest/`) and input-injection (`tools/linux/`) harnesses cover
+  what it can't (pixels, real key/pointer events).
 
 ## Build
 
