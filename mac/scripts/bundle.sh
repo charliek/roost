@@ -115,9 +115,9 @@ sed -e "s/@VERSION@/${VERSION}/g" "${TEMPLATE_PLIST}" \
 # PkgInfo nowadays but Spotlight prefers it.
 printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 
-# Resource bundles SwiftPM emits — Bundle.module reads from these,
-# so the .app needs to ship them alongside the binary. The
-# `Roost_Roost.bundle` carries our theme files (Resources/themes/).
+# Resource bundles SwiftPM emits — the .app ships them so the running
+# app can read its resources. `Roost_Roost.bundle` carries our theme
+# files (Resources/themes/), loaded via `Bundle.roostResources`.
 #
 # Discover the SwiftPM bin path dynamically. The prior hardcoded
 # `arm64-apple-macosx` path failed on Intel macOS runners
@@ -126,6 +126,13 @@ printf "APPL????" > "${APP_DIR}/Contents/PkgInfo"
 # built artifacts for the current toolchain + target triple +
 # config.
 echo "==> Copying SwiftPM resource bundles"
+# These live under Contents/Resources (NOT the .app root: nested bundles
+# outside Contents/ break codesigning). `Bundle.module`'s generated
+# accessor would instead look at `Bundle.main.bundleURL/<name>.bundle`
+# (the .app root) plus a compile-time build path — neither exists on a
+# clean install, so it `fatalError`ed there. The Swift side resolves the
+# themes bundle from Contents/Resources via `Bundle.main` instead (see
+# `Bundle.roostResources` in Theme.swift), never `Bundle.module`.
 for bundle in "${SWIFT_BIN_DIR}"/*.bundle; do
   [ -d "${bundle}" ] || continue
   cp -R "${bundle}" "${APP_DIR}/Contents/Resources/"
