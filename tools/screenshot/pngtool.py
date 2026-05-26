@@ -105,6 +105,8 @@ def write_png(path, w, h, rgb):
 
 
 def main():
+    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
+        sys.exit(__doc__)
     cmd = sys.argv[1]
     path = sys.argv[2]
     if cmd == "info":
@@ -196,4 +198,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (IndexError, ValueError) as e:
+        # A missing/invalid subcommand argument → show usage, not a stack.
+        sys.exit(f"error: {e}\n\n{__doc__}")

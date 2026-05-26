@@ -21,6 +21,8 @@ import struct
 import sys
 import time
 
+from _uinput import require_uinput, uinput_unavailable
+
 
 def _IOW(nr, size):
     return (1 << 30) | (ord('U') << 8) | nr | (size << 16)
@@ -52,30 +54,36 @@ def syn(fd):
 
 
 def main():
+    if len(sys.argv) < 4 or sys.argv[1] in ("-h", "--help"):
+        sys.exit(__doc__)
     W, H = int(sys.argv[1]), int(sys.argv[2])
     ops = sys.argv[3:]
-    fd = open("/dev/uinput", "wb", buffering=0)
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_SYN)
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
-    for b in BTN.values():
-        fcntl.ioctl(fd, UI_SET_KEYBIT, b)
-    fcntl.ioctl(fd, UI_SET_ABSBIT, ABS_X)
-    fcntl.ioctl(fd, UI_SET_ABSBIT, ABS_Y)
-    name = b"roost-test-ptr".ljust(80, b"\x00")
-    dev = name + struct.pack("HHHH", 0x03, 0x1, 0x1, 1) + struct.pack("I", 0)
-    # absmax[64], absmin[64], absfuzz[64], absflat[64]  (s32 each)
-    absmax = [0] * 64
-    absmin = [0] * 64
-    absfuzz = [0] * 64
-    absflat = [0] * 64
-    absmax[ABS_X] = W - 1
-    absmax[ABS_Y] = H - 1
-    dev += struct.pack("64i", *absmax) + struct.pack("64i", *absmin)
-    dev += struct.pack("64i", *absfuzz) + struct.pack("64i", *absflat)
-    fd.write(dev)
-    fd.flush()
-    fcntl.ioctl(fd, UI_DEV_CREATE)
+    require_uinput()
+    try:
+        fd = open("/dev/uinput", "wb", buffering=0)
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_SYN)
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
+        for b in BTN.values():
+            fcntl.ioctl(fd, UI_SET_KEYBIT, b)
+        fcntl.ioctl(fd, UI_SET_ABSBIT, ABS_X)
+        fcntl.ioctl(fd, UI_SET_ABSBIT, ABS_Y)
+        name = b"roost-test-ptr".ljust(80, b"\x00")
+        dev = name + struct.pack("HHHH", 0x03, 0x1, 0x1, 1) + struct.pack("I", 0)
+        # absmax[64], absmin[64], absfuzz[64], absflat[64]  (s32 each)
+        absmax = [0] * 64
+        absmin = [0] * 64
+        absfuzz = [0] * 64
+        absflat = [0] * 64
+        absmax[ABS_X] = W - 1
+        absmax[ABS_Y] = H - 1
+        dev += struct.pack("64i", *absmax) + struct.pack("64i", *absmin)
+        dev += struct.pack("64i", *absfuzz) + struct.pack("64i", *absflat)
+        fd.write(dev)
+        fd.flush()
+        fcntl.ioctl(fd, UI_DEV_CREATE)
+    except OSError as e:
+        sys.exit(uinput_unavailable(e))
     time.sleep(0.5)
     cur = [W // 2, H // 2]
 
