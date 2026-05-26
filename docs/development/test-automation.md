@@ -20,6 +20,64 @@ and the test suite both stand on it.
 
 ---
 
+## 0. North star
+
+Every way to drive Roost — **mouse/clicks, hotkeys, the CLI, and Lua
+scripts** — converges on **one core: the workspace operation set**
+(open/close/focus tab, create/rename/delete/reorder project, set-state,
+notify, dump, … plus a few view ops like screenshot / open-palette).
+Each surface is a *thin adapter* onto that core; the UI is a **reaction**
+to the core's events, never its own source of truth.
+
+```
+  roostctl (CLI) ─┐
+  Lua scripts ────┤──▶ IPC handler ──┐
+                                      ├─▶  workspace op set  ──emit──▶ events ──▶ UI re-renders
+  mouse / clicks ─┐                   │       (THE CORE)
+  hotkeys ────────┤──▶ UI dispatch ───┘
+```
+
+- **CLI + Lua** are out-of-process → reach the core over the IPC socket
+  (the handler is their adapter; Lua sits on top of the same op set).
+- **Clicks + hotkeys** are in-process → call the same op set directly
+  (their adapter is the UI command / keybind handler).
+- A hotkey (`Cmd+Shift+T`), a `roostctl` call, and a Lua script all
+  invoke the **same** command — e.g. "run action" or "open tab".
+
+**One contract, two implementations.** There is no shared *codebase*
+core — Swift and Rust can't share one. There is one shared **contract** —
+the IPC op set in `roost-ipc` — implemented by **Swift `Workspace` +
+AppKit** and **Rust `Workspace` + GTK**. "Same interface" means same op
+contract + behavioral parity, which the cross-platform E2E suite (below)
+exists to enforce. Per platform: identical command surface,
+platform-specific guts (`forkpty` vs `portable-pty`, Core Graphics vs
+Cairo).
+
+**Two seams** (both firmed up in the IPC refactor on #106):
+
+1. **surfaces → core** (commands in): CLI/Lua via IPC, UI/hotkeys direct.
+   *The convergence goal — partially there; every UI/hotkey action should
+   route through the op set, not divergent local logic.*
+2. **core → UI** (view reach-back: screenshot/dump/activate): GTK's one
+   `UiRequest` channel, Mac's one `UiBridge` seam.
+
+**Why this is the north star:** it buys the three things we optimize for
+at once —
+
+- **Testability** — tests drive the same op set users do and assert on
+  its events/state; no test-only backdoors that drift from reality.
+- **Programmability** — the op set *is* the public surface; Lua actions
+  and the launcher are first-class clients of it, same as the CLI.
+- **Clean architecture** — one place owns each mutation; the UI is a pure
+  projection of core state; adding a capability means adding an op + thin
+  adapters, not bespoke logic per surface.
+
+Every decision below (and in P2+) is measured against this: *does it
+route through the one op set, keep the UI reactive, and stay at parity
+across both implementations?*
+
+---
+
 ## 1. Goals & non-goals
 
 **Goals**
