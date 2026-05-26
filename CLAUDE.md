@@ -165,6 +165,12 @@ wrapper small.
   UI when verifying a change, `roostctl screenshot --out /tmp/shot.png`
   renders the running window to a PNG in-process (no OS screen capture;
   works even when the window is unfocused or occluded).
+- **Automated UI smoke testing**: `tools/uitest/` drives either UI
+  through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|gtk>`) and
+  captures labeled screenshots + a `manifest.md` of per-shot
+  expectations. One harness covers both UIs (shared IPC surface; only
+  launch/quit differ). The Linux low-level input-injection layer below
+  complements it. See [`tools/uitest/README.md`](tools/uitest/README.md).
 - **Linux UI test harness**: [`tools/linux/`](tools/linux/README.md)
   drives the GTK app in an automated way on Linux (COSMIC/Wayland) with
   no image libraries — `/dev/uinput` key/pointer injectors, a stdlib PNG

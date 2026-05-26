@@ -1056,10 +1056,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// Bring `tabID`'s tab forward: switch project if needed, select the
-    /// tab within it, and activate the app. Shared by the OS-banner
-    /// click handler and the inbox jump.
+    /// tab within it, and (when `activate`) raise the app. Shared by the
+    /// OS-banner click handler and the inbox jump (which want the app
+    /// raised) and the workspace `.active` arm for external IPC focus
+    /// (`roostctl tab focus`), which switches the visible tab without
+    /// stealing OS focus from the user's frontmost app — matching the
+    /// GTK `ActiveChanged` arm, which switches the page but never calls
+    /// `window.present()`.
     @MainActor
-    private func focusTab(tabID: Int64) {
+    private func focusTab(tabID: Int64, activate: Bool = true) {
         guard let session = tabs.first(where: { $0.id == tabID }) else { return }
         // selectProject is idempotent when the id already matches.
         if session.projectID != activeProjectID {
@@ -1069,7 +1074,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if let idx = projectTabs.firstIndex(where: { $0 === session }) {
             selectTab(at: idx)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        if activate {
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     /// Mirror the inbox count onto the Dock tile badge. `nil` at zero so
@@ -1469,11 +1476,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 rebuildTabBar()
             }
             rebuildSidebar()
-        case .active:
-            // `.active` is workspace-driven active-selection;
-            // the UI's local active state is authoritative
-            // within the UI, so we drop this.
-            break
+        case .active(let e):
+            // Workspace-driven active-selection change. The UI is
+            // authoritative for focus it initiates itself (pill click,
+            // new-tab open, restore, cascade-close fallback): those
+            // paths update the local selection *before* this echo
+            // arrives, so the guard below makes us a no-op and avoids a
+            // selectTab → focusTab → `.active` feedback loop. When the
+            // change originates *outside* the UI — `roostctl tab focus`,
+            // or any future external client — the UI hasn't switched
+            // yet, so bring the requested tab forward (without raising
+            // the app), matching GTK's `ActiveChanged` arm and the
+            // documented `tab focus` = "click the pill" behavior, which
+            // also clears the tab's notification badge via `selectTab`.
+            let alreadyShown = activeProjectID == e.projectID
+                && activeSessionByProject[e.projectID]?.id == e.tabID
+            if !alreadyShown, e.tabID != 0,
+               tabs.contains(where: { $0.id == e.tabID })
+            {
+                focusTab(tabID: e.tabID, activate: false)
+            }
         case .tabTitle(let e):
             // Phase 6a P6: OSC 0/1/2 changed a tab's title. Mirror
             // into the matching TabSession so rebuildTabBar uses

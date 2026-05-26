@@ -52,7 +52,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${MAC_DIR}/.." && pwd)"
 
-VERSION="${ROOST_VERSION:-0.1.0}"
+# Default the marketing version to the workspace's single source of
+# truth — `[workspace.package].version` in Cargo.toml — so a local
+# `bundle.sh debug` reports the same version the GTK UI, the .deb, and
+# `roostctl identify` do. The release workflow still overrides
+# ROOST_VERSION from the git tag (asserted to match Cargo.toml). The
+# `^version` anchor matches only the top-level key, not the
+# `version = "…"` entries nested under `[workspace.dependencies]`.
+CARGO_VERSION="$(grep -E '^version[[:space:]]*=' "${REPO_ROOT}/Cargo.toml" | head -1 \
+  | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+VERSION="${ROOST_VERSION:-${CARGO_VERSION:-0.0.0}}"
 APP_NAME="Roost"
 BUNDLE_ID="ai.stridelabs.Roost"
 TEMPLATE_PLIST="${MAC_DIR}/Resources/Info.plist.template"
