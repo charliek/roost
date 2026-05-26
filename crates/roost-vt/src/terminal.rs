@@ -204,6 +204,29 @@ impl Terminal {
         }
     }
 
+    /// True if the app has enabled any mouse-tracking mode (X10 /
+    /// normal / button / any-event via DECSET 1000/1002/1003). The
+    /// Linux/Mac UIs use this to decide whether the scroll wheel should
+    /// be encoded as a button-4/5 report instead of scrolling the local
+    /// viewport. Mirrors the Mac `isMouseTrackingActive`.
+    pub fn mouse_tracking(&self) -> bool {
+        let mut active: bool = false;
+        // SAFETY: handle non-null; out is a real local.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                (&mut active) as *mut bool as *mut _,
+            )
+        };
+        // Any non-success collapses to "not tracking" — the scroll
+        // handler then falls back to local scrollback / alt-screen.
+        if Error::from_result(rc).is_err() {
+            return false;
+        }
+        active
+    }
+
     /// Push the default foreground color into libghostty so SGR cells
     /// that inherit the default flip to the theme. Wraps
     /// `ghostty_terminal_set(OPT_COLOR_FOREGROUND, &rgb)`.

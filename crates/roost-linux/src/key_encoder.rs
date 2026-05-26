@@ -100,7 +100,7 @@ pub fn encode_key(
     }
 }
 
-fn translate_mods(m: gdk::ModifierType) -> Mods {
+pub(crate) fn translate_mods(m: gdk::ModifierType) -> Mods {
     let mut bits: u16 = 0;
     if m.contains(gdk::ModifierType::SHIFT_MASK) {
         bits |= gmods::SHIFT;

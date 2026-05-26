@@ -66,6 +66,12 @@ final class TerminalView: NSView {
     /// fails — in practice that should never happen.
     private var keyEncoder: KeyEncoder?
 
+    /// libghostty-vt mouse encoder bridge. Allocated alongside the
+    /// terminal + key encoder in `init`, freed implicitly in `deinit`.
+    /// Used by `scrollWheel` to forward the wheel as button-4/5 reports
+    /// when the focused app enables mouse tracking.
+    private var mouseEncoder: MouseEncoder?
+
     /// Pull-model snapshot of the terminal used by `draw()`.
     /// Phase 5.4b uses this only for the canvas color; 5.4c walks
     /// it cell-by-cell.
@@ -282,6 +288,7 @@ final class TerminalView: NSView {
         // surface (same one the Go binary uses via
         // `internal/ghostty/key.go`).
         self.keyEncoder = KeyEncoder(terminal: handle!)
+        self.mouseEncoder = MouseEncoder(terminal: handle!)
 
         // Let edge-pinned hosts (the `terminalContainer` in
         // `RoostApp.selectTab`) stretch the view past its 80×24
@@ -708,9 +715,36 @@ final class TerminalView: NSView {
         let rowDelta = quantizeScrollDelta(event: event)
         guard rowDelta != 0 else { return }
 
-        // Mouse tracking mode: app opted into mouse events. Drop
-        // for now — the mouse encoder bridge is a separate slice.
+        // Mouse tracking mode: the app opted into mouse events, so
+        // forward the wheel as button-4 (up) / button-5 (down) reports
+        // at the pointer's cell. One report per quantized row. The
+        // encoder honors the negotiated format (X10 / SGR / pixels).
         if isMouseTrackingActive() {
+            guard let mouseEncoder else { return }
+            let button: GhosttyMouseButton =
+                rowDelta > 0 ? GHOSTTY_MOUSE_BUTTON_FOUR : GHOSTTY_MOUSE_BUTTON_FIVE
+            let mods = Self.mouseMods(forFlags: event.modifierFlags)
+            let p = convert(event.locationInWindow, from: nil)
+            let cw = max(cellSize.width, 1)
+            let ch = max(cellSize.height, 1)
+            // Clamp into the grid so a wheel event just off the bottom /
+            // right edge still reports the last cell, not an out-of-range
+            // coordinate.
+            let x = Float(min(max(p.x, 0), cw * CGFloat(cols) - 1))
+            let y = Float(min(max(p.y, 0), ch * CGFloat(rows) - 1))
+            for _ in 0..<abs(rowDelta) {
+                let bytes = mouseEncoder.encodeWheel(
+                    button: button,
+                    mods: mods,
+                    x: x,
+                    y: y,
+                    screenWidth: UInt32(cw * CGFloat(cols)),
+                    screenHeight: UInt32(ch * CGFloat(rows)),
+                    cellWidth: UInt32(cw),
+                    cellHeight: UInt32(ch)
+                )
+                if !bytes.isEmpty { onKey?(bytes) }
+            }
             return
         }
 
@@ -787,6 +821,18 @@ final class TerminalView: NSView {
         var active: Bool = false
         _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &active)
         return active
+    }
+
+    /// Translate NSEvent.modifierFlags to libghostty-vt's mods bitmask
+    /// for a mouse report. Same bit layout as KeyEncoder's; duplicated
+    /// here to keep the mouse path independent of the key encoder.
+    private static func mouseMods(forFlags flags: NSEvent.ModifierFlags) -> GhosttyMods {
+        var mods: UInt16 = 0
+        if flags.contains(.shift)   { mods |= 1 << 0 } // GHOSTTY_MODS_SHIFT
+        if flags.contains(.control) { mods |= 1 << 1 } // GHOSTTY_MODS_CTRL
+        if flags.contains(.option)  { mods |= 1 << 2 } // GHOSTTY_MODS_ALT
+        if flags.contains(.command) { mods |= 1 << 3 } // GHOSTTY_MODS_SUPER
+        return GhosttyMods(mods)
     }
 
     /// Check whether the alt-screen is active (vim, less, etc.). The
