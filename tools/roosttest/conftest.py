@@ -61,3 +61,15 @@ def project(roost):
             roost.delete_project(pid)
         except Exception:
             pass  # a test may have already cascade-closed it
+
+
+@pytest.fixture
+def palette(roost):
+    """Drive the palette from a known-closed state, and leave it closed.
+
+    The palette is global UI state (one at a time), so a leaked-open
+    palette from a failed test would wedge the next one. Dismiss on both
+    sides (idempotent — a no-op when already closed)."""
+    roost.palette_dismiss()
+    yield roost
+    roost.palette_dismiss()

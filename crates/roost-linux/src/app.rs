@@ -3175,32 +3175,26 @@ impl App {
     /// Wired via the `app.focus-tab` action; click-handler in the
     /// gio::Notification's default action target.
     fn focus_tab_by_id(self: &Rc<Self>, tab_id: i64) {
-        let projects = self.projects.borrow();
-        let mut hit: Option<(i64, libadwaita::TabPage)> = None;
-        for (project_id, ui) in projects.iter() {
-            if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
-                hit = Some((*project_id, tab_ui.page.clone()));
-                break;
-            }
-        }
-        drop(projects);
-        let Some((project_id, page)) = hit else {
+        let Some(client) = self.client.borrow().clone() else {
             return;
         };
-        self.set_active_project(project_id);
-        let projects = self.projects.borrow();
-        if let Some(ui) = projects.get(&project_id) {
-            ui.tab_view.set_selected_page(&page);
+        // Route through the core: `focus_tab` updates `workspace.active()`
+        // (so `identify` / `tab.focus` report the tab the user was sent
+        // to) and fires `ActiveChanged`, which the handler reacts to with
+        // the project switch + tab select. Previously this did a UI-only
+        // `set_active_project` + `set_selected_page`, leaving the core's
+        // active tab stale vs. what's on screen — the UI as its own source
+        // of truth rather than a reaction to the core.
+        if client.workspace.focus_tab(tab_id).is_err() {
+            return; // tab vanished between the inbox snapshot and the jump
         }
-        drop(projects);
-        // Bring the window forward.
+        // Bring the window forward (jump-specific; ActiveChanged handles
+        // the on-screen selection).
         self.window.present();
         // Parity with Mac's `selectTab`: focusing a tab clears its
         // pending notification, which drops the inbox row + the tab's
         // needs-attention badge via the `TabNotification` false-edge.
-        if let Some(client) = self.client.borrow().clone() {
-            let _ = client.workspace.set_tab_has_notification(tab_id, false);
-        }
+        let _ = client.workspace.set_tab_has_notification(tab_id, false);
     }
 
     /// M9.5: close an AdwTabPage by tab id. Routes through the

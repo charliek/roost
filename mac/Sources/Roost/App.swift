@@ -1030,7 +1030,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             guard let tabID = Self.tabID(fromNotifItemID: item.id) else {
                 return .none  // "No notifications" sentinel
             }
-            self.focusTab(tabID: tabID)
+            // Update the *core* active tab (so identify / tab.focus report
+            // the jump target), not just UI selection — the `.active`
+            // event then drives the project switch + tab select. Routing
+            // through the workspace, rather than the prior UI-only
+            // `focusTab`, keeps the core the source of truth (matches the
+            // GTK `focus_tab_by_id` fix). Raise the app (a jump wants
+            // focus) and clear the tab's notification.
+            _ = try? RoostBackend.shared.localClient?.focusTab(tabID)
+            NSApp.activate(ignoringOtherApps: true)
+            let socket = self.socketPath
+            Task.detached { await clearTabNotification(socketPath: socket, tabID: tabID) }
             return .close
         })
     }

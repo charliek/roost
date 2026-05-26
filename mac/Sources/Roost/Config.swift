@@ -60,8 +60,14 @@ struct RoostConfig: Sendable {
 
     /// `~/.config/roost/config.conf` — XDG-style even on macOS, by
     /// deliberate divergence from Apple HIG (matches Ghostty / nvim
-    /// / fish / the Go binary's behavior).
+    /// / fish / the Go binary's behavior). `ROOST_CONFIG` overrides it
+    /// with an absolute file — used by the E2E harness to drive the
+    /// command launcher off a seeded config (mirrors the GTK side).
     static func defaultPath() -> URL {
+        if let override = ProcessInfo.processInfo.environment["ROOST_CONFIG"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home
             .appendingPathComponent(".config")
