@@ -143,6 +143,13 @@ jobs:
       - name: cargo build (roost-vt with ffi)
         run: cargo build -p roost-vt --features ffi
 
+      # The encoder regression tests (key + mouse) live behind the `ffi`
+      # feature because they exercise libghostty-vt directly; the default
+      # `cargo test` below can't see them. The archive is built above, so
+      # run them here as a real gate.
+      - name: cargo test (roost-vt with ffi)
+        run: cargo test -p roost-vt --features ffi
+
       - name: cargo test
         run: cargo test --workspace --exclude roost-linux
 

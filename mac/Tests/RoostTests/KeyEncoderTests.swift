@@ -32,6 +32,7 @@ import Testing
 private func keyEvent(
     keyCode: UInt16,
     chars: String,
+    charsIgnoringModifiers: String? = nil,
     modifiers: NSEvent.ModifierFlags = []
 ) -> NSEvent {
     guard let event = NSEvent.keyEvent(
@@ -42,7 +43,11 @@ private func keyEvent(
         windowNumber: 0,
         context: nil,
         characters: chars,
-        charactersIgnoringModifiers: chars,
+        // For a Ctrl+letter event the platform reports `characters` as the
+        // C0 byte but `charactersIgnoringModifiers` as the base letter —
+        // the encoder's unshifted-codepoint helper reads the latter, so
+        // tests can override it independently of `characters`.
+        charactersIgnoringModifiers: charsIgnoringModifiers ?? chars,
         isARepeat: false,
         keyCode: keyCode
     ) else {
@@ -67,6 +72,32 @@ private func withEncoder(_ body: (KeyEncoder) -> Void) {
         fatalError("ghostty_terminal_new failed (rc=\(rc.rawValue))")
     }
     defer { ghostty_terminal_free(term) }
+    guard let encoder = KeyEncoder(terminal: term) else {
+        fatalError("KeyEncoder init returned nil")
+    }
+    body(encoder)
+}
+
+/// Like `withEncoder`, but pushes the Kitty keyboard protocol's
+/// "disambiguate escape codes" flag (`CSI > 1 u`) into the terminal
+/// first. The encoder calls `setopt_from_terminal` on every encode, so
+/// it picks up the flag — the same path Claude Code / opencode trigger
+/// when they enable the protocol.
+@MainActor
+private func withKittyEncoder(_ body: (KeyEncoder) -> Void) {
+    var opts = GhosttyTerminalOptions()
+    opts.cols = 80
+    opts.rows = 24
+    opts.max_scrollback = 0
+    var term: GhosttyTerminal?
+    let rc = ghostty_terminal_new(nil, &term, opts)
+    guard rc.rawValue == 0, let term else {
+        fatalError("ghostty_terminal_new failed (rc=\(rc.rawValue))")
+    }
+    defer { ghostty_terminal_free(term) }
+    // CSI > 1 u — push Kitty flags (bit 0 = disambiguate).
+    let enable: [UInt8] = [0x1B, 0x5B, 0x3E, 0x31, 0x75]
+    enable.withUnsafeBufferPointer { ghostty_terminal_vt_write(term, $0.baseAddress, $0.count) }
     guard let encoder = KeyEncoder(terminal: term) else {
         fatalError("KeyEncoder init returned nil")
     }
@@ -208,6 +239,85 @@ func ctrl_c_returns_etx() {
         )
         let bytes = encoder.encode(event)
         #expect(bytes == Data([0x03]))
+    }
+}
+
+// MARK: - Kitty keyboard protocol (Ctrl+letter)
+
+// The reported bug: under the Kitty keyboard protocol (which Claude
+// Code / opencode enable) Roost dropped every Ctrl+letter because it
+// passed unshifted_codepoint = 0 to the encoder — letters aren't in the
+// functional entry table, so with no codepoint the encoder emits
+// nothing. These tests pin the post-fix CSI-u output and guard the drop.
+
+@MainActor
+@Test
+func ctrl_a_under_kitty_emits_csi_u() {
+    withKittyEncoder { encoder in
+        // Real Ctrl+A: characters = SOH (0x01), but the base letter is
+        // "a". The encoder reads the base letter for the unshifted
+        // codepoint and reports CSI 97 ; 5 u (97 = 'a', 5 = 1 + ctrl).
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_A),
+            chars: "\u{01}",
+            charsIgnoringModifiers: "a",
+            modifiers: [.control]
+        )
+        let bytes = encoder.encode(event)
+        #expect(bytes == Data([0x1B, 0x5B, 0x39, 0x37, 0x3B, 0x35, 0x75]))
+    }
+}
+
+@MainActor
+@Test
+func ctrl_k_under_kitty_emits_csi_u() {
+    withKittyEncoder { encoder in
+        // Ctrl+K → CSI 107 ; 5 u (107 = 'k').
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_K),
+            chars: "\u{0B}",
+            charsIgnoringModifiers: "k",
+            modifiers: [.control]
+        )
+        let bytes = encoder.encode(event)
+        #expect(bytes == Data([0x1B, 0x5B, 0x31, 0x30, 0x37, 0x3B, 0x35, 0x75]))
+    }
+}
+
+@MainActor
+@Test
+func ctrl_a_under_kitty_is_not_dropped() {
+    // Regression guard: pre-fix this returned empty Data (the encoder
+    // had no entry to build for a letter key with codepoint 0). The
+    // invariant the user cares about is "a non-empty CSI-u arrives".
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_A),
+            chars: "\u{01}",
+            charsIgnoringModifiers: "a",
+            modifiers: [.control]
+        )
+        let bytes = encoder.encode(event)
+        #expect(!bytes.isEmpty, "Ctrl+A under Kitty must not be dropped")
+        #expect(bytes.first == 0x1B, "should start with ESC")
+    }
+}
+
+@MainActor
+@Test
+func ctrl_a_legacy_returns_soh() {
+    // Legacy mode (no Kitty flags) derives the C0 byte from key + mods,
+    // so Ctrl+A is SOH (0x01) regardless of the unshifted codepoint.
+    // Proves the fix leaves the bash/readline path untouched.
+    withEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_A),
+            chars: "\u{01}",
+            charsIgnoringModifiers: "a",
+            modifiers: [.control]
+        )
+        let bytes = encoder.encode(event)
+        #expect(bytes == Data([0x01]))
     }
 }
 

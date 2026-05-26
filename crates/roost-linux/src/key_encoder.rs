@@ -53,6 +53,20 @@ pub fn encode_key(
         .map(|c| c.to_string().into_bytes())
         .unwrap_or_default();
 
+    // The unshifted base-layout codepoint (Ctrl+A → 'a' = 97). The
+    // Kitty keyboard protocol encoder needs this to build a CSI-u entry
+    // for letter/digit keys — they're absent from the functional entry
+    // table, so with 0 it emits NOTHING for Ctrl+letter (Claude Code /
+    // opencode enable Kitty, so every Ctrl+letter was silently dropped).
+    // Lower-case the keyval first so Ctrl+Shift+K still reports 'k'.
+    // Legacy mode derives the C0 byte from the key alone, unaffected.
+    let unshifted = key
+        .to_lower()
+        .to_unicode()
+        .filter(|c| !c.is_control() && (*c as u32) < 0xE000)
+        .map(|c| c as u32)
+        .unwrap_or(0);
+
     // Drop pure-modifier presses — they have no key. (Modifier-only
     // events arrive when the user holds Shift / Ctrl / etc; the
     // encoder would emit empty bytes anyway, but skipping avoids a
@@ -72,7 +86,7 @@ pub fn encode_key(
     event.set_key(ghostty_key);
     event.set_mods(mods);
     event.set_composing(false);
-    event.set_unshifted_codepoint(0);
+    event.set_unshifted_codepoint(unshifted);
     if !utf8_bytes.is_empty() {
         event.set_utf8(&utf8_bytes);
     }
