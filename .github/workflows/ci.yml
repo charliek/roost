@@ -22,6 +22,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       mac: ${{ steps.filter.outputs.mac }}
       linux: ${{ steps.filter.outputs.linux }}
+      tests: ${{ steps.filter.outputs.tests }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
       - uses: actions/checkout@v6
@@ -46,6 +47,10 @@ jobs:
             linux:
               - *rustcore
               - 'linux/**'
+            tests:
+              - 'tools/roosttest/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
             ci:
               - '.github/workflows/ci.yml'
 
@@ -267,16 +272,133 @@ jobs:
       - name: cargo build -p roost-linux
         run: cargo build -p roost-linux
 
+  # Functional E2E: launch the real GTK UI headless under Xvfb and drive
+  # it through the IPC op set with the pytest harness (tools/roosttest).
+  # Required — Linux is the cheap, reliable headless target.
+  e2e-gtk:
+    needs: changes
+    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GTK4 + libadwaita + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build the GTK UI
+        run: cargo build -p roost-linux
+
+      - name: Run E2E (GTK under Xvfb)
+        env:
+          GDK_BACKEND: x11
+          RUST_LOG: warn
+        # The harness launches its own `roost` process; under xvfb-run it
+        # inherits the virtual DISPLAY. tab.dump reads in-process render
+        # state, so no compositor screen-capture is involved.
+        run: xvfb-run -a uv run --group test pytest tools/roosttest --roost-target gtk -v
+
+  # macOS E2E against the Swift app. NOT in ci-success yet (non-blocking)
+  # while we shake out GUI-session-in-CI reliability — a failure shows as
+  # a red check but doesn't gate merge. See docs/development/test-automation.md.
+  e2e-mac:
+    needs: changes
+    if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            mac/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
+          restore-keys: swiftpm-${{ runner.os }}-
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-swiftmac-
+
+      - name: Bundle Roost.app
+        run: ./mac/scripts/bundle.sh debug
+
+      - name: Run E2E (Mac app)
+        run: uv run --group test pytest tools/roosttest --roost-target mac -v
+
   # Single required check. Always runs; passes iff no gated job failed (skipped
-  # jobs are fine — that's the path-filter doing its job).
+  # jobs are fine — that's the path-filter doing its job). `e2e-mac` is
+  # intentionally excluded (non-blocking for now).
   ci-success:
-    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build]
+    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build, e2e-gtk]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then

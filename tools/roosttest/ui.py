@@ -31,14 +31,6 @@ def socket_path(target: str) -> Path:
     raise ValueError(f"unknown target {target!r} (want mac|gtk)")
 
 
-def _roostctl() -> Path:
-    for cfg in ("release", "debug"):
-        p = REPO_ROOT / "target" / cfg / "roostctl"
-        if p.is_file():
-            return p
-    raise FileNotFoundError("roostctl not built — run `make build`")
-
-
 def is_alive(target: str) -> bool:
     try:
         c = Roost(socket_path(target))
