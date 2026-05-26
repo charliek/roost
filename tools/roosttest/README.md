@@ -28,7 +28,22 @@ Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), a session fixture that ensures the UI is up, `roost` (a client), `project` (a throwaway, cascade-cleaned project). |
 | `test_smoke.py` | The smoke suite: content via `tab.dump`, state progression, notifications, focus, title-lock, cascade-close. |
-| `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. A local `palette` fixture drives from a known-closed state and leaves it closed. |
+| `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. |
+| `test_notifications.py` | The multi-project notification inbox: `view_notifications` frame, jump-to-notification (focuses the tab + clears its badge), clear-all. |
+| `test_launcher.py` | The custom-command launcher (Cmd/Alt+Shift+T): lists the seeded commands + activating one spawns a tab that runs it. |
+| `fixtures/launcher.conf` | Seed config the harness points the UI at via `ROOST_CONFIG` (see below), giving the launcher tests a deterministic command list. |
+
+The shared `palette` fixture (open from closed, leave closed) lives in
+`conftest.py`.
+
+## Seeding config (`ROOST_CONFIG`)
+
+`ui.launch` sets `ROOST_CONFIG=fixtures/launcher.conf` on the UIs it
+starts (GTK via env; Mac via `open --env`), so the launcher reads a
+known command list. It applies only to harness-launched UIs — a
+developer's already-running UI keeps its own config, and the launcher
+tests `skip` when the seed isn't active. (`ROOST_CONFIG` is a real
+override on both UIs, mirroring `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`.)
 
 ## Known cross-UI parity gap (palette command set)
 
