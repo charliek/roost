@@ -1,45 +1,106 @@
-.PHONY: all libghostty build run test lint clean docs docs-serve
+# Roost — common dev tasks. Run `make` (or `make help`) to list them.
+#
+# Two native UIs around libghostty-vt: Swift + AppKit (mac/) and
+# Rust + gtk4-rs (crates/roost-linux), plus the roostctl CLI. See
+# docs/development/vision.md for the architecture + north star.
 
-# Default: full build (libghostty-vt then Go binary). On a fresh
-# clone the file rule below builds libghostty first; on subsequent
-# runs it's a no-op because the sentinel header already exists.
-# `make libghostty` (the .PHONY target) is the explicit way to
-# force a rebuild — useful after bumping the pinned Ghostty SHA.
-all: build/out/include/ghostty/vt.h build
+.DEFAULT_GOAL := help
 
-# Build libghostty-vt against the pinned Ghostty SHA. Always runs.
-# Output goes to build/out/ (header at build/out/include/ghostty/vt.h, lib at build/out/lib).
-libghostty:
-	./build/build.sh libghostty
+MAC_DIR     := mac
+APP         := $(MAC_DIR)/build/Roost.app
+GHOSTTY_LIB := third_party/ghostty/out/lib/libghostty-vt.a
 
-# File rule that produces the libghostty header. Used as the
-# fresh-clone bootstrap dep for `all`.
-build/out/include/ghostty/vt.h:
-	./build/build.sh libghostty
+# ---- help -------------------------------------------------------------
 
-# Build the Go binary. Assumes libghostty has already been built
-# (run `make libghostty` or `make` to bootstrap if not).
-build:
-	./build/build.sh build
+.PHONY: help
+help:  ## List available targets
+	@echo "Roost dev tasks:"
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
+	  | sort \
+	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-run: build
-	./roost
+# ---- setup ------------------------------------------------------------
 
-test:
-	go test ./...
+.PHONY: setup ghostty ghostty-force
+setup: $(GHOSTTY_LIB)  ## One-time bootstrap: toolchain (mise) + libghostty-vt
+	mise install
 
-lint:
-	golangci-lint run
+ghostty: $(GHOSTTY_LIB)  ## Build/cache libghostty-vt (no-op on cache hit)
 
-clean:
-	rm -rf build/out build/ghostty-src ./roost ./roost-cli site-build
+ghostty-force:  ## Rebuild libghostty-vt from scratch (after a Ghostty SHA bump)
+	third_party/ghostty/build.sh --force
 
-# Build the static documentation site under site-build/.
-docs:
-	uv sync --group docs
-	uv run mkdocs build
+# File rule: bootstraps libghostty-vt on a fresh clone so the first
+# `make build` / `make build-mac` just works.
+$(GHOSTTY_LIB):
+	third_party/ghostty/build.sh
 
-# Serve the documentation site locally on http://127.0.0.1:7070.
-docs-serve:
-	uv sync --group docs
-	uv run mkdocs serve
+# ---- build ------------------------------------------------------------
+
+.PHONY: build build-mac bundle build-all
+build: $(GHOSTTY_LIB)  ## cargo build the workspace (GTK UI + roostctl)
+	cargo build
+
+build-mac: $(GHOSTTY_LIB)  ## swift build the Mac app
+	cd $(MAC_DIR) && swift build
+
+bundle: $(GHOSTTY_LIB)  ## Build + assemble Roost.app (debug)
+	cd $(MAC_DIR) && ./scripts/bundle.sh debug
+
+build-all: build bundle  ## Build both UIs + the Mac bundle
+
+# ---- run --------------------------------------------------------------
+
+.PHONY: run-gtk run-mac
+run-gtk: build  ## Launch the GTK UI (Roost-gtk profile)
+	./target/debug/roost
+
+run-mac: bundle  ## Launch the bundled Mac app
+	open $(APP)
+
+# ---- test -------------------------------------------------------------
+
+.PHONY: test test-rust test-mac smoke-gtk smoke-mac
+test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
+
+test-rust:  ## cargo test --workspace
+	cargo test --workspace
+
+test-mac:  ## swift test (Mac)
+	cd $(MAC_DIR) && swift test
+
+smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
+	tools/uitest/smoke.sh gtk
+
+smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
+	tools/uitest/smoke.sh mac
+
+# ---- code quality -----------------------------------------------------
+
+.PHONY: fmt fmt-check clippy check
+fmt:  ## Format Rust (cargo fmt --all)
+	cargo fmt --all
+
+fmt-check:  ## Check formatting (what CI's rust-lint runs)
+	cargo fmt --all -- --check
+
+clippy:  ## Lint Rust (cargo clippy --workspace)
+	cargo clippy --workspace --all-targets
+
+check: fmt-check clippy test  ## Pre-push gate: fmt-check + clippy + tests
+
+# ---- docs -------------------------------------------------------------
+
+.PHONY: docs docs-serve
+docs:  ## Build the mkdocs site into site-build/
+	uv sync --group docs && uv run mkdocs build
+
+docs-serve:  ## Serve the docs locally (mkdocs serve)
+	uv sync --group docs && uv run mkdocs serve
+
+# ---- clean ------------------------------------------------------------
+
+.PHONY: clean
+clean:  ## Remove build artifacts (cargo target, Roost.app, site-build)
+	cargo clean
+	rm -rf $(MAC_DIR)/build site-build
