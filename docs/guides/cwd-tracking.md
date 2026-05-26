@@ -112,6 +112,8 @@ The `git status --porcelain` call runs once per prompt; if you have very large r
 
 If the running program in a tab sets its own title (vim, ssh, claude, the OSC 0 snippet above), the tab label shows that title and the header subtitle still shows the raw cwd. If you manually rename a tab via the `rename_tab` keybinding, that name sticks regardless.
 
+**Without** the shell snippet there is no live cwd to inherit, so `Ctrl-T` / `Cmd-T` falls back to the project's stored cwd (then `$HOME`) — new tabs still open somewhere sensible, just not wherever you last `cd`'d. The required setup is the OSC 7 snippet above; this matches Ghostty's default (it also relies on the shell emitting OSC 7).
+
 ## What you don't have to do
 
 - You don't have to set `ROOST_SOCKET` or `ROOST_TAB_ID`. Roost injects them itself.

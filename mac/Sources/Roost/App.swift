@@ -2020,7 +2020,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         guard daemonReachable, let projectID = activeProjectID else { return }
         // Title numbering is 1-based within the active project.
         let title = "roost-mac \(tabsForActiveProject().count + 1)"
-        guard let session = openTab(inProject: projectID, cwd: "", title: title) else { return }
+        // Cmd+T inherits the active tab's live (OSC 7-tracked) cwd, then
+        // project cwd, then $HOME — the same resolution the command
+        // launcher (Cmd+Shift+T) already uses. Without this, new tabs
+        // opened in $HOME instead of where the user was working.
+        let cwd = activeLaunchCwd(projectID: projectID)
+        guard let session = openTab(inProject: projectID, cwd: cwd, title: title) else { return }
         let projectTabs = tabsForActiveProject()
         let insertedIndex = projectTabs.firstIndex(where: { $0 === session })
             ?? max(0, projectTabs.count - 1)

@@ -8,7 +8,7 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Cmd-T`          | New tab                                         |
+| `Cmd-T`          | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)) |
 | `Cmd-W`          | Close the active tab                            |
 | `Cmd-R`          | Rename the active tab                           |
 | `Cmd-Shift-]`    | Cycle to the next tab (stops at the last tab; no wrap-around) |
@@ -60,7 +60,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Ctrl-T`         | New tab                                         |
+| `Ctrl-T`         | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)) |
 | `Ctrl-W`         | Close the active tab                            |
 | `Alt-R`          | Rename the active tab                           |
 | `Ctrl-Shift-]`   | Cycle to the next tab (stops at the last tab; no wrap-around) |
