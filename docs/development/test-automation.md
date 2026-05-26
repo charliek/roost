@@ -1,6 +1,9 @@
 # Test automation & scripting architecture (plan)
 
-Status: **proposal — awaiting decisions** (see [Open decisions](#open-decisions)).
+Status: **active plan** — runner decided (pytest; §7). The north star is
+canonical in [vision.md](vision.md#the-command-core-north-star); §0 here
+is the testing-lens recap. A few open decisions remain (see
+[Open decisions](#open-decisions)).
 Audience: Claude (primary) + the maintainer. Targets: this Mac, Macs in
 general, the Pop!_OS (COSMIC/Wayland) box, and CI (Linux + macOS runners).
 
@@ -292,10 +295,14 @@ network in the exposed `roost` table.
 
 ---
 
-## 7. Test-language decision  *(maintainer's call — analysis here)*
+## 7. Test-language decision  *(decided 2026-05-26)*
 
-The maintainer is unsure Lua is "robust enough" for tests and leans
-hybrid. Here is the honest analysis.
+**Decision: pytest drives the tests; Lua is a scoped user-scripting
+surface, not the test mechanism** (see
+[vision.md DL-12](vision.md#dl-12-pytest-drives-the-tests-lua-is-a-user-scripting-surface)).
+The analysis that led there is kept below; the key insight that made it
+low-stakes is that E2E robustness lives in the *affordances*, not the
+runner.
 
 **What actually drives E2E robustness** (flake resistance, good failures):
 
@@ -320,28 +327,28 @@ plus *how much harness code we own*.
 | **pytest** | Mature fixtures/parametrize/reporting/retries; assertion introspection; reuses #103's Python | Python runtime on every box + CI (cheap, but real); a second language; separate from the app |
 | **Hybrid** (pytest runner over the shared roostctl/Lua/IPC layer) | pytest ergonomics **and** the Lua launcher; can E2E-test launcher actions; clean role split — **Lua = what the app does, Python = how we assert** | Two languages to keep coherent; most moving parts |
 
-**My recommendation: hybrid, with pytest as the test runner.** Rationale:
-the robustness the maintainer cares about is in the shared layer (so Lua
-tests wouldn't be *flakier*), but pytest's reporting/fixtures/parametrize
-materially cut the harness code we'd otherwise own and give better failure
-diagnostics across a 2-UI matrix. Lua earns its place as the **in-app
-orchestration + launcher** language; pytest earns its place as the
-**runner**. They meet at the `roostctl`/IPC verbs. Tests invoke Lua
-*actions* where they want to exercise the launcher path end-to-end.
+**The decision: pytest as the test runner; Lua scoped to user
+scripting.** Tests are pytest over the IPC op set (plus `roostctl` /
+shell for the simplest cases) — its fixtures, parametrization over the
+2-UI matrix, and reporting cut the harness code we'd otherwise own, and
+the flake-killing affordances (`roostctl wait`, `tab dump`) live in the
+app, so the runner choice doesn't move the robustness floor. **Lua is
+deliberately *not* the test runner.** It is a user-facing scripting
+surface — the Cmd+Shift+T launcher and complex user-authored multi-step
+actions — added where it earns programmability and not over-invested as
+test infrastructure. Both stay thin adapters onto the same op set: a
+pytest step and a Lua action invoke identical ops, so neither can drift
+from what users actually drive.
 
 Concretely: `pytest` fixtures launch/quit each UI and yield a thin Python
 `Roost` client (wraps the socket + `roostctl`); tests assert with plain
-`assert`; a handful of tests `roostctl run` a Lua action and assert the
-resulting state. A **tiny Lua smoke** (≤1 script) also runs in CI to prove
-the zero-dep path and keep the Lua API honest.
+`assert`; where a test needs to exercise the launcher path, it runs the
+Lua action and asserts the resulting state via the op set.
 
-**If the maintainer prefers a single language:** go **Lua-only** — it's
-viable precisely because the robustness floor is shared; we'd invest ~a
-day in a small runner (discovery + JUnit emit + per-test timeout/retry).
-The decision is low-stakes and reversible once §5 lands, because the
-*operations* are identical either way.
-
-> **DECISION (fill in):** ☐ hybrid (pytest runner) · ☐ Lua-only · ☐ pytest-only
+> **DECISION (2026-05-26):** ☑ **pytest** runner for tests + **scoped
+> Lua** for user scripting. Supersedes the earlier "hybrid (pytest +
+> heavy Lua)" lean now that programmability + clean-architecture are
+> explicit north-star goals; Lua's role narrows to user-facing.
 
 ---
 
@@ -486,8 +493,8 @@ guessing.
 
 ## Open decisions
 
-1. **Test runner language** — hybrid (pytest) / Lua-only / pytest-only.
-   Recommendation: **hybrid, pytest runner** (§7). *Blocks P2.*
+1. ~~**Test runner language**~~ — **DECIDED (§7 / DL-12): pytest runner;
+   Lua scoped to user scripting.** *Unblocks P2.*
 2. **macOS CI launch** — bundle vs unbundled `swift run` for tests; how
    long to keep the macOS job non-required. *Blocks P3.*
 3. **Launcher action discovery** — global (`~/.config/roost/actions/`),
