@@ -1,10 +1,15 @@
-# Linux UI test harness
+# Linux real-input injection (`tools/input/linux/`)
 
-Tooling to drive and verify the `roost-linux` GTK app in an automated way —
-launch it, send input as a real user would, and read back what's on screen —
-without Pillow/ImageMagick/`wtype`/`ydotool` installed. Built up while
-verifying clipboard/reflow changes; intended to grow as UI testing becomes a
-routine task.
+The **real-OS-input** layer for Linux — the only way to exercise the actual
+key-encoder + mouse-gesture + clipboard path that IPC (`tools/roosttest/`) and
+in-process screenshots (`tools/screenshot/`) can't reach. Drives the
+`roost-linux` GTK app by injecting input as a real user would, without
+Pillow/ImageMagick/`wtype`/`ydotool` installed. (A Mac CGEvent sibling would
+live at `tools/input/mac/`; see [`../../README.md`](../../README.md) for the
+layer map.)
+
+PNG inspection isn't here — it's cross-platform, so it lives with the visual
+layer at [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
 
 Two input paths, two very different properties:
 
@@ -31,11 +36,13 @@ Everything is stdlib Python 3 + bash. No build step.
 |------|--------------|
 | `inject_key.py` | Press a key chord (`CTRL SHIFT C`) or type a string (`--type "ls\n"`). Follows keyboard focus. |
 | `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, drags. Needs single monitor. |
-| `pngtool.py` | Decode/inspect a PNG with no image libs: `info`, `pixel`, `hscan`/`vscan`, `textscan` (find text rows), `findcolor` (locate a UI element), `crop` (write a focused region). |
 | `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
 
-Run any Python tool with `python3 tools/linux/<tool>.py ...`; `--help`/no-args
+PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
+layer: [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
+
+Run any Python tool with `python3 tools/input/linux/<tool>.py ...`; `--help`/no-args
 prints usage.
 
 ## Seeing the UI: in-process screenshot
@@ -43,7 +50,7 @@ prints usage.
 `roostctl screenshot --out /tmp/x.png` renders the window **in-process**, so it
 works even when the window is occluded or unfocused — this is the source of
 truth for "what does roost think is on screen," independent of stacking/focus.
-Then inspect it with `pngtool.py`. (`cosmic-screenshot` captures the whole
+Then inspect it with `../../screenshot/pngtool.py`. (`cosmic-screenshot` captures the whole
 *physical* screen and is only needed to find a window's on-screen position for
 pointer injection.)
 
@@ -55,10 +62,10 @@ the *other* output silently miss (clicks land on the bound output instead).
 Symptom: drags produce no selection and the target window loses focus.
 
 ```sh
-tools/linux/single_monitor.sh status          # see what's enabled
-tools/linux/single_monitor.sh solo eDP-1       # disable the others
+tools/input/linux/single_monitor.sh status          # see what's enabled
+tools/input/linux/single_monitor.sh solo eDP-1       # disable the others
 # ... run pointer-based tests ...
-tools/linux/single_monitor.sh restore          # bring them back
+tools/input/linux/single_monitor.sh restore          # bring them back
 ```
 
 ## Mapping screen ↔ window coordinates
@@ -72,11 +79,11 @@ screen_x = window_x
 screen_y = window_y + PANEL_H     # PANEL_H ≈ screen_height − window_height
 ```
 
-Find `PANEL_H` from `pngtool.py info` on both a full-screen `cosmic-screenshot`
-and a `roostctl screenshot` (e.g. 1050 − 1018 = 32). Pass the **output's**
-logical width/height to `inject_pointer.py` (the `cosmic-screenshot` PNG size).
+Find `PANEL_H` from `../../screenshot/pngtool.py info` on both a full-screen
+`cosmic-screenshot` and a `roostctl screenshot` (e.g. 1050 − 1018 = 32). Pass the
+**output's** logical width/height to `inject_pointer.py` (the `cosmic-screenshot` PNG size).
 
-To locate a target cell, screenshot the window and use `pngtool.py textscan` to
+To locate a target cell, screenshot the window and use `../../screenshot/pngtool.py textscan` to
 find a text row's `y` and `x`-range; cell width ≈ row-width ÷ char-count, cell
 height ≈ spacing between rows.
 
@@ -101,12 +108,12 @@ roostctl tab send --tab "$AT" --bytes 'echo MARKER_0123456789_END\n'
 
 # locate the printed MARKER row in window pixels, add PANEL_H for screen y,
 # then drag right-to-left across it (single monitor, output is 1680x1050):
-python3 tools/linux/inject_pointer.py 1680 1050 "move 560 159" "down LEFT" "move 224 159" "up LEFT"
+python3 tools/input/linux/inject_pointer.py 1680 1050 "move 560 159" "down LEFT" "move 224 159" "up LEFT"
 
-python3 tools/linux/inject_key.py ALT C     # copy   (Linux: clipboard mod = Alt)
-python3 tools/linux/inject_key.py ALT V     # paste
+python3 tools/input/linux/inject_key.py ALT C     # copy   (Linux: clipboard mod = Alt)
+python3 tools/input/linux/inject_key.py ALT V     # paste
 roostctl screenshot --out /tmp/after.png    # MARKER appears at the prompt
-python3 tools/linux/pngtool.py crop /tmp/after.png /tmp/after_top.png 0 0 1680 205
+python3 tools/screenshot/pngtool.py crop /tmp/after.png /tmp/after_top.png 0 0 1680 205
 ```
 
 ## Caveat: cross-process clipboard on COSMIC

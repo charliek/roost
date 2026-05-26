@@ -79,10 +79,10 @@ e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
-	tools/uitest/smoke.sh gtk
+	tools/screenshot/smoke.sh gtk
 
 smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
-	tools/uitest/smoke.sh mac
+	tools/screenshot/smoke.sh mac
 
 # ---- code quality -----------------------------------------------------
 

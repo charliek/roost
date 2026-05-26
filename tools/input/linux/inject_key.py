@@ -19,6 +19,8 @@ import struct
 import sys
 import time
 
+from _uinput import require_uinput, uinput_unavailable
+
 
 def _IOW(nr, size):
     return (1 << 30) | (ord('U') << 8) | nr | (size << 16)
@@ -103,19 +105,23 @@ def open_device(needed_codes):
 
     Returns the open fd; the caller issues UI_DEV_DESTROY when done.
     """
-    fd = open("/dev/uinput", "wb", buffering=0)
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_SYN)
-    for c in set(needed_codes):
-        fcntl.ioctl(fd, UI_SET_KEYBIT, c)
-    # legacy uinput_user_dev: char name[80]; input_id(4*u16); u32 ff; then
-    # 4*64 s32 abs arrays. Pack name + bustype, zero-fill the rest.
-    name = b"roost-test-kbd".ljust(80, b"\x00")
-    dev = name + struct.pack("HHHH", 0x03, 0x1234, 0x5678, 1) + struct.pack("I", 0)
-    dev += b"\x00" * (4 * 64 * 4)
-    fd.write(dev)
-    fd.flush()
-    fcntl.ioctl(fd, UI_DEV_CREATE)
+    require_uinput()
+    try:
+        fd = open("/dev/uinput", "wb", buffering=0)
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_SYN)
+        for c in set(needed_codes):
+            fcntl.ioctl(fd, UI_SET_KEYBIT, c)
+        # legacy uinput_user_dev: char name[80]; input_id(4*u16); u32 ff; then
+        # 4*64 s32 abs arrays. Pack name + bustype, zero-fill the rest.
+        name = b"roost-test-kbd".ljust(80, b"\x00")
+        dev = name + struct.pack("HHHH", 0x03, 0x1234, 0x5678, 1) + struct.pack("I", 0)
+        dev += b"\x00" * (4 * 64 * 4)
+        fd.write(dev)
+        fd.flush()
+        fcntl.ioctl(fd, UI_DEV_CREATE)
+    except OSError as e:
+        sys.exit(uinput_unavailable(e))
     time.sleep(0.4)  # let libinput/compositor register the device
     return fd
 
@@ -135,6 +141,8 @@ def press_chord(fd, codes):
 
 def main():
     args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        sys.exit(__doc__)
     if args and args[0] == "--type":
         text = args[1]
         chords = [char_to_chord(ch) for ch in text]
@@ -160,4 +168,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyError as e:
+        sys.exit(f"error: unknown key/char {e}. Run with no args for the key list.")

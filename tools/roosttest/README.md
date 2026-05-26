@@ -86,13 +86,13 @@ it's pixel- or input- or shell-level. It lives elsewhere, by design:
 
 | Behavior | Why not here | Where |
 |---|---|---|
-| Selection + copy, real clipboard paste | mouse selection + OS clipboard, not IPC | `tools/linux` (uinput inject + clipread) |
-| Live resize / reflow | the UI sizes the grid to the window, so `tab.resize` doesn't pin a size | `tools/uitest` (resize window, check reflow) |
-| Theme color rendering | `tab.dump` is text-only (no color) | `tools/uitest` screenshots |
-| OSC 2 window-title | cwd-derived title + the shell re-emits each prompt overwrites it | `tools/uitest` (visible title) |
+| Selection + copy, real clipboard paste | mouse selection + OS clipboard, not IPC | `tools/input/linux` (uinput inject + clipread) |
+| Live resize / reflow | the UI sizes the grid to the window, so `tab.resize` doesn't pin a size | `tools/screenshot` (resize window, check reflow) |
+| Theme color rendering | `tab.dump` is text-only (no color) | `tools/screenshot` screenshots |
+| OSC 2 window-title | cwd-derived title + the shell re-emits each prompt overwrites it | `tools/screenshot` (visible title) |
 | OSC parsing itself | — | `roost-osc` unit tests (osc2/osc7/osc777) |
-| Sidebar open/close | no IPC-observable state | `tools/uitest`, or add an `identify` field |
+| Sidebar open/close | no IPC-observable state | `tools/screenshot`, or add an `identify` field |
 
 See [`docs/development/test-automation.md`](../../docs/development/test-automation.md)
 for the plan (CI tiers, `roostctl wait`, the relationship to
-`tools/uitest/` and `tools/linux/`).
+`tools/screenshot/` and `tools/input/linux/`).

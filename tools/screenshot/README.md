@@ -1,9 +1,20 @@
-# Roost UI test harness
+# Roost screenshot harness (`tools/screenshot/`)
 
-Automated, screenshot-driven smoke testing for both Roost UIs, driven
-entirely through `roostctl`. Use it to exercise the agent-state /
-notification / hook-lifecycle / focus / lifecycle surface after a change
-and to *see* the result without an OS screen-capture permission.
+The **visual** layer: screenshot-driven smoke testing for both Roost UIs,
+driven entirely through `roostctl`, plus `pngtool.py` to inspect the
+captures with no image libraries. Use it to verify what IPC can't *see* —
+pill-dot/badge colors, theme rendering, which tab is on screen, reflow —
+and to look at the result without an OS screen-capture permission.
+
+Two halves:
+- **Capture + scenarios** (`lib.sh`/`launch.sh`/`quit.sh`/`smoke.sh`,
+  bash + `roostctl`) — launch a UI, walk a scenario, write labeled PNGs.
+- **Inspection** (`pngtool.py`, stdlib Python) — `info` / `pixel` /
+  `textscan` / `findcolor` / `crop` a PNG for programmatic assertions.
+  Cross-platform, so the Linux input harness uses it too
+  ([`../input/linux/`](../input/linux/README.md)).
+
+See [`../README.md`](../README.md) for how this fits the three test layers.
 
 ## Why one harness for two UIs
 
@@ -27,14 +38,14 @@ clobber each other.
 
 ```bash
 # Launch a UI (idempotent — no-op if already running)
-tools/uitest/launch.sh mac        # or: gtk
+tools/screenshot/launch.sh mac        # or: gtk
 
 # Run the full smoke scenario; writes PNGs + manifest.md to an outdir
-tools/uitest/smoke.sh mac /tmp/ut-mac
-tools/uitest/smoke.sh gtk /tmp/ut-gtk
+tools/screenshot/smoke.sh mac /tmp/ut-mac
+tools/screenshot/smoke.sh gtk /tmp/ut-gtk
 
 # Quit cleanly (exercises fsync-on-exit; next launch restores the layout)
-tools/uitest/quit.sh mac
+tools/screenshot/quit.sh mac
 ```
 
 `smoke.sh` is self-contained: it creates a throwaway `uitest` project +

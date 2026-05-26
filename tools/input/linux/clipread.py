@@ -8,10 +8,19 @@ NOT necessarily mean roost's copy failed. Prefer verifying copy/paste with an
 in-roost round-trip (copy, then paste, screenshot the prompt). See the README
 and the "cross-process clipboard" note.
 """
-import gi
-gi.require_version('Gdk', '4.0')
-gi.require_version('Gtk', '4.0')
-from gi.repository import Gdk, Gtk, GLib  # noqa: E402
+import sys
+
+try:
+    import gi
+    gi.require_version('Gdk', '4.0')
+    gi.require_version('Gtk', '4.0')
+    from gi.repository import Gdk, Gtk, GLib  # noqa: E402
+except (ImportError, ValueError) as e:
+    sys.exit(
+        f"error: PyGObject (gi) with GTK4 typelibs not available ({e}).\n"
+        "clipread.py needs a Linux desktop session with PyGObject + GTK4 "
+        "(see tools/input/linux/README.md); it can't run on macOS or headless."
+    )
 
 Gtk.init()
 disp = Gdk.Display.get_default() or Gdk.Display.open(None)
