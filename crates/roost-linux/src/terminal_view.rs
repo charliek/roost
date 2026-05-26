@@ -941,14 +941,15 @@ impl TerminalViewState {
 
     /// Handle a single scroll-wheel `dy`. Negative = up (older
     /// history). 3 modes per the Go binary `cmd/roost/session.go`:
-    ///   * Mouse-tracking (DECSET 1000/1002/1003) — defer; commit 7
-    ///     of this plan doesn't enable mouse-tracking encode yet.
+    ///   * Mouse-tracking (DECSET 1000/1002/1003) — encode button-4/5
+    ///     reports via `encode_wheel_buttons`, checked first so a
+    ///     tracking alt-screen app (htop) gets the report.
     ///   * Alt-screen — translate to ArrowUp / ArrowDown via the key
     ///     encoder. Lets vim / less consume the wheel.
     ///   * Primary screen — local viewport scroll via
     ///     `Terminal::scroll_viewport(Delta)`.
     ///
-    /// Returns the bytes to feed into the PTY (the alt-screen arrow-key
+    /// Returns the bytes to feed into the PTY (the mouse / arrow-key
     /// encoding); empty for a local scrollback move. The caller
     /// dispatches them through `input_callback` after dropping the
     /// borrow, per the callback invariant on `TerminalViewState`.

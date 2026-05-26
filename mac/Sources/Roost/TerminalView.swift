@@ -699,11 +699,10 @@ final class TerminalView: NSView {
     /// state, matching Go `cmd/roost/session.go::handleScroll`
     /// (:776-900):
     ///
-    ///   1. Mouse-tracking mode → mouse-button-4/5 encode through
-    ///      a libghostty-vt mouse encoder. Deferred to a follow-up
-    ///      `polish/mouse-tracking-encoder` branch — for now we
-    ///      silently drop the event so the alt-screen / local
-    ///      paths stay simple.
+    ///   1. Mouse-tracking mode → mouse-button-4/5 reports encoded
+    ///      through the libghostty-vt mouse encoder, one per row, at
+    ///      the pointer's cell. Checked first so a mouse-tracking
+    ///      alt-screen app (htop) gets the report, not arrow keys.
     ///   2. Alt-screen, no mouse tracking → translate to Up/Down
     ///      arrow key presses through the existing key encoder so
     ///      vim / less behave like the user expects.
