@@ -750,7 +750,10 @@ impl TerminalViewState {
             }
         });
         for line in &mut lines {
-            let end = line.trim_end().len();
+            // Trim only ASCII spaces (the blank-cell filler above), not
+            // all Unicode whitespace, so the dump matches the Mac
+            // `dumpText` rstrip byte-for-byte (cross-UI parity).
+            let end = line.trim_end_matches(' ').len();
             line.truncate(end);
         }
         TerminalDump {

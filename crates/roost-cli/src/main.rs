@@ -390,6 +390,12 @@ async fn main() -> Result<()> {
             if state.is_none() && text.is_none() && !gone {
                 anyhow::bail!("wait needs at least one of --state, --text, or --gone");
             }
+            // `--gone` (tab must NOT exist) contradicts --state/--text
+            // (tab must exist); reject the combination up front rather
+            // than silently letting --gone win.
+            if gone && (state.is_some() || text.is_some()) {
+                anyhow::bail!("--gone cannot be combined with --state or --text");
+            }
             let tab_id = resolve_tab(&mut client, tab).await?;
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
@@ -421,9 +427,21 @@ async fn main() -> Result<()> {
                     };
                     let text_ok = match &text {
                         Some(needle) => {
-                            let dump: TabDumpResult =
-                                client.call(ops::TAB_DUMP, TabDumpParams { tab_id }).await?;
-                            dump.rows_text.join("\n").contains(needle.as_str())
+                            match client
+                                .call::<_, TabDumpResult>(ops::TAB_DUMP, TabDumpParams { tab_id })
+                                .await
+                            {
+                                Ok(dump) => dump.rows_text.join("\n").contains(needle.as_str()),
+                                // The tab closed between the list check
+                                // and the dump — not satisfied yet; keep
+                                // polling rather than failing the wait.
+                                Err(roost_ipc::ClientError::Server { code, .. })
+                                    if code == "not-found" =>
+                                {
+                                    false
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
                         }
                         None => true,
                     };
