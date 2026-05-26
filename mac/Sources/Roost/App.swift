@@ -264,6 +264,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             )
         }
 
+        // Register the UI bridge *before* `start()` binds the IPC
+        // socket, so `RoostBackend.shared.ui` is never nil while the
+        // socket is reachable. The window + tabs are built below, so
+        // bridge-backed ops still surface their own honest errors until
+        // then (`mainWindow` nil → "no window"; no tab → "not-found")
+        // rather than a misleading "no UI attached". Storing `self` is
+        // side-effect-free; `self` is fully initialized as the delegate.
+        RoostBackend.shared.registerUI(self)
         RoostBackend.shared.start(
             profile: profile,
             holdsSingleInstanceLock: holdsLock
@@ -408,10 +416,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
-        // Register as the UI bridge so the IPC handler can reach the
-        // main actor (screenshot render, tab.dump render-state walk)
-        // through one seam.
-        RoostBackend.shared.registerUI(self)
 
         // Round-6 R6.B: seat the divider at the persisted (or
         // default) sidebar width AFTER the window has been ordered
