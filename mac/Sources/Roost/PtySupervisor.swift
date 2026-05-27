@@ -508,18 +508,13 @@ final class PtySupervisor {
         }
     }
 
-    /// Build the NULL-terminated argv array. Empty input falls
-    /// back to `$SHELL` or `/bin/sh`. Returned strings are
-    /// strdup'd; the parent leaks them at spawn-scope (small
-    /// constant overhead).
+    /// Build the NULL-terminated argv array. Empty input falls back
+    /// to the user's `$SHELL` (or `/bin/sh`) launched as a LOGIN
+    /// shell — see `loginShellArgv`. Returned strings are strdup'd;
+    /// the parent leaks them at spawn-scope (small constant overhead).
     private func buildArgv(argv: [String]) -> [UnsafeMutablePointer<CChar>?] {
-        let resolved: [String]
-        if argv.isEmpty {
-            let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
-            resolved = [shell]
-        } else {
-            resolved = argv
-        }
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
+        let resolved = loginShellArgv(argv, shell: shell)
         var out: [UnsafeMutablePointer<CChar>?] = resolved.map { strdup($0) }
         out.append(nil)
         return out
@@ -540,6 +535,17 @@ final class PtySupervisor {
 }
 
 // MARK: - Helpers
+
+/// Resolve the argv to exec. An empty argv (the plain "open a shell"
+/// case) becomes the user's `$SHELL` (or `/bin/sh`) launched as a
+/// LOGIN shell via `-l`, so it sources `.bash_profile` / `.zprofile`:
+/// that silences macOS's bash deprecation banner and puts login-only
+/// PATH entries (e.g. `claude`) in scope, matching Terminal.app /
+/// Ghostty. A non-empty argv (launcher commands) is passed through
+/// verbatim — we never force `-l` onto an explicit command line.
+func loginShellArgv(_ argv: [String], shell: String) -> [String] {
+    argv.isEmpty ? [shell, "-l"] : argv
+}
 
 private func reapChild(pid: pid_t) -> Int32 {
     var status: Int32 = 0

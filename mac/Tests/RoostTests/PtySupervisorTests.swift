@@ -129,6 +129,17 @@ struct PtySupervisorTests {
         }
     }
 
+    @Test func emptyArgvBecomesLoginShell() {
+        // Default-shell case: $SHELL + `-l` (login) so profile files load.
+        #expect(loginShellArgv([], shell: "/bin/zsh") == ["/bin/zsh", "-l"])
+    }
+
+    @Test func explicitArgvPassesThroughUnchanged() {
+        // Launcher commands keep their argv — never force `-l`.
+        let argv = ["/bin/bash", "-c", "echo hi"]
+        #expect(loginShellArgv(argv, shell: "/bin/zsh") == argv)
+    }
+
     @Test(.disabled("event-observation crashes the swift-testing runner; covered by M4b IPCServer tests + M9 manual pass"))
     func closeReapsChild() async throws {
         let sup = await PtySupervisor()
