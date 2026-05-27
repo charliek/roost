@@ -17,6 +17,35 @@ import AppKit
 import CGhosttyVT
 import Foundation
 
+extension Bundle {
+    /// The bundle carrying Roost's themes (`themes/`). In a packaged
+    /// `.app` it lives at `Contents/Resources/Roost_Roost.bundle`,
+    /// resolved here via `Bundle.main` — deliberately NOT via SwiftPM's
+    /// generated `Bundle.module`. That accessor searches exactly
+    /// `Bundle.main.bundleURL/Roost_Roost.bundle` (the `.app` ROOT) plus
+    /// a build-machine path baked in at compile time; the root can't be
+    /// populated (nested bundles outside `Contents/` break codesigning)
+    /// and the build path doesn't exist on a user's machine, so
+    /// `Bundle.module` `fatalError`ed on every clean install while
+    /// dev/CI launches — which have that build path present — passed.
+    /// Falls back to `Bundle.module` for `swift run` / tests, where no
+    /// `.app` exists and the build-tree bundle does resolve.
+    static var roostResources: Bundle {
+        // `resourceURL` is `Contents/Resources` for a normally-launched
+        // `.app`; the explicit `bundleURL/Contents/Resources` candidate
+        // covers direct-exec contexts (e.g. running the binary by path),
+        // where `resourceURL` can resolve elsewhere. First hit wins.
+        for candidate in [
+            Bundle.main.resourceURL?.appendingPathComponent("Roost_Roost.bundle"),
+            Bundle.main.bundleURL
+                .appendingPathComponent("Contents/Resources/Roost_Roost.bundle"),
+        ] {
+            if let url = candidate, let bundle = Bundle(url: url) { return bundle }
+        }
+        return .module
+    }
+}
+
 /// Parsed terminal color scheme. Mirrors the Go binary's `Theme`
 /// struct field-for-field so a future "share theme between Go and
 /// Swift binaries" diagnostic stays trivial.
@@ -47,7 +76,7 @@ struct Theme: Sendable {
     /// UI never goes color-less.
     @MainActor
     static func loadBundled(name: String) -> Theme {
-        guard let url = Bundle.module.url(
+        guard let url = Bundle.roostResources.url(
             forResource: name,
             withExtension: nil,
             subdirectory: "themes"
@@ -70,7 +99,7 @@ struct Theme: Sendable {
     /// keeps the surface parallel.
     @MainActor
     static func bundledNames() -> [String] {
-        guard let urls = Bundle.module.urls(
+        guard let urls = Bundle.roostResources.urls(
             forResourcesWithExtension: nil,
             subdirectory: "themes"
         ) else { return [] }

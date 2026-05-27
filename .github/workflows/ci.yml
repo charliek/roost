@@ -230,6 +230,21 @@ jobs:
           "$BIN" --version
           codesign -dvv "$BIN" 2>&1 | grep -E 'adhoc|Format=' || true
 
+      - name: Verify themes resource bundle shipped (clean-install guard)
+        run: |
+          set -euo pipefail
+          # v0.0.2 crashed on every clean install because the themes bundle
+          # wasn't where the running app looks. Assert it ships under
+          # Contents/Resources, which is where `Bundle.roostResources`
+          # (Theme.swift) resolves it. Deterministic — no GUI launch (CI
+          # GUI sessions are flaky; the live-launch check is the local
+          # `make smoke-mac-launch` / pre-release step instead).
+          THEMES="mac/build/Roost.app/Contents/Resources/Roost_Roost.bundle/themes"
+          test -d "$THEMES" || { echo "FAIL: $THEMES missing — themes can't load on a clean install (the v0.0.2 crash)"; exit 1; }
+          count=$(find "$THEMES" -type f | wc -l | tr -d ' ')
+          [ "$count" -gt 0 ] || { echo "FAIL: $THEMES shipped empty"; exit 1; }
+          echo "OK: $count theme files shipped under Contents/Resources"
+
   gtk-build:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true'

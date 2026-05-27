@@ -60,7 +60,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac smoke-gtk smoke-mac
+.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac smoke-gtk smoke-mac smoke-mac-launch
 test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
 
 test-rust:  ## cargo test --workspace
@@ -83,6 +83,10 @@ smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 
 smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
 	tools/screenshot/smoke.sh mac
+
+smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build-tree resources, asserts it starts)
+	./mac/scripts/bundle.sh debug
+	./mac/scripts/smoke-launch.sh
 
 # ---- code quality -----------------------------------------------------
 
