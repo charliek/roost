@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparkle appcast for Roost macOS auto-update (issue #122).
+
+  Deployed verbatim to https://charliek.github.io/roost/appcast.xml by the
+  mkdocs "Documentation" workflow (docs.yml copies non-Markdown files from
+  docs/ into the Pages build). The app's Info.plist SUFeedURL points here.
+
+  The channel starts empty — Sparkle reads it, finds no <item>, and reports
+  "no update", which is the correct inert state until the first Sparkle-armed
+  release. release.yml's mac job appends an <item> per release via
+  mac/scripts/update-appcast.py (EdDSA-signed enclosure) and commits the result
+  back to main, which re-triggers this deploy. Prerelease tags get
+  <sparkle:channel>beta</sparkle:channel> so they don't reach stable users.
+
+  Do not hand-edit committed <item> entries: their sparkle:edSignature is
+  computed over the released DMG bytes.
+-->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Roost</title>
+    <link>https://github.com/charliek/roost</link>
+    <description>Appcast for Roost macOS auto-updates (Sparkle).</description>
+    <language>en</language>
+  </channel>
+</rss>
