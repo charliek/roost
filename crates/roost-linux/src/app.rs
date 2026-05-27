@@ -1415,16 +1415,28 @@ impl App {
     /// OpenTab RPC → on success, attach the tab to the project's
     /// TabView.
     async fn open_new_tab_in(self: &Rc<Self>, project_id: i64) -> anyhow::Result<()> {
-        // Inherit the active tab's live (OSC 7-tracked) cwd — the same
-        // resolution the command launcher uses. `active_tab_cwd` returns
-        // "" when unknown, which `LocalClient::open_tab` then resolves to
-        // the project's stored cwd, then $HOME, then `/`. (CR M4b3b: a
-        // project pinned to a directory should open its tabs there, not
-        // bounce them to the user's home.)
-        let cwd = self.active_tab_cwd(project_id);
+        let cwd = self.launch_cwd(project_id);
         self.open_tab_in_with(project_id, &cwd, "", &[])
             .await
             .map(|_| ())
+    }
+
+    /// New-tab/launcher cwd, native-first: a native read of the active
+    /// tab's shell cwd (current, even for shells that don't emit OSC 7,
+    /// e.g. stock /bin/bash) → the OSC 7-tracked cwd → "" (open_tab then
+    /// resolves project cwd → $HOME → `/`). A new tab spawns a LOCAL
+    /// shell, so the local path is what it should inherit. Shared by
+    /// Cmd-T (`open_new_tab_in`) and the command launcher
+    /// (`launch_command`) so both inherit the active dir identically.
+    fn launch_cwd(self: &Rc<Self>, project_id: i64) -> String {
+        let tracked = self.active_tab_cwd(project_id);
+        let native = self.active_tab_id(project_id).and_then(|tid| {
+            self.client
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.supervisor.foreground_cwd(tid))
+        });
+        resolve_launch_cwd(native, &tracked)
     }
 
     /// Open a tab in `project_id` starting at `cwd` with placeholder
@@ -2604,7 +2616,7 @@ impl App {
         }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let argv = custom_command::launch_argv(&shell, cmd);
-        let cwd = self.active_tab_cwd(pid);
+        let cwd = self.launch_cwd(pid);
         let title = cmd.title.clone();
         let app = self.clone();
         glib::spawn_future_local(async move {
@@ -3535,6 +3547,16 @@ fn notif_tab_id(item_id: &str) -> Option<i64> {
 /// first tab if no selection exists yet). Empty string when the
 /// project has no attached tabs — caller uses that as the "subtitle
 /// goes blank" signal.
+/// New-tab cwd precedence: native shell cwd (current, local) → the
+/// OSC 7-tracked cwd. An empty result lets `LocalClient::open_tab`
+/// resolve the project cwd → $HOME. Pure + unit-testable.
+fn resolve_launch_cwd(native: Option<String>, tracked: &str) -> String {
+    match native {
+        Some(n) if !n.is_empty() => n,
+        _ => tracked.to_string(),
+    }
+}
+
 fn active_tab_cwd(ui: &ProjectUi) -> String {
     // adw::TabView::selected_page returns the currently focused tab.
     // We resolve that back through `parse_tab_id_from_page` (same
@@ -3751,8 +3773,8 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 mod tests {
     use super::{
         compute_insert_idx, drain_server_driven_marker, is_already_attached_or_pending,
-        notif_tab_id, pick_next_active_project, restore_open_specs, tilde_abbreviate_with_home,
-        RestoreTab,
+        notif_tab_id, pick_next_active_project, resolve_launch_cwd, restore_open_specs,
+        tilde_abbreviate_with_home, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
@@ -3947,5 +3969,15 @@ mod tests {
         assert!(!drain_server_driven_marker(&set, 99));
         // The unrelated query didn't drain the real marker.
         assert!(set.borrow().contains(&5));
+    }
+
+    #[test]
+    fn resolve_launch_cwd_prefers_native() {
+        assert_eq!(resolve_launch_cwd(Some("/n".into()), "/t"), "/n");
+        // Empty/absent native falls back to the tracked cwd.
+        assert_eq!(resolve_launch_cwd(Some(String::new()), "/t"), "/t");
+        assert_eq!(resolve_launch_cwd(None, "/t"), "/t");
+        // Both empty stays empty (open_tab then resolves project → $HOME).
+        assert_eq!(resolve_launch_cwd(None, ""), "");
     }
 }

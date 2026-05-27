@@ -387,6 +387,17 @@ final class PtySupervisor {
         sessions[tabID] != nil
     }
 
+    /// Best-effort native read of the tab's shell cwd — the new-tab
+    /// fallback for shells that don't emit OSC 7. Reads the direct
+    /// child (the shell) process's current directory, which tracks the
+    /// shell's `cd`s; a new tab spawns a LOCAL shell, so the local path
+    /// is what it should inherit. Returns nil if the tab has no live
+    /// PTY or the read fails.
+    func foregroundCwd(tabID: Int64) -> String? {
+        guard let session = sessions[tabID] else { return nil }
+        return processCwd(pid: session.childPID)
+    }
+
     // MARK: Read-source helpers
 
     /// Install the DispatchSourceRead's event handler. Declared
@@ -545,6 +556,21 @@ final class PtySupervisor {
 /// verbatim — we never force `-l` onto an explicit command line.
 func loginShellArgv(_ argv: [String], shell: String) -> [String] {
     argv.isEmpty ? [shell, "-l"] : argv
+}
+
+/// The current working directory of `pid` via `proc_pidinfo`
+/// (`PROC_PIDVNODEPATHINFO`). Returns nil on any failure. Backs the
+/// new-tab cwd fallback when no OSC 7 cwd is tracked.
+private func processCwd(pid: pid_t) -> String? {
+    var info = proc_vnodepathinfo()
+    let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+    let rc = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size)
+    guard rc == size else { return nil }
+    let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { raw -> String in
+        guard let base = raw.baseAddress else { return "" }
+        return String(cString: base.assumingMemoryBound(to: CChar.self))
+    }
+    return path.isEmpty ? nil : path
 }
 
 private func reapChild(pid: pid_t) -> Int32 {

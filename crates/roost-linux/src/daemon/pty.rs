@@ -132,6 +132,19 @@ impl PtySupervisor {
             .map(|s| s.output_tx.subscribe())
     }
 
+    /// Best-effort native read of the tab's shell cwd — the new-tab
+    /// fallback for shells that don't emit OSC 7. Reads the direct
+    /// child (the shell) process's current directory; a new tab spawns
+    /// a LOCAL shell, so the local path is what it should inherit.
+    /// `None` if the tab has no live PTY or the read fails.
+    pub fn foreground_cwd(&self, tab_id: i64) -> Option<String> {
+        let pid = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(&tab_id).and_then(|s| s.pid)?
+        };
+        cwd_of_pid(pid)
+    }
+
     /// Spawn a shell for `tab_id`.
     ///
     /// Returns a `broadcast::Receiver` subscribed *before* the PTY
@@ -487,6 +500,22 @@ fn resolve_argv(argv: &[String], shell: &str) -> Vec<String> {
     }
 }
 
+/// Current working directory of `pid`. Linux reads `/proc/<pid>/cwd`;
+/// other platforms (the macOS GTK dev build) have no `/proc` and
+/// return `None` — the shipping GTK target is Linux. Backs the new-tab
+/// cwd fallback when no OSC 7 cwd is tracked.
+#[cfg(target_os = "linux")]
+fn cwd_of_pid(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cwd_of_pid(_pid: u32) -> Option<String> {
+    None
+}
+
 fn build_command(
     cwd: &str,
     argv: &[String],
@@ -583,5 +612,15 @@ mod tests {
             "echo hi".to_string(),
         ];
         assert_eq!(resolve_argv(&argv, "/bin/zsh"), argv);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_of_pid_reads_proc_self() {
+        let got = cwd_of_pid(std::process::id()).expect("own cwd via /proc");
+        assert_eq!(
+            std::path::Path::new(&got).canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
     }
 }
