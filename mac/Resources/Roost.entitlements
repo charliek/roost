@@ -1,44 +1,49 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
     Hardened-runtime entitlements for Roost.app.
 
     Effective when the bundle is code-signed (ad-hoc or Developer
-    ID). The M8-era bundle.sh signs ad-hoc with the `runtime`
-    option; Phase 8 adds Developer ID + notarization on top.
+    ID). bundle.sh signs with the `runtime` option; Phase 8 adds
+    Developer ID + notarization on top (#83).
 
-    File is intentionally a near-empty plist: Roost doesn't need
-    additional capabilities beyond what the hardened runtime
-    grants by default for a forkpty-spawning AppKit app.
+    com.apple.security.cs.disable-library-validation
 
-    What we INTENTIONALLY do not need:
+    Required by the embedded Sparkle.framework (issue #122). Library
+    validation insists every linked library be signed by the SAME
+    Team ID as the main executable (or be a platform binary). Roost
+    ships ad-hoc-signed (no Team ID yet, #83), so the hardened runtime
+    would refuse to load the framework and the app would abort at
+    launch with a code-signature (LV) kill. This entitlement lifts the
+    same-team requirement so the ad-hoc framework loads.
 
-    * `cs.disable-library-validation` — would only be needed if
-      we `dlopen`-ed third-party signed dylibs (e.g. plugins
-      signed by another team-id). We don't. The embedded
-      `roostctl` is exec'd (forkpty path → execve), and execve
-      is governed by Gatekeeper / quarantine, not library
-      validation. Sub-agent review flagged the earlier inclusion
-      of this entitlement here as based on a misreading of the
-      docs.
+    REMOVE THIS once #83 lands (Developer ID + notarization): when
+    Roost and Sparkle.framework are both signed by our Team ID,
+    same-team signing satisfies library validation and the entitlement
+    is no longer needed (cf. Ghostty, which is team-signed and carries
+    no LV-disable). Keeping it past that point needlessly weakens the
+    hardened runtime.
 
-    * `cs.allow-unsigned-executable-memory` / `cs.allow-jit` —
-      libghostty-vt is linked as a static archive (its code is
-      part of Roost's own signed image), no JIT, no dynamically
-      generated machine code at runtime. Add `allow-jit` only if
-      a future Ghostty bump introduces a JIT path (e.g. font
-      shaping via SIMD codegen).
+    What we still INTENTIONALLY do not need:
 
-    * `network.client` / `network.server` — Roost does not speak
-      over a network socket. The IPC server is UNIX-domain only.
+    * `cs.allow-unsigned-executable-memory` / `cs.allow-jit`
+      libghostty-vt is linked as a static archive (its code is part of
+      Roost's own signed image), no JIT, no dynamically generated
+      machine code at runtime. Add `allow-jit` only if a future
+      Ghostty bump introduces a JIT path (e.g. font shaping via SIMD
+      codegen).
 
-    * App Sandbox flags — sandboxing the shells Roost spawns
-      would defeat the product. cmux makes the same choice.
+    * `network.client` / `network.server` Roost does not speak over a
+      network socket; the IPC server is UNIX-domain only. (Sparkle's
+      update download runs in its own XPC service, which carries its
+      own networking; the main app does not need the entitlement.)
 
-    If a future change requires a real entitlement, drop the
-    intentional-emptiness comment block and add it.
+    * App Sandbox flags sandboxing the shells Roost spawns would defeat
+      the product. cmux makes the same choice.
 -->
 <plist version="1.0">
 <dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
 </dict>
 </plist>

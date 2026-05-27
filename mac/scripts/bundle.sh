@@ -24,11 +24,15 @@
 #      Falls back to the flat `mac/Resources/AppIcon.icns` when `actool`
 #      is unavailable (no full Xcode). See packaging/icon/README.md.
 #
+# What this script also does (issue #122):
+#   * Embeds Sparkle.framework under Contents/Frameworks and signs it
+#     inside-out (before the outer .app) so the app can auto-update.
+#
 # What this script does NOT do (Phase 8 follow-ups, intentional):
-#   * Code-sign with a Developer ID certificate.
+#   * Code-sign with a Developer ID certificate (ad-hoc until #83).
 #   * Notarize via `notarytool`.
-#   * Build a DMG.
-#   * Wire Sparkle's auto-update feed.
+#   * Build a DMG (release.yml's `make-dmg` step does that).
+#   * EdDSA-sign the DMG / publish the appcast (release.yml, issue #122).
 #
 # Usage:
 #   ./mac/scripts/bundle.sh                 # release build
@@ -137,6 +141,24 @@ for bundle in "${SWIFT_BIN_DIR}"/*.bundle; do
   [ -d "${bundle}" ] || continue
   cp -R "${bundle}" "${APP_DIR}/Contents/Resources/"
 done
+
+# Sparkle.framework — auto-update (issue #122). SwiftPM copies the
+# framework next to the built binary; we embed it under
+# Contents/Frameworks/ where the Roost binary's
+# `@executable_path/../Frameworks` rpath (Package.swift) resolves
+# `@rpath/Sparkle.framework/Versions/B/Sparkle`. Without this the app
+# aborts at launch with `dyld: Library not loaded`. `cp -R` preserves
+# the Versions/Current symlink farm that codesign requires.
+echo "==> Embedding Sparkle.framework"
+SPARKLE_FW_SRC="${SWIFT_BIN_DIR}/Sparkle.framework"
+if [ ! -d "${SPARKLE_FW_SRC}" ]; then
+  echo "error: Sparkle.framework not found at ${SPARKLE_FW_SRC}" >&2
+  echo "       (did 'swift build' fetch the Sparkle SPM artifact?)" >&2
+  exit 1
+fi
+mkdir -p "${APP_DIR}/Contents/Frameworks"
+cp -R "${SPARKLE_FW_SRC}" "${APP_DIR}/Contents/Frameworks/"
+echo "    Embedded: ${APP_DIR}/Contents/Frameworks/Sparkle.framework"
 
 # App icon. On macOS 26 (Tahoe) a loose .icns is treated as legacy and inset
 # on the system glass tile (a gray frame around the art). The fix is a compiled
@@ -288,7 +310,34 @@ else
     echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
     exit 1
   }
+  # Sparkle.framework is signed --deep but WITHOUT --entitlements: the
+  # framework + its nested helpers (XPCServices/*.xpc, Updater.app,
+  # Autoupdate) carry their own designated requirements, and forcing the
+  # app's entitlements onto them can break Sparkle's XPC handshake. The
+  # app's `disable-library-validation` entitlement (on the outer bundle)
+  # is what lets it load this ad-hoc framework. --deep is safe here (a
+  # framework signed with uniform options) — it is only dangerous on the
+  # outer .app, where it would clobber these nested signatures.
+  codesign_framework_or_die() {
+    local target="$1"
+    # shellcheck disable=SC2086  # TS_FLAG must word-split (empty => no flag)
+    if codesign --force --sign "${SIGN_IDENTITY}" \
+         --options runtime \
+         --deep \
+         ${TS_FLAG} \
+         "${target}"
+    then
+      return 0
+    fi
+    if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+      echo "    warn: codesign(${target}) failed; ROOST_ALLOW_UNSIGNED=1 set, continuing"
+      return 0
+    fi
+    echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
+    exit 1
+  }
   codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl"
+  codesign_framework_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
   codesign_or_die "${APP_DIR}"
 fi
 

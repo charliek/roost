@@ -26,7 +26,17 @@ let package = Package(
     products: [
         .executable(name: "Roost", targets: ["Roost"]),
     ],
-    dependencies: [],
+    dependencies: [
+        // Sparkle 2 auto-update. The release DMG is ad-hoc-signed
+        // (no Apple Developer ID yet — issue #83), so update
+        // authenticity rests on Sparkle's EdDSA signature, not on a
+        // Team ID. The embedded framework requires the
+        // `@executable_path/../Frameworks` rpath (linkerSettings
+        // below) and the `cs.disable-library-validation` entitlement
+        // (Resources/Roost.entitlements) to load under the hardened
+        // runtime without a matching signing team.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
+    ],
     targets: [
         // libghostty-vt's C API exposed to Swift as `CGhosttyVT`.
         //
@@ -72,6 +82,7 @@ let package = Package(
             name: "Roost",
             dependencies: [
                 .target(name: "CGhosttyVT"),
+                .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/Roost",
             exclude: [
@@ -110,8 +121,24 @@ let package = Package(
             //
             // Passing the archive as a positional argument forces
             // static linking and side-steps dyld entirely.
+            //
+            // The `-rpath @executable_path/../Frameworks` flag is for
+            // Sparkle, NOT libghostty-vt: Sparkle.framework's install
+            // name is `@rpath/Sparkle.framework/Versions/B/Sparkle`,
+            // and bundle.sh embeds it under Contents/Frameworks/. The
+            // binary needs this rpath entry or it aborts at launch
+            // with `dyld: Library not loaded: @rpath/Sparkle.framework
+            // /...`. (libghostty-vt stays static and needs no rpath.)
             linkerSettings: [
                 .unsafeFlags(["../third_party/ghostty/out/lib/libghostty-vt.a"]),
+                // `-Xlinker` prefixes are required: a bare `-rpath` is
+                // rejected by the Swift compiler driver ("unknown
+                // argument") — only `-Xlinker` passes the token straight
+                // through to `ld`.
+                .unsafeFlags([
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", "@executable_path/../Frameworks",
+                ]),
             ]
         ),
         .testTarget(
