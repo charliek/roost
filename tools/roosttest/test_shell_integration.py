@@ -104,3 +104,32 @@ def test_native_cwd_inherits_cd(roost, project, palette, target):
     # own pwd — independent of the new tab's OSC 7 timing.
     roost.run(new_id, "echo NEWTAB_PWD=$(pwd)")
     roost.wait_text(new_id, "NEWTAB_PWD=/usr", timeout=8)
+
+
+def test_launcher_inherits_native_cwd(roost, project, palette, target):
+    """The command launcher inherits the active tab's native cwd too —
+    parity with Cmd-T — for shells without OSC 7. Uses the seeded
+    `Print Pwd` command; skips when the seed config isn't active."""
+    if target == "gtk" and sys.platform == "darwin":
+        pytest.skip("GTK native cwd read is Linux-only (/proc); macOS GTK is dev-only")
+
+    probe = palette.palette_open(kind="launcher")
+    have_seed = "Print Pwd" in {it["title"] for it in probe["items"]}
+    palette.palette_dismiss()
+    if not have_seed:
+        pytest.skip("seed config not active (UI not launched by the harness)")
+
+    active = roost.open_tab(project, cwd="/tmp",
+                            argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.focus(active)
+    roost.run(active, 'cd /usr && echo "ATDIR:$(pwd)"')
+    roost.wait_text(active, "ATDIR:/usr", timeout=8)
+
+    before = {int(t["id"]) for t in roost.tabs()}
+    state = palette.palette_open(kind="launcher")
+    items = {it["title"]: it["id"] for it in state["items"]}
+    palette.palette_activate(items["Print Pwd"])
+    roost._wait(lambda: {int(t["id"]) for t in roost.tabs()} - before,
+                5.0, "launcher spawned a tab")
+    new_id = next(iter({int(t["id"]) for t in roost.tabs()} - before))
+    roost.wait_text(new_id, "LAUNCH_PWD=/usr", timeout=8)

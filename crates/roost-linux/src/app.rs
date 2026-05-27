@@ -1415,12 +1415,20 @@ impl App {
     /// OpenTab RPC → on success, attach the tab to the project's
     /// TabView.
     async fn open_new_tab_in(self: &Rc<Self>, project_id: i64) -> anyhow::Result<()> {
-        // Prefer a native read of the active tab's shell cwd: it reflects
-        // the current directory even for shells that don't emit OSC 7
-        // (e.g. stock /bin/bash), and a new tab spawns a LOCAL shell so
-        // the local path is what it should inherit. Fall back to the
-        // OSC 7-tracked cwd (`active_tab_cwd`); an empty result lets
-        // `LocalClient::open_tab` resolve project cwd → $HOME → `/`.
+        let cwd = self.launch_cwd(project_id);
+        self.open_tab_in_with(project_id, &cwd, "", &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// New-tab/launcher cwd, native-first: a native read of the active
+    /// tab's shell cwd (current, even for shells that don't emit OSC 7,
+    /// e.g. stock /bin/bash) → the OSC 7-tracked cwd → "" (open_tab then
+    /// resolves project cwd → $HOME → `/`). A new tab spawns a LOCAL
+    /// shell, so the local path is what it should inherit. Shared by
+    /// Cmd-T (`open_new_tab_in`) and the command launcher
+    /// (`launch_command`) so both inherit the active dir identically.
+    fn launch_cwd(self: &Rc<Self>, project_id: i64) -> String {
         let tracked = self.active_tab_cwd(project_id);
         let native = self.active_tab_id(project_id).and_then(|tid| {
             self.client
@@ -1428,10 +1436,7 @@ impl App {
                 .as_ref()
                 .and_then(|c| c.supervisor.foreground_cwd(tid))
         });
-        let cwd = resolve_launch_cwd(native, &tracked);
-        self.open_tab_in_with(project_id, &cwd, "", &[])
-            .await
-            .map(|_| ())
+        resolve_launch_cwd(native, &tracked)
     }
 
     /// Open a tab in `project_id` starting at `cwd` with placeholder
@@ -2611,7 +2616,7 @@ impl App {
         }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let argv = custom_command::launch_argv(&shell, cmd);
-        let cwd = self.active_tab_cwd(pid);
+        let cwd = self.launch_cwd(pid);
         let title = cmd.title.clone();
         let app = self.clone();
         glib::spawn_future_local(async move {
@@ -3768,8 +3773,8 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 mod tests {
     use super::{
         compute_insert_idx, drain_server_driven_marker, is_already_attached_or_pending,
-        notif_tab_id, pick_next_active_project, restore_open_specs, tilde_abbreviate_with_home,
-        RestoreTab,
+        notif_tab_id, pick_next_active_project, resolve_launch_cwd, restore_open_specs,
+        tilde_abbreviate_with_home, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
