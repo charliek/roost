@@ -9,11 +9,32 @@
   product version (or the goal-doc default 0.1.0 until we cut a real
   release tag in Phase 8).
 
+  Sparkle auto-update (issue #122):
+    * SUFeedURL       — the appcast on GitHub Pages.
+    * SUPublicEDKey   — the EdDSA public key updates are verified
+                        against. The matching private key is a repo
+                        secret (SPARKLE_ED_PRIVATE_KEY) used by
+                        release.yml to sign each DMG. Sparkle requires
+                        this key to be present in EVERY shipped build:
+                        an update whose new bundle lacks the key is
+                        rejected ("public key found in old bundle but
+                        not in new update").
+    * SUEnableAutomaticChecks — false for now so background checks
+                        never pop an "update available" panel during
+                        the release pipeline's E2E run (the E2E bundle
+                        can be older than the published appcast). Users
+                        invoke updates via the "Check for Updates…"
+                        menu item; revisit enabling silent checks once
+                        E2E launches Roost with checks disabled.
+
   Out of scope for M7 (separate Phase 8 work):
     * Code-signing certificate / `LSApplicationCategoryType`
-    * Sparkle auto-update keys (SUFeedURL, etc.)
-    * Hardened-runtime entitlements
+    * Hardened-runtime entitlements beyond Roost.entitlements
 -->
+<!-- XXX(#122): SUPublicEDKey below is the THROWAWAY spike key. Swap to
+     the maintainer's real public key (Phase 0) before the first
+     auto-updating release. -->
+
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
@@ -50,5 +71,11 @@
   <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>
+  <key>SUFeedURL</key>
+  <string>https://charliek.github.io/roost/appcast.xml</string>
+  <key>SUPublicEDKey</key>
+  <string>9n43stvrJeqWENXHYrisnIhByQ8N0OcjzSWAvhZj4fo=</string>
+  <key>SUEnableAutomaticChecks</key>
+  <false/>
 </dict>
 </plist>

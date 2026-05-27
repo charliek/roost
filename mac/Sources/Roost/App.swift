@@ -21,6 +21,7 @@
 
 import AppKit
 import Foundation
+import Sparkle
 
 @main
 @MainActor
@@ -148,6 +149,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// shutdown.
     private var singleInstance: SingleInstance?
     private var daemonReachable: Bool = false
+
+    /// Sparkle 2 auto-update controller (issue #122). Retained for the
+    /// app's lifetime; it owns the background update scheduler and
+    /// backs the "Check for Updates…" menu item. Updates are
+    /// authenticated by Sparkle's EdDSA signature (`SUPublicEDKey` in
+    /// Info.plist) — independent of Apple Developer ID, which is still
+    /// pending (#83). Created in `applicationDidFinishLaunching` before
+    /// `installMainMenu()` so the menu item can target it.
+    private var updaterController: SPUStandardUpdaterController?
 
     /// User config (Phase 6a M6). Resolved once on launch from
     /// `~/.config/roost/config.conf`; the values flow into theme
@@ -308,6 +318,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     action
                 )
             }
+        )
+
+        // Sparkle 2 auto-update (issue #122). Stand the updater up
+        // before installMainMenu() so the "Check for Updates…" item
+        // can target it. `startingUpdater: true` kicks off the
+        // background scheduler; whether it checks automatically is
+        // governed by SUEnableAutomaticChecks / SUScheduledCheckInterval
+        // in Info.plist. Feed URL + EdDSA public key also come from
+        // Info.plist (SUFeedURL / SUPublicEDKey).
+        self.updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
         )
 
         installMainMenu()
@@ -2661,6 +2684,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
+        // Sparkle "Check for Updates…" (issue #122). Targets the
+        // retained updaterController; its `checkForUpdates(_:)` opens
+        // Sparkle's standard update UI. Disabled gracefully if the
+        // controller failed to start (target nil → AppKit greys it).
+        let checkForUpdates = NSMenuItem(
+            title: "Check for Updates…",
+            action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        checkForUpdates.target = updaterController
+        appMenu.addItem(checkForUpdates)
         appMenu.addItem(.separator())
         let hide = NSMenuItem(
             title: "Hide Roost",
