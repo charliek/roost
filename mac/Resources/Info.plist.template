@@ -31,10 +31,6 @@
     * Code-signing certificate / `LSApplicationCategoryType`
     * Hardened-runtime entitlements beyond Roost.entitlements
 -->
-<!-- XXX(#122): SUPublicEDKey below is the THROWAWAY spike key. Swap to
-     the maintainer's real public key (Phase 0) before the first
-     auto-updating release. -->
-
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
@@ -74,7 +70,7 @@
   <key>SUFeedURL</key>
   <string>https://charliek.github.io/roost/appcast.xml</string>
   <key>SUPublicEDKey</key>
-  <string>9n43stvrJeqWENXHYrisnIhByQ8N0OcjzSWAvhZj4fo=</string>
+  <string>P2VexGJQtk6cptdgKi3skMV9+WcmcZMAKjSPrKhylJA=</string>
   <key>SUEnableAutomaticChecks</key>
   <false/>
 </dict>

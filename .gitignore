@@ -47,3 +47,14 @@ coverage.html
 /dist/
 /out/
 
+# Sparkle EdDSA signing keys (issue #122) — NEVER commit. The private key lives
+# only in the macOS login keychain and the SPARKLE_ED_PRIVATE_KEY repo secret.
+# These patterns are a safety net for a key accidentally exported into the
+# working tree (e.g. `generate_keys -x key.txt`).
+sparkle*priv*.key
+sparkle*private*
+*sparkle*.key
+*_ed25519
+*_ed25519.key
+sparkle_ed_key
+
