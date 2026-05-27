@@ -470,25 +470,38 @@ fn terminate_child(
     });
 }
 
+/// Resolve the argv to exec. An empty argv (the plain "open a shell"
+/// case) becomes the user's `$SHELL` (or `/bin/sh`) launched as a
+/// LOGIN shell via `-l`, so it sources profile files (`.bash_profile`
+/// / `.zprofile`): that silences macOS's bash deprecation banner and
+/// puts login-only PATH entries (e.g. `claude`) in scope, matching
+/// Terminal.app / Ghostty. A non-empty argv (launcher commands) is
+/// passed through verbatim. (`portable-pty` 0.8 couples program and
+/// argv[0], so we use the `-l` flag rather than the `-bash`
+/// dash-prefix login convention.)
+fn resolve_argv(argv: &[String], shell: &str) -> Vec<String> {
+    if argv.is_empty() {
+        vec![shell.to_string(), "-l".to_string()]
+    } else {
+        argv.to_vec()
+    }
+}
+
 fn build_command(
     cwd: &str,
     argv: &[String],
     tab_id: i64,
     socket_path: &std::path::Path,
 ) -> CommandBuilder {
-    // Argv-first: never call a shell to parse a single command string. If
-    // the caller sent an empty argv, fall back to the user's $SHELL (or
-    // /bin/sh) with no arguments.
-    let mut cmd = if let Some((program, args)) = argv.split_first() {
-        let mut c = CommandBuilder::new(program);
-        for a in args {
-            c.arg(a);
-        }
-        c
-    } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        CommandBuilder::new(shell)
-    };
+    // Argv-first: never call a shell to parse a single command string.
+    // An empty argv (plain "open a shell") resolves to `$SHELL -l` — a
+    // login shell, see `resolve_argv`.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let resolved = resolve_argv(argv, &shell);
+    let mut cmd = CommandBuilder::new(&resolved[0]);
+    for a in &resolved[1..] {
+        cmd.arg(a);
+    }
     if !cwd.is_empty() {
         cmd.cwd(cwd);
     }
@@ -545,4 +558,30 @@ pub enum PtyError {
     DuplicateTab(i64),
     #[error("spawn for tab {0} cancelled by close()")]
     Cancelled(i64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_argv_becomes_login_shell() {
+        // Default-shell case: `$SHELL -l` so profile files load.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            resolve_argv(&empty, "/bin/zsh"),
+            vec!["/bin/zsh".to_string(), "-l".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_argv_passes_through_unchanged() {
+        // Launcher commands keep their argv — never force `-l`.
+        let argv = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string(),
+        ];
+        assert_eq!(resolve_argv(&argv, "/bin/zsh"), argv);
+    }
 }

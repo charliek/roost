@@ -107,9 +107,13 @@ class Roost:
         self.call("project.delete", {"project_id": str(project_id)})
 
     def open_tab(self, project_id: int, cwd: str = "", title: str = "",
-                 cols: int = 80, rows: int = 24) -> int:
-        r = self.call("tab.open", {"project_id": str(project_id), "cwd": cwd,
-                                    "title": title, "cols": cols, "rows": rows})
+                 cols: int = 80, rows: int = 24,
+                 argv: list[str] | None = None) -> int:
+        params = {"project_id": str(project_id), "cwd": cwd,
+                  "title": title, "cols": cols, "rows": rows}
+        if argv:
+            params["argv"] = argv
+        r = self.call("tab.open", params)
         return int(r["tab"]["id"])
 
     def close_tab(self, tab_id: int) -> None:
