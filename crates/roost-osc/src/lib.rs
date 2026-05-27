@@ -76,6 +76,13 @@ pub enum OscEvent {
     /// The scanner doesn't synthesise the response; the daemon
     /// caller decides whether to route back to the UI or drop.
     ColorQuery(u8),
+
+    /// OSC 133 shell-integration prompt/command mark. Carries the raw
+    /// body after `133;` — `A` (prompt start), `B` (prompt end), `C`
+    /// (command start), `D` / `D;<exit>` (command end). Interpreting it
+    /// into tab state lives in the consumer (`apply_osc`), so the
+    /// scanner surfaces the body verbatim.
+    CommandMark(String),
 }
 
 /// State the byte-by-byte parser cycles through.
@@ -250,6 +257,12 @@ impl OscScanner {
                 if n == 10 || n == 11 || n == 12 {
                     self.pending.push(OscEvent::ColorQuery(n));
                 }
+            }
+            "133" => {
+                // Shell-integration prompt/command mark. Surface the raw
+                // body (`A`/`B`/`C`/`D`/`D;<exit>`); the consumer maps it
+                // to tab state.
+                self.pending.push(OscEvent::CommandMark(body.to_string()));
             }
             _ => {
                 // Unhandled OSC command. libghostty handles many
@@ -462,6 +475,39 @@ mod tests {
     fn osc7_simple_path() {
         let events = feed_all(b"\x1b]7;file:///Users/me/work\x07");
         assert_eq!(events, vec![OscEvent::Pwd("/Users/me/work".into())]);
+    }
+
+    #[test]
+    fn osc133_command_start() {
+        let events = feed_all(b"\x1b]133;C\x07");
+        assert_eq!(events, vec![OscEvent::CommandMark("C".into())]);
+    }
+
+    #[test]
+    fn osc133_command_end_with_exit_st_terminated() {
+        // ST (ESC \) terminator; body keeps the exit code after the
+        // second ';'.
+        let events = feed_all(b"\x1b]133;D;0\x1b\\");
+        assert_eq!(events, vec![OscEvent::CommandMark("D;0".into())]);
+    }
+
+    #[test]
+    fn osc133_prompt_start_split_across_feeds() {
+        let mut s = OscScanner::new();
+        assert!(s.feed(b"\x1b]133;").is_empty());
+        assert_eq!(s.feed(b"A\x07"), vec![OscEvent::CommandMark("A".into())]);
+    }
+
+    #[test]
+    fn osc133_interleaved_with_pwd() {
+        let events = feed_all(b"\x1b]133;C\x07\x1b]7;file:///tmp\x07");
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::CommandMark("C".into()),
+                OscEvent::Pwd("/tmp".into()),
+            ]
+        );
     }
 
     #[test]

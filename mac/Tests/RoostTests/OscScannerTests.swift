@@ -256,3 +256,31 @@ func unrelated_bytes_pass_through() {
     let bytes: [UInt8] = Array("some shell output\nmore output\n".utf8)
     #expect(feedAll(bytes).isEmpty)
 }
+
+// MARK: - OSC 133 (shell-integration prompt/command marks)
+
+@Test
+func osc133_command_start() {
+    #expect(feedAll("\u{1b}]133;C\u{07}") == [.commandMark("C")])
+}
+
+@Test
+func osc133_command_end_with_exit_st_terminator() {
+    // ESC ] 133 ; D ; 0 ESC \  — the exit code stays in the body.
+    #expect(feedAll("\u{1b}]133;D;0\u{1b}\\") == [.commandMark("D;0")])
+}
+
+@Test
+func osc133_split_across_feeds() {
+    let s = OscScanner()
+    #expect(s.feed(Data(Array("\u{1b}]133;".utf8))).isEmpty)
+    #expect(s.feed(Data(Array("A\u{07}".utf8))) == [.commandMark("A")])
+}
+
+@Test
+func osc133_interleaved_with_pwd() {
+    #expect(
+        feedAll("\u{1b}]133;C\u{07}\u{1b}]7;file:///tmp\u{07}")
+            == [.commandMark("C"), .pwd("/tmp")]
+    )
+}
