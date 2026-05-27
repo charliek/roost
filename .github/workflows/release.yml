@@ -11,6 +11,11 @@ name: Release
 #   MACOS_CERTIFICATE_PASSWORD, APPLE_ID, APPLE_TEAM_ID,
 #   APPLE_APP_SPECIFIC_PASSWORD. Without them the DMG ships ad-hoc-signed
 #   (Gatekeeper requires right-click → Open).
+#
+# Sparkle auto-update (issue #122) is independently gated on
+#   SPARKLE_ED_PRIVATE_KEY (the EdDSA signing key). Without it the DMG ships
+#   but isn't auto-updatable; with it, the mac job signs the DMG and publishes
+#   a signed appcast item to GitHub Pages. This does NOT require Apple signing.
 
 on:
   push:
@@ -200,6 +205,10 @@ jobs:
       # Surfaced from secrets; empty when unset → ad-hoc signing + no notarization.
       ROOST_DEVELOPER_ID_IDENTITY: ${{ secrets.ROOST_DEVELOPER_ID_IDENTITY }}
       HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+      # Sparkle EdDSA private key (issue #122); empty → DMG ships but isn't
+      # auto-updatable. Indirected through env because the `secrets` context
+      # isn't reliable in step-level `if` (same pattern as HAS_CERT).
+      HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -316,6 +325,73 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" --clobber
+
+      # Sparkle auto-update (issue #122). EdDSA-sign the DMG and append a signed
+      # <item> to the appcast on main, which docs.yml redeploys to Pages so the
+      # app's SUFeedURL serves it. Gated on the private-key secret (mirrors
+      # HAS_CERT) — without it the DMG still ships, just not auto-updatable.
+      #
+      # Runs AFTER notarize+upload so it signs the FINAL DMG bytes (a stapled
+      # ticket changes them) — the bytes a user actually downloads.
+      #
+      # SPARKLE_ED_PRIVATE_KEY is the base64 of the key file that Sparkle's
+      # `generate_keys -x` exports, i.e. set it with:
+      #     generate_keys -x key.txt && base64 < key.txt | pbcopy
+      # The matching public key must already be SUPublicEDKey in Info.plist.
+      - name: EdDSA-sign DMG + publish appcast
+        if: env.HAS_SPARKLE_KEY == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          tag="${GITHUB_REF_NAME}"
+          dmg="mac/build/Roost-${ver}.dmg"
+
+          # sign_update ships in the Sparkle SPM artifact that swift build
+          # fetched. Exclude old_dsa_scripts/ (a legacy shell shim, same name).
+          sign_update="$(find mac/.build/artifacts -path '*/bin/sign_update' -type f -not -path '*old_dsa*' | head -1)"
+          if [ -z "${sign_update}" ]; then
+            echo "::error::sign_update not found under mac/.build/artifacts (Sparkle SPM artifact missing?)"; exit 1
+          fi
+
+          # Decode the base64 secret to a temp key file; sign; remove the key
+          # on both the success and failure paths (the runner is ephemeral, but
+          # don't leave key material around longer than the signing call).
+          keyfile="$(mktemp)"
+          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" | base64 --decode > "${keyfile}"
+          if ! "${sign_update}" --ed-key-file "${keyfile}" "${dmg}" > sign_update.txt; then
+            rm -f "${keyfile}"
+            echo "::error::sign_update failed"; exit 1
+          fi
+          rm -f "${keyfile}"
+          echo "signed ${dmg}: $(cat sign_update.txt)"
+
+          # Append the <item> to main's appcast and push it back (NOT [skip ci]:
+          # docs.yml must fire to redeploy Pages). The job is detached at the
+          # tag, so operate on a fresh main; dedupe-by-version makes re-applying
+          # on the latest main idempotent, so retry on a racing push.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git checkout -B appcast-publish origin/main
+            ROOST_VERSION="${ver}" ROOST_TAG="${tag}" python3 mac/scripts/update-appcast.py
+            if git diff --quiet -- docs/appcast.xml; then
+              echo "appcast already current for ${tag} — nothing to push."; exit 0
+            fi
+            git add docs/appcast.xml
+            git commit -m "chore(appcast): publish ${tag} (#122)"
+            if git push "${remote}" HEAD:main; then
+              echo "pushed appcast for ${tag} to main."; exit 0
+            fi
+            echo "::warning::appcast push attempt ${attempt} failed (main moved or branch protection); retrying."
+            sleep 5
+          done
+          echo "::error::could not push appcast to main after 3 attempts. If branch protection rejected the github-actions push, allow it to bypass for this one file or use a dedicated token — see issue #122."
+          exit 1
 
       # Interim only: while the DMG isn't notarized, append the Gatekeeper-bypass
       # instructions to the release body so downloaders see them at the earliest
