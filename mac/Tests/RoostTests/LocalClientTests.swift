@@ -32,6 +32,16 @@ struct LocalClientOSCTests {
         #expect(parseOSC7Path("http://example.com/path") == nil)
     }
 
+    @Test func commandMarkStateMapsMarks() {
+        #expect(commandMarkState("C") == .running)
+        #expect(commandMarkState("D") == Workspace.TabState.none)
+        #expect(commandMarkState("D;0") == Workspace.TabState.none)
+        #expect(commandMarkState("A") == Workspace.TabState.none)
+        #expect(commandMarkState("B") == Workspace.TabState.none)
+        #expect(commandMarkState("") == nil)
+        #expect(commandMarkState("Z") == nil)
+    }
+
     @Test func osc777SplitsTitleAndBody() {
         let (title, body) = parseNotificationPayload(
             command: 777, payload: "notify;Build;Passed"

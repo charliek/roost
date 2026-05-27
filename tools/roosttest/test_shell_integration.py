@@ -148,7 +148,7 @@ def test_env_injected(roost, project):
     )
     roost.wait_text(
         tab,
-        "ENVCHK:tp=Roost si=1 feat=cwd,title,prompt term=xterm-256color rd=set",
+        "ENVCHK:tp=Roost si=1 feat=cwd,title,marks,prompt term=xterm-256color rd=set",
         timeout=8,
     )
 
@@ -217,3 +217,38 @@ def test_documented_rooster_override(roost, project):
         timeout=8,
         what="fancy title tracks cwd in a non-repo",
     )
+
+
+def test_osc133_drives_state(roost, project):
+    """OSC 133 C (command start) -> running; D (command end) -> cleared.
+    Emitted directly so it needs no shell integration; bare bash so only
+    our explicit marks drive state."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab, r"""printf '\033]133;C\033\\'; echo C133""")
+    roost.wait_text(tab, "C133", timeout=8)
+    roost.wait_state(tab, "running", timeout=5)
+    roost.run(tab, r"""printf '\033]133;D\033\\'; echo D133""")
+    roost.wait_text(tab, "D133", timeout=8)
+    roost.wait_state(tab, "none", timeout=5)
+
+
+def test_osc133_suppressed_when_hook_active(roost, project):
+    """While a Claude hook owns the tab (hookActive), shell OSC 133 is
+    suppressed — the hook's state wins; releasing it re-enables 133."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.set_hook_active(tab, True)
+    roost.set_state(tab, "idle")  # as the Claude hook would
+    roost.wait_state(tab, "idle", timeout=5)
+    # Shell emits C; with the hook active the dot must NOT flip to running.
+    roost.run(tab, r"""printf '\033]133;C\033\\'; echo HC1""")
+    roost.wait_text(tab, "HC1", timeout=8)
+    roost.run(tab, "echo HC2")  # second round-trip drains any queued OSC dispatch
+    roost.wait_text(tab, "HC2", timeout=8)
+    assert (roost.tab(tab) or {}).get("state") == "idle", (roost.tab(tab) or {}).get("state")
+    # Release the hook: shell OSC 133 drives state again.
+    roost.set_hook_active(tab, False)
+    roost.run(tab, r"""printf '\033]133;C\033\\'; echo HC3""")
+    roost.wait_text(tab, "HC3", timeout=8)
+    roost.wait_state(tab, "running", timeout=5)

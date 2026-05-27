@@ -23,7 +23,7 @@ esac
 _ROOST_BASH_LOADED=1
 
 _roost_feature() {
-  case ",${ROOST_SHELL_FEATURES:-cwd,title,prompt}," in
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt}," in
     *",no-$1,"*) return 1 ;;
     *) return 0 ;;
   esac
@@ -39,8 +39,16 @@ __roost_title() {
   printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
 }
 
+# OSC 133 command marks: C on command start (PS0), D when it ends (the
+# next prompt's PROMPT_COMMAND). Roost maps C -> running, D -> cleared.
+__roost_marks() {
+  _roost_feature marks || return 0
+  printf '\033]133;D\033\\'
+}
+_roost_feature marks && PS0='\e]133;C\e\\'"${PS0:-}"
+
 # Prepend so the user's existing PROMPT_COMMAND still runs.
-PROMPT_COMMAND="__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
+PROMPT_COMMAND="__roost_marks;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
 
 # Default prompt (cwd in blue + a plain $) only when the user hasn't set
 # one — bash's stock interactive default is '\s-\v\$ ', else empty.

@@ -125,6 +125,9 @@ class Roost:
     def set_state(self, tab_id: int, state: str) -> None:
         self.call("tab.set_state", {"tab_id": str(tab_id), "state": state})
 
+    def set_hook_active(self, tab_id: int, active: bool) -> None:
+        self.call("tab.set_hook_active", {"tab_id": str(tab_id), "active": active})
+
     def set_title(self, tab_id: int, title: str) -> None:
         self.call("tab.set_title", {"tab_id": str(tab_id), "title": title})
 
