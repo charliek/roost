@@ -14,6 +14,8 @@ so `MARKER:<value>` materializes only when the command actually runs
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 # Detect login state per shell: bash via `shopt -q login_shell`, zsh via
@@ -68,3 +70,37 @@ def test_explicit_argv_not_login(roost, project):
         '"$(shopt -q login_shell && echo yes || echo no)"',
     )
     roost.wait_text(tab, "EXARGV:bash=yes login=no", timeout=8)
+
+
+def test_native_cwd_inherits_cd(roost, project, palette, target):
+    """A new tab inherits the active tab's *current* dir via the native
+    cwd read, even when the shell emits no OSC 7 (bare bash). This is the
+    P3 fallback that fixes Cmd-T for shells without Roost integration.
+
+    Uses /usr (not a symlink on macOS or Linux) so the native read's
+    physical path matches the logical path. Skipped on the macOS GTK dev
+    build, which has no /proc; e2e-mac (proc_pidinfo) and Linux e2e-gtk
+    (/proc) cover the real read in CI.
+    """
+    if target == "gtk" and sys.platform == "darwin":
+        pytest.skip("GTK native cwd read is Linux-only (/proc); macOS GTK is dev-only")
+
+    # Bare shell: no rc, no profile, no integration -> no OSC 7 emitted.
+    active = roost.open_tab(project, cwd="/tmp",
+                            argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.focus(active)  # make the project active so new_tab lands here
+    roost.run(active, 'cd /usr && echo "ATDIR:$(pwd)"')
+    roost.wait_text(active, "ATDIR:/usr", timeout=8)  # cd done (output-only marker)
+
+    before = {int(t["id"]) for t in roost.tabs()}
+    state = palette.palette_open(kind="commands")
+    assert "new_tab" in roost.palette_item_ids(state), roost.palette_item_ids(state)
+    palette.palette_activate("new_tab")
+    roost._wait(lambda: {int(t["id"]) for t in roost.tabs()} - before,
+                5.0, "new_tab spawned a tab")
+    new_id = next(iter({int(t["id"]) for t in roost.tabs()} - before))
+
+    # The new tab spawned in the active shell's cwd (/usr), proven by its
+    # own pwd — independent of the new tab's OSC 7 timing.
+    roost.run(new_id, "echo NEWTAB_PWD=$(pwd)")
+    roost.wait_text(new_id, "NEWTAB_PWD=/usr", timeout=8)

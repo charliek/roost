@@ -923,9 +923,28 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// $HOME). Mirrors `updateWindowTitle`'s cwd resolution.
     @MainActor
     private func activeLaunchCwd(projectID: Int64) -> String {
-        let liveCwd = activeSessionByProject[projectID]?.liveCwd ?? ""
-        if !liveCwd.isEmpty { return liveCwd }
-        return projects.first(where: { $0.id == projectID })?.cwd ?? ""
+        let session = activeSessionByProject[projectID]
+        // Prefer a native read of the active tab's shell cwd: it reflects
+        // the *current* directory even for shells that don't emit OSC 7
+        // (e.g. stock /bin/bash), and a new tab spawns a LOCAL shell, so
+        // the local path is what it should inherit. Fall back to the
+        // OSC 7-tracked cwd, then the project's stored cwd.
+        var native: String?
+        if let tabID = session?.id {
+            native = RoostBackend.shared.supervisor?.foregroundCwd(tabID: tabID)
+        }
+        let live = session?.liveCwd ?? ""
+        let project = projects.first(where: { $0.id == projectID })?.cwd ?? ""
+        return Self.resolveLaunchCwd(native: native, live: live, project: project)
+    }
+
+    /// New-tab cwd precedence: native shell cwd (current, local) →
+    /// OSC 7-tracked cwd → project cwd. Pure + `nonisolated` so it's
+    /// unit-testable without standing up the app.
+    nonisolated static func resolveLaunchCwd(native: String?, live: String, project: String) -> String {
+        if let native, !native.isEmpty { return native }
+        if !live.isEmpty { return live }
+        return project
     }
 
     @MainActor
