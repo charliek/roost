@@ -480,6 +480,18 @@ final class Workspace {
         commit([.tabStateChanged(tabID: tabID, state: state)], persist: false)
     }
 
+    /// OSC 133 prompt/command mark → run state. Suppressed while a Claude
+    /// hook owns the tab (`hookActive`): the hook's per-turn state wins.
+    /// Mirrors `setTabTitleFromOSC`'s `userTitled` gate. NOT `setTabState`
+    /// — the hook's own `tab.set_state` op must stay ungated.
+    func setTabStateFromOSC(_ tabID: Int64, state: TabState) throws {
+        guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
+        if t.hookActive { return }
+        t.state = state
+        tabs[tabID] = t
+        commit([.tabStateChanged(tabID: tabID, state: state)], persist: false)
+    }
+
     func setTabHasNotification(_ tabID: Int64, hasPending: Bool) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         t.hasNotification = hasPending

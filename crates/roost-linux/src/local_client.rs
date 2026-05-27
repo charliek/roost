@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use roost_ipc::messages::{Project, Tab};
+use roost_ipc::messages::{Project, Tab, TabState};
 use tokio::sync::broadcast;
 
 use crate::daemon::{PtyOutputEvent, PtySupervisor, Workspace};
@@ -167,10 +167,30 @@ impl LocalClient {
                 let _ = self.workspace.set_tab_has_notification(tab_id, true);
                 let _ = self.workspace.fire_notification(tab_id, &title, &body);
             }
+            133 => {
+                // OSC 133 prompt/command mark → run state. Suppressed when
+                // a Claude hook owns the tab (set_tab_state_from_osc gates
+                // on hook_active).
+                if let Some(state) = command_mark_state(payload) {
+                    let _ = self.workspace.set_tab_state_from_osc(tab_id, state);
+                }
+            }
             _ => {
                 tracing::debug!(tab_id, command, "ignored OSC");
             }
         }
+    }
+}
+
+/// Map an OSC 133 mark body to a run state: `C` (command start) →
+/// `Running`; `A`/`B`/`D` (prompt / command end) → `None` (clear the dot);
+/// other bodies → `Option::None` (no change). Only the first char matters,
+/// so `D;<exit>` keeps the exit code we ignore.
+fn command_mark_state(body: &str) -> Option<TabState> {
+    match body.chars().next() {
+        Some('C') => Some(TabState::Running),
+        Some('A') | Some('B') | Some('D') => Some(TabState::None),
+        _ => None,
     }
 }
 
@@ -229,6 +249,17 @@ mod tests {
     #[test]
     fn osc7_handles_empty_host() {
         assert_eq!(parse_osc7_path("file:///tmp"), Some("/tmp".into()));
+    }
+
+    #[test]
+    fn command_mark_state_maps_marks() {
+        assert_eq!(command_mark_state("C"), Some(TabState::Running));
+        assert_eq!(command_mark_state("D"), Some(TabState::None));
+        assert_eq!(command_mark_state("D;0"), Some(TabState::None));
+        assert_eq!(command_mark_state("A"), Some(TabState::None));
+        assert_eq!(command_mark_state("B"), Some(TabState::None));
+        assert_eq!(command_mark_state(""), None);
+        assert_eq!(command_mark_state("Z"), None);
     }
 
     #[test]

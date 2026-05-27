@@ -747,6 +747,32 @@ impl Workspace {
         Ok(())
     }
 
+    /// OSC 133 prompt/command mark → run state. Suppressed while a Claude
+    /// hook owns the tab (`hook_active`): the hook's per-turn state wins.
+    /// Mirrors `set_tab_title_from_osc`'s `user_titled` gate — NOT
+    /// `set_tab_state` (the hook's own `tab.set_state` op must stay ungated).
+    pub fn set_tab_state_from_osc(
+        &self,
+        tab_id: i64,
+        state: TabState,
+    ) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let row = inner
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        if row.hook_active {
+            return Ok(());
+        }
+        row.state = state;
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabStateChanged { tab_id, state }],
+            Persist::Skip,
+        );
+        Ok(())
+    }
+
     pub fn set_tab_has_notification(
         &self,
         tab_id: i64,
@@ -1272,6 +1298,21 @@ mod tests {
         let t = ws.tab(tid).unwrap();
         assert_eq!(t.title, "manual");
         assert!(t.user_titled);
+    }
+
+    #[test]
+    fn set_tab_state_from_osc_respects_hook_active() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let tid = ws.open_tab(pid, "/", "").unwrap().id;
+        // Hook owns the tab: OSC 133 state is suppressed.
+        ws.set_tab_hook_active(tid, true).unwrap();
+        ws.set_tab_state_from_osc(tid, TabState::Running).unwrap();
+        assert_eq!(ws.tab(tid).unwrap().state, TabState::None);
+        // Release the hook: OSC 133 state applies.
+        ws.set_tab_hook_active(tid, false).unwrap();
+        ws.set_tab_state_from_osc(tid, TabState::Running).unwrap();
+        assert_eq!(ws.tab(tid).unwrap().state, TabState::Running);
     }
 
     #[test]

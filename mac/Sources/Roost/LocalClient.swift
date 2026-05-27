@@ -183,11 +183,31 @@ final class LocalClient {
             let (title, body) = parseNotificationPayload(command: command, payload: payload)
             try? workspace.setTabHasNotification(tabID, hasPending: true)
             try? workspace.fireNotification(tabID, title: title, body: body)
+        case 133:
+            // OSC 133 prompt/command mark → run state. Suppressed when a
+            // Claude hook owns the tab (setTabStateFromOSC gates on
+            // hookActive).
+            if let state = commandMarkState(payload) {
+                try? workspace.setTabStateFromOSC(tabID, state: state)
+            }
         default:
             // Other OSC commands are ignored — the spec doesn't
             // route them to workspace state.
             break
         }
+    }
+}
+
+/// Map an OSC 133 mark body to a run state: `C` (command start) →
+/// running; `A`/`B`/`D` (prompt / command end) → none (clear the dot);
+/// other bodies → nil (no change). Only the first char matters, so
+/// `D;<exit>` keeps the exit code we ignore.
+func commandMarkState(_ body: String) -> Workspace.TabState? {
+    guard let mark = body.first else { return nil }
+    switch mark {
+    case "C": return .running
+    case "A", "B", "D": return Workspace.TabState.none
+    default: return nil
     }
 }
 

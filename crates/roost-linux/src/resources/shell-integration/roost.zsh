@@ -10,7 +10,7 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, prompt.
+# disables): cwd, title, marks, prompt.
 #
 # KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/roost.zsh
 
@@ -20,7 +20,7 @@
 typeset -g _ROOST_ZSH_LOADED=1
 
 _roost_feature() {
-  case ",${ROOST_SHELL_FEATURES:-cwd,title,prompt}," in
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt}," in
     (*",no-$1,"*) return 1 ;;
     (*) return 0 ;;
   esac
@@ -36,9 +36,16 @@ __roost_title() {
   printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
 }
 
+# OSC 133 command marks: C before a command runs (preexec), D when it
+# ends / at the next prompt (precmd). Roost maps C -> running, D -> cleared.
+__roost_mark_c() { _roost_feature marks && printf '\033]133;C\033\\'; }
+__roost_mark_d() { _roost_feature marks && printf '\033]133;D\033\\'; }
+
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __roost_osc7
 add-zsh-hook precmd __roost_title
+add-zsh-hook preexec __roost_mark_c
+add-zsh-hook precmd __roost_mark_d
 
 # Default prompt (cwd in blue + a plain $) only when the user hasn't set
 # one — zsh's stock default PROMPT is '%m%# ', else empty.

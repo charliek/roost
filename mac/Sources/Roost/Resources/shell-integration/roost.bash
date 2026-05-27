@@ -10,7 +10,7 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, prompt.
+# disables): cwd, title, marks, prompt.
 #
 # KEEP IN SYNC with crates/roost-linux/src/resources/shell-integration/roost.bash
 
@@ -23,7 +23,7 @@ esac
 _ROOST_BASH_LOADED=1
 
 _roost_feature() {
-  case ",${ROOST_SHELL_FEATURES:-cwd,title,prompt}," in
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt}," in
     *",no-$1,"*) return 1 ;;
     *) return 0 ;;
   esac
@@ -39,8 +39,21 @@ __roost_title() {
   printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
 }
 
+# OSC 133 command marks: C on command start (PS0), D when it ends (the
+# next prompt's PROMPT_COMMAND). Roost maps C -> running, D -> cleared.
+__roost_marks() {
+  _roost_feature marks || return 0
+  printf '\033]133;D\033\\'
+}
+# C via PS0 needs bash >= 4.4; older bash (e.g. macOS /bin/bash 3.2)
+# silently ignores PS0, so only the D (command-end) mark fires there.
+if _roost_feature marks && { [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] ||
+  { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; }; then
+  PS0='\e]133;C\e\\'"${PS0:-}"
+fi
+
 # Prepend so the user's existing PROMPT_COMMAND still runs.
-PROMPT_COMMAND="__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
+PROMPT_COMMAND="__roost_marks;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"
 
 # Default prompt (cwd in blue + a plain $) only when the user hasn't set
 # one — bash's stock interactive default is '\s-\v\$ ', else empty.

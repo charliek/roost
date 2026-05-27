@@ -551,7 +551,7 @@ final class PtySupervisor {
         env["TERM_PROGRAM_VERSION"] =
             (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
         env["ROOST_SHELL_INTEGRATION"] = "1"
-        env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,prompt"
+        env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt"
         env["ROOST_RESOURCES_DIR"] = Bundle.roostResources.bundleURL.path
         var out: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0)=\($1)") }
         out.append(nil)
