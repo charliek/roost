@@ -535,7 +535,10 @@ final class PtySupervisor {
     /// parent's environment then overlays Roost's injected vars.
     private func buildEnv(tabID: Int64, socketPath: String) -> [UnsafeMutablePointer<CChar>?] {
         var env: [String: String] = ProcessInfo.processInfo.environment
-        env["TERM"] = env["TERM"] ?? "xterm-256color"
+        // Advertise the terminal Roost provides — force TERM rather than
+        // inheriting the launching terminal's (a child seeing an inherited
+        // TERM=tmux-256color / xterm-kitty would emit unsupported seqs).
+        env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["ROOST_TAB_ID"] = String(tabID)
         env["ROOST_SOCKET"] = socketPath

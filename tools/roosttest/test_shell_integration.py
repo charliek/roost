@@ -136,22 +136,19 @@ def test_launcher_inherits_native_cwd(roost, project, palette, target):
 
 
 def test_env_injected(roost, project):
-    """Roost injects its shell-integration env contract into every tab.
-
-    (TERM is intentionally not asserted: Roost inherits the parent TERM
-    and only defaults it to xterm-256color when absent, so its value is
-    environment-dependent. The Roost-specific contract is TERM_PROGRAM.)
-    """
+    """Roost injects its shell-integration env contract into every tab,
+    and forces TERM=xterm-256color (advertising the terminal it provides,
+    not the one that launched it)."""
     tab = roost.open_tab(project, cwd="/tmp")
     roost.run(
         tab,
-        'printf "ENVCHK:tp=%s si=%s feat=%s rd=%s\\n" '
+        'printf "ENVCHK:tp=%s si=%s feat=%s term=%s rd=%s\\n" '
         '"$TERM_PROGRAM" "$ROOST_SHELL_INTEGRATION" "$ROOST_SHELL_FEATURES" '
-        '"${ROOST_RESOURCES_DIR:+set}"',
+        '"$TERM" "${ROOST_RESOURCES_DIR:+set}"',
     )
     roost.wait_text(
         tab,
-        "ENVCHK:tp=Roost si=1 feat=cwd,title,prompt rd=set",
+        "ENVCHK:tp=Roost si=1 feat=cwd,title,prompt term=xterm-256color rd=set",
         timeout=8,
     )
 

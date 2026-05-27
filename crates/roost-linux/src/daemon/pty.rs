@@ -530,6 +530,9 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
     DIR.get_or_init(|| {
         let base = std::env::var_os("XDG_CACHE_HOME")
             .map(std::path::PathBuf::from)
+            // XDG: a relative cache path is invalid — ignore it and fall
+            // back to $HOME/.cache rather than writing relative to cwd.
+            .filter(|p| p.is_absolute())
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
             })?;
@@ -561,11 +564,10 @@ fn build_command(
     if !cwd.is_empty() {
         cmd.cwd(cwd);
     }
-    if let Some(term) = std::env::var_os("TERM") {
-        cmd.env("TERM", term);
-    } else {
-        cmd.env("TERM", "xterm-256color");
-    }
+    // Advertise the terminal Roost provides — force TERM rather than
+    // inheriting the launching terminal's (a child seeing an inherited
+    // TERM=tmux-256color / xterm-kitty would emit unsupported sequences).
+    cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     // Roost contract (documented in docs/reference/paths.md and the
     // refactor plan's acceptance criteria): every shell Roost spawns
