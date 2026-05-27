@@ -92,6 +92,7 @@ let package = Package(
             // without renaming.
             resources: [
                 .copy("Resources/themes"),
+                .copy("Resources/shell-integration"),
             ],
             // Linker settings for libghostty-vt. We deliberately pass
             // the static archive's path positionally instead of using

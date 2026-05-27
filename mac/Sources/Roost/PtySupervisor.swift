@@ -539,6 +539,17 @@ final class PtySupervisor {
         env["COLORTERM"] = "truecolor"
         env["ROOST_TAB_ID"] = String(tabID)
         env["ROOST_SOCKET"] = socketPath
+        // Roost shell-integration contract: identify the terminal and
+        // point shells at the shipped scripts (under
+        // $ROOST_RESOURCES_DIR/shell-integration). TERM stays
+        // xterm-256color (above) — we don't masquerade as another
+        // terminal. ROOST_SHELL_FEATURES is user-overridable.
+        env["TERM_PROGRAM"] = "Roost"
+        env["TERM_PROGRAM_VERSION"] =
+            (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
+        env["ROOST_SHELL_INTEGRATION"] = "1"
+        env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,prompt"
+        env["ROOST_RESOURCES_DIR"] = Bundle.roostResources.bundleURL.path
         var out: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0)=\($1)") }
         out.append(nil)
         return out

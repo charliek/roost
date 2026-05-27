@@ -133,3 +133,64 @@ def test_launcher_inherits_native_cwd(roost, project, palette, target):
                 5.0, "launcher spawned a tab")
     new_id = next(iter({int(t["id"]) for t in roost.tabs()} - before))
     roost.wait_text(new_id, "LAUNCH_PWD=/usr", timeout=8)
+
+
+def test_env_injected(roost, project):
+    """Roost injects its shell-integration env contract into every tab.
+
+    (TERM is intentionally not asserted: Roost inherits the parent TERM
+    and only defaults it to xterm-256color when absent, so its value is
+    environment-dependent. The Roost-specific contract is TERM_PROGRAM.)
+    """
+    tab = roost.open_tab(project, cwd="/tmp")
+    roost.run(
+        tab,
+        'printf "ENVCHK:tp=%s si=%s feat=%s rd=%s\\n" '
+        '"$TERM_PROGRAM" "$ROOST_SHELL_INTEGRATION" "$ROOST_SHELL_FEATURES" '
+        '"${ROOST_RESOURCES_DIR:+set}"',
+    )
+    roost.wait_text(
+        tab,
+        "ENVCHK:tp=Roost si=1 feat=cwd,title,prompt rd=set",
+        timeout=8,
+    )
+
+
+def test_resources_dir_has_scripts(roost, project):
+    """The shipped integration scripts are present at ROOST_RESOURCES_DIR
+    (Mac: in the .app bundle; GTK: written to the XDG cache at spawn)."""
+    tab = roost.open_tab(project, cwd="/tmp")
+    roost.run(
+        tab,
+        'if test -r "$ROOST_RESOURCES_DIR/shell-integration/roost.bash" '
+        '&& test -r "$ROOST_RESOURCES_DIR/shell-integration/roost.zsh"; '
+        'then r=ok; else r=missing; fi; printf "SCRIPTS:%s\\n" "$r"',
+    )
+    roost.wait_text(tab, "SCRIPTS:ok", timeout=8)
+
+
+def test_sourced_script_tracks_cwd(roost, project):
+    """Sourcing the shipped bash integration makes cwd follow `cd` via
+    OSC 7 — validates the shipped artifact actually works (not just that
+    it ships). Bare bash so only the sourced script enables OSC 7."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(
+        tab,
+        'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash" '
+        '&& cd /usr && echo "SRC:$(pwd)"',
+    )
+    roost.wait_text(tab, "SRC:/usr", timeout=8)
+    # The next prompt fires PROMPT_COMMAND -> OSC 7 -> tracked cwd.
+    assert _cwd_becomes(roost, tab, "/usr"), \
+        f"sourced script did not track cwd; got {(roost.tab(tab) or {}).get('cwd')!r}"
+
+
+def _cwd_becomes(roost, tab, want, timeout=5.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (roost.tab(tab) or {}).get("cwd") == want:
+            return True
+        time.sleep(0.05)
+    return False
