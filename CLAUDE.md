@@ -36,8 +36,10 @@ retired). Topic branches (`polish/*`, `refactor/*`, feature branches)
 open PRs into `main`. **Merges are manual**: CI must be green, then the
 committer merges — no auto-merge (the repo's `allow_auto_merge` is off;
 use `/merge-pr`). The single required check is **`ci-success`** from
-`.github/workflows/ci.yml` (rust/swift/gtk, path-filtered so jobs run
-only when relevant code changes). The legacy Go CI
+`.github/workflows/ci.yml` (rust/swift/gtk build+test plus the functional
+E2E jobs — `e2e-gtk` and `e2e-mac` — path-filtered so jobs run only when
+relevant code changes). Releases gate on the same `ci-success` via a
+`ci-gate` job in `release.yml`. The legacy Go CI
 (`.github/workflows/go-legacy.yml`) runs only on Go-file changes and is
 not required.
 
@@ -197,8 +199,10 @@ wrapper small.
   UI (`--roost-target mac|gtk`) and asserts on the op set (`tab.dump` /
   `tab.list` / `palette.*` / `identify`), so it exercises exactly what
   users + `roostctl` drive. No sleeps (condition waits), content via text
-  not pixels. `make e2e` / `make e2e-gtk` / `make e2e-mac`; runs headless
-  in CI (GTK under xvfb, required; macOS GUI-session). This is where new
+  not pixels. `make e2e` / `make e2e-gtk` / `make e2e-mac`; **both are
+  required CI gates** (GTK headless under xvfb; Mac on a macOS GUI-session
+  runner — the harness clears any stale instance before launch and scales
+  its timeouts up via `ROOST_TEST_TIMEOUT_SCALE`). This is where new
   cross-cutting behavior gets a regression test; the screenshot
   (`tools/screenshot/`) and input-injection (`tools/input/linux/`) harnesses cover
   what it can't (pixels, real key/pointer events).

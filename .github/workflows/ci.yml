@@ -236,9 +236,10 @@ jobs:
           # v0.0.2 crashed on every clean install because the themes bundle
           # wasn't where the running app looks. Assert it ships under
           # Contents/Resources, which is where `Bundle.roostResources`
-          # (Theme.swift) resolves it. Deterministic — no GUI launch (CI
-          # GUI sessions are flaky; the live-launch check is the local
-          # `make smoke-mac-launch` / pre-release step instead).
+          # (Theme.swift) resolves it. A deterministic file check — stronger
+          # and faster than inferring from a launch. GUI-launch coverage is
+          # the required e2e-mac job; the clean-install live launch is the
+          # local `make smoke-mac-launch` / pre-release step.
           THEMES="mac/build/Roost.app/Contents/Resources/Roost_Roost.bundle/themes"
           test -d "$THEMES" || { echo "FAIL: $THEMES missing — themes can't load on a clean install (the v0.0.2 crash)"; exit 1; }
           count=$(find "$THEMES" -type f | wc -l | tr -d ' ')
@@ -350,18 +351,23 @@ jobs:
         env:
           GDK_BACKEND: x11
           RUST_LOG: warn
+          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
+
         # The harness launches its own `roost` process; under xvfb-run it
         # inherits the virtual DISPLAY. tab.dump reads in-process render
         # state, so no compositor screen-capture is involved.
         run: xvfb-run -a uv run --group test pytest tools/roosttest --roost-target gtk -v
 
-  # macOS E2E against the Swift app. NOT in ci-success yet (non-blocking)
-  # while we shake out GUI-session-in-CI reliability — a failure shows as
-  # a red check but doesn't gate merge. See docs/development/test-automation.md.
+  # Functional E2E against the real Swift app, driven through the IPC op
+  # set by the pytest harness (tools/roosttest) — the Mac twin of e2e-gtk.
+  # Required (in ci-success). The harness clears any stale instance before
+  # launch (tools/roosttest/ui.py) and timeouts scale up for the slower
+  # shared runner; see docs/development/test-automation.md.
   e2e-mac:
     needs: changes
     if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
@@ -408,19 +414,47 @@ jobs:
         run: ./mac/scripts/bundle.sh debug
 
       - name: Run E2E (Mac app)
-        run: uv run --group test pytest tools/roosttest --roost-target mac -v
+        env:
+          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared macos-latest runner is slower/variable
+          ROOST_TEST_RESET_STATE: "1"     # ephemeral runner: start from a clean state.json
+        run: >
+          uv run --group test pytest tools/roosttest --roost-target mac -v
+          --junitxml=test-results/e2e-mac.xml
+
+      # On failure, salvage what makes a red blocking check debuggable: the
+      # app's own log, any macOS crash report, and a best-effort live
+      # screenshot (only lands if the app is still up). Staged into one dir
+      # because upload-artifact doesn't expand `~`/globs.
+      - name: Collect failure diagnostics
+        if: failure()
+        run: |
+          mkdir -p diagnostics
+          cp "$HOME/Library/Logs/Roost/roost.log" diagnostics/ 2>/dev/null || true
+          cp "$HOME"/Library/Logs/DiagnosticReports/Roost*.ips diagnostics/ 2>/dev/null || true
+          cp "$HOME"/Library/Logs/DiagnosticReports/Roost*.crash diagnostics/ 2>/dev/null || true
+          "mac/build/Roost.app/Contents/Resources/bin/roostctl" screenshot --out diagnostics/screen.png 2>/dev/null || true
+          ls -la diagnostics || true
+
+      - name: Upload E2E diagnostics + JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-mac-diagnostics
+          path: |
+            diagnostics/
+            test-results/
+          if-no-files-found: ignore
 
   # Single required check. Always runs; passes iff no gated job failed (skipped
-  # jobs are fine — that's the path-filter doing its job). `e2e-mac` is
-  # intentionally excluded (non-blocking for now).
+  # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build, e2e-gtk]
+    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then
