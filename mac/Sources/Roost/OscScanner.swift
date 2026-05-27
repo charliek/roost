@@ -33,6 +33,7 @@ enum OscEvent: Equatable {
     case pwd(String)
     case notification(title: String, body: String)
     case colorQuery(UInt8)  // 10, 11, or 12
+    case commandMark(String)  // OSC 133 prompt/command mark body (A/B/C/D[;exit])
 
     /// Maps a parsed event to the (osc_command, payload) pair the
     /// `ReportOsc` RPC expects. Used by `TerminalView.appendBytes`
@@ -68,6 +69,10 @@ enum OscEvent: Equatable {
             // emit the command number with empty payload so the
             // dispatch records it.
             return (UInt32(n), "?")
+        case .commandMark(let s):
+            // OSC 133 prompt/command mark; pass the body through to
+            // applyOSC, which maps it to tab state (P4b).
+            return (133, s)
         }
     }
 }
@@ -204,6 +209,10 @@ final class OscScanner {
                     pending.append(.colorQuery(n))
                 }
             }
+        case "133":
+            // Shell-integration prompt/command mark; surface the raw
+            // body (A/B/C/D[;exit]). applyOSC maps it to tab state (P4b).
+            pending.append(.commandMark(body))
         default:
             break
         }

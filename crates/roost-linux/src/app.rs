@@ -3151,6 +3151,9 @@ impl App {
                 }
             }
             E::ColorQuery(n) => (n as u32, "?".to_string()),
+            // OSC 133 prompt/command mark — pass the body through to
+            // apply_osc, which maps it to tab state (P4b).
+            E::CommandMark(body) => (133, body),
         };
         let Some(client) = self.client.borrow().clone() else {
             return;
