@@ -1,121 +1,124 @@
 # Tracking the working directory
 
-Three places in Roost want to know what directory each tab is "in":
+Three places in Roost care what directory a tab is "in":
 
-- The header subtitle under the project name.
-- The tab label (when the tab hasn't been renamed and the running program hasn't set its own title).
-- The cwd a new tab inherits when you press `Ctrl-T` / `Cmd-T`.
+- the cwd a new tab inherits on `Ctrl-T` / `Cmd-T` (and the command launcher),
+- the header subtitle under the project name,
+- the tab label (until you rename the tab or the running program sets its own title).
 
-All three read from the same source: **OSC 7 escape sequences emitted by the shell on every prompt**. If your shell emits them, the subtitle and tab label follow `cd` and new tabs open where the previous one left off. If it doesn't, you'll see a static path (the project's initial cwd) everywhere.
+## What works out of the box
 
-Fish emits OSC 7 by default. Bash and zsh do not — you have to add a one-liner.
+**New tabs open where you are.** On `Ctrl-T` / `Cmd-T`, Roost reads the active
+tab's shell working directory directly — natively, via `proc_pidinfo` on macOS
+and `/proc/<pid>/cwd` on Linux — and spawns the new tab there. No shell
+configuration required; works for any shell, including stock `/bin/bash`.
 
-## Is it already working?
+One caveat: a new tab spawns a *local* shell, so if the active tab is `ssh`'d to
+a remote host, the new tab opens in the local directory, not the remote one. To
+track a remote cwd, use the shell integration below — the remote shell emits
+OSC 7 over the connection.
 
-From inside a Roost tab, run:
+## What the shell integration adds
+
+Sourcing Roost's integration makes the shell emit **OSC 7** on every prompt,
+which adds:
+
+- the **header subtitle** following `cd` live,
+- the **tab label** following `cd` live,
+- **remote (SSH) cwd** tracking,
+
+plus (optionally) a tidy default **prompt** when you don't already have one.
+
+Fish emits OSC 7 natively, so it needs nothing. Bash and zsh don't — enable
+Roost's integration:
+
+## Enabling it
+
+Roost ships the integration scripts inside the app and points
+`$ROOST_RESOURCES_DIR` at them. Add one line to your shell rc:
+
+**bash** (`~/.bashrc`):
 
 ```bash
-printf '\e]7;file:///tmp\e\\'
+[ -n "$ROOST_TAB_ID" ] && [ -r "$ROOST_RESOURCES_DIR/shell-integration/roost.bash" ] \
+  && source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"
 ```
 
-The header subtitle should immediately flip to `/tmp`. If it does, OSC 7 reception works — the only question is whether your shell is auto-emitting it. Test that with a real `cd`:
-
-```bash
-cd /tmp
-```
-
-If the subtitle updates, you're done. If it stays put, your shell isn't emitting OSC 7 and you want one of the snippets below.
-
-## Snippets
-
-Pick one. They get fancier as you go.
-
-### Minimal
-
-**bash** (in `~/.bashrc`):
-
-```bash
-PROMPT_COMMAND='printf "\e]7;file://%s%s\e\\" "$HOSTNAME" "$PWD";'"$PROMPT_COMMAND"
-```
-
-**zsh** (in `~/.zshrc`):
+**zsh** (`~/.zshrc`):
 
 ```zsh
-_osc7() { printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD" }
-chpwd_functions+=(_osc7)
-_osc7  # initial emit, since chpwd doesn't fire for the starting cwd
+[[ -n "$ROOST_TAB_ID" && -r "$ROOST_RESOURCES_DIR/shell-integration/roost.zsh" ]] \
+  && source "$ROOST_RESOURCES_DIR/shell-integration/roost.zsh"
 ```
 
-These fire from every shell session you open, in any terminal. Harmless — terminals that don't understand OSC 7 ignore it — but if you want to keep your dotfiles tidy, see the gated version next.
+The `$ROOST_TAB_ID` guard makes the line a no-op outside Roost, so it's safe in a
+shared dotfile. (Loading the integration automatically — without editing your rc
+— is planned; until then this one line opts in.)
 
-### Gated on `$ROOST_TAB_ID`
+The scripts are gated on `$ROOST_TAB_ID`, idempotent, and interactive-only. They
+emit OSC 7 (cwd) and OSC 0 (a `~`-abbreviated path as the tab title), and set a
+default prompt only when `PS1` is unset or the shell's stock default.
 
-Roost sets `ROOST_TAB_ID` on every shell it spawns (alongside `ROOST_PROJECT_ID` and `ROOST_SOCKET`). Gating on it means the snippet only fires inside Roost.
+### Feature flags
 
-**bash:**
+`$ROOST_SHELL_FEATURES` is a comma list; prefix a feature with `no-` to disable
+it. Default: `cwd,title,prompt`.
+
+- `cwd` — emit OSC 7.
+- `title` — set the tab title to the cwd.
+- `prompt` — set a default prompt (only when you haven't set one).
+
+For example, to keep your own title and prompt, set
+`ROOST_SHELL_FEATURES=cwd` in your rc before sourcing.
+
+## The environment Roost injects
+
+Every shell Roost spawns sees:
+
+| Variable                  | Meaning                                                 |
+|---------------------------|---------------------------------------------------------|
+| `ROOST_TAB_ID`            | the tab's id — gate your integration on this            |
+| `ROOST_PROJECT_ID`        | the project's id                                        |
+| `ROOST_SOCKET`            | the IPC socket path (`roostctl` auto-detects it)        |
+| `ROOST_RESOURCES_DIR`     | where the shipped scripts live (`…/shell-integration/`) |
+| `ROOST_SHELL_INTEGRATION` | `1`                                                     |
+| `ROOST_SHELL_FEATURES`    | feature flags (above)                                   |
+| `TERM_PROGRAM`            | `Roost` (plus `TERM_PROGRAM_VERSION`)                   |
+| `TERM`                    | `xterm-256color`                                        |
+
+You don't have to set `ROOST_SOCKET`, `ROOST_TAB_ID`, or `ROOST_RESOURCES_DIR` —
+Roost injects them.
+
+## Fancier: a git-aware title with a 🐓
+
+Want the tab label to show a status icon + branch instead of just the path? This
+**overrides** the default title — source it *after* the line above, or set
+`ROOST_SHELL_FEATURES=cwd,prompt` so the shipped default title doesn't fight it.
+🐓 = clean tree or outside a repo, 🐣 = dirty tree.
 
 ```bash
-__roost_osc7() {
+__roost_fancy_title() {
   [ -n "$ROOST_TAB_ID" ] || return
-  printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$PWD"
-}
-PROMPT_COMMAND='__roost_osc7;'"$PROMPT_COMMAND"
-```
-
-**zsh:**
-
-```zsh
-_roost_osc7() {
-  [ -n "$ROOST_TAB_ID" ] || return
-  printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD"
-}
-chpwd_functions+=(_roost_osc7)
-_roost_osc7
-```
-
-### Full-featured: also set the tab title with a git indicator
-
-This emits OSC 7 *and* OSC 0. OSC 0 sets the tab title, so the tab label becomes a tilde-abbreviated path with a status icon (🐓 outside a repo or clean tree, 🐣 dirty tree) and the current branch in parentheses. The header subtitle still tracks the raw cwd via OSC 7.
-
-```bash
-__roost_osc7() {
-  [ -n "$ROOST_TAB_ID" ] || return
-  printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$PWD"
-}
-__roost_title() {
-  [ -n "$ROOST_TAB_ID" ] || return
-  local icon="🐓"
-  local title="${PWD/#$HOME/~}"
-  local branch
+  local icon="🐓" title="${PWD/#$HOME/~}" branch
   if branch=$(git symbolic-ref --short HEAD 2>/dev/null); then
-    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-      icon="🐣"
-    else
-      icon="🐓"
-    fi
+    [ -n "$(git status --porcelain 2>/dev/null)" ] && icon="🐣"
     title+=" (${branch})"
   fi
-  printf '\e]0;%s\e\\' "${icon} ${title}"
+  printf '\033]0;%s\033\\' "${icon} ${title}"
 }
-PROMPT_COMMAND="__roost_osc7;__roost_title;${PROMPT_COMMAND}"
+PROMPT_COMMAND="__roost_fancy_title;${PROMPT_COMMAND}"
 ```
 
-The `git status --porcelain` call runs once per prompt; if you have very large repos and a slow disk it's worth knowing about.
+The `git status --porcelain` runs once per prompt; on very large repos with a
+slow disk that's worth knowing about.
 
-## What lights up once OSC 7 is flowing
+## What lights up
 
-| Surface                           | Behavior                                                                             |
-|-----------------------------------|--------------------------------------------------------------------------------------|
-| Header subtitle                   | Follows `cd`, abbreviates `$HOME` to `~`, truncates from the left if too long        |
-| Tab label                         | Same, *unless* you've renamed the tab or the program inside is emitting its own OSC 0/1/2 title (which always wins) |
-| New-tab cwd                       | `Ctrl-T` / `Cmd-T` opens in the active tab's live cwd, not its starting cwd          |
+| Surface         | Behavior                                                                              |
+|-----------------|---------------------------------------------------------------------------------------|
+| New-tab cwd     | Always follows the active tab's current dir (native read) — integration or not.       |
+| Header subtitle | Follows `cd` once OSC 7 is flowing (shell integration).                                |
+| Tab label       | Same — unless you renamed the tab or the running program set its own title (it wins).  |
 
-If the running program in a tab sets its own title (vim, ssh, claude, the OSC 0 snippet above), the tab label shows that title and the header subtitle still shows the raw cwd. If you manually rename a tab via the `rename_tab` keybinding, that name sticks regardless.
-
-**Without** the shell snippet there is no live cwd to inherit, so `Ctrl-T` / `Cmd-T` falls back to the project's stored cwd (then `$HOME`) — new tabs still open somewhere sensible, just not wherever you last `cd`'d. The required setup is the OSC 7 snippet above; this matches Ghostty's default (it also relies on the shell emitting OSC 7).
-
-## What you don't have to do
-
-- You don't have to set `ROOST_SOCKET` or `ROOST_TAB_ID`. Roost injects them itself.
-- You don't have to install anything. OSC 7 is plain shell output.
-- You don't have to do anything in fish — it already emits OSC 7 in `fish_prompt`.
+If the program in a tab sets its own title (vim, ssh, claude), that shows and the
+subtitle still tracks the raw cwd. A manual rename sticks regardless.

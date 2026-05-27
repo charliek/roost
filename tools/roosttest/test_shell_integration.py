@@ -191,3 +191,22 @@ def _cwd_becomes(roost, tab, want, timeout=5.0):
             return True
         time.sleep(0.05)
     return False
+
+
+def test_documented_rooster_override(roost, project):
+    """The documented git-aware 🐓 title override works end to end: it
+    emits OSC 0 and the tab title reflects the rooster + the path (and the
+    emoji round-trips through the OSC scanner). Non-repo /usr -> 🐓."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(
+        tab,
+        r'''__rt() { printf '\033]0;🐓 %s\033\\' "${PWD/#$HOME/~}"; }; '''
+        r'''PROMPT_COMMAND="__rt;${PROMPT_COMMAND}"; cd /usr''',
+    )
+    roost._wait(
+        lambda: "🐓" in (roost.tab(tab) or {}).get("title", "")
+        and "/usr" in (roost.tab(tab) or {}).get("title", ""),
+        timeout=8,
+        what="rooster title tracks cwd",
+    )
