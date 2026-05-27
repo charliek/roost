@@ -277,6 +277,25 @@ jobs:
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
           rm -f "$RUNNER_TEMP/cert.p12"
 
+      # Guard (issue #122): a STABLE release must not ship the throwaway spike
+      # SUPublicEDKey — builds signed with the real key would fail to verify
+      # against it, and users on a throwaway-key build can't auto-update. A
+      # prerelease (-beta/-rc) may keep it to validate the appcast round-trip
+      # with the matching throwaway private key. Mirrors create-release's
+      # `case "$tag" in *-*)` prerelease idiom.
+      - name: Guard against the throwaway Sparkle key on stable releases
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF_NAME}" in
+            *-*) echo "prerelease ${GITHUB_REF_NAME} — throwaway SUPublicEDKey allowed for validation."; exit 0 ;;
+          esac
+          throwaway='9n43stvrJeqWENXHYrisnIhByQ8N0OcjzSWAvhZj4fo='
+          if grep -q "${throwaway}" mac/Resources/Info.plist.template; then
+            echo "::error::mac/Resources/Info.plist.template still carries the THROWAWAY SUPublicEDKey (#122). Swap it for the maintainer's real public key and set SPARKLE_ED_PRIVATE_KEY before cutting a stable release."
+            exit 1
+          fi
+          echo "SUPublicEDKey is not the throwaway placeholder — ok."
+
       - name: Bundle Roost.app
         run: ROOST_VERSION="${GITHUB_REF_NAME#v}" ./mac/scripts/bundle.sh release
 
