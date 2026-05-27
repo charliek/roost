@@ -520,6 +520,7 @@ fn cwd_of_pid(_pid: u32) -> Option<String> {
 /// to the Mac copy under mac/Sources/Roost/Resources/shell-integration/.
 const ROOST_BASH: &str = include_str!("../resources/shell-integration/roost.bash");
 const ROOST_ZSH: &str = include_str!("../resources/shell-integration/roost.zsh");
+const ROOST_ZSH_ZDOTENV: &str = include_str!("../resources/shell-integration/zsh/.zshenv");
 
 /// Write the embedded shell-integration scripts to a stable cache dir and
 /// return that dir — the value of `ROOST_RESOURCES_DIR` (scripts live at
@@ -541,6 +542,10 @@ fn roost_resources_dir() -> Option<&'static std::path::Path> {
         std::fs::create_dir_all(&si).ok()?;
         std::fs::write(si.join("roost.bash"), ROOST_BASH).ok()?;
         std::fs::write(si.join("roost.zsh"), ROOST_ZSH).ok()?;
+        // zsh ZDOTDIR shim (auto-bootstrap): <si>/zsh/.zshenv
+        let zsh_dir = si.join("zsh");
+        std::fs::create_dir_all(&zsh_dir).ok()?;
+        std::fs::write(zsh_dir.join(".zshenv"), ROOST_ZSH_ZDOTENV).ok()?;
         Some(root)
     })
     .as_deref()
@@ -587,6 +592,19 @@ fn build_command(
     }
     if let Some(dir) = roost_resources_dir() {
         cmd.env("ROOST_RESOURCES_DIR", dir);
+        // zsh auto-bootstrap: point ZDOTDIR at our shim (restores the
+        // user's ZDOTDIR, runs their startup, then loads roost.zsh). bash
+        // auto-bootstrap is a separate change; bash uses manual `source`.
+        if std::path::Path::new(&resolved[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some("zsh")
+        {
+            if let Some(z) = std::env::var_os("ZDOTDIR") {
+                cmd.env("ROOST_ZSH_ZDOTDIR", z);
+            }
+            cmd.env("ZDOTDIR", dir.join("shell-integration").join("zsh"));
+        }
     }
     cmd
 }
