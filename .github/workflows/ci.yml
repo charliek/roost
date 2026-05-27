@@ -351,6 +351,8 @@ jobs:
         env:
           GDK_BACKEND: x11
           RUST_LOG: warn
+          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
+
         # The harness launches its own `roost` process; under xvfb-run it
         # inherits the virtual DISPLAY. tab.dump reads in-process render
         # state, so no compositor screen-capture is involved.
