@@ -380,9 +380,16 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
   `ROOST_TEST=1`; the in-process renderer works unfocused, so no
   screencapture entitlement and **no Accessibility grant** (we never inject
   OS input in Tier 1).
-- Risk: app launch/quit hygiene and runner image quirks. Mitigation: start
-  the macOS E2E job **`continue-on-error` / non-required** for the first
-  few PRs, watch stability, then promote into `ci-success`.
+- Risk was app launch/quit hygiene and runner image quirks. **Resolved and
+  promoted** (2026-05): `e2e-mac` is now **required** (in `ci-success`). It
+  proved stable on `main` (26P/1S, ~8s); the only failures ever seen were a
+  real clean-install crash it *correctly caught*. The one cascade mode — a
+  crashed instance leaving a held single-instance flock that wedges the next
+  launch — is handled by pre-launch hygiene in the harness
+  (`tools/roosttest/ui.py` `_mac_cleanup()`: kill any leftover, then unlink
+  the stale socket + lock) plus a one-shot launch retry; timeouts scale via
+  `ROOST_TEST_TIMEOUT_SCALE=3` on the slower runner. **No pytest reruns** —
+  parity with `e2e-gtk`, so a genuine intermittent bug isn't masked.
 
 **Both:**
 - Path-filtered like the rest of `ci.yml` (run only when relevant code
@@ -429,7 +436,7 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
 
 | Risk | Mitigation |
 |---|---|
-| macOS app won't run cleanly in CI | Start the macOS E2E job non-required; drive via IPC (no TCC); fall back to launching the unbundled binary; promote to required once green N times. |
+| macOS app won't run cleanly in CI | **Resolved (2026-05):** promoted to required after proving stable. Drives via IPC (no TCC); the harness clears a stale lock/socket before launch and retries the open once; timeouts scale via `ROOST_TEST_TIMEOUT_SCALE`. |
 | `events.subscribe` wire work is bigger than hoped | Ship `roostctl wait` polling-backed first; swap to events later behind the same interface. |
 | `tab dump` differs subtly Mac vs GTK | Golden the dump format in a cross-UI test (same `cmd`, assert identical `rows_text`); both walk the same `RenderState` shape. |
 | Lua (`mlua`) C-dep friction in CI | It builds vendored Lua; cache the cargo artifacts; it only lands in `roostctl`, not the UIs. |
@@ -454,9 +461,10 @@ green CI, merged manually per branch policy.
   geometry/font/no-anim); the runner (per §7 decision) + 3–4 ported
   smoke cases; runs locally on both UIs. *Done when:* `make e2e` (or
   `roostctl test`) is green locally on Mac + GTK.
-- **P3 — CI.** Linux xvfb E2E job (required) + macOS E2E job
-  (non-required first). JUnit + artifact upload. *Done when:* Tier-1 runs
-  on PRs touching relevant paths; macOS job stable enough to promote.
+- **P3 — CI.** ✅ Linux xvfb E2E job (required) + macOS E2E job. JUnit +
+  artifact upload. *Done:* Tier-1 runs on PRs touching relevant paths, and
+  the macOS job was promoted to **required** (`ci-success`) once stable;
+  releases gate on the same `ci-success` via `release.yml`'s `ci-gate`.
 - **P4 — Lua engine.** `mlua` in `roostctl`; the `roost` API table;
   `roostctl run <script.lua>`; convert the Tier-1 helpers to use it (or
   the Lua smoke). *Done when:* a Lua action script can set up a
@@ -500,8 +508,10 @@ guessing.
 
 1. ~~**Test runner language**~~ — **DECIDED (§7 / DL-12): pytest runner;
    Lua scoped to user scripting.** *Unblocks P2.*
-2. **macOS CI launch** — bundle vs unbundled `swift run` for tests; how
-   long to keep the macOS job non-required. *Blocks P3.*
+2. ~~**macOS CI launch**~~ — **DECIDED (2026-05): bundle via
+   `bundle.sh` + launch through `open`; the macOS E2E job is now
+   required.** The harness clears a stale lock/socket before launch and
+   retries once; timeouts scale via `ROOST_TEST_TIMEOUT_SCALE`. *Unblocked P3.*
 3. **Launcher action discovery** — global (`~/.config/roost/actions/`),
    repo-local (`.roost/actions/`), or both; built-ins in-tree. *Blocks P5.*
 4. **Temp-workspace isolation** — point tests at a throwaway `state.json`

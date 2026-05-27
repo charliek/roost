@@ -13,12 +13,12 @@
 #
 # This script reproduces a user's machine by hiding the build-tree
 # bundle, then asserts the packaged .app still launches and answers
-# `identify`. It launches the real GUI app, so it's a LOCAL / pre-release
-# check (`make smoke-mac-launch`) — NOT a per-PR CI gate: CI GUI sessions
-# are flaky (the same reason e2e-mac is non-gating, and a second launch in
-# one job races the single-instance lock). Per-PR CI instead asserts the
-# themes bundle ships under Contents/Resources (deterministic, in the
-# required swift-mac job). Run after `scripts/bundle.sh`; the build tree is
+# `identify`. It *mutates the build tree* to fake a clean install, so it's
+# a LOCAL / pre-release check (`make smoke-mac-launch`), not a per-PR gate.
+# Per-PR CI covers the same ground without the build-tree surgery: the
+# required swift-mac job asserts the themes bundle ships under
+# Contents/Resources (deterministic), and the required e2e-mac job drives
+# the live GUI app. Run after `scripts/bundle.sh`; the build tree is
 # restored on exit (including on failure).
 set -euo pipefail
 

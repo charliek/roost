@@ -12,8 +12,19 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import socket
 import time
+
+# E2E timeouts are tuned for a fast dev box; shared CI runners (especially
+# the macos-latest GUI session) are slower and variable. Scale every wait
+# from one knob so CI can buy headroom without editing each call site.
+# Default 1.0 = unchanged locally; CI sets ROOST_TEST_TIMEOUT_SCALE=3.
+_TIMEOUT_SCALE = float(os.environ.get("ROOST_TEST_TIMEOUT_SCALE", "1.0"))
+
+
+def scaled_timeout(timeout: float) -> float:
+    return timeout * _TIMEOUT_SCALE
 
 
 class RoostError(Exception):
@@ -214,10 +225,13 @@ class Roost:
 
     @staticmethod
     def _wait(pred, timeout: float, what: str, interval: float = 0.1) -> None:
-        deadline = time.monotonic() + timeout
+        # Every wait_*/run helper funnels through here, so scaling the
+        # budget once covers them all (see scaled_timeout / ROOST_TEST_TIMEOUT_SCALE).
+        eff = scaled_timeout(timeout)
+        deadline = time.monotonic() + eff
         while True:
             if pred():
                 return
             if time.monotonic() >= deadline:
-                raise Timeout(f"timed out after {timeout}s waiting for {what}")
+                raise Timeout(f"timed out after {eff}s waiting for {what}")
             time.sleep(interval)

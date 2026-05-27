@@ -42,8 +42,43 @@ jobs:
             exit 1
           fi
 
+  # Don't ship a tag whose code never passed CI. `ci-success` is the single
+  # required check on `main`; the tagged commit (pushed to main moments
+  # earlier by /release:release) gets its own ci.yml run, so poll that
+  # commit's `ci-success` check and refuse to release unless it's green.
+  # Poll because that run may still be in flight when the tag fires.
+  ci-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Require ci-success green on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          deadline=$(( SECONDS + 2700 ))   # 45 min — releases aren't time-sensitive
+          while :; do
+            latest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs" \
+              --jq '[.check_runs[] | select(.name=="ci-success")] | sort_by(.started_at) | last')"
+            status="$(echo "${latest}" | jq -r '.status // "missing"')"
+            conclusion="$(echo "${latest}" | jq -r '.conclusion // ""')"
+            echo "ci-success @ ${GITHUB_SHA}: status=${status} conclusion=${conclusion}"
+            if [ "${status}" = "completed" ]; then
+              [ "${conclusion}" = "success" ] && { echo "CI green — releasing."; exit 0; }
+              echo "::error::ci-success concluded '${conclusion}' for ${GITHUB_SHA} — not releasing."
+              exit 1
+            fi
+            if [ "${SECONDS}" -ge "${deadline}" ]; then
+              echo "::error::timed out waiting for ci-success on ${GITHUB_SHA} (status=${status}). Push the commit to main and let CI finish before tagging."
+              exit 1
+            fi
+            sleep 20
+          done
+
   create-release:
-    needs: version-check
+    needs: [version-check, ci-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -175,6 +210,9 @@ jobs:
 
       - uses: jdx/mise-action@v4
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
         uses: actions/cache@v5
@@ -232,6 +270,18 @@ jobs:
 
       - name: Bundle Roost.app
         run: ROOST_VERSION="${GITHUB_REF_NAME#v}" ./mac/scripts/bundle.sh release
+
+      # Validate the *actual shipped artifact*: drive the release bundle
+      # through the E2E op set before it's packaged. ci-gate already
+      # confirmed the commit's required checks are green, but a version-bump
+      # commit can path-filter e2e-mac out of that run — this guarantees the
+      # binary in the DMG passes E2E regardless. Reuses the harness's
+      # pre-launch hygiene + scaled timeouts.
+      - name: E2E against the release bundle
+        env:
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_TEST_RESET_STATE: "1"
+        run: uv run --group test pytest tools/roosttest --roost-target mac -v
 
       - name: Make DMG
         run: ./mac/scripts/make-dmg.sh "${GITHUB_REF_NAME#v}"
