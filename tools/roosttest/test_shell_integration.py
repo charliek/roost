@@ -279,3 +279,22 @@ def test_bash_marks_emit_wired(roost, project):
         pytest.skip("bash < 4.4 (no PS0); C mark intentionally skipped")
     assert "PS0MARK:wired" in text, text
     assert "PS0MARK:missing" not in text
+
+
+def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
+    """A zsh tab auto-loads the integration via the ZDOTDIR shim — NO
+    manual `source` — and cwd follows `cd` (OSC 7). Skips if zsh isn't
+    installed. Uses /usr (not a symlink) so the path compares cleanly."""
+    import os
+    import shutil
+
+    zsh = "/bin/zsh" if os.path.exists("/bin/zsh") else (shutil.which("zsh") or "")
+    if not zsh:
+        pytest.skip("zsh not available")
+    tab = roost.open_tab(project, cwd="/tmp", argv=[zsh, "-l"])
+    # The shim defers roost.zsh to the first precmd; its OSC 7 hook then
+    # fires on subsequent prompts. A couple of round-trips lets it settle.
+    roost.run(tab, "cd /usr")
+    roost.run(tab, "true")
+    assert _cwd_becomes(roost, tab, "/usr", timeout=8), \
+        f"zsh auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"

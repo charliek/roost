@@ -180,7 +180,7 @@ final class PtySupervisor {
         }
         let cwdCopy = strdup(resolvedCwd)
         let cArgv = buildArgv(argv: argv)
-        let cEnv = buildEnv(tabID: tabID, socketPath: socketPath)
+        let cEnv = buildEnv(tabID: tabID, socketPath: socketPath, argv: argv)
 
         // forkpty allocates a PTY, forks, and dup2()s the slave
         // onto stdin/stdout/stderr in the child. We supply the
@@ -533,7 +533,9 @@ final class PtySupervisor {
 
     /// Build the NULL-terminated envp array. Inherits the
     /// parent's environment then overlays Roost's injected vars.
-    private func buildEnv(tabID: Int64, socketPath: String) -> [UnsafeMutablePointer<CChar>?] {
+    private func buildEnv(tabID: Int64, socketPath: String, argv: [String])
+        -> [UnsafeMutablePointer<CChar>?]
+    {
         var env: [String: String] = ProcessInfo.processInfo.environment
         // Advertise the terminal Roost provides — force TERM rather than
         // inheriting the launching terminal's (a child seeing an inherited
@@ -552,7 +554,19 @@ final class PtySupervisor {
             (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
         env["ROOST_SHELL_INTEGRATION"] = "1"
         env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt"
-        env["ROOST_RESOURCES_DIR"] = Bundle.roostResources.bundleURL.path
+        let resourcesDir = Bundle.roostResources.bundleURL.path
+        env["ROOST_RESOURCES_DIR"] = resourcesDir
+        // zsh auto-bootstrap: point ZDOTDIR at our shim, which restores the
+        // user's ZDOTDIR, runs their real zsh startup, then loads roost.zsh.
+        // (bash auto-bootstrap is a separate change; bash uses the
+        // documented manual `source` for now.)
+        let shell = argv.first ?? (env["SHELL"] ?? "/bin/sh")
+        if (shell as NSString).lastPathComponent == "zsh" {
+            if let userZdotdir = env["ZDOTDIR"], !userZdotdir.isEmpty {
+                env["ROOST_ZSH_ZDOTDIR"] = userZdotdir
+            }
+            env["ZDOTDIR"] = resourcesDir + "/shell-integration/zsh"
+        }
         var out: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0)=\($1)") }
         out.append(nil)
         return out
