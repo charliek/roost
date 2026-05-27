@@ -748,10 +748,9 @@ impl Workspace {
     }
 
     /// OSC 133 prompt/command mark → run state. Suppressed while a Claude
-    /// hook owns the tab (`hook_active`): the hook's per-turn state wins,
-    /// the same precedence OSC 9/777 notifications get. Mirrors
-    /// `set_tab_title_from_osc`'s `user_titled` gate — NOT `set_tab_state`
-    /// (the hook's own `tab.set_state` op must stay ungated).
+    /// hook owns the tab (`hook_active`): the hook's per-turn state wins.
+    /// Mirrors `set_tab_title_from_osc`'s `user_titled` gate — NOT
+    /// `set_tab_state` (the hook's own `tab.set_state` op must stay ungated).
     pub fn set_tab_state_from_osc(
         &self,
         tab_id: i64,

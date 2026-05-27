@@ -481,10 +481,9 @@ final class Workspace {
     }
 
     /// OSC 133 prompt/command mark → run state. Suppressed while a Claude
-    /// hook owns the tab (`hookActive`): the hook's per-turn state wins,
-    /// the same precedence OSC 9/777 notifications get. Mirrors
-    /// `setTabTitleFromOSC`'s `userTitled` gate. NOT `setTabState` — the
-    /// hook's own `tab.set_state` op must stay ungated.
+    /// hook owns the tab (`hookActive`): the hook's per-turn state wins.
+    /// Mirrors `setTabTitleFromOSC`'s `userTitled` gate. NOT `setTabState`
+    /// — the hook's own `tab.set_state` op must stay ungated.
     func setTabStateFromOSC(_ tabID: Int64, state: TabState) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         if t.hookActive { return }

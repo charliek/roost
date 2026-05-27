@@ -10,7 +10,7 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, prompt.
+# disables): cwd, title, marks, prompt.
 #
 # KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/roost.bash
 
@@ -45,7 +45,12 @@ __roost_marks() {
   _roost_feature marks || return 0
   printf '\033]133;D\033\\'
 }
-_roost_feature marks && PS0='\e]133;C\e\\'"${PS0:-}"
+# C via PS0 needs bash >= 4.4; older bash (e.g. macOS /bin/bash 3.2)
+# silently ignores PS0, so only the D (command-end) mark fires there.
+if _roost_feature marks && { [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] ||
+  { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; }; then
+  PS0='\e]133;C\e\\'"${PS0:-}"
+fi
 
 # Prepend so the user's existing PROMPT_COMMAND still runs.
 PROMPT_COMMAND="__roost_marks;__roost_osc7;__roost_title;${PROMPT_COMMAND:-}"

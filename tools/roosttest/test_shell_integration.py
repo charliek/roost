@@ -252,3 +252,30 @@ def test_osc133_suppressed_when_hook_active(roost, project):
     roost.run(tab, r"""printf '\033]133;C\033\\'; echo HC3""")
     roost.wait_text(tab, "HC3", timeout=8)
     roost.wait_state(tab, "running", timeout=5)
+
+
+def test_bash_marks_emit_wired(roost, project):
+    """The shipped bash integration wires the OSC 133 C mark into PS0 on
+    bash >= 4.4. Older bash (e.g. macOS /bin/bash 3.2) ignores PS0, so the
+    C mark is intentionally skipped there (only D fires) — assert that's
+    what we get rather than silently shipping a dead PS0."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(
+        tab,
+        'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
+        'if [ "${BASH_VERSINFO[0]}" -gt 4 ] || '
+        '{ [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 4 ]; }; then '
+        'case "$PS0" in *133*) r=wired;; *) r=missing;; esac; else r=oldbash; fi; '
+        'printf "PS0MARK:%s\\n" "$r"',
+    )
+    roost._wait(
+        lambda: any(f"PS0MARK:{v}" in roost.dump_text(tab)
+                    for v in ("wired", "oldbash", "missing")),
+        timeout=8, what="PS0 mark probe",
+    )
+    text = roost.dump_text(tab)
+    if "PS0MARK:oldbash" in text:
+        pytest.skip("bash < 4.4 (no PS0); C mark intentionally skipped")
+    assert "PS0MARK:wired" in text, text
+    assert "PS0MARK:missing" not in text

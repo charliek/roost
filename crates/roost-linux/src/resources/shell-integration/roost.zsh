@@ -10,7 +10,7 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, prompt.
+# disables): cwd, title, marks, prompt.
 #
 # KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/roost.zsh
 
