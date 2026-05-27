@@ -177,26 +177,54 @@ def _roost_running() -> bool:
                           stderr=subprocess.DEVNULL).returncode == 0
 
 
+def _wait_gone(timeout: float) -> bool:
+    """Poll until no Roost process remains, or `timeout` elapses.
+
+    Early-exits the instant the process dies, so a clean quit (or nothing
+    running) costs ~0 — the bound only bites a process that won't die.
+    """
+    deadline = time.monotonic() + timeout
+    while _roost_running():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
 def _mac_cleanup() -> None:
     """Make the next Mac launch start from a clean slate.
 
     Reached only when no *healthy* instance answers `identify` (launch()
     returns early otherwise), so we never disturb a developer's running
-    app. Order is the invariant: kill any leftover process *first*, then
-    unlink the stale socket + lock — unlinking while a live process holds
-    the flock would orphan the lock and let two instances run.
+    app — and when nothing is running this is a pure no-op (no waits).
+
+    Lock invariant: a process holding the single-instance flock must be
+    *confirmed dead* before we unlink the lock/socket. The flock lives on
+    the inode, not the path — unlinking it out from under a still-live
+    (wedged) process frees the path, so the launch retry creates a fresh
+    lock inode and a second instance runs alongside the old one. So
+    escalate quit → SIGTERM → SIGKILL and only unlink once nothing's left.
+    SIGKILL is uncatchable, so a wedged app can't keep us from a clean
+    slate; if even that fails (an unreapable zombie), fail loud rather than
+    double-instance.
     """
     home = Path.home()
     if _roost_running():
-        subprocess.run(["osascript", "-e", 'tell application "Roost" to quit'], check=False)
-        deadline = time.monotonic() + 5.0
-        while _roost_running() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if _roost_running():
-            subprocess.run(["pkill", "-x", "Roost"], check=False)
-            hard_deadline = time.monotonic() + 2.0
-            while _roost_running() and time.monotonic() < hard_deadline:
-                time.sleep(0.1)
+        # Graceful first; bound the Apple Event so a hung app can't wedge us
+        # (osascript would otherwise block on the default AE reply timeout).
+        try:
+            subprocess.run(["osascript", "-e", 'tell application "Roost" to quit'],
+                           check=False, timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if not _wait_gone(3.0):
+            subprocess.run(["pkill", "-x", "Roost"], check=False)         # SIGTERM
+            if not _wait_gone(2.0):
+                subprocess.run(["pkill", "-9", "-x", "Roost"], check=False)   # SIGKILL
+                if not _wait_gone(5.0):
+                    raise RuntimeError(
+                        "Roost survived SIGKILL — refusing to unlink its lock "
+                        "(would risk a second instance against a fresh lock inode)")
     cache = home / "Library/Caches/Roost"
     (cache / "roost.sock").unlink(missing_ok=True)
     (cache / "roost.lock").unlink(missing_ok=True)
