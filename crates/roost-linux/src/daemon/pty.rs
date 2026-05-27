@@ -516,6 +516,36 @@ fn cwd_of_pid(_pid: u32) -> Option<String> {
     None
 }
 
+/// Shell-integration scripts, embedded at build time. Kept byte-identical
+/// to the Mac copy under mac/Sources/Roost/Resources/shell-integration/.
+const ROOST_BASH: &str = include_str!("../resources/shell-integration/roost.bash");
+const ROOST_ZSH: &str = include_str!("../resources/shell-integration/roost.zsh");
+
+/// Write the embedded shell-integration scripts to a stable cache dir and
+/// return that dir — the value of `ROOST_RESOURCES_DIR` (scripts live at
+/// `<dir>/shell-integration/`). Written once per process; `None` if the
+/// cache dir can't be resolved or written.
+fn roost_resources_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            // XDG: a relative cache path is invalid — ignore it and fall
+            // back to $HOME/.cache rather than writing relative to cwd.
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })?;
+        let root = base.join("roost");
+        let si = root.join("shell-integration");
+        std::fs::create_dir_all(&si).ok()?;
+        std::fs::write(si.join("roost.bash"), ROOST_BASH).ok()?;
+        std::fs::write(si.join("roost.zsh"), ROOST_ZSH).ok()?;
+        Some(root)
+    })
+    .as_deref()
+}
+
 fn build_command(
     cwd: &str,
     argv: &[String],
@@ -534,11 +564,10 @@ fn build_command(
     if !cwd.is_empty() {
         cmd.cwd(cwd);
     }
-    if let Some(term) = std::env::var_os("TERM") {
-        cmd.env("TERM", term);
-    } else {
-        cmd.env("TERM", "xterm-256color");
-    }
+    // Advertise the terminal Roost provides — force TERM rather than
+    // inheriting the launching terminal's (a child seeing an inherited
+    // TERM=tmux-256color / xterm-kitty would emit unsupported sequences).
+    cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     // Roost contract (documented in docs/reference/paths.md and the
     // refactor plan's acceptance criteria): every shell Roost spawns
@@ -548,6 +577,17 @@ fn build_command(
     // wider env discovery.
     cmd.env("ROOST_TAB_ID", tab_id.to_string());
     cmd.env("ROOST_SOCKET", socket_path.as_os_str());
+    // Roost shell-integration contract (parity with the Mac UI). TERM
+    // stays xterm-256color (above). ROOST_SHELL_FEATURES is overridable.
+    cmd.env("TERM_PROGRAM", "Roost");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.env("ROOST_SHELL_INTEGRATION", "1");
+    if std::env::var_os("ROOST_SHELL_FEATURES").is_none() {
+        cmd.env("ROOST_SHELL_FEATURES", "cwd,title,prompt");
+    }
+    if let Some(dir) = roost_resources_dir() {
+        cmd.env("ROOST_RESOURCES_DIR", dir);
+    }
     cmd
 }
 
