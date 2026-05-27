@@ -68,8 +68,9 @@ it. Default: `cwd,title,prompt`.
 - `title` — set the tab title to the cwd.
 - `prompt` — set a default prompt (only when you haven't set one).
 
-For example, to keep your own title and prompt, set
-`ROOST_SHELL_FEATURES=cwd` in your rc before sourcing.
+The flags are opt-*out*: every feature is on unless its `no-` form is present.
+So to keep your own title and prompt, set
+`ROOST_SHELL_FEATURES=no-title,no-prompt` in your rc before sourcing.
 
 ## The environment Roost injects
 
@@ -78,7 +79,6 @@ Every shell Roost spawns sees:
 | Variable                  | Meaning                                                 |
 |---------------------------|---------------------------------------------------------|
 | `ROOST_TAB_ID`            | the tab's id — gate your integration on this            |
-| `ROOST_PROJECT_ID`        | the project's id                                        |
 | `ROOST_SOCKET`            | the IPC socket path (`roostctl` auto-detects it)        |
 | `ROOST_RESOURCES_DIR`     | where the shipped scripts live (`…/shell-integration/`) |
 | `ROOST_SHELL_INTEGRATION` | `1`                                                     |
@@ -91,10 +91,10 @@ Roost injects them.
 
 ## Fancier: a git-aware title with a 🐓
 
-Want the tab label to show a status icon + branch instead of just the path? This
-**overrides** the default title — source it *after* the line above, or set
-`ROOST_SHELL_FEATURES=cwd,prompt` so the shipped default title doesn't fight it.
-🐓 = clean tree or outside a repo, 🐣 = dirty tree.
+Want the tab label to show a status icon + branch instead of just the path? Set
+`ROOST_SHELL_FEATURES=no-title` (so the shipped title stays out of its way) and
+add this to your rc — its `__roost_fancy_title` becomes the only thing setting
+the title. 🐓 = clean tree or outside a repo, 🐣 = dirty tree.
 
 ```bash
 __roost_fancy_title() {
