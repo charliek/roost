@@ -30,16 +30,23 @@ pub fn write(target: Target, text: &str) {
     }
 }
 
-/// Read text from the given selection and hand it to `on_text` on the GTK
-/// main loop. No-op if there is no display, or for `Primary` off Linux.
+/// Read text from the given selection and hand it to `on_text` on the
+/// GTK main loop. The callback fires unconditionally — with an empty
+/// string when no display exists, the target is unsupported, or the
+/// read returns no text. Callers that fall through to the image / URI
+/// branches when text is absent rely on this contract; the existing
+/// text-paste sites short-circuit empty strings via `paste_text_into`.
 pub fn read(target: Target, on_text: impl FnOnce(String) + 'static) {
     let Some(clipboard) = target_clipboard(target) else {
+        on_text(String::new());
         return;
     };
     glib::spawn_future_local(async move {
-        if let Ok(Some(text)) = clipboard.read_text_future().await {
-            on_text(text.to_string());
-        }
+        let text = match clipboard.read_text_future().await {
+            Ok(Some(t)) => t.to_string(),
+            _ => String::new(),
+        };
+        on_text(text);
     });
 }
 

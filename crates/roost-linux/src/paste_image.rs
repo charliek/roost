@@ -16,9 +16,11 @@
 //! Mirrors the legacy Go implementation at `cmd/roost/paste_image.go`
 //! and the Mac counterpart in `mac/Sources/Roost/PasteImage.swift`.
 
+use std::cell::Cell;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gdk_pixbuf::prelude::*;
 use gdk_pixbuf::Pixbuf;
@@ -84,8 +86,7 @@ pub fn materialize(bytes: &[u8], mime: &str) -> Result<PathBuf, Error> {
     }
     let png_bytes = if mime == "image/png" {
         if let Some((w, h)) = png_dimensions(bytes) {
-            let pixels = (w as usize).saturating_mul(h as usize);
-            if pixels > MAX_PIXELS {
+            if !pixel_count_fits(w, h) {
                 return Err(Error::TooManyPixels {
                     width: w,
                     height: h,
@@ -99,42 +100,94 @@ pub fn materialize(bytes: &[u8], mime: &str) -> Result<PathBuf, Error> {
     write_temp_png(&png_bytes)
 }
 
-/// Convert a non-PNG image to PNG via gdk-pixbuf. Pre-checks the
-/// dimensions through `PixbufLoader` so a compression-bomb input
-/// can't allocate megapixels of RGBA buffer before we get a chance
-/// to reject it.
+/// Convert a non-PNG image to PNG via gdk-pixbuf. The dimension
+/// check runs from `size-prepared` (which fires after the header
+/// parses, before pixel decode starts) so a compression-bomb input
+/// can't force a megapixel-sized RGBA allocation before we reject
+/// it — that requires feeding the loader in small chunks rather
+/// than handing it the whole buffer in one `write`. We also cap the
+/// encoded PNG size so a benign decode that re-encodes huge can't
+/// slip past the source-byte cap.
 fn reencode_to_png(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let loader = gdk_pixbuf::PixbufLoader::new();
-    loader
-        .write(bytes)
-        .map_err(|e| Error::Decode(e.to_string()))?;
+    // size-prepared captures the header-reported dimensions exactly
+    // once; the closure can't bail out of `write` directly, so the
+    // outer loop reads this cell after each chunk and aborts.
+    let oversized: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
+    let cb_state = oversized.clone();
+    loader.connect_size_prepared(move |_, w, h| {
+        if !pixel_count_fits(w, h) {
+            cb_state.set(Some((w, h)));
+        }
+    });
+    const CHUNK: usize = 4096;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let end = (pos + CHUNK).min(bytes.len());
+        loader
+            .write(&bytes[pos..end])
+            .map_err(|e| Error::Decode(e.to_string()))?;
+        pos = end;
+        if let Some((w, h)) = oversized.get() {
+            let _ = loader.close();
+            return Err(Error::TooManyPixels {
+                width: w,
+                height: h,
+            });
+        }
+    }
     loader.close().map_err(|e| Error::Decode(e.to_string()))?;
     let pixbuf: Pixbuf = loader
         .pixbuf()
         .ok_or_else(|| Error::Decode("loader produced no pixbuf".to_string()))?;
     let (w, h) = (pixbuf.width(), pixbuf.height());
-    let pixels = (w as usize).saturating_mul(h as usize);
-    if pixels > MAX_PIXELS {
+    // Belt-and-suspenders: size-prepared fired, but some loaders
+    // don't emit it (broken plugins). Re-check post-decode.
+    if !pixel_count_fits(w, h) {
         return Err(Error::TooManyPixels {
             width: w,
             height: h,
         });
     }
-    pixbuf
+    let encoded = pixbuf
         .save_to_bufferv("png", &[])
-        .map(|b| b.to_vec())
-        .map_err(|e| Error::Encode(e.to_string()))
+        .map_err(|e| Error::Encode(e.to_string()))?;
+    if encoded.len() > MAX_BYTES {
+        return Err(Error::TooLarge { len: encoded.len() });
+    }
+    Ok(encoded.to_vec())
+}
+
+/// Overflow-safe `width * height <= MAX_PIXELS`. Uses division form
+/// to dodge the trapping multiplication; rejects non-positive
+/// dimensions (broken loaders, hand-crafted headers).
+pub fn pixel_count_fits(width: i32, height: i32) -> bool {
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+    (width as usize) <= MAX_PIXELS / (height as usize)
 }
 
 /// Peek a PNG IHDR for width/height without decoding pixels. PNG
-/// layout: 8-byte signature, then a length-prefixed `IHDR` chunk
-/// whose first 8 payload bytes are width(4) + height(4) BE.
+/// layout: 8-byte signature, then `length(4) + type(4) + payload +
+/// crc(4)`. The first chunk MUST be IHDR with length 13
+/// (RFC 2083 §11.2.2); we validate both the type bytes and the
+/// length before trusting the dimension fields, so a hand-crafted
+/// PNG-shaped blob with garbage in that slot can't mislead the
+/// caller's bounds check.
 pub fn png_dimensions(data: &[u8]) -> Option<(i32, i32)> {
     if data.len() < 24 {
         return None;
     }
     let sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     if data[..8] != sig {
+        return None;
+    }
+    let ihdr_len = i32::from_be_bytes(data[8..12].try_into().ok()?);
+    if ihdr_len != 13 {
+        return None;
+    }
+    if &data[12..16] != b"IHDR" {
         return None;
     }
     let w = i32::from_be_bytes(data[16..20].try_into().ok()?);
@@ -338,6 +391,44 @@ mod tests {
     fn png_dimensions_rejects_non_png() {
         assert_eq!(png_dimensions(&[0xff, 0xd8, 0xff, 0xe0]), None);
         assert_eq!(png_dimensions(&[]), None);
+    }
+
+    #[test]
+    fn png_dimensions_rejects_bad_ihdr_type() {
+        // Signature OK, chunk length = 13, but type "FOOO" — must
+        // reject so the caller's bounds check isn't fooled by garbage
+        // in the dimension slot.
+        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
+        png.extend_from_slice(b"FOOO");
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0C]);
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x07]);
+        assert_eq!(png_dimensions(&png), None);
+    }
+
+    #[test]
+    fn png_dimensions_rejects_bad_ihdr_length() {
+        // Signature + IHDR type OK, but length lies about its size
+        // (claims 99 bytes). Reject defensively.
+        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x63]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0C]);
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x07]);
+        assert_eq!(png_dimensions(&png), None);
+    }
+
+    #[test]
+    fn pixel_count_fits_bounds() {
+        assert!(pixel_count_fits(1024, 1024));
+        assert!(pixel_count_fits(1, MAX_PIXELS as i32));
+        assert!(pixel_count_fits(MAX_PIXELS as i32, 1));
+        // 100_000 × 100_000 = 10^10 — division-form check rejects
+        // without ever materialising the product.
+        assert!(!pixel_count_fits(100_000, 100_000));
+        assert!(!pixel_count_fits(0, 1));
+        assert!(!pixel_count_fits(1, 0));
+        assert!(!pixel_count_fits(-1, 1));
     }
 
     #[test]

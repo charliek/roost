@@ -637,7 +637,7 @@ impl TerminalView {
         let for_image = state.clone();
         clipboard::read_file_uris(move |paths| {
             if !paths.is_empty() {
-                paste_text_into(&state, paths.join(" "));
+                paste_text_into(&state, paths.join("\n"));
                 return;
             }
             clipboard::read_image(move |maybe| {
@@ -651,6 +651,14 @@ impl TerminalView {
             });
         });
     }
+
+    // Multi-path joining lives here rather than in paste_image_or_uris
+    // because `paths.join(...)` must use newline (not space): a Finder /
+    // Nautilus selection that includes "Screenshot 2026.png" or paths
+    // under "/Volumes/My Disk" would merge on space. Bracketed paste
+    // delivers the bytes verbatim; the receiver treats each line as a
+    // separate attachment candidate. Mirrors the Mac fix in
+    // TerminalView.paste(_:) under PR #149.
 
     /// Install a keystroke handler. Called with raw UTF-8 bytes when
     /// the view has focus and the user types a printable character.
@@ -1531,8 +1539,15 @@ fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
 /// Ctrl+Shift+V (CLIPBOARD) and, on Linux, middle-click (PRIMARY); the
 /// async clipboard read lives in `clipboard::read`. Reads the callback
 /// out of the borrow before invoking, per the callback invariant on
-/// `TerminalViewState`.
+/// `TerminalViewState`. Empty `text` is a no-op so middle-clicking with
+/// an empty PRIMARY selection doesn't send a stray `ESC[200~ESC[201~`,
+/// and so the image / URI cascade in `paste_from_clipboard` (which
+/// relies on `clipboard::read` firing with `""` when no text is
+/// available) doesn't double-paste.
 fn paste_text_into(state: &Rc<RefCell<TerminalViewState>>, text: String) {
+    if text.is_empty() {
+        return;
+    }
     let (bracketed, cb) = {
         let s = state.borrow();
         (s.terminal.mode_get(2004), s.input_callback.clone())
