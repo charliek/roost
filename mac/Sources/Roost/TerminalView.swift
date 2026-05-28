@@ -688,7 +688,13 @@ final class TerminalView: NSView {
     /// multi-row selections fill the first row from `startCol` to the
     /// right edge, interior rows full-width, and the last row from the
     /// left edge to `endCol`.
-    static func colRange(
+    ///
+    /// `nonisolated` so the `RoostTests` suite (which is not
+    /// `@MainActor`) can exercise it without ceremony. The function
+    /// is pure with no shared state, so dropping `@MainActor`
+    /// isolation that this otherwise inherits from the enclosing
+    /// view class is sound.
+    nonisolated static func colRange(
         forOffset offset: Int,
         totalRowSpan: Int,
         normalized n: (startY: UInt32, startCol: Int, endY: UInt32, endCol: Int),
