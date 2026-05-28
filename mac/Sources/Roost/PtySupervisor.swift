@@ -528,12 +528,26 @@ final class PtySupervisor {
         let resolved = loginShellArgv(argv, shell: shell)
         // Modern bash: add `--posix` so it honors ENV (the only
         // per-interactive-shell hook), which Roost points at roost.bash —
-        // see `bashAutobootstrap` and `buildEnv`. The argv and env decisions
-        // must agree, so both gate on `bashAutobootstrap`.
-        let execArgv = withBashPosix(resolved, apply: bashAutobootstrap(resolved, isDarwin: true))
+        // see `shouldBashBootstrap` and `buildEnv`. The argv `--posix` and
+        // the env injection must agree, so both gate on the same check.
+        let resourcesDir = Bundle.roostResources.bundleURL.path
+        let execArgv = withBashPosix(
+            resolved, apply: shouldBashBootstrap(resolved, resourcesDir: resourcesDir))
         var out: [UnsafeMutablePointer<CChar>?] = execArgv.map { strdup($0) }
         out.append(nil)
         return out
+    }
+
+    /// Whether to bash-auto-bootstrap `resolvedArgv`: the pure predicate
+    /// (`bashAutobootstrap`) AND the shipped roost.bash being present at
+    /// `resourcesDir`. `--posix` and the ENV injection must be applied
+    /// together — a `--posix` shell with no ENV script to source would be
+    /// stuck in POSIX mode with no startup recreation — so `buildArgv` and
+    /// `buildEnv` both gate on this.
+    private func shouldBashBootstrap(_ resolvedArgv: [String], resourcesDir: String) -> Bool {
+        bashAutobootstrap(resolvedArgv, isDarwin: true)
+            && FileManager.default.fileExists(
+                atPath: resourcesDir + "/shell-integration/roost.bash")
     }
 
     /// Build the NULL-terminated envp array. Inherits the
@@ -575,7 +589,7 @@ final class PtySupervisor {
                 env["ROOST_ZSH_ZDOTDIR"] = userZdotdir
             }
             env["ZDOTDIR"] = resourcesDir + "/shell-integration/zsh"
-        } else if bashAutobootstrap(resolvedArgv, isDarwin: true) {
+        } else if shouldBashBootstrap(resolvedArgv, resourcesDir: resourcesDir) {
             for (key, value) in bashBootstrapEnv(
                 resourcesDir: resourcesDir,
                 existingEnv: env["ENV"],
@@ -639,8 +653,10 @@ func withBashPosix(_ argv: [String], apply: Bool) -> [String] {
 /// auto-load vs. a manual source). A prior ENV is preserved into
 /// ROOST_BASH_ENV so the shim can restore it. HISTFILE is pinned to
 /// ~/.bash_history (POSIX mode would default it to ~/.sh_history) only when
-/// unset, with ROOST_BASH_UNEXPORT_HISTFILE telling the shim to un-export
-/// it afterward.
+/// fully unset, with ROOST_BASH_UNEXPORT_HISTFILE telling the shim to
+/// un-export it afterward. An *empty* HISTFILE is left alone — that's the
+/// idiom for disabling history, so we must not re-enable it (matches
+/// Ghostty's null-only check).
 func bashBootstrapEnv(
     resourcesDir: String,
     existingEnv: String?,
@@ -653,7 +669,7 @@ func bashBootstrapEnv(
     }
     out["ENV"] = resourcesDir + "/shell-integration/roost.bash"
     out["ROOST_BASH_INJECT"] = "1"
-    if (existingHistfile ?? "").isEmpty, let home, !home.isEmpty {
+    if existingHistfile == nil, let home, !home.isEmpty {
         out["HISTFILE"] = home + "/.bash_history"
         out["ROOST_BASH_UNEXPORT_HISTFILE"] = "1"
     }

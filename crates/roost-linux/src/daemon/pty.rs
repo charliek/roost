@@ -544,8 +544,10 @@ fn with_bash_posix(mut resolved: Vec<String>, apply: bool) -> Vec<String> {
 /// tells it to recreate startup (and distinguishes an auto-load from a
 /// manual source). A prior ENV is preserved into ROOST_BASH_ENV so the
 /// shim can restore it. HISTFILE is pinned to ~/.bash_history (POSIX mode
-/// would otherwise default it to ~/.sh_history) only when unset, with
+/// would otherwise default it to ~/.sh_history) only when fully unset, with
 /// ROOST_BASH_UNEXPORT_HISTFILE telling the shim to un-export it afterward.
+/// An *empty* HISTFILE is left alone — that's the idiom for disabling
+/// history, so we must not re-enable it (matches Ghostty's null-only check).
 fn bash_bootstrap_env(
     resources_dir: &std::path::Path,
     existing_env: Option<&str>,
@@ -559,7 +561,7 @@ fn bash_bootstrap_env(
     let script = resources_dir.join("shell-integration").join("roost.bash");
     out.push(("ENV".into(), script.to_string_lossy().into_owned()));
     out.push(("ROOST_BASH_INJECT".into(), "1".into()));
-    if existing_histfile.unwrap_or("").is_empty() {
+    if existing_histfile.is_none() {
         if let Some(home) = home.filter(|h| !h.is_empty()) {
             out.push(("HISTFILE".into(), format!("{home}/.bash_history")));
             out.push(("ROOST_BASH_UNEXPORT_HISTFILE".into(), "1".into()));
@@ -631,9 +633,14 @@ fn build_command(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let resolved = resolve_argv(argv, &shell);
     // Modern bash: add `--posix` so it honors ENV (its only
-    // per-interactive-shell hook), which we point at roost.bash below. The
-    // argv and env decisions must agree, so both gate on the same helper.
-    let bash_boot = bash_autobootstrap(&resolved, cfg!(target_os = "macos"));
+    // per-interactive-shell hook), which we point at roost.bash below.
+    // `--posix` and the ENV injection MUST be applied together — a `--posix`
+    // shell with no ENV would be stuck in POSIX mode with no startup files
+    // and no recreation — so gate both on the resources dir being writable
+    // (if the cache write failed there's no roost.bash to source).
+    let resources_dir = roost_resources_dir();
+    let bash_boot =
+        resources_dir.is_some() && bash_autobootstrap(&resolved, cfg!(target_os = "macos"));
     let resolved = with_bash_posix(resolved, bash_boot);
     let mut cmd = CommandBuilder::new(&resolved[0]);
     for a in &resolved[1..] {
@@ -663,7 +670,7 @@ fn build_command(
     if std::env::var_os("ROOST_SHELL_FEATURES").is_none() {
         cmd.env("ROOST_SHELL_FEATURES", "cwd,title,marks,prompt");
     }
-    if let Some(dir) = roost_resources_dir() {
+    if let Some(dir) = resources_dir {
         cmd.env("ROOST_RESOURCES_DIR", dir);
         // Auto-bootstrap the shipped integration with no rc edit (parity
         // with the Mac UI):
@@ -857,6 +864,20 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "HISTFILE"));
         assert!(!env.iter().any(|(k, _)| k == "ROOST_BASH_UNEXPORT_HISTFILE"));
         assert!(env.contains(&("ROOST_BASH_ENV".to_string(), "/u/env.sh".to_string())));
+    }
+
+    #[test]
+    fn bash_bootstrap_env_respects_empty_histfile() {
+        // An empty HISTFILE disables history on purpose — don't re-enable
+        // it by pinning ~/.bash_history (only a fully-unset HISTFILE pins).
+        let env = bash_bootstrap_env(
+            std::path::Path::new("/res"),
+            None,
+            Some(""),
+            Some("/home/u"),
+        );
+        assert!(!env.iter().any(|(k, _)| k == "HISTFILE"));
+        assert!(!env.iter().any(|(k, _)| k == "ROOST_BASH_UNEXPORT_HISTFILE"));
     }
 
     #[cfg(target_os = "linux")]

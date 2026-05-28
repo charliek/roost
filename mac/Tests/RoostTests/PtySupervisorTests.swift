@@ -208,6 +208,16 @@ struct PtySupervisorTests {
         #expect(env["ROOST_BASH_ENV"] == "/u/env.sh")
     }
 
+    @Test func bashBootstrapEnvRespectsEmptyHistfile() {
+        // An empty HISTFILE disables history on purpose — don't re-enable it
+        // by pinning ~/.bash_history (only a fully-unset HISTFILE pins).
+        let env = bashBootstrapEnv(
+            resourcesDir: "/res", existingEnv: nil,
+            existingHistfile: "", home: "/home/u")
+        #expect(env["HISTFILE"] == nil)
+        #expect(env["ROOST_BASH_UNEXPORT_HISTFILE"] == nil)
+    }
+
     @Test(.disabled("event-observation crashes the swift-testing runner; covered by M4b IPCServer tests + M9 manual pass"))
     func closeReapsChild() async throws {
         let sup = await PtySupervisor()
