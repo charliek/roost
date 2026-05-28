@@ -46,6 +46,21 @@ protocol UiBridge: AnyObject {
     func paletteQuery(_ text: String) -> PaletteSnapshot
     func paletteActivate(id: String) -> PaletteSnapshot?
     func dismissPaletteOverlay() -> PaletteSnapshot
+
+    // Selection drive surface (`selection.*` ops). Each takes a tab id;
+    // returning `false` / `nil` signals "no live tab" so the IPC
+    // handler maps to `not-found`. Coords are viewport (col, row); the
+    // TerminalView converts to scrollback-stable screen-y internally.
+    func setTabSelection(
+        tabID: Int64,
+        anchorCol: Int,
+        anchorRow: Int,
+        cursorCol: Int,
+        cursorRow: Int
+    ) -> Bool
+    func clearTabSelection(tabID: Int64) -> Bool
+    /// Outer optional = "tab exists?"; inner = "selection present?".
+    func dumpTabSelection(tabID: Int64) -> TerminalView.SelectionDump??
 }
 
 /// A read of the command-palette overlay for the `palette.*` IPC ops,

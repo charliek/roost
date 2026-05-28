@@ -18,14 +18,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roost_ipc::messages::{
-    ops, AppActivateParams, IdentifyParams, IdentifyResult, NotificationCreateParams,
-    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PaletteQueryParams,
-    PaletteStateParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
-    ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
-    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpCursor, TabDumpParams,
-    TabDumpResult, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult,
-    TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams,
+    ops, AppActivateParams, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    TabClearNotificationParams, TabCloseParams, TabDumpCursor, TabDumpParams, TabDumpResult,
+    TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams,
+    TabResizeParams, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -55,6 +56,32 @@ type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
 /// row with the given id); the rest always answer `Ok`.
 type PaletteReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, String>>;
 
+/// Snapshot of a tab's selection for the `selection.dump` op. Mirrors
+/// `terminal_view::SelectionDumpData` but lives in this crate so `ipc.rs`
+/// stays independent of the bin's `TerminalView`.
+pub struct SelectionData {
+    pub text: Option<String>,
+    pub anchor_visible: bool,
+    pub cursor_visible: bool,
+}
+
+/// Reply for a [`UiRequest::SelectionDump`]: `Some` carries the current
+/// selection (which may itself have `text == None` for an off-screen
+/// selection); `None` means no selection is active on the tab.
+/// `Err` means the tab id has no live terminal.
+type SelectionDumpReply = tokio::sync::oneshot::Sender<Result<Option<SelectionData>, String>>;
+
+/// Reply for [`UiRequest::SelectionSet`] / [`UiRequest::SelectionClear`]:
+/// `Ok(())` when applied, `Err` with a `not-found` style message when no
+/// live tab matches.
+type SelectionMutReply = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// Reply for [`UiRequest::ClipboardDump`]: the pasteboard contents
+/// (`Ok(Some)` = text present, `Ok(None)` = empty target / PRIMARY off
+/// Linux). The `Err` arm is never used today but kept for shape
+/// compatibility with `ui_call`'s `Result<T, String>` envelope.
+type ClipboardDumpReply = tokio::sync::oneshot::Sender<Result<Option<String>, String>>;
+
 /// One unit of work the IPC handler (a tokio worker thread) hands to the
 /// GTK main thread — the single seam for anything an op needs to do
 /// against GTK / libghostty, which are main-thread-only. The UI drains
@@ -83,6 +110,45 @@ pub enum UiRequest {
     PaletteActivate { id: String, reply: PaletteReply },
     /// Dismiss any open palette; reply with the (closed) state.
     PaletteDismiss { reply: PaletteReply },
+    /// `selection.set` — anchor a selection on a tab's terminal.
+    /// Both points are viewport `(col, row)`; the UI converts to
+    /// scrollback-stable screen-y space.
+    SelectionSet {
+        tab_id: i64,
+        anchor: (u16, u16),
+        cursor: (u16, u16),
+        reply: SelectionMutReply,
+    },
+    /// `selection.clear` — drop any active selection on this tab.
+    SelectionClear {
+        tab_id: i64,
+        reply: SelectionMutReply,
+    },
+    /// `selection.dump` — read back the current selection.
+    SelectionDump {
+        tab_id: i64,
+        reply: SelectionDumpReply,
+    },
+    /// `clipboard.dump` — read the host pasteboard. `target` is the
+    /// normalized string from the wire ("system" or "selection") which
+    /// the UI maps to the platform's CLIPBOARD / PRIMARY (Linux) or
+    /// `NSPasteboard.general` / `selectionPasteboard` (Mac on the
+    /// parallel implementation).
+    ClipboardDump {
+        target: ClipboardOp,
+        reply: ClipboardDumpReply,
+    },
+    /// `clipboard.write` — test-only pasteboard seeding.
+    ClipboardWrite { target: ClipboardOp, text: String },
+}
+
+/// Resolved clipboard target for the `clipboard.*` ops. Lives in this
+/// crate so the wire-string → platform-target mapping happens at the
+/// dispatcher boundary, not in the UI drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardOp {
+    System,
+    Selection,
 }
 
 use crate::daemon::state::WorkspaceError;
@@ -473,6 +539,69 @@ async fn dispatch(
                 .map_err(palette_err)?;
             encode(&state)
         }
+        ops::SELECTION_SET => {
+            let p: SelectionSetParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::SelectionSet {
+                tab_id: p.tab_id,
+                anchor: (p.anchor.col, p.anchor.row),
+                cursor: (p.cursor.col, p.cursor.row),
+                reply,
+            })
+            .await?
+            .map_err(HandlerError::not_found)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::SELECTION_CLEAR => {
+            let p: SelectionClearParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::SelectionClear {
+                tab_id: p.tab_id,
+                reply,
+            })
+            .await?
+            .map_err(HandlerError::not_found)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::SELECTION_DUMP => {
+            let p: SelectionDumpParams = decode(params)?;
+            let dump = h
+                .ui_call(|reply| UiRequest::SelectionDump {
+                    tab_id: p.tab_id,
+                    reply,
+                })
+                .await?
+                .map_err(HandlerError::not_found)?;
+            let result = match dump {
+                Some(d) => SelectionDumpResult {
+                    text: d.text,
+                    anchor_visible: d.anchor_visible,
+                    cursor_visible: d.cursor_visible,
+                },
+                None => SelectionDumpResult::default(),
+            };
+            encode(&result)
+        }
+        ops::CLIPBOARD_DUMP => {
+            let p: ClipboardDumpParams = decode(params)?;
+            let target = parse_clipboard_op(&p.target)?;
+            let text = h
+                .ui_call(|reply| UiRequest::ClipboardDump { target, reply })
+                .await?
+                .map_err(|e| HandlerError::new("internal", e))?;
+            encode(&ClipboardDumpResult { text })
+        }
+        ops::CLIPBOARD_WRITE => {
+            let p: ClipboardWriteParams = decode(params)?;
+            let target = parse_clipboard_op(&p.target)?;
+            // Fire-and-forget — matches the `app.activate` pattern.
+            // Headless handler / dropped receiver: no-op.
+            if let Some(tx) = &h.ui_tx {
+                let _ = tx.send(UiRequest::ClipboardWrite {
+                    target,
+                    text: p.text,
+                });
+            }
+            Ok(serde_json::json!({}))
+        }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -553,4 +682,18 @@ fn pty_err(e: crate::daemon::PtyError) -> HandlerError {
 /// that isn't there", i.e. `not-found`.
 fn palette_err(msg: String) -> HandlerError {
     HandlerError::not_found(msg)
+}
+
+/// Map the wire-format `target` string (`"system"` / `"selection"`) to
+/// the typed `ClipboardOp` the UI drain consumes. Unknown values are
+/// `invalid-param` so a typo doesn't silently fall through to the
+/// system clipboard.
+fn parse_clipboard_op(s: &str) -> Result<ClipboardOp, HandlerError> {
+    match s {
+        "system" => Ok(ClipboardOp::System),
+        "selection" => Ok(ClipboardOp::Selection),
+        other => Err(HandlerError::invalid_param(format!(
+            "clipboard target must be \"system\" or \"selection\" (got {other:?})"
+        ))),
+    }
 }

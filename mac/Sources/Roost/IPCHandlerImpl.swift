@@ -96,6 +96,19 @@ actor IPCHandlerImpl: IPCHandler {
             return try await encodeResult(self.paletteActivate(params: params))
         case "palette.dismiss":
             return try await encodeResult(self.paletteDismiss(params: params))
+        case "selection.set":
+            try await self.selectionSet(params: params)
+            return AnyCodable([:] as [String: Any])
+        case "selection.clear":
+            try await self.selectionClear(params: params)
+            return AnyCodable([:] as [String: Any])
+        case "selection.dump":
+            return try await encodeResult(self.selectionDump(params: params))
+        case "clipboard.dump":
+            return try await encodeResult(self.clipboardDump(params: params))
+        case "clipboard.write":
+            try await self.clipboardWrite(params: params)
+            return AnyCodable([:] as [String: Any])
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -458,6 +471,113 @@ actor IPCHandlerImpl: IPCHandler {
             throw IPCHandlerError.internalError("no UI for palette")
         }
         return ui
+    }
+
+    // MARK: selection + clipboard test ops
+
+    @MainActor
+    private func selectionSet(params: AnyCodable?) async throws {
+        let p = try decodeParams(
+            params, as: IPCSelectionSetParams.self,
+            expected: ["tab_id", "anchor", "cursor"]
+        )
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to drive selection")
+        }
+        let ok = ui.setTabSelection(
+            tabID: p.tabID,
+            anchorCol: Int(p.anchor.col),
+            anchorRow: Int(p.anchor.row),
+            cursorCol: Int(p.cursor.col),
+            cursorRow: Int(p.cursor.row)
+        )
+        if !ok {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+    }
+
+    @MainActor
+    private func selectionClear(params: AnyCodable?) async throws {
+        let p = try decodeParams(
+            params, as: IPCSelectionClearParams.self, expected: ["tab_id"]
+        )
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to drive selection")
+        }
+        if !ui.clearTabSelection(tabID: p.tabID) {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+    }
+
+    @MainActor
+    private func selectionDump(params: AnyCodable?) async throws -> IPCSelectionDumpResult {
+        let p = try decodeParams(
+            params, as: IPCSelectionDumpParams.self, expected: ["tab_id"]
+        )
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to read selection")
+        }
+        guard let outer = ui.dumpTabSelection(tabID: p.tabID) else {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+        if let dump = outer {
+            return IPCSelectionDumpResult(
+                text: dump.text,
+                anchorVisible: dump.anchorVisible,
+                cursorVisible: dump.cursorVisible
+            )
+        }
+        return IPCSelectionDumpResult(
+            text: nil, anchorVisible: false, cursorVisible: false
+        )
+    }
+
+    @MainActor
+    private func clipboardDump(params: AnyCodable?) async throws -> IPCClipboardDumpResult {
+        let p = try decodeParams(
+            params, as: IPCClipboardDumpParams.self, expected: ["target"]
+        )
+        let pb = try resolvePasteboard(target: p.target)
+        return IPCClipboardDumpResult(text: pb.string(forType: .string))
+    }
+
+    @MainActor
+    private func clipboardWrite(params: AnyCodable?) async throws {
+        let p = try decodeParams(
+            params, as: IPCClipboardWriteParams.self, expected: ["target", "text"]
+        )
+        let pb = try resolvePasteboard(target: p.target)
+        pb.clearContents()
+        pb.setString(p.text, forType: .string)
+    }
+
+    /// Map the wire `target` string to the matching `NSPasteboard`.
+    /// "system" → `NSPasteboard.general` (the ⌘V target). "selection"
+    /// → the custom named pasteboard shared with `TerminalView` for
+    /// drag-selection (`copy-on-select = .on`). Unknown values are
+    /// `invalid-param` so a typo doesn't silently fall through.
+    @MainActor
+    private func resolvePasteboard(target: String) throws -> NSPasteboard {
+        switch target {
+        case "system":
+            return NSPasteboard.general
+        case "selection":
+            return TerminalView.selectionPasteboard
+        default:
+            throw IPCHandlerError(
+                code: "invalid-param",
+                message: "clipboard target must be \"system\" or \"selection\" (got \"\(target)\")"
+            )
+        }
     }
 
     // MARK: screenshot
@@ -1023,4 +1143,90 @@ extension Workspace.TabState {
         case .idle: return .idle
         }
     }
+}
+
+// MARK: selection + clipboard test-op wire types
+
+private struct IPCSelectionPoint: Codable {
+    let col: UInt16
+    let row: UInt16
+}
+
+private struct IPCSelectionSetParams: Codable {
+    let tabID: Int64
+    let anchor: IPCSelectionPoint
+    let cursor: IPCSelectionPoint
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case anchor, cursor
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c,
+                debugDescription: "tab_id must be a stringified int64"
+            )
+        }
+        self.tabID = v
+        self.anchor = try c.decode(IPCSelectionPoint.self, forKey: .anchor)
+        self.cursor = try c.decode(IPCSelectionPoint.self, forKey: .cursor)
+    }
+}
+
+private struct IPCSelectionClearParams: Codable {
+    let tabID: Int64
+    enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c,
+                debugDescription: "tab_id must be a stringified int64"
+            )
+        }
+        self.tabID = v
+    }
+}
+
+private struct IPCSelectionDumpParams: Codable {
+    let tabID: Int64
+    enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c,
+                debugDescription: "tab_id must be a stringified int64"
+            )
+        }
+        self.tabID = v
+    }
+}
+
+private struct IPCSelectionDumpResult: Codable {
+    let text: String?
+    let anchorVisible: Bool
+    let cursorVisible: Bool
+    enum CodingKeys: String, CodingKey {
+        case text
+        case anchorVisible = "anchor_visible"
+        case cursorVisible = "cursor_visible"
+    }
+}
+
+private struct IPCClipboardDumpParams: Codable {
+    let target: String
+}
+
+private struct IPCClipboardDumpResult: Codable {
+    let text: String?
+}
+
+private struct IPCClipboardWriteParams: Codable {
+    let target: String
+    let text: String
 }

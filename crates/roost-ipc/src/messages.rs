@@ -373,6 +373,97 @@ pub struct PaletteStateResult {
 }
 
 // ============================================================================
+// Selection + clipboard (test ops, drive selection + read/seed pasteboard)
+// ============================================================================
+//
+// These exist so `tools/roosttest/` can drive selection state and assert on
+// the host clipboard end-to-end — neither was possible with the prior op
+// set (no mouse simulation; no way to read the OS clipboard from outside
+// the UI process). They also make selection a first-class op-set citizen
+// per CLAUDE.md's "one core, two implementations" principle.
+
+/// (col, row) in **viewport** coordinates — what the user would see if they
+/// could click the cell. Server-side the UI converts to libghostty's
+/// `PointTag::Screen` so the selection survives subsequent scrolling
+/// (mirrors mouseDown / drag_begin).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionPoint {
+    pub col: u16,
+    pub row: u16,
+}
+
+/// `selection.set` request: drop any existing selection and create a new
+/// one anchored at `anchor` with the cursor at `cursor`. Both are viewport
+/// (col, row); rows outside `[0, tab_rows)` are rejected `invalid-param`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionSetParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    pub anchor: SelectionPoint,
+    pub cursor: SelectionPoint,
+}
+
+/// `selection.clear` request: drop the selection on this tab (no-op if
+/// none active).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionClearParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+}
+
+/// `selection.dump` request: read back the current selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionDumpParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+}
+
+/// `selection.dump` response. `text` is `None` when no selection exists
+/// (or when both endpoints have scrolled off-screen and copy currently
+/// returns nothing — same lossy behavior as `⌘C` / Ctrl+Shift+C today).
+/// `anchor_visible` / `cursor_visible` report whether each endpoint is
+/// currently in the viewport — useful for asserting clip behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionDumpResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub anchor_visible: bool,
+    pub cursor_visible: bool,
+}
+
+/// `clipboard.dump` request. `target`: `"system"` reads the system
+/// clipboard (`NSPasteboard.general` / CLIPBOARD); `"selection"` reads
+/// the per-app selection pasteboard (named `NSPasteboard` on Mac /
+/// PRIMARY on Linux). Unknown values are rejected `invalid-param`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardDumpParams {
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardDumpResult {
+    /// `None` when the target has no text content (PRIMARY off Linux,
+    /// or an empty pasteboard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// `clipboard.write` request. Test-only seeding for the inverse of
+/// `clipboard.dump` — lets a test set a known pasteboard value before
+/// asserting paste behavior. Not a security regression: any process on
+/// the host can already write the OS clipboard.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardWriteParams {
+    pub target: String,
+    pub text: String,
+}
+
+// ============================================================================
 // Project lifecycle
 // ============================================================================
 
@@ -665,6 +756,15 @@ pub mod ops {
     pub const PALETTE_QUERY: &str = "palette.query";
     pub const PALETTE_ACTIVATE: &str = "palette.activate";
     pub const PALETTE_DISMISS: &str = "palette.dismiss";
+
+    /// Selection + clipboard test ops — drive selection state and
+    /// read/seed the host clipboard end-to-end. See module docs above
+    /// the corresponding param structs for the contract.
+    pub const SELECTION_SET: &str = "selection.set";
+    pub const SELECTION_CLEAR: &str = "selection.clear";
+    pub const SELECTION_DUMP: &str = "selection.dump";
+    pub const CLIPBOARD_DUMP: &str = "clipboard.dump";
+    pub const CLIPBOARD_WRITE: &str = "clipboard.write";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

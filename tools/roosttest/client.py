@@ -206,6 +206,42 @@ class Roost:
     def palette_dismiss(self) -> dict:
         return self.call("palette.dismiss")
 
+    # -- selection + clipboard (test ops) --------------------------------
+    # Mirror the user-driven drag flow (`selection.set` ~ mouseDown +
+    # drag), reading back via `selection.dump`. The host clipboard is
+    # accessible via `clipboard.dump` ("system" = ⌘V target / CLIPBOARD;
+    # "selection" = the per-app selection pasteboard on Mac / PRIMARY on
+    # Linux). `clipboard.write` seeds a known value for tests that need
+    # to assert paste behavior.
+
+    def selection_set(
+        self,
+        tab_id: int,
+        anchor: tuple[int, int],
+        cursor: tuple[int, int],
+    ) -> None:
+        """Anchor a selection at viewport (col, row) `anchor` and extend
+        to viewport (col, row) `cursor`. Raises `RoostError('not-found')`
+        if the tab has no live terminal."""
+        self.call("selection.set", {
+            "tab_id": str(tab_id),
+            "anchor": {"col": anchor[0], "row": anchor[1]},
+            "cursor": {"col": cursor[0], "row": cursor[1]},
+        })
+
+    def selection_clear(self, tab_id: int) -> None:
+        self.call("selection.clear", {"tab_id": str(tab_id)})
+
+    def selection_dump(self, tab_id: int) -> dict:
+        """Return `{text: str|None, anchor_visible: bool, cursor_visible: bool}`."""
+        return self.call("selection.dump", {"tab_id": str(tab_id)})
+
+    def clipboard_dump(self, target: str = "system") -> str | None:
+        return self.call("clipboard.dump", {"target": target}).get("text")
+
+    def clipboard_write(self, target: str, text: str) -> None:
+        self.call("clipboard.write", {"target": target, "text": text})
+
     @staticmethod
     def palette_item_ids(state: dict) -> list[str]:
         return [it["id"] for it in state.get("items", [])]
