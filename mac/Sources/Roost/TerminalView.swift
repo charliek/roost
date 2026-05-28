@@ -687,14 +687,7 @@ final class TerminalView: NSView {
         guard let s = Self.selectionPasteboard.string(forType: .string),
               !s.isEmpty
         else { return }
-        var payload = Data(s.utf8)
-        if bracketedPasteEnabled() {
-            var wrapped = Data([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e])
-            wrapped.append(payload)
-            wrapped.append(contentsOf: [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e])
-            payload = wrapped
-        }
-        onKey?(payload)
+        sendBracketedPaste(Data(s.utf8))
     }
 
     /// Accept middle-click without the view being first responder so a
@@ -729,26 +722,47 @@ final class TerminalView: NSView {
         pb.setString(text, forType: .string)
     }
 
-    /// Standard responder-chain paste. Reads the pasteboard's
-    /// string contents, asks libghostty-vt whether the shell has
-    /// enabled bracketed-paste mode (DECSET 2004), and wraps the
-    /// payload in `ESC[200~ … ESC[201~` if so. Falls through to
-    /// raw bytes when the shell hasn't asked for bracketed paste
-    /// (e.g. `cat`, basic POSIX shells).
+    /// Standard responder-chain paste. Text wins first so plain-text
+    /// paste behavior is unchanged; image / file-URL fallbacks deliver
+    /// a `.png` path to agents like Claude Code and Codex, which
+    /// recognise the path and offer to attach. See `PasteImage` for
+    /// the extraction order (file URLs → PNG passthrough → AppKit
+    /// re-encode). All three branches route through the same
+    /// bracketed-paste-aware path so `⌘V` works identically on text,
+    /// raw clipboard images, and Finder-copied image files.
     @objc
     func paste(_ sender: Any?) {
-        guard let s = NSPasteboard.general.string(forType: .string),
-              !s.isEmpty
-        else { return }
-        var payload = Data(s.utf8)
+        let pb = NSPasteboard.general
+        if let s = pb.string(forType: .string), !s.isEmpty {
+            sendBracketedPaste(Data(s.utf8))
+            return
+        }
+        switch PasteImage.extract(pb) {
+        case .path(let p):
+            sendBracketedPaste(Data(p.utf8))
+        case .paths(let ps):
+            sendBracketedPaste(Data(ps.joined(separator: " ").utf8))
+        case .none:
+            return
+        }
+    }
+
+    /// Wrap `payload` in `ESC[200~ … ESC[201~` when the shell has
+    /// DECSET 2004 active and hand it to the input callback. Shared by
+    /// `⌘V` (text + image paths) and middle-click PRIMARY paste so the
+    /// three paste paths can't drift apart on bracketing or write
+    /// routing.
+    @MainActor
+    private func sendBracketedPaste(_ payload: Data) {
+        var bytes = payload
         if bracketedPasteEnabled() {
             // ESC [ 2 0 0 ~ … ESC [ 2 0 1 ~
             var wrapped = Data([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e])
-            wrapped.append(payload)
+            wrapped.append(bytes)
             wrapped.append(contentsOf: [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e])
-            payload = wrapped
+            bytes = wrapped
         }
-        onKey?(payload)
+        onKey?(bytes)
     }
 
     /// Walk the latest render-state snapshot and concatenate the
