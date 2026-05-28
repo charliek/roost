@@ -404,9 +404,16 @@ impl Terminal {
     /// representation in the requested space (e.g. asking for
     /// `Viewport` coordinates for a row currently outside the visible
     /// viewport).
+    ///
+    /// The `gref` must have been obtained from this same terminal via
+    /// [`Self::grid_ref`] and must not have been invalidated by an
+    /// intervening mutating terminal call (per libghostty's transience
+    /// contract documented on [`GridRef`]).
     pub fn point_from_grid_ref(&self, gref: &GridRef, tag: PointTag) -> Option<Point> {
         let mut out = sys::GhosttyPointCoordinate::default();
-        // SAFETY: handle non-null; gref and out are caller-owned.
+        // SAFETY: handle non-null; gref came from this terminal's
+        // grid_ref (per the docstring contract above); out is a
+        // stack-owned local for libghostty to populate.
         let rc = unsafe {
             sys::ghostty_terminal_point_from_grid_ref(self.handle, &gref.0, tag.to_sys(), &mut out)
         };
