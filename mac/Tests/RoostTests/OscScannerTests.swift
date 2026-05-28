@@ -235,15 +235,17 @@ func malformed_st_recovers_following_osc() {
 
 @Test
 func body_truncates_at_max() {
-    // 10KB body should truncate at maxBody (8192 bytes). The Swift
-    // scanner's maxBody is file-private, so we assert against the
-    // documented value (8192).
+    // Body well above maxBody should truncate, but the title event
+    // still emits (truncated titles are benign). `maxBody` was raised
+    // from 8 KiB to 1 MiB as part of the OSC 52 fixup PR — the value
+    // is file-private, but we know it's 1 MiB.
+    let cap = 1024 * 1024
     let prefix: [UInt8] = [0x1B, 0x5D, 0x30, 0x3B]  // ESC ] 0 ;
-    let payload = prefix + Array(repeating: UInt8(ascii: "A"), count: 10_000) + [0x07]
+    let payload = prefix + Array(repeating: UInt8(ascii: "A"), count: cap + 512) + [0x07]
     let events = feedAll(payload)
     #expect(events.count == 1)
     if case .title(let t) = events[0] {
-        #expect(t.utf8.count == 8192)
+        #expect(t.utf8.count == cap)
     } else {
         Issue.record("expected .title event")
     }
