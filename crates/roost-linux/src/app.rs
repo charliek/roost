@@ -32,7 +32,7 @@ use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
-use crate::config::RoostConfig;
+use crate::config::{CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
@@ -169,6 +169,11 @@ pub struct App {
     /// to that baseline. Applied to every TerminalView via
     /// `apply_font_size_to_all`.
     current_font_size_pt: RefCell<f64>,
+    /// `copy-on-select` from `~/.config/roost/config.conf` (default
+    /// `True`). `RefCell` so a future config-reload path can update it
+    /// without rebuilding the App; new tabs read the current value
+    /// when constructed.
+    copy_on_select: RefCell<CopyOnSelect>,
     /// Tab ids whose close was triggered by the daemon (the user
     /// typed `exit`, or a CLI `tab close`, or another client's
     /// CloseTab RPC). The connect_close_page handler installed on
@@ -533,6 +538,7 @@ impl App {
             font_family: cfg.font_family.clone(),
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
+            copy_on_select: RefCell::new(cfg.copy_on_select),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
@@ -1547,10 +1553,11 @@ impl App {
         // tab opened after the user has zoomed in matches the
         // existing tabs, rather than snapping back to the config
         // baseline.
-        let terminal = Rc::new(TerminalView::with_theme_and_font(
+        let terminal = Rc::new(TerminalView::with_theme_font_and_copy(
             self.theme.borrow().clone(),
             self.font_family.as_deref(),
             Some(*self.current_font_size_pt.borrow()),
+            *self.copy_on_select.borrow(),
         ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
         let Some(client_for_session) = self.client.borrow().clone() else {

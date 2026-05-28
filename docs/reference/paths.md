@@ -58,17 +58,18 @@ Pre-rewrite builds stored their state under lowercase `~/Library/Application Sup
 
 ## Config keys
 
-`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored. Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list.
+`config.conf` is a tiny `key = value` file (no sections, no nesting). Lines starting with `#` are comments. Missing file → built-in defaults; unknown keys are ignored. Keybindings use Ghostty's `keybind = trigger=action` syntax — see [Keybindings](../getting-started/keybindings.md#custom-keybindings) for the full action list. The full reference (including the `copy-on-select` semantics) lives in [`config.md`](config.md).
 
 Keys use Ghostty-style hyphens (`font-family`, not `font_family`); a misspelled key is silently ignored.
 
-| Key           | Default                              | Effect                                                 |
-|---------------|--------------------------------------|--------------------------------------------------------|
-| `font-family` | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
-| `font-size`   | `12`                                 | Points.                                                |
-| `theme`       | `roost-dark`                         | Bundled color theme name. See [Themes](themes.md).     |
-| `keybind`     | (built-in defaults; see Keybindings) | Repeatable. `<trigger> = <action>`; later lines override. |
-| `command`     | (none)                               | Repeatable. A command-launcher entry (`Cmd/Alt+Shift+T`). See [Command launcher](#command-launcher) below. |
+| Key              | Default                              | Effect                                                 |
+|------------------|--------------------------------------|--------------------------------------------------------|
+| `font-family`    | `JetBrains Mono, Monaco, monospace`  | Comma-separated list. The first installed family wins. |
+| `font-size`      | `12`                                 | Points.                                                |
+| `theme`          | `roost-dark`                         | Bundled color theme name. See [Themes](themes.md).     |
+| `keybind`        | (built-in defaults; see Keybindings) | Repeatable. `<trigger> = <action>`; later lines override. |
+| `command`        | (none)                               | Repeatable. A command-launcher entry (`Cmd/Alt+Shift+T`). See [Command launcher](#command-launcher) below. |
+| `copy-on-select` | `true`                               | `off` / `true` / `clipboard`. Controls what a mouse-drag selection writes on release. See [`config.md`](config.md#copy-on-select) for per-platform behavior. |
 
 Tab-strip pill widths (`tab-min-width` / `tab-max-width`, macOS) are documented in [Tab Strip](tab-strip.md#config-keys).
 

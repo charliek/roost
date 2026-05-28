@@ -93,7 +93,8 @@ final class TabSession {
         cols: UInt16 = 80,
         rows: UInt16 = 24,
         theme: Theme = .fallback,
-        font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+        copyOnSelect: CopyOnSelect = .default
     ) {
         self.projectID = projectID
         self.initialCols = cols
@@ -104,7 +105,8 @@ final class TabSession {
             cols: cols,
             rows: rows,
             theme: theme,
-            font: font
+            font: font,
+            copyOnSelect: copyOnSelect
         )
     }
 

@@ -23,6 +23,45 @@ pub struct RoostConfig {
     /// order (= picker row order). A line missing `label`/`run` is
     /// skipped (see `custom_command::parse_command_line`).
     pub commands: Vec<CustomCommand>,
+    /// `copy-on-select` setting — controls what happens to a
+    /// mouse-drag selection on release. Three states match Ghostty's
+    /// vocabulary. Defaults to `True` on both platforms.
+    pub copy_on_select: CopyOnSelect,
+}
+
+/// Three-state `copy-on-select` config value matching Ghostty's
+/// `Off | True | Clipboard` semantics.
+///
+/// * `Off` — never auto-copy; the user must press the explicit copy
+///   shortcut (`⌘C` / Ctrl+Shift+C).
+/// * `True` (default) — write the selection to the "selection
+///   clipboard": PRIMARY on Linux, a named per-app `NSPasteboard` on
+///   Mac. Middle-click pastes from that target. The system clipboard
+///   (`⌘V` / Ctrl+Shift+V) is **not** touched.
+/// * `Clipboard` — write the selection to both the selection
+///   clipboard and the system clipboard. Drag-and-paste-into-another-
+///   app works without an explicit copy step.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOnSelect {
+    Off,
+    #[default]
+    True,
+    Clipboard,
+}
+
+impl CopyOnSelect {
+    /// Parse a config value. Accepts the Ghostty-compatible spellings
+    /// (`off | false | no` → Off, `true | yes` → True,
+    /// `clipboard | both` → Clipboard); any other value returns `None`
+    /// so the caller can fall back to the default and log.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "no" => Some(Self::Off),
+            "true" | "yes" => Some(Self::True),
+            "clipboard" | "both" => Some(Self::Clipboard),
+            _ => None,
+        }
+    }
 }
 
 impl RoostConfig {
@@ -69,6 +108,16 @@ impl RoostConfig {
                     if let Some((trigger, action)) = value.split_once('=') {
                         cfg.keybinds
                             .push((trigger.trim().to_string(), action.trim().to_string()));
+                    }
+                }
+                "copy-on-select" => {
+                    if let Some(v) = CopyOnSelect::parse(value) {
+                        cfg.copy_on_select = v;
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown copy-on-select value; falling back to default `true`"
+                        );
                     }
                 }
                 "command" => {
@@ -159,6 +208,42 @@ mod tests {
         assert_eq!(cfg.commands[0].run, "claude --resume");
         assert_eq!(cfg.commands[1].label, "Build");
         assert!(cfg.commands[1].hold);
+    }
+
+    #[test]
+    fn copy_on_select_defaults_to_true() {
+        let cfg = RoostConfig::parse("");
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::True);
+    }
+
+    #[test]
+    fn copy_on_select_accepts_all_three_states() {
+        assert_eq!(
+            RoostConfig::parse("copy-on-select = off").copy_on_select,
+            CopyOnSelect::Off
+        );
+        assert_eq!(
+            RoostConfig::parse("copy-on-select = false").copy_on_select,
+            CopyOnSelect::Off
+        );
+        assert_eq!(
+            RoostConfig::parse("copy-on-select = true").copy_on_select,
+            CopyOnSelect::True
+        );
+        assert_eq!(
+            RoostConfig::parse("copy-on-select = clipboard").copy_on_select,
+            CopyOnSelect::Clipboard
+        );
+        assert_eq!(
+            RoostConfig::parse("copy-on-select = both").copy_on_select,
+            CopyOnSelect::Clipboard
+        );
+    }
+
+    #[test]
+    fn copy_on_select_unknown_value_keeps_default() {
+        let cfg = RoostConfig::parse("copy-on-select = pancakes");
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::True);
     }
 
     #[test]

@@ -21,6 +21,39 @@ import Foundation
 /// lines in the order they appear — `canonicalizeBindings`
 /// applies them in order so later lines override earlier ones,
 /// matching the Go binary's semantics.
+/// Three-state `copy-on-select` config value matching Ghostty's
+/// `off | true | clipboard` semantics. Mirrors
+/// `crates/roost-linux/src/config.rs::CopyOnSelect` 1:1.
+///
+/// * `.off` — never auto-copy; the user must press the explicit copy
+///   shortcut (`⌘C` on Mac, Ctrl+Shift+C on Linux).
+/// * `.on` (default) — write the selection to the "selection
+///   clipboard": a named per-app `NSPasteboard` on Mac (`PRIMARY` on
+///   Linux). Middle-click pastes from that target. The system
+///   clipboard (`⌘V` / Ctrl+Shift+V) is **not** touched.
+/// * `.clipboard` — write to both the selection clipboard and the
+///   system clipboard. Drag-and-paste-into-another-app works
+///   without an explicit copy step.
+enum CopyOnSelect: Sendable {
+    case off
+    case on
+    case clipboard
+
+    static let `default`: CopyOnSelect = .on
+
+    /// Parse a config value. Accepts the Ghostty-compatible
+    /// spellings; any other value returns `nil` so the caller can
+    /// fall back to the default and log.
+    static func parse(_ s: String) -> CopyOnSelect? {
+        switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "off", "false", "no": return .off
+        case "true", "yes": return .on
+        case "clipboard", "both": return .clipboard
+        default: return nil
+        }
+    }
+}
+
 struct RoostConfig: Sendable {
     var themeName: String?
     var fontFamily: String?
@@ -37,6 +70,10 @@ struct RoostConfig: Sendable {
     /// order (= picker row order). A line missing `label`/`run` is
     /// skipped (see `parseCommandLine`).
     var commands: [CustomCommand] = []
+    /// `copy-on-select` setting — controls what mouse-drag selections
+    /// write to the clipboard on release. Defaults to `.on` (matches
+    /// Ghostty's default on macOS).
+    var copyOnSelect: CopyOnSelect = .default
 
     static let empty = RoostConfig(
         themeName: nil,
@@ -45,7 +82,8 @@ struct RoostConfig: Sendable {
         tabMinWidth: nil,
         tabMaxWidth: nil,
         keybinds: [],
-        commands: []
+        commands: [],
+        copyOnSelect: .default
     )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
@@ -163,6 +201,15 @@ func parse(_ text: String) -> RoostConfig {
                 if !t.isEmpty && !a.isEmpty {
                     cfg.keybinds.append(Keybind(trigger: t, action: a))
                 }
+            }
+        case "copy-on-select":
+            if let v = CopyOnSelect.parse(value) {
+                cfg.copyOnSelect = v
+            } else {
+                NSLog(
+                    "roost-mac: unknown copy-on-select value '%@'; keeping default 'true'",
+                    value
+                )
             }
         case "command":
             // Launcher entry: `command = label="…" run="…" …`. Parse
