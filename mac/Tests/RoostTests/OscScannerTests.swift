@@ -346,9 +346,32 @@ func osc52_empty_payload_dropped() {
 }
 
 @Test
-func osc52_unknown_selector_falls_back_to_system() {
-    let payload = "\u{1b}]52;q;\(b64("padded"))\u{07}"
-    #expect(feedAll(payload) == [.clipboard(target: .system, text: "padded")])
+func osc52_multi_char_selector_dropped() {
+    // OSC 52's selector is at most one character; `cp` is malformed
+    // per the spec. PR #154 originally coalesced this to system; the
+    // fixup PR tightened to drop, matching Ghostty's exact-match parser.
+    let payload = "\u{1b}]52;cp;\(b64("ignored"))\u{07}"
+    #expect(feedAll(payload) == [])
+}
+
+@Test
+func osc52_lone_unknown_selector_dropped() {
+    // Single-char unknown selectors (e.g. `q`) also drop — no `q`
+    // selector in the spec, and silently coalescing to system masks
+    // emitter bugs.
+    let payload = "\u{1b}]52;q;\(b64("ignored"))\u{07}"
+    #expect(feedAll(payload) == [])
+}
+
+@Test
+func osc52_truncated_body_drops_event() {
+    // A truncated OSC 52 body must NOT emit — partial base64 would
+    // silently write the wrong text to the clipboard. Pump enough
+    // bytes past `maxBody` to flip the truncation flag.
+    var payload: [UInt8] = [0x1B, 0x5D, 0x35, 0x32, 0x3B, 0x63, 0x3B]
+    payload.append(contentsOf: Array(repeating: UInt8(ascii: "A"), count: 1024 * 1024 + 512))
+    payload.append(0x07)
+    #expect(feedAll(payload) == [])
 }
 
 @Test

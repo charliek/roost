@@ -22,9 +22,12 @@
 //!     out of the slice. State persists across `feed` calls —
 //!     sequences split across multiple PTY reads scan correctly.
 //!
-//!   * Bodies longer than `MAX_BODY` (8192 bytes) are truncated
-//!     rather than buffered indefinitely. A misbehaving program
-//!     shouldn't be able to OOM the daemon.
+//!   * Bodies longer than `MAX_BODY` (1 MiB) are truncated rather
+//!     than buffered indefinitely. A misbehaving program shouldn't
+//!     be able to OOM the scanner. OSC 52 specifically refuses to
+//!     emit on a truncated body — a partial base64 decode would
+//!     silently write the wrong (truncated) text to the user's
+//!     clipboard.
 //!
 //! Out of scope (deliberately):
 //!
@@ -46,8 +49,13 @@
 use std::str;
 
 /// Maximum number of body bytes the scanner will buffer before
-/// truncating. 8KB matches the Go binary's `maxBody`.
-const MAX_BODY: usize = 8192;
+/// truncating. 1 MiB accommodates realistic OSC 52 clipboard
+/// payloads (file lists, stack traces) while still bounding the
+/// scanner against a malicious program holding the parser open.
+/// The Go binary's pre-rewrite scanner used 8 KiB, which silently
+/// truncated OSC 52 payloads — see `body_truncated` for how oversize
+/// payloads are handled now.
+const MAX_BODY: usize = 1024 * 1024;
 
 /// One parsed-out OSC event. Returned in order by `OscScanner::feed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +145,12 @@ pub struct OscScanner {
     /// `mac/Sources/Roost/OscScanner.swift` (merged from
     /// feature/rust-port `aebd408`).
     body: Vec<u8>,
+    /// `true` if the current OSC body grew past `MAX_BODY` and the
+    /// trailing bytes were dropped. OSC 52 dispatch checks this and
+    /// refuses to emit on a truncated body — a partial base64 decode
+    /// would otherwise silently write the wrong (or partial) text to
+    /// the user's clipboard. Reset on each new OSC.
+    body_truncated: bool,
     pending: Vec<OscEvent>,
 }
 
@@ -152,6 +166,7 @@ impl OscScanner {
             state: State::Outside,
             num: String::new(),
             body: Vec::new(),
+            body_truncated: false,
             pending: Vec::new(),
         }
     }
@@ -179,6 +194,7 @@ impl OscScanner {
                     self.state = State::Prefix;
                     self.num.clear();
                     self.body.clear();
+                    self.body_truncated = false;
                 }
                 0x1B => {
                     // ESC ESC: stay in Esc.
@@ -209,6 +225,8 @@ impl OscScanner {
                 _ => {
                     if self.body.len() < MAX_BODY {
                         self.body.push(b);
+                    } else {
+                        self.body_truncated = true;
                     }
                 }
             },
@@ -295,9 +313,16 @@ impl OscScanner {
                 // Program-initiated clipboard write. Body: `Ps;Pc` —
                 // selector + base64. Read requests (`Pc == "?"`) are
                 // dropped silently (phase 1 is write-only). Invalid
-                // base64 or non-UTF-8 payloads are dropped silently,
-                // matching Ghostty's behavior (Surface.zig "ignore
-                // this, valid data can also produce this error").
+                // base64 or non-UTF-8 payloads are dropped silently.
+                //
+                // Truncated bodies are dropped *entirely* rather than
+                // partial-decoded — a partial base64 of "hello world"
+                // would otherwise silently write a wrong (shorter)
+                // string to the user's clipboard. Better to lose the
+                // write than to corrupt the clipboard.
+                if self.body_truncated {
+                    return;
+                }
                 if let Some(event) = parse_osc52(body) {
                     self.pending.push(event);
                 }
@@ -344,45 +369,50 @@ fn is_conemu_body(body: &str) -> bool {
 }
 
 /// Decode an OSC 52 body of the form `Ps;Pc` into a
-/// [`OscEvent::Clipboard`]. Returns `None` for any case the consumer
-/// shouldn't see: read requests (`Pc == "?"`), invalid base64,
-/// non-UTF-8 decoded payloads, or empty payloads. Selector parsing
-/// is permissive: any `c` in `Ps` → `System`, any `p` or `s` (and
-/// only those) → `Selection`; an empty selector defaults to `System`
-/// (the bare `OSC 52 ; ;<payload>` form some emitters use).
+/// [`OscEvent::Clipboard`]. Returns `None` for read requests
+/// (`Pc == "?"`), invalid base64, non-UTF-8 decoded payloads, empty
+/// payloads, or unrecognized selectors.
+///
+/// Selector matching is **exact**, matching Ghostty's parser: an
+/// empty selector or `"c"` → `System`; `"p"` or `"s"` →
+/// `Selection`. Multi-character selectors (e.g. `"cp"`) are
+/// malformed under the OSC 52 spec and are dropped rather than
+/// coalesced. PR #154 used permissive `contains('c')` matching; the
+/// new exact-match form aligns with Ghostty and rejects the small
+/// class of garbage emitters that send `cp` or similar nonsense.
 fn parse_osc52(body: &str) -> Option<OscEvent> {
     let (ps, pc) = body.split_once(';')?;
     if pc == "?" {
-        // Read request — deferred to phase 2 (needs consent UI).
-        return None;
+        return None; // Read request — not supported in phase 1.
     }
-    let target = if ps.is_empty() || ps.contains('c') {
-        ClipboardTarget::System
-    } else if ps.contains('p') || ps.contains('s') {
-        ClipboardTarget::Selection
-    } else {
-        // Unknown selector — coalesce to system, matches Ghostty's
-        // permissive handling. Prevents silent drops on selectors a
-        // future spec adds.
-        ClipboardTarget::System
+    let target = match ps {
+        "" | "c" => ClipboardTarget::System,
+        "p" | "s" => ClipboardTarget::Selection,
+        _ => return None,
     };
     let bytes = decode_osc52_base64(pc)?;
     let text = String::from_utf8(bytes).ok()?;
     if text.is_empty() {
+        // Deliberate divergence from Ghostty, which interprets an
+        // empty payload as "clear the clipboard". Roost drops it —
+        // a remote process clearing the user's clipboard is a
+        // hostile operation that no realistic emitter does on
+        // purpose, and the cost of declining it is zero.
         return None;
     }
     Some(OscEvent::Clipboard { target, text })
 }
 
-/// Decode the base64 payload from an OSC 52 body. Strips any embedded
+/// Decode the base64 payload from an OSC 52 body. Strips ASCII
 /// whitespace first — some emitters wrap long base64 over multiple
-/// lines, which the standard alphabet decoder otherwise rejects. Maps
-/// the standard alphabet (`+`/`/`) and ignores padding mismatches the
-/// same way Ghostty does (`Surface.zig:2186` — "ignore this, valid data
-/// can produce this error").
+/// lines, which the standard-alphabet decoder otherwise rejects.
+/// `STANDARD.decode` is strict on padding; the realistic emitters
+/// (opencode, nvim, tmux, kitten) all produce padded base64 so this
+/// hasn't been a problem in practice. If we ever need padding
+/// tolerance, swap to a `GeneralPurpose` engine with
+/// `DecodePaddingMode::Indifferent`.
 fn decode_osc52_base64(pc: &str) -> Option<Vec<u8>> {
     use base64::engine::{general_purpose::STANDARD, Engine as _};
-    // base64 0.22 doesn't strip whitespace inline; pre-clean.
     let cleaned: String = pc.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     STANDARD.decode(cleaned.as_bytes()).ok()
 }
@@ -794,10 +824,12 @@ mod tests {
 
     #[test]
     fn body_truncates_at_max() {
-        // A 10KB body should truncate at MAX_BODY (8KB).
-        let mut payload = Vec::with_capacity(20_000);
+        // A body well above MAX_BODY should truncate, but the title
+        // event still emits (truncated titles are benign — a partial
+        // window title is fine; the alternative is no title at all).
+        let mut payload = Vec::with_capacity(MAX_BODY + 1024);
         payload.extend_from_slice(b"\x1b]0;");
-        payload.extend(std::iter::repeat(b'A').take(10_000));
+        payload.extend(std::iter::repeat(b'A').take(MAX_BODY + 512));
         payload.push(0x07);
         let events = feed_all(&payload);
         assert_eq!(events.len(), 1);
@@ -806,6 +838,42 @@ mod tests {
         } else {
             panic!("expected Title event");
         }
+    }
+
+    #[test]
+    fn osc52_truncated_body_drops_event() {
+        // A truncated OSC 52 body must NOT emit — a partial base64
+        // decode would silently write the wrong text to the user's
+        // clipboard. Construct a body whose total size exceeds
+        // MAX_BODY so the scanner buffers a prefix and flips
+        // `body_truncated`.
+        let mut payload = Vec::with_capacity(MAX_BODY + 1024);
+        payload.extend_from_slice(b"\x1b]52;c;");
+        // The base64 doesn't matter — it'll be truncated before the
+        // BEL terminator. Just pump enough bytes past the cap.
+        payload.extend(std::iter::repeat(b'A').take(MAX_BODY + 512));
+        payload.push(0x07);
+        let events = feed_all(&payload);
+        assert_eq!(events, Vec::<OscEvent>::new());
+    }
+
+    #[test]
+    fn osc52_multi_char_selector_dropped() {
+        // Per OSC 52 spec, the selector is at most one character.
+        // PR #154 originally coalesced `cp` to System; we now drop
+        // it to match Ghostty's exact-match parser.
+        let payload = format!("\x1b]52;cp;{}\x07", b64("ignored"));
+        assert_eq!(feed_all(payload.as_bytes()), Vec::<OscEvent>::new());
+    }
+
+    #[test]
+    fn osc52_lone_unknown_selector_dropped() {
+        // Single-char unknown selectors (e.g. `q`) should also drop
+        // under the exact-match scheme — there's no `q` selector in
+        // the spec, and silently coalescing to System masks bugs in
+        // emitters.
+        let payload = format!("\x1b]52;q;{}\x07", b64("ignored"));
+        assert_eq!(feed_all(payload.as_bytes()), Vec::<OscEvent>::new());
     }
 
     #[test]
@@ -932,20 +1000,9 @@ mod tests {
         assert_eq!(events, Vec::<OscEvent>::new());
     }
 
-    #[test]
-    fn osc52_unknown_selector_falls_back_to_system() {
-        // Emitter pads the selector with extra letters — Ghostty
-        // tolerates this. We coalesce to System rather than dropping.
-        let payload = format!("\x1b]52;q;{}\x07", b64("padded"));
-        let events = feed_all(payload.as_bytes());
-        assert_eq!(
-            events,
-            vec![OscEvent::Clipboard {
-                target: ClipboardTarget::System,
-                text: "padded".into(),
-            }]
-        );
-    }
+    // (osc52_unknown_selector_falls_back_to_system was replaced by
+    // `osc52_lone_unknown_selector_dropped` + `osc52_multi_char_selector_dropped`
+    // when the fixup PR tightened selector parsing to exact-match.)
 
     #[test]
     fn osc52_st_terminator_works() {

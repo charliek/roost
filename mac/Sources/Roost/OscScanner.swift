@@ -24,7 +24,11 @@
 
 import Foundation
 
-private let maxBody = 8192
+/// Maximum number of body bytes the scanner buffers before
+/// truncating. 1 MiB accommodates realistic OSC 52 clipboard payloads
+/// while still bounding the scanner against a misbehaving emitter.
+/// Mirrors `crates/roost-osc/src/lib.rs::MAX_BODY` 1:1.
+private let maxBody = 1024 * 1024
 
 /// One parsed-out OSC event. Returned in order by
 /// `OscScanner.feed`.
@@ -118,6 +122,12 @@ final class OscScanner {
     /// decode happens at dispatch time when we hand a String to
     /// downstream consumers.
     private var bodyBytes: [UInt8] = []
+    /// `true` if the current OSC body grew past `maxBody` and the
+    /// trailing bytes were dropped. OSC 52 dispatch refuses to emit
+    /// when this is set — a partial base64 decode would silently
+    /// write the wrong text to the user's clipboard. Reset on each
+    /// new OSC. Mirrors the Rust scanner's `body_truncated`.
+    private var bodyTruncated: Bool = false
     private var pending: [OscEvent] = []
 
     /// Feed a slice of PTY bytes. Returns OSC events parsed out
@@ -145,6 +155,7 @@ final class OscScanner {
                 state = .prefix
                 num.removeAll(keepingCapacity: true)
                 bodyBytes.removeAll(keepingCapacity: true)
+                bodyTruncated = false
             } else if b == 0x1B {
                 // ESC ESC: stay in esc.
             } else {
@@ -178,6 +189,8 @@ final class OscScanner {
             default:
                 if bodyBytes.count < maxBody {
                     bodyBytes.append(b)
+                } else {
+                    bodyTruncated = true
                 }
             }
         case .bodyEsc:
@@ -234,6 +247,12 @@ final class OscScanner {
             // (selector + base64). Read requests (`Pc == "?"`) drop —
             // phase 1 is write-only. Invalid base64 / non-UTF-8 also
             // drop silently, matching the Rust scanner + Ghostty.
+            //
+            // Truncated bodies drop entirely: a partial base64 of
+            // "hello world" would silently write a shorter wrong
+            // string to the user's clipboard. Better to lose the
+            // write than corrupt the clipboard.
+            if bodyTruncated { return }
             if let event = parseOsc52(body) {
                 pending.append(event)
             }
@@ -266,23 +285,25 @@ private func isConEmuBody(_ body: String) -> Bool {
 
 /// Decode an OSC 7 body of the form `file://[host]/path` into the
 /// Decode an OSC 52 body of the form `Ps;Pc` into a `.clipboard`
-/// event. Returns nil for read requests (`Pc == "?"`, deferred to
-/// phase 2), invalid base64, non-UTF-8 payloads, or empty payloads.
-/// Selector mapping mirrors `crates/roost-osc/src/lib.rs::parse_osc52`:
-/// any `c` → system; `p` / `s` → selection; unknown / empty selectors
-/// default to system.
+/// event. Returns nil for read requests (`Pc == "?"`), invalid
+/// base64, non-UTF-8 payloads, empty payloads, or unrecognized
+/// selectors. Mirrors `crates/roost-osc/src/lib.rs::parse_osc52` 1:1.
+///
+/// Selector matching is **exact**: empty or `"c"` → system;
+/// `"p"` or `"s"` → selection. Multi-character selectors (`"cp"`)
+/// and unknown single-character selectors are dropped, matching
+/// Ghostty's parser. PR #154 originally coalesced unknown selectors
+/// to system; this is the tightened form.
 private func parseOsc52(_ body: String) -> OscEvent? {
     guard let semi = body.firstIndex(of: ";") else { return nil }
     let ps = String(body[..<semi])
     let pc = String(body[body.index(after: semi)...])
-    if pc == "?" { return nil }  // read request — phase 2.
+    if pc == "?" { return nil }
     let target: OscClipboardTarget
-    if ps.isEmpty || ps.contains("c") {
-        target = .system
-    } else if ps.contains("p") || ps.contains("s") {
-        target = .selection
-    } else {
-        target = .system  // unknown selector — coalesce to system.
+    switch ps {
+    case "", "c": target = .system
+    case "p", "s": target = .selection
+    default: return nil
     }
     // Some emitters wrap long base64 over multiple lines; strip
     // whitespace before decoding (`Data(base64Encoded:)` would
@@ -290,6 +311,10 @@ private func parseOsc52(_ body: String) -> OscEvent? {
     let cleaned = pc.filter { !$0.isWhitespace }
     guard let data = Data(base64Encoded: cleaned) else { return nil }
     guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+        // Empty payload is a deliberate divergence from Ghostty
+        // (which treats it as "clear the clipboard"). Roost drops
+        // it — remote clearing is hostile and no real emitter does
+        // it on purpose.
         return nil
     }
     return .clipboard(target: target, text: text)
