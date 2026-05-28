@@ -1080,6 +1080,7 @@ dependencies = [
  "bitflags 2.11.1",
  "fs2",
  "futures",
+ "gdk-pixbuf",
  "glib",
  "gtk4",
  "libadwaita",
