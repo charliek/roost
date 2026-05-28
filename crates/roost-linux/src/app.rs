@@ -1753,38 +1753,53 @@ impl App {
                                 // FIFO-ordered with other writes
                                 // *once enqueued* — not with PTY
                                 // output that hasn't been drained yet.
-                                // **Limitation:** if the app later
-                                // changes the bg via `OSC 11;rgb:…`,
-                                // libghostty tracks it internally but
-                                // the scanner drops the set-color
-                                // body, so subsequent queries reply
-                                // with the static theme color. Real
-                                // for vim plugins that retheme on
-                                // colorscheme change; not for codex,
-                                // which only queries. Follow-up to
-                                // read libghostty's current colors via
-                                // `terminal.colors()` instead.
+                                // Reads libghostty's *currently
+                                // effective* colors so a prior
+                                // `OSC 10/11/12;rgb:…` set is
+                                // reflected in the next query reply
+                                // (vim colorscheme plugins etc.).
                                 // Reference: legacy
-                                // `internal/osc/scanner.go:280-300`,
-                                // memory note
-                                // `codex-gray-bg-osc11-fix`.
+                                // `internal/osc/scanner.go:280-300`.
                                 if let roost_osc::OscEvent::ColorQuery(n) = event {
-                                    let theme = app_for_osc.theme.borrow();
-                                    let color = match n {
-                                        10 => theme.foreground,
-                                        11 => theme.background,
-                                        12 => theme.cursor,
-                                        _ => {
-                                            drop(theme);
-                                            continue;
+                                    let color = match terminal_for_drain.live_colors() {
+                                        Ok(c) => match n {
+                                            10 => Some(c.foreground),
+                                            11 => Some(c.background),
+                                            // Cursor may be unset; fall
+                                            // back to the theme.
+                                            12 => c.cursor.or_else(|| {
+                                                Some(app_for_osc.theme.borrow().cursor)
+                                            }),
+                                            _ => None,
+                                        },
+                                        // Libghostty isn't reporting a
+                                        // default color yet (theme push
+                                        // hasn't landed, or FFI hiccup);
+                                        // the theme is what we last
+                                        // asked the terminal to render
+                                        // with, so it's the right
+                                        // fallback.
+                                        Err(err) => {
+                                            tracing::debug!(
+                                                ?err,
+                                                "live_colors failed; falling back to theme"
+                                            );
+                                            let theme = app_for_osc.theme.borrow();
+                                            match n {
+                                                10 => Some(theme.foreground),
+                                                11 => Some(theme.background),
+                                                12 => Some(theme.cursor),
+                                                _ => None,
+                                            }
                                         }
                                     };
-                                    drop(theme);
-                                    if let Some(reply) = roost_osc::format_color_query_response(
-                                        n,
-                                        (color.r, color.g, color.b),
-                                    ) {
-                                        session_for_replies.send_input(reply);
+                                    if let Some(color) = color {
+                                        if let Some(reply) = roost_osc::format_color_query_response(
+                                            n,
+                                            (color.r, color.g, color.b),
+                                        ) {
+                                            session_for_replies.send_input(reply);
+                                        }
                                     }
                                     continue;
                                 }
