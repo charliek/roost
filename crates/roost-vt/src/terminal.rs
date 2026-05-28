@@ -60,6 +60,100 @@ pub enum ActiveScreen {
     Alternate,
 }
 
+/// Which coordinate space a [`Point`] is interpreted in. Mirrors
+/// `GhosttyPointTag` 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointTag {
+    /// Active region — where the cursor can move. 0 = top of the
+    /// active region; scrollback rows are not addressable.
+    Active,
+    /// Visible viewport. 0 = top of what's currently on screen;
+    /// changes as the user scrolls.
+    Viewport,
+    /// Full screen including scrollback. 0 = top of scrollback. Rows
+    /// here are stable as long as the row has not aged out of the
+    /// scrollback buffer, which makes this the recommended coordinate
+    /// space for storing long-lived selection endpoints.
+    Screen,
+    /// Scrollback history only — the area above the active region.
+    /// 0 = top of scrollback.
+    History,
+}
+
+#[cfg(feature = "ffi")]
+impl PointTag {
+    fn to_sys(self) -> sys::GhosttyPointTag {
+        match self {
+            PointTag::Active => sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+            PointTag::Viewport => sys::GhosttyPointTag_GHOSTTY_POINT_TAG_VIEWPORT,
+            PointTag::Screen => sys::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
+            PointTag::History => sys::GhosttyPointTag_GHOSTTY_POINT_TAG_HISTORY,
+        }
+    }
+}
+
+/// A grid coordinate interpreted under a specific [`PointTag`].
+/// `y` is `u32` because `PointTag::Screen` indices grow with scrollback
+/// and can exceed `u16` for long-running sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Point {
+    pub tag: PointTag,
+    pub x: u16,
+    pub y: u32,
+}
+
+impl Point {
+    pub fn active(x: u16, y: u32) -> Self {
+        Self {
+            tag: PointTag::Active,
+            x,
+            y,
+        }
+    }
+    pub fn viewport(x: u16, y: u32) -> Self {
+        Self {
+            tag: PointTag::Viewport,
+            x,
+            y,
+        }
+    }
+    pub fn screen(x: u16, y: u32) -> Self {
+        Self {
+            tag: PointTag::Screen,
+            x,
+            y,
+        }
+    }
+    pub fn history(x: u16, y: u32) -> Self {
+        Self {
+            tag: PointTag::History,
+            x,
+            y,
+        }
+    }
+}
+
+/// Opaque reference to a position in the terminal's internal page
+/// structure, obtained via [`Terminal::grid_ref`].
+///
+/// # Transience
+///
+/// **A `GridRef` is only valid until the next update to the terminal
+/// it was taken from.** Any `vt_write`, `resize`, `reset`, or other
+/// mutating call may invalidate it. Per libghostty's C documentation,
+/// "there is no guarantee that a grid reference will remain valid
+/// after ANY operation, even if a seemingly unrelated part of the grid
+/// is changed."
+///
+/// For long-lived position tracking (e.g. selection state), do not
+/// store `GridRef` directly. Convert to a [`Point`] with
+/// [`PointTag::Screen`] via [`Terminal::convert_point`] and store
+/// that — screen coordinates remain stable until the row ages out of
+/// scrollback.
+#[cfg(feature = "ffi")]
+#[derive(Debug, Clone, Copy)]
+pub struct GridRef(sys::GhosttyGridRef);
+
 pub struct Terminal {
     handle: sys::GhosttyTerminal,
     /// `!Sync` marker — libghostty-vt is single-threaded. Using
@@ -268,6 +362,74 @@ impl Terminal {
             )
         };
         Error::from_result(rc)
+    }
+
+    /// Capture a transient [`GridRef`] for the position described by
+    /// `point`. Returns `None` if libghostty rejects the point
+    /// (out-of-range coordinates, no such row in the requested
+    /// coordinate space).
+    ///
+    /// The returned `GridRef` is only valid until the next mutating
+    /// terminal call. Prefer [`Self::convert_point`] for selection
+    /// logic that needs a stable handle.
+    pub fn grid_ref(&self, point: Point) -> Option<GridRef> {
+        let c_point = sys::GhosttyPoint {
+            tag: point.tag.to_sys(),
+            value: sys::GhosttyPointValue {
+                coordinate: sys::GhosttyPointCoordinate {
+                    x: point.x,
+                    y: point.y,
+                },
+            },
+        };
+        let mut out = sys::GhosttyGridRef {
+            size: std::mem::size_of::<sys::GhosttyGridRef>(),
+            node: std::ptr::null_mut(),
+            x: 0,
+            y: 0,
+        };
+        // SAFETY: handle non-null (constructor enforces); `c_point` and
+        // `out` are stack-owned for the call.
+        let rc = unsafe { sys::ghostty_terminal_grid_ref(self.handle, c_point, &mut out) };
+        Error::from_result(rc).ok()?;
+        if out.node.is_null() {
+            return None;
+        }
+        Some(GridRef(out))
+    }
+
+    /// Resolve a [`GridRef`] back to a [`Point`] in the requested
+    /// coordinate space. Returns `None` if the ref is invalid (e.g.
+    /// the underlying row has been freed) or if the row has no
+    /// representation in the requested space (e.g. asking for
+    /// `Viewport` coordinates for a row currently outside the visible
+    /// viewport).
+    pub fn point_from_grid_ref(&self, gref: &GridRef, tag: PointTag) -> Option<Point> {
+        let mut out = sys::GhosttyPointCoordinate::default();
+        // SAFETY: handle non-null; gref and out are caller-owned.
+        let rc = unsafe {
+            sys::ghostty_terminal_point_from_grid_ref(self.handle, &gref.0, tag.to_sys(), &mut out)
+        };
+        Error::from_result(rc).ok()?;
+        Some(Point {
+            tag,
+            x: out.x,
+            y: out.y,
+        })
+    }
+
+    /// Convert a `Point` from one coordinate space to another.
+    /// Composition of [`Self::grid_ref`] and [`Self::point_from_grid_ref`]
+    /// with the transient `GridRef` discarded immediately, which is the
+    /// only safe way to translate coordinates without holding a
+    /// `GridRef` across other terminal calls.
+    ///
+    /// Typical usage: store selection endpoints as `PointTag::Screen`
+    /// (stable while the row remains in scrollback) and convert back
+    /// to `PointTag::Viewport` each paint frame.
+    pub fn convert_point(&self, point: Point, into: PointTag) -> Option<Point> {
+        let gref = self.grid_ref(point)?;
+        self.point_from_grid_ref(&gref, into)
     }
 
     fn set_color_opt(
