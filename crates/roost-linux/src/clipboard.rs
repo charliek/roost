@@ -143,10 +143,7 @@ async fn drain_uri_list(clipboard: &gtk4::gdk::Clipboard) -> Result<String, anyh
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-async fn drain_stream(
-    stream: gio::InputStream,
-    cap: usize,
-) -> Result<Vec<u8>, anyhow::Error> {
+async fn drain_stream(stream: gio::InputStream, cap: usize) -> Result<Vec<u8>, anyhow::Error> {
     let mut out: Vec<u8> = Vec::new();
     loop {
         let bytes = stream
@@ -156,10 +153,7 @@ async fn drain_stream(
             break;
         }
         if out.len().saturating_add(bytes.len()) > cap {
-            return Err(anyhow::anyhow!(
-                "clipboard payload exceeds {} bytes",
-                cap
-            ));
+            return Err(anyhow::anyhow!("clipboard payload exceeds {} bytes", cap));
         }
         out.extend_from_slice(&bytes);
     }

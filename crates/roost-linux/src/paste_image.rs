@@ -86,7 +86,10 @@ pub fn materialize(bytes: &[u8], mime: &str) -> Result<PathBuf, Error> {
         if let Some((w, h)) = png_dimensions(bytes) {
             let pixels = (w as usize).saturating_mul(h as usize);
             if pixels > MAX_PIXELS {
-                return Err(Error::TooManyPixels { width: w, height: h });
+                return Err(Error::TooManyPixels {
+                    width: w,
+                    height: h,
+                });
             }
         }
         bytes.to_vec()
@@ -102,15 +105,20 @@ pub fn materialize(bytes: &[u8], mime: &str) -> Result<PathBuf, Error> {
 /// to reject it.
 fn reencode_to_png(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let loader = gdk_pixbuf::PixbufLoader::new();
-    loader.write(bytes).map_err(|e| Error::Decode(e.to_string()))?;
+    loader
+        .write(bytes)
+        .map_err(|e| Error::Decode(e.to_string()))?;
     loader.close().map_err(|e| Error::Decode(e.to_string()))?;
-    let pixbuf: Pixbuf = loader.pixbuf().ok_or_else(|| {
-        Error::Decode("loader produced no pixbuf".to_string())
-    })?;
+    let pixbuf: Pixbuf = loader
+        .pixbuf()
+        .ok_or_else(|| Error::Decode("loader produced no pixbuf".to_string()))?;
     let (w, h) = (pixbuf.width(), pixbuf.height());
     let pixels = (w as usize).saturating_mul(h as usize);
     if pixels > MAX_PIXELS {
-        return Err(Error::TooManyPixels { width: w, height: h });
+        return Err(Error::TooManyPixels {
+            width: w,
+            height: h,
+        });
     }
     pixbuf
         .save_to_bufferv("png", &[])
@@ -159,9 +167,14 @@ fn write_temp_png(data: &[u8]) -> Result<PathBuf, Error> {
         .create_new(true)
         .mode(0o600)
         .open(&path)
-        .map_err(|source| Error::Write { path: path.clone(), source })?;
-    file.write_all(data)
-        .map_err(|source| Error::Write { path: path.clone(), source })?;
+        .map_err(|source| Error::Write {
+            path: path.clone(),
+            source,
+        })?;
+    file.write_all(data).map_err(|source| Error::Write {
+        path: path.clone(),
+        source,
+    })?;
     Ok(path)
 }
 
@@ -293,7 +306,10 @@ mod tests {
         let jpg = tiny_jpeg_bytes();
         let path = materialize(&jpg, "image/jpeg").expect("materialize jpeg");
         let written = std::fs::read(&path).expect("read back");
-        assert_eq!(written[..8], [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            written[..8],
+            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
         cleanup(&path);
     }
 
