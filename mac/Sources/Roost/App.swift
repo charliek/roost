@@ -1428,7 +1428,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             rows: 24,
             theme: activeTheme,
             font: activeFont,
-            copyOnSelect: config.copyOnSelect
+            copyOnSelect: config.copyOnSelect,
+            clipboardWrite: config.clipboardWrite
         )
         session.liveTitle = title
         session.liveCwd = cwd.isEmpty ? nil : cwd
@@ -2098,7 +2099,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             rows: 24,
             theme: activeTheme,
             font: activeFont,
-            copyOnSelect: config.copyOnSelect
+            copyOnSelect: config.copyOnSelect,
+            clipboardWrite: config.clipboardWrite
         )
         let resolvedCwd: String
         if !cwd.isEmpty {

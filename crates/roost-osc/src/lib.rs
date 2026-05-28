@@ -84,6 +84,32 @@ pub enum OscEvent {
     /// into tab state lives in the consumer (`apply_osc`), so the
     /// scanner surfaces the body verbatim.
     CommandMark(String),
+
+    /// OSC 52 program-initiated clipboard write. Body shape is
+    /// `Ps;Pc` where `Ps` is a target selector (`c` = system clipboard,
+    /// `p` / `s` = selection / primary clipboard; other selectors are
+    /// coalesced into the system target to match Ghostty's permissive
+    /// behavior) and `Pc` is the base64-encoded UTF-8 payload. The
+    /// dispatch step decodes the base64 here so consumers never see
+    /// encoded text. OSC 52 read requests (`Pc == "?"`) are dropped —
+    /// phase 1 is write-only; read support requires consent UI and
+    /// lands later.
+    Clipboard {
+        target: ClipboardTarget,
+        text: String,
+    },
+}
+
+/// OSC 52 selector target. `Ps` accepts `c` (system clipboard, the
+/// ⌘V / Ctrl+V target), `p` / `s` (primary / selection clipboard —
+/// X11 PRIMARY on Linux, the named selection pasteboard on Mac), or
+/// is empty (defaults to `c`). Any other character falls through to
+/// `System` to match Ghostty's tolerance for emitters that pad the
+/// selector with extra letters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    System,
+    Selection,
 }
 
 /// State the byte-by-byte parser cycles through.
@@ -265,11 +291,21 @@ impl OscScanner {
                 // to tab state.
                 self.pending.push(OscEvent::CommandMark(body.to_string()));
             }
+            "52" => {
+                // Program-initiated clipboard write. Body: `Ps;Pc` —
+                // selector + base64. Read requests (`Pc == "?"`) are
+                // dropped silently (phase 1 is write-only). Invalid
+                // base64 or non-UTF-8 payloads are dropped silently,
+                // matching Ghostty's behavior (Surface.zig "ignore
+                // this, valid data can also produce this error").
+                if let Some(event) = parse_osc52(body) {
+                    self.pending.push(event);
+                }
+            }
             _ => {
                 // Unhandled OSC command. libghostty handles many
-                // others (4 = palette, 8 = hyperlink, 52 =
-                // clipboard, 110/111 = reset colors, …); we don't
-                // need to route those daemon-side.
+                // others (4 = palette, 8 = hyperlink, 110/111 = reset
+                // colors, …); we don't need to route those daemon-side.
             }
         }
     }
@@ -305,6 +341,50 @@ fn is_conemu_body(body: &str) -> bool {
         return false;
     }
     i == bytes.len() || bytes[i] == b';'
+}
+
+/// Decode an OSC 52 body of the form `Ps;Pc` into a
+/// [`OscEvent::Clipboard`]. Returns `None` for any case the consumer
+/// shouldn't see: read requests (`Pc == "?"`), invalid base64,
+/// non-UTF-8 decoded payloads, or empty payloads. Selector parsing
+/// is permissive: any `c` in `Ps` → `System`, any `p` or `s` (and
+/// only those) → `Selection`; an empty selector defaults to `System`
+/// (the bare `OSC 52 ; ;<payload>` form some emitters use).
+fn parse_osc52(body: &str) -> Option<OscEvent> {
+    let (ps, pc) = body.split_once(';')?;
+    if pc == "?" {
+        // Read request — deferred to phase 2 (needs consent UI).
+        return None;
+    }
+    let target = if ps.is_empty() || ps.contains('c') {
+        ClipboardTarget::System
+    } else if ps.contains('p') || ps.contains('s') {
+        ClipboardTarget::Selection
+    } else {
+        // Unknown selector — coalesce to system, matches Ghostty's
+        // permissive handling. Prevents silent drops on selectors a
+        // future spec adds.
+        ClipboardTarget::System
+    };
+    let bytes = decode_osc52_base64(pc)?;
+    let text = String::from_utf8(bytes).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(OscEvent::Clipboard { target, text })
+}
+
+/// Decode the base64 payload from an OSC 52 body. Strips any embedded
+/// whitespace first — some emitters wrap long base64 over multiple
+/// lines, which the standard alphabet decoder otherwise rejects. Maps
+/// the standard alphabet (`+`/`/`) and ignores padding mismatches the
+/// same way Ghostty does (`Surface.zig:2186` — "ignore this, valid data
+/// can produce this error").
+fn decode_osc52_base64(pc: &str) -> Option<Vec<u8>> {
+    use base64::engine::{general_purpose::STANDARD, Engine as _};
+    // base64 0.22 doesn't strip whitespace inline; pre-clean.
+    let cleaned: String = pc.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    STANDARD.decode(cleaned.as_bytes()).ok()
 }
 
 /// Decode an OSC 7 body of the form `file://[host]/path` into the
@@ -761,5 +841,125 @@ mod tests {
         payload.push(0x07);
         let events = feed_all(&payload);
         assert_eq!(events, vec![OscEvent::Title(title.to_string())]);
+    }
+
+    // OSC 52 — program-initiated clipboard write.
+
+    fn b64(s: &str) -> String {
+        use base64::engine::{general_purpose::STANDARD, Engine as _};
+        STANDARD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn osc52_c_target_decodes_payload() {
+        let payload = format!("\x1b]52;c;{}\x07", b64("hello-osc52"));
+        let events = feed_all(payload.as_bytes());
+        assert_eq!(
+            events,
+            vec![OscEvent::Clipboard {
+                target: ClipboardTarget::System,
+                text: "hello-osc52".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc52_p_target_routes_to_selection() {
+        let payload = format!("\x1b]52;p;{}\x07", b64("primary text"));
+        let events = feed_all(payload.as_bytes());
+        assert_eq!(
+            events,
+            vec![OscEvent::Clipboard {
+                target: ClipboardTarget::Selection,
+                text: "primary text".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc52_empty_selector_defaults_to_system() {
+        // Some emitters omit the selector: `OSC 52 ; ; <base64>`.
+        let payload = format!("\x1b]52;;{}\x07", b64("defaulted"));
+        let events = feed_all(payload.as_bytes());
+        assert_eq!(
+            events,
+            vec![OscEvent::Clipboard {
+                target: ClipboardTarget::System,
+                text: "defaulted".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc52_read_request_dropped() {
+        // `Pc == "?"` is a read request — phase 1 is write-only, the
+        // scanner drops the event entirely. (No consent UI yet.)
+        let events = feed_all(b"\x1b]52;c;?\x07");
+        assert_eq!(events, Vec::<OscEvent>::new());
+    }
+
+    #[test]
+    fn osc52_invalid_base64_dropped() {
+        // `!!!` decodes to garbage in the standard alphabet — match
+        // Ghostty's behavior of dropping silently rather than crashing
+        // the parser on a malformed payload.
+        let events = feed_all(b"\x1b]52;c;!!!not-base64!!!\x07");
+        assert_eq!(events, Vec::<OscEvent>::new());
+    }
+
+    #[test]
+    fn osc52_non_utf8_payload_dropped() {
+        // Valid base64 but decodes to invalid UTF-8 (0xFF 0xFE 0xFD).
+        // Roost surfaces text only, so a binary payload is dropped.
+        let payload = format!("\x1b]52;c;{}\x07", b64("\u{FFFD}")).replace("\u{FFFD}", "\u{FFFD}");
+        // Construct a known-bad UTF-8 base64 directly:
+        let bad_b64 = {
+            use base64::engine::{general_purpose::STANDARD, Engine as _};
+            STANDARD.encode([0xFFu8, 0xFE, 0xFD])
+        };
+        let _ = payload;
+        let bytes = format!("\x1b]52;c;{}\x07", bad_b64);
+        let events = feed_all(bytes.as_bytes());
+        assert_eq!(events, Vec::<OscEvent>::new());
+    }
+
+    #[test]
+    fn osc52_empty_payload_dropped() {
+        // Base64 of "" is "" — should drop rather than emit an empty
+        // clipboard write that would (uselessly) clear the user's
+        // pasteboard.
+        let events = feed_all(b"\x1b]52;c;\x07");
+        assert_eq!(events, Vec::<OscEvent>::new());
+    }
+
+    #[test]
+    fn osc52_unknown_selector_falls_back_to_system() {
+        // Emitter pads the selector with extra letters — Ghostty
+        // tolerates this. We coalesce to System rather than dropping.
+        let payload = format!("\x1b]52;q;{}\x07", b64("padded"));
+        let events = feed_all(payload.as_bytes());
+        assert_eq!(
+            events,
+            vec![OscEvent::Clipboard {
+                target: ClipboardTarget::System,
+                text: "padded".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc52_st_terminator_works() {
+        // ESC \ terminator (the other OSC end-marker). Same payload
+        // as the BEL-terminated test, must produce the same event.
+        let mut payload = format!("\x1b]52;c;{}", b64("st-terminated")).into_bytes();
+        payload.extend_from_slice(b"\x1b\\");
+        let events = feed_all(&payload);
+        assert_eq!(
+            events,
+            vec![OscEvent::Clipboard {
+                target: ClipboardTarget::System,
+                text: "st-terminated".into(),
+            }]
+        );
     }
 }

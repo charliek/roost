@@ -360,6 +360,24 @@ rows in display order (`subtitle` present on rows that have one).
 | `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |
 | `palette.dismiss` | `{}` | Close any open palette. |
 
+### Selection + clipboard test ops (`selection.*` / `clipboard.*`)
+
+| Op | Params | Effect |
+|---|---|---|
+| `selection.set` | `{"tab_id": "1", "anchor": {"col": 3, "row": 0}, "cursor": {"col": 17, "row": 0}}` | Anchor a selection on the tab's terminal at viewport `(col, row)`. The UI converts to libghostty's `PointTag::Screen` internally so the selection survives scrolling — same flow as `mouseDown` + `mouseDragged`. `not-found` if the tab has no live terminal. |
+| `selection.clear` | `{"tab_id": "1"}` | Drop the active selection (no-op if none). |
+| `selection.dump` | `{"tab_id": "1"}` | Read back the selection. Response: `{"text"?: "...", "anchor_visible": bool, "cursor_visible": bool}`. `text` is omitted when no selection is active or when all selection rows have scrolled out of the viewport (the v1 partial-copy limitation). |
+| `clipboard.dump` | `{"target": "system" \| "selection"}` | Read the host pasteboard. Response: `{"text"?: "..."}`. `system` is the ⌘V / Ctrl+V target; `selection` is the named per-app pasteboard on Mac / X11 PRIMARY on Linux. Unknown targets → `invalid-param`. |
+| `clipboard.write` | `{"target": "...", "text": "..."}` | Test-only pasteboard seeding (lets a roosttest case set a known value before asserting paste behavior). Not gated: any process on the host can already write the OS clipboard. |
+
+`roostctl` does not surface these yet — they exist for end-to-end test
+coverage (`tools/roosttest/`) and as a stable surface a future scriptable
+selection-driving feature (AI agent highlighting a region for the user
+to confirm) could build on. Each op routes through the UI seam
+(`UiRequest::Selection*` / `UiRequest::Clipboard*` on Linux, the
+`UiBridge` protocol on Mac), not the workspace — pasteboard + selection
+state live on the UI side.
+
 ### `events.subscribe`
 
 Opt-in to the event stream. After the response, the server pushes

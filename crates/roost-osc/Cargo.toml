@@ -19,6 +19,7 @@ description = "Streaming OSC scanner shared between roost-core (daemon-side rout
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
 
 [lints]
 workspace = true

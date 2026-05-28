@@ -33,7 +33,8 @@ use roost_linux::reconcile;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::clipboard;
-use crate::config::{CopyOnSelect, RoostConfig};
+use crate::config;
+use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
@@ -175,6 +176,12 @@ pub struct App {
     /// without rebuilding the App; new tabs read the current value
     /// when constructed.
     copy_on_select: RefCell<CopyOnSelect>,
+    /// `clipboard-write` policy from the config. Checked in
+    /// `report_osc_event` to gate OSC 52 writes. Default `Allow`
+    /// (matches Ghostty's default); `Deny` silently drops + logs.
+    /// `RefCell` for the same future-reload reason as
+    /// `copy_on_select`.
+    clipboard_write_policy: RefCell<ClipboardWrite>,
     /// Tab ids whose close was triggered by the daemon (the user
     /// typed `exit`, or a CLI `tab close`, or another client's
     /// CloseTab RPC). The connect_close_page handler installed on
@@ -540,6 +547,7 @@ impl App {
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
             copy_on_select: RefCell::new(cfg.copy_on_select),
+            clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
@@ -3299,6 +3307,26 @@ impl App {
     /// `NotificationEvent` / etc.
     fn report_osc_event(self: &Rc<Self>, tab_id: i64, event: roost_osc::OscEvent) {
         use roost_osc::OscEvent as E;
+        // OSC 52 short-circuits before the daemon dispatch: it's not
+        // workspace state, just an action. Honoring it on the UI side
+        // is correct because only the UI has the OS clipboard handle.
+        // `clipboard-write = deny` drops silently + logs at info,
+        // matching Ghostty's behavior (Surface.zig:2164-2166).
+        if let E::Clipboard { target, text } = event {
+            if *self.clipboard_write_policy.borrow() == config::ClipboardWrite::Deny {
+                tracing::info!(
+                    tab_id,
+                    "OSC 52 clipboard write dropped — clipboard-write = deny"
+                );
+                return;
+            }
+            let target = match target {
+                roost_osc::ClipboardTarget::System => clipboard::Target::Clipboard,
+                roost_osc::ClipboardTarget::Selection => clipboard::Target::Primary,
+            };
+            clipboard::write(target, &text);
+            return;
+        }
         let (command, payload): (u32, String) = match event {
             E::Title(t) => (0, t),
             // OSC 7 wire format is `file://<host>/<path>`. The
@@ -3320,6 +3348,8 @@ impl App {
             // OSC 133 prompt/command mark — pass the body through to
             // apply_osc, which maps it to tab state (P4b).
             E::CommandMark(body) => (133, body),
+            // Handled by the short-circuit above; unreachable here.
+            E::Clipboard { .. } => unreachable!(),
         };
         let Some(client) = self.client.borrow().clone() else {
             return;

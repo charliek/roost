@@ -54,6 +54,28 @@ enum CopyOnSelect: Sendable {
     }
 }
 
+/// Two-state policy for OSC 52 program-initiated clipboard writes.
+/// Matches the first two values of Ghostty's `clipboard-write`
+/// (`allow | deny`); `ask` is deferred until the consent banner UI
+/// lands. Default is `.allow` to match Ghostty's default.
+enum ClipboardWrite: Sendable {
+    case allow
+    case deny
+
+    static let `default`: ClipboardWrite = .allow
+
+    /// Parse a config value. `allow | true | yes` → `.allow`,
+    /// `deny | false | no` → `.deny`; any other value returns `nil`
+    /// so the caller can fall back to the default and log.
+    static func parse(_ s: String) -> ClipboardWrite? {
+        switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "allow", "true", "yes": return .allow
+        case "deny", "false", "no": return .deny
+        default: return nil
+        }
+    }
+}
+
 struct RoostConfig: Sendable {
     var themeName: String?
     var fontFamily: String?
@@ -74,6 +96,10 @@ struct RoostConfig: Sendable {
     /// write to the clipboard on release. Defaults to `.on` (matches
     /// Ghostty's default on macOS).
     var copyOnSelect: CopyOnSelect = .default
+    /// `clipboard-write` policy — controls whether programs running
+    /// in the terminal can write the host clipboard via OSC 52.
+    /// Defaults to `.allow` (matches Ghostty's default).
+    var clipboardWrite: ClipboardWrite = .default
 
     static let empty = RoostConfig(
         themeName: nil,
@@ -83,7 +109,8 @@ struct RoostConfig: Sendable {
         tabMaxWidth: nil,
         keybinds: [],
         commands: [],
-        copyOnSelect: .default
+        copyOnSelect: .default,
+        clipboardWrite: .default
     )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
@@ -208,6 +235,15 @@ func parse(_ text: String) -> RoostConfig {
             } else {
                 NSLog(
                     "roost-mac: unknown copy-on-select value '%@'; keeping default 'true'",
+                    value
+                )
+            }
+        case "clipboard-write":
+            if let v = ClipboardWrite.parse(value) {
+                cfg.clipboardWrite = v
+            } else {
+                NSLog(
+                    "roost-mac: unknown clipboard-write value '%@'; keeping default 'allow'",
                     value
                 )
             }
