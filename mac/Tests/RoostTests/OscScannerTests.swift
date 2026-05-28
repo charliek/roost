@@ -235,15 +235,17 @@ func malformed_st_recovers_following_osc() {
 
 @Test
 func body_truncates_at_max() {
-    // 10KB body should truncate at maxBody (8192 bytes). The Swift
-    // scanner's maxBody is file-private, so we assert against the
-    // documented value (8192).
+    // Body well above maxBody should truncate, but the title event
+    // still emits (truncated titles are benign). `maxBody` was raised
+    // from 8 KiB to 1 MiB as part of the OSC 52 fixup PR — the value
+    // is file-private, but we know it's 1 MiB.
+    let cap = 1024 * 1024
     let prefix: [UInt8] = [0x1B, 0x5D, 0x30, 0x3B]  // ESC ] 0 ;
-    let payload = prefix + Array(repeating: UInt8(ascii: "A"), count: 10_000) + [0x07]
+    let payload = prefix + Array(repeating: UInt8(ascii: "A"), count: cap + 512) + [0x07]
     let events = feedAll(payload)
     #expect(events.count == 1)
     if case .title(let t) = events[0] {
-        #expect(t.utf8.count == 8192)
+        #expect(t.utf8.count == cap)
     } else {
         Issue.record("expected .title event")
     }
@@ -346,9 +348,32 @@ func osc52_empty_payload_dropped() {
 }
 
 @Test
-func osc52_unknown_selector_falls_back_to_system() {
-    let payload = "\u{1b}]52;q;\(b64("padded"))\u{07}"
-    #expect(feedAll(payload) == [.clipboard(target: .system, text: "padded")])
+func osc52_multi_char_selector_dropped() {
+    // OSC 52's selector is at most one character; `cp` is malformed
+    // per the spec. PR #154 originally coalesced this to system; the
+    // fixup PR tightened to drop, matching Ghostty's exact-match parser.
+    let payload = "\u{1b}]52;cp;\(b64("ignored"))\u{07}"
+    #expect(feedAll(payload) == [])
+}
+
+@Test
+func osc52_lone_unknown_selector_dropped() {
+    // Single-char unknown selectors (e.g. `q`) also drop — no `q`
+    // selector in the spec, and silently coalescing to system masks
+    // emitter bugs.
+    let payload = "\u{1b}]52;q;\(b64("ignored"))\u{07}"
+    #expect(feedAll(payload) == [])
+}
+
+@Test
+func osc52_truncated_body_drops_event() {
+    // A truncated OSC 52 body must NOT emit — partial base64 would
+    // silently write the wrong text to the clipboard. Pump enough
+    // bytes past `maxBody` to flip the truncation flag.
+    var payload: [UInt8] = [0x1B, 0x5D, 0x35, 0x32, 0x3B, 0x63, 0x3B]
+    payload.append(contentsOf: Array(repeating: UInt8(ascii: "A"), count: 1024 * 1024 + 512))
+    payload.append(0x07)
+    #expect(feedAll(payload) == [])
 }
 
 @Test

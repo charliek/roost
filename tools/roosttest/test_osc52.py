@@ -1,10 +1,15 @@
 """End-to-end test for OSC 52 program-initiated clipboard writes.
 
-Sends synthetic OSC 52 bytes via `tab.write` and asserts the host
-clipboard updated. Uses the `clipboard.write` + `clipboard.dump` ops
-shipped in PR #151 to first seed a known-different baseline value,
-then verify the OSC 52 payload actually replaced it — a prior
-clipboard match would otherwise produce a false pass.
+Each test runs a `printf '\\033]52;c;<base64>\\007'` command in the
+shell so the OSC 52 bytes flow out the PTY's *output* side, where the
+terminal's scanner reads. `tab.write(raw_osc_bytes)` would write to
+the PTY's *input* side — bash would see them as keystrokes and no
+OSC parse would happen.
+
+Uses `clipboard.write` + `clipboard.dump` (PR #151) to first seed a
+known-different baseline value, then verify the OSC 52 payload
+actually replaced it — a prior matching clipboard value would
+otherwise produce a false pass.
 
 Run against either UI:
 
