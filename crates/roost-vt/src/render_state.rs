@@ -447,8 +447,10 @@ impl RenderState {
         // non-success as "no style data, use defaults" rather than
         // propagating an error: rendering a cell without styles is more
         // useful than failing the whole frame.
-        let mut s = sys::GhosttyStyle::default();
-        s.size = std::mem::size_of::<sys::GhosttyStyle>();
+        let mut s = sys::GhosttyStyle {
+            size: std::mem::size_of::<sys::GhosttyStyle>(),
+            ..Default::default()
+        };
         let rc = unsafe {
             sys::ghostty_render_state_row_cells_get(
                 self.row_cells,
