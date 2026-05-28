@@ -140,6 +140,84 @@ struct PtySupervisorTests {
         #expect(loginShellArgv(argv, shell: "/bin/zsh") == argv)
     }
 
+    @Test func bashAutobootstrapAppliesToSimpleBash() {
+        // Default-shell case (`[$SHELL, -l]`) and an explicit simple login
+        // bash both auto-bootstrap.
+        #expect(bashAutobootstrap(["/opt/homebrew/bin/bash", "-l"], isDarwin: true))
+        #expect(bashAutobootstrap(["/usr/bin/bash", "-l"], isDarwin: true))
+        #expect(bashAutobootstrap(["/usr/bin/bash"], isDarwin: true))
+        #expect(bashAutobootstrap(["bash", "-i"], isDarwin: true))
+        #expect(bashAutobootstrap(["bash", "-l", "-i"], isDarwin: true))
+    }
+
+    @Test func bashAutobootstrapSkipsApple32() {
+        // /bin/bash on macOS is Apple's 3.2 (no ENV+POSIX path) — leave it
+        // for the documented manual source. On Linux /bin/bash is modern.
+        #expect(!bashAutobootstrap(["/bin/bash", "-l"], isDarwin: true))
+        #expect(bashAutobootstrap(["/bin/bash", "-l"], isDarwin: false))
+    }
+
+    @Test func bashAutobootstrapSkipsLauncherAndNonBash() {
+        // Launcher / non-simple invocations pass through untouched: forcing
+        // --posix onto them would change their semantics.
+        #expect(!bashAutobootstrap(["/bin/bash", "-c", "echo hi"], isDarwin: true))
+        #expect(!bashAutobootstrap(["/usr/bin/bash", "--norc", "--noprofile"], isDarwin: false))
+        #expect(!bashAutobootstrap(["/usr/bin/bash", "--rcfile", "x"], isDarwin: false))
+        #expect(!bashAutobootstrap(["/usr/bin/bash", "--posix"], isDarwin: false))
+        #expect(!bashAutobootstrap(["/bin/zsh", "-l"], isDarwin: true))
+        #expect(!bashAutobootstrap([], isDarwin: true))
+    }
+
+    @Test func withBashPosixInsertsLongOptionFirst() {
+        // bash needs `--posix` before the short `-l` (a long option after a
+        // short one errors), so it goes right after argv[0].
+        #expect(withBashPosix(["/usr/bin/bash", "-l"], apply: true)
+            == ["/usr/bin/bash", "--posix", "-l"])
+        #expect(withBashPosix(["/usr/bin/bash"], apply: true)
+            == ["/usr/bin/bash", "--posix"])
+        // Not applied → untouched.
+        #expect(withBashPosix(["/bin/bash", "-l"], apply: false)
+            == ["/bin/bash", "-l"])
+    }
+
+    @Test func bashBootstrapEnvSetsEnvAndInject() {
+        let env = bashBootstrapEnv(
+            resourcesDir: "/res", existingEnv: nil,
+            existingHistfile: nil, home: "/home/u")
+        #expect(env["ENV"] == "/res/shell-integration/roost.bash")
+        #expect(env["ROOST_BASH_INJECT"] == "1")
+        #expect(env["ROOST_BASH_ENV"] == nil)
+    }
+
+    @Test func bashBootstrapEnvPinsHistfileWhenUnset() {
+        let env = bashBootstrapEnv(
+            resourcesDir: "/res", existingEnv: nil,
+            existingHistfile: nil, home: "/home/u")
+        #expect(env["HISTFILE"] == "/home/u/.bash_history")
+        #expect(env["ROOST_BASH_UNEXPORT_HISTFILE"] == "1")
+    }
+
+    @Test func bashBootstrapEnvKeepsExistingHistfile() {
+        // A user's HISTFILE wins; we don't pin or schedule an un-export.
+        let env = bashBootstrapEnv(
+            resourcesDir: "/res", existingEnv: "/u/env.sh",
+            existingHistfile: "/u/.myhist", home: "/home/u")
+        #expect(env["HISTFILE"] == nil)
+        #expect(env["ROOST_BASH_UNEXPORT_HISTFILE"] == nil)
+        // A prior ENV is preserved so the shim can restore it.
+        #expect(env["ROOST_BASH_ENV"] == "/u/env.sh")
+    }
+
+    @Test func bashBootstrapEnvRespectsEmptyHistfile() {
+        // An empty HISTFILE disables history on purpose — don't re-enable it
+        // by pinning ~/.bash_history (only a fully-unset HISTFILE pins).
+        let env = bashBootstrapEnv(
+            resourcesDir: "/res", existingEnv: nil,
+            existingHistfile: "", home: "/home/u")
+        #expect(env["HISTFILE"] == nil)
+        #expect(env["ROOST_BASH_UNEXPORT_HISTFILE"] == nil)
+    }
+
     @Test(.disabled("event-observation crashes the swift-testing runner; covered by M4b IPCServer tests + M9 manual pass"))
     func closeReapsChild() async throws {
         let sup = await PtySupervisor()

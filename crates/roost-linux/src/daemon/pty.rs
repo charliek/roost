@@ -500,6 +500,76 @@ fn resolve_argv(argv: &[String], shell: &str) -> Vec<String> {
     }
 }
 
+/// Whether to auto-bootstrap a modern bash: add `--posix` + point ENV at
+/// roost.bash (see `bash_bootstrap_env` and roost.bash's inject header).
+/// True iff argv[0] is a `bash`, it isn't Apple's SIP-locked `/bin/bash`
+/// (3.2 — its ENV+POSIX path is patched out, so it keeps the documented
+/// manual source), and the only extra args are plain login/interactive
+/// flags (`-l`/`-i`). That admits the default-shell case (`[$SHELL, -l]`)
+/// and an explicit `[bash, -l]`, but passes launcher commands (`-c`,
+/// `--norc`, `--rcfile`, …) and an already-`--posix` argv through
+/// untouched — forcing `--posix` onto those would change their semantics.
+fn bash_autobootstrap(resolved: &[String], is_macos: bool) -> bool {
+    let Some(arg0) = resolved.first() else {
+        return false;
+    };
+    if std::path::Path::new(arg0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        != Some("bash")
+    {
+        return false;
+    }
+    if is_macos && arg0 == "/bin/bash" {
+        return false;
+    }
+    resolved[1..].iter().all(|a| a == "-l" || a == "-i")
+}
+
+/// Insert `--posix` where bash needs it — right after argv[0], before the
+/// short `-l`/`-i` flags. bash rejects a GNU long option that follows a
+/// short one (`bash -l --posix` errors with `--: invalid option`), so the
+/// long option goes first. Returns `resolved` unchanged when `apply` is
+/// false.
+fn with_bash_posix(mut resolved: Vec<String>, apply: bool) -> Vec<String> {
+    if apply {
+        resolved.insert(1, "--posix".to_string());
+    }
+    resolved
+}
+
+/// The env vars to overlay when auto-bootstrapping bash (see roost.bash's
+/// inject header). `existing_env`/`existing_histfile` are the child's
+/// inherited values. ENV points bash at roost.bash; ROOST_BASH_INJECT="1"
+/// tells it to recreate startup (and distinguishes an auto-load from a
+/// manual source). A prior ENV is preserved into ROOST_BASH_ENV so the
+/// shim can restore it. HISTFILE is pinned to ~/.bash_history (POSIX mode
+/// would otherwise default it to ~/.sh_history) only when fully unset, with
+/// ROOST_BASH_UNEXPORT_HISTFILE telling the shim to un-export it afterward.
+/// An *empty* HISTFILE is left alone — that's the idiom for disabling
+/// history, so we must not re-enable it (matches Ghostty's null-only check).
+fn bash_bootstrap_env(
+    resources_dir: &std::path::Path,
+    existing_env: Option<&str>,
+    existing_histfile: Option<&str>,
+    home: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(prev) = existing_env.filter(|v| !v.is_empty()) {
+        out.push(("ROOST_BASH_ENV".into(), prev.to_string()));
+    }
+    let script = resources_dir.join("shell-integration").join("roost.bash");
+    out.push(("ENV".into(), script.to_string_lossy().into_owned()));
+    out.push(("ROOST_BASH_INJECT".into(), "1".into()));
+    if existing_histfile.is_none() {
+        if let Some(home) = home.filter(|h| !h.is_empty()) {
+            out.push(("HISTFILE".into(), format!("{home}/.bash_history")));
+            out.push(("ROOST_BASH_UNEXPORT_HISTFILE".into(), "1".into()));
+        }
+    }
+    out
+}
+
 /// Current working directory of `pid`. Linux reads `/proc/<pid>/cwd`;
 /// other platforms (the macOS GTK dev build) have no `/proc` and
 /// return `None` — the shipping GTK target is Linux. Backs the new-tab
@@ -562,6 +632,16 @@ fn build_command(
     // login shell, see `resolve_argv`.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let resolved = resolve_argv(argv, &shell);
+    // Modern bash: add `--posix` so it honors ENV (its only
+    // per-interactive-shell hook), which we point at roost.bash below.
+    // `--posix` and the ENV injection MUST be applied together — a `--posix`
+    // shell with no ENV would be stuck in POSIX mode with no startup files
+    // and no recreation — so gate both on the resources dir being writable
+    // (if the cache write failed there's no roost.bash to source).
+    let resources_dir = roost_resources_dir();
+    let bash_boot =
+        resources_dir.is_some() && bash_autobootstrap(&resolved, cfg!(target_os = "macos"));
+    let resolved = with_bash_posix(resolved, bash_boot);
     let mut cmd = CommandBuilder::new(&resolved[0]);
     for a in &resolved[1..] {
         cmd.arg(a);
@@ -590,20 +670,33 @@ fn build_command(
     if std::env::var_os("ROOST_SHELL_FEATURES").is_none() {
         cmd.env("ROOST_SHELL_FEATURES", "cwd,title,marks,prompt");
     }
-    if let Some(dir) = roost_resources_dir() {
+    if let Some(dir) = resources_dir {
         cmd.env("ROOST_RESOURCES_DIR", dir);
-        // zsh auto-bootstrap: point ZDOTDIR at our shim (restores the
-        // user's ZDOTDIR, runs their startup, then loads roost.zsh). bash
-        // auto-bootstrap is a separate change; bash uses manual `source`.
-        if std::path::Path::new(&resolved[0])
+        // Auto-bootstrap the shipped integration with no rc edit (parity
+        // with the Mac UI):
+        //   * zsh: point ZDOTDIR at our shim — it restores the user's
+        //     ZDOTDIR, runs their startup, then loads roost.zsh.
+        //   * modern bash: set ENV + ROOST_BASH_INJECT so the `--posix`
+        //     shell sources roost.bash, which recreates startup then loads
+        //     the integration (see `bash_bootstrap_env`).
+        let is_zsh = std::path::Path::new(&resolved[0])
             .file_name()
             .and_then(|n| n.to_str())
-            == Some("zsh")
-        {
+            == Some("zsh");
+        if is_zsh {
             if let Some(z) = std::env::var_os("ZDOTDIR") {
                 cmd.env("ROOST_ZSH_ZDOTDIR", z);
             }
             cmd.env("ZDOTDIR", dir.join("shell-integration").join("zsh"));
+        } else if bash_boot {
+            for (key, value) in bash_bootstrap_env(
+                dir,
+                std::env::var("ENV").ok().as_deref(),
+                std::env::var("HISTFILE").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+            ) {
+                cmd.env(key, value);
+            }
         }
     }
     cmd
@@ -670,6 +763,121 @@ mod tests {
             "echo hi".to_string(),
         ];
         assert_eq!(resolve_argv(&argv, "/bin/zsh"), argv);
+    }
+
+    fn sv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bash_autobootstrap_applies_to_simple_bash() {
+        // Default-shell case (`[$SHELL, -l]`) and an explicit simple login
+        // bash both auto-bootstrap.
+        assert!(bash_autobootstrap(
+            &sv(&["/opt/homebrew/bin/bash", "-l"]),
+            true
+        ));
+        assert!(bash_autobootstrap(&sv(&["/usr/bin/bash", "-l"]), true));
+        assert!(bash_autobootstrap(&sv(&["/usr/bin/bash"]), true));
+        assert!(bash_autobootstrap(&sv(&["bash", "-i"]), true));
+        assert!(bash_autobootstrap(&sv(&["bash", "-l", "-i"]), true));
+    }
+
+    #[test]
+    fn bash_autobootstrap_skips_apple_32() {
+        // /bin/bash on macOS is Apple's 3.2 (no ENV+POSIX) — skip it; on
+        // Linux /bin/bash is modern, so it applies.
+        assert!(!bash_autobootstrap(&sv(&["/bin/bash", "-l"]), true));
+        assert!(bash_autobootstrap(&sv(&["/bin/bash", "-l"]), false));
+    }
+
+    #[test]
+    fn bash_autobootstrap_skips_launcher_and_non_bash() {
+        // Launcher / non-simple invocations pass through untouched.
+        assert!(!bash_autobootstrap(
+            &sv(&["/bin/bash", "-c", "echo hi"]),
+            true
+        ));
+        assert!(!bash_autobootstrap(
+            &sv(&["/usr/bin/bash", "--norc", "--noprofile"]),
+            false
+        ));
+        assert!(!bash_autobootstrap(
+            &sv(&["/usr/bin/bash", "--rcfile", "x"]),
+            false
+        ));
+        assert!(!bash_autobootstrap(
+            &sv(&["/usr/bin/bash", "--posix"]),
+            false
+        ));
+        assert!(!bash_autobootstrap(&sv(&["/bin/zsh", "-l"]), true));
+        assert!(!bash_autobootstrap(&[], true));
+    }
+
+    #[test]
+    fn with_bash_posix_inserts_long_option_first() {
+        // bash needs `--posix` before the short `-l` (a long option after a
+        // short one errors), so it goes right after argv[0].
+        assert_eq!(
+            with_bash_posix(sv(&["/usr/bin/bash", "-l"]), true),
+            sv(&["/usr/bin/bash", "--posix", "-l"])
+        );
+        assert_eq!(
+            with_bash_posix(sv(&["/usr/bin/bash"]), true),
+            sv(&["/usr/bin/bash", "--posix"])
+        );
+        // Not applied → untouched.
+        assert_eq!(
+            with_bash_posix(sv(&["/bin/bash", "-l"]), false),
+            sv(&["/bin/bash", "-l"])
+        );
+    }
+
+    #[test]
+    fn bash_bootstrap_env_sets_env_and_inject() {
+        let env = bash_bootstrap_env(std::path::Path::new("/res"), None, None, Some("/home/u"));
+        assert!(env.contains(&(
+            "ENV".to_string(),
+            "/res/shell-integration/roost.bash".to_string()
+        )));
+        assert!(env.contains(&("ROOST_BASH_INJECT".to_string(), "1".to_string())));
+        assert!(!env.iter().any(|(k, _)| k == "ROOST_BASH_ENV"));
+    }
+
+    #[test]
+    fn bash_bootstrap_env_pins_histfile_when_unset() {
+        let env = bash_bootstrap_env(std::path::Path::new("/res"), None, None, Some("/home/u"));
+        assert!(env.contains(&("HISTFILE".to_string(), "/home/u/.bash_history".to_string())));
+        assert!(env.contains(&("ROOST_BASH_UNEXPORT_HISTFILE".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn bash_bootstrap_env_keeps_existing_histfile_and_env() {
+        // A user's HISTFILE wins (no pin, no un-export); a prior ENV is
+        // preserved so the shim can restore it.
+        let env = bash_bootstrap_env(
+            std::path::Path::new("/res"),
+            Some("/u/env.sh"),
+            Some("/u/.myhist"),
+            Some("/home/u"),
+        );
+        assert!(!env.iter().any(|(k, _)| k == "HISTFILE"));
+        assert!(!env.iter().any(|(k, _)| k == "ROOST_BASH_UNEXPORT_HISTFILE"));
+        assert!(env.contains(&("ROOST_BASH_ENV".to_string(), "/u/env.sh".to_string())));
+    }
+
+    #[test]
+    fn bash_bootstrap_env_respects_empty_histfile() {
+        // An empty HISTFILE disables history on purpose — don't re-enable
+        // it by pinning ~/.bash_history (only a fully-unset HISTFILE pins).
+        let env = bash_bootstrap_env(
+            std::path::Path::new("/res"),
+            None,
+            Some(""),
+            Some("/home/u"),
+        );
+        assert!(!env.iter().any(|(k, _)| k == "HISTFILE"));
+        assert!(!env.iter().any(|(k, _)| k == "ROOST_BASH_UNEXPORT_HISTFILE"));
     }
 
     #[cfg(target_os = "linux")]

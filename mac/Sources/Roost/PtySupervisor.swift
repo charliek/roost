@@ -526,9 +526,28 @@ final class PtySupervisor {
     private func buildArgv(argv: [String]) -> [UnsafeMutablePointer<CChar>?] {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
         let resolved = loginShellArgv(argv, shell: shell)
-        var out: [UnsafeMutablePointer<CChar>?] = resolved.map { strdup($0) }
+        // Modern bash: add `--posix` so it honors ENV (the only
+        // per-interactive-shell hook), which Roost points at roost.bash —
+        // see `shouldBashBootstrap` and `buildEnv`. The argv `--posix` and
+        // the env injection must agree, so both gate on the same check.
+        let resourcesDir = Bundle.roostResources.bundleURL.path
+        let execArgv = withBashPosix(
+            resolved, apply: shouldBashBootstrap(resolved, resourcesDir: resourcesDir))
+        var out: [UnsafeMutablePointer<CChar>?] = execArgv.map { strdup($0) }
         out.append(nil)
         return out
+    }
+
+    /// Whether to bash-auto-bootstrap `resolvedArgv`: the pure predicate
+    /// (`bashAutobootstrap`) AND the shipped roost.bash being present at
+    /// `resourcesDir`. `--posix` and the ENV injection must be applied
+    /// together — a `--posix` shell with no ENV script to source would be
+    /// stuck in POSIX mode with no startup recreation — so `buildArgv` and
+    /// `buildEnv` both gate on this.
+    private func shouldBashBootstrap(_ resolvedArgv: [String], resourcesDir: String) -> Bool {
+        bashAutobootstrap(resolvedArgv, isDarwin: true)
+            && FileManager.default.fileExists(
+                atPath: resourcesDir + "/shell-integration/roost.bash")
     }
 
     /// Build the NULL-terminated envp array. Inherits the
@@ -556,16 +575,29 @@ final class PtySupervisor {
         env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt"
         let resourcesDir = Bundle.roostResources.bundleURL.path
         env["ROOST_RESOURCES_DIR"] = resourcesDir
-        // zsh auto-bootstrap: point ZDOTDIR at our shim, which restores the
-        // user's ZDOTDIR, runs their real zsh startup, then loads roost.zsh.
-        // (bash auto-bootstrap is a separate change; bash uses the
-        // documented manual `source` for now.)
-        let shell = argv.first ?? (env["SHELL"] ?? "/bin/sh")
-        if (shell as NSString).lastPathComponent == "zsh" {
+        // Auto-bootstrap the shipped integration with no rc edit. Resolve the
+        // same argv `buildArgv` execs (default case → `[$SHELL, -l]`), then:
+        //   * zsh: point ZDOTDIR at our shim — it restores the user's
+        //     ZDOTDIR, runs their real zsh startup, then loads roost.zsh.
+        //   * modern bash: set ENV + ROOST_BASH_INJECT so the `--posix` shell
+        //     sources roost.bash, which recreates startup then loads the
+        //     integration. Apple's bash 3.2 can't (skipped in the helper).
+        let resolvedArgv = loginShellArgv(argv, shell: env["SHELL"] ?? "/bin/sh")
+        let shellName = resolvedArgv.first.map { ($0 as NSString).lastPathComponent } ?? ""
+        if shellName == "zsh" {
             if let userZdotdir = env["ZDOTDIR"], !userZdotdir.isEmpty {
                 env["ROOST_ZSH_ZDOTDIR"] = userZdotdir
             }
             env["ZDOTDIR"] = resourcesDir + "/shell-integration/zsh"
+        } else if shouldBashBootstrap(resolvedArgv, resourcesDir: resourcesDir) {
+            for (key, value) in bashBootstrapEnv(
+                resourcesDir: resourcesDir,
+                existingEnv: env["ENV"],
+                existingHistfile: env["HISTFILE"],
+                home: env["HOME"]
+            ) {
+                env[key] = value
+            }
         }
         var out: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0)=\($1)") }
         out.append(nil)
@@ -584,6 +616,64 @@ final class PtySupervisor {
 /// verbatim — we never force `-l` onto an explicit command line.
 func loginShellArgv(_ argv: [String], shell: String) -> [String] {
     argv.isEmpty ? [shell, "-l"] : argv
+}
+
+/// Whether to auto-bootstrap a modern bash — i.e. add `--posix` and point
+/// ENV at roost.bash so the integration loads with no rc edit (see
+/// `bashBootstrapEnv` and roost.bash's inject header). True iff `argv[0]`
+/// is a `bash`, it isn't Apple's `/bin/bash` (3.2, SIP-locked — its ENV
+/// POSIX path is patched out, so we leave it for the documented manual
+/// source), and the only extra args are plain login/interactive flags
+/// (`-l`/`-i`). That admits the default-shell case (`[$SHELL, -l]`) and an
+/// explicit `[bash, -l]`, but passes launcher commands (`-c`, `--norc`,
+/// `--rcfile`, …) and an already-`--posix` argv through untouched — adding
+/// `--posix` to those would change their semantics.
+func bashAutobootstrap(_ argv: [String], isDarwin: Bool) -> Bool {
+    guard let arg0 = argv.first else { return false }
+    guard (arg0 as NSString).lastPathComponent == "bash" else { return false }
+    if isDarwin && arg0 == "/bin/bash" { return false }
+    return argv.dropFirst().allSatisfy { $0 == "-l" || $0 == "-i" }
+}
+
+/// Insert `--posix` where bash needs it — right after argv[0], before the
+/// short `-l`/`-i` flags. bash rejects a GNU long option that follows a
+/// short one (`bash -l --posix` errors with `--: invalid option`), so the
+/// long option goes first. Returns `argv` unchanged when `apply` is false.
+func withBashPosix(_ argv: [String], apply: Bool) -> [String] {
+    guard apply else { return argv }
+    var out = argv
+    out.insert("--posix", at: 1)
+    return out
+}
+
+/// The env vars to overlay when auto-bootstrapping bash (see roost.bash's
+/// inject header). `existingEnv`/`existingHistfile` are the child's
+/// inherited values, if any. ENV points bash at roost.bash;
+/// ROOST_BASH_INJECT="1" tells it to recreate startup (and marks an
+/// auto-load vs. a manual source). A prior ENV is preserved into
+/// ROOST_BASH_ENV so the shim can restore it. HISTFILE is pinned to
+/// ~/.bash_history (POSIX mode would default it to ~/.sh_history) only when
+/// fully unset, with ROOST_BASH_UNEXPORT_HISTFILE telling the shim to
+/// un-export it afterward. An *empty* HISTFILE is left alone — that's the
+/// idiom for disabling history, so we must not re-enable it (matches
+/// Ghostty's null-only check).
+func bashBootstrapEnv(
+    resourcesDir: String,
+    existingEnv: String?,
+    existingHistfile: String?,
+    home: String?
+) -> [String: String] {
+    var out: [String: String] = [:]
+    if let prev = existingEnv, !prev.isEmpty {
+        out["ROOST_BASH_ENV"] = prev
+    }
+    out["ENV"] = resourcesDir + "/shell-integration/roost.bash"
+    out["ROOST_BASH_INJECT"] = "1"
+    if existingHistfile == nil, let home, !home.isEmpty {
+        out["HISTFILE"] = home + "/.bash_history"
+        out["ROOST_BASH_UNEXPORT_HISTFILE"] = "1"
+    }
+    return out
 }
 
 /// The current working directory of `pid` via `proc_pidinfo`
