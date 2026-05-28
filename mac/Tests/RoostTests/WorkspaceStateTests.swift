@@ -103,6 +103,20 @@ struct WorkspaceStateTests {
         #expect(after?.userTitled == true)
     }
 
+    @Test func setTabStateFromOSCRespectsHookActive() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/", title: "")
+        // A Claude hook owns the tab: OSC 133 state is suppressed.
+        try await ws.setTabHookActive(t.id, active: true)
+        try await ws.setTabStateFromOSC(t.id, state: .running)
+        #expect(await ws.tab(t.id)?.state == Workspace.TabState.none)
+        // Release the hook: OSC 133 state applies.
+        try await ws.setTabHookActive(t.id, active: false)
+        try await ws.setTabStateFromOSC(t.id, state: .running)
+        #expect(await ws.tab(t.id)?.state == Workspace.TabState.running)
+    }
+
     @Test func reorderTabsPartialKeepsUnlisted() async throws {
         let ws = await Workspace()
         let p = await ws.createProject(name: "p", cwd: "/")

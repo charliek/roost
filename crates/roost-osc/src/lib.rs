@@ -511,6 +511,24 @@ mod tests {
     }
 
     #[test]
+    fn osc133_bare_no_body() {
+        // Malformed (no kind letter) -> empty mark; harmless, the consumer
+        // (command_mark_state) maps "" to no state change.
+        assert_eq!(
+            feed_all(b"\x1b]133\x07"),
+            vec![OscEvent::CommandMark(String::new())]
+        );
+    }
+
+    #[test]
+    fn osc133_empty_body() {
+        assert_eq!(
+            feed_all(b"\x1b]133;\x07"),
+            vec![OscEvent::CommandMark(String::new())]
+        );
+    }
+
+    #[test]
     fn osc7_with_host_ignored() {
         let events = feed_all(b"\x1b]7;file://myhost/Users/me/work\x07");
         assert_eq!(events, vec![OscEvent::Pwd("/Users/me/work".into())]);
