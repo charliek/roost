@@ -101,6 +101,40 @@ func resolver_inverseWithExplicitColors_swapsThem() {
     #expect(hasBg)
 }
 
+/// Boundary: inverse on a cell that has only an explicit fg (no
+/// explicit bg). The default bg sits in the bg slot before the
+/// swap, so after inverse the effective fg should be `defaultBg`
+/// and the effective bg should be the originally-explicit fg.
+/// Mirror of the Rust `inverse_with_only_explicit_fg_*` case.
+@Test
+func resolver_inverseWithOnlyExplicitFg_swapsDefaultBgIntoFg() {
+    let (fg, bg, hasBg) = TerminalView.resolveCellColors(
+        cell: cell(foreground: explicitFg, inverse: true),
+        defaultFg: defaultFg,
+        defaultBg: defaultBg,
+        boldColor: nil
+    )
+    #expect(fg === defaultBg)
+    #expect(bg === explicitFg)
+    #expect(hasBg)
+}
+
+/// Mirror of the above with the colors flipped: explicit bg only,
+/// no explicit fg. After the swap effective fg = explicit bg,
+/// effective bg = default fg.
+@Test
+func resolver_inverseWithOnlyExplicitBg_swapsDefaultFgIntoBg() {
+    let (fg, bg, hasBg) = TerminalView.resolveCellColors(
+        cell: cell(background: explicitBg, inverse: true),
+        defaultFg: defaultFg,
+        defaultBg: defaultBg,
+        boldColor: nil
+    )
+    #expect(fg === explicitBg)
+    #expect(bg === defaultFg)
+    #expect(hasBg)
+}
+
 @Test
 func resolver_boldDefaultFg_usesBoldAccentWhenProvided() {
     let (fg, _, _) = TerminalView.resolveCellColors(

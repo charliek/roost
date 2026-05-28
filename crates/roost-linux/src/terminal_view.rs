@@ -1441,6 +1441,45 @@ mod tests {
         assert!(has_bg);
     }
 
+    /// Boundary: inverse on a cell that has only an explicit fg (no
+    /// explicit bg). The default bg sits in the bg slot before the
+    /// swap, so after inverse the effective fg should be `default_bg`
+    /// and the effective bg should be the originally-explicit fg.
+    #[test]
+    fn inverse_with_only_explicit_fg_swaps_default_bg_into_fg() {
+        let c = cell(
+            Some(EXPLICIT_FG),
+            None,
+            Style {
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, DEFAULT_BG);
+        assert_eq!(bg, EXPLICIT_FG);
+        assert!(has_bg);
+    }
+
+    /// Mirror of the above: explicit bg only, no explicit fg. After
+    /// the inverse swap the effective fg is the explicit bg and the
+    /// effective bg is the default fg.
+    #[test]
+    fn inverse_with_only_explicit_bg_swaps_default_fg_into_bg() {
+        let c = cell(
+            None,
+            Some(EXPLICIT_BG),
+            Style {
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, EXPLICIT_BG);
+        assert_eq!(bg, DEFAULT_FG);
+        assert!(has_bg);
+    }
+
     #[test]
     fn bold_default_fg_uses_bold_accent_when_provided() {
         let c = cell(
