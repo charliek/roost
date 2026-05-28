@@ -9,6 +9,52 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.3 — 2026-05-27
+
+Auto-update + shell-aware terminals release. Roost.app now ships with **Sparkle
+2 auto-update** so future fixes reach users automatically (no more hand-delivered
+DMGs), and the terminal is shell-aware: native cwd tracking, OSC 133
+prompt/command marks, and shipped shell-integration scripts that auto-bootstrap
+for bash and zsh. Plus the v0.0.2 clean-install crash fix and a batch of input
++ tab fixes.
+
+### Features
+
+- **Sparkle 2 auto-update** for the Mac app (#122, #128, #130) — EdDSA-signed
+  releases via a GitHub Pages appcast; works under ad-hoc signing (no Apple
+  Developer ID required). "Check for Updates…" in the App menu.
+- **Native shell-cwd tracking** (#120) — new tabs inherit the active tab's
+  working directory, read straight from the shell's PTY.
+- **OSC 133 prompt/command marks** parsed by both VT scanners (#121, #127); a
+  tab's `hookActive` run-state flips from them.
+- **Shell-integration scripts shipped in-bundle** (#125, #126) — `roost.bash` /
+  `roost.zsh` emit the env contract (cwd + prompt boundaries).
+- **Auto-bootstrap** for bash (`--posix` + `ENV`) and zsh (`ZDOTDIR`) (#129,
+  #132) — no `~/.bashrc` / `~/.zshrc` edits required.
+
+### Fixes
+
+- **Mac clean-install crash** (#116) — v0.0.2 crashed at launch on any machine
+  that wasn't the build host because themes resolved through `Bundle.module`'s
+  compile-time path. Themes now load via `Bundle.main` from `Contents/Resources`
+  (and a deterministic CI guard catches this class of regression).
+- **Default shell now spawned as a login shell** (#119) — picks up
+  `~/.zprofile` / `~/.bash_profile` like a normal terminal.
+- **Kitty / mouse-tracking input fixes** — scroll wheel encoded as button-4/5
+  under mouse tracking; Ctrl+letter works under Kitty (unshifted codepoint set);
+  Cmd-T / Ctrl-T new tab inherits the active tab's cwd.
+
+### Tests + CI
+
+- **Mac E2E is a required CI gate** for PRs and releases (#118).
+- New pytest coverage in `tools/roosttest/` for new-tab cwd inheritance and
+  shell integration (title, prompt, OSC 133 edges) (#131).
+
+### Docs
+
+- Shell-integration documentation rewrite (#126); dropped a stale
+  `ROOST_PROJECT_ID` env reference never injected by the Rust/Swift port (#133).
+
 ## v0.0.2 — 2026-05-26
 
 Programmability + automation release: the command palette and a growing set of
