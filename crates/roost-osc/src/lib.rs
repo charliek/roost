@@ -339,6 +339,42 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Synthesise the standard XTerm-form OSC 10/11/12 query *response*
+/// for query number `n` (one of 10/11/12) and the matching theme
+/// color. Output is `\x1b]N;rgb:RRRR/GGGG/BBBB\x07` — 16-bit-per-
+/// channel form (each 8-bit channel repeated to fill 4 hex digits),
+/// BEL-terminated. Mirrors the legacy Go
+/// `internal/osc/scanner.go:294-298` exactly so codex, claude-code,
+/// and any other agent that probes for theme colors get the same
+/// byte sequence the legacy port already proved working.
+///
+/// Returns `None` if `n` isn't a recognised query number. The caller
+/// picks which of foreground (10), background (11), or cursor (12)
+/// the `color` argument refers to — keeps this helper dependency-free
+/// (no `Theme` import, no `ColorRgb` newtype) so it can sit in
+/// `roost-osc` next to the scanner.
+///
+/// Why this lives here: codex (and reportedly claude-code) only emit
+/// their highlighted prompt-row backgrounds *after* the terminal
+/// answers an OSC 11 query. libghostty-vt's color-query handler is
+/// a no-op, so without this synthesised reply the prompt rows
+/// render invisibly against the canvas. Both UIs feed their
+/// scanners' `ColorQuery(n)` events through this formatter and
+/// write the bytes back to the PTY.
+pub fn format_color_query_response(n: u8, color: (u8, u8, u8)) -> Option<Vec<u8>> {
+    if !matches!(n, 10 | 11 | 12) {
+        return None;
+    }
+    let (r, g, b) = color;
+    Some(
+        format!(
+            "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
+            n, r, r, g, g, b, b
+        )
+        .into_bytes(),
+    )
+}
+
 fn hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -603,6 +639,44 @@ mod tests {
         // Set-color body shouldn't emit (libghostty handles).
         let events = feed_all(b"\x1b]10;rgb:00/00/00\x07");
         assert!(events.is_empty());
+    }
+
+    // -- format_color_query_response: byte-exact parity with the
+    //    legacy Go `internal/osc/scanner_test.go` cases.
+
+    #[test]
+    fn format_color_query_response_osc10_fg() {
+        let bytes = format_color_query_response(10, (0xFF, 0xFF, 0xFF)).expect("Some");
+        assert_eq!(bytes, b"\x1b]10;rgb:ffff/ffff/ffff\x07");
+    }
+
+    #[test]
+    fn format_color_query_response_osc11_bg() {
+        let bytes = format_color_query_response(11, (0x1E, 0x1E, 0x1E)).expect("Some");
+        assert_eq!(bytes, b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07");
+    }
+
+    #[test]
+    fn format_color_query_response_osc12_cursor() {
+        let bytes = format_color_query_response(12, (0x98, 0x98, 0x9D)).expect("Some");
+        assert_eq!(bytes, b"\x1b]12;rgb:9898/9898/9d9d\x07");
+    }
+
+    #[test]
+    fn format_color_query_response_rejects_unknown_n() {
+        // 13 isn't a recognised XTerm color-query code — caller
+        // should treat None as "skip" rather than fall through.
+        assert!(format_color_query_response(13, (0, 0, 0)).is_none());
+        assert!(format_color_query_response(0, (0, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn format_color_query_response_mixed_channels() {
+        // Pin the channel order (red, green, blue) so a future
+        // refactor of the format string can't accidentally swap them
+        // — would otherwise be silently invisible in the BEL bytes.
+        let bytes = format_color_query_response(11, (0x12, 0x34, 0x56)).expect("Some");
+        assert_eq!(bytes, b"\x1b]11;rgb:1212/3434/5656\x07");
     }
 
     // Multiple sequences
