@@ -4465,6 +4465,18 @@ extension RoostApp: NSSplitViewDelegate {
         // already persisted at the moment the user dragged the
         // divider before pressing ⌘B.
         guard w >= Self.sidebarMinWidth, w <= Self.sidebarMaxWidth else { return }
+        // Re-anchor `sidebarPreferredWidthConstraint` so it tracks
+        // the user's dragged position. Without this update, the
+        // constraint stays pinned at the launch-time width — and
+        // on subsequent window resize NSSplitView's
+        // holding-priority dance picks unpredictably between the
+        // stale constraint and the current frame, letting the
+        // sidebar drift wider as the window grows. Skip during a
+        // programmatic collapse (the constraint is intentionally
+        // deactivated then by `toggleSidebar`).
+        if !sidebarCollapsingProgrammatically {
+            sidebarPreferredWidthConstraint?.constant = w
+        }
         UserDefaults.standard.set(Double(w), forKey: Self.sidebarWidthDefaultsKey)
     }
 
