@@ -105,43 +105,43 @@ final class TerminalView: NSView {
 
     // MARK: - Selection state (Phase 6a M5)
 
-    /// Cell-coordinate selection state. Two cells form the
+    /// Cell-coordinate selection state. Two endpoints form the
     /// rectangle, normalized at draw + extract time so the user can
-    /// drag in any direction. Both points are inclusive on the
-    /// start side and exclusive on the end side — matching the
-    /// "drag-from-cursor" convention every other terminal uses.
+    /// drag in any direction.
+    ///
+    /// Rows are stored in libghostty's `PointTag::Screen` coordinate
+    /// space — the unified screen-including-scrollback index that
+    /// stays stable as the user scrolls. The viewport row equivalent
+    /// is computed each frame in [`draw`] via
+    /// `ghostty_terminal_grid_ref` so the highlight scrolls with the
+    /// content (matching Ghostty / cmux behavior). Cols are
+    /// column-index integers that don't change with vertical scroll.
     private struct CellSelection {
         var anchorCol: Int
-        var anchorRow: Int
+        var anchorScreenY: UInt32
         var cursorCol: Int
-        var cursorRow: Int
+        var cursorScreenY: UInt32
 
         /// True if the anchor and cursor land on the same cell —
         /// shouldn't render selection chrome for a single-cell
         /// "click but didn't drag" gesture.
-        var isEmpty: Bool { anchorCol == cursorCol && anchorRow == cursorRow }
+        var isEmpty: Bool { anchorCol == cursorCol && anchorScreenY == cursorScreenY }
 
-        /// Inclusive (startRow, startCol) and exclusive
-        /// (endRow, endCol) in the normalized direction.
-        func normalized() -> (startRow: Int, startCol: Int, endRow: Int, endCol: Int) {
-            let (sRow, sCol, eRow, eCol): (Int, Int, Int, Int)
-            if anchorRow == cursorRow {
-                sRow = anchorRow
-                eRow = anchorRow + 1
-                sCol = min(anchorCol, cursorCol)
-                eCol = max(anchorCol, cursorCol) + 1
-            } else if anchorRow < cursorRow {
-                sRow = anchorRow
-                sCol = anchorCol
-                eRow = cursorRow + 1
-                eCol = cursorCol + 1
+        /// Inclusive (startY, startCol) and exclusive (endY, endCol)
+        /// in screen-row space.
+        func normalized() -> (startY: UInt32, startCol: Int, endY: UInt32, endCol: Int) {
+            if anchorScreenY == cursorScreenY {
+                return (
+                    anchorScreenY,
+                    min(anchorCol, cursorCol),
+                    anchorScreenY &+ 1,
+                    max(anchorCol, cursorCol) + 1
+                )
+            } else if anchorScreenY < cursorScreenY {
+                return (anchorScreenY, anchorCol, cursorScreenY &+ 1, cursorCol + 1)
             } else {
-                sRow = cursorRow
-                sCol = cursorCol
-                eRow = anchorRow + 1
-                eCol = anchorCol + 1
+                return (cursorScreenY, cursorCol, anchorScreenY &+ 1, anchorCol + 1)
             }
-            return (sRow, sCol, eRow, eCol)
         }
     }
 
@@ -529,11 +529,12 @@ final class TerminalView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
+        guard let screenY = screenY(forViewportRow: cell.row) else { return }
         selection = CellSelection(
             anchorCol: cell.col,
-            anchorRow: cell.row,
+            anchorScreenY: screenY,
             cursorCol: cell.col,
-            cursorRow: cell.row
+            cursorScreenY: screenY
         )
         needsDisplay = true
     }
@@ -542,10 +543,65 @@ final class TerminalView: NSView {
         guard var sel = selection else { return }
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
+        guard let screenY = screenY(forViewportRow: cell.row) else { return }
         sel.cursorCol = cell.col
-        sel.cursorRow = cell.row
+        sel.cursorScreenY = screenY
         selection = sel
         needsDisplay = true
+    }
+
+    /// Convert a viewport row (0-indexed from top of visible area) to
+    /// its `PointTag::Screen` y coordinate. Returns nil if the row is
+    /// out of range or libghostty rejects the conversion. Used by
+    /// `mouseDown` / `mouseDragged` to anchor selection in
+    /// scrollback-stable coordinates.
+    @MainActor
+    private func screenY(forViewportRow row: Int) -> UInt32? {
+        guard let terminal else { return nil }
+        guard row >= 0, row < Int(rows) else { return nil }
+        var pt = GhosttyPoint()
+        pt.tag = GHOSTTY_POINT_TAG_VIEWPORT
+        pt.value.coordinate.x = 0
+        pt.value.coordinate.y = UInt32(row)
+        var gref = GhosttyGridRef()
+        gref.size = MemoryLayout<GhosttyGridRef>.size
+        guard ghostty_terminal_grid_ref(terminal, pt, &gref) == GHOSTTY_SUCCESS else {
+            return nil
+        }
+        var out = GhosttyPointCoordinate()
+        guard
+            ghostty_terminal_point_from_grid_ref(
+                terminal, &gref, GHOSTTY_POINT_TAG_SCREEN, &out
+            ) == GHOSTTY_SUCCESS
+        else { return nil }
+        return out.y
+    }
+
+    /// Convert a `PointTag::Screen` y coordinate back to its current
+    /// viewport row. Returns nil if the row is currently outside the
+    /// visible viewport (scrolled into history above or below), in
+    /// which case the caller should clip / skip.
+    @MainActor
+    private func viewportRow(forScreenY screenY: UInt32) -> Int? {
+        guard let terminal else { return nil }
+        var pt = GhosttyPoint()
+        pt.tag = GHOSTTY_POINT_TAG_SCREEN
+        pt.value.coordinate.x = 0
+        pt.value.coordinate.y = screenY
+        var gref = GhosttyGridRef()
+        gref.size = MemoryLayout<GhosttyGridRef>.size
+        guard ghostty_terminal_grid_ref(terminal, pt, &gref) == GHOSTTY_SUCCESS else {
+            return nil
+        }
+        var out = GhosttyPointCoordinate()
+        guard
+            ghostty_terminal_point_from_grid_ref(
+                terminal, &gref, GHOSTTY_POINT_TAG_VIEWPORT, &out
+            ) == GHOSTTY_SUCCESS
+        else { return nil }
+        let v = Int(out.y)
+        guard v >= 0, v < Int(rows) else { return nil }
+        return v
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -611,30 +667,78 @@ final class TerminalView: NSView {
     /// per row + drops empty trailing rows so a multi-line copy
     /// doesn't carry a wall of spaces from cells the terminal hasn't
     /// drawn into. Returns nil when there's no selection.
+    ///
+    /// Selection rows live in `PointTag::Screen` space; we resolve
+    /// each to its current viewport row before walking. Rows that
+    /// have scrolled out of the viewport are skipped — copy returns
+    /// only the portion of the selection that's currently visible.
+    /// A fuller scroll-walk-restore implementation is a follow-up.
     @MainActor
     private func selectedPlainText() -> String? {
         guard let sel = selection else { return nil }
         let n = sel.normalized()
         if let terminal { renderState.update(terminal: terminal) }
-        var rows: [String] = []
-        for _ in n.startRow..<n.endRow { rows.append("") }
-        renderState.walk { cell in
-            guard cell.row >= n.startRow, cell.row < n.endRow else { return }
-            guard cell.col >= n.startCol, cell.col < n.endCol else { return }
-            let idx = cell.row - n.startRow
-            if let g = cell.glyph {
-                rows[idx].append(String(g))
-            } else {
-                rows[idx].append(" ")
+        let totalRowSpan = Int(n.endY - n.startY)
+        guard totalRowSpan > 0 else { return nil }
+        var outRows: [String] = Array(repeating: "", count: totalRowSpan)
+
+        // Map currently-visible viewport rows -> selection offset.
+        var offsetForViewportRow: [Int: Int] = [:]
+        for offset in 0..<totalRowSpan {
+            let screenY = n.startY &+ UInt32(offset)
+            if let vRow = viewportRow(forScreenY: screenY) {
+                offsetForViewportRow[vRow] = offset
             }
         }
-        var trimmed = rows.map {
+        if offsetForViewportRow.isEmpty { return nil }
+
+        let cols = Int(self.cols)
+        renderState.walk { cell in
+            guard let offset = offsetForViewportRow[cell.row] else { return }
+            let (startCol, endCol) = TerminalView.colRange(
+                forOffset: offset,
+                totalRowSpan: totalRowSpan,
+                normalized: n,
+                cols: cols
+            )
+            guard cell.col >= startCol, cell.col < endCol else { return }
+            if let g = cell.glyph {
+                outRows[offset].append(String(g))
+            } else {
+                outRows[offset].append(" ")
+            }
+        }
+        var trimmed = outRows.map {
             String($0.reversed().drop(while: { $0 == " " }).reversed())
         }
         while let last = trimmed.last, last.isEmpty {
             trimmed.removeLast()
         }
         return trimmed.joined(separator: "\n")
+    }
+
+    /// Compute `[startCol, endCol)` for a single row of a multi-row
+    /// selection, given the row's `offset` within the normalized
+    /// screen-y range. Single-row selections use the literal cols;
+    /// multi-row selections fill the first row from `startCol` to the
+    /// right edge, interior rows full-width, and the last row from the
+    /// left edge to `endCol`.
+    ///
+    /// `nonisolated` so the `RoostTests` suite (which is not
+    /// `@MainActor`) can exercise it without ceremony. The function
+    /// is pure with no shared state, so dropping `@MainActor`
+    /// isolation that this otherwise inherits from the enclosing
+    /// view class is sound.
+    nonisolated static func colRange(
+        forOffset offset: Int,
+        totalRowSpan: Int,
+        normalized n: (startY: UInt32, startCol: Int, endY: UInt32, endCol: Int),
+        cols: Int
+    ) -> (startCol: Int, endCol: Int) {
+        if totalRowSpan == 1 { return (n.startCol, n.endCol) }
+        if offset == 0 { return (n.startCol, cols) }
+        if offset == totalRowSpan - 1 { return (0, n.endCol) }
+        return (0, cols)
     }
 
     /// Text snapshot of the full viewport for the `tab.dump` IPC op.
@@ -1182,34 +1286,30 @@ final class TerminalView: NSView {
 
         // Selection overlay (Phase 6a M5). Drawn last so it sits on
         // top of the glyph pass — translucent accent fill, no border.
+        //
+        // Selection rows are stored in screen-y (scrollback-stable)
+        // space; resolve each to a viewport row before drawing so the
+        // highlight scrolls with the content. Rows currently outside
+        // the visible viewport are skipped — the rectangle "exits"
+        // off the top / bottom of the view as the user scrolls.
         if let sel = selection, !sel.isEmpty {
             let n = sel.normalized()
             let overlay = theme.selectionBackground.withAlphaComponent(0.6)
             overlay.setFill()
-            for row in n.startRow..<n.endRow {
-                // Row-aware horizontal extent: a single-row selection
-                // spans the user's start/end cols; a multi-row
-                // selection spans full rows for every interior row.
-                let isFirst = (row == n.startRow)
-                let isLast = (row == n.endRow - 1)
-                let startCol: Int
-                let endCol: Int
-                if n.endRow - n.startRow == 1 {
-                    startCol = n.startCol
-                    endCol = n.endCol
-                } else if isFirst {
-                    startCol = n.startCol
-                    endCol = Int(cols)
-                } else if isLast {
-                    startCol = 0
-                    endCol = n.endCol
-                } else {
-                    startCol = 0
-                    endCol = Int(cols)
-                }
+            let totalRowSpan = Int(n.endY - n.startY)
+            let colsInt = Int(cols)
+            for offset in 0..<totalRowSpan {
+                let screenY = n.startY &+ UInt32(offset)
+                guard let vRow = viewportRow(forScreenY: screenY) else { continue }
+                let (startCol, endCol) = TerminalView.colRange(
+                    forOffset: offset,
+                    totalRowSpan: totalRowSpan,
+                    normalized: n,
+                    cols: colsInt
+                )
                 let r = NSRect(
                     x: CGFloat(startCol) * cellW,
-                    y: CGFloat(row) * cellH,
+                    y: CGFloat(vRow) * cellH,
                     width: CGFloat(endCol - startCol) * cellW,
                     height: cellH
                 )
