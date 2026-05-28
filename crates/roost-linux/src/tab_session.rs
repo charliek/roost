@@ -161,11 +161,21 @@ impl TabSession {
             return;
         }
         // Test-mode tap: mirror into the capture buffer before
-        // enqueuing. Done before send so the bytes are observable
-        // even on a tab whose supervisor write later fails.
+        // enqueuing. Capture order matches submission order because
+        // `send_input` is only ever called from the GTK main thread
+        // (the `terminal_view.set_on_input` closure runs there, the
+        // OSC drain runs there via `glib::spawn_future_local`, paste
+        // runs there). No concurrent producers → the capture
+        // observes the same byte order the cmd_rx drain enqueues.
+        //
+        // Captured BEFORE the send so a `tab.capture_pty_input`
+        // assertion reflects what the UI tried to write, even if a
+        // later supervisor write fails — the test wants to see
+        // intent, not what the kernel ultimately accepted.
+        //
         // Lock-poisoning is silently swallowed — a poisoned mutex
-        // means a prior panic in this test process; nothing left
-        // to do.
+        // means a prior panic in this test process; nothing useful
+        // to do here.
         if let Some(cap) = &self.input_capture {
             if let Ok(mut buf) = cap.lock() {
                 buf.extend_from_slice(&data);

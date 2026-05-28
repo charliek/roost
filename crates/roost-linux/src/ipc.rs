@@ -766,16 +766,24 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 }
 
 /// Map an error from a gated test-mode op back to a wire-friendly
-/// [`HandlerError`]. The handler distinguishes two failure modes:
-/// missing env var (`not-enabled`) vs unknown tab (`not-found`). The
-/// substring check is the simplest contract between the UI and the
-/// dispatcher — both speak the same English. Bumping this to a
-/// typed error is overkill while the surface stays at 2 ops.
+/// [`HandlerError`]. Three failure modes the UI distinguishes by
+/// message text:
+///   * env var missing → `not-enabled`
+///   * unknown tab id → `not-found`
+///   * anything else (capture buffer poisoned, feed channel closed)
+///     → `internal`, so a real failure surfaces clearly rather than
+///     being mistaken for a missing tab.
+///
+/// The substring contract is the simplest seam between the UI and
+/// the dispatcher while the surface stays small; bumping to a typed
+/// error is the right move when the third arm grows.
 fn map_test_op_err(err: String) -> HandlerError {
     if err.contains("ROOST_TEST_MODE") {
         HandlerError::new("not-enabled", err)
-    } else {
+    } else if err.contains("has no live terminal") {
         HandlerError::not_found(err)
+    } else {
+        HandlerError::new("internal", err)
     }
 }
 

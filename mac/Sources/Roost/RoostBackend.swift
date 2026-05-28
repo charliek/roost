@@ -157,9 +157,13 @@ final class RoostBackend {
     /// Read (and optionally clear) the captured bytes for a tab.
     /// Returns `nil` when no buffer was ever allocated for this tab
     /// (e.g. tab id unknown to test mode, or `testMode` is false).
+    ///
+    /// `Data(referencing: NSMutableData)` aliases the storage, so a
+    /// subsequent `buf.length = 0` empties the returned snapshot too.
+    /// Construct an OWNED copy via `Data(_:)` before mutating.
     func readInputCapture(tabID: Int64, drain: Bool) -> Data? {
         guard let buf = inputCaptures[tabID] else { return nil }
-        let snapshot = Data(referencing: buf)
+        let snapshot = Data(buf)
         if drain {
             buf.length = 0
         }

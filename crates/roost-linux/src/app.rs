@@ -1728,6 +1728,12 @@ impl App {
                     // silent no-op.
                     ui.tab_view.close_page(&page_for_cleanup);
                 }
+                // Drop the test-mode entries we registered above
+                // before kicking off the session future. The TabClosed
+                // event arm wouldn't fire on this path because the
+                // workspace never saw a successful attach, so this
+                // cleanup is the only place that catches the leak.
+                app_for_attach.drop_test_mode_state(tab_id);
             };
             let session = match session_handle.await {
                 Ok(Ok(s)) => Rc::new(s),
@@ -2023,11 +2029,8 @@ impl App {
                 // its inbox row to preserve "row exists iff pending".
                 self.notification_inbox.borrow_mut().remove(tab_id);
                 self.refresh_notif_badge();
-                // Test-mode bookkeeping: drop the tab's feed sender +
-                // input-capture buffer. Both are no-ops when not in
-                // test mode (the entries were never inserted).
-                self.feed_senders.borrow_mut().remove(&tab_id);
-                self.input_captures.borrow_mut().remove(&tab_id);
+                // Drop any test-mode entries (no-op outside test mode).
+                self.drop_test_mode_state(tab_id);
             }
             WorkspaceEvent::TabTitleChanged { tab_id, title } => {
                 let projects = self.projects.borrow();
@@ -3308,6 +3311,17 @@ impl App {
             roost_linux::ipc::ClipboardOp::Selection => clipboard::Target::Primary,
         };
         clipboard::write(target, &text);
+    }
+
+    /// Drop the per-tab test-mode entries we registered in
+    /// `attach_tab` (no-op outside test mode and for tabs whose
+    /// attach failed before the registration ran). Called from
+    /// both the `TabClosed` event arm and the `attach_tab`
+    /// `fail_cleanup` path so a failed attach can't leak entries
+    /// either.
+    fn drop_test_mode_state(self: &Rc<Self>, tab_id: i64) {
+        self.feed_senders.borrow_mut().remove(&tab_id);
+        self.input_captures.borrow_mut().remove(&tab_id);
     }
 
     /// Inject bytes into a live tab's PTY-output drain. Gated on

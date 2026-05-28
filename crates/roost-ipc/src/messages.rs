@@ -1067,6 +1067,73 @@ mod tests {
         round_trip(&p);
     }
 
+    /// `tab.feed_pty_bytes` params: tab_id is the string-int64
+    /// wrapper + data is base64 — same shape as `tab.write` so the
+    /// existing round-trip helper covers it. Drift between this and
+    /// the wire vector under `tests/ipc-vectors/` would be caught
+    /// by the vector loader; pinning the struct's own shape too
+    /// surfaces failures even closer to the source.
+    #[test]
+    fn tab_feed_pty_bytes_params_round_trip() {
+        let p = TabFeedPtyBytesParams {
+            tab_id: 5,
+            data: b"\x1b]11;rgb:00/11/22\x07".to_vec(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"tab_id\":\"5\""), "got: {json}");
+        // Wire format is base64; sanity-check that the payload is
+        // not the raw escape sequence.
+        assert!(!json.contains("\\x1b"), "got: {json}");
+        round_trip(&p);
+    }
+
+    /// `tab.capture_pty_input` params: `drain` defaults to false
+    /// (peek semantics) when omitted, matching the Mac side's
+    /// `decodeIfPresent ?? false`. Tested explicitly because a
+    /// silent default flip would break the test harness's
+    /// drain-then-assert pattern.
+    #[test]
+    fn tab_capture_pty_input_params_default_drain_is_false() {
+        let p: TabCapturePtyInputParams = serde_json::from_str(r#"{"tab_id":"5"}"#).unwrap();
+        assert_eq!(p.tab_id, 5);
+        assert!(!p.drain);
+        round_trip(&p);
+    }
+
+    /// Result struct's `data` field is base64 on the wire — same
+    /// helper as the params side, separate test so a future schema
+    /// change (e.g. dropping base64 in favor of escaped bytes)
+    /// breaks loudly.
+    #[test]
+    fn tab_capture_pty_input_result_round_trips_base64() {
+        let r = TabCapturePtyInputResult {
+            data: b"\x00\x01\x02\xfe\xff".to_vec(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"data\":\"AAEC/v8=\""), "got: {json}");
+        round_trip(&r);
+    }
+
+    /// `deny_unknown_fields` on `TabDumpResolvedParams` rejects
+    /// stray keys so a typo in a test client surfaces immediately
+    /// rather than getting silently dropped.
+    #[test]
+    fn tab_dump_resolved_params_reject_unknown_field() {
+        let bad = r#"{"tab_id":"5","extra":"x"}"#;
+        assert!(serde_json::from_str::<TabDumpResolvedParams>(bad).is_err());
+    }
+
+    /// Result struct's resolved-cell list is permissive (no
+    /// `deny_unknown_fields` on `TabDumpResolvedResult`), so the
+    /// server can add per-cell fields (underline, faint, …) without
+    /// breaking older clients. Test the negative — extra fields
+    /// must NOT fail.
+    #[test]
+    fn tab_dump_resolved_result_accepts_extra_fields() {
+        let json = r#"{"cols":80,"rows":24,"cells":[],"future_field":42}"#;
+        assert!(serde_json::from_str::<TabDumpResolvedResult>(json).is_ok());
+    }
+
     #[test]
     fn screenshot_params_default_scale_is_one() {
         let p: ScreenshotParams = serde_json::from_str("{}").unwrap();

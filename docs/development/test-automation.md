@@ -411,14 +411,14 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
   `GtkDrawingArea` renders fine under Xvfb; in-process `screenshot`
   doesn't need a compositor). Headless Wayland (`weston --backend=headless`
   / `sway --headless`) is a fallback if an X11-only quirk appears.
-- Run: build `roost` + `roostctl`, launch under `ROOST_TEST=1`, run the
+- Run: build `roost` + `roostctl`, launch under `ROOST_TEST_MODE=1`, run the
   Tier-1 suite via `tools/screenshot/launch.sh gtk` → runner.
 
 **macOS:**
 - Runner: `macos-latest` (GUI session present; AppKit windows work).
 - Build + bundle (or run the unbundled `swift run Roost` — TBD which is
   lighter for tests; the IPC socket comes up either way). Launch under
-  `ROOST_TEST=1`; the in-process renderer works unfocused, so no
+  `ROOST_TEST_MODE=1`; the in-process renderer works unfocused, so no
   screencapture entitlement and **no Accessibility grant** (we never inject
   OS input in Tier 1).
 - Risk was app launch/quit hygiene and runner image quirks. **Resolved and
@@ -498,7 +498,7 @@ green CI, merged manually per branch policy.
   wait`/`events`; unit tests for dump + a Rust/Swift test for the wire
   event fan-out. *Done when:* `roostctl tab dump` and `roostctl wait` work
   against both UIs locally; no `sleep` needed to observe a state change.
-- **P2 — test mode + Tier-1 harness skeleton.** `ROOST_TEST` (fixed
+- **P2 — test mode + Tier-1 harness skeleton.** `ROOST_TEST_MODE` (fixed
   geometry/font/no-anim); the runner (per §7 decision) + 3–4 ported
   smoke cases; runs locally on both UIs. *Done when:* `make e2e` (or
   `roostctl test`) is green locally on Mac + GTK.

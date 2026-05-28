@@ -145,22 +145,7 @@ final class TabSession {
         let (output, oCont) = AsyncStream<Data>.makeStream()
         self.keystrokeContinuation = kCont
 
-        terminalView.onKey = { [weak self] data in
-            // ROOST_TEST_MODE=1 tap: mirror outbound input bytes
-            // (keystrokes, paste, OSC reply replies — every byte
-            // appendBytes' onKey closure produces) into the per-tab
-            // capture buffer hung off RoostBackend.shared. Single
-            // tap point catches everything because the Mac OSC
-            // reply path also routes through onKey
-            // (TerminalView.appendBytes:366). The buffer is
-            // allocated lazily on first read by the IPC handler.
-            if let self, let tabID = self.id,
-               let buf = RoostBackend.shared.ensureInputCapture(tabID: tabID)
-            {
-                buf.append(data)
-            }
-            self?.keystrokeContinuation?.yield(.input(data))
-        }
+        installOnKeyWithTestCapture()
         terminalView.onResize = { [weak self] cols, rows in
             self?.resize(cols: cols, rows: rows)
         }
@@ -237,19 +222,7 @@ final class TabSession {
         self.keystrokeContinuation = kCont
         self.skipCloseRPC = closeOwnedByExternal
 
-        terminalView.onKey = { [weak self] data in
-            // ROOST_TEST_MODE=1 tap: same shape as in `start()`
-            // above. The two onKey installations are kept in lock-
-            // step — any future change to one must mirror to the
-            // other or `tab.capture_pty_input` will miss bytes for
-            // attach-flow tabs.
-            if let self, let tabID = self.id,
-               let buf = RoostBackend.shared.ensureInputCapture(tabID: tabID)
-            {
-                buf.append(data)
-            }
-            self?.keystrokeContinuation?.yield(.input(data))
-        }
+        installOnKeyWithTestCapture()
         terminalView.onResize = { [weak self] cols, rows in
             self?.resize(cols: cols, rows: rows)
         }
@@ -285,6 +258,27 @@ final class TabSession {
                 oCont.yield(data)
             }
             oCont.finish()
+        }
+    }
+
+    /// Install the onKey closure on `terminalView`. Shared between
+    /// `start()` and `attach()` so the capture-buffer tap added for
+    /// `tab.capture_pty_input` can never drift between the two
+    /// flows. When ROOST_TEST_MODE=1, every outbound byte
+    /// (keystrokes, paste, OSC reply replies — the Mac OSC reply
+    /// path also routes through `onKey` at
+    /// `TerminalView.appendBytes:366`) is mirrored into the per-tab
+    /// buffer hung off `RoostBackend.shared`. Outside test mode
+    /// the lookup is a single nil-return branch — no overhead.
+    @MainActor
+    private func installOnKeyWithTestCapture() {
+        terminalView.onKey = { [weak self] data in
+            if let self, let tabID = self.id,
+               let buf = RoostBackend.shared.ensureInputCapture(tabID: tabID)
+            {
+                buf.append(data)
+            }
+            self?.keystrokeContinuation?.yield(.input(data))
         }
     }
 
