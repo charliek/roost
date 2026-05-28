@@ -119,7 +119,9 @@ pub use mouse_encoder::{
 #[cfg(feature = "ffi")]
 pub use render_state::{Cell, ColorRgb, Colors, CursorInfo, CursorVisualStyle, RenderState, Style};
 #[cfg(feature = "ffi")]
-pub use terminal::{ActiveScreen, ScrollViewport, Terminal, TerminalOptions};
+pub use terminal::{
+    ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Terminal, TerminalOptions,
+};
 
 // ============================================================================
 // FFI smoke
