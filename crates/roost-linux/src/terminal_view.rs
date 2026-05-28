@@ -528,6 +528,14 @@ impl TerminalView {
         self.widget.queue_draw();
     }
 
+    /// Snapshot libghostty's currently-effective default colors. The
+    /// OSC drain task answers `OSC 10/11/12;?` queries from this so
+    /// any mid-session `OSC 11;rgb:…` set is reflected by the next
+    /// query reply.
+    pub fn live_colors(&self) -> roost_vt::Result<roost_vt::Colors> {
+        self.state.borrow().terminal.live_colors()
+    }
+
     /// Set the selection rectangle from viewport `(col, row)` coords.
     /// Mirrors `mouseDown` + `mouseDragged` for the IPC `selection.set`
     /// op: drops any existing selection, anchors at `anchor`, and sets

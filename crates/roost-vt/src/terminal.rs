@@ -321,6 +321,61 @@ impl Terminal {
         active
     }
 
+    /// Read libghostty's currently-effective default colors — i.e. the
+    /// values an OSC `]10;?` / `]11;?` / `]12;?` query should answer.
+    /// Returns the post-OSC-override view: if the app has set the bg
+    /// via `OSC 11;rgb:…`, the new value wins; otherwise the theme's
+    /// `set_color_background` push is what we return.
+    ///
+    /// Cursor is `Option<ColorRgb>` because libghostty can leave it
+    /// unset (then the renderer falls back to the theme's cursor
+    /// color); fg/bg are required and surface `Error::NoValue` if the
+    /// theme push hasn't happened — caller chooses how to fall back.
+    pub fn live_colors(&self) -> Result<crate::Colors> {
+        use crate::ColorRgb;
+        let mut fg = sys::GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        // SAFETY: handle non-null; fg is a real local.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND,
+                (&mut fg) as *mut sys::GhosttyColorRgb as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        let mut bg = sys::GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        // SAFETY: handle non-null; bg is a real local.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND,
+                (&mut bg) as *mut sys::GhosttyColorRgb as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        // Cursor may be unset — collapse `NoValue` to `None` so the
+        // caller can fall back to the theme without an error path.
+        let mut cur = sys::GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        // SAFETY: handle non-null; cur is a real local.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_CURSOR,
+                (&mut cur) as *mut sys::GhosttyColorRgb as *mut _,
+            )
+        };
+        let cursor = match Error::from_result(rc) {
+            Ok(()) => Some(ColorRgb::new(cur.r, cur.g, cur.b)),
+            Err(Error::NoValue) => None,
+            Err(err) => return Err(err),
+        };
+        Ok(crate::Colors {
+            foreground: ColorRgb::new(fg.r, fg.g, fg.b),
+            background: ColorRgb::new(bg.r, bg.g, bg.b),
+            cursor,
+        })
+    }
+
     /// Push the default foreground color into libghostty so SGR cells
     /// that inherit the default flip to the theme. Wraps
     /// `ghostty_terminal_set(OPT_COLOR_FOREGROUND, &rgb)`.

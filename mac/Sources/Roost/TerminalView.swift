@@ -352,25 +352,14 @@ final class TerminalView: NSView {
             // stdin alongside user keystrokes via the tab's
             // keystroke continuation — FIFO with other writes *once
             // enqueued*, not against PTY output that hasn't been
-            // drained yet. **Limitation:** if the app later changes
-            // the bg via `OSC 11;rgb:…`, libghostty tracks the new
-            // value internally but the scanner drops the set-color
-            // body, so subsequent queries reply with the static theme
-            // color. Affects vim retheme scenarios; not codex (which
-            // only queries). Follow-up to read libghostty's current
-            // colors via `ghostty_terminal_get(... COLOR_BACKGROUND)`
-            // instead. Mirrors the Linux drain at
+            // drained yet. Reads libghostty's *currently effective*
+            // color so a prior `OSC 10/11/12;rgb:…` set is reflected
+            // in the next query reply (vim colorscheme plugins etc.).
+            // Mirrors the Linux drain at
             // `crates/roost-linux/src/app.rs` and the legacy Go
-            // reference at `internal/osc/scanner.go:280-300`. See
-            // memory/codex-gray-bg-osc11-fix for context.
+            // reference at `internal/osc/scanner.go:280-300`.
             if case .colorQuery(let n) = event {
-                let color: NSColor?
-                switch n {
-                case 10: color = theme.foreground
-                case 11: color = theme.background
-                case 12: color = theme.cursor
-                default: color = nil
-                }
+                let color = TerminalView.liveColor(forQuery: n, terminal: terminal, theme: theme)
                 if let color = color,
                    let reply = TerminalView.formatColorQueryResponse(n: n, color: color)
                 {
@@ -1589,6 +1578,52 @@ final class TerminalView: NSView {
             Int(n), r, r, g, g, b, b
         )
         return Data(s.utf8)
+    }
+
+    /// Read the live effective color libghostty would render with for
+    /// the given OSC color-query number (10=fg, 11=bg, 12=cursor),
+    /// falling back to the theme when libghostty hasn't tracked a
+    /// value yet. Centralised so the OSC reply path on the Mac
+    /// matches the Linux `TerminalView::live_colors` shape — both
+    /// UIs must reply with the same color a `vim`-driven
+    /// `OSC 11;rgb:…` set most recently established.
+    ///
+    /// Returns `nil` if `n` isn't 10/11/12.
+    @MainActor
+    static func liveColor(
+        forQuery n: UInt8,
+        terminal: GhosttyTerminal,
+        theme: Theme
+    ) -> NSColor? {
+        let dataKey: GhosttyTerminalData
+        let themeFallback: NSColor
+        switch n {
+        case 10:
+            dataKey = GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND
+            themeFallback = theme.foreground
+        case 11:
+            dataKey = GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND
+            themeFallback = theme.background
+        case 12:
+            dataKey = GHOSTTY_TERMINAL_DATA_COLOR_CURSOR
+            themeFallback = theme.cursor
+        default:
+            return nil
+        }
+        var rgb = GhosttyColorRgb(r: 0, g: 0, b: 0)
+        let rc = ghostty_terminal_get(terminal, dataKey, &rgb)
+        guard rc.rawValue == 0 else {
+            // GHOSTTY_NO_VALUE (or any other non-zero rc) means
+            // libghostty isn't reporting a default yet — render with
+            // the theme, which is what the renderer paints anyway.
+            return themeFallback
+        }
+        return NSColor(
+            srgbRed: CGFloat(rgb.r) / 255,
+            green: CGFloat(rgb.g) / 255,
+            blue: CGFloat(rgb.b) / 255,
+            alpha: 1
+        )
     }
 
     /// Solid block cursor with the underlying glyph re-painted in an
