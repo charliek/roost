@@ -156,13 +156,31 @@ class TestOscPipeline:
         assert x_cell is not None, "X cell never appeared in resolved dump"
         assert x_cell["inverse"] is True, x_cell
         assert x_cell["has_explicit_bg"] is True, x_cell
-        # The swap puts the canvas-default bg in fg and vice versa.
-        # roost-dark: bg=#1e1e1e, fg=#ffffff. After swap: fg=#1e1e1e,
-        # bg=#ffffff. Don't pin the exact colors (themes drift, and
-        # CI may seed a different one) — just assert they SWAPPED,
-        # i.e. fg != bg for an inverse cell on a theme where the
-        # canvas fg != canvas bg (true for every bundled theme).
-        assert x_cell["fg"] != x_cell["bg"], x_cell
+        # Discover the canvas defaults from a non-inverse cell on the
+        # same row (e.g., the blank space at col 5) — instead of
+        # hard-coding roost-dark's `#ffffff` / `#1e1e1e`, which would
+        # silently rot if the harness ever ran against a different
+        # default theme. Inverse must SWAP those two colors exactly:
+        # asserting only fg != bg is too lax (any random swap would
+        # pass); asserting on the literal post-swap values catches a
+        # regression where, say, the resolver swapped to a third
+        # color or only swapped fg.
+        baseline = next(
+            c for c in dump["cells"]
+            if c["row"] == 9 and c["col"] == 5 and not c["inverse"]
+        )
+        canvas_fg = baseline["fg"]
+        canvas_bg = baseline["bg"]
+        assert canvas_fg != canvas_bg, (
+            f"baseline fg == bg ({canvas_fg!r}) — can't validate inverse swap "
+            f"on a single-color theme"
+        )
+        assert x_cell["fg"] == canvas_bg, (
+            f"inverse fg ({x_cell['fg']!r}) must == canvas bg ({canvas_bg!r})"
+        )
+        assert x_cell["bg"] == canvas_fg, (
+            f"inverse bg ({x_cell['bg']!r}) must == canvas fg ({canvas_fg!r})"
+        )
 
     # ----- #145 drain-wiring coverage -----------------------------------
 

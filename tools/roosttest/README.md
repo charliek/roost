@@ -3,8 +3,11 @@
 Functional end-to-end tests that drive a **real** Roost UI (Mac or GTK)
 over the JSON IPC socket and assert on the op set — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
-No test-only backdoors; assertions read back via `tab.dump` / `tab.list`
-/ `identify`.
+Most tests read back via `tab.dump` / `tab.list` / `identify`; the
+byte-level OSC pipeline tests additionally use the gated test-mode
+IPC ops (`tab.feed_pty_bytes` / `tab.capture_pty_input` /
+`tab.dump_resolved`, all `ROOST_TEST_MODE=1`-only) — see "OSC-routed
+regression patterns" below.
 
 ## Run
 
