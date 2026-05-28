@@ -527,6 +527,73 @@ impl TerminalView {
         self.widget.queue_draw();
     }
 
+    /// Set the selection rectangle from viewport `(col, row)` coords.
+    /// Mirrors `mouseDown` + `mouseDragged` for the IPC `selection.set`
+    /// op: drops any existing selection, anchors at `anchor`, and sets
+    /// the cursor end at `cursor`. Returns `false` and clears the
+    /// selection if either point can't be converted to a stable screen-y
+    /// (out-of-range row, terminal not ready). Same coordinate semantics
+    /// as the drag handlers.
+    pub fn set_selection(&self, anchor: (u16, u16), cursor: (u16, u16)) -> bool {
+        let mut s = self.state.borrow_mut();
+        let resolved = (|| {
+            let anchor_y = s.screen_y_for_viewport_row(anchor.1)?;
+            let cursor_y = s.screen_y_for_viewport_row(cursor.1)?;
+            Some((anchor_y, cursor_y))
+        })();
+        match resolved {
+            Some((anchor_y, cursor_y)) => {
+                s.selection = Some(Selection {
+                    anchor_col: anchor.0,
+                    anchor_screen_y: anchor_y,
+                    cursor_col: cursor.0,
+                    cursor_screen_y: cursor_y,
+                });
+                drop(s);
+                self.widget.queue_draw();
+                true
+            }
+            None => {
+                s.selection = None;
+                drop(s);
+                self.widget.queue_draw();
+                false
+            }
+        }
+    }
+
+    /// Clear any active selection on this terminal.
+    pub fn clear_selection(&self) {
+        let had = {
+            let mut s = self.state.borrow_mut();
+            s.selection.take().is_some()
+        };
+        if had {
+            self.widget.queue_draw();
+        }
+    }
+
+    /// Snapshot the current selection for the `selection.dump` IPC op:
+    /// extracted text (same path the `Alt+C` copy uses) + whether each
+    /// endpoint is currently visible in the viewport. Returns `None`
+    /// when no selection is active.
+    pub fn dump_selection(&self) -> Option<SelectionDumpData> {
+        let (anchor_screen_y, cursor_screen_y) = {
+            let s = self.state.borrow();
+            let sel = s.selection?;
+            (sel.anchor_screen_y, sel.cursor_screen_y)
+        };
+        let text = selection_text(&self.state);
+        let s = self.state.borrow();
+        let anchor_visible = s.viewport_row_for_screen_y(anchor_screen_y).is_some();
+        let cursor_visible = s.viewport_row_for_screen_y(cursor_screen_y).is_some();
+        Some(SelectionDumpData {
+            text,
+            anchor_visible,
+            cursor_visible,
+        })
+    }
+
     /// Copy the current selection to the system clipboard
     /// (`gdk::Display::clipboard`). No-op if the selection is empty. On
     /// Linux the text is also published to the X11/Wayland PRIMARY
@@ -717,6 +784,15 @@ struct TerminalViewState {
     /// once the session is attached. See the callback invariant on
     /// `input_callback`.
     on_resize: Option<Rc<dyn Fn(u16, u16)>>,
+}
+
+/// Selection snapshot for the `selection.dump` IPC op. `text` is the
+/// extracted plain text (same path as `Alt+C` / Ctrl+Shift+C) or `None`
+/// when the selection has scrolled fully out of the viewport.
+pub struct SelectionDumpData {
+    pub text: Option<String>,
+    pub anchor_visible: bool,
+    pub cursor_visible: bool,
 }
 
 /// Drag-selection state. Rows are stored as libghostty

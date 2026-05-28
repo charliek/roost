@@ -715,6 +715,65 @@ final class TerminalView: NSView {
         }
     }
 
+    /// Drive the selection from explicit viewport coords (the
+    /// `selection.set` IPC op). Mirrors `mouseDown` + `mouseDragged`
+    /// but with row/col passed in instead of computed from
+    /// `NSEvent.locationInWindow`. Returns `false` and clears the
+    /// selection if either point can't convert to a stable screen-y
+    /// (out-of-range row, terminal not ready).
+    @MainActor
+    @discardableResult
+    func setSelection(
+        anchorCol: Int,
+        anchorRow: Int,
+        cursorCol: Int,
+        cursorRow: Int
+    ) -> Bool {
+        guard let anchorY = screenY(forViewportRow: anchorRow),
+              let cursorY = screenY(forViewportRow: cursorRow)
+        else {
+            if selection != nil {
+                selection = nil
+                needsDisplay = true
+            }
+            return false
+        }
+        selection = CellSelection(
+            anchorCol: anchorCol,
+            anchorScreenY: anchorY,
+            cursorCol: cursorCol,
+            cursorScreenY: cursorY
+        )
+        needsDisplay = true
+        return true
+    }
+
+    /// Snapshot the current selection for the `selection.dump` IPC op.
+    /// Returns `nil` when no selection is active; otherwise carries the
+    /// extracted text (same path `⌘C` uses) plus whether each endpoint
+    /// is currently visible in the viewport.
+    @MainActor
+    func dumpSelection() -> SelectionDump? {
+        guard let sel = selection else { return nil }
+        let text = selectedPlainText()
+        let anchorVisible = viewportRow(forScreenY: sel.anchorScreenY) != nil
+        let cursorVisible = viewportRow(forScreenY: sel.cursorScreenY) != nil
+        return SelectionDump(
+            text: text,
+            anchorVisible: anchorVisible,
+            cursorVisible: cursorVisible
+        )
+    }
+
+    /// Result of [`dumpSelection`]. Mirrors the `SelectionDumpResult`
+    /// wire type. `text` is `nil` when no selection rows are currently
+    /// visible (same limitation as `selectedPlainText`).
+    struct SelectionDump {
+        let text: String?
+        let anchorVisible: Bool
+        let cursorVisible: Bool
+    }
+
     /// Standard responder-chain copy. `⌘C` is wired into the App's
     /// Edit menu via `selector: #selector(NSText.copy(_:))`; AppKit
     /// routes it here once the TerminalView is first responder.

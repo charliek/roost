@@ -4182,6 +4182,43 @@ extension RoostApp: UiBridge {
         return paletteSnapshot()
     }
 
+    // MARK: selection — IPC drive surface (selection.* ops)
+    //
+    // Resolve the tab id to its live `TerminalView`, then delegate.
+    // Returning `false` / `nil` from the outer optional signals
+    // "no live tab" so the IPC handler maps to `not-found`. Coords
+    // pass through to the view as viewport (col, row).
+
+    func setTabSelection(
+        tabID: Int64,
+        anchorCol: Int,
+        anchorRow: Int,
+        cursorCol: Int,
+        cursorRow: Int
+    ) -> Bool {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return false }
+        session.terminalView.setSelection(
+            anchorCol: anchorCol,
+            anchorRow: anchorRow,
+            cursorCol: cursorCol,
+            cursorRow: cursorRow
+        )
+        return true
+    }
+
+    func clearTabSelection(tabID: Int64) -> Bool {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return false }
+        session.terminalView.clearSelection()
+        return true
+    }
+
+    func dumpTabSelection(tabID: Int64) -> TerminalView.SelectionDump?? {
+        guard let session = tabs.first(where: { $0.id == tabID }) else {
+            return Optional<TerminalView.SelectionDump?>.none
+        }
+        return .some(session.terminalView.dumpSelection())
+    }
+
     /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.
     private func paletteSnapshot() -> PaletteSnapshot {
         guard let panel = palette else { return .closed }

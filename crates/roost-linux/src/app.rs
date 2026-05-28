@@ -32,6 +32,7 @@ use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
+use crate::clipboard;
 use crate::config::{CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
@@ -777,6 +778,26 @@ impl App {
                         }
                         UiRequest::PaletteDismiss { reply } => {
                             let _ = reply.send(Ok(app.ipc_palette_dismiss()));
+                        }
+                        UiRequest::SelectionSet {
+                            tab_id,
+                            anchor,
+                            cursor,
+                            reply,
+                        } => {
+                            let _ = reply.send(app.ipc_selection_set(tab_id, anchor, cursor));
+                        }
+                        UiRequest::SelectionClear { tab_id, reply } => {
+                            let _ = reply.send(app.ipc_selection_clear(tab_id));
+                        }
+                        UiRequest::SelectionDump { tab_id, reply } => {
+                            let _ = reply.send(app.ipc_selection_dump(tab_id));
+                        }
+                        UiRequest::ClipboardDump { target, reply } => {
+                            app.ipc_clipboard_dump(target, reply);
+                        }
+                        UiRequest::ClipboardWrite { target, text } => {
+                            app.ipc_clipboard_write(target, text);
                         }
                     }
                 }
@@ -3099,6 +3120,97 @@ impl App {
             driver.dismiss();
         }
         self.ipc_palette_state()
+    }
+
+    // MARK: selection + clipboard — IPC drive surface
+    //
+    // Service the `UiRequest::Selection*` / `UiRequest::Clipboard*` arms
+    // on the GTK main thread. Selection ops require a live `TerminalView`
+    // (`not-found` otherwise — matches `tab.dump`); clipboard ops touch
+    // the host pasteboard via `crate::clipboard`, identical to the
+    // user-driven Ctrl+Shift+C / drag paths.
+
+    fn ipc_selection_set(
+        self: &Rc<Self>,
+        tab_id: i64,
+        anchor: (u16, u16),
+        cursor: (u16, u16),
+    ) -> Result<(), String> {
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        view.set_selection(anchor, cursor);
+        Ok(())
+    }
+
+    fn ipc_selection_clear(self: &Rc<Self>, tab_id: i64) -> Result<(), String> {
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        view.clear_selection();
+        Ok(())
+    }
+
+    fn ipc_selection_dump(
+        self: &Rc<Self>,
+        tab_id: i64,
+    ) -> Result<Option<roost_linux::ipc::SelectionData>, String> {
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        Ok(view
+            .dump_selection()
+            .map(|d| roost_linux::ipc::SelectionData {
+                text: d.text,
+                anchor_visible: d.anchor_visible,
+                cursor_visible: d.cursor_visible,
+            }))
+    }
+
+    fn ipc_clipboard_dump(
+        self: &Rc<Self>,
+        target: roost_linux::ipc::ClipboardOp,
+        reply: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
+    ) {
+        // Inline equivalent of `clipboard::read` so we can answer the
+        // oneshot in BOTH the "had text" and "had nothing" cases —
+        // `clipboard::read`'s callback only fires on success, which
+        // would leave the IPC caller waiting forever for an empty
+        // pasteboard.
+        let gdk_target = match target {
+            roost_linux::ipc::ClipboardOp::System => clipboard::Target::Clipboard,
+            roost_linux::ipc::ClipboardOp::Selection => clipboard::Target::Primary,
+        };
+        let Some(display) = gtk4::gdk::Display::default() else {
+            let _ = reply.send(Ok(None));
+            return;
+        };
+        let cb = match gdk_target {
+            clipboard::Target::Clipboard => display.clipboard(),
+            #[cfg(target_os = "linux")]
+            clipboard::Target::Primary => display.primary_clipboard(),
+            #[cfg(not(target_os = "linux"))]
+            clipboard::Target::Primary => {
+                let _ = reply.send(Ok(None));
+                return;
+            }
+        };
+        glib::spawn_future_local(async move {
+            let result = match cb.read_text_future().await {
+                Ok(Some(text)) => Ok(Some(text.to_string())),
+                Ok(None) => Ok(None),
+                Err(_) => Ok(None),
+            };
+            let _ = reply.send(result);
+        });
+    }
+
+    fn ipc_clipboard_write(self: &Rc<Self>, target: roost_linux::ipc::ClipboardOp, text: String) {
+        let target = match target {
+            roost_linux::ipc::ClipboardOp::System => clipboard::Target::Clipboard,
+            roost_linux::ipc::ClipboardOp::Selection => clipboard::Target::Primary,
+        };
+        clipboard::write(target, &text);
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {
