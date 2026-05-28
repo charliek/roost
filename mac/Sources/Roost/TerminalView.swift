@@ -970,8 +970,18 @@ final class TerminalView: NSView {
         // Per-cell content. Walk yields backgrounds (always
         // optional), grapheme characters (nil for empty cells),
         // and foregrounds (optional, fall back to default fg).
-        // We do bg fills + glyph draws in a single pass so each
-        // cell is touched only once.
+        //
+        // **Two-pass walk** — collect bg fills + glyph draws in one
+        // walk, then paint Pass A (all bg rects) and Pass B (all
+        // glyphs) separately. Pre-split this was a single per-cell
+        // loop; a descender from row N (e.g. the lower stem of a 'g'
+        // in a gray prompt cell) could be painted, then row N+1's
+        // bg fill would clobber the descender ink because the loop
+        // walked in row-major order. Linux already does this same
+        // split — see `crates/roost-linux/src/terminal_view.rs` Pass
+        // A/B comments. SGR style bits (especially `inverse`) are
+        // applied via `resolveCellColors` so codex's `\e[7m` prompt
+        // row renders its gray bg.
         //
         // Glyph drawing currently uses NSAttributedString.draw —
         // simple, slow-but-correct. A glyph atlas (Core Text +
@@ -981,41 +991,75 @@ final class TerminalView: NSView {
         let cellW = cellSize.width
         let cellH = cellSize.height
         let defaultFg = canvasFg
+        let defaultBg = canvasBg
         let cellFont = self.font
+
+        struct BgFill { let rect: NSRect; let color: NSColor }
+        struct GlyphDraw {
+            let glyph: Character
+            let foreground: NSColor
+            let origin: NSPoint
+        }
+
+        var bgFills: [BgFill] = []
+        var glyphDraws: [GlyphDraw] = []
+
         renderState.walk { cell in
+            let (fg, bg, hasExplicitBg) = TerminalView.resolveCellColors(
+                cell: cell,
+                defaultFg: defaultFg,
+                defaultBg: defaultBg,
+                boldColor: nil
+            )
             let rect = NSRect(
                 x: CGFloat(cell.col) * cellW,
                 y: CGFloat(cell.row) * cellH,
                 width: cellW,
                 height: cellH
             )
-            if let bg = cell.background {
-                bg.setFill()
-                rect.fill()
+            if hasExplicitBg {
+                bgFills.append(BgFill(rect: rect, color: bg))
             }
             if let glyph = cell.glyph, !glyph.isWhitespace {
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: cellFont,
-                    .foregroundColor: cell.foreground ?? defaultFg,
-                ]
-                let line = NSAttributedString(string: String(glyph), attributes: attrs)
-                // Bottom-align glyphs to the cell's baseline. The
-                // grid origin is top-left (isFlipped=true), so the
-                // glyph's drawing origin is at the cell top + the
-                // font's ascender.
-                line.draw(at: NSPoint(x: rect.minX, y: rect.minY))
+                glyphDraws.append(GlyphDraw(
+                    glyph: glyph,
+                    foreground: fg,
+                    // Bottom-align glyphs to the cell's baseline.
+                    // The grid origin is top-left (isFlipped=true),
+                    // so the glyph's drawing origin is at the cell
+                    // top + the font's ascender.
+                    origin: NSPoint(x: rect.minX, y: rect.minY)
+                ))
             }
-            // M2: stash glyph at the cursor's cell so the cursor
-            // pass can redraw it in an inverted color over a
-            // focused block cursor. Done inline here to avoid a
-            // second cell walk just for the cursor cell.
+            // Stash glyph at the cursor's cell so the cursor pass can
+            // redraw it in an inverted color over a focused block
+            // cursor. Done inline so we don't need a second walk.
+            // Note this uses the *resolved* fg (post-inverse) so the
+            // cursor's "original foreground" matches what we'd have
+            // drawn under it.
             if let cur = cursorInfo,
                cell.row == Int(cur.row),
                cell.col == Int(cur.col)
             {
                 self.cursorCellGlyph = cell.glyph
-                self.cursorCellOriginalForeground = cell.foreground ?? defaultFg
+                self.cursorCellOriginalForeground = fg
             }
+        }
+
+        // Pass A — backgrounds.
+        for fill in bgFills {
+            fill.color.setFill()
+            fill.rect.fill()
+        }
+
+        // Pass B — glyphs.
+        for draw in glyphDraws {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: cellFont,
+                .foregroundColor: draw.foreground,
+            ]
+            let line = NSAttributedString(string: String(draw.glyph), attributes: attrs)
+            line.draw(at: draw.origin)
         }
 
         // Cursor (goal-mac-polish-cursor-keys M2 + Claude-cursor follow-up).
@@ -1112,6 +1156,44 @@ final class TerminalView: NSView {
     }
 
     // MARK: - Cursor draw helpers (M2)
+
+    /// Resolve a cell's effective fg/bg + whether it needs a BG fill,
+    /// applying SGR inverse + bold-accent rules. Static so it's pure
+    /// (no `self`) and can be unit-tested in
+    /// `mac/Tests/RoostTests/RenderResolverTests.swift`.
+    ///
+    /// Mirrors the legacy Go `cellColors`
+    /// (`cmd/roost/render.go:206-224`) and the Rust
+    /// `resolve_cell_colors` (`crates/roost-linux/src/terminal_view.rs`)
+    /// 1:1 — same rule order (explicit-color lookup → inverse swap →
+    /// bold-accent guarded by `!inverse && fg-was-default`) so both
+    /// UIs behave identically on inverse-marked TUI chrome (codex's
+    /// gray prompt row) and bold default-fg text.
+    ///
+    /// `boldColor` is `nil` today — themes don't yet parse a
+    /// `bold-color` key. The path is preserved for the eventual
+    /// theme-parser PR; without it bold default-fg cells render in
+    /// the canvas fg, matching pre-PR behavior.
+    static func resolveCellColors(
+        cell: RenderState.Cell,
+        defaultFg: NSColor,
+        defaultBg: NSColor,
+        boldColor: NSColor?
+    ) -> (foreground: NSColor, background: NSColor, hasExplicitBg: Bool) {
+        var fg = cell.foreground ?? defaultFg
+        var bg = cell.background ?? defaultBg
+        var hasExplicitBg = cell.background != nil
+        if cell.inverse {
+            (fg, bg) = (bg, fg)
+            hasExplicitBg = true
+        }
+        if cell.bold && cell.foreground == nil && !cell.inverse {
+            if let bc = boldColor {
+                fg = bc
+            }
+        }
+        return (fg, bg, hasExplicitBg)
+    }
 
     /// Solid block cursor with the underlying glyph re-painted in an
     /// inverted color so the character stays legible. Uses

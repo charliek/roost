@@ -117,7 +117,9 @@ pub use mouse_encoder::{
     mouse_action, mouse_button, MouseAction, MouseButton, MouseEncoder, MouseEvent,
 };
 #[cfg(feature = "ffi")]
-pub use render_state::{Cell, ColorRgb, Colors, CursorInfo, CursorVisualStyle, RenderState};
+pub use render_state::{
+    Cell, ColorRgb, Colors, CursorInfo, CursorVisualStyle, RenderState, Style,
+};
 #[cfg(feature = "ffi")]
 pub use terminal::{ActiveScreen, ScrollViewport, Terminal, TerminalOptions};
 

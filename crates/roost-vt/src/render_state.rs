@@ -111,6 +111,21 @@ pub struct Colors {
     pub cursor: Option<ColorRgb>,
 }
 
+/// SGR style bits the renderer needs to resolve effective fg/bg.
+/// Mirrors the `Bold / Italic / Inverse` fields on the legacy Go
+/// `internal/ghostty.Cell` — the three bits `cellColors`
+/// (`cmd/roost/render.go:206-224`) consumes to swap fg↔bg for
+/// `\e[7m` cells and apply the bold-accent rule. Underline /
+/// faint / blink / strikethrough / overline ride along the C
+/// struct but no caller uses them yet, so we drop them on the
+/// way in to keep `Cell` small.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Style {
+    pub bold: bool,
+    pub italic: bool,
+    pub inverse: bool,
+}
+
 /// Per-cell data the renderer needs. Background / foreground are
 /// `Option` because cells often inherit the terminal default (None →
 /// renderer paints with `Colors::foreground` / `Colors::background`).
@@ -124,6 +139,9 @@ pub struct Cell {
     pub fg: Option<ColorRgb>,
     /// Grapheme cluster text, UTF-8. Empty for blank cells.
     pub text: String,
+    /// SGR style bits (bold / italic / inverse). Default-style cells
+    /// carry `Style::default()` — all bits clear.
+    pub style: Style,
 }
 
 pub struct RenderState {
@@ -375,7 +393,15 @@ impl RenderState {
             String::new()
         };
 
-        Cell { col, bg, fg, text }
+        let style = self.read_cells_style();
+
+        Cell {
+            col,
+            bg,
+            fg,
+            text,
+            style,
+        }
     }
 
     fn read_u32(&self, data: sys::GhosttyRenderStateData) -> Result<u32> {
@@ -406,6 +432,38 @@ impl RenderState {
         };
         Error::from_result(rc).ok()?;
         Some(out.into())
+    }
+
+    fn read_cells_style(&self) -> Style {
+        // `GhosttyStyle` is a sized C struct — `.size` MUST be initialized
+        // to `sizeof(GhosttyStyle)` before the call so libghostty knows
+        // which fields this caller is prepared to receive (forward-compat
+        // contract per `ghostty/include/ghostty/vt/style.h`). The legacy
+        // Go renderer does the same via `roost_init_style`
+        // (`internal/ghostty/render.go:12-14`).
+        //
+        // The call returns `success` for every cell — even default-style
+        // cells get a zeroed `GhosttyStyle` back — so we treat any
+        // non-success as "no style data, use defaults" rather than
+        // propagating an error: rendering a cell without styles is more
+        // useful than failing the whole frame.
+        let mut s = sys::GhosttyStyle::default();
+        s.size = std::mem::size_of::<sys::GhosttyStyle>();
+        let rc = unsafe {
+            sys::ghostty_render_state_row_cells_get(
+                self.row_cells,
+                sys::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
+                (&mut s) as *mut _ as *mut _,
+            )
+        };
+        if Error::from_result(rc).is_err() {
+            return Style::default();
+        }
+        Style {
+            bold: s.bold,
+            italic: s.italic,
+            inverse: s.inverse,
+        }
     }
 
     fn read_cells_color(&self, data: sys::GhosttyRenderStateRowCellsData) -> Option<ColorRgb> {
@@ -497,6 +555,67 @@ mod tests {
             glyphs, "hello",
             "row 0 visible glyphs should be \"hello\", got {:?}",
             visible
+        );
+    }
+
+    /// Inverse-bit readback regression. Pre-fix, `Cell` had no `style`
+    /// field at all, so the renderer dropped `\e[7m` entirely and the
+    /// gray prompt row of TUI agents (codex, others) rendered against
+    /// the default canvas background instead of the inverted swap.
+    /// Verifies the bit survives the round trip libghostty → walk
+    /// callback for the inverse-marked cell *and* is clear on the
+    /// post-reset cell that follows.
+    #[test]
+    fn walk_reads_style_bits_for_inverse_cells() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("Terminal::new");
+        // CSI 7m = inverse on, CSI 1m = bold on (combined), reset, then Y.
+        terminal.vt_write(b"\x1b[1;7mX\x1b[0mY");
+
+        let mut render_state = RenderState::new().expect("RenderState::new");
+        render_state.update(&terminal).expect("update");
+
+        let mut row0: Vec<(u16, String, Style)> = Vec::new();
+        render_state
+            .walk(&terminal, |row, cell| {
+                if row == 0 && !cell.text.is_empty() && cell.text != " " {
+                    row0.push((cell.col, cell.text.clone(), cell.style));
+                }
+            })
+            .expect("walk");
+
+        let x_cell = row0
+            .iter()
+            .find(|(_, t, _)| t == "X")
+            .expect("X cell missing");
+        assert!(
+            x_cell.2.inverse,
+            "X cell should carry inverse=true after \\e[1;7m, got {:?}",
+            x_cell.2
+        );
+        assert!(
+            x_cell.2.bold,
+            "X cell should carry bold=true after \\e[1;7m, got {:?}",
+            x_cell.2
+        );
+
+        let y_cell = row0
+            .iter()
+            .find(|(_, t, _)| t == "Y")
+            .expect("Y cell missing");
+        assert!(
+            !y_cell.2.inverse,
+            "Y cell (post-reset) must not carry inverse, got {:?}",
+            y_cell.2
+        );
+        assert!(
+            !y_cell.2.bold,
+            "Y cell (post-reset) must not carry bold, got {:?}",
+            y_cell.2
         );
     }
 }

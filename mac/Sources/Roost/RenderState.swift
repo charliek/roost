@@ -92,12 +92,22 @@ final class RenderState {
     /// to the terminal's default colors. `glyph` is nil when the
     /// cell has no graphemes (empty cell — possibly with a bg fill,
     /// e.g. erase-with-color).
+    ///
+    /// `bold` / `italic` / `inverse` mirror the SGR style bits the
+    /// renderer needs to compute the effective fg/bg. `inverse`
+    /// in particular drives the swap that makes codex's `\e[7m`
+    /// gray prompt row render at all — without it the prompt
+    /// disappears into the canvas background (the visible
+    /// regression the PR fixes).
     struct Cell {
         let row: Int
         let col: Int
         let background: NSColor?
         let foreground: NSColor?
         let glyph: Character?
+        let bold: Bool
+        let italic: Bool
+        let inverse: Bool
     }
 
     /// Walk every cell in the latest snapshot. The callback runs
@@ -187,12 +197,35 @@ final class RenderState {
                     glyph = makeCharacter(from: cps)
                 }
 
+                // SGR style bits. GhosttyStyle is a sized C struct —
+                // `.size` MUST be the struct size before the call so
+                // libghostty knows which fields this caller is
+                // prepared to read (forward-compat contract from
+                // `ghostty/include/ghostty/vt/style.h`). Mirrors the
+                // legacy Go FFI at `internal/ghostty/render.go:182-189`.
+                // We treat any non-success rc as "no style data, use
+                // defaults" — better to render the cell without
+                // styling than to drop the whole frame.
+                var style = GhosttyStyle()
+                style.size = MemoryLayout<GhosttyStyle>.size
+                let styleRc = ghostty_render_state_row_cells_get(
+                    cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
+                    &style
+                )
+                let bold = styleRc.rawValue == 0 ? style.bold : false
+                let italic = styleRc.rawValue == 0 ? style.italic : false
+                let inverse = styleRc.rawValue == 0 ? style.inverse : false
+
                 fn(Cell(
                     row: row,
                     col: col,
                     background: background,
                     foreground: foreground,
-                    glyph: glyph
+                    glyph: glyph,
+                    bold: bold,
+                    italic: italic,
+                    inverse: inverse
                 ))
             }
         }
