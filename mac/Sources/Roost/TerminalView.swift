@@ -319,6 +319,41 @@ final class TerminalView: NSView {
         // the scanner is purely additive.
         let events = oscScanner.feed(data)
         for event in events {
+            // Synthesise OSC 10/11/12 query replies inline —
+            // libghostty-vt drops the .query arm of its color-op
+            // handler, so without us answering, codex (and reportedly
+            // claude-code) skip their prompt-row bg SGR sequence. We
+            // route the reply through `onKey` because the destination
+            // is exactly the same: bytes injected into the PTY's
+            // stdin alongside user keystrokes via the tab's
+            // keystroke continuation — FIFO with other writes *once
+            // enqueued*, not against PTY output that hasn't been
+            // drained yet. **Limitation:** if the app later changes
+            // the bg via `OSC 11;rgb:…`, libghostty tracks the new
+            // value internally but the scanner drops the set-color
+            // body, so subsequent queries reply with the static theme
+            // color. Affects vim retheme scenarios; not codex (which
+            // only queries). Follow-up to read libghostty's current
+            // colors via `ghostty_terminal_get(... COLOR_BACKGROUND)`
+            // instead. Mirrors the Linux drain at
+            // `crates/roost-linux/src/app.rs` and the legacy Go
+            // reference at `internal/osc/scanner.go:280-300`. See
+            // memory/codex-gray-bg-osc11-fix for context.
+            if case .colorQuery(let n) = event {
+                let color: NSColor?
+                switch n {
+                case 10: color = theme.foreground
+                case 11: color = theme.background
+                case 12: color = theme.cursor
+                default: color = nil
+                }
+                if let color = color,
+                   let reply = TerminalView.formatColorQueryResponse(n: n, color: color)
+                {
+                    onKey?(reply)
+                }
+                continue
+            }
             let (cmd, payload) = event.asReport
             onOsc?(cmd, payload)
         }
@@ -1227,6 +1262,36 @@ final class TerminalView: NSView {
             }
         }
         return (fg, bg, hasExplicitBg)
+    }
+
+    /// Synthesise the XTerm-form OSC 10/11/12 query response for
+    /// the given query number + theme color. Byte-identical to the
+    /// Rust `format_color_query_response` in
+    /// `crates/roost-osc/src/lib.rs` — both ports must produce the
+    /// same bytes so codex/claude-code see one terminal answer
+    /// regardless of which UI hosts the tab. `nonisolated` because
+    /// the function is pure (no `self`); see `resolveCellColors`
+    /// above for the same Swift 6 strict-concurrency rationale.
+    ///
+    /// Returns `nil` if `n` isn't one of the recognised color-query
+    /// numbers (10, 11, 12). Returns `nil` when the color can't be
+    /// converted to sRGB components (defensive — every bundled theme
+    /// color does convert).
+    nonisolated static func formatColorQueryResponse(n: UInt8, color: NSColor) -> Data? {
+        guard (10...12).contains(n), let srgb = color.usingColorSpace(.sRGB) else {
+            return nil
+        }
+        let r = UInt8(round(srgb.redComponent * 255))
+        let g = UInt8(round(srgb.greenComponent * 255))
+        let b = UInt8(round(srgb.blueComponent * 255))
+        // 16-bit-per-channel form: each 8-bit channel repeated to
+        // fill 4 hex digits, BEL-terminated. Matches xterm's reply
+        // and what codex/claude expect.
+        let s = String(
+            format: "\u{1B}]%d;rgb:%02x%02x/%02x%02x/%02x%02x\u{07}",
+            Int(n), r, r, g, g, b, b
+        )
+        return Data(s.utf8)
     }
 
     /// Solid block cursor with the underlying glyph re-painted in an

@@ -1706,6 +1706,7 @@ impl App {
             // state.
             let app_for_osc = app_for_attach.clone();
             let app_for_exit = app_for_attach.clone();
+            let session_for_replies = session.clone();
             glib::spawn_future_local(async move {
                 let mut scanner = roost_osc::OscScanner::new();
                 while let Some(msg) = output_rx.recv().await {
@@ -1713,6 +1714,52 @@ impl App {
                         TabOutput::Bytes(data) => {
                             let events = scanner.feed(&data);
                             for event in events {
+                                // Synthesise OSC 10/11/12 query
+                                // replies — libghostty-vt drops the
+                                // .query arm, so without us answering
+                                // codex (and reportedly claude-code)
+                                // skip their prompt-row bg SGR. The
+                                // reply rides the same per-tab serial
+                                // PTY-input channel as keystrokes
+                                // (`TabSession::send_input`), so it's
+                                // FIFO-ordered with other writes
+                                // *once enqueued* — not with PTY
+                                // output that hasn't been drained yet.
+                                // **Limitation:** if the app later
+                                // changes the bg via `OSC 11;rgb:…`,
+                                // libghostty tracks it internally but
+                                // the scanner drops the set-color
+                                // body, so subsequent queries reply
+                                // with the static theme color. Real
+                                // for vim plugins that retheme on
+                                // colorscheme change; not for codex,
+                                // which only queries. Follow-up to
+                                // read libghostty's current colors via
+                                // `terminal.colors()` instead.
+                                // Reference: legacy
+                                // `internal/osc/scanner.go:280-300`,
+                                // memory note
+                                // `codex-gray-bg-osc11-fix`.
+                                if let roost_osc::OscEvent::ColorQuery(n) = event {
+                                    let theme = app_for_osc.theme.borrow();
+                                    let color = match n {
+                                        10 => theme.foreground,
+                                        11 => theme.background,
+                                        12 => theme.cursor,
+                                        _ => {
+                                            drop(theme);
+                                            continue;
+                                        }
+                                    };
+                                    drop(theme);
+                                    if let Some(reply) = roost_osc::format_color_query_response(
+                                        n,
+                                        (color.r, color.g, color.b),
+                                    ) {
+                                        session_for_replies.send_input(reply);
+                                    }
+                                    continue;
+                                }
                                 app_for_osc.report_osc_event(tab_id, event);
                             }
                             terminal_for_drain.vt_write(&data);
