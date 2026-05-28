@@ -43,8 +43,10 @@ aliases, prompt, `PROMPT_COMMAND` hooks) load exactly as they do outside Roost.
 Two cases auto-loading can't reach, where you add one line to your rc instead:
 
 - **Apple's `/bin/bash` (3.2)** on macOS — its `ENV`/POSIX startup path is
-  patched out, so Roost can't inject. (Homebrew bash, or any bash ≥ 4.4, works
-  automatically.)
+  patched out, so Roost can't inject. Homebrew bash (or any bash ≥ 4.4) auto-loads,
+  but only when it's your **login shell**: Roost reads `$SHELL`, not `$PATH`. See
+  [Switching macOS default to Homebrew bash](#switching-macos-default-to-homebrew-bash)
+  below if `which bash` shows Homebrew but default tabs still spawn Apple's.
 - **zsh with a system `/etc/zshenv` that hard-sets `ZDOTDIR`** — it runs before
   Roost's shim and overrides it.
 
@@ -66,6 +68,49 @@ no-op outside Roost, and the script is idempotent if auto-loading already ran):
 ```
 
 Roost ships the scripts inside the app and points `$ROOST_RESOURCES_DIR` at them.
+
+### Switching macOS default to Homebrew bash
+
+A common confusion: you've run `brew install bash`, and `which bash` returns
+`/opt/homebrew/bin/bash` (5.x) — but a default Cmd-T tab still spawns Apple's
+3.2 and falls back to the manual-source path above. The two commands answer
+different questions:
+
+- `which bash` walks **`$PATH`** and reports the first executable named `bash`
+  — Homebrew puts `/opt/homebrew/bin` ahead of `/bin` via `brew shellenv`, so
+  this finds the modern one. It's "if I type `bash`, what runs?".
+- `$SHELL` is your **registered login shell** — the account property that
+  `chsh` sets, stored in macOS's directory service (`dscl . -read /Users/$USER
+  UserShell`). It's "what shell does this user prefer?", which is what Roost,
+  Terminal.app, `cron`, `sudo -s`, IDE terminals, and everything else asks when
+  they need to *spawn* a shell. It doesn't follow `$PATH`.
+
+Until you `chsh`, `$SHELL` stays at the registered value (Apple `/bin/bash` on
+many older or migrated macOS accounts), so default tabs use Apple bash even
+though `which bash` shows Homebrew. To make modern bash your login shell so
+every default tab auto-bootstraps:
+
+```bash
+# 1. Allow it as a login shell (macOS keeps an allow-list).
+grep -qx /opt/homebrew/bin/bash /etc/shells \
+  || echo /opt/homebrew/bin/bash | sudo tee -a /etc/shells
+
+# 2. Switch (prompts for your account password).
+chsh -s /opt/homebrew/bin/bash
+```
+
+Then **fully quit and relaunch Roost** so the GUI process inherits the new
+`$SHELL` from its parent environment. Verify in a fresh tab:
+
+```bash
+echo "$SHELL"; "$SHELL" --version | head -1
+# expect: /opt/homebrew/bin/bash + 5.x
+```
+
+If you'd rather not switch your account default, the manual-source line above
+works on Apple `/bin/bash`, and you can always open a single Homebrew-bash tab
+on demand via `roostctl tab open --argv /opt/homebrew/bin/bash --argv -l`
+(handy as a saved command-launcher entry).
 
 The scripts are gated on `$ROOST_TAB_ID`, idempotent, and interactive-only. They
 emit OSC 7 (cwd) and OSC 0 (a `~`-abbreviated path as the tab title), and set a
