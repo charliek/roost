@@ -55,6 +55,12 @@ struct Theme: Sendable {
     var cursor: NSColor
     var selectionBackground: NSColor
     var selectionForeground: NSColor
+    /// Ghostty `bold-color` accent. `nil` until a theme opts in;
+    /// bold cells without an explicit SGR fg adopt this color when
+    /// set, matching the Linux `Theme.bold_color` shape. Defaulted
+    /// here so existing memberwise-init callers (smoke tests, future
+    /// fixtures) keep compiling without naming the field.
+    var boldColor: NSColor? = nil
     var palette: [NSColor]  // exactly 256 entries
 
     /// Hard-coded fallback so the UI has a sane theme before
@@ -66,6 +72,7 @@ struct Theme: Sendable {
         cursor: NSColor(srgbRed: 0.6, green: 0.6, blue: 0.6, alpha: 1),
         selectionBackground: NSColor(srgbRed: 0.247, green: 0.388, blue: 0.545, alpha: 1),
         selectionForeground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
+        boldColor: nil,
         palette: Array(repeating: NSColor.gray, count: 256)
     )
 
@@ -150,11 +157,13 @@ private func parse(_ text: String) throws -> Theme {
             if let c = parseHexColor(rest) { theme.selectionBackground = c }
         case "selection-foreground":
             if let c = parseHexColor(rest) { theme.selectionForeground = c }
+        case "bold-color":
+            if let c = parseHexColor(rest) { theme.boldColor = c }
         default:
-            // Ghostty has many more keys (bold-color, cursor-text,
-            // link-color, …). Drop them silently rather than erroring
-            // so a user can keep an unchanged Ghostty theme file on
-            // disk and have Roost honor what it can.
+            // Ghostty has many more keys (cursor-text, link-color, …).
+            // Drop them silently rather than erroring so a user can
+            // keep an unchanged Ghostty theme file on disk and have
+            // Roost honor what it can.
             continue
         }
     }

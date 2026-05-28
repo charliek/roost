@@ -19,3 +19,4 @@ foreground = #ffffff
 cursor-color = #98989d
 selection-background = #3f638b
 selection-foreground = #ffffff
+bold-color = #ffffff

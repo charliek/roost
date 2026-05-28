@@ -22,6 +22,13 @@ pub struct Theme {
     pub cursor: ColorRgb,
     pub selection_background: ColorRgb,
     pub selection_foreground: ColorRgb,
+    /// Ghostty `bold-color` accent: when `Some`, bold cells whose
+    /// foreground is the default (no explicit SGR fg) render in this
+    /// color. `None` leaves bold default-fg cells rendering in the
+    /// canvas default — `resolve_cell_colors` already handles both
+    /// branches, and keeping the field optional makes "theme didn't
+    /// opt in" trivially visible in tests.
+    pub bold_color: Option<ColorRgb>,
     pub palette: [ColorRgb; 256],
 }
 
@@ -47,6 +54,7 @@ impl Theme {
             cursor: ColorRgb::new(0xbb, 0xbb, 0xbb),
             selection_background: ColorRgb::new(0x44, 0x4f, 0x69),
             selection_foreground: ColorRgb::new(0xff, 0xff, 0xff),
+            bold_color: None,
             palette,
         }
     }
@@ -175,6 +183,12 @@ fn parse_theme(content: &str) -> Option<Theme> {
                     got_anything = true;
                 }
             }
+            "bold-color" => {
+                if let Some(rgb) = parse_hex(value) {
+                    t.bold_color = Some(rgb);
+                    got_anything = true;
+                }
+            }
             _ => {}
         }
     }
@@ -249,5 +263,25 @@ mod tests {
                 .iter()
                 .any(|c| c.r != 0 || c.g != 0 || c.b != 0));
         }
+    }
+
+    #[test]
+    fn bundled_roost_dark_now_has_bold_color() {
+        let theme = Theme::load_bundled("roost-dark");
+        assert_eq!(theme.bold_color, Some(ColorRgb::new(0xff, 0xff, 0xff)));
+    }
+
+    #[test]
+    fn theme_without_bold_color_has_none() {
+        let snippet = "background = #1e1e1e\nforeground = #ffffff\n";
+        let parsed = parse_theme(snippet).expect("snippet has parseable lines");
+        assert!(parsed.bold_color.is_none());
+    }
+
+    #[test]
+    fn parser_reads_bold_color_line() {
+        let snippet = "foreground = #ffffff\nbold-color = #aabbcc\n";
+        let parsed = parse_theme(snippet).expect("snippet has parseable lines");
+        assert_eq!(parsed.bold_color, Some(ColorRgb::new(0xaa, 0xbb, 0xcc)));
     }
 }
