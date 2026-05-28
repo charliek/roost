@@ -63,11 +63,22 @@ class TestTestOps:
         on the next `tab.dump`. Confirms the bytes route through the
         same `TabOutput::Bytes`/`appendBytes` path the real PTY
         output uses — without that, libghostty never sees them and
-        nothing renders."""
+        nothing renders.
+
+        We prefix `\\x1b[2J\\x1b[10;1H` (clear screen + cursor to row
+        10) so the marker lands on a row the shell's startup output
+        won't touch. Without this, a slow shell on CI can race —
+        the prompt arrives after the marker and overwrites the
+        first few cells, breaking `marker in dump`. Putting the
+        marker far down keeps the assertion stable across runners.
+        """
         tab = roost.open_tab(project, cwd="/tmp")
         _wait_tab_attached(roost, tab)
         marker = "roost-feed-smoke-1234"
-        roost.tab_feed_pty_bytes(tab, marker.encode("ascii"))
+        roost.tab_feed_pty_bytes(
+            tab,
+            b"\x1b[2J\x1b[10;1H" + marker.encode("ascii"),
+        )
         roost.wait_text(tab, marker, timeout=5.0)
 
     def test_capture_pty_input_round_trip(self, roost, project):
