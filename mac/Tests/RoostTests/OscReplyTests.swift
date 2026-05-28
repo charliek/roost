@@ -148,3 +148,37 @@ func osc10_dynamicSetIsReflectedByQueryReply() throws {
     #expect(text.contains("aaaa/bbbb/cccc"), "got \(text)")
     #expect(!text.contains("ffff/ffff/ffff"), "stale theme fg leaked: \(text)")
 }
+
+@Test @MainActor
+func osc12_dynamicSetIsReflectedByQueryReply() throws {
+    var opts = GhosttyTerminalOptions()
+    opts.cols = 80
+    opts.rows = 24
+    opts.max_scrollback = 0
+
+    var maybeTerm: GhosttyTerminal?
+    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    let term = try #require(maybeTerm)
+    defer { ghostty_terminal_free(term) }
+
+    let theme = Theme(
+        foreground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
+        background: NSColor(srgbRed: 0x1c / 255.0, green: 0x1c / 255.0, blue: 0x1c / 255.0, alpha: 1),
+        cursor: NSColor(srgbRed: 0x98 / 255.0, green: 0x98 / 255.0, blue: 0x9d / 255.0, alpha: 1),
+        selectionBackground: .gray,
+        selectionForeground: .white,
+        palette: Array(repeating: .gray, count: 256)
+    )
+    Theme.apply(theme, to: term)
+
+    let setBytes: [UInt8] = Array("\u{1B}]12;rgb:de/ad/be\u{07}".utf8)
+    setBytes.withUnsafeBufferPointer {
+        ghostty_terminal_vt_write(term, $0.baseAddress, setBytes.count)
+    }
+
+    let live = try #require(TerminalView.liveColor(forQuery: 12, terminal: term, theme: theme))
+    let reply = try #require(TerminalView.formatColorQueryResponse(n: 12, color: live))
+    let text = String(decoding: reply, as: UTF8.self)
+    #expect(text.contains("dede/adad/bebe"), "got \(text)")
+    #expect(!text.contains("9898/9898/9d9d"), "stale theme cursor leaked: \(text)")
+}

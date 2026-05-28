@@ -101,3 +101,30 @@ fn osc_10_set_then_query_replies_with_new_fg() {
         .unwrap()
         .contains("aaaa/bbbb/cccc"));
 }
+
+#[test]
+fn osc_12_set_then_query_replies_with_new_cursor() {
+    let mut term = Terminal::new(TerminalOptions {
+        cols: 80,
+        rows: 24,
+        max_scrollback: 0,
+    })
+    .expect("Terminal::new");
+    set_starting_theme(&mut term);
+
+    term.vt_write(b"\x1b]12;rgb:de/ad/be\x07");
+
+    let live = term.live_colors().expect("live_colors");
+    assert_eq!(
+        live.cursor,
+        Some(ColorRgb::new(0xde, 0xad, 0xbe)),
+        "live cursor should reflect the OSC 12 set"
+    );
+
+    let cursor = live.cursor.expect("cursor live_color");
+    let reply = format_color_query_response(12, (cursor.r, cursor.g, cursor.b))
+        .expect("format_color_query_response 12");
+    assert!(std::str::from_utf8(&reply)
+        .unwrap()
+        .contains("dede/adad/bebe"));
+}
