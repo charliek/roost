@@ -741,7 +741,12 @@ final class TerminalView: NSView {
         case .path(let p):
             sendBracketedPaste(Data(p.utf8))
         case .paths(let ps):
-            sendBracketedPaste(Data(ps.joined(separator: " ").utf8))
+            // Newline-separate so a path containing a space (Finder's
+            // "Untitled 2.png" or "/Volumes/My Disk/foo.jpg") can't
+            // merge with its neighbour. Bracketed paste delivers the
+            // bytes verbatim; the receiving agent treats each line as
+            // an independent attachment candidate.
+            sendBracketedPaste(Data(ps.joined(separator: "\n").utf8))
         case .none:
             return
         }

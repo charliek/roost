@@ -3,12 +3,15 @@
 // Three input shapes, in priority order:
 //
 //   1. File URLs already on the pasteboard (Finder copy of an image
-//      file). The path is inserted verbatim — no temp copy.
+//      file). The path is inserted verbatim — no temp copy. Multiple
+//      paths are newline-joined so paths containing spaces survive a
+//      multi-select.
 //   2. PNG bytes on the pasteboard — passthrough to a temp file so
 //      the agent always sees a `.png` extension.
-//   3. Any other image representation libghostty-vt's host can render
-//      via `NSImage(pasteboard:)` (TIFF, JPEG, GIF, WebP, HEIC, …).
-//      Decoded once and re-encoded to PNG.
+//   3. Any other image representation we know how to read: TIFF,
+//      JPEG, GIF, WebP, HEIC. The raw clipboard bytes are size-capped
+//      first, then `CGImageSource` peeks dimensions before we let
+//      ImageIO allocate a decode buffer.
 //
 // The encoded path is then pasted as ordinary bracketed-paste text via
 // `TerminalView.paste(_:)`. Claude Code / Codex detect the `.png` path
@@ -18,6 +21,8 @@
 
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 enum PasteImage {
     enum Result: Equatable {
@@ -31,9 +36,10 @@ enum PasteImage {
     static let maxBytes = 10 * 1024 * 1024
 
     /// Decoded-megapixel cap. A 10 MiB JPEG can describe an 8000×8000
-    /// image whose RGBA buffer is 256 MiB — we check dimensions before
-    /// re-encoding so a compression-bomb input can't OOM the renderer.
-    /// 40 MP comfortably covers 5K and 8K screenshots.
+    /// image whose RGBA buffer is 256 MiB — we check dimensions via
+    /// `CGImageSource` (caching off) before letting ImageIO allocate
+    /// the decode buffer. 40 MP comfortably covers 5K and 8K
+    /// screenshots while rejecting obvious compression bombs.
     static let maxPixels = 40 * 1024 * 1024
 
     /// File extensions accepted in the file-URL fast path. The check is
@@ -42,11 +48,25 @@ enum PasteImage {
         "png", "jpg", "jpeg", "gif", "tiff", "tif", "webp", "heic", "heif", "bmp",
     ]
 
+    /// Source-image pasteboard types we walk in priority order. PNG is
+    /// first because it needs no re-encode round-trip; the rest are
+    /// decoded by ImageIO and re-encoded to PNG. UTIs use raw strings
+    /// (rather than `UTType.*.identifier`) so the table is stable
+    /// across SDK changes and easy to compare against the Go port.
+    static let sourceTypes: [(NSPasteboard.PasteboardType, Bool)] = [
+        (.png, true),
+        (.tiff, false),
+        (NSPasteboard.PasteboardType("public.jpeg"), false),
+        (NSPasteboard.PasteboardType("com.compuserve.gif"), false),
+        (NSPasteboard.PasteboardType("org.webmproject.webp"), false),
+        (NSPasteboard.PasteboardType("public.heic"), false),
+        (NSPasteboard.PasteboardType("public.heif"), false),
+    ]
+
     /// Top-level entry — try file URLs first (cheapest, no temp file),
     /// then fall back to materializing the clipboard image. Returns
     /// `.none` when there's nothing we know how to paste; callers
-    /// should treat that as a no-op (the keystroke is already
-    /// consumed elsewhere).
+    /// should treat that as a no-op.
     static func extract(_ pb: NSPasteboard) -> Result {
         let urls = fileURLPaths(from: pb)
         if urls.count == 1 { return .path(urls[0]) }
@@ -55,77 +75,139 @@ enum PasteImage {
         return .none
     }
 
-    /// Walk the pasteboard for `NSURL`-shaped entries; return the
-    /// subset that are local file URLs pointing at an image
-    /// extension. `readObjects(forClasses:options:)` covers both the
-    /// modern `.fileURL` UTI and the legacy `NSFilenamesPboardType`
-    /// indirection that Finder still emits on some drag/copy paths.
+    /// Walk the pasteboard for URL-shaped entries; return the subset
+    /// that are local file URLs pointing at an image extension.
+    /// `readObjects(forClasses:options:)` covers `.fileURL`, the
+    /// legacy `NSFilenamesPboardType` indirection that Finder still
+    /// emits on some drag/copy paths, and the raw `.fileURL` string
+    /// form. URLs are de-duplicated by `standardizedFileURL` so a
+    /// pasteboard that lists the same file under multiple types
+    /// (Finder is fond of this) doesn't produce a duplicate.
     static func fileURLPaths(from pb: NSPasteboard) -> [String] {
         guard let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else {
             return []
         }
-        return urls.compactMap { url -> String? in
-            guard url.isFileURL else { return nil }
+        var seen = Set<String>()
+        var out: [String] = []
+        for url in urls where url.isFileURL {
             let ext = url.pathExtension.lowercased()
-            guard imageExtensions.contains(ext) else { return nil }
-            return url.standardizedFileURL.path
+            guard imageExtensions.contains(ext) else { continue }
+            let path = url.standardizedFileURL.path
+            if seen.insert(path).inserted {
+                out.append(path)
+            }
         }
+        return out
     }
 
     /// Pull image bytes off the pasteboard, normalize to PNG, write to
     /// a temp file, return the absolute path. Returns nil on any
-    /// failure (size cap, decode error, write error, no image
-    /// representation present).
+    /// failure (size cap, decode error, write error, no recognised
+    /// representation present). The size cap is enforced against the
+    /// raw clipboard bytes BEFORE any decode so a small compressed
+    /// input can't force a large allocation.
     static func materializeImage(from pb: NSPasteboard) -> String? {
         let types = pb.types ?? []
-
-        // PNG passthrough. Skip the re-encode round-trip — preserves
-        // ICC profile + avoids any AppKit-driven colorspace drift.
-        if types.contains(.png), let data = pb.data(forType: .png) {
+        for (type, isPng) in sourceTypes {
+            guard types.contains(type), let data = pb.data(forType: type) else { continue }
             guard data.count <= maxBytes else {
                 RoostLogger.shared.warn(
-                    "clipboard image: png exceeds \(maxBytes) bytes (\(data.count))"
+                    "clipboard image: \(type.rawValue) exceeds \(maxBytes) bytes (\(data.count))"
                 )
                 return nil
             }
-            if let dims = pngDimensions(data), dims.width * dims.height > maxPixels {
-                RoostLogger.shared.warn(
-                    "clipboard image: png too large \(dims.width)x\(dims.height)"
-                )
-                return nil
+            if isPng {
+                if let dims = pngDimensions(data),
+                   !pixelCountFits(width: dims.width, height: dims.height)
+                {
+                    RoostLogger.shared.warn(
+                        "clipboard image: png too large \(dims.width)x\(dims.height)"
+                    )
+                    return nil
+                }
+                return writeTempPng(data)
             }
-            return writeTempPng(data)
+            return reencodeToPng(sourceData: data, sourceType: type.rawValue)
         }
+        return nil
+    }
 
-        // Fallback: ask AppKit to decode whatever the pasteboard has.
-        // `NSImage(pasteboard:)` walks the standard image UTIs in
-        // order; `tiffRepresentation` then gives us a uniform handle.
-        guard let img = NSImage(pasteboard: pb) else { return nil }
-        guard let tiff = img.tiffRepresentation else { return nil }
-        guard tiff.count <= maxBytes else {
+    /// Decode `data` via `CGImageSource` (caching off so the source
+    /// bytes don't get retained twice) after a header-only dimension
+    /// check, then re-encode to PNG via `CGImageDestination`. Caps are
+    /// enforced on both the source byte count (by the caller) and the
+    /// decoded pixel count (here) so neither stage can compression-bomb.
+    private static func reencodeToPng(sourceData: Data, sourceType: String) -> String? {
+        let opts = [
+            kCGImageSourceShouldCache: false,
+            kCGImageSourceShouldCacheImmediately: false,
+        ] as CFDictionary
+        guard let src = CGImageSourceCreateWithData(sourceData as CFData, opts) else {
+            RoostLogger.shared.warn("clipboard image: \(sourceType) source-create failed")
+            return nil
+        }
+        guard
+            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, opts)
+                as? [CFString: Any],
+            let w = props[kCGImagePropertyPixelWidth] as? Int,
+            let h = props[kCGImagePropertyPixelHeight] as? Int
+        else {
+            RoostLogger.shared.warn("clipboard image: \(sourceType) props missing dimensions")
+            return nil
+        }
+        guard pixelCountFits(width: w, height: h) else {
             RoostLogger.shared.warn(
-                "clipboard image: decoded tiff exceeds \(maxBytes) bytes (\(tiff.count))"
+                "clipboard image: \(sourceType) too large to decode \(w)x\(h)"
             )
             return nil
         }
-        guard let rep = NSBitmapImageRep(data: tiff) else { return nil }
-        let pixels = rep.pixelsWide &* rep.pixelsHigh
-        guard pixels <= maxPixels else {
+        guard let cg = CGImageSourceCreateImageAtIndex(src, 0, opts) else {
+            RoostLogger.shared.warn("clipboard image: \(sourceType) decode failed")
+            return nil
+        }
+        let out = NSMutableData()
+        guard
+            let dest = CGImageDestinationCreateWithData(
+                out,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            )
+        else {
+            RoostLogger.shared.warn("clipboard image: png destination-create failed")
+            return nil
+        }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            RoostLogger.shared.warn("clipboard image: png encode failed")
+            return nil
+        }
+        let pngData = out as Data
+        guard pngData.count <= maxBytes else {
             RoostLogger.shared.warn(
-                "clipboard image: too large to decode \(rep.pixelsWide)x\(rep.pixelsHigh)"
+                "clipboard image: encoded png exceeds \(maxBytes) bytes (\(pngData.count))"
             )
             return nil
         }
-        guard let encoded = rep.representation(using: .png, properties: [:]) else {
-            RoostLogger.shared.warn("clipboard image: png re-encode returned nil")
-            return nil
-        }
-        return writeTempPng(encoded)
+        return writeTempPng(pngData)
+    }
+
+    /// Overflow-safe `width * height <= maxPixels`. Both `Int` and the
+    /// trapping `*` would crash on huge values; the bitmap path's `&*`
+    /// would silently wrap to a small product. Division-form check
+    /// works whenever both dimensions are positive.
+    static func pixelCountFits(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        return width <= maxPixels / height
     }
 
     /// Peek a PNG IHDR for width/height without decoding pixels. PNG
-    /// layout: 8-byte signature, then a length-prefixed `IHDR` chunk
-    /// whose first 8 payload bytes are width(4) + height(4) BE.
+    /// layout: 8-byte signature, then `length(4) + type(4) + payload
+    /// + crc(4)`. The first chunk MUST be IHDR with length 13
+    /// (RFC 2083 §11.2.2); we validate both the type bytes and the
+    /// length before trusting the dimension fields, so a hand-crafted
+    /// PNG-ish blob with garbage in the IHDR slot can't mislead the
+    /// caller's bounds check.
     static func pngDimensions(_ data: Data) -> (width: Int, height: Int)? {
         guard data.count >= 24 else { return nil }
         let sig: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
@@ -138,6 +220,11 @@ enum PasteImage {
                 | (Int(data[base + 1]) << 16)
                 | (Int(data[base + 2]) << 8)
                 | Int(data[base + 3])
+        }
+        guard be32(8) == 13 else { return nil } // IHDR length is fixed
+        let ihdr: [UInt8] = [0x49, 0x48, 0x44, 0x52] // "IHDR"
+        for i in 0..<4 where data[data.startIndex + 12 + i] != ihdr[i] {
+            return nil
         }
         return (be32(16), be32(20))
     }
