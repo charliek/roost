@@ -1174,7 +1174,13 @@ final class TerminalView: NSView {
     /// `bold-color` key. The path is preserved for the eventual
     /// theme-parser PR; without it bold default-fg cells render in
     /// the canvas fg, matching pre-PR behavior.
-    static func resolveCellColors(
+    ///
+    /// `nonisolated` because the function is pure (no `self`, no
+    /// global state). Without it, Swift 6 strict concurrency
+    /// inherits `@MainActor` from the enclosing `TerminalView` and
+    /// the swift-testing `@Test` functions (which run on the
+    /// testing-library's own executor) can't call it synchronously.
+    nonisolated static func resolveCellColors(
         cell: RenderState.Cell,
         defaultFg: NSColor,
         defaultBg: NSColor,
