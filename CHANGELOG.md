@@ -9,6 +9,56 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.4 — 2026-05-28
+
+Rendering, selection, and clipboard release. Ghostty's sprite renderer is now
+ported for crisp box-drawing + block elements; text selection survives
+scrollback; copy-on-select + middle-click paste land for X11-style terminal
+ergonomics; and clipboard image paste delivers a `.png` path to Claude Code on
+both Mac and Linux. Plus OSC 10/11/12 + OSC 52 fixes that unblock codex's
+theme detection and well-behaved program-initiated clipboard writes.
+
+### Features
+
+- **Sprite renderer ported from Ghostty** (#140) — box-drawing and
+  block-element characters render crisp + cell-aligned instead of the font's
+  fallback glyphs.
+- **Three-state copy-on-select + middle-click paste** (#147) — selection
+  auto-copies; middle-click pastes; matches X11/Linux terminal ergonomics.
+- **Clipboard image paste → Claude Code** — clipboard images are written to a
+  temp `.png` and the path is pasted as text, so `claude` picks the image up
+  natively. Mac (#149) and Linux GTK (#153).
+- **OSC 52 program-initiated clipboard writes** (#154) — programs (`tmux`, ssh
+  forwards, etc.) can copy to the system clipboard via the standard escape.
+- **Scrollback-aware selection** (#141, #146) — selection anchors to
+  scrollback-stable coords, so highlights stay attached to the right text
+  while you scroll through history.
+- **Theme `bold-color`** (#142) — themes can override the color of bold cells.
+- **`selection.*` / `clipboard.*` IPC ops** (#151) — let the pytest harness
+  drive selection + clipboard from outside.
+
+### Fixes
+
+- **OSC 10/11/12 query replies** (#144, #145, #152) — answer terminal-color
+  queries with libghostty's live colors so apps (e.g. codex) detect the
+  dark/light theme correctly and stop rendering with a stuck gray bar.
+- **SGR inverse + Mac two-pass rendering** (#139) — inverse / reverse-video
+  cells render correctly under Mac's two-pass path; `Cell.style` exposed.
+- **OSC 52 hardening** (#155) — drop oversized payloads, tighten selector
+  parsing.
+
+### Release process
+
+- **`mac/scripts/publish-appcast.sh <tag>`** (#137) — local script (shed-style)
+  replaces release.yml's bot-driven appcast push, which `main`'s branch
+  protection rejected on v0.0.3. The maintainer runs it post-release; their
+  `git push` lands the appcast entry cleanly. Closed #136.
+
+### Docs
+
+- Shell setup notes: `$SHELL` vs `which bash` and how to `chsh` to Homebrew
+  bash (#138).
+
 ## v0.0.3 — 2026-05-27
 
 Auto-update + shell-aware terminals release. Roost.app now ships with **Sparkle

@@ -35,7 +35,7 @@ members = [
 # Single source of truth for the release version. Tag pushes (`v0.0.2`)
 # assert `${tag#v}` matches this in the release workflow; the .deb + .app
 # read it via $ROOST_VERSION at packaging time. Bump here before tagging.
-version       = "0.0.3"
+version       = "0.0.4"
 edition       = "2021"
 rust-version  = "1.85"
 license       = "MIT"
