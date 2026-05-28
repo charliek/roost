@@ -1052,8 +1052,36 @@ final class TerminalView: NSView {
             fill.rect.fill()
         }
 
-        // Pass B — glyphs.
+        // Pass B — glyphs. Box-drawing (U+2500..U+257F) and block-
+        // element (U+2580..U+259F) codepoints get a custom geometric
+        // renderer (`Sprite.draw`) that tiles pixel-perfectly across
+        // cells; everything else falls through to NSAttributedString.
+        // Core Text fonts produce visible seams in TUI chrome —
+        // most obvious in the opencode wordmark logo — which is what
+        // the Sprite module exists to fix.
+        let cgCtx = NSGraphicsContext.current?.cgContext
         for draw in glyphDraws {
+            // Sprite-render single-scalar grapheme cells whose
+            // codepoint falls in one of the geometric ranges.
+            // Multi-scalar graphemes (emoji ZWJ, combining marks)
+            // skip this path because the sprite layer is
+            // by-codepoint, not by-grapheme.
+            let scalars = draw.glyph.unicodeScalars
+            if let cgCtx,
+               scalars.count == 1,
+               let scalar = scalars.first,
+               Sprite.draw(
+                   in: cgCtx,
+                   x: draw.origin.x,
+                   y: draw.origin.y,
+                   w: cellW,
+                   h: cellH,
+                   fg: draw.foreground,
+                   codepoint: scalar.value
+               )
+            {
+                continue
+            }
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: cellFont,
                 .foregroundColor: draw.foreground,
@@ -1210,6 +1238,25 @@ final class TerminalView: NSView {
         color.setFill()
         rect.fill()
         guard let glyph = cursorCellGlyph, !glyph.isWhitespace else { return }
+        // Same sprite-vs-Pango dispatch as Pass B — a block-element
+        // cursor cell (e.g. a ▌ under a TUI cursor) must redraw
+        // geometrically too or it'd seam against the cursor block.
+        let scalars = glyph.unicodeScalars
+        if let cgCtx = NSGraphicsContext.current?.cgContext,
+           scalars.count == 1,
+           let scalar = scalars.first,
+           Sprite.draw(
+               in: cgCtx,
+               x: rect.minX,
+               y: rect.minY,
+               w: rect.width,
+               h: rect.height,
+               fg: theme.background,
+               codepoint: scalar.value
+           )
+        {
+            return
+        }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: cellFont,
             .foregroundColor: theme.background,

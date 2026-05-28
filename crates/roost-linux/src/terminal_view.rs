@@ -43,6 +43,7 @@ use roost_vt::{
 use crate::cell_metrics::{default_font_description, CellMetrics};
 use crate::clipboard;
 use crate::key_encoder;
+use crate::sprite;
 use crate::theme::Theme;
 
 /// Default cell grid the terminal allocates with. Cell pixels are
@@ -858,7 +859,12 @@ impl TerminalViewState {
             let _ = cr.fill();
         }
 
-        // Pass B: glyphs via Pango.
+        // Pass B: glyphs. Box-drawing (U+2500..U+257F) and block-
+        // element (U+2580..U+259F) codepoints get a custom geometric
+        // renderer that tiles pixel-perfectly across cells; everything
+        // else falls through to Pango. Pango fonts produce visible
+        // seams in TUI chrome — most obvious in the opencode wordmark
+        // logo — which is what `crate::sprite` exists to fix.
         let pango_ctx = widget.pango_context();
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_font_description(Some(&self.font_desc));
@@ -870,9 +876,21 @@ impl TerminalViewState {
                     continue;
                 }
             }
+            let x = *col as f64 * cell_w;
+            let y = *row as f64 * cell_h;
+            // Sprite-render single-codepoint cells whose codepoint
+            // falls in one of the geometric ranges. Multi-codepoint
+            // graphemes (emoji ZWJ etc.) skip this path because the
+            // sprite layer is by-codepoint, not by-grapheme.
+            let mut chars = text.chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                if sprite::draw_cell_sprite(cr, x, y, cell_w, cell_h, *fg, c as u32) {
+                    continue;
+                }
+            }
             set_cairo_color(cr, *fg);
             layout.set_text(text);
-            cr.move_to(*col as f64 * cell_w, *row as f64 * cell_h);
+            cr.move_to(x, y);
             pango_cairo::show_layout(cr, &layout);
         }
 
@@ -1169,10 +1187,22 @@ impl TerminalViewState {
 
                 if let Some((text, _fg)) = cursor_cell_text {
                     if !text.is_empty() && text != " " {
-                        set_cairo_color(cr, canvas_bg);
-                        layout.set_text(text);
-                        cr.move_to(x, y);
-                        pango_cairo::show_layout(cr, layout);
+                        // Same sprite-vs-Pango dispatch as Pass B —
+                        // a block-element cursor cell (e.g. a ▌ over
+                        // a TUI glyph) must redraw geometrically too
+                        // or it'd seam against the cursor block.
+                        let mut chars = text.chars();
+                        let drawn = if let (Some(c), None) = (chars.next(), chars.next()) {
+                            sprite::draw_cell_sprite(cr, x, y, cell_w, cell_h, canvas_bg, c as u32)
+                        } else {
+                            false
+                        };
+                        if !drawn {
+                            set_cairo_color(cr, canvas_bg);
+                            layout.set_text(text);
+                            cr.move_to(x, y);
+                            pango_cairo::show_layout(cr, layout);
+                        }
                     }
                 }
             }

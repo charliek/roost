@@ -22,6 +22,7 @@ mod notification_inbox;
 mod palette;
 mod palette_ui;
 mod rollup;
+mod sprite;
 mod tab_session;
 mod terminal_view;
 mod theme;
