@@ -1,0 +1,8 @@
+{
+  "id": "11",
+  "op": "tab.capture_pty_input",
+  "params": {
+    "tab_id": "5",
+    "drain": true
+  }
+}

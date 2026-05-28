@@ -217,6 +217,64 @@ when the cursor is off-viewport. Response is permissive, so per-cell
 color / scrollback fields can be added forward-compatibly. CLI:
 `roostctl tab dump --tab N` (plain rows) / `--json` (full result).
 
+### `tab.dump_resolved`
+
+Companion to `tab.dump` — a richer read of the same viewport, but each
+cell carries the post-resolver fg/bg the production paint path computes
+(including the theme's `bold-color` accent). Ungated; useful both for
+debugging "why is this row gray" and as the resolver-walk regression
+op for #142.
+
+Request: `{"params": {"tab_id": "3"}}`.
+Response (truncated):
+
+```json
+{"cols": 80, "rows": 24,
+ "cells": [
+   {"row": 0, "col": 0, "text": "h", "fg": "#ffffff", "bg": "#1c1c1c",
+    "has_explicit_bg": false, "bold": true, "italic": false, "inverse": false},
+   {"row": 0, "col": 1, "text": "i", "fg": "#ffffff", "bg": "#1c1c1c",
+    "has_explicit_bg": false, "bold": true, "italic": false, "inverse": false}
+ ]}
+```
+
+`fg` / `bg` are `#RRGGBB` strings (lowercase). `has_explicit_bg`
+distinguishes a default-bg cell (false) from an SGR-bg cell (true) so
+a test can pin paint behavior without reasoning about the canvas
+fallback. `text` is `" "` for blank cells.
+
+### `tab.feed_pty_bytes` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Injects raw bytes into a
+tab's PTY-output drain as if the supervisor had emitted them; the OSC
+scanner + libghostty + the input-reply path process them identically
+to real shell output. No shadow drain — same channel the real
+`TabSession` writes to. See
+`docs/development/test-automation.md` §5.4.
+
+Request:
+```json
+{"params": {"tab_id": "3", "data": "G10xMTtyZ2I6MDAvMTEvMjIH"}}
+```
+
+`data` is base64-encoded raw bytes. Response: `{}`.
+
+### `tab.capture_pty_input` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` at UI launch.** Returns (and by default
+drains) the bytes the UI has queued onto this tab's PTY-input channel
+since the last drain — keystrokes, paste payloads, OSC-reply
+synthesised replies. Combined with `tab.feed_pty_bytes` this lets a
+test exercise the full OSC reply round trip end-to-end.
+
+Request: `{"params": {"tab_id": "3", "drain": true}}`. `drain`
+defaults to `false` (peek). Response:
+
+```json
+{"data": "G10xMTtyZ2I6MDAwMC8xMTExLzIyMjIH"}
+```
+
 ### `project.create`
 
 Request: `{"params": {"name": "", "cwd": "/tmp"}}`. `name` empty means

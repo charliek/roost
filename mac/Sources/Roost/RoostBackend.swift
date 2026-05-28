@@ -61,6 +61,20 @@ protocol UiBridge: AnyObject {
     func clearTabSelection(tabID: Int64) -> Bool
     /// Outer optional = "tab exists?"; inner = "selection present?".
     func dumpTabSelection(tabID: Int64) -> TerminalView.SelectionDump??
+
+    /// Test-only drive surface (`tab.feed_pty_bytes`,
+    /// `tab.capture_pty_input`, `tab.dump_resolved`). All three return
+    /// `nil` for unknown tab id so the IPC handler can map to
+    /// `not-found`. The gate check (`ROOST_TEST_MODE=1`) lives in the
+    /// handler, NOT here — the bridge methods stay agnostic about
+    /// why they're being called. The Mac implementation is direct
+    /// because the production output path is also direct: the real
+    /// `TabSession.outputDrainTask` calls
+    /// `terminalView.appendBytes(_:)`, so `feedTabPtyBytes` calls
+    /// the same method on the same view — bytes are
+    /// indistinguishable to the OSC scanner + libghostty.
+    func feedTabPtyBytes(tabID: Int64, data: Data) -> Bool
+    func dumpResolvedCells(tabID: Int64) -> TerminalView.ResolvedDump?
 }
 
 /// A read of the command-palette overlay for the `palette.*` IPC ops,
@@ -107,6 +121,61 @@ final class RoostBackend {
     /// reaching for `NSApp.delegate`.
     private(set) weak var ui: (any UiBridge)?
 
+    /// `ROOST_TEST_MODE=1` was set in the app's environment at launch.
+    /// Read ONCE in `start(...)` and stashed here, so per-op dispatch is
+    /// a cheap bool check rather than a fresh `ProcessInfo` lookup and
+    /// a tester can't toggle the gate mid-session. The matching env
+    /// var name on the GTK side reads the same `ROOST_TEST_MODE=1`.
+    /// When false, the gated ops `tab.feed_pty_bytes` and
+    /// `tab.capture_pty_input` return `not-enabled` and the capture
+    /// buffer map stays empty (zero overhead in production).
+    private(set) var testMode: Bool = false
+
+    /// Per-tab capture buffers for `tab.capture_pty_input`. Populated
+    /// only when `testMode` is true; the buffer is appended-to by the
+    /// `onKey` closure tap installed in `TabSession.start()` /
+    /// `.attach()`. Mac doesn't need a feed-channel map (`feed_senders`
+    /// on the GTK side) because `TerminalView.appendBytes(_:)` is the
+    /// real PTY-output entry point — `feedTabPtyBytes` calls it
+    /// directly on the live `TerminalView`, with no parallel channel
+    /// to plumb.
+    private var inputCaptures: [Int64: NSMutableData] = [:]
+
+    /// Called by the `TabSession` constructor when `testMode` is true,
+    /// to allocate (and return) the per-tab capture buffer the
+    /// session should append to from its `onKey` tap. Returns `nil`
+    /// when `testMode` is false so the caller can avoid the
+    /// allocation entirely.
+    func ensureInputCapture(tabID: Int64) -> NSMutableData? {
+        guard testMode else { return nil }
+        if let existing = inputCaptures[tabID] { return existing }
+        let buf = NSMutableData()
+        inputCaptures[tabID] = buf
+        return buf
+    }
+
+    /// Read (and optionally clear) the captured bytes for a tab.
+    /// Returns `nil` when no buffer was ever allocated for this tab
+    /// (e.g. tab id unknown to test mode, or `testMode` is false).
+    ///
+    /// `Data(referencing: NSMutableData)` aliases the storage, so a
+    /// subsequent `buf.length = 0` empties the returned snapshot too.
+    /// Construct an OWNED copy via `Data(_:)` before mutating.
+    func readInputCapture(tabID: Int64, drain: Bool) -> Data? {
+        guard let buf = inputCaptures[tabID] else { return nil }
+        let snapshot = Data(buf)
+        if drain {
+            buf.length = 0
+        }
+        return snapshot
+    }
+
+    /// Drop the capture buffer for a closed tab. Safe to call on a
+    /// tab id that never had a buffer.
+    func dropInputCapture(tabID: Int64) {
+        inputCaptures.removeValue(forKey: tabID)
+    }
+
     /// Called by `RoostApp` after the window is created.
     func registerUI(_ ui: any UiBridge) {
         self.ui = ui
@@ -149,6 +218,9 @@ final class RoostBackend {
         if started { return }
         started = true
         self.holdsSingleInstanceLock = holdsSingleInstanceLock
+        // Read ROOST_TEST_MODE once at boot. Matches the GTK side
+        // `env::var("ROOST_TEST_MODE").as_deref() == Ok("1")`.
+        self.testMode = ProcessInfo.processInfo.environment["ROOST_TEST_MODE"] == "1"
 
         let workspace = Workspace(statePath: profile.stateJSONPath)
         let supervisor = PtySupervisor()

@@ -78,6 +78,31 @@ struct IPCHandlerDispatchTests {
         )
     }
 
+    /// The gated test-only ops MUST refuse without
+    /// `ROOST_TEST_MODE=1` at launch — surface a deterministic
+    /// `not-enabled` error rather than silently returning empty
+    /// data. Unit-test target boots `RoostBackend.shared` without
+    /// the env var, so `testMode` is false here.
+    @Test func feedPtyBytesRequiresTestMode() async {
+        let handler = await makeHandler()
+        await expectError(
+            "not-enabled",
+            "tab.feed_pty_bytes",
+            AnyCodable(["tab_id": "1", "data": ""] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func capturePtyInputRequiresTestMode() async {
+        let handler = await makeHandler()
+        await expectError(
+            "not-enabled",
+            "tab.capture_pty_input",
+            AnyCodable(["tab_id": "1", "drain": true] as [String: Any]),
+            on: handler
+        )
+    }
+
     @Test func renameMissingProjectIsNotFound() async {
         // mapWorkspace(.projectNotFound) → not-found.
         let handler = await makeHandler()

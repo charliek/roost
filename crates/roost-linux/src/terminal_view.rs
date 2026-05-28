@@ -149,6 +149,17 @@ impl TerminalView {
         self.state.borrow_mut().dump_text()
     }
 
+    /// Snapshot the live viewport through the same color resolver the
+    /// real `paint` path runs (including `theme.bold_color`), for
+    /// the `tab.dump_resolved` IPC op. Closes #142's call-site
+    /// gap: a test can assert that a bold cell ends up colored by
+    /// `bold_color`, which only holds if the production resolver
+    /// call site is plumbed correctly. Main-thread-only — same
+    /// libghostty + render-state requirements as `dump`.
+    pub fn dump_resolved_cells(&self) -> roost_linux::ipc::ResolvedCellsData {
+        self.state.borrow_mut().dump_resolved_cells()
+    }
+
     pub fn with_theme(theme: Theme) -> Self {
         let widget = DrawingArea::builder()
             .hexpand(true)
@@ -983,6 +994,46 @@ impl TerminalViewState {
             rows: self.rows as u32,
             cursor,
             rows_text: lines,
+        }
+    }
+
+    /// Walk the viewport through the same `resolve_cell_colors` call
+    /// `paint` runs, emitting a `ResolvedCellsData` for the
+    /// `tab.dump_resolved` IPC op. Pulls the theme's `bold_color`
+    /// out of `self.theme` exactly the way `paint` does — that's
+    /// the call-site invariant #142's tests need to pin.
+    fn dump_resolved_cells(&mut self) -> roost_linux::ipc::ResolvedCellsData {
+        if let Err(err) = self.render_state.update(&self.terminal) {
+            tracing::warn!(?err, "render_state.update failed for tab.dump_resolved");
+        }
+        let default_fg = self.theme.foreground;
+        let default_bg = self.theme.background;
+        let bold_color = self.theme.bold_color;
+        let mut cells: Vec<roost_linux::ipc::ResolvedCellData> = Vec::new();
+        let _ = self.render_state.walk(&self.terminal, |row, cell: Cell| {
+            let (fg, bg, has_explicit_bg) =
+                resolve_cell_colors(&cell, default_fg, default_bg, bold_color);
+            let text = if cell.text.is_empty() {
+                " ".to_string()
+            } else {
+                cell.text.clone()
+            };
+            cells.push(roost_linux::ipc::ResolvedCellData {
+                row,
+                col: cell.col,
+                text,
+                fg: (fg.r, fg.g, fg.b),
+                bg: (bg.r, bg.g, bg.b),
+                has_explicit_bg,
+                bold: cell.style.bold,
+                italic: cell.style.italic,
+                inverse: cell.style.inverse,
+            });
+        });
+        roost_linux::ipc::ResolvedCellsData {
+            cols: self.cols,
+            rows: self.rows,
+            cells,
         }
     }
 

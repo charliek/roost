@@ -945,6 +945,75 @@ final class TerminalView: NSView {
         let rowsText: [String]
     }
 
+    /// Post-resolver per-cell snapshot of the full viewport for the
+    /// `tab.dump_resolved` IPC op. Each cell carries the same
+    /// fg/bg/hasExplicitBg the production paint path computes via
+    /// `resolveCellColors(...)` — including the theme's optional
+    /// `bold-color` accent. Closes #142's call-site gap: a test
+    /// can assert that a bold cell ends up colored by
+    /// `theme.boldColor`, which only holds if the production
+    /// resolver call site is plumbed correctly.
+    struct ResolvedDump {
+        let cols: Int
+        let rows: Int
+        let cells: [ResolvedCell]
+    }
+
+    struct ResolvedCell {
+        let row: Int
+        let col: Int
+        /// `" "` for blank cells (matches the Linux `dump_resolved_cells`
+        /// shape, so wire-vector parity is byte-exact).
+        let text: String
+        let foreground: NSColor
+        let background: NSColor
+        let hasExplicitBg: Bool
+        let bold: Bool
+        let italic: Bool
+        let inverse: Bool
+    }
+
+    /// Walk the viewport through the same `resolveCellColors` call
+    /// `draw(_:)` runs, including the theme's `boldColor`, for the
+    /// `tab.dump_resolved` IPC op. Pins #142's call-site invariant:
+    /// the production paint reads `self.theme.boldColor`, so this
+    /// op (which reads from the same place) will fail loudly if a
+    /// regression sends `nil` past the resolver.
+    @MainActor
+    func dumpResolvedCells() -> ResolvedDump {
+        if let terminal { renderState.update(terminal: terminal) }
+        let defaultFg = self.theme.foreground
+        let defaultBg = self.theme.background
+        let boldColor = self.theme.boldColor
+        var cells: [ResolvedCell] = []
+        renderState.walk { cell in
+            let (fg, bg, hasExplicitBg) = TerminalView.resolveCellColors(
+                cell: cell,
+                defaultFg: defaultFg,
+                defaultBg: defaultBg,
+                boldColor: boldColor
+            )
+            let text: String
+            if let g = cell.glyph {
+                text = String(g)
+            } else {
+                text = " "
+            }
+            cells.append(ResolvedCell(
+                row: cell.row,
+                col: cell.col,
+                text: text,
+                foreground: fg,
+                background: bg,
+                hasExplicitBg: hasExplicitBg,
+                bold: cell.bold,
+                italic: cell.italic,
+                inverse: cell.inverse
+            ))
+        }
+        return ResolvedDump(cols: Int(cols), rows: Int(rows), cells: cells)
+    }
+
     /// Snapshot the whole viewport as text for `tab.dump`: one rstripped
     /// line per row (a blank cell becomes a space so columns line up)
     /// plus the cursor. Mirrors `selectedPlainText` / `draw`'s

@@ -4221,6 +4221,27 @@ extension RoostApp: UiBridge {
         return .some(session.terminalView.dumpSelection())
     }
 
+    // MARK: test ops — IPC drive surface (tab.feed_pty_bytes /
+    // tab.dump_resolved). Capture-input is read straight off
+    // RoostBackend.shared and never reaches this bridge.
+
+    func feedTabPtyBytes(tabID: Int64, data: Data) -> Bool {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return false }
+        // Direct call to the same `appendBytes` the real PTY
+        // output drain calls (`TabSession.outputDrainTask`,
+        // TabSession.swift). Indistinguishable from real PTY
+        // output to the OSC scanner + libghostty — no shadow
+        // drain (vision DL-5: "No test-only backdoors that drift
+        // from reality").
+        session.terminalView.appendBytes(data)
+        return true
+    }
+
+    func dumpResolvedCells(tabID: Int64) -> TerminalView.ResolvedDump? {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return nil }
+        return session.terminalView.dumpResolvedCells()
+    }
+
     /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.
     private func paletteSnapshot() -> PaletteSnapshot {
         guard let panel = palette else { return .closed }

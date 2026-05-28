@@ -109,6 +109,13 @@ actor IPCHandlerImpl: IPCHandler {
         case "clipboard.write":
             try await self.clipboardWrite(params: params)
             return AnyCodable([:] as [String: Any])
+        case "tab.feed_pty_bytes":
+            try await self.tabFeedPtyBytes(params: params)
+            return AnyCodable([:] as [String: Any])
+        case "tab.capture_pty_input":
+            return try await encodeResult(self.tabCapturePtyInput(params: params))
+        case "tab.dump_resolved":
+            return try await encodeResult(self.tabDumpResolved(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -558,6 +565,105 @@ actor IPCHandlerImpl: IPCHandler {
         let pb = try resolvePasteboard(target: p.target)
         pb.clearContents()
         pb.setString(p.text, forType: .string)
+    }
+
+    // MARK: test-only ops (ROOST_TEST_MODE=1)
+    //
+    // `tab.feed_pty_bytes` + `tab.capture_pty_input` are gated by
+    // `RoostBackend.shared.testMode` (which mirrors `ROOST_TEST_MODE=1`
+    // at launch). Without the env var the handlers return
+    // `not-enabled` so a user-local script can't drive PTY output
+    // into a live tab or read its keystrokes. `tab.dump_resolved`
+    // is intentionally ungated — it's a richer read of existing
+    // render state.
+
+    @MainActor
+    private func tabFeedPtyBytes(params: AnyCodable?) async throws {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "tab.feed_pty_bytes requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCTabFeedPtyBytesParams.self, expected: ["tab_id", "data"]
+        )
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to drive tab.feed_pty_bytes")
+        }
+        if !ui.feedTabPtyBytes(tabID: p.tabID, data: p.data) {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+    }
+
+    @MainActor
+    private func tabCapturePtyInput(
+        params: AnyCodable?
+    ) async throws -> IPCTabCapturePtyInputResult {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "tab.capture_pty_input requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCTabCapturePtyInputParams.self, expected: ["tab_id", "drain"]
+        )
+        // First confirm the tab actually exists (`not-found`
+        // signaling). If the capture buffer simply hasn't been
+        // allocated yet — no onKey traffic since open — return
+        // empty bytes, not `not-found`. This matches the
+        // `drain=true` contract where two back-to-back calls
+        // produce a non-empty + empty response.
+        guard let ui = RoostBackend.shared.ui,
+              ui.dumpTab(tabID: p.tabID) != nil
+        else {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+        let bytes =
+            RoostBackend.shared.readInputCapture(tabID: p.tabID, drain: p.drain) ?? Data()
+        return IPCTabCapturePtyInputResult(data: bytes)
+    }
+
+    @MainActor
+    private func tabDumpResolved(
+        params: AnyCodable?
+    ) async throws -> IPCTabDumpResolvedResult {
+        let p = try decodeParams(
+            params, as: IPCTabDumpResolvedParams.self, expected: ["tab_id"]
+        )
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to read tab.dump_resolved")
+        }
+        guard let dump = ui.dumpResolvedCells(tabID: p.tabID) else {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+        return IPCTabDumpResolvedResult(
+            cols: UInt16(dump.cols),
+            rows: UInt16(dump.rows),
+            cells: dump.cells.map { c in
+                IPCResolvedCell(
+                    row: UInt32(c.row),
+                    col: UInt16(c.col),
+                    text: c.text,
+                    fg: hexFromNSColor(c.foreground),
+                    bg: hexFromNSColor(c.background),
+                    hasExplicitBg: c.hasExplicitBg,
+                    bold: c.bold,
+                    italic: c.italic,
+                    inverse: c.inverse
+                )
+            }
+        )
     }
 
     /// Map the wire `target` string to the matching `NSPasteboard`.
@@ -1229,4 +1335,146 @@ private struct IPCClipboardDumpResult: Codable {
 private struct IPCClipboardWriteParams: Codable {
     let target: String
     let text: String
+}
+
+// MARK: test-only ops (ROOST_TEST_MODE=1)
+
+/// `tab.feed_pty_bytes` params. Same shape as `IPCTabWriteParams`
+/// (string-int64 tab id + base64 byte payload); kept as a separate
+/// struct rather than aliased so the wire schemas can diverge if
+/// they need to.
+private struct IPCTabFeedPtyBytesParams: Codable {
+    let tabID: Int64
+    let data: Data
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case data
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
+            )
+        }
+        self.tabID = v
+        let b64 = try c.decode(String.self, forKey: .data)
+        guard let d = Data(base64Encoded: b64) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .data, in: c, debugDescription: "data must be base64"
+            )
+        }
+        self.data = d
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+        try c.encode(data.base64EncodedString(), forKey: .data)
+    }
+}
+
+private struct IPCTabCapturePtyInputParams: Codable {
+    let tabID: Int64
+    let drain: Bool
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case drain
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
+            )
+        }
+        self.tabID = v
+        // `drain` defaults to false so a caller can omit it (peek
+        // semantics). Matches the Rust `#[serde(default)] pub drain:
+        // bool` shape in `TabCapturePtyInputParams`.
+        self.drain = try c.decodeIfPresent(Bool.self, forKey: .drain) ?? false
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+        try c.encode(drain, forKey: .drain)
+    }
+}
+
+private struct IPCTabCapturePtyInputResult: Codable {
+    let data: Data
+    enum CodingKeys: String, CodingKey { case data }
+    init(data: Data) {
+        self.data = data
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let b64 = try c.decode(String.self, forKey: .data)
+        guard let d = Data(base64Encoded: b64) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .data, in: c, debugDescription: "data must be base64"
+            )
+        }
+        self.data = d
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(data.base64EncodedString(), forKey: .data)
+    }
+}
+
+private struct IPCTabDumpResolvedParams: Codable {
+    let tabID: Int64
+    enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
+            )
+        }
+        self.tabID = v
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+    }
+}
+
+private struct IPCResolvedCell: Codable {
+    let row: UInt32
+    let col: UInt16
+    let text: String
+    let fg: String
+    let bg: String
+    let hasExplicitBg: Bool
+    let bold: Bool
+    let italic: Bool
+    let inverse: Bool
+    enum CodingKeys: String, CodingKey {
+        case row, col, text, fg, bg
+        case hasExplicitBg = "has_explicit_bg"
+        case bold, italic, inverse
+    }
+}
+
+private struct IPCTabDumpResolvedResult: Codable {
+    let cols: UInt16
+    let rows: UInt16
+    let cells: [IPCResolvedCell]
+}
+
+/// Format an `NSColor` as `#RRGGBB` for the `tab.dump_resolved` wire
+/// shape. Matches the GTK-side `rgb_hex` helper in
+/// `crates/roost-linux/src/ipc.rs` so cross-UI dumps compare equal.
+/// Returns `"#000000"` for any color that can't be converted to sRGB
+/// (defensive — every theme color in the bundled set converts).
+private func hexFromNSColor(_ color: NSColor) -> String {
+    guard let srgb = color.usingColorSpace(.sRGB) else { return "#000000" }
+    let r = UInt8(round(srgb.redComponent * 255))
+    let g = UInt8(round(srgb.greenComponent * 255))
+    let b = UInt8(round(srgb.blueComponent * 255))
+    return String(format: "#%02x%02x%02x", r, g, b)
 }

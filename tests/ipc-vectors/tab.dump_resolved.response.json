@@ -1,0 +1,32 @@
+{
+  "id": "12",
+  "ok": true,
+  "result": {
+    "cols": 80,
+    "rows": 24,
+    "cells": [
+      {
+        "row": 0,
+        "col": 0,
+        "text": "h",
+        "fg": "#ffffff",
+        "bg": "#1c1c1c",
+        "has_explicit_bg": false,
+        "bold": true,
+        "italic": false,
+        "inverse": false
+      },
+      {
+        "row": 0,
+        "col": 1,
+        "text": "i",
+        "fg": "#ffffff",
+        "bg": "#1c1c1c",
+        "has_explicit_bg": false,
+        "bold": true,
+        "italic": false,
+        "inverse": false
+      }
+    ]
+  }
+}

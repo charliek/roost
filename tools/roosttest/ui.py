@@ -161,8 +161,18 @@ def _launch_mac(app: Path) -> None:
     for attempt in (1, 2):
         _mac_cleanup()
         # `open --env` injects the seed config into the launched app
-        # (LaunchServices otherwise drops the caller's env).
-        subprocess.run(["open", "--env", f"ROOST_CONFIG={SEED_CONFIG}", str(app)], check=True)
+        # (LaunchServices otherwise drops the caller's env). Forward
+        # ROOST_TEST_MODE the same way so the bundled UI sees the
+        # test-mode gate; the GTK launch path inherits parent env
+        # directly via `**os.environ`.
+        argv = [
+            "open",
+            "--env", f"ROOST_CONFIG={SEED_CONFIG}",
+        ]
+        if "ROOST_TEST_MODE" in os.environ:
+            argv += ["--env", f"ROOST_TEST_MODE={os.environ['ROOST_TEST_MODE']}"]
+        argv += [str(app)]
+        subprocess.run(argv, check=True)
         try:
             wait_alive("mac")
             return

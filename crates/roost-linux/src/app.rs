@@ -214,6 +214,28 @@ pub struct App {
     /// workspace. (The same primitive will gate applying a remote
     /// reorder when cross-client convergence lands.)
     suppress_tab_reorder_echo: RefCell<bool>,
+    /// `ROOST_TEST_MODE=1` was set in the UI's environment at
+    /// launch. Read ONCE in `App::new` and stashed here so per-op
+    /// dispatch is a cheap bool check rather than a syscall, and so a
+    /// tester can't toggle the gate mid-session. When false, the
+    /// gated `tab.feed_pty_bytes` / `tab.capture_pty_input` ops
+    /// return `not-enabled` and the capture buffer + feed sender
+    /// maps below are never populated (zero overhead in production).
+    test_mode: bool,
+    /// Per-tab clones of the same `mpsc::UnboundedSender<TabOutput>`
+    /// the real `TabSession` writes to. Populated only when
+    /// `test_mode` is true; `tab.feed_pty_bytes` looks the tab id up
+    /// here and pushes `TabOutput::Bytes`, which the existing OSC
+    /// drain loop processes identically to real PTY output. The
+    /// channel is multi-producer mpsc, so the test sender races
+    /// safely with the live `TabSession`'s producer.
+    feed_senders: RefCell<HashMap<i64, tokio::sync::mpsc::UnboundedSender<TabOutput>>>,
+    /// Per-tab capture buffers for the `tab.capture_pty_input`
+    /// op. Populated only when `test_mode` is true; the buffer is
+    /// shared with `TabSession::send_input` so every outbound byte
+    /// (keystrokes, paste, OSC replies) is mirrored here as it's
+    /// enqueued.
+    input_captures: RefCell<HashMap<i64, crate::tab_session::InputCapture>>,
 }
 
 /// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
@@ -553,6 +575,15 @@ impl App {
             drag_original_order: RefCell::new(Vec::new()),
             drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
+            // Read the env var exactly once at boot so per-op
+            // dispatch is deterministic for the life of the process
+            // — a tester can't toggle the gate mid-session. Present-
+            // with-empty-value still counts (matches the Python
+            // truthiness `os.environ.get("ROOST_TEST_MODE") == "1"`
+            // pattern in `tools/roosttest/conftest.py`).
+            test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
+            feed_senders: RefCell::new(HashMap::new()),
+            input_captures: RefCell::new(HashMap::new()),
         });
         // M10: a single drop target on the sidebar listbox owns the
         // motion (live-shuffle) + drop (persist) handling for all
@@ -806,6 +837,23 @@ impl App {
                         }
                         UiRequest::ClipboardWrite { target, text } => {
                             app.ipc_clipboard_write(target, text);
+                        }
+                        UiRequest::TabFeedPtyBytes {
+                            tab_id,
+                            data,
+                            reply,
+                        } => {
+                            let _ = reply.send(app.ipc_tab_feed_pty_bytes(tab_id, data));
+                        }
+                        UiRequest::TabCapturePtyInput {
+                            tab_id,
+                            drain,
+                            reply,
+                        } => {
+                            let _ = reply.send(app.ipc_tab_capture_pty_input(tab_id, drain));
+                        }
+                        UiRequest::TabDumpResolved { tab_id, reply } => {
+                            let _ = reply.send(app.ipc_tab_dump_resolved(tab_id));
                         }
                     }
                 }
@@ -1594,13 +1642,34 @@ impl App {
         };
         let tab_id = tab.id;
         let rt = self.rt.clone();
+        // Test-mode wiring. Both are no-ops outside ROOST_TEST_MODE=1:
+        //   - `feed_senders` clones the same `output_tx` the real
+        //     `TabSession` already writes to, so `tab.feed_pty_bytes`
+        //     sends `TabOutput::Bytes` through the same mpsc consumer
+        //     loop the OSC drain reads from. Multi-producer mpsc
+        //     means the test sender races safely with the live
+        //     producer; single consumer drains FIFO.
+        //   - `input_captures` allocates a shared buffer that
+        //     `TabSession::send_input` mirrors every keystroke / OSC
+        //     reply / paste into, for `tab.capture_pty_input` to read.
+        let input_capture: Option<crate::tab_session::InputCapture> = if self.test_mode {
+            self.feed_senders
+                .borrow_mut()
+                .insert(tab_id, output_tx.clone());
+            let buf: crate::tab_session::InputCapture =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            self.input_captures.borrow_mut().insert(tab_id, buf.clone());
+            Some(buf)
+        } else {
+            None
+        };
         // M3b: subscribe to the in-process PtySupervisor. The
         // attach is synchronous (no gRPC dial), but we still hop
         // through `rt.spawn` so the drain task it kicks off lands
         // on the tokio runtime rather than the glib main loop.
         let supervisor = client_for_session.supervisor.clone();
-        let session_handle =
-            rt.spawn(async move { TabSession::attach(supervisor, tab_id, output_tx) });
+        let session_handle = rt
+            .spawn(async move { TabSession::attach(supervisor, tab_id, output_tx, input_capture) });
 
         let page: libadwaita::TabPage = ui.tab_view.append(terminal.widget());
         let page_for_future = page.clone();
@@ -1659,6 +1728,12 @@ impl App {
                     // silent no-op.
                     ui.tab_view.close_page(&page_for_cleanup);
                 }
+                // Drop the test-mode entries we registered above
+                // before kicking off the session future. The TabClosed
+                // event arm wouldn't fire on this path because the
+                // workspace never saw a successful attach, so this
+                // cleanup is the only place that catches the leak.
+                app_for_attach.drop_test_mode_state(tab_id);
             };
             let session = match session_handle.await {
                 Ok(Ok(s)) => Rc::new(s),
@@ -1954,6 +2029,8 @@ impl App {
                 // its inbox row to preserve "row exists iff pending".
                 self.notification_inbox.borrow_mut().remove(tab_id);
                 self.refresh_notif_badge();
+                // Drop any test-mode entries (no-op outside test mode).
+                self.drop_test_mode_state(tab_id);
             }
             WorkspaceEvent::TabTitleChanged { tab_id, title } => {
                 let projects = self.projects.borrow();
@@ -3234,6 +3311,81 @@ impl App {
             roost_linux::ipc::ClipboardOp::Selection => clipboard::Target::Primary,
         };
         clipboard::write(target, &text);
+    }
+
+    /// Drop the per-tab test-mode entries we registered in
+    /// `attach_tab` (no-op outside test mode and for tabs whose
+    /// attach failed before the registration ran). Called from
+    /// both the `TabClosed` event arm and the `attach_tab`
+    /// `fail_cleanup` path so a failed attach can't leak entries
+    /// either.
+    fn drop_test_mode_state(self: &Rc<Self>, tab_id: i64) {
+        self.feed_senders.borrow_mut().remove(&tab_id);
+        self.input_captures.borrow_mut().remove(&tab_id);
+    }
+
+    /// Inject bytes into a live tab's PTY-output drain. Gated on
+    /// `ROOST_TEST_MODE=1`. The bytes ride the same
+    /// `mpsc::UnboundedSender<TabOutput>` the supervisor uses, so the
+    /// OSC scanner + libghostty + the reply path all see them as if
+    /// they came from the shell — no shadow drain. (See
+    /// `docs/development/vision.md`: "No test-only backdoors that
+    /// drift from reality.")
+    fn ipc_tab_feed_pty_bytes(self: &Rc<Self>, tab_id: i64, data: Vec<u8>) -> Result<(), String> {
+        if !self.test_mode {
+            return Err("tab.feed_pty_bytes requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        let senders = self.feed_senders.borrow();
+        let Some(tx) = senders.get(&tab_id) else {
+            return Err(format!("tab {tab_id} has no live terminal"));
+        };
+        tx.send(TabOutput::Bytes(data))
+            .map_err(|e| format!("feed channel closed: {e}"))
+    }
+
+    /// Return (and optionally drain) the PTY-input bytes the UI has
+    /// queued for this tab since the last drain. Gated on
+    /// `ROOST_TEST_MODE=1`. The buffer is populated by
+    /// `TabSession::send_input` (a single tap point inside the
+    /// per-tab serial channel), so every keystroke / paste / OSC
+    /// reply is observable here without parallel plumbing.
+    fn ipc_tab_capture_pty_input(
+        self: &Rc<Self>,
+        tab_id: i64,
+        drain: bool,
+    ) -> Result<Vec<u8>, String> {
+        if !self.test_mode {
+            return Err("tab.capture_pty_input requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        let captures = self.input_captures.borrow();
+        let Some(buf) = captures.get(&tab_id) else {
+            return Err(format!("tab {tab_id} has no live terminal"));
+        };
+        let mut guard = buf
+            .lock()
+            .map_err(|e| format!("capture buffer poisoned: {e}"))?;
+        let bytes = if drain {
+            std::mem::take(&mut *guard)
+        } else {
+            guard.clone()
+        };
+        Ok(bytes)
+    }
+
+    /// Walk the tab's live render state through the SAME
+    /// `resolve_cell_colors` call the production `paint` path runs,
+    /// using the live `theme.bold_color`. Ungated — this is a
+    /// richer read of existing render state, not a shadow surface,
+    /// so it's safe (and useful) outside test mode. Pins #142's
+    /// resolver call-site plumbing end-to-end.
+    fn ipc_tab_dump_resolved(
+        self: &Rc<Self>,
+        tab_id: i64,
+    ) -> Result<roost_linux::ipc::ResolvedCellsData, String> {
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        Ok(view.dump_resolved_cells())
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {

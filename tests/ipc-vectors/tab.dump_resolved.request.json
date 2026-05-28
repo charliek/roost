@@ -1,0 +1,7 @@
+{
+  "id": "12",
+  "op": "tab.dump_resolved",
+  "params": {
+    "tab_id": "5"
+  }
+}

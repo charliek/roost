@@ -80,6 +80,33 @@ def test_echo(roost, project):
     assert "X=42" in roost.dump_text(tab)
 ```
 
+### OSC-routed regression patterns *(test-mode IPC ops)*
+
+When the behavior under test is a **byte-level wiring** detail — does
+the production code path actually drive the resolver correctly?, does
+an OSC reply reach `send_input`? — go through the gated
+`tab.feed_pty_bytes` + `tab.capture_pty_input` ops instead of trying
+to drive the shell into emitting the sequence. They require
+`ROOST_TEST_MODE=1` at UI launch (CI sets it; the harness's
+`tools/roosttest/test_test_ops.py` skips otherwise):
+
+```python
+def test_osc11_set_then_query_replies_with_new_bg(roost, project):
+    tab = roost.open_tab(project, cwd="/tmp")
+    # SET in one chunk so libghostty processes it before the next
+    # scanner.feed sees the QUERY.
+    roost.tab_feed_pty_bytes(tab, b"\x1b]11;rgb:00/11/22\x07")
+    roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
+    reply = roost.tab_capture_pty_input(tab, drain=True)
+    assert b"0000/1111/2222" in reply
+```
+
+For resolver-output asserts (theme bold-color, SGR inverse swap,
+etc.), `roost.tab_dump_resolved(tab)` walks the viewport through the
+production color resolver and returns per-cell `{fg, bg, bold,
+inverse, ...}` — see the smoke test in `test_test_ops.py`. This op
+is ungated.
+
 ## Out of scope here (use the other harnesses)
 
 Some behavior isn't deterministically drivable through the IPC op set —
@@ -93,6 +120,7 @@ it's pixel- or input- or shell-level. It lives elsewhere, by design:
 | OSC 2 window-title | cwd-derived title + the shell re-emits each prompt overwrites it | `tools/screenshot` (visible title) |
 | OSC parsing itself | — | `roost-osc` unit tests (osc2/osc7/osc777) |
 | Sidebar open/close | no IPC-observable state | `tools/screenshot`, or add an `identify` field |
+| Real shell-driven side effects (`cd` updating cwd, etc.) | the test-mode `tab.feed_pty_bytes` op *simulates* PTY output, it doesn't run a real shell | `tools/input/linux/` (real key+pointer injection) when the bug is in the shell↔UI handshake |
 
 See [`docs/development/test-automation.md`](../../docs/development/test-automation.md)
 for the plan (CI tiers, `roostctl wait`, the relationship to

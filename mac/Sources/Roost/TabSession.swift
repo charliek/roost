@@ -145,9 +145,7 @@ final class TabSession {
         let (output, oCont) = AsyncStream<Data>.makeStream()
         self.keystrokeContinuation = kCont
 
-        terminalView.onKey = { [weak self] data in
-            self?.keystrokeContinuation?.yield(.input(data))
-        }
+        installOnKeyWithTestCapture()
         terminalView.onResize = { [weak self] cols, rows in
             self?.resize(cols: cols, rows: rows)
         }
@@ -224,9 +222,7 @@ final class TabSession {
         self.keystrokeContinuation = kCont
         self.skipCloseRPC = closeOwnedByExternal
 
-        terminalView.onKey = { [weak self] data in
-            self?.keystrokeContinuation?.yield(.input(data))
-        }
+        installOnKeyWithTestCapture()
         terminalView.onResize = { [weak self] cols, rows in
             self?.resize(cols: cols, rows: rows)
         }
@@ -265,6 +261,27 @@ final class TabSession {
         }
     }
 
+    /// Install the onKey closure on `terminalView`. Shared between
+    /// `start()` and `attach()` so the capture-buffer tap added for
+    /// `tab.capture_pty_input` can never drift between the two
+    /// flows. When ROOST_TEST_MODE=1, every outbound byte
+    /// (keystrokes, paste, OSC reply replies — the Mac OSC reply
+    /// path also routes through `onKey` at
+    /// `TerminalView.appendBytes:366`) is mirrored into the per-tab
+    /// buffer hung off `RoostBackend.shared`. Outside test mode
+    /// the lookup is a single nil-return branch — no overhead.
+    @MainActor
+    private func installOnKeyWithTestCapture() {
+        terminalView.onKey = { [weak self] data in
+            if let self, let tabID = self.id,
+               let buf = RoostBackend.shared.ensureInputCapture(tabID: tabID)
+            {
+                buf.append(data)
+            }
+            self?.keystrokeContinuation?.yield(.input(data))
+        }
+    }
+
     /// Tear down the session. Closes the keystroke stream (which
     /// ends `runShellSession`'s writer loop), cancels the session
     /// task, and fires a best-effort `closeShellTab` if we know
@@ -280,6 +297,9 @@ final class TabSession {
         let skipRPC = skipCloseRPC
         if let id = self.id {
             self.id = nil
+            // Drop any input-capture buffer that test mode allocated
+            // for this tab. No-op outside ROOST_TEST_MODE=1.
+            RoostBackend.shared.dropInputCapture(tabID: id)
             // For externally-opened tabs (`skipCloseRPC == true`),
             // don't fire the LocalClient.closeTab RPC — the
             // opening client (`roostctl`, Claude hook) owns the
