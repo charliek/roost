@@ -829,9 +829,16 @@ impl TerminalViewState {
 
         self.render_state
             .walk(&self.terminal, |row, cell: Cell| {
-                let bg = cell.bg.unwrap_or(default_bg);
-                let fg = cell.fg.unwrap_or(default_fg);
-                if cell.bg.is_some() && bg != default_bg {
+                // Apply SGR inverse + bold-accent rules. Without this,
+                // codex's `\e[7m`-highlighted prompt row renders against
+                // the canvas-default bg and the gray prompt disappears
+                // (the visible regression the PR fixes). bold_color is
+                // None until/unless the theme parser learns `bold-color`
+                // — for now bold default-fg cells render in default_fg,
+                // matching pre-PR behavior.
+                let (fg, bg, has_explicit_bg) =
+                    resolve_cell_colors(&cell, default_fg, default_bg, None);
+                if has_explicit_bg && bg != default_bg {
                     bg_pass.push((row, cell.col, bg));
                 }
                 if !cell.text.is_empty() && cell.text != " " {
@@ -1179,6 +1186,45 @@ fn set_cairo_color(cr: &cairo::Context, rgb: ColorRgb) {
     cr.set_source_rgb(r, g, b);
 }
 
+/// Resolve a cell's effective fg/bg + whether it needs a BG fill,
+/// applying the same SGR inverse + bold-accent rules as the legacy
+/// Go `cellColors` (`cmd/roost/render.go:206-224`). Free function so
+/// it's unit-testable without a Cairo context or DrawingArea.
+///
+/// Rules (matching legacy 1:1):
+/// * Default colors are the per-frame terminal default.
+/// * Explicit SGR fg/bg overrides the default.
+/// * `\e[7m` (inverse) swaps the *effective* fg/bg — done **after**
+///   the explicit-color lookup and **before** the bold-accent step,
+///   and forces `has_explicit_bg = true` so the renderer paints the
+///   swap even when the cell had no explicit bg of its own.
+/// * `bold_color` is applied only when the cell is bold, has no
+///   explicit fg, and isn't inverted. (Bold red stays red; only
+///   bold default-fg text gets the accent.) Pass `None` to disable
+///   — themes haven't shipped a `bold-color` parser yet, so today
+///   every caller passes `None` and the bold-accent path is dead
+///   code preserved for forward-compat parity.
+pub(crate) fn resolve_cell_colors(
+    cell: &Cell,
+    default_fg: ColorRgb,
+    default_bg: ColorRgb,
+    bold_color: Option<ColorRgb>,
+) -> (ColorRgb, ColorRgb, bool) {
+    let mut fg = cell.fg.unwrap_or(default_fg);
+    let mut bg = cell.bg.unwrap_or(default_bg);
+    let mut has_explicit_bg = cell.bg.is_some();
+    if cell.style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+        has_explicit_bg = true;
+    }
+    if cell.style.bold && cell.fg.is_none() && !cell.style.inverse {
+        if let Some(bc) = bold_color {
+            fg = bc;
+        }
+    }
+    (fg, bg, has_explicit_bg)
+}
+
 /// Extract the active selection as plain text (trailing whitespace
 /// trimmed per line), or `None` when there is no non-empty selection.
 /// A free function — shared by the explicit copy path and (on Linux)
@@ -1310,4 +1356,194 @@ fn is_modifier_key(key: gtk4::gdk::Key) -> bool {
             | K::Num_Lock
             | K::Shift_Lock
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inverse + bold-accent resolver tests. The Pass A walk feeds
+    //! `resolve_cell_colors` per cell; getting this wrong produces a
+    //! visible regression (e.g. codex's gray prompt vanishing into
+    //! the canvas bg). All cases below mirror legacy
+    //! `cmd/roost/render.go::cellColors` behavior.
+    use super::*;
+    use roost_vt::{Cell, ColorRgb, Style};
+
+    const DEFAULT_FG: ColorRgb = ColorRgb::new(0xe5, 0xe5, 0xe5);
+    const DEFAULT_BG: ColorRgb = ColorRgb::new(0x1c, 0x1c, 0x1c);
+    const EXPLICIT_FG: ColorRgb = ColorRgb::new(0x80, 0xc0, 0x40);
+    const EXPLICIT_BG: ColorRgb = ColorRgb::new(0x3a, 0x3a, 0x3a);
+    const BOLD: ColorRgb = ColorRgb::new(0xff, 0xff, 0xff);
+
+    fn cell(fg: Option<ColorRgb>, bg: Option<ColorRgb>, style: Style) -> Cell {
+        Cell {
+            col: 0,
+            fg,
+            bg,
+            text: String::new(),
+            style,
+        }
+    }
+
+    #[test]
+    fn plain_default_cell_inherits_defaults_and_skips_bg_fill() {
+        let c = cell(None, None, Style::default());
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, DEFAULT_FG);
+        assert_eq!(bg, DEFAULT_BG);
+        assert!(!has_bg, "default cell must not trigger a per-cell bg fill");
+    }
+
+    #[test]
+    fn explicit_bg_is_reported_as_fillable() {
+        let c = cell(None, Some(EXPLICIT_BG), Style::default());
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, DEFAULT_FG);
+        assert_eq!(bg, EXPLICIT_BG);
+        assert!(has_bg);
+    }
+
+    /// The codex regression: `\e[7m` on an otherwise-default cell.
+    /// Pre-fix the resolver simply returned `(default_fg, default_bg,
+    /// false)`, so the renderer skipped the bg fill and the gray
+    /// prompt row stayed black.
+    #[test]
+    fn inverse_default_cell_swaps_colors_and_forces_bg_fill() {
+        let c = cell(
+            None,
+            None,
+            Style {
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, DEFAULT_BG, "inverse swap: fg becomes default bg");
+        assert_eq!(bg, DEFAULT_FG, "inverse swap: bg becomes default fg");
+        assert!(
+            has_bg,
+            "inverse must force has_explicit_bg=true so the swap is painted"
+        );
+    }
+
+    #[test]
+    fn inverse_with_explicit_colors_swaps_them() {
+        let c = cell(
+            Some(EXPLICIT_FG),
+            Some(EXPLICIT_BG),
+            Style {
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, EXPLICIT_BG);
+        assert_eq!(bg, EXPLICIT_FG);
+        assert!(has_bg);
+    }
+
+    /// Boundary: inverse on a cell that has only an explicit fg (no
+    /// explicit bg). The default bg sits in the bg slot before the
+    /// swap, so after inverse the effective fg should be `default_bg`
+    /// and the effective bg should be the originally-explicit fg.
+    #[test]
+    fn inverse_with_only_explicit_fg_swaps_default_bg_into_fg() {
+        let c = cell(
+            Some(EXPLICIT_FG),
+            None,
+            Style {
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, DEFAULT_BG);
+        assert_eq!(bg, EXPLICIT_FG);
+        assert!(has_bg);
+    }
+
+    /// Mirror of the above: explicit bg only, no explicit fg. After
+    /// the inverse swap the effective fg is the explicit bg and the
+    /// effective bg is the default fg.
+    #[test]
+    fn inverse_with_only_explicit_bg_swaps_default_fg_into_bg() {
+        let c = cell(
+            None,
+            Some(EXPLICIT_BG),
+            Style {
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, has_bg) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(fg, EXPLICIT_BG);
+        assert_eq!(bg, DEFAULT_FG);
+        assert!(has_bg);
+    }
+
+    #[test]
+    fn bold_default_fg_uses_bold_accent_when_provided() {
+        let c = cell(
+            None,
+            None,
+            Style {
+                bold: true,
+                ..Style::default()
+            },
+        );
+        let (fg, _, _) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, Some(BOLD));
+        assert_eq!(fg, BOLD);
+    }
+
+    #[test]
+    fn bold_with_explicit_fg_keeps_the_explicit_fg() {
+        let c = cell(
+            Some(EXPLICIT_FG),
+            None,
+            Style {
+                bold: true,
+                ..Style::default()
+            },
+        );
+        let (fg, _, _) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, Some(BOLD));
+        assert_eq!(
+            fg, EXPLICIT_FG,
+            "bold accent must not override explicit SGR fg (e.g. bold red stays red)"
+        );
+    }
+
+    #[test]
+    fn bold_with_inverse_does_not_apply_bold_accent_to_swapped_bg() {
+        // After inverse, fg = default_bg. Applying bold_color here
+        // would land it in the bg position and produce the wrong
+        // visual. The legacy guard `!cell.Inverse` prevents this.
+        let c = cell(
+            None,
+            None,
+            Style {
+                bold: true,
+                inverse: true,
+                ..Style::default()
+            },
+        );
+        let (fg, bg, _) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, Some(BOLD));
+        assert_eq!(fg, DEFAULT_BG, "post-inverse fg must remain default_bg");
+        assert_eq!(bg, DEFAULT_FG, "post-inverse bg must remain default_fg");
+    }
+
+    #[test]
+    fn bold_color_none_disables_the_accent() {
+        let c = cell(
+            None,
+            None,
+            Style {
+                bold: true,
+                ..Style::default()
+            },
+        );
+        let (fg, _, _) = resolve_cell_colors(&c, DEFAULT_FG, DEFAULT_BG, None);
+        assert_eq!(
+            fg, DEFAULT_FG,
+            "bold_color=None must leave default fg unchanged"
+        );
+    }
 }
