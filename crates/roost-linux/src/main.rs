@@ -21,6 +21,7 @@ mod keybind;
 mod notification_inbox;
 mod palette;
 mod palette_ui;
+mod paste_image;
 mod rollup;
 mod sprite;
 mod tab_session;

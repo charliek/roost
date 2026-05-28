@@ -70,6 +70,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gtk4 = { version = "0.10", features = ["v4_12"] }
 libadwaita = { version = "0.8", features = ["v1_4"] }
 glib = "0.21"
+# gdk-pixbuf decodes clipboard images (JPEG/GIF/TIFF/WebP) into a
+# uniform PNG byte-buffer so we can paste the resulting `.png` path
+# to Claude Code / Codex. Already a transitive dep of gtk4-rs; pinned
+# here so `use gdk_pixbuf::Pixbuf` resolves directly.
+gdk-pixbuf = "0.21"
 # Cairo + Pango for the cell renderer.
 pangocairo = "0.21"
 # AccelMods bitflags for the keybind table.

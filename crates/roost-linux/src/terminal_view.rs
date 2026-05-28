@@ -44,6 +44,7 @@ use crate::cell_metrics::{default_font_description, CellMetrics};
 use crate::clipboard;
 use crate::config::CopyOnSelect;
 use crate::key_encoder;
+use crate::paste_image;
 use crate::sprite;
 use crate::theme::Theme;
 
@@ -608,16 +609,46 @@ impl TerminalView {
         clipboard::write(clipboard::Target::Primary, &text);
     }
 
-    /// Read text from the system clipboard and feed it into the PTY.
-    /// Wraps the payload in bracketed-paste escapes (`ESC[200~` …
-    /// `ESC[201~`) when the terminal has DECSET 2004 active (zsh,
-    /// bash with the bracketed-paste plugin, vim insert mode, etc.).
-    /// The clipboard read is async; `clipboard::read` hops the result
-    /// back to the GTK main loop before `paste_text_into` runs.
+    /// Read the system clipboard and feed it into the PTY. Three
+    /// shapes, in priority order: text → file URIs (image extensions
+    /// only) → raw image bytes. Image bytes (PNG passthrough or any
+    /// other format gdk-pixbuf can decode) are written to a temp
+    /// `.png` and the path is pasted as bracketed text so agents like
+    /// Claude Code and Codex recognise it and offer to attach. The
+    /// three branches share `paste_text_into` so DECSET-2004 wrapping
+    /// stays consistent. Each read is async; the callbacks hop back
+    /// to the GTK main loop before touching `paste_text_into`.
     pub fn paste_from_clipboard(&self) {
         let state = self.state.clone();
         clipboard::read(clipboard::Target::Clipboard, move |text| {
-            paste_text_into(&state, text)
+            if !text.is_empty() {
+                paste_text_into(&state, text);
+                return;
+            }
+            Self::paste_image_or_uris(state);
+        });
+    }
+
+    /// File-URI fallback (cheap, text-shaped) → image-bytes fallback.
+    /// Pulled out of `paste_from_clipboard` because the closure has
+    /// already consumed the captured state once on the empty-text
+    /// branch, and re-using it requires a fresh clone hop.
+    fn paste_image_or_uris(state: Rc<RefCell<TerminalViewState>>) {
+        let for_image = state.clone();
+        clipboard::read_file_uris(move |paths| {
+            if !paths.is_empty() {
+                paste_text_into(&state, paths.join(" "));
+                return;
+            }
+            clipboard::read_image(move |maybe| {
+                let Some((bytes, mime)) = maybe else { return };
+                match paste_image::materialize(&bytes, &mime) {
+                    Ok(path) => {
+                        paste_text_into(&for_image, path.to_string_lossy().into_owned());
+                    }
+                    Err(e) => tracing::warn!(error = %e, "clipboard image materialize"),
+                }
+            });
         });
     }
 
