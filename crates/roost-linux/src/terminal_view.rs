@@ -42,6 +42,7 @@ use roost_vt::{
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
 use crate::clipboard;
+use crate::config::CopyOnSelect;
 use crate::key_encoder;
 use crate::sprite;
 use crate::theme::Theme;
@@ -123,20 +124,21 @@ impl TerminalView {
         Self::with_theme(Theme::default())
     }
 
-    /// Construct with a custom theme + optional font overrides.
-    /// Phase 7 commit 11: the App passes user-supplied
-    /// `font_family` + `font_size_pt` from `~/.config/roost/config.conf`
-    /// when present, falling back to the JetBrains Mono / 13pt
-    /// defaults otherwise. The theme's palette is pushed into
-    /// libghostty so SGR cells (`ls --color`, `git diff`) flip to the
-    /// theme's reds / greens / etc.
-    pub fn with_theme_and_font(
+    /// Construct with a custom theme, optional font overrides, and a
+    /// `copy-on-select` mode. The App passes user-supplied
+    /// `font_family` + `font_size_pt` + `copy_on_select` from
+    /// `~/.config/roost/config.conf` (defaults applied when absent).
+    /// The theme's palette is pushed into libghostty so SGR cells
+    /// (`ls --color`, `git diff`) flip to the theme's reds / greens.
+    pub fn with_theme_font_and_copy(
         theme: Theme,
         font_family: Option<&str>,
         font_size_pt: Option<f64>,
+        copy_on_select: CopyOnSelect,
     ) -> Self {
         let view = Self::with_theme(theme);
         view.apply_font(font_family, font_size_pt);
+        view.state.borrow_mut().copy_on_select = copy_on_select;
         view
     }
 
@@ -206,6 +208,7 @@ impl TerminalView {
             scrolled_back: false,
             scroll_accum: 0.0,
             selection: None,
+            copy_on_select: CopyOnSelect::default(),
             input_callback: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
@@ -316,16 +319,18 @@ impl TerminalView {
             let widget = widget.clone();
             move |_g, x, y| {
                 let mut s = state.borrow_mut();
-                if let Some((col, row)) = s.cell_at(x, y, &widget) {
-                    if let Some(screen_y) = s.screen_y_for_viewport_row(row) {
-                        s.selection = Some(Selection {
-                            anchor_col: col,
-                            anchor_screen_y: screen_y,
-                            cursor_col: col,
-                            cursor_screen_y: screen_y,
-                        });
-                    }
-                }
+                // Start a fresh selection, or clear any stale one if
+                // the viewport → screen conversion fails (terminal
+                // handle not ready, cell coords out of range).
+                s.selection = s.cell_at(x, y, &widget).and_then(|(col, row)| {
+                    let screen_y = s.screen_y_for_viewport_row(row)?;
+                    Some(Selection {
+                        anchor_col: col,
+                        anchor_screen_y: screen_y,
+                        cursor_col: col,
+                        cursor_screen_y: screen_y,
+                    })
+                });
                 drop(s);
                 widget.queue_draw();
             }
@@ -340,30 +345,50 @@ impl TerminalView {
                     let y = start_y + dy;
                     let cell_w = s.cell_metrics.cell_width;
                     let cell_h = s.cell_metrics.cell_height;
-                    let cell = cell_at_inner(x, y, cell_w, cell_h);
-                    if let Some((col, row)) = cell {
-                        if let Some(screen_y) = s.screen_y_for_viewport_row(row) {
-                            if let Some(sel) = s.selection.as_mut() {
-                                sel.cursor_col = col;
-                                sel.cursor_screen_y = screen_y;
-                            }
+                    let resolved = cell_at_inner(x, y, cell_w, cell_h).and_then(|(col, row)| {
+                        let screen_y = s.screen_y_for_viewport_row(row)?;
+                        Some((col, screen_y))
+                    });
+                    match (resolved, s.selection.as_mut()) {
+                        (Some((col, screen_y)), Some(sel)) => {
+                            sel.cursor_col = col;
+                            sel.cursor_screen_y = screen_y;
                         }
+                        (None, Some(_)) => {
+                            // Conversion failed mid-drag — drop the
+                            // selection rather than keep updating a
+                            // stale anchor.
+                            s.selection = None;
+                        }
+                        _ => {}
                     }
                 }
                 drop(s);
                 widget.queue_draw();
             }
         });
-        // On selection commit, publish to the X11/Wayland PRIMARY
-        // selection so a middle-click paste into another app works
-        // (the convention every Linux terminal honors). `Target::Primary`
-        // is a no-op off Linux, so installing the handler unconditionally
-        // is harmless on macOS.
+        // On selection commit, copy-on-select per the config. The
+        // three-state model matches Ghostty (`off | true | clipboard`):
+        //   * Off: no write (user has to press explicit copy).
+        //   * True (default): write to PRIMARY only. Middle-click
+        //     paste works; Ctrl+Shift+V keeps whatever was last
+        //     Ctrl+Shift+C'd. This is the conventional X11 behavior.
+        //   * Clipboard: write to BOTH PRIMARY and CLIPBOARD, so a
+        //     drag-and-Ctrl+V-into-another-app flow works.
+        // `Target::Primary` is a no-op off Linux, so installing the
+        // handler unconditionally is harmless on macOS.
         drag.connect_drag_end({
             let state = state.clone();
             move |_g, _x, _y| {
+                let mode = state.borrow().copy_on_select;
+                if mode == CopyOnSelect::Off {
+                    return;
+                }
                 if let Some(text) = selection_text(&state) {
                     clipboard::write(clipboard::Target::Primary, &text);
+                    if mode == CopyOnSelect::Clipboard {
+                        clipboard::write(clipboard::Target::Clipboard, &text);
+                    }
                 }
             }
         });
@@ -663,9 +688,14 @@ struct TerminalViewState {
     /// then dispatch. Discrete wheels usually report 1.0+ per notch
     /// so the accumulator passes through.
     scroll_accum: f64,
-    /// Current drag selection, in (col, row) viewport coordinates.
+    /// Current drag selection, in (col, screen_y) coordinates.
     /// `None` outside an active drag.
     selection: Option<Selection>,
+    /// `copy-on-select` mode from `~/.config/roost/config.conf`,
+    /// resolved at startup by `App` and passed through
+    /// [`TerminalView::with_theme_font_and_copy`]. Read by `drag_end`
+    /// to decide which clipboard target(s) receive the selection.
+    copy_on_select: CopyOnSelect,
     /// Caller-installed keystroke handler. Optional because the
     /// TerminalView can be built before its session is spawned;
     /// `set_on_input` populates it once the daemon round-trip is
@@ -1370,8 +1400,14 @@ fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
     });
     drop(s);
 
-    // Trim trailing whitespace per row + drop empty trailing rows.
+    // Trim trailing whitespace per row, then drop empty leading and
+    // trailing rows so a partial copy (where the first or last
+    // selection rows scrolled off-screen and are blank in `rows`)
+    // doesn't carry stray newlines into the clipboard.
     let mut trimmed: Vec<String> = rows.iter().map(|r| r.trim_end().to_string()).collect();
+    while matches!(trimmed.first(), Some(line) if line.is_empty()) {
+        trimmed.remove(0);
+    }
     while matches!(trimmed.last(), Some(line) if line.is_empty()) {
         trimmed.pop();
     }

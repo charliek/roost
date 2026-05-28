@@ -217,15 +217,32 @@ final class TerminalView: NSView {
     /// keystroke") + `cmd/roost/session.go:108-112` (`scrolledBack`).
     private var scrolledBack: Bool = false
 
+    /// `copy-on-select` mode. Read from `RoostConfig.copyOnSelect`
+    /// on tab creation and passed through here so mouseUp /
+    /// otherMouseDown can branch on it. Default matches the config
+    /// default (`.on`).
+    var copyOnSelect: CopyOnSelect = .default
+
+    /// Custom-named selection pasteboard for `copy-on-select = .on`.
+    /// Mirrors cmux's `com.mitchellh.ghostty.selection` pattern:
+    /// drag-to-select writes here and middle-click in any Roost
+    /// terminal reads from here, all without touching the system
+    /// pasteboard that ⌘V reads from.
+    static let selectionPasteboard = NSPasteboard(
+        name: NSPasteboard.Name("ai.stridelabs.Roost.selection")
+    )
+
     init(
         cols: UInt16 = 80,
         rows: UInt16 = 24,
         theme: Theme = .fallback,
-        font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+        copyOnSelect: CopyOnSelect = .default
     ) {
         self.cols = cols
         self.rows = rows
         self.theme = theme
+        self.copyOnSelect = copyOnSelect
 
         // Cell metrics: monospaced system font, advance width measured
         // from a representative wide glyph ("M"), height from the
@@ -529,7 +546,17 @@ final class TerminalView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
-        guard let screenY = screenY(forViewportRow: cell.row) else { return }
+        guard let screenY = screenY(forViewportRow: cell.row) else {
+            // libghostty rejected the viewport→screen conversion (very
+            // narrow window: tab tearing down, no terminal handle yet).
+            // Clear any stale selection so the user isn't left with a
+            // highlight pointing at the wrong row.
+            if selection != nil {
+                selection = nil
+                needsDisplay = true
+            }
+            return
+        }
         selection = CellSelection(
             anchorCol: cell.col,
             anchorScreenY: screenY,
@@ -543,7 +570,14 @@ final class TerminalView: NSView {
         guard var sel = selection else { return }
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
-        guard let screenY = screenY(forViewportRow: cell.row) else { return }
+        guard let screenY = screenY(forViewportRow: cell.row) else {
+            // Mid-drag conversion failure (rare — usually means the
+            // terminal handle just went away). Drop the selection
+            // rather than continue updating a stale anchor.
+            selection = nil
+            needsDisplay = true
+            return
+        }
         sel.cursorCol = cell.col
         sel.cursorScreenY = screenY
         selection = sel
@@ -612,7 +646,62 @@ final class TerminalView: NSView {
         if let sel = selection, sel.isEmpty {
             selection = nil
             needsDisplay = true
+            return
         }
+        // Copy-on-select. The three-state config follows Ghostty's
+        // semantics; see docs/reference/config.md for the user-facing
+        // explanation. The `.on` case writes only to the named
+        // selection pasteboard — ⌘V in another app is intentionally
+        // not affected; middle-click inside Roost reads from there.
+        // `.clipboard` ALSO writes to the system pasteboard, so a
+        // drag-and-paste-into-another-app flow works.
+        if copyOnSelect != .off,
+           let text = selectedPlainText(),
+           !text.isEmpty
+        {
+            switch copyOnSelect {
+            case .off:
+                break
+            case .on:
+                Self.selectionPasteboard.clearContents()
+                Self.selectionPasteboard.setString(text, forType: .string)
+            case .clipboard:
+                Self.selectionPasteboard.clearContents()
+                Self.selectionPasteboard.setString(text, forType: .string)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+        }
+    }
+
+    /// Middle-click pastes from the named selection pasteboard,
+    /// mirroring the X11 PRIMARY convention. Works for any
+    /// `copy-on-select` mode except `.off` (the pasteboard is empty
+    /// in that case so the paste is a no-op). Routes through the same
+    /// bracketed-paste-aware path as ⌘V.
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        guard let s = Self.selectionPasteboard.string(forType: .string),
+              !s.isEmpty
+        else { return }
+        var payload = Data(s.utf8)
+        if bracketedPasteEnabled() {
+            var wrapped = Data([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e])
+            wrapped.append(payload)
+            wrapped.append(contentsOf: [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e])
+            payload = wrapped
+        }
+        onKey?(payload)
+    }
+
+    /// Accept middle-click without the view being first responder so a
+    /// user can paste from the selection pasteboard into an unfocused
+    /// tab without an intermediate click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 
     /// Reset the selection. Hooked by `RoostApp` when switching
@@ -710,6 +799,13 @@ final class TerminalView: NSView {
         }
         var trimmed = outRows.map {
             String($0.reversed().drop(while: { $0 == " " }).reversed())
+        }
+        // Drop empty leading rows too — a partial copy where the
+        // first selection rows scrolled off-screen leaves their
+        // entries as empty strings here, and joining would emit
+        // stray leading newlines into the clipboard.
+        while let first = trimmed.first, first.isEmpty {
+            trimmed.removeFirst()
         }
         while let last = trimmed.last, last.isEmpty {
             trimmed.removeLast()
