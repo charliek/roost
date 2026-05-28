@@ -300,6 +300,64 @@ def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
         f"zsh auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"
 
 
+def _modern_bash() -> str:
+    """Path to a bash >= 4.4, or "" if only Apple's /bin/bash 3.2 exists.
+    Probes candidates on the harness host (same machine the UI spawns on)."""
+    import os
+    import shutil
+    import subprocess
+
+    def ok(path: str) -> bool:
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            out = subprocess.run(
+                [path, "-c", "echo ${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.split()
+            major, minor = int(out[0]), int(out[1])
+            return major > 4 or (major == 4 and minor >= 4)
+        except Exception:
+            return False
+
+    return next(
+        (c for c in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash",
+                     shutil.which("bash") or "", "/usr/bin/bash") if ok(c)),
+        "",
+    )
+
+
+def test_bash_auto_bootstrap_tracks_cwd(roost, project):
+    """A bash tab auto-loads the integration via `--posix` + ENV — NO manual
+    `source` — so cwd follows `cd` (OSC 7), and the inject header has left
+    POSIX mode (proving it recreated bash's startup rather than leaving the
+    shell in the raw `--posix` we spawned it with).
+
+    Needs a modern bash (>= 4.4) opened explicitly, mirroring the zsh test;
+    Apple's /bin/bash 3.2 can't do the ENV+POSIX path and is skipped (it
+    keeps the documented manual source). That the user's real ~/.bashrc
+    still loads on top is covered by live validation — CI dotfiles aren't
+    predictable, but POSIX mode being off here proves the recreation ran."""
+    bash = _modern_bash()
+    if not bash:
+        pytest.skip("no modern bash (>= 4.4); Apple /bin/bash 3.2 is manual-source only")
+    tab = roost.open_tab(project, cwd="/tmp", argv=[bash, "-l"])
+    # No manual source: --posix + ENV auto-load roost.bash; its OSC 7 hook
+    # fires on the prompt. A couple of round-trips lets it settle.
+    roost.run(tab, "cd /usr")
+    roost.run(tab, "true")
+    assert _cwd_becomes(roost, tab, "/usr", timeout=8), \
+        f"bash auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"
+    # The recreation block ran `set +o posix`; if the shell were still in
+    # the raw --posix state we spawned it with, this would read `on`.
+    roost.run(
+        tab,
+        'case ":$SHELLOPTS:" in *:posix:*) p=on;; *) p=off;; esac; '
+        'printf "BOOTPOSIX:%s\\n" "$p"',
+    )
+    roost.wait_text(tab, "BOOTPOSIX:off", timeout=8)
+
+
 def test_title_follows_cd_via_script(roost, project):
     """The shipped integration's default title feature sets the tab title
     to the cwd (tilde-abbreviated) via OSC 0 on cd."""
