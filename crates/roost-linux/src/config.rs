@@ -27,6 +27,36 @@ pub struct RoostConfig {
     /// mouse-drag selection on release. Three states match Ghostty's
     /// vocabulary. Defaults to `True` on both platforms.
     pub copy_on_select: CopyOnSelect,
+
+    /// `clipboard-write` policy — controls whether a program running
+    /// in the terminal can write the host clipboard via OSC 52. Two
+    /// states; defaults to `Allow` (matches Ghostty's default).
+    /// Phase 2 will add `Ask` with a consent banner.
+    pub clipboard_write: ClipboardWrite,
+}
+
+/// Two-state policy for OSC 52 program-initiated clipboard writes.
+/// Matches the first two values of Ghostty's `clipboard-write`
+/// (`allow | deny`); `ask` is deferred until the consent banner UI
+/// lands. Default is `Allow`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardWrite {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl ClipboardWrite {
+    /// Parse a config value. Accepts `allow | true | yes` → Allow and
+    /// `deny | false | no` → Deny. Any other value returns `None` so
+    /// the caller can log + fall back to the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "allow" | "true" | "yes" => Some(Self::Allow),
+            "deny" | "false" | "no" => Some(Self::Deny),
+            _ => None,
+        }
+    }
 }
 
 /// Three-state `copy-on-select` config value matching Ghostty's
@@ -117,6 +147,16 @@ impl RoostConfig {
                         tracing::warn!(
                             value,
                             "unknown copy-on-select value; falling back to default `true`"
+                        );
+                    }
+                }
+                "clipboard-write" => {
+                    if let Some(v) = ClipboardWrite::parse(value) {
+                        cfg.clipboard_write = v;
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown clipboard-write value; falling back to default `allow`"
                         );
                     }
                 }
@@ -244,6 +284,41 @@ mod tests {
     fn copy_on_select_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("copy-on-select = pancakes");
         assert_eq!(cfg.copy_on_select, CopyOnSelect::True);
+    }
+
+    #[test]
+    fn clipboard_write_defaults_to_allow() {
+        let cfg = RoostConfig::parse("");
+        assert_eq!(cfg.clipboard_write, ClipboardWrite::Allow);
+    }
+
+    #[test]
+    fn clipboard_write_accepts_allow_and_deny() {
+        assert_eq!(
+            RoostConfig::parse("clipboard-write = allow").clipboard_write,
+            ClipboardWrite::Allow
+        );
+        assert_eq!(
+            RoostConfig::parse("clipboard-write = true").clipboard_write,
+            ClipboardWrite::Allow
+        );
+        assert_eq!(
+            RoostConfig::parse("clipboard-write = deny").clipboard_write,
+            ClipboardWrite::Deny
+        );
+        assert_eq!(
+            RoostConfig::parse("clipboard-write = false").clipboard_write,
+            ClipboardWrite::Deny
+        );
+    }
+
+    #[test]
+    fn clipboard_write_unknown_value_keeps_default() {
+        let cfg = RoostConfig::parse("clipboard-write = ask");
+        // `ask` is a phase-2 value; parse currently rejects it so the
+        // default (Allow) wins. This test pins the contract so phase 2
+        // remembers to update the parser.
+        assert_eq!(cfg.clipboard_write, ClipboardWrite::Allow);
     }
 
     #[test]

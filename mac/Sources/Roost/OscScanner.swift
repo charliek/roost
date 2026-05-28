@@ -28,17 +28,29 @@ private let maxBody = 8192
 
 /// One parsed-out OSC event. Returned in order by
 /// `OscScanner.feed`.
+enum OscClipboardTarget: Equatable {
+    case system
+    case selection
+}
+
 enum OscEvent: Equatable {
     case title(String)
     case pwd(String)
     case notification(title: String, body: String)
     case colorQuery(UInt8)  // 10, 11, or 12
     case commandMark(String)  // OSC 133 prompt/command mark body (A/B/C/D[;exit])
+    /// OSC 52 program-initiated clipboard write. The body's base64
+    /// payload has already been decoded; `text` is plain UTF-8.
+    /// Read requests (`Pc == "?"`) are dropped at parse time —
+    /// phase 1 is write-only.
+    case clipboard(target: OscClipboardTarget, text: String)
 
     /// Maps a parsed event to the (osc_command, payload) pair the
     /// `ReportOsc` RPC expects. Used by `TerminalView.appendBytes`
     /// to bridge scanner output into the existing gRPC surface.
-    var asReport: (UInt32, String) {
+    /// Returns `nil` for events that are pure UI actions (e.g.
+    /// `.clipboard`) and don't belong on the daemon-side dispatch.
+    var asReport: (UInt32, String)? {
         switch self {
         case .title(let s):
             // OSC 0 is the conservative pick for sending titles
@@ -73,6 +85,10 @@ enum OscEvent: Equatable {
             // OSC 133 prompt/command mark; pass the body through to
             // applyOSC, which maps it to tab state (P4b).
             return (133, s)
+        case .clipboard:
+            // OSC 52 is a UI-only action — the daemon doesn't track
+            // pasteboard state, so don't forward.
+            return nil
         }
     }
 }
@@ -213,6 +229,14 @@ final class OscScanner {
             // Shell-integration prompt/command mark; surface the raw
             // body (A/B/C/D[;exit]). applyOSC maps it to tab state (P4b).
             pending.append(.commandMark(body))
+        case "52":
+            // OSC 52 program-initiated clipboard write. Body: `Ps;Pc`
+            // (selector + base64). Read requests (`Pc == "?"`) drop —
+            // phase 1 is write-only. Invalid base64 / non-UTF-8 also
+            // drop silently, matching the Rust scanner + Ghostty.
+            if let event = parseOsc52(body) {
+                pending.append(event)
+            }
         default:
             break
         }
@@ -241,6 +265,36 @@ private func isConEmuBody(_ body: String) -> Bool {
 }
 
 /// Decode an OSC 7 body of the form `file://[host]/path` into the
+/// Decode an OSC 52 body of the form `Ps;Pc` into a `.clipboard`
+/// event. Returns nil for read requests (`Pc == "?"`, deferred to
+/// phase 2), invalid base64, non-UTF-8 payloads, or empty payloads.
+/// Selector mapping mirrors `crates/roost-osc/src/lib.rs::parse_osc52`:
+/// any `c` → system; `p` / `s` → selection; unknown / empty selectors
+/// default to system.
+private func parseOsc52(_ body: String) -> OscEvent? {
+    guard let semi = body.firstIndex(of: ";") else { return nil }
+    let ps = String(body[..<semi])
+    let pc = String(body[body.index(after: semi)...])
+    if pc == "?" { return nil }  // read request — phase 2.
+    let target: OscClipboardTarget
+    if ps.isEmpty || ps.contains("c") {
+        target = .system
+    } else if ps.contains("p") || ps.contains("s") {
+        target = .selection
+    } else {
+        target = .system  // unknown selector — coalesce to system.
+    }
+    // Some emitters wrap long base64 over multiple lines; strip
+    // whitespace before decoding (`Data(base64Encoded:)` would
+    // otherwise reject the wrapped form).
+    let cleaned = pc.filter { !$0.isWhitespace }
+    guard let data = Data(base64Encoded: cleaned) else { return nil }
+    guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+        return nil
+    }
+    return .clipboard(target: target, text: text)
+}
+
 /// percent-decoded path. Returns nil for non-file URIs or
 /// malformed percent-encoding.
 private func parseOsc7(_ body: String) -> String? {

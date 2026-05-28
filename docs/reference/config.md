@@ -29,6 +29,7 @@ the launcher with deterministic commands.
 | `keybind` | `<trigger> = <action>` | (see `cmd/roost/shortcuts.go` legacy notes) | Append a custom keybinding. Repeatable; later entries override earlier ones. |
 | `command` | `label="…" run="…" [hold=…]` | none | Launcher entry surfaced in the command palette. Repeatable. |
 | `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
+| `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 
 ## `copy-on-select`
 
@@ -95,6 +96,43 @@ scroll-walk-restore to copy off-screen rows; the bug-fix
 [#146](https://github.com/charliek/roost/pull/146) explicitly leaves
 this as a known limitation.
 
+## `clipboard-write`
+
+Controls whether a program running inside the terminal can write the
+host clipboard by emitting the **OSC 52** escape sequence (`\e]52;c;<base64>\a`).
+This is the path opencode-over-SSH, nvim with `g:clipboard = osc52`,
+tmux `set -s set-clipboard on`, kitten ssh, yazi, and other TUIs use
+to get text back to your local clipboard.
+
+| Value | Behavior |
+|---|---|
+| `allow` *(default)* | OSC 52 writes the host clipboard. Matches Ghostty's default. |
+| `deny` | OSC 52 sequences are parsed and silently dropped — logged at info, no clipboard side-effect. |
+
+Phase 2 will add `ask` with a per-tab consent banner ("opencode wants
+to write 42 bytes to your clipboard — Allow once / Always / Deny");
+phase 1 is intentionally allow/deny only to keep the surface small.
+
+### Read direction (OSC 52 `?`)
+
+OSC 52 also supports a read direction (the program asks the terminal
+to send the clipboard contents back). Roost **always drops** read
+requests in phase 1 — there's no consent UI for them yet and reading
+the clipboard from a remote process is the more sensitive direction
+(shoulder-surfing a password manager value). This will become its own
+`clipboard-read = allow | ask | deny` setting in phase 2.
+
+### Targets
+
+OSC 52 carries a `Ps` selector indicating which clipboard to write:
+
+- `c` (default) → system clipboard (`NSPasteboard.general` on Mac,
+  `CLIPBOARD` on Linux — what ⌘V / Ctrl+V pastes from).
+- `p` or `s` → selection clipboard (named `NSPasteboard` on Mac,
+  X11 / Wayland `PRIMARY` on Linux — what middle-click pastes from).
+- Any other selector falls through to system (matches Ghostty's
+  permissive handling of emitters that pad the selector with letters).
+
 ## Example
 
 ```
@@ -113,6 +151,11 @@ copy-on-select = true
 # in another Mac app gets the dragged text:
 #
 #   copy-on-select = clipboard
+
+# Default: programs in the terminal can write your clipboard via
+# OSC 52 (the opencode-over-SSH path, nvim's g:clipboard = osc52,
+# tmux set-clipboard, etc.). Set `deny` to opt out.
+clipboard-write = allow
 
 keybind = ctrl+t = new_tab
 command = label="Claude" run="claude --resume"

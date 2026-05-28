@@ -295,3 +295,67 @@ func osc133_bare_no_body() {
 func osc133_empty_body() {
     #expect(feedAll("\u{1b}]133;\u{07}") == [.commandMark("")])
 }
+
+// MARK: - OSC 52 (program-initiated clipboard write)
+
+/// Convenience: base64-encode a UTF-8 string for OSC 52 payloads.
+private func b64(_ s: String) -> String {
+    Data(s.utf8).base64EncodedString()
+}
+
+@Test
+func osc52_c_target_decodes_payload() {
+    let payload = "\u{1b}]52;c;\(b64("hello-osc52"))\u{07}"
+    #expect(feedAll(payload) == [.clipboard(target: .system, text: "hello-osc52")])
+}
+
+@Test
+func osc52_p_target_routes_to_selection() {
+    let payload = "\u{1b}]52;p;\(b64("primary text"))\u{07}"
+    #expect(feedAll(payload) == [.clipboard(target: .selection, text: "primary text")])
+}
+
+@Test
+func osc52_empty_selector_defaults_to_system() {
+    // OSC 52 ; ; <base64> — some emitters omit the selector.
+    let payload = "\u{1b}]52;;\(b64("defaulted"))\u{07}"
+    #expect(feedAll(payload) == [.clipboard(target: .system, text: "defaulted")])
+}
+
+@Test
+func osc52_read_request_dropped() {
+    // Pc == "?" — read request, dropped in phase 1.
+    #expect(feedAll("\u{1b}]52;c;?\u{07}") == [])
+}
+
+@Test
+func osc52_invalid_base64_dropped() {
+    #expect(feedAll("\u{1b}]52;c;!!!not-base64!!!\u{07}") == [])
+}
+
+@Test
+func osc52_non_utf8_payload_dropped() {
+    // Valid base64 of three invalid-UTF-8 bytes (0xFF 0xFE 0xFD).
+    let badB64 = Data([0xFF, 0xFE, 0xFD]).base64EncodedString()
+    #expect(feedAll("\u{1b}]52;c;\(badB64)\u{07}") == [])
+}
+
+@Test
+func osc52_empty_payload_dropped() {
+    #expect(feedAll("\u{1b}]52;c;\u{07}") == [])
+}
+
+@Test
+func osc52_unknown_selector_falls_back_to_system() {
+    let payload = "\u{1b}]52;q;\(b64("padded"))\u{07}"
+    #expect(feedAll(payload) == [.clipboard(target: .system, text: "padded")])
+}
+
+@Test
+func osc52_st_terminator_works() {
+    let bytes: [UInt8] =
+        [0x1B, 0x5D, 0x35, 0x32, 0x3B, 0x63, 0x3B]
+        + Array(b64("st-terminated").utf8)
+        + [0x1B, 0x5C]
+    #expect(feedAll(bytes) == [.clipboard(target: .system, text: "st-terminated")])
+}

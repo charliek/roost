@@ -222,6 +222,12 @@ final class TerminalView: NSView {
     /// default (`.on`).
     var copyOnSelect: CopyOnSelect = .default
 
+    /// `clipboard-write` policy. Read from `RoostConfig.clipboardWrite`
+    /// at tab creation. Checked in `appendBytes`'s OSC 52 short-circuit
+    /// to decide whether a program-initiated clipboard write goes
+    /// through. Default `.allow` (matches Ghostty).
+    var clipboardWritePolicy: ClipboardWrite = .default
+
     /// Custom-named selection pasteboard for `copy-on-select = .on`.
     /// Mirrors cmux's `com.mitchellh.ghostty.selection` pattern:
     /// drag-to-select writes here and middle-click in any Roost
@@ -236,12 +242,14 @@ final class TerminalView: NSView {
         rows: UInt16 = 24,
         theme: Theme = .fallback,
         font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
-        copyOnSelect: CopyOnSelect = .default
+        copyOnSelect: CopyOnSelect = .default,
+        clipboardWrite: ClipboardWrite = .default
     ) {
         self.cols = cols
         self.rows = rows
         self.theme = theme
         self.copyOnSelect = copyOnSelect
+        self.clipboardWritePolicy = clipboardWrite
 
         // Cell metrics: monospaced system font, advance width measured
         // from a representative wide glyph ("M"), height from the
@@ -370,7 +378,28 @@ final class TerminalView: NSView {
                 }
                 continue
             }
-            let (cmd, payload) = event.asReport
+            // OSC 52 program-initiated clipboard write — UI-only
+            // action, not workspace state. Honor on the UI side
+            // because only the UI has the NSPasteboard handle.
+            // `clipboard-write = .deny` drops silently + logs,
+            // matching Ghostty (Surface.zig:2164-2166).
+            if case .clipboard(let target, let text) = event {
+                if clipboardWritePolicy == .deny {
+                    NSLog(
+                        "roost-mac: OSC 52 clipboard write dropped — clipboard-write = deny"
+                    )
+                    continue
+                }
+                let pb: NSPasteboard = (target == .system)
+                    ? NSPasteboard.general
+                    : Self.selectionPasteboard
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+                continue
+            }
+            guard let (cmd, payload) = event.asReport else {
+                continue
+            }
             onOsc?(cmd, payload)
         }
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
