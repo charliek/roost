@@ -284,3 +284,14 @@ func osc133_interleaved_with_pwd() {
             == [.commandMark("C"), .pwd("/tmp")]
     )
 }
+
+@Test
+func osc133_bare_no_body() {
+    // Malformed (no kind letter) -> empty mark; harmless downstream.
+    #expect(feedAll("\u{1b}]133\u{07}") == [.commandMark("")])
+}
+
+@Test
+func osc133_empty_body() {
+    #expect(feedAll("\u{1b}]133;\u{07}") == [.commandMark("")])
+}

@@ -298,3 +298,38 @@ def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
     roost.run(tab, "true")
     assert _cwd_becomes(roost, tab, "/usr", timeout=8), \
         f"zsh auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"
+
+
+def test_title_follows_cd_via_script(roost, project):
+    """The shipped integration's default title feature sets the tab title
+    to the cwd (tilde-abbreviated) via OSC 0 on cd."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab,
+              'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash" && cd /usr')
+    roost._wait(lambda: (roost.tab(tab) or {}).get("title") == "/usr",
+                timeout=8, what="tab title follows cd to /usr")
+
+
+def test_prompt_set_when_stock(roost, project):
+    r"""roost.bash sets its default prompt when PS1 is the shell's stock
+    default (bare bash's interactive PS1 is the stock '\s-\v\$ ')."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab,
+              'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
+              'printf "PS1APP:%s\\n" "${ROOST_PS1_APPLIED:-no}"')
+    roost.wait_text(tab, "PS1APP:1", timeout=8)
+
+
+def test_prompt_not_clobbered_when_custom(roost, project):
+    """roost.bash leaves a user-set prompt alone (only-if-stock): no
+    ROOST_PS1_APPLIED, and the user's PS1 survives."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab,
+              'PS1="MYPROMPT> "; '
+              'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
+              'printf "PS1CHK:applied=%s kept=%s\\n" "${ROOST_PS1_APPLIED:-no}" '
+              '"$([ "$PS1" = "MYPROMPT> " ] && echo yes || echo no)"')
+    roost.wait_text(tab, "PS1CHK:applied=no kept=yes", timeout=8)
