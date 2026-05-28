@@ -362,7 +362,7 @@ fn percent_decode(s: &str) -> Option<String> {
 /// scanners' `ColorQuery(n)` events through this formatter and
 /// write the bytes back to the PTY.
 pub fn format_color_query_response(n: u8, color: (u8, u8, u8)) -> Option<Vec<u8>> {
-    if !matches!(n, 10 | 11 | 12) {
+    if !matches!(n, 10..=12) {
         return None;
     }
     let (r, g, b) = color;
