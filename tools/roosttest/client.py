@@ -242,6 +242,52 @@ class Roost:
     def clipboard_write(self, target: str, text: str) -> None:
         self.call("clipboard.write", {"target": target, "text": text})
 
+    # -- test-only PTY drain ops (ROOST_TEST_MODE=1) ---------------------
+    # `tab.feed_pty_bytes` injects bytes into a tab's PTY-output drain;
+    # `tab.capture_pty_input` reads the bytes the UI has queued back
+    # onto the PTY input channel (keystrokes, paste, OSC reply replies).
+    # Both require ROOST_TEST_MODE=1 at UI launch — without it the
+    # server returns `not-enabled` (RoostError, code "not-enabled").
+    # The companion `tab.dump_resolved` is ungated (richer read of the
+    # same render state `tab.dump` exposes).
+    #
+    # Together these let the harness exercise OSC drains, reply
+    # round-trips, and other byte-level wiring end-to-end — the
+    # missing rung between Rust/Swift unit tests and the user-driven
+    # IO injectors under `tools/input/`. See
+    # `docs/development/test-automation.md` §5.4 for the full rationale.
+
+    def tab_feed_pty_bytes(self, tab_id: int, data: bytes) -> None:
+        """Inject raw bytes into a tab's PTY-output drain as if the
+        supervisor had emitted them. Indistinguishable from real PTY
+        output to the OSC scanner + libghostty. Raises
+        `RoostError('not-enabled')` when ROOST_TEST_MODE=1 was not set
+        at UI launch; `RoostError('not-found')` for unknown tab id."""
+        self.call("tab.feed_pty_bytes", {
+            "tab_id": str(tab_id),
+            "data": base64.b64encode(data).decode("ascii"),
+        })
+
+    def tab_capture_pty_input(self, tab_id: int, drain: bool = True) -> bytes:
+        """Return (and by default drain) the bytes the UI has queued
+        onto this tab's PTY-input channel since the last drain.
+        `drain=True` is the typical test pattern: feed → capture →
+        assert; the second call will return empty. Same gating +
+        error shape as `tab_feed_pty_bytes`."""
+        res = self.call("tab.capture_pty_input", {
+            "tab_id": str(tab_id),
+            "drain": drain,
+        })
+        return base64.b64decode(res.get("data", "") or "")
+
+    def tab_dump_resolved(self, tab_id: int) -> dict:
+        """Snapshot the live viewport AFTER the production color
+        resolver has run (including the theme's bold-color override).
+        Returns `{cols, rows, cells: [{row, col, text, fg, bg,
+        has_explicit_bg, bold, italic, inverse}, ...]}` with fg/bg as
+        `#RRGGBB` hex strings. Ungated — safe outside test mode."""
+        return self.call("tab.dump_resolved", {"tab_id": str(tab_id)})
+
     @staticmethod
     def palette_item_ids(state: dict) -> list[str]:
         return [it["id"] for it in state.get("items", [])]

@@ -352,6 +352,11 @@ jobs:
           GDK_BACKEND: x11
           RUST_LOG: warn
           ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
+          # Unlocks tab.feed_pty_bytes + tab.capture_pty_input on the
+          # UI side so the OSC-pipeline tests can drive PTY bytes
+          # end-to-end. The harness reads the same var to skip those
+          # tests entirely when it's absent (no spurious red).
+          ROOST_TEST_MODE: "1"
 
         # The harness launches its own `roost` process; under xvfb-run it
         # inherits the virtual DISPLAY. tab.dump reads in-process render
@@ -417,6 +422,10 @@ jobs:
         env:
           ROOST_TEST_TIMEOUT_SCALE: "3"   # shared macos-latest runner is slower/variable
           ROOST_TEST_RESET_STATE: "1"     # ephemeral runner: start from a clean state.json
+          # Unlocks the test-only IPC ops in the bundled Mac app
+          # (tools/roosttest/ui.py forwards this via `open --env`).
+          # See the GTK job above for full rationale.
+          ROOST_TEST_MODE: "1"
         run: >
           uv run --group test pytest tools/roosttest --roost-target mac -v
           --junitxml=test-results/e2e-mac.xml

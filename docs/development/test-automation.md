@@ -220,13 +220,54 @@ Expose the actions currently reachable only by keyboard/mouse so tests
 Each maps to the same handler the keybind already calls. This is what
 lets **Mac E2E avoid TCC** entirely.
 
-### 5.4 Test mode (`ROOST_TEST=1` or `--test-mode`)
+### 5.4 Test mode (`ROOST_TEST_MODE=1`)
 
-Make rendering reproducible: fixed window geometry (e.g. 1200×800 logical),
-a bundled fixed monospace font, animations off, and never steal OS focus.
-Screenshots then match across machines/DPI; reflow is deterministic.
-Optionally normalize the shell prompt for content tests (or tests just set
-`PS1` via `tab send`). Gated so it never affects normal runs.
+**Status: partially landed (the IPC scaffolding PR closes the IPC-side scaffolding;
+rendering-reproducibility knobs still open.)** Originally planned as
+`ROOST_TEST=1` / `--test-mode`. Now shipping under
+`ROOST_TEST_MODE=1` so it's unambiguous which subsystem the gate
+belongs to.
+
+The implemented surface (the IPC scaffolding PR):
+
+- **`tab.feed_pty_bytes`**: inject bytes into a live tab's PTY-output
+  drain. Indistinguishable from real shell output to the OSC scanner +
+  libghostty (same `mpsc::UnboundedSender<TabOutput>` on GTK; same
+  `TerminalView.appendBytes(_:)` on Mac — no shadow drain). Gated.
+- **`tab.capture_pty_input`**: read (and optionally drain) the bytes
+  the UI has queued onto a tab's PTY-input channel — keystrokes,
+  paste, synthesised OSC reply replies. Single tap point inside
+  `TabSession::send_input` (GTK) / the `onKey` closure
+  (`TabSession.start()` / `attach()` on Mac) catches everything.
+  Gated.
+- **`tab.dump_resolved`**: walk the viewport through the same
+  `resolve_cell_colors` call the production paint path runs (with
+  `theme.bold_color`). Ungated — no shadow state, just a richer read
+  of the existing render output.
+
+Both gated ops surface `not-enabled` when the env var is absent (a
+deterministic error rather than silent acceptance). The flag is read
+once at UI boot and stashed on `App` / `RoostBackend.shared` so per-op
+dispatch is a cheap bool check; a tester can't toggle the gate
+mid-session.
+
+Open: rendering reproducibility (fixed geometry / font / animations
+off / never steal focus). The renderer + window-creation paths are
+the remaining work for full visual-determinism — independent from
+the IPC scaffolding above. Same flag, same gating shape; new knobs
+join later without breaking the IPC scaffolding PR's surface.
+
+Vision compliance check (`docs/development/vision.md`: "No test-only
+backdoors that drift from reality"):
+
+- Feed/capture ride the **same** channels production uses. Bytes go
+  through the OSC scanner + libghostty exactly the way real PTY
+  output does; captured bytes are mirrored from the same
+  `send_input` / `onKey` path that hands bytes to the supervisor.
+  Nothing is observed in a shadow surface that the real renderer
+  doesn't also see.
+- `tab.dump_resolved` is ungated for the same reason: it's a richer
+  read of an existing surface, not a new one.
 
 ### 5.5 Wire/versioning notes
 

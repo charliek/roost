@@ -146,6 +146,19 @@ final class TabSession {
         self.keystrokeContinuation = kCont
 
         terminalView.onKey = { [weak self] data in
+            // ROOST_TEST_MODE=1 tap: mirror outbound input bytes
+            // (keystrokes, paste, OSC reply replies — every byte
+            // appendBytes' onKey closure produces) into the per-tab
+            // capture buffer hung off RoostBackend.shared. Single
+            // tap point catches everything because the Mac OSC
+            // reply path also routes through onKey
+            // (TerminalView.appendBytes:366). The buffer is
+            // allocated lazily on first read by the IPC handler.
+            if let self, let tabID = self.id,
+               let buf = RoostBackend.shared.ensureInputCapture(tabID: tabID)
+            {
+                buf.append(data)
+            }
             self?.keystrokeContinuation?.yield(.input(data))
         }
         terminalView.onResize = { [weak self] cols, rows in
@@ -225,6 +238,16 @@ final class TabSession {
         self.skipCloseRPC = closeOwnedByExternal
 
         terminalView.onKey = { [weak self] data in
+            // ROOST_TEST_MODE=1 tap: same shape as in `start()`
+            // above. The two onKey installations are kept in lock-
+            // step — any future change to one must mirror to the
+            // other or `tab.capture_pty_input` will miss bytes for
+            // attach-flow tabs.
+            if let self, let tabID = self.id,
+               let buf = RoostBackend.shared.ensureInputCapture(tabID: tabID)
+            {
+                buf.append(data)
+            }
             self?.keystrokeContinuation?.yield(.input(data))
         }
         terminalView.onResize = { [weak self] cols, rows in
@@ -280,6 +303,9 @@ final class TabSession {
         let skipRPC = skipCloseRPC
         if let id = self.id {
             self.id = nil
+            // Drop any input-capture buffer that test mode allocated
+            // for this tab. No-op outside ROOST_TEST_MODE=1.
+            RoostBackend.shared.dropInputCapture(tabID: id)
             // For externally-opened tabs (`skipCloseRPC == true`),
             // don't fire the LocalClient.closeTab RPC — the
             // opening client (`roostctl`, Claude hook) owns the

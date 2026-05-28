@@ -206,6 +206,14 @@ wrapper small.
   cross-cutting behavior gets a regression test; the screenshot
   (`tools/screenshot/`) and input-injection (`tools/input/linux/`) harnesses cover
   what it can't (pixels, real key/pointer events).
+  - **Test-mode IPC ops** (`ROOST_TEST_MODE=1` at UI launch — CI sets
+    it): `tab.feed_pty_bytes` injects bytes into a live tab's drain,
+    `tab.capture_pty_input` reads what the UI queued onto the input
+    side, and the (ungated) `tab.dump_resolved` walks the viewport
+    through the production color resolver. Together they cover
+    byte-level OSC/reply wiring end-to-end without needing a real
+    shell — pattern walk in
+    [`tools/roosttest/README.md`](tools/roosttest/README.md#osc-routed-regression-patterns).
 
 ## Build
 

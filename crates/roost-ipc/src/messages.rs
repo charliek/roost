@@ -464,6 +464,93 @@ pub struct ClipboardWriteParams {
 }
 
 // ============================================================================
+// Test-only ops (ROOST_TEST_MODE=1)
+// ============================================================================
+//
+// `tab.feed_pty_bytes` + `tab.capture_pty_input` are gated by the
+// `ROOST_TEST_MODE=1` env var set at UI launch. They drive PTY output
+// into a live tab and observe what the UI would have written back —
+// the missing rung that lets `tools/roosttest/` cover OSC drains,
+// reply round-trips, and other byte-level wiring end-to-end. See
+// `docs/development/test-automation.md` §5.4 for the full rationale.
+//
+// `tab.dump_resolved` is NOT gated: it's a richer read of the same
+// render state `tab.dump` already exposes, useful to anyone debugging
+// "why is this row gray." The resolver walk it pins is exactly the
+// one the production paint path runs, so it doubles as the
+// regression net for the bold-color resolver call site (#142).
+
+/// `tab.feed_pty_bytes` request: inject bytes into a tab's PTY-output
+/// drain as if the supervisor had emitted them. Indistinguishable
+/// from real PTY output to the OSC scanner + libghostty — same
+/// `TabOutput` channel, same downstream handlers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabFeedPtyBytesParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    /// Raw bytes encoded as base64. See `bytes_base64`.
+    #[serde(with = "bytes_base64")]
+    pub data: Vec<u8>,
+}
+
+/// `tab.capture_pty_input` request: return the bytes the UI has
+/// queued onto this tab's PTY-input channel (keystrokes, paste,
+/// synthesized OSC replies). `drain=true` consumes the buffer;
+/// `drain=false` peeks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabCapturePtyInputParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    #[serde(default)]
+    pub drain: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabCapturePtyInputResult {
+    /// Captured input bytes, base64-encoded on the wire.
+    #[serde(with = "bytes_base64")]
+    pub data: Vec<u8>,
+}
+
+/// `tab.dump_resolved` request: walk a tab's render state through
+/// the same resolver the production paint path uses (including the
+/// theme's bold-color override).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabDumpResolvedParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+}
+
+/// `tab.dump_resolved` response: post-resolver per-cell view of the
+/// terminal grid. Fg/bg are `#RRGGBB` to keep the JSON human-readable
+/// for test assertions. `has_explicit_bg` tracks whether the bg came
+/// from an SGR cell vs the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabDumpResolvedResult {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<ResolvedCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCell {
+    pub row: u32,
+    pub col: u16,
+    pub text: String,
+    /// `#RRGGBB`.
+    pub fg: String,
+    /// `#RRGGBB`.
+    pub bg: String,
+    pub has_explicit_bg: bool,
+    pub bold: bool,
+    pub italic: bool,
+    pub inverse: bool,
+}
+
+// ============================================================================
 // Project lifecycle
 // ============================================================================
 
@@ -765,6 +852,18 @@ pub mod ops {
     pub const SELECTION_DUMP: &str = "selection.dump";
     pub const CLIPBOARD_DUMP: &str = "clipboard.dump";
     pub const CLIPBOARD_WRITE: &str = "clipboard.write";
+
+    /// Test-only PTY drain ops — drive bytes through the OSC scanner,
+    /// libghostty, and the input-reply path. Gated behind
+    /// `ROOST_TEST_MODE=1` (set in CI for `e2e-gtk` and `e2e-mac`)
+    /// because injecting arbitrary PTY output and observing keystroke
+    /// bytes is something only a test harness should do.
+    pub const TAB_FEED_PTY_BYTES: &str = "tab.feed_pty_bytes";
+    pub const TAB_CAPTURE_PTY_INPUT: &str = "tab.capture_pty_input";
+    /// Ungated companion: a richer read of the same render state
+    /// `tab.dump` already exposes. Pins the resolver call site
+    /// (theme bold-color → `resolve_cell_colors`) end-to-end.
+    pub const TAB_DUMP_RESOLVED: &str = "tab.dump_resolved";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

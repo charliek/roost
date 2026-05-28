@@ -22,11 +22,13 @@ use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
     PaletteDismissParams, PaletteOpenParams, PaletteQueryParams, PaletteStateParams,
     PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ScreenshotParams, ScreenshotResult,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
     SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    TabClearNotificationParams, TabCloseParams, TabDumpCursor, TabDumpParams, TabDumpResult,
-    TabFocusParams, TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams,
-    TabResizeParams, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDumpCursor, TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -81,6 +83,47 @@ type SelectionMutReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 /// Linux). The `Err` arm is never used today but kept for shape
 /// compatibility with `ui_call`'s `Result<T, String>` envelope.
 type ClipboardDumpReply = tokio::sync::oneshot::Sender<Result<Option<String>, String>>;
+
+/// Reply for [`UiRequest::TabFeedPtyBytes`]: `Ok(())` when the bytes
+/// were enqueued onto the tab's output channel, `Err` when the tab id
+/// has no live terminal or `ROOST_TEST_MODE=1` was absent at launch.
+type UnitReply = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// Reply for [`UiRequest::TabCapturePtyInput`]: the bytes the UI has
+/// queued onto this tab's PTY-input channel since the last drain.
+/// `Err` for unknown tab or missing test-mode env var.
+type CapturedBytesReply = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
+
+/// Reply for [`UiRequest::TabDumpResolved`]: every cell on the tab's
+/// terminal viewport after the production color resolver has run.
+/// `Err` only for unknown tab; this op is ungated.
+type DumpResolvedReply = tokio::sync::oneshot::Sender<Result<ResolvedCellsData, String>>;
+
+/// Resolver-output snapshot for [`UiRequest::TabDumpResolved`]. Lives
+/// in this crate (like [`SelectionData`]) so the wire layer stays
+/// independent of the UI's `TerminalView`. The dispatch arm maps it
+/// to the wire-format [`roost_ipc::messages::TabDumpResolvedResult`].
+pub struct ResolvedCellsData {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<ResolvedCellData>,
+}
+
+/// One cell of [`ResolvedCellsData`]. Fields are normalized: `text`
+/// is `" "` for blank cells, `fg`/`bg` are the post-resolver colors
+/// (after bold-color, inverse swap, etc.), `has_explicit_bg`
+/// distinguishes default-bg cells from SGR-bg cells.
+pub struct ResolvedCellData {
+    pub row: u32,
+    pub col: u16,
+    pub text: String,
+    pub fg: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+    pub has_explicit_bg: bool,
+    pub bold: bool,
+    pub italic: bool,
+    pub inverse: bool,
+}
 
 /// One unit of work the IPC handler (a tokio worker thread) hands to the
 /// GTK main thread — the single seam for anything an op needs to do
@@ -140,6 +183,30 @@ pub enum UiRequest {
     },
     /// `clipboard.write` — test-only pasteboard seeding.
     ClipboardWrite { target: ClipboardOp, text: String },
+    /// `tab.feed_pty_bytes` — inject bytes into a tab's PTY-output
+    /// drain as if the supervisor had emitted them. The UI side
+    /// rejects (`Err`) when `ROOST_TEST_MODE=1` was not set at
+    /// launch.
+    TabFeedPtyBytes {
+        tab_id: i64,
+        data: Vec<u8>,
+        reply: UnitReply,
+    },
+    /// `tab.capture_pty_input` — read (and optionally drain) the
+    /// bytes the UI has queued onto a tab's PTY-input channel.
+    /// Gated like `TabFeedPtyBytes`.
+    TabCapturePtyInput {
+        tab_id: i64,
+        drain: bool,
+        reply: CapturedBytesReply,
+    },
+    /// `tab.dump_resolved` — return every cell on a tab's terminal
+    /// viewport after the production color resolver has run. Ungated
+    /// (no shadow state — same walk the real paint loop runs).
+    TabDumpResolved {
+        tab_id: i64,
+        reply: DumpResolvedReply,
+    },
 }
 
 /// Resolved clipboard target for the `clipboard.*` ops. Lives in this
@@ -602,6 +669,59 @@ async fn dispatch(
             }
             Ok(serde_json::json!({}))
         }
+        ops::TAB_FEED_PTY_BYTES => {
+            let p: TabFeedPtyBytesParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::TabFeedPtyBytes {
+                tab_id: p.tab_id,
+                data: p.data,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::TAB_CAPTURE_PTY_INPUT => {
+            let p: TabCapturePtyInputParams = decode(params)?;
+            let data = h
+                .ui_call(|reply| UiRequest::TabCapturePtyInput {
+                    tab_id: p.tab_id,
+                    drain: p.drain,
+                    reply,
+                })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&TabCapturePtyInputResult { data })
+        }
+        ops::TAB_DUMP_RESOLVED => {
+            let p: TabDumpResolvedParams = decode(params)?;
+            let dump = h
+                .ui_call(|reply| UiRequest::TabDumpResolved {
+                    tab_id: p.tab_id,
+                    reply,
+                })
+                .await?
+                .map_err(HandlerError::not_found)?;
+            let cells = dump
+                .cells
+                .into_iter()
+                .map(|c| ResolvedCell {
+                    row: c.row,
+                    col: c.col,
+                    text: c.text,
+                    fg: rgb_hex(c.fg),
+                    bg: rgb_hex(c.bg),
+                    has_explicit_bg: c.has_explicit_bg,
+                    bold: c.bold,
+                    italic: c.italic,
+                    inverse: c.inverse,
+                })
+                .collect();
+            encode(&TabDumpResolvedResult {
+                cols: dump.cols,
+                rows: dump.rows,
+                cells,
+            })
+        }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -636,6 +756,27 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, HandlerError> {
     serde_json::to_value(value).map_err(|e| HandlerError::new("internal", e.to_string()))
+}
+
+/// Format an (r,g,b) triple as `#RRGGBB` for the
+/// `tab.dump_resolved` wire format. Kept human-readable so test
+/// assertions can match on the literal string.
+fn rgb_hex(c: (u8, u8, u8)) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+}
+
+/// Map an error from a gated test-mode op back to a wire-friendly
+/// [`HandlerError`]. The handler distinguishes two failure modes:
+/// missing env var (`not-enabled`) vs unknown tab (`not-found`). The
+/// substring check is the simplest contract between the UI and the
+/// dispatcher — both speak the same English. Bumping this to a
+/// typed error is overkill while the surface stays at 2 ops.
+fn map_test_op_err(err: String) -> HandlerError {
+    if err.contains("ROOST_TEST_MODE") {
+        HandlerError::new("not-enabled", err)
+    } else {
+        HandlerError::not_found(err)
+    }
 }
 
 /// Reject a screenshot whose base64-encoded PNG would overflow the IPC
