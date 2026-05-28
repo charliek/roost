@@ -3,8 +3,11 @@
 Functional end-to-end tests that drive a **real** Roost UI (Mac or GTK)
 over the JSON IPC socket and assert on the op set — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
-No test-only backdoors; assertions read back via `tab.dump` / `tab.list`
-/ `identify`.
+Most tests read back via `tab.dump` / `tab.list` / `identify`; the
+byte-level OSC pipeline tests additionally use the gated test-mode
+IPC ops (`tab.feed_pty_bytes` / `tab.capture_pty_input` /
+`tab.dump_resolved`, all `ROOST_TEST_MODE=1`-only) — see "OSC-routed
+regression patterns" below.
 
 ## Run
 
@@ -33,6 +36,8 @@ Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
 | `test_launcher.py` | The custom-command launcher (Cmd/Alt+Shift+T): lists the seeded commands + activating one spawns a tab that runs it. |
 | `test_newtab_cwd.py` | New-tab cwd inheritance: `palette.activate("new_tab")` (Cmd-T / Ctrl-T) and the launcher both spawn in the active tab's live (OSC 7) cwd, not the project cwd. Emits OSC 7 itself so it's shell-independent. |
 | `test_terminal.py` | Program-driven terminal behavior: OSC 7 cwd tracking via a real `cd` (skip-guarded for shells without OSC 7). |
+| `test_test_ops.py` | Smoke triple for the test-only IPC ops (`tab.feed_pty_bytes`, `tab.capture_pty_input`, `tab.dump_resolved`) — the scaffolding for the byte-level OSC pipeline tests. Skipped without `ROOST_TEST_MODE=1`. |
+| `test_osc_pipeline.py` | End-to-end OSC pipeline: bold + inverse resolver call-site coverage (#142), OSC 10/11/12 set/query reply round-trips (#145), and parity OSC 0/7/9 routing tests. Drives bytes via `tab.feed_pty_bytes`; reads back via `tab.dump_resolved` + `tab.capture_pty_input`. The canonical example for the "OSC-routed regression patterns" section below. |
 | `fixtures/launcher.conf` | Seed config the harness points the UI at via `ROOST_CONFIG` (see below), giving the launcher tests a deterministic command list. |
 
 The shared `palette` fixture (open from closed, leave closed) lives in
