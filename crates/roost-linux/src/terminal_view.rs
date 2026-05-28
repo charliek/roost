@@ -881,6 +881,7 @@ impl TerminalViewState {
         // does the same here, fall back to the theme directly.
         let default_fg = self.theme.foreground;
         let default_bg = self.theme.background;
+        let bold_color = self.theme.bold_color;
 
         // Pass A: canvas + per-cell backgrounds.
         set_cairo_color(cr, default_bg);
@@ -906,12 +907,12 @@ impl TerminalViewState {
                 // Apply SGR inverse + bold-accent rules. Without this,
                 // codex's `\e[7m`-highlighted prompt row renders against
                 // the canvas-default bg and the gray prompt disappears
-                // (the visible regression the PR fixes). bold_color is
-                // None until/unless the theme parser learns `bold-color`
-                // — for now bold default-fg cells render in default_fg,
-                // matching pre-PR behavior.
+                // (the visible regression the PR fixes). The theme's
+                // optional `bold-color` accent (Ghostty `bold-color = …`)
+                // colors bold default-fg cells when present; themes
+                // that don't set it keep the canvas-default fg.
                 let (fg, bg, has_explicit_bg) =
-                    resolve_cell_colors(&cell, default_fg, default_bg, None);
+                    resolve_cell_colors(&cell, default_fg, default_bg, bold_color);
                 if has_explicit_bg && bg != default_bg {
                     bg_pass.push((row, cell.col, bg));
                 }
@@ -1312,10 +1313,10 @@ fn set_cairo_color(cr: &cairo::Context, rgb: ColorRgb) {
 ///   swap even when the cell had no explicit bg of its own.
 /// * `bold_color` is applied only when the cell is bold, has no
 ///   explicit fg, and isn't inverted. (Bold red stays red; only
-///   bold default-fg text gets the accent.) Pass `None` to disable
-///   — themes haven't shipped a `bold-color` parser yet, so today
-///   every caller passes `None` and the bold-accent path is dead
-///   code preserved for forward-compat parity.
+///   bold default-fg text gets the accent.) Pass `None` to disable.
+///   The theme parser populates this from the Ghostty `bold-color`
+///   line; themes that omit it keep the canvas-default fg for bold
+///   text.
 pub(crate) fn resolve_cell_colors(
     cell: &Cell,
     default_fg: ColorRgb,
@@ -1742,6 +1743,45 @@ mod tests {
         assert_eq!(
             fg, DEFAULT_FG,
             "bold_color=None must leave default fg unchanged"
+        );
+    }
+
+    /// End-to-end: feed `\e[1mX` through libghostty, walk via
+    /// `RenderState`, and confirm the resolver picks up the theme's
+    /// `bold-color` accent for the bold default-fg `X` cell. Pins the
+    /// full chain that the renderer relies on, so a regression
+    /// anywhere (parser, plumbing, resolver) fails this test instead
+    /// of a screenshot eyeball.
+    #[test]
+    fn bold_default_fg_through_libghostty_uses_theme_bold_color() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .expect("Terminal::new");
+        terminal.vt_write(b"\x1b[1mX");
+
+        let mut render_state = RenderState::new().expect("RenderState::new");
+        render_state.update(&terminal).expect("update");
+
+        let bold_accent = ColorRgb::new(0xaa, 0xbb, 0xcc);
+
+        let mut effective_fg: Option<ColorRgb> = None;
+        render_state
+            .walk(&terminal, |row, cell| {
+                if row == 0 && cell.text == "X" {
+                    let (fg, _, _) =
+                        resolve_cell_colors(&cell, DEFAULT_FG, DEFAULT_BG, Some(bold_accent));
+                    effective_fg = Some(fg);
+                }
+            })
+            .expect("walk");
+
+        assert_eq!(
+            effective_fg,
+            Some(bold_accent),
+            "bold default-fg X must resolve to the theme bold-color accent"
         );
     }
 }

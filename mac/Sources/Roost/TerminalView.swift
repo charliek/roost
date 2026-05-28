@@ -1238,13 +1238,14 @@ final class TerminalView: NSView {
 
         var bgFills: [BgFill] = []
         var glyphDraws: [GlyphDraw] = []
+        let boldColor = self.theme.boldColor
 
         renderState.walk { cell in
             let (fg, bg, hasExplicitBg) = TerminalView.resolveCellColors(
                 cell: cell,
                 defaultFg: defaultFg,
                 defaultBg: defaultBg,
-                boldColor: nil
+                boldColor: boldColor
             )
             let rect = NSRect(
                 x: CGFloat(cell.col) * cellW,
@@ -1429,10 +1430,9 @@ final class TerminalView: NSView {
     /// UIs behave identically on inverse-marked TUI chrome (codex's
     /// gray prompt row) and bold default-fg text.
     ///
-    /// `boldColor` is `nil` today — themes don't yet parse a
-    /// `bold-color` key. The path is preserved for the eventual
-    /// theme-parser PR; without it bold default-fg cells render in
-    /// the canvas fg, matching pre-PR behavior.
+    /// `boldColor` comes from `Theme.boldColor`, populated from the
+    /// Ghostty `bold-color` key. Themes that omit it pass `nil` and
+    /// bold default-fg cells render in the canvas fg.
     ///
     /// `nonisolated` because the function is pure (no `self`, no
     /// global state). Without it, Swift 6 strict concurrency
