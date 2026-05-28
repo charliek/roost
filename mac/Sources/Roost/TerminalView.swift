@@ -196,7 +196,6 @@ final class TerminalView: NSView {
     /// original glyph, so we have to redraw it to keep the character
     /// visible).
     private var cursorCellGlyph: Character?
-    private var cursorCellOriginalForeground: NSColor?
 
     // MARK: - Scrollback (goal-mac-polish-cursor-keys M6)
 
@@ -1184,7 +1183,6 @@ final class TerminalView: NSView {
         // inverted color over a focused block cursor.
         let cursorInfo = renderState.cursor()
         cursorCellGlyph = nil
-        cursorCellOriginalForeground = nil
         // Phase 6a M6: prefer the user-loaded theme's fg/bg over
         // libghostty-vt's compiled-in defaults. libghostty's
         // default colors are what the embedded shell sees as
@@ -1270,15 +1268,11 @@ final class TerminalView: NSView {
             // Stash glyph at the cursor's cell so the cursor pass can
             // redraw it in an inverted color over a focused block
             // cursor. Done inline so we don't need a second walk.
-            // Note this uses the *resolved* fg (post-inverse) so the
-            // cursor's "original foreground" matches what we'd have
-            // drawn under it.
             if let cur = cursorInfo,
                cell.row == Int(cur.row),
                cell.col == Int(cur.col)
             {
                 self.cursorCellGlyph = cell.glyph
-                self.cursorCellOriginalForeground = fg
             }
         }
 
