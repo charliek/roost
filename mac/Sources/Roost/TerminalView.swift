@@ -325,10 +325,18 @@ final class TerminalView: NSView {
             // claude-code) skip their prompt-row bg SGR sequence. We
             // route the reply through `onKey` because the destination
             // is exactly the same: bytes injected into the PTY's
-            // stdin alongside user keystrokes, serialised by the
-            // tab's existing keystroke continuation. Mirrors the
-            // Linux drain at `crates/roost-linux/src/app.rs` (search
-            // `format_color_query_response`) and the legacy Go
+            // stdin alongside user keystrokes via the tab's
+            // keystroke continuation — FIFO with other writes *once
+            // enqueued*, not against PTY output that hasn't been
+            // drained yet. **Limitation:** if the app later changes
+            // the bg via `OSC 11;rgb:…`, libghostty tracks the new
+            // value internally but the scanner drops the set-color
+            // body, so subsequent queries reply with the static theme
+            // color. Affects vim retheme scenarios; not codex (which
+            // only queries). Follow-up to read libghostty's current
+            // colors via `ghostty_terminal_get(... COLOR_BACKGROUND)`
+            // instead. Mirrors the Linux drain at
+            // `crates/roost-linux/src/app.rs` and the legacy Go
             // reference at `internal/osc/scanner.go:280-300`. See
             // memory/codex-gray-bg-osc11-fix for context.
             if case .colorQuery(let n) = event {

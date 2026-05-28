@@ -34,13 +34,14 @@
 //!     OSC 99 silently; Phase 6b can extend the proto + scanner if
 //!     dogfooding shows it's needed.
 //!
-//!   * OSC 10/11/12 color queries: emitted as `ColorQuery` events,
-//!     but no synthesised response. The daemon side doesn't yet
-//!     know a tab's current fg/bg/cursor (those live in the UI's
-//!     libghostty render state). P5 may decide to route color
-//!     queries back to the UI via a separate RPC, or just drop
-//!     them. The scanner just surfaces the event so P5 has the
-//!     choice.
+//!   * OSC 10/11/12 color queries: emitted as `ColorQuery` events.
+//!     The UI layer synthesises replies via
+//!     [`format_color_query_response`] and writes them back through
+//!     the PTY's input channel. Wiring lives on each UI side
+//!     (`crates/roost-linux/src/app.rs` drain task,
+//!     `mac/Sources/Roost/TerminalView.swift::appendBytes`); the
+//!     scanner stays dependency-free and just surfaces the event so
+//!     callers control what color to answer with.
 
 use std::str;
 

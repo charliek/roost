@@ -1719,13 +1719,27 @@ impl App {
                                 // .query arm, so without us answering
                                 // codex (and reportedly claude-code)
                                 // skip their prompt-row bg SGR. The
-                                // reply rides the same per-tab
-                                // serial PTY-input channel as
-                                // keystrokes so ordering is preserved
-                                // relative to anything the user types.
-                                // See memory/codex-gray-bg-osc11-fix
-                                // and the legacy reference at
-                                // `internal/osc/scanner.go:280-300`.
+                                // reply rides the same per-tab serial
+                                // PTY-input channel as keystrokes
+                                // (`TabSession::send_input`), so it's
+                                // FIFO-ordered with other writes
+                                // *once enqueued* — not with PTY
+                                // output that hasn't been drained yet.
+                                // **Limitation:** if the app later
+                                // changes the bg via `OSC 11;rgb:…`,
+                                // libghostty tracks it internally but
+                                // the scanner drops the set-color
+                                // body, so subsequent queries reply
+                                // with the static theme color. Real
+                                // for vim plugins that retheme on
+                                // colorscheme change; not for codex,
+                                // which only queries. Follow-up to
+                                // read libghostty's current colors via
+                                // `terminal.colors()` instead.
+                                // Reference: legacy
+                                // `internal/osc/scanner.go:280-300`,
+                                // memory note
+                                // `codex-gray-bg-osc11-fix`.
                                 if let roost_osc::OscEvent::ColorQuery(n) = event {
                                     let theme = app_for_osc.theme.borrow();
                                     let color = match n {
