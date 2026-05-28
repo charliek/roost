@@ -55,7 +55,7 @@ The full site lives under `docs/` and builds with `mkdocs-material` (`make docs-
 - [Installation](docs/getting-started/installation.md) — toolchain + build
 - [First Run](docs/getting-started/first-run.md) — launch behavior + where state lives
 - [Keybindings](docs/getting-started/keybindings.md) — tab/project switching, clipboard, mouse, scrollback
-- [Working Directory Tracking](docs/guides/cwd-tracking.md) — shell snippet so the header + tab labels follow `cd`
+- [Working Directory Tracking](docs/guides/cwd-tracking.md) — header + tab labels follow `cd` (auto-loaded for zsh + modern bash)
 - [Notifications](docs/guides/notifications.md) — how `roostctl` + OSC fallbacks surface in the UI
 - [Claude Code Hooks](docs/guides/claude-code.md) — copy-paste `settings.json`
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract

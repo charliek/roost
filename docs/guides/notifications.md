@@ -47,12 +47,11 @@ Identical `(title, body)` pairs on the same tab inside one second are dropped si
 2. The `ROOST_TAB_ID` environment variable, set by Roost when it spawns each tab's shell
 3. Error: tab id required
 
-Roost injects three environment variables into every spawned shell:
+Roost injects these environment variables into every spawned shell:
 
 | Variable           | Value                                                              |
 |--------------------|--------------------------------------------------------------------|
 | `ROOST_TAB_ID`     | The integer tab id this shell is bound to                          |
-| `ROOST_PROJECT_ID` | The integer project id this tab lives in                           |
 | `ROOST_SOCKET`     | The Unix-socket path the GUI is listening on                       |
 
 So `roostctl` invoked from inside any tab needs no flags or config — it knows where to send and which tab to mark.

@@ -139,7 +139,6 @@ Existing environment is inherited verbatim before these are set.
 |---|---|
 | `ROOST_SOCKET` | Override the socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
-| `ROOST_PROJECT_ID` | Default project id, set by the UI |
 
 `roostctl` also honours `ROOST_BUNDLE_PROFILE=mac|gtk` to pick which UI's socket it dials by default (useful when a Mac `Roost.app` and a GTK dev UI both run on macOS).
 

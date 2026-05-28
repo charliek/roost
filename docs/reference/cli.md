@@ -200,10 +200,9 @@ Internal: invoked by Claude Code via the generated settings file. Reads the hook
 |---|---|
 | `ROOST_SOCKET` | Override the UI socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
-| `ROOST_PROJECT_ID` | The project id this tab lives in (auto-set, available to scripts) |
 | `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
 
-`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_PROJECT_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac`/`gtk`) — see [Paths & Environment](paths.md).
+`ROOST_SOCKET` / `ROOST_TAB_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac`/`gtk`) — see [Paths & Environment](paths.md).
 
 ## Exit codes
 
