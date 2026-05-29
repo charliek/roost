@@ -470,6 +470,10 @@ impl TerminalView {
                 // Start a fresh selection, or clear any stale one if
                 // the viewport → screen conversion fails (terminal
                 // handle not ready, cell coords out of range).
+                // `committed = false` — a drag that never extends is
+                // a "click without drag" and shouldn't render a
+                // selection rect. drag_update flips it to true on the
+                // first movement.
                 s.selection = s.cell_at(x, y, &widget).and_then(|(col, row)| {
                     let screen_y = s.screen_y_for_viewport_row(row)?;
                     Some(Selection {
@@ -477,6 +481,7 @@ impl TerminalView {
                         anchor_screen_y: screen_y,
                         cursor_col: col,
                         cursor_screen_y: screen_y,
+                        committed: false,
                     })
                 });
                 drop(s);
@@ -621,6 +626,10 @@ impl TerminalView {
                     anchor_screen_y: screen_y,
                     cursor_col: span.col1,
                     cursor_screen_y: screen_y,
+                    // `committed = true` so a single-letter word
+                    // (col0 == col1) still renders + copies; Codex
+                    // flagged on PR #177 review.
+                    committed: true,
                 });
                 s.multi_click_consumed_this_gesture = true;
                 let mode = s.copy_on_select;
@@ -638,7 +647,18 @@ impl TerminalView {
                         }
                     }
                 }
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                // Deliberately NOT calling `gesture.set_state(Claimed)`
+                // — Codex flagged on PR #177 that claiming this
+                // sequence denies the parallel `GestureDrag`, which
+                // can then skip emitting `drag_end` and leave
+                // `multi_click_consumed_this_gesture` stuck on. The
+                // flag alone is enough to gate `drag_update` and
+                // `drag_end` for this gesture; the drag controller's
+                // `drag_begin` either already ran (single-cell
+                // selection now overwritten by the word span above)
+                // or runs after this handler and returns early on the
+                // flag.
+                let _ = gesture;
                 widget.queue_draw();
             }
         });
@@ -806,6 +826,9 @@ impl TerminalView {
                     anchor_screen_y: anchor_y,
                     cursor_col: cursor.0,
                     cursor_screen_y: cursor_y,
+                    // IPC-driven selections are deliberate commits;
+                    // single-cell sets must render + copy too.
+                    committed: true,
                 });
                 drop(s);
                 self.widget.queue_draw();
@@ -1180,11 +1203,29 @@ struct Selection {
     anchor_screen_y: u32,
     cursor_col: u16,
     cursor_screen_y: u32,
+    /// True when the selection was set as a deliberate commit (the
+    /// multi-click n_press dispatch, `set_selection` from IPC) rather
+    /// than as a single-cell `drag_begin` anchor that the user hasn't
+    /// extended yet. Codex flagged on PR #177 that a double-click on
+    /// a single-letter word (e.g. `i`) returns a `(col, col)` span —
+    /// geometrically equal to a click-without-drag, but the user
+    /// expects to see + copy it. `committed` is the bit that
+    /// distinguishes the two so paint + `selection_text` render the
+    /// single-cell case.
+    committed: bool,
 }
 
 impl Selection {
     fn is_empty(&self) -> bool {
         self.anchor_col == self.cursor_col && self.anchor_screen_y == self.cursor_screen_y
+    }
+
+    /// Should the renderer paint this selection / copy-on-select emit
+    /// text for it? A committed single-cell span (e.g. double-click
+    /// on `i`) renders even though `is_empty` is geometrically true;
+    /// an in-progress drag at the anchor cell does not.
+    fn is_visible(&self) -> bool {
+        self.committed || !self.is_empty()
     }
 
     /// Normalized `(start_col, start_y, end_col, end_y)` in screen-y
@@ -1491,7 +1532,7 @@ impl TerminalViewState {
         // and the cursor stay legible underneath. Same shape as the
         // Mac UI's `TerminalView.draw` selection draw.
         if let Some(sel) = self.selection {
-            if !sel.is_empty() {
+            if sel.is_visible() {
                 self.paint_selection(cr, sel, cell_w, cell_h);
             }
         }
@@ -1940,7 +1981,7 @@ pub(crate) fn resolve_cell_colors(
 fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
     let s = state.borrow();
     let sel = s.selection?;
-    if sel.is_empty() {
+    if !sel.is_visible() {
         return None;
     }
     let (sc, sy, ec, ey) = sel.normalized();
@@ -2211,6 +2252,7 @@ mod tests {
             anchor_screen_y: 100,
             cursor_col: 5,
             cursor_screen_y: 100,
+            committed: false,
         };
         assert!(sel.is_empty());
         let (sc, sy, ec, ey) = sel.normalized();
@@ -2225,6 +2267,7 @@ mod tests {
             anchor_screen_y: 10,
             cursor_col: 8,
             cursor_screen_y: 12,
+            committed: false,
         };
         let (sc, sy, ec, ey) = sel.normalized();
         assert_eq!((sc, sy, ec, ey), (5, 10, 9, 13));
@@ -2237,10 +2280,44 @@ mod tests {
             anchor_screen_y: 12,
             cursor_col: 5,
             cursor_screen_y: 10,
+            committed: false,
         };
         let (sc, sy, ec, ey) = sel.normalized();
         // Same rectangle as the previous test — direction-independent.
         assert_eq!((sc, sy, ec, ey), (5, 10, 9, 13));
+    }
+
+    #[test]
+    fn selection_is_visible_single_cell_uncommitted_hides() {
+        // Drag_begin at a single cell that the user never extended
+        // — anchor == cursor, committed = false. Should NOT render
+        // or copy.
+        let sel = Selection {
+            anchor_col: 5,
+            anchor_screen_y: 10,
+            cursor_col: 5,
+            cursor_screen_y: 10,
+            committed: false,
+        };
+        assert!(sel.is_empty());
+        assert!(!sel.is_visible());
+    }
+
+    #[test]
+    fn selection_is_visible_single_cell_committed_renders() {
+        // Multi-click selected a single-letter word like `i` — the
+        // n_press dispatch sets committed = true so the paint pass
+        // and selection_text still emit the cell, even though it's
+        // geometrically empty. Pins the Codex PR #177 regression.
+        let sel = Selection {
+            anchor_col: 5,
+            anchor_screen_y: 10,
+            cursor_col: 5,
+            cursor_screen_y: 10,
+            committed: true,
+        };
+        assert!(sel.is_empty());
+        assert!(sel.is_visible());
     }
 
     #[test]

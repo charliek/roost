@@ -121,11 +121,26 @@ final class TerminalView: NSView {
         var anchorScreenY: UInt32
         var cursorCol: Int
         var cursorScreenY: UInt32
+        /// True when the selection was set as a deliberate commit
+        /// (multi-click n_press dispatch, `setSelection` from IPC)
+        /// rather than as a single-cell `mouseDown` anchor that the
+        /// user hasn't dragged yet. Codex flagged on PR #177 that a
+        /// double-click on a single-letter word (e.g. `i`) returns a
+        /// single-cell span — geometrically equal to a
+        /// click-without-drag, but the user expects to see + copy
+        /// it. `committed` is the bit that distinguishes the two.
+        var committed: Bool = false
 
         /// True if the anchor and cursor land on the same cell —
         /// shouldn't render selection chrome for a single-cell
-        /// "click but didn't drag" gesture.
+        /// "click but didn't drag" gesture (unless it was committed
+        /// via multi-click; see `isVisible`).
         var isEmpty: Bool { anchorCol == cursorCol && anchorScreenY == cursorScreenY }
+
+        /// Should the renderer paint this selection / copy-on-select
+        /// write the pasteboard? A committed single-cell span paints;
+        /// an in-progress single-cell drag does not.
+        var isVisible: Bool { committed || !isEmpty }
 
         /// Inclusive (startY, startCol) and exclusive (endY, endCol)
         /// in screen-row space.
@@ -1094,11 +1109,13 @@ final class TerminalView: NSView {
             multiClickConsumedThisGesture = false
             return
         }
-        // If the drag never moved (anchor == cursor), clear the
-        // selection state — a single-cell "click but didn't drag"
-        // shouldn't leave a stray highlight. Real selections persist
-        // until the next mouseDown or `clearSelection()`.
-        if let sel = selection, sel.isEmpty {
+        // If the drag never moved (anchor == cursor) AND the selection
+        // wasn't committed via multi-click / IPC, clear it — a
+        // single-cell "click but didn't drag" shouldn't leave a stray
+        // highlight. Committed single-cell selections (Codex PR #177)
+        // and real multi-cell selections persist until the next
+        // mouseDown or `clearSelection()`.
+        if let sel = selection, !sel.isVisible {
             selection = nil
             needsDisplay = true
             return
@@ -1186,11 +1203,16 @@ final class TerminalView: NSView {
             }
             return false
         }
+        // IPC-driven selections (`selection.set`, the click-count
+        // dispatch from `handleClickCount`, the test-mode
+        // `tab.expand_selection_at`) are deliberate commits — a
+        // single-cell span must still paint + copy. Codex PR #177.
         selection = CellSelection(
             anchorCol: anchorCol,
             anchorScreenY: anchorY,
             cursorCol: cursorCol,
-            cursorScreenY: cursorY
+            cursorScreenY: cursorY,
+            committed: true
         )
         needsDisplay = true
         return true
@@ -2003,7 +2025,7 @@ final class TerminalView: NSView {
         // highlight scrolls with the content. Rows currently outside
         // the visible viewport are skipped — the rectangle "exits"
         // off the top / bottom of the view as the user scrolls.
-        if let sel = selection, !sel.isEmpty {
+        if let sel = selection, sel.isVisible {
             let n = sel.normalized()
             let overlay = theme.selectionBackground.withAlphaComponent(0.6)
             overlay.setFill()
