@@ -1,0 +1,5 @@
+row: hello world here
+col: 5
+break_chars: _-.+~/:@%
+click_count: 2
+---

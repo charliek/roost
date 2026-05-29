@@ -1,0 +1,8 @@
+row: hello
+col: 0
+break_chars: _-.+~/:@%
+click_count: 3
+---
+col0: 0
+col1: 4
+text: hello

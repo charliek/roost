@@ -270,6 +270,12 @@ final class TerminalView: NSView {
     /// through. Default `.allow` (matches Ghostty).
     var clipboardWritePolicy: ClipboardWrite = .default
 
+    /// Extra word-char set used by double-click word expansion in
+    /// `mouseDown(with:)`. Read from `RoostConfig.wordBreakChars` at
+    /// tab creation. Default matches Ghostty's `_-.+~/:@%` —
+    /// keeps file paths + URLs whole on double-click.
+    var wordBreakChars: String = WordSelection.defaultWordChars
+
     /// Custom-named selection pasteboard for `copy-on-select = .on`.
     /// Mirrors cmux's `com.mitchellh.ghostty.selection` pattern:
     /// drag-to-select writes here and middle-click in any Roost
@@ -285,13 +291,15 @@ final class TerminalView: NSView {
         theme: Theme = .fallback,
         font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
         copyOnSelect: CopyOnSelect = .default,
-        clipboardWrite: ClipboardWrite = .default
+        clipboardWrite: ClipboardWrite = .default,
+        wordBreakChars: String = WordSelection.defaultWordChars
     ) {
         self.cols = cols
         self.rows = rows
         self.theme = theme
         self.copyOnSelect = copyOnSelect
         self.clipboardWritePolicy = clipboardWrite
+        self.wordBreakChars = wordBreakChars
 
         // Cell metrics: monospaced system font, advance width measured
         // from a representative wide glyph ("M"), height from the
@@ -871,11 +879,79 @@ final class TerminalView: NSView {
         linkClickConsumedThisGesture = false
         let p = convert(event.locationInWindow, from: nil)
         let (col, row) = cellAt(point: p)
+        // Cmd-click on a URL wins over word/line expansion even at
+        // clickCount 2 / 3 — Cmd is the explicit "open this link"
+        // gesture; the user's still right-handed about which one
+        // they meant. Matches the cmux behavior.
         if handleLinkClick(col: col, row: row, commandHeld: commandHeld) {
             linkClickConsumedThisGesture = true
             return
         }
+        let clickCount = max(1, event.clickCount)
+        if clickCount >= 2 {
+            if handleClickCount(col: col, row: row, clickCount: clickCount) {
+                return
+            }
+        }
         selectionMouseDown(event)
+    }
+
+    /// Pure dispatch for double- (word) and triple-click (line)
+    /// selection. Returns `true` when the click was consumed and the
+    /// selection was set; `false` when the caller should fall through
+    /// to the single-cell selection path (whitespace double-click, or
+    /// any `clickCount <= 1`). Extracted into a non-NSEvent function so
+    /// swift-testing cases can drive the same path without fabricating
+    /// an `NSEvent` — mirrors `handleLinkClick`'s test-seam shape.
+    @MainActor
+    @discardableResult
+    func handleClickCount(col: Int, row: Int, clickCount: Int) -> Bool {
+        guard clickCount >= 2 else { return false }
+        let rowText = textForViewportRow(row)
+        let span: WordSpan?
+        if clickCount == 2 {
+            span = WordSelection.expandWord(
+                in: rowText,
+                at: col,
+                extraWordChars: wordBreakChars
+            )
+        } else {
+            // 3+ → line expansion. ghostty and iTerm2 both treat
+            // four-and-up-clicks as a no-op extending the triple-
+            // click selection; we degrade to the same line span.
+            span = WordSelection.expandLine(in: rowText)
+        }
+        guard let s = span else { return false }
+        let ok = setSelection(
+            anchorCol: s.col0,
+            anchorRow: row,
+            cursorCol: s.col1,
+            cursorRow: row
+        )
+        guard ok else { return false }
+        // Copy-on-select. Drag-end fires `mouseUp` which already runs
+        // the copy path against `selection`; double/triple-click
+        // doesn't drag, so we run the same copy step here. Same
+        // pasteboard targets + same selectedPlainText source as the
+        // mouseUp branch — kept in sync so a future config policy
+        // tweak only has to land once on either path.
+        if copyOnSelect != .off,
+           let text = selectedPlainText(),
+           !text.isEmpty
+        {
+            switch copyOnSelect {
+            case .off: break
+            case .on:
+                Self.selectionPasteboard.clearContents()
+                Self.selectionPasteboard.setString(text, forType: .string)
+            case .clipboard:
+                Self.selectionPasteboard.clearContents()
+                Self.selectionPasteboard.setString(text, forType: .string)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+        }
+        return true
     }
 
     /// Pure click-handling for clickable links. Returns `true` when

@@ -1,0 +1,12 @@
+# Custom `break_chars` set that drops `/` and `.` — file paths now
+# split into their segments on double-click. Click on `tmp` returns
+# just `tmp`, not `/tmp/foo.txt`. Documents the lever a user can pull
+# in their config.
+row: see /tmp/foo.txt today
+col: 7
+break_chars: _-+~:@%
+click_count: 2
+---
+col0: 5
+col1: 7
+text: tmp

@@ -1,0 +1,12 @@
+# Boundary between a word and a break char: clicking on the last
+# char OF the word still expands the word (the clicked cell itself
+# is a word char, so the algorithm walks left into the word). The
+# fixture pins which side of a word/break boundary wins.
+row: foo bar baz
+col: 2
+break_chars: _-.+~/:@%
+click_count: 2
+---
+col0: 0
+col1: 2
+text: foo

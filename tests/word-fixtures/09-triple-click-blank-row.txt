@@ -1,0 +1,13 @@
+# Triple-click on a fully-blank row degenerates to (0, 0) — a
+# single-cell span on column 0. The caller (setSelection) sees
+# selection.isEmpty == true and clamps to a single-cell highlight,
+# which mouseUp then clears. Matches ghostty's behavior on the
+# empty-prompt scrollback row.
+row:      
+col: 0
+break_chars: _-.+~/:@%
+click_count: 3
+---
+col0: 0
+col1: 0
+text:  
