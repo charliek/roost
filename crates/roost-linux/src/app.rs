@@ -182,6 +182,11 @@ pub struct App {
     /// `RefCell` for the same future-reload reason as
     /// `copy_on_select`.
     clipboard_write_policy: RefCell<ClipboardWrite>,
+    /// `word-break-chars` from the config — extra word-char set for
+    /// double-click word expansion. Passed to every new TerminalView
+    /// at construction. `RefCell` for the same future-reload reason
+    /// as `copy_on_select`.
+    word_break_chars: RefCell<String>,
     /// Tab ids whose close was triggered by the daemon (the user
     /// typed `exit`, or a CLI `tab close`, or another client's
     /// CloseTab RPC). The connect_close_page handler installed on
@@ -570,6 +575,7 @@ impl App {
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
             copy_on_select: RefCell::new(cfg.copy_on_select),
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
+            word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
@@ -854,6 +860,20 @@ impl App {
                         }
                         UiRequest::TabDumpResolved { tab_id, reply } => {
                             let _ = reply.send(app.ipc_tab_dump_resolved(tab_id));
+                        }
+                        UiRequest::TabExpandSelectionAt {
+                            tab_id,
+                            col,
+                            row,
+                            click_count,
+                            reply,
+                        } => {
+                            let _ = reply.send(app.ipc_tab_expand_selection_at(
+                                tab_id,
+                                col,
+                                row,
+                                click_count,
+                            ));
                         }
                     }
                 }
@@ -1635,6 +1655,7 @@ impl App {
             self.font_family.as_deref(),
             Some(*self.current_font_size_pt.borrow()),
             *self.copy_on_select.borrow(),
+            self.word_break_chars.borrow().clone(),
         ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
         let Some(client_for_session) = self.client.borrow().clone() else {
@@ -3386,6 +3407,37 @@ impl App {
             .terminal_view_for(tab_id)
             .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
         Ok(view.dump_resolved_cells())
+    }
+
+    /// Drive the production word-/line-expansion dispatch from
+    /// explicit `(col, row, click_count)` coords. Gated on
+    /// `ROOST_TEST_MODE=1` (same gate as `tab.feed_pty_bytes`) so a
+    /// user-local script can't move the selection out from under the
+    /// user. Returns the (col0, col1, text) triple matching the
+    /// committed selection — same shape `tab.expand_selection_at`
+    /// emits on the wire.
+    fn ipc_tab_expand_selection_at(
+        self: &Rc<Self>,
+        tab_id: i64,
+        col: u16,
+        row: u16,
+        click_count: u8,
+    ) -> Result<roost_linux::ipc::ExpandSelectionData, String> {
+        if !self.test_mode {
+            return Err("tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        let (col0, col1, text) =
+            view.expand_selection_at(col, row, click_count)
+                .ok_or_else(|| {
+                    format!(
+                        "no word/line span at ({col}, {row}) on tab {tab_id} \
+                     (whitespace double-click, or row out of range)"
+                    )
+                })?;
+        Ok(roost_linux::ipc::ExpandSelectionData { col0, col1, text })
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {

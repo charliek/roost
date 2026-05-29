@@ -116,6 +116,8 @@ actor IPCHandlerImpl: IPCHandler {
             return try await encodeResult(self.tabCapturePtyInput(params: params))
         case "tab.dump_resolved":
             return try await encodeResult(self.tabDumpResolved(params: params))
+        case "tab.expand_selection_at":
+            return try await encodeResult(self.tabExpandSelectionAt(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -629,6 +631,46 @@ actor IPCHandlerImpl: IPCHandler {
         let bytes =
             RoostBackend.shared.readInputCapture(tabID: p.tabID, drain: p.drain) ?? Data()
         return IPCTabCapturePtyInputResult(data: bytes)
+    }
+
+    @MainActor
+    private func tabExpandSelectionAt(
+        params: AnyCodable?
+    ) async throws -> IPCTabExpandSelectionAtResult {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCTabExpandSelectionAtParams.self,
+            expected: ["tab_id", "col", "row", "click_count"]
+        )
+        guard p.clickCount >= 2 else {
+            throw IPCHandlerError.invalidParam(
+                "click_count must be >= 2 (got \(p.clickCount))"
+            )
+        }
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to drive tab.expand_selection_at")
+        }
+        guard let outcome = ui.expandTabSelectionAt(
+            tabID: p.tabID,
+            col: Int(p.col),
+            row: Int(p.row),
+            clickCount: Int(p.clickCount)
+        ) else {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal, or no word/line span at (\(p.col), \(p.row))"
+            )
+        }
+        return IPCTabExpandSelectionAtResult(
+            col0: outcome.col0,
+            col1: outcome.col1,
+            text: outcome.text
+        )
     }
 
     @MainActor
@@ -1441,6 +1483,45 @@ private struct IPCTabDumpResolvedParams: Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(String(tabID), forKey: .tabID)
     }
+}
+
+private struct IPCTabExpandSelectionAtParams: Codable {
+    let tabID: Int64
+    let col: UInt16
+    let row: UInt16
+    let clickCount: UInt8
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case col, row
+        case clickCount = "click_count"
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
+            )
+        }
+        self.tabID = v
+        self.col = try c.decode(UInt16.self, forKey: .col)
+        self.row = try c.decode(UInt16.self, forKey: .row)
+        self.clickCount = try c.decode(UInt8.self, forKey: .clickCount)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+        try c.encode(col, forKey: .col)
+        try c.encode(row, forKey: .row)
+        try c.encode(clickCount, forKey: .clickCount)
+    }
+}
+
+private struct IPCTabExpandSelectionAtResult: Codable {
+    let col0: UInt16
+    let col1: UInt16
+    let text: String?
+    enum CodingKeys: String, CodingKey { case col0, col1, text }
 }
 
 private struct IPCResolvedCell: Codable {

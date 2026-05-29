@@ -75,6 +75,28 @@ protocol UiBridge: AnyObject {
     /// indistinguishable to the OSC scanner + libghostty.
     func feedTabPtyBytes(tabID: Int64, data: Data) -> Bool
     func dumpResolvedCells(tabID: Int64) -> TerminalView.ResolvedDump?
+    /// Drive the production word-/line-expansion dispatch from
+    /// explicit coords (the `tab.expand_selection_at` test-mode op).
+    /// Returns the (col0, col1, text) triple matching the committed
+    /// selection on success; `nil` when the dispatch falls through
+    /// (whitespace double-click, out-of-range row, terminal not
+    /// ready, or no live tab matches).
+    func expandTabSelectionAt(
+        tabID: Int64,
+        col: Int,
+        row: Int,
+        clickCount: Int
+    ) -> ExpandSelectionOutcome?
+}
+
+/// Outcome from `UiBridge.expandTabSelectionAt` — mirrors
+/// `roost_linux::ipc::ExpandSelectionData`. `text` is the extracted
+/// selection content, or `nil` when the renderer reports an empty
+/// selection (off-screen row, single-cell span outside the viewport).
+struct ExpandSelectionOutcome: Sendable {
+    let col0: UInt16
+    let col1: UInt16
+    let text: String?
 }
 
 /// A read of the command-palette overlay for the `palette.*` IPC ops,

@@ -1,0 +1,10 @@
+{
+  "id": "11",
+  "op": "tab.expand_selection_at",
+  "params": {
+    "tab_id": "5",
+    "col": 8,
+    "row": 10,
+    "click_count": 2
+  }
+}

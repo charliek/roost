@@ -1,0 +1,9 @@
+{
+  "id": "11",
+  "ok": true,
+  "result": {
+    "col0": 4,
+    "col1": 15,
+    "text": "/tmp/foo.txt"
+  }
+}

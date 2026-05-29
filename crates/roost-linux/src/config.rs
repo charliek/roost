@@ -10,8 +10,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::custom_command::{self, CustomCommand};
+use roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RoostConfig {
     pub theme_name: Option<String>,
     pub font_family: Option<String>,
@@ -33,6 +34,29 @@ pub struct RoostConfig {
     /// states; defaults to `Allow` (matches Ghostty's default).
     /// Phase 2 will add `Ask` with a consent banner.
     pub clipboard_write: ClipboardWrite,
+
+    /// `word-break-chars` setting — chars that count as word chars
+    /// (beyond Unicode letters/digits) for double-click word
+    /// expansion. Default matches Ghostty's `_-.+~/:@%`, keeping
+    /// file paths + URLs whole on double-click. Despite the
+    /// `-break-` name (kept for Ghostty compatibility) the value is
+    /// the EXTRA word-char set, not the break-char set.
+    pub word_break_chars: String,
+}
+
+impl Default for RoostConfig {
+    fn default() -> Self {
+        Self {
+            theme_name: None,
+            font_family: None,
+            font_size: None,
+            keybinds: Vec::new(),
+            commands: Vec::new(),
+            copy_on_select: CopyOnSelect::default(),
+            clipboard_write: ClipboardWrite::default(),
+            word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
+        }
+    }
 }
 
 /// Two-state policy for OSC 52 program-initiated clipboard writes.
@@ -159,6 +183,12 @@ impl RoostConfig {
                             "unknown clipboard-write value; falling back to default `allow`"
                         );
                     }
+                }
+                "word-break-chars" => {
+                    // Empty value is a deliberate user choice meaning
+                    // "Unicode letters/digits only" — distinct from
+                    // "missing key" (which falls back to the default).
+                    cfg.word_break_chars = value.to_string();
                 }
                 "command" => {
                     // Launcher entry: `command = label="…" run="…" …`.
@@ -319,6 +349,39 @@ mod tests {
         // default (Allow) wins. This test pins the contract so phase 2
         // remembers to update the parser.
         assert_eq!(cfg.clipboard_write, ClipboardWrite::Allow);
+    }
+
+    #[test]
+    fn word_break_chars_defaults_to_ghostty_set() {
+        let cfg = RoostConfig::parse("");
+        assert_eq!(cfg.word_break_chars, "_-.+~/:@%");
+    }
+
+    #[test]
+    fn word_break_chars_accepts_override() {
+        let cfg = RoostConfig::parse("word-break-chars = _-");
+        assert_eq!(cfg.word_break_chars, "_-");
+    }
+
+    #[test]
+    fn word_break_chars_empty_value_disables_extras() {
+        // Explicit empty value → "Unicode letters/digits only".
+        let cfg = RoostConfig::parse("word-break-chars = ");
+        assert_eq!(cfg.word_break_chars, "");
+    }
+
+    #[test]
+    fn word_break_chars_mixed_with_other_keys() {
+        let cfg = RoostConfig::parse(
+            r#"
+            copy-on-select = off
+            word-break-chars = _-
+            theme = catppuccin-mocha
+            "#,
+        );
+        assert_eq!(cfg.word_break_chars, "_-");
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::Off);
+        assert_eq!(cfg.theme_name.as_deref(), Some("catppuccin-mocha"));
     }
 
     #[test]

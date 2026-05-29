@@ -288,6 +288,29 @@ class Roost:
         `#RRGGBB` hex strings. Ungated — safe outside test mode."""
         return self.call("tab.dump_resolved", {"tab_id": str(tab_id)})
 
+    def tab_expand_selection_at(
+        self,
+        tab_id: int,
+        col: int,
+        row: int,
+        click_count: int,
+    ) -> dict:
+        """Drive the production double-/triple-click word/line
+        expansion at `(col, row)` and commit the resulting span as the
+        tab's selection. `click_count` must be >= 2 (the wire layer
+        rejects anything smaller with `invalid-param`).
+
+        Returns `{col0, col1, text}` mirroring the wire result. Both
+        col fields are inclusive cell indices; `text` is the selected
+        substring or `None` for a single-cell span that the renderer
+        reports as empty. Gated like `tab.feed_pty_bytes`."""
+        return self.call("tab.expand_selection_at", {
+            "tab_id": str(tab_id),
+            "col": col,
+            "row": row,
+            "click_count": click_count,
+        })
+
     @staticmethod
     def palette_item_ids(state: dict) -> list[str]:
         return [it["id"] for it in state.get("items", [])]
