@@ -6,8 +6,8 @@
 //
 // Defaulting `TerminalView.urlLauncher` to `WorkspaceUrlLauncher()`
 // keeps production code call-site identical to a direct
-// `NSWorkspace.shared.open` while tests substitute a `CapturingUrlLauncher`
-// that records the URL without dispatching to AppKit.
+// `NSWorkspace.shared.open`. The test stub lives next to the test
+// cases in `mac/Tests/RoostTests/TerminalViewClickableLinksTests.swift`.
 
 import AppKit
 import Foundation
@@ -15,8 +15,8 @@ import Foundation
 protocol UrlLauncher: AnyObject {
     /// Open `url` in whichever app the system associates with its
     /// scheme. Returns `true` if the launcher accepted the URL — the
-    /// terminal view doesn't act on the return value, but the
-    /// recording stubs use it to assert "open was called once".
+    /// terminal view doesn't act on the return value, but recording
+    /// stubs use it to assert "open was called once".
     @discardableResult
     func open(_ url: URL) -> Bool
 }
@@ -25,17 +25,5 @@ protocol UrlLauncher: AnyObject {
 final class WorkspaceUrlLauncher: UrlLauncher {
     func open(_ url: URL) -> Bool {
         NSWorkspace.shared.open(url)
-    }
-}
-
-/// Test stub. Records every URL the click handler hands it without
-/// dispatching to AppKit — the tests assert against `opened` and never
-/// need a real browser to launch.
-final class CapturingUrlLauncher: UrlLauncher {
-    private(set) var opened: [URL] = []
-
-    func open(_ url: URL) -> Bool {
-        opened.append(url)
-        return true
     }
 }

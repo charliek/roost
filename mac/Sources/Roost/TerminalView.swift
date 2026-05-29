@@ -171,9 +171,17 @@ final class TerminalView: NSView {
     private var commandHeld: Bool = false
 
     /// Plug-in launcher for the Cmd-click handler. Default routes to
-    /// `NSWorkspace.shared.open`; tests substitute a `CapturingUrlLauncher`
+    /// `NSWorkspace.shared.open`; tests substitute a custom launcher
     /// to assert without launching a real browser.
     @MainActor var urlLauncher: UrlLauncher = WorkspaceUrlLauncher()
+
+    /// Set during `mouseDown` when the Cmd-click short-circuit fires
+    /// (URL opened via `urlLauncher.open`). Read by `mouseDragged` +
+    /// `mouseUp` so the gesture skips the selection-drag path and the
+    /// trailing copy-on-select. Cleared by `mouseUp` once consumed,
+    /// preserving any prior selection that existed before the Cmd-
+    /// click began.
+    private var linkClickConsumedThisGesture: Bool = false
 
     /// Tracking area covering the full view bounds. Required so
     /// `mouseMoved` fires even when the user isn't dragging — hover
@@ -493,6 +501,10 @@ final class TerminalView: NSView {
         guard let window else {
             windowIsKey = false
             stopCursorBlink()
+            // Reparenting away from a window (tab close, tear-down)
+            // strands hover state. Clear it so the next mount starts
+            // fresh — same rationale as the cursor blink stop.
+            clearLinkHoverState()
             return
         }
         center.addObserver(
@@ -523,6 +535,11 @@ final class TerminalView: NSView {
     @objc private func handleWindowDidResignKey(_ note: Notification) {
         windowIsKey = false
         updateBlinkTimerForFocus()
+        // Cmd-Tab away from the window strands the hover state — the
+        // user can't see the cursor change and the underline is
+        // misleading on a background window. Clear so the next
+        // focus-in starts fresh.
+        clearLinkHoverState()
         needsDisplay = true
     }
 
@@ -542,9 +559,26 @@ final class TerminalView: NSView {
         if resigned {
             viewIsFirstResponder = false
             updateBlinkTimerForFocus()
+            // Same rationale as `handleWindowDidResignKey`: focus
+            // shifted away from this view, so the hover state is
+            // misleading.
+            clearLinkHoverState()
             needsDisplay = true
         }
         return resigned
+    }
+
+    /// Drop any active link-hover state and restore the default I-beam
+    /// cursor. Called on focus loss (window resign-key, view resign-
+    /// first-responder, window detach) so the underline + hand cursor
+    /// don't survive past the moment the user can act on them.
+    @MainActor
+    private func clearLinkHoverState() {
+        commandHeld = false
+        if hoverURL != nil {
+            hoverURL = nil
+        }
+        updateLinkCursor()
     }
 
     /// Drive the blink timer based on current focus. The timer only
@@ -632,11 +666,25 @@ final class TerminalView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        // Selection drag — handled by the original `mouseDragged`
-        // below — but Cmd+drag also keeps the hover state fresh so
-        // the underline doesn't stick if the user drags past the URL.
+        // A consumed Cmd-click already opened the URL; the up event
+        // is the only thing left, and selection state must stay
+        // untouched.
+        if linkClickConsumedThisGesture { return }
         commandHeld = event.modifierFlags.contains(.command)
-        recomputeHoverURL(at: convert(event.locationInWindow, from: nil))
+        let p = convert(event.locationInWindow, from: nil)
+        // Drag past the view edge — `cellAt` clamps to the nearest
+        // valid cell, which would otherwise keep the underline +
+        // hand cursor alive over an edge URL. Out-of-bounds drag
+        // → clear hover before the recompute can resurrect it.
+        if !bounds.contains(p) {
+            if hoverURL != nil {
+                hoverURL = nil
+                updateLinkCursor()
+                needsDisplay = true
+            }
+        } else {
+            recomputeHoverURL(at: p)
+        }
         selectionMouseDragged(event)
     }
 
@@ -820,9 +868,11 @@ final class TerminalView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         commandHeld = event.modifierFlags.contains(.command)
+        linkClickConsumedThisGesture = false
         let p = convert(event.locationInWindow, from: nil)
         let (col, row) = cellAt(point: p)
         if handleLinkClick(col: col, row: row, commandHeld: commandHeld) {
+            linkClickConsumedThisGesture = true
             return
         }
         selectionMouseDown(event)
@@ -842,17 +892,23 @@ final class TerminalView: NSView {
     func handleLinkClick(col: Int, row: Int, commandHeld: Bool) -> Bool {
         guard commandHeld, let terminal else { return false }
         self.commandHeld = true
-        if let hov = computeHoverURL(terminal: terminal, col: col, row: row),
-           hov.row == row,
-           col >= hov.col0,
-           col <= hov.col1,
-           let url = URL(string: hov.url)
-        {
-            hoverURL = hov
-            _ = urlLauncher.open(url)
+        guard let hov = computeHoverURL(terminal: terminal, col: col, row: row),
+              hov.row == row,
+              col >= hov.col0,
+              col <= hov.col1
+        else { return false }
+        // The pointer was over a URL the UI advertised via underline +
+        // hand cursor. Even if `URL(string:)` rejects the string (rare
+        // — malformed OSC 8 URI, exotic scheme), eat the click so we
+        // don't surprise the user with a stray selection drag after
+        // they thought they were following a link. Log + no-op.
+        hoverURL = hov
+        guard let url = URL(string: hov.url) else {
+            NSLog("roost-mac: Cmd-click on unparseable URL %@", hov.url)
             return true
         }
-        return false
+        _ = urlLauncher.open(url)
+        return true
     }
 
     /// Convert a viewport row (0-indexed from top of visible area) to
@@ -910,6 +966,15 @@ final class TerminalView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // PR B: a Cmd-click that opened a URL must not run
+        // copy-on-select against any prior selection that happened to
+        // be live before the click. Eat the up-event, clear the
+        // gesture flag, and preserve `selection` so the prior copy
+        // stays intact.
+        if linkClickConsumedThisGesture {
+            linkClickConsumedThisGesture = false
+            return
+        }
         // If the drag never moved (anchor == cursor), clear the
         // selection state — a single-cell "click but didn't drag"
         // shouldn't leave a stray highlight. Real selections persist

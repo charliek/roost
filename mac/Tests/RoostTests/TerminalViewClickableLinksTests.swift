@@ -16,6 +16,19 @@ import Testing
 
 @testable import Roost
 
+/// Test stub for `UrlLauncher`. Records every URL the click handler
+/// hands it without dispatching to AppKit. Lives in the test target
+/// so the production target doesn't ship a recording type that has
+/// no callers in production code.
+final class CapturingUrlLauncher: UrlLauncher {
+    private(set) var opened: [URL] = []
+
+    func open(_ url: URL) -> Bool {
+        opened.append(url)
+        return true
+    }
+}
+
 private func clickableTestTheme() -> Theme {
     Theme(
         foreground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
@@ -85,6 +98,38 @@ func plainClick_doesNotOpenURL() {
     let consumed = view.handleLinkClick(col: 10, row: 0, commandHeld: false)
     #expect(!consumed, "Plain click on URL must NOT consume the click")
     #expect(launcher.opened.isEmpty, "no URL opened: \(launcher.opened)")
+}
+
+@Test @MainActor
+func cmdClick_doesNotMutateExistingSelection() {
+    // Regression for the M5 selection regression Codex flagged on
+    // PR #173: if a non-empty selection exists before the user Cmd-
+    // clicks a URL, the previously-extracted selection text must
+    // survive both the click and the synthetic mouseUp that follows,
+    // so copy-on-select doesn't get re-fired against the stale
+    // selection and the clipboard doesn't double-copy.
+    let view = TerminalView(cols: 80, rows: 24, theme: clickableTestTheme())
+    let launcher = CapturingUrlLauncher()
+    view.urlLauncher = launcher
+
+    view.appendBytes(Data("hello world Visit https://example.com today".utf8))
+
+    // Pre-existing selection (cols 0..4 = "hello") from an earlier
+    // drag — set explicitly via the same path the IPC `selection.set`
+    // op uses, so we don't have to fake mouse events.
+    let selOK = view.setSelection(anchorCol: 0, anchorRow: 0, cursorCol: 4, cursorRow: 0)
+    #expect(selOK, "pre-existing selection setup should succeed")
+
+    // Now Cmd-click the URL. The selection from before the click
+    // must stay intact (still over "hello"), and the launcher
+    // sees the URL exactly once.
+    let consumed = view.handleLinkClick(col: 22, row: 0, commandHeld: true)
+    #expect(consumed)
+    #expect(launcher.opened == [URL(string: "https://example.com")!])
+
+    let dump = view.dumpSelection()
+    #expect(dump != nil, "selection was wiped by the Cmd-click — regression")
+    #expect(dump?.text == "hello", "selection text was rewritten by the Cmd-click — got \(String(describing: dump?.text))")
 }
 
 @Test @MainActor
