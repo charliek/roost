@@ -36,12 +36,17 @@ pub struct UrlSpan {
 
 /// Compiled regex. `OnceLock` so the first call pays the build cost
 /// and every subsequent call reuses the same matcher. Pattern is
-/// byte-identical with `internal/links/regex.go:18`.
+/// byte-identical with `internal/links/regex.go:18` — the body's
+/// negation class spells out `[\t\n\x0c\r ]` instead of `\s` because
+/// Go's `\s` is ASCII-only (per `regexp/syntax` docs) while Rust's
+/// `regex` and Swift's `NSRegularExpression` treat `\s` as Unicode
+/// whitespace. The explicit class is the only way to keep parity
+/// across all three engines.
 fn pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:(?:https?|ftp|file|ssh|git\+ssh)://|(?:mailto|tel|news):)[^\s<>"'`\\]+"#,
+            r#"(?i)(?:(?:https?|ftp|file|ssh|git\+ssh)://|(?:mailto|tel|news):)[^ \t\r\n\x0c<>"'`\\]+"#,
         )
         .expect("url regex compiles")
     })
@@ -434,9 +439,16 @@ mod fixtures {
                 _ => {}
             }
         }
+        // All-three or none — partial blocks indicate a fixture typo,
+        // not "no match", so refuse to interpret them silently. The
+        // Swift loader does the same.
         let want = match (col0, col1, url) {
             (Some(c0), Some(c1), Some(u)) => Some((c0, c1, u)),
-            _ => None,
+            (None, None, None) => None,
+            (col0_v, col1_v, url_v) => panic!(
+                "fixture {path:?}: partial expected block (col0={col0_v:?}, col1={col1_v:?}, url={url_v:?}); \
+                 either supply all three fields or none"
+            ),
         };
         Fixture {
             name,

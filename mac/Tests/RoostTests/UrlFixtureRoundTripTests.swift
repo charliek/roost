@@ -76,11 +76,24 @@ private func parseFixture(at url: URL) throws -> Fixture {
         default: continue
         }
     }
+    // All-three or none — partial blocks indicate a fixture typo, not
+    // "no match", so throw rather than silently absorb. Matches the
+    // Rust loader's panic behavior.
     let want: (Int, Int, String)?
-    if let c0 = col0, let c1 = col1, let u = urlStr {
+    switch (col0, col1, urlStr) {
+    case (.some(let c0), .some(let c1), .some(let u)):
         want = (c0, c1, u)
-    } else {
+    case (nil, nil, nil):
         want = nil
+    default:
+        throw NSError(
+            domain: "UrlFixtureRoundTrip",
+            code: 2,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "partial expected block in \(url.lastPathComponent) (col0=\(String(describing: col0)), col1=\(String(describing: col1)), url=\(String(describing: urlStr))) — supply all three or none"
+            ]
+        )
     }
     return Fixture(row: row ?? "", col: col ?? 0, want: want)
 }

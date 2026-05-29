@@ -23,16 +23,23 @@ struct UrlSpan: Equatable {
 
 enum UrlDetection {
     /// Compiled URL regex. NSRegularExpression's `[]` byte-class
-    /// semantics handle the body's exclusion set (`[^\s<>"'`\\]+`)
-    /// the same way Go's `regexp` does — both reject the same
-    /// characters and accept every other codepoint (so IDNA hosts
-    /// like `https://例え.テスト` match the body class as-is).
+    /// semantics handle the body's exclusion set the same way Go's
+    /// `regexp` does — both reject the same characters and accept
+    /// every other codepoint (so IDNA hosts like `https://例え.テスト`
+    /// match the body class as-is).
+    ///
+    /// The body's negation class spells out `[\t\n\x0c\r ]` instead of
+    /// `\s` because Go's `\s` is ASCII-only while
+    /// `NSRegularExpression`'s ICU regex treats `\s` as Unicode
+    /// whitespace (matches U+00A0 NBSP, U+2028, U+2029, etc.). The
+    /// explicit class is the only way to keep parity with the Go
+    /// binary's behavior + the Rust port in `roost-url`.
     ///
     /// Pattern is byte-identical with `roost_url::pattern()` to keep
     /// the two ports honest. Use Swift's raw-string literal `#"..."#`
     /// so the embedded backticks + backslash don't need escaping.
     static let pattern: NSRegularExpression = {
-        let raw = #"(?:(?:https?|ftp|file|ssh|git\+ssh)://|(?:mailto|tel|news):)[^\s<>"'`\\]+"#
+        let raw = #"(?:(?:https?|ftp|file|ssh|git\+ssh)://|(?:mailto|tel|news):)[^ \t\r\n\x0c<>"'`\\]+"#
         // `.caseInsensitive` corresponds to `(?i)` in the Rust regex —
         // dropped the inline flag from the pattern so the same body
         // text is shared with the Rust side.
@@ -40,13 +47,19 @@ enum UrlDetection {
     }()
 
     /// Find the URL straddling column `col` in `row`, or `nil` if no
-    /// URL covers that column. `col` is a 0-indexed char position into
-    /// `row` — out-of-range values return `nil`.
+    /// URL covers that column. `col` is a 0-indexed Unicode scalar
+    /// position into `row` (i.e. codepoint, matching Rust's `chars()`
+    /// and Go's `[]rune`) — out-of-range values return `nil`.
+    ///
+    /// Indexing by scalar (rather than grapheme cluster) is what keeps
+    /// us byte-exact with `roost_url::find_url_at` on cases like
+    /// `e\u{0301}` (e + combining acute), which Rust counts as 2 chars
+    /// and Swift's `Character` would have collapsed to 1.
     ///
     /// Mirrors `roost_url::find_url_at` 1:1.
     static func find(in row: String, at col: Int) -> UrlSpan? {
-        let chars = Array(row)
-        guard col >= 0, col < chars.count else { return nil }
+        let totalScalars = row.unicodeScalars.count
+        guard col >= 0, col < totalScalars else { return nil }
         for span in findAll(in: row) {
             if col >= span.col0 && col <= span.col1 {
                 return span
@@ -58,23 +71,32 @@ enum UrlDetection {
     /// Find every URL in `row`, sorted left-to-right.
     static func findAll(in row: String) -> [UrlSpan] {
         // NSRegularExpression operates on UTF-16 code units; build a
-        // UTF-16 → Character (= column) index table so we can translate
-        // match ranges back. Each entry holds the UTF-16 offset where
-        // its char index starts; the final entry holds the total
-        // UTF-16 length so end-of-match lookups don't need a special
-        // case. Same idea as Go's byteToRune table.
-        var utf16ToChar: [Int] = []
-        utf16ToChar.reserveCapacity(row.utf16.count + 1)
-        var charIdx = 0
-        for ch in row {
-            // Each Character may span one or more UTF-16 units; the
-            // table records the *start* of that span as `charIdx`.
-            for _ in 0..<ch.utf16.count {
-                utf16ToChar.append(charIdx)
+        // UTF-16 → scalar-index (= column) table so we can translate
+        // match ranges back. Each entry holds the scalar index whose
+        // UTF-16 span starts at that UTF-16 offset; the final entry
+        // holds the total scalar count so end-of-match lookups don't
+        // need a special case.
+        //
+        // Indexing by Unicode scalar (codepoint), NOT Swift `Character`
+        // (grapheme cluster), is what keeps the Swift port byte-exact
+        // with the Rust port's `chars()` and Go's `[]rune`. Combining
+        // marks like `e\u{0301}` therefore count as 2 columns here,
+        // same as Rust + Go — fixtures with combining sequences would
+        // otherwise drift between the ports.
+        var utf16ToScalar: [Int] = []
+        utf16ToScalar.reserveCapacity(row.utf16.count + 1)
+        var scalarIdx = 0
+        for s in row.unicodeScalars {
+            // Each Unicode scalar may span one or two UTF-16 code
+            // units (BMP = 1, supplementary plane = 2 via surrogate
+            // pair). Record the scalar index across that whole span.
+            let units = String(s).utf16.count
+            for _ in 0..<units {
+                utf16ToScalar.append(scalarIdx)
             }
-            charIdx += 1
+            scalarIdx += 1
         }
-        utf16ToChar.append(charIdx)
+        utf16ToScalar.append(scalarIdx)
 
         var out: [UrlSpan] = []
         let nsrow = row as NSString
@@ -89,11 +111,11 @@ enum UrlDetection {
             let trimmedLen = (trimmed as NSString).length
             let startUtf16 = r.location
             let endUtf16 = startUtf16 + trimmedLen
-            guard startUtf16 < utf16ToChar.count, endUtf16 < utf16ToChar.count else { continue }
-            let col0 = utf16ToChar[startUtf16]
-            let endCharExclusive = utf16ToChar[endUtf16]
-            guard endCharExclusive > col0 else { continue }
-            let col1 = endCharExclusive - 1
+            guard startUtf16 < utf16ToScalar.count, endUtf16 < utf16ToScalar.count else { continue }
+            let col0 = utf16ToScalar[startUtf16]
+            let endScalarExclusive = utf16ToScalar[endUtf16]
+            guard endScalarExclusive > col0 else { continue }
+            let col1 = endScalarExclusive - 1
             out.append(UrlSpan(col0: col0, col1: col1, url: trimmed))
         }
         return out
@@ -110,11 +132,17 @@ enum UrlDetection {
     /// immediately so libghostty's "valid only until next mutating
     /// call" contract isn't a concern for callers.
     static func hyperlinkAt(terminal: GhosttyTerminal, col: Int, row: Int) -> String? {
-        guard col >= 0, row >= 0 else { return nil }
+        // `UInt16(exactly:)` / `UInt32(exactly:)` guard against trap on
+        // an out-of-range Int — the caller's docstring contract is
+        // "out-of-range returns nil", not "crash".
+        guard
+            let col16 = UInt16(exactly: col),
+            let row32 = UInt32(exactly: row)
+        else { return nil }
         var pt = GhosttyPoint()
         pt.tag = GHOSTTY_POINT_TAG_VIEWPORT
-        pt.value.coordinate.x = UInt16(col)
-        pt.value.coordinate.y = UInt32(row)
+        pt.value.coordinate.x = col16
+        pt.value.coordinate.y = row32
         var gref = GhosttyGridRef()
         gref.size = MemoryLayout<GhosttyGridRef>.size
         guard ghostty_terminal_grid_ref(terminal, pt, &gref) == GHOSTTY_SUCCESS else {

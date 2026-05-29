@@ -1,0 +1,12 @@
+# Combining-mark fixture pins scalar (codepoint) indexing across
+# both ports. "cafe" + U+0301 COMBINING ACUTE = 5 codepoints (4
+# graphemes). Rust counts 5 chars, Swift unicodeScalars counts 5.
+# Drift here means the Swift port slipped back to Character
+# (grapheme cluster) indexing, which would collapse U+0301 into the
+# preceding "e" and shift col0 by 1 versus the Rust port.
+row: café https://example.com
+col: 12
+---
+col0: 6
+col1: 24
+url: https://example.com
