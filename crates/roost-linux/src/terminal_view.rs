@@ -233,6 +233,7 @@ impl TerminalView {
                 }
             }),
             link_click_consumed_this_gesture: false,
+            pointer_inside: false,
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -297,6 +298,12 @@ impl TerminalView {
         // motion event, so the underline + hand cursor track the
         // pointer even while Ctrl stays held.
         let motion_ctrl = EventControllerMotion::new();
+        motion_ctrl.connect_enter({
+            let state = state.clone();
+            move |_, _x, _y| {
+                state.borrow_mut().pointer_inside = true;
+            }
+        });
         motion_ctrl.connect_motion({
             let state = state.clone();
             let widget = widget.clone();
@@ -305,6 +312,7 @@ impl TerminalView {
                 let ctrl_held = mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let mut s = state.borrow_mut();
                 s.pointer = (x, y);
+                s.pointer_inside = true;
                 s.ctrl_held = ctrl_held;
                 let cell_w = s.cell_metrics.cell_width;
                 let cell_h = s.cell_metrics.cell_height;
@@ -329,6 +337,7 @@ impl TerminalView {
             let widget = widget.clone();
             move |_| {
                 let mut s = state.borrow_mut();
+                s.pointer_inside = false;
                 if s.hover_url.is_some() {
                     s.hover_url = None;
                     s.apply_link_cursor(&widget);
@@ -357,7 +366,13 @@ impl TerminalView {
                 let (px, py) = s.pointer;
                 let cell_w = s.cell_metrics.cell_width;
                 let cell_h = s.cell_metrics.cell_height;
-                let next = if ctrl_held {
+                // Only recompute hover if the pointer is currently
+                // inside the widget — Ctrl-press with the pointer
+                // outside (the user Tabbed back to the window with
+                // Ctrl already held but the pointer elsewhere) must
+                // not resurrect a stale underline at the last-known
+                // in-bounds cell.
+                let next = if ctrl_held && s.pointer_inside {
                     cell_at_inner(px, py, cell_w, cell_h)
                         .and_then(|(col, row)| s.compute_hover_url(col, row))
                 } else {
@@ -980,6 +995,11 @@ struct TerminalViewState {
     /// skips selection setup so a Ctrl-click doesn't drop a stray
     /// single-cell selection at the URL's anchor.
     link_click_consumed_this_gesture: bool,
+    /// True while the pointer is inside the widget bounds. Updated
+    /// by motion enter/leave. Read by the modifier-change handler so
+    /// pressing Ctrl with the pointer outside the widget doesn't
+    /// resurrect a stale underline at the last-known cell.
+    pointer_inside: bool,
 }
 
 /// Active URL hover. `col0` is the URL's first column (inclusive);
