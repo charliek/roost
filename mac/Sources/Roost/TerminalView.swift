@@ -183,6 +183,17 @@ final class TerminalView: NSView {
     /// click began.
     private var linkClickConsumedThisGesture: Bool = false
 
+    /// Set during `mouseDown` when `handleClickCount` commits a
+    /// word/line selection. Read by `mouseUp` so the gesture skips
+    /// (a) the "anchor == cursor → clear" branch (a single-cell
+    /// span — e.g. double-clicking the letter `i` or triple-clicking
+    /// a one-character row — would otherwise be wiped immediately on
+    /// release; Codex flagged this on PR #176) and (b) the copy-on-
+    /// select branch (handleClickCount already wrote the selection
+    /// to the pasteboard — avoids the redundant write Codex also
+    /// flagged). Cleared by `mouseUp` once consumed.
+    private var multiClickConsumedThisGesture: Bool = false
+
     /// Tracking area covering the full view bounds. Required so
     /// `mouseMoved` fires even when the user isn't dragging — hover
     /// detection wouldn't work otherwise. Rebuilt in
@@ -793,24 +804,34 @@ final class TerminalView: NSView {
     }
 
     /// Build the visible text of one viewport row by walking the
-    /// render state. Each cell contributes its grapheme (one Swift
-    /// `Character`) — empty cells fall through as `" "` so the column
-    /// indices line up with the renderer. Same shape as
-    /// `selectedPlainText` / `dumpText`, narrowed to a single row.
+    /// render state. Each cell contributes exactly **one Unicode
+    /// scalar** so the click column (which the renderer reports in
+    /// cell units) lines up with `unicodeScalars[col]` in
+    /// `WordSelection`/`UrlDetection` — codex flagged this on PR #176
+    /// after noticing that `e\u{0301} foo` would otherwise put scalar
+    /// index 2 on the space, not on `f`. We emit the grapheme's
+    /// first scalar and drop any trailing combining marks; the
+    /// terminal cell is one display column regardless, so the lossy
+    /// reduction only affects what the algorithms see (no glyph is
+    /// drawn from this string). Empty cells fall through as a single
+    /// space.
+    ///
+    /// Same shape as `selectedPlainText` / `dumpText`, narrowed to
+    /// a single row.
     @MainActor
     private func textForViewportRow(_ row: Int) -> String {
         guard let terminal else { return "" }
         renderState.update(terminal: terminal)
-        var line = ""
+        var scalars = String.UnicodeScalarView()
         renderState.walk { cell in
             guard cell.row == row else { return }
-            if let g = cell.glyph {
-                line.append(String(g))
+            if let g = cell.glyph, let first = g.unicodeScalars.first {
+                scalars.append(first)
             } else {
-                line.append(" ")
+                scalars.append(" ")
             }
         }
-        return line
+        return String(scalars)
     }
 
     /// Show the hand cursor when hovering a URL with Cmd held;
@@ -877,6 +898,7 @@ final class TerminalView: NSView {
     override func mouseDown(with event: NSEvent) {
         commandHeld = event.modifierFlags.contains(.command)
         linkClickConsumedThisGesture = false
+        multiClickConsumedThisGesture = false
         let p = convert(event.locationInWindow, from: nil)
         let (col, row) = cellAt(point: p)
         // Cmd-click on a URL wins over word/line expansion even at
@@ -890,6 +912,7 @@ final class TerminalView: NSView {
         let clickCount = max(1, event.clickCount)
         if clickCount >= 2 {
             if handleClickCount(col: col, row: row, clickCount: clickCount) {
+                multiClickConsumedThisGesture = true
                 return
             }
         }
@@ -1049,6 +1072,16 @@ final class TerminalView: NSView {
         // stays intact.
         if linkClickConsumedThisGesture {
             linkClickConsumedThisGesture = false
+            return
+        }
+        // PR #176: a double/triple-click that committed a word/line
+        // selection through `handleClickCount` is already done — the
+        // pasteboard write fired inside that helper, and a single-cell
+        // span (e.g. double-clicking the letter `i`) must survive the
+        // release instead of getting cleared by the "anchor == cursor
+        // → empty" branch below.
+        if multiClickConsumedThisGesture {
+            multiClickConsumedThisGesture = false
             return
         }
         // If the drag never moved (anchor == cursor), clear the
