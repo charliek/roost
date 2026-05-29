@@ -406,15 +406,6 @@ jobs:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
         run: |
           set -euo pipefail
-          # Defensive: the only path we should be modifying is docs/appcast.xml.
-          # If a future build script writes into a tracked path, fail loudly
-          # rather than silently sweeping it into the bot's commit.
-          unexpected="$(git status --porcelain | grep -vE '^.M docs/appcast\.xml$' || true)"
-          if [ -n "${unexpected}" ]; then
-            echo "::error::unexpected dirty paths beyond docs/appcast.xml:"
-            echo "${unexpected}"
-            exit 1
-          fi
           if git diff --quiet docs/appcast.xml; then
             # Genuinely unchanged: re-running the same tag against an appcast
             # that already carries it. update-appcast.py preserves the prior
@@ -427,6 +418,17 @@ jobs:
           git config user.name  "charliek-release-bot[bot]"
           git config user.email "288838662+charliek-release-bot[bot]@users.noreply.github.com"
           git add docs/appcast.xml
+          # Defensive: assert ONLY docs/appcast.xml is staged. The threat we
+          # guard against is a future build step writing into some other
+          # tracked path that then gets swept into the bot's commit. Working-
+          # tree dirt (e.g. Cargo.lock drift from cargo build) is intentionally
+          # tolerated — we never `git add -A`, so it can't sneak in.
+          staged="$(git diff --cached --name-only)"
+          if [ "${staged}" != "docs/appcast.xml" ]; then
+            echo "::error::unexpected staged paths beyond docs/appcast.xml:"
+            echo "${staged}"
+            exit 1
+          fi
           git commit -m "chore(appcast): publish ${GITHUB_REF_NAME} (#122)"
 
           # Push via an in-memory Authorization header instead of `remote set-url`
