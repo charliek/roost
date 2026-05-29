@@ -824,10 +824,15 @@ actor IPCHandlerImpl: IPCHandler {
             throw IPCHandlerError.internalError("no UI window for window_metrics")
         }
         let metrics = ui.sidebarMetrics()
-        let frame = window.frame
+        // Report the content rect (matches GTK's widget allocation,
+        // which is content-area, not toplevel-with-decorations).
+        // `NSWindow.frame` includes the titlebar; reporting that would
+        // break cross-platform width/height equivalence for callers
+        // that drive both UIs through the same op.
+        let content = window.contentRect(forFrameRect: window.frame)
         return IPCWindowMetricsResult(
-            windowWidth: Double(frame.width),
-            windowHeight: Double(frame.height),
+            windowWidth: Double(content.width),
+            windowHeight: Double(content.height),
             sidebarWidth: Double(metrics.width),
             sidebarCollapsed: metrics.collapsed
         )
@@ -860,9 +865,19 @@ actor IPCHandlerImpl: IPCHandler {
         guard let window = RoostBackend.shared.ui?.mainWindow else {
             throw IPCHandlerError.internalError("no UI window for window.resize")
         }
-        var frame = window.frame
-        frame.size = NSSize(width: CGFloat(p.width), height: CGFloat(p.height))
-        window.setFrame(frame, display: true, animate: false)
+        // Treat width/height as the CONTENT rect (matches GTK, which
+        // resizes the toplevel widget's allocation). Without this
+        // conversion, Mac would set the outer frame (including
+        // titlebar) to W×H while GTK sets content to W×H, producing
+        // different content sizes for the same op call.
+        let desiredContent = NSRect(
+            x: window.frame.origin.x, y: window.frame.origin.y,
+            width: CGFloat(p.width), height: CGFloat(p.height)
+        )
+        window.setFrame(
+            window.frameRect(forContentRect: desiredContent),
+            display: true, animate: false
+        )
     }
 }
 
