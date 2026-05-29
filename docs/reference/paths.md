@@ -121,25 +121,61 @@ without a restart.
 
 ## Environment variables Roost sets
 
-When Roost spawns a tab's shell, it injects:
+When Roost spawns a tab's shell, it injects the following. Existing
+environment is inherited verbatim *before* these are set — the user's
+own values for `TERM_PROGRAM_VERSION` etc. would be overwritten;
+`ROOST_SHELL_FEATURES` is the only one that defers to a pre-existing
+value (you can opt out of the default features by setting it in your
+rc — see [Feature flags](../guides/cwd-tracking.md#feature-flags)).
+
+### Terminal advertisement
+
+| Variable               | Value             | Purpose                                                                  |
+|------------------------|-------------------|--------------------------------------------------------------------------|
+| `TERM`                 | `xterm-256color`  | Terminfo entry the shell should use. Roost emulates xterm-256color faithfully. |
+| `COLORTERM`            | `truecolor`       | Signals 24-bit color support to modern TUIs (opencode, neovim, lazygit). Stripped at the SSH boundary unless [`ssh-env`](../guides/cwd-tracking.md#feature-flags) wraps `ssh` to forward it. |
+| `TERM_PROGRAM`         | `Roost`           | Lets remote tools detect they're running inside Roost.                   |
+| `TERM_PROGRAM_VERSION` | bundle short version | Same use case; tracks the running Roost build.                       |
+
+### Tab identity + IPC routing
 
 | Variable        | Purpose                                                              |
 |-----------------|----------------------------------------------------------------------|
-| `TERM`          | Set to `xterm-256color`                                              |
-| `COLORTERM`     | Set to `truecolor`                                                   |
-| `ROOST_TAB_ID`  | Integer tab id (used by `roostctl` to route notifications)              |
-| `ROOST_SOCKET`  | Absolute path to the Unix socket                                     |
+| `ROOST_TAB_ID`  | Integer tab id (used by `roostctl` to route notifications). Gate any shell-integration extension you write on this. |
+| `ROOST_SOCKET`  | Absolute path to the Unix domain socket (`roostctl` auto-detects it from this). |
 
-Existing environment is inherited verbatim before these are set.
+### Shell integration
 
-Roost's shell integration also defines an `ssh` function (when the
-`ssh-env` feature flag is on — default) that adds
+| Variable                  | Value                              | Purpose                                                 |
+|---------------------------|------------------------------------|---------------------------------------------------------|
+| `ROOST_SHELL_INTEGRATION` | `1`                                | Marker that the shell-integration env contract is in effect. |
+| `ROOST_SHELL_FEATURES`    | `cwd,title,marks,prompt,ssh-env`*  | Comma list of features the shipped scripts enable. Prefix any feature with `no-` to disable it (e.g. `cwd,title,marks,prompt,no-ssh-env`). See [Feature flags](../guides/cwd-tracking.md#feature-flags). |
+| `ROOST_RESOURCES_DIR`     | absolute path                      | Directory holding the shipped `shell-integration/` scripts. Source `$ROOST_RESOURCES_DIR/shell-integration/roost.bash` (or `.zsh`) to load them manually. |
+
+\* Default only when `ROOST_SHELL_FEATURES` is unset in the inherited
+env; set it in your rc / launch config to override.
+
+### Internal bootstrap (don't depend on these)
+
+Roost also sets `ZDOTDIR` (zsh) and `ENV` + a few `ROOST_BASH_*`
+helpers (bash auto-bootstrap) to inject the shell integration without
+requiring the user to edit their rc. These are reserved internals —
+read them if you're debugging Roost's startup, but don't build on
+them from user code.
+
+### `ssh-env` and the SSH boundary
+
+Without intervention, macOS's default `/etc/ssh/ssh_config.d/100-macos.conf`
+only forwards `LANG LC_*` over `ssh` — `COLORTERM` (and
+`TERM_PROGRAM` / `TERM_PROGRAM_VERSION`) silently drop, so modern TUIs
+on the remote host fall back to 256-color rendering. The `ssh-env`
+feature (default on) defines an `ssh` shell function that adds
 `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"` to every
-`ssh` invocation. Without this, `COLORTERM` is silently dropped at
-the SSH boundary (macOS's default `ssh_config` only forwards
-`LANG LC_*`) and modern TUIs on the remote host fall back to
-256-color. See [`docs/guides/cwd-tracking.md`](../guides/cwd-tracking.md#feature-flags)
-for the full feature-flag list and how to opt out.
+invocation. The remote host has to *accept* the forwarded vars
+(`sshd_config::AcceptEnv`); Debian/Ubuntu defaults only accept
+`LANG LC_*`, so the server-side setting often needs updating too.
+See [Feature flags](../guides/cwd-tracking.md#feature-flags) for the
+opt-out (`no-ssh-env`).
 
 ## Environment variables Roost reads
 
