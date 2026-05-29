@@ -4139,6 +4139,14 @@ extension RoostApp: UiBridge {
     /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
     var mainWindow: NSWindow? { window }
 
+    /// Sidebar pane width + collapsed state for `app.window_metrics`.
+    /// Collapse is keyed off "frame width is effectively zero" — the
+    /// same rule the toggle/divider-hide paths already use.
+    func sidebarMetrics() -> (width: CGFloat, collapsed: Bool) {
+        let w = sidebarPane?.frame.width ?? 0
+        return (width: w, collapsed: w < 1)
+    }
+
     // MARK: command palette — IPC drive surface (palette.* ops)
     //
     // The IPC handler reaches the live `PalettePanel` through these (same
@@ -4486,40 +4494,112 @@ extension RoostApp: NSOutlineViewDelegate {
     }
 }
 
+/// Result of the sidebar/content resize allocation. Pure value type
+/// so the allocation math is unit-testable without a live NSSplitView.
+struct SidebarResizeAllocation: Equatable {
+    /// `nil` means "let NSSplitView's default `adjustSubviews()`
+    /// handle it" — typically the user-drag and collapsed paths.
+    let sidebar: NSRect?
+    let content: NSRect?
+
+    static let useDefault = SidebarResizeAllocation(sidebar: nil, content: nil)
+}
+
+/// Compute the resize allocation for `RoostApp`'s split view.
+/// Returns `.useDefault` when NSSplitView's own `adjustSubviews()`
+/// should run (user drag, no width change, or sidebar collapsed);
+/// otherwise returns explicit frames for sidebar + content where
+/// the sidebar holds its current width (clamped to the configured
+/// band) and the content absorbs the entire window-resize delta.
+///
+/// This is the lever that fixes the sidebar-grows-on-resize bug.
+/// PR #159 tried to fix it by mutating a constraint on every
+/// `splitViewDidResizeSubviews` callback, which created a runaway
+/// loop. The correct fix is to take ownership of the redistribution
+/// here, where NSSplitView gives us a callback specifically for it.
+func computeSidebarResizeAllocation(
+    splitViewSize newSize: NSSize,
+    oldSize: NSSize,
+    currentSidebarFrame: NSRect,
+    dividerThickness: CGFloat,
+    minWidth: CGFloat,
+    maxWidth: CGFloat,
+    widthChangeTolerance: CGFloat = 0.5
+) -> SidebarResizeAllocation {
+    let dx = newSize.width - oldSize.width
+    let isWindowResize = abs(dx) > widthChangeTolerance
+    if !isWindowResize { return .useDefault }
+    // ⌘B collapse path: sidebar is at width 0. Let `adjustSubviews`
+    // honor the collapsed state; we don't want to hand the collapsed
+    // sidebar any width back.
+    if currentSidebarFrame.width < 1 { return .useDefault }
+    let sidebarW = max(minWidth, min(maxWidth, currentSidebarFrame.width))
+    let contentW = max(0, newSize.width - sidebarW - dividerThickness)
+    let height = newSize.height
+    return SidebarResizeAllocation(
+        sidebar: NSRect(x: 0, y: 0, width: sidebarW, height: height),
+        content: NSRect(
+            x: sidebarW + dividerThickness, y: 0,
+            width: contentW, height: height
+        )
+    )
+}
+
 extension RoostApp: NSSplitViewDelegate {
-    /// Round-6 R6.B: clamp + persist the sidebar pane's width.
-    /// `splitViewDidResizeSubviews` fires on every divider drag
-    /// (live, not on mouse-up) so the saved value tracks the user's
-    /// final position. Skip when the sidebar is hidden so a `⌘B`
-    /// toggle-collapse doesn't overwrite the saved width with `0`.
+    /// Own the redistribution when the *split view itself* changes
+    /// size (window resize). Sidebar holds its current width; content
+    /// absorbs the entire delta. This bypasses NSSplitView's default
+    /// holding-priority dance — which, paired with our `.defaultHigh`
+    /// preferred-width constraint at the same priority, was non-
+    /// deterministic and grew the sidebar proportionally with the
+    /// window (the bug PR #159 misdiagnosed).
+    ///
+    /// User divider drag also routes through here (NSSplitView calls
+    /// this on every layout pass), but `oldSize.width ==
+    /// newWidth` then, so we DON'T treat it as a window resize:
+    /// `adjustSubviews()` does its normal thing and the user's drag
+    /// goes through. Detection happens in
+    /// `computeSidebarResizeAllocation`.
+    func splitView(
+        _ splitView: NSSplitView,
+        resizeSubviewsWithOldSize oldSize: NSSize
+    ) {
+        guard splitView.arrangedSubviews.count == 2,
+              let sidebar = sidebarPane else {
+            splitView.adjustSubviews()
+            return
+        }
+        let alloc = computeSidebarResizeAllocation(
+            splitViewSize: splitView.bounds.size,
+            oldSize: oldSize,
+            currentSidebarFrame: sidebar.frame,
+            dividerThickness: splitView.dividerThickness,
+            minWidth: Self.sidebarMinWidth,
+            maxWidth: Self.sidebarMaxWidth
+        )
+        guard let sidebarFrame = alloc.sidebar,
+              let contentFrame = alloc.content else {
+            splitView.adjustSubviews()
+            return
+        }
+        sidebar.frame = sidebarFrame
+        splitView.arrangedSubviews[1].frame = contentFrame
+    }
+
+    /// Persist the sidebar pane's width on every layout change.
+    /// `splitViewDidResizeSubviews` fires for both user drag and
+    /// window resize; the band check below skips the ⌘B-collapsed
+    /// state (frame.width = 0). Does NOT mutate
+    /// `sidebarPreferredWidthConstraint` — that runaway-loop pattern
+    /// was what PR #159 introduced. The constraint stays pinned at
+    /// its launch-time value; user drag is preserved via NSSplitView's
+    /// internal "user-set" position, and `resizeSubviewsWithOldSize`
+    /// above is what holds the sidebar across window resize.
     func splitViewDidResizeSubviews(_ notification: Notification) {
-        // Round-6 R6.B: skip the persistence save until launch has
-        // fully settled. NSSplitView fires this during initial
-        // layout before our setPosition + width constraints have
-        // taken effect; persisting that pre-settle width would
-        // pollute the saved value with NSSplitView's auto-picked
-        // default.
         guard sidebarPersistenceActive else { return }
         guard let sidebar = sidebarPane else { return }
         let w = sidebar.frame.width
-        // Round-7 R7.A: skip persistence while the pane is in the
-        // ⌘B-collapsed state (frame.width = 0). The user's
-        // pre-collapse width is held in `sidebarRestoreWidth` and
-        // already persisted at the moment the user dragged the
-        // divider before pressing ⌘B.
         guard w >= Self.sidebarMinWidth, w <= Self.sidebarMaxWidth else { return }
-        // Re-anchor `sidebarPreferredWidthConstraint` so it tracks
-        // the user's dragged position. Without this update, the
-        // constraint stays pinned at the launch-time width — and
-        // on subsequent window resize NSSplitView's
-        // holding-priority dance picks unpredictably between the
-        // stale constraint and the current frame, letting the
-        // sidebar drift wider as the window grows. Skip during a
-        // programmatic collapse (the constraint is intentionally
-        // deactivated then by `toggleSidebar`).
-        if !sidebarCollapsingProgrammatically {
-            sidebarPreferredWidthConstraint?.constant = w
-        }
         UserDefaults.standard.set(Double(w), forKey: Self.sidebarWidthDefaultsKey)
     }
 

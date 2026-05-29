@@ -747,6 +747,34 @@ pub struct ScreenshotResult {
     pub scale: u32,
 }
 
+/// `app.window_metrics` request — nullary envelope (`{}`). The struct
+/// is empty but `deny_unknown_fields` rejects strays so a typo in the
+/// client surfaces immediately, matching every other op's contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowMetricsParams {}
+
+/// `app.window_metrics` response — logical (point) measurements of the
+/// running UI's window + sidebar. Used by the sidebar layout regression
+/// tests to assert the sidebar holds its width across window resizes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowMetricsResult {
+    pub window_width: f64,
+    pub window_height: f64,
+    pub sidebar_width: f64,
+    pub sidebar_collapsed: bool,
+}
+
+/// `window.resize` request — programmatically set the window's logical
+/// size. Test-mode only (gated by `ROOST_TEST_MODE=1`); see the op
+/// const comment block below for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowResizeParams {
+    pub width: f64,
+    pub height: f64,
+}
+
 // ============================================================================
 // Event data types
 // ============================================================================
@@ -863,6 +891,10 @@ pub mod ops {
     /// terminal) to a PNG, in-process. Returns the bytes base64-encoded
     /// so an agent can `see` the live UI without OS screen capture.
     pub const SCREENSHOT: &str = "app.screenshot";
+    /// Logical (point) measurements of the running UI's window + sidebar.
+    /// Used by the sidebar-holds-width regression tests; always available
+    /// (no test-mode gate — it's read-only).
+    pub const WINDOW_METRICS: &str = "app.window_metrics";
 
     /// Command-palette overlay: open a root frame, read the current
     /// frame's rows, set the filter, activate a row (same dispatch as its
@@ -890,6 +922,11 @@ pub mod ops {
     /// bytes is something only a test harness should do.
     pub const TAB_FEED_PTY_BYTES: &str = "tab.feed_pty_bytes";
     pub const TAB_CAPTURE_PTY_INPUT: &str = "tab.capture_pty_input";
+    /// Programmatically resize the running UI's window. Gated for the
+    /// same reason as the PTY drain ops: harness-only driver for the
+    /// sidebar layout regression suite (`tools/roosttest`); a real user
+    /// resizes the window themselves.
+    pub const WINDOW_RESIZE: &str = "window.resize";
     /// Ungated companion: a richer read of the same render state
     /// `tab.dump` already exposes. Pins the resolver call site
     /// (theme bold-color → `resolve_cell_colors`) end-to-end.
@@ -1296,6 +1333,32 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"png\":\"iVBORw0KGgo=\""), "got: {json}");
         round_trip(&r);
+    }
+
+    #[test]
+    fn window_metrics_result_round_trip() {
+        round_trip(&WindowMetricsResult {
+            window_width: 1100.0,
+            window_height: 700.0,
+            sidebar_width: 220.0,
+            sidebar_collapsed: false,
+        });
+        round_trip(&WindowMetricsResult {
+            window_width: 1800.0,
+            window_height: 700.0,
+            sidebar_width: 0.0,
+            sidebar_collapsed: true,
+        });
+    }
+
+    #[test]
+    fn window_resize_params_reject_unknown_field() {
+        round_trip(&WindowResizeParams {
+            width: 1100.0,
+            height: 700.0,
+        });
+        let bad = r#"{"width":1100.0,"height":700.0,"extra":"x"}"#;
+        assert!(serde_json::from_str::<WindowResizeParams>(bad).is_err());
     }
 
     #[test]

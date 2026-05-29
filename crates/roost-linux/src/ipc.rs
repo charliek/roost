@@ -29,6 +29,7 @@ use roost_ipc::messages::{
     TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
     TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
     TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -46,6 +47,12 @@ pub struct DumpData {
 /// Reply for a [`UiRequest::Screenshot`]: `(png_bytes, width, height)`
 /// on success, an error message on failure.
 type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
+
+/// Reply for a [`UiRequest::WindowMetrics`]:
+/// `(window_width, window_height, sidebar_width, sidebar_collapsed)`
+/// in logical points. Read-only — the `Err` arm only fires if the UI
+/// drain can't find the window (race during teardown).
+pub type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<(f64, f64, f64, bool), String>>;
 
 /// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
 /// error message (e.g. tab not found / no live terminal) on failure.
@@ -228,6 +235,17 @@ pub enum UiRequest {
         row: u16,
         click_count: u8,
         reply: ExpandSelectionReply,
+    },
+    /// `app.window_metrics` — read window size + sidebar pane width +
+    /// collapsed flag (logical points). Backs the sidebar-holds-width
+    /// regression suite. Ungated (read-only).
+    WindowMetrics { reply: WindowMetricsReply },
+    /// `window.resize` — programmatically set the window's logical
+    /// size. Gated for the same reason as the PTY drain ops.
+    WindowResize {
+        width: f64,
+        height: f64,
+        reply: UnitReply,
     },
 }
 
@@ -574,6 +592,19 @@ async fn dispatch(
                 scale: p.scale,
             })
         }
+        ops::WINDOW_METRICS => {
+            let _p: WindowMetricsParams = decode(params)?;
+            let (w, h_, sw, collapsed) = h
+                .ui_call(|reply| UiRequest::WindowMetrics { reply })
+                .await?
+                .map_err(|m| HandlerError::new("internal", m))?;
+            encode(&WindowMetricsResult {
+                window_width: w,
+                window_height: h_,
+                sidebar_width: sw,
+                sidebar_collapsed: collapsed,
+            })
+        }
         ops::PALETTE_OPEN => {
             let p: PaletteOpenParams = decode(params)?;
             if !matches!(p.kind.as_str(), "" | "commands" | "launcher") {
@@ -737,6 +768,23 @@ async fn dispatch(
                 col1: data.col1,
                 text: data.text,
             })
+        }
+        ops::WINDOW_RESIZE => {
+            let p: WindowResizeParams = decode(params)?;
+            if !(p.width.is_finite() && p.height.is_finite() && p.width > 0.0 && p.height > 0.0) {
+                return Err(HandlerError::invalid_param(format!(
+                    "width and height must be positive and finite (got {} x {})",
+                    p.width, p.height
+                )));
+            }
+            h.ui_call(|reply| UiRequest::WindowResize {
+                width: p.width,
+                height: p.height,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
         }
         ops::TAB_DUMP_RESOLVED => {
             let p: TabDumpResolvedParams = decode(params)?;
