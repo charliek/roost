@@ -1,0 +1,9 @@
+# Wikipedia URL with balanced parens: the trailing `)` belongs to the
+# URL because the corresponding `(` is inside it. trim_url must not
+# peel a balanced closing paren.
+row: see https://en.wikipedia.org/wiki/Rust_(programming_language) here
+col: 20
+---
+col0: 4
+col1: 60
+url: https://en.wikipedia.org/wiki/Rust_(programming_language)

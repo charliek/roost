@@ -1,0 +1,8 @@
+# The trailing `)` is unmatched within the URL — peel it. The opening
+# `(` belongs to the surrounding sentence, not the URL.
+row: see (https://example.com) here
+col: 10
+---
+col0: 5
+col1: 23
+url: https://example.com

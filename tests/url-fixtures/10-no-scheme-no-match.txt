@@ -1,0 +1,6 @@
+# Hostnames without a scheme do not match — narrow regex by design.
+# Path detection (./foo, src/main.go:42) and scp-style git remotes
+# are out of scope for the v1 port.
+row: this is not.a.url at all
+col: 10
+---

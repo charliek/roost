@@ -1,0 +1,6 @@
+row: links: https://a.test, https://b.test
+col: 10
+---
+col0: 7
+col1: 20
+url: https://a.test

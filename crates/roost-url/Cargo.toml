@@ -1,0 +1,18 @@
+[package]
+name        = "roost-url"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Shared URL detection (scheme regex + trailing-punctuation cleanup) consumed by roost-linux's GTK mouse path and mirrored by the Swift Mac port for parity."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+regex = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+# scp-style git remotes lack a scheme prefix — out of scope for v1.
+row: remote git@github.com:x/y.git origin
+col: 14
+---
