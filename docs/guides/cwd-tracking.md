@@ -148,18 +148,22 @@ disable.
 
 Every shell Roost spawns sees:
 
-| Variable                  | Meaning                                                 |
-|---------------------------|---------------------------------------------------------|
-| `ROOST_TAB_ID`            | the tab's id — gate your integration on this            |
-| `ROOST_SOCKET`            | the IPC socket path (`roostctl` auto-detects it)        |
-| `ROOST_RESOURCES_DIR`     | where the shipped scripts live (`…/shell-integration/`) |
-| `ROOST_SHELL_INTEGRATION` | `1`                                                     |
-| `ROOST_SHELL_FEATURES`    | feature flags (above)                                   |
-| `TERM_PROGRAM`            | `Roost` (plus `TERM_PROGRAM_VERSION`)                   |
-| `TERM`                    | `xterm-256color`                                        |
+| Variable                  | Meaning                                                                       |
+|---------------------------|-------------------------------------------------------------------------------|
+| `ROOST_TAB_ID`            | the tab's id — gate your integration on this                                  |
+| `ROOST_SOCKET`            | the IPC socket path (`roostctl` auto-detects it)                              |
+| `ROOST_RESOURCES_DIR`     | where the shipped scripts live (`…/shell-integration/`)                       |
+| `ROOST_SHELL_INTEGRATION` | `1`                                                                           |
+| `ROOST_SHELL_FEATURES`    | feature flags (above)                                                         |
+| `TERM_PROGRAM`            | `Roost` (plus `TERM_PROGRAM_VERSION`)                                         |
+| `TERM`                    | `xterm-256color`                                                              |
+| `COLORTERM`               | `truecolor` — signals 24-bit color to TUIs (forwarded over SSH via `ssh-env`) |
 
 You don't have to set `ROOST_SOCKET`, `ROOST_TAB_ID`, or `ROOST_RESOURCES_DIR` —
-Roost injects them.
+Roost injects them. The full authoritative table is in
+[`docs/reference/paths.md`](../reference/paths.md#environment-variables-roost-sets),
+which also covers the internal-bootstrap vars (`ZDOTDIR`, `ENV`,
+`ROOST_BASH_*`) that you shouldn't depend on from user code.
 
 ## Fancier: a git-aware title with a 🐓
 
