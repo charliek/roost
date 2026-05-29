@@ -147,6 +147,40 @@ final class TerminalView: NSView {
 
     private var selection: CellSelection?
 
+    // MARK: - Clickable links (PR B)
+
+    /// Live hover-URL state. `nil` when the pointer is not over a URL
+    /// or when the Cmd modifier isn't held. Populated by `mouseMoved`
+    /// + `flagsChanged` from either an OSC 8 hyperlink lookup or a
+    /// regex match on the row text under the pointer.
+    ///
+    /// Stored row is the **viewport** row (0-indexed). The underline
+    /// + click handler both consume it directly; if the user scrolls
+    /// while hovering, the next mouseMoved invalidates and recomputes.
+    private struct HoverURL: Equatable {
+        let col0: Int
+        let col1: Int
+        let row: Int
+        let url: String
+    }
+    private var hoverURL: HoverURL?
+
+    /// Last known Cmd-modifier state. Updated in `flagsChanged`; read
+    /// by hover + click + draw so the underline + hand cursor track
+    /// the modifier press/release in real time.
+    private var commandHeld: Bool = false
+
+    /// Plug-in launcher for the Cmd-click handler. Default routes to
+    /// `NSWorkspace.shared.open`; tests substitute a `CapturingUrlLauncher`
+    /// to assert without launching a real browser.
+    @MainActor var urlLauncher: UrlLauncher = WorkspaceUrlLauncher()
+
+    /// Tracking area covering the full view bounds. Required so
+    /// `mouseMoved` fires even when the user isn't dragging — hover
+    /// detection wouldn't work otherwise. Rebuilt in
+    /// `updateTrackingAreas` on bounds change.
+    nonisolated(unsafe) private var hoverTrackingArea: NSTrackingArea?
+
     /// Active theme. M6 first-cut: applied to the canvas + selection
     /// overlay + glyph fallback colors. Loaded from config on launch;
     /// the runtime fallback is the bundled `roost-dark` theme.
@@ -560,7 +594,190 @@ final class TerminalView: NSView {
         return (col, row)
     }
 
-    override func mouseDown(with event: NSEvent) {
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = hoverTrackingArea {
+            removeTrackingArea(existing)
+        }
+        // Cover the full visible bounds. `.activeAlways` so hover
+        // fires even when the window isn't key — Cmd-hover is a peek
+        // gesture and users expect the underline + hand cursor without
+        // first clicking the window. `.mouseMoved` is what makes
+        // `mouseMoved(with:)` deliver events at all (default tracking
+        // only fires enter/exit). `.inVisibleRect` lets AppKit clip
+        // the rect to the visible portion automatically.
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeAlways, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if hoverURL != nil {
+            hoverURL = nil
+            updateLinkCursor()
+            needsDisplay = true
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        commandHeld = event.modifierFlags.contains(.command)
+        recomputeHoverURL(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        // Selection drag — handled by the original `mouseDragged`
+        // below — but Cmd+drag also keeps the hover state fresh so
+        // the underline doesn't stick if the user drags past the URL.
+        commandHeld = event.modifierFlags.contains(.command)
+        recomputeHoverURL(at: convert(event.locationInWindow, from: nil))
+        selectionMouseDragged(event)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        let nowHeld = event.modifierFlags.contains(.command)
+        guard nowHeld != commandHeld else { return }
+        commandHeld = nowHeld
+        // Recompute hover state at the pointer's current position
+        // because the underline + cursor depend on `commandHeld`.
+        if let win = window {
+            let inWindow = win.mouseLocationOutsideOfEventStream
+            let p = convert(inWindow, from: nil)
+            if bounds.contains(p) {
+                recomputeHoverURL(at: p)
+            } else if hoverURL != nil {
+                hoverURL = nil
+                updateLinkCursor()
+                needsDisplay = true
+            }
+        }
+    }
+
+    /// Compute the URL covering the cell at `point`, if Cmd is held.
+    /// Prefers OSC 8 explicit hyperlinks over a regex match on the
+    /// row text — a shell that emits `\e]8;;URI\e\\…` decides what
+    /// "the URL" is regardless of what the cell text looks like.
+    /// Updates `hoverURL`, the cursor, and triggers a redraw.
+    @MainActor
+    private func recomputeHoverURL(at point: NSPoint) {
+        guard commandHeld, let terminal else {
+            if hoverURL != nil {
+                hoverURL = nil
+                updateLinkCursor()
+                needsDisplay = true
+            }
+            return
+        }
+        let (col, row) = cellAt(point: point)
+        let next = computeHoverURL(terminal: terminal, col: col, row: row)
+        if next != hoverURL {
+            hoverURL = next
+            updateLinkCursor()
+            needsDisplay = true
+        }
+    }
+
+    /// Resolve the URL (if any) covering `(col, row)`. OSC 8 wins
+    /// over regex: if the cell carries an explicit hyperlink, the
+    /// span is the contiguous run of cells sharing that URI; the
+    /// regex pass is skipped. Otherwise we build the row's text by
+    /// walking the render state and let `UrlDetection.find` answer.
+    @MainActor
+    private func computeHoverURL(
+        terminal: GhosttyTerminal,
+        col: Int,
+        row: Int
+    ) -> HoverURL? {
+        // Prefer OSC 8 explicit hyperlinks.
+        if let uri = UrlDetection.hyperlinkAt(terminal: terminal, col: col, row: row) {
+            let (c0, c1) = osc8SpanAt(terminal: terminal, col: col, row: row, uri: uri)
+            return HoverURL(col0: c0, col1: c1, row: row, url: uri)
+        }
+        // Regex fallback: assemble the row text + look up the column.
+        let rowText = textForViewportRow(row)
+        if let span = UrlDetection.find(in: rowText, at: col) {
+            return HoverURL(col0: span.col0, col1: span.col1, row: row, url: span.url)
+        }
+        return nil
+    }
+
+    /// Walk the OSC 8 hyperlink span outward from `(col, row)` so the
+    /// underline + click-target cover every cell that shares the same
+    /// URI. libghostty only answers per-cell; the contiguous-span walk
+    /// is the renderer's job. Stops when the URI changes or runs out
+    /// — we don't cross row boundaries here (linewrap is a TODO).
+    @MainActor
+    private func osc8SpanAt(
+        terminal: GhosttyTerminal,
+        col: Int,
+        row: Int,
+        uri: String
+    ) -> (col0: Int, col1: Int) {
+        var c0 = col
+        while c0 > 0,
+              UrlDetection.hyperlinkAt(terminal: terminal, col: c0 - 1, row: row) == uri
+        {
+            c0 -= 1
+        }
+        var c1 = col
+        let maxCol = Int(cols) - 1
+        while c1 < maxCol,
+              UrlDetection.hyperlinkAt(terminal: terminal, col: c1 + 1, row: row) == uri
+        {
+            c1 += 1
+        }
+        return (c0, c1)
+    }
+
+    /// Build the visible text of one viewport row by walking the
+    /// render state. Each cell contributes its grapheme (one Swift
+    /// `Character`) — empty cells fall through as `" "` so the column
+    /// indices line up with the renderer. Same shape as
+    /// `selectedPlainText` / `dumpText`, narrowed to a single row.
+    @MainActor
+    private func textForViewportRow(_ row: Int) -> String {
+        guard let terminal else { return "" }
+        renderState.update(terminal: terminal)
+        var line = ""
+        renderState.walk { cell in
+            guard cell.row == row else { return }
+            if let g = cell.glyph {
+                line.append(String(g))
+            } else {
+                line.append(" ")
+            }
+        }
+        return line
+    }
+
+    /// Show the hand cursor when hovering a URL with Cmd held;
+    /// otherwise restore the default I-beam. AppKit's cursor stack
+    /// can drift; calling `.set()` directly is the most reliable
+    /// path — `cursorUpdate(with:)` only fires on tracking-area
+    /// boundary crossings, not on internal state changes like a
+    /// modifier press.
+    @MainActor
+    private func updateLinkCursor() {
+        if hoverURL != nil && commandHeld {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.iBeam.set()
+        }
+    }
+
+    /// Cmd-click on a URL opens it; everything else falls through to
+    /// the regular selection-drag handler. Pull the selection logic
+    /// out of `mouseDown` into a helper so the Cmd-click short-circuit
+    /// can return cleanly without manually re-asserting selection
+    /// state.
+    private func selectionMouseDown(_ event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
         guard let screenY = screenY(forViewportRow: cell.row) else {
@@ -583,7 +800,7 @@ final class TerminalView: NSView {
         needsDisplay = true
     }
 
-    override func mouseDragged(with event: NSEvent) {
+    private func selectionMouseDragged(_ event: NSEvent) {
         guard var sel = selection else { return }
         let p = convert(event.locationInWindow, from: nil)
         let cell = cellAt(point: p)
@@ -599,6 +816,43 @@ final class TerminalView: NSView {
         sel.cursorScreenY = screenY
         selection = sel
         needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        commandHeld = event.modifierFlags.contains(.command)
+        let p = convert(event.locationInWindow, from: nil)
+        let (col, row) = cellAt(point: p)
+        if handleLinkClick(col: col, row: row, commandHeld: commandHeld) {
+            return
+        }
+        selectionMouseDown(event)
+    }
+
+    /// Pure click-handling for clickable links. Returns `true` when
+    /// the click was consumed (URL opened); `false` when the caller
+    /// should fall through to the regular selection-drag path.
+    ///
+    /// Extracted into a non-NSEvent function so swift-testing cases
+    /// can drive the same path without constructing an `NSEvent`
+    /// (which is awkward to fabricate in unit tests). The production
+    /// `mouseDown` is a thin wrapper that pulls col/row from the
+    /// event and delegates here.
+    @MainActor
+    @discardableResult
+    func handleLinkClick(col: Int, row: Int, commandHeld: Bool) -> Bool {
+        guard commandHeld, let terminal else { return false }
+        self.commandHeld = true
+        if let hov = computeHoverURL(terminal: terminal, col: col, row: row),
+           hov.row == row,
+           col >= hov.col0,
+           col <= hov.col1,
+           let url = URL(string: hov.url)
+        {
+            hoverURL = hov
+            _ = urlLauncher.open(url)
+            return true
+        }
+        return false
     }
 
     /// Convert a viewport row (0-indexed from top of visible area) to
@@ -1538,6 +1792,23 @@ final class TerminalView: NSView {
                 }
             }
             // Focused + !cursorBlinkOn → don't draw; cell shows through.
+        }
+
+        // Clickable-link underline (PR B). Draw a single-pixel rule
+        // across the bottom of the hovered URL's cells when Cmd is
+        // held + the pointer is over a URL. Sits between glyph and
+        // selection overlay so an active drag-selection over a URL
+        // still wins visually. Color is `theme.foreground` for v1 —
+        // a dedicated `link-color` theme key is a future widening.
+        if let hov = hoverURL, commandHeld {
+            let underline = NSRect(
+                x: CGFloat(hov.col0) * cellW,
+                y: CGFloat(hov.row + 1) * cellH - 1,
+                width: CGFloat(hov.col1 - hov.col0 + 1) * cellW,
+                height: 1
+            )
+            theme.foreground.setFill()
+            underline.fill()
         }
 
         // Selection overlay (Phase 6a M5). Drawn last so it sits on
