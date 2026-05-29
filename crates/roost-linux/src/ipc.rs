@@ -812,10 +812,13 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 }
 
 /// Map an error from a gated test-mode op back to a wire-friendly
-/// [`HandlerError`]. Three failure modes the UI distinguishes by
-/// message text:
+/// [`HandlerError`]. Failure modes the UI distinguishes by message
+/// text:
 ///   * env var missing → `not-enabled`
-///   * unknown tab id → `not-found`
+///   * unknown tab id, or `tab.expand_selection_at` falling through
+///     (whitespace double-click → no span) → `not-found`. The Mac
+///     handler returns `not-found` for the no-span case too — the
+///     `no word/line span` substring keeps both UIs symmetric.
 ///   * anything else (capture buffer poisoned, feed channel closed)
 ///     → `internal`, so a real failure surfaces clearly rather than
 ///     being mistaken for a missing tab.
@@ -826,7 +829,7 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 fn map_test_op_err(err: String) -> HandlerError {
     if err.contains("ROOST_TEST_MODE") {
         HandlerError::new("not-enabled", err)
-    } else if err.contains("has no live terminal") {
+    } else if err.contains("has no live terminal") || err.contains("no word/line span") {
         HandlerError::not_found(err)
     } else {
         HandlerError::new("internal", err)
