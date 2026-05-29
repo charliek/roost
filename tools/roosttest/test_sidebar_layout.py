@@ -27,6 +27,14 @@ from client import Roost
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 WIDTH_TOLERANCE_PT = 1.0
+# Bare xvfb (CI) has no window manager, so GTK4's `set_default_size`
+# doesn't actually resize a mapped toplevel — the `window.resize` IPC
+# op returns immediately but the window allocation stays put. Locally,
+# a real WM (Mutter / Quartz on a developer Mac) honors the resize and
+# the test runs end-to-end. Skip on GTK in CI; Mac runs always exercise
+# the regression. GTK's structural correctness (gtk4::Paned with
+# resize_start_child(false)) makes the parity-lock less critical here.
+SKIP_GTK_IN_CI = os.environ.get("CI") == "true"
 
 
 def _wait_window_width(roost, target_width: float, timeout: float = 2.0) -> dict:
@@ -44,6 +52,15 @@ def _wait_window_width(roost, target_width: float, timeout: float = 2.0) -> dict
         what=f"window width to reach {target_width}",
     )
     return roost.window_metrics()
+
+
+@pytest.fixture(autouse=True)
+def _skip_gtk_in_ci(target):
+    if SKIP_GTK_IN_CI and target == "gtk":
+        pytest.skip(
+            "GTK target on CI uses bare xvfb (no WM), so window.resize is "
+            "a no-op there; runs locally on developer GTK and on Mac CI"
+        )
 
 
 @pytest.mark.skipif(

@@ -361,11 +361,7 @@ jobs:
         # The harness launches its own `roost` process; under xvfb-run it
         # inherits the virtual DISPLAY. tab.dump reads in-process render
         # state, so no compositor screen-capture is involved.
-        # `--server-args="-screen 0 2560x1440x24"` enlarges xvfb's virtual
-        # display past its 1280×1024 default so `window.resize` calls in
-        # the sidebar-layout tests (which seed 1100×700 then 1800×700)
-        # aren't clamped by the X server.
-        run: xvfb-run -a --server-args="-screen 0 2560x1440x24" uv run --group test pytest tools/roosttest --roost-target gtk -v
+        run: xvfb-run -a uv run --group test pytest tools/roosttest --roost-target gtk -v
 
   # Functional E2E against the real Swift app, driven through the IPC op
   # set by the pytest harness (tools/roosttest) — the Mac twin of e2e-gtk.
