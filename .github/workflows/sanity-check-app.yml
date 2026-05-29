@@ -1,0 +1,47 @@
+name: sanity-check-app
+
+# Manual verification that the charliek-release-bot GitHub App is wired into
+# this repo: RELEASE_BOT_APP_ID + RELEASE_BOT_APP_KEY resolve, token mints,
+# the App's installation sees charliek/roost, and the token's identity is the
+# bot. Run from the Actions UI ("Run workflow"); output prints in the job log.
+#
+# Useful when:
+#   * first wiring the App into a new repo (verify before touching release.yml)
+#   * rotating the App's private key (re-verify after updating the secret)
+#   * migrating to a new App
+#
+# Companion to release.yml's bot-driven appcast publish (#122 / #136).
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}   # explicit: this workflow needs nothing from the workflow token
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - id: bot-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      - name: Token sees the right repo + installation
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::This repo (must print charliek/roost)"
+          gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
+          echo "::endgroup::"
+
+          echo "::group::Installation repository count (must be ≥1)"
+          # Count only — the App may later install on private repos (shed, etc.)
+          # and printing names into a public roost workflow log would leak them.
+          gh api /installation/repositories --jq '.total_count'
+          echo "::endgroup::"
+
+          echo "::group::Token identity (login should be charliek-release-bot[bot])"
+          gh api /user --jq '.login'
+          echo "::endgroup::"

@@ -12,14 +12,13 @@ name: Release
 #   APPLE_APP_SPECIFIC_PASSWORD. Without them the DMG ships ad-hoc-signed
 #   (Gatekeeper requires right-click → Open).
 #
-# Sparkle auto-update (issue #122): the DMG ships from CI normally; signing
-#   the DMG with the EdDSA key and publishing the appcast entry is a LOCAL
-#   post-release step the maintainer runs:
-#     mac/scripts/publish-appcast.sh <tag>
-#   It downloads the just-published DMG, signs it with the keychain key,
-#   updates docs/appcast.xml, and leaves the working tree dirty for review.
-#   Maintainer commits + pushes (admin → bypasses main's branch protection).
-#   See #136 for the why; mirrors shed's local scripts/set-version.sh.
+# Sparkle auto-update (issue #122): after the DMG is uploaded to the Release,
+#   the mac job EdDSA-signs it with SPARKLE_ED_PRIVATE_KEY, appends an entry
+#   to docs/appcast.xml, and pushes that commit to main as the
+#   charliek-release-bot GitHub App. The App is in main's ruleset bypass list
+#   (the only way to push past the ci-success requirement on a bot-authored
+#   commit — see #136 for the GITHUB_TOKEN attempt that failed). docs.yml then
+#   redeploys Pages → appcast live. No manual post-release step.
 
 on:
   push:
@@ -29,6 +28,14 @@ on:
 # Least privilege: default read; only the release-writing jobs get contents:write.
 permissions:
   contents: read
+
+# Serialize release runs against the same tag: rare in practice (tags are unique),
+# but a re-run via the Actions UI while the original is still building would
+# otherwise race on the appcast push. `cancel-in-progress: false` keeps both
+# runs alive — better to wait than to abort half-uploaded artifacts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   version-check:
@@ -345,15 +352,107 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" --clobber
 
-      # Sparkle appcast publishing is a LOCAL post-release step (issue #122):
-      # mac/scripts/publish-appcast.sh <tag> — run on the maintainer's machine.
-      # CI-driven push to main is rejected by branch protection (the bot isn't
-      # an admin; see #136), and the shed-style pattern of "maintainer mutates,
-      # maintainer pushes" is the right shape here too. This step just emits a
-      # reminder annotation on the workflow summary.
-      - name: Reminder — publish appcast locally
+      # Sparkle appcast publishing (issue #122). EdDSA-sign the just-uploaded
+      # DMG, append a signed <item> to docs/appcast.xml, and push to main as
+      # the charliek-release-bot App (which is in main's ruleset bypass list —
+      # the previous GITHUB_TOKEN attempt was rejected by branch protection;
+      # see #136). The mac job already has the Sparkle SPM artifacts (which
+      # carry sign_update) under mac/.build/artifacts, so no re-bootstrap.
+      - name: Mint release-bot App token
+        id: bot-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      - name: Sign DMG + append appcast entry
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
-          echo "::notice title=Appcast::run \`./mac/scripts/publish-appcast.sh ${GITHUB_REF_NAME}\` on your dev machine to sign Roost-${GITHUB_REF_NAME#v}.dmg and publish docs/appcast.xml (issue #122 / #136)."
+          set -euo pipefail
+          # Fail fast on missing config BEFORE doing any work.
+          if [ -z "${SPARKLE_ED_PRIVATE_KEY}" ]; then
+            echo "::error::SPARKLE_ED_PRIVATE_KEY secret is unset — can't sign the appcast entry."
+            exit 1
+          fi
+          VER="${GITHUB_REF_NAME#v}"
+          DMG="mac/build/Roost-${VER}.dmg"
+          test -s "${DMG}" || { echo "::error::${DMG} missing — DMG upload step must run first."; exit 1; }
+          SIGN_UPDATE="$(find mac/.build/artifacts -path '*/bin/sign_update' -type f -not -path '*old_dsa*' | head -1)"
+          if [ -z "${SIGN_UPDATE}" ]; then
+            echo "::error::sign_update not found under mac/.build/artifacts. Did Bundle Roost.app (which triggers swift build) run?"
+            exit 1
+          fi
+          W="$(mktemp -d)"
+          chmod 700 "$W"
+          trap 'rm -rf "$W"' EXIT
+          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" | base64 --decode > "${W}/key"
+          "${SIGN_UPDATE}" --ed-key-file "${W}/key" "${DMG}" > "${W}/sign.txt"
+          rm -f "${W}/key"
+          cat "${W}/sign.txt"
+
+          # Switch the workspace from the tagged commit onto main, mutate the
+          # tracked file, commit, push. The mac/build/ artifacts produced earlier
+          # are untracked and survive the checkout. Tag SHA is reachable from
+          # main (tag was cut from main), so the checkout is clean.
+          git fetch origin main
+          git checkout main
+          ROOST_VERSION="${VER}" ROOST_TAG="${GITHUB_REF_NAME}" ROOST_SIGN_FILE="${W}/sign.txt" \
+            python3 mac/scripts/update-appcast.py
+          xmllint --noout docs/appcast.xml
+
+      - name: Push signed appcast to main as release-bot
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Defensive: the only path we should be modifying is docs/appcast.xml.
+          # If a future build script writes into a tracked path, fail loudly
+          # rather than silently sweeping it into the bot's commit.
+          unexpected="$(git status --porcelain | grep -vE '^.M docs/appcast\.xml$' || true)"
+          if [ -n "${unexpected}" ]; then
+            echo "::error::unexpected dirty paths beyond docs/appcast.xml:"
+            echo "${unexpected}"
+            exit 1
+          fi
+          if git diff --quiet docs/appcast.xml; then
+            # Genuinely unchanged: re-running the same tag against an appcast
+            # that already carries it. update-appcast.py preserves the prior
+            # pubDate so the diff is empty when nothing else moved.
+            echo "::notice::docs/appcast.xml unchanged for ${GITHUB_REF_NAME} — nothing to push."
+            exit 0
+          fi
+          # Bot commit email follows GitHub's "<user-id>+<login>@users.noreply.github.com" convention.
+          # 288838662 is charliek-release-bot[bot]'s user id (gh api /users/charliek-release-bot[bot]).
+          git config user.name  "charliek-release-bot[bot]"
+          git config user.email "288838662+charliek-release-bot[bot]@users.noreply.github.com"
+          git add docs/appcast.xml
+          git commit -m "chore(appcast): publish ${GITHUB_REF_NAME} (#122)"
+
+          # Push via an in-memory Authorization header instead of `remote set-url`
+          # — keeps the App token out of .git/config on the runner disk.
+          # Retry up to 3× with rebase on race: the only change is the single
+          # appcast file, so a rebase against a concurrent main push (e.g.
+          # docs.yml redeploy or a merged PR landing during the release)
+          # cannot conflict.
+          push() {
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}" \
+                push origin main
+          }
+          for attempt in 1 2 3; do
+            if push; then
+              echo "::notice::Appcast pushed for ${GITHUB_REF_NAME} — docs.yml will redeploy Pages."
+              exit 0
+            fi
+            echo "::warning::push attempt ${attempt} failed; rebasing onto origin/main and retrying"
+            git fetch origin main
+            git rebase origin/main || {
+              echo "::error::rebase conflict on docs/appcast.xml — concurrent appcast write? Re-run after investigating."
+              exit 1
+            }
+          done
+          echo "::error::push failed after 3 attempts; main moved faster than the retry loop. Re-run the workflow."
+          exit 1
 
       # Interim only: while the DMG isn't notarized, append the Gatekeeper-bypass
       # instructions to the release body so downloaders see them at the earliest
