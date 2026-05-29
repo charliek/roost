@@ -225,6 +225,15 @@ impl TerminalView {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             on_resize: None,
+            hover_url: None,
+            ctrl_held: false,
+            url_opener: Rc::new(|uri| {
+                if let Err(err) = crate::url_launcher::open_uri(uri) {
+                    tracing::warn!(uri, ?err, "url launcher failed");
+                }
+            }),
+            link_click_consumed_this_gesture: false,
+            pointer_inside: false,
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -283,14 +292,102 @@ impl TerminalView {
         // Pointer tracking: the scroll controller doesn't carry a
         // position, so keep the latest hover here for the wheel-as-button
         // reports (which must name the cell under the pointer).
+        //
+        // PR C: the same motion controller also drives clickable-link
+        // hover state — recompute the URL under the pointer on every
+        // motion event, so the underline + hand cursor track the
+        // pointer even while Ctrl stays held.
         let motion_ctrl = EventControllerMotion::new();
+        motion_ctrl.connect_enter({
+            let state = state.clone();
+            move |_, _x, _y| {
+                state.borrow_mut().pointer_inside = true;
+            }
+        });
         motion_ctrl.connect_motion({
             let state = state.clone();
-            move |_ctrl, x, y| {
-                state.borrow_mut().pointer = (x, y);
+            let widget = widget.clone();
+            move |ctrl, x, y| {
+                let mods = ctrl.current_event_state();
+                let ctrl_held = mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                let mut s = state.borrow_mut();
+                s.pointer = (x, y);
+                s.pointer_inside = true;
+                s.ctrl_held = ctrl_held;
+                let cell_w = s.cell_metrics.cell_width;
+                let cell_h = s.cell_metrics.cell_height;
+                let next = if ctrl_held {
+                    cell_at_inner(x, y, cell_w, cell_h)
+                        .and_then(|(col, row)| s.compute_hover_url(col, row))
+                } else {
+                    None
+                };
+                if next != s.hover_url {
+                    s.hover_url = next;
+                    s.apply_link_cursor(&widget);
+                    drop(s);
+                    widget.queue_draw();
+                } else {
+                    drop(s);
+                }
+            }
+        });
+        motion_ctrl.connect_leave({
+            let state = state.clone();
+            let widget = widget.clone();
+            move |_| {
+                let mut s = state.borrow_mut();
+                s.pointer_inside = false;
+                if s.hover_url.is_some() {
+                    s.hover_url = None;
+                    s.apply_link_cursor(&widget);
+                    drop(s);
+                    widget.queue_draw();
+                }
             }
         });
         widget.add_controller(motion_ctrl);
+
+        // Track Ctrl press/release so the underline + cursor appear
+        // even without pointer movement (user presses Ctrl while the
+        // pointer is already over a URL). GTK4's `EventControllerKey`
+        // exposes a `modifiers` signal for exactly this.
+        let modifier_ctrl = EventControllerKey::new();
+        modifier_ctrl.connect_modifiers({
+            let state = state.clone();
+            let widget = widget.clone();
+            move |_ctrl, mods| {
+                let ctrl_held = mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                let mut s = state.borrow_mut();
+                if s.ctrl_held == ctrl_held {
+                    return glib::Propagation::Proceed;
+                }
+                s.ctrl_held = ctrl_held;
+                let (px, py) = s.pointer;
+                let cell_w = s.cell_metrics.cell_width;
+                let cell_h = s.cell_metrics.cell_height;
+                // Only recompute hover if the pointer is currently
+                // inside the widget — Ctrl-press with the pointer
+                // outside (the user Tabbed back to the window with
+                // Ctrl already held but the pointer elsewhere) must
+                // not resurrect a stale underline at the last-known
+                // in-bounds cell.
+                let next = if ctrl_held && s.pointer_inside {
+                    cell_at_inner(px, py, cell_w, cell_h)
+                        .and_then(|(col, row)| s.compute_hover_url(col, row))
+                } else {
+                    None
+                };
+                if next != s.hover_url {
+                    s.hover_url = next;
+                    s.apply_link_cursor(&widget);
+                    drop(s);
+                    widget.queue_draw();
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        widget.add_controller(modifier_ctrl);
 
         // Scroll wheel: 3 modes per the Mac UI / Go binary. Discrete
         // notches + smooth scroll both go through the same path; the
@@ -329,8 +426,30 @@ impl TerminalView {
         drag.connect_drag_begin({
             let state = state.clone();
             let widget = widget.clone();
-            move |_g, x, y| {
+            move |g, x, y| {
                 let mut s = state.borrow_mut();
+                s.link_click_consumed_this_gesture = false;
+                // PR C: Ctrl-click on a URL opens the URL and skips
+                // selection setup. Preserves any pre-existing
+                // selection — the user gets the new browser tab
+                // without losing the text they just copied.
+                let ctrl_held = g
+                    .current_event_state()
+                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                if ctrl_held {
+                    if let Some((col, row)) = s.cell_at(x, y, &widget) {
+                        if let Some(hov) = s.compute_hover_url(col, row) {
+                            let url = hov.url.clone();
+                            s.hover_url = Some(hov);
+                            s.link_click_consumed_this_gesture = true;
+                            let opener = s.url_opener.clone();
+                            drop(s);
+                            opener(&url);
+                            widget.queue_draw();
+                            return;
+                        }
+                    }
+                }
                 // Start a fresh selection, or clear any stale one if
                 // the viewport → screen conversion fails (terminal
                 // handle not ready, cell coords out of range).
@@ -352,6 +471,11 @@ impl TerminalView {
             let widget = widget.clone();
             move |g, dx, dy| {
                 let mut s = state.borrow_mut();
+                // PR C: don't mutate selection while a Ctrl-click
+                // gesture is being consumed for URL opening.
+                if s.link_click_consumed_this_gesture {
+                    return;
+                }
                 if let Some((start_x, start_y)) = g.start_point() {
                     let x = start_x + dx;
                     let y = start_y + dy;
@@ -392,7 +516,16 @@ impl TerminalView {
         drag.connect_drag_end({
             let state = state.clone();
             move |_g, _x, _y| {
-                let mode = state.borrow().copy_on_select;
+                let mut s = state.borrow_mut();
+                // PR C: a Ctrl-click consumed by URL launch must not
+                // run copy-on-select against any prior selection.
+                // Clear the gesture flag for the next gesture.
+                if s.link_click_consumed_this_gesture {
+                    s.link_click_consumed_this_gesture = false;
+                    return;
+                }
+                let mode = s.copy_on_select;
+                drop(s);
                 if mode == CopyOnSelect::Off {
                     return;
                 }
@@ -842,6 +975,43 @@ struct TerminalViewState {
     /// once the session is attached. See the callback invariant on
     /// `input_callback`.
     on_resize: Option<Rc<dyn Fn(u16, u16)>>,
+    /// Active link-hover. `Some` when the pointer is over a URL **and**
+    /// Ctrl is held; otherwise `None`. Populated by the motion
+    /// controller from either OSC 8 explicit hyperlinks or a regex
+    /// match on the row text. Consumed by `paint` (underline) and the
+    /// click controller (open URL).
+    hover_url: Option<HoverUrl>,
+    /// Last-known Ctrl-modifier state. The motion + key controllers
+    /// each refresh this; the click controller reads it to decide
+    /// whether the press should open a URL or fall through to
+    /// drag-selection.
+    ctrl_held: bool,
+    /// Pluggable launcher seam. Production routes to
+    /// `url_launcher::open_uri`; tests substitute a stub. `Rc` so the
+    /// gesture closure can clone cheaply.
+    url_opener: Rc<dyn Fn(&str)>,
+    /// Set by the click controller when a Ctrl-click opens a URL. The
+    /// drag controller's `drag_begin` sees it on the next press and
+    /// skips selection setup so a Ctrl-click doesn't drop a stray
+    /// single-cell selection at the URL's anchor.
+    link_click_consumed_this_gesture: bool,
+    /// True while the pointer is inside the widget bounds. Updated
+    /// by motion enter/leave. Read by the modifier-change handler so
+    /// pressing Ctrl with the pointer outside the widget doesn't
+    /// resurrect a stale underline at the last-known cell.
+    pointer_inside: bool,
+}
+
+/// Active URL hover. `col0` is the URL's first column (inclusive);
+/// `col1` is the last column (inclusive); `row` is the viewport row.
+/// Same shape as the Mac UI's `HoverURL` so future refactors that
+/// share more logic land symmetrically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoverUrl {
+    col0: u16,
+    col1: u16,
+    row: u16,
+    url: String,
 }
 
 /// Selection snapshot for the `selection.dump` IPC op. `text` is the
@@ -1156,6 +1326,21 @@ impl TerminalViewState {
             );
         }
 
+        // Pass C.5 — clickable-link underline. Draw a single-pixel
+        // rule across the bottom of the hovered URL's cells when
+        // Ctrl is held + the pointer is over a URL. Color is
+        // `theme.foreground` for v1 — a future `link-color` theme
+        // key (Tier 2 punch-list) would route in here.
+        if let Some(hov) = self.hover_url.as_ref() {
+            if self.ctrl_held {
+                let (r, g, b) = default_fg.to_f64();
+                cr.set_source_rgb(r, g, b);
+                let (x, y, w, h) = link_underline_rect(hov.col0, hov.col1, hov.row, cell_w, cell_h);
+                cr.rectangle(x, y, w, h);
+                let _ = cr.fill();
+            }
+        }
+
         // Pass D: selection overlay. Translucent fill so cell glyphs
         // and the cursor stay legible underneath. Same shape as the
         // Mac UI's `TerminalView.draw` selection draw.
@@ -1343,6 +1528,80 @@ impl TerminalViewState {
             }
         }
         out
+    }
+
+    /// Resolve the URL (if any) covering `(col, row)`. OSC 8 wins
+    /// over regex: if the cell carries an explicit hyperlink, the
+    /// span is the contiguous run of cells sharing that URI; the
+    /// regex pass is skipped. Otherwise we build the row's text by
+    /// walking the render state and let `roost_url::find_url_at`
+    /// answer. Mirrors the Mac UI's `computeHoverURL`.
+    fn compute_hover_url(&mut self, col: u16, row: u16) -> Option<HoverUrl> {
+        // OSC 8 first.
+        if let Some(uri) = self.terminal.hyperlink_at(col, row as u32) {
+            let (c0, c1) = self.osc8_span_at(col, row, &uri);
+            return Some(HoverUrl {
+                col0: c0,
+                col1: c1,
+                row,
+                url: uri,
+            });
+        }
+        let row_text = self.text_for_viewport_row(row);
+        let span = roost_url::find_url_at(&row_text, col)?;
+        Some(HoverUrl {
+            col0: span.col0,
+            col1: span.col1,
+            row,
+            url: span.url,
+        })
+    }
+
+    /// Walk an OSC 8 span outward from `(col, row)`. libghostty only
+    /// answers per-cell; the contiguous-span walk is the renderer's
+    /// job so the underline + click target cover every cell that
+    /// shares the URI. Stops at the row edge — line-wrap is a TODO.
+    fn osc8_span_at(&self, col: u16, row: u16, uri: &str) -> (u16, u16) {
+        let row_y = row as u32;
+        osc8_span_walk(col, self.cols.saturating_sub(1), uri, |c| {
+            self.terminal.hyperlink_at(c, row_y)
+        })
+    }
+
+    /// Build the visible text of one viewport row by walking the
+    /// render state. Each cell contributes its grapheme; empty cells
+    /// fall through as `' '` so the column indices line up with the
+    /// renderer. Same shape as `dump_text`, narrowed to one row.
+    fn text_for_viewport_row(&mut self, target_row: u16) -> String {
+        if let Err(err) = self.render_state.update(&self.terminal) {
+            tracing::warn!(?err, "render_state.update failed for hover URL");
+            return String::new();
+        }
+        let mut line = String::new();
+        let _ = self.render_state.walk(&self.terminal, |row, cell: Cell| {
+            if row != target_row as u32 {
+                return;
+            }
+            if cell.text.is_empty() {
+                line.push(' ');
+            } else {
+                line.push_str(&cell.text);
+            }
+        });
+        line
+    }
+
+    /// Swap the widget's cursor between `pointer` (URL hover with
+    /// Ctrl held) and `text` (default text cursor — same shape as
+    /// the Mac UI's `iBeam`). gtk4-rs's `set_cursor_from_name` takes
+    /// the GTK / icon-theme cursor name; `Some("pointer")` is the
+    /// recommended hand-style cursor.
+    fn apply_link_cursor(&self, widget: &DrawingArea) {
+        if self.hover_url.is_some() && self.ctrl_held {
+            widget.set_cursor_from_name(Some("pointer"));
+        } else {
+            widget.set_cursor_from_name(Some("text"));
+        }
     }
 
     /// Convert widget-pixel `(x, y)` to a (col, row) cell pair,
@@ -1622,6 +1881,49 @@ fn paste_text_into(state: &Rc<RefCell<TerminalViewState>>, text: String) {
         text.into_bytes()
     };
     cb(bytes);
+}
+
+/// Walk an OSC 8 hyperlink span outward from `col` while the
+/// per-cell URI lookup `hyperlink_at` keeps returning `Some(uri)`.
+/// Pure function so the `osc8_span_at` method on `TerminalViewState`
+/// can be unit-tested against a stubbed lookup without standing up
+/// a full GTK widget. `max_col` is the rightmost valid column on
+/// the row (inclusive) — typically `cols - 1`.
+fn osc8_span_walk<F>(col: u16, max_col: u16, uri: &str, mut hyperlink_at: F) -> (u16, u16)
+where
+    F: FnMut(u16) -> Option<String>,
+{
+    let mut c0 = col;
+    while c0 > 0 && hyperlink_at(c0 - 1).as_deref() == Some(uri) {
+        c0 -= 1;
+    }
+    let mut c1 = col;
+    while c1 < max_col && hyperlink_at(c1 + 1).as_deref() == Some(uri) {
+        c1 += 1;
+    }
+    (c0, c1)
+}
+
+/// Pixel rectangle (x, y, w, h) for the underline overlay drawn on
+/// a URL's cells. Extracted from the paint pass so tests can pin the
+/// math without standing up a Cairo surface. `cell_w` / `cell_h` are
+/// the live cell metrics; `col0` / `col1` are inclusive column
+/// bounds (mirrors `roost_url::UrlSpan`); `row` is the viewport row.
+/// Returns `(x, y, width, height)` in widget-pixel coordinates.
+fn link_underline_rect(
+    col0: u16,
+    col1: u16,
+    row: u16,
+    cell_w: f64,
+    cell_h: f64,
+) -> (f64, f64, f64, f64) {
+    let span_cells = (col1 - col0 + 1) as f64;
+    (
+        col0 as f64 * cell_w,
+        (row as f64 + 1.0) * cell_h - 1.0,
+        span_cells * cell_w,
+        1.0,
+    )
 }
 
 /// Pure-function variant of `TerminalViewState::cell_at` for use from
@@ -1964,5 +2266,92 @@ mod tests {
             Some(bold_accent),
             "bold default-fg X must resolve to the theme bold-color accent"
         );
+    }
+
+    // ============================================================
+    // Clickable-link helpers (PR C)
+    // ============================================================
+    //
+    // Click-path coverage: the OSC 8 span walk + the underline
+    // rectangle math are tested as pure functions; full click
+    // gesture wiring (modifier tracking, GestureDrag interaction)
+    // is exercised in CI's e2e-gtk pytest run against a live UI.
+    use std::collections::HashMap;
+
+    #[test]
+    fn osc8_span_walk_finds_contiguous_run() {
+        // Cells 5..9 all carry the same URI; everything else does not.
+        let cells: HashMap<u16, &'static str> = HashMap::from_iter([
+            (5, "https://x.test"),
+            (6, "https://x.test"),
+            (7, "https://x.test"),
+            (8, "https://x.test"),
+            (9, "https://x.test"),
+        ]);
+        let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
+
+        // Probing from the middle of the span walks both ways.
+        assert_eq!(osc8_span_walk(7, 79, "https://x.test", lookup), (5, 9));
+        // Probing from the left edge walks only rightward.
+        assert_eq!(osc8_span_walk(5, 79, "https://x.test", lookup), (5, 9));
+        // Probing from the right edge walks only leftward.
+        assert_eq!(osc8_span_walk(9, 79, "https://x.test", lookup), (5, 9));
+    }
+
+    #[test]
+    fn osc8_span_walk_handles_single_cell_span() {
+        // A 1-cell URI must report `(col, col)` — no over-walk past the
+        // span into adjacent non-OSC-8 cells.
+        let cells: HashMap<u16, &'static str> = HashMap::from_iter([(12, "https://only-one.test")]);
+        let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
+
+        assert_eq!(
+            osc8_span_walk(12, 79, "https://only-one.test", lookup),
+            (12, 12)
+        );
+    }
+
+    #[test]
+    fn osc8_span_walk_stops_at_right_edge() {
+        // The span runs all the way to the row's last cell — the walk
+        // must clamp at `max_col`, not over-run into the next row's
+        // first cell.
+        let cells: HashMap<u16, &'static str> =
+            HashMap::from_iter([(77, "https://x"), (78, "https://x"), (79, "https://x")]);
+        let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
+
+        assert_eq!(osc8_span_walk(78, 79, "https://x", lookup), (77, 79));
+    }
+
+    #[test]
+    fn osc8_span_walk_stops_at_uri_boundary() {
+        // Adjacent OSC 8 cells with a DIFFERENT URI must not extend
+        // the span — different hyperlinks live next to each other in
+        // shell output like `ls --hyperlink`.
+        let cells: HashMap<u16, &'static str> = HashMap::from_iter([
+            (3, "https://a"),
+            (4, "https://a"),
+            (5, "https://b"),
+            (6, "https://b"),
+        ]);
+        let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
+
+        assert_eq!(osc8_span_walk(4, 79, "https://a", lookup), (3, 4));
+        assert_eq!(osc8_span_walk(5, 79, "https://b", lookup), (5, 6));
+    }
+
+    #[test]
+    fn link_underline_rect_single_cell() {
+        // Single-cell URL underline on row 3, column 7 with 10x20 cells.
+        let (x, y, w, h) = link_underline_rect(7, 7, 3, 10.0, 20.0);
+        assert_eq!((x, y, w, h), (70.0, 79.0, 10.0, 1.0));
+    }
+
+    #[test]
+    fn link_underline_rect_multi_cell_span() {
+        // A 5-cell span (cols 4..8 inclusive) on row 0 at 8x16 cells:
+        // x=32, y=15, w=40, h=1.
+        let (x, y, w, h) = link_underline_rect(4, 8, 0, 8.0, 16.0);
+        assert_eq!((x, y, w, h), (32.0, 15.0, 40.0, 1.0));
     }
 }
