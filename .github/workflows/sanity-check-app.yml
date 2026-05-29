@@ -36,8 +36,10 @@ jobs:
           gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
           echo "::endgroup::"
 
-          echo "::group::Installation repositories (must list charliek/roost)"
-          gh api /installation/repositories --jq '.repositories[].full_name'
+          echo "::group::Installation repository count (must be ≥1)"
+          # Count only — the App may later install on private repos (shed, etc.)
+          # and printing names into a public roost workflow log would leak them.
+          gh api /installation/repositories --jq '.total_count'
           echo "::endgroup::"
 
           echo "::group::Token identity (login should be charliek-release-bot[bot])"
