@@ -1,12 +1,16 @@
 name: sanity-check-app
 
-# Throwaway: proves that the charliek-release-bot GitHub App is wired into
-# this repo correctly (App ID + private key secrets resolve, token mints,
-# token sees this repo as an installation). Run manually from the Actions UI,
-# verify the output prints `charliek/roost`, then delete this file before
-# merging. Lives only on the feat/release-bot-app branch.
+# Manual verification that the charliek-release-bot GitHub App is wired into
+# this repo: RELEASE_BOT_APP_ID + RELEASE_BOT_APP_KEY resolve, token mints,
+# the App's installation sees charliek/roost, and the token's identity is the
+# bot. Run from the Actions UI ("Run workflow"); output prints in the job log.
 #
-# Companion to release.yml's bot-driven appcast publish (issue #122 / #136).
+# Useful when:
+#   * first wiring the App into a new repo (verify before touching release.yml)
+#   * rotating the App's private key (re-verify after updating the secret)
+#   * migrating to a new App
+#
+# Companion to release.yml's bot-driven appcast publish (#122 / #136).
 
 on:
   workflow_dispatch: {}
