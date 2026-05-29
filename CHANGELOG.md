@@ -9,6 +9,61 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.5 — 2026-05-29
+
+URLs, selection, and SSH-aware terminals release. URLs in the terminal are now
+clickable on both Mac (⌘-click) and Linux (Ctrl-click), with OSC 8 hyperlink
+ranges plumbed through the workspace; double-click selects words and
+triple-click selects lines; `COLORTERM=truecolor` now follows you across SSH;
+and `release.yml` cuts releases end-to-end — no more local post-release
+script for the Sparkle appcast.
+
+### Features
+
+- **Click-to-open URLs** (#161, #171, #173, #175) — new `roost-url` crate
+  detects URLs in the terminal viewport; OSC 8 hyperlinks honored; ⌘-click on
+  Mac (#173), Ctrl-click on Linux (#175). Mirrored Swift implementation.
+- **Word-on-double-click + line-on-triple-click selection** (#161, #176, #177)
+  — both UIs; matches familiar terminal ergonomics; selection respects URL
+  ranges where applicable.
+- **`COLORTERM` forwarded across SSH** (#172) — new `ssh-env` shell feature
+  injects `COLORTERM=truecolor` into the SSH environment so remote sessions
+  render truecolor instead of dropping to 256-color.
+
+### Release process
+
+- **App-driven Sparkle appcast publish** (#178, closes #136) — `release.yml`
+  EdDSA-signs the DMG and pushes `docs/appcast.xml` to main as the
+  `charliek-release-bot` GitHub App, which is in `main`'s ruleset
+  `bypass_actors`. Replaces v0.0.4's local `publish-appcast.sh` script
+  (deleted). The release flow is now one command: `/release:release vX.Y.Z`.
+- **`update-appcast.py` is now idempotent** — preserves the prior `pubDate`
+  when replacing the same version, so workflow re-runs produce a clean
+  no-op diff instead of a content-identical churn commit.
+- **`main` migrated from classic protection to a ruleset** with `ci-success`
+  required + the release-bot App in the bypass list.
+
+### Fixes
+
+- **Mac sidebar holds its width when the window is resized** (#159).
+
+### Tests + CI
+
+- **Test-only IPC ops** (#157) — `tab.feed_pty_bytes`, `tab.capture_pty_input`,
+  `tab.dump_resolved` unlock new pytest coverage paths.
+- **OSC pipeline end-to-end coverage** (#142, #145, #158) — real OSC bytes
+  driven through the full pipeline in `tools/roosttest/test_osc_pipeline.py`.
+- **Mac OSC drain tests** (#156) — exercise `TerminalView.appendBytes` drain
+  with real OSC byte sequences.
+- **URL + word selection fixtures** (`tests/url-fixtures/`,
+  `tests/word-fixtures/`) — text-based fixtures covering schemes, unicode,
+  trailing punctuation, multi-cell glyphs.
+
+### Docs
+
+- Spawned-shell env-vars table completed + cross-linked between the two
+  shell-integration docs (#174).
+
 ## v0.0.4 — 2026-05-28
 
 Rendering, selection, and clipboard release. Ghostty's sprite renderer is now
