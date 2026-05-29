@@ -27,6 +27,7 @@ members = [
     "crates/roost-ipc",
     "crates/roost-vt",
     "crates/roost-osc",
+    "crates/roost-url",
     "crates/roost-cli",
     "crates/roost-linux",
 ]
@@ -75,6 +76,7 @@ cc      = "1.0"
 
 # Misc
 percent-encoding = "2.3"
+regex            = { version = "1.10" }
 
 [profile.release]
 lto         = "thin"

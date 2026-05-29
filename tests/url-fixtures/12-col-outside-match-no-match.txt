@@ -1,0 +1,5 @@
+# col 20 is past the URL's right edge — no match returned even
+# though the row has a URL at cols 4..17.
+row: see https://a.test here
+col: 20
+---

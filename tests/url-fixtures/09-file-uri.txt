@@ -1,0 +1,6 @@
+row: open file:///tmp/foo.txt now
+col: 10
+---
+col0: 5
+col1: 23
+url: file:///tmp/foo.txt

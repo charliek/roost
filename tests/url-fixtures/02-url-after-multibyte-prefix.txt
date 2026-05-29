@@ -1,0 +1,9 @@
+# UTF-8 prefix "naïve " is 6 chars / 7 bytes — ï is a 2-byte codepoint.
+# Without correct byte→char indexing the regex offsets slip by one
+# column from char 4 onward.
+row: naïve https://example.com
+col: 10
+---
+col0: 6
+col1: 24
+url: https://example.com

@@ -1,0 +1,9 @@
+# IDNA host: codepoints in the URL body match as-is. The regex body
+# class is [^\s<>"'`\\]+ which excludes whitespace + quote-like chars
+# but accepts every other codepoint.
+row: open https://例え.テスト/path here
+col: 7
+---
+col0: 5
+col1: 23
+url: https://例え.テスト/path

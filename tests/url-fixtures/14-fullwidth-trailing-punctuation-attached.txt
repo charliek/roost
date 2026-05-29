@@ -1,0 +1,9 @@
+# Fullwidth ideographic period (U+3002) is NOT in the ASCII strip
+# set — it stays attached to the URL. Matches the Go binary so neither
+# port surprises users with locale-dependent cutoff.
+row: see https://例え.テスト。 next
+col: 7
+---
+col0: 4
+col1: 18
+url: https://例え.テスト。

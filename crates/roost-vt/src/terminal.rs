@@ -480,6 +480,68 @@ impl Terminal {
         })
     }
 
+    /// Return the OSC 8 hyperlink URI attached to the cell at viewport
+    /// coordinates `(col, row)`, or `None` if the cell has no explicit
+    /// hyperlink. Returns `None` for out-of-range coordinates too.
+    ///
+    /// Two-call buffer pattern per libghostty's C API: first call asks
+    /// for the URI length with a null buffer (returns `OutOfSpace` and
+    /// populates `out_len`); second call passes a buffer of the
+    /// reported size. Mirrors `internal/ghostty/grid_ref.go::HyperlinkAt`
+    /// in the legacy Go binary.
+    ///
+    /// The grid_ref is captured + consumed immediately so libghostty's
+    /// "valid only until next mutating call" contract isn't a concern
+    /// for callers — we never hand the ref back out.
+    pub fn hyperlink_at(&self, col: u16, row: u32) -> Option<String> {
+        let gref = self.grid_ref(Point::viewport(col, row))?;
+
+        let mut out_len: usize = 0;
+        // First call: null buffer, returns OutOfSpace if there's a URI
+        // or Success+out_len=0 if there isn't.
+        // SAFETY: gref came from this terminal's grid_ref; out_len is
+        // a real stack local.
+        let rc = unsafe {
+            sys::ghostty_grid_ref_hyperlink_uri(&gref.0, std::ptr::null_mut(), 0, &mut out_len)
+        };
+        match Error::from_result(rc) {
+            Ok(()) => {
+                // No hyperlink on this cell.
+                if out_len == 0 {
+                    return None;
+                }
+                // Success with non-zero len + a null buffer would be a
+                // libghostty contract violation — return None
+                // defensively rather than panic.
+                return None;
+            }
+            Err(Error::OutOfSpace) => {
+                // Expected — drop through to allocate + retry.
+            }
+            Err(_) => return None,
+        }
+        if out_len == 0 {
+            return None;
+        }
+
+        let mut buf: Vec<u8> = vec![0; out_len];
+        let mut written: usize = 0;
+        // SAFETY: gref still valid (no mutating terminal call between
+        // first + second probe); buf and written are stack-owned.
+        let rc = unsafe {
+            sys::ghostty_grid_ref_hyperlink_uri(&gref.0, buf.as_mut_ptr(), buf.len(), &mut written)
+        };
+        if Error::from_result(rc).is_err() {
+            return None;
+        }
+        buf.truncate(written);
+        // The URI is documented as a URI string. We trust libghostty
+        // to write valid UTF-8 (URIs are ASCII per RFC 3986; pct-
+        // encoded bytes are still ASCII). Fall back to None if a
+        // future change introduces non-UTF-8 bytes.
+        String::from_utf8(buf).ok()
+    }
+
     /// Convert a `Point` from one coordinate space to another.
     /// Composition of [`Self::grid_ref`] and [`Self::point_from_grid_ref`]
     /// with the transient `GridRef` discarded immediately, which is the
