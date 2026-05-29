@@ -1,0 +1,11 @@
+# Unicode word with a precomposed `ï` (U+00EF). Pins scalar indexing
+# — the Rust port walks `chars()` and the Swift port walks
+# `unicodeScalars`, so both count `ï` as one cell.
+row: naïve approach
+col: 1
+break_chars: _-.+~/:@%
+click_count: 2
+---
+col0: 0
+col1: 4
+text: naïve

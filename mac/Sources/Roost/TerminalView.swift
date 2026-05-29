@@ -183,6 +183,17 @@ final class TerminalView: NSView {
     /// click began.
     private var linkClickConsumedThisGesture: Bool = false
 
+    /// Set during `mouseDown` when `handleClickCount` commits a
+    /// word/line selection. Read by `mouseUp` so the gesture skips
+    /// (a) the "anchor == cursor → clear" branch (a single-cell
+    /// span — e.g. double-clicking the letter `i` or triple-clicking
+    /// a one-character row — would otherwise be wiped immediately on
+    /// release; Codex flagged this on PR #176) and (b) the copy-on-
+    /// select branch (handleClickCount already wrote the selection
+    /// to the pasteboard — avoids the redundant write Codex also
+    /// flagged). Cleared by `mouseUp` once consumed.
+    private var multiClickConsumedThisGesture: Bool = false
+
     /// Tracking area covering the full view bounds. Required so
     /// `mouseMoved` fires even when the user isn't dragging — hover
     /// detection wouldn't work otherwise. Rebuilt in
@@ -270,6 +281,12 @@ final class TerminalView: NSView {
     /// through. Default `.allow` (matches Ghostty).
     var clipboardWritePolicy: ClipboardWrite = .default
 
+    /// Extra word-char set used by double-click word expansion in
+    /// `mouseDown(with:)`. Read from `RoostConfig.wordBreakChars` at
+    /// tab creation. Default matches Ghostty's `_-.+~/:@%` —
+    /// keeps file paths + URLs whole on double-click.
+    var wordBreakChars: String = WordSelection.defaultWordChars
+
     /// Custom-named selection pasteboard for `copy-on-select = .on`.
     /// Mirrors cmux's `com.mitchellh.ghostty.selection` pattern:
     /// drag-to-select writes here and middle-click in any Roost
@@ -285,13 +302,15 @@ final class TerminalView: NSView {
         theme: Theme = .fallback,
         font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
         copyOnSelect: CopyOnSelect = .default,
-        clipboardWrite: ClipboardWrite = .default
+        clipboardWrite: ClipboardWrite = .default,
+        wordBreakChars: String = WordSelection.defaultWordChars
     ) {
         self.cols = cols
         self.rows = rows
         self.theme = theme
         self.copyOnSelect = copyOnSelect
         self.clipboardWritePolicy = clipboardWrite
+        self.wordBreakChars = wordBreakChars
 
         // Cell metrics: monospaced system font, advance width measured
         // from a representative wide glyph ("M"), height from the
@@ -785,24 +804,34 @@ final class TerminalView: NSView {
     }
 
     /// Build the visible text of one viewport row by walking the
-    /// render state. Each cell contributes its grapheme (one Swift
-    /// `Character`) — empty cells fall through as `" "` so the column
-    /// indices line up with the renderer. Same shape as
-    /// `selectedPlainText` / `dumpText`, narrowed to a single row.
+    /// render state. Each cell contributes exactly **one Unicode
+    /// scalar** so the click column (which the renderer reports in
+    /// cell units) lines up with `unicodeScalars[col]` in
+    /// `WordSelection`/`UrlDetection` — codex flagged this on PR #176
+    /// after noticing that `e\u{0301} foo` would otherwise put scalar
+    /// index 2 on the space, not on `f`. We emit the grapheme's
+    /// first scalar and drop any trailing combining marks; the
+    /// terminal cell is one display column regardless, so the lossy
+    /// reduction only affects what the algorithms see (no glyph is
+    /// drawn from this string). Empty cells fall through as a single
+    /// space.
+    ///
+    /// Same shape as `selectedPlainText` / `dumpText`, narrowed to
+    /// a single row.
     @MainActor
     private func textForViewportRow(_ row: Int) -> String {
         guard let terminal else { return "" }
         renderState.update(terminal: terminal)
-        var line = ""
+        var scalars = String.UnicodeScalarView()
         renderState.walk { cell in
             guard cell.row == row else { return }
-            if let g = cell.glyph {
-                line.append(String(g))
+            if let g = cell.glyph, let first = g.unicodeScalars.first {
+                scalars.append(first)
             } else {
-                line.append(" ")
+                scalars.append(" ")
             }
         }
-        return line
+        return String(scalars)
     }
 
     /// Show the hand cursor when hovering a URL with Cmd held;
@@ -869,13 +898,83 @@ final class TerminalView: NSView {
     override func mouseDown(with event: NSEvent) {
         commandHeld = event.modifierFlags.contains(.command)
         linkClickConsumedThisGesture = false
+        multiClickConsumedThisGesture = false
         let p = convert(event.locationInWindow, from: nil)
         let (col, row) = cellAt(point: p)
+        // Cmd-click on a URL wins over word/line expansion even at
+        // clickCount 2 / 3 — Cmd is the explicit "open this link"
+        // gesture; the user's still right-handed about which one
+        // they meant. Matches the cmux behavior.
         if handleLinkClick(col: col, row: row, commandHeld: commandHeld) {
             linkClickConsumedThisGesture = true
             return
         }
+        let clickCount = max(1, event.clickCount)
+        if clickCount >= 2 {
+            if handleClickCount(col: col, row: row, clickCount: clickCount) {
+                multiClickConsumedThisGesture = true
+                return
+            }
+        }
         selectionMouseDown(event)
+    }
+
+    /// Pure dispatch for double- (word) and triple-click (line)
+    /// selection. Returns `true` when the click was consumed and the
+    /// selection was set; `false` when the caller should fall through
+    /// to the single-cell selection path (whitespace double-click, or
+    /// any `clickCount <= 1`). Extracted into a non-NSEvent function so
+    /// swift-testing cases can drive the same path without fabricating
+    /// an `NSEvent` — mirrors `handleLinkClick`'s test-seam shape.
+    @MainActor
+    @discardableResult
+    func handleClickCount(col: Int, row: Int, clickCount: Int) -> Bool {
+        guard clickCount >= 2 else { return false }
+        let rowText = textForViewportRow(row)
+        let span: WordSpan?
+        if clickCount == 2 {
+            span = WordSelection.expandWord(
+                in: rowText,
+                at: col,
+                extraWordChars: wordBreakChars
+            )
+        } else {
+            // 3+ → line expansion. ghostty and iTerm2 both treat
+            // four-and-up-clicks as a no-op extending the triple-
+            // click selection; we degrade to the same line span.
+            span = WordSelection.expandLine(in: rowText)
+        }
+        guard let s = span else { return false }
+        let ok = setSelection(
+            anchorCol: s.col0,
+            anchorRow: row,
+            cursorCol: s.col1,
+            cursorRow: row
+        )
+        guard ok else { return false }
+        // Copy-on-select. Drag-end fires `mouseUp` which already runs
+        // the copy path against `selection`; double/triple-click
+        // doesn't drag, so we run the same copy step here. Same
+        // pasteboard targets + same selectedPlainText source as the
+        // mouseUp branch — kept in sync so a future config policy
+        // tweak only has to land once on either path.
+        if copyOnSelect != .off,
+           let text = selectedPlainText(),
+           !text.isEmpty
+        {
+            switch copyOnSelect {
+            case .off: break
+            case .on:
+                Self.selectionPasteboard.clearContents()
+                Self.selectionPasteboard.setString(text, forType: .string)
+            case .clipboard:
+                Self.selectionPasteboard.clearContents()
+                Self.selectionPasteboard.setString(text, forType: .string)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+        }
+        return true
     }
 
     /// Pure click-handling for clickable links. Returns `true` when
@@ -973,6 +1072,16 @@ final class TerminalView: NSView {
         // stays intact.
         if linkClickConsumedThisGesture {
             linkClickConsumedThisGesture = false
+            return
+        }
+        // PR #176: a double/triple-click that committed a word/line
+        // selection through `handleClickCount` is already done — the
+        // pasteboard write fired inside that helper, and a single-cell
+        // span (e.g. double-clicking the letter `i`) must survive the
+        // release instead of getting cleared by the "anchor == cursor
+        // → empty" branch below.
+        if multiClickConsumedThisGesture {
+            multiClickConsumedThisGesture = false
             return
         }
         // If the drag never moved (anchor == cursor), clear the

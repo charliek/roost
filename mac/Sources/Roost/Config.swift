@@ -100,6 +100,13 @@ struct RoostConfig: Sendable {
     /// in the terminal can write the host clipboard via OSC 52.
     /// Defaults to `.allow` (matches Ghostty's default).
     var clipboardWrite: ClipboardWrite = .default
+    /// `word-break-chars` setting — chars that count as word chars
+    /// (beyond Unicode letters/digits) for double-click word
+    /// expansion. Default matches Ghostty's `_-.+~/:@%`, keeping
+    /// file paths + URLs whole on double-click. Despite the
+    /// `-break-` name (kept for Ghostty compatibility) the value is
+    /// the EXTRA word-char set, not the break-char set.
+    var wordBreakChars: String = WordSelection.defaultWordChars
 
     static let empty = RoostConfig(
         themeName: nil,
@@ -110,7 +117,8 @@ struct RoostConfig: Sendable {
         keybinds: [],
         commands: [],
         copyOnSelect: .default,
-        clipboardWrite: .default
+        clipboardWrite: .default,
+        wordBreakChars: WordSelection.defaultWordChars
     )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
@@ -247,6 +255,12 @@ func parse(_ text: String) -> RoostConfig {
                     value
                 )
             }
+        case "word-break-chars":
+            // Empty value is "no extras" — Unicode letters/digits
+            // only. Distinct from "missing" (which falls back to the
+            // default). Trimming has already happened; the empty
+            // string maps to the Unicode-only set.
+            cfg.wordBreakChars = value
         case "command":
             // Launcher entry: `command = label="…" run="…" …`. Parse
             // the RAW value (quotes intact) since the tokenizer in

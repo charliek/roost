@@ -1,0 +1,8 @@
+row: visit https://example.com today
+col: 10
+break_chars: _-.+~/:@%
+click_count: 2
+---
+col0: 6
+col1: 24
+text: https://example.com

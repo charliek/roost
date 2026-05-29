@@ -95,7 +95,8 @@ final class TabSession {
         theme: Theme = .fallback,
         font: NSFont = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
         copyOnSelect: CopyOnSelect = .default,
-        clipboardWrite: ClipboardWrite = .default
+        clipboardWrite: ClipboardWrite = .default,
+        wordBreakChars: String = WordSelection.defaultWordChars
     ) {
         self.projectID = projectID
         self.initialCols = cols
@@ -108,7 +109,8 @@ final class TabSession {
             theme: theme,
             font: font,
             copyOnSelect: copyOnSelect,
-            clipboardWrite: clipboardWrite
+            clipboardWrite: clipboardWrite,
+            wordBreakChars: wordBreakChars
         )
     }
 

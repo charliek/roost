@@ -1,0 +1,11 @@
+# Identifiers with underscores (and hyphens, periods, etc.) select
+# whole — the default `_` membership in break_chars keeps Python /
+# Ruby / Rust identifiers intact on double-click.
+row: result = my_var_name.field
+col: 12
+break_chars: _-.+~/:@%
+click_count: 2
+---
+col0: 9
+col1: 25
+text: my_var_name.field

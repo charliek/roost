@@ -1,0 +1,8 @@
+row: see /tmp/foo.txt today
+col: 7
+break_chars: _-.+~/:@%
+click_count: 2
+---
+col0: 4
+col1: 15
+text: /tmp/foo.txt

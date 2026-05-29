@@ -1,0 +1,12 @@
+# Triple-click trims trailing spaces — same as ghostty / iTerm2 do
+# so the clipboard doesn't carry a wall of empty cells from the
+# right side of the viewport that the shell never wrote into. The
+# row below has 5 literal trailing spaces; expandLine peels them.
+row: hello world here     
+col: 0
+break_chars: _-.+~/:@%
+click_count: 3
+---
+col0: 0
+col1: 15
+text: hello world here
