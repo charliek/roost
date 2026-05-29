@@ -1,0 +1,41 @@
+name: sanity-check-app
+
+# Throwaway: proves that the charliek-release-bot GitHub App is wired into
+# this repo correctly (App ID + private key secrets resolve, token mints,
+# token sees this repo as an installation). Run manually from the Actions UI,
+# verify the output prints `charliek/roost`, then delete this file before
+# merging. Lives only on the feat/release-bot-app branch.
+#
+# Companion to release.yml's bot-driven appcast publish (issue #122 / #136).
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}   # explicit: this workflow needs nothing from the workflow token
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - id: bot-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      - name: Token sees the right repo + installation
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::This repo (must print charliek/roost)"
+          gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
+          echo "::endgroup::"
+
+          echo "::group::Installation repositories (must list charliek/roost)"
+          gh api /installation/repositories --jq '.repositories[].full_name'
+          echo "::endgroup::"
+
+          echo "::group::Token identity (login should be charliek-release-bot[bot])"
+          gh api /user --jq '.login'
+          echo "::endgroup::"
