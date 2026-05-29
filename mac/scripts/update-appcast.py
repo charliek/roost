@@ -93,9 +93,17 @@ def main():
         sys.exit(f"error: {appcast_path} has no <channel>")
 
     # Dedupe by version so a re-run (or re-tag) replaces rather than duplicates.
+    # Preserve the prior pubDate when replacing: EdDSA signatures over the same
+    # bytes + key are byte-identical (deterministic Ed25519), so without this
+    # the only diff a re-run produces is a fresh timestamp — which makes the
+    # bot push a no-content-change commit on every release re-run.
+    preserved_pubdate = None
     for item in channel.findall("item"):
         existing = item.find(qname("version"))
         if existing is not None and existing.text == version:
+            prev = item.find("pubDate")
+            if prev is not None and prev.text:
+                preserved_pubdate = prev.text
             channel.remove(item)
 
     now = datetime.now(timezone.utc)
@@ -104,7 +112,7 @@ def main():
 
     item = ET.SubElement(channel, "item")
     ET.SubElement(item, "title").text = version
-    ET.SubElement(item, "pubDate").text = now.strftime(PUBDATE_FMT)
+    ET.SubElement(item, "pubDate").text = preserved_pubdate or now.strftime(PUBDATE_FMT)
     ET.SubElement(item, qname("version")).text = version
     ET.SubElement(item, qname("shortVersionString")).text = version
     ET.SubElement(item, qname("minimumSystemVersion")).text = min_macos
