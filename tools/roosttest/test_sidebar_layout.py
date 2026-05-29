@@ -58,27 +58,22 @@ class TestSidebarLayout:
         sidebar grows by ~20% of the window delta. Post-refactor
         (raw NSSplitView + custom splitView(_:resizeSubviewsWithOldSize:)):
         sidebar holds. GTK has always held; this test pins both behaviors.
-
-        Sizes are bounded under 1280pt because CI runs the GTK target
-        under xvfb's default 1280×1024 virtual display; anything wider
-        gets clamped by the X server and the resize never lands.
         """
         # Seed a known geometry. Use values comfortably inside the
         # sidebar's [160, 400] clamp so a tolerance miss doesn't get
         # swallowed by a constraint clip.
-        roost.window_resize(800, 600)
-        before = _wait_window_width(roost, 800)
+        roost.window_resize(1100, 700)
+        before = _wait_window_width(roost, 1100)
         baseline_sidebar = before["sidebar_width"]
         assert not before["sidebar_collapsed"], "sidebar must be visible for the test"
         assert 160 <= baseline_sidebar <= 400, (
             f"sidebar starting width {baseline_sidebar} out of [160, 400]"
         )
 
-        # The actual assertion. The pre-fix bug grew the sidebar by
-        # ~20% of the window delta — a 400pt window grow added ~80pt
-        # to the sidebar; a 1pt tolerance is well clear of that.
-        roost.window_resize(1200, 600)
-        after = _wait_window_width(roost, 1200)
+        # The actual assertion. The bug grew the sidebar by ~140pt for
+        # this resize; a 1pt tolerance is well clear of that.
+        roost.window_resize(1800, 700)
+        after = _wait_window_width(roost, 1800)
         assert abs(after["sidebar_width"] - baseline_sidebar) <= WIDTH_TOLERANCE_PT, (
             f"sidebar grew on window resize: before={baseline_sidebar} "
             f"after={after['sidebar_width']} (delta "
@@ -92,13 +87,13 @@ class TestSidebarLayout:
         case of the grow-on-widen bug: both share the holding-priority
         dance, so the regression test pins both directions.
         """
-        roost.window_resize(1200, 600)
-        before = _wait_window_width(roost, 1200)
+        roost.window_resize(1800, 700)
+        before = _wait_window_width(roost, 1800)
         baseline_sidebar = before["sidebar_width"]
 
-        roost.window_resize(800, 600)
-        after = _wait_window_width(roost, 800)
-        # The shrink target (800) is still wide enough that the
+        roost.window_resize(1100, 700)
+        after = _wait_window_width(roost, 1100)
+        # The shrink target (1100) is still wide enough that the
         # sidebar shouldn't be compressed (sidebar + min terminal width).
         assert abs(after["sidebar_width"] - baseline_sidebar) <= WIDTH_TOLERANCE_PT, (
             f"sidebar shrank on window narrow: before={baseline_sidebar} "

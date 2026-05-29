@@ -3471,29 +3471,12 @@ impl App {
     /// `window.resize` (test-mode only) — programmatically resize the
     /// window. Gated on `ROOST_TEST_MODE=1` so a user-local script
     /// can't yank window geometry out from under the user.
-    ///
-    /// GTK4 quirk: `set_default_size` alone doesn't reliably resize an
-    /// already-mapped toplevel under xvfb / headless WMs (the CI
-    /// environment). Pair it with `set_size_request` to FORCE the
-    /// allocation, then relax the request back to (-1, -1) so the
-    /// window stays freely resizable for any subsequent user gesture.
-    /// `default_width`/`default_height` property writes ensure the
-    /// allocation propagates on the next layout cycle.
     fn ipc_window_resize(self: &Rc<Self>, width: f64, height: f64) -> Result<(), String> {
         if !self.test_mode {
             return Err("window.resize requires ROOST_TEST_MODE=1 at UI launch".into());
         }
-        let w = width.round() as i32;
-        let h = height.round() as i32;
-        self.window.set_default_size(w, h);
-        self.window.set_size_request(w, h);
-        // Relax the size_request so a later test (or a real user) can
-        // still resize the window. Doing this on the next main-loop
-        // iteration ensures the allocation locks in at (w, h) first.
-        let window = self.window.clone();
-        glib::idle_add_local_once(move || {
-            window.set_size_request(-1, -1);
-        });
+        self.window
+            .set_default_size(width.round() as i32, height.round() as i32);
         Ok(())
     }
 
