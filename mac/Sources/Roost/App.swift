@@ -4505,6 +4505,14 @@ struct SidebarResizeAllocation: Equatable {
     static let useDefault = SidebarResizeAllocation(sidebar: nil, content: nil)
 }
 
+/// Threshold under which a `splitView` width delta is treated as
+/// rounding noise rather than a real window resize. AppKit can call
+/// `resizeSubviewsWithOldSize` with a sub-pixel float diff on what
+/// is effectively the same width (e.g. when tab-bar height changes
+/// re-trigger a layout pass); 0.5pt is well below any real interactive
+/// drag delta.
+let sidebarResizeWidthTolerance: CGFloat = 0.5
+
 /// Compute the resize allocation for `RoostApp`'s split view.
 /// Returns `.useDefault` when NSSplitView's own `adjustSubviews()`
 /// should run (user drag, no width change, or sidebar collapsed);
@@ -4523,11 +4531,10 @@ func computeSidebarResizeAllocation(
     currentSidebarFrame: NSRect,
     dividerThickness: CGFloat,
     minWidth: CGFloat,
-    maxWidth: CGFloat,
-    widthChangeTolerance: CGFloat = 0.5
+    maxWidth: CGFloat
 ) -> SidebarResizeAllocation {
     let dx = newSize.width - oldSize.width
-    let isWindowResize = abs(dx) > widthChangeTolerance
+    let isWindowResize = abs(dx) > sidebarResizeWidthTolerance
     if !isWindowResize { return .useDefault }
     // ⌘B collapse path: sidebar is at width 0. Let `adjustSubviews`
     // honor the collapsed state; we don't want to hand the collapsed

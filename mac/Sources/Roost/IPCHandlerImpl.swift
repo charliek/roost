@@ -820,10 +820,10 @@ actor IPCHandlerImpl: IPCHandler {
     @MainActor
     private func windowMetrics(params: AnyCodable?) async throws -> IPCWindowMetricsResult {
         _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
-        guard let window = RoostBackend.shared.ui?.mainWindow else {
+        guard let ui = RoostBackend.shared.ui, let window = ui.mainWindow else {
             throw IPCHandlerError.internalError("no UI window for window_metrics")
         }
-        let metrics = RoostBackend.shared.ui!.sidebarMetrics()
+        let metrics = ui.sidebarMetrics()
         let frame = window.frame
         return IPCWindowMetricsResult(
             windowWidth: Double(frame.width),
@@ -848,9 +848,13 @@ actor IPCHandlerImpl: IPCHandler {
         let p = try decodeParams(
             params, as: IPCWindowResizeParams.self, expected: ["width", "height"]
         )
-        guard p.width > 0, p.height > 0 else {
+        // Match the GTK handler's validation: width and height must be
+        // positive AND finite (no NaN/Infinity). Without the finite check
+        // a permissive client could push `CGFloat.infinity` into setFrame
+        // and trip AppKit's geometry assertions.
+        guard p.width.isFinite, p.height.isFinite, p.width > 0, p.height > 0 else {
             throw IPCHandlerError.invalidParam(
-                "width and height must be positive; got \(p.width) x \(p.height)"
+                "width and height must be positive and finite; got \(p.width) x \(p.height)"
             )
         }
         guard let window = RoostBackend.shared.ui?.mainWindow else {

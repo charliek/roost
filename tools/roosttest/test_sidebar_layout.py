@@ -19,11 +19,10 @@ by ~140pt over a 700pt window resize).
 from __future__ import annotations
 
 import os
-import time
 
 import pytest
 
-from client import scaled_timeout
+from client import Roost
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -33,20 +32,18 @@ WIDTH_TOLERANCE_PT = 1.0
 def _wait_window_width(roost, target_width: float, timeout: float = 2.0) -> dict:
     """Block until the UI reports the requested window width, then return
     the full metrics. GTK is asynchronous about applying the resize (the
-    request hops to the main context and re-allocates on the next idle);
-    polling avoids a fragile time.sleep.
+    request hops to the main context and re-allocates on the next idle).
+
+    Routes through `Roost._wait` so `ROOST_TEST_TIMEOUT_SCALE` scales
+    this wait alongside every other wait helper.
     """
-    deadline = time.monotonic() + scaled_timeout(timeout)
-    last = roost.window_metrics()
-    while abs(last["window_width"] - target_width) > WIDTH_TOLERANCE_PT:
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"window never reached width {target_width} "
-                f"(last seen {last['window_width']})"
-            )
-        time.sleep(0.05)
-        last = roost.window_metrics()
-    return last
+    Roost._wait(
+        lambda: abs(roost.window_metrics()["window_width"] - target_width)
+        <= WIDTH_TOLERANCE_PT,
+        timeout=timeout,
+        what=f"window width to reach {target_width}",
+    )
+    return roost.window_metrics()
 
 
 @pytest.mark.skipif(

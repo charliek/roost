@@ -50,9 +50,10 @@ type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), 
 
 /// Reply for a [`UiRequest::WindowMetrics`]:
 /// `(window_width, window_height, sidebar_width, sidebar_collapsed)`
-/// in logical points. Read-only — the `Err` arm only fires if the UI
-/// drain can't find the window (race during teardown).
-pub type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<(f64, f64, f64, bool), String>>;
+/// in logical points. The `Result<_, String>` envelope shape matches
+/// every sibling reply (so the shared `ui_call` helper works), but
+/// the UI side always answers `Ok` — GTK widget queries never fail.
+type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<(f64, f64, f64, bool), String>>;
 
 /// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
 /// error message (e.g. tab not found / no live terminal) on failure.
