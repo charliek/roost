@@ -524,6 +524,36 @@ pub struct TabDumpResolvedParams {
     pub tab_id: i64,
 }
 
+/// `tab.expand_selection_at` request: drive the same double-/triple-
+/// click word/line expansion the UI runs from a real mouse press,
+/// then commit the resulting span as the tab's selection. Gated like
+/// `tab.feed_pty_bytes` (ROOST_TEST_MODE=1) — promotes to a real op
+/// later if hooks need it. Mirrors the `handle_click_count` /
+/// `handleClickCount` shape on each port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabExpandSelectionAtParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    pub col: u16,
+    pub row: u16,
+    /// 2 → double-click (word), 3+ → triple-click (line). Values
+    /// below 2 are rejected with `invalid-param`.
+    pub click_count: u8,
+}
+
+/// `tab.expand_selection_at` response: the committed selection's
+/// bounds, mirroring `WordSpan`. `text` is the extracted selection
+/// content (same path `selection.dump` uses), or `None` when the
+/// span turned out to be a single-cell selection that the renderer
+/// reports as empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabExpandSelectionAtResult {
+    pub col0: u16,
+    pub col1: u16,
+    pub text: Option<String>,
+}
+
 /// `tab.dump_resolved` response: post-resolver per-cell view of the
 /// terminal grid. Fg/bg are `#RRGGBB` to keep the JSON human-readable
 /// for test assertions. `has_explicit_bg` tracks whether the bg came
@@ -864,6 +894,11 @@ pub mod ops {
     /// `tab.dump` already exposes. Pins the resolver call site
     /// (theme bold-color → `resolve_cell_colors`) end-to-end.
     pub const TAB_DUMP_RESOLVED: &str = "tab.dump_resolved";
+    /// Test-only word/line selection driver. Same gate as
+    /// `tab.feed_pty_bytes`; runs the production `handle_click_count`
+    /// dispatch on both UIs so the e2e suite can pin word/line
+    /// expansion without synthetic mouse events.
+    pub const TAB_EXPAND_SELECTION_AT: &str = "tab.expand_selection_at";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -1085,6 +1120,36 @@ mod tests {
         // not the raw escape sequence.
         assert!(!json.contains("\\x1b"), "got: {json}");
         round_trip(&p);
+    }
+
+    #[test]
+    fn tab_expand_selection_at_params_round_trip() {
+        let p = TabExpandSelectionAtParams {
+            tab_id: 7,
+            col: 2,
+            row: 0,
+            click_count: 2,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"tab_id\":\"7\""), "got: {json}");
+        assert!(json.contains("\"click_count\":2"), "got: {json}");
+        round_trip(&p);
+    }
+
+    #[test]
+    fn tab_expand_selection_at_result_round_trip() {
+        let r = TabExpandSelectionAtResult {
+            col0: 4,
+            col1: 15,
+            text: Some("/tmp/foo.txt".to_string()),
+        };
+        round_trip(&r);
+        let r_none = TabExpandSelectionAtResult {
+            col0: 0,
+            col1: 0,
+            text: None,
+        };
+        round_trip(&r_none);
     }
 
     /// `tab.capture_pty_input` params: `drain` defaults to false

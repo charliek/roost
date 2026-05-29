@@ -23,3 +23,4 @@ pub mod ipc;
 pub mod local_client;
 pub mod reconcile;
 pub mod single_instance;
+pub mod word_selection;

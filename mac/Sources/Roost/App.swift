@@ -4244,6 +4244,47 @@ extension RoostApp: UiBridge {
         return session.terminalView.dumpResolvedCells()
     }
 
+    func expandTabSelectionAt(
+        tabID: Int64,
+        col: Int,
+        row: Int,
+        clickCount: Int
+    ) -> ExpandSelectionOutcome? {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return nil }
+        // Same dispatch the real mouseDown runs. handleClickCount
+        // both commits the selection and writes the pasteboard;
+        // dumpSelection then reads the extracted text back.
+        guard
+            session.terminalView.handleClickCount(
+                col: col,
+                row: row,
+                clickCount: clickCount
+            )
+        else { return nil }
+        // dumpSelection returns text only; recompute the (col0, col1)
+        // bounds from the same row text the production dispatch
+        // walked. Cheap + deterministic — and avoids plumbing a new
+        // return type all the way through the WordSelection helper.
+        let rowText = session.terminalView.viewportRowTextForTest(row: row)
+        let span: WordSpan?
+        if clickCount == 2 {
+            span = WordSelection.expandWord(
+                in: rowText,
+                at: col,
+                extraWordChars: session.terminalView.wordBreakChars
+            )
+        } else {
+            span = WordSelection.expandLine(in: rowText)
+        }
+        guard let s = span else { return nil }
+        let text = session.terminalView.dumpSelection()?.text
+        return ExpandSelectionOutcome(
+            col0: UInt16(clamping: s.col0),
+            col1: UInt16(clamping: s.col1),
+            text: text
+        )
+    }
+
     /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.
     private func paletteSnapshot() -> PaletteSnapshot {
         guard let panel = palette else { return .closed }

@@ -803,6 +803,16 @@ final class TerminalView: NSView {
         return (c0, c1)
     }
 
+    /// Test-only re-export of `textForViewportRow` so the
+    /// `tab.expand_selection_at` IPC bridge can re-derive the (col0,
+    /// col1) span from the same row text the production dispatch
+    /// walked. Pure read; no state mutation beyond what the
+    /// production code path already does.
+    @MainActor
+    func viewportRowTextForTest(row: Int) -> String {
+        textForViewportRow(row)
+    }
+
     /// Build the visible text of one viewport row by walking the
     /// render state. Each cell contributes exactly **one Unicode
     /// scalar** so the click column (which the renderer reports in

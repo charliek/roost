@@ -125,9 +125,10 @@ impl TerminalView {
         Self::with_theme(Theme::default())
     }
 
-    /// Construct with a custom theme, optional font overrides, and a
-    /// `copy-on-select` mode. The App passes user-supplied
-    /// `font_family` + `font_size_pt` + `copy_on_select` from
+    /// Construct with a custom theme, optional font overrides, a
+    /// `copy-on-select` mode, and the `word-break-chars` extra
+    /// word-char set. The App passes user-supplied `font_family` +
+    /// `font_size_pt` + `copy_on_select` + `word_break_chars` from
     /// `~/.config/roost/config.conf` (defaults applied when absent).
     /// The theme's palette is pushed into libghostty so SGR cells
     /// (`ls --color`, `git diff`) flip to the theme's reds / greens.
@@ -136,10 +137,15 @@ impl TerminalView {
         font_family: Option<&str>,
         font_size_pt: Option<f64>,
         copy_on_select: CopyOnSelect,
+        word_break_chars: String,
     ) -> Self {
         let view = Self::with_theme(theme);
         view.apply_font(font_family, font_size_pt);
-        view.state.borrow_mut().copy_on_select = copy_on_select;
+        {
+            let mut s = view.state.borrow_mut();
+            s.copy_on_select = copy_on_select;
+            s.word_break_chars = word_break_chars;
+        }
         view
     }
 
@@ -234,6 +240,8 @@ impl TerminalView {
             }),
             link_click_consumed_this_gesture: false,
             pointer_inside: false,
+            multi_click_consumed_this_gesture: false,
+            word_break_chars: roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -429,6 +437,15 @@ impl TerminalView {
             move |g, x, y| {
                 let mut s = state.borrow_mut();
                 s.link_click_consumed_this_gesture = false;
+                // PR #176: the parallel GestureClick controller (added
+                // below) may have already claimed this press for a
+                // double/triple-click word/line expansion. If so, skip
+                // the selection-mutation path so the word selection it
+                // set survives the gesture. The flag is cleared in
+                // `drag_end` so the next gesture starts fresh.
+                if s.multi_click_consumed_this_gesture {
+                    return;
+                }
                 // PR C: Ctrl-click on a URL opens the URL and skips
                 // selection setup. Preserves any pre-existing
                 // selection — the user gets the new browser tab
@@ -474,6 +491,14 @@ impl TerminalView {
                 // PR C: don't mutate selection while a Ctrl-click
                 // gesture is being consumed for URL opening.
                 if s.link_click_consumed_this_gesture {
+                    return;
+                }
+                // PR #176: don't shrink a double/triple-click word
+                // selection back to a single cell when the pointer
+                // wobbles after the press. Drag-after-multi-click is
+                // intentionally a no-op (the "expand by word" gesture
+                // ghostty + iTerm2 ship is deferred — see plan).
+                if s.multi_click_consumed_this_gesture {
                     return;
                 }
                 if let Some((start_x, start_y)) = g.start_point() {
@@ -524,6 +549,14 @@ impl TerminalView {
                     s.link_click_consumed_this_gesture = false;
                     return;
                 }
+                // PR #176: the parallel GestureClick already wrote the
+                // word/line selection to PRIMARY. Skip the redundant
+                // write here (matches the Mac port's mouseUp short-
+                // circuit) and clear the flag for the next gesture.
+                if s.multi_click_consumed_this_gesture {
+                    s.multi_click_consumed_this_gesture = false;
+                    return;
+                }
                 let mode = s.copy_on_select;
                 drop(s);
                 if mode == CopyOnSelect::Off {
@@ -538,6 +571,78 @@ impl TerminalView {
             }
         });
         widget.add_controller(drag);
+
+        // PR #176: double-/triple-click word/line selection. A
+        // separate `GestureClick` controller is the cleanest gtk4-rs
+        // surface for n_press dispatch — `GestureDrag` doesn't carry
+        // press-count info. The two controllers coexist; GTK's
+        // built-in resolution lets `GestureDrag` keep handling drags
+        // while the click gesture catches multi-presses on the same
+        // primary button. The handler claims the event sequence for
+        // n_press >= 2 so the drag gesture's begin sees the
+        // `multi_click_consumed_this_gesture` flag and skips the
+        // single-cell anchor.
+        let multi_click = gtk4::GestureClick::new();
+        multi_click.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        multi_click.connect_pressed({
+            let state = state.clone();
+            let widget = widget.clone();
+            move |gesture, n_press, x, y| {
+                if n_press < 2 {
+                    return;
+                }
+                let mut s = state.borrow_mut();
+                // Don't fight the Ctrl-double-click → URL-open path:
+                // drag_begin will see Ctrl held and route to the URL
+                // launcher (PR #175 behavior preserved). Leaving the
+                // multi-click flag CLEAR lets drag_begin's regular
+                // branches run.
+                let ctrl_held = gesture
+                    .current_event_state()
+                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                if ctrl_held {
+                    return;
+                }
+                let Some((col, row)) = s.cell_at(x, y, &widget) else {
+                    return;
+                };
+                let word_break_chars = s.word_break_chars.clone();
+                let row_text = s.text_for_viewport_row(row);
+                let click_count = u8::try_from(n_press).unwrap_or(u8::MAX);
+                let Some(span) = click_count_span(&row_text, col, click_count, &word_break_chars)
+                else {
+                    return;
+                };
+                let Some(screen_y) = s.screen_y_for_viewport_row(row) else {
+                    return;
+                };
+                s.selection = Some(Selection {
+                    anchor_col: span.col0,
+                    anchor_screen_y: screen_y,
+                    cursor_col: span.col1,
+                    cursor_screen_y: screen_y,
+                });
+                s.multi_click_consumed_this_gesture = true;
+                let mode = s.copy_on_select;
+                drop(s);
+                // Copy-on-select right here. The Mac port handles it
+                // inside `handleClickCount`; the GTK side mirrors
+                // that so a click that never drags still writes the
+                // word/line to PRIMARY. The drag_end short-circuit
+                // above prevents the redundant write.
+                if mode != CopyOnSelect::Off {
+                    if let Some(text) = selection_text(&state) {
+                        clipboard::write(clipboard::Target::Primary, &text);
+                        if mode == CopyOnSelect::Clipboard {
+                            clipboard::write(clipboard::Target::Clipboard, &text);
+                        }
+                    }
+                }
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                widget.queue_draw();
+            }
+        });
+        widget.add_controller(multi_click);
 
         // Middle-click pastes the PRIMARY selection into this terminal,
         // matching Linux terminal convention. Routes through the same
@@ -713,6 +818,35 @@ impl TerminalView {
                 false
             }
         }
+    }
+
+    /// Drive the production word-/line-expansion dispatch (the same
+    /// `click_count_span` the GestureClick handler runs) from explicit
+    /// coords, then commit the resulting span as the selection.
+    /// `click_count` is 2 (word) or 3+ (line); anything below 2 is
+    /// rejected upstream. Returns `Some((col0, col1, text))` on success
+    /// and `None` when the dispatch falls through (whitespace
+    /// double-click, out-of-range row, terminal not ready). The
+    /// `tab.expand_selection_at` test-mode IPC op exposes this on
+    /// both UIs so the e2e suite can pin word/line expansion without
+    /// synthetic mouse events.
+    pub fn expand_selection_at(
+        &self,
+        col: u16,
+        row: u16,
+        click_count: u8,
+    ) -> Option<(u16, u16, Option<String>)> {
+        let span = {
+            let mut s = self.state.borrow_mut();
+            let row_text = s.text_for_viewport_row(row);
+            let word_break_chars = s.word_break_chars.clone();
+            click_count_span(&row_text, col, click_count, &word_break_chars)?
+        };
+        if !self.set_selection((span.col0, row), (span.col1, row)) {
+            return None;
+        }
+        let text = selection_text(&self.state);
+        Some((span.col0, span.col1, text))
     }
 
     /// Clear any active selection on this terminal.
@@ -1000,6 +1134,18 @@ struct TerminalViewState {
     /// pressing Ctrl with the pointer outside the widget doesn't
     /// resurrect a stale underline at the last-known cell.
     pointer_inside: bool,
+    /// Set when a double/triple-click commits a word/line selection
+    /// through the n_press dispatch. Read by `drag_end` so the
+    /// gesture skips the copy-on-select branch (n_press dispatch
+    /// already wrote the selection to PRIMARY) and the drag-update
+    /// branch (so a tiny pointer wobble after the multi-click
+    /// doesn't collapse the word selection to a single cell).
+    multi_click_consumed_this_gesture: bool,
+    /// Extra word-char set used by double-click word expansion in the
+    /// n_press dispatch. Loaded from `RoostConfig.word_break_chars`
+    /// at view construction; default matches Ghostty's `_-.+~/:@%`
+    /// (file paths + URLs stay whole on double-click).
+    word_break_chars: String,
 }
 
 /// Active URL hover. `col0` is the URL's first column (inclusive);
@@ -1569,9 +1715,19 @@ impl TerminalViewState {
     }
 
     /// Build the visible text of one viewport row by walking the
-    /// render state. Each cell contributes its grapheme; empty cells
-    /// fall through as `' '` so the column indices line up with the
-    /// renderer. Same shape as `dump_text`, narrowed to one row.
+    /// render state. Each cell contributes exactly **one Unicode
+    /// codepoint** so the click column (cell units) lines up with
+    /// `row.chars().nth(col)` in `word_selection` / `roost_url` —
+    /// codex flagged this on PR #176 after noticing that a row
+    /// starting with `e\u{0301}` would otherwise shift `chars()`
+    /// indices past cell columns. We emit each grapheme's first
+    /// char and drop any trailing combining marks; the terminal
+    /// cell is one display column regardless, so the lossy
+    /// reduction only affects what the algorithms see (no glyph is
+    /// painted from this string). Empty cells fall through as a
+    /// single space.
+    ///
+    /// Same shape as `dump_text`, narrowed to one row.
     fn text_for_viewport_row(&mut self, target_row: u16) -> String {
         if let Err(err) = self.render_state.update(&self.terminal) {
             tracing::warn!(?err, "render_state.update failed for hover URL");
@@ -1582,10 +1738,9 @@ impl TerminalViewState {
             if row != target_row as u32 {
                 return;
             }
-            if cell.text.is_empty() {
-                line.push(' ');
-            } else {
-                line.push_str(&cell.text);
+            match cell.text.chars().next() {
+                Some(c) => line.push(c),
+                None => line.push(' '),
             }
         });
         line
@@ -1881,6 +2036,28 @@ fn paste_text_into(state: &Rc<RefCell<TerminalViewState>>, text: String) {
         text.into_bytes()
     };
     cb(bytes);
+}
+
+/// Decide which span (word vs line) a double/triple-click should
+/// select for a row of text. Pure helper so the GTK n_press dispatch
+/// stays testable without standing up a `DrawingArea` — same shape
+/// as `osc8_span_walk`. Returns `None` for `click_count < 2` (caller
+/// falls through to the single-cell drag path) and for `click_count
+/// == 2` where the clicked cell itself is whitespace. `click_count`
+/// values above 3 fall through to the triple-click line span, matching
+/// what ghostty/iTerm2 do (and what the Mac port's `handleClickCount`
+/// does).
+fn click_count_span(
+    row_text: &str,
+    col: u16,
+    click_count: u8,
+    word_break_chars: &str,
+) -> Option<roost_linux::word_selection::WordSpan> {
+    match click_count {
+        0 | 1 => None,
+        2 => roost_linux::word_selection::expand_word(row_text, col, word_break_chars),
+        _ => Some(roost_linux::word_selection::expand_line(row_text)),
+    }
 }
 
 /// Walk an OSC 8 hyperlink span outward from `col` while the
@@ -2353,5 +2530,74 @@ mod tests {
         // x=32, y=15, w=40, h=1.
         let (x, y, w, h) = link_underline_rect(4, 8, 0, 8.0, 16.0);
         assert_eq!((x, y, w, h), (32.0, 15.0, 40.0, 1.0));
+    }
+
+    // ============================================================
+    // n_press dispatch (PR #161 — word/line selection)
+    // ============================================================
+    //
+    // The full click → expand_word/line → mutate selection → copy
+    // pipeline is exercised in the e2e pytest run against a live
+    // UI via `tab.expand_selection_at`. The unit-test layer below
+    // covers the pure click-count branch in isolation, mirroring
+    // PR #175's `osc8_span_walk` pure-helper coverage.
+
+    use roost_linux::word_selection::{WordSpan, DEFAULT_EXTRA_WORD_CHARS};
+
+    #[test]
+    fn click_count_span_single_click_falls_through() {
+        assert_eq!(
+            click_count_span("hello world", 2, 1, DEFAULT_EXTRA_WORD_CHARS),
+            None
+        );
+        // Zero click_count (defensive) also falls through.
+        assert_eq!(
+            click_count_span("hello world", 2, 0, DEFAULT_EXTRA_WORD_CHARS),
+            None
+        );
+    }
+
+    #[test]
+    fn click_count_span_double_click_returns_word() {
+        assert_eq!(
+            click_count_span("hello world", 8, 2, DEFAULT_EXTRA_WORD_CHARS),
+            Some(WordSpan { col0: 6, col1: 10 })
+        );
+    }
+
+    #[test]
+    fn click_count_span_double_click_whitespace_returns_none() {
+        assert_eq!(
+            click_count_span("hello world", 5, 2, DEFAULT_EXTRA_WORD_CHARS),
+            None
+        );
+    }
+
+    #[test]
+    fn click_count_span_triple_click_returns_line() {
+        assert_eq!(
+            click_count_span("hello world", 0, 3, DEFAULT_EXTRA_WORD_CHARS),
+            Some(WordSpan { col0: 0, col1: 10 })
+        );
+    }
+
+    #[test]
+    fn click_count_span_quadruple_click_degrades_to_line() {
+        // Match ghostty + iTerm2: 4+ clicks degenerate to line, not
+        // some larger selection unit Roost doesn't ship.
+        assert_eq!(
+            click_count_span("hello world", 0, 4, DEFAULT_EXTRA_WORD_CHARS),
+            Some(WordSpan { col0: 0, col1: 10 })
+        );
+    }
+
+    #[test]
+    fn click_count_span_custom_break_chars_splits_path() {
+        // Drop `/` and `.` from the extras — `/tmp/foo.txt` splits
+        // into segments on double-click. Pins the config lever.
+        assert_eq!(
+            click_count_span("see /tmp/foo.txt today", 7, 2, "_-+~:@%"),
+            Some(WordSpan { col0: 5, col1: 7 })
+        );
     }
 }

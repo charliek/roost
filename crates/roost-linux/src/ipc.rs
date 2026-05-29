@@ -26,9 +26,9 @@ use roost_ipc::messages::{
     SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
     TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDumpCursor, TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -98,6 +98,17 @@ type CapturedBytesReply = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
 /// terminal viewport after the production color resolver has run.
 /// `Err` only for unknown tab; this op is ungated.
 type DumpResolvedReply = tokio::sync::oneshot::Sender<Result<ResolvedCellsData, String>>;
+
+/// Reply for [`UiRequest::TabExpandSelectionAt`]: the (col0, col1, text)
+/// triple matching the committed selection. `Err` for unknown tab,
+/// missing test-mode env var, or an out-of-range coord that the
+/// renderer can't anchor a screen-y for.
+pub struct ExpandSelectionData {
+    pub col0: u16,
+    pub col1: u16,
+    pub text: Option<String>,
+}
+type ExpandSelectionReply = tokio::sync::oneshot::Sender<Result<ExpandSelectionData, String>>;
 
 /// Resolver-output snapshot for [`UiRequest::TabDumpResolved`]. Lives
 /// in this crate (like [`SelectionData`]) so the wire layer stays
@@ -206,6 +217,17 @@ pub enum UiRequest {
     TabDumpResolved {
         tab_id: i64,
         reply: DumpResolvedReply,
+    },
+    /// `tab.expand_selection_at` — run the production
+    /// double-/triple-click word/line dispatch against `(col, row)`
+    /// and commit the resulting span as the tab's selection. Gated
+    /// like `TabFeedPtyBytes` (ROOST_TEST_MODE=1).
+    TabExpandSelectionAt {
+        tab_id: i64,
+        col: u16,
+        row: u16,
+        click_count: u8,
+        reply: ExpandSelectionReply,
     },
 }
 
@@ -691,6 +713,30 @@ async fn dispatch(
                 .await?
                 .map_err(map_test_op_err)?;
             encode(&TabCapturePtyInputResult { data })
+        }
+        ops::TAB_EXPAND_SELECTION_AT => {
+            let p: TabExpandSelectionAtParams = decode(params)?;
+            if p.click_count < 2 {
+                return Err(HandlerError::new(
+                    "invalid-param",
+                    format!("click_count must be >= 2 (got {})", p.click_count),
+                ));
+            }
+            let data = h
+                .ui_call(|reply| UiRequest::TabExpandSelectionAt {
+                    tab_id: p.tab_id,
+                    col: p.col,
+                    row: p.row,
+                    click_count: p.click_count,
+                    reply,
+                })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&TabExpandSelectionAtResult {
+                col0: data.col0,
+                col1: data.col1,
+                text: data.text,
+            })
         }
         ops::TAB_DUMP_RESOLVED => {
             let p: TabDumpResolvedParams = decode(params)?;
