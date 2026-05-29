@@ -119,17 +119,30 @@ default prompt only when `PS1` is unset or the shell's stock default.
 ### Feature flags
 
 `$ROOST_SHELL_FEATURES` is a comma list; prefix a feature with `no-` to disable
-it. Default: `cwd,title,marks,prompt`.
+it. Default: `cwd,title,marks,prompt,ssh-env`.
 
 - `cwd` — emit OSC 7 (the working directory).
 - `title` — set the tab title to the cwd.
 - `marks` — emit OSC 133 command marks (these drive the tab's run-state dot).
 - `prompt` — set a default prompt (only when you haven't set one).
+- `ssh-env` — wrap `ssh` so it adds
+  `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"` to every
+  invocation. Without this, macOS's default `ssh_config` only forwards
+  `LANG LC_*` — `COLORTERM` is silently dropped at the SSH boundary
+  and modern TUIs (opencode, neovim with truecolor themes) fall back
+  to 256-color and look washed out on the remote host. Equivalent to
+  Ghostty's `shell-integration-features.ssh-env`. Whether the remote
+  *accepts* the forwarded vars depends on its `sshd_config::AcceptEnv`
+  setting; if the server rejects them, SendEnv is a silent no-op (no
+  worse than current behavior). Scoped to bare `ssh` — `scp`, `rsync`,
+  and `git push` use their own binaries and aren't wrapped.
 
 The flags are opt-*out*: every feature is on unless its `no-` form is present.
 So to keep your own title and prompt, set
 `ROOST_SHELL_FEATURES=no-title,no-prompt` in your rc — auto-loading re-sources
-your rc first, so the override is picked up before Roost's hooks apply.
+your rc first, so the override is picked up before Roost's hooks apply. The
+same opt-out works for `ssh-env`: `ROOST_SHELL_FEATURES=...,no-ssh-env` to
+disable.
 
 ## The environment Roost injects
 

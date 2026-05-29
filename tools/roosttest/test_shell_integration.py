@@ -391,3 +391,73 @@ def test_prompt_not_clobbered_when_custom(roost, project):
               'printf "PS1CHK:applied=%s kept=%s\\n" "${ROOST_PS1_APPLIED:-no}" '
               '"$([ "$PS1" = "MYPROMPT> " ] && echo yes || echo no)"')
     roost.wait_text(tab, "PS1CHK:applied=no kept=yes", timeout=8)
+
+
+# --- ssh-env feature ------------------------------------------------------
+#
+# The `ssh-env` feature defines an `ssh()` wrapper that adds
+# `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"` to every
+# `ssh` invocation. Goal: opencode + other modern TUIs render correctly
+# on remote hosts that today's macOS ssh_config silently strips
+# COLORTERM from. Equivalent to Ghostty's shell-integration-features.ssh-env.
+#
+# These tests cover the function-definition path (default on; opt-out
+# via no-ssh-env). The actual SendEnv argv injection is a literal,
+# verified by `declare -f ssh` inspection without invoking the real ssh
+# binary (the bash check below) and `which ssh` for zsh.
+
+
+def test_ssh_env_wrapper_defined_by_default_bash(roost, project):
+    """`ssh-env` is in the default feature list, so sourcing roost.bash
+    in a fresh interactive shell makes `ssh` a function (not a binary
+    path). Bare bash so only the sourced script enables the wrapper."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab,
+              'export ROOST_TAB_ID=1; '
+              'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
+              'printf "SSHFN:%s\\n" "$(type -t ssh)"')
+    roost.wait_text(tab, "SSHFN:function", timeout=8)
+
+
+def test_ssh_env_wrapper_omitted_when_opted_out_bash(roost, project):
+    """`ROOST_SHELL_FEATURES=...,no-ssh-env` opts out: `ssh` resolves
+    back to the underlying binary (`type -t ssh` = `file`), not a
+    function. Confirms the standard `no-<feature>` opt-out works for
+    the new flag."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab,
+              'export ROOST_TAB_ID=1; '
+              'export ROOST_SHELL_FEATURES=cwd,title,marks,prompt,no-ssh-env; '
+              'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
+              'printf "SSHFN:%s\\n" "$(type -t ssh)"')
+    # Expected: not a function. `type -t ssh` prints "file" when ssh
+    # resolves to a binary on PATH (the normal case on macOS + Linux
+    # CI), or empty when ssh isn't installed at all (still proves the
+    # wrapper didn't load).
+    roost.wait_text(tab, "SSHFN:", timeout=8)
+    # The exact follow-up text must not be "function".
+    import re
+    dump = roost.dump_text(tab)
+    line = next((ln for ln in dump.splitlines() if ln.startswith("SSHFN:")), "")
+    assert "function" not in line, \
+        f"ssh wrapper still defined after no-ssh-env opt-out: {line!r}"
+
+
+def test_ssh_env_wrapper_sendenv_args_bash(roost, project):
+    """The wrapper's body forwards COLORTERM + TERM_PROGRAM +
+    TERM_PROGRAM_VERSION via SendEnv. Verified by `declare -f ssh`
+    inspection — no remote network round-trip needed since the args
+    are a static literal."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    roost.run(tab,
+              'export ROOST_TAB_ID=1; '
+              'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
+              'declare -f ssh | tr -d "\\n" | sed -e "s/^/SSHDEF:/"')
+    roost.wait_text(tab, "SSHDEF:", timeout=8)
+    dump = roost.dump_text(tab)
+    line = next((ln for ln in dump.splitlines() if ln.startswith("SSHDEF:")), "")
+    assert "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" in line, \
+        f"ssh wrapper missing SendEnv literal: {line!r}"

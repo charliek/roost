@@ -132,6 +132,15 @@ When Roost spawns a tab's shell, it injects:
 
 Existing environment is inherited verbatim before these are set.
 
+Roost's shell integration also defines an `ssh` function (when the
+`ssh-env` feature flag is on — default) that adds
+`-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"` to every
+`ssh` invocation. Without this, `COLORTERM` is silently dropped at
+the SSH boundary (macOS's default `ssh_config` only forwards
+`LANG LC_*`) and modern TUIs on the remote host fall back to
+256-color. See [`docs/guides/cwd-tracking.md`](../guides/cwd-tracking.md#feature-flags)
+for the full feature-flag list and how to opt out.
+
 ## Environment variables Roost reads
 
 `roostctl` reads:

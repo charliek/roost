@@ -10,7 +10,15 @@
 # prompt, and reports cwd over SSH (where the native read can't reach).
 #
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
-# disables): cwd, title, marks, prompt.
+# disables): cwd, title, marks, prompt, ssh-env.
+#
+# `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"`
+# to every `ssh` invocation so modern TUIs (opencode, neovim with
+# truecolor themes) render correctly on remote hosts. Equivalent to
+# Ghostty's `shell-integration-features.ssh-env`. Requires the remote
+# sshd to `AcceptEnv` those variables (Debian/Ubuntu defaults only
+# accept LANG LC_*; users may need to extend `AcceptEnv` server-side
+# for the env to take effect).
 #
 # KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/roost.zsh
 
@@ -20,11 +28,27 @@
 typeset -g _ROOST_ZSH_LOADED=1
 
 _roost_feature() {
-  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt}," in
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt,ssh-env}," in
     (*",no-$1,"*) return 1 ;;
     (*) return 0 ;;
   esac
 }
+
+# `ssh-env` feature: forward terminal-capability env vars across the
+# SSH boundary. The macOS default `ssh_config` only sends LANG + LC_*,
+# so COLORTERM is silently dropped — opencode and other modern TUIs
+# then fall back to 256-color and look broken. `builtin command ssh`
+# bypasses any user-defined `ssh` alias/function, mirroring Ghostty's
+# `ssh-env` (ghostty.zsh::ssh). Whether the remote accepts these vars
+# depends on its `AcceptEnv` setting; SendEnv with a rejecting server
+# is a silent no-op (no worse than current behavior).
+if _roost_feature ssh-env; then
+  ssh() {
+    builtin command ssh \
+      -o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" \
+      "$@"
+  }
+fi
 
 __roost_osc7() {
   _roost_feature cwd || return 0
