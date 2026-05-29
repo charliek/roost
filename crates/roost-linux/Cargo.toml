@@ -41,6 +41,10 @@ roost-vt     = { path = "../roost-vt", features = ["ffi"] }
 # the (now-defunct) daemon and roost-linux consume it from here.
 # Mac UI keeps its hand-rolled Swift port (vision DL-5).
 roost-osc    = { path = "../roost-osc" }
+# PR C: shared URL detection (regex + trim pipeline). Mac UI keeps
+# the hand-rolled `UrlDetection.swift` port pinned via the
+# `tests/url-fixtures/` corpus.
+roost-url    = { path = "../roost-url" }
 
 # PTY supervisor copied from roost-core/src/pty.rs at M3a.
 portable-pty = { workspace = true }

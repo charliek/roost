@@ -1089,6 +1089,7 @@ dependencies = [
  "portable-pty",
  "roost-ipc",
  "roost-osc",
+ "roost-url",
  "roost-vt",
  "serde",
  "serde_json",

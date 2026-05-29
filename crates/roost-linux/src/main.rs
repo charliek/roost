@@ -27,6 +27,7 @@ mod sprite;
 mod tab_session;
 mod terminal_view;
 mod theme;
+mod url_launcher;
 
 use std::sync::Arc;
 
