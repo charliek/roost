@@ -572,7 +572,7 @@ final class PtySupervisor {
         env["TERM_PROGRAM_VERSION"] =
             (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
         env["ROOST_SHELL_INTEGRATION"] = "1"
-        env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt"
+        env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt,ssh-env"
         let resourcesDir = Bundle.roostResources.bundleURL.path
         env["ROOST_RESOURCES_DIR"] = resourcesDir
         // Auto-bootstrap the shipped integration with no rc edit. Resolve the

@@ -668,7 +668,7 @@ fn build_command(
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("ROOST_SHELL_INTEGRATION", "1");
     if std::env::var_os("ROOST_SHELL_FEATURES").is_none() {
-        cmd.env("ROOST_SHELL_FEATURES", "cwd,title,marks,prompt");
+        cmd.env("ROOST_SHELL_FEATURES", "cwd,title,marks,prompt,ssh-env");
     }
     if let Some(dir) = resources_dir {
         cmd.env("ROOST_RESOURCES_DIR", dir);

@@ -148,7 +148,7 @@ def test_env_injected(roost, project):
     )
     roost.wait_text(
         tab,
-        "ENVCHK:tp=Roost si=1 feat=cwd,title,marks,prompt term=xterm-256color rd=set",
+        "ENVCHK:tp=Roost si=1 feat=cwd,title,marks,prompt,ssh-env term=xterm-256color rd=set",
         timeout=8,
     )
 
@@ -449,15 +449,21 @@ def test_ssh_env_wrapper_sendenv_args_bash(roost, project):
     """The wrapper's body forwards COLORTERM + TERM_PROGRAM +
     TERM_PROGRAM_VERSION via SendEnv. Verified by `declare -f ssh`
     inspection — no remote network round-trip needed since the args
-    are a static literal."""
+    are a static literal.
+
+    `declare -f ssh` produces ~100 chars; in a default 80-col viewport
+    it wraps across rows. We can't bracket-search reliably (a unique
+    sentinel typed into the command would also appear in the command
+    echo) so we join the whole dump with no separator — wrap-recovery
+    by reassembly. The SendEnv literal is unique enough to the function
+    body that a false hit elsewhere is implausible."""
     tab = roost.open_tab(project, cwd="/tmp",
                          argv=["/bin/bash", "--norc", "--noprofile"])
     roost.run(tab,
               'export ROOST_TAB_ID=1; '
               'source "$ROOST_RESOURCES_DIR/shell-integration/roost.bash"; '
-              'declare -f ssh | tr -d "\\n" | sed -e "s/^/SSHDEF:/"')
-    roost.wait_text(tab, "SSHDEF:", timeout=8)
-    dump = roost.dump_text(tab)
-    line = next((ln for ln in dump.splitlines() if ln.startswith("SSHDEF:")), "")
-    assert "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" in line, \
-        f"ssh wrapper missing SendEnv literal: {line!r}"
+              'declare -f ssh; echo SSHDONE')
+    roost.wait_text(tab, "SSHDONE", timeout=8)
+    joined = "".join(roost.dump_text(tab).splitlines())
+    assert "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" in joined, \
+        f"ssh wrapper missing SendEnv literal in dump: {joined!r}"

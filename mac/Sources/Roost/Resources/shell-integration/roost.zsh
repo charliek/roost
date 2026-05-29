@@ -42,8 +42,15 @@ _roost_feature() {
 # `ssh-env` (ghostty.zsh::ssh). Whether the remote accepts these vars
 # depends on its `AcceptEnv` setting; SendEnv with a rejecting server
 # is a silent no-op (no worse than current behavior).
+#
+# `function ssh { ... }` (no parens) is the zsh-specific syntax that
+# skips alias expansion on the function name — without it, an existing
+# `alias ssh=...` would re-expand `ssh` before the parser sees it and
+# the function definition would silently land on the wrong name. The
+# function body still picks up zsh aliases on `command` if the user
+# defined one, so `builtin command` short-circuits both layers.
 if _roost_feature ssh-env; then
-  ssh() {
+  function ssh {
     builtin command ssh \
       -o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" \
       "$@"
