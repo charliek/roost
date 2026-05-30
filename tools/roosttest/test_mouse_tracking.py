@@ -26,61 +26,20 @@ job in CI.
 from __future__ import annotations
 
 import os
-import re
 import time
 
 import pytest
 
-from client import RoostError, scaled_timeout
+from client import scaled_timeout
+from util import drain, drain_until_match, wait_tab_attached
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
-def _wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
-    """`tab.open` returns as soon as the workspace creates the tab;
-    the UI's TerminalView attaches asynchronously on the main loop.
-    Poll `tab.dump` until it stops returning `not-found`."""
-    deadline = time.monotonic() + scaled_timeout(timeout)
-    while True:
-        try:
-            roost.dump_text(tab_id)
-            return
-        except RoostError as e:
-            if e.code != "not-found":
-                raise
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"tab {tab_id} never attached a TerminalView")
-        time.sleep(0.05)
-
-
-def _drain(roost, tab_id: int) -> bytes:
-    """One-shot drain. Returns whatever bytes the UI has queued onto
-    the input channel since the last drain — including empty when no
-    event fired."""
-    return roost.tab_capture_pty_input(tab_id, drain=True)
-
-
-def _drain_until_match(
-    roost, tab_id: int, pattern: bytes, timeout: float = 2.0
-) -> bytes:
-    """Poll-drain until `pattern` is seen or the deadline expires.
-    Same shape as the OSC pipeline helper."""
-    deadline = time.monotonic() + scaled_timeout(timeout)
-    captured = b""
-    while time.monotonic() < deadline:
-        captured += _drain(roost, tab_id)
-        if re.search(pattern, captured):
-            return captured
-        time.sleep(0.05)
-    raise AssertionError(
-        f"never saw pattern {pattern!r} on tab {tab_id} (captured={captured!r})"
-    )
-
-
-# The whole module is gated on test mode, AND we skip on GTK in PR A.
-# PR B drops the GTK skip and the suite becomes the cross-platform
-# parity gate.
+# The whole module is gated on test mode. Both platforms run it now
+# (PR B dropped the PR-A skip-on-gtk markers); it's the cross-
+# platform behavioral-parity gate the plan called for.
 pytestmark = [
     pytest.mark.skipif(
         not TEST_MODE,
@@ -96,22 +55,22 @@ def test_button_press_release_emits_sgr_when_tracking_enabled(roost, project, ta
     (0); the trailing `M` is press, `m` is release.
     """
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
     # Enable 1000 (button-event) + 1006 (SGR). Clear the input drain
     # so a stray shell-prompt write doesn't pollute the assertion.
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1000h\x1b[?1006h")
-    _drain(roost, tab)
+    drain(roost, tab)
 
     roost.tab_dispatch_mouse_event(
         tab, kind="press", button="left", cell_x=5, cell_y=3
     )
-    captured = _drain_until_match(roost, tab, rb"\x1b\[<0;6;4M")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4M", timeout=2.0)
     assert b"\x1b[<0;6;4M" in captured, captured
 
     roost.tab_dispatch_mouse_event(
         tab, kind="release", button="left", cell_x=5, cell_y=3
     )
-    captured = _drain_until_match(roost, tab, rb"\x1b\[<0;6;4m")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4m", timeout=2.0)
     assert b"\x1b[<0;6;4m" in captured, captured
 
 
@@ -120,8 +79,8 @@ def test_button_no_emit_when_tracking_off(roost, project, target):
     UI routes the press to the selection layer instead. Capture must
     be empty (no SGR sequence in the input channel)."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
-    _drain(roost, tab)  # discard the shell's prompt bytes
+    wait_tab_attached(roost, tab)
+    drain(roost, tab)  # discard the shell's prompt bytes
 
     roost.tab_dispatch_mouse_event(
         tab, kind="press", button="left", cell_x=2, cell_y=2
@@ -129,7 +88,7 @@ def test_button_no_emit_when_tracking_off(roost, project, target):
     # Allow a small settle window in case the UI ever buffers the
     # decision; capture must NOT contain any SGR mouse report.
     time.sleep(scaled_timeout(0.2))
-    captured = _drain(roost, tab)
+    captured = drain(roost, tab)
     assert b"\x1b[<" not in captured, captured
 
 
@@ -139,9 +98,9 @@ def test_drag_emits_motion_with_button_in_mode_1002(roost, project, target):
     drag bit set, release. The drag bit is `+ 32` on the button
     byte in libghostty's SGR encoding."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1002h\x1b[?1006h")
-    _drain(roost, tab)
+    drain(roost, tab)
 
     roost.tab_dispatch_mouse_event(
         tab, kind="press", button="left", cell_x=5, cell_y=3
@@ -152,8 +111,8 @@ def test_drag_emits_motion_with_button_in_mode_1002(roost, project, target):
     roost.tab_dispatch_mouse_event(
         tab, kind="release", button="left", cell_x=7, cell_y=3
     )
-    captured = _drain_until_match(
-        roost, tab, rb"\x1b\[<0;6;4M.*\x1b\[<32;8;4M.*\x1b\[<0;8;4m"
+    captured = drain_until_match(
+        roost, tab, rb"\x1b\[<0;6;4M.*\x1b\[<32;8;4M.*\x1b\[<0;8;4m", timeout=2.0
     )
     # Confirm the report shapes individually so a regression in any
     # one byte fails loudly with the offender named.
@@ -167,26 +126,26 @@ def test_motion_no_button_emits_only_in_mode_1003(roost, project, target):
     Mode 1003 enabled: same motion emits an SGR motion report with
     button=35 (no-button + motion bit 32, total 35)."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
     # Mode 1000 only — no any-event motion gate. The UI's mouseMoved
     # gate short-circuits motion-no-button before reaching the
     # encoder.
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1000h\x1b[?1006h")
-    _drain(roost, tab)
+    drain(roost, tab)
     roost.tab_dispatch_mouse_event(
         tab, kind="motion", button="none", cell_x=4, cell_y=4
     )
     time.sleep(scaled_timeout(0.2))
-    captured_off = _drain(roost, tab)
+    captured_off = drain(roost, tab)
     assert b"\x1b[<" not in captured_off, captured_off
 
     # Now enable 1003. Same motion → SGR report.
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1003h")
-    _drain(roost, tab)
+    drain(roost, tab)
     roost.tab_dispatch_mouse_event(
         tab, kind="motion", button="none", cell_x=4, cell_y=4
     )
-    captured_on = _drain_until_match(roost, tab, rb"\x1b\[<35;5;5M")
+    captured_on = drain_until_match(roost, tab, rb"\x1b\[<35;5;5M", timeout=2.0)
     assert b"\x1b[<35;5;5M" in captured_on, captured_on
 
 
@@ -196,14 +155,14 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
     `MotionThrottleTests`; here we lock in that the
     `tab.dispatch_mouse_event` path actually hits the throttle."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1003h\x1b[?1006h")
-    _drain(roost, tab)
+    drain(roost, tab)
     for _ in range(100):
         roost.tab_dispatch_mouse_event(
             tab, kind="motion", button="none", cell_x=10, cell_y=5
         )
-    captured = _drain_until_match(roost, tab, rb"\x1b\[<35;11;6M")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<35;11;6M", timeout=2.0)
     # Exactly one report — every subsequent same-cell motion is
     # suppressed by the throttle's `lastCell` check.
     reports = captured.count(b"\x1b[<35;11;6M")
@@ -215,16 +174,16 @@ def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):
     `\\x1b[I`. The bytes are the canonical xterm focus sequences and
     the order matters (TUIs interpret O as "lost"; I as "gained")."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1004h")
-    _drain(roost, tab)
+    drain(roost, tab)
 
     roost.app_set_window_focus(focus=False)
-    captured = _drain_until_match(roost, tab, rb"\x1b\[O")
+    captured = drain_until_match(roost, tab, rb"\x1b\[O", timeout=2.0)
     assert b"\x1b[O" in captured, captured
 
     roost.app_set_window_focus(focus=True)
-    captured = _drain_until_match(roost, tab, rb"\x1b\[I")
+    captured = drain_until_match(roost, tab, rb"\x1b\[I", timeout=2.0)
     assert b"\x1b[I" in captured, captured
 
 
@@ -233,12 +192,12 @@ def test_focus_event_silent_when_mode_1004_disabled(roost, project, target):
     A regression that always emitted would dump junk into the user's
     shell prompt on every Cmd-Tab."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
-    _drain(roost, tab)
+    wait_tab_attached(roost, tab)
+    drain(roost, tab)
     roost.app_set_window_focus(focus=False)
     roost.app_set_window_focus(focus=True)
     time.sleep(scaled_timeout(0.2))
-    captured = _drain(roost, tab)
+    captured = drain(roost, tab)
     assert b"\x1b[O" not in captured, captured
     assert b"\x1b[I" not in captured, captured
 
@@ -262,7 +221,7 @@ def test_osc_22_pointer_changes_cursor(roost, project, target):
     through the OSC scanner → cursor mapper → `app.cursor_shape`.
     Empty body and unknown names both canonicalise to `"default"`."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
 
     # `pointer` — the strix divider grab cursor.
     roost.tab_feed_pty_bytes(tab, b"\x1b]22;pointer\x1b\\")
@@ -287,13 +246,13 @@ def test_right_click_emits_button_2_when_tracking_on(roost, project, target):
     `\\x1b[<2;4;4M`. Button code `2` is right-button in SGR
     encoding; the cells are 1-indexed."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
+    wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1000h\x1b[?1006h")
-    _drain(roost, tab)
+    drain(roost, tab)
     roost.tab_dispatch_mouse_event(
         tab, kind="press", button="right", cell_x=3, cell_y=3
     )
-    captured = _drain_until_match(roost, tab, rb"\x1b\[<2;4;4M")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<2;4;4M", timeout=2.0)
     assert b"\x1b[<2;4;4M" in captured, captured
 
 
@@ -304,8 +263,8 @@ def test_left_click_when_tracking_off_does_not_emit_sgr(roost, project, target):
     the URL precedence in the same gesture — a no-URL no-tracking
     click anchors a selection and stays silent.)"""
     tab = roost.open_tab(project, cwd="/tmp")
-    _wait_tab_attached(roost, tab)
-    _drain(roost, tab)
+    wait_tab_attached(roost, tab)
+    drain(roost, tab)
 
     # Press + release with NO mode bytes fed. The capture must stay
     # SGR-free — the legacy selection path runs but it doesn't write
@@ -317,5 +276,5 @@ def test_left_click_when_tracking_off_does_not_emit_sgr(roost, project, target):
         tab, kind="release", button="left", cell_x=2, cell_y=2
     )
     time.sleep(scaled_timeout(0.2))
-    captured = _drain(roost, tab)
+    captured = drain(roost, tab)
     assert b"\x1b[<" not in captured, captured

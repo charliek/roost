@@ -30,51 +30,15 @@ Both targets run these in CI (e2e-gtk + e2e-mac) with
 from __future__ import annotations
 
 import os
-import re
 import time
 
 import pytest
 
-from client import RoostError, scaled_timeout
+from client import scaled_timeout
+from util import drain_until_match, wait_tab_attached
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
-
-
-def _wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
-    """`tab.open` returns as soon as the workspace creates the tab;
-    the UI's TerminalView attaches asynchronously on the main loop.
-    Poll `tab.dump` (same shape, same attachment dependency) until
-    it stops returning `not-found`."""
-    deadline = time.monotonic() + scaled_timeout(timeout)
-    while True:
-        try:
-            roost.dump_text(tab_id)
-            return
-        except RoostError as e:
-            if e.code != "not-found":
-                raise
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"tab {tab_id} never attached a TerminalView")
-        time.sleep(0.05)
-
-
-def _drain_capture_until(roost, tab_id: int, pattern: bytes, timeout: float = 5.0) -> bytes:
-    """Poll `tab.capture_pty_input(drain=True)`, accumulating chunks
-    until `pattern` is seen or the deadline expires. Returns the
-    accumulated bytes for assertion-context use; raises
-    `AssertionError` on timeout so the test fails loudly with the
-    captured tail."""
-    deadline = time.monotonic() + scaled_timeout(timeout)
-    captured = b""
-    while time.monotonic() < deadline:
-        captured += roost.tab_capture_pty_input(tab_id, drain=True)
-        if re.search(pattern, captured):
-            return captured
-        time.sleep(0.05)
-    raise AssertionError(
-        f"never saw pattern {pattern!r} on tab {tab_id} (captured={captured!r})"
-    )
 
 
 @pytest.mark.skipif(
@@ -109,7 +73,7 @@ class TestOscPipeline:
         strongest signal we can get from the bundled-theme set.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         # Clear + home + bold "B" + reset + non-bold "N", on a row
         # the shell startup won't touch.
         roost.tab_feed_pty_bytes(
@@ -135,7 +99,7 @@ class TestOscPipeline:
         leave `has_explicit_bg: false`.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(
             tab,
             b"\x1b[2J\x1b[10;1H\x1b[7mX",
@@ -192,11 +156,11 @@ class TestOscPipeline:
         — libghostty processes SET via vt_write before the QUERY's
         scanner.feed runs, so the reply uses the post-set bg."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;rgb:00/11/22\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]11;?\x07")
         # The 16-bit-per-channel form spells `0000/1111/2222`.
-        captured = _drain_capture_until(roost, tab, rb"0000/1111/2222")
+        captured = drain_until_match(roost, tab, rb"0000/1111/2222")
         # The stale theme bg must NOT be in the reply — for roost-dark
         # that's `1e1e/1e1e/1e1e` (no escape characters needed; the
         # color string is sufficient).
@@ -204,19 +168,19 @@ class TestOscPipeline:
 
     def test_osc10_set_then_query_replies_with_new_fg(self, roost, project):
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]10;rgb:aa/bb/cc\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]10;?\x07")
-        captured = _drain_capture_until(roost, tab, rb"aaaa/bbbb/cccc")
+        captured = drain_until_match(roost, tab, rb"aaaa/bbbb/cccc")
         # Stale theme fg (roost-dark): `ffff/ffff/ffff`.
         assert b"ffff/ffff/ffff" not in captured, captured
 
     def test_osc12_set_then_query_replies_with_new_cursor(self, roost, project):
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]12;rgb:de/ad/be\x07")
         roost.tab_feed_pty_bytes(tab, b"\x1b]12;?\x07")
-        captured = _drain_capture_until(roost, tab, rb"dede/adad/bebe")
+        captured = drain_until_match(roost, tab, rb"dede/adad/bebe")
         # Stale theme cursor (the default cmux/roost cursor):
         # `9898/9898/9d9d`.
         assert b"9898/9898/9d9d" not in captured, captured
@@ -236,12 +200,12 @@ class TestOscPipeline:
         body as out-of-scope; this test stays here so a future
         reordering surfaces by unskipping."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(
             tab,
             b"\x1b]11;rgb:00/11/22\x07\x1b]11;?\x07",
         )
-        captured = _drain_capture_until(roost, tab, rb"\x1b\]11;rgb:")
+        captured = drain_until_match(roost, tab, rb"\x1b\]11;rgb:")
         # When this is FIXED, the assertion should flip to check
         # that the post-set color (0000/1111/2222) appears AND
         # the stale theme color (1e1e/1e1e/1e1e) does not.
@@ -258,7 +222,7 @@ class TestOscPipeline:
         regression in the OSC dispatch surfaces without depending on
         shell integration."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]7;file:///usr\x07")
         # The dispatch fires asynchronously on the UI loop; poll
         # tab.list until cwd reflects.
@@ -277,7 +241,7 @@ class TestOscPipeline:
         until the user explicitly renames (then `user_titled=true`
         locks it). Pins the OSC dispatch end-to-end."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         marker = "roost-osc0-title-test"
         roost.tab_feed_pty_bytes(tab, b"\x1b]0;" + marker.encode("ascii") + b"\x07")
         deadline = time.monotonic() + scaled_timeout(5.0)
@@ -295,7 +259,7 @@ class TestOscPipeline:
         `tab.has_notification = true` via the workspace's
         notification path — same surface a Claude Code hook drives."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]9;build complete\x07")
         deadline = time.monotonic() + scaled_timeout(5.0)
         while time.monotonic() < deadline:
