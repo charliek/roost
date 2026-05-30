@@ -885,6 +885,25 @@ impl App {
                         } => {
                             let _ = reply.send(app.ipc_window_resize(width, height));
                         }
+                        UiRequest::TabDispatchMouseEvent {
+                            tab_id,
+                            kind,
+                            button,
+                            cell_x,
+                            cell_y,
+                            mods,
+                            reply,
+                        } => {
+                            let _ = reply.send(app.ipc_tab_dispatch_mouse_event(
+                                tab_id, kind, button, cell_x, cell_y, mods,
+                            ));
+                        }
+                        UiRequest::AppSetWindowFocus { focused, reply } => {
+                            let _ = reply.send(app.ipc_app_set_window_focus(focused));
+                        }
+                        UiRequest::AppCursorShape { reply } => {
+                            let _ = reply.send(app.ipc_app_cursor_shape());
+                        }
                     }
                 }
             });
@@ -3175,6 +3194,21 @@ impl App {
         None
     }
 
+    /// Look up the `TabSession` for a tab id by scanning all
+    /// projects (the workspace doesn't carry the GTK-side session
+    /// handle). Sibling of `terminal_view_for`. Used to push
+    /// synthetic-event bytes (mouse / focus IPC ops) onto the same
+    /// per-tab serial input channel real keystrokes flow through.
+    fn tab_session_for(self: &Rc<Self>, tab_id: i64) -> Option<Rc<TabSession>> {
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
+                return Some(tab.session.clone());
+            }
+        }
+        None
+    }
+
     /// Read a tab's terminal viewport as text for the `tab.dump` op.
     /// Errors (→ `not-found` on the wire) when the tab has no live
     /// `TerminalView`.
@@ -3450,6 +3484,81 @@ impl App {
         Ok(roost_linux::ipc::ExpandSelectionData { col0, col1, text })
     }
 
+    /// Drive a synthetic mouse event into the production routing
+    /// path at cell coords. Gated on `ROOST_TEST_MODE=1`. Same
+    /// mouse-tracking gating + encoder format negotiation production
+    /// uses — the seam is `TerminalView::ipc_dispatch_mouse_event`.
+    fn ipc_tab_dispatch_mouse_event(
+        self: &Rc<Self>,
+        tab_id: i64,
+        kind: roost_linux::mouse_routing::MouseRoutingAction,
+        button: Option<roost_linux::mouse_routing::MouseRoutingButton>,
+        cell_x: u32,
+        cell_y: u32,
+        mods: u32,
+    ) -> Result<(), String> {
+        if !self.test_mode {
+            return Err("tab.dispatch_mouse_event requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        let view = self
+            .terminal_view_for(tab_id)
+            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
+        let bytes = view.ipc_dispatch_mouse_event(kind, button, cell_x, cell_y, mods as u16);
+        if bytes.is_empty() {
+            // Encoder declined (mode/format mismatch). Not a fault —
+            // production callers also fall through silently.
+            return Ok(());
+        }
+        // Push to the same PTY input channel keystrokes use. The
+        // capture buffer taps that channel, so the e2e test reads
+        // the emitted bytes via `tab.capture_pty_input`.
+        if let Some(session) = self.tab_session_for(tab_id) {
+            session.send_input(bytes);
+        }
+        Ok(())
+    }
+
+    /// Drive a synthetic window-focus state change. Gated on
+    /// `ROOST_TEST_MODE=1`. Targets the active tab (matches the Mac
+    /// behavior). Encoder is gated on mode 1004 by
+    /// `TerminalView::ipc_set_window_focus`.
+    fn ipc_app_set_window_focus(self: &Rc<Self>, focused: bool) -> Result<(), String> {
+        if !self.test_mode {
+            return Err("app.set_window_focus requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        // Active tab: the page selected in the active project's
+        // TabView. Returns None when nothing is selected (workspace
+        // is empty on a cold start).
+        let pid = *self.active_project_id.borrow();
+        let Some(active_tab_id) = self.active_tab_id(pid) else {
+            return Err("no active tab to drive focus on".into());
+        };
+        let session = self
+            .tab_session_for(active_tab_id)
+            .ok_or_else(|| format!("active tab {active_tab_id} has no live terminal"))?;
+        let view = self
+            .terminal_view_for(active_tab_id)
+            .ok_or_else(|| format!("active tab {active_tab_id} has no live terminal"))?;
+        let bytes = view.ipc_set_window_focus(focused);
+        if !bytes.is_empty() {
+            session.send_input(bytes);
+        }
+        Ok(())
+    }
+
+    /// `app.cursor_shape` — read the active tab's last-seen OSC 22
+    /// W3C cursor name. Ungated (read-only).
+    fn ipc_app_cursor_shape(self: &Rc<Self>) -> Result<String, String> {
+        let pid = *self.active_project_id.borrow();
+        let Some(active_tab_id) = self.active_tab_id(pid) else {
+            return Ok("default".to_string());
+        };
+        let view = self
+            .terminal_view_for(active_tab_id)
+            .ok_or_else(|| format!("tab {active_tab_id} has no live terminal"))?;
+        Ok(view.current_cursor_shape_name())
+    }
+
     /// `app.window_metrics` — return window size + sidebar pane width +
     /// collapsed flag in logical points. Read-only: always succeeds.
     /// `Widget::width()` returns the allocated logical width; for the
@@ -3587,21 +3696,15 @@ impl App {
             return;
         }
         // OSC 22 pointer shape — UI-only action (no workspace state).
-        // PR B wires the W3C cursor-name → gdk::Cursor mapping into
-        // the GTK `TerminalView`. PR A only adds the scanner variant +
-        // a swallow here so the Linux side compiles. Logging the body
-        // makes regressions easy to spot during PR B's dogfood pass.
+        // Apply the W3C cursor name to the matching tab's
+        // TerminalView; the view stores it, gates the actual
+        // `set_cursor_from_name` on pointer-in-view, and resets on
+        // alt-screen exit. Mirrors the Mac UI's
+        // `applyCurrentCursorShapeIfNeeded` path.
         if let E::MouseShape(name) = event {
-            // Bound the logged preview: OSC 22 payloads are scanner-
-            // capped but can still be 1 MiB; pretty-printing the full
-            // body during a noisy stream would flood debug logs.
-            let preview: String = name.chars().take(64).collect();
-            tracing::debug!(
-                tab_id,
-                name_len = name.len(),
-                name_preview = %preview,
-                "OSC 22 mouse shape (PR A: ignored on GTK; wired in PR B)"
-            );
+            if let Some(view) = self.terminal_view_for(tab_id) {
+                view.apply_mouse_shape(&name);
+            }
             return;
         }
         let (command, payload): (u32, String) = match event {
@@ -3627,6 +3730,7 @@ impl App {
             E::CommandMark(body) => (133, body),
             // Handled by the short-circuits above; unreachable here.
             E::Clipboard { .. } => unreachable!(),
+            // Handled above via `apply_mouse_shape` on the tab's view.
             E::MouseShape(_) => unreachable!(),
         };
         let Some(client) = self.client.borrow().clone() else {

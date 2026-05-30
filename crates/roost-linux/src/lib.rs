@@ -21,6 +21,7 @@
 pub mod daemon;
 pub mod ipc;
 pub mod local_client;
+pub mod mouse_routing;
 pub mod reconcile;
 pub mod single_instance;
 pub mod word_selection;

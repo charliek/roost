@@ -17,9 +17,10 @@ All tests use the `tab.feed_pty_bytes` (to enable a mode) +
 `tab.dispatch_mouse_event` / `app.set_window_focus` /
 `app.cursor_shape` IPC ops; capture via `tab.capture_pty_input`.
 
-PR A skips on `--roost-target gtk` because the GTK wiring lands in
-PR B; PR B removes the skip-on-gtk markers and the same suite
-becomes the cross-platform parity gate.
+Cross-platform behavioral-parity gate: every case runs against
+`--roost-target mac` (PR A wiring) and `--roost-target gtk`
+(PR B wiring). A regression on either side fails the matching
+job in CI.
 """
 
 from __future__ import annotations
@@ -88,21 +89,12 @@ pytestmark = [
 ]
 
 
-def _skip_if_gtk(target: str) -> None:
-    """Skip helper that PR B will delete after wiring the GTK side."""
-    if target == "gtk":
-        pytest.skip(
-            "mouse-tracking + OSC 22 + focus + cursor-shape wiring lands on GTK in PR B"
-        )
-
-
 def test_button_press_release_emits_sgr_when_tracking_enabled(roost, project, target):
     """Mode 1000 + 1006 (button-event + SGR). A press LEFT at cell
     (5, 3) → `\\x1b[<0;6;4M`; release → `\\x1b[<0;6;4m`. SGR
     encoding uses 1-indexed cells; bit 0 of the button byte is left
     (0); the trailing `M` is press, `m` is release.
     """
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     # Enable 1000 (button-event) + 1006 (SGR). Clear the input drain
@@ -127,7 +119,6 @@ def test_button_no_emit_when_tracking_off(roost, project, target):
     """No `\\x1b[?1000h` enable bytes → the encoder declines and the
     UI routes the press to the selection layer instead. Capture must
     be empty (no SGR sequence in the input channel)."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     _drain(roost, tab)  # discard the shell's prompt bytes
@@ -147,7 +138,6 @@ def test_drag_emits_motion_with_button_in_mode_1002(roost, project, target):
     sequence produces three SGR reports: press(LEFT), motion with
     drag bit set, release. The drag bit is `+ 32` on the button
     byte in libghostty's SGR encoding."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1002h\x1b[?1006h")
@@ -176,7 +166,6 @@ def test_motion_no_button_emits_only_in_mode_1003(roost, project, target):
     """Mode 1000 alone: motion-no-button is suppressed (no report).
     Mode 1003 enabled: same motion emits an SGR motion report with
     button=35 (no-button + motion bit 32, total 35)."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     # Mode 1000 only — no any-event motion gate. The UI's mouseMoved
@@ -206,7 +195,6 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
     (per-cell dedup). The 60 Hz cap is covered by the Swift
     `MotionThrottleTests`; here we lock in that the
     `tab.dispatch_mouse_event` path actually hits the throttle."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1003h\x1b[?1006h")
@@ -226,7 +214,6 @@ def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):
     """Mode 1004 on → focus-out emits `\\x1b[O`; focus-in emits
     `\\x1b[I`. The bytes are the canonical xterm focus sequences and
     the order matters (TUIs interpret O as "lost"; I as "gained")."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1004h")
@@ -245,7 +232,6 @@ def test_focus_event_silent_when_mode_1004_disabled(roost, project, target):
     """Default mode (no 1004 enable) → focus toggles emit nothing.
     A regression that always emitted would dump junk into the user's
     shell prompt on every Cmd-Tab."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     _drain(roost, tab)
@@ -275,7 +261,6 @@ def test_osc_22_pointer_changes_cursor(roost, project, target):
     """Each W3C name produced by strix and friends round-trips
     through the OSC scanner → cursor mapper → `app.cursor_shape`.
     Empty body and unknown names both canonicalise to `"default"`."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
 
@@ -301,7 +286,6 @@ def test_right_click_emits_button_2_when_tracking_on(roost, project, target):
     """Mode 1000 + 1006: right-button press at (3, 3) → SGR
     `\\x1b[<2;4;4M`. Button code `2` is right-button in SGR
     encoding; the cells are 1-indexed."""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     roost.tab_feed_pty_bytes(tab, b"\x1b[?1000h\x1b[?1006h")
@@ -319,7 +303,6 @@ def test_left_click_when_tracking_off_does_not_emit_sgr(roost, project, target):
     silent. (Earlier test asserts absence; this one also exercises
     the URL precedence in the same gesture — a no-URL no-tracking
     click anchors a selection and stays silent.)"""
-    _skip_if_gtk(target)
     tab = roost.open_tab(project, cwd="/tmp")
     _wait_tab_attached(roost, tab)
     _drain(roost, tab)
