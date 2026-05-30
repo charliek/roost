@@ -3503,7 +3503,10 @@ impl App {
         let (view, session) = self
             .tab_handles_for(tab_id)
             .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
-        let bytes = view.ipc_dispatch_mouse_event(kind, button, cell_x, cell_y, mods as u16);
+        // libghostty's `Mods` is u16; reject IPC payloads that overflow
+        // it rather than silently dropping the high bits.
+        let mods = u16::try_from(mods).map_err(|_| format!("modifier mask {mods} exceeds u16"))?;
+        let bytes = view.ipc_dispatch_mouse_event(kind, button, cell_x, cell_y, mods);
         if bytes.is_empty() {
             // Encoder declined (mode/format mismatch). Not a fault —
             // production callers also fall through silently.
@@ -3529,7 +3532,10 @@ impl App {
         // is empty on a cold start).
         let pid = *self.active_project_id.borrow();
         let Some(active_tab_id) = self.active_tab_id(pid) else {
-            return Err("no active tab to drive focus on".into());
+            // Empty / cold workspace is not a server fault — map to
+            // the `not-found` contract via the established phrase so
+            // `ipc.rs::map_test_op_err` returns the right code.
+            return Err("active tab has no live terminal".into());
         };
         let (view, session) = self
             .tab_handles_for(active_tab_id)

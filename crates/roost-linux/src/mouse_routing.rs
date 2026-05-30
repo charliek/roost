@@ -88,11 +88,13 @@ pub fn compute_mouse_tracking_dispatch(
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct MotionEmitter {
     /// Last cell we emitted a report for. `None` until the first
-    /// commit.
-    pub last_cell: Option<(u32, u32)>,
+    /// commit. Private so the `would_emit` / `commit` invariants
+    /// are the only way to advance state; tests within this crate
+    /// access via the in-module `mod tests` rules.
+    last_cell: Option<(u32, u32)>,
     /// Monotonic seconds of the last emit. `None` until the first
     /// commit.
-    pub last_emit: Option<f64>,
+    last_emit: Option<f64>,
 }
 
 impl MotionEmitter {
