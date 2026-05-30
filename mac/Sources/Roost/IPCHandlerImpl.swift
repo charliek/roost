@@ -123,6 +123,14 @@ actor IPCHandlerImpl: IPCHandler {
             return try await encodeResult(self.tabDumpResolved(params: params))
         case "tab.expand_selection_at":
             return try await encodeResult(self.tabExpandSelectionAt(params: params))
+        case "tab.dispatch_mouse_event":
+            try await self.tabDispatchMouseEvent(params: params)
+            return AnyCodable([:] as [String: Any])
+        case "app.set_window_focus":
+            try await self.appSetWindowFocus(params: params)
+            return AnyCodable([:] as [String: Any])
+        case "app.cursor_shape":
+            return try await encodeResult(self.appCursorShape(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -676,6 +684,92 @@ actor IPCHandlerImpl: IPCHandler {
             col1: outcome.col1,
             text: outcome.text
         )
+    }
+
+    @MainActor
+    private func tabDispatchMouseEvent(params: AnyCodable?) async throws {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "tab.dispatch_mouse_event requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCTabDispatchMouseEventParams.self,
+            expected: ["tab_id", "kind", "button", "cell_x", "cell_y", "mods"]
+        )
+        let action: MouseRoutingAction
+        switch p.kind {
+        case "press": action = .press
+        case "release": action = .release
+        case "motion": action = .motion
+        default:
+            throw IPCHandlerError.invalidParam(
+                "kind must be one of press|release|motion (got \(p.kind))"
+            )
+        }
+        let button: MouseRoutingButton?
+        switch p.button {
+        case "left": button = .left
+        case "right": button = .right
+        case "middle": button = .middle
+        case "wheel_up": button = .four
+        case "wheel_down": button = .five
+        case "none": button = nil
+        default:
+            throw IPCHandlerError.invalidParam(
+                "button must be one of left|right|middle|wheel_up|wheel_down|none (got \(p.button))"
+            )
+        }
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to drive tab.dispatch_mouse_event")
+        }
+        if !ui.dispatchTabMouseEvent(
+            tabID: p.tabID,
+            kind: action,
+            button: button,
+            cellCol: p.cellX,
+            cellRow: p.cellY,
+            mods: p.mods
+        ) {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "tab \(p.tabID) has no live terminal"
+            )
+        }
+    }
+
+    @MainActor
+    private func appSetWindowFocus(params: AnyCodable?) async throws {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "app.set_window_focus requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCAppSetWindowFocusParams.self, expected: ["focus"]
+        )
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to drive app.set_window_focus")
+        }
+        if !ui.setSimulatedFocus(focused: p.focus) {
+            throw IPCHandlerError(
+                code: "not-found",
+                message: "no active tab to drive focus on"
+            )
+        }
+    }
+
+    @MainActor
+    private func appCursorShape(params: AnyCodable?) async throws -> IPCAppCursorShapeResult {
+        // Nullary envelope — accept `{}` or `null`. Surfaces typos via
+        // `deny_unknown_fields` on the param struct.
+        _ = try decodeParams(params, as: IPCAppCursorShapeParams.self, expected: [])
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI to read app.cursor_shape")
+        }
+        return IPCAppCursorShapeResult(shape: ui.currentCursorShape())
     }
 
     @MainActor
@@ -1640,6 +1734,56 @@ private struct IPCTabDumpResolvedResult: Codable {
     let cols: UInt16
     let rows: UInt16
     let cells: [IPCResolvedCell]
+}
+
+private struct IPCTabDispatchMouseEventParams: Codable {
+    let tabID: Int64
+    let kind: String
+    let button: String
+    let cellX: UInt32
+    let cellY: UInt32
+    let mods: UInt32
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case kind, button
+        case cellX = "cell_x"
+        case cellY = "cell_y"
+        case mods
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try c.decode(String.self, forKey: .tabID)
+        guard let v = Int64(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
+            )
+        }
+        self.tabID = v
+        self.kind = try c.decode(String.self, forKey: .kind)
+        self.button = try c.decode(String.self, forKey: .button)
+        self.cellX = try c.decode(UInt32.self, forKey: .cellX)
+        self.cellY = try c.decode(UInt32.self, forKey: .cellY)
+        self.mods = try c.decodeIfPresent(UInt32.self, forKey: .mods) ?? 0
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(String(tabID), forKey: .tabID)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(button, forKey: .button)
+        try c.encode(cellX, forKey: .cellX)
+        try c.encode(cellY, forKey: .cellY)
+        try c.encode(mods, forKey: .mods)
+    }
+}
+
+private struct IPCAppSetWindowFocusParams: Codable {
+    let focus: Bool
+}
+
+private struct IPCAppCursorShapeParams: Codable {}
+
+private struct IPCAppCursorShapeResult: Codable {
+    let shape: String
 }
 
 /// Format an `NSColor` as `#RRGGBB` for the `tab.dump_resolved` wire

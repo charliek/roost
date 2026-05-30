@@ -384,3 +384,53 @@ func osc52_st_terminator_works() {
         + [0x1B, 0x5C]
     #expect(feedAll(bytes) == [.clipboard(target: .system, text: "st-terminated")])
 }
+
+// MARK: - OSC 22 (mouse pointer shape)
+
+@Test
+func osc22_pointer_st_terminated() {
+    let bytes: [UInt8] = [0x1B, 0x5D, 0x32, 0x32, 0x3B] + Array("pointer".utf8) + [0x1B, 0x5C]
+    #expect(feedAll(bytes) == [.mouseShape("pointer")])
+}
+
+@Test
+func osc22_default_st_terminated() {
+    let bytes: [UInt8] = [0x1B, 0x5D, 0x32, 0x32, 0x3B] + Array("default".utf8) + [0x1B, 0x5C]
+    #expect(feedAll(bytes) == [.mouseShape("default")])
+}
+
+@Test
+func osc22_bel_terminator() {
+    let bytes: [UInt8] = [0x1B, 0x5D, 0x32, 0x32, 0x3B] + Array("text".utf8) + [0x07]
+    #expect(feedAll(bytes) == [.mouseShape("text")])
+}
+
+@Test
+func osc22_empty_payload_maps_to_empty_string() {
+    // Empty reset form `\x1b]22;\x1b\\`. Surfaces an empty name; the
+    // UI maps "" → platform default cursor. Deliberate divergence
+    // from ghostty/macOS, which rejects the empty form.
+    let bytes: [UInt8] = [0x1B, 0x5D, 0x32, 0x32, 0x3B, 0x1B, 0x5C]
+    #expect(feedAll(bytes) == [.mouseShape("")])
+}
+
+@Test
+func osc22_unknown_shape_passes_through_raw() {
+    let bytes: [UInt8] = [0x1B, 0x5D, 0x32, 0x32, 0x3B] + Array("not_a_real_shape".utf8) + [0x1B, 0x5C]
+    #expect(feedAll(bytes) == [.mouseShape("not_a_real_shape")])
+}
+
+@Test
+func osc22_grabbing_passes_through() {
+    let bytes: [UInt8] = [0x1B, 0x5D, 0x32, 0x32, 0x3B] + Array("grabbing".utf8) + [0x1B, 0x5C]
+    #expect(feedAll(bytes) == [.mouseShape("grabbing")])
+}
+
+@Test
+func osc22_split_across_feeds() {
+    let s = OscScanner()
+    let first = s.feed(Data([0x1B, 0x5D, 0x32, 0x32, 0x3B] + Array("poin".utf8)))
+    #expect(first.isEmpty)
+    let second = s.feed(Data(Array("ter".utf8) + [0x07]))
+    #expect(second == [.mouseShape("pointer")])
+}
