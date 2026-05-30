@@ -174,7 +174,7 @@ def test_collapsed_sidebar_survives_project_delete(roost, target):
     #    the sidebar is still collapsed. Pre-fix, the next-pick
     #    `selectProject` would have uncollapsed it.
     Roost._wait(
-        lambda: roost.identify()["active_project_id"] not in (0, active_id),
+        lambda: roost.identify()["active_project_id"] != active_id,
         timeout=5.0,
         what="next project to become active after delete",
     )

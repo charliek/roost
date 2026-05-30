@@ -343,11 +343,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // + M3 selectTab paths.
         desktopNotifications.requestAuthorization()
         desktopNotifications.onActivate = { [weak self] tabID in
-            // User action (banner click): reveal the sidebar so the
-            // jump destination is visible. `focusTab` itself is pure
-            // data mutation per DL-11.
-            self?.ensureSidebarVisible()
-            self?.focusTab(tabID: tabID)
+            // Guard tab existence BEFORE the reveal so a click on a
+            // banner for a since-closed tab doesn't uncollapse the
+            // sidebar (and rewrite `RoostSidebarVisible = true`) for
+            // a navigation that won't happen. Same guard pattern as
+            // `jumpToUnread`. `focusTab` itself is pure data mutation
+            // per DL-11.
+            guard let self,
+                  self.tabs.contains(where: { $0.id == tabID })
+            else { return }
+            self.ensureSidebarVisible()
+            self.focusTab(tabID: tabID)
         }
 
         // Probe the cell-grid intrinsic size so the right pane reserves
