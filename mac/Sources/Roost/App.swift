@@ -1300,8 +1300,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 }
 
                 // Restore the UI active project + tab selection.
+                // `revealSidebar: false` because this is a launch-time
+                // restore, not a user action — if the user had the
+                // sidebar collapsed at quit, we must not auto-uncollapse
+                // it. Without this, `selectProject` → `ensureSidebar
+                // Visible` → `toggleSidebar` would also rewrite
+                // `RoostSidebarVisible = true`, silently erasing the
+                // user's collapse preference on every launch.
                 if let pid = activeID {
-                    self.selectProject(id: pid)
+                    self.selectProject(id: pid, revealSidebar: false)
                     self.selectTabByPosition(in: pid, position: Int32(activePos))
                 }
                 // The subscription emits a `.resync` as its first event,
@@ -1771,14 +1778,24 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func selectProject(id: Int64) {
+    private func selectProject(id: Int64, revealSidebar: Bool = true) {
         // M3: Reveal the sidebar on ⌘1-9 / explicit project-switch
         // so the user can see which project they've landed on.
         // Mirrors Go `cmd/roost/app.go:1487`. Programmatic selection
         // paths that already have the sidebar in view (single-click
         // sidebar row, WatchEvents reconcile) flow through here too
         // — calling ensureVisible is idempotent when already shown.
-        ensureSidebarVisible()
+        //
+        // `revealSidebar: false` is for callers that restore project
+        // selection programmatically (notably `bootstrapWorkspace` on
+        // launch) and must preserve the user's collapse intent. Without
+        // that escape hatch, `ensureSidebarVisible` → `toggleSidebar`
+        // would silently uncollapse a sidebar the user hid via ⌘B
+        // AND rewrite `RoostSidebarVisible = true` to UserDefaults,
+        // erasing the preference on every launch.
+        if revealSidebar {
+            ensureSidebarVisible()
+        }
         activeProjectID = id
         applySidebarSelection()
         updateWindowTitle()
