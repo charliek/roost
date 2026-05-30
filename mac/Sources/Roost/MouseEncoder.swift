@@ -48,6 +48,62 @@ final class MouseEncoder {
         ghostty_mouse_encoder_free(encoder)
     }
 
+    /// Encode a button event (press / release / motion-with-button)
+    /// at the pointer's cell. Sibling of `encodeWheel` with an
+    /// explicit action — used for the mode 1000/1002 left/right press
+    /// and release paths, plus mode 1002 drag motion. The encoder
+    /// honors the negotiated format (X10 / SGR / pixels) and returns
+    /// empty when tracking is off or the format declines to report.
+    func encodeButton(
+        action: GhosttyMouseAction,
+        button: GhosttyMouseButton,
+        mods: GhosttyMods,
+        x: Float,
+        y: Float,
+        screenWidth: UInt32,
+        screenHeight: UInt32,
+        cellWidth: UInt32,
+        cellHeight: UInt32
+    ) -> Data {
+        return encodeImpl(
+            action: action,
+            buttonOrNil: button,
+            mods: mods,
+            x: x,
+            y: y,
+            screenWidth: screenWidth,
+            screenHeight: screenHeight,
+            cellWidth: cellWidth,
+            cellHeight: cellHeight
+        )
+    }
+
+    /// Encode a motion-no-button event (mode 1003 "any-event"). The
+    /// pointer moves with no button held; the encoder emits a motion
+    /// report when the negotiated mode includes 1003, otherwise the
+    /// returned `Data` is empty.
+    func encodeMotionNoButton(
+        mods: GhosttyMods,
+        x: Float,
+        y: Float,
+        screenWidth: UInt32,
+        screenHeight: UInt32,
+        cellWidth: UInt32,
+        cellHeight: UInt32
+    ) -> Data {
+        return encodeImpl(
+            action: GHOSTTY_MOUSE_ACTION_MOTION,
+            buttonOrNil: nil,
+            mods: mods,
+            x: x,
+            y: y,
+            screenWidth: screenWidth,
+            screenHeight: screenHeight,
+            cellWidth: cellWidth,
+            cellHeight: cellHeight
+        )
+    }
+
     /// Encode a single wheel notch as a button press at the pointer's
     /// cell. `x`/`y` are in surface-space pixels (points are fine as long
     /// as `cellWidth`/`cellHeight` use the same unit — the encoder only
@@ -55,6 +111,35 @@ final class MouseEncoder {
     /// Data when the encoder declines to report (e.g. tracking off).
     func encodeWheel(
         button: GhosttyMouseButton,
+        mods: GhosttyMods,
+        x: Float,
+        y: Float,
+        screenWidth: UInt32,
+        screenHeight: UInt32,
+        cellWidth: UInt32,
+        cellHeight: UInt32
+    ) -> Data {
+        return encodeImpl(
+            action: GHOSTTY_MOUSE_ACTION_PRESS,
+            buttonOrNil: button,
+            mods: mods,
+            x: x,
+            y: y,
+            screenWidth: screenWidth,
+            screenHeight: screenHeight,
+            cellWidth: cellWidth,
+            cellHeight: cellHeight
+        )
+    }
+
+    /// Shared encode path. `buttonOrNil` of `nil` clears the button
+    /// on the event (motion-no-button); a real value sets it. The
+    /// `setopt_from_terminal` push runs every call so a mode flip
+    /// between encodes (apps toggle 1000/1002/1003 mid-stream) is
+    /// picked up immediately.
+    private func encodeImpl(
+        action: GhosttyMouseAction,
+        buttonOrNil: GhosttyMouseButton?,
         mods: GhosttyMods,
         x: Float,
         y: Float,
@@ -75,8 +160,12 @@ final class MouseEncoder {
             ghostty_mouse_encoder_setopt(encoder, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, $0)
         }
 
-        ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_PRESS)
-        ghostty_mouse_event_set_button(event, button)
+        ghostty_mouse_event_set_action(event, action)
+        if let button = buttonOrNil {
+            ghostty_mouse_event_set_button(event, button)
+        } else {
+            ghostty_mouse_event_clear_button(event)
+        }
         ghostty_mouse_event_set_mods(event, mods)
         var pos = GhosttyMousePosition()
         pos.x = x

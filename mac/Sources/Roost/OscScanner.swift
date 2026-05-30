@@ -48,6 +48,13 @@ enum OscEvent: Equatable {
     /// Read requests (`Pc == "?"`) are dropped at parse time —
     /// phase 1 is write-only.
     case clipboard(target: OscClipboardTarget, text: String)
+    /// OSC 22 — set the mouse pointer shape by W3C/CSS cursor name
+    /// (`pointer`, `default`, `text`, `crosshair`, `grab`, `grabbing`,
+    /// `not-allowed`, `n/s/e/w-resize`, …). Empty name and unknown
+    /// names both pass through; the UI maps them to the platform
+    /// default cursor. Strix uses `pointer` for the divider grab and
+    /// `default` to reset.
+    case mouseShape(String)
 
     /// Maps a parsed event to the (osc_command, payload) pair the
     /// `ReportOsc` RPC expects. Used by `TerminalView.appendBytes`
@@ -92,6 +99,11 @@ enum OscEvent: Equatable {
         case .clipboard:
             // OSC 52 is a UI-only action — the daemon doesn't track
             // pasteboard state, so don't forward.
+            return nil
+        case .mouseShape:
+            // OSC 22 is a UI-only action — only the Mac/GTK renderer
+            // owns the OS cursor; the daemon has no concept of
+            // pointer shape.
             return nil
         }
     }
@@ -238,6 +250,10 @@ final class OscScanner {
                     pending.append(.colorQuery(n))
                 }
             }
+        case "22":
+            // Set mouse pointer shape (W3C cursor name). Pass through
+            // verbatim — the UI maps empty + unknown to default.
+            pending.append(.mouseShape(body))
         case "133":
             // Shell-integration prompt/command mark; surface the raw
             // body (A/B/C/D[;exit]). applyOSC maps it to tab state (P4b).

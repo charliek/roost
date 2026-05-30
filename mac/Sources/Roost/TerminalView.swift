@@ -20,6 +20,7 @@
 
 import AppKit
 import CGhosttyVT
+import QuartzCore  // CACurrentMediaTime — monotonic clock for the motion throttle.
 
 final class TerminalView: NSView {
     /// Maximum scrollback rows libghostty-vt retains per terminal.
@@ -209,6 +210,17 @@ final class TerminalView: NSView {
     /// flagged). Cleared by `mouseUp` once consumed.
     private var multiClickConsumedThisGesture: Bool = false
 
+    /// Set during `mouseDown` when `forwardMouseEventToTracking`
+    /// successfully sent the press to the encoder. Read by
+    /// `mouseUp` / `mouseDragged` so the gesture skips the
+    /// selection / copy-on-select paths even when the matching
+    /// release encoder returns empty (e.g. X10 / mode 9, which
+    /// doesn't report releases). Without this flag a tracked X10
+    /// click would fall through to `mouseUp`'s copy-on-select and
+    /// clobber the user's clipboard from a TUI click. Cleared by
+    /// `mouseUp`.
+    private var trackingPressConsumedThisGesture: Bool = false
+
     /// Tracking area covering the full view bounds. Required so
     /// `mouseMoved` fires even when the user isn't dragging — hover
     /// detection wouldn't work otherwise. Rebuilt in
@@ -275,6 +287,35 @@ final class TerminalView: NSView {
     /// the user can quickly flick back without overshoot.
     private var scrollAccum: Double = 0.0
     private var lastScrollDirection: Int = 0
+
+    /// Throttle for mode 1003 motion-no-button reports. Caps the
+    /// PTY's motion-byte rate to 60 Hz and skips per-cell duplicates.
+    /// Lives on TerminalView so the per-tab throttle state doesn't
+    /// leak across tabs. See `MotionEmitter` in MouseRouting.swift.
+    private var motionEmitter = MotionEmitter()
+
+    /// Last applied W3C cursor name from OSC 22. Empty string (or
+    /// `"default"`) means the platform default arrow. Strix sends
+    /// `pointer` while hovering its split bar and `default` to reset.
+    /// Read by `cursorUpdate(with:)` and the `app.cursor_shape` IPC
+    /// op (Tier 1 OSC 22 wiring). Reset to empty on alt-screen exit
+    /// so a hung TUI's stale `pointer` doesn't survive across tab
+    /// teardown / shell reset.
+    private var currentOscShape: String = ""
+
+    /// Tracks the prior alt-screen state so `appendBytes` can detect
+    /// an alt→primary transition and reset `currentOscShape`. xterm
+    /// convention: a TUI that owns the alt screen owns the cursor
+    /// shape with it; once the alt screen exits, the platform
+    /// default returns.
+    private var wasAltScreenActive: Bool = false
+
+    /// Set by the OSC 22 drain arm in `appendBytes` if any OSC 22
+    /// landed during the current chunk. Read at the alt-screen-exit
+    /// reset to skip the reset when the TUI already set its own
+    /// shape (typical strix exit: `default` immediately before the
+    /// alt-exit CSI). Reset to false at the top of each `appendBytes`.
+    private var oscShapeSetInThisChunk: Bool = false
 
     /// `true` when the viewport has been scrolled away from the bottom
     /// by a local-scroll event. Cleared by the snap-to-bottom hook in
@@ -417,6 +458,7 @@ final class TerminalView: NSView {
         // daemon can react to title / cwd / notification OSCs.
         // The bytes still flow through to libghostty unchanged —
         // the scanner is purely additive.
+        oscShapeSetInThisChunk = false
         let events = oscScanner.feed(data)
         for event in events {
             // Synthesise OSC 10/11/12 query replies inline —
@@ -462,6 +504,19 @@ final class TerminalView: NSView {
                 pb.setString(text, forType: .string)
                 continue
             }
+            // OSC 22 cursor shape — UI-only action. Strix uses this
+            // for the divider grab; kitty et al. for broader hover
+            // affordances. Empty body and unknown names both fall
+            // back to the platform default arrow on
+            // `cursorUpdate(with:)`. Store the raw name (canonicalised
+            // for the IPC reader) so the next tracking-area refresh
+            // applies it.
+            if case .mouseShape(let name) = event {
+                currentOscShape = name
+                oscShapeSetInThisChunk = true
+                applyCurrentCursorShapeIfNeeded()
+                continue
+            }
             guard let (cmd, payload) = event.asReport else {
                 continue
             }
@@ -471,6 +526,24 @@ final class TerminalView: NSView {
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             ghostty_terminal_vt_write(terminal, base, data.count)
         }
+        // Alt→primary transition resets the OSC 22 cursor shape so a
+        // TUI that owned the alt screen with a `pointer` doesn't
+        // leave the cursor stuck on shell prompt. Matches xterm /
+        // ghostty conventions.
+        //
+        // Skip the reset when this chunk also processed an OSC 22 —
+        // the TUI explicitly set its own shape on the way out (e.g.
+        // strix sends `default` immediately before exiting alt), and
+        // clobbering it here would lose the byte-order ordering the
+        // scanner already honored.
+        let altNow = isAltScreenActive()
+        if wasAltScreenActive, !altNow, !currentOscShape.isEmpty,
+           !oscShapeSetInThisChunk
+        {
+            currentOscShape = ""
+            applyCurrentCursorShapeIfNeeded()
+        }
+        wasAltScreenActive = altNow
         needsDisplay = true
     }
 
@@ -563,6 +636,12 @@ final class TerminalView: NSView {
         // the next blink tick — matches Go session.go:1232 behavior.
         cursorBlinkOn = true
         updateBlinkTimerForFocus()
+        // Mode 1004 focus tracking: report focus-in to the app. vim,
+        // less, btop and similar TUIs use this to redraw on focus
+        // state changes. Emit only when the app actually enabled
+        // the mode — otherwise the bytes would land at the shell
+        // prompt as visible junk.
+        emitFocusEvent(focused: true)
         needsDisplay = true
     }
 
@@ -574,7 +653,56 @@ final class TerminalView: NSView {
         // misleading on a background window. Clear so the next
         // focus-in starts fresh.
         clearLinkHoverState()
+        emitFocusEvent(focused: false)
         needsDisplay = true
+    }
+
+    /// Write the xterm focus-tracking sequence onto the PTY input
+    /// channel when mode 1004 is enabled. Routes through the pure
+    /// `encodeFocusBytes` helper so the production byte selection
+    /// (CSI I for gained, CSI O for lost) is testable without an
+    /// NSView.
+    ///
+    /// Background tabs' TerminalViews each observe the same window-
+    /// key notifications, so without gating on first-responder
+    /// status every Cmd-Tab would write focus events to every
+    /// open mode-1004 TUI. `requireFirstResponder=true` (the default
+    /// for the window-notification path) keeps the emit on the
+    /// active tab only. The IPC test seam passes `false` because
+    /// `app.set_window_focus` already targets the active session
+    /// upstream.
+    @MainActor
+    func emitFocusEvent(focused: Bool, requireFirstResponder: Bool = true) {
+        guard isFocusTrackingActive() else { return }
+        if requireFirstResponder, !viewIsFirstResponder { return }
+        let data = Self.encodeFocusBytes(focused: focused)
+        if !data.isEmpty {
+            onKey?(data)
+        }
+    }
+
+    /// Pure byte encoder for the xterm focus-tracking sequence.
+    /// Uses libghostty-vt's `ghostty_focus_encode` so the wire
+    /// format follows the same authoritative source ghostty itself
+    /// uses. Returns empty `Data` on any FFI hiccup; callers
+    /// `onKey?(...)` only when non-empty. Exposed for unit tests so
+    /// a regression that swapped CSI I / CSI O is caught against
+    /// the actual encoder, not test-local literals.
+    ///
+    /// `nonisolated` so swift-testing's default-isolated suite can
+    /// call it without hopping to `@MainActor` (TerminalView's
+    /// isolation). The C call is thread-safe and stateless.
+    nonisolated static func encodeFocusBytes(focused: Bool) -> Data {
+        let event: GhosttyFocusEvent = focused ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST
+        var buf = [CChar](repeating: 0, count: 8)
+        var written: size_t = 0
+        let rc = buf.withUnsafeMutableBufferPointer { p in
+            ghostty_focus_encode(event, p.baseAddress, p.count, &written)
+        }
+        guard rc.rawValue == GHOSTTY_SUCCESS.rawValue, written > 0 else { return Data() }
+        return buf.prefix(written).withUnsafeBufferPointer { ptr in
+            Data(bytes: ptr.baseAddress!, count: written)
+        }
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -684,11 +812,25 @@ final class TerminalView: NSView {
         hoverTrackingArea = area
     }
 
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerIsOverThisView = true
+        // A background-tab OSC 22 drain may have set
+        // `currentOscShape` while we were unfocused; apply now that
+        // the pointer is over us so the shape lands without waiting
+        // for the next mouseMoved.
+        applyCurrentCursorShapeIfNeeded()
+    }
+
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        pointerIsOverThisView = false
         if hoverURL != nil {
             hoverURL = nil
-            updateLinkCursor()
+            // No `.set()` call: the pointer's now in another tracking
+            // area (or outside the window), and changing the OS
+            // cursor here would race the destination's
+            // `cursorUpdate`. Redraw to drop the URL underline.
             needsDisplay = true
         }
     }
@@ -696,7 +838,22 @@ final class TerminalView: NSView {
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
         commandHeld = event.modifierFlags.contains(.command)
-        recomputeHoverURL(at: convert(event.locationInWindow, from: nil))
+        let point = convert(event.locationInWindow, from: nil)
+        // URL hover detection runs regardless of mode — Cmd-hover is
+        // a peek gesture and the underline + hand cursor are useful
+        // even when a TUI has mouse tracking enabled.
+        recomputeHoverURL(at: point)
+        // Mode 1003 (any-event) motion: report movement to the PTY
+        // with no button held. The 60 Hz cap + per-cell dedup lives
+        // inside `emitMouseTracking` so the IPC test seam exercises
+        // it too.
+        guard isMouseTrackingActive(), isAnyEventMotionTrackingActive() else { return }
+        emitMouseTracking(
+            action: .motion,
+            button: nil,
+            mods: Self.mouseMods(forFlags: event.modifierFlags),
+            point: point
+        )
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -718,6 +875,20 @@ final class TerminalView: NSView {
             }
         } else {
             recomputeHoverURL(at: p)
+        }
+        // Mouse-tracking apps under mode 1002 (button-event) want
+        // drag motion reports. The encoder declines (returns empty)
+        // when the mode is 1000-only — but if the press was already
+        // consumed by tracking, the drag still belongs to the TUI
+        // (we just don't ship motion bytes). Mirror of the mouseUp
+        // tracking-press-consumed short-circuit.
+        let dragForwarded = forwardMouseEventToTracking(
+            kind: .motion,
+            button: .left,
+            event: event
+        )
+        if dragForwarded || trackingPressConsumedThisGesture {
+            return
         }
         selectionMouseDragged(event)
     }
@@ -859,19 +1030,69 @@ final class TerminalView: NSView {
         return String(scalars)
     }
 
-    /// Show the hand cursor when hovering a URL with Cmd held;
-    /// otherwise restore the default I-beam. AppKit's cursor stack
-    /// can drift; calling `.set()` directly is the most reliable
-    /// path — `cursorUpdate(with:)` only fires on tracking-area
-    /// boundary crossings, not on internal state changes like a
-    /// modifier press.
+    /// Apply the right cursor for the current state. AppKit's cursor
+    /// stack can drift; calling `.set()` directly is the most
+    /// reliable path — `cursorUpdate(with:)` only fires on
+    /// tracking-area boundary crossings, not on internal state
+    /// changes like a modifier press.
+    ///
+    /// Precedence (highest → lowest):
+    ///   1. Cmd-hover over a URL → `.pointingHand` (URL beats OSC 22).
+    ///   2. OSC 22 cursor shape set by the running TUI → mapped via
+    ///      `nsCursorForW3CName`.
+    ///   3. Default → `.iBeam` (the terminal's "I-can-select-text" cue).
     @MainActor
     private func updateLinkCursor() {
+        applyCurrentCursorShapeIfNeeded()
+    }
+
+    /// Apply the cursor implied by `commandHeld + hoverURL +
+    /// currentOscShape`. Called from the URL-hover recompute and
+    /// from the OSC 22 drain — both can change the right answer.
+    ///
+    /// Only mutates the system cursor when the pointer is inside
+    /// THIS view's tracking area. Without that gate a background
+    /// tab's OSC 22 drain would re-apply a process-global cursor
+    /// while the pointer is over another tab (or another app).
+    /// The view's own `cursorUpdate(with:)` override re-applies
+    /// on tracking-area boundary crossings, so on the next enter
+    /// the right cursor lands.
+    @MainActor
+    private func applyCurrentCursorShapeIfNeeded() {
+        guard pointerIsOverThisView else { return }
         if hoverURL != nil && commandHeld {
             NSCursor.pointingHand.set()
-        } else {
-            NSCursor.iBeam.set()
+            return
         }
+        if !currentOscShape.isEmpty {
+            nsCursorForW3CName(currentOscShape).set()
+            return
+        }
+        NSCursor.iBeam.set()
+    }
+
+    /// Tracks whether the pointer is currently inside our hover
+    /// tracking area. Updated by `mouseEntered` / `mouseExited`
+    /// (the tracking area's `.mouseEnteredAndExited` flag), so a
+    /// background-tab OSC 22 drain doesn't reach NSCursor while the
+    /// pointer is elsewhere.
+    private var pointerIsOverThisView: Bool = false
+
+    /// AppKit calls this when the pointer crosses our tracking area.
+    /// Without this override the OS would reset to `.arrow` on every
+    /// crossing; here we re-apply the active cursor so OSC 22 + URL
+    /// hover survive the boundary.
+    override func cursorUpdate(with event: NSEvent) {
+        applyCurrentCursorShapeIfNeeded()
+    }
+
+    /// Read-only accessor for the active OSC 22 shape (canonicalised
+    /// — empty body and `"default"` both return `"default"`). Used by
+    /// the `app.cursor_shape` IPC op so test clients can assert the
+    /// renderer actually consumed an OSC 22 payload.
+    @MainActor
+    func currentCursorShapeName() -> String {
+        return canonicalCursorShape(currentOscShape)
     }
 
     /// Cmd-click on a URL opens it; everything else falls through to
@@ -924,14 +1145,28 @@ final class TerminalView: NSView {
         commandHeld = event.modifierFlags.contains(.command)
         linkClickConsumedThisGesture = false
         multiClickConsumedThisGesture = false
+        trackingPressConsumedThisGesture = false
         let p = convert(event.locationInWindow, from: nil)
         let (col, row) = cellAt(point: p)
         // Cmd-click on a URL wins over word/line expansion even at
         // clickCount 2 / 3 — Cmd is the explicit "open this link"
         // gesture; the user's still right-handed about which one
-        // they meant. Matches the cmux behavior.
+        // they meant. Matches the cmux behavior. URL precedence also
+        // wins over mouse-tracking forwarding (matches ghostty).
         if handleLinkClick(col: col, row: row, commandHeld: commandHeld) {
             linkClickConsumedThisGesture = true
+            return
+        }
+        // Mouse-tracking apps (TUIs with `\x1b[?1000h` / `?1002h`
+        // enabled) get press reports at the pointer's cell. libvt's
+        // encoder gates internally on the negotiated mode + format;
+        // an empty return when the mode declines is its job.
+        if forwardMouseEventToTracking(
+            kind: .press,
+            button: .left,
+            event: event
+        ) {
+            trackingPressConsumedThisGesture = true
             return
         }
         let clickCount = max(1, event.clickCount)
@@ -1109,6 +1344,21 @@ final class TerminalView: NSView {
             multiClickConsumedThisGesture = false
             return
         }
+        // Mouse-tracking owned the press; the release belongs to it
+        // too. Try the encoder first; if it declines (X10 / mode 9
+        // doesn't report releases) the gesture STILL must skip
+        // selection / copy-on-select — without this check the
+        // X10-tracked click would clobber the clipboard. Mirror of
+        // the `forward press → consumed` short-circuit on mouseDown.
+        let releaseForwarded = forwardMouseEventToTracking(
+            kind: .release,
+            button: .left,
+            event: event
+        )
+        if releaseForwarded || trackingPressConsumedThisGesture {
+            trackingPressConsumedThisGesture = false
+            return
+        }
         // If the drag never moved (anchor == cursor) AND the selection
         // wasn't committed via multi-click / IPC, clear it — a
         // single-cell "click but didn't drag" shouldn't leave a stray
@@ -1144,6 +1394,51 @@ final class TerminalView: NSView {
                 NSPasteboard.general.setString(text, forType: .string)
             }
         }
+    }
+
+    /// Right-button press → forward to the encoder when mouse
+    /// tracking is on; otherwise no-op (no context menu yet — Tier 3
+    /// scope). When the encoder declines (e.g. mode is 1000-only and
+    /// the negotiated set doesn't include right-button), the bytes
+    /// are empty and the event silently passes through.
+    override func rightMouseDown(with event: NSEvent) {
+        if forwardMouseEventToTracking(
+            kind: .press,
+            button: .right,
+            event: event
+        ) {
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
+
+    /// Right-button release: pair with `rightMouseDown` so apps
+    /// using mode 1006 (SGR) get the explicit release event with the
+    /// right-button identifier. Outside tracking, fall through.
+    override func rightMouseUp(with event: NSEvent) {
+        if forwardMouseEventToTracking(
+            kind: .release,
+            button: .right,
+            event: event
+        ) {
+            return
+        }
+        super.rightMouseUp(with: event)
+    }
+
+    /// Right-button drag motion: AppKit dispatches this separately
+    /// from `mouseDragged` (which is left-only). Under mode 1002
+    /// the TUI expects motion reports for the held button to keep
+    /// flowing — left or right.
+    override func rightMouseDragged(with event: NSEvent) {
+        if forwardMouseEventToTracking(
+            kind: .motion,
+            button: .right,
+            event: event
+        ) {
+            return
+        }
+        super.rightMouseDragged(with: event)
     }
 
     /// Middle-click pastes from the named selection pasteboard,
@@ -1515,11 +1810,37 @@ final class TerminalView: NSView {
     ///     bit 15      = the ANSI flag (false for DEC private modes).
     @MainActor
     private func bracketedPasteEnabled() -> Bool {
+        return isDecModeEnabled(2004)
+    }
+
+    /// Read a DEC private mode flag. `0x7FFF` mask is the bit packing
+    /// the `ghostty_mode_new` C macro uses: low 15 bits = mode number,
+    /// bit 15 = ANSI flag (always 0 for DEC private modes). Returns
+    /// `false` on any FFI hiccup so callers default to "not enabled."
+    @MainActor
+    private func isDecModeEnabled(_ mode: UInt16) -> Bool {
         guard let terminal else { return false }
         var on = false
-        let mode = GhosttyMode(2004 & 0x7FFF)
-        let rc = ghostty_terminal_mode_get(terminal, mode, &on)
+        let m = GhosttyMode(mode & 0x7FFF)
+        let rc = ghostty_terminal_mode_get(terminal, m, &on)
         return rc.rawValue == 0 && on
+    }
+
+    /// True when mode 1003 (any-event motion tracking) is on. Strix
+    /// enables this so it can detect hover over its split bar without
+    /// holding a button. Without 1003, only mode 1000/1002 reports
+    /// are emitted and motion-no-button is suppressed at the call
+    /// site.
+    @MainActor
+    private func isAnyEventMotionTrackingActive() -> Bool {
+        return isDecModeEnabled(1003)
+    }
+
+    /// True when mode 1004 (focus tracking) is on. vim, less, btop
+    /// and similar TUIs use it to redraw on focus state changes.
+    @MainActor
+    private func isFocusTrackingActive() -> Bool {
+        return isDecModeEnabled(1004)
     }
 
     /// Phase 5.5b: forward keystrokes to the StreamPty writer.
@@ -1702,6 +2023,170 @@ final class TerminalView: NSView {
         var screen: GhosttyTerminalScreen = GHOSTTY_TERMINAL_SCREEN_PRIMARY
         _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
         return screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+    }
+
+    /// Decide via the pure `computeMouseTrackingDispatch` whether to
+    /// forward this mouse event to the encoder, and (if so) call
+    /// the encoder + emit. Returns `true` when the event was
+    /// consumed by the mouse-tracking forward — caller must not
+    /// run any other handler. Returns `false` when the event should
+    /// fall through to selection / paste / etc.
+    ///
+    /// `linkClickConsumedThisGesture` already short-circuits Cmd-click
+    /// URL launches at the very top of each NSEvent override, so the
+    /// `urlInterceptsClick` argument here is `false` — by the time we
+    /// reach this helper, any URL precedence has already been applied.
+    @MainActor
+    private func forwardMouseEventToTracking(
+        kind: MouseRoutingAction,
+        button: MouseRoutingButton?,
+        event: NSEvent
+    ) -> Bool {
+        let dispatch = computeMouseTrackingDispatch(
+            eventKind: kind,
+            button: button,
+            isMouseTrackingActive: isMouseTrackingActive(),
+            urlInterceptsClick: false
+        )
+        guard case .forward(let action, let buttonOut) = dispatch else {
+            return false
+        }
+        let p = convert(event.locationInWindow, from: nil)
+        return emitMouseTracking(
+            action: action,
+            button: buttonOut,
+            mods: Self.mouseMods(forFlags: event.modifierFlags),
+            point: p
+        )
+    }
+
+    /// Drive the encoder and emit. Lifted out of
+    /// `forwardMouseEventToTracking` so the test-mode IPC op
+    /// (`tab.dispatch_mouse_event`) can call it with synthetic
+    /// cell coordinates instead of an `NSEvent`.
+    ///
+    /// For motion-no-button (mode 1003) we run `motionEmitter` here
+    /// so the throttle applies to BOTH the real `mouseMoved` path
+    /// AND the IPC test seam. Without this, a sweep that takes the
+    /// real cursor 16 ms per cell would emit at ~60 Hz but the
+    /// synthetic IPC dispatch would emit one report per call,
+    /// blowing past the cap.
+    @MainActor
+    @discardableResult
+    func emitMouseTracking(
+        action: MouseRoutingAction,
+        button: MouseRoutingButton?,
+        mods: GhosttyMods,
+        point: NSPoint
+    ) -> Bool {
+        guard let mouseEncoder else { return false }
+        let cw = max(cellSize.width, 1)
+        let ch = max(cellSize.height, 1)
+        // Clamp the point into the grid so an event just off the
+        // edge still names the last cell, not an out-of-range
+        // coordinate. Mirrors `scrollWheel`'s clamp.
+        let x = Float(min(max(point.x, 0), cw * CGFloat(cols) - 1))
+        let y = Float(min(max(point.y, 0), ch * CGFloat(rows) - 1))
+        let screenW = UInt32(cw * CGFloat(cols))
+        let screenH = UInt32(ch * CGFloat(rows))
+        let cellWPx = UInt32(cw)
+        let cellHPx = UInt32(ch)
+        // 60 Hz cap + per-cell dedup for motion-no-button. Press /
+        // release / drag (motion-with-button) are intentionally NOT
+        // throttled: TUIs care about every press and release event,
+        // and drag motion under mode 1002 lives or dies on tight
+        // feedback. The throttle exists only because mode 1003 floods
+        // the input drain when the user sweeps the pointer fast.
+        //
+        // PEEK now; COMMIT only if the encoder actually emits below.
+        // Committing on a declined encode would silently suppress
+        // the next event the encoder would have accepted — e.g. mode
+        // 1003 toggling on between two same-cell motions.
+        //
+        // The throttle keys on the CLAMPED cell (derived from `x`/`y`,
+        // not the raw `point`) so an off-grid event that the encoder
+        // sees as the edge cell also dedups against the same key.
+        let motionCellCol: Int
+        let motionCellRow: Int
+        let motionNow: Double
+        let throttleMotionNoButton = (action == .motion && button == nil)
+        if throttleMotionNoButton {
+            motionCellCol = Int(CGFloat(x) / cw)
+            motionCellRow = Int(CGFloat(y) / ch)
+            motionNow = CACurrentMediaTime()
+            guard motionEmitter.wouldEmit(
+                col: motionCellCol,
+                row: motionCellRow,
+                nowSeconds: motionNow
+            ) else {
+                return false
+            }
+        } else {
+            motionCellCol = 0
+            motionCellRow = 0
+            motionNow = 0
+        }
+
+        // Motion with `button: nil` → mode 1003 any-motion path.
+        // Everything else (press / release / motion-with-button)
+        // takes the explicit-button path.
+        let bytes: Data
+        if action == .motion, button == nil {
+            bytes = mouseEncoder.encodeMotionNoButton(
+                mods: mods,
+                x: x, y: y,
+                screenWidth: screenW, screenHeight: screenH,
+                cellWidth: cellWPx, cellHeight: cellHPx
+            )
+        } else {
+            guard let b = button else { return false }
+            bytes = mouseEncoder.encodeButton(
+                action: Self.cMouseAction(forRoutingAction: action),
+                button: Self.cMouseButton(forRoutingButton: b),
+                mods: mods,
+                x: x, y: y,
+                screenWidth: screenW, screenHeight: screenH,
+                cellWidth: cellWPx, cellHeight: cellHPx
+            )
+        }
+        if bytes.isEmpty {
+            // Encoder declined (negotiated mode doesn't permit this
+            // report — e.g. mode 1000 receives a motion event). Don't
+            // swallow the event AND don't commit the throttle: the
+            // next call should be allowed to retry if the mode flips.
+            return false
+        }
+        if throttleMotionNoButton {
+            motionEmitter.commit(
+                col: motionCellCol,
+                row: motionCellRow,
+                nowSeconds: motionNow
+            )
+        }
+        onKey?(bytes)
+        return true
+    }
+
+    private static func cMouseAction(
+        forRoutingAction action: MouseRoutingAction
+    ) -> GhosttyMouseAction {
+        switch action {
+        case .press: return GHOSTTY_MOUSE_ACTION_PRESS
+        case .release: return GHOSTTY_MOUSE_ACTION_RELEASE
+        case .motion: return GHOSTTY_MOUSE_ACTION_MOTION
+        }
+    }
+
+    private static func cMouseButton(
+        forRoutingButton button: MouseRoutingButton
+    ) -> GhosttyMouseButton {
+        switch button {
+        case .left: return GHOSTTY_MOUSE_BUTTON_LEFT
+        case .right: return GHOSTTY_MOUSE_BUTTON_RIGHT
+        case .middle: return GHOSTTY_MOUSE_BUTTON_MIDDLE
+        case .four: return GHOSTTY_MOUSE_BUTTON_FOUR
+        case .five: return GHOSTTY_MOUSE_BUTTON_FIVE
+        }
     }
 
     /// Lets AutoLayout size the view to its cell grid by default.

@@ -106,6 +106,16 @@ pub enum OscEvent {
         target: ClipboardTarget,
         text: String,
     },
+
+    /// OSC 22 — set the mouse pointer shape via a W3C/CSS cursor name
+    /// (`pointer`, `default`, `text`, `crosshair`, `grab`, `grabbing`,
+    /// `not-allowed`, `col-resize`, `row-resize`, `n/s/e/w-resize`, …).
+    /// The scanner surfaces the raw name verbatim — empty bodies and
+    /// unknown names both pass through, and the UI layer decides how
+    /// to map them (typically empty + unknown → platform default).
+    /// Strix in particular emits `\x1b]22;pointer\x1b\\` while
+    /// hovering its split bar and `\x1b]22;default\x1b\\` to reset.
+    MouseShape(String),
 }
 
 /// OSC 52 selector target. `Ps` accepts `c` (system clipboard, the
@@ -302,6 +312,15 @@ impl OscScanner {
                 if n == 10 || n == 11 || n == 12 {
                     self.pending.push(OscEvent::ColorQuery(n));
                 }
+            }
+            "22" => {
+                // Set mouse pointer shape (W3C cursor name). Pass the
+                // body through verbatim — strix sends `pointer` /
+                // `default`, kitty et al. send the broader W3C set.
+                // Truncated bodies still emit (a truncated name maps
+                // to "unknown" → default on the UI side, which is
+                // the right fallback semantics anyway).
+                self.pending.push(OscEvent::MouseShape(body.to_string()));
             }
             "133" => {
                 // Shell-integration prompt/command mark. Surface the raw
@@ -1003,6 +1022,86 @@ mod tests {
     // (osc52_unknown_selector_falls_back_to_system was replaced by
     // `osc52_lone_unknown_selector_dropped` + `osc52_multi_char_selector_dropped`
     // when the fixup PR tightened selector parsing to exact-match.)
+
+    // OSC 22 (mouse pointer shape)
+
+    #[test]
+    fn osc22_pointer_st_terminated() {
+        let events = feed_all(b"\x1b]22;pointer\x1b\\");
+        assert_eq!(events, vec![OscEvent::MouseShape("pointer".into())]);
+    }
+
+    #[test]
+    fn osc22_default_st_terminated() {
+        let events = feed_all(b"\x1b]22;default\x1b\\");
+        assert_eq!(events, vec![OscEvent::MouseShape("default".into())]);
+    }
+
+    #[test]
+    fn osc22_bel_terminator() {
+        // Some emitters use BEL instead of ST — the parser must accept
+        // both for OSC 22 just like every other supported OSC.
+        let events = feed_all(b"\x1b]22;text\x07");
+        assert_eq!(events, vec![OscEvent::MouseShape("text".into())]);
+    }
+
+    #[test]
+    fn osc22_empty_payload_maps_to_empty_string() {
+        // Empty reset form `\x1b]22;\x1b\\`. The scanner surfaces the
+        // empty body verbatim; the UI maps "" → platform default. This
+        // is a deliberate divergence from ghostty/macOS, which rejects
+        // the empty form — see strix's comment in src/terminal.rs.
+        let events = feed_all(b"\x1b]22;\x1b\\");
+        assert_eq!(events, vec![OscEvent::MouseShape(String::new())]);
+    }
+
+    #[test]
+    fn osc22_unknown_shape_passes_through_raw() {
+        // The scanner doesn't filter unknown names — the UI layer
+        // owns the W3C → platform cursor mapping and falls back to
+        // default on unknowns. Keeps OSC 22 the only place that knows
+        // the cursor name set, instead of two parsers in sync.
+        let events = feed_all(b"\x1b]22;not_a_real_shape\x1b\\");
+        assert_eq!(
+            events,
+            vec![OscEvent::MouseShape("not_a_real_shape".into())]
+        );
+    }
+
+    #[test]
+    fn osc22_grabbing_passes_through() {
+        let events = feed_all(b"\x1b]22;grabbing\x1b\\");
+        assert_eq!(events, vec![OscEvent::MouseShape("grabbing".into())]);
+    }
+
+    #[test]
+    fn osc22_split_across_feeds() {
+        let mut s = OscScanner::new();
+        assert!(s.feed(b"\x1b]22;poin").is_empty());
+        assert_eq!(
+            s.feed(b"ter\x07"),
+            vec![OscEvent::MouseShape("pointer".into())]
+        );
+    }
+
+    #[test]
+    fn osc22_truncated_body_still_emits_prefix() {
+        // Oversize payloads truncate at MAX_BODY. OSC 22 still emits
+        // the truncated prefix (unlike OSC 52, which drops to avoid
+        // clipboard corruption — a partial cursor name just falls
+        // back to "default" on the UI side).
+        let mut payload = Vec::with_capacity(MAX_BODY + 1024);
+        payload.extend_from_slice(b"\x1b]22;");
+        payload.extend(std::iter::repeat(b'A').take(MAX_BODY + 512));
+        payload.push(0x07);
+        let events = feed_all(&payload);
+        assert_eq!(events.len(), 1);
+        if let OscEvent::MouseShape(name) = &events[0] {
+            assert_eq!(name.len(), MAX_BODY);
+        } else {
+            panic!("expected MouseShape event");
+        }
+    }
 
     #[test]
     fn osc52_st_terminator_works() {

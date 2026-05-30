@@ -91,6 +91,31 @@ protocol UiBridge: AnyObject {
         row: Int,
         clickCount: Int
     ) -> ExpandSelectionOutcome?
+
+    /// Drive a synthetic mouse event into the tab's `TerminalView`
+    /// at cell-grid coords. Same `routeMouseEvent` path the real
+    /// NSEvent / GestureClick takes. Returns `false` when the tab
+    /// id doesn't match a live terminal.
+    func dispatchTabMouseEvent(
+        tabID: Int64,
+        kind: MouseRoutingAction,
+        button: MouseRoutingButton?,
+        cellCol: UInt32,
+        cellRow: UInt32,
+        mods: UInt32
+    ) -> Bool
+
+    /// Drive a focus state change without actually moving OS focus.
+    /// Used by the `app.set_window_focus` IPC op so the e2e suite can
+    /// pin mode 1004's `\x1b[I` / `\x1b[O` emit without taking real
+    /// focus from the test runner. Returns `false` when no UI / no
+    /// active tab.
+    func setSimulatedFocus(focused: Bool) -> Bool
+
+    /// Return the active tab's current W3C cursor shape name (the
+    /// canonical form — empty body and `"default"` both map to
+    /// `"default"`). Used by the `app.cursor_shape` IPC op.
+    func currentCursorShape() -> String
 }
 
 /// Outcome from `UiBridge.expandTabSelectionAt` — mirrors

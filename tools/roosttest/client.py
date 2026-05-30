@@ -297,6 +297,47 @@ class Roost:
         `#RRGGBB` hex strings. Ungated — safe outside test mode."""
         return self.call("tab.dump_resolved", {"tab_id": str(tab_id)})
 
+    def tab_dispatch_mouse_event(
+        self,
+        tab_id: int,
+        kind: str,
+        button: str,
+        cell_x: int,
+        cell_y: int,
+        mods: int = 0,
+    ) -> None:
+        """Drive a synthetic mouse event into the UI's mouse handler at
+        cell-grid coordinates. Same `routeMouseEvent` path the real
+        NSEvent / GestureClick takes, so the negotiated mouse-tracking
+        mode + encoder format are honored exactly.
+
+        `kind` ∈ {"press","release","motion"}; `button` ∈
+        {"left","right","middle","wheel_up","wheel_down","none"}
+        (use "none" for motion-no-button events under mode 1003).
+        Gated by ROOST_TEST_MODE=1; raises `RoostError('not-enabled')`
+        when the gate is off, `not-found` for an unknown tab id."""
+        self.call("tab.dispatch_mouse_event", {
+            "tab_id": str(tab_id),
+            "kind": kind,
+            "button": button,
+            "cell_x": cell_x,
+            "cell_y": cell_y,
+            "mods": mods,
+        })
+
+    def app_set_window_focus(self, focus: bool) -> None:
+        """Drive the focus-tracking emit path without taking real OS
+        focus. Mode 1004 → `\\x1b[I` / `\\x1b[O` lands on the active
+        tab's input channel. Gated by ROOST_TEST_MODE=1."""
+        self.call("app.set_window_focus", {"focus": focus})
+
+    def app_cursor_shape(self) -> str:
+        """Return the active tab's currently-applied W3C cursor name
+        (canonical: empty body and `"default"` both return
+        `"default"`). Ungated."""
+        res = self.call("app.cursor_shape", {})
+        return res.get("shape", "")
+
     def tab_expand_selection_at(
         self,
         tab_id: int,

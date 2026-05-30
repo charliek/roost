@@ -3586,6 +3586,24 @@ impl App {
             clipboard::write(target, &text);
             return;
         }
+        // OSC 22 pointer shape — UI-only action (no workspace state).
+        // PR B wires the W3C cursor-name → gdk::Cursor mapping into
+        // the GTK `TerminalView`. PR A only adds the scanner variant +
+        // a swallow here so the Linux side compiles. Logging the body
+        // makes regressions easy to spot during PR B's dogfood pass.
+        if let E::MouseShape(name) = event {
+            // Bound the logged preview: OSC 22 payloads are scanner-
+            // capped but can still be 1 MiB; pretty-printing the full
+            // body during a noisy stream would flood debug logs.
+            let preview: String = name.chars().take(64).collect();
+            tracing::debug!(
+                tab_id,
+                name_len = name.len(),
+                name_preview = %preview,
+                "OSC 22 mouse shape (PR A: ignored on GTK; wired in PR B)"
+            );
+            return;
+        }
         let (command, payload): (u32, String) = match event {
             E::Title(t) => (0, t),
             // OSC 7 wire format is `file://<host>/<path>`. The
@@ -3607,8 +3625,9 @@ impl App {
             // OSC 133 prompt/command mark — pass the body through to
             // apply_osc, which maps it to tab state (P4b).
             E::CommandMark(body) => (133, body),
-            // Handled by the short-circuit above; unreachable here.
+            // Handled by the short-circuits above; unreachable here.
             E::Clipboard { .. } => unreachable!(),
+            E::MouseShape(_) => unreachable!(),
         };
         let Some(client) = self.client.borrow().clone() else {
             return;

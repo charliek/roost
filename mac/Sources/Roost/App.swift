@@ -20,6 +20,7 @@
 // converts each event for `handleEvent` below.
 
 import AppKit
+import CGhosttyVT
 import Foundation
 import Sparkle
 
@@ -4329,6 +4330,65 @@ extension RoostApp: UiBridge {
             col1: UInt16(clamping: s.col1),
             text: text
         )
+    }
+
+    // MARK: test ops — mouse/focus/cursor (PR A: mouse-tracking +
+    // OSC 22 wiring). Each routes through the same TerminalView path
+    // a real NSEvent would, so the e2e suite pins the production
+    // mouse-encoder + focus-tracking + OSC 22 emit chain.
+
+    func dispatchTabMouseEvent(
+        tabID: Int64,
+        kind: MouseRoutingAction,
+        button: MouseRoutingButton?,
+        cellCol: UInt32,
+        cellRow: UInt32,
+        mods: UInt32
+    ) -> Bool {
+        guard let session = tabs.first(where: { $0.id == tabID }) else { return false }
+        let view = session.terminalView
+        // Compute the surface-space pixel point at the cell's
+        // upper-left so the encoder's pixel→cell math lands on the
+        // exact requested cell. Mirrors the wheel-handler clamp:
+        // a cell on the right/bottom edge maps to its lower bound.
+        let cellW = view.cellSize.width
+        let cellH = view.cellSize.height
+        let px = NSPoint(
+            x: (CGFloat(cellCol) + 0.5) * cellW,
+            y: (CGFloat(cellRow) + 0.5) * cellH
+        )
+        let ghMods = GhosttyMods(UInt16(truncatingIfNeeded: mods))
+        view.emitMouseTracking(
+            action: kind,
+            button: button,
+            mods: ghMods,
+            point: px
+        )
+        return true
+    }
+
+    func setSimulatedFocus(focused: Bool) -> Bool {
+        // Apply to the active tab only — the e2e harness assumes
+        // there's one focused tab at a time. Returns `false` when
+        // there's no tab (relaunched cold). `requireFirstResponder:
+        // false` because the bridge already targeted the active
+        // session; the real OS focus may be elsewhere (the e2e
+        // suite runs without taking the window key for itself).
+        guard let pid = activeProjectID,
+              let session = activeSessionByProject[pid]
+        else { return false }
+        session.terminalView.emitFocusEvent(
+            focused: focused,
+            requireFirstResponder: false
+        )
+        return true
+    }
+
+    func currentCursorShape() -> String {
+        guard let pid = activeProjectID,
+              let session = activeSessionByProject[pid]
+        else { return "default" }
+        return session.terminalView.currentCursorShapeName()
     }
 
     /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.

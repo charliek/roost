@@ -542,6 +542,62 @@ pub struct TabExpandSelectionAtParams {
     pub click_count: u8,
 }
 
+/// `tab.dispatch_mouse_event` request: drive a synthetic mouse event
+/// into the UI's mouse handler at cell-grid coordinates. Same path
+/// the real NSEvent / GestureClick takes — gating on the negotiated
+/// mouse-tracking mode, encoder choice, and SGR / X10 / pixel
+/// formats happens inside the handler so this op tests exactly what
+/// production does.
+///
+/// `kind` is one of `"press"`, `"release"`, `"motion"`. `button` is
+/// `"left" | "right" | "middle" | "wheel_up" | "wheel_down" | "none"`
+/// (use `"none"` for motion-without-button events under mode 1003).
+/// `cell_x` / `cell_y` are 0-indexed grid coordinates. `mods` carries
+/// the same bit layout as the key encoder's `Mods`. Gated by
+/// `ROOST_TEST_MODE=1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabDispatchMouseEventParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    /// `"press" | "release" | "motion"`.
+    pub kind: String,
+    /// `"left" | "right" | "middle" | "wheel_up" | "wheel_down" | "none"`.
+    pub button: String,
+    pub cell_x: u32,
+    pub cell_y: u32,
+    /// Bit layout matches the key encoder's `Mods`: shift(0), ctrl(1),
+    /// alt(2), cmd/super(3). `0` for no modifiers.
+    #[serde(default)]
+    pub mods: u32,
+}
+
+/// `app.set_window_focus` request: drive the focus-tracking emit
+/// path without actually moving OS focus. When mode 1004 is on, the
+/// UI writes `\x1b[I` / `\x1b[O` onto the tab's input channel; tests
+/// pick those up via `tab.capture_pty_input`. Gated by
+/// `ROOST_TEST_MODE=1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppSetWindowFocusParams {
+    pub focus: bool,
+}
+
+/// `app.cursor_shape` request: return the W3C cursor name the UI is
+/// currently applying for the active tab. Returns the last-seen OSC
+/// 22 payload, or `"default"` if no shape has been requested yet
+/// (and `"default"` for the empty-string reset form, so callers can
+/// always assert against a non-empty name). Not gated — read-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppCursorShapeParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppCursorShapeResult {
+    /// W3C cursor name (`default`, `pointer`, `text`, …).
+    pub shape: String,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -936,6 +992,20 @@ pub mod ops {
     /// dispatch on both UIs so the e2e suite can pin word/line
     /// expansion without synthetic mouse events.
     pub const TAB_EXPAND_SELECTION_AT: &str = "tab.expand_selection_at";
+    /// Test-only synthetic mouse event. Drives the same
+    /// `routeMouseEvent` helper a real NSEvent / GestureClick uses,
+    /// so the e2e suite can pin button-event and motion encoding
+    /// without a window manager. Gated by `ROOST_TEST_MODE=1`.
+    pub const TAB_DISPATCH_MOUSE_EVENT: &str = "tab.dispatch_mouse_event";
+    /// Test-only focus-state driver. Drives the focus-tracking emit
+    /// path so the e2e suite can pin mode 1004 `\x1b[I` / `\x1b[O`
+    /// without taking real OS focus from the test runner. Gated by
+    /// `ROOST_TEST_MODE=1`.
+    pub const APP_SET_WINDOW_FOCUS: &str = "app.set_window_focus";
+    /// Ungated read of the active tab's current W3C cursor name —
+    /// the latest OSC 22 payload, or `"default"` if none has landed.
+    /// Used by the e2e suite to assert OSC 22 actually applied.
+    pub const APP_CURSOR_SHAPE: &str = "app.cursor_shape";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -1359,6 +1429,54 @@ mod tests {
         });
         let bad = r#"{"width":1100.0,"height":700.0,"extra":"x"}"#;
         assert!(serde_json::from_str::<WindowResizeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn tab_dispatch_mouse_event_params_round_trip() {
+        let p = TabDispatchMouseEventParams {
+            tab_id: 11,
+            kind: "press".into(),
+            button: "left".into(),
+            cell_x: 6,
+            cell_y: 3,
+            mods: 0,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"tab_id\":\"11\""), "got: {json}");
+        assert!(json.contains("\"kind\":\"press\""), "got: {json}");
+        round_trip(&p);
+
+        // `mods` defaults to 0 when omitted (most tests don't carry mods).
+        let no_mods: TabDispatchMouseEventParams = serde_json::from_str(
+            r#"{"tab_id":"3","kind":"motion","button":"none","cell_x":1,"cell_y":1}"#,
+        )
+        .unwrap();
+        assert_eq!(no_mods.mods, 0);
+
+        let bad =
+            r#"{"tab_id":"3","kind":"press","button":"left","cell_x":1,"cell_y":1,"extra":"x"}"#;
+        assert!(serde_json::from_str::<TabDispatchMouseEventParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_set_window_focus_params_round_trip() {
+        round_trip(&AppSetWindowFocusParams { focus: true });
+        round_trip(&AppSetWindowFocusParams { focus: false });
+        let bad = r#"{"focus":true,"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppSetWindowFocusParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_cursor_shape_round_trips_empty_params_and_result() {
+        round_trip(&AppCursorShapeParams {});
+        round_trip(&AppCursorShapeResult {
+            shape: "pointer".into(),
+        });
+        round_trip(&AppCursorShapeResult {
+            shape: "default".into(),
+        });
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppCursorShapeParams>(bad).is_err());
     }
 
     #[test]
