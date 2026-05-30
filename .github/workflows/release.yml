@@ -439,21 +439,23 @@ jobs:
           fi
           git commit -m "chore(appcast): publish ${GITHUB_REF_NAME} (#122)"
 
-          # Auth via in-memory header — keeps the App token out of
-          # .git/config on the runner disk. Same `-c http....extraheader`
-          # has to be on the fetch too; on a private repo the fetch leg
-          # of the retry loop would otherwise authenticate anonymously
-          # and fail before push could retry.
-          AUTH_HDR="http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}"
-          push() { git -c "${AUTH_HDR}" push origin main; }
+          # URL-embedded token at push time — the http.extraheader pattern
+          # via `git -c` is NOT honored for the outgoing HTTP request
+          # (reproduced in v0.0.6: git -c http.<URL>.extraheader=… still
+          # prompts "could not read Username"). Embedding the token in
+          # the push URL works — it stays in argv, never written to
+          # .git/config on disk, single-tenant runner so other processes
+          # don't see it.
+          TOKEN_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          push() { git push "${TOKEN_URL}" HEAD:main; }
           for attempt in 1 2 3; do
             if push; then
               echo "::notice::Appcast pushed for ${GITHUB_REF_NAME} — docs.yml will redeploy Pages."
               exit 0
             fi
             echo "::warning::push attempt ${attempt} failed; rebasing onto origin/main and retrying"
-            git -c "${AUTH_HDR}" fetch origin main
-            git rebase origin/main || {
+            git fetch "${TOKEN_URL}" main
+            git rebase FETCH_HEAD || {
               echo "::error::rebase conflict on docs/appcast.xml — concurrent appcast write? Re-run after investigating."
               exit 1
             }

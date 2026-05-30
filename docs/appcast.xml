@@ -29,5 +29,13 @@
       <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
       <enclosure url="https://github.com/charliek/roost/releases/download/v0.0.5/Roost-0.0.5.dmg" type="application/octet-stream" sparkle:edSignature="nHT79Wfz++NP2mMY+Qhws7dh7x7BSrpd5w2ZeF0zY+UqwFuHswDHw9jWzr6xl+9bg2rS+h2+eltBgIb5xgVKBw==" length="5629813" />
     </item>
+    <item>
+      <title>0.0.6</title>
+      <pubDate>Sat, 30 May 2026 18:12:31 +0000</pubDate>
+      <sparkle:version>0.0.6</sparkle:version>
+      <sparkle:shortVersionString>0.0.6</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/charliek/roost/releases/download/v0.0.6/Roost-0.0.6.dmg" type="application/octet-stream" sparkle:edSignature="jaeRFCgGsfhmT5TudftoY1VzM66XQYLxKWDYYYEjC/LSviXdVn/X6OSGUD6rcTjiU4OzVuCBgH3bpV+0C8skDg==" length="5656063" />
+    </item>
   </channel>
 </rss>
