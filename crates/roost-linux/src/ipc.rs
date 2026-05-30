@@ -18,14 +18,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roost_ipc::messages::{
-    ops, AppActivateParams, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDumpCursor, TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    ops, AppActivateParams, AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams,
+    ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
     TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
     TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
     TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
@@ -247,6 +248,28 @@ pub enum UiRequest {
         width: f64,
         height: f64,
         reply: UnitReply,
+    },
+    /// `tab.dispatch_mouse_event` — drive a synthetic mouse event
+    /// into the production routing path at cell-grid coords. Same
+    /// path the real GestureClick / GestureDrag / EventControllerMotion
+    /// take. Gated on `ROOST_TEST_MODE=1`.
+    TabDispatchMouseEvent {
+        tab_id: i64,
+        kind: crate::mouse_routing::MouseRoutingAction,
+        button: Option<crate::mouse_routing::MouseRoutingButton>,
+        cell_x: u32,
+        cell_y: u32,
+        mods: u32,
+        reply: UnitReply,
+    },
+    /// `app.set_window_focus` — drive the focus-tracking emit path
+    /// without actually taking GTK focus. Targets the active tab.
+    /// Gated on `ROOST_TEST_MODE=1`.
+    AppSetWindowFocus { focused: bool, reply: UnitReply },
+    /// `app.cursor_shape` — return the active tab's currently
+    /// applied OSC 22 W3C cursor name. Ungated (read-only).
+    AppCursorShape {
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
 }
 
@@ -816,6 +839,62 @@ async fn dispatch(
                 rows: dump.rows,
                 cells,
             })
+        }
+        ops::TAB_DISPATCH_MOUSE_EVENT => {
+            let p: TabDispatchMouseEventParams = decode(params)?;
+            let kind = match p.kind.as_str() {
+                "press" => crate::mouse_routing::MouseRoutingAction::Press,
+                "release" => crate::mouse_routing::MouseRoutingAction::Release,
+                "motion" => crate::mouse_routing::MouseRoutingAction::Motion,
+                other => {
+                    return Err(HandlerError::invalid_param(format!(
+                        "kind must be one of press|release|motion (got {other})"
+                    )));
+                }
+            };
+            let button = match p.button.as_str() {
+                "left" => Some(crate::mouse_routing::MouseRoutingButton::Left),
+                "right" => Some(crate::mouse_routing::MouseRoutingButton::Right),
+                "middle" => Some(crate::mouse_routing::MouseRoutingButton::Middle),
+                "wheel_up" => Some(crate::mouse_routing::MouseRoutingButton::Four),
+                "wheel_down" => Some(crate::mouse_routing::MouseRoutingButton::Five),
+                "none" => None,
+                other => {
+                    return Err(HandlerError::invalid_param(format!(
+                        "button must be one of left|right|middle|wheel_up|wheel_down|none (got {other})"
+                    )));
+                }
+            };
+            h.ui_call(|reply| UiRequest::TabDispatchMouseEvent {
+                tab_id: p.tab_id,
+                kind,
+                button,
+                cell_x: p.cell_x,
+                cell_y: p.cell_y,
+                mods: p.mods,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_SET_WINDOW_FOCUS => {
+            let p: AppSetWindowFocusParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppSetWindowFocus {
+                focused: p.focus,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_CURSOR_SHAPE => {
+            let _: AppCursorShapeParams = decode(params)?;
+            let shape = h
+                .ui_call(|reply| UiRequest::AppCursorShape { reply })
+                .await?
+                .map_err(|e| HandlerError::new("internal", e))?;
+            encode(&AppCursorShapeResult { shape })
         }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never
