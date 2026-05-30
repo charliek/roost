@@ -68,6 +68,10 @@ struct Inner {
     next_id: i64,
     active_project_id: i64,
     active_tab_id: i64,
+    /// Whether the sidebar is collapsed (hidden). UI-set via
+    /// `set_sidebar_collapsed`; persisted so a relaunch restores it
+    /// (GTK parity with the Mac UI's `RoostSidebarVisible`).
+    sidebar_collapsed: bool,
     /// Monotonic commit counter, bumped each time a persistable
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
@@ -248,6 +252,7 @@ impl Workspace {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut inner = Inner {
             next_id: snapshot.next_id.max(1),
+            sidebar_collapsed: snapshot.sidebar_collapsed,
             ..Inner::default()
         };
 
@@ -312,6 +317,27 @@ impl Workspace {
     /// to re-open each project's saved tabs as fresh shells.
     pub fn take_restore_layout(&self) -> Option<RestoreLayout> {
         self.restore_layout.lock().unwrap().take()
+    }
+
+    /// The sidebar's persisted collapsed state. The UI reads this at
+    /// startup to restore the user's hide/show choice (GTK parity with
+    /// the Mac UI's `RoostSidebarVisible`).
+    pub fn sidebar_collapsed(&self) -> bool {
+        self.inner.lock().unwrap().sidebar_collapsed
+    }
+
+    /// Record the sidebar's collapsed state and persist it. Emits no
+    /// event — the UI that toggled already flipped its own widget; this
+    /// only writes the choice through so a relaunch restores it. A no-op
+    /// (no write) when unchanged, so re-toggling to the same state can't
+    /// churn `state.json`.
+    pub fn set_sidebar_collapsed(&self, collapsed: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.sidebar_collapsed == collapsed {
+            return;
+        }
+        inner.sidebar_collapsed = collapsed;
+        self.commit(inner, Vec::new(), Persist::Write);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent> {
@@ -1142,6 +1168,7 @@ impl Inner {
             next_id: self.next_id,
             active_project_id: self.active_project_id,
             active_tab_position,
+            sidebar_collapsed: self.sidebar_collapsed,
             projects: self
                 .projects
                 .values()
@@ -1433,6 +1460,35 @@ mod tests {
         assert_eq!(rp.tabs[1].title, "btab");
         // `take_restore_layout` is one-shot.
         assert!(ws2.take_restore_layout().is_none());
+    }
+
+    #[test]
+    fn sidebar_collapsed_persists_across_reopen() {
+        // GTK parity with the Mac UI's RoostSidebarVisible: the user's
+        // hide/show choice survives quit + relaunch. Backs the locally-run
+        // e2e `test_sidebar_collapsed_state_survives_relaunch`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            assert!(!ws.sidebar_collapsed(), "defaults to expanded");
+            ws.set_sidebar_collapsed(true);
+            assert!(ws.sidebar_collapsed());
+        }
+        // Reopen: the collapsed choice is restored from disk.
+        let ws2 = Workspace::open(path.clone());
+        assert!(
+            ws2.sidebar_collapsed(),
+            "collapsed state must survive reopen"
+        );
+        // And toggling back to expanded persists too.
+        ws2.set_sidebar_collapsed(false);
+        drop(ws2);
+        let ws3 = Workspace::open(path);
+        assert!(
+            !ws3.sidebar_collapsed(),
+            "expanded state must survive reopen"
+        );
     }
 
     #[test]

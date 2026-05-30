@@ -514,6 +514,13 @@ impl App {
         sidebar_box.append(&sidebar_header);
         sidebar_box.append(&sidebar_scroll);
         sidebar_box.append(&new_project_button);
+        // Restore the persisted sidebar hide/show choice now, before the
+        // window maps — synchronous (not in the async `bootstrap`) so the
+        // first `window.metrics` query can't race the restore. Nothing
+        // re-reveals it later (only `toggle_sidebar` flips visibility).
+        if client.workspace.sidebar_collapsed() {
+            sidebar_box.set_visible(false);
+        }
 
         // Right pane: a Stack of per-project AdwTabView widgets.
         let tab_stack = gtk4::Stack::builder().hexpand(true).vexpand(true).build();
@@ -3597,6 +3604,12 @@ impl App {
         // `+ Project` button orphaned in a thin strip.
         let visible = self.sidebar_box.is_visible();
         self.sidebar_box.set_visible(!visible);
+        // Persist the choice so it survives relaunch (GTK parity with the
+        // Mac UI's RoostSidebarVisible). New visibility is `!visible`, so
+        // collapsed == `visible` (the prior state).
+        if let Some(client) = self.client.borrow().clone() {
+            client.workspace.set_sidebar_collapsed(visible);
+        }
     }
 
     fn switch_project_by_index(self: &Rc<Self>, n: usize) {

@@ -48,6 +48,13 @@ pub struct SnapshotFile {
     /// selection is restored by position, not id.
     #[serde(default)]
     pub active_tab_position: i32,
+    /// Whether the sidebar was collapsed (hidden) at save time, so a
+    /// relaunch restores the user's hide/show choice. Defaulted so a
+    /// file from an older build (no key) loads as "expanded". The Mac
+    /// UI persists the same choice in UserDefaults (`RoostSidebarVisible`);
+    /// this is the GTK equivalent, kept at behavioral parity.
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +214,7 @@ mod tests {
             next_id: 42,
             active_project_id: 1,
             active_tab_position: 1,
+            sidebar_collapsed: true,
             projects: vec![ProjectSnapshot {
                 id: 1,
                 name: "Roost".into(),
@@ -248,6 +256,7 @@ mod tests {
         assert_eq!(back.next_id, 5);
         assert_eq!(back.active_project_id, 0);
         assert_eq!(back.active_tab_position, 0);
+        assert!(!back.sidebar_collapsed, "absent key defaults to expanded");
         assert_eq!(back.projects.len(), 1);
         assert!(back.projects[0].tabs.is_empty());
     }

@@ -23,6 +23,12 @@ Two regressions in the same class, locked in here:
    user-action call sites. Matches GTK's `set_active_project` and the
    vision.md DL-11 principle.
 
+Both UIs persist the collapse choice: the Mac UI in UserDefaults
+(`RoostSidebarVisible`), the GTK/Linux UI in `state.json`
+(`SnapshotFile.sidebar_collapsed`, restored synchronously in `App::new`
+and written through on `toggle_sidebar`). So this runs and passes on a
+developer GTK build (Linux or the macOS GTK dev profile) too, not just Mac.
+
 Skip on CI entirely:
 - GTK CI runs under bare xvfb (no WM); the quit/relaunch lifecycle is
   unreliable there.
