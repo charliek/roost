@@ -3592,7 +3592,16 @@ impl App {
         // a swallow here so the Linux side compiles. Logging the body
         // makes regressions easy to spot during PR B's dogfood pass.
         if let E::MouseShape(name) = event {
-            tracing::debug!(tab_id, %name, "OSC 22 mouse shape (PR A: ignored on GTK; wired in PR B)");
+            // Bound the logged preview: OSC 22 payloads are scanner-
+            // capped but can still be 1 MiB; pretty-printing the full
+            // body during a noisy stream would flood debug logs.
+            let preview: String = name.chars().take(64).collect();
+            tracing::debug!(
+                tab_id,
+                name_len = name.len(),
+                name_preview = %preview,
+                "OSC 22 mouse shape (PR A: ignored on GTK; wired in PR B)"
+            );
             return;
         }
         let (command, payload): (u32, String) = match event {

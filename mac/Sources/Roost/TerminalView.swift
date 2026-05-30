@@ -658,10 +658,10 @@ final class TerminalView: NSView {
     }
 
     /// Write the xterm focus-tracking sequence onto the PTY input
-    /// channel when mode 1004 is enabled. Uses libghostty-vt's
-    /// `ghostty_focus_encode` so the wire format follows the same
-    /// authoritative source as ghostty itself (CSI I for gained,
-    /// CSI O for lost).
+    /// channel when mode 1004 is enabled. Routes through the pure
+    /// `encodeFocusBytes` helper so the production byte selection
+    /// (CSI I for gained, CSI O for lost) is testable without an
+    /// NSView.
     ///
     /// Background tabs' TerminalViews each observe the same window-
     /// key notifications, so without gating on first-responder
@@ -675,17 +675,34 @@ final class TerminalView: NSView {
     func emitFocusEvent(focused: Bool, requireFirstResponder: Bool = true) {
         guard isFocusTrackingActive() else { return }
         if requireFirstResponder, !viewIsFirstResponder { return }
+        let data = Self.encodeFocusBytes(focused: focused)
+        if !data.isEmpty {
+            onKey?(data)
+        }
+    }
+
+    /// Pure byte encoder for the xterm focus-tracking sequence.
+    /// Uses libghostty-vt's `ghostty_focus_encode` so the wire
+    /// format follows the same authoritative source ghostty itself
+    /// uses. Returns empty `Data` on any FFI hiccup; callers
+    /// `onKey?(...)` only when non-empty. Exposed for unit tests so
+    /// a regression that swapped CSI I / CSI O is caught against
+    /// the actual encoder, not test-local literals.
+    ///
+    /// `nonisolated` so swift-testing's default-isolated suite can
+    /// call it without hopping to `@MainActor` (TerminalView's
+    /// isolation). The C call is thread-safe and stateless.
+    nonisolated static func encodeFocusBytes(focused: Bool) -> Data {
         let event: GhosttyFocusEvent = focused ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST
         var buf = [CChar](repeating: 0, count: 8)
         var written: size_t = 0
         let rc = buf.withUnsafeMutableBufferPointer { p in
             ghostty_focus_encode(event, p.baseAddress, p.count, &written)
         }
-        guard rc.rawValue == GHOSTTY_SUCCESS.rawValue, written > 0 else { return }
-        let data = buf.prefix(written).withUnsafeBufferPointer { ptr in
+        guard rc.rawValue == GHOSTTY_SUCCESS.rawValue, written > 0 else { return Data() }
+        return buf.prefix(written).withUnsafeBufferPointer { ptr in
             Data(bytes: ptr.baseAddress!, count: written)
         }
-        onKey?(data)
     }
 
     override func becomeFirstResponder() -> Bool {

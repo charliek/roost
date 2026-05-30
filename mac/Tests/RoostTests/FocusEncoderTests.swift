@@ -1,9 +1,10 @@
 // FocusEncoderTests — wire-byte tests for mode 1004 focus
-// tracking. The xterm focus sequences are two bytes each and
-// stable, so the test pins them byte-exactly. The mode-gating
-// itself lives on the TerminalView side (`isFocusTrackingActive`
-// reads `ghostty_terminal_mode_get(1004)`); this file covers the
-// emit-byte selection only.
+// tracking. Drives the production `TerminalView.encodeFocusBytes`
+// helper (which routes through libghostty-vt's
+// `ghostty_focus_encode`) and asserts on its output. Test-local
+// literals are only used to PIN the canonical xterm sequences
+// against the encoder's actual output — a regression that swapped
+// CSI I / CSI O would fail here.
 
 import Foundation
 import Testing
@@ -13,39 +14,39 @@ import Testing
 @Suite("Mode 1004 focus tracking bytes")
 struct FocusEncoderTests {
 
-    /// Pin the exact ESC sequence emitted on focus gain. xterm spec:
-    /// CSI I (`\x1b[I`) — three bytes, last is uppercase I.
-    @Test("focus gained → ESC [ I (3 bytes)")
+    /// Focus gained → CSI I (`\x1b[I`) — three bytes. Asserts the
+    /// canonical xterm sequence against the production encoder
+    /// output, so a wrong byte in `ghostty_focus_encode` (or a
+    /// swapped event mapping in `encodeFocusBytes`) is caught here.
+    @Test("focus gained → ESC [ I (3 bytes from encoder)")
     func focusInBytes() {
-        let bytes: [UInt8] = [0x1B, 0x5B, 0x49]
-        let data = Data(bytes)
-        #expect(data.count == 3)
-        #expect(data[0] == 0x1B)
-        #expect(data[1] == 0x5B)  // '['
-        #expect(data[2] == 0x49)  // 'I'
+        let produced = TerminalView.encodeFocusBytes(focused: true)
+        #expect(produced == Data([0x1B, 0x5B, 0x49]))
     }
 
-    /// Pin the exact ESC sequence emitted on focus loss. CSI O
-    /// (`\x1b[O`) — three bytes, last is uppercase O. Wrong byte
-    /// here would silently send `O` as the focus-in marker and `I`
-    /// for focus-out, which TUIs interpret backwards.
-    @Test("focus lost → ESC [ O (3 bytes)")
+    /// Focus lost → CSI O (`\x1b[O`) — three bytes. A regression
+    /// that emitted `O` for gained and `I` for lost would silently
+    /// invert focus-state on every TUI that uses mode 1004.
+    @Test("focus lost → ESC [ O (3 bytes from encoder)")
     func focusOutBytes() {
-        let bytes: [UInt8] = [0x1B, 0x5B, 0x4F]
-        let data = Data(bytes)
-        #expect(data.count == 3)
-        #expect(data[0] == 0x1B)
-        #expect(data[1] == 0x5B)  // '['
-        #expect(data[2] == 0x4F)  // 'O'
+        let produced = TerminalView.encodeFocusBytes(focused: false)
+        #expect(produced == Data([0x1B, 0x5B, 0x4F]))
     }
 
-    @Test("focus-in and focus-out differ by exactly one byte")
+    /// The two encoder outputs differ by exactly one byte (the
+    /// terminator: I vs O). Asserts on the encoder-produced byte
+    /// arrays, so a future change that grew the sequence (e.g.
+    /// added a parameter) would fail loudly.
+    @Test("focus-in and focus-out encoder output differ by exactly one byte")
     func focusInAndOutDifferByOneByte() {
-        let inBytes: [UInt8] = [0x1B, 0x5B, 0x49]
-        let outBytes: [UInt8] = [0x1B, 0x5B, 0x4F]
-        // First two bytes match; only the terminator differs.
-        #expect(inBytes[0] == outBytes[0])
-        #expect(inBytes[1] == outBytes[1])
-        #expect(inBytes[2] != outBytes[2])
+        let gained = Array(TerminalView.encodeFocusBytes(focused: true))
+        let lost = Array(TerminalView.encodeFocusBytes(focused: false))
+        #expect(gained.count == lost.count)
+        #expect(gained.count == 3)
+        // First two bytes (ESC + `[`) match; only the terminator
+        // differs.
+        #expect(gained[0] == lost[0])
+        #expect(gained[1] == lost[1])
+        #expect(gained[2] != lost[2])
     }
 }
