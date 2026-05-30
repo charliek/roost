@@ -76,8 +76,13 @@ jobs:
           set -euo pipefail
           deadline=$(( SECONDS + 2700 ))   # 45 min — releases aren't time-sensitive
           while :; do
-            latest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs" \
-              --jq '[.check_runs[] | select(.name=="ci-success")] | sort_by(.started_at) | last')"
+            # Server-side check_name filter. Without it, the endpoint returns
+            # ≤30 runs per page; on busy commits ci-success can fall off the
+            # first page and the loop would spin until timeout looking for
+            # a check that exists.
+            latest="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?check_name=ci-success" \
+              --jq '.check_runs | sort_by(.started_at) | last')"
             status="$(echo "${latest}" | jq -r '.status // "missing"')"
             conclusion="$(echo "${latest}" | jq -r '.conclusion // ""')"
             echo "ci-success @ ${GITHUB_SHA}: status=${status} conclusion=${conclusion}"
@@ -431,23 +436,20 @@ jobs:
           fi
           git commit -m "chore(appcast): publish ${GITHUB_REF_NAME} (#122)"
 
-          # Push via an in-memory Authorization header instead of `remote set-url`
-          # — keeps the App token out of .git/config on the runner disk.
-          # Retry up to 3× with rebase on race: the only change is the single
-          # appcast file, so a rebase against a concurrent main push (e.g.
-          # docs.yml redeploy or a merged PR landing during the release)
-          # cannot conflict.
-          push() {
-            git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}" \
-                push origin main
-          }
+          # Auth via in-memory header — keeps the App token out of
+          # .git/config on the runner disk. Same `-c http....extraheader`
+          # has to be on the fetch too; on a private repo the fetch leg
+          # of the retry loop would otherwise authenticate anonymously
+          # and fail before push could retry.
+          AUTH_HDR="http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}"
+          push() { git -c "${AUTH_HDR}" push origin main; }
           for attempt in 1 2 3; do
             if push; then
               echo "::notice::Appcast pushed for ${GITHUB_REF_NAME} — docs.yml will redeploy Pages."
               exit 0
             fi
             echo "::warning::push attempt ${attempt} failed; rebasing onto origin/main and retrying"
-            git fetch origin main
+            git -c "${AUTH_HDR}" fetch origin main
             git rebase origin/main || {
               echo "::error::rebase conflict on docs/appcast.xml — concurrent appcast write? Re-run after investigating."
               exit 1
