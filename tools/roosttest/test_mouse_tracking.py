@@ -64,13 +64,13 @@ def test_button_press_release_emits_sgr_when_tracking_enabled(roost, project, ta
     roost.tab_dispatch_mouse_event(
         tab, kind="press", button="left", cell_x=5, cell_y=3
     )
-    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4M")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4M", timeout=2.0)
     assert b"\x1b[<0;6;4M" in captured, captured
 
     roost.tab_dispatch_mouse_event(
         tab, kind="release", button="left", cell_x=5, cell_y=3
     )
-    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4m")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<0;6;4m", timeout=2.0)
     assert b"\x1b[<0;6;4m" in captured, captured
 
 
@@ -112,7 +112,7 @@ def test_drag_emits_motion_with_button_in_mode_1002(roost, project, target):
         tab, kind="release", button="left", cell_x=7, cell_y=3
     )
     captured = drain_until_match(
-        roost, tab, rb"\x1b\[<0;6;4M.*\x1b\[<32;8;4M.*\x1b\[<0;8;4m"
+        roost, tab, rb"\x1b\[<0;6;4M.*\x1b\[<32;8;4M.*\x1b\[<0;8;4m", timeout=2.0
     )
     # Confirm the report shapes individually so a regression in any
     # one byte fails loudly with the offender named.
@@ -145,7 +145,7 @@ def test_motion_no_button_emits_only_in_mode_1003(roost, project, target):
     roost.tab_dispatch_mouse_event(
         tab, kind="motion", button="none", cell_x=4, cell_y=4
     )
-    captured_on = drain_until_match(roost, tab, rb"\x1b\[<35;5;5M")
+    captured_on = drain_until_match(roost, tab, rb"\x1b\[<35;5;5M", timeout=2.0)
     assert b"\x1b[<35;5;5M" in captured_on, captured_on
 
 
@@ -162,7 +162,7 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
         roost.tab_dispatch_mouse_event(
             tab, kind="motion", button="none", cell_x=10, cell_y=5
         )
-    captured = drain_until_match(roost, tab, rb"\x1b\[<35;11;6M")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<35;11;6M", timeout=2.0)
     # Exactly one report — every subsequent same-cell motion is
     # suppressed by the throttle's `lastCell` check.
     reports = captured.count(b"\x1b[<35;11;6M")
@@ -179,11 +179,11 @@ def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):
     drain(roost, tab)
 
     roost.app_set_window_focus(focus=False)
-    captured = drain_until_match(roost, tab, rb"\x1b\[O")
+    captured = drain_until_match(roost, tab, rb"\x1b\[O", timeout=2.0)
     assert b"\x1b[O" in captured, captured
 
     roost.app_set_window_focus(focus=True)
-    captured = drain_until_match(roost, tab, rb"\x1b\[I")
+    captured = drain_until_match(roost, tab, rb"\x1b\[I", timeout=2.0)
     assert b"\x1b[I" in captured, captured
 
 
@@ -252,7 +252,7 @@ def test_right_click_emits_button_2_when_tracking_on(roost, project, target):
     roost.tab_dispatch_mouse_event(
         tab, kind="press", button="right", cell_x=3, cell_y=3
     )
-    captured = drain_until_match(roost, tab, rb"\x1b\[<2;4;4M")
+    captured = drain_until_match(roost, tab, rb"\x1b\[<2;4;4M", timeout=2.0)
     assert b"\x1b[<2;4;4M" in captured, captured
 
 
