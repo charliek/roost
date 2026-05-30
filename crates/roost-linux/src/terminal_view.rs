@@ -222,7 +222,13 @@ impl TerminalView {
             font_desc,
             cell_metrics: metrics,
             cursor_blink_on: true,
-            has_focus: true,
+            // Initialized to false so the first real
+            // `focus_ctrl.connect_enter` is an edge transition that
+            // emits CSI I under mode 1004. With `has_focus = true`
+            // at init, the dedup in connect_enter would swallow the
+            // first focus-in event the user generates after the
+            // widget is realized.
+            has_focus: false,
             scrolled_back: false,
             scroll_accum: 0.0,
             selection: None,
@@ -244,6 +250,7 @@ impl TerminalView {
             multi_click_consumed_this_gesture: false,
             word_break_chars: roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
             tracking_press_consumed_this_gesture: false,
+            right_tracking_press_consumed_this_gesture: false,
             motion_emitter: roost_linux::mouse_routing::MotionEmitter::new(),
             current_osc_shape: String::new(),
             was_alt_screen_active: false,
@@ -321,6 +328,14 @@ impl TerminalView {
                     return;
                 }
                 s.has_focus = false;
+                // Drop the cursor-name cache: some compositors
+                // reset the OS cursor on focus-loss, so a cached
+                // `Some("pointer")` would skip re-applying on focus
+                // return — leaving the cursor visually stuck on
+                // GTK's default even though we believe we already
+                // pushed `pointer`. Symmetric to the leave-on-
+                // pointer-exit cache drop.
+                s.last_applied_cursor_name = None;
                 // Mac's `handleWindowDidResignKey` clears the URL
                 // hover so the underline + Ctrl-hand cursor don't
                 // survive off-window. GTK parity.
@@ -1460,6 +1475,14 @@ struct TerminalViewState {
     /// the matching release encoder returns empty (X10 / mode 9
     /// doesn't report releases). Cleared on drag-end.
     tracking_press_consumed_this_gesture: bool,
+    /// Right-button equivalent of the left's
+    /// `tracking_press_consumed_this_gesture`. Set on a successful
+    /// right-press forward; read by right-release so a TUI that
+    /// disables mouse tracking between press and release still gets
+    /// the matching release report (or, when the TUI ENABLES
+    /// tracking between press and release, the release is suppressed
+    /// to avoid an orphan event). Cleared on right-release.
+    right_tracking_press_consumed_this_gesture: bool,
     /// 60 Hz cap + per-cell dedup for mode 1003 motion-no-button
     /// reports. Sibling of the Mac UI's MotionEmitter.
     motion_emitter: roost_linux::mouse_routing::MotionEmitter,
@@ -2572,9 +2595,19 @@ fn link_underline_rect(
 /// Shared right-button forward path used by both `right_click`
 /// gesture-controller signals (pressed + released). Both arms
 /// differ only in the `MouseRoutingAction` — extracted to dedup
-/// ~26 lines per arm and to give a single place for any future
-/// right-button policy tweaks (e.g., a press-consumed flag for
-/// mid-gesture mode toggles).
+/// ~26 lines per arm and to give a single place for the
+/// press-consumed flag that handles mid-gesture mode toggles.
+///
+/// Mid-gesture handling:
+/// * Press fires while `mouse_tracking()` is on → forward AND mark
+///   `right_tracking_press_consumed_this_gesture = true`.
+/// * Release fires: if the flag is set, ALWAYS forward (the
+///   matching release belongs to the tracking gesture even if the
+///   TUI disabled tracking between press and release — leaving a
+///   press without a release would otherwise wedge the TUI's
+///   button-state machine). If the flag is NOT set and tracking is
+///   on now, ignore the release: it would be an orphan (the TUI
+///   enabled tracking mid-gesture and the press wasn't reported).
 fn forward_right_button(
     state: &Rc<RefCell<TerminalViewState>>,
     action: roost_linux::mouse_routing::MouseRoutingAction,
@@ -2583,8 +2616,22 @@ fn forward_right_button(
     y: f64,
 ) {
     let mut s = state.borrow_mut();
-    if !s.terminal.mouse_tracking() {
-        return;
+    match action {
+        roost_linux::mouse_routing::MouseRoutingAction::Press => {
+            if !s.terminal.mouse_tracking() {
+                s.right_tracking_press_consumed_this_gesture = false;
+                return;
+            }
+        }
+        roost_linux::mouse_routing::MouseRoutingAction::Release => {
+            if !s.right_tracking_press_consumed_this_gesture {
+                // Press wasn't forwarded (tracking was off then, or
+                // never enabled). Drop the release so the TUI's
+                // event queue stays balanced.
+                return;
+            }
+        }
+        _ => {}
     }
     let mods = key_encoder::translate_mods(raw_mods);
     let bytes = s.emit_mouse_tracking(
@@ -2594,6 +2641,22 @@ fn forward_right_button(
         x,
         y,
     );
+    if matches!(
+        action,
+        roost_linux::mouse_routing::MouseRoutingAction::Press
+    ) {
+        // Mark even on a declined encode so a release after a
+        // tracking-on press never gets dropped as "orphan". Mirror
+        // of the left-drag X10 fix.
+        s.right_tracking_press_consumed_this_gesture = true;
+    } else if matches!(
+        action,
+        roost_linux::mouse_routing::MouseRoutingAction::Release
+    ) {
+        // Clear after the release fires through so the next press
+        // gesture starts fresh.
+        s.right_tracking_press_consumed_this_gesture = false;
+    }
     let cb = s.input_callback.clone();
     drop(s);
     if !bytes.is_empty() {
