@@ -409,6 +409,7 @@ jobs:
       - name: Push signed appcast to main as release-bot
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          BOT_SLUG: ${{ steps.bot-token.outputs.app-slug }}
         run: |
           set -euo pipefail
           if git diff --quiet docs/appcast.xml; then
@@ -418,10 +419,12 @@ jobs:
             echo "::notice::docs/appcast.xml unchanged for ${GITHUB_REF_NAME} — nothing to push."
             exit 0
           fi
-          # Bot commit email follows GitHub's "<user-id>+<login>@users.noreply.github.com" convention.
-          # 288838662 is charliek-release-bot[bot]'s user id (gh api /users/charliek-release-bot[bot]).
-          git config user.name  "charliek-release-bot[bot]"
-          git config user.email "288838662+charliek-release-bot[bot]@users.noreply.github.com"
+          # Bot identity from the action's app-slug output + the public /users
+          # endpoint (installation tokens can't call /user — 403). This keeps
+          # the identity portable if the App is ever renamed.
+          bot_id="$(gh api "/users/${BOT_SLUG}[bot]" --jq '.id')"
+          git config user.name  "${BOT_SLUG}[bot]"
+          git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
           git add docs/appcast.xml
           # Defensive: assert ONLY docs/appcast.xml is staged. The threat we
           # guard against is a future build step writing into some other
@@ -484,24 +487,56 @@ jobs:
           } > "${RUNNER_TEMP}/relbody.md"
           gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/relbody.md"
 
+  # Notify charliek/apt-charliek to republish its package index. Uses a
+  # release-bot App token scoped to the receiver (no per-pipeline PAT). The
+  # App must be installed on apt-charliek (it was as of 2026-05-29 — verify
+  # via sanity-check-app.yml after any rotation).
+  #
+  # Legacy alternative: APT_DISPATCH_TOKEN PAT. To use it instead, drop the
+  # mint step and set GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }} on the
+  # dispatch step. Roost migrated to the App in this commit.
   dispatch-apt-charliek:
     needs: linux
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch apt-charliek publish
+      - name: Decide whether to dispatch
+        id: guard
         env:
-          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
-          TOKEN_SET: ${{ secrets.APT_DISPATCH_TOKEN != '' }}
+          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           case "${tag}" in
-            *-*) echo "::notice::${tag} is a prerelease — skipping apt-charliek dispatch (include_prerelease:false)."; exit 0 ;;
+            *-*)
+              echo "::notice::${tag} is a prerelease — skipping apt-charliek dispatch (include_prerelease:false)."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
           esac
-          if [ "${TOKEN_SET}" != "true" ]; then
-            echo "::warning::APT_DISPATCH_TOKEN not set — skipping dispatch. apt-charliek self-heals on its next publish run (collect-debs.sh re-scans every package)."
-            exit 0
+          if [ -z "${APP_ID}" ]; then
+            echo "::warning::RELEASE_BOT_APP_ID not set — skipping dispatch. apt-charliek self-heals on its next publish run (collect-debs.sh re-scans every package)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Mint an apt-charliek token
+        if: steps.guard.outputs.skip == 'false'
+        id: apt
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner: charliek
+          repositories: apt-charliek
+
+      - name: Dispatch apt-charliek publish
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.apt.outputs.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
           gh api repos/charliek/apt-charliek/dispatches --method POST \
             -f event_type=publish \
             -F "client_payload[package]=roost" \

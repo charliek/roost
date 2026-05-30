@@ -33,7 +33,9 @@ That's it. Everything else is automatic.
      keeps the Gatekeeper bypass instructions on the Release body while
      the DMG is not notarized.
    - `dispatch-apt-charliek` — fire a `repository_dispatch` at
-     `charliek/apt-charliek` so the .debs land on `apt.stridelabs.ai`
+     `charliek/apt-charliek` so the .debs land on `apt.stridelabs.ai`.
+     Uses a release-bot App token scoped to `apt-charliek` (no
+     per-pipeline PAT); the App must be installed on apt-charliek too.
 
 ## Version files this repo owns
 
@@ -62,10 +64,10 @@ build identity beyond "last released" is needed (e.g. for `roostctl
 
 | Secret | Purpose | Required? |
 |---|---|---|
-| `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID (3902108) | required — bot push of signed appcast |
+| `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID (3902108) | required — bot push of signed appcast + apt-charliek dispatch |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required — same |
 | `SPARKLE_ED_PRIVATE_KEY` | EdDSA signing key for Sparkle appcast, base64-encoded | required for stable releases (a `*-beta`/`*-rc` build skips signing) |
-| `APT_DISPATCH_TOKEN` | PAT with `repository_dispatch: write` on `charliek/apt-charliek` | optional — if unset, the dispatch step emits a warning and apt-charliek self-heals on its next scheduled re-scan |
+| `APT_DISPATCH_TOKEN` | Legacy PAT — superseded by the release-bot App; can be removed once you're sure the App-based dispatch is working | optional / deprecated |
 | `MACOS_CERTIFICATE_P12_BASE64` + `MACOS_CERTIFICATE_PASSWORD` + `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `ROOST_DEVELOPER_ID_IDENTITY` | Mac code-signing + notarization | optional — currently unset (Apple Dev account pending, issue #83); DMG ships ad-hoc-signed until then |
 
 ## Branch protection
@@ -107,7 +109,7 @@ guard fires correctly).
 | `mac` job fails at "Sign DMG + append appcast entry" with `SPARKLE_ED_PRIVATE_KEY secret is unset` | Stable release without the signing secret | Set the secret; re-run the mac job, OR cut the release as `vX.Y.Z-beta1` (the throwaway-key guard at the top of the mac job only enforces the real key for stable tags) |
 | `mac` job fails at "Push signed appcast" with `protected branch hook declined` | App removed from ruleset bypass | Re-add `{ actor_id: 3902108, actor_type: "Integration" }` to `main-protection`'s `bypass_actors` |
 | Appcast not visible at `https://charliek.github.io/roost/appcast.xml` after a release | `docs.yml` didn't redeploy | Check `docs.yml`'s most recent run; re-trigger via Actions UI if needed |
-| `dispatch-apt-charliek` shows a warning about missing token | `APT_DISPATCH_TOKEN` unset | Set the secret, OR wait for apt-charliek's next scheduled re-scan (it picks up new .debs automatically) |
+| `dispatch-apt-charliek` shows a warning about missing token | `RELEASE_BOT_APP_ID` unset OR the App is not installed on `charliek/apt-charliek` | Confirm via `sanity-check-app.yml`'s "Token can reach charliek/apt-charliek" block; if missing, install the App on apt-charliek. Otherwise wait for apt-charliek's next scheduled re-scan (it picks up new .debs automatically) |
 | v0.0.5 incident: mac job failed at appcast step because `Cargo.lock` drifted during the build | `/release:release` didn't bump `Cargo.lock` (legacy plugin); the staged-set assertion in the bot push step caught the drift | Now solved: `/release-workflows:release` runs `update-version.sh` which always regenerates `Cargo.lock`. |
 
 ## Adopting the convention (for new contributors)
