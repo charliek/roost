@@ -210,6 +210,17 @@ final class TerminalView: NSView {
     /// flagged). Cleared by `mouseUp` once consumed.
     private var multiClickConsumedThisGesture: Bool = false
 
+    /// Set during `mouseDown` when `forwardMouseEventToTracking`
+    /// successfully sent the press to the encoder. Read by
+    /// `mouseUp` / `mouseDragged` so the gesture skips the
+    /// selection / copy-on-select paths even when the matching
+    /// release encoder returns empty (e.g. X10 / mode 9, which
+    /// doesn't report releases). Without this flag a tracked X10
+    /// click would fall through to `mouseUp`'s copy-on-select and
+    /// clobber the user's clipboard from a TUI click. Cleared by
+    /// `mouseUp`.
+    private var trackingPressConsumedThisGesture: Bool = false
+
     /// Tracking area covering the full view bounds. Required so
     /// `mouseMoved` fires even when the user isn't dragging — hover
     /// detection wouldn't work otherwise. Rebuilt in
@@ -298,6 +309,13 @@ final class TerminalView: NSView {
     /// shape with it; once the alt screen exits, the platform
     /// default returns.
     private var wasAltScreenActive: Bool = false
+
+    /// Set by the OSC 22 drain arm in `appendBytes` if any OSC 22
+    /// landed during the current chunk. Read at the alt-screen-exit
+    /// reset to skip the reset when the TUI already set its own
+    /// shape (typical strix exit: `default` immediately before the
+    /// alt-exit CSI). Reset to false at the top of each `appendBytes`.
+    private var oscShapeSetInThisChunk: Bool = false
 
     /// `true` when the viewport has been scrolled away from the bottom
     /// by a local-scroll event. Cleared by the snap-to-bottom hook in
@@ -440,6 +458,7 @@ final class TerminalView: NSView {
         // daemon can react to title / cwd / notification OSCs.
         // The bytes still flow through to libghostty unchanged —
         // the scanner is purely additive.
+        oscShapeSetInThisChunk = false
         let events = oscScanner.feed(data)
         for event in events {
             // Synthesise OSC 10/11/12 query replies inline —
@@ -494,6 +513,7 @@ final class TerminalView: NSView {
             // applies it.
             if case .mouseShape(let name) = event {
                 currentOscShape = name
+                oscShapeSetInThisChunk = true
                 applyCurrentCursorShapeIfNeeded()
                 continue
             }
@@ -510,8 +530,16 @@ final class TerminalView: NSView {
         // TUI that owned the alt screen with a `pointer` doesn't
         // leave the cursor stuck on shell prompt. Matches xterm /
         // ghostty conventions.
+        //
+        // Skip the reset when this chunk also processed an OSC 22 —
+        // the TUI explicitly set its own shape on the way out (e.g.
+        // strix sends `default` immediately before exiting alt), and
+        // clobbering it here would lose the byte-order ordering the
+        // scanner already honored.
         let altNow = isAltScreenActive()
-        if wasAltScreenActive, !altNow, !currentOscShape.isEmpty {
+        if wasAltScreenActive, !altNow, !currentOscShape.isEmpty,
+           !oscShapeSetInThisChunk
+        {
             currentOscShape = ""
             applyCurrentCursorShapeIfNeeded()
         }
@@ -833,13 +861,16 @@ final class TerminalView: NSView {
         }
         // Mouse-tracking apps under mode 1002 (button-event) want
         // drag motion reports. The encoder declines (returns empty)
-        // when the mode is 1000-only, so this is a safe call to make
-        // any time tracking is on.
-        if forwardMouseEventToTracking(
+        // when the mode is 1000-only — but if the press was already
+        // consumed by tracking, the drag still belongs to the TUI
+        // (we just don't ship motion bytes). Mirror of the mouseUp
+        // tracking-press-consumed short-circuit.
+        let dragForwarded = forwardMouseEventToTracking(
             kind: .motion,
             button: .left,
             event: event
-        ) {
+        )
+        if dragForwarded || trackingPressConsumedThisGesture {
             return
         }
         selectionMouseDragged(event)
@@ -1097,6 +1128,7 @@ final class TerminalView: NSView {
         commandHeld = event.modifierFlags.contains(.command)
         linkClickConsumedThisGesture = false
         multiClickConsumedThisGesture = false
+        trackingPressConsumedThisGesture = false
         let p = convert(event.locationInWindow, from: nil)
         let (col, row) = cellAt(point: p)
         // Cmd-click on a URL wins over word/line expansion even at
@@ -1117,6 +1149,7 @@ final class TerminalView: NSView {
             button: .left,
             event: event
         ) {
+            trackingPressConsumedThisGesture = true
             return
         }
         let clickCount = max(1, event.clickCount)
@@ -1294,13 +1327,19 @@ final class TerminalView: NSView {
             multiClickConsumedThisGesture = false
             return
         }
-        // Mirror the mouseDown forward: when mouse tracking is on,
-        // release reports go to the encoder, NOT to copy-on-select.
-        if forwardMouseEventToTracking(
+        // Mouse-tracking owned the press; the release belongs to it
+        // too. Try the encoder first; if it declines (X10 / mode 9
+        // doesn't report releases) the gesture STILL must skip
+        // selection / copy-on-select — without this check the
+        // X10-tracked click would clobber the clipboard. Mirror of
+        // the `forward press → consumed` short-circuit on mouseDown.
+        let releaseForwarded = forwardMouseEventToTracking(
             kind: .release,
             button: .left,
             event: event
-        ) {
+        )
+        if releaseForwarded || trackingPressConsumedThisGesture {
+            trackingPressConsumedThisGesture = false
             return
         }
         // If the drag never moved (anchor == cursor) AND the selection
@@ -1368,6 +1407,21 @@ final class TerminalView: NSView {
             return
         }
         super.rightMouseUp(with: event)
+    }
+
+    /// Right-button drag motion: AppKit dispatches this separately
+    /// from `mouseDragged` (which is left-only). Under mode 1002
+    /// the TUI expects motion reports for the held button to keep
+    /// flowing — left or right.
+    override func rightMouseDragged(with event: NSEvent) {
+        if forwardMouseEventToTracking(
+            kind: .motion,
+            button: .right,
+            event: event
+        ) {
+            return
+        }
+        super.rightMouseDragged(with: event)
     }
 
     /// Middle-click pastes from the named selection pasteboard,
