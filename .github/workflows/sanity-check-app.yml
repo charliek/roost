@@ -1,16 +1,27 @@
 name: sanity-check-app
 
 # Manual verification that the charliek-release-bot GitHub App is wired into
-# this repo: RELEASE_BOT_APP_ID + RELEASE_BOT_APP_KEY resolve, token mints,
-# the App's installation sees charliek/roost, and the token's identity is the
-# bot. Run from the Actions UI ("Run workflow"); output prints in the job log.
+# every repo roost's release.yml touches: roost itself (for the appcast push)
+# and charliek/apt-charliek (for the publish dispatch). Run from the Actions
+# UI ("Run workflow") after setting the RELEASE_BOT_APP_* secrets and
+# confirming the App is installed on both repos.
 #
 # Useful when:
 #   * first wiring the App into a new repo (verify before touching release.yml)
 #   * rotating the App's private key (re-verify after updating the secret)
 #   * migrating to a new App
+#   * after adopting a new cross-repo target
 #
-# Companion to release.yml's bot-driven appcast publish (#122 / #136).
+# Each block mints a short-lived installation token scoped to one repo and
+# calls a read-only endpoint. A failure to mint, or a 404 on the reach check,
+# means the App isn't installed on that repo — fix the install before the
+# next release runs.
+#
+# Bot identity comes from the action's `app-slug` output, NOT
+# `gh api /user`, which returns 403 for installation tokens (they don't
+# authenticate as a user).
+#
+# Companion to release.yml's appcast push and apt-charliek dispatch (#122, #136).
 
 on:
   workflow_dispatch: {}
@@ -21,15 +32,17 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - id: bot-token
+      # ── 1. self (charliek/roost — appcast push target) ──
+      - id: self-token
         uses: actions/create-github-app-token@v2
         with:
           app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
 
-      - name: Token sees the right repo + installation
+      - name: Token sees roost + bot identity
         env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          GH_TOKEN: ${{ steps.self-token.outputs.token }}
+          BOT_SLUG: ${{ steps.self-token.outputs.app-slug }}
         run: |
           set -euo pipefail
           echo "::group::This repo (must print charliek/roost)"
@@ -37,11 +50,31 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Installation repository count (must be ≥1)"
-          # Count only — the App may later install on private repos (shed, etc.)
-          # and printing names into a public roost workflow log would leak them.
+          # Count only — the App also installs on private repos and printing
+          # names in this public workflow log would leak them.
           gh api /installation/repositories --jq '.total_count'
           echo "::endgroup::"
 
-          echo "::group::Token identity (login should be charliek-release-bot[bot])"
-          gh api /user --jq '.login'
+          # Installation tokens can't call /user (403 "Resource not accessible by
+          # integration") — bot identity comes from the action's app-slug output.
+          echo "::group::Bot identity (should end with [bot])"
+          echo "${BOT_SLUG}[bot]"
+          echo "::endgroup::"
+
+      # ── 2. charliek/apt-charliek (publish dispatch target) ──
+      - id: apt-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: apt-charliek
+
+      - name: Token can reach charliek/apt-charliek
+        env:
+          GH_TOKEN: ${{ steps.apt-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::charliek/apt-charliek (must print the same)"
+          gh api "/repos/charliek/apt-charliek" --jq '.full_name'
           echo "::endgroup::"
