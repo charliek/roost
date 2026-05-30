@@ -9,6 +9,72 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.6 — 2026-05-30
+
+Mouse-aware terminals release. Strix and other mouse-driven TUIs now click,
+drag, hover, and change cursor shape through Roost the same way they do under
+ghostty, on both Mac and Linux. Plus two Mac sidebar fixes that ship the
+behavior v0.0.5 was supposed to have, and a release-pipeline migration where
+the same release-bot GitHub App now drives every cross-repo push (no more
+per-pipeline PATs).
+
+### Features
+
+- **TUI mouse-tracking, focus, and OSC 22 cursor shape — Mac (#183) and
+  Linux (#184)** — TUIs like strix that drive mouse-tracking modes (button,
+  motion, SGR encoding), focus reporting, and OSC 22 cursor-shape changes
+  now work end-to-end through Roost on both platforms. A new
+  `tools/roosttest/test_mouse_tracking.py` suite enforces behavioral parity
+  across `--roost-target mac` and `--roost-target gtk` so a regression on
+  either side fails the matching CI job.
+
+### Fixes
+
+- **Mac sidebar holds its width on window resize** (#180) — re-fix of the bug
+  PR #159 misdiagnosed (and that v0.0.5 still shipped). The Mac sidebar now
+  owns resize redistribution directly via
+  `splitView(_:resizeSubviewsWithOldSize:)`; the sidebar clamps to [160, 400]
+  and the content view absorbs the window-resize delta.
+- **Mac sidebar stays collapsed across quit + relaunch** (#181, #182) — fixes
+  a pre-existing bug where ⌘B-collapsed sidebars silently re-opened on
+  relaunch AND silently corrupted persistence by writing
+  `RoostSidebarVisible=true` back to UserDefaults. PR #182 refactored the
+  fix into a cleaner vision.md DL-11 shape: `selectProject(id:)` and
+  `focusTab(tabID:)` are pure data mutators that never touch sidebar
+  visibility; user-action call sites invoke `ensureSidebarVisible()`
+  explicitly.
+
+### Release process
+
+- **Adopt `cc-plugins:release-workflows` convention** (#179) — roost is the
+  first consumer of the new release framework: `scripts/release/update-version.sh`
+  bumps Cargo.toml + Cargo.lock together (closes the Cargo.lock-drift bug
+  class that produced the v0.0.5 mac-job failure), `RELEASING.md` documents
+  the per-repo policy, two commits per release (`docs(changelog)` then
+  `chore(version)`), and the skill flow is one command:
+  `/release-workflows:release vX.Y.Z`.
+- **Release-bot App as single cross-repo credential** (#191) — `apt-charliek`
+  dispatch and the Sparkle appcast push now both authenticate via tokens
+  minted from the `charliek-release-bot` App (scoped per-target via
+  `actions/create-github-app-token`'s `owner` + `repositories`). The legacy
+  `APT_DISPATCH_TOKEN` PAT is retired; the appcast bot identity reads from
+  the action's `app-slug` output at runtime instead of being hardcoded so
+  the App can be renamed without per-repo edits.
+- **`sanity-check-app.yml` now verifies both roost AND `apt-charliek`** —
+  multi-target shape catches App-install-on-target-repo mistakes before the
+  next release tries to push there. Also fixes a latent `/user` 403 bug
+  (installation tokens can't call `/user` — bot identity comes from the
+  action's `app-slug` output).
+
+### Tests + CI
+
+- **Cross-platform mouse-tracking regression suite** (#183, #184) — every
+  case runs against both UIs by default; gtk-skip markers from PR #183 were
+  dropped in #184 once the GTK wiring landed.
+- **Pipeline-helper consolidation** (#190) — shared `_wait_tab_attached` +
+  `_drain_until` helpers extracted to `tools/roosttest/util.py` (CodeRabbit
+  flagged the duplication across both mouse-tracking and OSC-pipeline tests).
+
 ## v0.0.5 — 2026-05-29
 
 URLs, selection, and SSH-aware terminals release. URLs in the terminal are now
