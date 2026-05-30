@@ -73,6 +73,13 @@ def drain_until_match(
         if re.search(pattern, captured):
             return captured
         time.sleep(0.05)
+    # One last drain+check after the deadline so a reply that lands
+    # during the final 50 ms sleep window isn't lost. Otherwise the
+    # check-then-drain-then-sleep loop ordering can flake out tests
+    # whose data arrived in time but missed the last loop iteration.
+    captured += drain(roost, tab_id)
+    if re.search(pattern, captured):
+        return captured
     raise AssertionError(
         f"never saw pattern {pattern!r} on tab {tab_id} (captured={captured!r})"
     )
