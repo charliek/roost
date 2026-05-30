@@ -1,0 +1,10 @@
+{
+  "id": "20",
+  "ok": true,
+  "result": {
+    "window_width": 1100.0,
+    "window_height": 700.0,
+    "sidebar_width": 220.0,
+    "sidebar_collapsed": false
+  }
+}

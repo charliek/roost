@@ -183,6 +183,15 @@ class Roost:
         r = self.call("app.screenshot", {"scale": scale})
         return base64.b64decode(r["png"]), r["width"], r["height"]
 
+    def window_metrics(self) -> dict:
+        """{window_width, window_height, sidebar_width, sidebar_collapsed}
+        in logical points. Backs the sidebar-holds-width regression."""
+        return self.call("app.window_metrics", {})
+
+    def window_resize(self, width: float, height: float) -> None:
+        """Test-mode only — set the window's logical size."""
+        self.call("window.resize", {"width": float(width), "height": float(height)})
+
     # -- command palette --------------------------------------------------
     # Each op returns the resulting palette state:
     #   {open: bool, frame?: str, query: str, selection: int,

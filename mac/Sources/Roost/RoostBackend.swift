@@ -33,6 +33,10 @@ import Foundation
 protocol UiBridge: AnyObject {
     /// Main window, for whole-window ops (`app.screenshot`).
     var mainWindow: NSWindow? { get }
+    /// Sidebar pane's current frame width in points, plus whether the
+    /// sidebar is collapsed. Drives `app.window_metrics`, used by the
+    /// sidebar-holds-width regression suite.
+    func sidebarMetrics() -> (width: CGFloat, collapsed: Bool)
     /// Read a tab's terminal viewport as text (`tab.dump`); `nil` when
     /// no live tab holds that id.
     func dumpTab(tabID: Int64) -> TerminalView.Dump?

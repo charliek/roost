@@ -875,6 +875,16 @@ impl App {
                                 click_count,
                             ));
                         }
+                        UiRequest::WindowMetrics { reply } => {
+                            let _ = reply.send(app.ipc_window_metrics());
+                        }
+                        UiRequest::WindowResize {
+                            width,
+                            height,
+                            reply,
+                        } => {
+                            let _ = reply.send(app.ipc_window_resize(width, height));
+                        }
                     }
                 }
             });
@@ -3438,6 +3448,36 @@ impl App {
                     )
                 })?;
         Ok(roost_linux::ipc::ExpandSelectionData { col0, col1, text })
+    }
+
+    /// `app.window_metrics` — return window size + sidebar pane width +
+    /// collapsed flag in logical points. Read-only: always succeeds.
+    /// `Widget::width()` returns the allocated logical width; for the
+    /// sidebar that's the start child of the `gtk4::Paned` we built
+    /// with `resize_start_child(false) + shrink_start_child(false)`,
+    /// so it equals the paned position when visible.
+    fn ipc_window_metrics(self: &Rc<Self>) -> Result<(f64, f64, f64, bool), String> {
+        let w = self.window.width() as f64;
+        let h = self.window.height() as f64;
+        let collapsed = !self.sidebar_box.is_visible();
+        let sw = if collapsed {
+            0.0
+        } else {
+            self.sidebar_box.width() as f64
+        };
+        Ok((w, h, sw, collapsed))
+    }
+
+    /// `window.resize` (test-mode only) — programmatically resize the
+    /// window. Gated on `ROOST_TEST_MODE=1` so a user-local script
+    /// can't yank window geometry out from under the user.
+    fn ipc_window_resize(self: &Rc<Self>, width: f64, height: f64) -> Result<(), String> {
+        if !self.test_mode {
+            return Err("window.resize requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        self.window
+            .set_default_size(width.round() as i32, height.round() as i32);
+        Ok(())
     }
 
     fn toggle_sidebar(self: &Rc<Self>) {

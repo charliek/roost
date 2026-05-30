@@ -86,6 +86,11 @@ actor IPCHandlerImpl: IPCHandler {
             return AnyCodable([:] as [String: Any])
         case "app.screenshot":
             return try await encodeResult(self.screenshotCapture(params: params))
+        case "app.window_metrics":
+            return try await encodeResult(self.windowMetrics(params: params))
+        case "window.resize":
+            try await self.windowResize(params: params)
+            return AnyCodable([:] as [String: Any])
         case "palette.open":
             return try await encodeResult(self.paletteOpen(params: params))
         case "palette.state":
@@ -806,6 +811,74 @@ actor IPCHandlerImpl: IPCHandler {
             scale: p.scale
         )
     }
+
+    /// `app.window_metrics`: logical (point) measurements of the running
+    /// UI's window + sidebar. Backs the sidebar-holds-width regression
+    /// suite — a real user reads pixels, but a programmatic test reads
+    /// these and asserts `sidebar_width` unchanged across a `window.resize`.
+    /// Always available (no test-mode gate; read-only).
+    @MainActor
+    private func windowMetrics(params: AnyCodable?) async throws -> IPCWindowMetricsResult {
+        _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
+        guard let ui = RoostBackend.shared.ui, let window = ui.mainWindow else {
+            throw IPCHandlerError.internalError("no UI window for window_metrics")
+        }
+        let metrics = ui.sidebarMetrics()
+        // Report the content rect (matches GTK's widget allocation,
+        // which is content-area, not toplevel-with-decorations).
+        // `NSWindow.frame` includes the titlebar; reporting that would
+        // break cross-platform width/height equivalence for callers
+        // that drive both UIs through the same op.
+        let content = window.contentRect(forFrameRect: window.frame)
+        return IPCWindowMetricsResult(
+            windowWidth: Double(content.width),
+            windowHeight: Double(content.height),
+            sidebarWidth: Double(metrics.width),
+            sidebarCollapsed: metrics.collapsed
+        )
+    }
+
+    /// `window.resize` (test-mode only): programmatically set the window's
+    /// logical size. Gated for the same reason as the PTY drain ops —
+    /// only a harness should be driving window geometry; a real user
+    /// resizes themselves.
+    @MainActor
+    private func windowResize(params: AnyCodable?) async throws {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "window.resize requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCWindowResizeParams.self, expected: ["width", "height"]
+        )
+        // Match the GTK handler's validation: width and height must be
+        // positive AND finite (no NaN/Infinity). Without the finite check
+        // a permissive client could push `CGFloat.infinity` into setFrame
+        // and trip AppKit's geometry assertions.
+        guard p.width.isFinite, p.height.isFinite, p.width > 0, p.height > 0 else {
+            throw IPCHandlerError.invalidParam(
+                "width and height must be positive and finite; got \(p.width) x \(p.height)"
+            )
+        }
+        guard let window = RoostBackend.shared.ui?.mainWindow else {
+            throw IPCHandlerError.internalError("no UI window for window.resize")
+        }
+        // Treat width/height as the CONTENT rect (matches GTK, which
+        // resizes the toplevel widget's allocation). Without this
+        // conversion, Mac would set the outer frame (including
+        // titlebar) to W×H while GTK sets content to W×H, producing
+        // different content sizes for the same op call.
+        let desiredContent = NSRect(
+            x: window.frame.origin.x, y: window.frame.origin.y,
+            width: CGFloat(p.width), height: CGFloat(p.height)
+        )
+        window.setFrame(
+            window.frameRect(forContentRect: desiredContent),
+            display: true, animate: false
+        )
+    }
 }
 
 // MARK: - Param decoding helpers
@@ -1022,6 +1095,28 @@ private struct IPCTabResizeParams: Codable {
         case tabID = "tab_id"
         case cols, rows
     }
+}
+
+/// `app.window_metrics` response — mirrors `WindowMetricsResult` in
+/// `crates/roost-ipc/src/messages.rs`. Logical (point) measurements.
+private struct IPCWindowMetricsResult: Codable {
+    let windowWidth: Double
+    let windowHeight: Double
+    let sidebarWidth: Double
+    let sidebarCollapsed: Bool
+    enum CodingKeys: String, CodingKey {
+        case windowWidth = "window_width"
+        case windowHeight = "window_height"
+        case sidebarWidth = "sidebar_width"
+        case sidebarCollapsed = "sidebar_collapsed"
+    }
+}
+
+/// `window.resize` params — mirrors `WindowResizeParams` in
+/// `crates/roost-ipc/src/messages.rs`. Test-mode-gated by the handler.
+private struct IPCWindowResizeParams: Codable {
+    let width: Double
+    let height: Double
 }
 
 private struct IPCProjectCreateParams: Codable {
