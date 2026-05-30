@@ -343,7 +343,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // + M3 selectTab paths.
         desktopNotifications.requestAuthorization()
         desktopNotifications.onActivate = { [weak self] tabID in
-            self?.focusTab(tabID: tabID)
+            // Guard tab existence BEFORE the reveal so a click on a
+            // banner for a since-closed tab doesn't uncollapse the
+            // sidebar (and rewrite `RoostSidebarVisible = true`) for
+            // a navigation that won't happen. Same guard pattern as
+            // `jumpToUnread`. `focusTab` itself is pure data mutation
+            // per DL-11.
+            guard let self,
+                  self.tabs.contains(where: { $0.id == tabID })
+            else { return }
+            self.ensureSidebarVisible()
+            self.focusTab(tabID: tabID)
         }
 
         // Probe the cell-grid intrinsic size so the right pane reserves
@@ -1079,6 +1089,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // `focusTab`, keeps the core the source of truth (matches the
             // GTK `focus_tab_by_id` fix). Raise the app (a jump wants
             // focus) and clear the tab's notification.
+            //
+            // User action: reveal the sidebar so the jump destination is
+            // visible; the `.active` event arm uses pure `focusTab` and
+            // can't be relied on to uncollapse for us.
+            self.ensureSidebarVisible()
             _ = try? RoostBackend.shared.localClient?.focusTab(tabID)
             NSApp.activate(ignoringOtherApps: true)
             let socket = self.socketPath
@@ -1120,6 +1135,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// stealing OS focus from the user's frontmost app — matching the
     /// GTK `ActiveChanged` arm, which switches the page but never calls
     /// `window.present()`.
+    ///
+    /// Pure data mutation: does not touch sidebar visibility. Inherits
+    /// that contract from `selectProject(id:)`. Call sites that should
+    /// reveal the sidebar (user-action paths — banner click, palette
+    /// confirm, ⌘⇧U) must invoke `ensureSidebarVisible()` before this
+    /// call (or before the workspace-routed `localClient?.focusTab`
+    /// that re-enters here via the `.active` arm).
     @MainActor
     private func focusTab(tabID: Int64, activate: Bool = true) {
         guard let session = tabs.first(where: { $0.id == tabID }) else { return }
@@ -1299,16 +1321,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                // Restore the UI active project + tab selection.
-                // `revealSidebar: false` because this is a launch-time
-                // restore, not a user action — if the user had the
-                // sidebar collapsed at quit, we must not auto-uncollapse
-                // it. Without this, `selectProject` → `ensureSidebar
-                // Visible` → `toggleSidebar` would also rewrite
-                // `RoostSidebarVisible = true`, silently erasing the
-                // user's collapse preference on every launch.
+                // Restore the UI active project + tab selection. This
+                // is a launch-time restore, not a user action — and
+                // `selectProject` is now pure data mutation, so the
+                // user's collapsed-sidebar preference is preserved
+                // automatically.
                 if let pid = activeID {
-                    self.selectProject(id: pid, revealSidebar: false)
+                    self.selectProject(id: pid)
                     self.selectTabByPosition(in: pid, position: Int32(activePos))
                 }
                 // The subscription emits a `.resync` as its first event,
@@ -1777,25 +1796,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // source-list style.
     }
 
+    /// Pure data mutation: swap the active project + reconcile tabs.
+    /// Does NOT touch sidebar visibility — call sites that want the
+    /// sidebar revealed (user-action paths like ⌘1-9, sidebar-row
+    /// click, palette confirm) must invoke `ensureSidebarVisible()`
+    /// themselves before this call. Mirrors GTK's
+    /// `set_active_project` and the vision.md DL-11 principle: "the
+    /// UI is a reaction to the core's events, not a parallel source
+    /// of truth." Programmatic callers (bootstrap, event reconcile,
+    /// `focusTab` for external IPC, project-delete next-pick) get
+    /// silent mutation and preserve the user's collapse intent.
     @MainActor
-    private func selectProject(id: Int64, revealSidebar: Bool = true) {
-        // M3: Reveal the sidebar on ⌘1-9 / explicit project-switch
-        // so the user can see which project they've landed on.
-        // Mirrors Go `cmd/roost/app.go:1487`. Programmatic selection
-        // paths that already have the sidebar in view (single-click
-        // sidebar row, WatchEvents reconcile) flow through here too
-        // — calling ensureVisible is idempotent when already shown.
-        //
-        // `revealSidebar: false` is for callers that restore project
-        // selection programmatically (notably `bootstrapWorkspace` on
-        // launch) and must preserve the user's collapse intent. Without
-        // that escape hatch, `ensureSidebarVisible` → `toggleSidebar`
-        // would silently uncollapse a sidebar the user hid via ⌘B
-        // AND rewrite `RoostSidebarVisible = true` to UserDefaults,
-        // erasing the preference on every launch.
-        if revealSidebar {
-            ensureSidebarVisible()
-        }
+    private func selectProject(id: Int64) {
         activeProjectID = id
         applySidebarSelection()
         updateWindowTitle()
@@ -1831,8 +1843,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // M3: reveal the sidebar BEFORE the async create round-trip
         // so the user gets immediate visual feedback even if the
         // create fails. Matches Go `cmd/roost/app.go:1337`. The
-        // follow-on `selectProject(id:)` call also ensures visibility
-        // for the success path; this one defends the failure path.
+        // follow-on `selectProject(id:)` is pure data mutation per
+        // DL-11 — this is the only reveal in the success path too.
         ensureSidebarVisible()
         let socketPath = self.socketPath
         Task { [weak self] in
@@ -2673,6 +2685,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func selectProjectFromMenu(_ sender: NSMenuItem) {
         let id = Int64(sender.tag)
         guard id != activeProjectID else { return }
+        // User action (⌘1-9): reveal the sidebar so the user can see
+        // which project they landed on. Mirrors Go `cmd/roost/app.go:1487`.
+        ensureSidebarVisible()
         selectProject(id: id)
     }
 
@@ -3255,12 +3270,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// Force the sidebar visible without toggling. Called from the
-    /// three user actions where Go (`cmd/roost/app.go:1337,1487,1975`)
+    /// user-action paths where Go (`cmd/roost/app.go:1337,1487,1975`)
     /// auto-expands the sidebar so the user sees the affected row:
-    /// `newProject` (sidebar shows the freshly-created project),
-    /// `selectProject` (the ⌘1-9 switcher reveals the focused project),
-    /// and `beginRenameActiveProject` (M4 hookup — rename popover
-    /// needs the row visible to anchor against).
+    /// `newProject` (freshly-created project), `selectProjectFromMenu`
+    /// (⌘1-9 reveals the focused project), `renameActiveProject`
+    /// (rename popover needs the row to anchor against), plus the
+    /// notification jumps (banner click, palette confirm, ⌘⇧U). The
+    /// underlying `selectProject` / `focusTab` are pure data mutators
+    /// per DL-11; reveal is a per-call-site concern.
     ///
     /// Round-7 R7.A: collapse is now a width-0 state, not
     /// `isHidden = true`. Delegate to `toggleSidebar` when the pane
@@ -3290,6 +3307,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // — hence identify / tab.focus / the restored selection — tracks the
         // jump, not just UI selection. The `.active` event drives the project
         // switch + tab select; clear the tab's notification.
+        //
+        // User action (⌘⇧U): reveal the sidebar so the jump destination is
+        // visible. `focusTab` is pure data mutation per DL-11.
+        ensureSidebarVisible()
         _ = try? RoostBackend.shared.localClient?.focusTab(tabID)
         let socket = socketPath
         Task.detached { await clearTabNotification(socketPath: socket, tabID: tabID) }
