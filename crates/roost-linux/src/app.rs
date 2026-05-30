@@ -3194,16 +3194,16 @@ impl App {
         None
     }
 
-    /// Look up the `TabSession` for a tab id by scanning all
-    /// projects (the workspace doesn't carry the GTK-side session
-    /// handle). Sibling of `terminal_view_for`. Used to push
-    /// synthetic-event bytes (mouse / focus IPC ops) onto the same
-    /// per-tab serial input channel real keystrokes flow through.
-    fn tab_session_for(self: &Rc<Self>, tab_id: i64) -> Option<Rc<TabSession>> {
+    /// Return both `(view, session)` Rc clones in one scan. Used by
+    /// the IPC mouse/focus paths so a project removal between two
+    /// separate lookups can't return inconsistent
+    /// `(Some(session), None)` — AND so the synthetic-event hot
+    /// path pays only one O(n) walk.
+    fn tab_handles_for(self: &Rc<Self>, tab_id: i64) -> Option<(Rc<TerminalView>, Rc<TabSession>)> {
         let projects = self.projects.borrow();
         for ui in projects.values() {
             if let Some(tab) = ui.tabs.borrow().get(&tab_id) {
-                return Some(tab.session.clone());
+                return Some((tab.view.clone(), tab.session.clone()));
             }
         }
         None
@@ -3500,8 +3500,8 @@ impl App {
         if !self.test_mode {
             return Err("tab.dispatch_mouse_event requires ROOST_TEST_MODE=1 at UI launch".into());
         }
-        let view = self
-            .terminal_view_for(tab_id)
+        let (view, session) = self
+            .tab_handles_for(tab_id)
             .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?;
         let bytes = view.ipc_dispatch_mouse_event(kind, button, cell_x, cell_y, mods as u16);
         if bytes.is_empty() {
@@ -3512,9 +3512,7 @@ impl App {
         // Push to the same PTY input channel keystrokes use. The
         // capture buffer taps that channel, so the e2e test reads
         // the emitted bytes via `tab.capture_pty_input`.
-        if let Some(session) = self.tab_session_for(tab_id) {
-            session.send_input(bytes);
-        }
+        session.send_input(bytes);
         Ok(())
     }
 
@@ -3533,11 +3531,8 @@ impl App {
         let Some(active_tab_id) = self.active_tab_id(pid) else {
             return Err("no active tab to drive focus on".into());
         };
-        let session = self
-            .tab_session_for(active_tab_id)
-            .ok_or_else(|| format!("active tab {active_tab_id} has no live terminal"))?;
-        let view = self
-            .terminal_view_for(active_tab_id)
+        let (view, session) = self
+            .tab_handles_for(active_tab_id)
             .ok_or_else(|| format!("active tab {active_tab_id} has no live terminal"))?;
         let bytes = view.ipc_set_window_focus(focused);
         if !bytes.is_empty() {

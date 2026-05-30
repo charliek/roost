@@ -240,6 +240,7 @@ impl TerminalView {
             }),
             link_click_consumed_this_gesture: false,
             pointer_inside: false,
+            last_applied_cursor_name: None,
             multi_click_consumed_this_gesture: false,
             word_break_chars: roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
             tracking_press_consumed_this_gesture: false,
@@ -247,7 +248,6 @@ impl TerminalView {
             current_osc_shape: String::new(),
             was_alt_screen_active: false,
             osc_shape_set_in_this_chunk: false,
-            pointer_is_over_this_view: false,
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -289,6 +289,14 @@ impl TerminalView {
             let widget = widget.clone();
             move |_| {
                 let mut s = state.borrow_mut();
+                // Dedup: GTK can fire focus-in twice in a row during a
+                // window-manager activate cycle (compositor grab +
+                // key-focus). Mode 1004 emit must only fire on the
+                // edge — emitting CSI I twice would land junk at a
+                // shell prompt and confuse mode-1004 TUIs.
+                if s.has_focus {
+                    return;
+                }
                 s.has_focus = true;
                 s.cursor_blink_on = true;
                 let bytes = s.encode_focus_bytes_if_active(true);
@@ -307,7 +315,20 @@ impl TerminalView {
             let widget = widget.clone();
             move |_| {
                 let mut s = state.borrow_mut();
+                if !s.has_focus {
+                    // Dedup symmetric to connect_enter; spurious
+                    // focus-leave during a WM activate cycle.
+                    return;
+                }
                 s.has_focus = false;
+                // Mac's `handleWindowDidResignKey` clears the URL
+                // hover so the underline + Ctrl-hand cursor don't
+                // survive off-window. GTK parity.
+                let hover_was_set = s.hover_url.is_some();
+                if hover_was_set {
+                    s.hover_url = None;
+                    s.apply_link_cursor(&widget);
+                }
                 let bytes = s.encode_focus_bytes_if_active(false);
                 let cb = s.input_callback.clone();
                 drop(s);
@@ -336,7 +357,6 @@ impl TerminalView {
             move |_, _x, _y| {
                 let mut s = state.borrow_mut();
                 s.pointer_inside = true;
-                s.pointer_is_over_this_view = true;
                 // A background-tab OSC 22 drain may have set
                 // `current_osc_shape` while we were unfocused; apply
                 // now that the pointer is over us so the shape lands
@@ -406,7 +426,11 @@ impl TerminalView {
             move |_| {
                 let mut s = state.borrow_mut();
                 s.pointer_inside = false;
-                s.pointer_is_over_this_view = false;
+                // Drop the cached cursor-name so a re-enter pushes a
+                // fresh `set_cursor_from_name` (the OS may have
+                // changed the cursor under us while the pointer was
+                // away).
+                s.last_applied_cursor_name = None;
                 if s.hover_url.is_some() {
                     s.hover_url = None;
                     s.apply_link_cursor(&widget);
@@ -845,54 +869,26 @@ impl TerminalView {
         right_click.set_button(gtk4::gdk::BUTTON_SECONDARY);
         right_click.connect_pressed({
             let state = state.clone();
-            let widget = widget.clone();
             move |g, _n_press, x, y| {
-                let mut s = state.borrow_mut();
-                if !s.terminal.mouse_tracking() {
-                    return;
-                }
-                let mods = key_encoder::translate_mods(g.current_event_state());
-                let bytes = s.emit_mouse_tracking(
+                forward_right_button(
+                    &state,
                     roost_linux::mouse_routing::MouseRoutingAction::Press,
-                    Some(roost_linux::mouse_routing::MouseRoutingButton::Right),
-                    mods,
+                    g.current_event_state(),
                     x,
                     y,
                 );
-                let cb = s.input_callback.clone();
-                drop(s);
-                if !bytes.is_empty() {
-                    if let Some(cb) = cb {
-                        cb(bytes);
-                    }
-                }
-                let _ = widget;
             }
         });
         right_click.connect_released({
             let state = state.clone();
-            let widget = widget.clone();
             move |g, _n_press, x, y| {
-                let mut s = state.borrow_mut();
-                if !s.terminal.mouse_tracking() {
-                    return;
-                }
-                let mods = key_encoder::translate_mods(g.current_event_state());
-                let bytes = s.emit_mouse_tracking(
+                forward_right_button(
+                    &state,
                     roost_linux::mouse_routing::MouseRoutingAction::Release,
-                    Some(roost_linux::mouse_routing::MouseRoutingButton::Right),
-                    mods,
+                    g.current_event_state(),
                     x,
                     y,
                 );
-                let cb = s.input_callback.clone();
-                drop(s);
-                if !bytes.is_empty() {
-                    if let Some(cb) = cb {
-                        cb(bytes);
-                    }
-                }
-                let _ = widget;
             }
         });
         widget.add_controller(right_click);
@@ -1004,12 +1000,15 @@ impl TerminalView {
     /// state is on screen by the next frame.
     pub fn vt_write(&self, bytes: &[u8]) {
         let mut s = self.state.borrow_mut();
-        // Snapshot the prior alt-screen state so the OSC drain can
-        // detect the alt→primary transition and reset the OSC 22
-        // cursor shape if the TUI didn't already set its own. We
-        // reset `osc_shape_set_in_this_chunk` BEFORE the OSC drain
-        // calls `apply_mouse_shape`; `app.rs` interleaves the
-        // events with vt_write, so this method just snapshots.
+        // Snapshot the prior alt-screen state so we can detect an
+        // alt→primary transition and reset the OSC 22 cursor shape
+        // after vt_write applies the bytes. Note the cross-file
+        // ordering: app.rs drains the OSC scanner FIRST (calling
+        // `apply_mouse_shape` for each MouseShape event in this
+        // chunk, which sets `osc_shape_set_in_this_chunk`), THEN
+        // calls vt_write. So when we read the flag below, it
+        // reflects the chunk's OSC 22 activity; we clear it at the
+        // end to prepare for the next chunk's drain.
         s.was_alt_screen_active = s.terminal.active_screen() == ActiveScreen::Alternate;
         s.terminal.vt_write(bytes);
         let alt_now = s.terminal.active_screen() == ActiveScreen::Alternate;
@@ -1477,11 +1476,12 @@ struct TerminalViewState {
     /// explicitly set its own shape on the way out (e.g. strix
     /// sends `default` immediately before the alt-exit CSI).
     osc_shape_set_in_this_chunk: bool,
-    /// True while the pointer is over THIS widget. Used by the OSC
-    /// 22 apply path to gate `set_cursor_from_name` so a background
-    /// tab's drain doesn't change the visible cursor while the
-    /// user's pointer is over another tab.
-    pointer_is_over_this_view: bool,
+    /// Last GTK cursor name pushed via `set_cursor_from_name`.
+    /// `apply_current_cursor_shape` short-circuits when the same
+    /// name would be pushed again — under steady-state strix hover
+    /// a TUI may re-assert OSC 22 `pointer` on every motion event,
+    /// and re-pushing the identical name is wasted FFI.
+    last_applied_cursor_name: Option<&'static str>,
 }
 
 /// Active URL hover. `col0` is the URL's first column (inclusive);
@@ -2103,24 +2103,31 @@ impl TerminalViewState {
     }
 
     /// Apply the OSC 22 W3C cursor name to the underlying widget.
-    /// Gated on `pointer_is_over_this_view` so a background tab's
-    /// drain doesn't change the visible cursor. URL hover (Ctrl
-    /// over a URL) wins precedence over OSC 22.
-    fn apply_current_cursor_shape(&self, widget: &DrawingArea) {
-        if !self.pointer_is_over_this_view {
+    /// Gated on `pointer_inside` so a background tab's OSC drain
+    /// doesn't change the visible cursor. URL hover (Ctrl over a
+    /// URL) wins precedence over OSC 22 > GTK default text cursor
+    /// (matches the Mac UI's iBeam fallback in `nsCursorForW3CName`).
+    ///
+    /// Skips the FFI `set_cursor_from_name` call when the same name
+    /// would be pushed — under steady-state strix hover the same
+    /// `pointer` lands on every motion event and re-pushing is
+    /// wasted work.
+    fn apply_current_cursor_shape(&mut self, widget: &DrawingArea) {
+        if !self.pointer_inside {
             return;
         }
-        if self.hover_url.is_some() && self.ctrl_held {
-            widget.set_cursor_from_name(Some("pointer"));
+        let next: &'static str = if self.hover_url.is_some() && self.ctrl_held {
+            "pointer"
+        } else if !self.current_osc_shape.is_empty() {
+            roost_linux::mouse_routing::gtk_cursor_name_for_w3c(&self.current_osc_shape)
+        } else {
+            "text"
+        };
+        if self.last_applied_cursor_name == Some(next) {
             return;
         }
-        if !self.current_osc_shape.is_empty() {
-            let gtk_name =
-                roost_linux::mouse_routing::gtk_cursor_name_for_w3c(&self.current_osc_shape);
-            widget.set_cursor_from_name(Some(gtk_name));
-            return;
-        }
-        widget.set_cursor_from_name(Some("text"));
+        widget.set_cursor_from_name(Some(next));
+        self.last_applied_cursor_name = Some(next);
     }
 
     /// Write the xterm focus-tracking sequence onto the PTY input
@@ -2207,16 +2214,15 @@ impl TerminalViewState {
     }
 
     /// Swap the widget's cursor between `pointer` (URL hover with
-    /// Ctrl held) and `text` (default text cursor — same shape as
-    /// the Mac UI's `iBeam`). gtk4-rs's `set_cursor_from_name` takes
-    /// the GTK / icon-theme cursor name; `Some("pointer")` is the
-    /// recommended hand-style cursor.
-    fn apply_link_cursor(&self, widget: &DrawingArea) {
-        if self.hover_url.is_some() && self.ctrl_held {
-            widget.set_cursor_from_name(Some("pointer"));
-        } else {
-            widget.set_cursor_from_name(Some("text"));
-        }
+    /// Update the cursor when URL hover state changes. Routes
+    /// through `apply_current_cursor_shape` so the precedence ladder
+    /// (URL > OSC 22 > default text) stays in one place. The earlier
+    /// inline `set_cursor_from_name("text")` unconditionally on
+    /// no-URL-hover silently clobbered any OSC 22 shape the TUI had
+    /// asked for, breaking strix's `pointer` cursor every time the
+    /// pointer moved off a URL.
+    fn apply_link_cursor(&mut self, widget: &DrawingArea) {
+        self.apply_current_cursor_shape(widget);
     }
 
     /// Convert widget-pixel `(x, y)` to a (col, row) cell pair,
@@ -2561,6 +2567,40 @@ fn link_underline_rect(
         span_cells * cell_w,
         1.0,
     )
+}
+
+/// Shared right-button forward path used by both `right_click`
+/// gesture-controller signals (pressed + released). Both arms
+/// differ only in the `MouseRoutingAction` — extracted to dedup
+/// ~26 lines per arm and to give a single place for any future
+/// right-button policy tweaks (e.g., a press-consumed flag for
+/// mid-gesture mode toggles).
+fn forward_right_button(
+    state: &Rc<RefCell<TerminalViewState>>,
+    action: roost_linux::mouse_routing::MouseRoutingAction,
+    raw_mods: gtk4::gdk::ModifierType,
+    x: f64,
+    y: f64,
+) {
+    let mut s = state.borrow_mut();
+    if !s.terminal.mouse_tracking() {
+        return;
+    }
+    let mods = key_encoder::translate_mods(raw_mods);
+    let bytes = s.emit_mouse_tracking(
+        action,
+        Some(roost_linux::mouse_routing::MouseRoutingButton::Right),
+        mods,
+        x,
+        y,
+    );
+    let cb = s.input_callback.clone();
+    drop(s);
+    if !bytes.is_empty() {
+        if let Some(cb) = cb {
+            cb(bytes);
+        }
+    }
 }
 
 /// Monotonic-clock seconds since process start. Sibling of
