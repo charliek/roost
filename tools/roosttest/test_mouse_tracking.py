@@ -137,7 +137,7 @@ def test_button_no_emit_when_tracking_off(roost, project, target):
     )
     # Allow a small settle window in case the UI ever buffers the
     # decision; capture must NOT contain any SGR mouse report.
-    time.sleep(0.2)
+    time.sleep(scaled_timeout(0.2))
     captured = _drain(roost, tab)
     assert b"\x1b[<" not in captured, captured
 
@@ -187,7 +187,7 @@ def test_motion_no_button_emits_only_in_mode_1003(roost, project, target):
     roost.tab_dispatch_mouse_event(
         tab, kind="motion", button="none", cell_x=4, cell_y=4
     )
-    time.sleep(0.2)
+    time.sleep(scaled_timeout(0.2))
     captured_off = _drain(roost, tab)
     assert b"\x1b[<" not in captured_off, captured_off
 
@@ -251,10 +251,24 @@ def test_focus_event_silent_when_mode_1004_disabled(roost, project, target):
     _drain(roost, tab)
     roost.app_set_window_focus(focus=False)
     roost.app_set_window_focus(focus=True)
-    time.sleep(0.2)
+    time.sleep(scaled_timeout(0.2))
     captured = _drain(roost, tab)
     assert b"\x1b[O" not in captured, captured
     assert b"\x1b[I" not in captured, captured
+
+
+def _wait_cursor_shape(roost, expected: str, timeout: float = 2.0) -> None:
+    """Poll `app.cursor_shape` until it equals `expected` or the
+    deadline expires. Each call gets its own scaled deadline so
+    sequential phases inside one test don't share a budget."""
+    deadline = time.monotonic() + scaled_timeout(timeout)
+    while time.monotonic() < deadline:
+        if roost.app_cursor_shape() == expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"cursor never became {expected!r} (got {roost.app_cursor_shape()!r})"
+    )
 
 
 def test_osc_22_pointer_changes_cursor(roost, project, target):
@@ -267,37 +281,20 @@ def test_osc_22_pointer_changes_cursor(roost, project, target):
 
     # `pointer` — the strix divider grab cursor.
     roost.tab_feed_pty_bytes(tab, b"\x1b]22;pointer\x1b\\")
-    deadline = time.monotonic() + scaled_timeout(2.0)
-    while time.monotonic() < deadline:
-        if roost.app_cursor_shape() == "pointer":
-            break
-        time.sleep(0.05)
-    assert roost.app_cursor_shape() == "pointer"
+    _wait_cursor_shape(roost, "pointer")
 
     # `default` — the strix reset form.
     roost.tab_feed_pty_bytes(tab, b"\x1b]22;default\x1b\\")
-    while time.monotonic() < deadline:
-        if roost.app_cursor_shape() == "default":
-            break
-        time.sleep(0.05)
-    assert roost.app_cursor_shape() == "default"
+    _wait_cursor_shape(roost, "default")
 
     # `text` — BEL terminator. Same dispatch path as the ST form.
     roost.tab_feed_pty_bytes(tab, b"\x1b]22;text\x07")
-    while time.monotonic() < deadline:
-        if roost.app_cursor_shape() == "text":
-            break
-        time.sleep(0.05)
-    assert roost.app_cursor_shape() == "text"
+    _wait_cursor_shape(roost, "text")
 
     # Empty reset form. Canonicalises to "default" on the wire so
     # tests can always assert against a non-empty name.
     roost.tab_feed_pty_bytes(tab, b"\x1b]22;\x1b\\")
-    while time.monotonic() < deadline:
-        if roost.app_cursor_shape() == "default":
-            break
-        time.sleep(0.05)
-    assert roost.app_cursor_shape() == "default"
+    _wait_cursor_shape(roost, "default")
 
 
 def test_right_click_emits_button_2_when_tracking_on(roost, project, target):
@@ -336,6 +333,6 @@ def test_left_click_when_tracking_off_does_not_emit_sgr(roost, project, target):
     roost.tab_dispatch_mouse_event(
         tab, kind="release", button="left", cell_x=2, cell_y=2
     )
-    time.sleep(0.2)
+    time.sleep(scaled_timeout(0.2))
     captured = _drain(roost, tab)
     assert b"\x1b[<" not in captured, captured

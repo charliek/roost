@@ -287,8 +287,17 @@ final class TerminalView: NSView {
     /// `"default"`) means the platform default arrow. Strix sends
     /// `pointer` while hovering its split bar and `default` to reset.
     /// Read by `cursorUpdate(with:)` and the `app.cursor_shape` IPC
-    /// op (Tier 1 OSC 22 wiring).
+    /// op (Tier 1 OSC 22 wiring). Reset to empty on alt-screen exit
+    /// so a hung TUI's stale `pointer` doesn't survive across tab
+    /// teardown / shell reset.
     private var currentOscShape: String = ""
+
+    /// Tracks the prior alt-screen state so `appendBytes` can detect
+    /// an alt→primary transition and reset `currentOscShape`. xterm
+    /// convention: a TUI that owns the alt screen owns the cursor
+    /// shape with it; once the alt screen exits, the platform
+    /// default returns.
+    private var wasAltScreenActive: Bool = false
 
     /// `true` when the viewport has been scrolled away from the bottom
     /// by a local-scroll event. Cleared by the snap-to-bottom hook in
@@ -497,6 +506,16 @@ final class TerminalView: NSView {
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             ghostty_terminal_vt_write(terminal, base, data.count)
         }
+        // Alt→primary transition resets the OSC 22 cursor shape so a
+        // TUI that owned the alt screen with a `pointer` doesn't
+        // leave the cursor stuck on shell prompt. Matches xterm /
+        // ghostty conventions.
+        let altNow = isAltScreenActive()
+        if wasAltScreenActive, !altNow, !currentOscShape.isEmpty {
+            currentOscShape = ""
+            applyCurrentCursorShapeIfNeeded()
+        }
+        wasAltScreenActive = altNow
         needsDisplay = true
     }
 
@@ -611,17 +630,34 @@ final class TerminalView: NSView {
     }
 
     /// Write the xterm focus-tracking sequence onto the PTY input
-    /// channel when mode 1004 is enabled. `\x1b[I` for focus-in,
-    /// `\x1b[O` for focus-out. libghostty-vt's standalone API doesn't
-    /// expose a dedicated focus encoder; the two byte sequences are
-    /// stable per xterm so inlining is the minimal-overhead path.
+    /// channel when mode 1004 is enabled. Uses libghostty-vt's
+    /// `ghostty_focus_encode` so the wire format follows the same
+    /// authoritative source as ghostty itself (CSI I for gained,
+    /// CSI O for lost).
+    ///
+    /// Background tabs' TerminalViews each observe the same window-
+    /// key notifications, so without gating on first-responder
+    /// status every Cmd-Tab would write focus events to every
+    /// open mode-1004 TUI. `requireFirstResponder=true` (the default
+    /// for the window-notification path) keeps the emit on the
+    /// active tab only. The IPC test seam passes `false` because
+    /// `app.set_window_focus` already targets the active session
+    /// upstream.
     @MainActor
-    func emitFocusEvent(focused: Bool) {
+    func emitFocusEvent(focused: Bool, requireFirstResponder: Bool = true) {
         guard isFocusTrackingActive() else { return }
-        let bytes: Data = focused
-            ? Data([0x1B, 0x5B, 0x49])  // ESC [ I
-            : Data([0x1B, 0x5B, 0x4F])  // ESC [ O
-        onKey?(bytes)
+        if requireFirstResponder, !viewIsFirstResponder { return }
+        let event: GhosttyFocusEvent = focused ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST
+        var buf = [CChar](repeating: 0, count: 8)
+        var written: size_t = 0
+        let rc = buf.withUnsafeMutableBufferPointer { p in
+            ghostty_focus_encode(event, p.baseAddress, p.count, &written)
+        }
+        guard rc.rawValue == GHOSTTY_SUCCESS.rawValue, written > 0 else { return }
+        let data = buf.prefix(written).withUnsafeBufferPointer { ptr in
+            Data(bytes: ptr.baseAddress!, count: written)
+        }
+        onKey?(data)
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -731,11 +767,25 @@ final class TerminalView: NSView {
         hoverTrackingArea = area
     }
 
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerIsOverThisView = true
+        // A background-tab OSC 22 drain may have set
+        // `currentOscShape` while we were unfocused; apply now that
+        // the pointer is over us so the shape lands without waiting
+        // for the next mouseMoved.
+        applyCurrentCursorShapeIfNeeded()
+    }
+
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        pointerIsOverThisView = false
         if hoverURL != nil {
             hoverURL = nil
-            updateLinkCursor()
+            // No `.set()` call: the pointer's now in another tracking
+            // area (or outside the window), and changing the OS
+            // cursor here would race the destination's
+            // `cursorUpdate`. Redraw to drop the URL underline.
             needsDisplay = true
         }
     }
@@ -951,18 +1001,34 @@ final class TerminalView: NSView {
     /// Apply the cursor implied by `commandHeld + hoverURL +
     /// currentOscShape`. Called from the URL-hover recompute and
     /// from the OSC 22 drain — both can change the right answer.
+    ///
+    /// Only mutates the system cursor when the pointer is inside
+    /// THIS view's tracking area. Without that gate a background
+    /// tab's OSC 22 drain would re-apply a process-global cursor
+    /// while the pointer is over another tab (or another app).
+    /// The view's own `cursorUpdate(with:)` override re-applies
+    /// on tracking-area boundary crossings, so on the next enter
+    /// the right cursor lands.
     @MainActor
     private func applyCurrentCursorShapeIfNeeded() {
+        guard pointerIsOverThisView else { return }
         if hoverURL != nil && commandHeld {
             NSCursor.pointingHand.set()
             return
         }
-        if !currentOscShape.isEmpty, currentOscShape != "default" {
+        if !currentOscShape.isEmpty {
             nsCursorForW3CName(currentOscShape).set()
             return
         }
         NSCursor.iBeam.set()
     }
+
+    /// Tracks whether the pointer is currently inside our hover
+    /// tracking area. Updated by `mouseEntered` / `mouseExited`
+    /// (the tracking area's `.mouseEnteredAndExited` flag), so a
+    /// background-tab OSC 22 drain doesn't reach NSCursor while the
+    /// pointer is elsewhere.
+    private var pointerIsOverThisView: Bool = false
 
     /// AppKit calls this when the pointer crosses our tracking area.
     /// Without this override the OS would reset to `.arrow` on every
@@ -1965,13 +2031,17 @@ final class TerminalView: NSView {
         // Committing on a declined encode would silently suppress
         // the next event the encoder would have accepted — e.g. mode
         // 1003 toggling on between two same-cell motions.
+        //
+        // The throttle keys on the CLAMPED cell (derived from `x`/`y`,
+        // not the raw `point`) so an off-grid event that the encoder
+        // sees as the edge cell also dedups against the same key.
         let motionCellCol: Int
         let motionCellRow: Int
         let motionNow: Double
         let throttleMotionNoButton = (action == .motion && button == nil)
         if throttleMotionNoButton {
-            motionCellCol = Int(point.x / cw)
-            motionCellRow = Int(point.y / ch)
+            motionCellCol = Int(CGFloat(x) / cw)
+            motionCellRow = Int(CGFloat(y) / ch)
             motionNow = CACurrentMediaTime()
             guard motionEmitter.wouldEmit(
                 col: motionCellCol,

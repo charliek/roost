@@ -764,8 +764,8 @@ actor IPCHandlerImpl: IPCHandler {
     @MainActor
     private func appCursorShape(params: AnyCodable?) async throws -> IPCAppCursorShapeResult {
         // Nullary envelope — accept `{}` or `null`. Surfaces typos via
-        // `deny_unknown_fields` on the param struct.
-        _ = try decodeParams(params, as: IPCAppCursorShapeParams.self, expected: [])
+        // `deny_unknown_fields` on the shared `IPCEmptyParams`.
+        _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
         guard let ui = RoostBackend.shared.ui else {
             throw IPCHandlerError.internalError("no UI to read app.cursor_shape")
         }
@@ -1779,8 +1779,6 @@ private struct IPCTabDispatchMouseEventParams: Codable {
 private struct IPCAppSetWindowFocusParams: Codable {
     let focus: Bool
 }
-
-private struct IPCAppCursorShapeParams: Codable {}
 
 private struct IPCAppCursorShapeResult: Codable {
     let shape: String

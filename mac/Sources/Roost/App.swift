@@ -4370,11 +4370,17 @@ extension RoostApp: UiBridge {
     func setSimulatedFocus(focused: Bool) -> Bool {
         // Apply to the active tab only — the e2e harness assumes
         // there's one focused tab at a time. Returns `false` when
-        // there's no tab (relaunched cold).
+        // there's no tab (relaunched cold). `requireFirstResponder:
+        // false` because the bridge already targeted the active
+        // session; the real OS focus may be elsewhere (the e2e
+        // suite runs without taking the window key for itself).
         guard let pid = activeProjectID,
               let session = activeSessionByProject[pid]
         else { return false }
-        session.terminalView.emitFocusEvent(focused: focused)
+        session.terminalView.emitFocusEvent(
+            focused: focused,
+            requireFirstResponder: false
+        )
         return true
     }
 

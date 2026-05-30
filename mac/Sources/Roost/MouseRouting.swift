@@ -185,16 +185,6 @@ struct MotionEmitter: Equatable {
         lastEmit = nowSeconds
     }
 
-    /// Convenience for tests + callers that don't care about the
-    /// peek/commit split. Mutates state and returns whether the
-    /// caller should emit.
-    mutating func shouldEmit(col: Int, row: Int, nowSeconds: Double) -> Bool {
-        if !wouldEmit(col: col, row: row, nowSeconds: nowSeconds) {
-            return false
-        }
-        commit(col: col, row: row, nowSeconds: nowSeconds)
-        return true
-    }
 }
 
 /// Decide whether a mouse event should be forwarded to the PTY via
