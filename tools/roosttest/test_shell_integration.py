@@ -1,9 +1,15 @@
 """Shell-integration E2E (runs against both --roost-target mac and gtk).
 
-P1 — login shell: Roost spawns the default shell as a LOGIN shell (via
-`-l`) so profile files (.bash_profile/.zprofile) load. On macOS that
-silences the bash deprecation banner and puts login-only PATH entries
-(e.g. `claude`) in scope; it matches Terminal.app / Ghostty.
+P1 — shell type follows Ghostty's platform split: Roost spawns the
+default shell as a LOGIN shell (via `-l`) on **macOS** (so
+.bash_profile/.zprofile load — silencing the bash deprecation banner
+and putting login-only PATH entries like `claude` in scope, matching
+Terminal.app), but as a **non-login interactive** shell on **Linux** (so
+~/.bashrc loads — where prompts/aliases live; a Linux login shell would
+read the profile chain and let a stray .bash_profile shadow .bashrc).
+The expected state keys off the UI host OS (`sys.platform`), since the
+Rust default-shell logic gates `-l` on `cfg!(target_os = "macos")`: the
+Mac app and the macOS GTK dev build are login, Linux GTK is non-login.
 
 Assertion technique: the asserted substring must appear ONLY in command
 *output*, never in the echoed command line. We print the result through
@@ -33,8 +39,16 @@ _LOGIN_PROBE = (
 )
 
 
-def test_default_shell_is_login(roost, project):
-    """A plain new tab's shell is a login shell."""
+def test_default_shell_login_matches_platform(roost, project):
+    """A plain new tab's shell is a login shell on macOS, non-login on
+    Linux — Ghostty's platform split (see module docstring). The host OS
+    decides because the Rust logic gates `-l` on
+    `cfg!(target_os = "macos")`; the Mac app only ever runs on darwin,
+    and the macOS GTK dev build is login too, so `sys.platform` is the
+    correct determinant for either target."""
+    expect_login = sys.platform == "darwin"
+    want = "yes" if expect_login else "no"
+    other = "no" if expect_login else "yes"
     tab = roost.open_tab(project, cwd="/tmp")
     roost.run(tab, _LOGIN_PROBE)
     roost._wait(
@@ -48,8 +62,11 @@ def test_default_shell_is_login(roost, project):
     text = roost.dump_text(tab)
     if "ROOST_LOGIN_RESULT:skip" in text:
         pytest.skip("default shell is neither bash nor zsh")
-    assert "ROOST_LOGIN_RESULT:yes" in text, f"expected a login shell, got:\n{text}"
-    assert "ROOST_LOGIN_RESULT:no" not in text
+    assert f"ROOST_LOGIN_RESULT:{want}" in text, (
+        f"expected a {'login' if expect_login else 'non-login'} shell on "
+        f"{sys.platform}, got:\n{text}"
+    )
+    assert f"ROOST_LOGIN_RESULT:{other}" not in text
 
 
 def test_explicit_argv_not_login(roost, project):

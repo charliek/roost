@@ -484,17 +484,37 @@ fn terminate_child(
 }
 
 /// Resolve the argv to exec. An empty argv (the plain "open a shell"
-/// case) becomes the user's `$SHELL` (or `/bin/sh`) launched as a
-/// LOGIN shell via `-l`, so it sources profile files (`.bash_profile`
-/// / `.zprofile`): that silences macOS's bash deprecation banner and
-/// puts login-only PATH entries (e.g. `claude`) in scope, matching
-/// Terminal.app / Ghostty. A non-empty argv (launcher commands) is
-/// passed through verbatim. (`portable-pty` 0.8 couples program and
-/// argv[0], so we use the `-l` flag rather than the `-bash`
-/// dash-prefix login convention.)
+/// case) becomes the user's `$SHELL` (or `/bin/sh`), and we follow
+/// Ghostty's platform split for whether it's a LOGIN shell:
+///
+///   * macOS → login shell (`-l`). GUI apps don't inherit the login
+///     `PATH` (launchd doesn't source the profile), and the macOS dev
+///     world keeps config in `.bash_profile` / `.zprofile` and expects
+///     every terminal to be a login shell. So `-l` sources those and
+///     puts login-only `PATH` entries (e.g. `claude`) in scope, and
+///     silences the bash deprecation banner — matching Terminal.app.
+///   * Linux (and other non-macOS) → non-login interactive shell. A
+///     Linux login bash reads the profile chain and STOPS at the first
+///     of `.bash_profile` / `.bash_login` / `.profile`, so a stray
+///     `.bash_profile` (e.g. one a tool's installer drops in) shadows
+///     `.profile` and the interactive `~/.bashrc` — where prompts,
+///     aliases, and color usually live — never loads. Ghostty launches
+///     a non-login shell everywhere but macOS for exactly this reason
+///     ("No other platform behaves this way", `Exec.zig`); a Linux
+///     desktop session already exports the login `PATH` before Roost
+///     starts, so there's nothing to recover with `-l`. roost.bash's
+///     non-login branch then sources `/etc/bash.bashrc` + `~/.bashrc`.
+///
+/// A non-empty argv (launcher commands) is passed through verbatim.
+/// (`portable-pty` 0.8 couples program and argv[0], so we use the `-l`
+/// flag rather than the `-bash` dash-prefix login convention.)
 fn resolve_argv(argv: &[String], shell: &str) -> Vec<String> {
     if argv.is_empty() {
-        vec![shell.to_string(), "-l".to_string()]
+        if cfg!(target_os = "macos") {
+            vec![shell.to_string(), "-l".to_string()]
+        } else {
+            vec![shell.to_string()]
+        }
     } else {
         argv.to_vec()
     }
@@ -628,8 +648,9 @@ fn build_command(
     socket_path: &std::path::Path,
 ) -> CommandBuilder {
     // Argv-first: never call a shell to parse a single command string.
-    // An empty argv (plain "open a shell") resolves to `$SHELL -l` — a
-    // login shell, see `resolve_argv`.
+    // An empty argv (plain "open a shell") resolves to the user's
+    // `$SHELL` — a login shell (`-l`) on macOS, a non-login interactive
+    // shell on Linux. See `resolve_argv`.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let resolved = resolve_argv(argv, &shell);
     // Modern bash: add `--posix` so it honors ENV (its only
@@ -745,13 +766,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_argv_becomes_login_shell() {
-        // Default-shell case: `$SHELL -l` so profile files load.
+    fn empty_argv_becomes_default_shell() {
+        // Default-shell case follows Ghostty's platform split: a login
+        // shell (`-l`) on macOS so profile files load, a non-login
+        // interactive shell on Linux so `~/.bashrc` loads (a stray
+        // `.bash_profile` would otherwise shadow it). See `resolve_argv`.
         let empty: Vec<String> = Vec::new();
-        assert_eq!(
-            resolve_argv(&empty, "/bin/zsh"),
+        let expected = if cfg!(target_os = "macos") {
             vec!["/bin/zsh".to_string(), "-l".to_string()]
-        );
+        } else {
+            vec!["/bin/zsh".to_string()]
+        };
+        assert_eq!(resolve_argv(&empty, "/bin/zsh"), expected);
     }
 
     #[test]
