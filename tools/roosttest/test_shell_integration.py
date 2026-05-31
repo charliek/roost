@@ -169,23 +169,38 @@ def test_env_injected(roost, project):
     # full-suite load `run()` can otherwise fire before the PTY is live and
     # the keystrokes are lost (no echo, no output → a spurious timeout).
     wait_tab_attached(roost, tab)
+    # Emit each field on its OWN short line, not one long line: the UI sizes
+    # the grid to the window, so a single ~83-char marker wraps at narrow
+    # widths and a contiguous-substring match flakes on window size. Short
+    # per-field lines never wrap. Each value appears only in the OUTPUT (the
+    # echoed command shows the literal `%s`/`$VAR`), so a match is genuine.
     roost.run(
         tab,
-        'printf "ENVCHK:tp=%s si=%s feat=%s term=%s rd=%s\\n" '
+        'printf "ENV_tp=%s\\nENV_si=%s\\nENV_feat=%s\\nENV_term=%s\\n'
+        'ENV_rd=%s\\nENV_done\\n" '
         '"$TERM_PROGRAM" "$ROOST_SHELL_INTEGRATION" "$ROOST_SHELL_FEATURES" '
         '"$TERM" "${ROOST_RESOURCES_DIR:+set}"',
     )
-    expected = (
-        "ENVCHK:tp=Roost si=1 feat=cwd,title,marks,prompt,ssh-env "
-        "term=xterm-256color rd=set"
-    )
+    expected = [
+        "ENV_tp=Roost",
+        "ENV_si=1",
+        "ENV_feat=cwd,title,marks,prompt,ssh-env",
+        "ENV_term=xterm-256color",
+        "ENV_rd=set",
+    ]
     try:
-        roost.wait_text(tab, expected, timeout=12)
+        roost.wait_text(tab, "ENV_done", timeout=12)  # all fields emitted
     except Timeout:
         raise AssertionError(
-            f"shell-integration env contract missing. Expected {expected!r}; "
-            f"tab {tab} viewport:\n{roost._safe_dump_text(tab)}"
+            f"shell-integration env probe produced no output; tab {tab} "
+            f"viewport:\n{roost._safe_dump_text(tab)}"
         )
+    text = roost._safe_dump_text(tab)
+    missing = [m for m in expected if m not in text]
+    assert not missing, (
+        f"shell-integration env contract missing {missing}; tab {tab} "
+        f"viewport:\n{text}"
+    )
 
 
 def test_resources_dir_has_scripts(roost, project):
@@ -317,12 +332,22 @@ def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
     if not zsh:
         pytest.skip("zsh not available")
     tab = roost.open_tab(project, cwd="/tmp", argv=[zsh, "-l"])
-    # The shim defers roost.zsh to the first precmd; its OSC 7 hook then
-    # fires on subsequent prompts. A couple of round-trips lets it settle.
+    wait_tab_attached(roost, tab)
+    # The ZDOTDIR shim loads roost.zsh on the FIRST precmd (deferred so a
+    # user's .zshrc can't drop us); roost.zsh's OSC 7 hook then fires from
+    # the NEXT prompt on. So give it several prompt cycles before polling —
+    # the load + hook-registration + emit costs a couple of prompts, and a
+    # slow CI runner widens that window. (Verified working on a clean
+    # ubuntu:24.04 in Docker — the deferred-load timing is the only variable.)
     roost.run(tab, "cd /usr")
-    roost.run(tab, "true")
-    assert cwd_reaches(roost, tab, "/usr", timeout=8), \
-        f"zsh auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"
+    for _ in range(3):
+        roost.run(tab, "true")
+    if not cwd_reaches(roost, tab, "/usr", timeout=10):
+        raise AssertionError(
+            "zsh auto-bootstrap cwd not tracked; got "
+            f"{(roost.tab(tab) or {}).get('cwd')!r}. Viewport:\n"
+            f"{roost._safe_dump_text(tab)}"
+        )
 
 
 def _modern_bash() -> str:

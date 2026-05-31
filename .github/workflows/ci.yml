@@ -307,11 +307,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install GTK4 + libadwaita + Xvfb
+      - name: Install GTK4 + libadwaita + Xvfb (+ zsh for shell-integration tests)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
