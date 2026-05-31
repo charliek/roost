@@ -42,29 +42,21 @@ def test_cwd_tracking_follows_cd(roost, project):
     assert roost.tab(tab)["cwd"] == "/usr"
 
 
-def test_title_follows_cwd(roost, project, target):
-    """The tab title should re-derive from the cwd when it changes via
-    OSC 7. Match the basename (`usr`): the Mac UI titles a tab with the
-    cwd's leaf (`/tmp` → `tmp`) while GTK shows the path — `usr` is in both
-    and absent from `tmp`. Poll, since the title updates a beat after cwd.
+def test_title_follows_cwd(roost, project):
+    """The tab title follows the cwd via the model on any shell.
 
-    XXX: skipped on Mac pending investigation (issue #196). The title
-    following cwd is **shell-driven** (the integration emits OSC 0 each
-    prompt) — neither Workspace re-derives the title in its cwd setter. The
-    GTK default shell has integration (emits OSC 0 → title gets `usr`); Mac
-    CI's default shell is Apple bash 3.2 with NO integration → no OSC 0 → the
-    title stays at the open-time leaf (`tmp`). So it's not a Mac UI bug. The
-    open question (issue #196): should the title follow cwd via the *model*
-    (re-derive in set_tab_cwd when !userTitled, both UIs) so it works on any
-    shell? If so, this skip can be dropped and the test run cross-platform.
+    Mechanism (issue #196 model fix): `set_tab_cwd` re-derives the
+    title from cwd when `!user_titled`, emitting `TabTitleChanged`
+    alongside `TabCwdChanged`. On shells with integration the next
+    prompt's OSC 0 (`__roost_title`) refines the basename to the
+    tilde-abbreviated full path (`${PWD/#$HOME/~}`) — latest-wins —
+    but the model invariant holds regardless. Pre-fix this test was
+    skipped on Mac because the runner's default shell (Apple bash 3.2)
+    has no integration → no OSC 0 → title stayed at the open-time leaf.
+
+    Match the basename (`usr`): present on both shells. Poll, since
+    events land a beat after `cd`.
     """
-    if target == "mac":
-        pytest.skip(
-            "title-follows-cwd is shell-OSC-0-driven; Mac CI's default shell "
-            "(Apple bash 3.2) has no integration, so no OSC 0. Not a Mac UI "
-            "bug — see issue #196. cwd tracking is covered cross-platform by "
-            "test_cwd_tracking_follows_cd."
-        )
     tab = _cd_and_emit_osc7(roost, project)
     Roost._wait(
         lambda: "usr" in (roost.tab(tab) or {}).get("title", ""),

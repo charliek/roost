@@ -101,6 +101,12 @@ pub struct RestoreProject {
 pub struct RestoreTab {
     pub cwd: String,
     pub title: String,
+    /// Whether the saved title was a manual user rename (Cmd+R /
+    /// `tab.set_title`). When true, the restore path re-asserts
+    /// the `user_titled` lock so a post-relaunch `cd` doesn't
+    /// silently re-derive the title from cwd. See `set_tab_cwd`
+    /// for the gate. Persisted in `TabSnapshot.user_titled`.
+    pub user_titled: bool,
 }
 
 /// Workspace event channel. Server-push subscribers in `ipc.rs`
@@ -276,6 +282,7 @@ impl Workspace {
                                 RestoreTab {
                                     cwd: t.cwd.clone(),
                                     title: t.title.clone(),
+                                    user_titled: t.user_titled,
                                 },
                             )
                         })
@@ -742,18 +749,33 @@ impl Workspace {
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        row.cwd = cwd.to_string();
+        let cwd_owned = cwd.to_string();
+        row.cwd = cwd_owned.clone();
         // Shell-driven (OSC 7 fires per `cd`) but write-through: each
         // change lands in the page cache without an fsync, so a `cd`
         // loop is cheap and the latest cwd is always on disk.
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::TabCwdChanged {
-                tab_id,
-                cwd: cwd.to_string(),
-            }],
-            Persist::Write,
-        );
+        let mut events = vec![WorkspaceEvent::TabCwdChanged {
+            tab_id,
+            cwd: cwd_owned,
+        }];
+        // Re-derive title from cwd when the user hasn't explicitly
+        // renamed (mirrors `set_tab_title_from_osc`'s `user_titled`
+        // gate). Lets the title follow cwd on shells without
+        // integration (Apple /bin/bash 3.2, --norc bash). On integrated
+        // shells, the next prompt's OSC 0 refines this basename to the
+        // tilde-abbreviated path via `set_tab_title_from_osc` —
+        // latest-wins. Event order is cwd-then-title (cause-then-effect).
+        if !row.user_titled {
+            let new_title = derive_title(cwd);
+            if row.title != new_title {
+                row.title = new_title.clone();
+                events.push(WorkspaceEvent::TabTitleChanged {
+                    tab_id,
+                    title: new_title,
+                });
+            }
+        }
+        self.commit(inner, events, Persist::Write);
         Ok(())
     }
 
@@ -1181,6 +1203,7 @@ impl Inner {
                             title: t.title.clone(),
                             cwd: t.cwd.clone(),
                             position: t.position,
+                            user_titled: t.user_titled,
                         })
                         .collect();
                     tabs.sort_by_key(|t| t.position);
@@ -1209,6 +1232,16 @@ fn unix_now() -> i64 {
 fn derive_title(cwd: &str) -> String {
     if cwd.is_empty() {
         return "shell".into();
+    }
+    // Special-case "/": Path::file_name() returns None for the root,
+    // and the prior "shell" fallback diverges from the Swift twin
+    // (NSString.lastPathComponent("/") returns "/") and from what
+    // shell integration's __roost_title would emit ("/"). Return "/"
+    // explicitly to keep both UIs in lockstep and avoid the surprising
+    // "you're at root, but the tab title says 'shell'" UX on
+    // un-integrated shells.
+    if cwd == "/" {
+        return "/".into();
     }
     std::path::Path::new(cwd)
         .file_name()
@@ -1325,6 +1358,104 @@ mod tests {
         let t = ws.tab(tid).unwrap();
         assert_eq!(t.title, "manual");
         assert!(t.user_titled);
+    }
+
+    /// Issue #196: `set_tab_cwd` re-derives the tab title from cwd
+    /// when `!user_titled`, so the title follows cwd on any shell
+    /// (Apple bash 3.2 / `--norc` bash / etc.), not just shells with
+    /// the OSC 0 integration loaded. Events fire cwd-then-title.
+    #[test]
+    fn set_tab_cwd_re_derives_title_when_not_user_titled() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let tid = ws.open_tab(pid, "/tmp", "").unwrap().id;
+        assert_eq!(ws.tab(tid).unwrap().title, "tmp");
+        let mut rx = ws.subscribe();
+        ws.set_tab_cwd(tid, "/usr").unwrap();
+        // Cwd-then-title: cause-then-effect.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabCwdChanged { tab_id, ref cwd })
+                if tab_id == tid && cwd == "/usr"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabTitleChanged { tab_id, ref title })
+                if tab_id == tid && title == "usr"
+        ));
+        assert_eq!(ws.tab(tid).unwrap().title, "usr");
+    }
+
+    /// `set_tab_cwd` does NOT touch the title when the user has
+    /// manually renamed (mirrors `set_tab_title_from_osc`'s gate).
+    #[test]
+    fn set_tab_cwd_preserves_user_titled_title() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let tid = ws.open_tab(pid, "/tmp", "").unwrap().id;
+        ws.set_tab_title(tid, "manual").unwrap();
+        let mut rx = ws.subscribe();
+        ws.set_tab_cwd(tid, "/usr").unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabCwdChanged { tab_id, ref cwd })
+                if tab_id == tid && cwd == "/usr"
+        ));
+        // No TabTitleChanged — user_titled blocks the re-derivation.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(ws.tab(tid).unwrap().title, "manual");
+    }
+
+    /// `cd .` (cwd unchanged in basename) doesn't churn a redundant
+    /// TabTitleChanged. Guards against per-prompt event spam from a
+    /// shell that re-emits the same OSC 7 every prompt.
+    #[test]
+    fn set_tab_cwd_skips_title_event_when_basename_unchanged() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let tid = ws.open_tab(pid, "/tmp", "").unwrap().id;
+        let mut rx = ws.subscribe();
+        ws.set_tab_cwd(tid, "/tmp").unwrap();
+        // Cwd event fires (same string but the model writes through);
+        // title event suppressed since basename didn't change.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabCwdChanged { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// CLI / IPC `tab.open` callers can pass an explicit placeholder
+    /// title (`"roostctl"`, `"Tab 1"`, …). open_tab leaves
+    /// user_titled=false on those (the supplied title is treated as
+    /// a placeholder per the open_tab comment). The model fix
+    /// overwrites the placeholder on the first cwd change.
+    /// Guards: a future refactor that flips open_tab to
+    /// `user_titled = !title.is_empty()` silently inverts the model
+    /// invariant — this test catches it.
+    #[test]
+    fn set_tab_cwd_overwrites_placeholder_title() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let tid = ws.open_tab(pid, "/tmp", "roostctl").unwrap().id;
+        assert_eq!(ws.tab(tid).unwrap().title, "roostctl");
+        assert!(!ws.tab(tid).unwrap().user_titled);
+        ws.set_tab_cwd(tid, "/usr").unwrap();
+        assert_eq!(ws.tab(tid).unwrap().title, "usr");
+    }
+
+    /// Cross-platform parity: `derive_title("/")` returns `"/"`,
+    /// matching the Swift twin's `(cwd as NSString).lastPathComponent`
+    /// for the root case and what shell integration's `__roost_title`
+    /// would emit. Without this special-case Path::file_name() returns
+    /// None and the fallback `"shell"` diverges from the Mac UI on
+    /// `cd /` — the model fix now exercises this routinely.
+    #[test]
+    fn derive_title_root_returns_slash() {
+        assert_eq!(derive_title("/"), "/");
+        assert_eq!(derive_title(""), "shell");
+        assert_eq!(derive_title("/tmp"), "tmp");
+        assert_eq!(derive_title("/usr/local"), "local");
     }
 
     #[test]
@@ -1523,6 +1654,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/b", "/c"]
         );
+    }
+
+    /// Issue #196 follow-up: `user_titled` is persisted across
+    /// relaunch so a manually-renamed tab keeps its rename — and so
+    /// the model's `set_tab_cwd` re-derivation (also #196) doesn't
+    /// silently clobber it on the first post-relaunch `cd`.
+    #[test]
+    fn user_titled_persists_across_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/").unwrap().id;
+            let manual = ws.open_tab(pid, "/tmp", "").unwrap().id;
+            let placeholder = ws.open_tab(pid, "/tmp", "roostctl").unwrap().id;
+            ws.set_tab_title(manual, "docs").unwrap();
+            assert!(ws.tab(manual).unwrap().user_titled);
+            assert!(!ws.tab(placeholder).unwrap().user_titled);
+        }
+        let ws2 = Workspace::open(path);
+        let restore = ws2.take_restore_layout().unwrap();
+        let tabs = &restore.projects[0].tabs;
+        // Two tabs persisted; restore order matches save order.
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].title, "docs");
+        assert!(tabs[0].user_titled, "manual rename keeps user_titled");
+        assert_eq!(tabs[1].title, "roostctl");
+        assert!(!tabs[1].user_titled, "placeholder title is not user_titled");
     }
 
     #[test]

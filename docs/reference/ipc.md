@@ -464,6 +464,14 @@ emitted.
 * `tab.state_changed` — `{"tab_id": "<id>", "state": "<TabState>"}`.
 * `tab.title_changed` — `{"tab_id": "<id>", "title": "<string>"}`.
 * `tab.cwd_changed`   — `{"tab_id": "<id>", "cwd": "<string>"}`.
+  Note: when an OSC 7 (or `tab.set_cwd`-equivalent) lands on a tab
+  whose `user_titled` is false, the workspace also re-derives the
+  title from the basename of the new cwd. Subscribers will see a
+  `tab.cwd_changed` immediately followed by a `tab.title_changed`
+  (in that order, cause-then-effect) for that single op — treat
+  them as a pair, not as one-event-per-op. On shells with the
+  shipped integration, a further `tab.title_changed` arrives a
+  prompt cycle later (OSC 0 → tilde-abbreviated full path).
 * `tab.notification`  — `{"tab_id": "<id>", "has_pending": <bool>}`.
 * `project.created`   — `{"project": <Project>}` (tabs empty).
 * `project.renamed`   — `{"project_id": "<id>", "name": "<string>"}`.

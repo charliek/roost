@@ -1340,14 +1340,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 for project in self.projects {
                     let saved = restore?.projects
                         .first(where: { $0.projectID == project.id })?.tabs ?? []
-                    let specs: [(cwd: String, title: String)] =
-                        saved.isEmpty ? [("", "")] : saved.map { ($0.cwd, $0.title) }
+                    let specs: [(cwd: String, title: String, userTitled: Bool)] =
+                        saved.isEmpty
+                            ? [("", "", false)]
+                            : saved.map { ($0.cwd, $0.title, $0.userTitled) }
                     for (idx, spec) in specs.enumerated() {
                         let isActive = project.id == activeID && idx == activePos
                         self.openTab(
                             inProject: project.id,
                             cwd: spec.cwd,
                             title: spec.title,
+                            userTitled: spec.userTitled,
                             focusInWorkspaceWhenReady: isActive
                         )
                     }
@@ -2152,6 +2155,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         cwd: String,
         title: String,
         argv: [String] = [],
+        userTitled: Bool = false,
         focusInWorkspaceWhenReady: Bool = false
     ) -> TabSession? {
         guard daemonReachable else { return nil }
@@ -2198,6 +2202,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // `selectTabByPosition`. #95 review.
             if focusInWorkspaceWhenReady {
                 _ = try? RoostBackend.shared.workspace?.focusTab(tabID)
+            }
+            // Restore: re-assert the manual-rename lock. `openTab`
+            // always seeds `userTitled=false` (the supplied title is
+            // treated as a placeholder); `setTabTitle` flips it back
+            // to true and emits a tabTitleChanged. Without this, the
+            // first post-relaunch `setTabCwd` would re-derive the
+            // title (issue #196 model fix).
+            if userTitled && !title.isEmpty {
+                _ = try? RoostBackend.shared.workspace?.setTabTitle(tabID, title: title)
             }
         }
         return session

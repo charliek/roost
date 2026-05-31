@@ -78,6 +78,14 @@ pub struct TabSnapshot {
     pub title: String,
     pub cwd: String,
     pub position: i32,
+    /// True iff the user manually renamed the tab (Cmd+R / tab.set_title).
+    /// Persisted so a manual rename survives relaunch — and, after the
+    /// model-side title-follows-cwd change in `set_tab_cwd`, isn't silently
+    /// re-derived to the basename on the first post-relaunch `cd`.
+    /// Defaulted so a state.json from a build predating this field loads
+    /// as "not user-titled" (the prior implicit value).
+    #[serde(default)]
+    pub user_titled: bool,
 }
 
 /// Read `state.json` at `path`. Returns:
@@ -226,11 +234,13 @@ mod tests {
                         title: "shell".into(),
                         cwd: "/tmp".into(),
                         position: 0,
+                        user_titled: false,
                     },
                     TabSnapshot {
                         title: "logs".into(),
                         cwd: "/var/log".into(),
                         position: 1,
+                        user_titled: true,
                     },
                 ],
             }],
@@ -259,6 +269,36 @@ mod tests {
         assert!(!back.sidebar_collapsed, "absent key defaults to expanded");
         assert_eq!(back.projects.len(), 1);
         assert!(back.projects[0].tabs.is_empty());
+    }
+
+    #[test]
+    fn legacy_tab_without_user_titled_defaults_to_false() {
+        // A state.json written by a build predating user_titled
+        // persistence has no `user_titled` key per tab. It must still
+        // load, with the field defaulted to false (matches the prior
+        // implicit "always not user-titled" behavior).
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        std::fs::write(
+            &p,
+            br#"{
+                "next_id": 5,
+                "projects": [{
+                    "id": 1, "name": "Old", "cwd": "/tmp",
+                    "position": 0, "created_at": 1,
+                    "tabs": [{ "title": "docs", "cwd": "/usr", "position": 0 }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let back = read_state(&p).unwrap().expect("present");
+        let tab = &back.projects[0].tabs[0];
+        assert_eq!(tab.title, "docs");
+        assert_eq!(tab.cwd, "/usr");
+        assert!(
+            !tab.user_titled,
+            "missing user_titled key must default to false"
+        );
     }
 
     #[test]

@@ -103,6 +103,86 @@ struct WorkspaceStateTests {
         #expect(after?.userTitled == true)
     }
 
+    /// Issue #196: `setTabCwd` re-derives the tab title from cwd
+    /// when `!userTitled`, so the title follows cwd on any shell
+    /// (Apple bash 3.2 / `--norc` bash / etc.), not just shells with
+    /// the OSC 0 integration loaded. Events fire cwd-then-title.
+    @Test func setTabCwdReDerivesTitleWhenNotUserTitled() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "")
+        #expect(await ws.tab(t.id)?.title == "tmp")
+        let captured = EventCapture()
+        await ws.subscribe { captured.append(label(for: $0)) }
+        try await ws.setTabCwd(t.id, cwd: "/usr")
+        let labels = captured.snapshot()
+        // Cwd-then-title: cause-then-effect.
+        #expect(labels == ["tabCwdChanged", "tabTitleChanged"])
+        #expect(await ws.tab(t.id)?.title == "usr")
+    }
+
+    /// `setTabCwd` does NOT touch the title when the user has
+    /// manually renamed (mirrors `setTabTitleFromOSC`'s gate).
+    @Test func setTabCwdPreservesUserTitledTitle() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "")
+        try await ws.setTabTitle(t.id, title: "manual")
+        let captured = EventCapture()
+        await ws.subscribe { captured.append(label(for: $0)) }
+        try await ws.setTabCwd(t.id, cwd: "/usr")
+        // No tabTitleChanged — userTitled blocks the re-derivation.
+        #expect(captured.snapshot() == ["tabCwdChanged"])
+        #expect(await ws.tab(t.id)?.title == "manual")
+    }
+
+    /// `cd .` (cwd unchanged in basename) doesn't churn a redundant
+    /// tabTitleChanged. Guards against per-prompt event spam from
+    /// a shell that re-emits the same OSC 7 every prompt.
+    @Test func setTabCwdSkipsTitleEventWhenBasenameUnchanged() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "")
+        let captured = EventCapture()
+        await ws.subscribe { captured.append(label(for: $0)) }
+        try await ws.setTabCwd(t.id, cwd: "/tmp")
+        // Cwd event still fires (model writes through); title
+        // suppressed since basename didn't change.
+        #expect(captured.snapshot() == ["tabCwdChanged"])
+    }
+
+    /// CLI / IPC `tab.open` callers can pass an explicit placeholder
+    /// title (`"roostctl"`, `"Tab 1"`, …). `openTab` leaves
+    /// `userTitled=false` on those (the supplied title is treated
+    /// as a placeholder per the openTab comment). The model fix
+    /// overwrites the placeholder on the first cwd change.
+    /// Guards: a future refactor that flips `openTab` to
+    /// `userTitled = !title.isEmpty` silently inverts the model
+    /// invariant — this test catches it.
+    @Test func setTabCwdOverwritesPlaceholderTitle() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "roostctl")
+        #expect(await ws.tab(t.id)?.title == "roostctl")
+        #expect(await ws.tab(t.id)?.userTitled == false)
+        try await ws.setTabCwd(t.id, cwd: "/usr")
+        #expect(await ws.tab(t.id)?.title == "usr")
+    }
+
+    /// Cross-platform parity: opening a tab at cwd `/` derives the
+    /// title to `"/"`, matching the Rust twin's `derive_title("/")`
+    /// (special-cased there because `Path::file_name()` returns
+    /// `None`). Swift's `(cwd as NSString).lastPathComponent` already
+    /// returns `"/"` for the root, so this is a regression lock
+    /// rather than a code change. Since `deriveTitle` is private,
+    /// route the assertion through `openTab`.
+    @Test func openTabAtRootDerivesTitleSlash() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let t = try await ws.openTab(projectID: p.id, cwd: "/", title: "")
+        #expect(await ws.tab(t.id)?.title == "/")
+    }
+
     @Test func setTabStateFromOSCRespectsHookActive() async throws {
         let ws = await Workspace()
         let p = await ws.createProject(name: "p", cwd: "/")
@@ -242,6 +322,60 @@ struct WorkspaceStatePersistenceTests {
         // `takeRestoreLayout` is one-shot.
         let again = await ws2.takeRestoreLayout()
         #expect(again == nil)
+    }
+
+    /// Issue #196 follow-up: `userTitled` is persisted across
+    /// relaunch so a manually-renamed tab keeps its rename — and so
+    /// the model's `setTabCwd` re-derivation (also #196) doesn't
+    /// silently clobber it on the first post-relaunch `cd`.
+    @Test func userTitledPersistsAcrossRelaunch() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        try await {
+            let ws = await Workspace(statePath: path)
+            let p = await ws.createProject(name: "p", cwd: "/")
+            let manual = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "")
+            let placeholder = try await ws.openTab(projectID: p.id, cwd: "/tmp", title: "roostctl")
+            try await ws.setTabTitle(manual.id, title: "docs")
+            #expect(await ws.tab(manual.id)?.userTitled == true)
+            #expect(await ws.tab(placeholder.id)?.userTitled == false)
+        }()
+
+        let ws2 = await Workspace(statePath: path)
+        let restore = try #require(await ws2.takeRestoreLayout())
+        let rp = try #require(restore.projects.first)
+        #expect(rp.tabs.count == 2)
+        #expect(rp.tabs[0].title == "docs")
+        #expect(rp.tabs[0].userTitled, "manual rename keeps userTitled")
+        #expect(rp.tabs[1].title == "roostctl")
+        #expect(!rp.tabs[1].userTitled, "placeholder title is not userTitled")
+    }
+
+    /// A state.json written by a build predating `user_titled`
+    /// persistence has no `user_titled` key per tab. Must load with
+    /// the field defaulted to `false` (matches the prior implicit
+    /// "always not user-titled" behavior).
+    @Test func legacyTabWithoutUserTitledDefaultsToFalse() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let legacy = """
+        {
+            "next_id": 5,
+            "projects": [{
+                "id": 1, "name": "Old", "cwd": "/tmp",
+                "position": 0, "created_at": 1,
+                "tabs": [{ "title": "docs", "cwd": "/usr", "position": 0 }]
+            }]
+        }
+        """
+        try legacy.write(toFile: path, atomically: true, encoding: .utf8)
+        let ws = await Workspace(statePath: path)
+        let restore = try #require(await ws.takeRestoreLayout())
+        let tab = try #require(restore.projects.first?.tabs.first)
+        #expect(tab.title == "docs")
+        #expect(tab.cwd == "/usr")
+        #expect(!tab.userTitled, "missing user_titled key must default to false")
     }
 
     @Test func legacyStateWithoutTabsLoadsWithDefaults() async {
