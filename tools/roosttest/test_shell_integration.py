@@ -236,13 +236,23 @@ def test_sourced_script_tracks_cwd(roost, project):
 def test_documented_rooster_override(roost, project):
     """The documented git-aware override (`__roost_fancy_title`) works end
     to end: in a non-repo dir it emits OSC 0 with 🐓 + the ~-path, the tab
-    title reflects it, and the emoji round-trips through the OSC scanner."""
+    title reflects it, and the emoji round-trips through the OSC scanner.
+
+    Also pins the `$HOME → ~` abbreviation across bash versions: the recipe
+    uses a `case` + prefix-strip, NOT `${PWD/#$HOME/~}`, because that isn't
+    portable — macOS bash 3.2 treats the replacement `~` as literal while
+    bash >= 5.2 tilde-expands it (a no-op showing the full home path), and
+    escaping (`\\~`) just flips which version breaks. The cd-to-$HOME step
+    below runs on both runners (Apple bash 3.2 on Mac, bash 5.x on Linux),
+    so it catches a regression to either non-portable form."""
     tab = roost.open_tab(project, cwd="/tmp",
                          argv=["/bin/bash", "--norc", "--noprofile"])
     # The exact function from docs/guides/cwd-tracking.md, as a one-liner.
     fancy = (
         r'''__roost_fancy_title() { [ -n "$ROOST_TAB_ID" ] || return; '''
-        r'''local icon="🐓" title="${PWD/#$HOME/~}" branch; '''
+        r'''local icon="🐓" branch title; '''
+        r'''case "$PWD" in "$HOME") title="~";; "$HOME"/*) title="~${PWD#"$HOME"}";; '''
+        r'''*) title="$PWD";; esac; '''
         r'''if branch=$(git symbolic-ref --short HEAD 2>/dev/null); then '''
         r'''[ -n "$(git status --porcelain 2>/dev/null)" ] && icon="🐣"; '''
         r'''title+=" (${branch})"; fi; '''
@@ -256,6 +266,15 @@ def test_documented_rooster_override(roost, project):
         and "/usr" in (roost.tab(tab) or {}).get("title", ""),
         timeout=8,
         what="fancy title tracks cwd in a non-repo",
+    )
+    # Regression guard for the escaped tilde: in $HOME the title must
+    # abbreviate to "🐓 ~", not the full home path. (With an unescaped `~`
+    # the substitution no-ops and this would show "🐓 /home/<user>".)
+    roost.run(tab, 'cd "$HOME"')
+    roost._wait(
+        lambda: "🐓 ~" in (roost.tab(tab) or {}).get("title", ""),
+        timeout=8,
+        what="fancy title abbreviates $HOME to ~",
     )
 
 
