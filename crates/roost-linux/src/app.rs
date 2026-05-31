@@ -990,19 +990,37 @@ impl App {
                 .and_then(|r| r.projects.iter().find(|p| p.project_id == project.id))
                 .map(|p| p.tabs.as_slice())
                 .unwrap_or(&[]);
-            for (cwd, title) in restore_open_specs(saved) {
+            for (cwd, title, user_titled) in restore_open_specs(saved) {
                 // Handle a failed tab open per-tab rather than `?`-ing
                 // out: one stale cwd / PTY spawn failure must not abort
                 // the whole bootstrap (and the workspace subscription
                 // isn't installed yet, so a bubbled error would leave
                 // startup half-built). Log + continue. #95 review.
-                if let Err(err) = self.open_tab_in_with(project.id, &cwd, &title, &[]).await {
-                    tracing::warn!(
+                match self.open_tab_in_with(project.id, &cwd, &title, &[]).await {
+                    Ok(tab_id) if user_titled && !title.is_empty() => {
+                        // Re-assert the manual-rename lock: `open_tab`
+                        // always starts with `user_titled=false` (the
+                        // supplied title is treated as a placeholder).
+                        // `set_tab_title` flips it back to true and
+                        // emits a TabTitleChanged. Without this, the
+                        // first post-relaunch `set_tab_cwd` would
+                        // re-derive the title (issue #196 model fix).
+                        if let Err(err) = client.workspace.set_tab_title(tab_id, &title) {
+                            tracing::warn!(
+                                project_id = project.id,
+                                tab_id,
+                                ?err,
+                                "restore: failed to re-lock manual title; continuing"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(
                         project_id = project.id,
                         cwd = %cwd,
                         ?err,
                         "restore: failed to open a saved tab; continuing"
-                    );
+                    ),
                 }
             }
         }
@@ -2101,11 +2119,13 @@ impl App {
                 let projects = self.projects.borrow();
                 for ui in projects.values() {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
-                        let label = tilde_abbreviate(&cwd);
-                        let current = tab_ui.page.title().to_string();
-                        if current.starts_with("Tab ") {
-                            tab_ui.page.set_title(&label);
-                        }
+                        // Title handling is now done by the workspace itself:
+                        // `set_tab_cwd` re-derives the title from cwd when
+                        // `!user_titled` and emits a `TabTitleChanged` arm,
+                        // which lands at the handler above. The prior local
+                        // fallback that overwrote a `Tab N` placeholder with
+                        // the tilde-abbreviated cwd was superseded by that
+                        // model-side path (issue #196).
                         *tab_ui.cwd.borrow_mut() = cwd.clone();
                     }
                 }
@@ -4251,18 +4271,19 @@ fn pick_next_active_project<T>(projects: &HashMap<i64, T>) -> Option<i64> {
     projects.keys().copied().min()
 }
 
-/// Session-restore rule: the `(cwd, title)` specs to open for a
-/// project. Each saved tab maps to one spec; a project with **no**
-/// saved tabs seeds a single default tab (empty cwd + title →
-/// resolved/derived by the open path). Pure so the seed-one-when-empty
-/// rule is unit-tested without the GTK bootstrap.
-fn restore_open_specs(saved: &[RestoreTab]) -> Vec<(String, String)> {
+/// Session-restore rule: the `(cwd, title, user_titled)` specs to open
+/// for a project. Each saved tab maps to one spec; a project with
+/// **no** saved tabs seeds a single default tab (empty cwd + title →
+/// resolved/derived by the open path; `user_titled=false` since the
+/// caller didn't pick a name). Pure so the seed-one-when-empty rule
+/// is unit-tested without the GTK bootstrap.
+fn restore_open_specs(saved: &[RestoreTab]) -> Vec<(String, String, bool)> {
     if saved.is_empty() {
-        vec![(String::new(), String::new())]
+        vec![(String::new(), String::new(), false)]
     } else {
         saved
             .iter()
-            .map(|t| (t.cwd.clone(), t.title.clone()))
+            .map(|t| (t.cwd.clone(), t.title.clone(), t.user_titled))
             .collect()
     }
 }
@@ -4388,29 +4409,32 @@ mod tests {
     }
 
     /// `restore_open_specs` encodes the seed-one-when-empty rule: a
-    /// project with saved tabs re-opens exactly those (cwd + title in
-    /// order); a project with none seeds a single default tab.
+    /// project with saved tabs re-opens exactly those (cwd + title +
+    /// user_titled in order); a project with none seeds a single
+    /// default tab (`user_titled=false` since nobody picked a name).
     #[test]
     fn restore_open_specs_seeds_one_when_empty() {
         assert_eq!(
             restore_open_specs(&[]),
-            vec![(String::new(), String::new())]
+            vec![(String::new(), String::new(), false)]
         );
         let saved = vec![
             RestoreTab {
                 cwd: "/a".into(),
                 title: "first".into(),
+                user_titled: false,
             },
             RestoreTab {
                 cwd: "/b".into(),
-                title: "second".into(),
+                title: "docs".into(),
+                user_titled: true,
             },
         ];
         assert_eq!(
             restore_open_specs(&saved),
             vec![
-                ("/a".to_string(), "first".to_string()),
-                ("/b".to_string(), "second".to_string()),
+                ("/a".to_string(), "first".to_string(), false),
+                ("/b".to_string(), "docs".to_string(), true),
             ]
         );
     }

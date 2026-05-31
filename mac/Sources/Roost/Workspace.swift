@@ -145,7 +145,13 @@ final class Workspace {
                         projectID: p.id,
                         tabs: p.tabs
                             .sorted { $0.position < $1.position }
-                            .map { RestoreTab(cwd: $0.cwd, title: $0.title) }
+                            .map {
+                                RestoreTab(
+                                    cwd: $0.cwd,
+                                    title: $0.title,
+                                    userTitled: $0.userTitled
+                                )
+                            }
                     )
                 },
                 activeProjectID: snapshot.activeProjectID,
@@ -465,11 +471,29 @@ final class Workspace {
     func setTabCwd(_ tabID: Int64, cwd: String) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
         t.cwd = cwd
-        tabs[tabID] = t
         // Shell-driven (OSC 7 fires per `cd`) but write-through: cheap
         // (no fsync until flush()), so a `cd` loop is fine and the
         // latest cwd is always on disk (last write wins).
-        commit([.tabCwdChanged(tabID: tabID, cwd: cwd)], persist: true)
+        var events: [Event] = [.tabCwdChanged(tabID: tabID, cwd: cwd)]
+        // Re-derive title from cwd when the user hasn't explicitly
+        // renamed (mirrors `setTabTitleFromOSC`'s `userTitled` gate).
+        // Lets the title follow cwd on shells without integration
+        // (Apple /bin/bash 3.2, --norc bash). On integrated shells,
+        // the next prompt's OSC 0 refines this basename to the
+        // tilde-abbreviated path via `setTabTitleFromOSC` —
+        // latest-wins. Event order is cwd-then-title
+        // (cause-then-effect). See the Rust twin in
+        // `crates/roost-linux/src/daemon/state.rs::set_tab_cwd` and
+        // issue #196.
+        if !t.userTitled {
+            let newTitle = deriveTitle(cwd: cwd)
+            if t.title != newTitle {
+                t.title = newTitle
+                events.append(.tabTitleChanged(tabID: tabID, title: newTitle))
+            }
+        }
+        tabs[tabID] = t
+        commit(events, persist: true)
     }
 
     func setTabState(_ tabID: Int64, state: TabState) throws {
@@ -615,7 +639,8 @@ final class Workspace {
                             SnapshotFile.TabSnapshot(
                                 title: $0.title,
                                 cwd: $0.cwd,
-                                position: $0.position
+                                position: $0.position,
+                                userTitled: $0.userTitled
                             )
                         }
                     return SnapshotFile.ProjectSnapshot(
@@ -783,6 +808,38 @@ final class Workspace {
             let title: String
             let cwd: String
             let position: Int32
+            /// True iff the user manually renamed the tab (Cmd+R /
+            /// `tab.set_title`). Persisted so a manual rename survives
+            /// relaunch — and, after issue #196's model-side
+            /// title-follows-cwd change in `setTabCwd`, isn't silently
+            /// re-derived to the basename on the first post-relaunch
+            /// `cd`. Defaulted on decode so a state.json from a build
+            /// predating this field loads as "not user-titled".
+            let userTitled: Bool
+
+            init(title: String, cwd: String, position: Int32, userTitled: Bool = false) {
+                self.title = title
+                self.cwd = cwd
+                self.position = position
+                self.userTitled = userTitled
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case title, cwd, position
+                case userTitled = "user_titled"
+            }
+
+            // Custom decode so a missing `user_titled` key (legacy
+            // file or the other UI predating user_titled persistence)
+            // defaults to `false` rather than throwing — matches
+            // Rust's `#[serde(default)]`.
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                title = try c.decode(String.self, forKey: .title)
+                cwd = try c.decode(String.self, forKey: .cwd)
+                position = try c.decode(Int32.self, forKey: .position)
+                userTitled = try c.decodeIfPresent(Bool.self, forKey: .userTitled) ?? false
+            }
         }
 
         enum CodingKeys: String, CodingKey {
@@ -812,6 +869,12 @@ final class Workspace {
     struct RestoreTab: Sendable, Equatable {
         let cwd: String
         let title: String
+        /// Whether the saved title was a manual user rename (Cmd+R /
+        /// `tab.set_title`). When true, the restore path re-asserts
+        /// the `userTitled` lock so a post-relaunch `cd` doesn't
+        /// silently re-derive the title from cwd. See `setTabCwd`
+        /// for the gate. Persisted in `SnapshotFile.TabSnapshot.userTitled`.
+        let userTitled: Bool
     }
 
     struct RestoreProject: Sendable, Equatable {
