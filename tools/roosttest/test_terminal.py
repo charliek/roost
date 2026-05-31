@@ -15,6 +15,7 @@ where the shell cooperates: OSC 7 cwd tracking via a real `cd`.
 
 from __future__ import annotations
 
+from client import Roost
 from util import cwd_reaches, precondition
 
 
@@ -33,4 +34,12 @@ def test_cwd_tracking_follows_cd(roost, project):
     precondition(cwd_reaches(roost, tab, "/usr"),
                  "OSC 7 cwd not tracked (terminal cwd reception unavailable)")
     assert roost.tab(tab)["cwd"] == "/usr"
-    assert "/usr" in roost.tab(tab)["title"]  # title derives from cwd
+    # Title derives from cwd. Match the basename (`usr`), not the full
+    # path: the Mac UI titles a tab with the cwd's leaf (`/tmp` → `tmp`)
+    # while GTK shows the path — `usr` is in both and absent from `tmp`.
+    # Poll, since the title updates a beat after the tracked cwd.
+    Roost._wait(
+        lambda: "usr" in (roost.tab(tab) or {}).get("title", ""),
+        timeout=5,
+        what="tab title reflects cwd /usr",
+    )
