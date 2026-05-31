@@ -136,8 +136,11 @@ def wait_shell_ready(
     `wait_text` call is itself scaled by ROOST_TEST_TIMEOUT_SCALE
     inside `_wait`, so the outer total is a SOFT cap (the last
     iteration may overrun the outer deadline by up to one scaled
-    `per_attempt_timeout`). On exhaustion, raises `client.Timeout`
-    with a viewport dump — never hangs.
+    `per_attempt_timeout`). On retry exhaustion, raises `client.Timeout`
+    with a viewport dump. A transport failure (`roost.send` /
+    `wait_text` raising a non-timeout `RoostError` like `not-found`
+    when the tab dies) propagates the underlying `RoostError` rather
+    than being rewrapped — the caller gets the real cause.
 
     `suffix` is `uuid4().hex` (`[0-9a-f]`) — shell-safe inside single
     quotes. Callers should not parameterize the value without

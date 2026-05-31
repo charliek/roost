@@ -37,7 +37,7 @@ silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 | `client.py` | `Roost` — a thin JSON-IPC client (direct Unix socket). Op methods (`open_tab`, `set_state`, `dump`, …) + no-`sleep` waits (`wait_state`, `wait_text`, `wait_gone`) + `run()` (wait for prompt, then send a command). |
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), `fresh` (`--roost-fresh`/`ROOST_TEST_FRESH`), a session fixture that owns/ensures the UI (hermetic in fresh mode), `roost` (a client), `project` (a throwaway, cascade-cleaned project). Also the `SKIPS: N` terminal summary. |
-| `util.py` | Cross-file helpers: `precondition` / `skip_on_ci` (the skip policy), `cwd_reaches` (scaled cwd poll), `wait_tab_attached`, drain helpers. |
+| `util.py` | Cross-file helpers: `precondition` / `skip_on_ci` (the skip policy), `cwd_reaches` (scaled cwd poll), `wait_tab_attached`, `wait_shell_ready` (pre-input race-fix for shells that emit pre-prompt content), drain helpers. |
 | `test_smoke.py` | The smoke suite: content via `tab.dump`, state progression, notifications, focus, title-lock, cascade-close. |
 | `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. |
 | `test_notifications.py` | The multi-project notification inbox: `view_notifications` frame, jump-to-notification (focuses the tab + clears its badge), clear-all. |
