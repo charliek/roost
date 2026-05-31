@@ -2208,9 +2208,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // treated as a placeholder); `setTabTitle` flips it back
             // to true and emits a tabTitleChanged. Without this, the
             // first post-relaunch `setTabCwd` would re-derive the
-            // title (issue #196 model fix).
+            // title (issue #196 model fix). Log on failure so a
+            // silently-lost lock is diagnosable — mirrors the Rust
+            // twin's `tracing::warn!` in `app.rs::bootstrap` restore.
             if userTitled && !title.isEmpty {
-                _ = try? RoostBackend.shared.workspace?.setTabTitle(tabID, title: title)
+                do {
+                    try RoostBackend.shared.workspace?.setTabTitle(tabID, title: title)
+                } catch {
+                    RoostLogger.shared.warn(
+                        "restore: failed to re-lock manual title for tab \(tabID) (title=\(title)): \(error); next cd will re-derive"
+                    )
+                }
             }
         }
         return session
