@@ -17,23 +17,13 @@ the *live* cwd, not the project cwd.
 
 from __future__ import annotations
 
-import time
-
-import pytest
+from client import Timeout
+from util import cwd_reaches, precondition
 
 # Live cwd distinct from the project fixture's /tmp, and real on both
 # Linux and macOS (note: /tmp is a symlink on macOS, /usr is not — we
 # only ever assert on /usr, so the symlink quirk can't bite us).
 LIVE_CWD = "/usr"
-
-
-def _cwd_becomes(roost, tab, want, timeout=3.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if (roost.tab(tab) or {}).get("cwd") == want:
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def _active_tab_in_live_cwd(roost, project):
@@ -48,8 +38,13 @@ def _active_tab_in_live_cwd(roost, project):
     # the form docs/guides/cwd-tracking.md documents as the smoke test).
     roost.run(tab, rf"cd {LIVE_CWD} && printf '\033]7;file://{LIVE_CWD}\033\\' && echo AT=done")
     roost.wait_text(tab, "AT=done", timeout=8)
-    if not _cwd_becomes(roost, tab, LIVE_CWD):
-        pytest.skip("OSC 7 cwd not tracked (terminal cwd reception unavailable)")
+    # The explicit OSC 7 emit above means tracking should always work; a
+    # failure here is a regression in fresh mode (hard fail), a capability
+    # gap on an ad-hoc dev UI otherwise (skip).
+    precondition(
+        cwd_reaches(roost, tab, LIVE_CWD),
+        "OSC 7 cwd not tracked (terminal cwd reception unavailable)",
+    )
     return tab
 
 
@@ -60,6 +55,22 @@ def _new_tab_id(roost, before, what):
         what,
     )
     return next(iter({int(t["id"]) for t in roost.tabs()} - before))
+
+
+def _wait_pwd_output(roost, tab_id, needle, timeout=12.0):
+    """Wait for a spawned tab's `pwd` marker, dumping the tab on timeout so
+    a flake is diagnosable instead of an opaque wait failure. The base
+    timeout is generous (scaled by ROOST_TEST_TIMEOUT_SCALE) because the
+    spawned shell must start + run its command under CI load before output
+    appears."""
+    try:
+        roost.wait_text(tab_id, needle, timeout=timeout)
+    except Timeout:
+        dump = roost._safe_dump_text(tab_id)
+        raise AssertionError(
+            f"tab {tab_id} never showed {needle!r} (shell slow to spawn/run?). "
+            f"Viewport:\n{dump}"
+        )
 
 
 def test_new_tab_inherits_active_cwd(roost, project, palette):
@@ -77,7 +88,7 @@ def test_new_tab_inherits_active_cwd(roost, project, palette):
     # Ask the new shell where it is — proves the *spawn* cwd directly,
     # independent of the new tab's own OSC 7 timing.
     roost.run(new_id, "echo NEWTAB_PWD=$(pwd)")
-    roost.wait_text(new_id, f"NEWTAB_PWD={LIVE_CWD}", timeout=8)
+    _wait_pwd_output(roost, new_id, f"NEWTAB_PWD={LIVE_CWD}")
 
 
 def test_launcher_runs_in_active_cwd(roost, project, palette):
@@ -88,11 +99,10 @@ def test_launcher_runs_in_active_cwd(roost, project, palette):
 
     state = palette.palette_open(kind="launcher")
     items = {it["title"]: it["id"] for it in state["items"]}
-    if "Print Pwd" not in items:
-        pytest.skip("seed config not active (UI not launched by the harness)")
+    precondition("Print Pwd" in items, "seed config not active (UI not launched by the harness)")
 
     before = {int(t["id"]) for t in roost.tabs()}
     state = palette.palette_activate(items["Print Pwd"])
     assert state["open"] is False
     new_id = _new_tab_id(roost, before, "launcher spawned a tab")
-    roost.wait_text(new_id, f"LAUNCH_PWD={LIVE_CWD}", timeout=8)
+    _wait_pwd_output(roost, new_id, f"LAUNCH_PWD={LIVE_CWD}")

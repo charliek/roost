@@ -16,6 +16,8 @@ The profile defaults to:
 
 The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost` or `Roost-gtk`.
 
+Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` lives) — the socket, single-instance lock, and log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
+
 This is a deliberate divergence from Apple's HIG on macOS: Roost matches the convention used by Ghostty, nvim, fish, and most CLI-adjacent tools, which keeps user-edited config alongside the rest of one's dotfiles. State files (which the user does not edit) stay in `~/Library/Application Support/<app_label>/` and the socket lives in `~/Library/Caches/<app_label>/`.
 
 ### macOS — `Mac` profile (Swift `Roost.app`)

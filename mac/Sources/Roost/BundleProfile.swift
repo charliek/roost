@@ -41,11 +41,10 @@ struct BundleProfile: Sendable {
     var logPath: String { (logDir as NSString).appendingPathComponent("roost.log") }
 
     /// `roost.lock` lives next to the socket so the single-instance
-    /// flock and the IPC socket share a parent directory. M4c
-    /// added the lock for Mac; the Linux side keeps its lock under
-    /// the state dir per `crates/roost-linux/src/single_instance.rs`
-    /// — the two paths differ deliberately to avoid a cross-platform
-    /// `~/Library/Caches` vs. `$XDG_RUNTIME_DIR` symlink dance.
+    /// flock and the IPC socket share a parent directory — on **both**
+    /// UIs (Linux passes `BundleProfile::lock_path()`, also socket-
+    /// relative). Because it derives from `socketPath`, a
+    /// `ROOST_STATE_DIR` override never moves the lock.
     var lockPath: String {
         let parent = (socketPath as NSString).deletingLastPathComponent
         return (parent as NSString).appendingPathComponent("roost.lock")
@@ -93,9 +92,26 @@ struct BundleProfile: Sendable {
             appLabel: appLabel,
             appID: appID,
             socketPath: socket,
-            stateDir: stateDir,
+            // Redirect ONLY the state dir when ROOST_STATE_DIR is set, so
+            // tests (and side-by-side instances) get an isolated state.json
+            // while socket/lock/log stay on the default path.
+            stateDir: applyStateDirOverride(stateDir, env["ROOST_STATE_DIR"]),
             logDir: logDir
         )
+    }
+
+    /// Apply a `ROOST_STATE_DIR` override to `defaultDir`. Strict
+    /// (**absolute** + non-empty) — NOT the permissive `ROOST_CONFIG`
+    /// policy: a relative state dir resolves against the process CWD,
+    /// which is nondeterministic. A set-but-invalid value (non-empty +
+    /// non-absolute) is ignored with a warn; empty/unset falls back
+    /// silently. KEEP IN SYNC with `paths.rs` `apply_state_dir_override`.
+    private static func applyStateDirOverride(_ defaultDir: String, _ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return defaultDir }
+        if raw.hasPrefix("/") { return raw }
+        FileHandle.standardError.write(Data(
+            "ROOST_STATE_DIR ignored: not an absolute path; using default state dir\n".utf8))
+        return defaultDir
     }
 
     /// Mac profile — what the Swift `Roost.app` uses.

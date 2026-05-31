@@ -60,7 +60,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac smoke-gtk smoke-mac smoke-mac-launch
+.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac e2e-gtk-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch
 test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
 
 test-rust:  ## cargo test --workspace
@@ -77,6 +77,12 @@ e2e-gtk:  ## E2E against the GTK UI
 
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
+
+e2e-gtk-ci:  ## GTK E2E at CI parity (test-mode + fresh harness-owned UI, isolated state)
+	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh
+
+e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
+	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 	tools/screenshot/smoke.sh gtk

@@ -15,33 +15,59 @@ where the shell cooperates: OSC 7 cwd tracking via a real `cd`.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
+from client import Roost
+from util import cwd_reaches, precondition
 
-def _cwd_becomes(roost, tab, want, timeout=2.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if (roost.tab(tab) or {}).get("cwd") == want:
-            return True
-        time.sleep(0.1)
-    return False
+
+def _cd_and_emit_osc7(roost, project):
+    """Open a tab, `cd /usr`, and emit OSC 7 explicitly (the same
+    `ESC ] 7 ; file://… ST` the shell integration sends). Hermetic — no
+    dependence on the shell's own PROMPT_COMMAND integration loading.
+    Returns the tab id once the tracked cwd is /usr."""
+    tab = roost.open_tab(project, cwd="/tmp")
+    roost.run(tab, r"cd /usr && printf '\033]7;file:///usr\033\\' && echo AT=done")
+    roost.wait_text(tab, "AT=done", timeout=8)
+    precondition(cwd_reaches(roost, tab, "/usr"),
+                 "OSC 7 cwd not tracked (terminal cwd reception unavailable)")
+    return tab
 
 
 def test_cwd_tracking_follows_cd(roost, project):
-    """`cd` updates the tab's tracked cwd (the shell emits OSC 7; roost
-    parses it → cwd → the derived title). Skips on shells without OSC 7
-    integration (e.g. a bare bash with no PROMPT_COMMAND), rather than
-    pinning a shell-dependent assertion."""
-    tab = roost.open_tab(project, cwd="/tmp")
-    roost.run(tab, "printf 'P=%s\\n' 1")
-    roost.wait_text(tab, "P=1", timeout=8)
-
-    roost.run(tab, "cd /usr && printf 'AT=%s\\n' done")
-    roost.wait_text(tab, "AT=done", timeout=8)
-
-    if not _cwd_becomes(roost, tab, "/usr"):
-        pytest.skip("shell does not emit OSC 7 (no cwd integration)")
+    """The OSC 7 → tracked-cwd pipeline. A failure is a real regression in
+    cwd reception, so it's a hard failure in fresh mode (the shell's
+    *automatic* emit-on-cd is covered in test_shell_integration)."""
+    tab = _cd_and_emit_osc7(roost, project)
     assert roost.tab(tab)["cwd"] == "/usr"
-    assert "/usr" in roost.tab(tab)["title"]  # title derives from cwd
+
+
+def test_title_follows_cwd(roost, project, target):
+    """The tab title should re-derive from the cwd when it changes via
+    OSC 7. Match the basename (`usr`): the Mac UI titles a tab with the
+    cwd's leaf (`/tmp` → `tmp`) while GTK shows the path — `usr` is in both
+    and absent from `tmp`. Poll, since the title updates a beat after cwd.
+
+    XXX: skipped on Mac pending investigation (issue #196). The title
+    following cwd is **shell-driven** (the integration emits OSC 0 each
+    prompt) — neither Workspace re-derives the title in its cwd setter. The
+    GTK default shell has integration (emits OSC 0 → title gets `usr`); Mac
+    CI's default shell is Apple bash 3.2 with NO integration → no OSC 0 → the
+    title stays at the open-time leaf (`tmp`). So it's not a Mac UI bug. The
+    open question (issue #196): should the title follow cwd via the *model*
+    (re-derive in set_tab_cwd when !userTitled, both UIs) so it works on any
+    shell? If so, this skip can be dropped and the test run cross-platform.
+    """
+    if target == "mac":
+        pytest.skip(
+            "title-follows-cwd is shell-OSC-0-driven; Mac CI's default shell "
+            "(Apple bash 3.2) has no integration, so no OSC 0. Not a Mac UI "
+            "bug — see issue #196. cwd tracking is covered cross-platform by "
+            "test_cwd_tracking_follows_cd."
+        )
+    tab = _cd_and_emit_osc7(roost, project)
+    Roost._wait(
+        lambda: "usr" in (roost.tab(tab) or {}).get("title", ""),
+        timeout=5,
+        what="tab title reflects cwd /usr",
+    )

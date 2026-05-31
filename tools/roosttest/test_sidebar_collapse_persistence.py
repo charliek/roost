@@ -29,41 +29,39 @@ Both UIs persist the collapse choice: the Mac UI in UserDefaults
 and written through on `toggle_sidebar`). So this runs and passes on a
 developer GTK build (Linux or the macOS GTK dev profile) too, not just Mac.
 
-Skip on CI entirely:
+Skip on CI entirely (the mid-test quit→relaunch is the unreliable part,
+independent of state isolation — which `ROOST_STATE_DIR` now handles):
 - GTK CI runs under bare xvfb (no WM); the quit/relaunch lifecycle is
   unreliable there.
-- Mac CI sets `ROOST_TEST_RESET_STATE=1` so `ui._mac_cleanup` deletes
-  `state.json` between launches, plus the GUI runner is slow enough
-  that the mid-test `ui.quit + ui.launch` cycle frequently exceeds
-  the 90s `wait_alive` budget even after the harness's retry.
+- The macOS GUI runner is slow enough that the mid-test `ui.quit +
+  ui.launch` cycle frequently exceeds the 90s `wait_alive` budget even
+  after the harness's retry (slow LaunchServices respawn).
 
 Runs locally on a developer Mac (and on a developer GTK build under a
 real window manager) — where the fix is actually iterated, the test
-reliably catches the bug.
+reliably catches the bug. The regression class is also covered off the
+relaunch path: the GTK Rust unit test
+`sidebar_collapsed_persists_across_reopen` and the Mac Swift
+`UserDefaults` unit test (WS7).
 """
 
 from __future__ import annotations
-
-import os
 
 import pytest
 
 import ui
 from client import Roost
-
-
-SKIP_ON_CI = os.environ.get("CI") == "true"
+from util import skip_on_ci
 
 
 @pytest.fixture(autouse=True)
 def _skip_on_ci():
-    if SKIP_ON_CI:
-        pytest.skip(
-            "quit + relaunch is unreliable on CI: GTK xvfb has no WM, and the "
-            "Mac runner's ROOST_TEST_RESET_STATE=1 nukes state.json + slow "
-            "LaunchServices respawn pushes wait_alive past its 90s budget. "
-            "Runs locally where the fix is actually iterated."
-        )
+    skip_on_ci(
+        "quit + relaunch is unreliable on CI: GTK xvfb has no WM, and the slow "
+        "macOS LaunchServices respawn pushes wait_alive past its 90s budget",
+        alt_coverage="Rust sidebar_collapsed_persists_across_reopen + "
+        "Swift sidebarVisibleStateSurvivesReopen",
+    )
 
 
 def _toggle_to_collapsed(roost: Roost) -> None:

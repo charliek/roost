@@ -61,7 +61,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Persistence key for the M3 toggle-sidebar state. Read at launch,
     /// written on every toggle. Default = true (visible) for new users.
-    private static let sidebarVisibleDefaultsKey = "RoostSidebarVisible"
+    // nonisolated so the nonisolated `sidebarVisibleOnLaunch` helper can
+    // read it (a plain Sendable String constant — safe from any context).
+    nonisolated private static let sidebarVisibleDefaultsKey = "RoostSidebarVisible"
 
     /// Round-6 R6.B: persisted sidebar width, plus the clamp bounds
     /// used by the `NSSplitViewDelegate` callbacks. Width survives
@@ -72,6 +74,35 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     static let sidebarMinWidth: CGFloat = 160
     static let sidebarMaxWidth: CGFloat = 400
     private static let sidebarWidthDefaultsKey = "RoostSidebarWidth"
+
+    /// Defaults store for UI prefs (sidebar visibility + width). Normally
+    /// `UserDefaults.standard`; when `ROOST_DEFAULTS_SUITE` is set (the E2E
+    /// harness) it redirects to a throwaway suite so a test run never reads
+    /// or writes the developer's real prefs — the UserDefaults analog of
+    /// the `ROOST_STATE_DIR` state.json isolation (which can't reach
+    /// UserDefaults). Prod behavior is unchanged when the env is unset.
+    // Computed (not a stored `static let`): `UserDefaults` is non-Sendable
+    // under Swift 6, so a stored nonisolated global is rejected. A computed
+    // property has no shared storage; `UserDefaults(suiteName:)` returns the
+    // shared backing store for a given suite, so repeated access is cheap +
+    // consistent.
+    nonisolated static var uiDefaults: UserDefaults {
+        if let suite = ProcessInfo.processInfo.environment["ROOST_DEFAULTS_SUITE"],
+           !suite.isEmpty, let store = UserDefaults(suiteName: suite) {
+            return store
+        }
+        return .standard
+    }
+
+    /// Whether the sidebar should start visible, given a defaults store.
+    /// A missing value (never toggled) → visible; an explicit `false` →
+    /// collapsed. Pure + injectable so the launch-restore decision is
+    /// unit-tested without standing up the full app — the Mac analog of
+    /// the Rust `sidebar_collapsed_persists_across_reopen` test, covering
+    /// the regression class the CI-skipped relaunch e2e can't.
+    nonisolated static func sidebarVisibleOnLaunch(_ defaults: UserDefaults) -> Bool {
+        (defaults.object(forKey: sidebarVisibleDefaultsKey) as? Bool) ?? true
+    }
 
     /// Round-6 R6.B: gate the `splitViewDidResizeSubviews` save
     /// path. NSSplitView fires the resize-did callback DURING the
@@ -376,7 +407,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // pre-round-6 fixed default. A stored value outside the
         // [min, max] band is clamped (which is also the implicit
         // recovery path for a previously-saved out-of-range width).
-        let storedSidebarWidth = UserDefaults.standard.double(forKey: Self.sidebarWidthDefaultsKey)
+        let storedSidebarWidth = Self.uiDefaults.double(forKey: Self.sidebarWidthDefaultsKey)
         let sidebarWidth: CGFloat = {
             let candidate = storedSidebarWidth > 0 ? CGFloat(storedSidebarWidth) : 220
             return max(Self.sidebarMinWidth, min(Self.sidebarMaxWidth, candidate))
@@ -431,9 +462,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // Restore the user's last-known toggle state (M3). UserDefaults
         // returns `false` for an unset key, so we read it back as
         // Optional<Bool>-shaped to distinguish "not set" (default
-        // visible) from "explicitly false" (user hid it).
-        let stored = UserDefaults.standard.object(forKey: Self.sidebarVisibleDefaultsKey) as? Bool
-        let startsCollapsed = stored == false
+        // visible) from "explicitly false" (user hid it) — see
+        // `sidebarVisibleOnLaunch`.
+        let startsCollapsed = !Self.sidebarVisibleOnLaunch(Self.uiDefaults)
 
         let root = NSView(frame: window.contentRect(forFrameRect: window.frame))
         root.addSubview(split)
@@ -3253,7 +3284,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             sidebarMaxWidthConstraint?.isActive = true
             sidebarPreferredWidthConstraint?.constant = restore
             split.setPosition(restore, ofDividerAt: 0)
-            UserDefaults.standard.set(true, forKey: Self.sidebarVisibleDefaultsKey)
+            Self.uiDefaults.set(true, forKey: Self.sidebarVisibleDefaultsKey)
         } else {
             // Collapse.
             sidebarRestoreWidth = currentWidth
@@ -3266,7 +3297,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             sidebarCollapsingProgrammatically = true
             split.setPosition(0, ofDividerAt: 0)
             sidebarCollapsingProgrammatically = false
-            UserDefaults.standard.set(false, forKey: Self.sidebarVisibleDefaultsKey)
+            Self.uiDefaults.set(false, forKey: Self.sidebarVisibleDefaultsKey)
         }
     }
 
@@ -4705,7 +4736,7 @@ extension RoostApp: NSSplitViewDelegate {
         guard let sidebar = sidebarPane else { return }
         let w = sidebar.frame.width
         guard w >= Self.sidebarMinWidth, w <= Self.sidebarMaxWidth else { return }
-        UserDefaults.standard.set(Double(w), forKey: Self.sidebarWidthDefaultsKey)
+        Self.uiDefaults.set(Double(w), forKey: Self.sidebarWidthDefaultsKey)
     }
 
     /// Lower bound for the interactive divider drag. AppKit calls

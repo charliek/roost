@@ -10,7 +10,7 @@ keeps its own config); CI always launches fresh, so it runs there.
 
 from __future__ import annotations
 
-import pytest
+from util import precondition
 
 SEED_LABELS = ("Echo Marker", "List Tmp")
 
@@ -23,8 +23,7 @@ def _launcher_items(palette):
 
 
 def _require_seed(items):
-    if "Echo Marker" not in items:
-        pytest.skip("seed config not active (UI not launched by the harness)")
+    precondition("Echo Marker" in items, "seed config not active (UI not launched by the harness)")
 
 
 def test_launcher_lists_seeded_commands(palette):

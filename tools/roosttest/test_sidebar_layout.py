@@ -10,10 +10,20 @@ locks in the parity assertion on both UIs.
 `ROOST_TEST_MODE` is unset — the bare resize attempt would fail with
 `not-enabled` and produce noisy "wrong reason" failures.
 
+Capability gate (instead of a blanket CI skip): a resize only lands if
+the environment honors it up to the available screen. GTK CI runs xvfb
+with a large virtual screen (`-screen 0 2560x1440x24`) so the toplevel
+resizes the full amount and these run there; but a tiling/constraining
+compositor (some local setups) or a small screen may grant only a
+partial — or no — resize. So we *measure the achieved window delta* and:
+  - assert the sidebar-hold invariant when the delta is large enough to
+    be meaningful (>= USABLE_DELTA_PT — the original bug grew the sidebar
+    ~20% of the window delta, far above the 1pt tolerance);
+  - emit a registered skip when the environment granted too little resize.
+We never fail via a resize timeout.
+
 Tolerance: 1pt. Divider thickness and HiDPI rounding can shift the
-measured pane width by a sub-point in either direction; 1pt is well
-under the regression we're catching (the original bug grew the sidebar
-by ~140pt over a 700pt window resize).
+measured pane width sub-point; 1pt is well under the ~140pt regression.
 """
 
 from __future__ import annotations
@@ -22,29 +32,20 @@ import os
 
 import pytest
 
-from client import Roost
+from client import Roost, Timeout
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 WIDTH_TOLERANCE_PT = 1.0
-# Bare xvfb (CI) has no window manager, so GTK4's `set_default_size`
-# doesn't actually resize a mapped toplevel — the `window.resize` IPC
-# op returns immediately but the window allocation stays put. Locally,
-# a real WM (Mutter / Quartz on a developer Mac) honors the resize and
-# the test runs end-to-end. Skip on GTK in CI; Mac runs always exercise
-# the regression. GTK's structural correctness (gtk4::Paned with
-# resize_start_child(false)) makes the parity-lock less critical here.
-SKIP_GTK_IN_CI = os.environ.get("CI") == "true"
+# Achieved window-width delta we need before the hold-invariant assertion
+# is meaningful (the bug would grow the sidebar well beyond 1pt over this).
+USABLE_DELTA_PT = 200.0
 
 
 def _wait_window_width(roost, target_width: float, timeout: float = 2.0) -> dict:
     """Block until the UI reports the requested window width, then return
-    the full metrics. GTK is asynchronous about applying the resize (the
-    request hops to the main context and re-allocates on the next idle).
-
-    Routes through `Roost._wait` so `ROOST_TEST_TIMEOUT_SCALE` scales
-    this wait alongside every other wait helper.
-    """
+    the full metrics. Raises `Timeout` if the width never gets there.
+    Routes through `Roost._wait` so `ROOST_TEST_TIMEOUT_SCALE` scales it."""
     Roost._wait(
         lambda: abs(roost.window_metrics()["window_width"] - target_width)
         <= WIDTH_TOLERANCE_PT,
@@ -54,13 +55,17 @@ def _wait_window_width(roost, target_width: float, timeout: float = 2.0) -> dict
     return roost.window_metrics()
 
 
-@pytest.fixture(autouse=True)
-def _skip_gtk_in_ci(target):
-    if SKIP_GTK_IN_CI and target == "gtk":
-        pytest.skip(
-            "GTK target on CI uses bare xvfb (no WM), so window.resize is "
-            "a no-op there; runs locally on developer GTK and on Mac CI"
-        )
+def _resize_settle(roost, target_width: float) -> dict:
+    """Request `target_width` and return the settled metrics. Does NOT fail
+    if the WM refuses or only partially grants the resize — the caller
+    gates on the achieved delta. (GTK applies resizes asynchronously, so
+    we still wait for the width to reach the target when the WM allows it.)
+    """
+    roost.window_resize(target_width, 700)
+    try:
+        return _wait_window_width(roost, target_width)
+    except Timeout:
+        return roost.window_metrics()  # WM granted less than requested
 
 
 @pytest.mark.skipif(
@@ -76,26 +81,32 @@ class TestSidebarLayout:
         (raw NSSplitView + custom splitView(_:resizeSubviewsWithOldSize:)):
         sidebar holds. GTK has always held; this test pins both behaviors.
         """
-        # Seed a known geometry. Use values comfortably inside the
-        # sidebar's [160, 400] clamp so a tolerance miss doesn't get
-        # swallowed by a constraint clip.
-        roost.window_resize(1100, 700)
-        before = _wait_window_width(roost, 1100)
+        # Seed a known geometry, then widen. The capability gate runs
+        # BEFORE any geometry assertion: under a constraining WM (xvfb,
+        # tiling compositors) the window size is unreliable, so a baseline
+        # assertion would trip spuriously — skip first if the WM won't
+        # grant a usable resize.
+        before = _resize_settle(roost, 1100)
+        after = _resize_settle(roost, 1800)
+        achieved = abs(after["window_width"] - before["window_width"])
+        if achieved < USABLE_DELTA_PT:
+            pytest.skip(
+                f"WM granted only a {achieved:.0f}pt window delta "
+                f"({before['window_width']:.0f}→{after['window_width']:.0f}); "
+                "need ≥200pt to exercise the sidebar-hold invariant (no WM?)"
+            )
+        # WM cooperated → the geometry is trustworthy. Assert invariants.
         baseline_sidebar = before["sidebar_width"]
         assert not before["sidebar_collapsed"], "sidebar must be visible for the test"
         assert 160 <= baseline_sidebar <= 400, (
             f"sidebar starting width {baseline_sidebar} out of [160, 400]"
         )
-
-        # The actual assertion. The bug grew the sidebar by ~140pt for
-        # this resize; a 1pt tolerance is well clear of that.
-        roost.window_resize(1800, 700)
-        after = _wait_window_width(roost, 1800)
+        # The bug grew the sidebar ~140pt for a 700pt resize; 1pt clears it.
         assert abs(after["sidebar_width"] - baseline_sidebar) <= WIDTH_TOLERANCE_PT, (
             f"sidebar grew on window resize: before={baseline_sidebar} "
             f"after={after['sidebar_width']} (delta "
-            f"{after['sidebar_width'] - baseline_sidebar:+.1f}pt). "
-            f"Window: {before['window_width']} → {after['window_width']}."
+            f"{after['sidebar_width'] - baseline_sidebar:+.1f}pt) over a "
+            f"{achieved:.0f}pt window widen."
         )
 
     def test_sidebar_holds_width_on_window_shrink(self, roost):
@@ -104,15 +115,20 @@ class TestSidebarLayout:
         case of the grow-on-widen bug: both share the holding-priority
         dance, so the regression test pins both directions.
         """
-        roost.window_resize(1800, 700)
-        before = _wait_window_width(roost, 1800)
+        before = _resize_settle(roost, 1800)
         baseline_sidebar = before["sidebar_width"]
 
-        roost.window_resize(1100, 700)
-        after = _wait_window_width(roost, 1100)
+        after = _resize_settle(roost, 1100)
+        achieved = abs(after["window_width"] - before["window_width"])
+        if achieved < USABLE_DELTA_PT:
+            pytest.skip(
+                f"WM granted only a {achieved:.0f}pt window delta "
+                f"({before['window_width']:.0f}→{after['window_width']:.0f}); "
+                "need ≥200pt to exercise the sidebar-hold invariant (no WM?)"
+            )
         # The shrink target (1100) is still wide enough that the
         # sidebar shouldn't be compressed (sidebar + min terminal width).
         assert abs(after["sidebar_width"] - baseline_sidebar) <= WIDTH_TOLERANCE_PT, (
             f"sidebar shrank on window narrow: before={baseline_sidebar} "
-            f"after={after['sidebar_width']}"
+            f"after={after['sidebar_width']} over a {achieved:.0f}pt window narrow."
         )

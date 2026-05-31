@@ -21,6 +21,23 @@ def pytest_addoption(parser):
         "--roost-target", action="store", default=None, choices=list(ui.TARGETS),
         help="which UI to drive (mac|gtk); default $ROOST_TARGET or gtk",
     )
+    parser.addoption(
+        "--roost-fresh", action="store_true", default=False,
+        help="force a harness-owned UI: quit any running instance and launch a "
+             "hermetic one (seeded config + throwaway ROOST_STATE_DIR). Also via "
+             "ROOST_TEST_FRESH=1. DESTRUCTIVE: closes a running dev session.",
+    )
+
+
+@pytest.fixture(scope="session")
+def fresh(pytestconfig) -> bool:
+    val = bool(pytestconfig.getoption("--roost-fresh")) or \
+        os.environ.get("ROOST_TEST_FRESH") == "1"
+    if val:
+        # Export so non-fixture helpers (util.is_fresh) see flag-driven
+        # fresh too, not just the env-driven form.
+        os.environ["ROOST_TEST_FRESH"] = "1"
+    return val
 
 
 @pytest.fixture(scope="session")
@@ -33,12 +50,14 @@ def target(pytestconfig) -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _ui_session(target):
-    started_here = not ui.is_alive(target)
-    ui.launch(target)
+def _ui_session(target, fresh):
+    # `start_session` returns True when the harness owns the instance
+    # (launched it with a throwaway state dir); only then do we quit it +
+    # clean up at teardown. A reused dev UI is left running and untouched.
+    started_here = ui.start_session(target, fresh=fresh)
     yield
-    if started_here:  # leave a UI the developer already had running
-        ui.quit(target)
+    if started_here:
+        ui.end_session(target)
 
 
 @pytest.fixture
@@ -73,3 +92,24 @@ def palette(roost):
     roost.palette_dismiss()
     yield roost
     roost.palette_dismiss()
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Make skips loud: print every skipped test + reason at session end.
+
+    Skips are how the suite hid regressions both ways (a test mode left off
+    locally; a feature unimplemented behind a CI skip). Surfacing the count
+    + reasons means a run that quietly skipped half the suite can't read as
+    "all green" — the reviewer sees `SKIPS: N` and what was dropped.
+    """
+    skipped = terminalreporter.stats.get("skipped", [])
+    if not skipped:
+        return
+    terminalreporter.write_sep("-", f"SKIPS: {len(skipped)}")
+    for rep in skipped:
+        reason = ""
+        lr = getattr(rep, "longrepr", None)
+        # A skip's longrepr is the (path, lineno, "Skipped: <reason>") tuple.
+        if isinstance(lr, tuple) and len(lr) == 3:
+            reason = str(lr[2]).removeprefix("Skipped: ")
+        terminalreporter.write_line(f"  SKIP {rep.nodeid} — {reason}")
