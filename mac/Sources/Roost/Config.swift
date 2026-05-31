@@ -147,6 +147,102 @@ struct RoostConfig: Sendable {
             .appendingPathComponent("roost")
             .appendingPathComponent("config.conf")
     }
+
+    /// Round-trip-safe edit of `~/.config/roost/config.conf`.
+    /// Replaces every line whose key equals `key` (the parser is
+    /// last-wins on duplicates, so replacing only the first would let
+    /// a stale later line clobber the new value); appends `<key> =
+    /// <value>` at the end when no matching line exists. `value` is
+    /// written verbatim — quoting is the caller's job (e.g.
+    /// `font-family` wants `"…"` because family names contain
+    /// spaces). Comments and unrelated keys are preserved verbatim.
+    /// Returns the underlying error on disk-write failure (callers
+    /// log + swallow; a failed persist must not crash the UI).
+    ///
+    /// **NOT safe for multi-valued keys.** The `keybind = …` and
+    /// `command = …` entries are accumulated by the parser into
+    /// arrays; calling `setKey("keybind", …)` would collapse every
+    /// keybind line into one. Restrict callers to single-valued
+    /// keys (`theme`, `font-family`, `font-size`).
+    ///
+    /// Mirrors `crates/roost-linux/src/config.rs::set_key`.
+    @discardableResult
+    static func setKey(_ key: String, value: String, at path: URL = defaultPath()) -> Error? {
+        // Distinguish "file doesn't exist" (treat as empty, the
+        // common bootstrap case) from "file exists but is
+        // unreadable" (permissions, decode error, etc.) — silently
+        // proceeding past an unreadable file would let the atomic
+        // write overwrite the whole config with just the new line,
+        // nuking the user's other settings.
+        let existing: String
+        if FileManager.default.fileExists(atPath: path.path) {
+            do {
+                existing = try String(contentsOf: path, encoding: .utf8)
+            } catch {
+                return error
+            }
+        } else {
+            existing = ""
+        }
+        let updated = renderSetKey(existing: existing, key: key, value: value)
+        do {
+            try FileManager.default.createDirectory(
+                at: path.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            // Atomic write via a sibling tmp file + rename. `Data`'s
+            // `.atomic` option does exactly this on Apple platforms.
+            try (updated.data(using: .utf8) ?? Data()).write(to: path, options: .atomic)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    /// Pure helper: compute the post-`setKey` file contents. Split
+    /// out for unit tests so we can assert exact bytes without
+    /// touching the filesystem.
+    static func renderSetKey(existing: String, key: String, value: String) -> String {
+        let newLine = "\(key) = \(value)"
+        var lines: [String]
+        if existing.isEmpty {
+            lines = []
+        } else {
+            let hadTrailingNewline = existing.hasSuffix("\n")
+            lines = existing.components(separatedBy: "\n")
+            if hadTrailingNewline {
+                // `components(separatedBy:)` on a trailing newline
+                // leaves a trailing empty element; drop it so we can
+                // re-add a single newline at the end.
+                lines.removeLast()
+            }
+        }
+        var replaced = false
+        for i in 0..<lines.count where lineKeyMatches(lines[i], key) {
+            // Preserve any leading indentation the user pretty-printed
+            // with, so a hand-formatted `  theme = …` line stays
+            // indented after a rewrite.
+            let indent = String(lines[i].prefix(while: { $0 == " " || $0 == "\t" }))
+            lines[i] = indent + newLine
+            replaced = true
+        }
+        if !replaced {
+            lines.append(newLine)
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// `true` when `line` is a non-comment `key = …` line whose key
+    /// matches `target` after trimming. Blank + `#`-comment lines
+    /// never count, so we don't accidentally uncomment a disabled
+    /// entry.
+    static func lineKeyMatches(_ line: String, _ target: String) -> Bool {
+        let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+        if trimmed.isEmpty || trimmed.hasPrefix("#") { return false }
+        guard let eq = trimmed.firstIndex(of: "=") else { return false }
+        let keyPart = trimmed[..<eq].trimmingCharacters(in: .whitespaces)
+        return keyPart == target
+    }
 }
 
 /// Parse a config-file body. Public for tests; never throws — any

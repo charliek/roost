@@ -155,6 +155,12 @@ pub struct PaletteCommands;
 impl PaletteCommands {
     pub const SELECT_THEME_ID: &'static str = "select_theme";
 
+    /// Palette-only drill-in into the monospace font family list.
+    /// Same pattern as `SELECT_THEME_ID`: not a `KeybindAction`, pushes
+    /// a sub-frame with live preview + Esc-to-revert. Mirrors the Mac
+    /// app's `PaletteCommands.selectFontID`.
+    pub const SELECT_FONT_ID: &'static str = "select_font";
+
     /// Palette-only drill-in into the live notification inbox. Like
     /// `SELECT_THEME_ID`, not a `KeybindAction` — built dynamically in
     /// `App::command_items` so its title can carry the live count.
@@ -164,6 +170,7 @@ impl PaletteCommands {
 
     pub const SPECS: &'static [(&'static str, &'static str)] = &[
         (Self::SELECT_THEME_ID, "Select Theme…"),
+        (Self::SELECT_FONT_ID, "Select Font…"),
         ("new_tab", "New Tab"),
         ("close_tab", "Close Tab"),
         ("rename_tab", "Rename Tab"),
@@ -527,11 +534,11 @@ mod tests {
     #[test]
     fn every_command_id_resolves_or_is_select_theme() {
         for (id, _title) in PaletteCommands::SPECS {
-            if *id == PaletteCommands::SELECT_THEME_ID {
-                // Sentinel — drills into the theme list, not a keybind.
+            if *id == PaletteCommands::SELECT_THEME_ID || *id == PaletteCommands::SELECT_FONT_ID {
+                // Sentinel — drills into a sub-frame, not a keybind.
                 assert!(
                     KeybindAction::from_name(id).is_none(),
-                    "select_theme should not be a real keybind action"
+                    "{id:?} should not be a real keybind action"
                 );
                 continue;
             }

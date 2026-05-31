@@ -221,6 +221,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var palette: PalettePanel?
     private var paletteOpen = false
     private var themeNameAtOpen: String?
+    /// Font family captured when the palette opened, restored on
+    /// dismiss-without-confirm so an in-flight live preview reverts.
+    /// `nil` while the palette is closed. The inner `String?` carries
+    /// "no family configured" (= system default) distinctly from the
+    /// outer "palette not open" state.
+    private var fontFamilyAtOpen: String??
+    /// Live font family (post-`Select Font` selection). `nil` means
+    /// the user has no `font-family =` line in their config; the
+    /// renderer falls back to the system monospace default. Tracked
+    /// separately from `config.fontFamily` because that's the
+    /// boot-time snapshot — the live value can drift past it via the
+    /// palette without touching the boot config.
+    private var activeFontFamily: String?
     private var activeFont: NSFont = .monospacedSystemFont(
         ofSize: 14,
         weight: .regular
@@ -330,6 +343,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         self.config = RoostConfig.load()
         self.activeThemeName = config.themeName ?? "roost-dark"
         self.activeTheme = Theme.loadBundled(name: activeThemeName)
+        self.activeFontFamily = config.fontFamily
         self.activeFont = resolveFont(
             family: config.fontFamily,
             size: config.fontSize ?? 14
@@ -853,10 +867,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Switch the active theme at runtime and broadcast it to every
     /// open terminal (all tabs, all projects — `tabs` is the flat
-    /// list). Not persisted: `config.conf` still wins on next launch.
-    /// Resolves the palette once and reuses it across terminals so
-    /// live-preview arrowing stays cheap. New tabs read `activeTheme`
-    /// on spawn, so both confirm and revert propagate forward.
+    /// list). Not persisted on its own — used by both live preview
+    /// (`previewTheme`) and revert (`revertTheme`); the commit-only
+    /// persist lives in `commitTheme`. Resolves the palette once and
+    /// reuses it across terminals so live-preview arrowing stays
+    /// cheap. New tabs read `activeTheme` on spawn, so both confirm
+    /// and revert propagate forward.
     @MainActor
     private func setActiveTheme(_ theme: Theme, name: String) {
         activeTheme = theme
@@ -873,6 +889,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func showCommandPalette(_ sender: Any?) {
         guard palette == nil, let window else { return }
         themeNameAtOpen = activeThemeName
+        fontFamilyAtOpen = .some(activeFontFamily)
         paletteOpen = true
 
         let root = PaletteFrame(
@@ -902,6 +919,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func dismissPalette() {
         palette = nil
         paletteOpen = false
+        themeNameAtOpen = nil
+        fontFamilyAtOpen = nil
         window?.makeKeyAndOrderFront(nil)
         focusActiveTerminal()
     }
@@ -1017,6 +1036,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         switch item.id {
         case PaletteCommands.selectThemeID:
             return .push(themeFrame(), themeBehavior())
+        case PaletteCommands.selectFontID:
+            return .push(fontFrame(), fontBehavior())
         case PaletteCommands.viewNotificationsID:
             return .push(notificationsFrame(), notificationsBehavior())
         case PaletteCommands.clearNotificationsID:
@@ -1070,9 +1091,130 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func themeBehavior() -> PaletteBehavior {
         PaletteBehavior(
             onHighlight: { [weak self] item in self?.previewTheme(name: item.id) },
-            onConfirm: { _ in .close },  // highlight already applied it; just close
+            onConfirm: { [weak self] item in
+                self?.commitTheme(name: item.id)
+                return .close
+            },
             onCancel: { [weak self] in self?.revertTheme() }
         )
+    }
+
+    /// Build the font sub-frame: curated programming fonts first
+    /// (filtered to those NSFont reports installed), then every
+    /// other monospace family alphabetically. Pre-selects the live
+    /// family.
+    @MainActor
+    private func fontFrame() -> PaletteFrame {
+        let families = availableFontFamilies()
+        // Match against the PRIMARY entry of a comma list (e.g. the
+        // value `"Fira Code, Monospace"` should pre-select "Fira
+        // Code"). Mirrors `App::font_frame` on the Linux side.
+        let active = activeFontFamily ?? activeFont.familyName ?? ""
+        let primary =
+            active
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first(where: { !$0.isEmpty }) ?? ""
+        let selection =
+            families.firstIndex(where: { $0.caseInsensitiveCompare(primary) == .orderedSame })
+            ?? 0
+        let items = families.map { PaletteItem(id: $0, title: $0) }
+        return PaletteFrame(
+            id: "fonts",
+            placeholder: "Select a font…",
+            items: items,
+            selection: selection
+        )
+    }
+
+    @MainActor
+    private func fontBehavior() -> PaletteBehavior {
+        PaletteBehavior(
+            onHighlight: { [weak self] item in self?.previewFontFamily(name: item.id) },
+            onConfirm: { [weak self] item in
+                self?.commitFontFamily(name: item.id)
+                return .close
+            },
+            onCancel: { [weak self] in self?.revertFontFamily() }
+        )
+    }
+
+    /// Curated programming fonts that look great in a terminal, in a
+    /// thoughtful order. The first entries that are actually
+    /// installed lead the picker; uninstalled entries are skipped.
+    /// Mirrors `App::CURATED_FONTS` on the Linux side.
+    private static let curatedFonts: [String] = [
+        "JetBrains Mono",
+        "JetBrainsMono Nerd Font",
+        "Fira Code",
+        "Fira Mono",
+        "Hack",
+        "Source Code Pro",
+        "Cascadia Code",
+        "Cascadia Mono",
+        "IBM Plex Mono",
+        "Inconsolata",
+        "Iosevka",
+        "SF Mono",
+        "Menlo",
+        "Monaco",
+        // Cross-platform additions; usually missing on macOS so the
+        // installed-filter step elides them, but kept here so the two
+        // platforms' curated lists stay close.
+        "DejaVu Sans Mono",
+        "Ubuntu Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+    ]
+
+    /// Enumerate font families for the picker: curated first
+    /// (filtered to installed), then every other monospace family
+    /// alphabetically. Uses `NSFontManager` to enumerate the
+    /// installed monospace set.
+    @MainActor
+    private func availableFontFamilies() -> [String] {
+        let manager = NSFontManager.shared
+        // `availableFontNames(with:[.fixedPitchFontMask])` returns
+        // *typeface* names (e.g. "Menlo-Regular"), one row per
+        // weight/style; we want family names. Cross-reference with
+        // `availableFontFamilies` (which is family-deduped) and keep
+        // the families that have at least one fixed-pitch face.
+        let allFamilies = Set(manager.availableFontFamilies)
+        let monoTypefaces = manager.availableFontNames(with: [.fixedPitchFontMask]) ?? []
+        var monoFamilies = Set<String>()
+        for face in monoTypefaces {
+            // `NSFont(name:size:).familyName` is the most reliable
+            // map from typeface → family; fall back to a hyphen-strip
+            // heuristic if AppKit refuses to resolve a face.
+            if let family = NSFont(name: face, size: 12)?.familyName,
+               allFamilies.contains(family)
+            {
+                monoFamilies.insert(family)
+            }
+        }
+        let installed = { (name: String) -> Bool in
+            allFamilies.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame })
+        }
+        var seen = Set<String>()
+        var out: [String] = []
+        for entry in Self.curatedFonts {
+            if installed(entry), !seen.contains(entry.lowercased()) {
+                // Use the canonical name from `allFamilies` if it's a
+                // case mismatch.
+                let canonical =
+                    allFamilies.first(where: { $0.caseInsensitiveCompare(entry) == .orderedSame })
+                    ?? entry
+                out.append(canonical)
+                seen.insert(canonical.lowercased())
+            }
+        }
+        let remaining = monoFamilies
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        for name in remaining where !seen.contains(name.lowercased()) {
+            out.append(name)
+            seen.insert(name.lowercased())
+        }
+        return out
     }
 
     // MARK: - Notification inbox
@@ -1218,6 +1360,133 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func revertTheme() {
         guard let name = themeNameAtOpen, name != activeThemeName else { return }
         setActiveTheme(Theme.loadBundled(name: name), name: name)
+    }
+
+    /// Commit the user's Enter on the theme sub-frame: make sure
+    /// live state matches `name` (highlight normally does this; a
+    /// fast-Enter without ever moving is a no-preview path), then
+    /// persist to `~/.config/roost/config.conf` so the next launch
+    /// picks the same theme. Preview + revert deliberately do NOT
+    /// call this — they only mutate in-memory state.
+    @MainActor
+    private func commitTheme(name: String) {
+        if name != activeThemeName {
+            setActiveTheme(Theme.loadBundled(name: name), name: name)
+        }
+        writeBackTheme(name)
+    }
+
+    @MainActor
+    private func previewFontFamily(name: String) {
+        if name == activeFontFamily { return }
+        setActiveFontFamily(name)
+    }
+
+    /// Revert to the font family captured when the palette opened.
+    /// The double-Optional snapshot disambiguates "palette never
+    /// opened" (outer nil) from "user had no `font-family =` line"
+    /// (inner nil).
+    @MainActor
+    private func revertFontFamily() {
+        guard let target = fontFamilyAtOpen else { return }
+        if target == activeFontFamily { return }
+        setActiveFontFamily(target)
+    }
+
+    /// Commit the user's Enter on the font sub-frame: ensure live
+    /// state matches `name`, then persist to config. Counterpart to
+    /// `commitTheme`.
+    ///
+    /// Preserves a comma-separated fallback chain (e.g. `"JetBrains
+    /// Mono, Monospace"`) when the user confirms the chain's primary
+    /// — the picker only exposes individual family names but a user
+    /// may have hand-edited a fallback into config, and a no-op
+    /// Enter on the pre-selected primary shouldn't silently drop it.
+    @MainActor
+    private func commitFontFamily(name: String) {
+        let currentPrimary =
+            activeFontFamily?
+            .split(separator: ",")
+            .first
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        if currentPrimary?.caseInsensitiveCompare(name) == .orderedSame {
+            // No-op confirm: keep the existing chain + skip the write.
+            return
+        }
+        setActiveFontFamily(name)
+        writeBackFontFamily(name)
+    }
+
+    /// Apply `family` (nil = system monospace) at the current size.
+    /// Used by both preview and commit; commit additionally calls
+    /// `writeBackFontFamily`.
+    @MainActor
+    private func setActiveFontFamily(_ family: String?) {
+        activeFontFamily = family
+        let size = activeFont.pointSize
+        let newFont = resolveFont(family: family, size: size)
+        activeFont = newFont
+        for session in tabs {
+            session.terminalView.updateFont(newFont)
+        }
+    }
+
+    /// Persist `theme = <name>` to the user's config file. Logs and
+    /// swallows IO errors — a failed write must not crash the UI;
+    /// the in-memory selection still works for the rest of the
+    /// session.
+    @MainActor
+    private func writeBackTheme(_ name: String) {
+        if let err = RoostConfig.setKey("theme", value: name) {
+            NSLog("roost-mac: failed to persist theme to config.conf: %@", "\(err)")
+        }
+    }
+
+    /// Persist `font-family = "<name>"` to config. The value is
+    /// wrapped in double quotes since family names commonly contain
+    /// spaces ("JetBrains Mono"); the parser strips them on read.
+    @MainActor
+    private func writeBackFontFamily(_ name: String) {
+        if let err = RoostConfig.setKey("font-family", value: "\"\(name)\"") {
+            NSLog("roost-mac: failed to persist font-family to config.conf: %@", "\(err)")
+        }
+    }
+
+    /// Persist `font-size = <pt>` to config. Whole values render as
+    /// integers ("14") rather than floats ("14.0").
+    @MainActor
+    private func writeBackFontSize(_ size: CGFloat) {
+        if let err = RoostConfig.setKey("font-size", value: formatFontSize(size)) {
+            NSLog("roost-mac: failed to persist font-size to config.conf: %@", "\(err)")
+        }
+    }
+
+    /// Format a font size for the config file. Whole numbers render
+    /// as integers; non-whole values keep up to two decimals (trailing
+    /// zeros trimmed) so a `font-size = 14.5` round-trips cleanly.
+    /// `nonisolated static` for unit-testing without an `App`.
+    ///
+    /// Locale-pinned to POSIX (`en_US_POSIX`) — `String(format:)`
+    /// is locale-aware, so a French/German UI would otherwise write
+    /// `font-size = 14,5` which the parser (which goes through
+    /// `Double(_ value: String)` and accepts only `.` as the
+    /// decimal separator) silently rejects on next launch.
+    nonisolated static func formatFontSize(_ size: CGFloat) -> String {
+        let rounded = size.rounded()
+        if abs(rounded - size) < 0.001 {
+            return String(Int(rounded))
+        }
+        let s = String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), Double(size))
+        var trimmed = s
+        while trimmed.hasSuffix("0") { trimmed.removeLast() }
+        if trimmed.hasSuffix(".") { trimmed.removeLast() }
+        return trimmed
+    }
+
+    /// Non-static wrapper so call sites can stay terse.
+    @MainActor
+    private func formatFontSize(_ size: CGFloat) -> String {
+        Self.formatFontSize(size)
     }
 
     /// Dispatch a palette command through the same handlers the menu
@@ -3423,6 +3692,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func fontReset(_ sender: Any?) {
         let defaultSize = config.fontSize ?? 14
+        // No-op when the live size already matches the baseline.
+        // Skipping `applyFont` also skips its config write — otherwise
+        // a stray Cmd+0 on an unconfigured user would materialize
+        // `font-size = <default>` into a config that never had a
+        // font-size line.
+        if abs(activeFont.pointSize - defaultSize) < 0.01 { return }
         applyFont(size: defaultSize)
     }
 
@@ -3449,11 +3724,19 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// automatically — no separate plumbing needed here.
     @MainActor
     private func applyFont(size: CGFloat) {
-        let newFont = resolveFont(family: config.fontFamily, size: size)
+        // Use the *live* font family (post-`Select Font…` selection),
+        // not the boot-time config snapshot — otherwise font-size
+        // zooming would silently revert the family selection.
+        let newFont = resolveFont(family: activeFontFamily, size: size)
         activeFont = newFont
         for session in tabs {
             session.terminalView.updateFont(newFont)
         }
+        // Font-size changes are commit-only (no preview / revert
+        // distinction like theme + font-family have), so persist
+        // unconditionally here. The atomic tmp+rename keeps repeated
+        // Cmd+= presses cheap.
+        writeBackFontSize(size)
     }
 
     /// Resolve the same default socket path as `roost-common`'s Mac

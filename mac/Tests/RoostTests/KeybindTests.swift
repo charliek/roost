@@ -39,12 +39,18 @@ func unknownActionTypoKeepsTheDefault() throws {
 
 @Test
 func paletteCommandsStayInKeybindNamespace() {
-    // Every palette command id (except the theme-drill sentinel) must
-    // be a real keybind action, so `runCommand`'s switch + the shortcut
-    // hint can't silently drift from the namespace.
-    for spec in PaletteCommands.specs where spec.id != PaletteCommands.selectThemeID {
+    // Every palette command id (except the drill-in sentinels) must
+    // be a real keybind action, so `runCommand`'s switch + the
+    // shortcut hint can't silently drift from the namespace.
+    let sentinels: Set<String> = [
+        PaletteCommands.selectThemeID,
+        PaletteCommands.selectFontID,
+    ]
+    for spec in PaletteCommands.specs where !sentinels.contains(spec.id) {
         #expect(KeybindAction.isKnown(spec.id), "\(spec.id) is not a known keybind action")
         #expect(!spec.title.isEmpty)
     }
-    #expect(!KeybindAction.isKnown(PaletteCommands.selectThemeID))
+    for sentinel in sentinels {
+        #expect(!KeybindAction.isKnown(sentinel))
+    }
 }
