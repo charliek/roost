@@ -61,7 +61,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Persistence key for the M3 toggle-sidebar state. Read at launch,
     /// written on every toggle. Default = true (visible) for new users.
-    private static let sidebarVisibleDefaultsKey = "RoostSidebarVisible"
+    // nonisolated so the nonisolated `sidebarVisibleOnLaunch` helper can
+    // read it (a plain Sendable String constant — safe from any context).
+    nonisolated private static let sidebarVisibleDefaultsKey = "RoostSidebarVisible"
 
     /// Round-6 R6.B: persisted sidebar width, plus the clamp bounds
     /// used by the `NSSplitViewDelegate` callbacks. Width survives
