@@ -370,7 +370,7 @@ jobs:
         id: bot-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          client-id:      ${{ secrets.RELEASE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
 
       - name: Sign DMG + append appcast entry
@@ -507,7 +507,7 @@ jobs:
       - name: Decide whether to dispatch
         id: guard
         env:
-          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+          CLIENT_ID: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -518,8 +518,8 @@ jobs:
               exit 0
               ;;
           esac
-          if [ -z "${APP_ID}" ]; then
-            echo "::warning::RELEASE_BOT_APP_ID not set — skipping dispatch. apt-charliek self-heals on its next publish run (collect-debs.sh re-scans every package)."
+          if [ -z "${CLIENT_ID}" ]; then
+            echo "::warning::RELEASE_BOT_CLIENT_ID not set — skipping dispatch. apt-charliek self-heals on its next publish run (collect-debs.sh re-scans every package)."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -530,7 +530,7 @@ jobs:
         id: apt
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
           owner: charliek
           repositories: apt-charliek
