@@ -189,7 +189,12 @@ the title. 🐓 = clean tree or outside a repo, 🐣 = dirty tree.
 ```bash
 __roost_fancy_title() {
   [ -n "$ROOST_TAB_ID" ] || return
-  local icon="🐓" title="${PWD/#$HOME/~}" branch
+  local icon="🐓" branch title
+  case "$PWD" in
+    "$HOME")    title="~" ;;
+    "$HOME"/*)  title="~${PWD#"$HOME"}" ;;
+    *)          title="$PWD" ;;
+  esac
   if branch=$(git symbolic-ref --short HEAD 2>/dev/null); then
     [ -n "$(git status --porcelain 2>/dev/null)" ] && icon="🐣"
     title+=" (${branch})"
@@ -198,6 +203,13 @@ __roost_fancy_title() {
 }
 PROMPT_COMMAND="__roost_fancy_title;${PROMPT_COMMAND}"
 ```
+
+The `$HOME → ~` abbreviation uses a `case` + prefix-strip rather than the
+tempting `${PWD/#$HOME/~}`, because that one-liner **isn't portable**: macOS's
+`/bin/bash` (3.2) treats the replacement `~` as a literal, but bash ≥ 5.2
+tilde-expands it back to `$HOME` — a silent no-op that shows the full
+`/home/you/...` path. Escaping it (`\~`) flips the breakage to the other
+version. The `case` form is correct on both and leaves non-home paths untouched.
 
 The `git status --porcelain` runs once per prompt; on very large repos with a
 slow disk that's worth knowing about.
