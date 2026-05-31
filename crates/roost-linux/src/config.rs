@@ -7,7 +7,8 @@
 //! (unknown keys silently ignored).
 
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::custom_command::{self, CustomCommand};
 use roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS;
@@ -214,6 +215,141 @@ impl RoostConfig {
     }
 }
 
+/// Round-trip-safe edit of `~/.config/roost/config.conf`.
+///
+/// Replaces every line whose key (the text before the first `=`,
+/// trimmed) equals `key`. The parser is "last-wins" on duplicates, so
+/// replacing only the first occurrence would silently let a later
+/// duplicate clobber the new value — replacing all keeps the file
+/// honest. If no matching line exists, appends `<key> = <value>` at
+/// the end (adding a trailing newline if the file didn't have one).
+/// Comments and unrelated keys are preserved verbatim.
+///
+/// **NOT safe for multi-valued keys.** The `keybind = …` and
+/// `command = …` entries are accumulated by the parser into vectors;
+/// calling `set_key("keybind", …)` would collapse every keybind line
+/// into one. Restrict callers to single-valued keys (`theme`,
+/// `font-family`, `font-size`).
+///
+/// `value` is written verbatim — callers are responsible for adding
+/// surrounding quotes when the value contains spaces (`font-family`
+/// gets `"…"`; bare names like `theme = roost-dark` and numeric
+/// `font-size = 14` do not). The write is atomic via tmp-file +
+/// rename in the same directory. The parent directory is created if
+/// missing.
+pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let existing = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let new_contents = render_set_key(&existing, key, value);
+    write_atomic(path, &new_contents)
+}
+
+/// Pure helper: compute the post-`set_key` file contents from the
+/// existing contents. Split out so the round-trip tests can assert on
+/// the exact bytes without touching the filesystem.
+fn render_set_key(existing: &str, key: &str, value: &str) -> String {
+    let new_line = format!("{key} = {value}");
+    let mut lines: Vec<String> = if existing.is_empty() {
+        // Treat an empty file as zero lines (not one empty line), so
+        // an appended entry doesn't end up preceded by a blank.
+        Vec::new()
+    } else {
+        let had_trailing_newline = existing.ends_with('\n');
+        let mut v: Vec<String> = existing.split('\n').map(|s| s.to_string()).collect();
+        // `split('\n')` on a trailing newline leaves a trailing empty
+        // element; drop it so we can re-add a single newline at end.
+        if had_trailing_newline {
+            v.pop();
+        }
+        v
+    };
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        if line_key_matches(line, key) {
+            // Preserve any leading indentation the user pretty-printed
+            // with, so a hand-formatted `  theme = …` line stays
+            // indented after a rewrite.
+            let indent: String = line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            *line = format!("{indent}{new_line}");
+            replaced = true;
+        }
+    }
+    if !replaced {
+        lines.push(new_line);
+    }
+    let mut out = lines.join("\n");
+    // Always end with a single newline so re-edits land on their own
+    // line and `cat`-ing the file in a terminal doesn't dangle.
+    out.push('\n');
+    out
+}
+
+/// `true` when `line` is a non-comment `key = …` line whose key
+/// matches `target` after trimming. Comment + blank lines (the parser
+/// drops them) never count, so we don't accidentally edit a comment.
+fn line_key_matches(line: &str, target: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let Some(eq) = trimmed.find('=') else {
+        return false;
+    };
+    trimmed[..eq].trim_end() == target
+}
+
+fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Per-call nonce so two `set_key` calls from the same process
+    // can't pick the same tmp filename and clobber each other's
+    // write. Pid alone collides on rapid back-to-back commits (e.g.
+    // theme.set immediately followed by font-family.set).
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{stem}.roost.tmp.{}.{}",
+        std::process::id(),
+        nonce
+    ));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Public so the UI can pass `&ROOST_CONFIG`-aware paths into
+/// `set_key` without re-deriving them. Returns `None` when `$HOME` is
+/// unset and `$ROOST_CONFIG` is empty — same fallback the loader uses.
+pub fn config_path() -> Option<PathBuf> {
+    default_path()
+}
+
 fn default_path() -> Option<PathBuf> {
     // `ROOST_CONFIG` overrides the path with an absolute file — used by
     // the E2E harness to drive the command launcher off a seeded config
@@ -396,5 +532,124 @@ mod tests {
         // Only the well-formed line survives.
         assert_eq!(cfg.commands.len(), 1);
         assert_eq!(cfg.commands[0].label, "Good");
+    }
+
+    // ----- set_key round-trip ---------------------------------------
+
+    #[test]
+    fn set_key_replaces_existing_value_in_place() {
+        let before = "theme = catppuccin-mocha\nfont-size = 14\n";
+        let after = render_set_key(before, "theme", "roost-dark");
+        // `theme` line updated; `font-size` untouched; trailing newline
+        // preserved (no double newline).
+        assert_eq!(after, "theme = roost-dark\nfont-size = 14\n");
+    }
+
+    #[test]
+    fn set_key_appends_when_missing() {
+        let before = "theme = roost-dark\n";
+        let after = render_set_key(before, "font-family", "\"JetBrains Mono\"");
+        assert_eq!(
+            after,
+            "theme = roost-dark\nfont-family = \"JetBrains Mono\"\n"
+        );
+    }
+
+    #[test]
+    fn set_key_appends_to_empty_file() {
+        let after = render_set_key("", "theme", "roost-dark");
+        assert_eq!(after, "theme = roost-dark\n");
+    }
+
+    #[test]
+    fn set_key_appends_when_no_trailing_newline() {
+        // The file ended without a newline (e.g. user hand-edited).
+        // The new line still lands on its own row.
+        let before = "theme = roost-dark";
+        let after = render_set_key(before, "font-size", "14");
+        assert_eq!(after, "theme = roost-dark\nfont-size = 14\n");
+    }
+
+    #[test]
+    fn set_key_replaces_all_duplicates() {
+        // The parser is "last-wins" on duplicates, so replacing only
+        // the first occurrence would let a stale later line clobber
+        // the new value. Every occurrence must be rewritten.
+        let before = "theme = a\ntheme = b\nfont-size = 14\ntheme = c\n";
+        let after = render_set_key(before, "theme", "roost-dark");
+        assert_eq!(
+            after,
+            "theme = roost-dark\ntheme = roost-dark\nfont-size = 14\ntheme = roost-dark\n"
+        );
+    }
+
+    #[test]
+    fn set_key_preserves_comments_and_other_keys() {
+        let before = "# my roost config\n\ntheme = old\n# inline note\nfont-size = 14\n";
+        let after = render_set_key(before, "theme", "new");
+        assert_eq!(
+            after,
+            "# my roost config\n\ntheme = new\n# inline note\nfont-size = 14\n"
+        );
+    }
+
+    #[test]
+    fn set_key_ignores_commented_lines() {
+        // A `# theme = …` line shouldn't be treated as the canonical
+        // setting; we should append rather than uncomment the user's
+        // disabled entry.
+        let before = "# theme = disabled\nfont-size = 14\n";
+        let after = render_set_key(before, "theme", "roost-dark");
+        assert_eq!(
+            after,
+            "# theme = disabled\nfont-size = 14\ntheme = roost-dark\n"
+        );
+    }
+
+    #[test]
+    fn set_key_handles_value_with_spaces_via_caller_quoting() {
+        // `set_key` writes `value` verbatim; quoting (when the value
+        // contains spaces) is the caller's responsibility. The parser
+        // already strips matching surrounding quotes on read, so a
+        // round-trip with `font-family = "JetBrains Mono"` re-parses
+        // cleanly.
+        let before = "";
+        let after = render_set_key(before, "font-family", "\"JetBrains Mono\"");
+        let cfg = RoostConfig::parse(&after);
+        assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
+    }
+
+    #[test]
+    fn set_key_disk_round_trip_creates_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/dir/config.conf");
+        super::set_key(&path, "theme", "roost-dark").unwrap();
+        super::set_key(&path, "font-family", "\"JetBrains Mono\"").unwrap();
+        super::set_key(&path, "font-size", "15").unwrap();
+        let cfg = RoostConfig::load_from(path);
+        assert_eq!(cfg.theme_name.as_deref(), Some("roost-dark"));
+        assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(cfg.font_size, Some(15.0));
+    }
+
+    #[test]
+    fn set_key_preserves_leading_whitespace_in_unrelated_lines() {
+        // Indented unrelated lines should round-trip exactly (we only
+        // rewrite the matched key's line).
+        let before = "    # indented note\n  font-size = 14\ntheme = old\n";
+        let after = render_set_key(before, "theme", "new");
+        assert_eq!(
+            after,
+            "    # indented note\n  font-size = 14\ntheme = new\n"
+        );
+    }
+
+    #[test]
+    fn set_key_preserves_indent_on_matched_line() {
+        // A hand-formatted `  theme = old` should keep its indent
+        // after a rewrite — only the key=value text changes.
+        let before = "  theme = old\nfont-size = 14\n";
+        let after = render_set_key(before, "theme", "new");
+        assert_eq!(after, "  theme = new\nfont-size = 14\n");
     }
 }

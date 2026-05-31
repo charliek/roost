@@ -39,6 +39,7 @@ COMMON_COMMAND_IDS = (
     "font_decrease",
     "font_reset",
     "select_theme",
+    "select_font",
 )
 
 
@@ -86,6 +87,15 @@ def test_activate_select_theme_pushes_subframe(palette):
     assert st["open"] is True
     assert st["frame"] == "themes"
     assert len(st["items"]) > 0, "theme list should not be empty"
+
+
+def test_activate_select_font_pushes_subframe(palette):
+    palette.palette_open()
+    st = palette.palette_activate("select_font")
+    # Drilling into the font list: a new frame, palette still open.
+    assert st["open"] is True
+    assert st["frame"] == "fonts"
+    assert len(st["items"]) > 0, "font list should not be empty"
 
 
 def test_activate_unknown_id_is_not_found(palette):

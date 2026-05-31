@@ -158,8 +158,15 @@ pub struct App {
     /// Count badge overlaid on the HeaderBar notifications bell. Hidden
     /// at zero; `refresh_notif_badge` keeps it in sync with the inbox.
     notif_badge: gtk4::Label,
-    /// Optional font-family override from config.
-    font_family: Option<String>,
+    /// Optional font-family override from config. `RefCell` because
+    /// the command palette swaps it live (Select Font…); new tabs
+    /// read the current value at spawn so confirm + revert propagate
+    /// forward, matching the theme story.
+    font_family: RefCell<Option<String>>,
+    /// Font family captured when the palette opened, restored on
+    /// dismiss-without-confirm so an in-flight live preview reverts.
+    /// `None` while the palette is closed or before the first open.
+    font_family_at_open: RefCell<Option<Option<String>>>,
     /// Optional font-size override from config (points). Snapshot
     /// of the value read at boot; the live size (with FontIncrease /
     /// FontDecrease / FontReset adjustments) lives in
@@ -577,7 +584,8 @@ impl App {
             palette: RefCell::new(None),
             notification_inbox: RefCell::new(NotificationInbox::new()),
             notif_badge: notif_badge.clone(),
-            font_family: cfg.font_family.clone(),
+            font_family: RefCell::new(cfg.font_family.clone()),
+            font_family_at_open: RefCell::new(None),
             font_size_pt: cfg.font_size,
             current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
             copy_on_select: RefCell::new(cfg.copy_on_select),
@@ -1706,7 +1714,7 @@ impl App {
         // baseline.
         let terminal = Rc::new(TerminalView::with_theme_font_and_copy(
             self.theme.borrow().clone(),
-            self.font_family.as_deref(),
+            self.font_family.borrow().as_deref(),
             Some(*self.current_font_size_pt.borrow()),
             *self.copy_on_select.borrow(),
             self.word_break_chars.borrow().clone(),
@@ -2577,6 +2585,15 @@ impl App {
             KeybindAction::FontDecrease => self.adjust_font_size(-1.0),
             KeybindAction::FontReset => {
                 let baseline = self.font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT);
+                let current = *self.current_font_size_pt.borrow();
+                // No-op when the live size already matches the baseline.
+                // Skipping the apply call also skips its config write —
+                // otherwise a stray Cmd+0 on an unconfigured user would
+                // materialize `font-size = <default>` into a config that
+                // never had a font-size line.
+                if (current - baseline).abs() < 0.01 {
+                    return;
+                }
                 *self.current_font_size_pt.borrow_mut() = baseline;
                 self.apply_font_size_to_all(baseline);
             }
@@ -2674,22 +2691,38 @@ impl App {
     /// each view's existing `apply_font` path so cell metrics get
     /// remeasured + a redraw is queued automatically.
     fn apply_font_size_to_all(self: &Rc<Self>, size_pt: f64) {
-        let projects = self.projects.borrow();
-        for ui in projects.values() {
-            let tabs = ui.tabs.borrow();
-            for tab_ui in tabs.values() {
-                tab_ui
-                    .view
-                    .apply_font(self.font_family.as_deref(), Some(size_pt));
+        {
+            let projects = self.projects.borrow();
+            let family = self.font_family.borrow();
+            for ui in projects.values() {
+                let tabs = ui.tabs.borrow();
+                for tab_ui in tabs.values() {
+                    tab_ui.view.apply_font(family.as_deref(), Some(size_pt));
+                }
             }
+        }
+        // Persist the new size back to ~/.config/roost/config.conf
+        // so the next launch starts at the same zoom level. Font-size
+        // changes are commit-only (no preview/revert distinction
+        // like theme + font-family have), so the write is
+        // unconditional here. Format whole values as integers
+        // (`font-size = 14`, not `14.0`) to keep the file readable.
+        if let Err(e) = write_back_font_size(size_pt) {
+            tracing::warn!(
+                error = %e,
+                size = size_pt,
+                "failed to persist font-size to config.conf"
+            );
         }
     }
 
     /// Switch the active theme at runtime and broadcast it to every
-    /// open terminal (all tabs, all projects). Not persisted:
-    /// `config.conf` still wins on next launch. New tabs read
-    /// `self.theme` at spawn, so both confirm and revert propagate
-    /// forward. Mirrors the Mac UI's `setActiveTheme`.
+    /// open terminal (all tabs, all projects). Not persisted on its
+    /// own — used for both live preview (`preview_theme`) and revert
+    /// (`revert_theme`); the commit-only persist lives in
+    /// `commit_theme`. New tabs read `self.theme` at spawn, so both
+    /// confirm and revert propagate forward. Mirrors the Mac UI's
+    /// `setActiveTheme`.
     fn set_active_theme(self: &Rc<Self>, theme: Theme, name: String) {
         *self.active_theme_name.borrow_mut() = name;
         let projects = self.projects.borrow();
@@ -2703,6 +2736,91 @@ impl App {
         *self.theme.borrow_mut() = theme;
     }
 
+    /// Commit the user's Enter on the theme sub-frame: make sure the
+    /// live theme matches `name` (the highlight path normally does
+    /// this, but a fast-Enter without ever moving the highlight is a
+    /// no-preview path), then persist it to `~/.config/roost/config.conf`
+    /// so the next launch picks the same theme. Preview/revert
+    /// deliberately do NOT call this — they only mutate in-memory
+    /// state.
+    fn commit_theme(self: &Rc<Self>, name: &str) {
+        if *self.active_theme_name.borrow() != name {
+            self.set_active_theme(Theme::load_bundled(name), name.to_string());
+        }
+        if let Err(e) = write_back_theme(name) {
+            tracing::warn!(error = %e, theme = name, "failed to persist theme to config.conf");
+        }
+    }
+
+    /// Switch the active font family at runtime and broadcast it to
+    /// every open terminal. Mirrors `set_active_theme`. Not persisted;
+    /// `commit_font_family` does that. Passing `None` falls back to
+    /// the compiled-in `DEFAULT_FONT_FAMILY` so a revert from a
+    /// previewed family actually resets the rendered text — Pango's
+    /// `TerminalView::apply_font(None, …)` deliberately no-ops the
+    /// family slot to support size-only updates, so we must pass an
+    /// explicit family string to revert visually.
+    fn set_active_font_family(self: &Rc<Self>, family: Option<String>) {
+        // Clone the to-be-applied family BEFORE moving into the
+        // RefCell so the per-tab loop below can read it without
+        // holding a live borrow across arbitrary view code (any
+        // future apply_font side-effect that re-enters would
+        // otherwise trip a BorrowError).
+        let applied: String = family
+            .as_deref()
+            .unwrap_or(crate::cell_metrics::DEFAULT_FONT_FAMILY)
+            .to_string();
+        *self.font_family.borrow_mut() = family;
+        let size = *self.current_font_size_pt.borrow();
+        let projects = self.projects.borrow();
+        for ui in projects.values() {
+            let tabs = ui.tabs.borrow();
+            for tab_ui in tabs.values() {
+                tab_ui.view.apply_font(Some(&applied), Some(size));
+            }
+        }
+    }
+
+    /// Commit the user's Enter on the font sub-frame: ensure live
+    /// state matches `name`, then persist to config. Counterpart to
+    /// `commit_theme`.
+    ///
+    /// Preserves a comma-separated fallback chain (e.g. `"JetBrains
+    /// Mono, Monospace"`) when the user confirms the chain's primary
+    /// — the picker only exposes individual family names but a user
+    /// may have hand-edited a fallback into config. The check is
+    /// against the **at-open snapshot**, not the live preview value:
+    /// if the user previewed another font and arrowed back, the
+    /// live state is already the stripped primary, so comparing
+    /// against the live value would still drop the fallback.
+    fn commit_font_family(self: &Rc<Self>, name: &str) {
+        let opened = self.font_family_at_open.borrow().clone().flatten();
+        let opened_primary = opened
+            .as_deref()
+            .and_then(|s| s.split(',').map(str::trim).find(|t| !t.is_empty()));
+        if opened_primary
+            .map(|p| p.eq_ignore_ascii_case(name))
+            .unwrap_or(false)
+        {
+            // No-op confirm: restore the opened chain to live state
+            // (an interim preview may have replaced it with the bare
+            // primary) and DON'T rewrite the file — it already has
+            // the chain the user opened with.
+            if *self.font_family.borrow() != opened {
+                self.set_active_font_family(opened);
+            }
+            return;
+        }
+        self.set_active_font_family(Some(name.to_string()));
+        if let Err(e) = write_back_font_family(name) {
+            tracing::warn!(
+                error = %e,
+                family = name,
+                "failed to persist font-family to config.conf"
+            );
+        }
+    }
+
     // ----- Command palette (Cmd+Shift+P / Alt+Shift+P) -------------
 
     /// Open the command palette over the content overlay. Captures the
@@ -2713,6 +2831,7 @@ impl App {
             return;
         }
         *self.theme_name_at_open.borrow_mut() = Some(self.active_theme_name.borrow().clone());
+        *self.font_family_at_open.borrow_mut() = Some(self.font_family.borrow().clone());
 
         // Reverse map (action → shortcut label) from the canonicalized
         // bindings, so each command row shows its keybind hint. First
@@ -3109,6 +3228,7 @@ impl App {
     fn dismiss_palette(self: &Rc<Self>) {
         *self.palette.borrow_mut() = None;
         *self.theme_name_at_open.borrow_mut() = None;
+        *self.font_family_at_open.borrow_mut() = None;
         self.focus_active_terminal();
     }
 
@@ -3120,6 +3240,9 @@ impl App {
     fn confirm_palette_command(self: &Rc<Self>, item: &PaletteItem) -> PaletteOutcome {
         if item.id == PaletteCommands::SELECT_THEME_ID {
             return PaletteOutcome::Push(self.theme_frame(), self.theme_behavior());
+        }
+        if item.id == PaletteCommands::SELECT_FONT_ID {
+            return PaletteOutcome::Push(self.font_frame(), self.font_behavior());
         }
         if item.id == PaletteCommands::VIEW_NOTIFICATIONS_ID {
             return PaletteOutcome::Push(self.notifications_frame(), self.notifications_behavior());
@@ -3162,21 +3285,29 @@ impl App {
     }
 
     /// Theme sub-frame behavior: arrowing previews live, Enter keeps
-    /// (highlight already applied it), Esc/dismiss reverts.
+    /// + persists, Esc/dismiss reverts. The persist is on Enter only
+    /// — arrowing through every theme would otherwise thrash the
+    /// config file.
     fn theme_behavior(self: &Rc<Self>) -> PaletteBehavior {
         let weak_highlight = Rc::downgrade(self);
+        let weak_confirm = Rc::downgrade(self);
         let weak_cancel = Rc::downgrade(self);
-        PaletteBehavior::new(|_| PaletteOutcome::Close)
-            .on_highlight(move |item| {
-                if let Some(app) = weak_highlight.upgrade() {
-                    app.preview_theme(&item.id);
-                }
-            })
-            .on_cancel(move || {
-                if let Some(app) = weak_cancel.upgrade() {
-                    app.revert_theme();
-                }
-            })
+        PaletteBehavior::new(move |item| {
+            if let Some(app) = weak_confirm.upgrade() {
+                app.commit_theme(&item.id);
+            }
+            PaletteOutcome::Close
+        })
+        .on_highlight(move |item| {
+            if let Some(app) = weak_highlight.upgrade() {
+                app.preview_theme(&item.id);
+            }
+        })
+        .on_cancel(move || {
+            if let Some(app) = weak_cancel.upgrade() {
+                app.revert_theme();
+            }
+        })
     }
 
     /// Apply `name` to every terminal as a live preview (skip if it's
@@ -3197,6 +3328,168 @@ impl App {
             return;
         }
         self.set_active_theme(Theme::load_bundled(&name), name);
+    }
+
+    /// Build the font sub-frame: curated programming fonts first
+    /// (filtered to those Pango reports installed), then every other
+    /// installed monospace family alphabetically. Pre-selects the
+    /// live family.
+    fn font_frame(self: &Rc<Self>) -> PaletteFrame {
+        let families = self.available_font_families();
+        let active = self
+            .font_family
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| crate::cell_metrics::DEFAULT_FONT_FAMILY.to_string());
+        // Match against the primary entry of a comma list (e.g. the
+        // default `"JetBrains Mono, Monospace"` should pre-select
+        // "JetBrains Mono"). Fall back to row 0 if not found.
+        let primary = active
+            .split(',')
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        let selection = families
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(primary))
+            .unwrap_or(0);
+        let items = families
+            .into_iter()
+            .map(|n| PaletteItem::new(n.clone(), n))
+            .collect();
+        PaletteFrame::new("fonts", "Select a font…", items).with_selection(selection)
+    }
+
+    /// Font sub-frame behavior: mirrors `theme_behavior` 1:1. Arrowing
+    /// previews live (no persist), Enter persists, Esc reverts.
+    fn font_behavior(self: &Rc<Self>) -> PaletteBehavior {
+        let weak_highlight = Rc::downgrade(self);
+        let weak_confirm = Rc::downgrade(self);
+        let weak_cancel = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            if let Some(app) = weak_confirm.upgrade() {
+                app.commit_font_family(&item.id);
+            }
+            PaletteOutcome::Close
+        })
+        .on_highlight(move |item| {
+            if let Some(app) = weak_highlight.upgrade() {
+                app.preview_font_family(&item.id);
+            }
+        })
+        .on_cancel(move || {
+            if let Some(app) = weak_cancel.upgrade() {
+                app.revert_font_family();
+            }
+        })
+    }
+
+    /// Apply `name` to every terminal as a live preview (skip if it's
+    /// already active).
+    fn preview_font_family(self: &Rc<Self>, name: &str) {
+        let already = self
+            .font_family
+            .borrow()
+            .as_deref()
+            .map(|s| s == name)
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        self.set_active_font_family(Some(name.to_string()));
+    }
+
+    /// Revert to the font family captured when the palette opened.
+    /// The snapshot uses `Option<Option<String>>` so we can tell
+    /// "palette never opened" (outer `None`) from "user had no
+    /// `font-family =` line in config" (inner `None`).
+    fn revert_font_family(self: &Rc<Self>) {
+        let Some(target) = self.font_family_at_open.borrow().clone() else {
+            return;
+        };
+        let current = self.font_family.borrow().clone();
+        if current == target {
+            return;
+        }
+        self.set_active_font_family(target);
+    }
+
+    /// Curated programming fonts that look great in a terminal, in a
+    /// thoughtful order. The first entry that's actually installed
+    /// becomes the top of the picker; uninstalled entries are skipped.
+    /// Mirrors the Swift `availableFontFamilies` curated list.
+    const CURATED_FONTS: &'static [&'static str] = &[
+        "JetBrains Mono",
+        "JetBrainsMono Nerd Font",
+        "Fira Code",
+        "Fira Mono",
+        "Hack",
+        "Source Code Pro",
+        "Cascadia Code",
+        "Cascadia Mono",
+        "IBM Plex Mono",
+        "Inconsolata",
+        "Iosevka",
+        "DejaVu Sans Mono",
+        "Ubuntu Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+        // Mac-only families (no-op on Linux when not installed).
+        "SF Mono",
+        "Menlo",
+        "Monaco",
+    ];
+
+    /// Enumerate font families for the picker: curated first
+    /// (filtered to installed), then every other monospace family
+    /// alphabetically. Uses the active window's Pango context so the
+    /// resolved font_map matches what the renderer will actually use.
+    fn available_font_families(self: &Rc<Self>) -> Vec<String> {
+        let context = self.window.pango_context();
+        let Some(font_map) = context.font_map() else {
+            // Fontconfig blew up — offer only the generic Monospace
+            // alias, which always resolves to *some* installed face.
+            // The curated list verbatim would be unsafe: an Enter on
+            // a curated row that isn't installed would persist a font
+            // the renderer can't satisfy, silently falling back to a
+            // different glyph set than the picker advertised.
+            return vec!["Monospace".to_string()];
+        };
+        let families = font_map.list_families();
+        // Build a name→is_monospace map (case-insensitive lookup).
+        let mut installed: Vec<(String, bool)> = families
+            .iter()
+            .map(|family| (family.name().to_string(), family.is_monospace()))
+            .collect();
+        installed.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+        let canonical_name = |name: &str| -> Option<String> {
+            installed
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(n, _)| n.clone())
+        };
+
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::<String>::new();
+        for entry in Self::CURATED_FONTS {
+            if let Some(n) = canonical_name(entry) {
+                let key = n.to_lowercase();
+                if seen.insert(key) {
+                    out.push(n);
+                }
+            }
+        }
+        for (n, is_mono) in &installed {
+            if !is_mono {
+                continue;
+            }
+            let key = n.to_lowercase();
+            if seen.insert(key) {
+                out.push(n.clone());
+            }
+        }
+        out
     }
 
     fn active_terminal_view(self: &Rc<Self>) -> Option<Rc<TerminalView>> {
@@ -4320,6 +4613,62 @@ fn drain_server_driven_marker(set: &RefCell<HashSet<i64>>, tab_id: i64) -> bool 
     set.borrow_mut().remove(&tab_id)
 }
 
+/// Persist `theme = <name>` to the user's config file. Returns the
+/// IO error to the caller (which logs once at the user-action
+/// boundary), per the repo convention "return errors rather than
+/// logging-and-swallowing them; log at the boundary that handles
+/// the error". A failed write must not crash the UI; the in-memory
+/// selection still works for the rest of the session.
+///
+/// Returns `Ok(())` if `$HOME` and `$ROOST_CONFIG` are both unset
+/// (no config path is resolvable) — there's nothing to persist to
+/// in that case, and bubbling the absence up as an error would be
+/// noise.
+fn write_back_theme(name: &str) -> std::io::Result<()> {
+    let Some(path) = config::config_path() else {
+        return Ok(());
+    };
+    config::set_key(&path, "theme", name)
+}
+
+/// Persist `font-family = "<name>"` to the user's config file.
+/// Wraps the value in double quotes since family names commonly
+/// contain spaces ("JetBrains Mono"); the parser strips them back
+/// off on read.
+fn write_back_font_family(name: &str) -> std::io::Result<()> {
+    let Some(path) = config::config_path() else {
+        return Ok(());
+    };
+    let quoted = format!("\"{}\"", name);
+    config::set_key(&path, "font-family", &quoted)
+}
+
+/// Persist `font-size = <pt>` to the user's config file. Whole
+/// values are written as integers ("14") rather than floats ("14.0")
+/// to keep the file human-readable.
+fn write_back_font_size(size_pt: f64) -> std::io::Result<()> {
+    let Some(path) = config::config_path() else {
+        return Ok(());
+    };
+    let formatted = format_font_size(size_pt);
+    config::set_key(&path, "font-size", &formatted)
+}
+
+/// Format a font size in points for the config file. Whole numbers
+/// render as integers; non-whole values keep up to two decimal places
+/// so a `font-size = 14.5` round-trip cleanly. Split out for testing
+/// (no I/O).
+fn format_font_size(size_pt: f64) -> String {
+    if (size_pt.round() - size_pt).abs() < 0.001 {
+        format!("{}", size_pt.round() as i64)
+    } else {
+        // Two decimals is plenty for point sizes; trim trailing zeros.
+        let s = format!("{:.2}", size_pt);
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+        trimmed.to_string()
+    }
+}
+
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
@@ -4388,9 +4737,9 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_insert_idx, drain_server_driven_marker, is_already_attached_or_pending,
-        notif_tab_id, pick_next_active_project, resolve_launch_cwd, restore_open_specs,
-        tilde_abbreviate_with_home, RestoreTab,
+        compute_insert_idx, drain_server_driven_marker, format_font_size,
+        is_already_attached_or_pending, notif_tab_id, pick_next_active_project, resolve_launch_cwd,
+        restore_open_specs, tilde_abbreviate_with_home, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
@@ -4598,5 +4947,22 @@ mod tests {
         assert_eq!(resolve_launch_cwd(None, "/t"), "/t");
         // Both empty stays empty (open_tab then resolves project → $HOME).
         assert_eq!(resolve_launch_cwd(None, ""), "");
+    }
+
+    #[test]
+    fn format_font_size_whole_renders_as_integer() {
+        assert_eq!(format_font_size(14.0), "14");
+        assert_eq!(format_font_size(8.0), "8");
+        // Floating-point fuzz like 14.0000000001 still rounds.
+        assert_eq!(format_font_size(14.0 + f64::EPSILON), "14");
+    }
+
+    #[test]
+    fn format_font_size_keeps_decimals_when_needed() {
+        assert_eq!(format_font_size(14.5), "14.5");
+        // Trailing zeros are trimmed (no "14.50").
+        assert_eq!(format_font_size(14.50), "14.5");
+        // Two-decimal precision is preserved.
+        assert_eq!(format_font_size(13.25), "13.25");
     }
 }

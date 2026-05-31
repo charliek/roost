@@ -126,6 +126,11 @@ private func contiguousRanges(_ offsets: [Int]) -> [Range<Int>] {
 /// command that drills into the theme list rather than firing once).
 enum PaletteCommands {
     static let selectThemeID = "select_theme"
+    /// Palette-only drill-in into the monospace font family list.
+    /// Same pattern as `selectThemeID`: not a `KeybindAction`, pushes
+    /// a sub-frame with live preview + Esc-to-revert. Mirrors the
+    /// Linux `PaletteCommands::SELECT_FONT_ID`.
+    static let selectFontID = "select_font"
 
     /// Palette-only drill-in into the live notification inbox. Like
     /// `selectThemeID`, not a `KeybindAction` — built dynamically in
@@ -136,6 +141,7 @@ enum PaletteCommands {
 
     static let specs: [(id: String, title: String)] = [
         (selectThemeID, "Select Theme…"),
+        (selectFontID, "Select Font…"),
         (KeybindAction.newTab, "New Tab"),
         (KeybindAction.closeTab, "Close Tab"),
         (KeybindAction.renameTab, "Rename Tab"),
