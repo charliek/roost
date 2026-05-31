@@ -307,11 +307,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install GTK4 + libadwaita + Xvfb
+      - name: Install GTK4 + libadwaita + Xvfb (+ zsh for shell-integration tests)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -415,19 +415,27 @@ jobs:
           key: cargo-${{ runner.os }}-swiftmac-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-swiftmac-
 
+      # Modern bash (>= 4.4) so the bash auto-bootstrap shell-integration
+      # test runs instead of skipping (macOS ships only Apple bash 3.2). The
+      # test finds it at /opt/homebrew/bin/bash via `_modern_bash`.
+      - name: Install modern bash
+        run: brew install bash
+
       - name: Bundle Roost.app
         run: ./mac/scripts/bundle.sh debug
 
       - name: Run E2E (Mac app)
         env:
           ROOST_TEST_TIMEOUT_SCALE: "3"   # shared macos-latest runner is slower/variable
-          ROOST_TEST_RESET_STATE: "1"     # ephemeral runner: start from a clean state.json
           # Unlocks the test-only IPC ops in the bundled Mac app
           # (tools/roosttest/ui.py forwards this via `open --env`).
           # See the GTK job above for full rationale.
           ROOST_TEST_MODE: "1"
+        # --roost-fresh: own a hermetic instance with an isolated, throwaway
+        # ROOST_STATE_DIR (replaces the old ROOST_TEST_RESET_STATE clean-slate
+        # hack — the harness no longer deletes the real state.json).
         run: >
-          uv run --group test pytest tools/roosttest --roost-target mac -v
+          uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh -v
           --junitxml=test-results/e2e-mac.xml
 
       # On failure, salvage what makes a red blocking check debuggable: the

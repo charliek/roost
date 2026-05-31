@@ -320,8 +320,11 @@ jobs:
       - name: E2E against the release bundle
         env:
           ROOST_TEST_TIMEOUT_SCALE: "3"
-          ROOST_TEST_RESET_STATE: "1"
-        run: uv run --group test pytest tools/roosttest --roost-target mac -v
+          # Match the e2e-mac CI job's surface so the release bundle is
+          # exercised identically (test-only ops unlocked). --roost-fresh
+          # owns a hermetic instance with an isolated, throwaway state dir.
+          ROOST_TEST_MODE: "1"
+        run: uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh -v
 
       - name: Make DMG
         run: ./mac/scripts/make-dmg.sh "${GITHUB_REF_NAME#v}"

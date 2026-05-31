@@ -9,11 +9,39 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
 from client import Roost, RoostError, scaled_timeout
+
+# The throwaway state dir for a harness-owned session (set in
+# `start_session`, removed in `end_session`). `ROOST_STATE_DIR` points the
+# launched UI at this so its `state.json` never touches the developer's
+# real saved tabs — and is wiped between runs so no stale layout leaks in.
+# Only set when the harness *launches* the UI; a reused dev instance keeps
+# its own state. None when reusing or before a session starts.
+_SESSION_STATE_DIR: Path | None = None
+
+# Env vars to strip from a harness-launched GTK UI's inherited environment.
+# These are either per-tab values Roost injects itself (a stale inherited
+# value would leak into every tab — `pty.rs` keeps a pre-set
+# ROOST_SHELL_FEATURES instead of injecting the default) or selectors the
+# harness sets explicitly (config/profile/state). Keeps a UI launched from
+# inside a Roost tab, or from a shell with these exported, hermetic.
+_UI_ENV_SANITIZE = (
+    "ROOST_SHELL_FEATURES",
+    "ROOST_SHELL_INTEGRATION",
+    "ROOST_RESOURCES_DIR",
+    "ROOST_TAB_ID",
+    "ROOST_SOCKET",
+    "ROOST_BUNDLE_PROFILE",
+    "ROOST_STATE_DIR",
+    "ROOST_CONFIG",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ("mac", "gtk")
@@ -24,6 +52,13 @@ TARGETS = ("mac", "gtk")
 # harness launches; a developer's already-running UI keeps its own config
 # (the launcher tests skip when the seed isn't active).
 SEED_CONFIG = Path(__file__).resolve().parent / "fixtures" / "launcher.conf"
+
+# Throwaway UserDefaults suite for a harness-launched Mac app, so sidebar
+# prefs (RoostSidebarVisible/width) never touch the developer's real
+# defaults — the UserDefaults analog of the throwaway ROOST_STATE_DIR
+# (ROOST_STATE_DIR can't reach UserDefaults). A fixed name so it persists
+# across the sidebar test's mid-test relaunch; cleaned up in `end_session`.
+MAC_TEST_DEFAULTS_SUITE = "ai.stridelabs.Roost.e2e"
 
 
 def socket_path(target: str) -> Path:
@@ -115,24 +150,82 @@ def _materializes(c: Roost, tab_id: int, deadline: float, window: float = 3.0) -
     return False
 
 
-def launch(target: str) -> None:
-    """Start the UI if it isn't already running. Returns once its socket
-    answers `identify`."""
+def start_session(target: str, *, fresh: bool) -> bool:
+    """Ensure a UI is running for the test session. Returns True if the
+    harness started (and therefore owns) it — the caller quits it at
+    teardown.
+
+    Normal mode reuses a developer's already-running UI (and leaves it
+    alone). Fresh mode (`--roost-fresh` / `ROOST_TEST_FRESH=1`) instead
+    force-quits any running instance so the harness owns a hermetic one —
+    seeded config + an isolated, throwaway `ROOST_STATE_DIR`. A
+    harness-launched UI ALWAYS gets the throwaway state dir, so no run ever
+    reads or writes the developer's real `state.json`.
+    """
+    global _SESSION_STATE_DIR
+    if fresh and is_alive(target):
+        print(
+            f"WARNING: --roost-fresh is force-quitting the running {target} "
+            f"Roost instance (its session/tabs will be closed)",
+            file=sys.stderr,
+        )
+        quit(target)
     if is_alive(target):
+        return False  # reuse the developer's running UI (non-fresh)
+    _SESSION_STATE_DIR = Path(tempfile.mkdtemp(prefix="roost-e2e-state-"))
+    launch(target, state_dir=_SESSION_STATE_DIR, force=fresh)
+    return True
+
+
+def end_session(target: str) -> None:
+    """Quit a harness-owned UI and remove its throwaway state (state dir +,
+    on Mac, the isolated UserDefaults suite)."""
+    global _SESSION_STATE_DIR
+    quit(target)
+    if _SESSION_STATE_DIR is not None:
+        shutil.rmtree(_SESSION_STATE_DIR, ignore_errors=True)
+        _SESSION_STATE_DIR = None
+    if target == "mac":
+        subprocess.run(["defaults", "delete", MAC_TEST_DEFAULTS_SUITE],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -> None:
+    """Start the UI. Returns once its socket answers `identify`. No-op if
+    already running unless `force` (fresh mode, where the caller has
+    already asked the running instance to quit). `state_dir`, when given,
+    is passed as `ROOST_STATE_DIR` so the UI isolates its `state.json`."""
+    if is_alive(target) and not force:
         return
+    # A mid-test relaunch (e.g. the sidebar-persistence test's quit→launch)
+    # calls this bare; reuse the session's throwaway dir so state persists
+    # across the relaunch and never falls back to the dev's real state.json.
+    if state_dir is None:
+        state_dir = _SESSION_STATE_DIR
     if target == "mac":
         if platform.system() != "Darwin":
             raise RuntimeError("mac target requires macOS")
         app = REPO_ROOT / "mac/build/Roost.app"
         if not app.is_dir():
             subprocess.run(["./scripts/bundle.sh", "debug"], cwd=REPO_ROOT / "mac", check=True)
-        _launch_mac(app)
+        _launch_mac(app, state_dir=state_dir)
     elif target == "gtk":
         binary = REPO_ROOT / "target/debug/roost"
         if not binary.is_file():
             subprocess.run(["cargo", "build", "-p", "roost-linux"], cwd=REPO_ROOT, check=True)
-        env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn"),
-               "ROOST_CONFIG": str(SEED_CONFIG)}
+        # GTK inherits the full parent env, so sanitize vars that would
+        # send the UI somewhere other than what the harness drives. Drop
+        # the per-tab vars Roost injects itself (else a value leaked from
+        # the shell that launched pytest — e.g. ROOST_SHELL_FEATURES=
+        # no-title from a dev's ~/.bashrc — rides into the UI and every
+        # tab inherits it, breaking hermetic assertions), plus the profile
+        # selector. Then set our own config/state explicitly.
+        env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn")}
+        for leaked in _UI_ENV_SANITIZE:
+            env.pop(leaked, None)
+        env["ROOST_CONFIG"] = str(SEED_CONFIG)
+        if state_dir is not None:
+            env["ROOST_STATE_DIR"] = str(state_dir)
         # Detached: outlive this call; the quit() path SIGTERMs it by pid.
         subprocess.Popen([str(binary)], cwd=REPO_ROOT, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -142,7 +235,7 @@ def launch(target: str) -> None:
         raise ValueError(f"unknown target {target!r}")
 
 
-def _launch_mac(app: Path) -> None:
+def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
     """Clean any dead leftover, `open` the bundle, wait until ready —
     retrying the open once if the first launch never becomes ready.
 
@@ -162,15 +255,23 @@ def _launch_mac(app: Path) -> None:
         _mac_cleanup()
         # `open --env` injects the seed config into the launched app
         # (LaunchServices otherwise drops the caller's env). Forward
-        # ROOST_TEST_MODE the same way so the bundled UI sees the
-        # test-mode gate; the GTK launch path inherits parent env
-        # directly via `**os.environ`.
+        # ROOST_TEST_MODE + ROOST_STATE_DIR the same way so the bundled UI
+        # sees the test-mode gate and writes state.json to the throwaway
+        # dir (not the dev's ~/Library/Application Support/Roost). The GTK
+        # launch path inherits parent env directly via `**os.environ`.
+        # This hand-maintained allowlist is the one place a new override
+        # can silently no-op on Mac, so keep it in sync with `launch`.
         argv = [
             "open",
             "--env", f"ROOST_CONFIG={SEED_CONFIG}",
         ]
         if "ROOST_TEST_MODE" in os.environ:
             argv += ["--env", f"ROOST_TEST_MODE={os.environ['ROOST_TEST_MODE']}"]
+        if state_dir is not None:
+            argv += ["--env", f"ROOST_STATE_DIR={state_dir}"]
+        # Isolate UserDefaults-backed prefs (sidebar visibility/width) to a
+        # throwaway suite so a harness run never reads/writes the dev's prefs.
+        argv += ["--env", f"ROOST_DEFAULTS_SUITE={MAC_TEST_DEFAULTS_SUITE}"]
         argv += [str(app)]
         subprocess.run(argv, check=True)
         try:
@@ -238,14 +339,10 @@ def _mac_cleanup() -> None:
     cache = home / "Library/Caches/Roost"
     (cache / "roost.sock").unlink(missing_ok=True)
     (cache / "roost.lock").unlink(missing_ok=True)
-    # Fresh workspace, opt-in only: a crash-left state.json would reopen
-    # stale tabs and add variance. Gated behind ROOST_TEST_RESET_STATE
-    # (CI sets it) so a local `make e2e-mac` never wipes a developer's
-    # real saved tab layout — there's no env to redirect the state path
-    # (it derives from HOME, see BundleProfile.swift), so we must guard
-    # the delete itself.
-    if os.environ.get("ROOST_TEST_RESET_STATE") == "1":
-        (home / "Library/Application Support/Roost/state.json").unlink(missing_ok=True)
+    # Fresh workspace comes from the throwaway `ROOST_STATE_DIR` the harness
+    # passes at launch (an empty dir = no stale tabs), so there's nothing to
+    # delete here and the developer's real state.json is never touched. This
+    # replaced the old ROOST_TEST_RESET_STATE-gated unlink.
 
 
 def quit(target: str) -> None:
