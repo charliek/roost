@@ -278,6 +278,57 @@ compat (optional fields). Document each new op in
 
 ---
 
+### 5.6 Hermetic runs, harness flags & the skip policy  *(2026-05)*
+
+The pytest harness is parameterized + configured by these knobs (full
+operational detail in [`tools/roosttest/README.md`](../../tools/roosttest/README.md)):
+
+**Make targets.** `make e2e` / `e2e-gtk` / `e2e-mac` are the quick local
+runs (reuse a running UI if present). `make e2e-gtk-ci` / `e2e-mac-ci`
+reproduce CI exactly — they set `ROOST_TEST_MODE=1` and `--roost-fresh`, so
+a local run exercises the **same set CI does** (no test-mode-gated tests
+silently skipped). `e2e-mac-ci` is **destructive** (force-quits a running
+`Roost.app`); the targets are labeled accordingly.
+
+**Environment / flags.**
+
+| Knob | Set by | Effect |
+|---|---|---|
+| `ROOST_TEST_MODE=1` | CI jobs; `make *-ci` | Unlocks the gated test-only IPC ops (§5.4). Read once at UI boot. |
+| `--roost-fresh` / `ROOST_TEST_FRESH=1` | `make *-ci`; CI | Harness **owns** a fresh, hermetic instance: force-quit any running UI (lock-safe on Mac), launch with isolated state, always quit at teardown. Also flips precondition-skips to hard failures (below). |
+| `ROOST_STATE_DIR` | harness (per-run `mkdtemp`) | **Prod env, both UIs.** Redirects only `state.json`'s dir; socket/lock/log stay on the default path so the harness still finds the UI. Gives each run a throwaway workspace — never touches the dev's real saved tabs. (See [paths.md](../reference/paths.md).) |
+| `ROOST_DEFAULTS_SUITE` | harness (Mac) | **Prod env, Mac only.** Redirects the macOS app's `UserDefaults` to a throwaway suite (sidebar visibility/width) — the `UserDefaults` analog of `ROOST_STATE_DIR`, which can't reach it. |
+| `ROOST_TEST_TIMEOUT_SCALE=3` | CI (slower runners) | Scales every `wait_*` budget. Local default 1. |
+| `ROOST_CONFIG` | harness | Points the UI at `fixtures/launcher.conf` (seed launcher commands). |
+
+`ROOST_TEST_RESET_STATE` (a former gate that *deleted* `~/Library/.../state.json`
+on Mac) was **retired** — the throwaway `ROOST_STATE_DIR` subsumes it
+without a destructive delete.
+
+**The skip policy (the trustworthiness rule).** A `skip` must mean only
+"this environment genuinely can't exercise this" — never "the setup didn't
+work" or "we didn't turn the mode on." Enforced by three helpers in
+`tools/roosttest/util.py`:
+
+- `precondition(ok, reason)` — a *setup* precondition (seed config present,
+  OSC 7 cwd tracking working) is a **hard failure in fresh mode** (the
+  harness guarantees the environment, so a failure is a real regression);
+  a graceful skip otherwise (an ad-hoc dev UI may lack the capability).
+- `skip_on_ci(reason, alt_coverage=…)` — for the rare test that genuinely
+  can't run remotely (e.g. a quit→relaunch lifecycle under bare xvfb); it
+  must cite where the regression class is **otherwise covered** (e.g. the
+  sidebar-persistence relaunch e2e is alt-covered by a Rust unit test + a
+  Swift `UserDefaults` test).
+- `cwd_reaches(...)` — the scaled, shared cwd-poll (replaced per-file
+  copies that ignored `ROOST_TEST_TIMEOUT_SCALE`).
+
+Every run prints a `SKIPS: N` summary listing each skipped test + reason
+(`conftest.py::pytest_terminal_summary`), so a run that quietly skipped
+half the suite can never read as "all green" — the failure mode that
+motivated this rule. Capability skips that *shouldn't* happen on the
+platform that owns a feature (e.g. a shell-integration test needing zsh)
+are a CI-runner-provisioning gap, tracked separately, not silently normal.
+
 ## 6. Lua scripting layer
 
 ### 6.1 Engine & placement
@@ -430,7 +481,10 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
   (`tools/roosttest/ui.py` `_mac_cleanup()`: kill any leftover, then unlink
   the stale socket + lock) plus a one-shot launch retry; timeouts scale via
   `ROOST_TEST_TIMEOUT_SCALE=3` on the slower runner. **No pytest reruns** —
-  parity with `e2e-gtk`, so a genuine intermittent bug isn't masked.
+  parity with `e2e-gtk`, so a genuine intermittent bug isn't masked. Both
+  e2e jobs now run `--roost-fresh` with a throwaway `ROOST_STATE_DIR` for
+  hermetic state (§5.6); this replaced the old `ROOST_TEST_RESET_STATE`
+  state.json delete.
 
 **Both:**
 - Path-filtered like the rest of `ci.yml` (run only when relevant code
@@ -452,8 +506,9 @@ drives via IPC + in-process screenshot (no TCC, no compositor capture).
 - **Timing:** only `roostctl wait` / `wait_for`. No `sleep` in any test.
 - **Isolation:** each test creates its own project and cascade-closes it
   (the smoke already does this); a fixture guarantees cleanup even on
-  failure. Consider a `state.json` pointed at a temp dir per run so tests
-  never touch the dev workspace.
+  failure. **Implemented (2026-05):** a harness-launched UI also gets a
+  throwaway `ROOST_STATE_DIR` (+ `ROOST_DEFAULTS_SUITE` on Mac), so a run
+  never touches the dev's real `state.json`/prefs — see §5.6.
 
 ---
 
@@ -555,5 +610,8 @@ guessing.
    retries once; timeouts scale via `ROOST_TEST_TIMEOUT_SCALE`. *Unblocked P3.*
 3. **Launcher action discovery** — global (`~/.config/roost/actions/`),
    repo-local (`.roost/actions/`), or both; built-ins in-tree. *Blocks P5.*
-4. **Temp-workspace isolation** — point tests at a throwaway `state.json`
-   dir, or rely on create/cascade-close hygiene. *Blocks P2.*
+4. ~~**Temp-workspace isolation**~~ — **DECIDED (2026-05): both.** Tests
+   keep per-test `project` create/cascade-close hygiene *and* a
+   harness-launched UI runs against a throwaway `ROOST_STATE_DIR`
+   (+ `ROOST_DEFAULTS_SUITE` on Mac), so a run never touches the dev's real
+   workspace. See §5.6.
