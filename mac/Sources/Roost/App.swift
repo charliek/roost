@@ -1373,7 +1373,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if name != activeThemeName {
             setActiveTheme(Theme.loadBundled(name: name), name: name)
         }
-        writeBackTheme(name)
+        if let err = writeBackTheme(name) {
+            NSLog("roost-mac: failed to persist theme to config.conf: %@", "\(err)")
+        }
     }
 
     @MainActor
@@ -1400,21 +1402,37 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Preserves a comma-separated fallback chain (e.g. `"JetBrains
     /// Mono, Monospace"`) when the user confirms the chain's primary
     /// — the picker only exposes individual family names but a user
-    /// may have hand-edited a fallback into config, and a no-op
-    /// Enter on the pre-selected primary shouldn't silently drop it.
+    /// may have hand-edited a fallback into config. The check is
+    /// against the **at-open snapshot**, not the live preview
+    /// value: if the user previewed another font and arrowed back,
+    /// the live state is already the stripped primary, so comparing
+    /// against the live value would still drop the fallback.
     @MainActor
     private func commitFontFamily(name: String) {
-        let currentPrimary =
-            activeFontFamily?
+        // `fontFamilyAtOpen` is `Optional<Optional<String>>` —
+        // outer nil = palette never opened (defensive); inner nil =
+        // user had no font-family line. Flatten to a plain
+        // `String?`.
+        let opened: String? = fontFamilyAtOpen.flatMap { $0 }
+        let openedPrimary =
+            opened?
             .split(separator: ",")
             .first
             .map { $0.trimmingCharacters(in: .whitespaces) }
-        if currentPrimary?.caseInsensitiveCompare(name) == .orderedSame {
-            // No-op confirm: keep the existing chain + skip the write.
+        if openedPrimary?.caseInsensitiveCompare(name) == .orderedSame {
+            // No-op confirm: restore the opened chain to live state
+            // (an interim preview may have replaced it with the bare
+            // primary) and DON'T rewrite the file — it already has
+            // the chain the user opened with.
+            if activeFontFamily != opened {
+                setActiveFontFamily(opened)
+            }
             return
         }
         setActiveFontFamily(name)
-        writeBackFontFamily(name)
+        if let err = writeBackFontFamily(name) {
+            NSLog("roost-mac: failed to persist font-family to config.conf: %@", "\(err)")
+        }
     }
 
     /// Apply `family` (nil = system monospace) at the current size.
@@ -1431,34 +1449,34 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Persist `theme = <name>` to the user's config file. Logs and
-    /// swallows IO errors — a failed write must not crash the UI;
+    /// Persist `theme = <name>` to the user's config file. Returns
+    /// the error to the caller (which logs once at the user-action
+    /// boundary), per the repo convention "return errors rather
+    /// than logging-and-swallowing them; log at the boundary that
+    /// handles the error". A failed write must not crash the UI;
     /// the in-memory selection still works for the rest of the
     /// session.
     @MainActor
-    private func writeBackTheme(_ name: String) {
-        if let err = RoostConfig.setKey("theme", value: name) {
-            NSLog("roost-mac: failed to persist theme to config.conf: %@", "\(err)")
-        }
+    @discardableResult
+    private func writeBackTheme(_ name: String) -> Error? {
+        RoostConfig.setKey("theme", value: name)
     }
 
     /// Persist `font-family = "<name>"` to config. The value is
     /// wrapped in double quotes since family names commonly contain
     /// spaces ("JetBrains Mono"); the parser strips them on read.
     @MainActor
-    private func writeBackFontFamily(_ name: String) {
-        if let err = RoostConfig.setKey("font-family", value: "\"\(name)\"") {
-            NSLog("roost-mac: failed to persist font-family to config.conf: %@", "\(err)")
-        }
+    @discardableResult
+    private func writeBackFontFamily(_ name: String) -> Error? {
+        RoostConfig.setKey("font-family", value: "\"\(name)\"")
     }
 
     /// Persist `font-size = <pt>` to config. Whole values render as
     /// integers ("14") rather than floats ("14.0").
     @MainActor
-    private func writeBackFontSize(_ size: CGFloat) {
-        if let err = RoostConfig.setKey("font-size", value: formatFontSize(size)) {
-            NSLog("roost-mac: failed to persist font-size to config.conf: %@", "\(err)")
-        }
+    @discardableResult
+    private func writeBackFontSize(_ size: CGFloat) -> Error? {
+        RoostConfig.setKey("font-size", value: formatFontSize(size))
     }
 
     /// Format a font size for the config file. Whole numbers render
@@ -3736,7 +3754,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // distinction like theme + font-family have), so persist
         // unconditionally here. The atomic tmp+rename keeps repeated
         // Cmd+= presses cheap.
-        writeBackFontSize(size)
+        if let err = writeBackFontSize(size) {
+            NSLog("roost-mac: failed to persist font-size to config.conf: %@", "\(err)")
+        }
     }
 
     /// Resolve the same default socket path as `roost-common`'s Mac

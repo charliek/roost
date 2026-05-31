@@ -311,6 +311,13 @@ fn line_key_matches(line: &str, target: &str) -> bool {
 
 fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Per-call nonce so two `set_key` calls from the same process
+    // can't pick the same tmp filename and clobber each other's
+    // write. Pid alone collides on rapid back-to-back commits (e.g.
+    // theme.set immediately followed by font-family.set).
+    static NONCE: AtomicU64 = AtomicU64::new(0);
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent = if parent.as_os_str().is_empty() {
@@ -322,7 +329,12 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "config".to_string());
-    let tmp = parent.join(format!(".{stem}.roost.tmp.{}", std::process::id()));
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{stem}.roost.tmp.{}.{}",
+        std::process::id(),
+        nonce
+    ));
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;

@@ -2701,13 +2701,19 @@ impl App {
                 }
             }
         }
-        // Persist the new size back to ~/.config/roost/config.conf so
-        // the next launch starts at the same zoom level. Font-size
-        // changes are commit-only (no preview/revert distinction like
-        // theme + font-family have), so the write is unconditional
-        // here. Format whole values as integers (`font-size = 14`,
-        // not `14.0`) to keep the file readable.
-        write_back_font_size(size_pt);
+        // Persist the new size back to ~/.config/roost/config.conf
+        // so the next launch starts at the same zoom level. Font-size
+        // changes are commit-only (no preview/revert distinction
+        // like theme + font-family have), so the write is
+        // unconditional here. Format whole values as integers
+        // (`font-size = 14`, not `14.0`) to keep the file readable.
+        if let Err(e) = write_back_font_size(size_pt) {
+            tracing::warn!(
+                error = %e,
+                size = size_pt,
+                "failed to persist font-size to config.conf"
+            );
+        }
     }
 
     /// Switch the active theme at runtime and broadcast it to every
@@ -2741,7 +2747,9 @@ impl App {
         if *self.active_theme_name.borrow() != name {
             self.set_active_theme(Theme::load_bundled(name), name.to_string());
         }
-        write_back_theme(name);
+        if let Err(e) = write_back_theme(name) {
+            tracing::warn!(error = %e, theme = name, "failed to persist theme to config.conf");
+        }
     }
 
     /// Switch the active font family at runtime and broadcast it to
@@ -2778,26 +2786,39 @@ impl App {
     /// `commit_theme`.
     ///
     /// Preserves a comma-separated fallback chain (e.g. `"JetBrains
-    /// Mono, Monospace"`) when the user confirms the chain's primary —
-    /// the picker only exposes individual family names but a user may
-    /// have hand-edited a fallback into config, and a no-op Enter on
-    /// the pre-selected primary shouldn't silently drop it.
+    /// Mono, Monospace"`) when the user confirms the chain's primary
+    /// — the picker only exposes individual family names but a user
+    /// may have hand-edited a fallback into config. The check is
+    /// against the **at-open snapshot**, not the live preview value:
+    /// if the user previewed another font and arrowed back, the
+    /// live state is already the stripped primary, so comparing
+    /// against the live value would still drop the fallback.
     fn commit_font_family(self: &Rc<Self>, name: &str) {
-        let current = self.font_family.borrow();
-        let current_primary = current
+        let opened = self.font_family_at_open.borrow().clone().flatten();
+        let opened_primary = opened
             .as_deref()
             .and_then(|s| s.split(',').map(str::trim).find(|t| !t.is_empty()));
-        if current_primary
+        if opened_primary
             .map(|p| p.eq_ignore_ascii_case(name))
             .unwrap_or(false)
         {
-            // No-op confirm: keep the existing chain + don't rewrite
-            // the file (avoids dropping `, Monospace` fallback chains).
+            // No-op confirm: restore the opened chain to live state
+            // (an interim preview may have replaced it with the bare
+            // primary) and DON'T rewrite the file — it already has
+            // the chain the user opened with.
+            if *self.font_family.borrow() != opened {
+                self.set_active_font_family(opened);
+            }
             return;
         }
-        drop(current);
         self.set_active_font_family(Some(name.to_string()));
-        write_back_font_family(name);
+        if let Err(e) = write_back_font_family(name) {
+            tracing::warn!(
+                error = %e,
+                family = name,
+                "failed to persist font-family to config.conf"
+            );
+        }
     }
 
     // ----- Command palette (Cmd+Shift+P / Alt+Shift+P) -------------
@@ -4592,44 +4613,45 @@ fn drain_server_driven_marker(set: &RefCell<HashSet<i64>>, tab_id: i64) -> bool 
     set.borrow_mut().remove(&tab_id)
 }
 
-/// Persist `theme = <name>` to the user's config file. Logs and
-/// swallows IO errors — a failed write must not crash the UI; the
-/// in-memory selection still works for the rest of the session, and
-/// the user will see the next launch fall back to the prior value.
-fn write_back_theme(name: &str) {
+/// Persist `theme = <name>` to the user's config file. Returns the
+/// IO error to the caller (which logs once at the user-action
+/// boundary), per the repo convention "return errors rather than
+/// logging-and-swallowing them; log at the boundary that handles
+/// the error". A failed write must not crash the UI; the in-memory
+/// selection still works for the rest of the session.
+///
+/// Returns `Ok(())` if `$HOME` and `$ROOST_CONFIG` are both unset
+/// (no config path is resolvable) — there's nothing to persist to
+/// in that case, and bubbling the absence up as an error would be
+/// noise.
+fn write_back_theme(name: &str) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
-        return;
+        return Ok(());
     };
-    if let Err(e) = config::set_key(&path, "theme", name) {
-        tracing::warn!(error = %e, path = %path.display(), "failed to persist theme to config.conf");
-    }
+    config::set_key(&path, "theme", name)
 }
 
 /// Persist `font-family = "<name>"` to the user's config file.
 /// Wraps the value in double quotes since family names commonly
 /// contain spaces ("JetBrains Mono"); the parser strips them back
 /// off on read.
-fn write_back_font_family(name: &str) {
+fn write_back_font_family(name: &str) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
-        return;
+        return Ok(());
     };
     let quoted = format!("\"{}\"", name);
-    if let Err(e) = config::set_key(&path, "font-family", &quoted) {
-        tracing::warn!(error = %e, path = %path.display(), "failed to persist font-family to config.conf");
-    }
+    config::set_key(&path, "font-family", &quoted)
 }
 
 /// Persist `font-size = <pt>` to the user's config file. Whole
 /// values are written as integers ("14") rather than floats ("14.0")
 /// to keep the file human-readable.
-fn write_back_font_size(size_pt: f64) {
+fn write_back_font_size(size_pt: f64) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
-        return;
+        return Ok(());
     };
     let formatted = format_font_size(size_pt);
-    if let Err(e) = config::set_key(&path, "font-size", &formatted) {
-        tracing::warn!(error = %e, path = %path.display(), "failed to persist font-size to config.conf");
-    }
+    config::set_key(&path, "font-size", &formatted)
 }
 
 /// Format a font size in points for the config file. Whole numbers
