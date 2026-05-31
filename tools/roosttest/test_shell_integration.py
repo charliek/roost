@@ -24,6 +24,9 @@ import sys
 
 import pytest
 
+from client import Timeout
+from util import cwd_reaches, precondition, wait_tab_attached
+
 # Detect login state per shell: bash via `shopt -q login_shell`, zsh via
 # `[[ -o login ]]`. Anything else POSIX (dash, etc.) reports `skip` —
 # Roost ships integration for bash + zsh. Both arms parse cleanly in
@@ -133,8 +136,7 @@ def test_launcher_inherits_native_cwd(roost, project, palette, target):
     probe = palette.palette_open(kind="launcher")
     have_seed = "Print Pwd" in {it["title"] for it in probe["items"]}
     palette.palette_dismiss()
-    if not have_seed:
-        pytest.skip("seed config not active (UI not launched by the harness)")
+    precondition(have_seed, "seed config not active (UI not launched by the harness)")
 
     active = roost.open_tab(project, cwd="/tmp",
                             argv=["/bin/bash", "--norc", "--noprofile"])
@@ -155,19 +157,35 @@ def test_launcher_inherits_native_cwd(roost, project, palette, target):
 def test_env_injected(roost, project):
     """Roost injects its shell-integration env contract into every tab,
     and forces TERM=xterm-256color (advertising the terminal it provides,
-    not the one that launched it)."""
-    tab = roost.open_tab(project, cwd="/tmp")
+    not the one that launched it).
+
+    Hermetic: a bare `--norc --noprofile` bash so the developer's own
+    `~/.bashrc` (which may `export ROOST_SHELL_FEATURES=no-title` per the
+    documented git-aware-title recipe) can't override the injected default
+    we assert. Roost injects the env regardless of which shell runs."""
+    tab = roost.open_tab(project, cwd="/tmp",
+                         argv=["/bin/bash", "--norc", "--noprofile"])
+    # Wait for the TerminalView to attach before driving the shell: under
+    # full-suite load `run()` can otherwise fire before the PTY is live and
+    # the keystrokes are lost (no echo, no output → a spurious timeout).
+    wait_tab_attached(roost, tab)
     roost.run(
         tab,
         'printf "ENVCHK:tp=%s si=%s feat=%s term=%s rd=%s\\n" '
         '"$TERM_PROGRAM" "$ROOST_SHELL_INTEGRATION" "$ROOST_SHELL_FEATURES" '
         '"$TERM" "${ROOST_RESOURCES_DIR:+set}"',
     )
-    roost.wait_text(
-        tab,
-        "ENVCHK:tp=Roost si=1 feat=cwd,title,marks,prompt,ssh-env term=xterm-256color rd=set",
-        timeout=8,
+    expected = (
+        "ENVCHK:tp=Roost si=1 feat=cwd,title,marks,prompt,ssh-env "
+        "term=xterm-256color rd=set"
     )
+    try:
+        roost.wait_text(tab, expected, timeout=12)
+    except Timeout:
+        raise AssertionError(
+            f"shell-integration env contract missing. Expected {expected!r}; "
+            f"tab {tab} viewport:\n{roost._safe_dump_text(tab)}"
+        )
 
 
 def test_resources_dir_has_scripts(roost, project):
@@ -196,18 +214,8 @@ def test_sourced_script_tracks_cwd(roost, project):
     )
     roost.wait_text(tab, "SRC:/usr", timeout=8)
     # The next prompt fires PROMPT_COMMAND -> OSC 7 -> tracked cwd.
-    assert _cwd_becomes(roost, tab, "/usr"), \
+    assert cwd_reaches(roost, tab, "/usr"), \
         f"sourced script did not track cwd; got {(roost.tab(tab) or {}).get('cwd')!r}"
-
-
-def _cwd_becomes(roost, tab, want, timeout=5.0):
-    import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if (roost.tab(tab) or {}).get("cwd") == want:
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def test_documented_rooster_override(roost, project):
@@ -313,7 +321,7 @@ def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
     # fires on subsequent prompts. A couple of round-trips lets it settle.
     roost.run(tab, "cd /usr")
     roost.run(tab, "true")
-    assert _cwd_becomes(roost, tab, "/usr", timeout=8), \
+    assert cwd_reaches(roost, tab, "/usr", timeout=8), \
         f"zsh auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"
 
 
@@ -363,7 +371,7 @@ def test_bash_auto_bootstrap_tracks_cwd(roost, project):
     # fires on the prompt. A couple of round-trips lets it settle.
     roost.run(tab, "cd /usr")
     roost.run(tab, "true")
-    assert _cwd_becomes(roost, tab, "/usr", timeout=8), \
+    assert cwd_reaches(roost, tab, "/usr", timeout=8), \
         f"bash auto-bootstrap cwd not tracked; got {(roost.tab(tab) or {}).get('cwd')!r}"
     # The recreation block ran `set +o posix`; if the shell were still in
     # the raw --posix state we spawned it with, this would read `on`.

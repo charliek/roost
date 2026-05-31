@@ -15,33 +15,22 @@ where the shell cooperates: OSC 7 cwd tracking via a real `cd`.
 
 from __future__ import annotations
 
-import time
-
-import pytest
-
-
-def _cwd_becomes(roost, tab, want, timeout=2.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if (roost.tab(tab) or {}).get("cwd") == want:
-            return True
-        time.sleep(0.1)
-    return False
+from util import cwd_reaches, precondition
 
 
 def test_cwd_tracking_follows_cd(roost, project):
-    """`cd` updates the tab's tracked cwd (the shell emits OSC 7; roost
-    parses it → cwd → the derived title). Skips on shells without OSC 7
-    integration (e.g. a bare bash with no PROMPT_COMMAND), rather than
-    pinning a shell-dependent assertion."""
+    """The OSC 7 → cwd → derived-title pipeline. We `cd` for real and then
+    emit the OSC 7 sequence ourselves (the same `ESC ] 7 ; file://… ST` the
+    shell integration sends), so this is hermetic — it doesn't depend on
+    the shell's own PROMPT_COMMAND integration loading. A failure is a real
+    regression in the cwd pipeline, so it's a hard failure in fresh mode
+    (the shell's *automatic* emit-on-cd is covered in test_shell_integration).
+    """
     tab = roost.open_tab(project, cwd="/tmp")
-    roost.run(tab, "printf 'P=%s\\n' 1")
-    roost.wait_text(tab, "P=1", timeout=8)
-
-    roost.run(tab, "cd /usr && printf 'AT=%s\\n' done")
+    roost.run(tab, r"cd /usr && printf '\033]7;file:///usr\033\\' && echo AT=done")
     roost.wait_text(tab, "AT=done", timeout=8)
 
-    if not _cwd_becomes(roost, tab, "/usr"):
-        pytest.skip("shell does not emit OSC 7 (no cwd integration)")
+    precondition(cwd_reaches(roost, tab, "/usr"),
+                 "OSC 7 cwd not tracked (terminal cwd reception unavailable)")
     assert roost.tab(tab)["cwd"] == "/usr"
     assert "/usr" in roost.tab(tab)["title"]  # title derives from cwd
