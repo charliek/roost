@@ -57,7 +57,30 @@ fi
 #    --workspace is the surface that actually moves.
 #    --offline is safe: we're only changing internal version strings,
 #    not touching the dep tree.
-cargo update --workspace --offline >/dev/null
+#
+#    Resolve cargo via `mise exec` when the repo pins its toolchain
+#    there (.mise.toml is the source of truth for the rust channel —
+#    see rust-toolchain.toml's pin too), else fall back to whatever
+#    cargo is on PATH (CI runners using actions-rs / rustup don't
+#    need mise). Without this the script silently inherits the
+#    caller's shell — non-interactive shells (`bash -c`, a release
+#    skill subprocess, etc.) often don't have cargo on PATH even when
+#    `mise install` already provisioned the pinned toolchain. Strix
+#    v0.0.2 hit this exact failure mode; the fix landed in the
+#    convention's cargo-workspace.sh template (cc-plugins#12) and is
+#    cherry-picked here to keep roost aligned with that source of
+#    truth.
+if command -v mise >/dev/null 2>&1 && [[ -f .mise.toml ]]; then
+  cargo=(mise exec -- cargo)
+elif command -v cargo >/dev/null 2>&1; then
+  cargo=(cargo)
+else
+  echo "error: cargo not found and 'mise exec' unavailable." >&2
+  echo "       Install Rust (via rustup) or run inside a shell where" >&2
+  echo "       \`mise exec -- cargo --version\` or \`cargo --version\` works." >&2
+  exit 1
+fi
+"${cargo[@]}" update --workspace --offline >/dev/null
 
 # 4. Verify the lockfile saw the bump. Cargo.lock uses single-space
 #    style regardless of Cargo.toml's layout.
