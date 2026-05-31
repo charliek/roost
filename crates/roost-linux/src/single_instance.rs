@@ -6,7 +6,10 @@
 //! the Mac UI will pick up in M4. The bind sequence is intentionally
 //! TOCTOU-safe:
 //!
-//! 1. Open `<state_dir>/roost.lock` (`O_CREAT | O_RDWR`).
+//! 1. Open the lock file (`O_CREAT | O_RDWR`). The caller passes
+//!    `BundleProfile::lock_path()`, which lives next to the socket
+//!    (`<socket dir>/roost.lock`), NOT under `state_dir` — so a
+//!    `ROOST_STATE_DIR` override doesn't move the lock.
 //! 2. `flock(LOCK_EX | LOCK_NB)`. Fails → another live instance
 //!    owns it; read the PID, return [`AcquireError::AlreadyHeld`].
 //! 3. Truncate + write our PID to the lock file (best-effort —

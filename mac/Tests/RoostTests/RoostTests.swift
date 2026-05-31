@@ -102,3 +102,72 @@ func bundleProfileEnvOverridesDefault() {
     #expect(p.appID == "ai.stridelabs.Roost.gtk")
 }
 
+// MARK: - ROOST_STATE_DIR override (lockstep with paths.rs apply_state_dir_override)
+
+@Test
+func stateDirOverrideAbsoluteMovesOnlyStateDir() {
+    let base = BundleProfile.mac(environment: ["HOME": "/Users/tester"])
+    let p = BundleProfile.mac(environment: [
+        "HOME": "/Users/tester",
+        "ROOST_STATE_DIR": "/tmp/roost-isolated-state",
+    ])
+    #expect(p.stateDir == "/tmp/roost-isolated-state")
+    #expect(p.stateJSONPath == "/tmp/roost-isolated-state/state.json")
+    // Invariant: socket, lock, log stay on the default profile path.
+    #expect(p.socketPath == base.socketPath)
+    #expect(p.lockPath == base.lockPath)
+    #expect(p.logPath == base.logPath)
+}
+
+@Test
+func stateDirOverrideUnsetKeepsDefault() {
+    let p = BundleProfile.mac(environment: ["HOME": "/Users/tester"])
+    #expect(p.stateDir == "/Users/tester/Library/Application Support/Roost")
+}
+
+@Test
+func stateDirOverrideEmptyKeepsDefault() {
+    let p = BundleProfile.mac(environment: [
+        "HOME": "/Users/tester",
+        "ROOST_STATE_DIR": "",
+    ])
+    #expect(p.stateDir == "/Users/tester/Library/Application Support/Roost")
+}
+
+@Test
+func stateDirOverrideRelativeKeepsDefault() {
+    let p = BundleProfile.mac(environment: [
+        "HOME": "/Users/tester",
+        "ROOST_STATE_DIR": "relative/state",
+    ])
+    #expect(p.stateDir == "/Users/tester/Library/Application Support/Roost")
+}
+
+// MARK: - Sidebar visibility persistence (UserDefaults)
+//
+// Mac analog of the Rust `sidebar_collapsed_persists_across_reopen` test —
+// covers the regression class the CI-skipped relaunch e2e can't, since the
+// Rust GTK state.json test doesn't exercise the Mac UserDefaults path.
+
+@Test
+func sidebarVisibleOnLaunchDefaultsToVisibleWhenUnset() {
+    let suite = "ai.stridelabs.Roost.test.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    // Never toggled → sidebar starts visible.
+    #expect(RoostApp.sidebarVisibleOnLaunch(defaults) == true)
+}
+
+@Test
+func sidebarVisibleStateSurvivesReopen() {
+    let suite = "ai.stridelabs.Roost.test.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    // User hides it → an explicit false must survive a "relaunch" (re-read).
+    defaults.set(false, forKey: "RoostSidebarVisible")
+    #expect(RoostApp.sidebarVisibleOnLaunch(defaults) == false)
+    // User re-shows it → back to visible.
+    defaults.set(true, forKey: "RoostSidebarVisible")
+    #expect(RoostApp.sidebarVisibleOnLaunch(defaults) == true)
+}
+

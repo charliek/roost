@@ -65,6 +65,12 @@ impl BundleProfile {
             BundleProfileKind::Gtk => ("Roost-gtk", "ai.stridelabs.Roost.gtk"),
         };
         let (socket_path, state_dir, log_dir) = resolve_paths(app_label)?;
+        // Redirect ONLY the state dir when `ROOST_STATE_DIR` is set, so
+        // tests (and side-by-side instances) get an isolated `state.json`
+        // while the socket/lock/log stay on the default profile path — the
+        // CLI + harness find the UI by the unchanged socket. See
+        // `apply_state_dir_override` for the strict (absolute) policy.
+        let state_dir = apply_state_dir_override(state_dir, std::env::var_os("ROOST_STATE_DIR"));
         Ok(BundleProfile {
             kind,
             app_label,
@@ -126,6 +132,35 @@ impl BundleProfile {
             // Fall back to a leaf-style filename to avoid a panic.
             None => PathBuf::from("roost.lock"),
         }
+    }
+}
+
+/// Apply a `ROOST_STATE_DIR` override to the resolved state dir. The env
+/// value is passed in (not read here) so the policy is unit-testable
+/// without mutating process-global env. Redirects **only** the state dir;
+/// the caller leaves socket/lock/log untouched.
+///
+/// Validation follows the strict `valid_home`/XDG style (**absolute** +
+/// non-empty), NOT the permissive `ROOST_CONFIG` policy: a relative state
+/// dir would resolve against the process CWD — nondeterministic, and a
+/// likely way to scribble state somewhere unexpected. A set-but-invalid
+/// value (non-empty + non-absolute) is ignored with a warn; empty/unset
+/// falls back silently (mirrors the HOME handling in `resolve_paths`).
+/// Existence isn't checked — like the default dir, it's created on first
+/// write. KEEP IN SYNC with `BundleProfile.swift`'s override.
+fn apply_state_dir_override(default: PathBuf, raw: Option<std::ffi::OsString>) -> PathBuf {
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let p = PathBuf::from(&raw);
+    if p.is_absolute() {
+        p
+    } else {
+        tracing::warn!(
+            value = ?raw,
+            "ROOST_STATE_DIR ignored: not an absolute path; using default state dir"
+        );
+        default
     }
 }
 
@@ -274,5 +309,62 @@ mod tests {
         assert_eq!(mac.socket_path, gtk.socket_path);
         assert_eq!(mac.state_dir, gtk.state_dir);
         assert_eq!(mac.log_dir, gtk.log_dir);
+    }
+
+    // ROOST_STATE_DIR override policy (pure helper — no env mutation).
+    // Mirrored by BundleProfileTests.swift; kept in lockstep.
+
+    #[test]
+    fn state_dir_override_absolute_replaces() {
+        let got = apply_state_dir_override(
+            PathBuf::from("/default/state"),
+            Some("/tmp/throwaway".into()),
+        );
+        assert_eq!(got, PathBuf::from("/tmp/throwaway"));
+    }
+
+    #[test]
+    fn state_dir_override_unset_keeps_default() {
+        let default = PathBuf::from("/default/state");
+        assert_eq!(apply_state_dir_override(default.clone(), None), default);
+    }
+
+    #[test]
+    fn state_dir_override_empty_keeps_default() {
+        let default = PathBuf::from("/default/state");
+        assert_eq!(
+            apply_state_dir_override(default.clone(), Some("".into())),
+            default
+        );
+    }
+
+    #[test]
+    fn state_dir_override_relative_keeps_default() {
+        let default = PathBuf::from("/default/state");
+        assert_eq!(
+            apply_state_dir_override(default.clone(), Some("relative/state".into())),
+            default
+        );
+    }
+
+    #[test]
+    fn state_dir_override_moves_only_state_dir() {
+        // The lockstep invariant: redirecting state_dir must leave the
+        // socket, lock, and log paths byte-identical.
+        let base = BundleProfile::gtk().expect("gtk profile");
+        let overridden = BundleProfile {
+            state_dir: apply_state_dir_override(
+                base.state_dir.clone(),
+                Some("/tmp/roost-isolated-state".into()),
+            ),
+            ..base.clone()
+        };
+        assert_eq!(
+            overridden.state_json_path(),
+            PathBuf::from("/tmp/roost-isolated-state/state.json")
+        );
+        assert_eq!(overridden.socket_path, base.socket_path);
+        assert_eq!(overridden.lock_path(), base.lock_path());
+        assert_eq!(overridden.log_path(), base.log_path());
     }
 }
