@@ -37,8 +37,22 @@ For **zsh** and **modern bash (≥ 4.4)** Roost loads the integration
 automatically — **no rc edit**. It points the shell at the shipped script
 (`ZDOTDIR` for zsh; `--posix` + `ENV` for bash), runs your normal startup files
 first, then layers the integration on top, so your config still wins. Your real
-login + rc files (`.bash_profile`/`.bashrc`, `.zprofile`/`.zshrc`/`.zlogin`,
-aliases, prompt, `PROMPT_COMMAND` hooks) load exactly as they do outside Roost.
+startup files (aliases, prompt, `PROMPT_COMMAND` hooks) load exactly as they do
+outside Roost.
+
+**Login vs. non-login shell** (this decides *which* startup files run). Roost
+follows the same platform split as Ghostty: a default tab is a **login shell on
+macOS** (sources `/etc/profile` then the first of `.bash_profile` / `.bash_login`
+/ `.profile`; `.zprofile` / `.zlogin` for zsh) and a **non-login interactive
+shell on Linux** (sources `/etc/bash.bashrc` then `~/.bashrc`; `~/.zshrc` for
+zsh). macOS GUI apps don't inherit the login `PATH` and the macOS world keeps
+config in `.bash_profile`, so a login shell is expected there; on Linux the
+desktop session already exports the login `PATH`, and config conventionally
+lives in `~/.bashrc`, which only a non-login shell sources. If you keep bash
+config in `~/.bashrc` but also have a `~/.bash_profile` (some tool installers
+drop one in), note that on macOS the login shell stops at `.bash_profile` and
+never reads `.bashrc` unless `.bash_profile` sources it — the standard fix is to
+add `[ -f ~/.bashrc ] && . ~/.bashrc` to `~/.bash_profile`.
 
 Two cases auto-loading can't reach, where you add one line to your rc instead:
 

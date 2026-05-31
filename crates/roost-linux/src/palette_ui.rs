@@ -211,8 +211,14 @@ impl Drop for PaletteOverlay {
         // Defensive: if the App's handle is dropped without a dismiss
         // (shouldn't happen — every close path routes through
         // `dismiss`), still detach the widgets so they don't linger.
-        self.inner.overlay.remove_overlay(&self.inner.catcher);
-        self.inner.overlay.remove_overlay(&self.inner.card);
+        // `dismiss` sets `closing` and removes both overlays *before*
+        // clearing the App's handle (which drops us), so skip when it
+        // already ran — removing an unparented child trips
+        // `gtk_overlay_remove_overlay`'s parent assertion.
+        if !self.inner.closing.get() {
+            self.inner.overlay.remove_overlay(&self.inner.catcher);
+            self.inner.overlay.remove_overlay(&self.inner.card);
+        }
     }
 }
 
