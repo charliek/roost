@@ -79,13 +79,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// or writes the developer's real prefs — the UserDefaults analog of
     /// the `ROOST_STATE_DIR` state.json isolation (which can't reach
     /// UserDefaults). Prod behavior is unchanged when the env is unset.
-    nonisolated static let uiDefaults: UserDefaults = {
+    // Computed (not a stored `static let`): `UserDefaults` is non-Sendable
+    // under Swift 6, so a stored nonisolated global is rejected. A computed
+    // property has no shared storage; `UserDefaults(suiteName:)` returns the
+    // shared backing store for a given suite, so repeated access is cheap +
+    // consistent.
+    nonisolated static var uiDefaults: UserDefaults {
         if let suite = ProcessInfo.processInfo.environment["ROOST_DEFAULTS_SUITE"],
            !suite.isEmpty, let store = UserDefaults(suiteName: suite) {
             return store
         }
         return .standard
-    }()
+    }
 
     /// Whether the sidebar should start visible, given a defaults store.
     /// A missing value (never toggled) → visible; an explicit `false` →

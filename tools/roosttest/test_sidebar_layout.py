@@ -10,15 +10,16 @@ locks in the parity assertion on both UIs.
 `ROOST_TEST_MODE` is unset — the bare resize attempt would fail with
 `not-enabled` and produce noisy "wrong reason" failures.
 
-Capability gate (instead of a blanket CI skip): `window.resize` only
-takes effect when the window manager honors it. Bare xvfb (GTK CI) has
-no WM, so the toplevel doesn't actually resize; a tiling/constraining
-compositor (some local setups) may grant only a partial resize. So we
-*measure the achieved window delta* and:
+Capability gate (instead of a blanket CI skip): a resize only lands if
+the environment honors it up to the available screen. GTK CI runs xvfb
+with a large virtual screen (`-screen 0 2560x1440x24`) so the toplevel
+resizes the full amount and these run there; but a tiling/constraining
+compositor (some local setups) or a small screen may grant only a
+partial — or no — resize. So we *measure the achieved window delta* and:
   - assert the sidebar-hold invariant when the delta is large enough to
     be meaningful (>= USABLE_DELTA_PT — the original bug grew the sidebar
     ~20% of the window delta, far above the 1pt tolerance);
-  - emit a registered skip when the WM granted ~no resize (the xvfb case).
+  - emit a registered skip when the environment granted too little resize.
 We never fail via a resize timeout.
 
 Tolerance: 1pt. Divider thickness and HiDPI rounding can shift the
