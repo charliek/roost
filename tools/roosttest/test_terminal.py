@@ -48,20 +48,22 @@ def test_title_follows_cwd(roost, project, target):
     cwd's leaf (`/tmp` → `tmp`) while GTK shows the path — `usr` is in both
     and absent from `tmp`. Poll, since the title updates a beat after cwd.
 
-    XXX: skipped on Mac pending investigation (issue #196). The cwd tracks
-    to /usr on Mac, but the tab title stays at the tab's original-cwd leaf
-    ('tmp') — Mac doesn't update the title on an OSC 7 cwd change, while GTK
-    does. This was never exercised on Mac before (the old test relied on the
-    shell's own OSC 7 and skipped there — Apple bash 3.2 emits none); making
-    the test hermetic surfaced the gap. Revisit on macOS: confirm whether the
-    Mac title is *meant* to follow OSC 7 cwd changes (GTK does) and, if so,
-    fix the Mac side, then drop this skip. See issue #196 for the full notes.
+    XXX: skipped on Mac pending investigation (issue #196). The title
+    following cwd is **shell-driven** (the integration emits OSC 0 each
+    prompt) — neither Workspace re-derives the title in its cwd setter. The
+    GTK default shell has integration (emits OSC 0 → title gets `usr`); Mac
+    CI's default shell is Apple bash 3.2 with NO integration → no OSC 0 → the
+    title stays at the open-time leaf (`tmp`). So it's not a Mac UI bug. The
+    open question (issue #196): should the title follow cwd via the *model*
+    (re-derive in set_tab_cwd when !userTitled, both UIs) so it works on any
+    shell? If so, this skip can be dropped and the test run cross-platform.
     """
     if target == "mac":
         pytest.skip(
-            "Mac tab title does not follow OSC 7 cwd changes (GTK does) — "
-            "under investigation, see issue #196. cwd tracking itself is "
-            "covered cross-platform by test_cwd_tracking_follows_cd."
+            "title-follows-cwd is shell-OSC-0-driven; Mac CI's default shell "
+            "(Apple bash 3.2) has no integration, so no OSC 0. Not a Mac UI "
+            "bug — see issue #196. cwd tracking is covered cross-platform by "
+            "test_cwd_tracking_follows_cd."
         )
     tab = _cd_and_emit_osc7(roost, project)
     Roost._wait(
