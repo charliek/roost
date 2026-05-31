@@ -25,7 +25,7 @@ import sys
 import pytest
 
 from client import Timeout
-from util import cwd_reaches, precondition, wait_tab_attached
+from util import cwd_reaches, precondition, wait_shell_ready, wait_tab_attached
 
 # Detect login state per shell: bash via `shopt -q login_shell`, zsh via
 # `[[ -o login ]]`. Anything else POSIX (dash, etc.) reports `skip` —
@@ -53,6 +53,14 @@ def test_default_shell_login_matches_platform(roost, project):
     want = "yes" if expect_login else "no"
     other = "no" if expect_login else "yes"
     tab = roost.open_tab(project, cwd="/tmp")
+    # The default shell on either platform is integrated (bash on
+    # Linux, zsh on macOS) — it emits pre-prompt content
+    # (compinit warnings on the GH ubuntu runner zsh / `--posix`
+    # recreation in bash / etc.) that races `roost.run`'s
+    # viewport-non-empty check, eating the first keystroke. Wait
+    # for attach + the printf sentinel before sending the probe.
+    wait_tab_attached(roost, tab)
+    wait_shell_ready(roost, tab)
     roost.run(tab, _LOGIN_PROBE)
     roost._wait(
         lambda: any(
@@ -348,10 +356,19 @@ def test_zsh_auto_bootstrap_tracks_cwd(roost, project):
     import shutil
 
     zsh = "/bin/zsh" if os.path.exists("/bin/zsh") else (shutil.which("zsh") or "")
-    if not zsh:
-        pytest.skip("zsh not available")
+    # In fresh mode (CI), the GTK + Mac runners are provisioned with zsh — a
+    # missing binary is a CI-provisioning regression, NOT a benign capability
+    # gap. Outside fresh mode (dev hosts), skip cleanly when zsh isn't
+    # installed.
+    precondition(bool(zsh), "zsh not available")
     tab = roost.open_tab(project, cwd="/tmp", argv=[zsh, "-l"])
     wait_tab_attached(roost, tab)
+    # GH runner zsh prints `compinit: insecure directories…` before the first
+    # prompt, which makes the harness's default "viewport non-empty" readiness
+    # signal a false positive — the first keystroke is dropped into a
+    # still-initializing zle. wait_shell_ready loops on a `printf '%s\n' VAL`
+    # sentinel so the shell is provably interactable before we send `cd`.
+    wait_shell_ready(roost, tab)
     # The ZDOTDIR shim loads roost.zsh on the FIRST precmd (deferred so a
     # user's .zshrc can't drop us); roost.zsh's OSC 7 hook then fires from
     # the NEXT prompt on. So give it several prompt cycles before polling —
@@ -408,9 +425,21 @@ def test_bash_auto_bootstrap_tracks_cwd(roost, project):
     still loads on top is covered by live validation — CI dotfiles aren't
     predictable, but POSIX mode being off here proves the recreation ran."""
     bash = _modern_bash()
-    if not bash:
-        pytest.skip("no modern bash (>= 4.4); Apple /bin/bash 3.2 is manual-source only")
+    # In fresh mode (CI), the Mac runner is provisioned with brew bash; Linux
+    # ships modern bash by default. A missing modern bash is a CI-provisioning
+    # regression on either, NOT a benign capability gap. Outside fresh mode
+    # (dev hosts), skip cleanly when only Apple's 3.2 is around.
+    precondition(
+        bool(bash),
+        "no modern bash (>= 4.4); Apple /bin/bash 3.2 is manual-source only",
+    )
     tab = roost.open_tab(project, cwd="/tmp", argv=[bash, "-l"])
+    # Bash's --posix + ENV inject + recreate-startup chain emits content
+    # before the first prompt is interactable; same race the zsh test above
+    # documents. wait_shell_ready proves the shell can run a command before
+    # the first `roost.run` lands.
+    wait_tab_attached(roost, tab)
+    wait_shell_ready(roost, tab)
     # No manual source: --posix + ENV auto-load roost.bash; its OSC 7 hook
     # fires on the prompt. A couple of round-trips lets it settle.
     roost.run(tab, "cd /usr")

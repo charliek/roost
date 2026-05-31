@@ -108,9 +108,15 @@ Helpers in `util.py`:
 
 Every run prints a **`SKIPS: N`** summary (each skipped test + reason) via
 `conftest.py::pytest_terminal_summary`, so a half-skipped run can't read as
-"all green." Tests that skip only for a missing tool the platform should
-have (e.g. zsh / modern bash) are a CI-provisioning gap tracked in issues,
-not silently normal.
+"all green." The zsh + modern-bash CI-provisioning gap (issue #197) is
+closed: the GTK and Mac CI runners install zsh and modern bash; the
+auto-bootstrap tests now use `precondition(...)` rather than `pytest.skip`,
+so a missed CI install hard-fails in fresh mode rather than silently
+skipping. The `wait_shell_ready` helper in `util.py` is the canonical
+pre-input pattern for any test that spawns a non-bare shell — it works
+around shells that emit pre-prompt output (compinit, MOTD, `--posix`
+recreation) which would otherwise race the harness's "viewport non-empty"
+readiness check.
 
 ## Determinism notes (why it isn't flaky)
 
