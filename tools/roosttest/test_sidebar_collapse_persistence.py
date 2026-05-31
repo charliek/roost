@@ -74,14 +74,33 @@ def _toggle_to_collapsed(roost: Roost) -> None:
     roost.palette_activate("toggle_sidebar")
 
 
+def _sidebar_visible_and_allocated(roost: Roost) -> bool:
+    """The sidebar is uncollapsed AND its width has been allocated.
+    The two checks are independent on GTK: `is_visible()` flips
+    synchronously, but the layout pass that materializes a non-zero
+    allocation width is queued on the idle. Polling both rules out the
+    `visible=True, width=0` transient that poisons downstream tests."""
+    m = roost.window_metrics()
+    return not m["sidebar_collapsed"] and m["sidebar_width"] > 0
+
+
 def _toggle_to_visible(roost: Roost) -> None:
-    """Drive the palette to restore the sidebar. No-op if already visible."""
+    """Drive the palette to restore the sidebar, then wait for the GTK
+    layout pass to materialize a non-zero width — otherwise the next
+    test inherits a `visible=True, width=0` transient (GTK runs the
+    layout on the idle cycle after `set_visible(true)`)."""
     metrics = roost.window_metrics()
-    if not metrics["sidebar_collapsed"]:
-        return
-    roost.palette_open()
-    roost.palette_query("toggle sidebar")
-    roost.palette_activate("toggle_sidebar")
+    if metrics["sidebar_collapsed"]:
+        roost.palette_open()
+        roost.palette_query("toggle sidebar")
+        roost.palette_activate("toggle_sidebar")
+    # Always wait for settle — even on the no-op path the caller may
+    # be the post-relaunch teardown where the layout pass hasn't run yet.
+    Roost._wait(
+        lambda: _sidebar_visible_and_allocated(roost),
+        timeout=2.0,
+        what="sidebar to settle visible with non-zero width",
+    )
 
 
 def test_sidebar_collapsed_state_survives_relaunch(roost, target):

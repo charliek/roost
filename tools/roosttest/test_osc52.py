@@ -20,7 +20,10 @@ Run against either UI:
 from __future__ import annotations
 
 import base64
+import sys
 import uuid
+
+import pytest
 
 
 def _emit_osc52_command(target: str, text: str) -> str:
@@ -65,7 +68,22 @@ def test_osc52_writes_system_clipboard(roost, project):
     assert roost.clipboard_dump("system") != baseline
 
 
-def test_osc52_writes_selection_clipboard(roost, project):
+def test_osc52_writes_selection_clipboard(roost, project, target):
+    # The GTK selection clipboard maps to the X11/Wayland PRIMARY
+    # selection (`clipboard::Target::Primary` in roost-linux is
+    # `#[cfg(target_os = "linux")]`-gated to no-op off Linux). The
+    # macOS GTK dev build therefore has no PRIMARY backing: write is
+    # a no-op, dump returns None, and the test fails before the OSC
+    # 52 path even runs. Skip on that profile only; on real Linux
+    # CI (e2e-gtk) and on `--roost-target mac` (named NSPasteboard)
+    # the test runs and exercises the real PRIMARY path.
+    if target == "gtk" and sys.platform == "darwin":
+        pytest.skip(
+            "GTK selection clipboard (X11/Wayland PRIMARY) is Linux-only; "
+            "macOS GTK dev build has no PRIMARY. System clipboard covered "
+            "by test_osc52_writes_system_clipboard. Real GTK on Linux runs "
+            "this in e2e-gtk CI."
+        )
     tab = roost.open_tab(project, cwd="/tmp", title="osc52-sel")
     baseline = _seed_baseline(roost, "selection")
     payload = f"osc52-sel-{uuid.uuid4().hex[:8]}"
