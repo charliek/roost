@@ -34,7 +34,7 @@ jobs:
     steps:
       # ── 1. self (charliek/roost — appcast push target) ──
       - id: self-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
@@ -63,7 +63,7 @@ jobs:
 
       # ── 2. charliek/apt-charliek (publish dispatch target) ──
       - id: apt-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
