@@ -21,10 +21,11 @@ from __future__ import annotations
 import os
 import re
 import time
+import uuid
 
 import pytest
 
-from client import RoostError, scaled_timeout
+from client import RoostError, Timeout, scaled_timeout
 
 
 def is_fresh() -> bool:
@@ -93,6 +94,90 @@ def wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
         if time.monotonic() >= deadline:
             raise TimeoutError(f"tab {tab_id} never attached a TerminalView")
         time.sleep(0.05)
+
+
+def wait_shell_ready(
+    roost,
+    tab_id: int,
+    *,
+    sentinel_attempts: int = 10,
+    per_attempt_timeout: float = 2.0,
+    total_timeout: float = 20.0,
+) -> None:
+    """Wait until the tab's shell can run a command and produce output.
+
+    Robust against shells that emit startup output (compinit, MOTD,
+    /etc/zshrc banners, `--posix` recreation, login chains) BEFORE
+    the line editor is interactable: the harness's default
+    'viewport non-empty' check (`roost.run`) races such output,
+    dropping the first keystroke into a half-initialized zle.
+
+    Each attempt sends `printf 'ROOST_READY_%s\\n' '<freshUuid>'`.
+    The `%s` + positional-arg pattern is load-bearing: the shell
+    echoes the typed command verbatim to the prompt line, so a
+    literal sentinel inside single quotes would match `wait_text`
+    via the echo before the shell ever runs the command. With `%s`
+    + a separate VALUE arg, the echo shows the literal `%s` while
+    only the printf OUTPUT contains the resolved value — present
+    only when the command actually executes. Mirrors the in-tree
+    convention documented in test_shell_integration.py:13-18.
+
+    A fresh sentinel suffix is generated per attempt so a partial
+    echo or a delayed first-attempt completion can't false-positive
+    a later attempt.
+
+    By the time this helper returns, the shell HAS executed printf
+    and emitted output — that's what `wait_text` matched — so the
+    race `roost.run`'s viewport-non-empty check defends against
+    (writes-while-zle-uninitialized) is already past. The lingering
+    sentinel echo is harmless to subsequent `roost.run` calls.
+
+    Bounded by `sentinel_attempts` outer iterations; each per-attempt
+    `wait_text` call is itself scaled by ROOST_TEST_TIMEOUT_SCALE
+    inside `_wait`, so the outer total is a SOFT cap (the last
+    iteration may overrun the outer deadline by up to one scaled
+    `per_attempt_timeout`). On retry exhaustion, raises `client.Timeout`
+    with a viewport dump. A transport failure (`roost.send` /
+    `wait_text` raising a non-timeout `RoostError` like `not-found`
+    when the tab dies) propagates the underlying `RoostError` rather
+    than being rewrapped — the caller gets the real cause.
+
+    `suffix` is `uuid4().hex` (`[0-9a-f]`) — shell-safe inside single
+    quotes. Callers should not parameterize the value without
+    re-checking that quoting.
+    """
+    deadline = time.monotonic() + scaled_timeout(total_timeout)
+    last_sentinel = ""
+    for _ in range(sentinel_attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Fresh sentinel per attempt so a partial echo from a prior
+        # iteration can't false-positive this one.
+        suffix = uuid.uuid4().hex
+        last_sentinel = f"ROOST_READY_{suffix}"
+        # Output-only marker: echo shows the literal `%s`; only the
+        # printf STDOUT contains the suffix.
+        roost.send(tab_id, f"printf 'ROOST_READY_%s\\n' '{suffix}'\n")
+        # 0.3s floor leaves room for `_wait`'s 100ms polling to see at
+        # least 2-3 cycles; anything shorter would race the poll
+        # interval. _wait re-applies scaled_timeout internally, so
+        # per_attempt_timeout is passed un-scaled here.
+        attempt_budget = min(per_attempt_timeout, max(0.3, remaining))
+        try:
+            roost.wait_text(tab_id, last_sentinel, timeout=attempt_budget)
+            return
+        except Timeout:
+            continue
+    try:
+        tail = roost._safe_dump_text(tab_id)
+    except Exception:
+        tail = "<dump unavailable>"
+    raise Timeout(
+        f"shell never echoed printf output (last sentinel={last_sentinel!r}) "
+        f"within {sentinel_attempts} attempts / {total_timeout}s (scaled). "
+        f"Viewport tail:\n{tail}"
+    )
 
 
 def drain(roost, tab_id: int) -> bytes:

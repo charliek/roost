@@ -307,11 +307,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install GTK4 + libadwaita + Xvfb
+      - name: Install GTK4 + libadwaita + Xvfb + zsh
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -388,6 +388,23 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+
+      - name: Install modern bash + version probe
+        # `test_bash_auto_bootstrap_tracks_cwd` needs bash >= 4.4 for its
+        # `--posix` + ENV auto-bootstrap path; Apple's /bin/bash is 3.2,
+        # SIP-locked. Brew lands modern bash at /opt/homebrew/bin/bash on
+        # ARM runners, /usr/local/bin/bash on Intel (the test's
+        # `_modern_bash()` probes both). The idempotent `list || install`
+        # form is robust to runner images that ship bash preinstalled;
+        # the version probe makes a future preinstall-regression loud in
+        # CI logs rather than silently re-triggering the test's
+        # `precondition("no modern bash")` failure.
+        run: |
+          brew list bash >/dev/null 2>&1 || brew install bash
+          which bash || true
+          for p in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+            if [ -x "$p" ]; then "$p" --version; fi
+          done
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty

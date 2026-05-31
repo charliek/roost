@@ -37,7 +37,7 @@ silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 | `client.py` | `Roost` — a thin JSON-IPC client (direct Unix socket). Op methods (`open_tab`, `set_state`, `dump`, …) + no-`sleep` waits (`wait_state`, `wait_text`, `wait_gone`) + `run()` (wait for prompt, then send a command). |
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), `fresh` (`--roost-fresh`/`ROOST_TEST_FRESH`), a session fixture that owns/ensures the UI (hermetic in fresh mode), `roost` (a client), `project` (a throwaway, cascade-cleaned project). Also the `SKIPS: N` terminal summary. |
-| `util.py` | Cross-file helpers: `precondition` / `skip_on_ci` (the skip policy), `cwd_reaches` (scaled cwd poll), `wait_tab_attached`, drain helpers. |
+| `util.py` | Cross-file helpers: `precondition` / `skip_on_ci` (the skip policy), `cwd_reaches` (scaled cwd poll), `wait_tab_attached`, `wait_shell_ready` (pre-input race-fix for shells that emit pre-prompt content), drain helpers. |
 | `test_smoke.py` | The smoke suite: content via `tab.dump`, state progression, notifications, focus, title-lock, cascade-close. |
 | `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. |
 | `test_notifications.py` | The multi-project notification inbox: `view_notifications` frame, jump-to-notification (focuses the tab + clears its badge), clear-all. |
@@ -108,9 +108,15 @@ Helpers in `util.py`:
 
 Every run prints a **`SKIPS: N`** summary (each skipped test + reason) via
 `conftest.py::pytest_terminal_summary`, so a half-skipped run can't read as
-"all green." Tests that skip only for a missing tool the platform should
-have (e.g. zsh / modern bash) are a CI-provisioning gap tracked in issues,
-not silently normal.
+"all green." The zsh + modern-bash CI-provisioning gap (issue #197) is
+closed: the GTK and Mac CI runners install zsh and modern bash; the
+auto-bootstrap tests now use `precondition(...)` rather than `pytest.skip`,
+so a missed CI install hard-fails in fresh mode rather than silently
+skipping. The `wait_shell_ready` helper in `util.py` is the canonical
+pre-input pattern for any test that spawns a non-bare shell — it works
+around shells that emit pre-prompt output (compinit, MOTD, `--posix`
+recreation) which would otherwise race the harness's "viewport non-empty"
+readiness check.
 
 ## Determinism notes (why it isn't flaky)
 
