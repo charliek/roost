@@ -9,6 +9,78 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.7 — 2026-06-01
+
+Command-palette polish release. The palette gains a **Select Font…** picker that
+writes your theme, font, and size choices back to config, and its root list is
+reordered so the Theme/Font drill-ins lead. Tab titles now follow the working
+directory on any shell (not just integrated ones), three GTK/Linux parity bugs
+are fixed, and the e2e suite is reworked so a local run exercises exactly what
+CI does.
+
+### Features
+
+- **Select Font… in the command palette + config write-back (#203)** — a new
+  **Select Font…** entry in ⌘⇧P / Ctrl+Shift+P drills into a sub-frame of
+  installed monospace families (arrow = live preview, Esc = revert, Enter =
+  commit), mirroring the existing **Select Theme…** pattern. A curated
+  programming-font list leads (JetBrains Mono, Fira Code, Cascadia, Iosevka,
+  IBM Plex, plus platform natives like SF Mono / Menlo and DejaVu / Ubuntu
+  Mono), filtered to what's actually installed. Theme, font family, and font
+  size now persist to `~/.config/roost/config.conf` via a new atomic
+  `RoostConfig.setKey` / `config::set_key` helper (tmp+rename, comment- and
+  indentation-preserving). No new IPC ops — both UIs at parity.
+- **Palette root leads with the drill-ins (#206)** — the command-palette root
+  now orders Select Theme… → Select Font… → View Notifications → Clear All
+  Notifications → the rest, on both UIs (the notification rows previously led).
+- **GTK sidebar collapsed state persists across relaunch (#192)** — a
+  ⌘B-collapsed sidebar on Linux now stays collapsed after quit + relaunch.
+
+### Fixes
+
+- **Tab title follows cwd on any shell (#202, closes #196)** — the model
+  re-derives a tab's title from the cwd basename when the tab isn't
+  user-titled, so the title tracks `cd` even on shells without the OSC 0
+  integration loaded (Apple `/bin/bash` 3.2, `--norc`, etc.). Integrated shells
+  still refine to the tilde-abbreviated full path on the next prompt
+  (latest-wins, no flicker). `user_titled` is now persisted in the tab snapshot
+  so a manual rename survives `cd` across relaunch; `derive_title("/")` matches
+  across UIs.
+- **Linux default tab is a non-login interactive shell (#192)** — match
+  Ghostty's platform split (login shell only on macOS). A stray
+  `~/.bash_profile` no longer shadows `~/.bashrc`, so the prompt, aliases, and
+  color the user sees in their normal terminal load.
+- **GTK palette overlay double-removal CRITICALs (#192)** — closing the command
+  palette no longer logs a pair of `gtk_overlay_remove_overlay` assertion
+  failures; `Drop` skips removal when `dismiss` already ran.
+
+### Tests + CI
+
+- **Trustworthy e2e suite — local == CI (#194)** — a skip now means only "this
+  environment genuinely can't exercise this," never "the setup didn't work."
+  Adds `ROOST_STATE_DIR` (both UIs) + Mac `UserDefaults` isolation
+  (`ROOST_DEFAULTS_SUITE`) so the harness can own a fresh hermetic instance;
+  `--roost-fresh` / `make e2e-{gtk,mac}-ci` make local runs exercise the same
+  set CI does.
+- **CI shell provisioning + flake hardening (#204, #205)** — provision zsh +
+  Homebrew bash on CI and harden a shell-startup race; fix two local-env e2e
+  flakes (OSC 52 PRIMARY selection + a sidebar layout-stall).
+
+### Docs
+
+- **Document the e2e harness flags, CI configs, and skip policy (#198).**
+- **Abbreviate `$HOME` to `~` in the rooster-title recipe, portably (#199).**
+
+### Release process
+
+- **mise-aware cargo lookup in `update-version.sh` (#201)** — the release bump
+  script resolves cargo through mise.
+- **`create-github-app-token` v2 → v3 + app-id → client-id (#195, #200)** —
+  bump the token action to v3 (Node 24) and switch to `client-id` to resolve
+  the v3 deprecation.
+- **URL-embedded token for the Sparkle appcast push (#122)** — fixes the
+  appcast push that publishes the release.
+
 ## v0.0.6 — 2026-05-30
 
 Mouse-aware terminals release. Strix and other mouse-driven TUIs now click,
