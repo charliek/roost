@@ -1055,19 +1055,22 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// switch actions, clipboard, and `command_palette` itself are
     /// intentionally excluded.
     ///
-    /// The two notification commands lead the list (multi-project triage
-    /// is the point) and are built here rather than in `specs` so "View
-    /// Notifications" can carry the live pending count.
+    /// The two notification commands sit just below the Select Theme… /
+    /// Select Font… drill-ins and are built here rather than in `specs`
+    /// so "View Notifications" can carry the live pending count.
     @MainActor
     private func paletteCommandItems() -> [PaletteItem] {
-        var items: [PaletteItem] = []
+        var items = PaletteCommands.specs.map { id, title in
+            PaletteItem(id: id, title: title, trailingText: shortcutText(for: id))
+        }
         let count = notificationInbox.count
         let viewTitle = count > 0 ? "View Notifications (\(count))" : "View Notifications"
-        items.append(PaletteItem(id: PaletteCommands.viewNotificationsID, title: viewTitle))
-        items.append(PaletteItem(id: PaletteCommands.clearNotificationsID, title: "Clear All Notifications"))
-        items.append(contentsOf: PaletteCommands.specs.map { id, title in
-            PaletteItem(id: id, title: title, trailingText: shortcutText(for: id))
-        })
+        let notifItems = [
+            PaletteItem(id: PaletteCommands.viewNotificationsID, title: viewTitle),
+            PaletteItem(id: PaletteCommands.clearNotificationsID, title: "Clear All Notifications"),
+        ]
+        let insertAt = (items.firstIndex { $0.id == PaletteCommands.selectFontID }).map { $0 + 1 } ?? 0
+        items.insert(contentsOf: notifItems, at: insertAt)
         return items
     }
 

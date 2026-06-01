@@ -2848,13 +2848,16 @@ impl App {
         for (accel, action) in bindings {
             reverse.entry(action).or_insert(accel);
         }
-        // Notification commands lead the list (multi-project triage is
-        // the point); built dynamically so "View Notifications" carries
-        // the live pending count.
-        let mut items = self.notification_command_items();
-        items.extend(command_items(|action| {
-            reverse.get(&action).and_then(accel_label)
-        }));
+        // The two notification commands sit just below the Select Theme… /
+        // Select Font… drill-ins; built dynamically so "View Notifications"
+        // carries the live pending count.
+        let mut items = command_items(|action| reverse.get(&action).and_then(accel_label));
+        let notif = self.notification_command_items();
+        let at = items
+            .iter()
+            .position(|i| i.id == PaletteCommands::SELECT_FONT_ID)
+            .map_or(0, |i| i + 1);
+        items.splice(at..at, notif);
         let root = PaletteFrame::new("commands", "Execute a command…", items);
 
         let weak = Rc::downgrade(self);
