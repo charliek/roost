@@ -2856,7 +2856,7 @@ impl App {
         let at = items
             .iter()
             .position(|i| i.id == PaletteCommands::SELECT_FONT_ID)
-            .map_or(0, |i| i + 1);
+            .map_or(items.len(), |i| i + 1);
         items.splice(at..at, notif);
         let root = PaletteFrame::new("commands", "Execute a command…", items);
 

@@ -1069,7 +1069,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             PaletteItem(id: PaletteCommands.viewNotificationsID, title: viewTitle),
             PaletteItem(id: PaletteCommands.clearNotificationsID, title: "Clear All Notifications"),
         ]
-        let insertAt = (items.firstIndex { $0.id == PaletteCommands.selectFontID }).map { $0 + 1 } ?? 0
+        let insertAt = (items.firstIndex { $0.id == PaletteCommands.selectFontID }).map { $0 + 1 } ?? items.count
         items.insert(contentsOf: notifItems, at: insertAt)
         return items
     }
