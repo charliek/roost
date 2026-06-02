@@ -1971,27 +1971,26 @@ impl App {
                                 }
                                 // OSC 4 palette query — answer each index
                                 // from libghostty's live palette (a prior
-                                // `OSC 4;Ps;rgb:…` set wins), falling back
-                                // to the theme palette on FFI error. Same
-                                // per-tab serial reply channel as the OSC
-                                // 10/11/12 path above. This unblocks
-                                // opencode/opentui, which gate *all* color
-                                // detection on a reply to `OSC 4;0;?`.
+                                // `OSC 4;Ps;rgb:…` set wins), falling back to
+                                // the theme palette on FFI error. Same per-tab
+                                // serial reply channel as the OSC 10/11/12 path
+                                // above. opentui (opencode in local mode + other
+                                // TUIs) gates its color detection on a reply to
+                                // `OSC 4;0;?`.
                                 if let roost_osc::OscEvent::PaletteQuery(ref indices) = event {
-                                    let live = terminal_for_drain.live_palette();
-                                    if let Err(err) = &live {
-                                        tracing::debug!(
-                                            ?err,
-                                            "live_palette failed; falling back to theme palette"
-                                        );
-                                    }
-                                    let theme = app_for_osc.theme.borrow();
+                                    let palette = match terminal_for_drain.live_palette() {
+                                        Ok(p) => p,
+                                        Err(err) => {
+                                            tracing::debug!(
+                                                ?err,
+                                                "live_palette failed; falling back to theme palette"
+                                            );
+                                            app_for_osc.theme.borrow().palette
+                                        }
+                                    };
                                     let mut reply = Vec::new();
                                     for &idx in indices {
-                                        let color = match &live {
-                                            Ok(palette) => palette[idx as usize],
-                                            Err(_) => theme.palette[idx as usize],
-                                        };
+                                        let color = palette[idx as usize];
                                         reply.extend_from_slice(
                                             &roost_osc::format_palette_query_response(
                                                 idx,

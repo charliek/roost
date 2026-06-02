@@ -63,24 +63,27 @@ Code: `crates/roost-osc/src/lib.rs` (scanner + formatters),
 `crates/roost-linux/src/app.rs` (drain reply arm),
 `mac/Sources/Roost/TerminalView.swift` (`appendBytes` reply arm).
 
-## Channel 2 — libghostty-answered device queries (`write_pty`)
+## Channel 2 — libghostty-answered device queries (`write_pty`) — *planned*
+
+> **Status: not yet implemented.** The OSC color channel above is live; this
+> device-query channel is the planned follow-up. Until it lands, Roost
+> answers only the OSC color channel, so probing TUIs see a terminal that
+> ignores DA1/DSR/XTVERSION/DECRQM. (Note: this does *not* affect opencode —
+> it falls back gracefully without device-query replies.) The rest of this
+> section describes the intended design.
 
 libghostty-vt's C terminal layer installs trampolines for an effects
 callback set called `write_pty`. When the parser produces a host
 response — DA1/DA2 (`ESC[c` / `ESC[>c`), DSR (`ESC[5n` / `ESC[6n`),
 XTVERSION (`ESC[>q`), ENQ, DECRQM mode reports (`ESC[?Ps$p`), size
-reports — it hands the bytes to `write_pty`. Roost wires that callback and
-forwards the bytes to the PTY input.
+reports — it hands the bytes to `write_pty`. Roost *would* wire that
+callback and forward the bytes to the PTY input.
 
-The callback fires **synchronously inside `vt_write`** (mid-parse), so
-Roost uses a **collect-then-send** buffer: the callback only appends reply
+The callback fires **synchronously inside `vt_write`** (mid-parse), so the
+plan is a **collect-then-send** buffer: the callback only appends reply
 bytes to a per-tab buffer, and Roost drains that buffer to `send_input` /
 `onKey` *after* `vt_write` returns. This avoids any reentrancy/borrow
 hazard and keeps replies FIFO-ordered with keystrokes.
-
-> Status: wired in the `write_pty` device-query change (the follow-up to
-> the OSC 4 work). Until then Roost answered only the OSC color channel,
-> so probing TUIs saw a terminal that ignored DA1/DSR/etc.
 
 **Deferred:** DEC mode 2031 (live light/dark color-scheme change
 notifications) is tracked separately — it needs Roost to *proactively*
