@@ -1,5 +1,5 @@
 // OscScanner unit tests — Swift port of the Rust suite in
-// `crates/roost-core/src/osc.rs`. Both implementations are
+// `crates/roost-osc/src/lib.rs`. Both implementations are
 // byte-equivalent state machines; the Swift port runs in
 // `TerminalView.appendBytes` to lift OSC events from the PTY
 // stream into the daemon-bound `ReportOsc` RPC.
@@ -433,4 +433,55 @@ func osc22_split_across_feeds() {
     #expect(first.isEmpty)
     let second = s.feed(Data(Array("ter".utf8) + [0x07]))
     #expect(second == [.mouseShape("pointer")])
+}
+
+// MARK: - OSC 4 (palette color query)
+// Mirrors the Rust `osc4_*` scanner cases in `crates/roost-osc/src/lib.rs`
+// so `parseOsc4Query` stays byte-equivalent with the Rust parser.
+
+@Test
+func osc4_single_query_emits() {
+    // The gate opencode/opentui probes with: ESC]4;0;?
+    #expect(feedAll("\u{1B}]4;0;?\u{07}") == [.paletteQuery([0])])
+}
+
+@Test
+func osc4_query_st_terminator() {
+    #expect(feedAll("\u{1B}]4;1;?\u{1B}\\") == [.paletteQuery([1])])
+}
+
+@Test
+func osc4_multi_index_query_emits() {
+    #expect(feedAll("\u{1B}]4;0;?;1;?;255;?\u{07}") == [.paletteQuery([0, 1, 255])])
+}
+
+@Test
+func osc4_set_dropped() {
+    // Set form is libghostty's to apply — not surfaced.
+    #expect(feedAll("\u{1B}]4;2;rgb:de/ad/be\u{07}").isEmpty)
+}
+
+@Test
+func osc4_mixed_set_and_query_surfaces_only_query() {
+    #expect(feedAll("\u{1B}]4;0;rgb:11/22/33;1;?\u{07}") == [.paletteQuery([1])])
+}
+
+@Test
+func osc4_split_across_feeds() {
+    let s = OscScanner()
+    let first = s.feed(Data(Array("\u{1B}]4;0;".utf8)))
+    #expect(first.isEmpty)
+    let second = s.feed(Data(Array("?\u{07}".utf8)))
+    #expect(second == [.paletteQuery([0])])
+}
+
+@Test
+func osc4_out_of_range_index_skipped() {
+    // 256 doesn't fit a palette slot — skip it, keep the valid one.
+    #expect(feedAll("\u{1B}]4;256;?;7;?\u{07}") == [.paletteQuery([7])])
+}
+
+@Test
+func osc4_incomplete_pair_dropped() {
+    #expect(feedAll("\u{1B}]4;0\u{07}").isEmpty)
 }

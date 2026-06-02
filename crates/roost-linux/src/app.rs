@@ -1969,6 +1969,40 @@ impl App {
                                     }
                                     continue;
                                 }
+                                // OSC 4 palette query — answer each index
+                                // from libghostty's live palette (a prior
+                                // `OSC 4;Ps;rgb:…` set wins), falling back to
+                                // the theme palette on FFI error. Same per-tab
+                                // serial reply channel as the OSC 10/11/12 path
+                                // above. opentui (opencode in local mode + other
+                                // TUIs) gates its color detection on a reply to
+                                // `OSC 4;0;?`.
+                                if let roost_osc::OscEvent::PaletteQuery(ref indices) = event {
+                                    let palette = match terminal_for_drain.live_palette() {
+                                        Ok(p) => p,
+                                        Err(err) => {
+                                            tracing::debug!(
+                                                ?err,
+                                                "live_palette failed; falling back to theme palette"
+                                            );
+                                            app_for_osc.theme.borrow().palette
+                                        }
+                                    };
+                                    let mut reply = Vec::new();
+                                    for &idx in indices {
+                                        let color = palette[idx as usize];
+                                        reply.extend_from_slice(
+                                            &roost_osc::format_palette_query_response(
+                                                idx,
+                                                (color.r, color.g, color.b),
+                                            ),
+                                        );
+                                    }
+                                    if !reply.is_empty() {
+                                        session_for_replies.send_input(reply);
+                                    }
+                                    continue;
+                                }
                                 app_for_osc.report_osc_event(tab_id, event);
                             }
                             terminal_for_drain.vt_write(&data);
@@ -4062,6 +4096,9 @@ impl App {
             E::Clipboard { .. } => unreachable!(),
             // Handled above via `apply_mouse_shape` on the tab's view.
             E::MouseShape(_) => unreachable!(),
+            // Handled by the drain's OSC 4 reply short-circuit; never
+            // routed to the daemon.
+            E::PaletteQuery(_) => unreachable!(),
         };
         let Some(client) = self.client.borrow().clone() else {
             return;

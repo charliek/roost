@@ -376,6 +376,34 @@ impl Terminal {
         })
     }
 
+    /// Read libghostty's live 256-entry palette — the post-OSC-override
+    /// view an `OSC 4;Ps;?` query should answer. If the app changed a
+    /// slot via `OSC 4;Ps;rgb:…`, the new value wins; otherwise each
+    /// entry is the theme's `set_color_palette` push.
+    ///
+    /// Mirrors [`Self::live_colors`] (which answers the OSC 10/11/12
+    /// special-color queries); the index-into-256 form here answers OSC
+    /// 4. The caller falls back to the static theme palette on error.
+    pub fn live_palette(&self) -> Result<[crate::ColorRgb; 256]> {
+        use crate::ColorRgb;
+        // libghostty's PaletteC is `[256]RGB.C`, layout-compatible with
+        // `[GhosttyColorRgb; 256]` (the top-of-file size/align guards
+        // pin `ColorRgb` <-> `GhosttyColorRgb`). `get` copies into this
+        // caller-owned buffer.
+        let mut raw = [sys::GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
+        // SAFETY: handle non-null; `raw` is a 256-entry buffer matching
+        // the PaletteC layout libghostty writes.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_PALETTE,
+                raw.as_mut_ptr() as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(raw.map(|c| ColorRgb::new(c.r, c.g, c.b)))
+    }
+
     /// Push the default foreground color into libghostty so SGR cells
     /// that inherit the default flip to the theme. Wraps
     /// `ghostty_terminal_set(OPT_COLOR_FOREGROUND, &rgb)`.

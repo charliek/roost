@@ -42,6 +42,11 @@ enum OscEvent: Equatable {
     case pwd(String)
     case notification(title: String, body: String)
     case colorQuery(UInt8)  // 10, 11, or 12
+    /// OSC 4 palette query — `4;Ps;?`, optionally repeated
+    /// (`4;0;?;1;?;…`). Carries the queried palette indices (`Ps`,
+    /// 0…255). Like `.colorQuery`, the UI answers each index from the
+    /// live palette; set forms (`4;Ps;rgb:…`) are libghostty's to apply.
+    case paletteQuery([UInt8])
     case commandMark(String)  // OSC 133 prompt/command mark body (A/B/C/D[;exit])
     /// OSC 52 program-initiated clipboard write. The body's base64
     /// payload has already been decoded; `text` is plain UTF-8.
@@ -104,6 +109,10 @@ enum OscEvent: Equatable {
             // OSC 22 is a UI-only action — only the Mac/GTK renderer
             // owns the OS cursor; the daemon has no concept of
             // pointer shape.
+            return nil
+        case .paletteQuery:
+            // OSC 4 palette queries are answered inline in the UI from
+            // the live palette; never routed to the daemon.
             return nil
         }
     }
@@ -254,6 +263,15 @@ final class OscScanner {
             // Set mouse pointer shape (W3C cursor name). Pass through
             // verbatim — the UI maps empty + unknown to default.
             pending.append(.mouseShape(body))
+        case "4":
+            // Palette color query: `Ps;?` pairs, optionally repeated
+            // (`4;0;?;1;?;…`). Surface the queried indices; the UI
+            // answers each from the live palette. Set forms
+            // (`4;Ps;rgb:…`) are libghostty's to apply.
+            let indices = parseOsc4Query(body)
+            if !indices.isEmpty {
+                pending.append(.paletteQuery(indices))
+            }
         case "133":
             // Shell-integration prompt/command mark; surface the raw
             // body (A/B/C/D[;exit]). applyOSC maps it to tab state (P4b).
@@ -279,6 +297,26 @@ final class OscScanner {
 }
 
 // MARK: - Helpers (port of P4's free fns)
+
+/// Parse an OSC 4 query body into the queried palette indices.
+///
+/// Body is `Ps;Pc[;Ps;Pc…]`: each `Ps` is a palette index (0…255) and
+/// `Pc` is `?` (query) or a color spec (set). Only `?` (query) pairs
+/// are returned — set pairs are libghostty's to apply. Out-of-range /
+/// unparseable indices and a trailing unpaired field are skipped.
+/// Byte-for-byte parity with the Rust `parse_osc4_query`.
+private func parseOsc4Query(_ body: String) -> [UInt8] {
+    let fields = body.split(separator: ";", omittingEmptySubsequences: false)
+    var indices: [UInt8] = []
+    var i = 0
+    while i + 1 < fields.count {
+        if fields[i + 1] == "?", let n = UInt8(fields[i]) {
+            indices.append(n)
+        }
+        i += 2
+    }
+    return indices
+}
 
 /// True if an OSC 9 body looks like a ConEmu extension rather
 /// than an iTerm2 notification.
