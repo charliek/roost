@@ -182,3 +182,73 @@ func osc12_dynamicSetIsReflectedByQueryReply() throws {
     #expect(text.contains("dede/adad/bebe"), "got \(text)")
     #expect(!text.contains("9898/9898/9d9d"), "stale theme cursor leaked: \(text)")
 }
+
+// MARK: - OSC 4 palette query replies
+// Swift companion to the Rust `format_palette_query_response` +
+// `osc4_*` tests; byte-identical so opencode/opentui see one terminal
+// answer regardless of which UI hosts the tab.
+
+@Test
+func osc4_replyPaletteIsByteExact() {
+    let c = NSColor(srgbRed: 0x12 / 255.0, green: 0x34 / 255.0, blue: 0x56 / 255.0, alpha: 1)
+    let reply = TerminalView.formatPaletteQueryResponse(index: 0, color: c)
+    #expect(reply.map(Array.init) == asciiBytes("\u{1B}]4;0;rgb:1212/3434/5656\u{07}"))
+}
+
+@Test
+func osc4_replyEchoesIndex() {
+    // Index is echoed verbatim; channels stay red/green/blue.
+    let c = NSColor(srgbRed: 1, green: 0, blue: 0x80 / 255.0, alpha: 1)
+    let reply = TerminalView.formatPaletteQueryResponse(index: 231, color: c)
+    #expect(reply.map(Array.init) == asciiBytes("\u{1B}]4;231;rgb:ffff/0000/8080\u{07}"))
+}
+
+/// OSC 4 analogue of the #145 dynamic-color test: a mid-session
+/// `OSC 4;Ps;rgb:…` set must be reflected in the next `OSC 4;Ps;?`
+/// reply, read from libghostty's live palette (not the stale theme).
+@Test @MainActor
+func osc4_dynamicSetIsReflectedByQueryReply() throws {
+    var opts = GhosttyTerminalOptions()
+    opts.cols = 80
+    opts.rows = 24
+    opts.max_scrollback = 0
+
+    var maybeTerm: GhosttyTerminal?
+    #expect(ghostty_terminal_new(nil, &maybeTerm, opts).rawValue == 0)
+    let term = try #require(maybeTerm)
+    defer { ghostty_terminal_free(term) }
+
+    // Seed slot 5 with a known theme color so the "stale" assertion has
+    // a value to compare against.
+    var palette = Array(repeating: NSColor.gray, count: 256)
+    palette[5] = NSColor(srgbRed: 0x1c / 255.0, green: 0x1c / 255.0, blue: 0x1c / 255.0, alpha: 1)
+    let theme = Theme(
+        foreground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
+        background: NSColor(srgbRed: 0x1c / 255.0, green: 0x1c / 255.0, blue: 0x1c / 255.0, alpha: 1),
+        cursor: NSColor(srgbRed: 0x98 / 255.0, green: 0x98 / 255.0, blue: 0x9d / 255.0, alpha: 1),
+        selectionBackground: .gray,
+        selectionForeground: .white,
+        palette: palette
+    )
+    Theme.apply(theme, to: term)
+
+    // App sets palette slot 5 mid-session.
+    let setBytes: [UInt8] = Array("\u{1B}]4;5;rgb:de/ad/be\u{07}".utf8)
+    setBytes.withUnsafeBufferPointer {
+        ghostty_terminal_vt_write(term, $0.baseAddress, setBytes.count)
+    }
+
+    let live = TerminalView.livePalette(terminal: term, theme: theme)
+    let reply = try #require(
+        TerminalView.formatPaletteQueryResponse(index: 5, color: live[5])
+    )
+    let text = String(decoding: reply, as: UTF8.self)
+    #expect(
+        text.contains("4;5;rgb:dede/adad/bebe"),
+        "reply must encode the post-set color (got \(text))"
+    )
+    #expect(
+        !text.contains("1c1c/1c1c/1c1c"),
+        "reply must NOT encode the stale theme color (got \(text))"
+    )
+}

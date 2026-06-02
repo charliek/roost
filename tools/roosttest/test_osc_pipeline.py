@@ -185,6 +185,37 @@ class TestOscPipeline:
         # `9898/9898/9d9d`.
         assert b"9898/9898/9d9d" not in captured, captured
 
+    # ----- OSC 4 palette-query coverage (opencode/opentui gate) ----------
+
+    def test_osc4_query_replies_to_gate_probe(self, roost, project):
+        """opencode/opentui gate ALL terminal color detection on a reply
+        to `OSC 4;0;?` (a 300ms-timeout probe). Pre-fix roost ignored
+        OSC 4, so the probe timed out and opencode fell back to an
+        unreadable gray theme. Post-fix the drain answers each index from
+        the live palette. We don't pin the exact color (palette[0] is
+        theme-dependent) — only that a well-formed OSC 4 reply for
+        index 0 comes back, which is what unblocks opencode."""
+        tab = roost.open_tab(project, cwd="/tmp")
+        wait_tab_attached(roost, tab)
+        roost.tab_feed_pty_bytes(tab, b"\x1b]4;0;?\x07")
+        captured = drain_until_match(
+            roost, tab, rb"\x1b\]4;0;rgb:[0-9a-f]{4}/[0-9a-f]{4}/[0-9a-f]{4}"
+        )
+        assert b"\x1b]4;0;rgb:" in captured, captured
+
+    def test_osc4_set_then_query_replies_with_new_palette(self, roost, project):
+        """OSC 4 analogue of #145: a mid-session `OSC 4;5;rgb:de/ad/be`
+        set must be reflected in the next `OSC 4;5;?` reply, read from
+        libghostty's live palette. SET in one feed, QUERY in a second so
+        libghostty's vt_write applies the set before the query's
+        scanner.feed runs (the same ordering the OSC 11 test relies on)."""
+        tab = roost.open_tab(project, cwd="/tmp")
+        wait_tab_attached(roost, tab)
+        roost.tab_feed_pty_bytes(tab, b"\x1b]4;5;rgb:de/ad/be\x07")
+        roost.tab_feed_pty_bytes(tab, b"\x1b]4;5;?\x07")
+        captured = drain_until_match(roost, tab, rb"\x1b\]4;5;rgb:dede/adad/bebe")
+        assert b"\x1b]4;5;rgb:dede/adad/bebe" in captured, captured
+
     @pytest.mark.skip(
         reason=(
             "known #145 limitation: vt_write happens AFTER scanner.feed in the "

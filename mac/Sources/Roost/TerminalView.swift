@@ -485,6 +485,26 @@ final class TerminalView: NSView {
                 }
                 continue
             }
+            // OSC 4 palette query — answer each index from libghostty's
+            // live palette (a prior `OSC 4;Ps;rgb:…` set wins), theme
+            // fallback on FFI miss. Same `onKey` PTY-input route as the
+            // OSC 10/11/12 path above. Unblocks opencode/opentui, which
+            // gate *all* color detection on a reply to `OSC 4;0;?`.
+            if case .paletteQuery(let indices) = event {
+                let palette = TerminalView.livePalette(terminal: terminal, theme: theme)
+                var reply = Data()
+                for idx in indices where Int(idx) < palette.count {
+                    if let bytes = TerminalView.formatPaletteQueryResponse(
+                        index: idx, color: palette[Int(idx)]
+                    ) {
+                        reply.append(bytes)
+                    }
+                }
+                if !reply.isEmpty {
+                    onKey?(reply)
+                }
+                continue
+            }
             // OSC 52 program-initiated clipboard write — UI-only
             // action, not workspace state. Honor on the UI side
             // because only the UI has the NSPasteboard handle.
@@ -2655,6 +2675,55 @@ final class TerminalView: NSView {
             blue: CGFloat(rgb.b) / 255,
             alpha: 1
         )
+    }
+
+    /// Format an OSC 4 palette-query reply:
+    /// `ESC]4;<index>;rgb:RRRR/GGGG/BBBB BEL`. Mirrors
+    /// `formatColorQueryResponse` (16-bit channels, BEL-terminated) for
+    /// the palette path so both UIs answer byte-identically. The index
+    /// echoes the queried palette slot.
+    ///
+    /// Returns `nil` when the color can't convert to sRGB (defensive).
+    nonisolated static func formatPaletteQueryResponse(index: UInt8, color: NSColor) -> Data? {
+        guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
+        let r = UInt8(round(srgb.redComponent * 255))
+        let g = UInt8(round(srgb.greenComponent * 255))
+        let b = UInt8(round(srgb.blueComponent * 255))
+        let s = String(
+            format: "\u{1B}]4;%d;rgb:%02x%02x/%02x%02x/%02x%02x\u{07}",
+            Int(index), r, r, g, g, b, b
+        )
+        return Data(s.utf8)
+    }
+
+    /// Read libghostty's live 256-entry palette — the post-OSC-override
+    /// view an `OSC 4;Ps;?` query should answer — falling back to the
+    /// theme palette when libghostty hasn't tracked one yet. The OSC-4
+    /// analogue of `liveColor`; mirrors the Linux
+    /// `TerminalView::live_palette` shape so both UIs reply with the
+    /// color a prior `OSC 4;Ps;rgb:…` set most recently established.
+    @MainActor
+    static func livePalette(terminal: GhosttyTerminal, theme: Theme) -> [NSColor] {
+        // libghostty's PaletteC is `[256]RGB.C`, layout-compatible with
+        // a contiguous `[GhosttyColorRgb]` of 256; `get` copies into it.
+        var raw = [GhosttyColorRgb](repeating: GhosttyColorRgb(r: 0, g: 0, b: 0), count: 256)
+        let rc = raw.withUnsafeMutableBytes { buf in
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE, buf.baseAddress)
+        }
+        guard rc.rawValue == 0 else {
+            // GHOSTTY_NO_VALUE (or any non-zero rc) — libghostty hasn't
+            // tracked a palette yet; render with the theme palette, what
+            // the renderer paints anyway.
+            return theme.palette
+        }
+        return raw.map {
+            NSColor(
+                srgbRed: CGFloat($0.r) / 255,
+                green: CGFloat($0.g) / 255,
+                blue: CGFloat($0.b) / 255,
+                alpha: 1
+            )
+        }
     }
 
     /// Solid block cursor with the underlying glyph re-painted in an

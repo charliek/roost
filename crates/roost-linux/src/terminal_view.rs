@@ -1103,6 +1103,13 @@ impl TerminalView {
         self.state.borrow().terminal.live_colors()
     }
 
+    /// Live 256-entry palette — the OSC drain answers `OSC 4;Ps;?`
+    /// queries from this, reflecting any mid-session `OSC 4;Ps;rgb:…`
+    /// set. See [`Terminal::live_palette`].
+    pub fn live_palette(&self) -> roost_vt::Result<[roost_vt::ColorRgb; 256]> {
+        self.state.borrow().terminal.live_palette()
+    }
+
     /// Set the selection rectangle from viewport `(col, row)` coords.
     /// Mirrors `mouseDown` + `mouseDragged` for the IPC `selection.set`
     /// op: drops any existing selection, anchors at `anchor`, and sets

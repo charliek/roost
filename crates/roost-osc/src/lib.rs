@@ -86,6 +86,14 @@ pub enum OscEvent {
     /// caller decides whether to route back to the UI or drop.
     ColorQuery(u8),
 
+    /// OSC 4 palette query — `4;Ps;?`, optionally repeated
+    /// (`4;0;?;1;?;…`). Carries the queried palette indices (`Ps`,
+    /// 0..=255). Like [`OscEvent::ColorQuery`], the scanner doesn't
+    /// synthesise the reply — the UI answers each index from the live
+    /// palette (with a theme fallback). Set forms (`4;Ps;rgb:…`) are
+    /// libghostty's to apply and are not surfaced here.
+    PaletteQuery(Vec<u8>),
+
     /// OSC 133 shell-integration prompt/command mark. Carries the raw
     /// body after `133;` — `A` (prompt start), `B` (prompt end), `C`
     /// (command start), `D` / `D;<exit>` (command end). Interpreting it
@@ -346,10 +354,21 @@ impl OscScanner {
                     self.pending.push(event);
                 }
             }
+            "4" => {
+                // Palette color query: `Ps;?` pairs, optionally
+                // repeated (`4;0;?;1;?;…`). Surface the queried indices;
+                // the UI answers each from the live palette (theme
+                // fallback). Set forms (`4;Ps;rgb:…`) are libghostty's
+                // to apply and aren't surfaced here.
+                let indices = parse_osc4_query(body);
+                if !indices.is_empty() {
+                    self.pending.push(OscEvent::PaletteQuery(indices));
+                }
+            }
             _ => {
                 // Unhandled OSC command. libghostty handles many
-                // others (4 = palette, 8 = hyperlink, 110/111 = reset
-                // colors, …); we don't need to route those daemon-side.
+                // others (8 = hyperlink, 110/111 = reset colors, …);
+                // we don't need to route those daemon-side.
             }
         }
     }
@@ -503,6 +522,44 @@ pub fn format_color_query_response(n: u8, color: (u8, u8, u8)) -> Option<Vec<u8>
         )
         .into_bytes(),
     )
+}
+
+/// Parse an OSC 4 query body into the queried palette indices.
+///
+/// Body is `Ps;Pc[;Ps;Pc…]`: each `Ps` is a palette index (0..=255)
+/// and `Pc` is `?` (query) or a color spec (set). Only `?` (query)
+/// pairs are returned — set pairs are libghostty's to apply.
+/// Out-of-range / unparseable indices and a trailing unpaired field
+/// are skipped.
+fn parse_osc4_query(body: &str) -> Vec<u8> {
+    let mut fields = body.split(';');
+    let mut indices = Vec::new();
+    while let Some(idx) = fields.next() {
+        let Some(spec) = fields.next() else {
+            break; // trailing unpaired field
+        };
+        if spec == "?" {
+            if let Ok(n) = idx.parse::<u8>() {
+                indices.push(n);
+            }
+        }
+    }
+    indices
+}
+
+/// Format an OSC 4 palette-query reply:
+/// `ESC]4;<index>;rgb:RRRR/GGGG/BBBB BEL`.
+///
+/// Mirrors [`format_color_query_response`]'s 16-bit-per-channel,
+/// BEL-terminated XTerm form (each 8-bit channel doubled). The index
+/// echoes the queried palette slot (0..=255).
+pub fn format_palette_query_response(index: u8, color: (u8, u8, u8)) -> Vec<u8> {
+    let (r, g, b) = color;
+    format!(
+        "\x1b]4;{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
+        index, r, r, g, g, b, b
+    )
+    .into_bytes()
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -807,6 +864,78 @@ mod tests {
         // — would otherwise be silently invisible in the BEL bytes.
         let bytes = format_color_query_response(11, (0x12, 0x34, 0x56)).expect("Some");
         assert_eq!(bytes, b"\x1b]11;rgb:1212/3434/5656\x07");
+    }
+
+    // OSC 4 (palette color queries)
+
+    #[test]
+    fn osc4_single_query_emits() {
+        // The gate opencode/opentui probes with: `ESC]4;0;?`.
+        let events = feed_all(b"\x1b]4;0;?\x07");
+        assert_eq!(events, vec![OscEvent::PaletteQuery(vec![0])]);
+    }
+
+    #[test]
+    fn osc4_query_st_terminator() {
+        let events = feed_all(b"\x1b]4;1;?\x1b\\");
+        assert_eq!(events, vec![OscEvent::PaletteQuery(vec![1])]);
+    }
+
+    #[test]
+    fn osc4_multi_index_query_emits() {
+        let events = feed_all(b"\x1b]4;0;?;1;?;255;?\x07");
+        assert_eq!(events, vec![OscEvent::PaletteQuery(vec![0, 1, 255])]);
+    }
+
+    #[test]
+    fn osc4_set_dropped() {
+        // Set form is libghostty's to apply — not surfaced.
+        let events = feed_all(b"\x1b]4;2;rgb:de/ad/be\x07");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn osc4_mixed_set_and_query_surfaces_only_query() {
+        let events = feed_all(b"\x1b]4;0;rgb:11/22/33;1;?\x07");
+        assert_eq!(events, vec![OscEvent::PaletteQuery(vec![1])]);
+    }
+
+    #[test]
+    fn osc4_split_across_feeds() {
+        let mut s = OscScanner::new();
+        let a = s.feed(b"\x1b]4;0;");
+        assert!(a.is_empty());
+        let b = s.feed(b"?\x07");
+        assert_eq!(b, vec![OscEvent::PaletteQuery(vec![0])]);
+    }
+
+    #[test]
+    fn osc4_out_of_range_index_skipped() {
+        // 256 doesn't fit a palette slot — skip it, keep the valid one.
+        let events = feed_all(b"\x1b]4;256;?;7;?\x07");
+        assert_eq!(events, vec![OscEvent::PaletteQuery(vec![7])]);
+    }
+
+    #[test]
+    fn osc4_incomplete_pair_dropped() {
+        // `4;0` with no `?`/color is incomplete — nothing surfaced.
+        let events = feed_all(b"\x1b]4;0\x07");
+        assert!(events.is_empty());
+    }
+
+    // -- format_palette_query_response: byte-exact, mirrors
+    //    format_color_query_response's 16-bit channels + BEL.
+
+    #[test]
+    fn format_palette_query_response_byte_exact() {
+        let bytes = format_palette_query_response(0, (0x12, 0x34, 0x56));
+        assert_eq!(bytes, b"\x1b]4;0;rgb:1212/3434/5656\x07");
+    }
+
+    #[test]
+    fn format_palette_query_response_index_echoed() {
+        let bytes = format_palette_query_response(231, (0xFF, 0x00, 0x80));
+        assert_eq!(bytes, b"\x1b]4;231;rgb:ffff/0000/8080\x07");
     }
 
     // Multiple sequences
