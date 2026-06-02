@@ -9,6 +9,37 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.8 — 2026-06-02
+
+Terminal color-fidelity release. Fixes a palette bug that made every 256-color
+TUI (vim, htop, lazygit — and notably **opencode over SSH**) render the wrong
+colors, and adds OSC 4 palette-query replies so color-detecting TUIs read
+roost's palette correctly.
+
+### Features
+
+- **OSC 4 palette-query replies (#208)** — roost now answers `OSC 4;Ps;?`
+  palette queries from its live palette (reflecting any mid-session
+  `OSC 4;Ps;rgb:…` set), mirroring the existing OSC 10/11/12 replies. opentui-
+  based TUIs (opencode in local mode, among others) gate their color detection
+  on the OSC 4 reply. `docs/reference/terminal-queries.md` documents roost's two
+  reply-channel model — embedder-synthesized OSC colors vs. the planned
+  libghostty `write_pty` device-query channel (tracked in #209).
+
+### Fixes
+
+- **256-color palette: cube + grayscale ramp (#207)** — roost's theme palette
+  only populated the 16 ANSI colors; the xterm 6×6×6 color cube (16–231) and
+  24-step grayscale ramp (232–255) were a flat placeholder (`#808080` gray on
+  Mac, black on Linux). Because `set_color_palette` pushes the full 256-entry
+  array, it also overwrote libghostty's correct compiled-in cube — so every
+  `SGR 48;5;N` / `38;5;N` cell rendered the same wrong color. Most visible over
+  SSH: **opencode in a shed** uses 256-color (because `COLORTERM` is unset
+  there), so its `#080808` background rendered as `#808080` gray and was
+  unreadable. Both UIs now compute the standard xterm-256 palette (cube levels
+  `[0,95,135,175,215,255]`, grayscale `8+10·n`) as the base, with theme files
+  overriding on top. Affects every 256-color TUI, locally and over SSH.
+
 ## v0.0.7 — 2026-06-01
 
 Command-palette polish release. The palette gains a **Select Font…** picker that
