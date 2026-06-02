@@ -73,8 +73,44 @@ struct Theme: Sendable {
         selectionBackground: NSColor(srgbRed: 0.247, green: 0.388, blue: 0.545, alpha: 1),
         selectionForeground: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1),
         boldColor: nil,
-        palette: Array(repeating: NSColor.gray, count: 256)
+        palette: Theme.standardXterm256Palette()
     )
+
+    /// The standard xterm 256-color palette: 16 ANSI colors (0–15), the
+    /// 6×6×6 color cube (16–231), and the 24-step grayscale ramp
+    /// (232–255). Used as the palette BASE that theme files override on
+    /// top of — a theme file only specifies the 16 ANSI slots, so without
+    /// this base every 256-color index (`SGR 48;5;N` / `38;5;N`) fell back
+    /// to a flat placeholder and rendered the same wrong color. 256-color
+    /// TUIs (vim/htop/lazygit, and opencode over SSH where COLORTERM is
+    /// unset) depend on the cube + ramp being correct. Matches libghostty's
+    /// and xterm's computed values.
+    static func standardXterm256Palette() -> [NSColor] {
+        func srgb(_ r: Int, _ g: Int, _ b: Int) -> NSColor {
+            NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
+        }
+        var p: [NSColor] = []
+        p.reserveCapacity(256)
+        // 0–15: standard ANSI (normal + bright).
+        let ansi = [
+            (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
+            (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+            (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+            (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+        ]
+        for (r, g, b) in ansi { p.append(srgb(r, g, b)) }
+        // 16–231: 6×6×6 color cube. Channel levels are 0, then 95+40·n.
+        let levels = [0, 95, 135, 175, 215, 255]
+        for i in 0..<216 {
+            p.append(srgb(levels[(i / 36) % 6], levels[(i / 6) % 6], levels[i % 6]))
+        }
+        // 232–255: 24-step grayscale ramp, 8 + 10·n.
+        for i in 0..<24 {
+            let v = 8 + i * 10
+            p.append(srgb(v, v, v))
+        }
+        return p
+    }
 
     /// Look up a theme by bundled file name. Names match the
     /// embedded filenames verbatim (`"Dracula+"`, `"Catppuccin

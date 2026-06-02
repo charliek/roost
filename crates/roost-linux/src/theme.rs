@@ -36,10 +36,14 @@ impl Theme {
     /// Hard-coded roost-dark, used as fallback when parsing a theme
     /// file fails or no bundled theme matches the user's choice.
     pub fn roost_dark_fallback() -> Self {
-        let mut palette = [ColorRgb::default(); 256];
-        // libghostty's compiled-in palette is reasonable for indices
-        // we don't override; the bundled theme will populate the
-        // load_bundled path when the user picks a real theme.
+        // Start from the full standard xterm 256-color palette so the
+        // 6×6×6 cube (16–231) + grayscale ramp (232–255) are correct;
+        // the theme's own ANSI colors (0–7 here, 0–15 in theme files)
+        // override on top. Without this base, indices 16–255 were a flat
+        // placeholder and every `SGR 48;5;N` cell rendered the same wrong
+        // color — `set_color_palette` pushes the full 256-entry array, so
+        // it overwrote libghostty's correct compiled-in cube/ramp too.
+        let mut palette = standard_xterm_256();
         palette[0] = ColorRgb::new(0x1a, 0x1a, 0x1a);
         palette[1] = ColorRgb::new(0xcc, 0x37, 0x2e);
         palette[2] = ColorRgb::new(0x26, 0xa4, 0x39);
@@ -126,6 +130,49 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
         include_str!("../../../cmd/roost/themes/TokyoNight"),
     ),
 ];
+
+/// The standard xterm 256-color palette: 16 ANSI colors (0–15), the
+/// 6×6×6 color cube (16–231), and the 24-step grayscale ramp (232–255).
+/// Used as the palette base so 256-color content (`SGR 48;5;N` /
+/// `38;5;N` — vim/htop/lazygit, and opencode over SSH where COLORTERM is
+/// unset) renders correctly even when a theme file only defines the 16
+/// ANSI slots. Matches libghostty's and xterm's computed values.
+fn standard_xterm_256() -> [ColorRgb; 256] {
+    let mut p = [ColorRgb::default(); 256];
+    // 0–15: standard ANSI (normal + bright).
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    for (i, &(r, g, b)) in ANSI.iter().enumerate() {
+        p[i] = ColorRgb::new(r, g, b);
+    }
+    // 16–231: 6×6×6 color cube. Channel levels are 0, then 95 + 40·n.
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    for i in 0..216 {
+        p[16 + i] = ColorRgb::new(LEVELS[(i / 36) % 6], LEVELS[(i / 6) % 6], LEVELS[i % 6]);
+    }
+    // 232–255: 24-step grayscale ramp, 8 + 10·n.
+    for i in 0..24 {
+        let v = 8 + (i as u8) * 10;
+        p[232 + i] = ColorRgb::new(v, v, v);
+    }
+    p
+}
 
 fn parse_theme(content: &str) -> Option<Theme> {
     let mut t = Theme::roost_dark_fallback();
@@ -283,5 +330,44 @@ mod tests {
         let snippet = "foreground = #ffffff\nbold-color = #aabbcc\n";
         let parsed = parse_theme(snippet).expect("snippet has parseable lines");
         assert_eq!(parsed.bold_color, Some(ColorRgb::new(0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn standard_xterm_256_cube_and_grayscale() {
+        let p = standard_xterm_256();
+        // 6×6×6 cube corners.
+        assert_eq!(p[16], ColorRgb::new(0, 0, 0), "cube black");
+        assert_eq!(p[231], ColorRgb::new(255, 255, 255), "cube white");
+        assert_eq!(p[21], ColorRgb::new(0, 0, 255), "cube blue");
+        assert_eq!(p[196], ColorRgb::new(255, 0, 0), "cube red");
+        assert_eq!(p[46], ColorRgb::new(0, 255, 0), "cube green");
+        // Grayscale ramp ends.
+        assert_eq!(p[232], ColorRgb::new(8, 8, 8), "gray ramp start");
+        assert_eq!(p[255], ColorRgb::new(238, 238, 238), "gray ramp end");
+        // ANSI base.
+        assert_eq!(p[15], ColorRgb::new(255, 255, 255), "ansi white");
+    }
+
+    #[test]
+    fn themes_populate_256_color_cube_not_placeholder() {
+        // Regression: opencode over SSH (256-color, COLORTERM unset)
+        // backgrounds with `48;5;232` (#080808). Pre-fix indices 16–255
+        // were a flat placeholder so every 256-color cell rendered the
+        // same wrong color. The cube/ramp must survive theme loading even
+        // though theme files only define the 16 ANSI slots.
+        for name in Theme::bundled_names() {
+            let t = Theme::load_bundled(&name);
+            assert_eq!(t.palette[232], ColorRgb::new(8, 8, 8), "{name}: gray 232");
+            assert_eq!(
+                t.palette[196],
+                ColorRgb::new(255, 0, 0),
+                "{name}: cube red 196"
+            );
+            assert_eq!(
+                t.palette[21],
+                ColorRgb::new(0, 0, 255),
+                "{name}: cube blue 21"
+            );
+        }
     }
 }
