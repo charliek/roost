@@ -372,6 +372,37 @@ pub struct PaletteStateResult {
     pub items: Vec<PaletteItemView>,
 }
 
+/// `palette.present` params: open the palette on a caller-supplied list
+/// of rows and block until the user picks one or dismisses. This is the
+/// programmatic twin of the command palette — a script (or a Roost
+/// provider) hands Roost a list and Roost returns the chosen `id`. The
+/// item shape is the same [`PaletteItemView`] the read ops emit, so the
+/// "present a list / read a list" contract is one schema. `title` and
+/// `placeholder` are optional chrome; `items` is required (an empty list
+/// is rejected `invalid-param` — nothing to present).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PalettePresentParams {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub placeholder: String,
+    pub items: Vec<PaletteItemView>,
+}
+
+/// Reply for `palette.present`: the user's choice. `selected_id` carries
+/// the activated row's id; `dismissed` is true when the user closed the
+/// palette without picking (Esc / focus loss / another palette opening
+/// over it). Exactly one is meaningful — `dismissed: true` leaves
+/// `selected_id` `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PalettePresentResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_id: Option<String>,
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
 // ============================================================================
 // Selection + clipboard (test ops, drive selection + read/seed pasteboard)
 // ============================================================================
@@ -961,6 +992,12 @@ pub mod ops {
     pub const PALETTE_QUERY: &str = "palette.query";
     pub const PALETTE_ACTIVATE: &str = "palette.activate";
     pub const PALETTE_DISMISS: &str = "palette.dismiss";
+    /// Open the palette on a caller-supplied list and block until the
+    /// user picks a row or dismisses. The programmatic twin of the
+    /// command palette: a script or a Roost provider hands Roost the
+    /// rows and gets back the chosen id. UI-only — routed through the
+    /// UI seam, not the workspace.
+    pub const PALETTE_PRESENT: &str = "palette.present";
 
     /// Selection + clipboard test ops — drive selection state and
     /// read/seed the host clipboard end-to-end. See module docs above
@@ -1390,6 +1427,47 @@ mod tests {
         let json = serde_json::to_string(&closed).unwrap();
         assert!(!json.contains("frame"), "closed state omits frame: {json}");
         round_trip(&closed);
+    }
+
+    #[test]
+    fn palette_present_round_trips() {
+        let present = PalettePresentParams {
+            title: "Open shed".into(),
+            placeholder: "Pick a service…".into(),
+            items: vec![
+                PaletteItemView {
+                    id: "web".into(),
+                    title: "shed: web".into(),
+                    subtitle: Some("../shed/web".into()),
+                },
+                PaletteItemView {
+                    id: "api".into(),
+                    title: "shed: api".into(),
+                    subtitle: None,
+                },
+            ],
+        };
+        round_trip(&present);
+        // Strict envelope: unknown top-level fields are rejected.
+        assert!(serde_json::from_str::<PalettePresentParams>(r#"{"items":[],"bogus":1}"#).is_err());
+
+        // A picked row carries `selected_id`, `dismissed` false.
+        let picked = PalettePresentResult {
+            selected_id: Some("api".into()),
+            dismissed: false,
+        };
+        round_trip(&picked);
+        // Dismissal omits `selected_id` on the wire.
+        let dismissed = PalettePresentResult {
+            selected_id: None,
+            dismissed: true,
+        };
+        let json = serde_json::to_string(&dismissed).unwrap();
+        assert!(
+            !json.contains("selected_id"),
+            "dismissal omits selected_id: {json}"
+        );
+        round_trip(&dismissed);
     }
 
     #[test]

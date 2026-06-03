@@ -412,11 +412,12 @@ rows in display order (`subtitle` present on rows that have one).
 
 | Op | Request params | Notes |
 |---|---|---|
-| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher. Other values → `invalid-param`. |
+| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette. Other values → `invalid-param`. |
 | `palette.state` | `{}` | Read the current state. |
 | `palette.query` | `{"query": "theme"}` | Set the current frame's filter (resets selection to the top match). |
 | `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |
 | `palette.dismiss` | `{}` | Close any open palette. |
+| `palette.present` | `{"title": "Open shed", "items": [{"id": "web", "title": "shed: web"}]}` | Open the palette on a caller-supplied list and **block** until the user picks a row or dismisses. Replies `{"selected_id"?, "dismissed"}` — `selected_id` is omitted on dismissal. `invalid-param` if `items` is empty. The programmatic twin of the command palette (and the same item schema a [provider](../guides/extending.md#3-dynamic-providers) prints). v1 limitation: if the client disconnects while blocked, the palette stays open until the user dismisses it (no server-side cancellation yet). |
 
 ### Selection + clipboard test ops (`selection.*` / `clipboard.*`)
 

@@ -59,6 +59,11 @@ enum KeybindAction {
     /// Cmd+Shift+T custom command launcher. Like `commandPalette`,
     /// Mac-and-GTK only (no Go counterpart).
     static let commandLauncher = "command_launcher"
+    /// Cmd+Shift+E custom palette — the dynamic, script-backed picker
+    /// (`provider =` list + discovered scripts). `…+shift+r` would be the
+    /// "R for Run" mnemonic but RenameProject owns it; `…+shift+e`
+    /// ("Extensions") is free. Users rebind to `…+shift+r` via config.
+    static let customPalette = "custom_palette"
     static let unbind        = "unbind"
 
     /// `switch_project_N` (1..9). Defined as a function rather than
@@ -74,7 +79,7 @@ enum KeybindAction {
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
         paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
-        jumpToUnread, commandPalette, commandLauncher,
+        jumpToUnread, commandPalette, commandLauncher, customPalette,
     ]
 
     /// True if `action` is a recognized name (including the
@@ -240,6 +245,9 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.commandPalette: ["\(primary)+shift+p"],
         // ⌘⇧T — custom command launcher. ⌘T is New Tab; ⌘⇧T is free.
         KeybindAction.commandLauncher: ["\(primary)+shift+t"],
+        // ⌘⇧E — custom palette (providers). ⌘⇧R is RenameProject, so
+        // "E for Extensions" rather than steal it.
+        KeybindAction.customPalette: ["\(primary)+shift+e"],
         // Browser-style font sizing. + and = both bind because
         // cmd-+ on US layouts is really cmd-shift-=, and many
         // users hit cmd-= without the shift.

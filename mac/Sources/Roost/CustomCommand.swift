@@ -130,8 +130,9 @@ func launchIndex(_ id: String) -> Int? {
 
 /// Quote-aware tokenizer: a `"` toggles quote mode (and is dropped),
 /// unquoted whitespace ends a token, everything else accumulates. Empty
-/// tokens (a stray `""`) are dropped.
-private func tokenizeCommand(_ s: String) -> [String] {
+/// tokens (a stray `""`) are dropped. Shared with `Provider.swift`, which
+/// parses `provider =` records in the same `key="value"` grammar.
+func tokenizeCommand(_ s: String) -> [String] {
     var tokens: [String] = []
     var cur = ""
     var inQuote = false

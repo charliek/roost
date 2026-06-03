@@ -15,6 +15,17 @@ func commandPaletteBoundToSuperShiftPByDefault() throws {
 }
 
 @Test
+func customPaletteBoundToSuperShiftEAndNotStealingRenameProject() throws {
+    let table = canonicalizeBindings(defaults: defaultBindingsMac(), user: [], warn: noWarn)
+    let custom = try #require(triggerToAccel("super+shift+e"))
+    #expect(table[custom] == KeybindAction.customPalette)
+    // ⌘⇧R must still belong to RenameProject (the custom palette took ⌘⇧E
+    // precisely to avoid stealing it).
+    let renameProject = try #require(triggerToAccel("super+shift+r"))
+    #expect(table[renameProject] == KeybindAction.renameProject)
+}
+
+@Test
 func userCanUnbindCommandPalette() throws {
     let table = canonicalizeBindings(
         defaults: defaultBindingsMac(),

@@ -92,6 +92,11 @@ struct RoostConfig: Sendable {
     /// order (= picker row order). A line missing `label`/`run` is
     /// skipped (see `parseCommandLine`).
     var commands: [CustomCommand] = []
+    /// Dynamic, script-backed providers — `provider =` config lines (in
+    /// source order) followed by executables discovered under the
+    /// `providers/` dir next to the config file. Drive the custom palette
+    /// (⌘⇧E). See `Provider.swift`.
+    var providers: [Provider] = []
     /// `copy-on-select` setting — controls what mouse-drag selections
     /// write to the clipboard on release. Defaults to `.on` (matches
     /// Ghostty's default on macOS).
@@ -116,6 +121,7 @@ struct RoostConfig: Sendable {
         tabMaxWidth: nil,
         keybinds: [],
         commands: [],
+        providers: [],
         copyOnSelect: .default,
         clipboardWrite: .default,
         wordBreakChars: WordSelection.defaultWordChars
@@ -125,10 +131,11 @@ struct RoostConfig: Sendable {
     /// the file doesn't exist, is empty, or fails to parse — a
     /// missing config is the common path, not an error.
     static func load(from path: URL = defaultPath()) -> RoostConfig {
-        guard let text = try? String(contentsOf: path, encoding: .utf8) else {
-            return .empty
-        }
-        return parse(text)
+        var cfg = (try? String(contentsOf: path, encoding: .utf8)).map(parse) ?? .empty
+        // Discovered providers append after any `provider =` config
+        // entries, so config order wins and the dir fills in the rest.
+        cfg.providers.append(contentsOf: discoverProviders(dir: providersDir(configPath: path)))
+        return cfg
     }
 
     /// `~/.config/roost/config.conf` — XDG-style even on macOS, by
@@ -367,6 +374,14 @@ func parse(_ text: String) -> RoostConfig {
             } else {
                 NSLog("roost-mac: skipping malformed `command =` line (needs label + run)")
             }
+        case "provider":
+            // Dynamic provider: `provider = label="…" run="…" …`. Same
+            // grammar as `command =`; a line missing label/run is skipped.
+            if let p = parseProviderLine(rawValue) {
+                cfg.providers.append(p)
+            } else {
+                NSLog("roost-mac: skipping malformed `provider =` line (needs label + run)")
+            }
         default:
             // Many other keys are valid in the Go binary's config
             // (font-style, …); silently drop the ones M6/P1 don't
@@ -375,4 +390,39 @@ func parse(_ text: String) -> RoostConfig {
         }
     }
     return cfg
+}
+
+/// The `providers/` directory beside the config file (so the E2E
+/// harness's `ROOST_CONFIG` override scopes discovery to its temp dir,
+/// just like it scopes the launcher's `command =` entries).
+func providersDir(configPath: URL) -> URL {
+    configPath.deletingLastPathComponent().appendingPathComponent("providers")
+}
+
+/// Discover executable provider scripts in `dir`, sorted by filename for
+/// a stable row order. Non-files, non-executables, and dotfiles are
+/// skipped; a missing dir yields an empty list. The first ~2 KiB of each
+/// file is read for `# @roost.label:` / `# @roost.title:` metadata.
+func discoverProviders(dir: URL) -> [Provider] {
+    let fm = FileManager.default
+    guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return [] }
+    var providers: [Provider] = []
+    for name in names.sorted() {
+        if name.hasPrefix(".") { continue }
+        let path = dir.appendingPathComponent(name).path
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
+        guard fm.isExecutableFile(atPath: path) else { continue }
+        let header = readProviderHeader(path)
+        providers.append(providerFromFile(path: path, filename: name, header: header))
+    }
+    return providers
+}
+
+/// Read the leading bytes of a script for header-comment metadata.
+private func readProviderHeader(_ path: String) -> String {
+    guard let fh = FileHandle(forReadingAtPath: path) else { return "" }
+    defer { try? fh.close() }
+    let data = (try? fh.read(upToCount: 2048)) ?? Data()
+    return String(decoding: data, as: UTF8.self)
 }

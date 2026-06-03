@@ -215,6 +215,15 @@ class Roost:
     def palette_dismiss(self) -> dict:
         return self.call("palette.dismiss")
 
+    def palette_present(self, items: list[dict], title: str = "", placeholder: str = "") -> dict:
+        """Present a caller-supplied list and BLOCK until the user picks a
+        row or dismisses. Returns ``{"selected_id"?, "dismissed"}``. Because
+        it blocks, drive the selection from a *second* connection (or a
+        thread) — see test_provider.py."""
+        return self.call(
+            "palette.present", {"title": title, "placeholder": placeholder, "items": items}
+        )
+
     # -- selection + clipboard (test ops) --------------------------------
     # Mirror the user-driven drag flow (`selection.set` ~ mouseDown +
     # drag), reading back via `selection.dump`. The host clipboard is

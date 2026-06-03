@@ -175,6 +175,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     private var socketPath: String = ""
 
+    /// Monotonic counter for provider sub-frame ids (see
+    /// `nextProviderFrameID`). Main-actor isolated like the rest of the app.
+    private var providerFrameSeq = 0
+
+    /// Monotonic token bumped per provider run, so a superseded run's late
+    /// result (provider A in flight, user picks B) is dropped rather than
+    /// pushing a stale frame onto the current one.
+    private var providerReq = 0
+
     /// M4c: the single-instance flock held for the lifetime of the
     /// process. Released when the holder is dropped (the lock fd is
     /// closed in `SingleInstance.deinit`), which happens at app
@@ -1002,6 +1011,166 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: insertedIndex)
     }
 
+    // MARK: - Custom palette (Cmd+Shift+E) — script-backed providers
+
+    /// Open the custom palette on the configured provider list
+    /// (`provider =` entries + discovered scripts), presented as the root
+    /// frame like the launcher. No-op if a palette is already open.
+    @objc @MainActor
+    private func showCustomPalette(_ sender: Any?) {
+        guard palette == nil, let window else { return }
+        paletteOpen = true
+        let providers = RoostConfig.load().providers
+        let panel = PalettePanel(
+            parent: window,
+            contentRegion: terminalContainer,
+            root: providerListFrame(providers),
+            behavior: providerListBehavior(providers)
+        ) { [weak self] in
+            self?.dismissPalette()
+        }
+        palette = panel
+        panel.present()
+    }
+
+    /// The provider-list frame: one row per configured provider (or the
+    /// "No providers configured" sentinel when empty).
+    @MainActor
+    private func providerListFrame(_ providers: [Provider]) -> PaletteFrame {
+        PaletteFrame(id: "custom", placeholder: "Custom commands…", items: providerItems(providers))
+    }
+
+    /// Confirm on a provider row → run its `list` phase off-main, then
+    /// drill into the resulting rows (pushed asynchronously). The
+    /// `provider:none` sentinel and any stale id are a no-op.
+    @MainActor
+    private func providerListBehavior(_ providers: [Provider]) -> PaletteBehavior {
+        PaletteBehavior(onConfirm: { [weak self] item in
+            guard let self else { return .close }
+            guard let idx = providerIndex(item.id), providers.indices.contains(idx) else {
+                return .none
+            }
+            let provider = providers[idx]
+            Task { @MainActor in await self.openProviderList(provider) }
+            return .none
+        })
+    }
+
+    /// Run a provider's `list` phase and push its rows as a sub-frame. If
+    /// the palette closed while the script ran, the result is dropped.
+    @MainActor
+    private func openProviderList(_ provider: Provider) async {
+        let want = palette
+        providerReq += 1
+        let req = providerReq
+        let result = await runProvider(provider, phase: .list, selectedID: nil)
+        // Apply only if no newer provider run superseded this one and the
+        // palette that asked for it is still on screen — a dismiss + reopen
+        // during the spawn must not be clobbered.
+        guard req == providerReq, let panel = palette, panel === want, panel.isLive else { return }
+        pushProviderResult(panel: panel, provider: provider, result: result)
+    }
+
+    /// Confirm on a provider item → run its `activate` phase with the
+    /// selected id. The script acts (usually via `$ROOST_SOCKET`); its
+    /// stdout may drill in (more rows) or be empty (close the palette).
+    @MainActor
+    private func providerItemBehavior(_ provider: Provider) -> PaletteBehavior {
+        PaletteBehavior(onConfirm: { [weak self] item in
+            // Non-actionable rows (overflow hint, error) stay put.
+            // Only the overflow hint is non-actionable here (error rows
+            // live in their own no-op-behavior frame); exact-match the
+            // reserved id so a provider's real item id isn't swallowed.
+            if item.id == providerOverflowID { return .none }
+            guard let self else { return .close }
+            Task { @MainActor in await self.activateProviderItem(provider, selectedID: item.id) }
+            return .none
+        })
+    }
+
+    @MainActor
+    private func activateProviderItem(_ provider: Provider, selectedID: String) async {
+        let want = palette
+        providerReq += 1
+        let req = providerReq
+        let result = await runProvider(provider, phase: .activate, selectedID: selectedID)
+        // Same stale-result guard as `openProviderList` (newer run + panel).
+        guard req == providerReq, let panel = palette, panel === want, panel.isLive else { return }
+        // Empty success = "done, close"; rows or error drills in / shows it.
+        if case .success(let out) = result, out.items.isEmpty {
+            panel.driveDismiss()
+        } else {
+            pushProviderResult(panel: panel, provider: provider, result: result)
+        }
+    }
+
+    /// Push a provider's parsed output (or an error row) as a sub-frame.
+    @MainActor
+    private func pushProviderResult(
+        panel: PalettePanel, provider: Provider, result: Result<ProviderOutput, ProviderError>
+    ) {
+        switch result {
+        case .success(let out):
+            let placeholder = out.placeholder.isEmpty ? "\(provider.title)…" : out.placeholder
+            let frame = PaletteFrame(
+                id: nextProviderFrameID(), placeholder: placeholder,
+                items: providerOutputPaletteItems(out, limit: provider.limit))
+            panel.drivePush(frame: frame, behavior: providerItemBehavior(provider))
+        case .failure(let err):
+            let msg = err.message
+            NSLog("roost-mac: provider '%@' failed: %@", provider.label, msg)
+            let frame = PaletteFrame(
+                id: nextProviderFrameID(), placeholder: "Provider error",
+                items: [PaletteItem(id: "provider:_error", title: "Provider failed", subtitle: msg)])
+            panel.drivePush(frame: frame, behavior: PaletteBehavior(onConfirm: { _ in .none }))
+        }
+    }
+
+    /// Assemble the active-tab context handed to a provider run.
+    @MainActor
+    private func providerContext(selectedID: String?) -> ProviderContext {
+        var ctx = ProviderContext()
+        ctx.socket = socketPath
+        ctx.selectedID = selectedID
+        ctx.query = palette?.driveSnapshot().query ?? ""
+        if let pid = activeProjectID {
+            ctx.activeProjectID = pid
+            ctx.activeCwd = activeLaunchCwd(projectID: pid)
+            if let session = activeSessionByProject[pid] {
+                ctx.activeTabID = session.id
+                ctx.activeTitle = session.liveTitle ?? ""
+            }
+        }
+        return ctx
+    }
+
+    /// Run one provider phase as a subprocess (off the main actor, with
+    /// the provider's timeout) and parse its stdout.
+    @MainActor
+    private func runProvider(
+        _ provider: Provider, phase: ProviderPhase, selectedID: String?
+    ) async -> Result<ProviderOutput, ProviderError> {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
+        let ctx = providerContext(selectedID: selectedID)
+        let argv = providerInvocationArgv(
+            shell: shell, run: provider.run, shellInterpret: provider.shellInterpret, phase: phase)
+        let env = providerInvocationEnv(phase: phase, ctx: ctx)
+        let stdinStr = providerInvocationStdin(phase: phase, ctx: ctx)
+        let cwd = ctx.activeCwd
+        let timeout = provider.timeoutSecs
+        return await Task.detached(priority: .userInitiated) {
+            runProviderProcess(argv: argv, env: env, stdin: stdinStr, cwd: cwd, timeoutSecs: timeout)
+        }.value
+    }
+
+    /// Monotonic id for a pushed provider sub-frame, so nested drill-ins
+    /// don't share a behaviors-map key (which a pop would remove for both).
+    @MainActor
+    private func nextProviderFrameID() -> String {
+        providerFrameSeq += 1
+        return "provider:items:\(providerFrameSeq)"
+    }
+
     /// The launch cwd: the active tab's live (OSC 7-tracked) cwd, else
     /// the project's cwd, else "" (the open-tab path then resolves
     /// $HOME). Mirrors `updateWindowTitle`'s cwd resolution.
@@ -1043,6 +1212,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         case PaletteCommands.clearNotificationsID:
             clearAllNotifications()
             return .close
+        case "custom_commands":
+            // Dynamic drill-in surfaced in the command palette when
+            // providers are configured. Reload fresh (matches the
+            // launcher) and push the custom frame.
+            let providers = RoostConfig.load().providers
+            return .push(providerListFrame(providers), providerListBehavior(providers))
         default:
             runCommand(item.id)
             return .close
@@ -1071,6 +1246,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         ]
         let insertAt = (items.firstIndex { $0.id == PaletteCommands.selectFontID }).map { $0 + 1 } ?? items.count
         items.insert(contentsOf: notifItems, at: insertAt)
+        // Surface the custom palette (script-backed providers) as a
+        // drill-in row, but only when at least one provider is configured.
+        if !RoostConfig.load().providers.isEmpty {
+            items.append(
+                PaletteItem(
+                    id: "custom_commands", title: "Custom Commands…",
+                    trailingText: shortcutText(for: KeybindAction.customPalette)))
+        }
         return items
     }
 
@@ -1568,7 +1751,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // re-press is a harmless no-op.
         if paletteOpen,
             menuItem.action != #selector(showCommandPalette(_:)),
-            menuItem.action != #selector(showCommandLauncher(_:))
+            menuItem.action != #selector(showCommandLauncher(_:)),
+            menuItem.action != #selector(showCustomPalette(_:))
         {
             return false
         }
@@ -3205,6 +3389,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         launcherItem.target = self
         bind(launcherItem, to: KeybindAction.commandLauncher)
         viewMenu.addItem(launcherItem)
+        let customPaletteItem = NSMenuItem(
+            title: "Custom Commands…",
+            action: #selector(showCustomPalette(_:)),
+            keyEquivalent: ""
+        )
+        customPaletteItem.target = self
+        bind(customPaletteItem, to: KeybindAction.customPalette)
+        viewMenu.addItem(customPaletteItem)
         viewMenu.addItem(.separator())
         let zoomInItem = NSMenuItem(
             title: "Zoom In",
@@ -4531,6 +4723,165 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
     }
 }
 
+/// Holds the continuation for a `palette.present` so the confirm and
+/// dismiss closures can race to resume it exactly once. `@unchecked
+/// Sendable` (NSLock-guarded) so it crosses the (main-actor) closure
+/// boundaries the checker can't prove.
+private final class PresentResumeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<String?, Never>?
+    init(_ c: CheckedContinuation<String?, Never>) { cont = c }
+    func resume(_ value: String?) {
+        lock.lock()
+        let c = cont
+        cont = nil
+        lock.unlock()
+        c?.resume(returning: value)
+    }
+}
+
+/// `@unchecked Sendable` box so the timeout watchdog (on a background
+/// queue) can terminate the `Process` (which isn't `Sendable`).
+private final class ProcBox: @unchecked Sendable {
+    let p: Process
+    init(_ p: Process) { self.p = p }
+}
+
+/// Drains one pipe to EOF on a background queue, so stdout and stderr can
+/// be read concurrently (a child that fills one pipe while we block on the
+/// other can't deadlock). `@unchecked Sendable` (NSLock-guarded) so it
+/// crosses the dispatch closure boundary.
+private final class PipeDrain: @unchecked Sendable {
+    private let fh: FileHandle
+    private let lock = NSLock()
+    private var data = Data()
+    init(_ fh: FileHandle) { self.fh = fh }
+    func drain() {
+        let d = fh.readDataToEndOfFile()
+        lock.lock()
+        data = d
+        lock.unlock()
+    }
+    func result() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
+/// Tiny thread-safe flag for "the watchdog fired".
+private final class TimeoutFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+    func get() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+/// Run a provider phase as a subprocess (blocking — call off the main
+/// actor). Writes the context JSON to stdin, reads stdout/stderr, and
+/// enforces `timeoutSecs` via a watchdog that terminates the child.
+/// Mirrors `run_provider_subprocess` on the GTK side.
+private func runProviderProcess(
+    argv: [String], env: [(String, String)], stdin: String, cwd: String, timeoutSecs: UInt64
+) -> Result<ProviderOutput, ProviderError> {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: argv[0])
+    proc.arguments = Array(argv.dropFirst())
+    var environment = ProcessInfo.processInfo.environment
+    for (k, v) in env { environment[k] = v }
+    proc.environment = environment
+    // Only set the cwd if it still exists — the active tab's dir may have
+    // been removed; don't let that fail the whole spawn.
+    var cwdIsDir: ObjCBool = false
+    if !cwd.isEmpty, FileManager.default.fileExists(atPath: cwd, isDirectory: &cwdIsDir),
+        cwdIsDir.boolValue
+    {
+        proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    }
+
+    let inPipe = Pipe()
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    proc.standardInput = inPipe
+    proc.standardOutput = outPipe
+    proc.standardError = errPipe
+
+    do {
+        try proc.run()
+    } catch {
+        return .failure(ProviderError(message: "spawn provider: \(error.localizedDescription)"))
+    }
+
+    if let data = stdin.data(using: .utf8), !data.isEmpty {
+        inPipe.fileHandleForWriting.write(data)
+    }
+    try? inPipe.fileHandleForWriting.close()
+
+    let box = ProcBox(proc)
+    let timedOut = TimeoutFlag()
+    let watchdog = DispatchWorkItem {
+        timedOut.set()
+        box.p.terminate()  // SIGTERM
+        // Escalate to SIGKILL shortly after, so a child that ignores
+        // SIGTERM (or a descendant holding the pipes open) can't keep the
+        // blocking reader stuck past the timeout — its death closes the
+        // pipes, unblocking `readDataToEndOfFile`.
+        let pid = box.p.processIdentifier
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(500)) {
+            if box.p.isRunning { kill(pid, SIGKILL) }
+        }
+    }
+    DispatchQueue.global(qos: .userInitiated)
+        .asyncAfter(deadline: .now() + .seconds(Int(timeoutSecs)), execute: watchdog)
+
+    // Drain stdout and stderr concurrently so a child that fills one pipe
+    // while we're blocked on the other can't deadlock.
+    let outDrain = PipeDrain(outPipe.fileHandleForReading)
+    let errDrain = PipeDrain(errPipe.fileHandleForReading)
+    let group = DispatchGroup()
+    let readQ = DispatchQueue.global(qos: .userInitiated)
+    group.enter()
+    readQ.async {
+        outDrain.drain()
+        group.leave()
+    }
+    group.enter()
+    readQ.async {
+        errDrain.drain()
+        group.leave()
+    }
+    group.wait()
+    proc.waitUntilExit()
+    watchdog.cancel()
+    let outData = outDrain.result()
+    let errData = errDrain.result()
+
+    if timedOut.get() {
+        return .failure(ProviderError(message: "provider timed out after \(timeoutSecs)s"))
+    }
+    if proc.terminationStatus != 0 {
+        let stderr = String(decoding: errData, as: UTF8.self)
+        let tail = stderr.split(separator: "\n").last.map(String.init)?
+            .trimmingCharacters(in: .whitespaces) ?? ""
+        let code = proc.terminationStatus
+        return .failure(ProviderError(message: tail.isEmpty ? "provider exited with status \(code)" : "provider exited \(code): \(tail)"))
+    }
+    let stdout = String(decoding: outData, as: UTF8.self)
+    do {
+        return .success(try parseProviderOutput(stdout))
+    } catch {
+        return .failure(ProviderError(message: "provider output: \(error.localizedDescription)"))
+    }
+}
+
 extension RoostApp: UiBridge {
     /// Expose the (private) window to the IPC handler via the bridge.
     /// `dumpTab(tabID:)` (defined above) satisfies the rest of `UiBridge`.
@@ -4555,12 +4906,44 @@ extension RoostApp: UiBridge {
     /// IPC layer: "" / "commands" → command palette, "launcher" → the
     /// custom-command launcher), then read back its state.
     func openPalette(kind: String) -> PaletteSnapshot {
-        if kind == "launcher" {
-            showCommandLauncher(nil)
-        } else {
-            showCommandPalette(nil)
+        switch kind {
+        case "launcher": showCommandLauncher(nil)
+        case "custom": showCustomPalette(nil)
+        default: showCommandPalette(nil)
         }
         return paletteSnapshot()
+    }
+
+    /// `palette.present`: open the palette on a caller-supplied list and
+    /// resume with the chosen row id (or `nil` on dismissal). Blocking —
+    /// the continuation is resumed from the confirm/dismiss closures.
+    func presentPalette(title: String, placeholder: String, items: [PaletteSnapshot.Item]) async -> String? {
+        await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            // Close any open palette first, then present fresh.
+            palette?.driveDismiss()
+            guard let window else {
+                cont.resume(returning: nil)
+                return
+            }
+            let ph = !placeholder.isEmpty ? placeholder : (!title.isEmpty ? title : "Select…")
+            let paletteItems = items.map { PaletteItem(id: $0.id, title: $0.title, subtitle: $0.subtitle) }
+            let root = PaletteFrame(id: "present", placeholder: ph, items: paletteItems)
+            // Shared between confirm + dismiss; whoever fires first wins.
+            let resume = PresentResumeBox(cont)
+            let behavior = PaletteBehavior(onConfirm: { item in
+                resume.resume(item.id)
+                return .close
+            })
+            let panel = PalettePanel(
+                parent: window, contentRegion: terminalContainer, root: root, behavior: behavior
+            ) { [weak self] in
+                self?.dismissPalette()
+                resume.resume(nil)
+            }
+            palette = panel
+            paletteOpen = true
+            panel.present()
+        }
     }
 
     /// `palette.state`: snapshot the live palette, or the closed state.
