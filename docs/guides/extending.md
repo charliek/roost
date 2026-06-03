@@ -142,8 +142,15 @@ is convenient:
 ```json
 { "placeholder": "Pick a service",
   "items": [ {"id": "web", "title": "shed: web", "subtitle": "../shed/web"},
-             {"id": "api", "title": "shed: api"} ] }
+             {"id": "api", "title": "shed: api"},
+             {"id": "_none", "title": "No services", "actionable": false} ] }
 ```
+
+Each item has a required `id` (round-trips back as `ROOST_SELECTED_ID`)
+and `title`, an optional `subtitle`, and an optional **`actionable`**
+(default `true`). Set `actionable: false` for an **empty/disabled row**
+(e.g. "No results"): it renders but can't be selected, and selecting it is
+a no-op that leaves the palette open — Roost never calls `activate` for it.
 
 A bare `[ … ]` array is also accepted. On **`activate`**:
 
@@ -151,6 +158,21 @@ A bare `[ … ]` array is also accepted. On **`activate`**:
   did its work);
 - print **more `items`** → Roost drills into a sub-menu — the same schema
   as `list`, so multi-step menus need no extra mechanism.
+
+### Opening tabs from `activate`
+
+The usual thing `activate` does is open a tab that runs something, via
+`roostctl tab open` (which now takes a command after `--`):
+
+- `roostctl tab open --project-id "$ROOST_ACTIVE_PROJECT_ID" -- <cmd>` runs
+  `<cmd>` in a new tab that **closes when it exits** (hold=false).
+- add `--hold` to keep the tab open afterward (drops to a shell).
+- add `--after-tab "$ROOST_ACTIVE_TAB_ID"` to place it **next to the active
+  tab**, and `--focus` to switch to it.
+
+So "open this next to me and switch to it" is one call —
+`roostctl tab open --project-id … --after-tab … --focus -- <cmd>`. See the
+[CLI reference](../reference/cli.md) for the full flag set.
 
 **Safety rails.** stdout must be valid JSON, so don't let your shell rc
 echo onto it (Roost runs `run` non-interactively). Rows past `limit` are
@@ -166,17 +188,36 @@ Discovered scripts are run by absolute (shell-quoted) path; a config
 Because input is env-or-stdin and output is "print one JSON object", a
 provider is a few lines in any language:
 
+The bash tab is a complete **"Open shed"** provider: list the *running*
+sheds, and on selection open `shed console <name>` in a tab next to the
+current one (closing when you disconnect). Drop it at
+`~/.config/roost/providers/shed.sh`, `chmod +x`.
+
 === "bash"
 
     ```bash
     #!/usr/bin/env bash
     # @roost.label: Open shed
-    case "$1" in
+    # Roost may be launched (Finder) with a minimal PATH — make sure shed,
+    # roostctl, and jq are found.
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+    case "${1:-}" in
       list)
-        printf '{"items":[{"id":"web","title":"shed: web"},{"id":"api","title":"shed: api"}]}' ;;
+        rows=$(shed list --json 2>/dev/null \
+          | jq -c '[.[] | select(.status=="running")
+                   | {id: .name, title: ("shed: " + .name), subtitle: .ssh}]' || true)
+        if [ -z "$rows" ] || [ "$rows" = "[]" ]; then
+          printf '{"items":[{"id":"_none","title":"No running sheds","subtitle":"shed start <name>","actionable":false}]}'
+        else
+          printf '{"items":%s}' "$rows"
+        fi ;;
       activate)
-        roostctl --socket "$ROOST_SOCKET" tab open \
-          --project-id "$ROOST_ACTIVE_PROJECT_ID" -- shed open "$ROOST_SELECTED_ID" ;;
+        # Login shell (-l) for PATH; the shed name is a positional arg
+        # ($1), never spliced into the script string. hold=false: when
+        # `shed console` disconnects, the shell exits → the tab closes.
+        roostctl tab open --project-id "$ROOST_ACTIVE_PROJECT_ID" \
+          --after-tab "$ROOST_ACTIVE_TAB_ID" --focus --title "shed: $ROOST_SELECTED_ID" \
+          -- "${SHELL:-/bin/bash}" -lc 'shed console "$1"' shed "$ROOST_SELECTED_ID" ;;
     esac
     ```
 
@@ -184,27 +225,42 @@ provider is a few lines in any language:
 
     ```python
     #!/usr/bin/env python3
-    import json, os, subprocess, sys
+    import json, subprocess, sys
     inp = json.load(sys.stdin)
     if inp["phase"] == "list":
-        json.dump({"items": [{"id": s, "title": f"shed: {s}"} for s in ("web", "api")]}, sys.stdout)
+        sheds = json.loads(subprocess.run(["shed", "list", "--json"],
+                                          capture_output=True, text=True).stdout or "[]")
+        items = [{"id": s["name"], "title": f"shed: {s['name']}", "subtitle": s["ssh"]}
+                 for s in sheds if s["status"] == "running"]
+        if not items:
+            items = [{"id": "_none", "title": "No running sheds", "actionable": False}]
+        json.dump({"items": items}, sys.stdout)
     else:
-        subprocess.run(["roostctl", "--socket", inp["socket"], "tab", "open",
-                        "--project-id", inp["active_tab"]["project_id"],
-                        "--", "shed", "open", inp["selected_id"]])
+        tab = inp["active_tab"]
+        # Pass the shed name as a positional arg ($1), not interpolated.
+        subprocess.run(["roostctl", "tab", "open", "--project-id", tab["project_id"],
+                        "--after-tab", tab["id"], "--focus",
+                        "--", "/bin/bash", "-lc", 'shed console "$1"', "shed", inp["selected_id"]])
     ```
 
 === "typescript"
 
     ```ts
     #!/usr/bin/env -S node
+    const { execFileSync } = require("child_process");
     const inp = JSON.parse(require("fs").readFileSync(0, "utf8"));
     if (inp.phase === "list") {
-      process.stdout.write(JSON.stringify({ items: ["web", "api"].map(s => ({ id: s, title: `shed: ${s}` })) }));
+      const sheds = JSON.parse(execFileSync("shed", ["list", "--json"]).toString() || "[]");
+      const items = sheds.filter((s: any) => s.status === "running")
+        .map((s: any) => ({ id: s.name, title: `shed: ${s.name}`, subtitle: s.ssh }));
+      process.stdout.write(JSON.stringify({
+        items: items.length ? items : [{ id: "_none", title: "No running sheds", actionable: false }],
+      }));
     } else {
-      require("child_process").execFileSync("roostctl",
-        ["--socket", inp.socket, "tab", "open", "--project-id", inp.active_tab.project_id,
-         "--", "shed", "open", inp.selected_id]);
+      const t = inp.active_tab;
+      // Shed name as a positional arg ($1), not interpolated into the script.
+      execFileSync("roostctl", ["tab", "open", "--project-id", t.project_id,
+        "--after-tab", t.id, "--focus", "--", "/bin/bash", "-lc", 'shed console "$1"', "shed", inp.selected_id]);
     }
     ```
 
@@ -223,5 +279,7 @@ choice=$(roostctl palette present --title "Open shed" --items "$items" --json | 
 ```
 
 Items can also be piped on stdin (`… | roostctl palette present`). This is
-the same item schema providers print — a provider is just the
-Roost-driven version of the same contract.
+the same `{id, title, subtitle?}` item shape providers print — a provider
+is just the Roost-driven version of the same contract. (One v1 difference:
+`palette.present` rows are always selectable — the `actionable` flag is
+honored for *provider* rows only, not over the `palette.present` wire.)

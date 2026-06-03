@@ -23,6 +23,11 @@ pub struct PaletteItem {
     pub subtitle: Option<String>,
     /// Right-aligned hint, e.g. a shortcut like "Alt+Shift+P".
     pub trailing_text: Option<String>,
+    /// When `false`, the row renders but can't be confirmed — `confirm`
+    /// skips it (no behavior fired, palette stays open). Used for empty /
+    /// disabled states (e.g. a provider's "No results" row, the overflow
+    /// hint). Defaults to `true`.
+    pub actionable: bool,
 }
 
 impl PaletteItem {
@@ -32,6 +37,7 @@ impl PaletteItem {
             title: title.into(),
             subtitle: None,
             trailing_text: None,
+            actionable: true,
         }
     }
 
@@ -42,6 +48,11 @@ impl PaletteItem {
 
     pub fn with_trailing(mut self, trailing: Option<String>) -> Self {
         self.trailing_text = trailing;
+        self
+    }
+
+    pub fn with_actionable(mut self, actionable: bool) -> Self {
+        self.actionable = actionable;
         self
     }
 }

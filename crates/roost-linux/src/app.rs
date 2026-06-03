@@ -3158,14 +3158,9 @@ impl App {
     fn provider_item_behavior(self: &Rc<Self>, provider: provider::Provider) -> PaletteBehavior {
         let weak = Rc::downgrade(self);
         PaletteBehavior::new(move |item| {
-            // Non-actionable rows (overflow hint, error) stay put.
-            // The only non-actionable row in an items frame is the
-            // overflow hint (error rows live in their own no-op-behavior
-            // frame). Exact-match the reserved id so a provider's real
-            // item id can't be accidentally swallowed.
-            if item.id == provider::OVERFLOW_ID {
-                return PaletteOutcome::None;
-            }
+            // Non-actionable rows (the overflow hint, a provider's
+            // `"actionable":false` row) never reach here — `confirm`
+            // skips them before invoking the behavior.
             let Some(app) = weak.upgrade() else {
                 return PaletteOutcome::Close;
             };

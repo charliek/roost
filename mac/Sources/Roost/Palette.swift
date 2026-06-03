@@ -21,12 +21,21 @@ struct PaletteItem: Equatable {
     var subtitle: String?
     /// Right-aligned hint, e.g. a shortcut like "⌘T".
     var trailingText: String?
+    /// When `false`, the row renders but can't be confirmed — `confirm`
+    /// skips it (no behavior fired, palette stays open). Used for empty /
+    /// disabled states (a provider's "No results" row, the overflow hint).
+    /// Defaults to `true`.
+    var actionable: Bool
 
-    init(id: String, title: String, subtitle: String? = nil, trailingText: String? = nil) {
+    init(
+        id: String, title: String, subtitle: String? = nil, trailingText: String? = nil,
+        actionable: Bool = true
+    ) {
         self.id = id
         self.title = title
         self.subtitle = subtitle
         self.trailingText = trailingText
+        self.actionable = actionable
     }
 }
 

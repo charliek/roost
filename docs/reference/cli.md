@@ -114,6 +114,9 @@ Tab lifecycle and I/O for automation. `tab send` needs an existing live PTY (a U
 
 ```bash
 roostctl tab open --project-id 1 --cwd ~/projects/roost
+roostctl tab open --project-id 1 -- htop                       # run a command in the tab
+roostctl tab open --project-id 1 --hold -- make test           # keep the tab open after it exits
+roostctl tab open --project-id 1 --after-tab 5 --focus -- vim   # next to tab 5, then focus it
 roostctl tab close --tab 5
 roostctl tab send --tab 5 --bytes 'ls -la\n'
 roostctl tab resize --tab 5 --cols 120 --rows 40
@@ -121,6 +124,17 @@ roostctl tab reorder --project-id 1 --order 3,5,7
 roostctl tab dump --tab 5          # the visible viewport as text
 roostctl tab dump --tab 5 --json   # full result: dims + cursor + rows
 ```
+
+`tab open` prints the new tab id on stdout (so `id=$(roostctl tab open …)`). A **command** can follow `--`; without one the tab opens the default shell. The command's working directory is `--cwd` (default: the project's cwd).
+
+| Flag | Effect |
+|---|---|
+| `-- <cmd…>` | Run this command in the tab. The tab **closes when the command exits** (hold=false) — standard terminal behavior. |
+| `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
+| `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
+| `--focus` | Focus (activate) the new tab after opening. |
+
+These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
 `tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
 

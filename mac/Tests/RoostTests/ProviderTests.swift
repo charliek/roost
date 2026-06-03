@@ -214,26 +214,49 @@ func providerItemsEmptyShowsSentinel() {
     #expect(items.count == 1)
     #expect(items[0].id == "provider:none")
     #expect(providerIndex(items[0].id) == nil)
+    #expect(!items[0].actionable)  // the sentinel is non-selectable
 }
 
 @Test
 func outputPaletteItemsCapsAndHints() {
     let out = ProviderOutput(
         placeholder: "",
-        items: (0..<5).map { ProviderOutputItem(id: "i\($0)", title: "Item \($0)", subtitle: nil) })
+        items: (0..<5).map {
+            ProviderOutputItem(id: "i\($0)", title: "Item \($0)", subtitle: nil, actionable: nil)
+        })
     let rows = providerOutputPaletteItems(out, limit: 3)
     #expect(rows.count == 4)  // 3 real + 1 overflow hint
     #expect(rows[2].id == "i2")
+    #expect(rows[2].actionable)  // absent ⇒ actionable
     #expect(rows[3].id == providerOverflowID)
     #expect(rows[3].title == "… 2 more")
+    #expect(!rows[3].actionable)  // overflow hint is non-actionable
 }
 
 @Test
 func outputPaletteItemsUnderLimitHasNoHint() {
     let out = ProviderOutput(
-        placeholder: "", items: [ProviderOutputItem(id: "a", title: "A", subtitle: "sub")])
+        placeholder: "",
+        items: [ProviderOutputItem(id: "a", title: "A", subtitle: "sub", actionable: nil)])
     let rows = providerOutputPaletteItems(out, limit: 100)
     #expect(rows.count == 1)
     #expect(rows[0].subtitle == "sub")
     #expect(!rows.contains { $0.id == providerOverflowID })
+}
+
+@Test
+func actionableParsesAndCarriesThrough() {
+    let out = try! parseProviderOutput(
+        #"{"items":[{"id":"x","title":"X","actionable":false},{"id":"y","title":"Y"}]}"#)
+    #expect(out.items[0].actionable == false)
+    #expect(out.items[1].actionable == nil)
+    let rows = providerOutputPaletteItems(out, limit: 100)
+    #expect(!rows[0].actionable)
+    #expect(rows[1].actionable)
+}
+
+@Test
+func paletteItemActionableDefaultsTrue() {
+    #expect(PaletteItem(id: "a", title: "A").actionable)
+    #expect(!PaletteItem(id: "a", title: "A", actionable: false).actionable)
 }

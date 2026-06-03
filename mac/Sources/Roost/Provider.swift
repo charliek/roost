@@ -238,6 +238,10 @@ struct ProviderOutputItem: Decodable, Equatable, Sendable {
     let id: String
     let title: String
     let subtitle: String?
+    /// When `false`, the row renders but can't be selected (the palette
+    /// stays open) — for empty/disabled states like "No results". Absent
+    /// (nil) ⇒ actionable.
+    let actionable: Bool?
 }
 
 /// A provider's parsed stdout: the rows plus optional palette chrome.
@@ -290,7 +294,7 @@ func providerItems(_ providers: [Provider]) -> [PaletteItem] {
         return [
             PaletteItem(
                 id: "provider:none", title: "No providers configured",
-                subtitle: "Add `provider = …` to config.conf")
+                subtitle: "Add `provider = …` to config.conf", actionable: false)
         ]
     }
     return providers.enumerated().map { i, p in
@@ -310,12 +314,15 @@ func providerIndex(_ id: String) -> Int? {
 /// silently truncating.
 func providerOutputPaletteItems(_ out: ProviderOutput, limit: Int) -> [PaletteItem] {
     var rows = out.items.prefix(limit).map {
-        PaletteItem(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+        PaletteItem(
+            id: $0.id, title: $0.title, subtitle: $0.subtitle, actionable: $0.actionable ?? true)
     }
     if out.items.count > limit {
         let extra = out.items.count - limit
         rows.append(
-            PaletteItem(id: providerOverflowID, title: "… \(extra) more", subtitle: "refine your query"))
+            PaletteItem(
+                id: providerOverflowID, title: "… \(extra) more", subtitle: "refine your query",
+                actionable: false))
     }
     return rows
 }
