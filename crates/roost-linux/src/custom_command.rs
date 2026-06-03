@@ -135,8 +135,9 @@ pub fn launch_index(id: &str) -> Option<usize> {
 
 /// Quote-aware tokenizer: a `"` toggles quote mode (and is dropped),
 /// unquoted whitespace ends a token, everything else accumulates. Empty
-/// tokens (a stray `""`) are dropped.
-fn tokenize(s: &str) -> Vec<String> {
+/// tokens (a stray `""`) are dropped. Shared with `provider.rs`, which
+/// parses `provider =` records in the same `key="value"` grammar.
+pub(crate) fn tokenize(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;

@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -114,6 +115,16 @@ struct PaletteInner {
     /// Called once on teardown: clears `App.palette` + refocuses the
     /// terminal. Taken so it fires at most once.
     on_dismiss: RefCell<Option<Box<dyn Fn()>>>,
+    /// Monotonic session id (vs. the `Rc` address, which the allocator can
+    /// reuse after free — an ABA hazard for the stale-provider guard).
+    session_id: u64,
+}
+
+/// Next palette-session id. Monotonic for the process lifetime, so a
+/// dismissed-then-reopened palette never reuses an id.
+fn next_session_id() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 impl PaletteOverlay {
@@ -182,6 +193,7 @@ impl PaletteOverlay {
             closing: Cell::new(false),
             armed: Cell::new(false),
             on_dismiss: RefCell::new(Some(Box::new(on_dismiss))),
+            session_id: next_session_id(),
         });
 
         inner.wire_signals();
@@ -497,6 +509,18 @@ impl PaletteInner {
         self.fire_highlight();
     }
 
+    /// Push a sub-frame from outside `confirm` (async provider results).
+    /// Mirrors the `PaletteOutcome::Push` arm: register the behavior,
+    /// push the frame, re-render, and restore focus to the entry.
+    fn drive_push(self: &Rc<Self>, frame: PaletteFrame, behavior: PaletteBehavior) {
+        self.behaviors
+            .borrow_mut()
+            .insert(frame.id.clone(), behavior);
+        self.state.borrow_mut().push(frame);
+        self.sync_ui();
+        self.entry.grab_focus();
+    }
+
     /// Select the visible row whose item id matches, then confirm it —
     /// the same `confirm` a click/Enter runs (so it pushes a sub-frame or
     /// dispatches the command). False if no visible row has that id.
@@ -536,6 +560,14 @@ impl PaletteOverlay {
             inner: self.inner.clone(),
         }
     }
+
+    /// Stable identity of this palette *session* (the `Rc` backing it).
+    /// An async provider result compares this against the live palette's
+    /// id to tell whether the palette it targeted is still on screen —
+    /// vs. dismissed and replaced by a different one while the script ran.
+    pub fn id(&self) -> u64 {
+        self.inner.session_id
+    }
 }
 
 /// Drives a live palette over a cloned `Rc<PaletteInner>`. See
@@ -556,6 +588,14 @@ impl PaletteDriver {
     }
     pub fn dismiss(&self) {
         self.inner.dismiss(false);
+    }
+    /// Drill into a sub-frame programmatically — the same transition
+    /// `PaletteOutcome::Push` performs in `confirm`, but driven from
+    /// outside (a provider's async `list` result populating the palette
+    /// after the spawn returns). The caller must have dropped any borrow
+    /// of `App.palette` first (see [`PaletteOverlay::driver`]).
+    pub fn push(&self, frame: PaletteFrame, behavior: PaletteBehavior) {
+        self.inner.drive_push(frame, behavior);
     }
 }
 

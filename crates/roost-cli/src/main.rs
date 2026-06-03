@@ -43,12 +43,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteOpenParams, PaletteQueryParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ScreenshotParams, ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams,
-    TabDumpResult, TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams,
-    TabResizeParams, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabState,
-    TabWriteParams,
+    PaletteItemView, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
+    ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
+    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams, TabDumpResult,
+    TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -358,6 +358,23 @@ enum PaletteCmd {
     },
     /// Dismiss any open palette.
     Dismiss {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Present a caller-supplied list and block until the user picks a
+    /// row or dismisses, then print the chosen id (nothing on dismiss).
+    /// Items come from `--items <json>` or stdin: a JSON array
+    /// `[{"id","title","subtitle?"}]` or an object `{"items":[…]}`.
+    Present {
+        /// Title/placeholder shown in the search field.
+        #[arg(long, default_value = "")]
+        title: String,
+        /// Overrides `--title` for the field placeholder when set.
+        #[arg(long, default_value = "")]
+        placeholder: String,
+        /// The items JSON. When omitted, read from stdin (dmenu-style).
+        #[arg(long)]
+        items: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -740,11 +757,71 @@ async fn main() -> Result<()> {
                 .await?;
             print_palette(&state, json)?;
         }
+        Cmd::Palette(PaletteCmd::Present {
+            title,
+            placeholder,
+            items,
+            json,
+        }) => {
+            let raw = match items {
+                Some(s) => s,
+                None => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf
+                }
+            };
+            let parsed = parse_present_items(&raw)?;
+            let result: PalettePresentResult = client
+                .call(
+                    ops::PALETTE_PRESENT,
+                    PalettePresentParams {
+                        title,
+                        placeholder,
+                        items: parsed,
+                    },
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if let Some(id) = &result.selected_id {
+                println!("{id}");
+            }
+            // Dismissed → print nothing; exit 0 either way.
+        }
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. } | Cmd::Claude(_) => unreachable!(),
     }
 
     Ok(())
+}
+
+/// Parse the `palette present` items payload. Accepts a bare JSON array
+/// of rows or an object with an `items` array (the same shape a Roost
+/// provider prints), so a script can pipe either form. Rejects an
+/// empty/blank payload so the user gets a clear error instead of an
+/// `invalid-param` from the daemon.
+fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("no items: pass --items <json> or pipe a JSON array on stdin");
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("parse items json: {e}"))?;
+    let items_value = if value.is_array() {
+        value
+    } else {
+        value.get("items").cloned().ok_or_else(|| {
+            anyhow::anyhow!("items json must be an array or have an `items` array")
+        })?
+    };
+    let items: Vec<PaletteItemView> =
+        serde_json::from_value(items_value).map_err(|e| anyhow::anyhow!("decode items: {e}"))?;
+    if items.is_empty() {
+        anyhow::bail!("items list is empty");
+    }
+    Ok(items)
 }
 
 /// Render a [`PaletteStateResult`] for the terminal: a header line, then

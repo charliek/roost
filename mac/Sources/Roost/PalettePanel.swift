@@ -345,6 +345,20 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         dismiss(confirmed: false)
     }
 
+    /// Drill into a sub-frame programmatically — the same transition
+    /// `PaletteOutcome.push` performs in `confirm`, but driven from
+    /// outside (a provider's async `list` result populating the palette
+    /// after the spawn returns).
+    func drivePush(frame: PaletteFrame, behavior: PaletteBehavior) {
+        behaviors[frame.id] = behavior
+        state.push(frame)
+        syncUI()
+    }
+
+    /// True while the panel is still on screen (not torn down). The
+    /// provider spawn checks this before pushing a late-arriving result.
+    var isLive: Bool { !isClosing }
+
     /// Re-render the field + table for the current frame and fire the
     /// highlight preview for the selected row.
     private func syncUI() {

@@ -21,16 +21,17 @@ use roost_ipc::messages::{
     ops, AppActivateParams, AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams,
     ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
     NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -66,6 +67,12 @@ type DumpReply = tokio::sync::oneshot::Sender<Result<DumpData, String>>;
 /// `PaletteActivate` ever returns the `Err` arm (no palette open, or no
 /// row with the given id); the rest always answer `Ok`.
 type PaletteReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, String>>;
+
+/// Reply for [`UiRequest::PalettePresent`]: the user's choice, delivered
+/// once the palette closes (a pick or a dismissal). Unlike the other
+/// palette ops, `palette.present` does not reply on open — it blocks
+/// like `wait` until the user acts.
+type PalettePresentReply = tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>;
 
 /// Snapshot of a tab's selection for the `selection.dump` op. Mirrors
 /// `terminal_view::SelectionDumpData` but lives in this crate so `ipc.rs`
@@ -173,6 +180,15 @@ pub enum UiRequest {
     PaletteActivate { id: String, reply: PaletteReply },
     /// Dismiss any open palette; reply with the (closed) state.
     PaletteDismiss { reply: PaletteReply },
+    /// Open the palette on a caller-supplied list and reply once the
+    /// user picks a row or dismisses (blocking — the reply is deferred,
+    /// not sent on open). Items are `(id, title, subtitle)`.
+    PalettePresent {
+        title: String,
+        placeholder: String,
+        items: Vec<(String, String, Option<String>)>,
+        reply: PalettePresentReply,
+    },
     /// `selection.set` — anchor a selection on a tab's terminal.
     /// Both points are viewport `(col, row)`; the UI converts to
     /// scrollback-stable screen-y space.
@@ -631,9 +647,9 @@ async fn dispatch(
         }
         ops::PALETTE_OPEN => {
             let p: PaletteOpenParams = decode(params)?;
-            if !matches!(p.kind.as_str(), "" | "commands" | "launcher") {
+            if !matches!(p.kind.as_str(), "" | "commands" | "launcher" | "custom") {
                 return Err(HandlerError::invalid_param(format!(
-                    "unknown palette kind {:?} (want \"commands\" or \"launcher\")",
+                    "unknown palette kind {:?} (want \"commands\", \"launcher\", or \"custom\")",
                     p.kind
                 )));
             }
@@ -682,6 +698,29 @@ async fn dispatch(
                 .await?
                 .map_err(palette_err)?;
             encode(&state)
+        }
+        ops::PALETTE_PRESENT => {
+            let p: PalettePresentParams = decode(params)?;
+            if p.items.is_empty() {
+                return Err(HandlerError::invalid_param(
+                    "palette.present requires a non-empty items list",
+                ));
+            }
+            let items = p
+                .items
+                .into_iter()
+                .map(|it| (it.id, it.title, it.subtitle))
+                .collect::<Vec<_>>();
+            let result = h
+                .ui_call(|reply| UiRequest::PalettePresent {
+                    title: p.title,
+                    placeholder: p.placeholder,
+                    items,
+                    reply,
+                })
+                .await?
+                .map_err(palette_err)?;
+            encode(&result)
         }
         ops::SELECTION_SET => {
             let p: SelectionSetParams = decode(params)?;

@@ -1,0 +1,12 @@
+{
+  "id": "42",
+  "op": "palette.present",
+  "params": {
+    "title": "Open shed",
+    "placeholder": "Pick a service…",
+    "items": [
+      { "id": "web", "title": "shed: web", "subtitle": "../shed/web" },
+      { "id": "api", "title": "shed: api" }
+    ]
+  }
+}

@@ -45,6 +45,7 @@ use crate::palette::{command_items, PaletteCommands, PaletteFrame, PaletteItem};
 use crate::palette_ui::{
     PaletteBehavior, PaletteOutcome, PaletteOverlay, PaletteSnapshot, TOP_GAP,
 };
+use crate::provider;
 use crate::rollup::{project_rollup, RollupState, TabState};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
@@ -150,6 +151,10 @@ pub struct App {
     content_overlay: gtk4::Overlay,
     /// The open command palette overlay, or `None` when closed.
     palette: RefCell<Option<crate::palette_ui::PaletteOverlay>>,
+    /// Monotonic token bumped per provider run, so a superseded run's late
+    /// result (provider A in flight, user picks B) is dropped rather than
+    /// pushing a stale frame onto the current one.
+    provider_req: std::cell::Cell<u64>,
     /// Live inbox of pending agent notifications, surfaced through the
     /// command palette ("View Notifications") + the HeaderBar button.
     /// Membership is driven off the `has_notification` edges in
@@ -582,6 +587,7 @@ impl App {
             theme_name_at_open: RefCell::new(None),
             content_overlay: content_overlay.clone(),
             palette: RefCell::new(None),
+            provider_req: std::cell::Cell::new(0),
             notification_inbox: RefCell::new(NotificationInbox::new()),
             notif_badge: notif_badge.clone(),
             font_family: RefCell::new(cfg.font_family.clone()),
@@ -838,6 +844,14 @@ impl App {
                         }
                         UiRequest::PaletteDismiss { reply } => {
                             let _ = reply.send(Ok(app.ipc_palette_dismiss()));
+                        }
+                        UiRequest::PalettePresent {
+                            title,
+                            placeholder,
+                            items,
+                            reply,
+                        } => {
+                            app.ipc_palette_present(title, placeholder, items, reply);
                         }
                         UiRequest::SelectionSet {
                             tab_id,
@@ -2557,7 +2571,9 @@ impl App {
         // GTK analog of the Swift app's `validateMenuItem` gate.
         let is_picker_toggle = matches!(
             action,
-            KeybindAction::CommandPalette | KeybindAction::CommandLauncher
+            KeybindAction::CommandPalette
+                | KeybindAction::CommandLauncher
+                | KeybindAction::CustomPalette
         );
         if !is_picker_toggle && self.palette.borrow().is_some() {
             return;
@@ -2565,6 +2581,7 @@ impl App {
         match action {
             KeybindAction::CommandPalette => self.show_command_palette(),
             KeybindAction::CommandLauncher => self.show_command_launcher(),
+            KeybindAction::CustomPalette => self.show_custom_palette(),
             KeybindAction::NewTab => {
                 let pid = *self.active_project_id.borrow();
                 if pid == 0 {
@@ -2892,6 +2909,15 @@ impl App {
             .position(|i| i.id == PaletteCommands::SELECT_FONT_ID)
             .map_or(items.len(), |i| i + 1);
         items.splice(at..at, notif);
+        // Surface the custom palette (script-backed providers) as a
+        // drill-in row, but only when at least one provider is configured
+        // — otherwise the command palette stays uncluttered.
+        if !cfg.providers.is_empty() {
+            let hint = reverse
+                .get(&KeybindAction::CustomPalette)
+                .and_then(accel_label);
+            items.push(PaletteItem::new("custom_commands", "Custom Commands…").with_trailing(hint));
+        }
         let root = PaletteFrame::new("commands", "Execute a command…", items);
 
         let weak = Rc::downgrade(self);
@@ -3034,6 +3060,325 @@ impl App {
                 tracing::warn!(?err, "command launcher: open_tab failed");
             }
         });
+    }
+
+    // MARK: custom palette (provider scripts) — Cmd+Shift+E / Alt+Shift+E
+
+    /// Open the custom palette on the configured provider list
+    /// (`provider =` entries + discovered scripts), presented as the root
+    /// frame like the launcher. No-op if a palette is already open.
+    fn show_custom_palette(self: &Rc<Self>) {
+        if self.palette.borrow().is_some() {
+            return;
+        }
+        let providers = RoostConfig::load_default().providers;
+        let root = self.provider_list_frame(&providers);
+        let behavior = self.provider_list_behavior(providers);
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    /// The provider-list frame: one row per configured provider (or the
+    /// "No providers configured" sentinel when empty).
+    fn provider_list_frame(self: &Rc<Self>, providers: &[provider::Provider]) -> PaletteFrame {
+        PaletteFrame::new(
+            "custom",
+            "Custom commands…",
+            provider::provider_items(providers),
+        )
+    }
+
+    /// Confirm on a provider row → run its `list` phase off-main, then
+    /// drill into the resulting rows. Returns `None` (stay open) — the
+    /// result frame is pushed asynchronously once the script returns. The
+    /// `provider:none` sentinel and any stale id are a no-op.
+    fn provider_list_behavior(
+        self: &Rc<Self>,
+        providers: Vec<provider::Provider>,
+    ) -> PaletteBehavior {
+        let weak = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            let Some(app) = weak.upgrade() else {
+                return PaletteOutcome::Close;
+            };
+            match provider::provider_index(&item.id) {
+                Some(index) if index < providers.len() => {
+                    let provider = providers[index].clone();
+                    let weak2 = Rc::downgrade(&app);
+                    glib::spawn_future_local(async move {
+                        if let Some(app) = weak2.upgrade() {
+                            app.open_provider_list(provider).await;
+                        }
+                    });
+                    PaletteOutcome::None
+                }
+                _ => PaletteOutcome::None, // sentinel / stale id
+            }
+        })
+    }
+
+    /// Run a provider's `list` phase and push its rows as a sub-frame. If
+    /// the palette closed while the script ran, the result is dropped.
+    async fn open_provider_list(self: &Rc<Self>, provider: provider::Provider) {
+        let want = self.palette.borrow().as_ref().map(|o| o.id());
+        let req = self.provider_req.get().wrapping_add(1);
+        self.provider_req.set(req);
+        let result = self
+            .run_provider(&provider, provider::Phase::List, None)
+            .await;
+        // Apply only if (a) no newer provider run superseded this one, and
+        // (b) the palette that asked for it is still on screen — a dismiss
+        // + reopen (e.g. palette.present) during the spawn must not be
+        // clobbered by a stale result.
+        if self.provider_req.get() != req {
+            return;
+        }
+        let driver = match self.palette.borrow().as_ref() {
+            Some(o) if Some(o.id()) == want => o.driver(),
+            _ => return,
+        };
+        self.push_provider_result(&driver, provider, result);
+    }
+
+    /// Confirm on a provider item → run its `activate` phase with the
+    /// selected id. The script acts (usually via `$ROOST_SOCKET`); its
+    /// stdout may drill in (more rows) or be empty (close the palette).
+    fn provider_item_behavior(self: &Rc<Self>, provider: provider::Provider) -> PaletteBehavior {
+        let weak = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            // Non-actionable rows (overflow hint, error) stay put.
+            // The only non-actionable row in an items frame is the
+            // overflow hint (error rows live in their own no-op-behavior
+            // frame). Exact-match the reserved id so a provider's real
+            // item id can't be accidentally swallowed.
+            if item.id == provider::OVERFLOW_ID {
+                return PaletteOutcome::None;
+            }
+            let Some(app) = weak.upgrade() else {
+                return PaletteOutcome::Close;
+            };
+            let provider = provider.clone();
+            let selected = item.id.clone();
+            let weak2 = Rc::downgrade(&app);
+            glib::spawn_future_local(async move {
+                if let Some(app) = weak2.upgrade() {
+                    app.activate_provider_item(provider, selected).await;
+                }
+            });
+            PaletteOutcome::None
+        })
+    }
+
+    /// Run `activate` for the chosen row, then drill in (more rows) or
+    /// close (side-effect-only / empty stdout).
+    async fn activate_provider_item(
+        self: &Rc<Self>,
+        provider: provider::Provider,
+        selected_id: String,
+    ) {
+        let want = self.palette.borrow().as_ref().map(|o| o.id());
+        let req = self.provider_req.get().wrapping_add(1);
+        self.provider_req.set(req);
+        let result = self
+            .run_provider(&provider, provider::Phase::Activate, Some(selected_id))
+            .await;
+        // Same stale-result guard as `open_provider_list` (newer run +
+        // palette session).
+        if self.provider_req.get() != req {
+            return;
+        }
+        let driver = match self.palette.borrow().as_ref() {
+            Some(o) if Some(o.id()) == want => o.driver(),
+            _ => return,
+        };
+        // Empty success = "done, close"; anything else (rows or error)
+        // drills in / shows the error row.
+        let close_only = matches!(&result, Ok(o) if o.items.is_empty());
+        if close_only {
+            driver.dismiss();
+        } else {
+            self.push_provider_result(&driver, provider, result);
+        }
+    }
+
+    /// Push a provider's parsed output (or an error row) as a sub-frame.
+    fn push_provider_result(
+        self: &Rc<Self>,
+        driver: &crate::palette_ui::PaletteDriver,
+        provider: provider::Provider,
+        result: Result<provider::ProviderOutput, String>,
+    ) {
+        match result {
+            Ok(output) => {
+                let placeholder = if output.placeholder.is_empty() {
+                    format!("{}…", provider.title)
+                } else {
+                    output.placeholder.clone()
+                };
+                let items = provider::output_palette_items(&output, provider.limit);
+                let frame = PaletteFrame::new(Self::next_provider_frame_id(), placeholder, items);
+                let behavior = self.provider_item_behavior(provider);
+                driver.push(frame, behavior);
+            }
+            Err(msg) => {
+                tracing::warn!(provider = %provider.label, error = %msg, "provider run failed");
+                let frame = PaletteFrame::new(
+                    Self::next_provider_frame_id(),
+                    "Provider error",
+                    vec![PaletteItem::new("provider:_error", "Provider failed")
+                        .with_subtitle(Some(msg))],
+                );
+                driver.push(frame, PaletteBehavior::new(|_| PaletteOutcome::None));
+            }
+        }
+    }
+
+    /// Assemble the active-tab context handed to a provider run.
+    fn provider_context(self: &Rc<Self>, selected_id: Option<String>) -> provider::ProviderContext {
+        let pid = *self.active_project_id.borrow();
+        let active_tab_id = self.active_tab_id(pid);
+        let active_cwd = if pid != 0 {
+            self.launch_cwd(pid)
+        } else {
+            String::new()
+        };
+        let active_title = active_tab_id
+            .and_then(|tid| {
+                self.projects.borrow().get(&pid).and_then(|ui| {
+                    ui.tabs
+                        .borrow()
+                        .get(&tid)
+                        .map(|t| t.page.title().to_string())
+                })
+            })
+            .unwrap_or_default();
+        let socket = self
+            .client
+            .borrow()
+            .as_ref()
+            .map(|c| c.socket_path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let query = self
+            .palette
+            .borrow()
+            .as_ref()
+            .map(|o| o.driver().snapshot().query)
+            .unwrap_or_default();
+        provider::ProviderContext {
+            socket,
+            query,
+            selected_id,
+            active_tab_id,
+            active_project_id: if pid != 0 { Some(pid) } else { None },
+            active_cwd,
+            active_title,
+        }
+    }
+
+    /// Run one provider phase as a subprocess (off the GTK main thread,
+    /// via `rt`, with the provider's timeout) and parse its stdout.
+    async fn run_provider(
+        self: &Rc<Self>,
+        provider: &provider::Provider,
+        phase: provider::Phase,
+        selected_id: Option<String>,
+    ) -> Result<provider::ProviderOutput, String> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let ctx = self.provider_context(selected_id);
+        let run = provider.run.clone();
+        let timeout = provider.timeout_secs;
+        let shell_interpret = provider.shell_interpret;
+        self.rt
+            .spawn(async move {
+                Self::run_provider_subprocess(shell, run, shell_interpret, phase, ctx, timeout)
+                    .await
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("provider task failed: {e}")))
+    }
+
+    /// The blocking half (runs on a `tokio` worker, not the GTK thread):
+    /// spawn the provider command, write the context JSON to its stdin,
+    /// wait with a timeout, and parse stdout. `kill_on_drop` ensures a
+    /// timed-out child is reaped.
+    async fn run_provider_subprocess(
+        shell: String,
+        run: String,
+        shell_interpret: bool,
+        phase: provider::Phase,
+        ctx: provider::ProviderContext,
+        timeout_secs: u64,
+    ) -> Result<provider::ProviderOutput, String> {
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let argv = provider::invocation_argv(&shell, &run, shell_interpret, phase);
+        let env = provider::invocation_env(phase, &ctx);
+        let stdin_json = provider::invocation_stdin(phase, &ctx);
+
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        // Only set the cwd if it still exists — the active tab's dir may
+        // have been removed; don't let that fail the whole spawn (inherit
+        // Roost's cwd instead).
+        if !ctx.active_cwd.is_empty() && std::path::Path::new(&ctx.active_cwd).is_dir() {
+            cmd.current_dir(&ctx.active_cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| format!("spawn provider: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(stdin_json.as_bytes()).await;
+            // stdin drops here → EOF for the child.
+        }
+        let output =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+                .await
+            {
+                Err(_) => return Err(format!("provider timed out after {timeout_secs}s")),
+                Ok(Err(e)) => return Err(format!("provider io error: {e}")),
+                Ok(Ok(o)) => o,
+            };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail = stderr.lines().last().unwrap_or("").trim().to_string();
+            let code = output.status.code().unwrap_or(-1);
+            return Err(if tail.is_empty() {
+                format!("provider exited with status {code}")
+            } else {
+                format!("provider exited {code}: {tail}")
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        provider::parse_provider_output(&stdout)
+    }
+
+    /// Monotonic, process-unique id for a pushed provider sub-frame, so
+    /// nested drill-ins don't share a behaviors-map key (which a pop
+    /// would otherwise remove for both levels).
+    fn next_provider_frame_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!("provider:items:{}", SEQ.fetch_add(1, Ordering::Relaxed))
     }
 
     /// The active tab's live cwd (OSC 7-tracked) in `project_id`, or ""
@@ -3287,6 +3632,16 @@ impl App {
         if item.id == PaletteCommands::CLEAR_NOTIFICATIONS_ID {
             self.clear_all_notifications();
             return PaletteOutcome::Close;
+        }
+        if item.id == "custom_commands" {
+            // The dynamic drill-in surfaced in the command palette when
+            // providers are configured. Reload providers fresh (matches
+            // the launcher's reload-on-open) and push the custom frame.
+            let providers = RoostConfig::load_default().providers;
+            return PaletteOutcome::Push(
+                self.provider_list_frame(&providers),
+                self.provider_list_behavior(providers),
+            );
         }
         let id = item.id.clone();
         let weak = Rc::downgrade(self);
@@ -3596,6 +3951,7 @@ impl App {
     fn ipc_palette_open(self: &Rc<Self>, kind: &str) -> PaletteStateResult {
         match kind {
             "launcher" => self.show_command_launcher(),
+            "custom" => self.show_custom_palette(),
             _ => self.show_command_palette(),
         }
         self.ipc_palette_state()
@@ -3642,6 +3998,77 @@ impl App {
             driver.dismiss();
         }
         self.ipc_palette_state()
+    }
+
+    /// `palette.present`: open the palette on a caller-supplied list and
+    /// fulfill `reply` once the user picks a row (`selected_id`) or
+    /// dismisses. Blocking — the reply is sent from the confirm/dismiss
+    /// closures, not here. Any already-open palette is dismissed so the
+    /// present takes over.
+    fn ipc_palette_present(
+        self: &Rc<Self>,
+        title: String,
+        placeholder: String,
+        items: Vec<(String, String, Option<String>)>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<roost_ipc::messages::PalettePresentResult, String>,
+        >,
+    ) {
+        // Close any open palette first (its own dismiss path clears the
+        // handle via on_dismiss), then present fresh.
+        let existing = self.palette.borrow().as_ref().map(|o| o.driver());
+        if let Some(driver) = existing {
+            driver.dismiss();
+        }
+
+        let placeholder = if !placeholder.is_empty() {
+            placeholder
+        } else if !title.is_empty() {
+            title
+        } else {
+            "Select…".to_string()
+        };
+        let palette_items: Vec<PaletteItem> = items
+            .into_iter()
+            .map(|(id, title, subtitle)| PaletteItem::new(id, title).with_subtitle(subtitle))
+            .collect();
+        let root = PaletteFrame::new("present", placeholder, palette_items);
+
+        // Shared between confirm (a pick) and dismiss; whoever fires
+        // first takes the sender, so the reply is sent exactly once.
+        let shared = Rc::new(RefCell::new(Some(reply)));
+        let confirm_reply = shared.clone();
+        let behavior = PaletteBehavior::new(move |item| {
+            if let Some(tx) = confirm_reply.borrow_mut().take() {
+                let _ = tx.send(Ok(roost_ipc::messages::PalettePresentResult {
+                    selected_id: Some(item.id.clone()),
+                    dismissed: false,
+                }));
+            }
+            PaletteOutcome::Close
+        });
+
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let dismiss_reply = shared.clone();
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+                if let Some(tx) = dismiss_reply.borrow_mut().take() {
+                    let _ = tx.send(Ok(roost_ipc::messages::PalettePresentResult {
+                        selected_id: None,
+                        dismissed: true,
+                    }));
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
     }
 
     // MARK: selection + clipboard — IPC drive surface

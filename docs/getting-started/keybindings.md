@@ -32,6 +32,7 @@ Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on
 |------------------|-------------------------------------------------|
 | `Cmd-Shift-P`    | Open the command palette (fuzzy-find + run any command) |
 | `Cmd-Shift-T`    | Open the command launcher (run a configured `command =` entry in a new tab) |
+| `Cmd-Shift-E`    | Open the custom palette (script-backed `provider =` menus — see [Extending Roost](../guides/extending.md)) |
 
 ### Clipboard
 
@@ -84,6 +85,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 |------------------|-------------------------------------------------|
 | `Alt-Shift-P`    | Open the command palette (fuzzy-find + run any command) |
 | `Alt-Shift-T`    | Open the command launcher (run a configured `command =` entry in a new tab) |
+| `Alt-Shift-E`    | Open the custom palette (script-backed `provider =` menus — see [Extending Roost](../guides/extending.md)) |
 
 ### Clipboard
 
@@ -211,6 +213,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `jump_to_unread`      | `super+shift+u` / `ctrl+shift+u`                       |
 | `command_palette`     | `super+shift+p` / `alt+shift+p`                        |
 | `command_launcher`    | `super+shift+t` / `alt+shift+t`                        |
+| `custom_palette`      | `super+shift+e` / `alt+shift+e`                        |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
 | `font_increase`       | `super+plus`, `super+equal` / `ctrl+plus`, `ctrl+equal` |

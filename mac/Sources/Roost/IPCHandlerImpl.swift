@@ -101,6 +101,8 @@ actor IPCHandlerImpl: IPCHandler {
             return try await encodeResult(self.paletteActivate(params: params))
         case "palette.dismiss":
             return try await encodeResult(self.paletteDismiss(params: params))
+        case "palette.present":
+            return try await encodeResult(self.palettePresent(params: params))
         case "selection.set":
             try await self.selectionSet(params: params)
             return AnyCodable([:] as [String: Any])
@@ -449,9 +451,9 @@ actor IPCHandlerImpl: IPCHandler {
     private func paletteOpen(params: AnyCodable?) async throws -> IPCPaletteStateResult {
         let p = try decodeParams(params, as: IPCPaletteOpenParams.self, expected: ["kind"])
         let kind = p.kind ?? ""
-        guard ["", "commands", "launcher"].contains(kind) else {
+        guard ["", "commands", "launcher", "custom"].contains(kind) else {
             throw IPCHandlerError.invalidParam(
-                "unknown palette kind \"\(kind)\" (want \"commands\" or \"launcher\")")
+                "unknown palette kind \"\(kind)\" (want \"commands\", \"launcher\", or \"custom\")")
         }
         let ui = try paletteUI()
         return IPCPaletteStateResult(ui.openPalette(kind: kind))
@@ -484,6 +486,22 @@ actor IPCHandlerImpl: IPCHandler {
     private func paletteDismiss(params: AnyCodable?) async throws -> IPCPaletteStateResult {
         _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
         return IPCPaletteStateResult(try paletteUI().dismissPaletteOverlay())
+    }
+
+    @MainActor
+    private func palettePresent(params: AnyCodable?) async throws -> IPCPalettePresentResult {
+        let p = try decodeParams(
+            params, as: IPCPalettePresentParams.self, expected: ["title", "placeholder", "items"])
+        guard !p.items.isEmpty else {
+            throw IPCHandlerError.invalidParam("palette.present requires a non-empty items list")
+        }
+        let ui = try paletteUI()
+        let items = p.items.map {
+            PaletteSnapshot.Item(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+        }
+        let selected = await ui.presentPalette(
+            title: p.title ?? "", placeholder: p.placeholder ?? "", items: items)
+        return IPCPalettePresentResult(selected_id: selected, dismissed: selected == nil)
     }
 
     /// The registered UI bridge, or `internal` if none (headless).
@@ -1388,6 +1406,23 @@ private struct IPCPaletteStateResult: Codable {
             IPCPaletteItemView(id: $0.id, title: $0.title, subtitle: $0.subtitle)
         }
     }
+}
+
+/// Params for `palette.present`: optional chrome + the required item
+/// list. Mirrors `roost_ipc::messages::PalettePresentParams`.
+private struct IPCPalettePresentParams: Codable {
+    let title: String?
+    let placeholder: String?
+    let items: [IPCPaletteItemView]
+    enum CodingKeys: String, CodingKey { case title, placeholder, items }
+}
+
+/// `palette.present` response. `selected_id` is omitted (nil → absent)
+/// on dismissal, matching the Rust `skip_serializing_if`.
+private struct IPCPalettePresentResult: Codable {
+    let selected_id: String?
+    let dismissed: Bool
+    enum CodingKeys: String, CodingKey { case selected_id, dismissed }
 }
 
 private struct IPCTabSetTitleParams: Codable {

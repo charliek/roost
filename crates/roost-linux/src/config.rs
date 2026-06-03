@@ -11,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::custom_command::{self, CustomCommand};
+use crate::provider::{self, Provider};
 use roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,11 @@ pub struct RoostConfig {
     /// order (= picker row order). A line missing `label`/`run` is
     /// skipped (see `custom_command::parse_command_line`).
     pub commands: Vec<CustomCommand>,
+    /// Dynamic, script-backed providers — `provider =` config lines (in
+    /// source order) followed by executables discovered under the
+    /// `providers/` dir next to the config file. Drive the custom palette
+    /// (Cmd/Alt+Shift+E). See `crate::provider`.
+    pub providers: Vec<Provider>,
     /// `copy-on-select` setting — controls what happens to a
     /// mouse-drag selection on release. Three states match Ghostty's
     /// vocabulary. Defaults to `True` on both platforms.
@@ -53,6 +59,7 @@ impl Default for RoostConfig {
             font_size: None,
             keybinds: Vec::new(),
             commands: Vec::new(),
+            providers: Vec::new(),
             copy_on_select: CopyOnSelect::default(),
             clipboard_write: ClipboardWrite::default(),
             word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
@@ -128,10 +135,15 @@ impl RoostConfig {
     }
 
     pub fn load_from(path: PathBuf) -> Self {
-        let Ok(content) = fs::read_to_string(&path) else {
-            return Self::default();
+        let mut cfg = match fs::read_to_string(&path) {
+            Ok(content) => Self::parse(&content),
+            Err(_) => Self::default(),
         };
-        Self::parse(&content)
+        // Discovered providers append after any `provider =` config
+        // entries, so config order wins and the dir fills in the rest.
+        cfg.providers
+            .extend(discover_providers(providers_dir(&path)));
+        cfg
     }
 
     pub fn parse(content: &str) -> Self {
@@ -202,6 +214,19 @@ impl RoostConfig {
                         tracing::warn!(
                             line = raw.trim(),
                             "skipping malformed `command =` line (needs label + run)"
+                        );
+                    }
+                }
+                "provider" => {
+                    // Dynamic provider: `provider = label="…" run="…" …`.
+                    // Same grammar as `command =`; a line missing
+                    // label/run is skipped, not fatal.
+                    if let Some(p) = provider::parse_provider_line(value) {
+                        cfg.providers.push(p);
+                    } else {
+                        tracing::warn!(
+                            line = raw.trim(),
+                            "skipping malformed `provider =` line (needs label + run)"
                         );
                     }
                 }
@@ -350,6 +375,64 @@ pub fn config_path() -> Option<PathBuf> {
     default_path()
 }
 
+/// The `providers/` directory beside the config file (so the E2E
+/// harness's `ROOST_CONFIG` override scopes discovery to its temp dir,
+/// just like it scopes the launcher's `command =` entries).
+fn providers_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("providers")
+}
+
+/// Discover executable provider scripts in `dir`, sorted by filename for
+/// a stable row order. Non-files, non-executables, and dotfiles are
+/// skipped; a missing dir yields an empty list. The first ~2 KiB of each
+/// file is read for `# @roost.label:` / `# @roost.title:` metadata.
+fn discover_providers(dir: PathBuf) -> Vec<Provider> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    let mut files: Vec<_> = entries.flatten().collect();
+    files.sort_by_key(|e| e.file_name());
+    for entry in files {
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if filename.starts_with('.') {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let header = read_header(&path);
+        out.push(provider::provider_from_file(
+            &path.to_string_lossy(),
+            &filename,
+            &header,
+        ));
+    }
+    out
+}
+
+/// Read the leading bytes of a script for header-comment metadata. Lossy
+/// UTF-8 is fine — we only scan comment lines.
+fn read_header(path: &Path) -> String {
+    use std::io::Read;
+    let Ok(file) = fs::File::open(path) else {
+        return String::new();
+    };
+    // Read at most the 2 KiB cap — a provider may be a large compiled
+    // binary, so don't slurp the whole file just to scan a comment header.
+    let mut buf = Vec::new();
+    if file.take(2048).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn default_path() -> Option<PathBuf> {
     // `ROOST_CONFIG` overrides the path with an absolute file — used by
     // the E2E harness to drive the command launcher off a seeded config
@@ -414,6 +497,59 @@ mod tests {
         assert_eq!(cfg.commands[0].run, "claude --resume");
         assert_eq!(cfg.commands[1].label, "Build");
         assert!(cfg.commands[1].hold);
+    }
+
+    #[test]
+    fn parses_provider_entries_in_order() {
+        let cfg = RoostConfig::parse(
+            r#"
+            provider = label="Open shed" run="shed.sh"
+            provider = label="Worktrees" run="wt.sh" timeout=8 limit=20
+            "#,
+        );
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(cfg.providers[0].label, "Open shed");
+        assert_eq!(cfg.providers[0].run, "shed.sh");
+        assert_eq!(cfg.providers[1].timeout_secs, 8);
+        assert_eq!(cfg.providers[1].limit, 20);
+    }
+
+    #[test]
+    fn malformed_provider_skipped() {
+        let cfg = RoostConfig::parse(r#"provider = label="NoRun""#);
+        assert!(cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn discovers_executable_providers_from_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfgpath = tmp.path().join("config.conf");
+        fs::write(
+            &cfgpath,
+            "theme = roost-dark\nprovider = label=\"Configured\" run=\"c.sh\"\n",
+        )
+        .unwrap();
+        let pdir = tmp.path().join("providers");
+        fs::create_dir_all(&pdir).unwrap();
+        let script = pdir.join("shed.sh");
+        fs::write(&script, "#!/bin/sh\n# @roost.label: Open shed\necho '{}'\n").unwrap();
+        let mut perm = fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&script, perm).unwrap();
+        // A non-executable file in the dir is ignored.
+        fs::write(pdir.join("notes.txt"), "ignore me").unwrap();
+
+        let cfg = RoostConfig::load_from(cfgpath);
+        // Config provider first (source order), discovered script after.
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(cfg.providers[0].label, "Configured");
+        assert_eq!(cfg.providers[1].label, "Open shed"); // from header metadata
+                                                         // Discovered providers keep the raw path and exec directly;
+                                                         // config entries are shell-interpreted.
+        assert_eq!(cfg.providers[1].run, script.to_string_lossy());
+        assert!(!cfg.providers[1].shell_interpret);
+        assert!(cfg.providers[0].shell_interpret);
     }
 
     #[test]

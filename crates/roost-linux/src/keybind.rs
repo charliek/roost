@@ -60,6 +60,12 @@ pub enum KeybindAction {
     /// list) on its own picker. Default `projectMod+shift+t` —
     /// Cmd+Shift+T on macOS-GTK, Alt+Shift+T on Linux.
     CommandLauncher,
+    /// Open the custom palette (config-defined `provider =` list, plus
+    /// any discovered provider scripts) — the dynamic, script-backed
+    /// picker. Default `projectMod+shift+e` — Cmd+Shift+E on macOS-GTK,
+    /// Alt+Shift+E on Linux. (`…+shift+r` is RenameProject; users who
+    /// prefer the "R for Run" mnemonic rebind via config.)
+    CustomPalette,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
     /// `switch_project_N` where N is 1..=9.
@@ -91,6 +97,7 @@ impl KeybindAction {
             "font_reset" => Some(Self::FontReset),
             "command_palette" => Some(Self::CommandPalette),
             "command_launcher" => Some(Self::CommandLauncher),
+            "custom_palette" => Some(Self::CustomPalette),
             "unbind" => Some(Self::Unbind),
             other => {
                 if let Some(n) = other.strip_prefix("switch_project_") {
@@ -282,6 +289,16 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &mut out,
         &format!("{project_mod}+shift+t"),
         KeybindAction::CommandLauncher,
+    );
+
+    // Custom palette (script-backed providers): Cmd+Shift+E on macOS-GTK,
+    // Alt+Shift+E on Linux. `…+shift+r` would be the "R for Run" mnemonic
+    // but RenameProject already owns it; `…+shift+e` ("Extensions") is
+    // free on both platforms. Users rebind to `…+shift+r` via config.
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+e"),
+        KeybindAction::CustomPalette,
     );
 
     // Browser-style font sizing on the active terminal. `Cmd-+` on
@@ -509,6 +526,33 @@ mod tests {
         assert_eq!(
             defaults.get(&trigger),
             Some(&KeybindAction::CommandLauncher)
+        );
+    }
+
+    #[test]
+    fn custom_palette_action_and_default() {
+        assert_eq!(
+            KeybindAction::from_name("custom_palette"),
+            Some(KeybindAction::CustomPalette)
+        );
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // projectMod+shift+e: Cmd+Shift+E on macOS, Alt+Shift+E on Linux.
+        // Must NOT collide with RenameProject (`…+shift+r`).
+        let trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+e").unwrap()
+        } else {
+            parse_trigger("alt+shift+e").unwrap()
+        };
+        assert_eq!(defaults.get(&trigger), Some(&KeybindAction::CustomPalette));
+        let rename_project = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+r").unwrap()
+        } else {
+            parse_trigger("alt+shift+r").unwrap()
+        };
+        assert_eq!(
+            defaults.get(&rename_project),
+            Some(&KeybindAction::RenameProject),
+            "custom_palette default must not steal RenameProject's binding"
         );
     }
 

@@ -50,6 +50,10 @@ protocol UiBridge: AnyObject {
     func paletteQuery(_ text: String) -> PaletteSnapshot
     func paletteActivate(id: String) -> PaletteSnapshot?
     func dismissPaletteOverlay() -> PaletteSnapshot
+    /// `palette.present`: open the palette on a caller-supplied list and
+    /// resume with the chosen row id (`nil` on dismissal). Blocking — the
+    /// reply is sent when the user picks or dismisses, not on open.
+    func presentPalette(title: String, placeholder: String, items: [PaletteSnapshot.Item]) async -> String?
 
     // Selection drive surface (`selection.*` ops). Each takes a tab id;
     // returning `false` / `nil` signals "no live tab" so the IPC

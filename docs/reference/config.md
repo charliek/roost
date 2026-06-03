@@ -27,7 +27,8 @@ the launcher with deterministic commands.
 | `tab-min-width` | number | `80` (Mac) | Minimum tab pill width in points. `0` disables the floor. Mac-only. |
 | `tab-max-width` | number | `220` (Mac) | Maximum tab pill width in points. `0` disables the cap (pills grow to fit). Mac-only. |
 | `keybind` | `<trigger> = <action>` | (see `cmd/roost/shortcuts.go` legacy notes) | Append a custom keybinding. Repeatable; later entries override earlier ones. |
-| `command` | `label="…" run="…" [hold=…]` | none | Launcher entry surfaced in the command palette. Repeatable. |
+| `command` | `label="…" run="…" [hold=…]` | none | Launcher entry (⌘⇧T / Alt+Shift+T) that runs a fixed command in a new tab. Repeatable. See [Extending Roost](../guides/extending.md#2-the-command-launcher). |
+| `provider` | `label="…" run="…" [timeout=…] [limit=…]` | none | Dynamic, script-backed menu in the custom palette (⌘⇧E / Alt+Shift+E). The script generates rows on demand and acts on the choice. Repeatable; executables in `providers/` (beside this file) are also discovered. See [Extending Roost](../guides/extending.md#3-dynamic-providers). |
 | `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 
@@ -158,8 +159,16 @@ copy-on-select = true
 clipboard-write = allow
 
 keybind = ctrl+t = new_tab
+
+# A fixed launcher command (⌘⇧T / Alt+Shift+T):
 command = label="Claude" run="claude --resume"
+
+# A dynamic, script-backed menu (⌘⇧E / Alt+Shift+E). The script prints
+# its rows on `list` and acts on the choice on `activate`:
+provider = label="Open shed" run="~/.config/roost/providers/shed.sh"
 ```
 
-See [`paths.md`](paths.md) for where the file lives on each platform,
-and [`themes.md`](themes.md) for the `theme` value enumeration.
+See [Extending Roost](../guides/extending.md) for the full `command =` /
+`provider =` contract (with bash / Python / TypeScript examples),
+[`paths.md`](paths.md) for where the file lives on each platform, and
+[`themes.md`](themes.md) for the `theme` value enumeration.

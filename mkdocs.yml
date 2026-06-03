@@ -96,7 +96,9 @@ nav:
       - Notifications: guides/notifications.md
       - Claude Code Hooks: guides/claude-code.md
       - Working Directory Tracking: guides/cwd-tracking.md
+      - Extending Roost: guides/extending.md
   - Reference:
+      - Configuration: reference/config.md
       - CLI: reference/cli.md
       - IPC: reference/ipc.md
       - Paths & Environment: reference/paths.md
