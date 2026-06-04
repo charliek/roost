@@ -73,6 +73,28 @@ def test_provider_list_then_activate_round_trips_selection(roost, palette):
     )
 
 
+def test_provider_non_actionable_row_is_no_op(roost, palette):
+    """A provider row with `actionable:false` renders but can't be
+    selected — activating it is a no-op and the palette stays open."""
+    items = _provider_root(palette)
+    _require_seed(items)
+
+    palette.palette_activate(items["Fixture Provider"])
+    roost._wait(
+        lambda: "Disabled row" in _titles(roost.palette_state()),
+        8.0,
+        "provider list populated",
+    )
+    by_title = {it["title"]: it["id"] for it in roost.palette_state()["items"]}
+    frame_before = roost.palette_state()["frame"]
+
+    # Activating the non-actionable row neither closes nor drills in.
+    st = roost.palette_activate(by_title["Disabled row"])
+    assert st["open"] is True
+    assert st["frame"] == frame_before
+    assert "Provider Alpha" in _titles(st)  # still the items frame, unchanged
+
+
 def test_palette_present_returns_selection(palette, target):
     """`palette.present` blocks until a pick; drive the selection from a
     second connection while the present call is in flight."""

@@ -9,9 +9,9 @@
 //!   roostctl set-title --title TITLE [--tab ID]
 //!   roostctl identify
 //!   roostctl tab focus [--tab ID]
-//!   roostctl tab list
+//!   roostctl tab list [--json]
 //!   roostctl tab set-state --state STATE [--tab ID]
-//!   roostctl tab open --project-id N [--cwd …] [--cols 80] [--rows 24]
+//!   roostctl tab open --project-id N [--cwd …] [--after-tab ID] [--focus] [--hold] [-- <cmd…>]
 //!   roostctl tab close [--tab ID]
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
@@ -230,7 +230,12 @@ enum TabCmd {
         #[arg(long, env = "ROOST_TAB_ID")]
         tab: Option<i64>,
     },
-    List,
+    /// List projects + their tabs. `--json` emits the machine-readable
+    /// workspace snapshot (the `tab.list` result) instead of plain text.
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     SetState {
         #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
         state: String,
@@ -245,6 +250,12 @@ enum TabCmd {
     /// the project's cwd; `--cols / --rows` default to 80x24 (the
     /// UI re-quantizes to its cell grid on first attach). Prints
     /// the new tab id on stdout.
+    ///
+    /// A command to run in the tab can be given after `--`
+    /// (e.g. `roostctl tab open --project-id 1 -- htop`). Without a
+    /// command the tab opens the default shell. By default the tab
+    /// closes when the command exits (hold=false); `--hold` keeps it
+    /// open by dropping to an interactive shell afterward.
     Open {
         #[arg(long)]
         project_id: i64,
@@ -256,6 +267,22 @@ enum TabCmd {
         rows: u32,
         #[arg(long, default_value = "roostctl")]
         title: String,
+        /// Place the new tab immediately after this tab (same project).
+        /// Omitted ⇒ appended at the end.
+        #[arg(long)]
+        after_tab: Option<i64>,
+        /// Focus (activate) the new tab after opening it.
+        #[arg(long, default_value_t = false)]
+        focus: bool,
+        /// Keep the tab open after the command exits, dropping to an
+        /// interactive shell (mirrors `command = … hold=true`). Only
+        /// meaningful with a command after `--`.
+        #[arg(long, default_value_t = false)]
+        hold: bool,
+        /// Command + args to run in the tab, after `--`. Empty ⇒ the
+        /// default shell.
+        #[arg(last = true)]
+        argv: Vec<String>,
     },
     /// Close a tab. The UI closes the PTY (if live) and emits
     /// `tab.closed`.
@@ -529,18 +556,22 @@ async fn main() -> Result<()> {
                 .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id })
                 .await?;
         }
-        Cmd::Tab(TabCmd::List) => {
+        Cmd::Tab(TabCmd::List { json }) => {
             let resp = list_tabs(&mut client).await?;
-            for project in resp.projects {
-                println!("project {} — {}", project.id, project.name);
-                for tab in project.tabs {
-                    println!(
-                        "  tab {} [{}] {} cwd={}",
-                        tab.id,
-                        format_state(tab.state),
-                        tab.title,
-                        tab.cwd
-                    );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                for project in resp.projects {
+                    println!("project {} — {}", project.id, project.name);
+                    for tab in project.tabs {
+                        println!(
+                            "  tab {} [{}] {} cwd={}",
+                            tab.id,
+                            format_state(tab.state),
+                            tab.title,
+                            tab.cwd
+                        );
+                    }
                 }
             }
         }
@@ -617,24 +648,59 @@ async fn main() -> Result<()> {
             cols,
             rows,
             title,
+            after_tab,
+            focus,
+            hold,
+            argv,
         }) => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            // `--hold` wraps the command so a fresh interactive shell takes
+            // over when it exits (tab persists). Without it, the argv runs
+            // directly and the tab closes on exit. Empty argv ⇒ default shell.
+            let argv = if hold && !argv.is_empty() {
+                held_argv(&shell, &argv)
+            } else {
+                argv
+            };
             let resp: TabOpenResult = client
                 .call(
                     ops::TAB_OPEN,
                     TabOpenParams {
                         project_id,
                         cwd,
-                        argv: vec![],
+                        argv,
                         cols,
                         rows,
                         title,
                     },
                 )
                 .await?;
-            println!(
-                "opened tab {} in project {} (cwd={})",
-                resp.tab.id, resp.tab.project_id, resp.tab.cwd
-            );
+            let new_id = resp.tab.id;
+            // `--after-tab`: place the new tab right after that one via a
+            // reorder over the project's current order.
+            if let Some(after) = after_tab {
+                let snapshot = list_tabs(&mut client).await?;
+                if let Some(project) = snapshot.projects.iter().find(|p| p.id == project_id) {
+                    let ids: Vec<i64> = project.tabs.iter().map(|t| t.id).collect();
+                    client
+                        .call::<_, serde_json::Value>(
+                            ops::TAB_REORDER,
+                            TabReorderParams {
+                                project_id,
+                                tab_ids: order_with_after(&ids, new_id, after),
+                            },
+                        )
+                        .await?;
+                }
+            }
+            if focus {
+                client
+                    .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id: new_id })
+                    .await?;
+            }
+            // Print just the new tab id (matches the documented contract;
+            // script-friendly for `id=$(roostctl tab open …)`).
+            println!("{new_id}");
         }
         Cmd::Tab(TabCmd::Close { tab }) => {
             let tab_id = resolve_tab(&mut client, tab).await?;
@@ -1214,9 +1280,77 @@ fn format_state(state: TabState) -> &'static str {
     }
 }
 
+/// Wrap `argv` (a command) so the tab persists after it exits (hold=true):
+/// run the command, then `exec` a fresh interactive shell. Uses the
+/// positional-args trick — `"$@"` runs the command, `"$0"` is the shell —
+/// so `argv` needs no quoting/escaping. The wrapper is **`/bin/sh`** (so
+/// the POSIX `$@`/`$0` work regardless of the user's `$SHELL` — fish, for
+/// one, doesn't expose them in `-c`); `$0` is the user's `$SHELL`, which
+/// `exec "$0" -i` re-launches interactively. Caller ensures `argv` is
+/// non-empty. Mirrors the launcher's hold path (`custom_command::launch_argv`).
+fn held_argv(shell: &str, argv: &[String]) -> Vec<String> {
+    let mut out = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        // `set +e` so an inherited `errexit` can't abort before the
+        // `exec` when the command returns nonzero — `--hold` must still
+        // hand off to the interactive shell.
+        r#"set +e; "$@"; exec "$0" -i"#.to_string(),
+        // $0 = the user's shell (re-launched by `exec "$0"`), then $1.. = argv.
+        shell.to_string(),
+    ];
+    out.extend(argv.iter().cloned());
+    out
+}
+
+/// The project's tab-id order with `new` moved to immediately after
+/// `after`. `new` is assumed already present (tab.open appended it). If
+/// `after` isn't in the list, the order is returned unchanged (new stays
+/// at the end).
+fn order_with_after(ids: &[i64], new: i64, after: i64) -> Vec<i64> {
+    let base: Vec<i64> = ids.iter().copied().filter(|&id| id != new).collect();
+    match base.iter().position(|&id| id == after) {
+        Some(i) => {
+            let mut out = Vec::with_capacity(ids.len());
+            out.extend_from_slice(&base[..=i]);
+            out.push(new);
+            out.extend_from_slice(&base[i + 1..]);
+            out
+        }
+        None => ids.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_argv_wraps_command_and_execs_shell() {
+        let argv = held_argv("/bin/zsh", &["shed".into(), "console".into(), "x".into()]);
+        assert_eq!(
+            argv,
+            vec![
+                "/bin/sh", // POSIX wrapper (works even if $SHELL is fish)
+                "-c",
+                r#"set +e; "$@"; exec "$0" -i"#,
+                "/bin/zsh", // $0 — the user's shell, re-launched interactively
+                "shed",     // $1
+                "console",  // $2
+                "x",        // $3
+            ]
+        );
+    }
+
+    #[test]
+    fn order_with_after_places_new_after_target() {
+        // tab.open appended `3`; move it after `1`.
+        assert_eq!(order_with_after(&[1, 2, 3], 3, 1), vec![1, 3, 2]);
+        // After the (now second-to-last) tab — a no-op shuffle.
+        assert_eq!(order_with_after(&[1, 2, 3], 3, 2), vec![1, 2, 3]);
+        // `after` not present → unchanged (new stays at the end).
+        assert_eq!(order_with_after(&[1, 2, 3], 3, 99), vec![1, 2, 3]);
+    }
 
     #[test]
     fn decode_escapes_handles_common_sequences() {

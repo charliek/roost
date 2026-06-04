@@ -395,6 +395,9 @@ impl PaletteInner {
         let Some(item) = self.state.borrow().selected_item() else {
             return; // empty filter → no-op
         };
+        if !item.actionable {
+            return; // non-actionable row (e.g. a "No results" sentinel) — stay open
+        }
         let id = self.state.borrow().current().id.clone();
         let outcome = {
             let behaviors = self.behaviors.borrow();

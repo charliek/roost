@@ -290,6 +290,11 @@ pub struct ProviderOutputItem {
     pub title: String,
     #[serde(default)]
     pub subtitle: Option<String>,
+    /// When `Some(false)`, the row renders but can't be selected (the
+    /// palette stays open) — for empty/disabled states like "No results".
+    /// Absent ⇒ actionable.
+    #[serde(default)]
+    pub actionable: Option<bool>,
 }
 
 /// A provider's parsed stdout: the rows plus optional palette chrome.
@@ -329,7 +334,8 @@ pub fn parse_provider_output(stdout: &str) -> Result<ProviderOutput, String> {
 pub fn provider_items(providers: &[Provider]) -> Vec<PaletteItem> {
     if providers.is_empty() {
         return vec![PaletteItem::new("provider:none", "No providers configured")
-            .with_subtitle(Some("Add `provider = …` to config.conf".to_string()))];
+            .with_subtitle(Some("Add `provider = …` to config.conf".to_string()))
+            .with_actionable(false)];
     }
     providers
         .iter()
@@ -363,14 +369,17 @@ pub fn output_palette_items(out: &ProviderOutput, limit: usize) -> Vec<PaletteIt
         .iter()
         .take(limit)
         .map(|it| {
-            PaletteItem::new(it.id.clone(), it.title.clone()).with_subtitle(it.subtitle.clone())
+            PaletteItem::new(it.id.clone(), it.title.clone())
+                .with_subtitle(it.subtitle.clone())
+                .with_actionable(it.actionable.unwrap_or(true))
         })
         .collect();
     if out.items.len() > limit {
         let extra = out.items.len() - limit;
         rows.push(
             PaletteItem::new(OVERFLOW_ID, format!("… {extra} more"))
-                .with_subtitle(Some("refine your query".to_string())),
+                .with_subtitle(Some("refine your query".to_string()))
+                .with_actionable(false),
         );
     }
     rows
@@ -596,6 +605,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "provider:none");
         assert_eq!(provider_index(&items[0].id), None);
+        assert!(!items[0].actionable); // the sentinel is non-selectable
     }
 
     #[test]
@@ -607,6 +617,7 @@ mod tests {
                     id: format!("i{i}"),
                     title: format!("Item {i}"),
                     subtitle: None,
+                    actionable: None,
                 })
                 .collect(),
         };
@@ -614,8 +625,10 @@ mod tests {
         // 3 real rows + 1 overflow hint.
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[2].id, "i2");
+        assert!(rows[2].actionable); // absent ⇒ actionable
         assert_eq!(rows[3].id, OVERFLOW_ID);
         assert_eq!(rows[3].title, "… 2 more");
+        assert!(!rows[3].actionable); // overflow hint is non-actionable
     }
 
     #[test]
@@ -626,11 +639,33 @@ mod tests {
                 id: "a".into(),
                 title: "A".into(),
                 subtitle: Some("sub".into()),
+                actionable: None,
             }],
         };
         let rows = output_palette_items(&out, 100);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subtitle.as_deref(), Some("sub"));
         assert!(rows.iter().all(|r| r.id != OVERFLOW_ID));
+    }
+
+    #[test]
+    fn actionable_parses_and_carries_through() {
+        // Explicit `actionable:false` on an item parses and propagates to
+        // the palette row; omitting it defaults to actionable.
+        let out = parse_provider_output(
+            r#"{"items":[{"id":"x","title":"X","actionable":false},{"id":"y","title":"Y"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(out.items[0].actionable, Some(false));
+        assert_eq!(out.items[1].actionable, None);
+        let rows = output_palette_items(&out, 100);
+        assert!(!rows[0].actionable);
+        assert!(rows[1].actionable);
+    }
+
+    #[test]
+    fn palette_item_actionable_defaults_true() {
+        assert!(PaletteItem::new("a", "A").actionable);
+        assert!(!PaletteItem::new("a", "A").with_actionable(false).actionable);
     }
 }

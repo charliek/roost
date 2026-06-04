@@ -267,6 +267,7 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     private func confirm() {
         guard let item = state.selectedItem else { return }  // empty filter → no-op
+        guard item.actionable else { return }  // non-actionable sentinel — stay open
         guard let outcome = behaviors[state.current.id]?.onConfirm(item) else { return }
         switch outcome {
         case .close:

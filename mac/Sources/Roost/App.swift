@@ -1077,11 +1077,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func providerItemBehavior(_ provider: Provider) -> PaletteBehavior {
         PaletteBehavior(onConfirm: { [weak self] item in
-            // Non-actionable rows (overflow hint, error) stay put.
-            // Only the overflow hint is non-actionable here (error rows
-            // live in their own no-op-behavior frame); exact-match the
-            // reserved id so a provider's real item id isn't swallowed.
-            if item.id == providerOverflowID { return .none }
+            // Non-actionable rows (the overflow hint, a provider's
+            // `actionable:false` row) never reach here — `confirm` skips
+            // them before invoking the behavior.
             guard let self else { return .close }
             Task { @MainActor in await self.activateProviderItem(provider, selectedID: item.id) }
             return .none
