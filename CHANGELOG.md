@@ -9,6 +9,42 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.9 — 2026-06-04
+
+Extensibility release. Roost gains a **script-backed provider system**: drop an
+executable in `~/.config/roost/providers/` (or add a `provider =` line to config)
+and it appears as a dynamic, on-demand menu in a new **custom palette**
+(⌘⇧E / Alt+Shift+E) — "open shed", "switch worktree", anything a script can list —
+plus the CLI building blocks to act on a selection. See the new
+**[Extending Roost](docs/guides/extending.md)** guide.
+
+### Features
+
+- **Script-backed providers + custom palette (#210)** — a `provider =` config entry,
+  or an executable under `~/.config/roost/providers/`, is run on demand to populate a
+  palette frame (`list`), then again to act on the choice (`activate`). Active-tab
+  context is passed via env vars + a stdin JSON object, and `{items}` JSON is read back
+  (drill-in supported). Surfaced via ⌘⇧E / Alt+Shift+E and a conditional
+  "Custom Commands…" row in the command palette. One contract, both UIs.
+- **`palette.present` IPC op (#210)** — a script hands Roost a list and blocks for the
+  user's pick; the programmatic twin of the command palette. Exposed as
+  `roostctl palette present` (items via `--items` or stdin).
+- **Scriptable `tab open` + `tab list --json` (#211)** — `roostctl tab open` gains a
+  trailing `-- <cmd…>` (run a command in the tab; closes on exit = hold=false), `--hold`
+  (keep it open afterward, like `command = … hold=true`), `--after-tab <id>` (place the
+  new tab next to that one), and `--focus`; `tab list` gains `--json`.
+- **Non-actionable palette rows (#211)** — palette items can be marked non-selectable
+  (`actionable: false`), so a provider's empty/disabled row (e.g. "No results") renders
+  but can't be picked and leaves the palette open.
+
+### Docs
+
+- New **[Extending Roost](docs/guides/extending.md)** guide — CLI/IPC automation, the
+  `command =` launcher, and the `provider =` protocol with bash / Python / TypeScript
+  examples (incl. a complete "Open shed" provider). The **Configuration** reference is
+  now linked in the nav, and `docs/reference/{cli,ipc}.md` document the new `tab.*` /
+  `palette.*` surface.
+
 ## v0.0.8 — 2026-06-02
 
 Terminal color-fidelity release. Fixes a palette bug that made every 256-color
