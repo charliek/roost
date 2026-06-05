@@ -1131,6 +1131,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         ctx.socket = socketPath
         ctx.selectedID = selectedID
         ctx.query = palette?.driveSnapshot().query ?? ""
+        ctx.roostctl = resolveBundledRoostctl()
         if let pid = activeProjectID {
             ctx.activeProjectID = pid
             ctx.activeCwd = activeLaunchCwd(projectID: pid)
@@ -1140,6 +1141,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
         }
         return ctx
+    }
+
+    /// Roost's bundled `roostctl` (`Roost.app/Contents/Resources/bin/roostctl`),
+    /// handed to providers as `ROOST_ROOSTCTL` so they don't need it on PATH.
+    /// `nil` when not present (e.g. a `swift run` dev build with no embedded
+    /// CLI) — the provider then falls back to a PATH `roostctl`.
+    private func resolveBundledRoostctl() -> String? {
+        guard let url = Bundle.main.resourceURL?.appendingPathComponent("bin/roostctl"),
+            FileManager.default.isExecutableFile(atPath: url.path)
+        else { return nil }
+        return url.path
     }
 
     /// Run one provider phase as a subprocess (off the main actor, with
@@ -4795,6 +4807,12 @@ private func runProviderProcess(
     proc.arguments = Array(argv.dropFirst())
     var environment = ProcessInfo.processInfo.environment
     for (k, v) in env { environment[k] = v }
+    // If Roost couldn't resolve its own roostctl, strip any inherited
+    // ROOST_ROOSTCTL so the script's ${ROOST_ROOSTCTL:-roostctl} PATH
+    // fallback fires (don't leak a stale parent value).
+    if !env.contains(where: { $0.0 == "ROOST_ROOSTCTL" }) {
+        environment["ROOST_ROOSTCTL"] = nil
+    }
     proc.environment = environment
     // Only set the cwd if it still exists — the active tab's dir may have
     // been removed; don't let that fail the whole spawn.

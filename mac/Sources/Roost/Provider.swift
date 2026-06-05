@@ -61,6 +61,10 @@ struct ProviderContext {
     var activeProjectID: Int64?
     var activeCwd: String = ""
     var activeTitle: String = ""
+    /// Absolute path to Roost's own `roostctl`, exposed as `ROOST_ROOSTCTL`
+    /// so a provider can drive Roost without `roostctl` on `PATH` (the Mac
+    /// `.app` bundles it off-`PATH`). `nil` when it can't be located.
+    var roostctl: String?
 }
 
 /// Parse one `provider =` value into a `Provider`. Returns nil when
@@ -189,6 +193,7 @@ func providerInvocationEnv(phase: ProviderPhase, ctx: ProviderContext) -> [(Stri
     if let id = ctx.activeTabID { env.append(("ROOST_ACTIVE_TAB_ID", String(id))) }
     if let id = ctx.activeProjectID { env.append(("ROOST_ACTIVE_PROJECT_ID", String(id))) }
     if let sel = ctx.selectedID { env.append(("ROOST_SELECTED_ID", sel)) }
+    if let rc = ctx.roostctl { env.append(("ROOST_ROOSTCTL", rc)) }
     return env
 }
 

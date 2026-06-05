@@ -33,6 +33,23 @@ roostctl [--socket <PATH>] <COMMAND>
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket.
 
+### Where `roostctl` lives
+
+`roostctl` ships next to each UI, but the two platforms put it in
+different places — only one is on `PATH`:
+
+| Platform | Path | On `PATH`? |
+|---|---|---|
+| **Linux (`.deb`)** | `/usr/bin/roostctl` | ✅ yes |
+| **macOS (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+
+For your own shell on macOS, symlink it onto `PATH` once
+(`ln -s /Applications/Roost.app/Contents/Resources/bin/roostctl
+/usr/local/bin/roostctl`). **Provider scripts don't need to** — Roost
+sets `ROOST_ROOSTCTL` to the absolute path of its own `roostctl` when it
+runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is portable across both
+platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
+
 ## `notify`
 
 ```bash
@@ -214,6 +231,7 @@ Internal: invoked by Claude Code via the generated settings file. Reads the hook
 |---|---|
 | `ROOST_SOCKET` | Override the UI socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
+| `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl` (see [Where `roostctl` lives](#where-roostctl-lives)) |
 | `ROOST_DEBUG` | If set, `claude-hook` writes failure messages to stderr |
 
 `ROOST_SOCKET` / `ROOST_TAB_ID` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac`/`gtk`) — see [Paths & Environment](paths.md).

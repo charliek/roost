@@ -87,6 +87,12 @@ pub struct ProviderContext {
     pub active_project_id: Option<i64>,
     pub active_cwd: String,
     pub active_title: String,
+    /// Absolute path to Roost's own `roostctl`, exposed to the script as
+    /// `ROOST_ROOSTCTL` so a provider can drive Roost without `roostctl`
+    /// on `PATH` — the Mac `.app` bundles it off-`PATH`; the Linux `.deb`
+    /// installs it on `PATH`; either way Roost hands the script the exact
+    /// binary. `None` when Roost can't locate its sibling.
+    pub roostctl: Option<String>,
 }
 
 /// Parse one `provider =` value into a [`Provider`]. Returns `None` when
@@ -236,6 +242,9 @@ pub fn invocation_env(phase: Phase, ctx: &ProviderContext) -> Vec<(String, Strin
     }
     if let Some(sel) = &ctx.selected_id {
         env.push(("ROOST_SELECTED_ID".to_string(), sel.clone()));
+    }
+    if let Some(rc) = &ctx.roostctl {
+        env.push(("ROOST_ROOSTCTL".to_string(), rc.clone()));
     }
     env
 }
@@ -493,6 +502,7 @@ mod tests {
             active_project_id: Some(3),
             active_cwd: "/repo".into(),
             active_title: "build".into(),
+            roostctl: Some("/usr/bin/roostctl".into()),
         };
         let env = invocation_env(Phase::Activate, &ctx);
         let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
@@ -502,6 +512,7 @@ mod tests {
         assert_eq!(get("ROOST_ACTIVE_TAB_ID").as_deref(), Some("7"));
         assert_eq!(get("ROOST_ACTIVE_PROJECT_ID").as_deref(), Some("3"));
         assert_eq!(get("ROOST_ACTIVE_CWD").as_deref(), Some("/repo"));
+        assert_eq!(get("ROOST_ROOSTCTL").as_deref(), Some("/usr/bin/roostctl"));
     }
 
     #[test]
@@ -513,6 +524,7 @@ mod tests {
         let env = invocation_env(Phase::List, &ctx);
         assert!(!env.iter().any(|(k, _)| k == "ROOST_SELECTED_ID"));
         assert!(!env.iter().any(|(k, _)| k == "ROOST_ACTIVE_TAB_ID"));
+        assert!(!env.iter().any(|(k, _)| k == "ROOST_ROOSTCTL")); // None ⇒ omitted
     }
 
     #[test]
@@ -525,6 +537,7 @@ mod tests {
             active_project_id: Some(3),
             active_cwd: "/repo".into(),
             active_title: "build".into(),
+            roostctl: None,
         };
         let json = invocation_stdin(Phase::Activate, &ctx);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
