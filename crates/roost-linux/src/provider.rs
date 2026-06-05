@@ -325,15 +325,32 @@ pub fn parse_provider_output(stdout: &str) -> Result<ProviderOutput, String> {
     if trimmed.is_empty() {
         return Ok(ProviderOutput::default());
     }
-    if trimmed.starts_with('[') {
-        let items: Vec<ProviderOutputItem> =
-            serde_json::from_str(trimmed).map_err(|e| e.to_string())?;
-        return Ok(ProviderOutput {
+    let parsed = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<ProviderOutputItem>>(trimmed).map(|items| ProviderOutput {
             placeholder: String::new(),
             items,
-        });
+        })
+    } else {
+        serde_json::from_str::<ProviderOutput>(trimmed)
+    };
+    parsed.map_err(|e| {
+        format!("provider output is not a valid menu — expected a JSON `{{\"items\":[…]}}` object or `[…]` array: {e}")
+    })
+}
+
+/// Parse an `activate` phase's stdout. Activate is primarily a side
+/// effect; its stdout is ignored unless it *looks* like a provider payload
+/// — a JSON object/array (a drill-down sub-menu). Non-JSON output (the tab
+/// id `roostctl tab open` prints, log lines, …) yields an empty result, so
+/// the palette just closes. Output that *does* look like JSON but fails to
+/// parse is still surfaced as an error (a genuinely malformed sub-menu).
+pub fn parse_activate_output(stdout: &str) -> Result<ProviderOutput, String> {
+    let trimmed = stdout.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        parse_provider_output(stdout)
+    } else {
+        Ok(ProviderOutput::default())
     }
-    serde_json::from_str(trimmed).map_err(|e| e.to_string())
 }
 
 /// Build the palette rows that list the configured providers (the
@@ -595,6 +612,45 @@ mod tests {
     fn parse_output_malformed_is_err() {
         assert!(parse_provider_output("not json").is_err());
         assert!(parse_provider_output(r#"{"items":[{"title":"no id"}]}"#).is_err());
+    }
+
+    #[test]
+    fn parse_output_error_names_expected_shape() {
+        // A bare tab id is valid JSON but the wrong shape; the message
+        // should name the menu shape rather than a raw serde error.
+        let err = parse_provider_output("8").unwrap_err();
+        assert!(err.contains("not a valid menu"), "got: {err}");
+        assert!(err.contains("items"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_activate_ignores_non_json_side_effect_output() {
+        // `roostctl tab open` prints the new tab id; a path or log line is
+        // likewise side-effect noise. All ⇒ empty (palette closes).
+        for s in ["8", "8\n", "/some/path\n", "opened tab 8\n", "", "   \n "] {
+            assert_eq!(
+                parse_activate_output(s).unwrap(),
+                ProviderOutput::default(),
+                "expected empty for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_activate_parses_json_drilldown_and_errors_on_malformed() {
+        // JSON-shaped output is a sub-menu: parsed when valid…
+        let out = parse_activate_output(r#"{"items":[{"id":"a","title":"A"}]}"#).unwrap();
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(
+            parse_activate_output(r#"[{"id":"a","title":"A"}]"#)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        // …and still an error when it looks like JSON but isn't valid.
+        assert!(parse_activate_output(r#"{"items":[{"title":"no id"}]}"#).is_err());
+        assert!(parse_activate_output("{ broken").is_err());
     }
 
     #[test]

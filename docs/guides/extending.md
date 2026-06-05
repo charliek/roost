@@ -155,12 +155,19 @@ and `title`, an optional `subtitle`, and an optional **`actionable`**
 (e.g. "No results"): it renders but can't be selected, and selecting it is
 a no-op that leaves the palette open — Roost never calls `activate` for it.
 
-A bare `[ … ]` array is also accepted. On **`activate`**:
+A bare `[ … ]` array is also accepted. On **`activate`**, stdout is
+*optional* — it's read as a menu only when it looks like one:
 
 - print **nothing** (or `{}`) → the palette closes (your script already
   did its work);
 - print **more `items`** → Roost drills into a sub-menu — the same schema
-  as `list`, so multi-step menus need no extra mechanism.
+  as `list`, so multi-step menus need no extra mechanism;
+- print **anything else** → ignored; the palette closes. So a
+  side-effecting command's incidental output (e.g. the new tab id
+  `roostctl tab open` prints) is fine — **you don't need to redirect it**.
+  (Output that *looks* like JSON — trimmed, starts with `{` or `[` — but
+  doesn't parse is still reported as an error, so a malformed sub-menu
+  isn't silently swallowed.)
 
 ### Opening tabs from `activate`
 
@@ -189,10 +196,11 @@ So "open this next to me and switch to it" is one call:
 `"${ROOST_ROOSTCTL:-roostctl}" tab open --project-id … --after-tab … --focus -- <cmd>`.
 See the [CLI reference](../reference/cli.md) for the full flag set.
 
-**Safety rails.** stdout must be valid JSON, so don't let your shell rc
-echo onto it (Roost runs `run` non-interactively). Rows past `limit` are
-dropped with a "… N more" hint; a run that exceeds `timeout`, exits
-non-zero, or prints garbage surfaces an error row (and is logged).
+**Safety rails.** A **`list`** must print valid JSON, so don't let your
+shell rc echo onto it (Roost runs `run` non-interactively); **`activate`**
+stdout is lenient (above). Rows past `limit` are dropped with a "… N more"
+hint; a run that exceeds `timeout`, exits non-zero, or prints malformed
+menu JSON surfaces an error row (and is logged).
 `limit` bounds *rows*, not output size — a provider stuck printing is
 bounded by `timeout` (killed when it elapses, escalating to `SIGKILL`).
 Discovered scripts are run by absolute (shell-quoted) path; a config

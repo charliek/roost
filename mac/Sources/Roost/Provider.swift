@@ -284,11 +284,34 @@ func parseProviderOutput(_ stdout: String) throws -> ProviderOutput {
     if trimmed.isEmpty { return ProviderOutput() }
     let data = Data(trimmed.utf8)
     let decoder = JSONDecoder()
-    if trimmed.hasPrefix("[") {
-        let items = try decoder.decode([ProviderOutputItem].self, from: data)
-        return ProviderOutput(placeholder: "", items: items)
+    do {
+        if trimmed.hasPrefix("[") {
+            let items = try decoder.decode([ProviderOutputItem].self, from: data)
+            return ProviderOutput(placeholder: "", items: items)
+        }
+        return try decoder.decode(ProviderOutput.self, from: data)
+    } catch {
+        // The raw DecodingError ("data couldn't be read…") is opaque;
+        // name the expected shape instead (mirrors the Rust message).
+        throw ProviderError(
+            message:
+                "provider output is not a valid menu — expected a JSON `{\"items\":[…]}` object or `[…]` array")
     }
-    return try decoder.decode(ProviderOutput.self, from: data)
+}
+
+/// Parse an `activate` phase's stdout. Activate is primarily a side
+/// effect; its stdout is ignored unless it *looks* like a provider payload
+/// — a JSON object/array (a drill-down sub-menu). Non-JSON output (the tab
+/// id `roostctl tab open` prints, log lines, …) yields an empty result, so
+/// the palette just closes. Output that *does* look like JSON but fails to
+/// parse is still surfaced as an error (a genuinely malformed sub-menu).
+/// Mirrors `parse_activate_output` on the GTK side.
+func parseActivateOutput(_ stdout: String) throws -> ProviderOutput {
+    let trimmed = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") {
+        return try parseProviderOutput(stdout)
+    }
+    return ProviderOutput()
 }
 
 /// Build the palette rows that list the configured providers (the "Custom

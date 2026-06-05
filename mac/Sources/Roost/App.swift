@@ -1169,7 +1169,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let cwd = ctx.activeCwd
         let timeout = provider.timeoutSecs
         return await Task.detached(priority: .userInitiated) {
-            runProviderProcess(argv: argv, env: env, stdin: stdinStr, cwd: cwd, timeoutSecs: timeout)
+            runProviderProcess(
+                argv: argv, env: env, stdin: stdinStr, cwd: cwd, timeoutSecs: timeout, phase: phase)
         }.value
     }
 
@@ -4800,7 +4801,8 @@ private final class TimeoutFlag: @unchecked Sendable {
 /// enforces `timeoutSecs` via a watchdog that terminates the child.
 /// Mirrors `run_provider_subprocess` on the GTK side.
 private func runProviderProcess(
-    argv: [String], env: [(String, String)], stdin: String, cwd: String, timeoutSecs: UInt64
+    argv: [String], env: [(String, String)], stdin: String, cwd: String, timeoutSecs: UInt64,
+    phase: ProviderPhase
 ) -> Result<ProviderOutput, ProviderError> {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: argv[0])
@@ -4892,7 +4894,12 @@ private func runProviderProcess(
     }
     let stdout = String(decoding: outData, as: UTF8.self)
     do {
-        return .success(try parseProviderOutput(stdout))
+        // Activate is a side-effect phase: ignore non-JSON stdout (e.g. the
+        // tab id `roostctl tab open` prints) so it doesn't fail parsing.
+        return .success(
+            try phase == .activate ? parseActivateOutput(stdout) : parseProviderOutput(stdout))
+    } catch let err as ProviderError {
+        return .failure(err)
     } catch {
         return .failure(ProviderError(message: "provider output: \(error.localizedDescription)"))
     }

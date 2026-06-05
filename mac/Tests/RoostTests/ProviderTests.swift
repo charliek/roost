@@ -194,6 +194,40 @@ func parseOutputMalformedThrows() {
     #expect(throws: (any Error).self) { try parseProviderOutput(#"{"items":[{"title":"no id"}]}"#) }
 }
 
+@Test
+func parseOutputErrorNamesExpectedShape() throws {
+    // A bare tab id is valid JSON but the wrong shape; the message names
+    // the menu shape rather than the opaque DecodingError text.
+    do {
+        _ = try parseProviderOutput("8")
+        Issue.record("expected a throw")
+    } catch let err as ProviderError {
+        #expect(err.message.contains("not a valid menu"))
+        #expect(err.message.contains("items"))
+    }
+}
+
+@Test
+func parseActivateIgnoresNonJSONSideEffectOutput() throws {
+    // `roostctl tab open` prints the new tab id; a path or log line is
+    // likewise side-effect noise. All ⇒ empty (palette closes).
+    for s in ["8", "8\n", "/some/path\n", "opened tab 8\n", "", "   \n "] {
+        #expect(try parseActivateOutput(s) == ProviderOutput(), "expected empty for \(s)")
+    }
+}
+
+@Test
+func parseActivateParsesJSONDrilldownAndErrorsOnMalformed() throws {
+    // JSON-shaped output is a sub-menu: parsed when valid…
+    #expect(try parseActivateOutput(#"{"items":[{"id":"a","title":"A"}]}"#).items.count == 1)
+    #expect(try parseActivateOutput(#"[{"id":"a","title":"A"}]"#).items.count == 1)
+    // …and still an error when it looks like JSON but isn't valid.
+    #expect(throws: (any Error).self) {
+        try parseActivateOutput(#"{"items":[{"title":"no id"}]}"#)
+    }
+    #expect(throws: (any Error).self) { try parseActivateOutput("{ broken") }
+}
+
 // MARK: - palette row builders
 
 @Test
