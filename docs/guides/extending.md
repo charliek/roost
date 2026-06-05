@@ -129,7 +129,10 @@ is convenient:
 
 - **Env vars:** `ROOST_SOCKET`, `ROOST_PROVIDER_PHASE`, `ROOST_QUERY`,
   `ROOST_ACTIVE_TAB_ID`, `ROOST_ACTIVE_PROJECT_ID`, `ROOST_ACTIVE_CWD`,
-  `ROOST_ACTIVE_TITLE`, and on activate `ROOST_SELECTED_ID`.
+  `ROOST_ACTIVE_TITLE`, `ROOST_ROOSTCTL` (absolute path to Roost's own
+  `roostctl` when it can resolve one — best-effort, so keep the
+  `"${ROOST_ROOSTCTL:-roostctl}"` fallback; [see below](#opening-tabs-from-activate)),
+  and on activate `ROOST_SELECTED_ID`.
 - **Stdin JSON:**
   ```json
   { "v": 1, "phase": "activate", "selected_id": "api", "query": "ap",
@@ -162,17 +165,29 @@ A bare `[ … ]` array is also accepted. On **`activate`**:
 ### Opening tabs from `activate`
 
 The usual thing `activate` does is open a tab that runs something, via
-`roostctl tab open` (which now takes a command after `--`):
+Roost's CLI. **Call `$ROOST_ROOSTCTL`, not a bare `roostctl`** — Roost
+sets it to its own CLI so your provider works without `roostctl` on
+`PATH`. Where that CLI lives differs by platform, which is exactly why
+the env var exists:
 
-- `roostctl tab open --project-id "$ROOST_ACTIVE_PROJECT_ID" -- <cmd>` runs
-  `<cmd>` in a new tab that **closes when it exits** (hold=false).
-- add `--hold` to keep the tab open afterward (drops to a shell).
+| Platform | `roostctl` location | On `PATH`? |
+|---|---|---|
+| **Linux (`.deb`)** | `/usr/bin/roostctl` | ✅ yes |
+| **macOS (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+
+`ROOST_ROOSTCTL` points at the right binary on both, so the portable form
+is `"${ROOST_ROOSTCTL:-roostctl}"` (env var first, falling back to a
+`PATH` copy for terminal/dev use). It runs `roostctl tab open`, which:
+
+- `… tab open --project-id "$ROOST_ACTIVE_PROJECT_ID" -- <cmd>` runs `<cmd>`
+  in a new tab that **closes when it exits** (hold=false);
+- add `--hold` to keep the tab open afterward (drops to a shell);
 - add `--after-tab "$ROOST_ACTIVE_TAB_ID"` to place it **next to the active
   tab**, and `--focus` to switch to it.
 
-So "open this next to me and switch to it" is one call —
-`roostctl tab open --project-id … --after-tab … --focus -- <cmd>`. See the
-[CLI reference](../reference/cli.md) for the full flag set.
+So "open this next to me and switch to it" is one call:
+`"${ROOST_ROOSTCTL:-roostctl}" tab open --project-id … --after-tab … --focus -- <cmd>`.
+See the [CLI reference](../reference/cli.md) for the full flag set.
 
 **Safety rails.** stdout must be valid JSON, so don't let your shell rc
 echo onto it (Roost runs `run` non-interactively). Rows past `limit` are
@@ -198,8 +213,8 @@ current one (closing when you disconnect). Drop it at
     ```bash
     #!/usr/bin/env bash
     # @roost.label: Open shed
-    # Roost may be launched (Finder) with a minimal PATH — make sure shed,
-    # roostctl, and jq are found.
+    # Roost may be launched (Finder) with a minimal PATH — make sure shed
+    # and jq are found. (roostctl comes from $ROOST_ROOSTCTL, below.)
     export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
     case "${1:-}" in
       list)
@@ -212,10 +227,12 @@ current one (closing when you disconnect). Drop it at
           printf '{"items":%s}' "$rows"
         fi ;;
       activate)
-        # Login shell (-l) for PATH; the shed name is a positional arg
-        # ($1), never spliced into the script string. hold=false: when
-        # `shed console` disconnects, the shell exits → the tab closes.
-        roostctl tab open --project-id "$ROOST_ACTIVE_PROJECT_ID" \
+        # $ROOST_ROOSTCTL is Roost's own CLI (bundled off-PATH on Mac);
+        # fall back to a PATH copy for terminal/dev runs. Login shell (-l)
+        # for PATH; the shed name is a positional arg ($1), never spliced
+        # into the script string. hold=false: when `shed console`
+        # disconnects, the shell exits → the tab closes.
+        "${ROOST_ROOSTCTL:-roostctl}" tab open --project-id "$ROOST_ACTIVE_PROJECT_ID" \
           --after-tab "$ROOST_ACTIVE_TAB_ID" --focus --title "shed: $ROOST_SELECTED_ID" \
           -- "${SHELL:-/bin/bash}" -lc 'shed console "$1"' shed "$ROOST_SELECTED_ID" ;;
     esac
@@ -225,7 +242,7 @@ current one (closing when you disconnect). Drop it at
 
     ```python
     #!/usr/bin/env python3
-    import json, subprocess, sys
+    import json, os, subprocess, sys
     inp = json.load(sys.stdin)
     if inp["phase"] == "list":
         sheds = json.loads(subprocess.run(["shed", "list", "--json"],
@@ -237,8 +254,9 @@ current one (closing when you disconnect). Drop it at
         json.dump({"items": items}, sys.stdout)
     else:
         tab = inp["active_tab"]
+        roostctl = os.environ.get("ROOST_ROOSTCTL", "roostctl")  # Roost's own CLI
         # Pass the shed name as a positional arg ($1), not interpolated.
-        subprocess.run(["roostctl", "tab", "open", "--project-id", tab["project_id"],
+        subprocess.run([roostctl, "tab", "open", "--project-id", tab["project_id"],
                         "--after-tab", tab["id"], "--focus",
                         "--", "/bin/bash", "-lc", 'shed console "$1"', "shed", inp["selected_id"]])
     ```
@@ -258,8 +276,9 @@ current one (closing when you disconnect). Drop it at
       }));
     } else {
       const t = inp.active_tab;
+      const roostctl = process.env.ROOST_ROOSTCTL ?? "roostctl";  // Roost's own CLI
       // Shed name as a positional arg ($1), not interpolated into the script.
-      execFileSync("roostctl", ["tab", "open", "--project-id", t.project_id,
+      execFileSync(roostctl, ["tab", "open", "--project-id", t.project_id,
         "--after-tab", t.id, "--focus", "--", "/bin/bash", "-lc", 'shed console "$1"', "shed", inp.selected_id]);
     }
     ```

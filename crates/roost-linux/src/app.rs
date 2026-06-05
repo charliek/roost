@@ -3271,6 +3271,24 @@ impl App {
             .as_ref()
             .map(|o| o.driver().snapshot().query)
             .unwrap_or_default();
+        // Roost's own roostctl, resolved as a sibling of the running
+        // binary (`/usr/bin/roost` → `/usr/bin/roostctl` from the .deb;
+        // `target/debug/roost` → `…/roostctl` in dev). Canonicalize first
+        // so a symlinked launch resolves to the real install dir, and
+        // require the executable bit (mirrors provider discovery in
+        // config.rs, and matches the Mac `isExecutableFile` check). Lets a
+        // provider shell out without roostctl on PATH.
+        let roostctl = std::env::current_exe()
+            .ok()
+            .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
+            .and_then(|exe| exe.parent().map(|d| d.join("roostctl")))
+            .filter(|p| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(p)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            })
+            .map(|p| p.to_string_lossy().into_owned());
         provider::ProviderContext {
             socket,
             query,
@@ -3279,6 +3297,7 @@ impl App {
             active_project_id: if pid != 0 { Some(pid) } else { None },
             active_cwd,
             active_title,
+            roostctl,
         }
     }
 
@@ -3324,10 +3343,17 @@ impl App {
         let env = provider::invocation_env(phase, &ctx);
         let stdin_json = provider::invocation_stdin(phase, &ctx);
 
+        let has_roostctl = env.iter().any(|(k, _)| k == "ROOST_ROOSTCTL");
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         for (k, v) in env {
             cmd.env(k, v);
+        }
+        // If Roost couldn't resolve its own roostctl, strip any inherited
+        // ROOST_ROOSTCTL so the script's `${ROOST_ROOSTCTL:-roostctl}` PATH
+        // fallback actually fires (don't leak a stale parent value).
+        if !has_roostctl {
+            cmd.env_remove("ROOST_ROOSTCTL");
         }
         // Only set the cwd if it still exists — the active tab's dir may
         // have been removed; don't let that fail the whole spawn (inherit

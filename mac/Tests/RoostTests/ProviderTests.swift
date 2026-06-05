@@ -114,6 +114,7 @@ func invocationEnvCarriesContext() {
     ctx.activeTabID = 7
     ctx.activeProjectID = 3
     ctx.activeCwd = "/repo"
+    ctx.roostctl = "/usr/bin/roostctl"
     let env = providerInvocationEnv(phase: .activate, ctx: ctx)
     func get(_ k: String) -> String? { env.first { $0.0 == k }?.1 }
     #expect(get("ROOST_PROVIDER_PHASE") == "activate")
@@ -122,6 +123,7 @@ func invocationEnvCarriesContext() {
     #expect(get("ROOST_ACTIVE_TAB_ID") == "7")
     #expect(get("ROOST_ACTIVE_PROJECT_ID") == "3")
     #expect(get("ROOST_ACTIVE_CWD") == "/repo")
+    #expect(get("ROOST_ROOSTCTL") == "/usr/bin/roostctl")
 }
 
 @Test
@@ -131,6 +133,7 @@ func invocationEnvOmitsAbsentOptionals() {
     let env = providerInvocationEnv(phase: .list, ctx: ctx)
     #expect(!env.contains { $0.0 == "ROOST_SELECTED_ID" })
     #expect(!env.contains { $0.0 == "ROOST_ACTIVE_TAB_ID" })
+    #expect(!env.contains { $0.0 == "ROOST_ROOSTCTL" })  // nil ⇒ omitted
 }
 
 @Test
