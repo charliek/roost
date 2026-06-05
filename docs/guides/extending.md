@@ -130,8 +130,9 @@ is convenient:
 - **Env vars:** `ROOST_SOCKET`, `ROOST_PROVIDER_PHASE`, `ROOST_QUERY`,
   `ROOST_ACTIVE_TAB_ID`, `ROOST_ACTIVE_PROJECT_ID`, `ROOST_ACTIVE_CWD`,
   `ROOST_ACTIVE_TITLE`, `ROOST_ROOSTCTL` (absolute path to Roost's own
-  `roostctl` — [see below](#opening-tabs-from-activate)), and on activate
-  `ROOST_SELECTED_ID`.
+  `roostctl` when it can resolve one — best-effort, so keep the
+  `"${ROOST_ROOSTCTL:-roostctl}"` fallback; [see below](#opening-tabs-from-activate)),
+  and on activate `ROOST_SELECTED_ID`.
 - **Stdin JSON:**
   ```json
   { "v": 1, "phase": "activate", "selected_id": "api", "query": "ap",
