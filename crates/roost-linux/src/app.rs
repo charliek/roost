@@ -3390,7 +3390,12 @@ impl App {
             });
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        provider::parse_provider_output(&stdout)
+        // Activate is a side-effect phase: ignore non-JSON stdout (e.g. the
+        // tab id `roostctl tab open` prints) so it doesn't fail parsing.
+        match phase {
+            provider::Phase::Activate => provider::parse_activate_output(&stdout),
+            provider::Phase::List => provider::parse_provider_output(&stdout),
+        }
     }
 
     /// Monotonic, process-unique id for a pushed provider sub-frame, so
