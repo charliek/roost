@@ -9,6 +9,38 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.10 — 2026-06-05
+
+Provider polish release. Two refinements to the v0.0.9 script-backed provider system
+that make providers **portable** and **forgiving**: Roost now hands a provider the path
+to its own `roostctl`, and an `activate` that just *does something* no longer has to
+sanitize its stdout.
+
+### Features
+
+- **`ROOST_ROOSTCTL` for providers (#212)** — Roost injects `ROOST_ROOSTCTL` (the absolute
+  path to its own `roostctl`) into provider scripts, so they can drive Roost without
+  `roostctl` on `PATH`. Closes the macOS gap where the `.dmg` bundles `roostctl` inside the
+  app (off `PATH`) and a Finder-launched app gets a minimal `PATH`; the Linux `.deb` already
+  installs it on `PATH`. Use `"${ROOST_ROOSTCTL:-roostctl}"`. Best-effort — when Roost can't
+  resolve its own CLI the var is omitted (and any inherited one stripped) so the `PATH`
+  fallback fires.
+
+### Fixes
+
+- **Lenient `activate` stdout (#213)** — an `activate` phase is a side effect, so its stdout
+  is now ignored unless it *looks* like a provider payload (a JSON object/array = a drill-down
+  sub-menu). A command's incidental output — e.g. the new tab id `roostctl tab open` prints —
+  no longer fails parsing with "Provider failed". JSON-shaped output that doesn't parse is
+  still reported (so a malformed sub-menu isn't swallowed), and the parse error now names the
+  expected shape. The `list` phase stays strict.
+
+### Docs
+
+- **[Extending Roost](docs/guides/extending.md)** documents `ROOST_ROOSTCTL` (with the
+  Mac/Linux `roostctl` location split) and the lenient `activate`-stdout contract;
+  `docs/reference/cli.md` gains a "Where `roostctl` lives" section + the env-var row.
+
 ## v0.0.9 — 2026-06-04
 
 Extensibility release. Roost gains a **script-backed provider system**: drop an
