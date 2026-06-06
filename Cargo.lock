@@ -1046,7 +1046,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "roost-cli"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "base64",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "roost-ipc"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "base64",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "roost-linux"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -1103,21 +1103,21 @@ dependencies = [
 
 [[package]]
 name = "roost-osc"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "base64",
 ]
 
 [[package]]
 name = "roost-url"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "roost-vt"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "bindgen",
  "thiserror",
