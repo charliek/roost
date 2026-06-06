@@ -291,6 +291,174 @@ current one (closing when you disconnect). Drop it at
     }
     ```
 
+### Advanced — multi-step wizards
+
+`activate` is **recursive**: when it prints `{items}`, Roost drills into a
+sub-frame, and picking a row there runs `activate` again with that row's
+id. That's the whole mechanism behind a **wizard** — chain several prompts
+with no new API. Three things make it work:
+
+- **`list` is step 1; each `activate` is the next step.** Return more
+  `items` to advance; print nothing to finish (the palette closes).
+- **Carry state in the row id.** `activate` only ever receives the *one*
+  selected id — there's no cross-step memory — so encode the choices so far
+  into each row's id, a continuation token like `image=base&cpus=4&mem=8192`.
+  The script is a state machine keyed on which keys the id already carries.
+- **Run slow work in the new tab, not in `activate`.** `activate` has a
+  ≤60s timeout, so anything lengthy (a build, a VM create) must be launched
+  *inside* a tab you open — which also shows progress live. `activate`
+  itself returns immediately.
+
+The example below is a **"Create shed"** wizard: it requires a Git project
+root (a non-selectable error row otherwise — see
+[`actionable`](#the-contract)), walks image → CPUs → memory → disk, then
+opens a tab that runs `shed create` (mounting the current directory via
+`--local-dir`) and drops into the shed. The name is derived from the
+folder, sanitized to alphanumerics, and de-duplicated. Context is read from
+the `$ROOST_*` env vars ([above](#the-contract)); you could equally parse
+the stdin JSON like the basic example. Drop it at
+`~/.config/roost/providers/create-shed.py`, `chmod +x`.
+
+```python
+#!/usr/bin/env python3
+# @roost.label: Create shed
+"""Create-shed wizard: image → CPUs → memory → disk, then create a shed for
+the current directory and open `shed console`. See the notes above for the
+state-in-the-id and run-in-the-tab patterns."""
+import json
+import os
+import re
+import subprocess
+import sys
+
+# Finder-launched Roost may have a minimal PATH — make sure `shed` is found.
+# (roostctl comes from $ROOST_ROOSTCTL, so it needn't be on PATH.)
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
+
+CPUS = [1, 2, 4, 8]
+MEMS = [2048, 4096, 8192, 16384]  # MB
+DISKS = ["10G", "20G", "50G"]
+
+
+def emit(items):
+    json.dump({"items": items}, sys.stdout)
+
+
+def run(*args):
+    """Run a command; return its stdout ('' on failure)."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True)
+        return p.stdout if p.returncode == 0 else ""
+    except OSError:
+        return ""
+
+
+def field(sel, key):
+    """Pull a value out of an 'a=1&b=2' id."""
+    for part in sel.split("&"):
+        k, _, v = part.partition("=")
+        if k == key:
+            return v
+    return ""
+
+
+def shed_name(cwd):
+    """basename → alphanumerics (fallback 'shed'), then -2/-3 on collision."""
+    base = re.sub(r"[^A-Za-z0-9]", "", os.path.basename(cwd)) or "shed"
+    try:
+        taken = {s["name"] for s in json.loads(run("shed", "list", "--json") or "[]")}
+    except (ValueError, KeyError, TypeError):
+        taken = set()
+    name, n = base, 2
+    while name in taken:
+        name, n = f"{base}-{n}", n + 1
+    return name
+
+
+# Step rows. `p` is the accumulated id prefix, folded into each new id.
+def cpu_rows(p):
+    return [{"id": f"{p}&cpus={c}", "title": f"{c} vCPU"} for c in CPUS]
+
+
+def mem_rows(p):
+    return [{"id": f"{p}&mem={m}", "title": f"{m // 1024} GB", "subtitle": f"{m} MB"} for m in MEMS]
+
+
+def disk_rows(p):
+    return [{"id": f"{p}&upper={d}", "title": f"{d} writable layer"} for d in DISKS]
+
+
+def do_list(cwd):
+    # Gate: only a Git project root (a .git entry; a subdir has none, so this
+    # also enforces "at the root").
+    if not os.path.exists(os.path.join(cwd, ".git")):
+        emit([{"id": "_nogit", "title": "Project not found (no .git)",
+               "subtitle": "create shed only works at a repo root", "actionable": False}])
+        return
+    try:
+        imgs = json.loads(run("shed", "image", "ls", "--json") or "{}").get("images", [])
+    except ValueError:
+        imgs = []
+    if not imgs:
+        emit([{"id": "_none", "title": "No images", "actionable": False}])
+    elif len(imgs) == 1:  # auto-skip the image step when there's only one
+        emit(cpu_rows(f"image={imgs[0]['name']}"))
+    else:
+        emit([{"id": f"image={i['name']}", "title": i["name"],
+               "subtitle": i.get("docker_ref", "")} for i in imgs])
+
+
+def do_activate(cwd, sel):
+    if "upper=" in sel:  # all four chosen → create in a new tab
+        name = shed_name(cwd)
+        roostctl = os.environ.get("ROOST_ROOSTCTL", "roostctl")
+        shell = os.environ.get("SHELL", "/bin/bash")
+        # Create + console run in the tab (see notes). On failure, drop to an
+        # interactive shell so the error stays visible.
+        inner = (
+            'if shed create "$1" --local-dir "$2" --image "$3" '
+            '--cpus "$4" --memory "$5" --upper-size "$6"; then\n'
+            '  exec shed console "$1"\n'
+            'else\n'
+            '  echo; echo "shed create failed (see output above)."\n'
+            '  exec "${SHELL:-/bin/bash}" -i\n'
+            'fi'
+        )
+        subprocess.run([
+            roostctl, "tab", "open",
+            "--project-id", os.environ.get("ROOST_ACTIVE_PROJECT_ID", ""),
+            "--after-tab", os.environ.get("ROOST_ACTIVE_TAB_ID", ""),
+            "--focus", "--title", f"shed: {name}",
+            "--", shell, "-lc", inner,
+            "shed", name, cwd,
+            field(sel, "image"), field(sel, "cpus"), field(sel, "mem"), field(sel, "upper"),
+        ])
+    elif "mem=" in sel:
+        emit(disk_rows(sel))
+    elif "cpus=" in sel:
+        emit(mem_rows(sel))
+    elif sel.startswith("image="):
+        emit(cpu_rows(sel))
+
+
+def main():
+    phase = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ROOST_PROVIDER_PHASE", "")
+    cwd = os.environ.get("ROOST_ACTIVE_CWD", "")
+    if phase == "list":
+        do_list(cwd)
+    elif phase == "activate":
+        do_activate(cwd, os.environ.get("ROOST_SELECTED_ID", ""))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+> **No free-text input (v1).** Every step is a *selection* — Roost has no
+> "type a value" prompt. Derive what you can (here the name comes from the
+> directory) or pre-list options; a typed name/port/path isn't expressible
+> yet.
+
 ---
 
 ## `palette.present` — let a script drive its own menu
