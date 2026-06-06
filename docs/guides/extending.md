@@ -221,9 +221,10 @@ current one (closing when you disconnect). Drop it at
     ```bash
     #!/usr/bin/env bash
     # @roost.label: Open shed
-    # Roost may be launched (Finder) with a minimal PATH — make sure shed
-    # and jq are found. (roostctl comes from $ROOST_ROOSTCTL, below.)
-    export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+    # Roost may launch with a minimal PATH, so cover where shed + jq live:
+    # Homebrew (Mac), /usr/bin (Linux .deb), ~/.local/bin. Add other install
+    # dirs as needed. (roostctl comes from $ROOST_ROOSTCTL, below.)
+    export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:$HOME/.local/bin:$PATH"
     case "${1:-}" in
       list)
         rows=$(shed list --json 2>/dev/null \
@@ -251,6 +252,9 @@ current one (closing when you disconnect). Drop it at
     ```python
     #!/usr/bin/env python3
     import json, os, subprocess, sys
+    # Minimal launch PATH? Cover where shed lives: Homebrew (Mac), /usr/bin
+    # (Linux .deb), ~/.local/bin. Add other install dirs as needed.
+    os.environ["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"
     inp = json.load(sys.stdin)
     if inp["phase"] == "list":
         sheds = json.loads(subprocess.run(["shed", "list", "--json"],
@@ -274,6 +278,9 @@ current one (closing when you disconnect). Drop it at
     ```ts
     #!/usr/bin/env -S node
     const { execFileSync } = require("child_process");
+    // Minimal launch PATH? Cover where shed lives: Homebrew (Mac), /usr/bin
+    // (Linux .deb), ~/.local/bin. Add other install dirs as needed.
+    process.env.PATH = `/opt/homebrew/bin:/usr/local/bin:/usr/bin:${process.env.HOME}/.local/bin:${process.env.PATH ?? ""}`;
     const inp = JSON.parse(require("fs").readFileSync(0, "utf8"));
     if (inp.phase === "list") {
       const sheds = JSON.parse(execFileSync("shed", ["list", "--json"]).toString() || "[]");
@@ -331,9 +338,10 @@ import re
 import subprocess
 import sys
 
-# Finder-launched Roost may have a minimal PATH — make sure `shed` is found.
+# Roost may launch with a minimal PATH, so cover where `shed` lives: Homebrew
+# (Mac), /usr/bin (Linux .deb), ~/.local/bin. Add other install dirs as needed.
 # (roostctl comes from $ROOST_ROOSTCTL, so it needn't be on PATH.)
-os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
+os.environ["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"
 
 CPUS = [1, 2, 4, 8]
 MEMS = [2048, 4096, 8192, 16384]  # MB
