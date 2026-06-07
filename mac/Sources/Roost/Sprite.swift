@@ -5,12 +5,10 @@
 // across adjacent cells — you get visible hairline seams in TUI
 // chrome (most obvious in the opencode wordmark logo). Ghostty
 // solves this with a custom sprite renderer in
-// `ghostty/src/font/sprite/draw/{block,box}.zig`; the legacy Go
-// port mirrored it in `cmd/roost/sprite.go`. This module is the
+// `ghostty/src/font/sprite/draw/{block,box}.zig`. This module is the
 // Swift + Core Graphics equivalent — every dispatch arm and helper
-// is a direct port of the Go file (which itself is a port of the
-// Zig original). When tweaking pixel math, cross-reference all
-// three. The Rust sibling lives at
+// follows the Zig original. When tweaking pixel math,
+// cross-reference it. The Rust sibling lives at
 // `crates/roost-linux/src/sprite.rs` and stays in lockstep with
 // this file per the CLAUDE.md parity rule.
 //
@@ -418,8 +416,7 @@ enum Sprite {
     }
 
     /// "Light" stroke width derived from cell height. Roughly 7% of
-    /// cell height, min 1px — mirrors the heuristic in
-    /// `cmd/roost/sprite.go::boxThickness`.
+    /// cell height, min 1px.
     private static func boxThickness(_ h: CGFloat) -> CGFloat {
         let t = (h / 14).rounded()
         return t < 1 ? 1 : t
@@ -427,7 +424,7 @@ enum Sprite {
 
     /// Paint up to four cardinal-direction strokes that meet at the
     /// cell center with correct heavy/double junction precedence.
-    /// Direct port of `box.zig::linesChar` (lines 399-637).
+    /// Follows `box.zig::linesChar` (lines 399-637).
     private static func drawBoxLines(
         _ ctx: CGContext, _ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat,
         _ ln: Lines4
@@ -508,7 +505,7 @@ enum Sprite {
     }
 
     /// Perpendicular-stroke termination logic from `linesChar`. Same
-    /// rules as the Rust `pick_junction`; see the Go file for the
+    /// rules as the Rust `pick_junction`; see `box.zig` for the
     /// original prose explanation.
     private static func pickJunction(
         _ perp1: LineStyle, _ perp2: LineStyle,

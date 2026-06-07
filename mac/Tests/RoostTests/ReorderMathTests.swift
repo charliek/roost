@@ -1,9 +1,8 @@
-// Mirror of `cmd/roost/sidebar_reorder_test.go::TestComputeInsertIdx`
-// case-for-case (20 cases — 5 source positions × 4 raw targets each).
-// The Linux Rust port at
-// `crates/roost-linux/src/app.rs::compute_insert_idx_matches_go_table`
-// covers the same set; this is the third corner of the triangle. Drift
-// here will cause cross-UI reorder behavior to diverge.
+// Table-driven tests for `computeInsertIdx` — 20 cases (5 source
+// positions × 4 raw targets each) covering forward/backward drops and
+// the on/after-source no-ops. The Linux UI's
+// `crates/roost-linux/src/app.rs` covers the same set; drift here will
+// cause cross-UI reorder behavior to diverge.
 
 import Foundation
 import Testing

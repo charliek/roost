@@ -7,8 +7,8 @@
 // drives membership off the `has_notification` edges it already
 // receives; this file just keeps the ordered, deduped, capped list.
 //
-// Design (see plans/notification-inbox): a LIVE inbox, not a history
-// log. One entry per tab, newest-first, capped at `capacity`. The
+// Design: a LIVE inbox, not a history log. One entry per tab,
+// newest-first, capped at `capacity`. The
 // invariant is: a tab has a row here iff it has a pending notification
 // (modulo cap eviction). Jumping to a tab — or clearing it — drops the
 // row via the same false-edge that clears the sidebar dot.

@@ -1,6 +1,6 @@
 //! Shared URL detection for clickable-link support in both Roost UIs.
 //!
-//! The Linux (GTK) UI consumes this directly; the Swift Mac port
+//! The Linux (GTK) UI consumes this directly; the Swift Mac UI
 //! re-implements the same regex + trim pipeline by hand and pins parity
 //! against the shared corpus in `tests/url-fixtures/`. One contract,
 //! two implementations — same shape as `roost-osc` vs.
@@ -8,16 +8,15 @@
 //!
 //! ## Detection is intentionally narrow
 //!
-//! Only well-known URL schemes match. Out of scope for the v1 port:
+//! Only well-known URL schemes match. Out of scope for v1:
 //!
-//! * Path detection (`./foo`, `~/bar`, `src/main.go:42`).
+//! * Path detection (`./foo`, `~/bar`, `src/main.rs:42`).
 //! * scp-style git remotes (`git@github.com:x/y`).
 //! * IPv6 literal hosts (`[::1]:8080`).
 //!
 //! ghostty's URL regex (`../ghostty/src/config/url.zig`) covers all of
-//! these and is the future widening target — the legacy Go binary's
-//! narrow scheme regex (`internal/links/regex.go`) is the v1 baseline
-//! ported here.
+//! these and is the future widening target; the narrow scheme regex
+//! here is the v1 baseline.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -35,13 +34,11 @@ pub struct UrlSpan {
 }
 
 /// Compiled regex. `OnceLock` so the first call pays the build cost
-/// and every subsequent call reuses the same matcher. Pattern is
-/// byte-identical with `internal/links/regex.go:18` — the body's
+/// and every subsequent call reuses the same matcher. The body's
 /// negation class spells out `[\t\n\x0c\r ]` instead of `\s` because
-/// Go's `\s` is ASCII-only (per `regexp/syntax` docs) while Rust's
-/// `regex` and Swift's `NSRegularExpression` treat `\s` as Unicode
-/// whitespace. The explicit class is the only way to keep parity
-/// across all three engines.
+/// Rust's `regex` and Swift's `NSRegularExpression` treat `\s` as
+/// Unicode whitespace — the explicit ASCII-only class is the only way
+/// to keep the Mac and Linux matchers in lockstep.
 fn pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -56,11 +53,10 @@ fn pattern() -> &'static Regex {
 /// URL covers that column. `col` is a 0-indexed char position into
 /// `row` — out-of-range values return `None`.
 ///
-/// Mirrors `internal/links/regex.go::FindAt` 1:1: the cleaned URL has
-/// trailing punctuation and unmatched brackets stripped via
-/// [`trim_url`], and the returned `col0`/`col1` reflect the trimmed
-/// span (so an underline drawn on those cells doesn't extend past the
-/// last cell of the URL into the trailing period).
+/// The cleaned URL has trailing punctuation and unmatched brackets
+/// stripped via [`trim_url`], and the returned `col0`/`col1` reflect
+/// the trimmed span (so an underline drawn on those cells doesn't
+/// extend past the last cell of the URL into the trailing period).
 pub fn find_url_at(row: &str, col: u16) -> Option<UrlSpan> {
     let total_chars = row.chars().count();
     let col = col as usize;
@@ -80,8 +76,7 @@ pub fn find_all_urls(row: &str) -> Vec<UrlSpan> {
     // Map byte offsets in `row` back to char (column) indices. The
     // table holds the byte offset where each successive char starts,
     // plus a sentinel for the end-of-string byte length so end-of-
-    // match lookups don't need a special case. Matches the Go binary's
-    // `byteToRune` table in `internal/links/regex.go:46-54`.
+    // match lookups don't need a special case.
     let mut byte_to_char: Vec<usize> = Vec::with_capacity(row.len() + 1);
     for (byte_off, _) in row.char_indices() {
         byte_to_char.push(byte_off);
@@ -99,7 +94,7 @@ pub fn find_all_urls(row: &str) -> Vec<UrlSpan> {
         let end_byte = start_byte + trimmed.len();
         let start_col = byte_to_char_index(&byte_to_char, start_byte);
         let end_col_exclusive = byte_to_char_index(&byte_to_char, end_byte);
-        // end_col is inclusive (matches Go's `Col1`).
+        // end_col is inclusive.
         if end_col_exclusive == 0 || end_col_exclusive <= start_col {
             continue;
         }
@@ -132,9 +127,9 @@ fn byte_to_char_index(table: &[usize], byte_off: usize) -> usize {
 }
 
 /// Strip trailing sentence punctuation and unmatched closing brackets
-/// from a URL match. Mirrors `internal/links/regex.go::trimURL`:
-/// sentence punctuation almost never belongs to a URL, and a trailing
-/// `)` is part of the URL only if there's a matching `(` inside it
+/// from a URL match: sentence punctuation almost never belongs to a
+/// URL, and a trailing `)` is part of the URL only if there's a
+/// matching `(` inside it
 /// (so Wikipedia's `_(disambiguation)` survives but `(see foo)` peels).
 ///
 /// Returned slice points back into the input; the caller wraps it in
@@ -172,12 +167,12 @@ pub fn trim_url(mut u: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// 1:1 mirror of `internal/links/regex_test.go::TestFindAt`.
-    /// Any drift between these cases and the Go corpus would mean a
-    /// user-visible regression in URL-click behavior — keep them in
-    /// step when widening either side.
+    /// `find_url_at` against the shared URL fixture corpus. Any drift
+    /// in these cases would mean a user-visible regression in
+    /// URL-click behavior — keep them in step with the Mac UI's
+    /// matcher when widening either side.
     #[test]
-    fn find_at_matches_legacy_go_corpus() {
+    fn find_at_matches_reference_corpus() {
         struct Case {
             name: &'static str,
             row: &'static str,
@@ -306,10 +301,10 @@ mod tests {
         }
     }
 
-    /// 1:1 mirror of `internal/links/regex_test.go::TestTrimURL`. Keep
-    /// in step with the Go corpus.
+    /// `trim_url` against the shared URL fixture corpus. Keep in step
+    /// with the Mac UI's trim pipeline.
     #[test]
-    fn trim_url_matches_legacy_go_corpus() {
+    fn trim_url_matches_reference_corpus() {
         let cases: &[(&str, &str)] = &[
             ("https://x.test", "https://x.test"),
             ("https://x.test.", "https://x.test"),
@@ -328,8 +323,8 @@ mod tests {
     /// Unicode codepoints in the URL body match as-is — we don't do
     /// IDNA, we just respect the regex's `[^\s<>"'`\\]+` body class.
     /// Trailing fullwidth period (U+3002) does NOT trim — the trim
-    /// pass only strips ASCII punctuation, matching the Go binary so
-    /// neither port surprises users with locale-dependent cutoff.
+    /// pass only strips ASCII punctuation, so neither UI surprises
+    /// users with locale-dependent cutoff.
     #[test]
     fn unicode_url_body_matches_codepoints() {
         let row = "open https://例え.テスト/path here";
@@ -340,7 +335,7 @@ mod tests {
     #[test]
     fn fullwidth_trailing_punctuation_not_stripped() {
         // U+3002 IDEOGRAPHIC FULL STOP — not in the ASCII strip set,
-        // so it stays attached. Mirrors the Go binary's behavior.
+        // so it stays attached.
         let row = "see https://例え.テスト。 next";
         let span = find_url_at(row, 7).expect("unicode trail match");
         assert!(

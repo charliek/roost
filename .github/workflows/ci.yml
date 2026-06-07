@@ -1,10 +1,9 @@
 name: CI
 
-# Primary CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
+# CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
 # `changes` job (path filter) gates the rust/swift/gtk jobs so they run only when
 # code that impacts them changes; `ci-success` is the single aggregated required
-# check (stable regardless of which jobs run). The legacy Go CI lives in
-# go-legacy.yml, path-filtered to Go files.
+# check (stable regardless of which jobs run).
 
 on:
   push:
@@ -84,6 +83,21 @@ jobs:
         # installed — handled by the dedicated `gtk-build` job instead of
         # bloating this lint runner with the GTK toolchain.
         run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
+
+  themes-parity:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.mac == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # The bundled themes live in two trees (Rust crate + Mac SwiftPM
+      # bundle) because SwiftPM `.copy` can't reach outside mac/. Guard
+      # the copies against drift — adding a theme to one UI only is a
+      # classic miss.
+      - name: Bundled themes byte-identical across UIs
+        run: diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
 
   rust-build:
     needs: changes
@@ -319,7 +333,7 @@ jobs:
       - uses: jdx/mise-action@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Cache vendored libghostty-vt
         id: cache-ghostty
@@ -387,7 +401,7 @@ jobs:
       - uses: jdx/mise-action@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Install modern bash + version probe
         # `test_bash_auto_bootstrap_tracks_cwd` needs bash >= 4.4 for its
@@ -471,7 +485,7 @@ jobs:
 
       - name: Upload E2E diagnostics + JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-mac-diagnostics
           path: |
@@ -482,13 +496,13 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
+    needs: [changes, rust-lint, themes-parity, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then

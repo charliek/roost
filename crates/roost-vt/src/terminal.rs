@@ -5,8 +5,8 @@
 //! `ghostty_terminal_free`. The handle is `Send` (the FFI is thread-safe
 //! at the "owned by one thread at a time" level) but explicitly `!Sync`
 //! — libghostty-vt must not be touched from more than one thread
-//! concurrently, mirroring the Go binary's main-thread invariant
-//! (`CLAUDE.md` "Threading") and the Mac UI's `@MainActor` discipline.
+//! concurrently, enforcing the main-thread invariant (`CLAUDE.md`
+//! "Threading") that the Mac UI's `@MainActor` discipline also keeps.
 
 use std::marker::PhantomData;
 use std::ptr;
@@ -31,8 +31,8 @@ const _: () = assert!(
 pub struct TerminalOptions {
     pub cols: u16,
     pub rows: u16,
-    /// Number of rows of off-screen scrollback to retain. The Mac UI
-    /// uses 2000 to match the Go binary's `cmd/roost/session.go`.
+    /// Number of rows of off-screen scrollback to retain. Both UIs
+    /// use 2000.
     pub max_scrollback: usize,
 }
 
@@ -515,8 +515,7 @@ impl Terminal {
     /// Two-call buffer pattern per libghostty's C API: first call asks
     /// for the URI length with a null buffer (returns `OutOfSpace` and
     /// populates `out_len`); second call passes a buffer of the
-    /// reported size. Mirrors `internal/ghostty/grid_ref.go::HyperlinkAt`
-    /// in the legacy Go binary.
+    /// reported size.
     ///
     /// The grid_ref is captured + consumed immediately so libghostty's
     /// "valid only until next mutating call" contract isn't a concern

@@ -64,10 +64,6 @@ and links the same vendored `libghostty-vt` static archive.
 `Roost.app/Contents/Resources/bin/roostctl` so a packaged .app is
 self-contained for `claude install`.
 
-The legacy Go + GTK4 binary still ships from `main` — see
-[Legacy → Installation](../reference/legacy-go/installation.md)
-for that build path.
-
 ## Prerequisites
 
 | Tool | Purpose | Pinned version |
@@ -121,7 +117,7 @@ open mac/build/Roost.app
 
 ### macOS 26 (Tahoe) `libghostty-vt` shim
 
-`third_party/ghostty/build.sh` ships the same `arm64-macos` SDK shim as the legacy `build/build.sh`. When it detects macOS 26+ on Apple Silicon with an `arm64e`-only system SDK, it redirects Zig's SDK lookup to a sibling `MacOSX1[45].sdk` for the duration of the `zig build` call. Xcode Command Line Tools usually keeps one prior major SDK installed; reinstall (`xcode-select --install`) if you hit the `no sibling MacOSX1[45].sdk` error.
+`third_party/ghostty/build.sh` ships an `arm64-macos` SDK shim. When it detects macOS 26+ on Apple Silicon with an `arm64e`-only system SDK, it redirects Zig's SDK lookup to a sibling `MacOSX1[45].sdk` for the duration of the `zig build` call. Xcode Command Line Tools usually keeps one prior major SDK installed; reinstall (`xcode-select --install`) if you hit the `no sibling MacOSX1[45].sdk` error.
 
 ## Linux (Ubuntu / Debian)
 

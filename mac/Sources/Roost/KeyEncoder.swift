@@ -13,9 +13,8 @@
 // `ghostty_key_encoder_setopt_from_terminal` so cursor-key-application
 // mode, Kitty keyboard flags, modifyOtherKeys state, etc. follow the
 // live terminal — Claude Code's mode toggles, for instance, take effect
-// on the very next keystroke. Same invariant the Go binary's
-// `KeyEncoder.SyncFromTerminal()` honors per call in
-// `internal/ghostty/key.go`.
+// on the very next keystroke. The same invariant holds: the encoder is
+// re-synced from libghostty-vt's terminal state on every encode.
 //
 // The keycode → `GhosttyKey` table mirrors W3C UI Events keyboard codes,
 // which is what `GhosttyKey` enumerates. We translate Carbon `kVK_*`

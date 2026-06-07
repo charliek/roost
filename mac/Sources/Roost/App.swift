@@ -770,9 +770,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         pane.addSubview(terminalContainer)
 
         NSLayoutConstraint.activate([
-            // Round-3 R3: match the Go GTK binary's implicit-zero
-            // outer spacing — tab bar pinned to pane edges, terminal
-            // flush against the scroll view + window edges. The 24pt
+            // Round-3 R3: zero outer spacing — tab bar pinned to pane
+            // edges, terminal flush against the scroll view + window
+            // edges. The 24pt
             // pill height inside the strip stays the same; only the
             // outer container paddings change.
             tabScroll.topAnchor.constraint(equalTo: pane.topAnchor),
@@ -2048,9 +2048,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // M5: workspace is empty. Close the window unconditionally
             // — applicationShouldTerminateAfterLastWindowClosed is true
             // by default for NSWindow-based apps, so the window close
-            // cascades to app termination. Matches Go
-            // cmd/roost/app.go:2107-2115 ("len(a.projectViews) == 0 →
-            // win.Close()"). Hoisted out of the `if wasActive` branch
+            // cascades to app termination — when the project list goes
+            // empty the window closes. Hoisted out of the `if wasActive` branch
             // so it fires after the menu-driven delete-last-project
             // path too (that path nils `activeProjectID` before this
             // event lands; `wasActive` is then false).
@@ -2158,8 +2157,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // OSC 7 changed cwd. Same flow — update + rebuild
             // when the affected tab is in the active project. Refresh
             // the window subtitle when the change is on the *active*
-            // tab so the headerbar tracks `cd` in real time, matching
-            // `cmd/roost/app.go::updateHeader`.
+            // tab so the headerbar tracks `cd` in real time, via
+            // `updateWindowTitle()`.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
                 session.liveCwd = e.cwd
                 if session.projectID == activeProjectID {
@@ -2240,8 +2239,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // the per-tab agent state from the sidebar rollup. The pill
             // dot still tracks the raw state — only the project-level
             // rollup demotes. Mirrors Linux `crates/roost-linux/src/rollup.rs`
-            // semantics; the Go binary doesn't have this suppression at
-            // all (deliberate extension past Go-parity).
+            // semantics.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
                 session.hookActive = e.active
                 rebuildSidebar()
@@ -2335,10 +2333,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         let projectTabs = tabsForActiveProject()
         if projectTabs.isEmpty {
-            // Mirror the Go binary's "every project always shows a
-            // tab" feel: auto-open one so the terminal area is never
-            // stuck on a previous project's view. Lazy — only the
-            // visited project incurs the spawn cost.
+            // Every project always shows a tab: auto-open one so the
+            // terminal area is never stuck on a previous project's
+            // view. Lazy — only the visited project incurs the spawn
+            // cost.
             if daemonReachable {
                 openNewTab()
             } else {
@@ -2362,7 +2360,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         guard daemonReachable else { return }
         // M3: reveal the sidebar BEFORE the async create round-trip
         // so the user gets immediate visual feedback even if the
-        // create fails. Matches Go `cmd/roost/app.go:1337`. The
+        // create fails. The
         // follow-on `selectProject(id:)` is pure data mutation per
         // DL-11 — this is the only reveal in the success path too.
         ensureSidebarVisible()
@@ -3224,7 +3222,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         let id = Int64(sender.tag)
         guard id != activeProjectID else { return }
         // User action (⌘1-9): reveal the sidebar so the user can see
-        // which project they landed on. Mirrors Go `cmd/roost/app.go:1487`.
+        // which project they landed on.
         ensureSidebarVisible()
         selectProject(id: id)
     }
@@ -3236,7 +3234,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func renameActiveProject(_ sender: Any?) {
         guard let id = activeProjectID else { return }
         // M3: reveal the sidebar so the user sees the project row
-        // their rename will affect. Mirrors Go `app.go:1975`.
+        // their rename will affect.
         ensureSidebarVisible()
         // M5 of `goal-mac-parity-2026-05-18.md`: route through the
         // shared inline-rename flow. The pre-M5 implementation
@@ -3333,7 +3331,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         fileMenu.addItem(closeTabItem)
         fileMenu.addItem(.separator())
         // M4: rename the active tab. ⌘R; pairs with ⌘⇧R for rename
-        // project so the muscle-memory split mirrors Go's defaults.
+        // project for a clean muscle-memory split.
         let renameTabItem = NSMenuItem(
             title: "Rename Tab…",
             action: #selector(renameActiveTab(_:)),
@@ -3360,7 +3358,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         fileMenu.addItem(closeProjectItem)
         fileMenu.addItem(.separator())
         // M4: cycle prev / next within the active project's tabs.
-        // ⌘⇧[ / ⌘⇧]; wraps at ends. Matches Go cycle_tab_prev /
+        // ⌘⇧[ / ⌘⇧]; wraps at ends. Bound to the cycle_tab_prev /
         // cycle_tab_next actions.
         let cyclePrevItem = NSMenuItem(
             title: "Previous Tab",
@@ -3541,10 +3539,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Mirror the active project's identity in the window chrome: the
     /// title becomes the project name; the subtitle becomes the live
     /// cwd of the active tab (falling back to the project's static cwd
-    /// before any tab is open or OSC 7 has fired). Matches the
-    /// libadwaita `AdwWindowTitle` pattern the Go binary uses for the
-    /// same window — see `cmd/roost/app.go::updateHeader` for the
-    /// reference, which reads `sess.lastPWD` populated by OSC 7.
+    /// before any tab is open or OSC 7 has fired). The live cwd is the
+    /// session's `liveCwd`, populated by OSC 7.
     @MainActor
     private func updateWindowTitle() {
         guard let window else { return }
@@ -3577,8 +3573,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         {
             return f
         }
-        // No family or unknown → system monospace. Same default the
-        // Go binary uses when `font-family` is unset.
+        // No family or unknown → system monospace. The default when
+        // `font-family` is unset.
         return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
@@ -3651,7 +3647,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Move focus to the previous tab in the active project, wrapping
     /// from the first to the last. ⌘⇧[ by default.
-    /// Mirrors Go `cmd/roost/app.go::cycleTab(delta=-1)`.
+    /// Delegates to `cycleTab(delta: -1)`.
     @objc @MainActor
     private func cycleTabPrev(_ sender: Any?) {
         cycleTab(delta: -1)
@@ -3659,7 +3655,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Move focus to the next tab in the active project, wrapping
     /// from the last to the first. ⌘⇧] by default.
-    /// Mirrors Go `cmd/roost/app.go::cycleTab(delta=+1)`.
+    /// Delegates to `cycleTab(delta: +1)`.
     @objc @MainActor
     private func cycleTabNext(_ sender: Any?) {
         cycleTab(delta: 1)
@@ -3682,8 +3678,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Rename the active tab. M5 of `goal-mac-parity-2026-05-18.md`
     /// replaced the pre-existing NSAlert with an NSPopover anchored
-    /// to the active pill — same UX as the Go binary's tab rename
-    /// (`cmd/roost/app.go::renameActiveTab`) and Linux M9. Mirrors
+    /// to the active pill — same inline-rename UX as Linux M9. Mirrors
     /// the popover-over-the-strip pattern documented at Linux
     /// `crates/roost-linux/src/app.rs:1057-1119`.
     /// On commit the daemon sets the per-tab `user_titled` lock so
@@ -3816,8 +3811,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// Force the sidebar visible without toggling. Called from the
-    /// user-action paths where Go (`cmd/roost/app.go:1337,1487,1975`)
-    /// auto-expands the sidebar so the user sees the affected row:
+    /// user-action paths that auto-expand the sidebar so the user sees
+    /// the affected row:
     /// `newProject` (freshly-created project), `selectProjectFromMenu`
     /// (⌘1-9 reveals the focused project), `renameActiveProject`
     /// (rename popover needs the row to anchor against), plus the
@@ -3896,7 +3891,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Lower bound on the cell-grid font size. Smaller renders cell
     /// metrics that collapse the cursor / glyph into the wrong
-    /// rect. The Go binary uses the same floor.
+    /// rect.
     private static let fontSizeMin: CGFloat = 8
     /// Upper bound on the cell-grid font size. Anything larger and a
     /// single tab's terminal eats the whole window before a useful
@@ -3928,7 +3923,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Bump the font size in 1pt increments, clamped to
     /// `[fontSizeMin, fontSizeMax]`. The change is applied
     /// uniformly across every TabSession's TerminalView — global
-    /// zoom, mirroring the Go binary's behaviour. (Per-tab zoom
+    /// zoom, not per-tab. (Per-tab zoom
     /// would need a TabSession-side stored size and a more
     /// elaborate keybind dispatch; not worth the complexity for the
     /// audience this serves.)
@@ -4450,10 +4445,9 @@ final class TabPillView: NSView, NSTextFieldDelegate {
     /// AppKit calls `menu(for:)` on every right-click; returning a
     /// per-call NSMenu instead of installing one statically keeps the
     /// item targets fresh — each menu holds a reference to *this*
-    /// pill's index even after the strip rebuilds. The Go binary doesn't
-    /// have a tab-pill menu (sidebar-only); we extend Mac slightly past
-    /// Go parity here because cmux + Linux M8 do this and the user has
-    /// been training the muscle memory.
+    /// pill's index even after the strip rebuilds. The tab-pill context
+    /// menu follows cmux + Linux M8, where the user has been training
+    /// the muscle memory.
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu()
 
@@ -4530,7 +4524,7 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
 
     /// M6 of `goal-mac-parity-2026-05-18.md`: 3px stripe on the
     /// leading edge colored by the per-project rollup. Hidden when
-    /// the rollup is `.none`. The Go binary's GTK row uses a CSS
+    /// the rollup is `.none`. The Linux UI's GTK row uses a CSS
     /// `box-shadow: inset 3px 0 0 <color>`; we reproduce the same
     /// visual with an explicit NSView so the row owns the rendering
     /// (NSTableCellView styling can be subtle).

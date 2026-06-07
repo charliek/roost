@@ -5,9 +5,9 @@
 //! the daemon-removal refactor. Adaptations vs the daemon original:
 //!
 //! * Tab id type stays `i64` (matches the roost-ipc wire id range).
-//! * `ROOST_TAB_ID` + `ROOST_SOCKET` env vars are now injected into
-//!   the child process — the daemon never did this in the Rust path
-//!   (the Go path did via `cmd/roost/spawn.go`). The acceptance
+//! * `ROOST_TAB_ID` + `ROOST_SOCKET` env vars are injected into the
+//!   child process so external tooling can dial back to this tab —
+//!   the earlier daemon original did not do this. The acceptance
 //!   criterion in the plan explicitly calls these out.
 //! * Output goes to a per-tab broadcast channel rather than a
 //!   single-consumer mpsc, so the UI's renderer and any future

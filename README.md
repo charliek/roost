@@ -61,11 +61,3 @@ The full site lives under `docs/` and builds with `mkdocs-material` (`make docs-
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract
 
 `CLAUDE.md` at the repo root captures the project conventions enforced by review.
-
-## Legacy (Go)
-
-The original Go + GTK4 implementation (`cmd/`, `internal/`, `go.mod`) is retained
-for now and still builds (`mise install && make build` → `./roost ./roost-cli`),
-but the Rust/Swift port above is the path forward. The Go code is slated for
-removal once parity is confirmed — see [`plans/GODELETE.md`](plans/GODELETE.md).
-Its docs live under the "Legacy (Go prototype)" section of the docs site.

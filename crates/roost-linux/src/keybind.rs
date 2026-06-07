@@ -1,11 +1,10 @@
 //! Keybind trigger parser + default action table.
 //!
-//! Mirrors `mac/Sources/Roost/Keybind.swift` (Phase 6 P1) in shape +
-//! the Go binary's `cmd/roost/shortcuts.go`. Defaults flip Linux's
-//! primary modifier to `ctrl` (Mac uses `super`/`cmd`); everything
-//! else — modifier-alias rules, `unbind` semantics, action namespace —
-//! is shared with the other UIs so config files port verbatim across
-//! `mac/`, `linux/`, and the Go binary.
+//! Mirrors `mac/Sources/Roost/Keybind.swift` (Phase 6 P1) in shape.
+//! Defaults flip Linux's primary modifier to `ctrl` (Mac uses
+//! `super`/`cmd`); everything else — modifier-alias rules, `unbind`
+//! semantics, action namespace — is shared with the Mac UI so config
+//! files apply verbatim across both UIs.
 
 use std::collections::HashMap;
 
@@ -42,10 +41,10 @@ pub enum KeybindAction {
     Paste,
     ToggleSidebar,
     /// Browser-style font sizing on the active tab's terminal.
-    /// Defaults to `primary+plus`/`primary+equal` (Go matches both
+    /// Defaults to `primary+plus`/`primary+equal` (both are bound
     /// because `Cmd-+` on US layouts is really `Cmd-Shift-=` and
-    /// users frequently hit `Cmd-=` without shift). Mirrors the
-    /// Go binary's per-tab font adjusters.
+    /// users frequently hit `Cmd-=` without shift). Per-tab font
+    /// adjusters.
     FontIncrease,
     /// Default `primary+minus`.
     FontDecrease,
@@ -170,8 +169,7 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
     })
 }
 
-/// Default bindings table — host-platform aware. Matches the Go
-/// binary's `cmd/roost/app.go::defaultBindings`:
+/// Default bindings table — host-platform aware:
 ///
 /// * Linux: `primary = ctrl`, `projectMod = alt`, `clipboardMod = alt`.
 /// * macOS: `primary = super` (Cmd), `projectMod = super`,
@@ -232,8 +230,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
 
     // Cycle prev/next: Shift+[ and Shift+] map to bracketleft/right on
     // most US layouts; some layouts emit braceleft/right after Shift.
-    // Bind both so the keybind fires regardless of layout — matches
-    // the Go binary's pair-bind in cmd/roost/app.go::defaultBindings.
+    // Bind both so the keybind fires regardless of layout.
     add(
         &mut out,
         &format!("{primary}+shift+bracketleft"),
@@ -303,7 +300,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
 
     // Browser-style font sizing on the active terminal. `Cmd-+` on
     // US layouts is really `Cmd-Shift-=`, and many users hit `Cmd-=`
-    // without shift; bind both for FontIncrease (Go does the same).
+    // without shift; bind both for FontIncrease.
     add(
         &mut out,
         &format!("{primary}+plus"),
@@ -327,9 +324,9 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
             &format!("{project_mod}+{n}"),
             KeybindAction::SwitchProject(n),
         );
-        // SwitchTab stays on Ctrl on both platforms — matches the Go
-        // binary, and keeps `Cmd+N` (or `Alt+N`) free for the
-        // project-switching keybind above.
+        // SwitchTab stays on Ctrl on both platforms, which keeps
+        // `Cmd+N` (or `Alt+N`) free for the project-switching keybind
+        // above.
         add(&mut out, &format!("ctrl+{n}"), KeybindAction::SwitchTab(n));
     }
 
@@ -441,8 +438,7 @@ mod tests {
         let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
         // RenameTab + RenameProject default to the host's project
         // modifier — `alt+r` / `alt+shift+r` on Linux, `super+r` /
-        // `super+shift+r` (Cmd+R / Cmd+Shift+R) on macOS — matching
-        // the Go binary's `cmd/roost/app.go::defaultBindings`. Same
+        // `super+shift+r` (Cmd+R / Cmd+Shift+R) on macOS. The same
         // physical gesture maps to the same action regardless of
         // host, which is what users expect when sharing a config
         // file across machines.

@@ -13,8 +13,7 @@
 //!      lives in `std::env::temp_dir()` with mode `0o600`.
 //!
 //! The encoded path is then pasted as ordinary bracketed-paste text.
-//! Mirrors the legacy Go implementation at `cmd/roost/paste_image.go`
-//! and the Mac counterpart in `mac/Sources/Roost/PasteImage.swift`.
+//! Mirrors the Mac counterpart in `mac/Sources/Roost/PasteImage.swift`.
 
 use std::cell::Cell;
 use std::io::Write;
@@ -25,8 +24,8 @@ use std::rc::Rc;
 use gdk_pixbuf::prelude::*;
 use gdk_pixbuf::Pixbuf;
 
-/// Maximum clipboard payload we'll materialize. Matches the legacy
-/// Go cap (cmd/roost/paste_image.go:27) and the Mac port's ceiling.
+/// Maximum clipboard payload we'll materialize. Matches the Mac UI's
+/// 10 MiB ceiling.
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// Decoded-megapixel cap. A 10 MiB JPEG can describe an 8000×8000

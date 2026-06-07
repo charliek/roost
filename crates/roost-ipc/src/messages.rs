@@ -370,6 +370,14 @@ pub struct PaletteStateResult {
     pub selection: u32,
     #[serde(default)]
     pub items: Vec<PaletteItemView>,
+    /// Whether the highlighted row is fully within the scrolled
+    /// viewport — the observable for the keep-selection-visible behavior
+    /// (the palette scrolls the highlight into view as it moves). `None`
+    /// when a UI can't report it (e.g. no selection, or a UI that
+    /// doesn't expose list geometry); only set this `false` when the
+    /// selected row is genuinely clipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_in_view: Option<bool>,
 }
 
 /// `palette.present` params: open the palette on a caller-supplied list
@@ -1419,13 +1427,20 @@ mod tests {
                     subtitle: Some("exit 0".into()),
                 },
             ],
+            selected_in_view: Some(true),
         };
         round_trip(&live);
 
-        // Closed: `frame` omitted (skip_serializing_if), defaults restore it.
+        // Closed: `frame` + `selected_in_view` omitted (skip_serializing_if),
+        // defaults restore them.
         let closed = PaletteStateResult::default();
         let json = serde_json::to_string(&closed).unwrap();
         assert!(!json.contains("frame"), "closed state omits frame: {json}");
+        assert!(
+            !json.contains("selected_in_view"),
+            "closed state omits selected_in_view: {json}"
+        );
+        assert_eq!(closed.selected_in_view, None);
         round_trip(&closed);
     }
 

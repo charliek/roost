@@ -2,26 +2,20 @@
 #
 # Schema: https://docs.coderabbit.ai/getting-started/configure-coderabbit
 #
-# The repo runs an active long-lived `feature/rust-port` branch
-# (per `plans/goal-rust-port-polish-2026-05-16.md`) that accepts
-# polish PRs from short-lived `polish/*` topic branches. CodeRabbit's
-# default behavior is to skip auto-review on PRs targeting any
-# non-default branch, which would silently break the
-# "auto-merge when CI green + CodeRabbit clean" gate the goal
-# established. Explicitly opt those base branches in.
+# Topic branches (`polish/*`, `refactor/*`, feature branches) open PRs
+# into `main`; auto-review runs on those.
 
 reviews:
   auto_review:
     enabled: true
     base_branches:
       - "main"
-      - "feature/rust-port"
   review_status: true
   profile: chill
 
 language: en
 tone_instructions: |
   Be direct and concrete. Cite code as `file:line`
-  (e.g. `mac/Sources/Roost/App.swift:123`). CLAUDE.md and
-  plans/ carry conventions and active milestones; reference
-  them when feedback hinges on those decisions.
+  (e.g. `mac/Sources/Roost/App.swift:123`). CLAUDE.md carries
+  the project conventions; reference it when feedback hinges on
+  those decisions.

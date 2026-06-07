@@ -1,10 +1,8 @@
-/* Roost gtk4-rs UI overrides. Ported from cmd/roost/style.css to keep
- * the Linux Rust UI visually equivalent to the Go binary the user is
- * happy with. Targets libadwaita 1.x; revisit on major bumps.
+/* Roost gtk4-rs UI overrides. Targets libadwaita 1.x; revisit on
+ * major bumps.
  *
  * Keep this small — every rule is a surface that can fight a future
- * libadwaita restyle. Class names match the Go binary verbatim so
- * users browsing one codebase find the same rules in the other. */
+ * libadwaita restyle. */
 
 /* Sidebar selection: libadwaita's default selection is faint; promote
  * it to the accent color so the active project clearly pops. */
@@ -41,14 +39,13 @@ tabbar tab:checked {
  * the row's leading margin for the selection state — a real border
  * would shift the label. needs-input wins; running is informational;
  * idle is muted. The "none" state has no class, no stripe. The
- * daemon's TabState enum (proto/roost.proto) has no ERROR variant,
- * matching the Go binary; if the daemon grows one later, add a
- * `.roost-rollup-error` rule alongside these three and the matching
- * `RollupState::Error` variant in `rollup.rs`.
+ * daemon's TabState enum has no ERROR variant; if the daemon grows
+ * one later, add a `.roost-rollup-error` rule alongside these three
+ * and the matching `RollupState::Error` variant in `rollup.rs`.
  *
- * Colors mirror the per-tab indicator SVGs (cmd/roost/indicator.go).
- * Hard-coded rather than @accent_bg_color etc. because the indicator
- * meaning is semantic, not theme-dependent. */
+ * Colors mirror the per-tab indicator SVGs. Hard-coded rather than
+ * @accent_bg_color etc. because the indicator meaning is semantic,
+ * not theme-dependent. */
 listbox.navigation-sidebar > row.roost-rollup-running {
   box-shadow: inset 3px 0 0 #5fa3f0;
 }
@@ -140,7 +137,7 @@ listbox.navigation-sidebar > row.roost-rollup-idle {
 
 /* Drag-to-reorder feedback lives in app.rs: the dragged row's opacity
  * is set directly via gtk_widget_set_opacity in the drag-source
- * setup. CSS-based styling of the source row was tried in the Go
- * binary (multiple variants of background, box-shadow, outline) but
- * did not render reliably during a drag; the opacity API takes a
- * different code path and applies cleanly. */
+ * setup. CSS-based styling of the source row was tried (multiple
+ * variants of background, box-shadow, outline) but did not render
+ * reliably during a drag; the opacity API takes a different code
+ * path and applies cleanly. */

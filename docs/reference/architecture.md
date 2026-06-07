@@ -2,7 +2,7 @@
 
 Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed the workspace + PTY supervisor in-process. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
 
-For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md). For the legacy Go binary's architecture see [Legacy → Architecture](legacy-go/architecture.md).
+For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md).
 
 ## Stack
 
@@ -40,7 +40,6 @@ docs/
   reference/ipc.md        # JSON IPC wire spec — canonical
   archive/roost.proto     # Historical reference (the pre-M7 gRPC schema)
 third_party/ghostty/      # Vendored libghostty-vt build
-cmd/, internal/, build/   # Legacy Go binary — see Legacy section, deleted in Phase 9
 ```
 
 ## Hot path
@@ -102,6 +101,5 @@ The Mac PTY read path uses a dedicated pattern: the `DispatchSourceRead` closure
 - Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) split across two channels — embedder-synthesized OSC color replies vs. libghostty-answered device replies. See [Terminal query replies](terminal-queries.md) for which is which and why.
 - The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket (`~/Library/Caches/Roost/roost.sock` for Mac, `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux). `roostctl --target {mac,gtk}` routes to the right one; `roostctl` with no `--target` auto-detects via a parallel `connect()` probe of both candidate sockets.
 - Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on a pidfile next to the socket. Second launches read the holder PID and exit 0. `ROOST_ALLOW_MULTI=1` bypasses for dev/test workflows.
-- The legacy Go `cmd/` + `internal/` tree is unaffected by the Rust workspace and builds independently via `build/build.sh` until the Phase 9 cutover.
 
 See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

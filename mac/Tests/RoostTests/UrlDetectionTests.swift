@@ -1,10 +1,9 @@
 // Swift companion to the Rust suite in `crates/roost-url/src/lib.rs`.
-// Every case here mirrors a Go-binary case from
-// `internal/links/regex_test.go` so a future drift between the two
-// ports surfaces as a test failure on the Mac side. The shared wire
-// vectors in `tests/url-fixtures/` are loaded by a separate test file
-// (UrlFixtureRoundTripTests.swift) — this file is the in-language
-// readability layer.
+// Every case here mirrors one in that suite so a future drift between
+// the two UIs surfaces as a test failure on the Mac side. The shared
+// wire vectors in `tests/url-fixtures/` are loaded by a separate test
+// file (UrlFixtureRoundTripTests.swift) — this file is the
+// in-language readability layer.
 
 import Testing
 
@@ -119,7 +118,7 @@ func unicodeUrlBodyMatchesCodepoints() {
 @Test
 func fullwidthTrailingPunctuationNotStripped() {
     // U+3002 IDEOGRAPHIC FULL STOP — not in the ASCII strip set, so
-    // it stays attached. Mirrors the Go binary so neither port
+    // it stays attached. Both UIs behave the same way so neither
     // surprises users with locale-dependent cutoff.
     let row = "see https://例え.テスト。 next"
     let span = UrlDetection.find(in: row, at: 7)

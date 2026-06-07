@@ -1,9 +1,8 @@
 // Path display helpers for window chrome.
 //
-// Ported from the Go binary's `cmd/roost/app.go::pathDisplay` to keep
-// the Mac subtitle string identical to what the GTK headerbar shows
-// for the same cwd. Pure functions so they can be unit-tested without
-// AppKit / a window context.
+// Keeps the Mac subtitle string identical to what the GTK headerbar
+// shows for the same cwd. Pure functions so they can be unit-tested
+// without AppKit / a window context.
 
 import Foundation
 
@@ -13,7 +12,7 @@ import Foundation
 /// scalars (i.e. `Character`s) rather than bytes, so CJK / emoji /
 /// accented characters don't slice mid-codepoint.
 ///
-/// Matches `cmd/roost/path_display_test.go::TestPathDisplay` case-for-case.
+/// Covered case-for-case by `PathDisplayTests`.
 func pathDisplay(_ path: String, home: String, max: Int) -> String {
     // Defensive guard for non-positive `max`: `Collection.suffix(_:)`
     // documents a runtime trap on negative arguments, and the

@@ -1,12 +1,11 @@
 // Drag-drop reorder math for sidebar projects + tab pills.
 //
 // Pure, sync, no AppKit dependency so it can be unit-tested without
-// driving NSDraggingSession headlessly. Ported verbatim from
-// `cmd/roost/app.go::computeInsertIdx` (Go binary) and tested with
-// the same 20-case table at `cmd/roost/sidebar_reorder_test.go`. The
-// Linux Rust port at `crates/roost-linux/src/app.rs::compute_insert_idx`
-// also mirrors this — keep all three byte-equivalent so dragging
-// behaves identically on either UI.
+// driving NSDraggingSession headlessly. Tested with a 20-case table
+// in ReorderMathTests. The Linux UI's
+// `crates/roost-linux/src/app.rs::compute_insert_idx` mirrors this —
+// keep both byte-equivalent so dragging behaves identically on
+// either UI.
 
 import Foundation
 

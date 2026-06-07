@@ -1,14 +1,7 @@
 # Roost architecture & principles
 
 This is Roost's **living architecture** and the principles behind it —
-the north star every PR is measured against. The Rust + Swift port this
-doc originally planned is **complete and merged to `main`** (cutover
-2026-05-23); the migration's phased history is summarized in
-[Migration history](#migration-history) and detailed in
-[`plans/`](../../plans/). The legacy Go + GTK4 implementation is
-described in [spec.md](spec.md) and the legacy
-[architecture.md](../reference/architecture.md), retained until the
-**GODELETE** step removes the Go code.
+the north star every PR is measured against.
 
 ## The product
 
@@ -245,8 +238,8 @@ experience.
 
 `gtk4-rs` calls `pango_cairo_context_set_font_options` directly via raw
 FFI and does not have the `gotk4` `cairo.FontOptions` record-struct
-mismatch that forces the Go binary's `internal/pangoextra` workaround.
-The workaround dies with the Go code in GODELETE.
+mismatch that would otherwise force a separate `pangocairo` FFI
+workaround.
 
 ### DL-7: Tabs persist as layout, not live state (revised 2026-05-24)
 
@@ -279,9 +272,7 @@ inside `Roost.app` writes hook paths that point at the bundled location.
 ### DL-10: Ghostty SHA pinned in `third_party/ghostty/build.sh`
 
 `third_party/ghostty/build.sh` pins the libghostty-vt commit for the
-Rust + Swift builds. (The legacy `build/build.sh` pins the same commit
-for the Go cgo build and is retired with the Go code in GODELETE; until
-then, bumps move both in lockstep.)
+Rust + Swift builds — the single source of the pin.
 
 ### DL-11: One command core, thin per-surface adapters (2026-05-26)
 
@@ -320,11 +311,8 @@ The Rust + Swift port is **complete** (cutover to `main` 2026-05-23). The
 phased plan that built it — direction-setter → FFI spikes → (interim
 gRPC daemon) → Mac UI → Linux UI → inline-core refactor (daemon → JSON
 IPC, `roostctl`, delete `roost-core`/`roost-proto`/`roost-common`/
-`roost-smoke`) → bundling → cutover — is recorded phase-by-phase in
-[`plans/`](../../plans/). The one remaining step is **GODELETE**: removing
-the legacy Go code (`cmd/`, `internal/`, `go.mod`, `build/`,
-`go-legacy.yml`) once Rust/Swift parity is confirmed — see
-[`plans/GODELETE.md`](../../plans/GODELETE.md).
+`roost-smoke`) → bundling → cutover — is done; Roost has been Swift
+(macOS) + Rust (Linux) over in-process JSON IPC since.
 
 ## Relationship to existing docs
 
@@ -334,9 +322,5 @@ the legacy Go code (`cmd/`, `internal/`, `go.mod`, `build/`,
 | [`docs/development/test-automation.md`](test-automation.md) | The testing + scripting plan that operationalizes the north star (pytest E2E, Lua scripting, CI). |
 | [`docs/reference/ipc.md`](../reference/ipc.md) | JSON IPC wire format spec — the canonical command contract. |
 | [`docs/reference/architecture.md`](../reference/architecture.md) | Package layout + threading contract for the in-process implementation. |
-| [`docs/development/spec.md`](spec.md) | Original design spec for the **legacy Go + GTK4** implementation. Historical; retained until GODELETE. |
 | [`docs/archive/roost.proto`](../archive/roost.proto) | Historical reference for the pre-rewrite gRPC contract. |
 | `CLAUDE.md` | Project conventions enforced by review; mirrors the principles here. |
-
-After GODELETE, `spec.md` and the legacy architecture diagrams move to
-`docs/historical/` with a one-line note at the top.

@@ -9,11 +9,10 @@
 // iterators, etc.). Snapshots are cheap; the expensive thing is
 // walking 80x24 cells, which 5.4c will do.
 //
-// The Go cgo binding solved the same problem in
-// `internal/ghostty/render.go`; this is a Swift port of just the
-// pieces we need so far. Field-name parity with the upstream C
-// header (size, foreground, background) is checked at compile time
-// by the Swift importer.
+// This wraps just the pieces of libghostty's render state we need
+// so far. Field-name parity with the upstream C header (size,
+// foreground, background) is checked at compile time by the Swift
+// importer.
 
 import AppKit
 import CGhosttyVT
@@ -201,8 +200,7 @@ final class RenderState {
                 // `.size` MUST be the struct size before the call so
                 // libghostty knows which fields this caller is
                 // prepared to read (forward-compat contract from
-                // `ghostty/include/ghostty/vt/style.h`). Mirrors the
-                // legacy Go FFI at `internal/ghostty/render.go:182-189`.
+                // `ghostty/include/ghostty/vt/style.h`).
                 // We treat any non-success rc as "no style data, use
                 // defaults" — better to render the cell without
                 // styling than to drop the whole frame.

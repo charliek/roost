@@ -1,6 +1,6 @@
 // OSC 10/11/12 query-reply synthesis tests, Swift companion to the
 // Rust suite in `crates/roost-osc/src/lib.rs::tests::format_color_query_*`.
-// Both ports MUST produce byte-identical replies — codex/claude-code
+// Both UIs MUST produce byte-identical replies — codex/claude-code
 // see one terminal answer regardless of which UI hosts the tab. When
 // the Rust suite grows a case, mirror it here.
 
@@ -16,8 +16,7 @@ private func asciiBytes(_ s: String) -> [UInt8] {
 
 @Test
 func osc11_replyBgIsByteExactWithLegacy() {
-    // theme bg = #1e1e1e — same value the legacy Go suite pins in
-    // `internal/osc/scanner_test.go:279`.
+    // theme bg = #1e1e1e.
     let bg = NSColor(srgbRed: 0x1e / 255.0, green: 0x1e / 255.0, blue: 0x1e / 255.0, alpha: 1)
     let reply = TerminalView.formatColorQueryResponse(n: 11, color: bg)
     #expect(reply.map(Array.init) == asciiBytes("\u{1B}]11;rgb:1e1e/1e1e/1e1e\u{07}"))
@@ -33,7 +32,7 @@ func osc10_replyFgIsByteExactWithLegacy() {
 
 @Test
 func osc12_replyCursorIsByteExactWithLegacy() {
-    // Legacy reference: rgb:9898/9898/9d9d (the cmux/default cursor).
+    // Expected: rgb:9898/9898/9d9d (the cmux/default cursor).
     let cursor = NSColor(srgbRed: 0x98 / 255.0, green: 0x98 / 255.0, blue: 0x9d / 255.0, alpha: 1)
     let reply = TerminalView.formatColorQueryResponse(n: 12, color: cursor)
     #expect(reply.map(Array.init) == asciiBytes("\u{1B}]12;rgb:9898/9898/9d9d\u{07}"))

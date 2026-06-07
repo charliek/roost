@@ -16,8 +16,7 @@
 // The encoded path is then pasted as ordinary bracketed-paste text via
 // `TerminalView.paste(_:)`. Claude Code / Codex detect the `.png` path
 // and offer to attach. No special image escape protocol is used; this
-// mirrors the legacy Go implementation at `cmd/roost/paste_image.go`
-// and cmux's `TerminalImageTransfer.swift`.
+// matches cmux's `TerminalImageTransfer.swift`.
 
 import AppKit
 import Foundation
@@ -31,8 +30,8 @@ enum PasteImage {
         case none
     }
 
-    /// Maximum clipboard payload we'll materialize. Matches the legacy
-    /// Go cap (cmd/roost/paste_image.go:27) and cmux's 10 MiB ceiling.
+    /// Maximum clipboard payload we'll materialize: cmux's 10 MiB
+    /// ceiling.
     static let maxBytes = 10 * 1024 * 1024
 
     /// Decoded-megapixel cap. A 10 MiB JPEG can describe an 8000×8000
@@ -52,7 +51,7 @@ enum PasteImage {
     /// first because it needs no re-encode round-trip; the rest are
     /// decoded by ImageIO and re-encoded to PNG. UTIs use raw strings
     /// (rather than `UTType.*.identifier`) so the table is stable
-    /// across SDK changes and easy to compare against the Go port.
+    /// across SDK changes.
     static let sourceTypes: [(NSPasteboard.PasteboardType, Bool)] = [
         (.png, true),
         (.tiff, false),

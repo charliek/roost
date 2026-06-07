@@ -1,17 +1,14 @@
 //! URL launcher for the Ctrl-click handler.
 //!
-//! Two-tier dispatch, **xdg-open first** to match the legacy Go
-//! binary's `internal/openuri/openuri_linux.go` rationale: GIO's
-//! `AppInfo` lookup can disagree with `xdg-mime`'s configured URI
-//! handler on some desktops, so preferring `xdg-open` avoids
-//! opening the wrong browser. `gio::AppInfo::launch_default_for_uri`
-//! is the fallback for sandboxed environments where `xdg-open` isn't
-//! on `PATH`.
+//! Two-tier dispatch, **xdg-open first**: GIO's `AppInfo` lookup can
+//! disagree with `xdg-mime`'s configured URI handler on some
+//! desktops, so preferring `xdg-open` avoids opening the wrong
+//! browser. `gio::AppInfo::launch_default_for_uri` is the fallback
+//! for sandboxed environments where `xdg-open` isn't on `PATH`.
 //!
 //! The xdg-open spawn uses `gio::Subprocess` rather than
 //! `std::process::Command` so the child is reaped by GIO's child-
-//! watch mechanism instead of becoming a zombie. The legacy Go path
-//! also waits in a goroutine for the same reason.
+//! watch mechanism instead of becoming a zombie.
 
 use gtk4::gio;
 

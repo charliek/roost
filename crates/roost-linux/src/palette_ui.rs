@@ -103,6 +103,10 @@ struct PaletteInner {
     card: gtk4::Box,
     entry: gtk4::Entry,
     list: gtk4::ListBox,
+    /// The scroller wrapping `list`. Retained so selection changes can
+    /// scroll the highlighted row into view (GtkListBox doesn't do this
+    /// itself when focus stays on the search entry).
+    scroll: gtk4::ScrolledWindow,
     /// Set while we programmatically rewrite the entry text (query
     /// restore on push/pop) so the `changed` handler ignores the echo.
     suppress_changed: Cell<bool>,
@@ -189,6 +193,7 @@ impl PaletteOverlay {
             card: card.clone(),
             entry: entry.clone(),
             list: list.clone(),
+            scroll: scroll.clone(),
             suppress_changed: Cell::new(false),
             closing: Cell::new(false),
             armed: Cell::new(false),
@@ -309,6 +314,33 @@ impl PaletteInner {
         });
         self.catcher.add_controller(click);
 
+        // Keep the highlighted row visible across layout changes. The
+        // scroller's vertical adjustment emits `changed` when its range
+        // (content/viewport size) updates — i.e. after the rows for a
+        // freshly opened or re-filtered frame are laid out. That's when
+        // the pre-positioned selection (e.g. the theme list opening on
+        // the active theme partway down) can finally be scrolled into
+        // view; arrow nav handles itself synchronously since layout is
+        // already settled.
+        //
+        // The scroll is deferred to an idle rather than applied inline:
+        // `changed` fires *during* the ScrolledWindow's size-allocate, and
+        // a `set_value` made now is overwritten when that allocation
+        // finishes (it re-clamps scroll to the top). Running one main-loop
+        // iteration later — after the allocation completes — makes the
+        // scroll stick.
+        self.scroll.vadjustment().connect_changed({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.scroll_selection_into_view();
+                    }
+                });
+            }
+        });
+
         // Focus-out on the card (and all descendants) → dismiss. Fires
         // when focus leaves for the terminal or another window; staying
         // within the entry/list keeps `contains_focus` true.
@@ -369,7 +401,48 @@ impl PaletteInner {
         let row = selection.min(count - 1) as i32;
         if let Some(r) = self.list.row_at_index(row) {
             self.list.select_row(Some(&r));
+            self.scroll_selection_into_view();
         }
+    }
+
+    /// The selected row's `(top, height)` in the list's (= scroll
+    /// content) coordinate space, or `None` when there's no selection or
+    /// the row isn't laid out yet (open / re-filter rebuilt the rows this
+    /// turn, so sizes aren't known). `compute_bounds` is the non-deprecated
+    /// successor to `allocation()` and reports the row's content position
+    /// regardless of the current scroll offset.
+    fn selected_row_extent(&self) -> Option<(f64, f64)> {
+        let row = self.list.selected_row()?;
+        let bounds = row.compute_bounds(&self.list)?;
+        let h = bounds.height() as f64;
+        if h <= 0.0 {
+            return None;
+        }
+        Some((bounds.y() as f64, h))
+    }
+
+    /// Scroll so the selected row is fully visible. GtkListBox only
+    /// auto-scrolls to a row when that row holds keyboard focus, but the
+    /// palette keeps focus on the search entry and drives selection from
+    /// its key controller — so without this the highlight rides off the
+    /// top/bottom edge (worst on the theme list, which opens
+    /// pre-positioned on the active theme partway down).
+    ///
+    /// On arrow nav layout is already settled, so this scrolls
+    /// immediately. On open / re-filter the rows are rebuilt this turn and
+    /// the viewport isn't laid out yet (`selected_row_extent` returns
+    /// `None`); the `vadjustment::changed` handler wired in `wire_signals`
+    /// re-runs this once layout settles, covering the pre-positioned open
+    /// case.
+    fn scroll_selection_into_view(self: &Rc<Self>) {
+        let Some((y, h)) = self.selected_row_extent() else {
+            return;
+        };
+        let adj = self.scroll.vadjustment();
+        if adj.page_size() <= 0.0 {
+            return;
+        }
+        adj.set_value(reveal_offset(y, h, adj.value(), adj.page_size()));
     }
 
     fn fire_highlight(self: &Rc<Self>) {
@@ -495,7 +568,32 @@ impl PaletteInner {
                 .into_iter()
                 .map(|m| (m.item.id, m.item.title, m.item.subtitle))
                 .collect(),
+            selected_in_view: self.selected_row_in_view(),
         }
+    }
+
+    /// Whether the highlighted row sits fully inside the scrolled
+    /// viewport. `None` before layout (sizes unknown) or with no
+    /// selection — callers treat `None` as "can't tell", so only `Some(
+    /// false)` flags a genuinely clipped highlight (the bug this guards).
+    ///
+    /// Measured relative to the scroller (the viewport), NOT via the
+    /// adjustment value: that reflects the *applied* scroll position, so a
+    /// value that was set but not yet translated onto screen (e.g. clobbered
+    /// by an in-flight allocation) still reads as out-of-view here. The
+    /// page size bounds the visible band.
+    fn selected_row_in_view(&self) -> Option<bool> {
+        let row = self.list.selected_row()?;
+        let bounds = row.compute_bounds(&self.scroll)?;
+        let height = bounds.height() as f64;
+        let page = self.scroll.vadjustment().page_size();
+        if height <= 0.0 || page <= 0.0 {
+            return None;
+        }
+        let top = bounds.y() as f64;
+        let bottom = top + height;
+        // Half-pixel slack absorbs fractional layout rounding.
+        Some(top >= -0.5 && bottom <= page + 0.5)
     }
 
     /// Set the filter as if typed: re-filter, re-select the top match,
@@ -550,6 +648,9 @@ pub struct PaletteSnapshot {
     pub query: String,
     pub selection: usize,
     pub items: Vec<(String, String, Option<String>)>,
+    /// Whether the highlighted row is fully within the scrolled viewport
+    /// (`None` = can't tell yet — pre-layout or no selection).
+    pub selected_in_view: Option<bool>,
 }
 
 impl PaletteOverlay {
@@ -682,9 +783,49 @@ fn markup_for(title: &str, ranges: &[Range<usize>]) -> String {
     out
 }
 
+/// Minimal vertical scroll offset that brings a row spanning
+/// `[y, y + height)` fully into a viewport of height `page` currently
+/// scrolled to `offset`: scroll up if the row is above the viewport,
+/// down if it's below, otherwise leave `offset` unchanged.
+fn reveal_offset(y: f64, height: f64, offset: f64, page: f64) -> f64 {
+    if y < offset {
+        y
+    } else if y + height > offset + page {
+        y + height - page
+    } else {
+        offset
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_offset_keeps_offset_when_row_fully_visible() {
+        assert_eq!(reveal_offset(100.0, 32.0, 50.0, 420.0), 50.0);
+    }
+
+    #[test]
+    fn reveal_offset_scrolls_up_to_row_above_viewport() {
+        // Row at y=50 while scrolled to 100 → bring the row top to the top.
+        assert_eq!(reveal_offset(50.0, 32.0, 100.0, 420.0), 50.0);
+    }
+
+    #[test]
+    fn reveal_offset_scrolls_down_to_row_below_viewport() {
+        // Row at y=400..432 with viewport 0..420 → align row bottom to
+        // viewport bottom (432 - 420 = 12).
+        assert_eq!(reveal_offset(400.0, 32.0, 0.0, 420.0), 12.0);
+    }
+
+    #[test]
+    fn reveal_offset_reveals_last_row_off_the_bottom() {
+        // The reported bug: arrowing to the final row (here y=736..768) of
+        // a list taller than the viewport must scroll it into view rather
+        // than clip it.
+        assert_eq!(reveal_offset(736.0, 32.0, 0.0, 420.0), 348.0);
+    }
 
     #[test]
     fn markup_plain_when_no_ranges() {

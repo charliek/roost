@@ -7,8 +7,8 @@
 //! height (preferring `metrics.height()` from Pango ≥ 1.44, falling
 //! back to ascent + descent).
 //!
-//! Mirrors the Go binary's `cmd/roost/font.go::measureMetrics` + the
-//! Mac UI's `TerminalView.updateFont` 1:1.
+//! Matches the measurement the Mac UI's `TerminalView.updateFont`
+//! does 1:1.
 
 use gtk4::pango::{self, FontDescription};
 use gtk4::prelude::{FontFamilyExt, FontMapExt};
@@ -16,7 +16,7 @@ use gtk4::prelude::{FontFamilyExt, FontMapExt};
 /// Default font family chain. JetBrains Mono is preferred when
 /// installed; falls through to system monospace via Pango's
 /// `Monospace` alias. The full font-family fallback resolution
-/// (`pickFontFamily` from `cmd/roost/font.go`) lands in commit 11.
+/// lands in commit 11.
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono, Monospace";
 
 /// Default font size in points. Matches the Mac UI default.
@@ -66,8 +66,7 @@ impl CellMetrics {
 
         // Floor the cell-height to integer pixels for cell-aligned
         // rendering. Sub-pixel cell heights produce visible smearing
-        // across rows; the Go binary made the same choice. Cell width
-        // is also floored for the same reason.
+        // across rows. Cell width is also floored for the same reason.
         let cell_width = cell_width.floor().max(1.0);
         let cell_height = cell_height.floor().max(1.0);
 
@@ -106,9 +105,9 @@ const GENERIC_FAMILIES: &[&str] = &[
 /// so the silent fall-through to `Monospace` is visible in the log.
 /// Diagnostic only — no behavioral change: `Monospace` is a fontconfig
 /// generic that always resolves to a monospace face, so cell alignment
-/// is preserved. Mirrors the Go binary's `pickFontFamily`. `configured`
-/// is the user's comma-separated `font_family` (the first entry is the
-/// primary); `None` means the `DEFAULT_FONT_FAMILY` default applies.
+/// is preserved. `configured` is the user's comma-separated
+/// `font_family` (the first entry is the primary); `None` means the
+/// `DEFAULT_FONT_FAMILY` default applies.
 pub fn warn_if_primary_family_missing(context: &pango::Context, configured: Option<&str>) {
     let list = configured.unwrap_or(DEFAULT_FONT_FAMILY);
     let Some(primary) = list

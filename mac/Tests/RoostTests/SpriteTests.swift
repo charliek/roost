@@ -1,8 +1,7 @@
-// Pixel-assertion suite mirroring `crates/roost-linux/src/sprite.rs::tests`
-// and the legacy `cmd/roost/sprite_test.go`. Renders each glyph into a
-// CGBitmapContext and pokes at raw bytes to verify fills land in the
-// right places. The OpenCode-logo regression is `blockTilingNoGap` —
-// two adjacent █ cells must abut with no seam.
+// Pixel-assertion suite mirroring `crates/roost-linux/src/sprite.rs::tests`.
+// Renders each glyph into a CGBitmapContext and pokes at raw bytes to
+// verify fills land in the right places. The OpenCode-logo regression
+// is `blockTilingNoGap` — two adjacent █ cells must abut with no seam.
 //
 // When the Rust suite grows a case, mirror it here in the same order so
 // both UIs stay at behavioral parity.

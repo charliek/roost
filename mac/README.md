@@ -25,8 +25,7 @@ mise install                        # gets zig 0.15.2 if not already installed
 
 Subsequent `swift build` runs are fast — the artifacts are cached and
 the script no-ops on the next invocation. Re-run the script after a
-Ghostty SHA bump (which happens in lockstep on `build/build.sh` and
-`third_party/ghostty/build.sh`).
+Ghostty SHA bump in `third_party/ghostty/build.sh`.
 
 ## Run it
 

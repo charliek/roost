@@ -1,7 +1,11 @@
 //! Bundled themes + ghostty-format parser.
 //!
-//! Ports `mac/Sources/Roost/Theme.swift` (Phase 6 M6) + the
-//! `cmd/roost/themes/` directory bundle. Themes carry the 256-entry
+//! Ports `mac/Sources/Roost/Theme.swift` (Phase 6 M6). The theme files
+//! live in `crates/roost-linux/src/resources/themes/` (the Rust
+//! source-of-truth, alongside the vendored icons) and a byte-identical
+//! copy in `mac/Sources/Roost/Resources/themes/` for the Swift bundle;
+//! `make themes-check` guards the two against drift. Themes carry the
+//! 256-entry
 //! libghostty palette plus the chrome colors (foreground, background,
 //! cursor, selection). Each theme file is embedded via `include_str!`
 //! so the binary is self-contained — no `XDG_DATA_DIRS` lookup, no
@@ -64,7 +68,7 @@ impl Theme {
     }
 
     /// Look up a bundled theme by name. Case-insensitive matching
-    /// against the file names under `cmd/roost/themes/`. Returns
+    /// against the file names under `resources/themes/`. Returns
     /// the fallback if nothing matches so the UI always renders.
     pub fn load_bundled(name: &str) -> Self {
         for (theme_name, source) in BUNDLED_THEMES {
@@ -100,35 +104,44 @@ impl Default for Theme {
     }
 }
 
-/// Bundled theme set: name → file contents, embedded via
-/// `include_str!`. New themes can be dropped into the array below;
-/// they're matched case-insensitively in `Theme::load_bundled`.
+/// `(name, include_str!("resources/themes/name"))` — names the theme
+/// once. `$name` must be a literal so `concat!` + `include_str!` resolve
+/// it at compile time.
+macro_rules! bundled_theme {
+    ($name:literal) => {
+        ($name, include_str!(concat!("resources/themes/", $name)))
+    };
+}
+
+/// Bundled theme set: name → file contents, embedded via `include_str!`.
+/// Drop a file into `resources/themes/`, add a `bundled_theme!` line, and
+/// it's matched case-insensitively in `Theme::load_bundled`.
 const BUNDLED_THEMES: &[(&str, &str)] = &[
-    (
-        "roost-dark",
-        include_str!("../../../cmd/roost/themes/roost-dark"),
-    ),
-    (
-        "Atom One Dark",
-        include_str!("../../../cmd/roost/themes/Atom One Dark"),
-    ),
-    (
-        "Catppuccin Mocha",
-        include_str!("../../../cmd/roost/themes/Catppuccin Mocha"),
-    ),
-    ("Dracula", include_str!("../../../cmd/roost/themes/Dracula")),
-    (
-        "Dracula+",
-        include_str!("../../../cmd/roost/themes/Dracula+"),
-    ),
-    (
-        "Gruvbox Dark Hard",
-        include_str!("../../../cmd/roost/themes/Gruvbox Dark Hard"),
-    ),
-    (
-        "TokyoNight",
-        include_str!("../../../cmd/roost/themes/TokyoNight"),
-    ),
+    bundled_theme!("roost-dark"),
+    bundled_theme!("Atom One Dark"),
+    bundled_theme!("Catppuccin Mocha"),
+    bundled_theme!("Dracula"),
+    bundled_theme!("Dracula+"),
+    bundled_theme!("Gruvbox Dark Hard"),
+    bundled_theme!("TokyoNight"),
+    // Additional Ghostty-format themes (byte-identical to upstream).
+    bundled_theme!("0x96f"),
+    bundled_theme!("Atom"),
+    bundled_theme!("Atom One Light"),
+    bundled_theme!("Ayu Light"),
+    bundled_theme!("Ayu Mirage"),
+    bundled_theme!("Nord"),
+    bundled_theme!("Rose Pine"),
+    bundled_theme!("Solarized Dark Patched"),
+    bundled_theme!("Catppuccin Frappe"),
+    bundled_theme!("Catppuccin Macchiato"),
+    bundled_theme!("TokyoNight Storm"),
+    bundled_theme!("TokyoNight Night"),
+    bundled_theme!("Gruvbox Dark"),
+    bundled_theme!("One Half Dark"),
+    bundled_theme!("GitHub Dark Default"),
+    bundled_theme!("Everforest Dark Hard"),
+    bundled_theme!("Kanagawa Wave"),
 ];
 
 /// The standard xterm 256-color palette: 16 ANSI colors (0–15), the
@@ -299,6 +312,31 @@ mod tests {
         for name in &names {
             let _ = Theme::load_bundled(name);
         }
+    }
+
+    #[test]
+    fn every_theme_file_is_registered() {
+        // A theme file dropped into resources/themes/ but not added to
+        // BUNDLED_THEMES is invisible to the Linux UI (the Mac side
+        // auto-discovers by listing the dir). `themes-check` guards the two
+        // resource trees; this guards the Rust registration against them.
+        // (The reverse — a registered name with no file — fails to compile
+        // via include_str!.)
+        use std::collections::HashSet;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/resources/themes");
+        let registered: HashSet<String> = Theme::bundled_names().into_iter().collect();
+        let mut missing: Vec<String> = std::fs::read_dir(dir)
+            .expect("themes dir readable")
+            .map(|e| e.expect("dir entry"))
+            .filter(|e| e.file_type().expect("file type").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !registered.contains(name))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "theme files present in resources/themes/ but not in BUNDLED_THEMES: {missing:?}"
+        );
     }
 
     #[test]
