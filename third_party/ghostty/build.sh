@@ -140,7 +140,16 @@ fi
 
 echo "==> Building libghostty-vt"
 maybe_arm64_sdk_shim
-zig build -Demit-lib-vt=true -Doptimize=ReleaseFast --prefix "${OUT_DIR}"
+# `-Dcpu=baseline`: build for the architecture's portable baseline CPU, not
+# the builder's native CPU. Without it, zig (via Ghostty's
+# `standardTargetOptions`) bakes in whatever instructions the building
+# machine supports — fine locally, but in CI the artifact is cached per-OS
+# (not per-CPU) and restored across GitHub's heterogeneous runner fleet, so
+# a lib built on a richer CPU SIGILLs (exit -4) the instant it runs on a
+# poorer one. That surfaced as a flaky "gtk UI did not boot" + roost-vt ffi
+# test crashes. Baseline keeps the static archive portable across any CPU
+# of the same arch.
+zig build -Demit-lib-vt=true -Doptimize=ReleaseFast -Dcpu=baseline --prefix "${OUT_DIR}"
 popd >/dev/null
 
 # zig emits BOTH `libghostty-vt.a` and `libghostty-vt.dylib` (plus
