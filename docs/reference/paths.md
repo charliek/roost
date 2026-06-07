@@ -56,7 +56,7 @@ The directories are created at first launch with mode `0700`.
 
 ### No migration from pre-rewrite lowercase paths
 
-Pre-rewrite builds stored their state under lowercase `~/Library/Application Support/roost/` and `~/Library/Caches/roost/`. The current builds use capital `Roost`. There is no auto-migration — state in the lowercase directories is intentionally orphaned, and the legacy Go build's SQLite database is not migrated into `state.json`. Start empty.
+Pre-rewrite builds stored their state under lowercase `~/Library/Application Support/roost/` and `~/Library/Caches/roost/`. The current builds use capital `Roost`. There is no auto-migration — state in the lowercase directories is intentionally orphaned, and a pre-rewrite build's SQLite database is not migrated into `state.json`. Start empty.
 
 ## Config keys
 

@@ -10,8 +10,7 @@ description = "Shell-integration CLI for the Roost UIs (notify, set-title, focus
 
 [[bin]]
 # `roostctl` is the post-M5 binary name. The previous transitional
-# name `roost-cli-rs` survives only in plans/* and the historical
-# commit messages.
+# name `roost-cli-rs` survives only in historical commit messages.
 name = "roostctl"
 path = "src/main.rs"
 

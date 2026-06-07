@@ -61,9 +61,3 @@ The full site lives under `docs/` and builds with `mkdocs-material` (`make docs-
 - [Architecture](docs/reference/architecture.md) — package layout + threading contract
 
 `CLAUDE.md` at the repo root captures the project conventions enforced by review.
-
-## Legacy (Go)
-
-The original Go + GTK4 implementation has been retired now that the Rust/Swift
-port is at parity. Its working snapshot — code, docs, and the full migration
-history — is archived in the separate `roost-legacy-go` repository.

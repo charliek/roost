@@ -2,7 +2,7 @@
 
 Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed the workspace + PTY supervisor in-process. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
 
-For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md). The retired Go + GTK4 prototype's architecture is archived in the separate `roost-legacy-go` repository.
+For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md).
 
 ## Stack
 

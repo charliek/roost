@@ -16,6 +16,6 @@ reviews:
 language: en
 tone_instructions: |
   Be direct and concrete. Cite code as `file:line`
-  (e.g. `mac/Sources/Roost/App.swift:123`). CLAUDE.md and
-  plans/ carry conventions and active milestones; reference
-  them when feedback hinges on those decisions.
+  (e.g. `mac/Sources/Roost/App.swift:123`). CLAUDE.md carries
+  the project conventions; reference it when feedback hinges on
+  those decisions.

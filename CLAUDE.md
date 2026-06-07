@@ -41,11 +41,6 @@ E2E jobs — `e2e-gtk` and `e2e-mac` — path-filtered so jobs run only when
 relevant code changes). Releases gate on the same `ci-success` via a
 `ci-gate` job in `release.yml`.
 
-The original Go + GTK4 implementation has been removed (the **GODELETE**
-step) now that the Rust + Swift UIs are at parity; its working snapshot —
-code, docs, and the full migration history — is archived in the separate
-`roost-legacy-go` repository. There is no Go code or Go CI in this repo.
-
 `claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor
 branch and is **frozen** at `00b3d10`. Do not start new work on it.
 
