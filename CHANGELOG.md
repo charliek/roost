@@ -9,6 +9,55 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.11 — 2026-06-07
+
+Theme expansion and a big internal cleanup. The bundled theme set doubles to 24,
+the GTK command palette keeps its highlighted row in view, the macOS projects
+sidebar gets a readable selection color, and the legacy Go + GTK4 implementation
+is retired.
+
+### Features
+
+- **17 more bundled themes — 24 total (#218)** — adds `0x96f`, `Atom`,
+  `Atom One Light`, `Ayu Light`, `Ayu Mirage`, `Nord`, `Rose Pine`,
+  `Solarized Dark Patched`, `Catppuccin Frappe`/`Macchiato`,
+  `TokyoNight Storm`/`Night`, `Gruvbox Dark`, `One Half Dark`,
+  `GitHub Dark Default`, `Everforest Dark Hard`, and `Kanagawa Wave`
+  (byte-identical to Ghostty's set) across both UIs. Pick one with
+  `theme = NAME`; browse them in the command palette's **Select Theme…**.
+- **Readable colored selection in the macOS projects sidebar (#216)** — the
+  selected project row uses a legible accent fill instead of the washed-out
+  default.
+
+### Fixes
+
+- **GTK palette keeps the highlighted row in view (#218)** — arrowing past the
+  last visible row, and opening the **Select Theme…** / **Select Font…** pickers
+  pre-positioned on the active theme/font, now scroll the highlight into view
+  instead of leaving it clipped or off-screen.
+
+### Internal
+
+- **GODELETE — removed the legacy Go + GTK4 implementation (#218)** — now that
+  the Swift (macOS) and Rust + gtk4-rs (Linux) UIs are at parity, the original Go
+  prototype (`cmd/`, `internal/`, `build/`, `go.mod`, the Go CI) is gone. Its
+  working snapshot and full migration history are archived separately. Bundled
+  theme files moved into the Rust crate
+  (`crates/roost-linux/src/resources/themes/`), kept byte-identical to the macOS
+  bundle copy by a `themes-parity` CI job.
+
+### Tests + CI
+
+- **Hardened `test_env_injected` against a shell-startup race (#217).**
+- **Bumped GitHub Actions to current major tags (#218)** — `setup-uv@v7`,
+  `upload-artifact@v7`, `upload-pages-artifact@v5`.
+
+### Docs
+
+- **Extending Roost guide (#214, #215)** — added an advanced multi-step wizard
+  (Python) provider example and made the provider example's `PATH` handling
+  cross-platform.
+
 ## v0.0.10 — 2026-06-05
 
 Provider polish release. Two refinements to the v0.0.9 script-backed provider system
