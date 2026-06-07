@@ -85,4 +85,3 @@ The defaults aim at the cmux/ghostty look: cell-snapped metrics, grayscale AA, l
 - **Cursor / underline / strikethrough thickness adjusters are not exposed.** Only the cell, baseline, and stem-thicken knobs land here; the TUI-alignment family of `adjust_cursor_*`, `adjust_underline_*`, `adjust_strikethrough_*`, and `adjust_box_thickness` are deferred.
 - **Sidebar and tab-label fonts use GTK's UI font.** Only the terminal cell font is configurable.
 - **All restart-required except size hotkeys.** `Cmd-+/-/0` rescales live; every other knob (family, features, AA, hint, cell adjusters, font-thicken) takes effect on next launch.
-- **Cairo font option control is implemented via a small cgo wrapper** (`internal/pangoextra`) because gotk4's `pangocairo.ContextSetFontOptions` binding crashes. See [Architecture](architecture.md) for the package layout.

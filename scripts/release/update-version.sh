@@ -6,8 +6,7 @@
 # workspace member crate inherits via `version.workspace = true`).
 #
 # `pyproject.toml` in this repo is for the test harness only — it has
-# its own version cadence and is NOT touched by releases. Same for
-# `go.mod`, which is a legacy artifact from the pre-Rust port.
+# its own version cadence and is NOT touched by releases.
 #
 # Roost's Cargo.toml uses the column-aligned style (`version       = "X.Y.Z"`)
 # throughout the [workspace.package] block. The sed replacement preserves

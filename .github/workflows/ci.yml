@@ -1,10 +1,9 @@
 name: CI
 
-# Primary CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
+# CI for Roost (Rust + Swift). Runs on main + PRs targeting main. A
 # `changes` job (path filter) gates the rust/swift/gtk jobs so they run only when
 # code that impacts them changes; `ci-success` is the single aggregated required
-# check (stable regardless of which jobs run). The legacy Go CI lives in
-# go-legacy.yml, path-filtered to Go files.
+# check (stable regardless of which jobs run).
 
 on:
   push:

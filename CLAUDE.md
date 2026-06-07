@@ -39,13 +39,12 @@ use `/merge-pr`). The single required check is **`ci-success`** from
 `.github/workflows/ci.yml` (rust/swift/gtk build+test plus the functional
 E2E jobs — `e2e-gtk` and `e2e-mac` — path-filtered so jobs run only when
 relevant code changes). Releases gate on the same `ci-success` via a
-`ci-gate` job in `release.yml`. The legacy Go CI
-(`.github/workflows/go-legacy.yml`) runs only on Go-file changes and is
-not required.
+`ci-gate` job in `release.yml`.
 
-The legacy Go code (`cmd/`, `internal/`, `go.mod`, `build/`) is retained
-but secondary; it is removed in the **GODELETE** step once Rust/Swift
-parity is confirmed — see [`plans/GODELETE.md`](plans/GODELETE.md).
+The original Go + GTK4 implementation has been removed (the **GODELETE**
+step) now that the Rust + Swift UIs are at parity; its working snapshot —
+code, docs, and the full migration history — is archived in the separate
+`roost-legacy-go` repository. There is no Go code or Go CI in this repo.
 
 `claude/discuss-architecture-refactor-cjU3E` is the predecessor refactor
 branch and is **frozen** at `00b3d10`. Do not start new work on it.
@@ -57,7 +56,7 @@ differentiator is multi-project workspace with notification routing
 for AI coding agents (Claude Code, Codex, etc.). Inspiration: cmux.
 Constraint: smaller scope than cmux.
 
-See `docs/development/spec.md` for the design doc and
+See `docs/development/vision.md` for the design rationale and
 `docs/reference/architecture.md` for diagrams.
 
 ## Architecture

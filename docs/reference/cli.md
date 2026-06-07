@@ -7,9 +7,7 @@ Claude Code hooks) but works from any shell that can reach the
 socket. See [`docs/reference/ipc.md`](ipc.md) for the wire
 format.
 
-Crate: `crates/roost-cli` (binary `roostctl`). For the legacy
-Go CLI that ships from `main`, see
-[Legacy → CLI](legacy-go/cli.md).
+Crate: `crates/roost-cli` (binary `roostctl`).
 
 ## Usage
 

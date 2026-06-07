@@ -1,11 +1,11 @@
 # Development Setup
 
-Roost has two active development surfaces on the `feature/rust-port` branch:
+Roost has two active development surfaces:
 
 1. The Rust workspace at `crates/` (`roost-ipc`, `roost-vt`, `roost-osc`, `roost-cli`, `roost-linux`).
 2. The Swift package at `mac/` (the macOS UI, `Roost.app`).
 
-Both link the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`. For iterating on the legacy Go binary still shipping from `main`, see [Legacy → Development setup](../reference/legacy-go/development-setup.md).
+Both link the same vendored `libghostty-vt` static archive built from `third_party/ghostty/`.
 
 ## Prerequisites
 
@@ -83,9 +83,9 @@ The voice for new docs is set in `mkdocs.yml`: professional + direct (no marketi
 
 ## Bumping the pinned Ghostty SHA
 
-`libghostty-vt`'s API is documented as unstable. Bumps land in their own commit and move two scripts in lockstep:
+`libghostty-vt`'s API is documented as unstable. Bumps land in their own commit:
 
-1. Edit `third_party/ghostty/build.sh` and `build/build.sh` — update `GHOSTTY_SHA` in both.
+1. Edit `third_party/ghostty/build.sh` — update `GHOSTTY_SHA`.
 2. `./third_party/ghostty/build.sh --force` to rebuild from the new SHA.
 3. Fix any FFI breakage in `crates/roost-vt`. The C symbols are listed in `src/lib_vt.zig` of the Ghostty source.
 4. Re-run `cargo test --workspace` and `swift test` from `mac/`.

@@ -94,13 +94,15 @@ let package = Package(
                 // checkout. The directory itself is deleted by M4b3b
                 // in the same commit.
             ],
-            // Phase 6a M6: bundled theme files lifted from the Go binary
-            // at `cmd/roost/themes/`. SwiftPM exposes them via
+            // Bundled theme files. The source-of-truth copy lives in the
+            // Rust crate at `crates/roost-linux/src/resources/themes/`;
+            // this is a byte-identical copy (kept in sync by
+            // `make themes-check`) because SwiftPM `.copy` can't reach
+            // outside the package. SwiftPM exposes them via
             // `Bundle.module.url(forResource:withExtension:)` — see
             // Theme.swift. The directory is copied (not processed) so the
-            // bundle layout mirrors the Go side and the same theme names
-            // ("Dracula", "Catppuccin Mocha", "roost-dark", …) resolve
-            // without renaming.
+            // theme names ("Dracula", "Catppuccin Mocha", "roost-dark", …)
+            // resolve without renaming.
             resources: [
                 .copy("Resources/themes"),
                 .copy("Resources/shell-integration"),
@@ -115,9 +117,7 @@ let package = Package(
             // binary; without a matching `-Wl,-rpath` the result
             // aborts at launch with `dyld: Library not loaded:
             // @rpath/libghostty-vt.dylib / Reason: no LC_RPATH's
-            // found`. The legacy build/build.sh ships the same
-            // workaround for the cgo binding — see its top-of-file
-            // comment.
+            // found`.
             //
             // Passing the archive as a positional argument forces
             // static linking and side-steps dyld entirely.

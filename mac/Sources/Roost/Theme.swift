@@ -1,11 +1,11 @@
 // Roost theme — Phase 6a M6.
 //
-// Ports the theme system from the Go binary's `cmd/roost/theme.go` so
-// users can keep using the same theme files (same names, same on-disk
-// format) under the Rust+Swift port. The bundled theme files live at
-// `Sources/Roost/Resources/themes/` and are copied verbatim from
-// `cmd/roost/themes/`; new themes added on the Go side need to be
-// mirrored here until the Phase 9 cutover collapses the two trees.
+// The theme system — same theme files (same names, same on-disk format)
+// as the Rust/Linux UI. The bundled theme files live at
+// `Sources/Roost/Resources/themes/`; the source-of-truth copy is in the
+// Rust crate at `crates/roost-linux/src/resources/themes/`, and the two
+// trees are kept byte-identical by `make themes-check`. Add a new theme
+// to both trees (and to `BUNDLED_THEMES` in `theme.rs`).
 //
 // File format mirrors Ghostty's `themes/` directory entries
 // (e.g. `palette = 0=#1a1a1a`, `background = #1e1e1e`,

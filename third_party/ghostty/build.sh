@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # Vendored Ghostty / libghostty-vt build for the new architecture.
 #
-# Mirrors the script at build/build.sh but writes into third_party/ghostty/
-# and only handles libghostty-vt — the Rust workspace under crates/ links the
-# resulting static archive directly via crates/roost-vt's build.rs (bindgen +
-# rustc-link-search), and the Mac Xcode project under mac/ references it via
-# OTHER_LDFLAGS. There is no second "build the application" stage here.
+# Builds libghostty-vt into third_party/ghostty/ — the Rust workspace under
+# crates/ links the resulting static archive directly via crates/roost-vt's
+# build.rs (bindgen + rustc-link-search), and the Mac Xcode project under mac/
+# references it via OTHER_LDFLAGS. There is no second "build the application"
+# stage here.
 #
-# Pinned SHA must move in lockstep with build/build.sh until the Phase 9
-# cutover described in docs/development/vision.md, after which the legacy
-# build/ directory is deleted and only this script survives.
+# This is the single source of the pinned libghostty-vt SHA (the legacy Go
+# prototype's build/build.sh was removed in GODELETE).
 #
 # Usage:
 #   ./third_party/ghostty/build.sh           # build (idempotent on cache hit)
@@ -18,8 +17,8 @@
 set -euo pipefail
 
 # --- Pinned versions ---------------------------------------------------------
-# Ghostty SHA — KEEP IN SYNC with build/build.sh until Phase 9 cutover.
-# Bump deliberately, in its own PR, with a rebuild test on Linux + Mac CI.
+# Ghostty SHA — bump deliberately, in its own PR, with a rebuild test on
+# Linux + Mac CI.
 GHOSTTY_SHA="c74f6d56d1feef473033057bc0ff7e3f00cf6421"  # 2026-04-25, builds lib-vt cleanly with zig 0.15.1
 GHOSTTY_REPO="https://github.com/ghostty-org/ghostty.git"
 
@@ -57,9 +56,8 @@ fi
 # On macOS 26+ on Apple Silicon, the system libSystem.tbd ships only
 # arm64e-macos targets, but Zig 0.15.2 builds its host build runner as
 # plain arm64-macos — every libc symbol comes back undefined at link
-# time. Mirrors the shim in build/build.sh; both scripts pin the same
-# Ghostty SHA + Zig version and hit the identical link failure on
-# macOS 26 hosts. KEEP IN SYNC with build/build.sh until Phase 9.
+# time. This shim redirects Zig's SDK lookup to a sibling MacOSX1[45].sdk
+# for the duration of the build.
 sdk_has_plain_arm64() {
   local tbd="$1/usr/lib/libSystem.tbd"
   [ -f "${tbd}" ] || return 1

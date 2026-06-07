@@ -5,7 +5,7 @@ product's stated differentiator: a multi-project terminal multiplexer for
 AI coding agents. This is a reference document, not a roadmap — items
 here are candidates, not commitments.
 
-See `docs/development/spec.md` for the original design rationale and
+See `docs/development/vision.md` for the design rationale and
 `docs/reference/architecture.md` for what already exists.
 
 ## How items are scored

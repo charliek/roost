@@ -49,7 +49,6 @@ NOT bumped:
 
 - `pyproject.toml` — for the `tools/roosttest/` pytest harness; has its own
   version cadence
-- `go.mod` — legacy artifact from the pre-Rust port; not a release surface
 - `mac/Resources/Info.plist.template`'s `SUPublicEDKey` — bumped only when
   the Sparkle EdDSA key is rotated, not per release
 
