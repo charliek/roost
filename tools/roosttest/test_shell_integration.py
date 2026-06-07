@@ -177,6 +177,13 @@ def test_env_injected(roost, project):
     # full-suite load `run()` can otherwise fire before the PTY is live and
     # the keystrokes are lost (no echo, no output → a spurious timeout).
     wait_tab_attached(roost, tab)
+    # ...and that the shell's line editor is interactable before sending the
+    # probe. Even a `--norc --noprofile` bash can emit pre-prompt content
+    # under CI load (a login-chain banner), which races `run()`'s
+    # viewport-non-empty check and drops the first keystrokes — the env probe
+    # then comes back empty. The printf sentinel proves the shell actually
+    # runs a command first. Matches the other shell-integration tests.
+    wait_shell_ready(roost, tab)
     # Emit each field on its OWN short line, not one long line: the UI sizes
     # the grid to the window, so a single ~83-char marker wraps at narrow
     # widths and a contiguous-substring match flakes on window size. Short
