@@ -5,11 +5,10 @@
 //! across adjacent cells — you get visible hairline seams in TUI
 //! chrome (most obvious in the opencode wordmark logo). Ghostty
 //! solves this with a custom sprite renderer in
-//! `ghostty/src/font/sprite/draw/{block,box}.zig`; the legacy Go
-//! port mirrored it in `cmd/roost/sprite.go`. This module is the
-//! Rust + Cairo equivalent — every dispatch arm and helper is a
-//! direct port of the Go file (which itself is a port of the Zig
-//! original). When tweaking pixel math, cross-reference all three.
+//! `ghostty/src/font/sprite/draw/{block,box}.zig`. This module is the
+//! Rust + Cairo equivalent — every dispatch arm and helper follows
+//! that Zig original's pixel math. When tweaking it, cross-reference
+//! the Zig source.
 //!
 //! Public entry point: [`draw_cell_sprite`] — returns `true` when
 //! the codepoint is handled (caller skips the font glyph), `false`
@@ -1855,8 +1854,7 @@ fn draw_box_glyph(
 }
 
 /// "Light" stroke width derived from cell height. Roughly 7% of cell
-/// height, min 1px — mirrors the heuristic in
-/// `cmd/roost/sprite.go::boxThickness`.
+/// height, min 1px.
 fn box_thickness(h: f64) -> f64 {
     let t = (h / 14.0).round();
     if t < 1.0 {
@@ -2149,8 +2147,8 @@ fn draw_diag(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, ur_to_ll: bool
     }
 }
 
-/// `count` horizontal dash segments centered vertically. Direct
-/// port of `box.zig::dashHorizontal` (lines 779-851).
+/// `count` horizontal dash segments centered vertically. Follows
+/// `box.zig::dashHorizontal` (lines 779-851).
 fn draw_h_dash(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, count: i32, style: LineStyle) {
     let mut thick = box_thickness(h);
     if matches!(style, LineStyle::Heavy) {
@@ -2254,7 +2252,7 @@ fn draw_v_dash(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, count: i32, 
 
 #[cfg(test)]
 mod tests {
-    //! Pixel-assertion suite mirroring `cmd/roost/sprite_test.go`.
+    //! Pixel-assertion suite for the sprite renderer.
     //! Renders each glyph into a Cairo ARGB32 image surface and
     //! pokes at raw bytes to verify fills land in the right places.
     //! The OpenCode-logo regression is `block_tiling_no_gap` — two

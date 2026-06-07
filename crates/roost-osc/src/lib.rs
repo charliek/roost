@@ -1,19 +1,18 @@
 //! Streaming OSC scanner — Phase 6a P4.
 //!
-//! Port of `internal/osc/scanner.go` from the Go binary, adapted for
-//! the Rust daemon's architecture:
+//! OSC scanner tailored to the daemon's architecture:
 //!
-//!   * The Go scanner sits next to libghostty-vt and handles only
+//!   * The UI's libghostty handles window-title OSC (0/1/2) itself,
+//!     so a scanner sitting next to it would only need to cover the
 //!     OSC classes libghostty doesn't surface (notifications, cwd,
-//!     color queries). The Mac/Linux UI's libghostty handles
-//!     window-title OSC (0/1/2) itself.
+//!     color queries).
 //!
-//!   * The Rust scanner sits in the daemon, which is intentionally
-//!     libghostty-free (see goal-rust-port-polish DL choices). The
-//!     UI reports raw OSC bytes via `ReportOsc` and the daemon
-//!     parses everything it needs to route. So this scanner emits
-//!     `Title` for OSC 0/1/2 in addition to the classes the Go
-//!     scanner already handled.
+//!   * This scanner instead sits in the daemon, which is
+//!     intentionally libghostty-free (see goal-rust-port-polish DL
+//!     choices). The UI reports raw OSC bytes via `ReportOsc` and the
+//!     daemon parses everything it needs to route. So this scanner
+//!     also emits `Title` for OSC 0/1/2, on top of the
+//!     notification/cwd/color classes.
 //!
 //! Architecture:
 //!
@@ -52,9 +51,9 @@ use std::str;
 /// truncating. 1 MiB accommodates realistic OSC 52 clipboard
 /// payloads (file lists, stack traces) while still bounding the
 /// scanner against a malicious program holding the parser open.
-/// The Go binary's pre-rewrite scanner used 8 KiB, which silently
-/// truncated OSC 52 payloads — see `body_truncated` for how oversize
-/// payloads are handled now.
+/// A smaller cap (e.g. 8 KiB) would silently truncate large OSC 52
+/// payloads — see `body_truncated` for how oversize payloads are
+/// handled here.
 const MAX_BODY: usize = 1024 * 1024;
 
 /// One parsed-out OSC event. Returned in order by `OscScanner::feed`.
@@ -74,10 +73,9 @@ pub enum OscEvent {
     Pwd(String),
 
     /// OSC 9 (iTerm2 notification, title-only) or OSC 777 (Konsole
-    /// `notify;title;body` form). The Go binary's ConEmu OSC 9 sub-
-    /// commands (`OSC 9;<1..12>`) are filtered out — libghostty's
-    /// OSC handler owns those semantics — and the resulting body
-    /// dropped.
+    /// `notify;title;body` form). ConEmu OSC 9 sub-commands
+    /// (`OSC 9;<1..12>`) are filtered out — libghostty's OSC handler
+    /// owns those semantics — and the resulting body dropped.
     Notification { title: String, body: String },
 
     /// OSC 10 / 11 / 12 with body `"?"` — query for the current
@@ -492,10 +490,9 @@ fn percent_decode(s: &str) -> Option<String> {
 /// for query number `n` (one of 10/11/12) and the matching theme
 /// color. Output is `\x1b]N;rgb:RRRR/GGGG/BBBB\x07` — 16-bit-per-
 /// channel form (each 8-bit channel repeated to fill 4 hex digits),
-/// BEL-terminated. Mirrors the legacy Go
-/// `internal/osc/scanner.go:294-298` exactly so codex, claude-code,
-/// and any other agent that probes for theme colors get the same
-/// byte sequence the legacy port already proved working.
+/// BEL-terminated. This is the exact byte sequence codex,
+/// claude-code, and other agents that probe for theme colors expect
+/// back from an OSC 10/11/12 query.
 ///
 /// Returns `None` if `n` isn't a recognised query number. The caller
 /// picks which of foreground (10), background (11), or cursor (12)
@@ -828,8 +825,8 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // -- format_color_query_response: byte-exact parity with the
-    //    legacy Go `internal/osc/scanner_test.go` cases.
+    // -- format_color_query_response: byte-exact response shape for
+    //    OSC 10/11/12 color queries.
 
     #[test]
     fn format_color_query_response_osc10_fg() {
@@ -960,8 +957,8 @@ mod tests {
     fn malformed_st_recovers_following_osc() {
         // ESC followed by non-\ aborts the sequence in flight,
         // but should re-feed the byte so a subsequent OSC ESC
-        // starts a NEW sequence cleanly. The Go scanner has the
-        // same behaviour — preserves the back-to-back OSC case.
+        // starts a NEW sequence cleanly — preserves the back-to-back
+        // OSC case.
         let mut s = OscScanner::new();
         // Start an OSC, abort it with ESC + bogus byte, then
         // start a fresh OSC.

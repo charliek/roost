@@ -4,7 +4,6 @@
 //! per-project / per-tab UI state. Sidebar = `gtk::ListBox` of project
 //! rows on the left. Right pane = `gtk::Stack` of `adw::TabView`s,
 //! one per project, swapped when the sidebar selection changes.
-//! Mirrors the Go binary's `cmd/roost/app.go` widget tree shape.
 //!
 //! M10: drag-to-reorder. Sidebar uses `gtk::DragSource` per row +
 //! a single `gtk::DropTarget` on the listbox; motion live-shuffles
@@ -216,7 +215,7 @@ pub struct App {
     /// M10: snapshot of the sidebar order taken at drag-begin.
     /// Drag-end rolls back to this if the drop didn't persist
     /// (drag cancelled outside the sidebar, or `ReorderProjects`
-    /// RPC failed). Mirrors the Go binary's `dragOriginalOrder`.
+    /// RPC failed).
     drag_original_order: RefCell<Vec<i64>>,
     /// M10: set true once `ReorderProjects` persists (or a no-op
     /// drop is acknowledged). Drag-end consults this to decide
@@ -255,29 +254,26 @@ pub struct App {
     input_captures: RefCell<HashMap<i64, crate::tab_session::InputCapture>>,
 }
 
-/// Bundled chrome stylesheet. Ported from `cmd/roost/style.css`;
-/// kept in sync verbatim with the Go binary so the two UIs feel
-/// identical. Loaded once at App::new and applied via the display's
-/// shared style context so it composes with the user's libadwaita
-/// theme rather than replacing it.
+/// Bundled chrome stylesheet, kept verbatim in sync with the Mac UI
+/// so the two UIs feel identical. Loaded once at App::new and applied
+/// via the display's shared style context so it composes with the
+/// user's libadwaita theme rather than replacing it.
 const STYLE_CSS: &str = include_str!("resources/style.css");
 
-/// Bundled chrome icons. Vendored from `cmd/roost/icons/` (which in
-/// turn comes from upstream Adwaita) so the GTK app doesn't depend
-/// on the user's system `adwaita-icon-theme` being installed —
-/// matches the Go binary's icons.gresource approach but skips the
-/// gresource compilation step (one less build-tool dependency) by
-/// embedding the SVGs directly into the binary via `include_bytes!`.
+/// Bundled chrome icons, vendored from upstream Adwaita so the GTK
+/// app doesn't depend on the user's system `adwaita-icon-theme` being
+/// installed. The SVGs are embedded directly into the binary via
+/// `include_bytes!`, avoiding any gresource compilation step (one less
+/// build-tool dependency).
 const ICON_FOLDER_SYMBOLIC: &[u8] = include_bytes!("resources/icons/folder-symbolic.svg");
 const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
     include_bytes!("resources/icons/sidebar-show-symbolic.svg");
 const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
 const ICON_BELL_SYMBOLIC: &[u8] = include_bytes!("resources/icons/bell-symbolic.svg");
 
-/// Per-tab status indicator icons (M7). Vendored from cmd/roost
-/// alongside the chrome icons so the GTK app doesn't depend on any
-/// system icon-theme search path for these — same trade-off as the
-/// M5 chrome icons.
+/// Per-tab status indicator icons (M7). Vendored alongside the chrome
+/// icons so the GTK app doesn't depend on any system icon-theme search
+/// path for these — same trade-off as the M5 chrome icons.
 const ICON_RUNNING: &[u8] = include_bytes!("resources/icons/icon_running.svg");
 const ICON_NEEDS_INPUT: &[u8] = include_bytes!("resources/icons/icon_needs_input.svg");
 const ICON_IDLE: &[u8] = include_bytes!("resources/icons/icon_idle.svg");
@@ -291,8 +287,7 @@ fn embedded_icon(bytes: &'static [u8]) -> gtk4::gio::BytesIcon {
     gtk4::gio::BytesIcon::new(&glib_bytes)
 }
 
-/// Apply the per-tab status indicator icon to `page`. Mirrors the
-/// Go binary's `cmd/roost/indicator.go` cache. `TabState::None`
+/// Apply the per-tab status indicator icon to `page`. `TabState::None`
 /// clears the indicator (`set_indicator_icon(None)`); the other
 /// three pick the matching SVG.
 fn apply_indicator_icon(page: &libadwaita::TabPage, state: TabState) {
@@ -392,8 +387,7 @@ impl App {
             .title("Roost (Linux)")
             .build();
 
-        // M9.5: force the libadwaita color scheme to dark. The Go
-        // binary does the same on its `adw::StyleManager` (a
+        // M9.5: force the libadwaita color scheme to dark (a
         // terminal-app convention: the chrome around the terminal
         // looks weird in light mode because the terminal area itself
         // is always dark from the bundled roost-dark theme).
@@ -425,15 +419,14 @@ impl App {
         // `adw::WindowTitle` is the libadwaita 1.x analog of NSWindow's
         // title + subtitle. Title = project name (or status during
         // bootstrap), subtitle = active tab's cwd. Matches the Mac UI's
-        // two-line title format and the Go binary's `HeaderBar.WindowTitle`.
+        // two-line title format.
         let window_title = WindowTitle::new("Roost", "connecting…");
         header.set_title_widget(Some(&window_title));
 
         // Headerbar buttons: folder picker (left) + sidebar toggle
-        // (left) + `+ Tab` (right). Matches the Go binary's
-        // `cmd/roost/app.go` chrome — same icons, same positions.
-        // Wired below after `app_struct` exists so the handlers can
-        // capture an `Rc<App>` clone.
+        // (left) + `+ Tab` (right). Matches the Mac UI chrome — same
+        // icons, same positions. Wired below after `app_struct` exists
+        // so the handlers can capture an `Rc<App>` clone.
         let folder_button = gtk4::Button::builder()
             .child(&gtk4::Image::from_gicon(&embedded_icon(
                 ICON_FOLDER_SYMBOLIC,
@@ -482,10 +475,10 @@ impl App {
         header.pack_end(&notif_button);
 
         // Sidebar: vertical Box of [section header] / [scrolled project
-        // list] / [`+ Project` footer button]. Matches the Go binary's
-        // `cmd/roost/app.go` sidebar layout verbatim — header label,
-        // list, button — so users moving between the two UIs find the
-        // same affordances in the same places.
+        // list] / [`+ Project` footer button]. Matches the Mac UI
+        // sidebar layout verbatim — header label, list, button — so
+        // users moving between the two UIs find the same affordances in
+        // the same places.
         let sidebar_header = gtk4::Label::builder()
             .label("Projects")
             .halign(gtk4::Align::Start)
@@ -506,8 +499,7 @@ impl App {
 
         // `pill` for the libadwaita rounded-rect look; drop the
         // `flat` class so the button reads as a discrete affordance
-        // with a visible chip rather than text-only. Matches the
-        // Go binary's `+ Project` button which renders with the
+        // with a visible chip rather than text-only. Renders with the
         // default libadwaita button background. M9.5.
         let new_project_button = gtk4::Button::builder()
             .label("+ Project")
@@ -615,8 +607,7 @@ impl App {
         // M10: a single drop target on the sidebar listbox owns the
         // motion (live-shuffle) + drop (persist) handling for all
         // project rows. Per-row drag sources are wired inside
-        // `add_project_ui`. Mirrors the Go binary's
-        // `installSidebarDropTarget` (cmd/roost/app.go:1011).
+        // `add_project_ui`. See `install_sidebar_drop_target`.
         app_struct.install_sidebar_drop_target();
 
         // Sidebar row selection → switch active project.
@@ -657,8 +648,7 @@ impl App {
 
         // Headerbar buttons.
         // - Folder picker: pop a FileChooser, then create a project
-        //   with the chosen cwd. Mirrors `cmd/roost/app.go`'s
-        //   "new project from folder" path.
+        //   with the chosen cwd (the "new project from folder" path).
         folder_button.connect_clicked({
             let app = app_struct.clone();
             move |btn| {
@@ -1170,8 +1160,8 @@ impl App {
         });
         row.add_controller(row_click);
 
-        // M9: double-click also enters rename mode (matches the Go
-        // binary). Button 1 (primary) double-press.
+        // M9: double-click also enters rename mode. Button 1 (primary)
+        // double-press.
         let row_dblclick = gtk4::GestureClick::builder()
             .button(gtk4::gdk::BUTTON_PRIMARY)
             .build();
@@ -1224,8 +1214,8 @@ impl App {
         // GTK4 capability). We just listen for the completed
         // reorder and fire `ReorderTabs` RPC so the daemon
         // persists the new order; the WatchEvents `TabsReordered`
-        // arm handles cross-client convergence. Mirrors the Go
-        // binary's `persistTabOrder` (cmd/roost/app.go:1061).
+        // arm handles cross-client convergence. See
+        // `reorder_tabs_async`.
         tab_view.connect_page_reordered({
             let app = self.clone();
             let project_id = project.id;
@@ -1276,10 +1266,10 @@ impl App {
 
         // `autohide(false)`: libadwaita defaults to hiding the tab bar
         // when there's only one page (iOS-style minimal chrome). Both
-        // the Go GTK binary and the Mac UI always show the strip, so
-        // single-tab projects still get a visible tab pill + `×`
-        // close affordance. Without this, users see only the
-        // terminal area until a second tab is opened.
+        // this UI and the Mac UI always show the strip, so single-tab
+        // projects still get a visible tab pill + `×` close affordance.
+        // Without this, users see only the terminal area until a second
+        // tab is opened.
         let tab_bar = libadwaita::TabBar::builder()
             .view(&tab_view)
             .autohide(false)
@@ -1456,8 +1446,8 @@ impl App {
 
     /// Open the inline rename popover for `(project_id, tab_id)`.
     /// Inline rename for tabs uses a `gtk::Popover` pointing at the
-    /// tab pill (the Go binary's pattern) rather than `connect_setup_menu`
-    /// (which is the per-page context menu, not an inline-edit hook).
+    /// tab pill rather than `connect_setup_menu` (which is the per-page
+    /// context menu, not an inline-edit hook).
     fn begin_rename_tab(self: &Rc<Self>, project_id: i64, tab_id: i64) {
         let projects = self.projects.borrow();
         let Some(ui) = projects.get(&project_id) else {
@@ -1938,8 +1928,6 @@ impl App {
                                 // `OSC 10/11/12;rgb:…` set is
                                 // reflected in the next query reply
                                 // (vim colorscheme plugins etc.).
-                                // Reference: legacy
-                                // `internal/osc/scanner.go:280-300`.
                                 if let roost_osc::OscEvent::ColorQuery(n) = event {
                                     let color = match terminal_for_drain.live_colors() {
                                         Ok(c) => match n {
@@ -2024,13 +2012,10 @@ impl App {
                         TabOutput::Exit { status, reason } => {
                             tracing::info!(tab_id, status, %reason, "PTY exited");
                             // M9.5: close the page directly from the
-                            // drain task on PTY exit. Mirrors the Go
-                            // binary's `sess.onPTYExit = func() {
-                            // view.ClosePage(page) }` pattern — a
-                            // unified close path through the
-                            // close-page signal handler instead of
-                            // round-tripping through the daemon's
-                            // TabDeletedEvent. The
+                            // drain task on PTY exit — a unified close
+                            // path through the close-page signal handler
+                            // instead of round-tripping through the
+                            // daemon's TabDeletedEvent. The
                             // `connect_close_page` handler installed
                             // in `add_project_ui` does the actual
                             // removal + CloseTab RPC.
@@ -2545,8 +2530,7 @@ impl App {
         // escape sequence — the shell rendered the sequence as
         // garbled text and the keybind never fired. Matches the
         // Mac UI's `NSMenu performKeyEquivalent` priority (menu
-        // fires before responder chain) and the Go binary's same
-        // pattern on its window-scoped ShortcutController.
+        // fires before responder chain).
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
         for (accel, action) in bindings {
@@ -4478,10 +4462,10 @@ impl App {
         self.add_project_ui(&project);
         self.set_active_project(project.id);
         // M9.5: seed the new project with a default tab so the user
-        // lands inside a shell. Mac UI + Go binary do this same
-        // dance — clicking "+ Project" with no follow-up never
-        // makes sense, and a bare project with no tabs renders an
-        // empty terminal pane (the bug reported).
+        // lands inside a shell. The Mac UI does this same dance —
+        // clicking "+ Project" with no follow-up never makes sense,
+        // and a bare project with no tabs renders an empty terminal
+        // pane (the bug reported).
         self.open_new_tab_in(project.id).await?;
         Ok(())
     }
@@ -4695,8 +4679,7 @@ impl App {
 
     /// M10: read the current visual order of project ids by
     /// walking the sidebar's rows. Each row's `widget_name` is
-    /// `"project-<id>"` (set in `add_project_ui`). Mirrors the Go
-    /// binary's `sidebarOrder` (cmd/roost/app.go:989).
+    /// `"project-<id>"` (set in `add_project_ui`).
     fn sidebar_order(&self) -> Vec<i64> {
         let mut ids = Vec::new();
         let mut i: i32 = 0;
@@ -4717,8 +4700,7 @@ impl App {
     /// (Remove clears selection in SelectionBrowse mode, which
     /// would otherwise jump the active project mid-rebuild).
     /// Used on rollback (drag cancelled) and on inbound
-    /// `ProjectsReordered` events. Verbatim port of the Go
-    /// binary's `applySidebarOrder` (cmd/roost/app.go:957).
+    /// `ProjectsReordered` events.
     fn apply_sidebar_order(self: &Rc<Self>, ordered_ids: &[i64]) {
         let prev_active = *self.active_project_id.borrow();
         let projects = self.projects.borrow();
@@ -4737,8 +4719,7 @@ impl App {
     /// M10: live-shuffle the dragged row toward `raw_target_idx`
     /// during drag-motion. Pure visual feedback; persistence
     /// happens later in the drop handler. No-op when the drop
-    /// would land on the source's own slot. Mirrors the Go
-    /// binary's `shuffleSidebarToward` (cmd/roost/app.go:907).
+    /// would land on the source's own slot.
     fn shuffle_sidebar_toward(self: &Rc<Self>, src_id: i64, raw_target_idx: usize) {
         let projects = self.projects.borrow();
         let Some(ui) = projects.get(&src_id) else {
@@ -4768,8 +4749,7 @@ impl App {
     /// When the pointer is over a row, the index is the row's
     /// index if y is above the row's midline, else row_index + 1.
     /// When the pointer is in empty space below the last row, we
-    /// return the row count ("insert at end"). Mirrors the Go
-    /// binary's `rawTargetForY` (cmd/roost/app.go:1044).
+    /// return the row count ("insert at end").
     fn raw_target_for_y(&self, y: f64) -> usize {
         if let Some(row) = self.sidebar.row_at_y(y as i32) {
             let mut idx = row.index();
@@ -4787,9 +4767,9 @@ impl App {
     /// M10: attach a `gtk::DragSource` to a project row so it can
     /// be picked up. Dragged content is the project's int64 id.
     /// Visual feedback: the source row dims to 40% opacity while
-    /// the drag is in flight (Go binary path; CSS `:drop(active)`
-    /// styling was unreliable in our environment so we set
-    /// opacity directly). The drop target on the listbox handles
+    /// the drag is in flight (CSS `:drop(active)` styling was
+    /// unreliable in our environment so we set opacity directly).
+    /// The drop target on the listbox handles
     /// motion + persistence; this side just publishes the
     /// payload and tracks rollback snapshot.
     fn install_row_drag_source(self: &Rc<Self>, row: &gtk4::ListBoxRow, project_id: i64) {
@@ -4884,9 +4864,7 @@ impl App {
 
     /// M10: fire `ReorderProjects` RPC. On error, roll the
     /// sidebar back to `snapshot` so the visual order doesn't
-    /// diverge from the daemon's persisted order. Mirrors the
-    /// Go binary's drop handler error path
-    /// (cmd/roost/app.go:1028-1032). The double-spawn
+    /// diverge from the daemon's persisted order. The double-spawn
     /// (`glib::spawn_future_local` wrapping `rt.spawn`) bridges
     /// the tokio gRPC future back to the GTK main loop so the
     /// rollback runs on the right thread — same pattern as
@@ -5082,10 +5060,8 @@ fn restore_open_specs(saved: &[RestoreTab]) -> Vec<(String, String, bool)> {
 /// source's own slot — either side of itself). Off-by-one is
 /// load-bearing here: when `raw_target_idx > source_idx`, removing
 /// the source first shifts every later index down by one, so the
-/// insert position is `raw_target_idx - 1`. Verbatim port of the
-/// Go binary's `computeInsertIdx` (cmd/roost/app.go:936); the
-/// table-driven test below mirrors `TestComputeInsertIdx` in
-/// `cmd/roost/sidebar_reorder_test.go`.
+/// insert position is `raw_target_idx - 1`. The table-driven test
+/// below exercises the boundary cases.
 fn compute_insert_idx(source_idx: usize, raw_target_idx: usize) -> Option<usize> {
     if raw_target_idx == source_idx || raw_target_idx == source_idx + 1 {
         return None;
@@ -5364,12 +5340,11 @@ mod tests {
     /// drag-reorder. The raw target index is computed with the
     /// source row still in place; when we remove-then-insert
     /// past the source, every index after the source shifts
-    /// down by one. Table mirrors the Go binary's
-    /// `TestComputeInsertIdx` (cmd/roost/sidebar_reorder_test.go)
-    /// — same source-position × raw-target matrix so the two
-    /// UIs stay byte-for-byte equivalent on the reorder math.
+    /// down by one. The table walks the full source-position ×
+    /// raw-target matrix so this UI and the Mac UI stay
+    /// byte-for-byte equivalent on the reorder math.
     #[test]
-    fn compute_insert_idx_matches_go_table() {
+    fn compute_insert_idx_matches_reference_table() {
         // (source_idx, raw_target_idx, expected) where expected
         // is `None` for a no-op or `Some(insert_idx)`.
         let cases: &[(usize, usize, Option<usize>)] = &[

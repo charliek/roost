@@ -5,9 +5,9 @@
 //! stripe lives in `resources/style.css` (`.roost-rollup-*`); this
 //! module picks which one to apply.
 //!
-//! Mirrors the Go binary's per-project state rollup in
-//! `cmd/roost/app.go` so users moving between the two UIs see the
-//! same precedence (needs-input wins, hook-active suppresses noise).
+//! Kept at parity with the Mac UI's per-project state rollup so users
+//! moving between the two UIs see the same precedence (needs-input
+//! wins, hook-active suppresses noise).
 
 /// Per-tab agent state as exposed by the daemon's `TabStateChangedEvent`.
 /// The proto numeric mapping is:

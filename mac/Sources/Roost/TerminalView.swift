@@ -24,13 +24,11 @@ import QuartzCore  // CACurrentMediaTime — monotonic clock for the motion thro
 
 final class TerminalView: NSView {
     /// Maximum scrollback rows libghostty-vt retains per terminal.
-    /// Matches Go binary's `cmd/roost/session.go:186` (M6).
     static let defaultScrollback: size_t = 2000
 
-    /// Discrete scroll-wheel notches → terminal rows. Matches Go
-    /// `cmd/roost/session.go:794`: ~3 rows per click on a discrete
-    /// wheel. Trackpad smooth-scroll bypasses this multiplier and
-    /// uses point-precision accumulation instead.
+    /// Discrete scroll-wheel notches → terminal rows: ~3 rows per
+    /// click on a discrete wheel. Trackpad smooth-scroll bypasses
+    /// this multiplier and uses point-precision accumulation instead.
     private static let rowsPerWheelNotch: Int = 3
 
     /// Live cell-grid metrics. `cols` and `rows` follow the view's
@@ -241,10 +239,9 @@ final class TerminalView: NSView {
     /// of waiting for the next blink tick.
     private var cursorBlinkOn: Bool = true
 
-    /// 530ms cadence matches the Go binary's `cursorBlinkPeriod`
-    /// (`cmd/roost/session.go:37`), which is also iTerm2 / Terminal.app's
-    /// default. Paused while the view doesn't have focus; restarted
-    /// on focus regain.
+    /// 530ms cadence, which is also iTerm2 / Terminal.app's default.
+    /// Paused while the view doesn't have focus; restarted on focus
+    /// regain.
     ///
     /// `nonisolated(unsafe)`: Swift 6 strict concurrency otherwise
     /// rejects `cursorBlinkTimer?.invalidate()` in the nonisolated
@@ -266,7 +263,8 @@ final class TerminalView: NSView {
 
     /// True when the cursor should render as a focused (solid block /
     /// bar / underline depending on style) versus a blurred hollow
-    /// outline. Mirrors Go `cmd/roost/session.go::windowFocused`.
+    /// outline. The terminal is focused only when its window is key
+    /// and the view is first responder.
     private var hasFocus: Bool { windowIsKey && viewIsFirstResponder }
 
     /// Cached glyph from the cell the cursor lands on. Stashed during
@@ -320,9 +318,8 @@ final class TerminalView: NSView {
     /// `true` when the viewport has been scrolled away from the bottom
     /// by a local-scroll event. Cleared by the snap-to-bottom hook in
     /// `keyDown`, which fires `GHOSTTY_SCROLL_VIEWPORT_BOTTOM` before
-    /// the keystroke reaches libghostty. Mirrors Go
-    /// `cmd/roost/input.go:67` ("Snap viewport before delivering the
-    /// keystroke") + `cmd/roost/session.go:108-112` (`scrolledBack`).
+    /// the keystroke reaches libghostty (snap viewport before
+    /// delivering the keystroke).
     private var scrolledBack: Bool = false
 
     /// `copy-on-select` mode. Read from `RoostConfig.copyOnSelect`
@@ -396,11 +393,9 @@ final class TerminalView: NSView {
         var opts = GhosttyTerminalOptions()
         opts.cols = cols
         opts.rows = rows
-        // M6: enable scrollback storage. Matches Go binary's
-        // MaxScrollback: 2000 in cmd/roost/session.go:186. Without
-        // a positive value libghostty-vt discards lines as they
-        // scroll off the screen — scroll-wheel events would have
-        // nothing to scroll into.
+        // M6: enable scrollback storage. Without a positive value
+        // libghostty-vt discards lines as they scroll off the screen
+        // — scroll-wheel events would have nothing to scroll into.
         opts.max_scrollback = Self.defaultScrollback
 
         var handle: GhosttyTerminal?
@@ -415,9 +410,8 @@ final class TerminalView: NSView {
         // theme's palette instead of libghostty's compiled-in default.
         // M6 only changed the canvas + selection colors at draw time;
         // this closes the SGR-cell gap so `ls --color`, `git diff`,
-        // `htop` etc. all flip with the active theme. Mirrors the
-        // Go binary's `internal/ghostty/terminal.go::SetTheme`. Done
-        // here so the very first frame paints with the right colors;
+        // `htop` etc. all flip with the active theme. Done here so the
+        // very first frame paints with the right colors;
         // `setTheme(_:)` re-applies the same way for live theme swaps.
         Theme.apply(theme, to: handle!)
 
@@ -426,8 +420,7 @@ final class TerminalView: NSView {
         // to live in `keyDown` — fixes Shift+Tab, Shift+Enter,
         // Option+Arrow, Ctrl+letter, and so on by routing every
         // NSEvent through libghostty-vt's `ghostty_key_encoder_*`
-        // surface (same one the Go binary uses via
-        // `internal/ghostty/key.go`).
+        // surface.
         self.keyEncoder = KeyEncoder(terminal: handle!)
         self.mouseEncoder = MouseEncoder(terminal: handle!)
 
@@ -474,8 +467,7 @@ final class TerminalView: NSView {
             // color so a prior `OSC 10/11/12;rgb:…` set is reflected
             // in the next query reply (vim colorscheme plugins etc.).
             // Mirrors the Linux drain at
-            // `crates/roost-linux/src/app.rs` and the legacy Go
-            // reference at `internal/osc/scanner.go:280-300`.
+            // `crates/roost-linux/src/app.rs`.
             if case .colorQuery(let n) = event {
                 let color = TerminalView.liveColor(forQuery: n, terminal: terminal, theme: theme)
                 if let color = color,
@@ -653,7 +645,7 @@ final class TerminalView: NSView {
     @objc private func handleWindowDidBecomeKey(_ note: Notification) {
         windowIsKey = true
         // Snap the cursor on so it appears immediately rather than at
-        // the next blink tick — matches Go session.go:1232 behavior.
+        // the next blink tick.
         cursorBlinkOn = true
         updateBlinkTimerForFocus()
         // Mode 1004 focus tracking: report focus-in to the app. vim,
@@ -779,8 +771,7 @@ final class TerminalView: NSView {
     private func startCursorBlink() {
         guard cursorBlinkTimer == nil else { return }
         // 530ms half-period (= ~0.94 Hz full blink cycle). Common
-        // terminal value; matches Go `cursorBlinkPeriod` in
-        // `cmd/roost/session.go:37`.
+        // terminal value.
         cursorBlinkTimer = Timer.scheduledTimer(
             withTimeInterval: 0.530,
             repeats: true
@@ -1870,14 +1861,13 @@ final class TerminalView: NSView {
     /// state — cursor-key application mode, Kitty keyboard flags,
     /// modifyOtherKeys, etc. — and produces the correct escape
     /// sequence for Shift+Tab (`\x1b[Z`), Shift+Enter, Option+Arrow,
-    /// Ctrl+letter, and arrow / function / navigation keys. Same
-    /// surface the Go binary uses via `internal/ghostty/key.go`.
+    /// Ctrl+letter, and arrow / function / navigation keys.
     override func keyDown(with event: NSEvent) {
         guard let keyEncoder else { return }
         // M6: snap the viewport back to the bottom before delivering
-        // the keystroke. Mirrors Go input.go:67. Without this, typing
-        // while scrolled-back would let the shell prompt scroll off
-        // the visible area on the next render.
+        // the keystroke. Without this, typing while scrolled-back
+        // would let the shell prompt scroll off the visible area on
+        // the next render.
         if scrolledBack, let terminal {
             var sv = GhosttyTerminalScrollViewport()
             sv.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM
@@ -1896,8 +1886,7 @@ final class TerminalView: NSView {
     }
 
     /// Wheel / trackpad scroll. Three behaviors depending on terminal
-    /// state, matching Go `cmd/roost/session.go::handleScroll`
-    /// (:776-900):
+    /// state:
     ///
     ///   1. Mouse-tracking mode → mouse-button-4/5 reports encoded
     ///      through the libghostty-vt mouse encoder, one per row, at
@@ -2004,7 +1993,7 @@ final class TerminalView: NSView {
         }
         // Discrete wheel: scrollingDeltaY is signed clicks. Bias by
         // rowsPerWheelNotch so a single click moves a noticeable
-        // chunk (matches Go's session.go:794).
+        // chunk.
         let clicks = Int(event.scrollingDeltaY.rounded())
         scrollAccum = 0
         lastScrollDirection = clicks > 0 ? 1 : (clicks < 0 ? -1 : 0)
@@ -2478,7 +2467,6 @@ final class TerminalView: NSView {
             let cursorColor = cur.color ?? theme.cursor
             if !hasFocus {
                 // Unfocused: hollow outline, always on (no blink).
-                // Mirrors Go `cmd/roost/render.go:154-161`.
                 drawCursorOutline(in: cursorRect, color: cursorColor)
             } else if cursorBlinkOn {
                 // Focused + blink-on: visual style decides shape.
@@ -2563,8 +2551,7 @@ final class TerminalView: NSView {
     /// (no `self`) and can be unit-tested in
     /// `mac/Tests/RoostTests/RenderResolverTests.swift`.
     ///
-    /// Mirrors the legacy Go `cellColors`
-    /// (`cmd/roost/render.go:206-224`) and the Rust
+    /// Mirrors the Rust
     /// `resolve_cell_colors` (`crates/roost-linux/src/terminal_view.rs`)
     /// 1:1 — same rule order (explicit-color lookup → inverse swap →
     /// bold-accent guarded by `!inverse && fg-was-default`) so both
@@ -2604,7 +2591,7 @@ final class TerminalView: NSView {
     /// Synthesise the XTerm-form OSC 10/11/12 query response for
     /// the given query number + theme color. Byte-identical to the
     /// Rust `format_color_query_response` in
-    /// `crates/roost-osc/src/lib.rs` — both ports must produce the
+    /// `crates/roost-osc/src/lib.rs` — both UIs must produce the
     /// same bytes so codex/claude-code see one terminal answer
     /// regardless of which UI hosts the tab. `nonisolated` because
     /// the function is pure (no `self`); see `resolveCellColors`

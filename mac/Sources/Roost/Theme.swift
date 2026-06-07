@@ -46,9 +46,9 @@ extension Bundle {
     }
 }
 
-/// Parsed terminal color scheme. Mirrors the Go binary's `Theme`
-/// struct field-for-field so a future "share theme between Go and
-/// Swift binaries" diagnostic stays trivial.
+/// Parsed terminal color scheme: foreground, background, cursor,
+/// selection, optional bold accent, and the 256-entry color palette
+/// read from a Ghostty theme file.
 struct Theme: Sendable {
     var foreground: NSColor
     var background: NSColor
@@ -137,9 +137,7 @@ struct Theme: Sendable {
     }
 
     /// Returns the list of bundled theme names (sorted). Useful for
-    /// future "themes" picker UI; M6 doesn't use it but the
-    /// equivalent `BundledThemeNames()` lives on the Go side and
-    /// keeps the surface parallel.
+    /// a future "themes" picker UI; M6 doesn't use it yet.
     @MainActor
     static func bundledNames() -> [String] {
         guard let urls = Bundle.roostResources.urls(
@@ -150,8 +148,7 @@ struct Theme: Sendable {
     }
 }
 
-/// Parse a Ghostty-format theme file. Same line-per-key shape as
-/// `cmd/roost/theme.go::parseTheme`:
+/// Parse a Ghostty-format theme file. One key per line:
 ///   palette = N=#RRGGBB
 ///   background = #RRGGBB
 ///   foreground = #RRGGBB
@@ -238,8 +235,7 @@ extension Theme {
     }
 
     /// Push fg / bg / cursor + 256-color palette into a libghostty-vt
-    /// terminal. Mirrors the Go binary's
-    /// `internal/ghostty/terminal.go::SetTheme`.
+    /// terminal.
     ///
     /// Safe to call at any point in a terminal's life, including after
     /// `ghostty_terminal_vt_write` — the command palette's live theme
@@ -284,8 +280,8 @@ extension Theme {
 }
 
 /// Convert an NSColor (in any color space) to libghostty's RGB struct.
-/// Converts to sRGB first to match the bit-exact values the Go binary
-/// pushes; `usingColorSpace(.sRGB)` returns nil for color spaces that
+/// Converts to sRGB first so the 8-bit channel values are bit-exact;
+/// `usingColorSpace(.sRGB)` returns nil for color spaces that
 /// can't be represented in sRGB (rare for the named colors we use),
 /// in which case we fall back to a black pixel rather than corrupting
 /// the FFI struct with NaN-derived bytes.

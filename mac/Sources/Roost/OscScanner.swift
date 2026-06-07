@@ -382,8 +382,8 @@ private func parseOsc7(_ body: String) -> String? {
     guard let slash = rest.firstIndex(of: "/") else { return nil }
     let path = String(rest[slash...])
     // Foundation's `removingPercentEncoding` returns nil on
-    // malformed encoding (matches Go's `url.PathUnescape` failure
-    // mode and P4's `percent_decode`'s `None` return).
+    // malformed encoding — a nil/None return on a decode failure,
+    // matching the Linux UI's `percent_decode` path.
     return path.removingPercentEncoding
 }
 

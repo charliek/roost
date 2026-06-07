@@ -112,13 +112,11 @@ pub struct Colors {
 }
 
 /// SGR style bits the renderer needs to resolve effective fg/bg.
-/// Mirrors the `Bold / Italic / Inverse` fields on the legacy Go
-/// `internal/ghostty.Cell` — the three bits `cellColors`
-/// (`cmd/roost/render.go:206-224`) consumes to swap fg↔bg for
-/// `\e[7m` cells and apply the bold-accent rule. Underline /
-/// faint / blink / strikethrough / overline ride along the C
-/// struct but no caller uses them yet, so we drop them on the
-/// way in to keep `Cell` small.
+/// `Bold / Italic / Inverse` are the three bits the cell-color
+/// resolver consumes to swap fg↔bg for `\e[7m` cells and apply the
+/// bold-accent rule. Underline / faint / blink / strikethrough /
+/// overline ride along the C struct but no caller uses them yet, so
+/// we drop them on the way in to keep `Cell` small.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub bold: bool,
@@ -438,9 +436,7 @@ impl RenderState {
         // `GhosttyStyle` is a sized C struct — `.size` MUST be initialized
         // to `sizeof(GhosttyStyle)` before the call so libghostty knows
         // which fields this caller is prepared to receive (forward-compat
-        // contract per `ghostty/include/ghostty/vt/style.h`). The legacy
-        // Go renderer does the same via `roost_init_style`
-        // (`internal/ghostty/render.go:12-14`).
+        // contract per `ghostty/include/ghostty/vt/style.h`).
         //
         // The call returns `success` for every cell — even default-style
         // cells get a zeroed `GhosttyStyle` back — so we treat any

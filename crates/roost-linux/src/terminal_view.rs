@@ -1,8 +1,8 @@
 //! Cell renderer over libghostty-vt — Phase 7 commit 4.
 //!
 //! Owns a [`roost_vt::Terminal`] + a [`roost_vt::RenderState`] and
-//! paints into a [`gtk::DrawingArea`]'s Cairo context. Two-pass walk
-//! mirroring the Go binary's `cmd/roost/render.go`:
+//! paints into a [`gtk::DrawingArea`]'s Cairo context. Multi-pass
+//! walk:
 //!   1. Pass A: background fills (canvas + per-cell bg).
 //!   2. Pass B: glyphs via Pango layout (one layout reused per frame,
 //!      `set_text` per cell).
@@ -18,8 +18,7 @@
 //! scrollback + selection + clipboard (7), full theme + config (11).
 //! This commit hard-codes a roost-dark palette + JetBrains Mono fall-
 //! through to Monospace + a static `vt_write` "hello" payload so we
-//! can eyeball the renderer side-by-side with the Go binary on Mac
-//! Homebrew GTK.
+//! can eyeball the renderer on Mac Homebrew GTK.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -54,7 +53,7 @@ use crate::theme::Theme;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-/// Cursor blink half-period. 530ms matches the Mac UI + Go binary.
+/// Cursor blink half-period. 530ms matches the Mac UI.
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// Light-weight handle into a [`TerminalView`] that can be cloned
@@ -177,8 +176,7 @@ impl TerminalView {
         let terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
-            // 2000 rows of off-screen history matches both the Go
-            // binary (`cmd/roost/session.go`) and the Mac UI's M6
+            // 2000 rows of off-screen history matches the Mac UI's M6
             // scrollback. Enough for a `seq 1 5000 | less` session
             // without growing memory.
             max_scrollback: 2000,
@@ -203,8 +201,8 @@ impl TerminalView {
         let font_desc = default_font_description();
         // Hinting + antialias on so monospace cells align to whole
         // pixels. gtk4-rs's `pangocairo` binding exposes
-        // `context_set_font_options` directly via raw FFI, so the
-        // gotk4 `pangoextra` workaround (DL-6) doesn't apply.
+        // `context_set_font_options` directly, so no extra FFI shim is
+        // needed to set them.
         let mut font_options = cairo::FontOptions::new().expect("alloc cairo::FontOptions");
         font_options.set_antialias(cairo::Antialias::Gray);
         font_options.set_hint_metrics(cairo::HintMetrics::On);
@@ -497,7 +495,7 @@ impl TerminalView {
         });
         widget.add_controller(modifier_ctrl);
 
-        // Scroll wheel: 3 modes per the Mac UI / Go binary. Discrete
+        // Scroll wheel: 3 modes, matching the Mac UI. Discrete
         // notches + smooth scroll both go through the same path; the
         // smooth-scroll accumulator handles trackpad fractional rows.
         let scroll_ctrl = EventControllerScroll::new(
@@ -1332,10 +1330,9 @@ impl TerminalView {
                     return glib::Propagation::Proceed;
                 }
                 // A real key: typing snaps the viewport back to the bottom
-                // (matches the Go binary's `cmd/roost/input.go:67`) and
-                // clears any active selection — even when the key encodes
-                // to nothing (dead keys / IME composition / unmapped),
-                // since typing always overrides a selection.
+                // and clears any active selection — even when the key
+                // encodes to nothing (dead keys / IME composition /
+                // unmapped), since typing always overrides a selection.
                 let snapped = s.scrolled_back;
                 if s.scrolled_back {
                     s.terminal.scroll_viewport(ScrollViewport::Bottom);
@@ -1400,8 +1397,7 @@ struct TerminalViewState {
     /// True while the viewport has been scrolled back into history.
     /// Cleared the moment we scroll back to bottom (either via a
     /// keystroke snap or by the wheel reaching the active region).
-    /// The Go binary tracks this in `cmd/roost/session.go` to decide
-    /// whether to snap before encoding a key.
+    /// Consulted before encoding a key to decide whether to snap.
     scrolled_back: bool,
     /// Smooth-scroll accumulator. Trackpad / Magic Mouse deltas are
     /// fractional rows; we accumulate until we have a whole row,
@@ -1937,7 +1933,7 @@ impl TerminalViewState {
     }
 
     /// Handle a single scroll-wheel `dy`. Negative = up (older
-    /// history). 3 modes per the Go binary `cmd/roost/session.go`:
+    /// history). 3 modes:
     ///   * Mouse-tracking (DECSET 1000/1002/1003) — encode button-4/5
     ///     reports via `encode_wheel_buttons`, checked first so a
     ///     tracking alt-screen app (htop) gets the report.
@@ -2384,11 +2380,10 @@ fn set_cairo_color(cr: &cairo::Context, rgb: ColorRgb) {
 }
 
 /// Resolve a cell's effective fg/bg + whether it needs a BG fill,
-/// applying the same SGR inverse + bold-accent rules as the legacy
-/// Go `cellColors` (`cmd/roost/render.go:206-224`). Free function so
-/// it's unit-testable without a Cairo context or DrawingArea.
+/// applying the SGR inverse + bold-accent rules below. Free function
+/// so it's unit-testable without a Cairo context or DrawingArea.
 ///
-/// Rules (matching legacy 1:1):
+/// Rules:
 /// * Default colors are the per-frame terminal default.
 /// * Explicit SGR fg/bg overrides the default.
 /// * `\e[7m` (inverse) swaps the *effective* fg/bg — done **after**
@@ -2751,8 +2746,7 @@ mod tests {
     //! Inverse + bold-accent resolver tests. The Pass A walk feeds
     //! `resolve_cell_colors` per cell; getting this wrong produces a
     //! visible regression (e.g. codex's gray prompt vanishing into
-    //! the canvas bg). All cases below mirror legacy
-    //! `cmd/roost/render.go::cellColors` behavior.
+    //! the canvas bg). All cases below exercise `resolve_cell_colors`.
     use super::*;
     use roost_vt::{Cell, ColorRgb, Style};
 

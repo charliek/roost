@@ -1,17 +1,16 @@
 // User config — Phase 6a M6.
 //
 // Reads `~/.config/roost/config.conf` and surfaces the subset of
-// settings the Swift UI honors. The file format mirrors the Go
-// binary's spec (XDG-style path even on macOS — see CLAUDE.md and
+// settings the Swift UI honors. The file format follows the shared
+// config spec (XDG-style path even on macOS — see CLAUDE.md and
 // docs/development/spec.md for the rationale): one
 // `key = value` per line, `#`-prefixed comments allowed,
 // whitespace forgiving.
 //
 // M6 ships the read path for `theme`, `font-family`, `font-size`
 // (which the UI applies on launch). Keybind overrides — the larger
-// chunk of the Go-side config surface in `cmd/roost/shortcuts.go` —
-// land as a follow-up slice; defaults already match the Go binary
-// on Mac.
+// chunk of the shortcut config surface — land as a follow-up slice;
+// the compiled-in defaults already cover the common Mac bindings.
 
 import Foundation
 
@@ -19,8 +18,8 @@ import Foundation
 /// fall back to compiled-in defaults when the user hasn't set a
 /// preference. `keybinds` is the ordered list of `keybind = …`
 /// lines in the order they appear — `canonicalizeBindings`
-/// applies them in order so later lines override earlier ones,
-/// matching the Go binary's semantics.
+/// applies them in order so later lines override earlier ones
+/// (last-write-wins).
 /// Three-state `copy-on-select` config value matching Ghostty's
 /// `off | true | clipboard` semantics. Mirrors
 /// `crates/roost-linux/src/config.rs::CopyOnSelect` 1:1.
@@ -140,7 +139,7 @@ struct RoostConfig: Sendable {
 
     /// `~/.config/roost/config.conf` — XDG-style even on macOS, by
     /// deliberate divergence from Apple HIG (matches Ghostty / nvim
-    /// / fish / the Go binary's behavior). `ROOST_CONFIG` overrides it
+    /// / fish / the Linux UI's behavior). `ROOST_CONFIG` overrides it
     /// with an absolute file — used by the E2E harness to drive the
     /// command launcher off a seeded config (mirrors the GTK side).
     static func defaultPath() -> URL {
@@ -325,8 +324,7 @@ func parse(_ text: String) -> RoostConfig {
             // the first `=` already gave us `value = "<trigger> =
             // <action>"`; split again on `=` to separate trigger
             // from action. Lenient: drop malformed lines silently
-            // (matches the Go binary's tolerance for editor saves
-            // mid-edit).
+            // (tolerates editor saves mid-edit).
             //
             // Note: `value` was unconditionally quote-stripped
             // above for `theme` / `font-family`; that's safe for
@@ -383,7 +381,7 @@ func parse(_ text: String) -> RoostConfig {
                 NSLog("roost-mac: skipping malformed `provider =` line (needs label + run)")
             }
         default:
-            // Many other keys are valid in the Go binary's config
+            // Many other keys are valid in the config file
             // (font-style, …); silently drop the ones M6/P1 don't
             // yet consume.
             continue

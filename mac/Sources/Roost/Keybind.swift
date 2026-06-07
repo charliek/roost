@@ -1,12 +1,12 @@
 // Roost keybind system — Phase 6a P1.
 //
-// Ports `cmd/roost/shortcuts.go` (the Ghostty-style trigger parser +
-// the defaults/user-overrides merger) to Swift. Lets users keep
-// using the same `keybind = trigger = action` lines in
-// `~/.config/roost/config.conf` they were using on the Go binary —
-// no migration; same action namespace; same alias rules.
+// The Ghostty-style trigger parser plus the defaults/user-overrides
+// merger. Users write `keybind = trigger = action` lines in
+// `~/.config/roost/config.conf`; the parser shares its action
+// namespace and alias rules with the Linux UI so the same config
+// works on both.
 //
-// Action namespace (matches the Go binary verbatim):
+// Action namespace:
 //   new_tab close_tab rename_tab new_project rename_project
 //   cycle_tab_prev cycle_tab_next paste copy
 //   font_increase font_decrease font_reset
@@ -27,9 +27,8 @@ import Foundation
 
 // MARK: - Action names
 
-/// Canonical action identifiers. Keep this enum in lockstep with
-/// `cmd/roost/shortcuts.go`'s `Action*` constants so a user's
-/// existing config keeps working under the Swift binary.
+/// Canonical action identifiers. Keep this enum in lockstep with the
+/// Linux UI's action constants so a user's config works on both UIs.
 enum KeybindAction {
     static let newTab        = "new_tab"
     static let closeTab      = "close_tab"
@@ -47,17 +46,16 @@ enum KeybindAction {
     static let fontDecrease  = "font_decrease"
     static let fontReset     = "font_reset"
     static let toggleSidebar = "toggle_sidebar"
-    /// Phase 6a P7: jump to the next unread (notified) tab. New
-    /// action; not present on the Go binary (cmux-inspired
-    /// ⌘⇧U convention).
+    /// Phase 6a P7: jump to the next unread (notified) tab
+    /// (cmux-inspired ⌘⇧U convention).
     static let jumpToUnread  = "jump_to_unread"
-    /// Cmd+Shift+P command palette. Mac-only for now — there's no
-    /// Go/Linux counterpart yet, so this breaks the otherwise-lockstep
+    /// Cmd+Shift+P command palette. Mac-only for now — no Linux
+    /// counterpart yet, so this breaks the otherwise-lockstep
     /// namespace deliberately; add the peer action when Linux grows a
     /// palette.
     static let commandPalette = "command_palette"
     /// Cmd+Shift+T custom command launcher. Like `commandPalette`,
-    /// Mac-and-GTK only (no Go counterpart).
+    /// Mac-and-GTK only.
     static let commandLauncher = "command_launcher"
     /// Cmd+Shift+E custom palette — the dynamic, script-backed picker
     /// (`provider =` list + discovered scripts). `…+shift+r` would be the
@@ -71,9 +69,9 @@ enum KeybindAction {
     static func switchProject(_ n: Int) -> String { "switch_project_\(n)" }
     static func switchTab(_ n: Int) -> String { "switch_tab_\(n)" }
 
-    /// All recognized non-numeric action names. The Go binary calls
-    /// this `knownActions`; used by `canonicalizeBindings` to warn
-    /// on typos in user config (so `keybind = cmd+t = nwe_tab`
+    /// All recognized non-numeric action names. Used by
+    /// `canonicalizeBindings` to warn on typos in user config (so
+    /// `keybind = cmd+t = nwe_tab`
     /// preserves the default rather than silently dropping it).
     static let knownStaticActions: Set<String> = [
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
@@ -136,8 +134,7 @@ struct Accel: Hashable {
 ///   * empty key segment,
 ///   * unknown modifier alias,
 ///   * unknown special key name.
-/// Caller should `NSLog` and skip — mirrors the Go binary's
-/// `triggerToAccel` returning ok=false.
+/// Caller should `NSLog` and skip the malformed binding.
 func triggerToAccel(_ trigger: String) -> Accel? {
     let raw = trigger.trimmingCharacters(in: .whitespaces)
     if raw.isEmpty { return nil }
@@ -203,9 +200,8 @@ private func keyEquivalentForToken(_ token: String) -> String? {
 
 // MARK: - Default bindings
 
-/// Default action → [trigger] table for macOS. Mirrors the Go
-/// binary's `defaultBindings()` with `runtime.GOOS == "darwin"`
-/// branch — primary/projectMod/clipboardMod all = "super" (⌘).
+/// Default action → [trigger] table for macOS —
+/// primary/projectMod/clipboardMod all = "super" (⌘).
 func defaultBindingsMac() -> [String: [String]] {
     let primary = "super"
     let projectMod = "super"
@@ -216,8 +212,7 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.closeTab:  ["\(primary)+w"],
         KeybindAction.renameTab: ["\(projectMod)+r"],
         // Shift-[ produces braceleft on US layouts; bracketleft on
-        // layouts that don't transform. Keep both. (Go binary
-        // semantics; preserved verbatim.)
+        // layouts that don't transform. Keep both.
         KeybindAction.cycleTabPrev: [
             "\(primary)+shift+braceleft",
             "\(primary)+shift+bracketleft",
@@ -265,8 +260,7 @@ func defaultBindingsMac() -> [String: [String]] {
 // MARK: - Canonicalization (defaults + user overrides → accel table)
 
 /// Merge default + user keybinds into a final `Accel → action`
-/// table. Pure data; no NSMenu calls. Mirrors the Go binary's
-/// `canonicalizeBindings`:
+/// table. Pure data; no NSMenu calls. The canonicalization steps:
 ///
 ///  1. Alias collapse: `cmd+t` / `super+t` / `command+t` all map
 ///     to the same Accel, so `keybind = cmd+t = unbind` correctly

@@ -1,13 +1,12 @@
 // URL detection mirror of `crates/roost-url/src/lib.rs`. The Rust
-// crate is authoritative; this file ports the same regex + trim
-// pipeline by hand because the AppKit UI doesn't link the Rust
+// crate is authoritative; this file reimplements the same regex +
+// trim pipeline by hand because the AppKit UI doesn't link the Rust
 // workspace. Parity is pinned by the shared `tests/url-fixtures/`
-// corpus — both ports load the same files and assert byte-equality.
+// corpus — both UIs load the same files and assert byte-equality.
 //
-// The regex is the legacy Go binary's scheme-only pattern (see
-// `internal/links/regex.go:18`). Path detection (./foo, ~/bar) and
-// scp-style git remotes (git@github.com:x/y) are out of scope for the
-// v1 port; widen here + in `roost-url` together when the time comes.
+// The regex is a scheme-only pattern. Path detection (./foo, ~/bar)
+// and scp-style git remotes (git@github.com:x/y) are out of scope
+// for now; widen here + in `roost-url` together when the time comes.
 
 import CGhosttyVT
 import Foundation
@@ -22,22 +21,21 @@ struct UrlSpan: Equatable {
 }
 
 enum UrlDetection {
-    /// Compiled URL regex. NSRegularExpression's `[]` byte-class
-    /// semantics handle the body's exclusion set the same way Go's
-    /// `regexp` does — both reject the same characters and accept
+    /// Compiled URL regex. The body's exclusion set rejects only the
+    /// whitespace + delimiter characters spelled out below and accepts
     /// every other codepoint (so IDNA hosts like `https://例え.テスト`
     /// match the body class as-is).
     ///
     /// The body's negation class spells out `[\t\n\x0c\r ]` instead of
-    /// `\s` because Go's `\s` is ASCII-only while
-    /// `NSRegularExpression`'s ICU regex treats `\s` as Unicode
-    /// whitespace (matches U+00A0 NBSP, U+2028, U+2029, etc.). The
-    /// explicit class is the only way to keep parity with the Go
-    /// binary's behavior + the Rust port in `roost-url`.
+    /// `\s` because `NSRegularExpression`'s ICU regex treats `\s` as
+    /// Unicode whitespace (matches U+00A0 NBSP, U+2028, U+2029, etc.).
+    /// The explicit class is the only way to keep parity with the Rust
+    /// implementation in `roost-url`.
     ///
     /// Pattern is byte-identical with `roost_url::pattern()` to keep
-    /// the two ports honest. Use Swift's raw-string literal `#"..."#`
-    /// so the embedded backticks + backslash don't need escaping.
+    /// the two implementations honest. Use Swift's raw-string literal
+    /// `#"..."#` so the embedded backticks + backslash don't need
+    /// escaping.
     static let pattern: NSRegularExpression = {
         let raw = #"(?:(?:https?|ftp|file|ssh|git\+ssh)://|(?:mailto|tel|news):)[^ \t\r\n\x0c<>"'`\\]+"#
         // `.caseInsensitive` corresponds to `(?i)` in the Rust regex —
@@ -48,8 +46,8 @@ enum UrlDetection {
 
     /// Find the URL straddling column `col` in `row`, or `nil` if no
     /// URL covers that column. `col` is a 0-indexed Unicode scalar
-    /// position into `row` (i.e. codepoint, matching Rust's `chars()`
-    /// and Go's `[]rune`) — out-of-range values return `nil`.
+    /// position into `row` (i.e. codepoint, matching Rust's `chars()`)
+    /// — out-of-range values return `nil`.
     ///
     /// Indexing by scalar (rather than grapheme cluster) is what keeps
     /// us byte-exact with `roost_url::find_url_at` on cases like
@@ -78,11 +76,11 @@ enum UrlDetection {
         // need a special case.
         //
         // Indexing by Unicode scalar (codepoint), NOT Swift `Character`
-        // (grapheme cluster), is what keeps the Swift port byte-exact
-        // with the Rust port's `chars()` and Go's `[]rune`. Combining
-        // marks like `e\u{0301}` therefore count as 2 columns here,
-        // same as Rust + Go — fixtures with combining sequences would
-        // otherwise drift between the ports.
+        // (grapheme cluster), is what keeps this byte-exact with the
+        // Rust implementation's `chars()`. Combining marks like
+        // `e\u{0301}` therefore count as 2 columns here, same as Rust
+        // — fixtures with combining sequences would otherwise drift
+        // between the two UIs.
         var utf16ToScalar: [Int] = []
         utf16ToScalar.reserveCapacity(row.utf16.count + 1)
         var scalarIdx = 0
@@ -173,8 +171,7 @@ enum UrlDetection {
     }
 
     /// Strip trailing sentence punctuation and unmatched closing
-    /// brackets from a URL match. Mirrors
-    /// `roost_url::trim_url` / `internal/links/regex.go::trimURL`:
+    /// brackets from a URL match. Mirrors `roost_url::trim_url`:
     /// sentence punctuation almost never belongs to a URL, and a
     /// trailing `)` is part of the URL only if there's a matching
     /// `(` inside it (so Wikipedia's `_(disambiguation)` survives but

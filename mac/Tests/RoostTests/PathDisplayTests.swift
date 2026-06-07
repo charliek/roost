@@ -1,6 +1,8 @@
-// Mirror of `cmd/roost/path_display_test.go::TestPathDisplay` —
-// case-for-case. Pin the chrome subtitle string identical across the
-// Go GTK binary and the Mac Swift UI for the same daemon state.
+// Tests for `pathDisplay`, the chrome-subtitle path formatter:
+// home-directory collapse to `~`, character-counted truncation that
+// keeps the right end, and the `max <= 0` guards. The Linux UI shares
+// the same rules so the subtitle string matches across both UIs for
+// the same state.
 
 import Foundation
 import Testing
