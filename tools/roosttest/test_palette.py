@@ -135,3 +135,30 @@ def test_open_launcher_frame(palette):
     st = palette.palette_open(kind="launcher")
     assert st["open"] is True
     assert st["frame"] == "launcher"
+
+
+def test_theme_frame_keeps_selection_in_view(target, palette):
+    """The theme list opens pre-positioned on the active theme; the palette
+    must scroll that row into the viewport so its highlight is visible.
+
+    Regression for a GTK bug where the pre-selected row rode off the bottom
+    (invisible highlight, though arrowing still changed the theme) because
+    nothing scrolled the list to the selection. The bundled theme set
+    overflows the palette viewport and a fresh instance's default active
+    theme (`roost-dark`) sorts last, so the pre-selected row starts
+    off-screen — exercising the scroll. `selected_in_view` is reported only
+    by the GTK UI (the Mac UI scrolls correctly and omits the field)."""
+    if target != "gtk":
+        pytest.skip("selected_in_view geometry is reported by the GTK UI only")
+    palette.palette_open()
+    st = palette.palette_activate("select_theme")
+    assert st["frame"] == "themes"
+    assert len(st["items"]) > 1, "theme list should have multiple rows"
+    # The scroll lands on a frame tick after layout settles, so poll until
+    # the highlighted row is fully within the viewport (rather than reading
+    # a single pre-layout snapshot).
+    palette._wait(
+        lambda: palette.palette_state().get("selected_in_view") is True,
+        10.0,
+        "theme frame scrolls the pre-selected row into view",
+    )

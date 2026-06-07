@@ -367,6 +367,7 @@ fn palette_state_from(s: &PaletteSnapshot) -> PaletteStateResult {
                 subtitle: subtitle.clone(),
             })
             .collect(),
+        selected_in_view: s.selected_in_view,
     }
 }
 
