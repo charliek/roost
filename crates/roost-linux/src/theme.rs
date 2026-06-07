@@ -1,7 +1,11 @@
 //! Bundled themes + ghostty-format parser.
 //!
-//! Ports `mac/Sources/Roost/Theme.swift` (Phase 6 M6) + the
-//! `cmd/roost/themes/` directory bundle. Themes carry the 256-entry
+//! Ports `mac/Sources/Roost/Theme.swift` (Phase 6 M6). The theme files
+//! live in `crates/roost-linux/src/resources/themes/` (the Rust
+//! source-of-truth, alongside the vendored icons) and a byte-identical
+//! copy in `mac/Sources/Roost/Resources/themes/` for the Swift bundle;
+//! `make themes-check` guards the two against drift. Themes carry the
+//! 256-entry
 //! libghostty palette plus the chrome colors (foreground, background,
 //! cursor, selection). Each theme file is embedded via `include_str!`
 //! so the binary is self-contained — no `XDG_DATA_DIRS` lookup, no
@@ -64,7 +68,7 @@ impl Theme {
     }
 
     /// Look up a bundled theme by name. Case-insensitive matching
-    /// against the file names under `cmd/roost/themes/`. Returns
+    /// against the file names under `resources/themes/`. Returns
     /// the fallback if nothing matches so the UI always renders.
     pub fn load_bundled(name: &str) -> Self {
         for (theme_name, source) in BUNDLED_THEMES {
@@ -106,28 +110,28 @@ impl Default for Theme {
 const BUNDLED_THEMES: &[(&str, &str)] = &[
     (
         "roost-dark",
-        include_str!("../../../cmd/roost/themes/roost-dark"),
+        include_str!("resources/themes/roost-dark"),
     ),
     (
         "Atom One Dark",
-        include_str!("../../../cmd/roost/themes/Atom One Dark"),
+        include_str!("resources/themes/Atom One Dark"),
     ),
     (
         "Catppuccin Mocha",
-        include_str!("../../../cmd/roost/themes/Catppuccin Mocha"),
+        include_str!("resources/themes/Catppuccin Mocha"),
     ),
-    ("Dracula", include_str!("../../../cmd/roost/themes/Dracula")),
+    ("Dracula", include_str!("resources/themes/Dracula")),
     (
         "Dracula+",
-        include_str!("../../../cmd/roost/themes/Dracula+"),
+        include_str!("resources/themes/Dracula+"),
     ),
     (
         "Gruvbox Dark Hard",
-        include_str!("../../../cmd/roost/themes/Gruvbox Dark Hard"),
+        include_str!("resources/themes/Gruvbox Dark Hard"),
     ),
     (
         "TokyoNight",
-        include_str!("../../../cmd/roost/themes/TokyoNight"),
+        include_str!("resources/themes/TokyoNight"),
     ),
 ];
 
