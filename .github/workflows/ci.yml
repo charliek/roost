@@ -371,6 +371,11 @@ jobs:
           # end-to-end. The harness reads the same var to skip those
           # tests entirely when it's absent (no spurious red).
           ROOST_TEST_MODE: "1"
+          # Where the harness captures the launched UI's stdout+stderr (the
+          # GTK UI tees its log to stdout). Collected + uploaded below so a
+          # boot failure under xvfb isn't blind — the Mac twin already does
+          # this via crash reports; this is the GTK equivalent.
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-e2e-logs
 
         # The harness launches its own `roost` process; under xvfb-run it
         # inherits the virtual DISPLAY. tab.dump reads in-process render
@@ -382,6 +387,25 @@ jobs:
         run: >
           xvfb-run -a --server-args="-screen 0 2560x1440x24"
           uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
+
+      # Stage the captured UI log into one dir (upload-artifact doesn't
+      # expand globs/`~`). The harness writes the launched UI's stdout+stderr
+      # to ROOST_E2E_LOG_DIR; grab it whether or not the run failed.
+      - name: Collect failure diagnostics
+        if: always()
+        run: |
+          mkdir -p diagnostics
+          cp "${RUNNER_TEMP}"/roost-e2e-logs/*.log diagnostics/ 2>/dev/null || true
+          ls -la diagnostics || true
+
+      - name: Upload E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-gtk-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Functional E2E against the real Swift app, driven through the IPC op
   # set by the pytest harness (tools/roosttest) — the Mac twin of e2e-gtk.
