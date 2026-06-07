@@ -315,6 +315,31 @@ mod tests {
     }
 
     #[test]
+    fn every_theme_file_is_registered() {
+        // A theme file dropped into resources/themes/ but not added to
+        // BUNDLED_THEMES is invisible to the Linux UI (the Mac side
+        // auto-discovers by listing the dir). `themes-check` guards the two
+        // resource trees; this guards the Rust registration against them.
+        // (The reverse — a registered name with no file — fails to compile
+        // via include_str!.)
+        use std::collections::HashSet;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/resources/themes");
+        let registered: HashSet<String> = Theme::bundled_names().into_iter().collect();
+        let mut missing: Vec<String> = std::fs::read_dir(dir)
+            .expect("themes dir readable")
+            .map(|e| e.expect("dir entry"))
+            .filter(|e| e.file_type().expect("file type").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !registered.contains(name))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "theme files present in resources/themes/ but not in BUNDLED_THEMES: {missing:?}"
+        );
+    }
+
+    #[test]
     fn all_bundled_themes_parse() {
         for (name, _source) in BUNDLED_THEMES {
             let theme = Theme::load_bundled(name);

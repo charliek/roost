@@ -24,7 +24,7 @@ The setting takes effect on the next launch (themes are not hot-reloaded today).
 | `Catppuccin Macchiato`   | Catppuccin's deeper mid-dark flavor.                       |
 | `Catppuccin Mocha`       | Pastel dark; the darkest Catppuccin flavor.               |
 | `Dracula`                | The original Dracula palette.                              |
-| `Dracula+`               | Higher-contrast Dracula variant with `cursor-text` set.   |
+| `Dracula+`               | Higher-contrast Dracula variant.                          |
 | `Everforest Dark Hard`   | Warm, low-saturation forest greens.                       |
 | `GitHub Dark Default`    | GitHub's current dark UI palette.                         |
 | `Gruvbox Dark`           | Warm retro palette, medium contrast.                      |
@@ -42,20 +42,19 @@ Every theme other than `roost-dark` is a byte-identical copy of a file from [Gho
 
 ## File format
 
-Theme files are plain key=value text with `#` comments — the same syntax as `config.conf` (and as Ghostty's themes). Roost honors:
+Theme files are plain key=value text with `#` comments — the same syntax as `config.conf` (and as Ghostty's themes). Roost starts from the built-in `roost-dark` palette and overlays whatever keys a file sets; any key a file omits keeps its `roost-dark` value. Nothing is required — a file with only `palette` lines is valid. Roost honors:
 
-| Key                    | Required | Effect                                                                |
-|------------------------|----------|-----------------------------------------------------------------------|
-| `background`           | yes      | Default background color. Parser errors if missing.                   |
-| `foreground`           | yes      | Default foreground color. Parser errors if missing.                   |
-| `palette = N=#RRGGBB`  | no       | One of the 16 ANSI colors (`N` in `0..15`). Unset entries default to black. Indices 16–255 are computed (xterm 6×6×6 cube + 24-step gray ramp). |
-| `cursor-color`         | no       | Cursor block fill. Defaults to `foreground`.                          |
-| `cursor-text`          | no       | Glyph color when the cursor sits over a non-empty cell. Defaults to `background`. |
-| `bold-color`           | no       | Color for bold text drawn with the *default* foreground. Bold-with-explicit-color (e.g. bold red) is unaffected. Defaults to `foreground`. |
-| `selection-background` | no       | Selection overlay color (rendered at 35% alpha). Defaults to `foreground`. |
-| `selection-foreground` | no       | Parsed but currently unused (see *Limitations*). Defaults to `background`. |
+| Key                    | Effect                                                                |
+|------------------------|-----------------------------------------------------------------------|
+| `background`           | Default background color.                                             |
+| `foreground`           | Default foreground color.                                             |
+| `palette = N=#RRGGBB`  | One of the 16 ANSI colors (`N` in `0..15`). Indices 16–255 are computed (xterm 6×6×6 cube + 24-step gray ramp). |
+| `cursor-color`         | Cursor block fill.                                                    |
+| `bold-color`           | Color for bold text drawn with the *default* foreground. Bold-with-explicit-color (e.g. bold red) is unaffected. |
+| `selection-background` | Selection overlay color (rendered at 35% alpha).                     |
+| `selection-foreground` | Parsed but currently unused (see *Limitations*).                     |
 
-Unknown keys are silently ignored. A theme file is typically ~22 lines.
+Any other key — including Ghostty's `cursor-text`, `link-color`, and `palette-generate` — is silently ignored. A theme file is typically ~22 lines.
 
 Example (the bundled `Dracula+`):
 

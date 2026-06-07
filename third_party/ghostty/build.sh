@@ -3,9 +3,9 @@
 #
 # Builds libghostty-vt into third_party/ghostty/ — the Rust workspace under
 # crates/ links the resulting static archive directly via crates/roost-vt's
-# build.rs (bindgen + rustc-link-search), and the Mac Xcode project under mac/
-# references it via OTHER_LDFLAGS. There is no second "build the application"
-# stage here.
+# build.rs (bindgen + rustc-link-search), and the Mac SwiftPM package under
+# mac/ links it via package linker settings (see mac/Package.swift). There is
+# no second "build the application" stage here.
 #
 # This is the single source of the pinned libghostty-vt SHA (the legacy Go
 # prototype's build/build.sh was removed in GODELETE).

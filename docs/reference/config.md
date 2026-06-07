@@ -139,7 +139,7 @@ OSC 52 carries a `Ps` selector indicating which clipboard to write:
 ```
 # ~/.config/roost/config.conf
 
-theme = catppuccin-mocha
+theme = Catppuccin Mocha
 font-family = "JetBrains Mono"
 font-size = 14
 
