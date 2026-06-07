@@ -4654,6 +4654,25 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         } else {
             stripe.isHidden = true
         }
+        applyLabelColor()
+    }
+
+    /// Dim the label a touch when this row isn't the selected (emphasized)
+    /// one, so the active project's white label stands out more. AppKit sets
+    /// `backgroundStyle` from the row's selection/emphasis — `.emphasized`
+    /// (forced by `SidebarRowView` whenever selected) maps to white; anything
+    /// else gets the muted tone. Driven from `configure(...)` and the
+    /// `backgroundStyle` observer so it survives cell reuse. Skipped
+    /// mid-rename (the bezeled editor manages its own colors).
+    static let inactiveLabel = NSColor(white: 0.82, alpha: 1.0)
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { applyLabelColor() }
+    }
+
+    private func applyLabelColor() {
+        guard !isEditing else { return }
+        textField?.textColor = backgroundStyle == .emphasized ? .white : Self.inactiveLabel
     }
 
     /// Begin inline rename. The row's `textField` flips to an editable
@@ -4731,6 +4750,46 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         let cancel = onCancel
         endEdit()
         cancel?()
+    }
+}
+
+/// Custom selection drawing for the projects sidebar. The outline view is
+/// `.sourceList`, whose default selected-row styling is emphasis-dependent:
+/// when the outline isn't first responder (the normal case — the terminal
+/// owns the keyboard), AppKit renders the selected row as faint translucent
+/// fill + accent-blue label text, which is illegible over the sidebar's
+/// behind-window vibrancy with a light app behind. We take the fill and the
+/// label color into our own hands instead (same approach as `PaletteRowView`).
+/// We deliberately do NOT override `isEmphasized`: its real value drives a
+/// brighter pill while the sidebar holds focus, so the focus cue survives.
+final class SidebarRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard isSelected else { return }
+        // One consistent deep accent fill, regardless of focus. We deliberately
+        // do NOT brighten while the sidebar holds focus: the outline is only
+        // first responder for the instant between a click and the terminal
+        // taking focus back, so an emphasis-driven brighter fill just reads as
+        // a distracting flash. White label text (forced below) stays legible,
+        // and the opaque-ish fill survives a light app behind the vibrancy.
+        let accent = NSColor.controlAccentColor
+        let base = accent.usingColorSpace(.sRGB) ?? accent
+        let fill = base.blended(withFraction: 0.5, of: NSColor(white: 0.12, alpha: 1)) ?? base
+        fill.setFill()
+        let r = bounds.insetBy(dx: 6, dy: 1)
+        NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6).fill()
+    }
+
+    /// Force the emphasized (white-text) cell styling whenever selected, in
+    /// both focus states — this is what replaces source-list's low-contrast
+    /// blue label tint. Gated off while the row is inline-renaming: that cell
+    /// hosts a light bezeled editor, where `.emphasized` would paint the typed
+    /// text white-on-light.
+    override var interiorBackgroundStyle: NSView.BackgroundStyle {
+        guard isSelected else { return .normal }
+        if let cell = view(atColumn: 0) as? ProjectRowCellView, cell.isEditing {
+            return .normal
+        }
+        return .emphasized
     }
 }
 
@@ -5343,6 +5402,13 @@ extension RoostApp: NSOutlineViewDelegate {
         let rollup = projectRollup(tabs: pairs)
         cell.configure(with: row.project, notifying: notifying, rollup: rollup)
         return cell
+    }
+
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        rowViewForItem item: Any
+    ) -> NSTableRowView? {
+        SidebarRowView()
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
