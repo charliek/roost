@@ -395,6 +395,22 @@ impl PaletteInner {
         }
     }
 
+    /// The selected row's `(top, height)` in the list's (= scroll
+    /// content) coordinate space, or `None` when there's no selection or
+    /// the row isn't laid out yet (open / re-filter rebuilt the rows this
+    /// turn, so sizes aren't known). `compute_bounds` is the non-deprecated
+    /// successor to `allocation()` and reports the row's content position
+    /// regardless of the current scroll offset.
+    fn selected_row_extent(&self) -> Option<(f64, f64)> {
+        let row = self.list.selected_row()?;
+        let bounds = row.compute_bounds(&self.list)?;
+        let h = bounds.height() as f64;
+        if h <= 0.0 {
+            return None;
+        }
+        Some((bounds.y() as f64, h))
+    }
+
     /// Scroll so the selected row is fully visible. GtkListBox only
     /// auto-scrolls to a row when that row holds keyboard focus, but the
     /// palette keeps focus on the search entry and drives selection from
@@ -402,34 +418,21 @@ impl PaletteInner {
     /// top/bottom edge (worst on the theme list, which opens
     /// pre-positioned on the active theme partway down).
     ///
-    /// Done from a tick callback (one-shot) rather than an idle: on open
-    /// and re-filter the rows are rebuilt this turn and the scroller's
-    /// viewport hasn't been allocated yet, so an idle would measure a
-    /// zero-height row against an unclamped page size and decide nothing
-    /// needs scrolling. A tick callback runs after the next layout pass,
-    /// when the row bounds and `page_size` are real.
+    /// On arrow nav layout is already settled, so this scrolls
+    /// immediately. On open / re-filter the rows are rebuilt this turn and
+    /// the viewport isn't laid out yet (`selected_row_extent` returns
+    /// `None`); the `vadjustment::changed` handler wired in `wire_signals`
+    /// re-runs this once layout settles, covering the pre-positioned open
+    /// case.
     fn scroll_selection_into_view(self: &Rc<Self>) {
-        let Some(row) = self.list.selected_row() else {
+        let Some((y, h)) = self.selected_row_extent() else {
             return;
         };
-        let alloc = row.allocation();
         let adj = self.scroll.vadjustment();
-        // Pre-layout (open / re-filter rebuilt the rows this turn): sizes
-        // aren't known yet, so there's nothing to scroll to. The
-        // `vadjustment::changed` handler wired in `wire_signals` re-runs
-        // this once layout settles (it fires when the content/viewport
-        // size becomes known), which covers the pre-positioned open case.
-        // Arrow nav, by contrast, happens after layout, so this runs
-        // immediately.
-        if alloc.height() == 0 || adj.page_size() <= 0.0 {
+        if adj.page_size() <= 0.0 {
             return;
         }
-        adj.set_value(reveal_offset(
-            alloc.y() as f64,
-            alloc.height() as f64,
-            adj.value(),
-            adj.page_size(),
-        ));
+        adj.set_value(reveal_offset(y, h, adj.value(), adj.page_size()));
     }
 
     fn fire_highlight(self: &Rc<Self>) {
@@ -564,14 +567,12 @@ impl PaletteInner {
     /// selection — callers treat `None` as "can't tell", so only `Some(
     /// false)` flags a genuinely clipped highlight (the bug this guards).
     fn selected_row_in_view(&self) -> Option<bool> {
-        let row = self.list.selected_row()?;
-        let alloc = row.allocation();
+        let (top, height) = self.selected_row_extent()?;
         let adj = self.scroll.vadjustment();
-        if alloc.height() == 0 || adj.page_size() <= 0.0 {
+        if adj.page_size() <= 0.0 {
             return None;
         }
-        let top = alloc.y() as f64;
-        let bottom = top + alloc.height() as f64;
+        let bottom = top + height;
         // Half-pixel slack absorbs fractional layout rounding.
         Some(top >= adj.value() - 0.5 && bottom <= adj.value() + adj.page_size() + 0.5)
     }
