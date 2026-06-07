@@ -26,6 +26,15 @@ from client import Roost, RoostError, scaled_timeout
 # its own state. None when reusing or before a session starts.
 _SESSION_STATE_DIR: Path | None = None
 
+# A harness-launched GTK UI's process handle + the file capturing its
+# stdout+stderr (the UI tees its log to stdout). Retained so `wait_alive`
+# can tell a UI that crashed on boot (process already exited) from one
+# that's merely slow, and surface the captured log instead of an opaque
+# "did not boot". `None` until a GTK launch; the Mac path launches via
+# `open` (no direct child) and leaves these unset.
+_GTK_PROC: "subprocess.Popen[bytes] | None" = None
+_GTK_LOG: Path | None = None
+
 # Env vars to strip from a harness-launched GTK UI's inherited environment.
 # These are either per-tab values Roost injects itself (a stale inherited
 # value would leak into every tab — `pty.rs` keeps a pre-set
@@ -85,6 +94,35 @@ def is_alive(target: str) -> bool:
         return False
 
 
+def _gtk_log_path() -> Path:
+    """Where a harness-launched GTK UI's stdout+stderr are captured. Honors
+    `ROOST_E2E_LOG_DIR` (CI points it at a dir it collects + uploads as a
+    build artifact); falls back to the system temp dir for local runs."""
+    base = Path(os.environ.get("ROOST_E2E_LOG_DIR") or tempfile.gettempdir())
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "roost-gtk-ui.log"
+
+
+def _boot_failure_detail(target: str) -> str:
+    """Diagnostic suffix for a GTK boot timeout: whether the launched UI
+    already exited (so it crashed, not just slow) and the tail of its
+    captured log. Empty for Mac (launched via `open`, no captured child)."""
+    if target != "gtk" or _GTK_PROC is None:
+        return ""
+    parts = []
+    rc = _GTK_PROC.poll()
+    if rc is not None:
+        parts.append(f" — UI process exited (code {rc}) before becoming ready")
+    if _GTK_LOG is not None and _GTK_LOG.exists():
+        try:
+            tail = _GTK_LOG.read_text(errors="replace").splitlines()[-40:]
+        except OSError:
+            tail = []
+        if tail:
+            parts.append("\n--- captured UI log (last 40 lines) ---\n" + "\n".join(tail))
+    return "".join(parts)
+
+
 def wait_alive(target: str, timeout: float = 30.0) -> None:
     """Block until the UI is *ready to drive*, not merely until the socket
     answers.
@@ -119,7 +157,9 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
         except (OSError, RoostError):
             pass
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"{target} UI did not boot within {timeout}s")
+            raise TimeoutError(
+                f"{target} UI did not boot within {timeout}s{_boot_failure_detail(target)}"
+            )
         time.sleep(0.25)
 
     # (2) subscription live: a freshly opened tab must materialize.
@@ -132,7 +172,10 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
                 c.close_tab(probe)
                 return
             c.close_tab(probe)  # event was missed; retry once sub is live
-        raise TimeoutError(f"{target} UI event subscription not live within {timeout}s")
+        raise TimeoutError(
+            f"{target} UI event subscription not live within {timeout}s"
+            f"{_boot_failure_detail(target)}"
+        )
     finally:
         c.close()
 
@@ -180,8 +223,10 @@ def start_session(target: str, *, fresh: bool) -> bool:
 def end_session(target: str) -> None:
     """Quit a harness-owned UI and remove its throwaway state (state dir +,
     on Mac, the isolated UserDefaults suite)."""
-    global _SESSION_STATE_DIR
+    global _SESSION_STATE_DIR, _GTK_PROC, _GTK_LOG
     quit(target)
+    _GTK_PROC = None
+    _GTK_LOG = None
     if _SESSION_STATE_DIR is not None:
         shutil.rmtree(_SESSION_STATE_DIR, ignore_errors=True)
         _SESSION_STATE_DIR = None
@@ -226,10 +271,21 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         env["ROOST_CONFIG"] = str(SEED_CONFIG)
         if state_dir is not None:
             env["ROOST_STATE_DIR"] = str(state_dir)
-        # Detached: outlive this call; the quit() path SIGTERMs it by pid.
-        subprocess.Popen([str(binary)], cwd=REPO_ROOT, env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        # Capture stdout+stderr (the UI tees its log to stdout, and an early
+        # panic that predates the file logger only shows on stderr) so a boot
+        # failure isn't blind — `wait_alive` reads this on timeout and CI
+        # uploads it. Detached: outlive this call; quit() SIGTERMs it by pid.
+        global _GTK_PROC, _GTK_LOG
+        _GTK_LOG = _gtk_log_path()
+        log_fh = open(_GTK_LOG, "wb")
+        try:
+            _GTK_PROC = subprocess.Popen(
+                [str(binary)], cwd=REPO_ROOT, env=env,
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()  # the child holds its own dup of the fd
         wait_alive(target)
     else:
         raise ValueError(f"unknown target {target!r}")
