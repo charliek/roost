@@ -51,6 +51,12 @@ is retired.
 - **Hardened `test_env_injected` against a shell-startup race (#217).**
 - **Bumped GitHub Actions to current major tags (#218)** — `setup-uv@v7`,
   `upload-artifact@v7`, `upload-pages-artifact@v5`.
+- **Portable `libghostty-vt` + GTK E2E diagnostics (#219)** — build the
+  vendored `libghostty-vt` for a baseline CPU (`-Dcpu=baseline`) so the
+  shipped binaries run on any CPU of the architecture; a native-CPU build
+  cached across CI's mixed runner fleet was SIGILL-crashing both the GTK UI
+  and the `roost-vt` ffi test. Also capture + upload the GTK UI's log so a
+  boot failure under xvfb isn't blind (the gap that hid this).
 
 ### Docs
 
