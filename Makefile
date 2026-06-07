@@ -96,7 +96,7 @@ smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build
 
 # ---- code quality -----------------------------------------------------
 
-.PHONY: fmt fmt-check clippy check
+.PHONY: fmt fmt-check clippy themes-check check
 fmt:  ## Format Rust (cargo fmt --all)
 	cargo fmt --all
 
@@ -106,7 +106,10 @@ fmt-check:  ## Check formatting (what CI's rust-lint runs)
 clippy:  ## Lint Rust (cargo clippy --workspace)
 	cargo clippy --workspace --all-targets
 
-check: fmt-check clippy test  ## Pre-push gate: fmt-check + clippy + tests
+themes-check:  ## Assert the Rust + Mac bundled-theme copies are byte-identical
+	diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
+
+check: fmt-check clippy themes-check test  ## Pre-push gate: fmt-check + clippy + themes-check + tests
 
 # ---- docs -------------------------------------------------------------
 

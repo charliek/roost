@@ -108,10 +108,7 @@ impl Default for Theme {
 /// `include_str!`. New themes can be dropped into the array below;
 /// they're matched case-insensitively in `Theme::load_bundled`.
 const BUNDLED_THEMES: &[(&str, &str)] = &[
-    (
-        "roost-dark",
-        include_str!("resources/themes/roost-dark"),
-    ),
+    ("roost-dark", include_str!("resources/themes/roost-dark")),
     (
         "Atom One Dark",
         include_str!("resources/themes/Atom One Dark"),
@@ -121,17 +118,62 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
         include_str!("resources/themes/Catppuccin Mocha"),
     ),
     ("Dracula", include_str!("resources/themes/Dracula")),
-    (
-        "Dracula+",
-        include_str!("resources/themes/Dracula+"),
-    ),
+    ("Dracula+", include_str!("resources/themes/Dracula+")),
     (
         "Gruvbox Dark Hard",
         include_str!("resources/themes/Gruvbox Dark Hard"),
     ),
+    ("TokyoNight", include_str!("resources/themes/TokyoNight")),
+    // Additional Ghostty-format themes (byte-identical to upstream).
+    ("0x96f", include_str!("resources/themes/0x96f")),
+    ("Atom", include_str!("resources/themes/Atom")),
     (
-        "TokyoNight",
-        include_str!("resources/themes/TokyoNight"),
+        "Atom One Light",
+        include_str!("resources/themes/Atom One Light"),
+    ),
+    ("Ayu Light", include_str!("resources/themes/Ayu Light")),
+    ("Ayu Mirage", include_str!("resources/themes/Ayu Mirage")),
+    ("Nord", include_str!("resources/themes/Nord")),
+    ("Rose Pine", include_str!("resources/themes/Rose Pine")),
+    (
+        "Solarized Dark Patched",
+        include_str!("resources/themes/Solarized Dark Patched"),
+    ),
+    (
+        "Catppuccin Frappe",
+        include_str!("resources/themes/Catppuccin Frappe"),
+    ),
+    (
+        "Catppuccin Macchiato",
+        include_str!("resources/themes/Catppuccin Macchiato"),
+    ),
+    (
+        "TokyoNight Storm",
+        include_str!("resources/themes/TokyoNight Storm"),
+    ),
+    (
+        "TokyoNight Night",
+        include_str!("resources/themes/TokyoNight Night"),
+    ),
+    (
+        "Gruvbox Dark",
+        include_str!("resources/themes/Gruvbox Dark"),
+    ),
+    (
+        "One Half Dark",
+        include_str!("resources/themes/One Half Dark"),
+    ),
+    (
+        "GitHub Dark Default",
+        include_str!("resources/themes/GitHub Dark Default"),
+    ),
+    (
+        "Everforest Dark Hard",
+        include_str!("resources/themes/Everforest Dark Hard"),
+    ),
+    (
+        "Kanagawa Wave",
+        include_str!("resources/themes/Kanagawa Wave"),
     ),
 ];
 

@@ -85,6 +85,21 @@ jobs:
         # bloating this lint runner with the GTK toolchain.
         run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 
+  themes-parity:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.mac == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # The bundled themes live in two trees (Rust crate + Mac SwiftPM
+      # bundle) because SwiftPM `.copy` can't reach outside mac/. Guard
+      # the copies against drift — adding a theme to one UI only is a
+      # classic miss.
+      - name: Bundled themes byte-identical across UIs
+        run: diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
+
   rust-build:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
@@ -482,13 +497,13 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
+    needs: [changes, rust-lint, themes-parity, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then
