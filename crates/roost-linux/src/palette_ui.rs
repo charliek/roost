@@ -322,12 +322,22 @@ impl PaletteInner {
         // the active theme partway down) can finally be scrolled into
         // view; arrow nav handles itself synchronously since layout is
         // already settled.
+        //
+        // The scroll is deferred to an idle rather than applied inline:
+        // `changed` fires *during* the ScrolledWindow's size-allocate, and
+        // a `set_value` made now is overwritten when that allocation
+        // finishes (it re-clamps scroll to the top). Running one main-loop
+        // iteration later — after the allocation completes — makes the
+        // scroll stick.
         self.scroll.vadjustment().connect_changed({
             let weak = Rc::downgrade(self);
             move |_| {
-                if let Some(inner) = weak.upgrade() {
-                    inner.scroll_selection_into_view();
-                }
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.scroll_selection_into_view();
+                    }
+                });
             }
         });
 
@@ -566,15 +576,24 @@ impl PaletteInner {
     /// viewport. `None` before layout (sizes unknown) or with no
     /// selection — callers treat `None` as "can't tell", so only `Some(
     /// false)` flags a genuinely clipped highlight (the bug this guards).
+    ///
+    /// Measured relative to the scroller (the viewport), NOT via the
+    /// adjustment value: that reflects the *applied* scroll position, so a
+    /// value that was set but not yet translated onto screen (e.g. clobbered
+    /// by an in-flight allocation) still reads as out-of-view here. The
+    /// page size bounds the visible band.
     fn selected_row_in_view(&self) -> Option<bool> {
-        let (top, height) = self.selected_row_extent()?;
-        let adj = self.scroll.vadjustment();
-        if adj.page_size() <= 0.0 {
+        let row = self.list.selected_row()?;
+        let bounds = row.compute_bounds(&self.scroll)?;
+        let height = bounds.height() as f64;
+        let page = self.scroll.vadjustment().page_size();
+        if height <= 0.0 || page <= 0.0 {
             return None;
         }
+        let top = bounds.y() as f64;
         let bottom = top + height;
         // Half-pixel slack absorbs fractional layout rounding.
-        Some(top >= adj.value() - 0.5 && bottom <= adj.value() + adj.page_size() + 0.5)
+        Some(top >= -0.5 && bottom <= page + 0.5)
     }
 
     /// Set the filter as if typed: re-filter, re-select the top match,
