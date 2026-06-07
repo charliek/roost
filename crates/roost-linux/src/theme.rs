@@ -104,77 +104,44 @@ impl Default for Theme {
     }
 }
 
-/// Bundled theme set: name → file contents, embedded via
-/// `include_str!`. New themes can be dropped into the array below;
-/// they're matched case-insensitively in `Theme::load_bundled`.
+/// `(name, include_str!("resources/themes/name"))` — names the theme
+/// once. `$name` must be a literal so `concat!` + `include_str!` resolve
+/// it at compile time.
+macro_rules! bundled_theme {
+    ($name:literal) => {
+        ($name, include_str!(concat!("resources/themes/", $name)))
+    };
+}
+
+/// Bundled theme set: name → file contents, embedded via `include_str!`.
+/// Drop a file into `resources/themes/`, add a `bundled_theme!` line, and
+/// it's matched case-insensitively in `Theme::load_bundled`.
 const BUNDLED_THEMES: &[(&str, &str)] = &[
-    ("roost-dark", include_str!("resources/themes/roost-dark")),
-    (
-        "Atom One Dark",
-        include_str!("resources/themes/Atom One Dark"),
-    ),
-    (
-        "Catppuccin Mocha",
-        include_str!("resources/themes/Catppuccin Mocha"),
-    ),
-    ("Dracula", include_str!("resources/themes/Dracula")),
-    ("Dracula+", include_str!("resources/themes/Dracula+")),
-    (
-        "Gruvbox Dark Hard",
-        include_str!("resources/themes/Gruvbox Dark Hard"),
-    ),
-    ("TokyoNight", include_str!("resources/themes/TokyoNight")),
+    bundled_theme!("roost-dark"),
+    bundled_theme!("Atom One Dark"),
+    bundled_theme!("Catppuccin Mocha"),
+    bundled_theme!("Dracula"),
+    bundled_theme!("Dracula+"),
+    bundled_theme!("Gruvbox Dark Hard"),
+    bundled_theme!("TokyoNight"),
     // Additional Ghostty-format themes (byte-identical to upstream).
-    ("0x96f", include_str!("resources/themes/0x96f")),
-    ("Atom", include_str!("resources/themes/Atom")),
-    (
-        "Atom One Light",
-        include_str!("resources/themes/Atom One Light"),
-    ),
-    ("Ayu Light", include_str!("resources/themes/Ayu Light")),
-    ("Ayu Mirage", include_str!("resources/themes/Ayu Mirage")),
-    ("Nord", include_str!("resources/themes/Nord")),
-    ("Rose Pine", include_str!("resources/themes/Rose Pine")),
-    (
-        "Solarized Dark Patched",
-        include_str!("resources/themes/Solarized Dark Patched"),
-    ),
-    (
-        "Catppuccin Frappe",
-        include_str!("resources/themes/Catppuccin Frappe"),
-    ),
-    (
-        "Catppuccin Macchiato",
-        include_str!("resources/themes/Catppuccin Macchiato"),
-    ),
-    (
-        "TokyoNight Storm",
-        include_str!("resources/themes/TokyoNight Storm"),
-    ),
-    (
-        "TokyoNight Night",
-        include_str!("resources/themes/TokyoNight Night"),
-    ),
-    (
-        "Gruvbox Dark",
-        include_str!("resources/themes/Gruvbox Dark"),
-    ),
-    (
-        "One Half Dark",
-        include_str!("resources/themes/One Half Dark"),
-    ),
-    (
-        "GitHub Dark Default",
-        include_str!("resources/themes/GitHub Dark Default"),
-    ),
-    (
-        "Everforest Dark Hard",
-        include_str!("resources/themes/Everforest Dark Hard"),
-    ),
-    (
-        "Kanagawa Wave",
-        include_str!("resources/themes/Kanagawa Wave"),
-    ),
+    bundled_theme!("0x96f"),
+    bundled_theme!("Atom"),
+    bundled_theme!("Atom One Light"),
+    bundled_theme!("Ayu Light"),
+    bundled_theme!("Ayu Mirage"),
+    bundled_theme!("Nord"),
+    bundled_theme!("Rose Pine"),
+    bundled_theme!("Solarized Dark Patched"),
+    bundled_theme!("Catppuccin Frappe"),
+    bundled_theme!("Catppuccin Macchiato"),
+    bundled_theme!("TokyoNight Storm"),
+    bundled_theme!("TokyoNight Night"),
+    bundled_theme!("Gruvbox Dark"),
+    bundled_theme!("One Half Dark"),
+    bundled_theme!("GitHub Dark Default"),
+    bundled_theme!("Everforest Dark Hard"),
+    bundled_theme!("Kanagawa Wave"),
 ];
 
 /// The standard xterm 256-color palette: 16 ANSI colors (0–15), the
