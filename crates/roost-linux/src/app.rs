@@ -485,6 +485,15 @@ impl App {
             .halign(gtk4::Align::Start)
             .css_classes(["sidebar-section-header"])
             .build();
+        // Opaque header band so the "PROJECTS" label area stays solid when
+        // the sidebar is translucent — mirrors the Mac UI's solid header
+        // (and the footer band below). The band fills the sidebar width;
+        // the label keeps its left alignment inside it.
+        let sidebar_header_band = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["roost-sidebar-header"])
+            .build();
+        sidebar_header_band.append(&sidebar_header);
 
         let sidebar = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Browse)
@@ -498,27 +507,34 @@ impl App {
             .vexpand(true)
             .build();
 
-        // `pill` for the libadwaita rounded-rect look; drop the
-        // `flat` class so the button reads as a discrete affordance
-        // with a visible chip rather than text-only. Renders with the
-        // default libadwaita button background. M9.5.
+        // Flat rounded `.roost-add-project` chip (styled in style.css) to
+        // match the Mac UI's subtle bezel button: a compact, centered chip,
+        // not full-width. No libadwaita `.pill` (its gradient/bevel reads
+        // heavier than the Mac affordance). Sits in an opaque footer band
+        // (below) so the button area stays solid even when the sidebar is
+        // translucent — mirrors the Mac UI's solid footer.
         let new_project_button = gtk4::Button::builder()
-            .label("+ Project")
-            .css_classes(["roost-add-project", "pill"])
-            .margin_top(4)
-            .margin_bottom(8)
-            .margin_start(8)
-            .margin_end(8)
-            .halign(gtk4::Align::Fill)
+            .label("+ New Project")
+            .css_classes(["roost-add-project"])
+            .halign(gtk4::Align::Center)
             .build();
+        let sidebar_footer = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["roost-sidebar-footer"])
+            .build();
+        sidebar_footer.append(&new_project_button);
 
         let sidebar_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .width_request(220)
+            // Min width matches the Mac UI's sidebar floor (160) so the
+            // panel can be dragged narrower; the Paned position below sets
+            // the wider default.
+            .width_request(160)
+            .css_classes(["roost-sidebar"])
             .build();
-        sidebar_box.append(&sidebar_header);
+        sidebar_box.append(&sidebar_header_band);
         sidebar_box.append(&sidebar_scroll);
-        sidebar_box.append(&new_project_button);
+        sidebar_box.append(&sidebar_footer);
         // Restore the persisted sidebar hide/show choice now, before the
         // window maps — synchronous (not in the async `bootstrap`) so the
         // first `window.metrics` query can't race the restore. Nothing
@@ -527,8 +543,14 @@ impl App {
             sidebar_box.set_visible(false);
         }
 
-        // Right pane: a Stack of per-project AdwTabView widgets.
-        let tab_stack = gtk4::Stack::builder().hexpand(true).vexpand(true).build();
+        // Right pane: a Stack of per-project AdwTabView widgets. The
+        // `.roost-tab-stack` class lets style.css re-opaque this pane when
+        // the sidebar is translucent.
+        let tab_stack = gtk4::Stack::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .css_classes(["roost-tab-stack"])
+            .build();
 
         let paned = gtk4::Paned::builder()
             .orientation(gtk4::Orientation::Horizontal)
@@ -548,6 +570,19 @@ impl App {
         outer.append(&header);
         outer.append(&content_overlay);
         window.set_content(Some(&outer));
+
+        // Projects-sidebar translucency: tint only when the display
+        // supports an alpha visual AND a compositor is present. GDK
+        // documents is_rgba()/is_composited() as complementary; Wayland
+        // (the primary target) reports both true. Read once at startup —
+        // no live re-toggle on compositor change. Style lives in the
+        // `.roost-translucent` rules in style.css; absent the class the
+        // stock opaque background stands.
+        let translucent =
+            gtk4::gdk::Display::default().is_some_and(|d| d.is_rgba() && d.is_composited());
+        if translucent {
+            window.add_css_class("roost-translucent");
+        }
 
         // Load + apply user config now so the first TerminalView
         // gets the right theme + font.
@@ -1085,10 +1120,10 @@ impl App {
         let label = gtk4::Label::builder()
             .label(&project.name)
             .halign(gtk4::Align::Start)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(12)
-            .margin_end(12)
+            .margin_top(2)
+            .margin_bottom(2)
+            .margin_start(10)
+            .margin_end(10)
             .build();
         let entry = gtk4::Entry::builder()
             .margin_top(2)
@@ -1099,6 +1134,11 @@ impl App {
         let name_stack = gtk4::Stack::builder()
             .transition_type(gtk4::StackTransitionType::Crossfade)
             .transition_duration(120)
+            // Size to the visible child (the short label), not the tallest
+            // child — otherwise the hidden rename Entry's min-height makes
+            // every row tall. The pill height is then set by the CSS
+            // `min-height` on the row child.
+            .vhomogeneous(false)
             .build();
         name_stack.add_named(&label, Some("label"));
         name_stack.add_named(&entry, Some("entry"));
@@ -4404,11 +4444,12 @@ impl App {
         if n == 0 {
             return;
         }
-        let projects = self.projects.borrow();
-        let mut ids: Vec<i64> = projects.keys().copied().collect();
-        ids.sort();
-        if let Some(&id) = ids.get(n - 1) {
-            drop(projects);
+        // Map Ctrl/Cmd+N to the Nth project in VISUAL (sidebar) order, so it
+        // tracks drag-reorder. Previously this sorted the project ids, which
+        // ignored reordering — after dragging a row, Ctrl+N still picked the
+        // id-sorted Nth project, not the one at the Nth visible position.
+        let order = self.sidebar_order();
+        if let Some(&id) = order.get(n - 1) {
             self.set_active_project(id);
         }
     }

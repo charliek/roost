@@ -4,17 +4,66 @@
  * Keep this small — every rule is a surface that can fight a future
  * libadwaita restyle. */
 
-/* Sidebar selection: libadwaita's default selection is faint; promote
- * it to the accent color so the active project clearly pops. */
-listbox.navigation-sidebar > row:selected {
-  background: @accent_bg_color;
-  color: @accent_fg_color;
+/* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
+ * (the name Stack), inset ~6px/1px to match the Mac UI's
+ * `bounds.insetBy(dx:6, dy:1)` + 6px-radius pill. Drawing on the child
+ * (not the row) keeps the row's leading `box-shadow` rollup stripe at the
+ * TRUE left edge — the stripe must not inset with the pill. Fill is
+ * HARDCODED #12509d (not @accent_bg_color): the host accent isn't always
+ * blue and libadwaita dims it under :backdrop, but the Mac pill is a
+ * constant vivid blue regardless of window focus, so we pin it.
+ *
+ * The CSS node for GtkListBox is `list` (not `listbox`), so every sidebar
+ * rule targets the `.navigation-sidebar` style class directly rather than
+ * an element prefix that wouldn't match. */
+/* Flatten libadwaita's own row chrome: it gives the row a border-radius
+ * (which would round the inset box-shadow rollup stripe into a curve) and
+ * a horizontal margin (which would push the stripe off the true left
+ * edge). Zero both so the stripe is a straight bar flush to the edge; the
+ * rounded selection comes from the child pill below, not the row. */
+.navigation-sidebar > row {
+  border-radius: 0;
+  margin-left: 0;
+  margin-right: 0;
+  /* Drop libadwaita's tall row min-height; the pill (child) sets the
+   * height below so rows are compact like the Mac sidebar. */
+  min-height: 0;
 }
-listbox.navigation-sidebar > row:selected:hover {
-  background: shade(@accent_bg_color, 1.05);
+.navigation-sidebar > row > * {
+  border-radius: 6px;
+  margin: 1px 6px;
+  min-height: 28px;
 }
-listbox.navigation-sidebar > row:hover:not(:selected) {
-  background: alpha(currentColor, 0.06);
+.navigation-sidebar > row:selected,
+.navigation-sidebar > row:selected:backdrop {
+  background: transparent;
+}
+.navigation-sidebar > row:selected > *,
+.navigation-sidebar > row:selected:backdrop > * {
+  background-color: #12509d;
+}
+.navigation-sidebar > row:selected:hover > * {
+  background-color: shade(#12509d, 1.08);
+}
+/* Clear the row-level hover too, so libadwaita's full-width hover tint
+ * doesn't bleed outside the inset pill; the hover fill goes on the child. */
+.navigation-sidebar > row:hover:not(:selected) {
+  background: transparent;
+}
+.navigation-sidebar > row:hover:not(:selected) > * {
+  background-color: alpha(currentColor, 0.06);
+}
+/* Row label tone + weight: Mac uses NSColor(white:0.82)=#d1d1d1 unselected,
+ * white when selected, in a semibold-ish face so the names read with weight
+ * like the Mac sidebar. Near-default size so the text fills the pill rather
+ * than leaving padding. */
+.navigation-sidebar > row label {
+  color: #d1d1d1;
+  font-size: 1em;
+  font-weight: bold;
+}
+.navigation-sidebar > row:selected label {
+  color: #ffffff;
 }
 
 /* Tab bar: subtle accent tint on the checked tab. Only restyle the
@@ -23,14 +72,57 @@ tabbar tab:checked {
   background: alpha(@accent_bg_color, 0.18);
 }
 
-/* Sidebar section header above the project list. */
+/* Sidebar section header above the project list. Brighter + bolder to
+ * match the Mac UI (~11pt semibold, near-full-opacity white) rather than
+ * the old faint micro-caps. */
 .sidebar-section-header {
   padding: 8px 12px 4px;
-  font-size: 0.78em;
+  font-size: 0.9em;
   font-weight: bold;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
-  opacity: 0.55;
+  opacity: 0.6;
+}
+
+/* "+ New Project" footer button: a subtle Mac-style flat rounded chip.
+ * The `.pill` class is dropped in app.rs; style `.roost-add-project`
+ * directly. background-image:none + box-shadow:none strip libadwaita's
+ * gradient + bevel so it reads flat like the AppKit button. */
+button.roost-add-project {
+  background-image: none;
+  background-color: alpha(#ffffff, 0.10);
+  border: 1px solid alpha(#ffffff, 0.12);
+  border-radius: 6px;
+  box-shadow: none;
+  color: #ffffff;
+  font-weight: bold;
+  font-size: 1em;
+  padding: 3px 16px;
+  /* Drop libadwaita's tall button min-height so the padding sets the
+   * height — a compact chip like the Mac button. */
+  min-height: 0;
+}
+button.roost-add-project:hover {
+  background-color: alpha(#ffffff, 0.12);
+}
+button.roost-add-project:active {
+  background-color: alpha(#ffffff, 0.16);
+}
+
+/* Opaque header band behind the "PROJECTS" label, symmetric with the
+ * footer — keeps the top of the sidebar solid (like the Mac UI) instead of
+ * letting the translucent tint show through behind the label. */
+.roost-sidebar-header {
+  background-color: #1e1e1e;
+}
+
+/* Footer band holding the "+ New Project" button — a solid strip with a
+ * hairline top separator, mirroring the Mac UI's footer. Stays opaque even
+ * when the sidebar is translucent, so the button never sits over glass. */
+.roost-sidebar-footer {
+  background-color: #1e1e1e;
+  border-top: 1px solid alpha(#ffffff, 0.06);
+  padding: 8px;
 }
 
 /* Project row agent-state rollup: a 3px left-edge stripe coloured by
@@ -46,13 +138,13 @@ tabbar tab:checked {
  * Colors mirror the per-tab indicator SVGs. Hard-coded rather than
  * @accent_bg_color etc. because the indicator meaning is semantic,
  * not theme-dependent. */
-listbox.navigation-sidebar > row.roost-rollup-running {
+.navigation-sidebar > row.roost-rollup-running {
   box-shadow: inset 3px 0 0 #5fa3f0;
 }
-listbox.navigation-sidebar > row.roost-rollup-needs-input {
+.navigation-sidebar > row.roost-rollup-needs-input {
   box-shadow: inset 3px 0 0 #f0a040;
 }
-listbox.navigation-sidebar > row.roost-rollup-idle {
+.navigation-sidebar > row.roost-rollup-idle {
   box-shadow: inset 3px 0 0 #7a7a7a;
 }
 
@@ -141,3 +233,49 @@ listbox.navigation-sidebar > row.roost-rollup-idle {
  * variants of background, box-shadow, outline) but did not render
  * reliably during a drag; the opacity API takes a different code
  * path and applies cleanly. */
+
+/* Projects-sidebar translucency (Mac behind-window vibrancy analog).
+ * Toggled by the `.roost-translucent` class added to the window in
+ * App::new only when the display supports RGBA + compositing
+ * (`is_rgba() && is_composited()`); otherwise no class is added and the
+ * stock opaque libadwaita background stands. Real compositor blur is not
+ * client-controllable on GNOME/COSMIC today, so this is an alpha tint,
+ * not frosted glass.
+ *
+ * ONLY the sidebar column carries alpha. Everything else is explicitly
+ * re-opaqued at a single base color (#1e1e1e, the roost-dark terminal
+ * background) so the right-pane seam is invisible. `roostctl screenshot`
+ * renders the window backing opaque, so this can only be verified with a
+ * real compositor grab (cosmic-screenshot / grim). */
+window.roost-translucent {
+  background-color: transparent;
+}
+window.roost-translucent box.roost-sidebar {
+  background-color: alpha(#1e1e1e, 0.95);
+}
+/* Every node stacked on the tint must be transparent or its opaque
+ * view background hides the tint — including the viewport a
+ * GtkScrolledWindow may insert. */
+window.roost-translucent box.roost-sidebar scrolledwindow,
+window.roost-translucent box.roost-sidebar viewport,
+window.roost-translucent box.roost-sidebar .navigation-sidebar,
+window.roost-translucent box.roost-sidebar list {
+  background-color: transparent;
+  background-image: none;
+}
+window.roost-translucent overlay,
+window.roost-translucent paned {
+  background-color: transparent;
+}
+/* Keep the chrome + right pane fully OPAQUE. */
+window.roost-translucent headerbar {
+  background-color: #1e1e1e;
+}
+window.roost-translucent paned > separator {
+  background-color: #1e1e1e;
+}
+window.roost-translucent .roost-tab-stack,
+window.roost-translucent .roost-tab-stack tabview,
+window.roost-translucent .roost-tab-stack tabbar {
+  background-color: #1e1e1e;
+}
