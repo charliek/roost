@@ -31,7 +31,7 @@ If the target tab *is* the currently focused one and the window is active, the b
 
 Pending notifications are also a navigable list, so you can jump straight to what needs attention instead of hunting through the sidebar:
 
-- **Jump to unread** (`Cmd-Shift-U` / `Ctrl-Shift-U`) focuses the next tab with a pending notification — the active project first, then the others. Focusing the tab clears its badge, so repeating the shortcut walks through everything pending.
+- **Jump to unread** (`Cmd-Shift-U` / `Alt-Shift-U`) focuses the next tab with a pending notification — the active project first, then the others. Focusing the tab clears its badge, so repeating the shortcut walks through everything pending.
 - **The notification inbox** is the command palette's **View Notifications** entry: one row per pending tab, labeled `<project> · <tab>` with the message body. Activating a row jumps to that tab and clears it.
 - **Clear All Notifications** (also in the command palette) empties the inbox and drops every pending badge at once.
 

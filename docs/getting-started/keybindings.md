@@ -1,6 +1,8 @@
 # Keybindings
 
-Roost uses platform-native modifiers: **Cmd** on macOS, **Ctrl** plus **Alt** on Linux. The same actions are available on both platforms — only the modifier differs.
+Roost uses platform-native modifiers: **Cmd** on macOS. On **Linux**, **Alt** is the app modifier (the role Cmd plays on macOS), leaving **Ctrl** to the shell — the only `Ctrl` defaults are `Ctrl-1`…`Ctrl-9` (switch tab) and `Ctrl-Shift-C` / `Ctrl-Shift-V` (copy/paste). The same actions are available on both platforms — only the modifier differs.
+
+Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-keybindings)) — e.g. `keybind = ctrl+t = new_tab` restores the pre-Alt `Alt-T` chord.
 
 ## macOS
 
@@ -61,11 +63,11 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Ctrl-T`         | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)) |
-| `Ctrl-W`         | Close the active tab                            |
+| `Alt-T`         | New tab (opens in the active tab's live cwd — see [cwd tracking](../guides/cwd-tracking.md)) |
+| `Alt-W`         | Close the active tab                            |
 | `Alt-R`          | Rename the active tab                           |
-| `Ctrl-Shift-]`   | Cycle to the next tab (stops at the last tab; no wrap-around) |
-| `Ctrl-Shift-[`   | Cycle to the previous tab (stops at the first tab; no wrap-around) |
+| `Alt-Shift-]`   | Cycle to the next tab (stops at the last tab; no wrap-around) |
+| `Alt-Shift-[`   | Cycle to the previous tab (stops at the first tab; no wrap-around) |
 | `Ctrl-1` … `Ctrl-9` | Switch to tab at position 1 .. 9             |
 
 ### Project management
@@ -76,7 +78,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
-| `Ctrl-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
+| `Alt-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
 
 ### Commands
@@ -103,9 +105,9 @@ Bare `Ctrl-C` is left as SIGINT — it's not overloaded for copy. Copying (or si
 
 | Shortcut         | Action                                          |
 |------------------|-------------------------------------------------|
-| `Ctrl-+` / `Ctrl-=` | Increase font size for the active tab        |
-| `Ctrl--`         | Decrease font size for the active tab           |
-| `Ctrl-0`         | Reset font size to the `font_size` from config  |
+| `Alt-+` / `Alt-=` | Increase font size for the active tab          |
+| `Alt--`          | Decrease font size for the active tab           |
+| `Alt-0`          | Reset font size to the `font_size` from config  |
 
 Font size adjustments are per-tab and held in memory only. They do not persist across restarts, and new tabs always start at `font_size` from `config.conf`. The size is clamped to 6 .. 72 points; out-of-range steps saturate.
 
@@ -129,7 +131,7 @@ Anything not bound as an app shortcut flows to the focused terminal through libg
 
 ## How the shortcut controller is wired
 
-Shortcuts run in GTK's *capture* phase, which means they fire before the focused widget — including the terminal surface — sees the event. That's why `Cmd-T` (or `Ctrl-T` on Linux) works while the terminal is focused: the window's controller catches it first and dispatches the action, and the keystroke never reaches the shell. Anything not bound at the window level falls through to the terminal as usual.
+Shortcuts run in GTK's *capture* phase, which means they fire before the focused widget — including the terminal surface — sees the event. That's why `Cmd-T` (or `Alt-T` on Linux) works while the terminal is focused: the window's controller catches it first and dispatches the action, and the keystroke never reaches the shell. Anything not bound at the window level falls through to the terminal as usual.
 
 The terminal's own key controller is also in capture phase — that's what stops GTK's default focus-traversal from consuming Tab and Shift-Tab before the shell (or Claude Code) sees them.
 
@@ -153,7 +155,7 @@ Pressing any input-producing key when the viewport is scrolled back snaps the vi
 
 The sidebar still supports mouse-driven rename: double-click a project row to rename it inline, or right-click for a Rename / Close menu.
 
-If you close the last tab in a project, Roost closes that project too. The "Are you sure?" confirmation dialog only appears for explicit close-project actions (the sidebar X button or the right-click menu); `Cmd-W` / `Ctrl-W` on the final tab closes the project silently.
+If you close the last tab in a project, Roost closes that project too. The "Are you sure?" confirmation dialog only appears for explicit close-project actions (the sidebar X button or the right-click menu); `Cmd-W` / `Alt-W` on the final tab closes the project silently.
 
 Tab titles set via `Cmd-R` / `Alt-R` are persisted and locked: subsequent OSC 1/2 escapes from the shell (`\e]2;new-title\a`, common in shell prompts) are silently ignored on a renamed tab. The same lock applies to titles set via `roostctl set-title --tab <id> --title "..."`. v1 has no in-app way to clear the lock; renaming again with `Cmd-R` / `Alt-R` updates the displayed label but the lock stays on. To revert to shell-driven titles, delete and recreate the tab.
 
@@ -199,26 +201,26 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 
 | Action                | Default (macOS / Linux)                                |
 |-----------------------|--------------------------------------------------------|
-| `new_tab`             | `super+t` / `ctrl+t`                                   |
-| `close_tab`           | `super+w` / `ctrl+w`                                   |
+| `new_tab`             | `super+t` / `alt+t`                                    |
+| `close_tab`           | `super+w` / `alt+w`                                    |
 | `rename_tab`          | `super+r` / `alt+r`                                    |
-| `cycle_tab_prev`      | `super+shift+bracketleft` / `ctrl+shift+bracketleft`   |
-| `cycle_tab_next`      | `super+shift+bracketright` / `ctrl+shift+bracketright` |
+| `cycle_tab_prev`      | `super+shift+bracketleft` / `alt+shift+bracketleft`   |
+| `cycle_tab_next`      | `super+shift+bracketright` / `alt+shift+bracketright` |
 | `paste`               | `super+v`, `ctrl+shift+v` / `alt+v`, `ctrl+shift+v`    |
 | `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
 | `new_project`         | `super+n` / `alt+n`                                    |
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
 | `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |
-| `jump_to_unread`      | `super+shift+u` / `ctrl+shift+u`                       |
+| `jump_to_unread`      | `super+shift+u` / `alt+shift+u`                        |
 | `command_palette`     | `super+shift+p` / `alt+shift+p`                        |
 | `command_launcher`    | `super+shift+t` / `alt+shift+t`                        |
 | `custom_palette`      | `super+shift+e` / `alt+shift+e`                        |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
-| `font_increase`       | `super+plus`, `super+equal` / `ctrl+plus`, `ctrl+equal` |
-| `font_decrease`       | `super+minus` / `ctrl+minus`                           |
-| `font_reset`          | `super+0` / `ctrl+0`                                   |
+| `font_increase`       | `super+plus`, `super+equal` / `alt+plus`, `alt+equal`  |
+| `font_decrease`       | `super+minus` / `alt+minus`                            |
+| `font_reset`          | `super+0` / `alt+0`                                    |
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 

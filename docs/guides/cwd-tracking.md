@@ -2,13 +2,13 @@
 
 Three places in Roost care what directory a tab is "in":
 
-- the cwd a new tab inherits on `Ctrl-T` / `Cmd-T` (and the command launcher),
+- the cwd a new tab inherits on `Alt-T` / `Cmd-T` (and the command launcher),
 - the header subtitle under the project name,
 - the tab label (until you rename the tab or the running program sets its own title).
 
 ## What works out of the box
 
-**New tabs open where you are.** On `Ctrl-T` / `Cmd-T`, Roost reads the active
+**New tabs open where you are.** On `Alt-T` / `Cmd-T`, Roost reads the active
 tab's shell working directory directly — natively, via `proc_pidinfo` on macOS
 and `/proc/<pid>/cwd` on Linux — and spawns the new tab there. No shell
 configuration required; works for any shell, including stock `/bin/bash`.

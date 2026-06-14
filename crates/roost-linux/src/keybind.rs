@@ -1,10 +1,11 @@
 //! Keybind trigger parser + default action table.
 //!
 //! Mirrors `mac/Sources/Roost/Keybind.swift` (Phase 6 P1) in shape.
-//! Defaults flip Linux's primary modifier to `ctrl` (Mac uses
-//! `super`/`cmd`); everything else — modifier-alias rules, `unbind`
-//! semantics, action namespace — is shared with the Mac UI so config
-//! files apply verbatim across both UIs.
+//! Defaults use `alt` as Linux's app modifier (Mac uses `super`/`cmd`);
+//! `ctrl` is left to the shell apart from `Ctrl+1‑9` (switch_tab) and
+//! the `Ctrl+Shift+C/V` copy/paste alternates. Everything else —
+//! modifier-alias rules, `unbind` semantics, action namespace — is
+//! shared with the Mac UI so config files apply verbatim across both UIs.
 
 use std::collections::HashMap;
 
@@ -171,7 +172,12 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
 
 /// Default bindings table — host-platform aware:
 ///
-/// * Linux: `primary = ctrl`, `projectMod = alt`, `clipboardMod = alt`.
+/// * Linux: `primary = projectMod = clipboardMod = alt`. `Alt` is the
+///   single app modifier (the role `super`/Cmd plays on macOS), leaving
+///   `Ctrl` to the shell/readline. The only `Ctrl` defaults are
+///   `Ctrl+1‑9` (switch_tab, hardcoded below so it stays distinct from
+///   `Alt+1‑9` switch_project) and the `Ctrl+Shift+C/V` copy/paste
+///   alternates.
 /// * macOS: `primary = super` (Cmd), `projectMod = super`,
 ///   `clipboardMod = super`.
 ///
@@ -184,7 +190,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
     let (primary, project_mod, clipboard_mod) = if cfg!(target_os = "macos") {
         ("super", "super", "super")
     } else {
-        ("ctrl", "alt", "alt")
+        ("alt", "alt", "alt")
     };
 
     let mut out = Vec::new();
@@ -220,7 +226,7 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::CloseProject,
     );
     // Jump to the next unread notification. `primary+shift+u`
-    // (Cmd+Shift+U on macOS-GTK, Ctrl+Shift+U on Linux) — parity with
+    // (Cmd+Shift+U on macOS-GTK, Alt+Shift+U on Linux) — parity with
     // the Mac UI's `jump_to_unread`.
     add(
         &mut out,
@@ -478,11 +484,11 @@ mod tests {
             defaults.get(&close_project_trigger),
             Some(&KeybindAction::CloseProject)
         );
-        // JumpToUnread → primary+shift+u (Cmd/Ctrl+Shift+U), Mac parity.
+        // JumpToUnread → primary+shift+u (Cmd/Alt+Shift+U), Mac parity.
         let jump_trigger = if cfg!(target_os = "macos") {
             parse_trigger("super+shift+u").unwrap()
         } else {
-            parse_trigger("ctrl+shift+u").unwrap()
+            parse_trigger("alt+shift+u").unwrap()
         };
         assert_eq!(
             defaults.get(&jump_trigger),
@@ -555,23 +561,62 @@ mod tests {
     #[test]
     fn default_bindings_primary_modifier_is_host_appropriate() {
         let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
-        // NewTab lives on `primary+t` — `ctrl+t` on Linux,
+        // NewTab lives on `primary+t` — `alt+t` on Linux,
         // `super+t` (Cmd+T) on macOS. Pins the host-detect logic so
         // a refactor of `default_bindings` can't silently flip
         // platforms.
         let expected_new_tab = if cfg!(target_os = "macos") {
             "super+t"
         } else {
-            "ctrl+t"
+            "alt+t"
         };
         let trigger = parse_trigger(expected_new_tab).unwrap();
         assert_eq!(defaults.get(&trigger), Some(&KeybindAction::NewTab));
     }
 
     #[test]
+    fn cycle_tab_defaults_are_host_appropriate() {
+        // The tab-cycle chord moved to `primary+shift+bracket{left,right}`
+        // — `Alt+Shift+[`/`]` on Linux, `Cmd+Shift+[`/`]` on macOS. Pins
+        // it so a refactor can't silently send these back to Ctrl (the
+        // pre-Alt-scheme Linux default) where they'd leak `Meta-{` to the
+        // shell instead of switching tabs.
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        let (prev, next) = if cfg!(target_os = "macos") {
+            ("super+shift+bracketleft", "super+shift+bracketright")
+        } else {
+            ("alt+shift+bracketleft", "alt+shift+bracketright")
+        };
+        assert_eq!(
+            defaults.get(&parse_trigger(prev).unwrap()),
+            Some(&KeybindAction::CycleTabPrev)
+        );
+        assert_eq!(
+            defaults.get(&parse_trigger(next).unwrap()),
+            Some(&KeybindAction::CycleTabNext)
+        );
+    }
+
+    #[test]
+    fn default_bindings_have_no_duplicate_accels() {
+        // The Linux defaults now all share one modifier (Alt, mirroring
+        // Mac's all-super), so a future edit could silently map two
+        // actions onto the same Accel — `into_iter().collect()` into the
+        // HashMap would drop one without warning. Guard against it.
+        let defaults = default_bindings();
+        let mut seen = std::collections::HashSet::new();
+        for (accel, action) in &defaults {
+            assert!(
+                seen.insert(accel.clone()),
+                "duplicate default binding for {accel:?} (action {action:?})"
+            );
+        }
+    }
+
+    #[test]
     fn user_override_replaces_default() {
         // Use a trigger the host-detect defaults won't already claim.
-        // On Linux `ctrl+t` is now the NewTab default; on macOS
+        // On Linux `alt+t` is now the NewTab default; on macOS
         // `super+t` is. `ctrl+shift+alt+t` is guaranteed unbound on
         // both, so a user adding it as `new_tab` should appear in
         // the canonicalized map alongside the platform default.
@@ -588,7 +633,7 @@ mod tests {
         let platform_default = if cfg!(target_os = "macos") {
             "super+t"
         } else {
-            "ctrl+t"
+            "alt+t"
         };
         assert_eq!(
             map.get(&parse_trigger(platform_default).unwrap()),
@@ -603,7 +648,7 @@ mod tests {
         let platform_default = if cfg!(target_os = "macos") {
             "super+t"
         } else {
-            "ctrl+t"
+            "alt+t"
         };
         let user = vec![(platform_default.into(), "unbind".into())];
         let map = canonicalize_bindings(defaults, user, |_| {});

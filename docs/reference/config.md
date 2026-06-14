@@ -158,6 +158,8 @@ copy-on-select = true
 # tmux set-clipboard, etc.). Set `deny` to opt out.
 clipboard-write = allow
 
+# Add a custom trigger (here, restoring the pre-Alt Ctrl+T for new_tab
+# on Linux — the default is now Alt+T). See docs/getting-started/keybindings.md.
 keybind = ctrl+t = new_tab
 
 # A fixed launcher command (⌘⇧T / Alt+Shift+T):
