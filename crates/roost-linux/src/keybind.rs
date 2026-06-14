@@ -1,10 +1,11 @@
 //! Keybind trigger parser + default action table.
 //!
 //! Mirrors `mac/Sources/Roost/Keybind.swift` (Phase 6 P1) in shape.
-//! Defaults flip Linux's primary modifier to `ctrl` (Mac uses
-//! `super`/`cmd`); everything else — modifier-alias rules, `unbind`
-//! semantics, action namespace — is shared with the Mac UI so config
-//! files apply verbatim across both UIs.
+//! Defaults use `alt` as Linux's app modifier (Mac uses `super`/`cmd`);
+//! `ctrl` is left to the shell apart from `Ctrl+1‑9` (switch_tab) and
+//! the `Ctrl+Shift+C/V` copy/paste alternates. Everything else —
+//! modifier-alias rules, `unbind` semantics, action namespace — is
+//! shared with the Mac UI so config files apply verbatim across both UIs.
 
 use std::collections::HashMap;
 
