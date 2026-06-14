@@ -9,6 +9,21 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## [Unreleased]
+
+### Changed
+
+- **Linux default keybindings are now Alt-centric** — on Linux, `Alt` is the
+  single app modifier (the role Cmd plays on macOS), leaving `Ctrl` to the
+  shell. Moved: `new_tab` `Ctrl+T` → `Alt+T`, `close_tab` `Ctrl+W` → `Alt+W`,
+  tab cycle `Ctrl+Shift+[`/`]` → `Alt+Shift+[`/`]`, `jump_to_unread`
+  `Ctrl+Shift+U` → `Alt+Shift+U`, and font zoom `Ctrl+±`/`Ctrl+0` →
+  `Alt+±`/`Alt+0`. Unchanged: `Ctrl+1‑9` (switch tab) and the
+  `Ctrl+Shift+C`/`V` copy/paste alternates stay on `Ctrl`; all project,
+  palette, and clipboard actions were already on `Alt`. Every binding is
+  overridable — restore a prior chord via config, e.g.
+  `keybind = ctrl+t = new_tab`.
+
 ## v0.0.11 — 2026-06-07
 
 Theme expansion and a big internal cleanup. The bundled theme set doubles to 24,

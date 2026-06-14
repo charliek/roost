@@ -14,7 +14,7 @@ font_feature = -calt
 | Key                | Default                                   | Effect                                                                                  |
 |--------------------|-------------------------------------------|-----------------------------------------------------------------------------------------|
 | `font_family`      | `JetBrains Mono, Monaco, monospace`       | Comma-separated family list. The first installed family wins. The fallback chain matters because Pango's macOS fallback is unreliable when the head of the list is missing. On Linux, if the *primary* (first) family is not installed, Roost logs a one-time warning at startup and falls back to the `Monospace` generic — cell alignment is preserved, but install the family (or reorder the list) to silence it. |
-| `font_size`        | `12`                                      | Point size. Adjustable per-tab at runtime via `Cmd-+` / `Cmd--` (`Ctrl-+` / `Ctrl--` on Linux). |
+| `font_size`        | `12`                                      | Point size. Adjustable per-tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
 | `font_family_bold` | (inherits `font_family`)                  | Override family used for bold text. Useful when pairing fonts (e.g. Iosevka regular + Berkeley Mono Bold). When unset, Pango synthesizes bold from the regular family. |
 | `font_feature`     | (none)                                    | OpenType feature tag. Repeatable: each line appends one entry. Joined with commas at render time. |
 | `hint_metrics`     | `on`                                      | One of `on`, `off`, `default`. Snaps glyph advance widths to integer pixels. Keep `on` for monospace crispness — without it, cells look soft. |
