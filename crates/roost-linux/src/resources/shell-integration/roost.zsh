@@ -12,7 +12,7 @@
 # Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
 # disables): cwd, title, marks, prompt, ssh-env.
 #
-# `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"`
+# `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`
 # to every `ssh` invocation so modern TUIs (opencode, neovim with
 # truecolor themes) render correctly on remote hosts. Equivalent to
 # Ghostty's `shell-integration-features.ssh-env`. Requires the remote
@@ -52,7 +52,7 @@ _roost_feature() {
 if _roost_feature ssh-env; then
   function ssh {
     builtin command ssh \
-      -o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION" \
+      -o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK" \
       "$@"
   }
 fi

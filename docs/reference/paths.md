@@ -138,6 +138,7 @@ rc — see [Feature flags](../guides/cwd-tracking.md#feature-flags)).
 | `COLORTERM`            | `truecolor`       | Signals 24-bit color support to modern TUIs (opencode, neovim, lazygit). Stripped at the SSH boundary unless [`ssh-env`](../guides/cwd-tracking.md#feature-flags) wraps `ssh` to forward it. |
 | `TERM_PROGRAM`         | `Roost`           | Lets remote tools detect they're running inside Roost.                   |
 | `TERM_PROGRAM_VERSION` | bundle short version | Same use case; tracks the running Roost build.                       |
+| `FORCE_HYPERLINK`      | `1`               | Advertises OSC 8 hyperlink support. CLIs that gate on the `supports-hyperlinks` library (Claude Code, anything on chalk/terminal-link) only allowlist known terminals by `TERM_PROGRAM`, and `Roost` isn't one — without this they emit plain text instead of clickable links (e.g. Claude Code's footer `PR #N`). Roost renders + opens OSC 8 links (Cmd/Ctrl-click), so the override is honest. Forwarded over SSH via [`ssh-env`](../guides/cwd-tracking.md#feature-flags). |
 
 ### Tab identity + IPC routing
 
@@ -172,8 +173,8 @@ only forwards `LANG LC_*` over `ssh` — `COLORTERM` (and
 `TERM_PROGRAM` / `TERM_PROGRAM_VERSION`) silently drop, so modern TUIs
 on the remote host fall back to 256-color rendering. The `ssh-env`
 feature (default on) defines an `ssh` shell function that adds
-`-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"` to every
-invocation. The remote host has to *accept* the forwarded vars
+`-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"` to
+every invocation. The remote host has to *accept* the forwarded vars
 (`sshd_config::AcceptEnv`); Debian/Ubuntu defaults only accept
 `LANG LC_*`, so the server-side setting often needs updating too.
 See [Feature flags](../guides/cwd-tracking.md#feature-flags) for the

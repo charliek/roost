@@ -140,8 +140,8 @@ it. Default: `cwd,title,marks,prompt,ssh-env`.
 - `marks` — emit OSC 133 command marks (these drive the tab's run-state dot).
 - `prompt` — set a default prompt (only when you haven't set one).
 - `ssh-env` — wrap `ssh` so it adds
-  `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION"` to every
-  invocation. Without this, macOS's default `ssh_config` only forwards
+  `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`
+  to every invocation. Without this, macOS's default `ssh_config` only forwards
   `LANG LC_*` — `COLORTERM` is silently dropped at the SSH boundary
   and modern TUIs (opencode, neovim with truecolor themes) fall back
   to 256-color and look washed out on the remote host. Equivalent to
@@ -172,6 +172,7 @@ Every shell Roost spawns sees:
 | `TERM_PROGRAM`            | `Roost` (plus `TERM_PROGRAM_VERSION`)                                         |
 | `TERM`                    | `xterm-256color`                                                              |
 | `COLORTERM`               | `truecolor` — signals 24-bit color to TUIs (forwarded over SSH via `ssh-env`) |
+| `FORCE_HYPERLINK`         | `1` — advertises OSC 8 hyperlink support so `supports-hyperlinks`-gated CLIs (Claude Code et al.) emit clickable links (forwarded over SSH via `ssh-env`) |
 
 You don't have to set `ROOST_SOCKET`, `ROOST_TAB_ID`, or `ROOST_RESOURCES_DIR` —
 Roost injects them. The full authoritative table is in

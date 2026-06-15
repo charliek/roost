@@ -92,6 +92,13 @@ async fn pty_injects_roost_env_vars() {
         text.contains("ROOST_SOCKET=/tmp/roost-pty-env.sock"),
         "expected ROOST_SOCKET in env, got:\n{text}"
     );
+    // Advertise OSC 8 hyperlink support so `supports-hyperlinks`-gated
+    // CLIs (Claude Code et al.) emit clickable links instead of plain
+    // text — "Roost" isn't on their TERM_PROGRAM allowlist.
+    assert!(
+        text.contains("FORCE_HYPERLINK=1"),
+        "expected FORCE_HYPERLINK=1 in env, got:\n{text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
