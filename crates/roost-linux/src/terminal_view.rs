@@ -2591,10 +2591,9 @@ where
 /// "held". `super`/Cmd maps to BOTH `SUPER_MASK` and `META_MASK`: GTK's
 /// macOS backend reports the Command key as Meta (the keybind layer maps
 /// `super` → `<Meta>`), while X11/Wayland report a bound Super key as
-/// Super — accept either. A multi-bit or empty `AccelMods` (never
-/// produced by `parse_link_modifier`) falls back to Ctrl so the link
-/// gesture stays reachable. Free fn (not a method) so it unit-tests
-/// without a `TerminalViewState`.
+/// Super — accept either. Callers only ever pass a single-flag modifier
+/// (`parse_link_modifier` / `default_link_modifier`). Free fn (not a
+/// method) so it unit-tests without a `TerminalViewState`.
 fn link_modifier_mask(m: AccelMods) -> gtk4::gdk::ModifierType {
     use gtk4::gdk::ModifierType as M;
     let mut set = M::empty();
@@ -2606,9 +2605,6 @@ fn link_modifier_mask(m: AccelMods) -> gtk4::gdk::ModifierType {
     }
     if m.contains(AccelMods::SUPER) {
         set |= M::SUPER_MASK | M::META_MASK;
-    }
-    if set.is_empty() {
-        set = M::CONTROL_MASK;
     }
     set
 }

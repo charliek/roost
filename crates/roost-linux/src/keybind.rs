@@ -140,6 +140,21 @@ bitflags::bitflags! {
     }
 }
 
+/// Map a single modifier token (one `+`-separated segment) to its flag,
+/// or `None` for a non-modifier token (a key name, or invalid input).
+/// The accepted spellings live here once so `parse_trigger` and
+/// `parse_link_modifier` can't drift. `meta` is an alias for `super`
+/// (same physical key; GTK's macOS backend reports Cmd as Meta).
+fn parse_modifier_token(token: &str) -> Option<AccelMods> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "shift" => Some(AccelMods::SHIFT),
+        "ctrl" | "control" => Some(AccelMods::CTRL),
+        "alt" | "opt" | "option" => Some(AccelMods::ALT),
+        "super" | "cmd" | "command" | "meta" => Some(AccelMods::SUPER),
+        _ => None,
+    }
+}
+
 /// Parse a Ghostty-style trigger ("ctrl+shift+t", "alt+1") into an
 /// [`Accel`]. Returns `None` for unparseable input so the canonicalizer
 /// can warn + fall through to the default.
@@ -155,12 +170,9 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
         if part.is_empty() {
             return None;
         }
-        match part.to_ascii_lowercase().as_str() {
-            "shift" => mods |= AccelMods::SHIFT,
-            "ctrl" | "control" => mods |= AccelMods::CTRL,
-            "alt" | "opt" | "option" => mods |= AccelMods::ALT,
-            "super" | "cmd" | "command" => mods |= AccelMods::SUPER,
-            _ => last = Some(part),
+        match parse_modifier_token(part) {
+            Some(m) => mods |= m,
+            None => last = Some(part),
         }
     }
     let key = last?.to_ascii_lowercase();
@@ -193,16 +205,15 @@ pub fn default_link_modifier() -> AccelMods {
     }
 }
 
-/// Parse a `link-modifier` config value into a single modifier flag.
-/// Accepts the same spellings as [`parse_trigger`]'s modifier tokens
-/// (`ctrl`/`control`, `alt`/`opt`/`option`, `super`/`cmd`/`command`/
-/// `meta`). Returns `None` for anything else so the caller can warn and
-/// keep [`default_link_modifier`].
+/// Parse a `link-modifier` config value into a single modifier flag,
+/// sharing [`parse_modifier_token`]'s spellings (`ctrl`, `alt`,
+/// `super`/`cmd`/`command`/`meta`). `shift` is a valid keybind modifier
+/// but not a sensible link modifier, so it's rejected; everything else
+/// unrecognized returns `None` so the caller can warn and keep
+/// [`default_link_modifier`].
 pub fn parse_link_modifier(value: &str) -> Option<AccelMods> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "ctrl" | "control" => Some(AccelMods::CTRL),
-        "alt" | "opt" | "option" => Some(AccelMods::ALT),
-        "super" | "cmd" | "command" | "meta" => Some(AccelMods::SUPER),
+    match parse_modifier_token(value) {
+        Some(m) if m != AccelMods::SHIFT => Some(m),
         _ => None,
     }
 }
