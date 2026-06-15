@@ -1,7 +1,8 @@
 # Roost
 
-A macOS + Linux desktop terminal multiplexer for AI coding agents. Sidebar of
-projects on the left, tabs per project, one libghostty-vt terminal per tab. The
+A macOS + Linux desktop terminal multiplexer for AI coding agents (Claude Code,
+Codex, and the like). Sidebar of projects on the left, tabs per project, one
+libghostty-vt terminal per tab. The
 `roostctl` companion CLI surfaces notifications when an agent in a tab needs
 attention.
 
