@@ -107,7 +107,7 @@ handles + `vt_write` calls are also main-thread-only.
   AppKit; it signals completion back through the same AsyncStream
   bridge.
 * Env: `ROOST_TAB_ID` + `ROOST_SOCKET` + `TERM` + `COLORTERM=
-  truecolor` injected before execve.
+  truecolor` + `FORCE_HYPERLINK=1` injected before execve.
 
 When in doubt: if it touches GTK / AppKit or libghostty-vt, it runs
 on the main thread.

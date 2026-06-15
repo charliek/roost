@@ -675,6 +675,14 @@ fn build_command(
     // TERM=tmux-256color / xterm-kitty would emit unsupported sequences).
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
+    // links (Ctrl-click), but the `supports-hyperlinks` library many CLIs
+    // gate on — Claude Code, anything on chalk/terminal-link — only
+    // allowlists known terminals by TERM_PROGRAM, and "Roost" isn't one.
+    // Without this they emit plain text instead of a link (e.g. Claude
+    // Code's footer "PR #N"). FORCE_HYPERLINK is that ecosystem's "my
+    // terminal supports it" override; honest here because we genuinely do.
+    cmd.env("FORCE_HYPERLINK", "1");
     // Roost contract (documented in docs/reference/paths.md and the
     // refactor plan's acceptance criteria): every shell Roost spawns
     // sees its tab id and the IPC socket path, so `roostctl` invoked

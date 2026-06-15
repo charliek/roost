@@ -36,7 +36,9 @@ use crate::config;
 use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
-use crate::keybind::{canonicalize_bindings, default_bindings, Accel, AccelMods, KeybindAction};
+use crate::keybind::{
+    canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
+};
 use crate::notification_inbox::{
     compose_title, relative_time, NotificationInbox, NotificationRecord,
 };
@@ -198,6 +200,11 @@ pub struct App {
     /// at construction. `RefCell` for the same future-reload reason
     /// as `copy_on_select`.
     word_break_chars: RefCell<String>,
+    /// Resolved `link-modifier` (Cmd on macOS / Alt on Linux by
+    /// default; `link-modifier` config overrides). Held during a
+    /// hover/click over a URL to reveal + open it. Passed to every new
+    /// TerminalView at construction.
+    link_modifier: AccelMods,
     /// Tab ids whose close was triggered by the daemon (the user
     /// typed `exit`, or a CLI `tab close`, or another client's
     /// CloseTab RPC). The connect_close_page handler installed on
@@ -625,6 +632,7 @@ impl App {
             copy_on_select: RefCell::new(cfg.copy_on_select),
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
+            link_modifier: resolve_link_modifier(cfg.link_modifier),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
@@ -1763,6 +1771,7 @@ impl App {
             Some(*self.current_font_size_pt.borrow()),
             *self.copy_on_select.borrow(),
             self.word_break_chars.borrow().clone(),
+            self.link_modifier,
         ));
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<TabOutput>();
         let Some(client_for_session) = self.client.borrow().clone() else {

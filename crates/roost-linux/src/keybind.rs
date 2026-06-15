@@ -140,6 +140,21 @@ bitflags::bitflags! {
     }
 }
 
+/// Map a single modifier token (one `+`-separated segment) to its flag,
+/// or `None` for a non-modifier token (a key name, or invalid input).
+/// The accepted spellings live here once so `parse_trigger` and
+/// `parse_link_modifier` can't drift. `meta` is an alias for `super`
+/// (same physical key; GTK's macOS backend reports Cmd as Meta).
+fn parse_modifier_token(token: &str) -> Option<AccelMods> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "shift" => Some(AccelMods::SHIFT),
+        "ctrl" | "control" => Some(AccelMods::CTRL),
+        "alt" | "opt" | "option" => Some(AccelMods::ALT),
+        "super" | "cmd" | "command" | "meta" => Some(AccelMods::SUPER),
+        _ => None,
+    }
+}
+
 /// Parse a Ghostty-style trigger ("ctrl+shift+t", "alt+1") into an
 /// [`Accel`]. Returns `None` for unparseable input so the canonicalizer
 /// can warn + fall through to the default.
@@ -155,12 +170,9 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
         if part.is_empty() {
             return None;
         }
-        match part.to_ascii_lowercase().as_str() {
-            "shift" => mods |= AccelMods::SHIFT,
-            "ctrl" | "control" => mods |= AccelMods::CTRL,
-            "alt" | "opt" | "option" => mods |= AccelMods::ALT,
-            "super" | "cmd" | "command" => mods |= AccelMods::SUPER,
-            _ => last = Some(part),
+        match parse_modifier_token(part) {
+            Some(m) => mods |= m,
+            None => last = Some(part),
         }
     }
     let key = last?.to_ascii_lowercase();
@@ -168,6 +180,48 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
         modifiers: mods,
         key,
     })
+}
+
+/// The modifier that — held during a mouse hover/click over a URL —
+/// reveals the link (underline + hand cursor) and opens it on click.
+/// Platform-aware, matching each desktop's "open link" convention and
+/// the app's own keybind scheme:
+///
+/// * macOS: `Super` (Cmd) — parity with the Swift UI and native Mac
+///   apps. (At the GDK layer the Command key arrives as Meta/Super; the
+///   GTK widget maps both, see `TerminalView`'s link-modifier check.)
+/// * Linux: `Alt` — the GTK app's single "primary" modifier (mirrors
+///   `default_bindings`), leaving `Ctrl` to the shell/readline.
+///
+/// Users override via `link-modifier = ctrl|alt|super` in
+/// `~/.config/roost/config.conf` (parsed by [`parse_link_modifier`]).
+/// Linux users who want the traditional Ctrl+click set
+/// `link-modifier = ctrl`.
+pub fn default_link_modifier() -> AccelMods {
+    if cfg!(target_os = "macos") {
+        AccelMods::SUPER
+    } else {
+        AccelMods::ALT
+    }
+}
+
+/// Parse a `link-modifier` config value into a single modifier flag,
+/// sharing [`parse_modifier_token`]'s spellings (`ctrl`, `alt`,
+/// `super`/`cmd`/`command`/`meta`). `shift` is a valid keybind modifier
+/// but not a sensible link modifier, so it's rejected; everything else
+/// unrecognized returns `None` so the caller can warn and keep
+/// [`default_link_modifier`].
+pub fn parse_link_modifier(value: &str) -> Option<AccelMods> {
+    match parse_modifier_token(value) {
+        Some(m) if m != AccelMods::SHIFT => Some(m),
+        _ => None,
+    }
+}
+
+/// Resolve the effective link modifier: the config override when set,
+/// else the platform default.
+pub fn resolve_link_modifier(config_override: Option<AccelMods>) -> AccelMods {
+    config_override.unwrap_or_else(default_link_modifier)
 }
 
 /// Default bindings table — host-platform aware:
@@ -375,6 +429,46 @@ pub fn canonicalize_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_link_modifier_accepts_aliases() {
+        assert_eq!(parse_link_modifier("ctrl"), Some(AccelMods::CTRL));
+        assert_eq!(parse_link_modifier("control"), Some(AccelMods::CTRL));
+        assert_eq!(parse_link_modifier("alt"), Some(AccelMods::ALT));
+        assert_eq!(parse_link_modifier("option"), Some(AccelMods::ALT));
+        assert_eq!(parse_link_modifier("super"), Some(AccelMods::SUPER));
+        assert_eq!(parse_link_modifier("cmd"), Some(AccelMods::SUPER));
+        assert_eq!(parse_link_modifier("command"), Some(AccelMods::SUPER));
+        assert_eq!(parse_link_modifier("meta"), Some(AccelMods::SUPER));
+        // Case-insensitive + surrounding whitespace tolerated.
+        assert_eq!(parse_link_modifier("  CTRL "), Some(AccelMods::CTRL));
+    }
+
+    #[test]
+    fn parse_link_modifier_rejects_unknown() {
+        assert_eq!(parse_link_modifier("hyper"), None);
+        assert_eq!(parse_link_modifier(""), None);
+        assert_eq!(parse_link_modifier("ctrl+alt"), None);
+    }
+
+    #[test]
+    fn default_link_modifier_is_platform_primary() {
+        let expected = if cfg!(target_os = "macos") {
+            AccelMods::SUPER
+        } else {
+            AccelMods::ALT
+        };
+        assert_eq!(default_link_modifier(), expected);
+    }
+
+    #[test]
+    fn resolve_link_modifier_prefers_override() {
+        assert_eq!(
+            resolve_link_modifier(Some(AccelMods::CTRL)),
+            AccelMods::CTRL
+        );
+        assert_eq!(resolve_link_modifier(None), default_link_modifier());
+    }
 
     #[test]
     fn parser_handles_modifier_aliases() {

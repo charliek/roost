@@ -31,6 +31,7 @@ the launcher with deterministic commands.
 | `provider` | `label="…" run="…" [timeout=…] [limit=…]` | none | Dynamic, script-backed menu in the custom palette (⌘⇧E / Alt+Shift+E). The script generates rows on demand and acts on the choice. Repeatable; executables in `providers/` (beside this file) are also discovered. See [Extending Roost](../guides/extending.md#3-dynamic-providers). |
 | `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
+| `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. **GTK app only** today. See [the dedicated section below](#link-modifier). |
 
 ## `copy-on-select`
 
@@ -134,6 +135,60 @@ OSC 52 carries a `Ps` selector indicating which clipboard to write:
 - Any other selector falls through to system (matches Ghostty's
   permissive handling of emitters that pad the selector with letters).
 
+## `link-modifier`
+
+Holding this modifier while hovering a URL reveals it (underline + hand
+cursor); holding it while clicking opens it in your default browser.
+URLs come from both OSC 8 hyperlinks (what tools like Claude Code emit)
+and plain `https://…` text matched on screen.
+
+| Value | Modifier |
+|---|---|
+| `ctrl` | Control |
+| `alt` | Alt / Option |
+| `super` *(aliases: `cmd`, `command`, `meta`)* | Super / Command |
+
+**Defaults are platform-native**, mirroring the keybinding scheme:
+
+- **macOS: Cmd** — matches the Swift app and native Mac apps (⌘-click).
+- **Linux: Alt** — the GTK app's single "primary" modifier, leaving
+  Ctrl free for the shell/readline.
+
+**Linux users who prefer the traditional Ctrl+click** (the ghostty /
+common-terminal convention) just set:
+
+```conf
+link-modifier = ctrl
+```
+
+> **Scope:** this setting is honored by the **GTK app only**. The Swift
+> Mac app's modifier is currently fixed to Cmd, so the key is silently
+> ignored there (harmless — unknown keys are always dropped).
+>
+> **Heads up (Linux):** some window managers/compositors grab `Alt`+drag
+> to move windows, which can swallow `Alt`+click. If link-clicking feels
+> flaky on your desktop, switch to `link-modifier = ctrl`.
+
+### Prefer Ctrl across the board? (Linux)
+
+The GTK app defaults to an **Alt-centric** scheme (`Alt+T` new tab,
+`Alt+W` close, etc.) so Ctrl stays free for the shell. If you'd rather
+use the more familiar Ctrl shortcuts, you can remap both the link
+modifier and any keybinding — `keybind` lines are repeatable and
+last-wins:
+
+```conf
+# Ctrl+click to open links
+link-modifier = ctrl
+
+# Restore Ctrl-based shortcuts (examples — see the keybindings doc)
+keybind = ctrl+t = new_tab
+keybind = ctrl+w = close_tab
+```
+
+See [Keybindings](../getting-started/keybindings.md) for the full action
+list and trigger syntax.
+
 ## Example
 
 ```
@@ -157,6 +212,10 @@ copy-on-select = true
 # OSC 52 (the opencode-over-SSH path, nvim's g:clipboard = osc52,
 # tmux set-clipboard, etc.). Set `deny` to opt out.
 clipboard-write = allow
+
+# Open links with Ctrl+click instead of the platform default
+# (Cmd on Mac, Alt on Linux). GTK app only.
+link-modifier = ctrl
 
 # Add a custom trigger (here, restoring the pre-Alt Ctrl+T for new_tab
 # on Linux — the default is now Alt+T). See docs/getting-started/keybindings.md.

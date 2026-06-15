@@ -21,7 +21,8 @@
 //   * Quit-time reap: iterate all sessions, `SIGHUP` →
 //     `waitpid` with timeout → `SIGKILL` fallback. No zombies.
 //   * Env: `ROOST_TAB_ID` + `ROOST_SOCKET` + `TERM` +
-//     `COLORTERM=truecolor` injected before execve.
+//     `COLORTERM=truecolor` + `FORCE_HYPERLINK=1` injected before
+//     execve.
 
 import Darwin
 import Foundation
@@ -561,6 +562,15 @@ final class PtySupervisor {
         // TERM=tmux-256color / xterm-kitty would emit unsupported seqs).
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
+        // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
+        // links (Cmd-click), but the `supports-hyperlinks` library many
+        // CLIs gate on — Claude Code, anything on chalk/terminal-link —
+        // only allowlists known terminals by TERM_PROGRAM, and "Roost"
+        // isn't one. Without this they emit plain text instead of a link
+        // (e.g. Claude Code's footer "PR #N"). FORCE_HYPERLINK is that
+        // ecosystem's "my terminal supports it" override; honest here
+        // because we genuinely do.
+        env["FORCE_HYPERLINK"] = "1"
         env["ROOST_TAB_ID"] = String(tabID)
         env["ROOST_SOCKET"] = socketPath
         // Roost shell-integration contract: identify the terminal and

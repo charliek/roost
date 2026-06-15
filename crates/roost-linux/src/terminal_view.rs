@@ -43,6 +43,7 @@ use crate::cell_metrics::{default_font_description, CellMetrics};
 use crate::clipboard;
 use crate::config::CopyOnSelect;
 use crate::key_encoder;
+use crate::keybind::{self, AccelMods};
 use crate::paste_image;
 use crate::sprite;
 use crate::theme::Theme;
@@ -137,6 +138,7 @@ impl TerminalView {
         font_size_pt: Option<f64>,
         copy_on_select: CopyOnSelect,
         word_break_chars: String,
+        link_modifier: AccelMods,
     ) -> Self {
         let view = Self::with_theme(theme);
         view.apply_font(font_family, font_size_pt);
@@ -144,6 +146,7 @@ impl TerminalView {
             let mut s = view.state.borrow_mut();
             s.copy_on_select = copy_on_select;
             s.word_break_chars = word_break_chars;
+            s.link_modifier = link_modifier;
         }
         view
     }
@@ -236,7 +239,8 @@ impl TerminalView {
             rows: DEFAULT_ROWS,
             on_resize: None,
             hover_url: None,
-            ctrl_held: false,
+            link_modifier: keybind::default_link_modifier(),
+            link_mod_held: false,
             url_opener: Rc::new(|uri| {
                 if let Err(err) = crate::url_launcher::open_uri(uri) {
                     tracing::warn!(uri, ?err, "url launcher failed");
@@ -382,14 +386,14 @@ impl TerminalView {
             let widget = widget.clone();
             move |ctrl, x, y| {
                 let raw_mods = ctrl.current_event_state();
-                let ctrl_held = raw_mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let mut s = state.borrow_mut();
                 s.pointer = (x, y);
                 s.pointer_inside = true;
-                s.ctrl_held = ctrl_held;
+                let link_held = s.link_modifier_held(raw_mods);
+                s.link_mod_held = link_held;
                 let cell_w = s.cell_metrics.cell_width;
                 let cell_h = s.cell_metrics.cell_height;
-                let next = if ctrl_held {
+                let next = if link_held {
                     cell_at_inner(x, y, cell_w, cell_h)
                         .and_then(|(col, row)| s.compute_hover_url(col, row))
                 } else {
@@ -454,31 +458,32 @@ impl TerminalView {
         });
         widget.add_controller(motion_ctrl);
 
-        // Track Ctrl press/release so the underline + cursor appear
-        // even without pointer movement (user presses Ctrl while the
-        // pointer is already over a URL). GTK4's `EventControllerKey`
-        // exposes a `modifiers` signal for exactly this.
+        // Track link-modifier press/release so the underline + cursor
+        // appear even without pointer movement (user presses the
+        // modifier while the pointer is already over a URL). GTK4's
+        // `EventControllerKey` exposes a `modifiers` signal for exactly
+        // this.
         let modifier_ctrl = EventControllerKey::new();
         modifier_ctrl.connect_modifiers({
             let state = state.clone();
             let widget = widget.clone();
             move |_ctrl, mods| {
-                let ctrl_held = mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let mut s = state.borrow_mut();
-                if s.ctrl_held == ctrl_held {
+                let link_held = s.link_modifier_held(mods);
+                if s.link_mod_held == link_held {
                     return glib::Propagation::Proceed;
                 }
-                s.ctrl_held = ctrl_held;
+                s.link_mod_held = link_held;
                 let (px, py) = s.pointer;
                 let cell_w = s.cell_metrics.cell_width;
                 let cell_h = s.cell_metrics.cell_height;
                 // Only recompute hover if the pointer is currently
-                // inside the widget — Ctrl-press with the pointer
-                // outside (the user Tabbed back to the window with
-                // Ctrl already held but the pointer elsewhere) must
+                // inside the widget — a modifier press with the pointer
+                // outside (the user Tabbed back to the window with the
+                // modifier already held but the pointer elsewhere) must
                 // not resurrect a stale underline at the last-known
                 // in-bounds cell.
-                let next = if ctrl_held && s.pointer_inside {
+                let next = if link_held && s.pointer_inside {
                     cell_at_inner(px, py, cell_w, cell_h)
                         .and_then(|(col, row)| s.compute_hover_url(col, row))
                 } else {
@@ -545,14 +550,12 @@ impl TerminalView {
                 if s.multi_click_consumed_this_gesture {
                     return;
                 }
-                // PR C: Ctrl-click on a URL opens the URL and skips
+                // PR C: link-modifier-click on a URL opens it and skips
                 // selection setup. Preserves any pre-existing
                 // selection — the user gets the new browser tab
                 // without losing the text they just copied.
-                let ctrl_held = g
-                    .current_event_state()
-                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-                if ctrl_held {
+                let link_held = s.link_modifier_held(g.current_event_state());
+                if link_held {
                     if let Some((col, row)) = s.cell_at(x, y, &widget) {
                         if let Some(hov) = s.compute_hover_url(col, row) {
                             let url = hov.url.clone();
@@ -787,15 +790,12 @@ impl TerminalView {
                     return;
                 }
                 let mut s = state.borrow_mut();
-                // Don't fight the Ctrl-double-click → URL-open path:
-                // drag_begin will see Ctrl held and route to the URL
-                // launcher (PR #175 behavior preserved). Leaving the
-                // multi-click flag CLEAR lets drag_begin's regular
-                // branches run.
-                let ctrl_held = gesture
-                    .current_event_state()
-                    .contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-                if ctrl_held {
+                // Don't fight the link-modifier-double-click → URL-open
+                // path: drag_begin will see the modifier held and route
+                // to the URL launcher (PR #175 behavior preserved).
+                // Leaving the multi-click flag CLEAR lets drag_begin's
+                // regular branches run.
+                if s.link_modifier_held(gesture.current_event_state()) {
                     return;
                 }
                 let Some((col, row)) = s.cell_at(x, y, &widget) else {
@@ -1434,16 +1434,21 @@ struct TerminalViewState {
     /// `input_callback`.
     on_resize: Option<Rc<dyn Fn(u16, u16)>>,
     /// Active link-hover. `Some` when the pointer is over a URL **and**
-    /// Ctrl is held; otherwise `None`. Populated by the motion
-    /// controller from either OSC 8 explicit hyperlinks or a regex
-    /// match on the row text. Consumed by `paint` (underline) and the
-    /// click controller (open URL).
+    /// the link modifier is held; otherwise `None`. Populated by the
+    /// motion controller from either OSC 8 explicit hyperlinks or a
+    /// regex match on the row text. Consumed by `paint` (underline) and
+    /// the click controller (open URL).
     hover_url: Option<HoverUrl>,
-    /// Last-known Ctrl-modifier state. The motion + key controllers
+    /// Which held modifier reveals + opens a URL (Cmd on macOS, Alt on
+    /// Linux by default; overridable via `link-modifier` config). The
+    /// motion / key / click controllers test the live event state
+    /// against this through [`Self::link_modifier_held`].
+    link_modifier: AccelMods,
+    /// Last-known link-modifier state. The motion + key controllers
     /// each refresh this; the click controller reads it to decide
     /// whether the press should open a URL or fall through to
     /// drag-selection.
-    ctrl_held: bool,
+    link_mod_held: bool,
     /// Pluggable launcher seam. Production routes to
     /// `url_launcher::open_uri`; tests substitute a stub. `Rc` so the
     /// gesture closure can clone cheaply.
@@ -1853,12 +1858,12 @@ impl TerminalViewState {
         }
 
         // Pass C.5 — clickable-link underline. Draw a single-pixel
-        // rule across the bottom of the hovered URL's cells when
-        // Ctrl is held + the pointer is over a URL. Color is
+        // rule across the bottom of the hovered URL's cells when the
+        // link modifier is held + the pointer is over a URL. Color is
         // `theme.foreground` for v1 — a future `link-color` theme
         // key (Tier 2 punch-list) would route in here.
         if let Some(hov) = self.hover_url.as_ref() {
-            if self.ctrl_held {
+            if self.link_mod_held {
                 let (r, g, b) = default_fg.to_f64();
                 cr.set_source_rgb(r, g, b);
                 let (x, y, w, h) = link_underline_rect(hov.col0, hov.col1, hov.row, cell_w, cell_h);
@@ -2142,7 +2147,7 @@ impl TerminalViewState {
         if !self.pointer_inside {
             return;
         }
-        let next: &'static str = if self.hover_url.is_some() && self.ctrl_held {
+        let next: &'static str = if self.hover_url.is_some() && self.link_mod_held {
             "pointer"
         } else if !self.current_osc_shape.is_empty() {
             roost_linux::mouse_routing::gtk_cursor_name_for_w3c(&self.current_osc_shape)
@@ -2154,6 +2159,16 @@ impl TerminalViewState {
         }
         widget.set_cursor_from_name(Some(next));
         self.last_applied_cursor_name = Some(next);
+    }
+
+    /// True when the configured link modifier is held in `raw`. Lives
+    /// here (not at the call sites) so the macOS Command-key quirk is
+    /// handled once: GTK's macOS backend delivers Cmd as `META_MASK`
+    /// (the keybind layer maps `super` → `<Meta>`), while X11/Wayland
+    /// report a bound Super key as `SUPER_MASK` — for `super`/Cmd we
+    /// accept either. See [`link_modifier_mask`].
+    fn link_modifier_held(&self, raw: gtk4::gdk::ModifierType) -> bool {
+        raw.intersects(link_modifier_mask(self.link_modifier))
     }
 
     /// Write the xterm focus-tracking sequence onto the PTY input
@@ -2572,6 +2587,28 @@ where
     (c0, c1)
 }
 
+/// Map an [`AccelMods`] link modifier to the GDK mask(s) that count as
+/// "held". `super`/Cmd maps to BOTH `SUPER_MASK` and `META_MASK`: GTK's
+/// macOS backend reports the Command key as Meta (the keybind layer maps
+/// `super` → `<Meta>`), while X11/Wayland report a bound Super key as
+/// Super — accept either. Callers only ever pass a single-flag modifier
+/// (`parse_link_modifier` / `default_link_modifier`). Free fn (not a
+/// method) so it unit-tests without a `TerminalViewState`.
+fn link_modifier_mask(m: AccelMods) -> gtk4::gdk::ModifierType {
+    use gtk4::gdk::ModifierType as M;
+    let mut set = M::empty();
+    if m.contains(AccelMods::CTRL) {
+        set |= M::CONTROL_MASK;
+    }
+    if m.contains(AccelMods::ALT) {
+        set |= M::ALT_MASK;
+    }
+    if m.contains(AccelMods::SUPER) {
+        set |= M::SUPER_MASK | M::META_MASK;
+    }
+    set
+}
+
 /// Pixel rectangle (x, y, w, h) for the underline overlay drawn on
 /// a URL's cells. Extracted from the paint pass so tests can pin the
 /// math without standing up a Cairo surface. `cell_w` / `cell_h` are
@@ -2749,6 +2786,27 @@ mod tests {
     //! the canvas bg). All cases below exercise `resolve_cell_colors`.
     use super::*;
     use roost_vt::{Cell, ColorRgb, Style};
+
+    #[test]
+    fn link_modifier_mask_super_accepts_meta_and_super() {
+        use gtk4::gdk::ModifierType as M;
+        let mask = link_modifier_mask(AccelMods::SUPER);
+        // GTK's macOS backend delivers Cmd as Meta; X11/Wayland Super
+        // keys as Super. Both must register as "link modifier held".
+        assert!(mask.intersects(M::META_MASK), "Cmd-as-Meta must match");
+        assert!(mask.intersects(M::SUPER_MASK), "Super must match");
+        // A plain Ctrl press must NOT trip the super link modifier.
+        assert!(!M::CONTROL_MASK.intersects(mask));
+    }
+
+    #[test]
+    fn link_modifier_mask_ctrl_and_alt_are_exact() {
+        use gtk4::gdk::ModifierType as M;
+        assert_eq!(link_modifier_mask(AccelMods::CTRL), M::CONTROL_MASK);
+        assert_eq!(link_modifier_mask(AccelMods::ALT), M::ALT_MASK);
+        // Ctrl link modifier must not be tripped by Cmd/Meta.
+        assert!(!M::META_MASK.intersects(link_modifier_mask(AccelMods::CTRL)));
+    }
 
     const DEFAULT_FG: ColorRgb = ColorRgb::new(0xe5, 0xe5, 0xe5);
     const DEFAULT_BG: ColorRgb = ColorRgb::new(0x1c, 0x1c, 0x1c);
