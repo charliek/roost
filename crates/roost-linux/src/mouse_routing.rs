@@ -54,8 +54,9 @@ pub enum MouseRoutingDispatch {
 ///
 /// Precedence (highest → lowest):
 /// 1. URL takes priority over mouse forwarding (`url_intercepts_click`
-///    is true when Ctrl is held over a URL hit, the GTK equivalent
-///    of macOS Cmd-hover). Matches ghostty.
+///    is true when the link modifier is held over a URL hit — Cmd on
+///    macOS, Alt on Linux by default, `link-modifier`-configurable).
+///    Matches ghostty.
 /// 2. Mouse tracking off → pass through.
 /// 3. Otherwise → forward to encoder.
 pub fn compute_mouse_tracking_dispatch(

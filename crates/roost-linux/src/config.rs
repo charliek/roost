@@ -11,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::custom_command::{self, CustomCommand};
+use crate::keybind::{self, AccelMods};
 use crate::provider::{self, Provider};
 use roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS;
 
@@ -49,6 +50,14 @@ pub struct RoostConfig {
     /// `-break-` name (kept for Ghostty compatibility) the value is
     /// the EXTRA word-char set, not the break-char set.
     pub word_break_chars: String,
+
+    /// `link-modifier` — which held modifier reveals + opens a URL on
+    /// hover/click (the underline + hand cursor + click-to-open).
+    /// `None` means "use the platform default"
+    /// ([`keybind::default_link_modifier`]: Cmd on macOS, Alt on
+    /// Linux). Set `link-modifier = ctrl` for traditional Ctrl+click.
+    /// GTK-only today — the Swift UI's modifier is fixed to Cmd.
+    pub link_modifier: Option<AccelMods>,
 }
 
 impl Default for RoostConfig {
@@ -63,6 +72,7 @@ impl Default for RoostConfig {
             copy_on_select: CopyOnSelect::default(),
             clipboard_write: ClipboardWrite::default(),
             word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
+            link_modifier: None,
         }
     }
 }
@@ -202,6 +212,17 @@ impl RoostConfig {
                     // "Unicode letters/digits only" — distinct from
                     // "missing key" (which falls back to the default).
                     cfg.word_break_chars = value.to_string();
+                }
+                "link-modifier" => {
+                    if let Some(m) = keybind::parse_link_modifier(value) {
+                        cfg.link_modifier = Some(m);
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown link-modifier value; expected ctrl|alt|super, \
+                             keeping the platform default"
+                        );
+                    }
                 }
                 "command" => {
                     // Launcher entry: `command = label="…" run="…" …`.
@@ -449,6 +470,33 @@ fn default_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_modifier_unset_defaults_to_none() {
+        let cfg = RoostConfig::parse("theme = Dracula\n");
+        assert_eq!(cfg.link_modifier, None);
+    }
+
+    #[test]
+    fn link_modifier_parses_override() {
+        assert_eq!(
+            RoostConfig::parse("link-modifier = ctrl\n").link_modifier,
+            Some(AccelMods::CTRL)
+        );
+        assert_eq!(
+            RoostConfig::parse("link-modifier = super\n").link_modifier,
+            Some(AccelMods::SUPER)
+        );
+    }
+
+    #[test]
+    fn link_modifier_unknown_value_keeps_default() {
+        // Unparseable value warns + leaves None (= platform default).
+        assert_eq!(
+            RoostConfig::parse("link-modifier = wat\n").link_modifier,
+            None
+        );
+    }
 
     #[test]
     fn parses_basic_fields() {

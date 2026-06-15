@@ -170,6 +170,49 @@ pub fn parse_trigger(trigger: &str) -> Option<Accel> {
     })
 }
 
+/// The modifier that — held during a mouse hover/click over a URL —
+/// reveals the link (underline + hand cursor) and opens it on click.
+/// Platform-aware, matching each desktop's "open link" convention and
+/// the app's own keybind scheme:
+///
+/// * macOS: `Super` (Cmd) — parity with the Swift UI and native Mac
+///   apps. (At the GDK layer the Command key arrives as Meta/Super; the
+///   GTK widget maps both, see `TerminalView`'s link-modifier check.)
+/// * Linux: `Alt` — the GTK app's single "primary" modifier (mirrors
+///   `default_bindings`), leaving `Ctrl` to the shell/readline.
+///
+/// Users override via `link-modifier = ctrl|alt|super` in
+/// `~/.config/roost/config.conf` (parsed by [`parse_link_modifier`]).
+/// Linux users who want the traditional Ctrl+click set
+/// `link-modifier = ctrl`.
+pub fn default_link_modifier() -> AccelMods {
+    if cfg!(target_os = "macos") {
+        AccelMods::SUPER
+    } else {
+        AccelMods::ALT
+    }
+}
+
+/// Parse a `link-modifier` config value into a single modifier flag.
+/// Accepts the same spellings as [`parse_trigger`]'s modifier tokens
+/// (`ctrl`/`control`, `alt`/`opt`/`option`, `super`/`cmd`/`command`/
+/// `meta`). Returns `None` for anything else so the caller can warn and
+/// keep [`default_link_modifier`].
+pub fn parse_link_modifier(value: &str) -> Option<AccelMods> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => Some(AccelMods::CTRL),
+        "alt" | "opt" | "option" => Some(AccelMods::ALT),
+        "super" | "cmd" | "command" | "meta" => Some(AccelMods::SUPER),
+        _ => None,
+    }
+}
+
+/// Resolve the effective link modifier: the config override when set,
+/// else the platform default.
+pub fn resolve_link_modifier(config_override: Option<AccelMods>) -> AccelMods {
+    config_override.unwrap_or_else(default_link_modifier)
+}
+
 /// Default bindings table — host-platform aware:
 ///
 /// * Linux: `primary = projectMod = clipboardMod = alt`. `Alt` is the
@@ -375,6 +418,46 @@ pub fn canonicalize_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_link_modifier_accepts_aliases() {
+        assert_eq!(parse_link_modifier("ctrl"), Some(AccelMods::CTRL));
+        assert_eq!(parse_link_modifier("control"), Some(AccelMods::CTRL));
+        assert_eq!(parse_link_modifier("alt"), Some(AccelMods::ALT));
+        assert_eq!(parse_link_modifier("option"), Some(AccelMods::ALT));
+        assert_eq!(parse_link_modifier("super"), Some(AccelMods::SUPER));
+        assert_eq!(parse_link_modifier("cmd"), Some(AccelMods::SUPER));
+        assert_eq!(parse_link_modifier("command"), Some(AccelMods::SUPER));
+        assert_eq!(parse_link_modifier("meta"), Some(AccelMods::SUPER));
+        // Case-insensitive + surrounding whitespace tolerated.
+        assert_eq!(parse_link_modifier("  CTRL "), Some(AccelMods::CTRL));
+    }
+
+    #[test]
+    fn parse_link_modifier_rejects_unknown() {
+        assert_eq!(parse_link_modifier("hyper"), None);
+        assert_eq!(parse_link_modifier(""), None);
+        assert_eq!(parse_link_modifier("ctrl+alt"), None);
+    }
+
+    #[test]
+    fn default_link_modifier_is_platform_primary() {
+        let expected = if cfg!(target_os = "macos") {
+            AccelMods::SUPER
+        } else {
+            AccelMods::ALT
+        };
+        assert_eq!(default_link_modifier(), expected);
+    }
+
+    #[test]
+    fn resolve_link_modifier_prefers_override() {
+        assert_eq!(
+            resolve_link_modifier(Some(AccelMods::CTRL)),
+            AccelMods::CTRL
+        );
+        assert_eq!(resolve_link_modifier(None), default_link_modifier());
+    }
 
     #[test]
     fn parser_handles_modifier_aliases() {
