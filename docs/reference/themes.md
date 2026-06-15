@@ -17,8 +17,6 @@ The setting takes effect on the next launch (themes are not hot-reloaded today).
 | `0x96f`                  | Muted dark with vivid accents.                              |
 | `Atom`                   | The classic Atom editor palette.                           |
 | `Atom One Dark`          | Atom editor's familiar dark scheme.                        |
-| `Atom One Light`         | Atom One on a light background.                            |
-| `Ayu Light`              | Ayu's bright, warm light variant.                          |
 | `Ayu Mirage`             | Ayu's muted mid-dark variant.                              |
 | `Catppuccin Frappe`      | Catppuccin's softer mid-dark flavor.                       |
 | `Catppuccin Macchiato`   | Catppuccin's deeper mid-dark flavor.                       |
@@ -30,15 +28,19 @@ The setting takes effect on the next launch (themes are not hot-reloaded today).
 | `Gruvbox Dark`           | Warm retro palette, medium contrast.                      |
 | `Gruvbox Dark Hard`      | Warm, high-contrast retro palette.                        |
 | `Kanagawa Wave`          | Muted indigo/teal inspired by Hokusai.                    |
+| `Material Ocean`         | Very dark blue-black with soft Material accents.          |
+| `Monokai Pro`            | Warm grey base; vibrant pink/green/yellow/purple.        |
+| `Monokai Remastered`     | Near-black Monokai; high-contrast saturated accents.     |
 | `Nord`                   | Cool, desaturated arctic blues.                           |
 | `One Half Dark`          | The One Half dark scheme.                                 |
+| `Oxocarbon`              | IBM Carbon dark; cool cyan/blue/magenta accents.         |
 | `Rose Pine`              | Soft rosy mauves on deep base.                            |
 | `Solarized Dark Patched` | Solarized Dark with the common ANSI patch.               |
+| `Synthwave`              | Pure-black base with neon retro accents.                 |
 | `TokyoNight`             | Cool blues + softer accent colors.                       |
-| `TokyoNight Night`       | The darkest TokyoNight variant.                          |
 | `TokyoNight Storm`       | TokyoNight on a slightly lighter base.                  |
 
-Every theme other than `roost-dark` is a byte-identical copy of a file from [Ghostty's bundled set](https://github.com/ghostty-org/ghostty/tree/main/src/config/themes). If you want a Ghostty theme that's not on this list, it usually parses cleanly in roost — see *File format* below. (`Atom One Light` and `Ayu Light` are light-background themes; they render a light terminal area inside Roost's dark window chrome.)
+Every theme other than `roost-dark` is a byte-identical copy of a file from [Ghostty's bundled set](https://github.com/ghostty-org/ghostty/tree/main/src/config/themes). If you want a Ghostty theme that's not on this list, it usually parses cleanly in roost — see *File format* below. The bundled set is dark-only by design; light-background Ghostty themes still load if you add one, but they render a light terminal area inside Roost's dark window chrome.
 
 ## File format
 
