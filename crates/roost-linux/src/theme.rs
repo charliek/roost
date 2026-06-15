@@ -127,8 +127,6 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
     // Additional Ghostty-format themes (byte-identical to upstream).
     bundled_theme!("0x96f"),
     bundled_theme!("Atom"),
-    bundled_theme!("Atom One Light"),
-    bundled_theme!("Ayu Light"),
     bundled_theme!("Ayu Mirage"),
     bundled_theme!("Nord"),
     bundled_theme!("Rose Pine"),
@@ -136,12 +134,16 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
     bundled_theme!("Catppuccin Frappe"),
     bundled_theme!("Catppuccin Macchiato"),
     bundled_theme!("TokyoNight Storm"),
-    bundled_theme!("TokyoNight Night"),
     bundled_theme!("Gruvbox Dark"),
     bundled_theme!("One Half Dark"),
     bundled_theme!("GitHub Dark Default"),
     bundled_theme!("Everforest Dark Hard"),
     bundled_theme!("Kanagawa Wave"),
+    bundled_theme!("Monokai Pro"),
+    bundled_theme!("Monokai Remastered"),
+    bundled_theme!("Synthwave"),
+    bundled_theme!("Material Ocean"),
+    bundled_theme!("Oxocarbon"),
 ];
 
 /// The standard xterm 256-color palette: 16 ANSI colors (0–15), the
