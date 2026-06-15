@@ -9,7 +9,17 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
-## [Unreleased]
+## v0.0.12 — 2026-06-15
+
+### Added
+
+- **Five new dark themes** — `Monokai Pro`, `Monokai Remastered`, `Synthwave`,
+  `Material Ocean`, and `Oxocarbon`. The bundled set is now 26 themes, all dark.
+- **Configurable link-open modifier (GTK)** — hold a modifier and click an
+  OSC 8 hyperlink or `https://…` text to open it in your browser. Defaults to
+  Cmd on macOS and Alt on Linux; override with `link-modifier = ctrl|alt|super`
+  in `config.conf`. Linux users who prefer the conventional Ctrl+click set
+  `link-modifier = ctrl`.
 
 ### Changed
 
@@ -23,6 +33,17 @@ release workflow asserts they agree).
   palette, and clipboard actions were already on `Alt`. Every binding is
   overridable — restore a prior chord via config, e.g.
   `keybind = ctrl+t = new_tab`.
+- **Bundled themes are now dark-only** — removed the two light themes (`Atom One
+  Light`, `Ayu Light`) and the near-duplicate `TokyoNight Night` (identical to
+  `TokyoNight` as rendered by Roost).
+- **GTK projects sidebar** refined to match the Mac UI (#220).
+
+### Fixed
+
+- **Clickable links from Claude Code and other tools (#224)** — Roost now
+  advertises OSC 8 hyperlink support (`FORCE_HYPERLINK=1`) to programs running
+  in the terminal on both the Mac and GTK UIs, so Claude Code's PR-footer links
+  (and any `supports-hyperlinks`-gated output) render as clickable links.
 
 ## v0.0.11 — 2026-06-07
 
