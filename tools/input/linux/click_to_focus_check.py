@@ -56,6 +56,12 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 
 
 def _skip(msg: str) -> NoReturn:
+    # In CI (ROOST_REQUIRE_REAL_INPUT=1) Xvfb/xdotool/the binary are all
+    # present, so a "skip" means a real setup failure, not an unsupported
+    # environment — surface it as a failure rather than a silent pass.
+    if os.environ.get("ROOST_REQUIRE_REAL_INPUT") == "1":
+        print(f"FAIL (real-input required): {msg}")
+        sys.exit(1)
     print(f"SKIP: {msg}")
     sys.exit(0)
 
@@ -67,11 +73,11 @@ def _free_display() -> str:
     _skip("no free X display in :99..:129")
 
 
-def _wait_window_mapped(display: str, timeout: float = 10.0) -> None:
-    """Wait until the Roost toplevel is realized + mapped under Xvfb.
-    Driving a tab before the window maps lets the new-tab grab_focus
-    no-op against an unmapped widget (the same hazard the e2e harness
-    avoids with its boot-readiness gate)."""
+def _wait_window_mapped(display: str, timeout: float = 10.0) -> str:
+    """Wait until the Roost toplevel is realized + mapped under Xvfb, and
+    return its X window id. Driving a tab before the window maps lets the
+    new-tab grab_focus no-op against an unmapped widget (the same hazard
+    the e2e harness avoids with its boot-readiness gate)."""
     env = _xenv(display)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -86,7 +92,7 @@ def _wait_window_mapped(display: str, timeout: float = 10.0) -> None:
             )
             m = re.search(r"Geometry:\s*(\d+)x(\d+)", geo.stdout)
             if m and int(m.group(2)) > 200:
-                return
+                return wid
         time.sleep(0.2)
     raise TimeoutError("roost window never mapped under Xvfb")
 
@@ -145,34 +151,86 @@ def _check_click_to_focus(r, click, wait_tab_attached) -> None:
 
 
 def _check_project_switch_focus(r, click) -> None:
-    """F2: switching projects by clicking a sidebar row grabs focus on
-    the new project's terminal. Real-click only — the IPC switch path
-    doesn't focus a sidebar row, so it never reproduced the strand bug
-    (focus left on the clicked GtkListBoxRow, cursor hollow)."""
-    # Expand the sidebar AND move focus onto the toggle button (off the
-    # terminal): a toggle click flips visibility and takes focus, so
-    # re-expand if that first click collapsed it, then wait for the
-    # expand to settle before reading geometry / clicking a row.
-    click(68, 27)
+    """F2 + #1: clicking a sidebar project row grabs focus on the new
+    project's terminal (F2) AND syncs the workspace core's active
+    selection — what identify / persistence / notification routing read
+    (#1). Real-click only: the IPC switch path goes through the core, so
+    it can reproduce neither the focus strand nor the core desync."""
+    # Row 0 is the throwaway-state bootstrap project (list() is creation
+    # order == sidebar order here). Establish a *different* active project
+    # in both core and UI via the IPC focus path (which routes through the
+    # core), so the row-0 click below is a genuine switch and the core
+    # starts off row 0.
+    projects = r.list()
+    row0 = int(projects[0]["id"])
+    other = next(p for p in projects if int(p["id"]) != row0)
+    r.focus(int(other["tabs"][0]["id"]))
+    r._wait(lambda: r.identify()["active_project_id"] == int(other["id"]),
+            timeout=4.0, what="baseline: a non-row-0 project active in the core")
+
+    # Move focus off the terminal via the sidebar-toggle button (it takes
+    # focus and flips sidebar visibility). Poll-click so a dropped XTEST
+    # click is retried, then ensure the sidebar ends expanded for the row
+    # click (re-expanding keeps focus on the button, not the terminal).
+    _click_until(click, (68, 27), r, want=False,
+                 what="move focus off the terminal via the sidebar toggle")
     if r.window_metrics().get("sidebar_collapsed"):
         click(68, 27)
     r._wait(lambda: not r.window_metrics().get("sidebar_collapsed"),
             timeout=4.0, what="sidebar expanded for the project-switch click")
-    if r.app_active_terminal_focused():
-        raise AssertionError("expected the terminal unfocused after toggling the sidebar")
 
-    # Click sidebar row 0 — the throwaway-state bootstrap project, never
-    # the active one here (the click-to-focus check left its own project
-    # active), so this is a real project switch. X is derived (mid-
-    # sidebar); Y is the first row under the PROJECTS header, a constant
-    # for the controlled Xvfb screen + default test theme (the test fails
-    # loudly via the timeout below if it drifts). One click is a
-    # deterministic switch; poll for the idle-deferred grab to land —
-    # without the fix, focus stays on the row and this times out.
+    # Click sidebar row 0. X is derived (mid-sidebar); Y is the first row
+    # under the PROJECTS header, a constant for the controlled Xvfb screen
+    # + default test theme (the test fails loudly via the timeouts below
+    # if it drifts). One click is a deterministic switch to row 0.
     sb = int(r.window_metrics().get("sidebar_width", 0) or 0)
     click(max(10, sb // 2), 100)
+
+    # F2: the idle-deferred grab lands focus on the new project's terminal.
     r._wait(lambda: r.app_active_terminal_focused(), timeout=8.0,
             what="terminal focus after switching projects via a sidebar-row click")
+    # #1: the click must also sync the core's active selection, not just
+    # the UI. Without the core-sync this stays on the previous project.
+    r._wait(lambda: r.identify()["active_project_id"] == row0, timeout=4.0,
+            what="core active project to track the sidebar-row click (#1 core-sync)")
+
+
+def _check_alt_digit_switches_project_not_tab(r, send_key, wait_tab_attached) -> None:
+    """Alt+digit must switch PROJECTS only — never tabs (Linux).
+
+    AdwTabView's built-in Alt+1..9 / Alt+0 tab shortcuts collide with our
+    Linux Alt+digit = SwitchProject. With the row-0 project already active
+    (SwitchProject a no-op), the collision flips the tab and the core
+    desyncs within a few presses. Real-input only — the IPC path can't
+    reproduce the GTK shortcut-manager race.
+    """
+    projects = r.list()
+    row0 = int(projects[0]["id"])
+    row1 = int(projects[1]["id"])  # creation order == sidebar order here
+    # Row-0 project needs >=2 tabs; add a 2nd and select it, with row-0 the
+    # active project (via the core path, which is reliable).
+    t2 = r.open_tab(row0, cwd="/tmp")
+    wait_tab_attached(r, t2)
+    r.focus(t2)
+    r._wait(lambda: (idy := r.identify())["active_tab_id"] == t2
+            and idy["active_project_id"] == row0,
+            timeout=4.0, what="row-0 active with its 2nd tab selected")
+
+    # Alt+1 targets sidebar row 0 = already active, so SwitchProject is a
+    # no-op; the tab/project must NOT move. Press enough times to clear the
+    # pre-fix non-determinism (the collision manifested by ~press 3).
+    for i in range(8):
+        send_key("alt+1")
+        idy = r.identify()
+        assert idy["active_tab_id"] == t2, \
+            f"Alt+1 #{i+1} changed the active tab (AdwTabView Alt+digit collision)"
+        assert idy["active_project_id"] == row0, \
+            f"Alt+1 #{i+1} changed the active project"
+
+    # Alt+2 must still drive SwitchProject — switch to the 2nd project.
+    send_key("alt+2")
+    r._wait(lambda: r.identify()["active_project_id"] == row1, timeout=4.0,
+            what="Alt+2 switches to the 2nd project (SwitchProject still works)")
 
 
 def main() -> int:
@@ -228,11 +286,22 @@ def main() -> int:
             )
             time.sleep(0.4)
 
+        def send_key(combo: str) -> None:
+            # No WM under Xvfb, so set X input focus on the Roost window
+            # explicitly before injecting. --clearmodifiers releases any
+            # held modifier so rapid Alt+N presses don't stick together.
+            subprocess.run(["xdotool", "windowfocus", wid],
+                           env=_xenv(display), check=False)
+            subprocess.run(["xdotool", "key", "--clearmodifiers", combo],
+                           env=_xenv(display), check=False)
+            time.sleep(0.35)
+
         r = _connect(lambda: Roost(str(sock)))
         try:
-            _wait_window_mapped(display)
+            wid = _wait_window_mapped(display)
             _check_click_to_focus(r, click, wait_tab_attached)
             _check_project_switch_focus(r, click)
+            _check_alt_digit_switches_project_not_tab(r, send_key, wait_tab_attached)
         finally:
             r.close()
     finally:
@@ -259,7 +328,8 @@ def main() -> int:
             xvfb.wait()
         shutil.rmtree(run, ignore_errors=True)
 
-    print("PASS: click-to-focus and project-switch both grab terminal focus")
+    print("PASS: click-to-focus, project-switch focus, and Alt+digit "
+          "project-only switching all verified")
     return 0
 
 

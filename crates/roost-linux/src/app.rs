@@ -654,22 +654,40 @@ impl App {
         // `add_project_ui`. See `install_sidebar_drop_target`.
         app_struct.install_sidebar_drop_target();
 
-        // Sidebar row selection → switch active project.
+        // Sidebar row selection → switch the active project (UI
+        // reaction). This fires for ANY selection change — user click,
+        // the programmatic `select_row` in `set_active_project`, the
+        // auto-select when a deleted project's row is removed — so it must
+        // NOT sync the core (that would race/echo the active tab). The
+        // core sync is driven by `row-activated` below, which only a
+        // genuine user click/Enter fires.
         sidebar.connect_row_selected({
             let app = app_struct.clone();
             move |_, row| {
                 if let Some(row) = row {
-                    let pid = row.index() as i64;
-                    // Sidebar rows carry their project id in the
-                    // `name` GObject property (set when we build
-                    // the row); read it back here.
+                    // Sidebar rows carry their project id in the `name`
+                    // GObject property (set when we build the row).
                     if let Some(name) = row.widget_name().to_string().strip_prefix("project-") {
                         if let Ok(id) = name.parse::<i64>() {
                             app.set_active_project(id);
-                            return;
                         }
                     }
-                    let _ = pid;
+                }
+            }
+        });
+
+        // Sidebar row *activation* (genuine user click / Enter — never a
+        // programmatic selection or a structural change) → sync the core's
+        // active selection to the activated project's active tab.
+        sidebar.connect_row_activated({
+            let app = app_struct.clone();
+            move |_, row| {
+                if let Some(name) = row.widget_name().to_string().strip_prefix("project-") {
+                    if let Ok(id) = name.parse::<i64>() {
+                        if let Some(tab_id) = app.active_tab_id(id) {
+                            app.sync_core_active_tab(tab_id);
+                        }
+                    }
                 }
             }
         });
@@ -1229,6 +1247,12 @@ impl App {
         row.add_controller(row_dblclick);
 
         let tab_view = TabView::new();
+        // Drop AdwTabView's built-in Alt+1..9 / Alt+0 tab shortcuts: on Linux
+        // our project modifier is Alt, so they collide with Alt+digit =
+        // SwitchProject / FontReset (and bypass the core-synced switch path).
+        tab_view.remove_shortcuts(
+            libadwaita::TabViewShortcuts::ALT_DIGITS | libadwaita::TabViewShortcuts::ALT_ZERO,
+        );
         // Hook "close-page" so the daemon learns about the close,
         // even when the user clicks the [×] on a tab pill.
         tab_view.connect_close_page({
@@ -1298,6 +1322,15 @@ impl App {
                 if *app.active_project_id.borrow() == project_id {
                     app.refresh_window_subtitle();
                 }
+                // NB: deliberately does NOT sync the core's active tab.
+                // `selected-page` fires for non-user reasons too — tab
+                // attach, and the bootstrap tab_view re-asserting its
+                // selection when a deleted project's page is removed from
+                // the stack — so a sync here races/overwrites the core's
+                // active tab (it was observed reverting `active()` to the
+                // bootstrap tab). Tab switches sync from the explicit user
+                // gestures instead (`switch_tab_by_index`). Tab-pill mouse
+                // clicks are therefore not yet core-synced — a follow-up.
             }
         });
         // M8: per-tab context menu (right-click a pill). AdwTabView
@@ -4486,7 +4519,7 @@ impl App {
         // id-sorted Nth project, not the one at the Nth visible position.
         let order = self.sidebar_order();
         if let Some(&id) = order.get(n - 1) {
-            self.set_active_project(id);
+            self.activate_project_from_ui(id);
         }
     }
 
@@ -4500,10 +4533,21 @@ impl App {
             return;
         };
         let pages = ui.tab_view.pages();
-        if let Some(obj) = pages.item((n - 1) as u32) {
+        let tab_id = if let Some(obj) = pages.item((n - 1) as u32) {
             if let Ok(page) = obj.downcast::<libadwaita::TabPage>() {
                 ui.tab_view.set_selected_page(&page);
+                parse_tab_id_from_page(&page)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        drop(projects);
+        // Explicit user gesture: sync the core's active tab (the
+        // `selected-page` notify intentionally doesn't — see its comment).
+        if let Some(tab_id) = tab_id {
+            self.sync_core_active_tab(tab_id);
         }
     }
 
@@ -4672,6 +4716,45 @@ impl App {
         // pending notification, which drops the inbox row + the tab's
         // needs-attention badge via the `TabNotification` false-edge.
         let _ = client.workspace.set_tab_has_notification(tab_id, false);
+    }
+
+    /// Make `project_id` active from a UI action (sidebar click, project
+    /// keybind) and sync the core to its active tab. The sync lives here,
+    /// not in `set_active_project`, because that is also the
+    /// `ActiveChanged` reaction body — syncing there would echo the core's
+    /// *previous* selection back over the one the caller asked for.
+    fn activate_project_from_ui(self: &Rc<Self>, project_id: i64) {
+        self.set_active_project(project_id);
+        // An empty project (no tab yet) has nothing to focus, so the
+        // core's active selection stays put until its first tab opens. In
+        // normal use a project always has >=1 tab — closing the last tab
+        // cascades the project away — so this only bites a raw IPC
+        // `project.create` with no `tab.open`.
+        if let Some(tab_id) = self.active_tab_id(project_id) {
+            self.sync_core_active_tab(tab_id);
+        }
+    }
+
+    /// Sync the workspace core's active selection to `tab_id` after a
+    /// UI-originating selection change. Without it the core's `active()` —
+    /// read by `identify`, persistence, and notification routing — goes
+    /// stale vs. what's on screen (UI as its own source of truth, against
+    /// the north star). Guarded on the *read*: `focus_tab` always emits
+    /// `ActiveChanged` (state.rs:881), so skipping when the core is
+    /// already on this tab stops a core-driven `set_selected_page` notify
+    /// from echoing `focus_tab` back and looping.
+    fn sync_core_active_tab(self: &Rc<Self>, tab_id: i64) {
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if client.workspace.active().1 != tab_id {
+            // This is the boundary (a GTK signal handler), so log rather
+            // than propagate. The only error is the tab vanishing between
+            // the UI selection and here — benign for a sync.
+            if let Err(e) = client.workspace.focus_tab(tab_id) {
+                tracing::debug!(?e, tab_id, "sync_core_active_tab: focus_tab failed");
+            }
+        }
     }
 
     /// `KeybindAction::JumpToUnread`: focus the next tab with a pending

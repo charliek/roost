@@ -540,11 +540,19 @@ impl PaletteInner {
                 }
             }
         }
-        self.overlay.remove_overlay(&self.catcher);
-        self.overlay.remove_overlay(&self.card);
+        // Refocus (via on_dismiss) BEFORE tearing down the overlay. The
+        // card owns the focused entry, so removing it first leaves the
+        // entry a dangling focus widget: the callback's grab_focus then
+        // transitions focus off a destroyed widget and GTK aborts
+        // (`gtk_widget_unset_state_flags: GTK_IS_WIDGET (widget)`). Moving
+        // focus while the entry is still alive, then removing the now-
+        // unfocused card, is safe. The `closing` guard above absorbs the
+        // re-entrant dismiss that the entry's focus-out fires.
         if let Some(cb) = self.on_dismiss.borrow_mut().take() {
             cb();
         }
+        self.overlay.remove_overlay(&self.catcher);
+        self.overlay.remove_overlay(&self.card);
     }
 
     // MARK: IPC drive surface (palette.* ops)
