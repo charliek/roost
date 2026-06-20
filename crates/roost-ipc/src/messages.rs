@@ -655,6 +655,21 @@ pub struct AppActiveTerminalFocusedResult {
     pub focused: bool,
 }
 
+/// `app.selected_tab_id` params. Read-only, not gated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppSelectedTabIdParams {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSelectedTabIdResult {
+    /// The tab id currently selected in the active project's AdwTabView
+    /// (the on-screen tab — UI truth, independent of the core's active
+    /// tab). `0` when there is no selection. Lets tests assert the UI
+    /// selection and the workspace core agree.
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -1075,6 +1090,11 @@ pub mod ops {
     /// terminal. Reads logical focus, so it works under the WM-less
     /// Xvfb runner where the toplevel never gains compositor focus.
     pub const APP_ACTIVE_TERMINAL_FOCUSED: &str = "app.active_terminal_focused";
+
+    /// `app.selected_tab_id` — the active project's on-screen selected
+    /// tab id (UI truth), for asserting the core and the displayed tab
+    /// agree. GTK-only; read-only, not gated.
+    pub const APP_SELECTED_TAB_ID: &str = "app.selected_tab_id";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -1603,6 +1623,13 @@ mod tests {
         round_trip(&AppActiveTerminalFocusedResult { focused: false });
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppActiveTerminalFocusedParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_selected_tab_id_round_trips() {
+        round_trip(&AppSelectedTabIdParams {});
+        round_trip(&AppSelectedTabIdResult { tab_id: 42 });
+        round_trip(&AppSelectedTabIdResult { tab_id: 0 });
     }
 
     #[test]
