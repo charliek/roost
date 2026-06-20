@@ -1585,6 +1585,11 @@ impl App {
         // pill while the RPC silently renames the background tab.
         // CodeRabbit caught this on PR #63.
         self.select_page_programmatic(&ui.tab_view, &tab_ui.page);
+        // Renaming a background tab switches the UI to it (above), so the
+        // core must follow — the guarded select suppresses the notify
+        // auto-sync, so sync explicitly. No-op when it's already the active
+        // tab (the common Alt+R case).
+        self.sync_core_active_tab(tab_id);
 
         let entry = gtk4::Entry::builder()
             .text(&current_title)
