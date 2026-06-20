@@ -18,8 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roost_ipc::messages::{
-    ops, AppActivateParams, AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams,
-    ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
+    AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
     NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
     PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
@@ -286,6 +287,11 @@ pub enum UiRequest {
     /// applied OSC 22 W3C cursor name. Ungated (read-only).
     AppCursorShape {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// `app.active_terminal_focused` — return whether the active tab's
+    /// terminal holds GTK logical keyboard focus. Ungated (read-only).
+    AppActiveTerminalFocused {
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
     },
 }
 
@@ -934,6 +940,14 @@ async fn dispatch(
                 .await?
                 .map_err(|e| HandlerError::new("internal", e))?;
             encode(&AppCursorShapeResult { shape })
+        }
+        ops::APP_ACTIVE_TERMINAL_FOCUSED => {
+            let _: AppActiveTerminalFocusedParams = decode(params)?;
+            let focused = h
+                .ui_call(|reply| UiRequest::AppActiveTerminalFocused { reply })
+                .await?
+                .map_err(|e| HandlerError::new("internal", e))?;
+            encode(&AppActiveTerminalFocusedResult { focused })
         }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never

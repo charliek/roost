@@ -38,9 +38,41 @@ Everything is stdlib Python 3 + bash. No build step.
 | `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, drags. Needs single monitor. |
 | `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
+| `click_to_focus_check.py` | Self-contained real-click focus regression (click-to-focus + project-switch focus). Spins up its own Xvfb + throwaway Roost and clicks with **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
 
 PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
 layer: [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
+
+## Real-click focus regression (`click_to_focus_check.py`)
+
+Two focus behaviors can only be exercised by a **real** pointer press, so the IPC
+e2e suite can't reach them: `tab.dispatch_mouse_event` writes mouse-report bytes
+straight to the PTY and never enters the GTK gesture stack, and the IPC project
+switch never focuses a sidebar row. This check drives real clicks through the GTK
+gesture stack to cover both:
+
+- **click-to-focus** — clicking the terminal body grabs keyboard focus.
+- **project-switch focus** — clicking a sidebar project row focuses the new
+  project's terminal (without the idle-deferred grab, focus stays on the clicked
+  `GtkListBoxRow` and the cursor goes hollow).
+
+Unlike the `inject_*` tools above (which target a live COSMIC/Wayland session via
+`/dev/uinput`), this one is fully self-contained — it launches its own headless
+Xvfb + a throwaway Roost (private of your session: no shared socket, no session
+bus, isolated `ROOST_STATE_DIR`) and injects clicks with `xdotool`. So it needs
+only `Xvfb` + `xdotool` and runs anywhere, but it does **not** exercise the
+Wayland/uinput path (use the injectors for that). It is **not** wired into CI yet.
+
+```sh
+make test-click-to-focus            # or:
+python3 tools/input/linux/click_to_focus_check.py
+```
+
+Each check defocuses the terminal first (a non-terminal click), so the
+unfocused→focused transition pins the focus path under test. Focus is read via the
+`app.active_terminal_focused` IPC op (GTK logical focus, observable without a
+window manager). PASS exits 0; a missing `Xvfb`/`xdotool`/binary prints `SKIP` and
+exits 0.
 
 Run any Python tool with `python3 tools/input/linux/<tool>.py ...`; `--help`/no-args
 prints usage.

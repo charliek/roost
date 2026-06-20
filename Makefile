@@ -60,7 +60,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac e2e-gtk-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch
+.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac e2e-gtk-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch test-click-to-focus
 test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
 
 test-rust:  ## cargo test --workspace
@@ -93,6 +93,9 @@ smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
 smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build-tree resources, asserts it starts)
 	./mac/scripts/bundle.sh debug
 	./mac/scripts/smoke-launch.sh
+
+test-click-to-focus:  ## GTK click-to-focus real-input regression (self-contained Xvfb+xdotool; not CI-gated)
+	uv run --group test python tools/input/linux/click_to_focus_check.py
 
 # ---- code quality -----------------------------------------------------
 

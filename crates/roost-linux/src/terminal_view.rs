@@ -906,6 +906,25 @@ impl TerminalView {
         });
         widget.add_controller(right_click);
 
+        // Click-to-focus: a pointer press grabs keyboard focus, so a
+        // click starts typing — and is the recovery path when focus
+        // landed elsewhere (a sidebar row, the tab bar). AppKit gives
+        // this free via `acceptsFirstResponder`; GTK4 does not focus a
+        // custom `DrawingArea` on click, so we wire it explicitly. A
+        // dedicated all-button (button 0) gesture — not folded into
+        // `GestureDrag` — keeps focus off the selection/paste paths and
+        // never claims the sequence, so it can't deny the parallel drag
+        // (the PR #177 hazard).
+        let focus_click = gtk4::GestureClick::new();
+        focus_click.set_button(0);
+        focus_click.connect_pressed({
+            let widget = widget.clone();
+            move |_gesture, _n_press, _x, _y| {
+                widget.grab_focus();
+            }
+        });
+        widget.add_controller(focus_click);
+
         // Cursor blink: toggle every 530ms while the widget exists.
         // Pausing the timer on focus loss is a polish nit deferred to
         // commit 7 — for now we just stop redrawing the cursor when

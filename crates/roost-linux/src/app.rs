@@ -967,6 +967,9 @@ impl App {
                         UiRequest::AppCursorShape { reply } => {
                             let _ = reply.send(app.ipc_app_cursor_shape());
                         }
+                        UiRequest::AppActiveTerminalFocused { reply } => {
+                            let _ = reply.send(app.ipc_app_active_terminal_focused());
+                        }
                     }
                 }
             });
@@ -1597,12 +1600,21 @@ impl App {
         self.sidebar.select_row(Some(&ui.sidebar_row));
         drop(projects);
         *self.active_project_id.borrow_mut() = project_id;
-        // M9.5: clicking a project shouldn't leave focus on the
-        // sidebar row — the user wants to type into the terminal
-        // immediately, not navigate the project list. Hand focus to
-        // the active tab's TerminalView. Matches Mac UI behaviour
-        // (`selectProject(id:)` ends with `terminalView.window?.makeFirstResponder`).
-        self.focus_active_terminal();
+        // M9.5: clicking a project shouldn't leave focus on the sidebar
+        // row — hand focus to the active tab's TerminalView (matches the
+        // Mac `selectProject` ending in `makeFirstResponder`).
+        //
+        // Deferred to an idle tick: a real sidebar-row *click* focuses
+        // the `GtkListBoxRow` as part of click handling, and that focus
+        // settles *after* this handler returns — a synchronous grab is
+        // immediately stolen back by the row, stranding focus (cursor
+        // hollow). The next main-loop iteration runs after the click
+        // settles, so the grab sticks. (IPC/keyboard switches don't focus
+        // a row, so only real clicks showed the bug.)
+        let app = self.clone();
+        glib::idle_add_local_once(move || {
+            app.focus_active_terminal();
+        });
     }
 
     /// Move keyboard focus to the active project's active tab's
@@ -4402,6 +4414,21 @@ impl App {
             .terminal_view_for(active_tab_id)
             .ok_or_else(|| format!("tab {active_tab_id} has no live terminal"))?;
         Ok(view.current_cursor_shape_name())
+    }
+
+    /// `app.active_terminal_focused` — whether the active tab's
+    /// TerminalView holds GTK *logical* keyboard focus
+    /// (`window.focus_widget() == terminal`). Reads logical focus, not
+    /// the global `:has-focus` property, so it reports the state
+    /// `grab_focus()` sets even under the WM-less Xvfb e2e runner where
+    /// the toplevel never gains the compositor's input focus. Ungated
+    /// (read-only); returns `false` when there is no active terminal.
+    fn ipc_app_active_terminal_focused(self: &Rc<Self>) -> Result<bool, String> {
+        let Some(view) = self.active_terminal_view() else {
+            return Ok(false);
+        };
+        let widget = view.widget().clone().upcast::<gtk4::Widget>();
+        Ok(gtk4::prelude::GtkWindowExt::focus(&self.window) == Some(widget))
     }
 
     /// `app.window_metrics` — return window size + sidebar pane width +
