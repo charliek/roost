@@ -860,31 +860,6 @@ impl App {
             app.add_action(&close_tab_action);
         }
 
-        // Re-assert terminal focus when the window regains activation
-        // (alt-tab back), the GTK analog of Swift's
-        // `applicationDidBecomeActive -> focusActiveTerminal`. GTK
-        // usually restores the remembered focus widget for free, so this
-        // is belt-and-suspenders — but don't steal focus from an open
-        // palette or a rename entry the user is mid-edit in.
-        app_struct.window.connect_is_active_notify({
-            let app = app_struct.clone();
-            move |win| {
-                if !win.is_active() {
-                    return;
-                }
-                if app.palette.borrow().is_some() {
-                    return;
-                }
-                if let Some(focused) = gtk4::prelude::GtkWindowExt::focus(win) {
-                    // A text entry (palette/rename) owns focus — leave it.
-                    if focused.is::<gtk4::Text>() || focused.is::<gtk4::Entry>() {
-                        return;
-                    }
-                }
-                app.focus_active_terminal();
-            }
-        });
-
         app_struct.window.present();
 
         // UI bridge: the IPC handler (a tokio worker) forwards every
