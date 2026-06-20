@@ -15,8 +15,20 @@ so it is observable under the WM-less Xvfb e2e runner, unlike the global
 
 from __future__ import annotations
 
+import pytest
+
 from client import Roost
 from util import wait_tab_attached
+
+
+@pytest.fixture(autouse=True)
+def _gtk_only(target):
+    """These tests read the `app.active_terminal_focused` op, which only
+    the GTK UI implements. The Mac UI already has the focus behavior
+    (it's the reference); exposing the op + running these on Mac for
+    full parity is a follow-up."""
+    if target != "gtk":
+        pytest.skip("app.active_terminal_focused is implemented by the GTK UI only")
 
 
 def _wait_terminal_focused(roost, what: str, timeout: float = 2.0) -> None:

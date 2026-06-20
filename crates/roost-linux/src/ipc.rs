@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams,
-    ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
     NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
     PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
