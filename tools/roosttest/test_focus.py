@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from client import Roost
+from client import Roost, RoostError
 from util import wait_tab_attached
 
 
@@ -105,8 +105,8 @@ def test_project_switch_focuses_terminal(roost):
         for pid in (a, b):
             try:
                 roost.delete_project(pid)
-            except Exception:
-                pass
+            except RoostError:
+                pass  # already cascade-closed; real errors still propagate
 
 
 def test_tab_switch_keeps_focus(roost, project):

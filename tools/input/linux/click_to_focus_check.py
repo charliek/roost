@@ -248,6 +248,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(os.getpgid(roost.pid), signal.SIGKILL)
+                    roost.wait()
                 except ProcessLookupError:
                     pass
         try:
@@ -255,6 +256,7 @@ def main() -> int:
             xvfb.wait(timeout=5)
         except subprocess.TimeoutExpired:
             xvfb.kill()
+            xvfb.wait()
         shutil.rmtree(run, ignore_errors=True)
 
     print("PASS: click-to-focus and project-switch both grab terminal focus")
