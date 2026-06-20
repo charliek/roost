@@ -48,6 +48,7 @@ jobs:
               - 'linux/**'
             tests:
               - 'tools/roosttest/**'
+              - 'tools/input/linux/**'
               - 'pyproject.toml'
               - 'uv.lock'
             ci:
@@ -325,7 +326,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb zsh
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev xvfb xdotool zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -387,6 +388,24 @@ jobs:
         run: >
           xvfb-run -a --server-args="-screen 0 2560x1440x24"
           uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
+
+      # Real-click focus regression: F1 click-to-focus + F2 project switch
+      # + #1 core-sync. The only layer that drives real clicks through the
+      # GTK gesture stack (the IPC suite can't reach it). Self-contained —
+      # it starts its OWN Xvfb + a throwaway Roost — so it runs as its own
+      # step, NOT under xvfb-run. continue-on-error while we gather signal
+      # on XTEST-under-Xvfb reliability on shared runners; promote to a
+      # required gate once it's proven stable. ROOST_REQUIRE_REAL_INPUT
+      # turns the script's self-skip into a failure here (xdotool/Xvfb are
+      # installed, so a skip means a real setup problem, not "unsupported").
+      - name: Real-click focus regression (Xvfb + xdotool)
+        continue-on-error: true
+        env:
+          GDK_BACKEND: x11
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_REQUIRE_REAL_INPUT: "1"
+        run: uv run --group test python tools/input/linux/click_to_focus_check.py
 
       # Stage the captured UI log into one dir (upload-artifact doesn't
       # expand globs/`~`). The harness writes the launched UI's stdout+stderr

@@ -56,6 +56,12 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 
 
 def _skip(msg: str) -> NoReturn:
+    # In CI (ROOST_REQUIRE_REAL_INPUT=1) Xvfb/xdotool/the binary are all
+    # present, so a "skip" means a real setup failure, not an unsupported
+    # environment — surface it as a failure rather than a silent pass.
+    if os.environ.get("ROOST_REQUIRE_REAL_INPUT") == "1":
+        print(f"FAIL (real-input required): {msg}")
+        sys.exit(1)
     print(f"SKIP: {msg}")
     sys.exit(0)
 
