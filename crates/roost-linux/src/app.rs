@@ -237,6 +237,15 @@ pub struct App {
     /// workspace. (The same primitive will gate applying a remote
     /// reorder when cross-client convergence lands.)
     suppress_tab_reorder_echo: RefCell<bool>,
+    /// Set while the `ActiveChanged` (core -> UI) reaction runs, so the
+    /// programmatic `set_active_project` stack swap + `set_selected_page`
+    /// it performs don't fire the `selected-page` notify's UI -> core
+    /// sync and echo `focus_tab` back. The read-guard in
+    /// `sync_core_active_tab` alone is insufficient: stale queued
+    /// `ActiveChanged` events drive `set_selected_page` to tabs the core
+    /// has already moved off of, so the guard sees a mismatch and
+    /// oscillates the active tab.
+    suppress_active_sync: RefCell<bool>,
     /// `ROOST_TEST_MODE=1` was set in the UI's environment at
     /// launch. Read ONCE in `App::new` and stashed here so per-op
     /// dispatch is a cheap bool check rather than a syscall, and so a
@@ -638,6 +647,7 @@ impl App {
             drag_original_order: RefCell::new(Vec::new()),
             drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
+            suppress_active_sync: RefCell::new(false),
             // Read the env var exactly once at boot so per-op
             // dispatch is deterministic for the life of the process
             // — a tester can't toggle the gate mid-session. Present-
@@ -658,6 +668,14 @@ impl App {
         sidebar.connect_row_selected({
             let app = app_struct.clone();
             move |_, row| {
+                // `set_active_project` programmatically calls `select_row`
+                // to sync the highlight, which re-fires this handler. When
+                // that happens inside a core -> UI reaction, treat it as
+                // an echo, not a user click: skip so we don't sync the
+                // (stale, mid-reaction) selected tab back to the core.
+                if *app.suppress_active_sync.borrow() {
+                    return;
+                }
                 if let Some(row) = row {
                     let pid = row.index() as i64;
                     // Sidebar rows carry their project id in the
@@ -665,7 +683,7 @@ impl App {
                     // the row); read it back here.
                     if let Some(name) = row.widget_name().to_string().strip_prefix("project-") {
                         if let Ok(id) = name.parse::<i64>() {
-                            app.set_active_project(id);
+                            app.activate_project_from_ui(id);
                             return;
                         }
                     }
@@ -1297,6 +1315,15 @@ impl App {
             move |_| {
                 if *app.active_project_id.borrow() == project_id {
                     app.refresh_window_subtitle();
+                    // Tab-pill click / tab keybind: sync the core's active
+                    // tab. Skip when this notify is the core -> UI
+                    // reaction's own programmatic selection (else we echo
+                    // focus_tab back; see suppress_active_sync).
+                    if !*app.suppress_active_sync.borrow() {
+                        if let Some(tab_id) = app.active_tab_id(project_id) {
+                            app.sync_core_active_tab(tab_id);
+                        }
+                    }
                 }
             }
         });
@@ -2317,6 +2344,10 @@ impl App {
                 tracing::debug!(tab_id, hook_active = active, "hook_active.changed applied");
             }
             WorkspaceEvent::ActiveChanged { project_id, tab_id } => {
+                // Core -> UI reaction: the swap + select below are
+                // programmatic, so suppress their `selected-page` notify's
+                // UI -> core sync (see `suppress_active_sync`).
+                *self.suppress_active_sync.borrow_mut() = true;
                 if project_id != 0 {
                     self.set_active_project(project_id);
                 }
@@ -2328,6 +2359,7 @@ impl App {
                         }
                     }
                 }
+                *self.suppress_active_sync.borrow_mut() = false;
             }
             WorkspaceEvent::TabsReordered { .. } | WorkspaceEvent::ProjectsReordered { .. } => {
                 // M9 polish: reorder events are emitted by the
@@ -2526,8 +2558,12 @@ impl App {
         }
         *self.suppress_tab_reorder_echo.borrow_mut() = false;
 
-        // 9. Restore active selection from the snapshot.
+        // 9. Restore active selection from the snapshot. This is a
+        //    core -> UI reaction like the `ActiveChanged` handler, so
+        //    suppress the UI -> core sync echo on the programmatic
+        //    `select_row` / `set_selected_page` it performs.
         if plan.active_project != 0 {
+            *self.suppress_active_sync.borrow_mut() = true;
             self.set_active_project(plan.active_project);
             if plan.active_tab != 0 {
                 let projects = self.projects.borrow();
@@ -2537,6 +2573,7 @@ impl App {
                     }
                 }
             }
+            *self.suppress_active_sync.borrow_mut() = false;
         }
         self.refresh_window_subtitle();
     }
@@ -4486,7 +4523,7 @@ impl App {
         // id-sorted Nth project, not the one at the Nth visible position.
         let order = self.sidebar_order();
         if let Some(&id) = order.get(n - 1) {
-            self.set_active_project(id);
+            self.activate_project_from_ui(id);
         }
     }
 
@@ -4672,6 +4709,40 @@ impl App {
         // pending notification, which drops the inbox row + the tab's
         // needs-attention badge via the `TabNotification` false-edge.
         let _ = client.workspace.set_tab_has_notification(tab_id, false);
+    }
+
+    /// Make `project_id` active from a UI action (sidebar click, project
+    /// keybind) and sync the core to its active tab. The sync lives here,
+    /// not in `set_active_project`, because that is also the
+    /// `ActiveChanged` reaction body — syncing there would echo the core's
+    /// *previous* selection back over the one the caller asked for.
+    fn activate_project_from_ui(self: &Rc<Self>, project_id: i64) {
+        self.set_active_project(project_id);
+        // An empty project (no tab yet) has nothing to focus, so the
+        // core's active selection stays put until its first tab opens. In
+        // normal use a project always has >=1 tab — closing the last tab
+        // cascades the project away — so this only bites a raw IPC
+        // `project.create` with no `tab.open`.
+        if let Some(tab_id) = self.active_tab_id(project_id) {
+            self.sync_core_active_tab(tab_id);
+        }
+    }
+
+    /// Sync the workspace core's active selection to `tab_id` after a
+    /// UI-originating selection change. Without it the core's `active()` —
+    /// read by `identify`, persistence, and notification routing — goes
+    /// stale vs. what's on screen (UI as its own source of truth, against
+    /// the north star). Guarded on the *read*: `focus_tab` always emits
+    /// `ActiveChanged` (state.rs:881), so skipping when the core is
+    /// already on this tab stops a core-driven `set_selected_page` notify
+    /// from echoing `focus_tab` back and looping.
+    fn sync_core_active_tab(self: &Rc<Self>, tab_id: i64) {
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if client.workspace.active().1 != tab_id {
+            let _ = client.workspace.focus_tab(tab_id);
+        }
     }
 
     /// `KeybindAction::JumpToUnread`: focus the next tab with a pending

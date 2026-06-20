@@ -15,9 +15,11 @@ so it is observable under the WM-less Xvfb e2e runner, unlike the global
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from client import Roost, RoostError
+from client import Roost, RoostError, scaled_timeout
 from util import wait_tab_attached
 
 
@@ -133,3 +135,46 @@ def test_close_tab_focuses_survivor(roost, project):
     roost.close_tab(b)
     Roost._wait(lambda: roost.tab(b) is None, timeout=5.0, what="closed tab to drop")
     _wait_terminal_focused(roost, what="surviving tab's terminal focused after close")
+
+
+def test_crossproject_focus_not_overwritten(roost):
+    """Core-driven `tab.focus` to a tab in another project must leave the
+    core active on that exact tab. Guards the re-entrancy hazard: the
+    project-switch core-sync must live in the UI-action paths, NOT inside
+    the `ActiveChanged` reaction (`set_active_project`) — otherwise the
+    reaction would echo `focus_tab(project's *previously*-selected tab)`
+    and clobber the active tab the caller actually asked for."""
+    a = roost.create_project(name="xover-a", cwd="/tmp")
+    b = roost.create_project(name="xover-b", cwd="/tmp")
+    try:
+        a1 = roost.open_tab(a, cwd="/tmp")
+        wait_tab_attached(roost, a1)
+        a2 = roost.open_tab(a, cwd="/tmp")  # a2 becomes A's on-screen selected tab
+        wait_tab_attached(roost, a2)
+        b1 = roost.open_tab(b, cwd="/tmp")
+        wait_tab_attached(roost, b1)
+
+        roost.focus(b1)
+        Roost._wait(lambda: roost.identify()["active_tab_id"] == b1,
+                    timeout=4.0, what="project B active")
+        # Focus a1 — a DIFFERENT tab than A's on-screen selected tab (a2).
+        roost.focus(a1)
+        Roost._wait(lambda: roost.identify()["active_tab_id"] == a1,
+                    timeout=4.0, what="core active tab to reach a1")
+        # The overwrite is in the ASYNC GTK ActiveChanged reaction that runs
+        # after focus(a1) returns — it would echo focus_tab(a2) over a1. So
+        # require the core to *stay* on a1 across the reaction window, not
+        # just read a1 once (which the immediate focus_tab result satisfies
+        # even with the bug).
+        deadline = time.monotonic() + scaled_timeout(1.5)
+        while time.monotonic() < deadline:
+            assert roost.identify()["active_tab_id"] == a1, \
+                "core active tab overwritten to A's previously-selected tab"
+            time.sleep(0.1)
+        assert roost.identify()["active_project_id"] == a
+    finally:
+        for pid in (a, b):
+            try:
+                roost.delete_project(pid)
+            except RoostError:
+                pass
