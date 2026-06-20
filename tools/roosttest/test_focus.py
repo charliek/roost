@@ -62,3 +62,62 @@ def test_palette_steals_then_restores_terminal_focus(palette, project):
 
     roost.palette_dismiss()
     _wait_terminal_focused(roost, what="terminal refocused after palette dismiss")
+
+
+def test_project_switch_focuses_terminal(roost):
+    """Switching the active project lands keyboard focus on the new
+    project's active terminal — the Swift `selectProject` ->
+    `makeFirstResponder` parity.
+
+    Forward sentinel for the IPC/keyboard switch path, NOT the F2
+    regression: switching via `tab.focus` doesn't focus a sidebar row,
+    so it never reproduced the strand bug (focus left on the clicked
+    GtkListBoxRow, cursor hollow). The real-click F2 regression lives in
+    tools/input/linux/click_to_focus_check.py."""
+    a = roost.create_project(name="focus-a", cwd="/tmp")
+    b = roost.create_project(name="focus-b", cwd="/tmp")
+    try:
+        ta = roost.open_tab(a, cwd="/tmp")
+        wait_tab_attached(roost, ta)
+        tb = roost.open_tab(b, cwd="/tmp")
+        wait_tab_attached(roost, tb)
+
+        roost.focus(ta)
+        assert roost.identify()["active_project_id"] == a
+        _wait_terminal_focused(roost, what="terminal focused after switch to project A")
+
+        roost.focus(tb)
+        assert roost.identify()["active_project_id"] == b
+        _wait_terminal_focused(roost, what="terminal focused after switch to project B")
+    finally:
+        for pid in (a, b):
+            try:
+                roost.delete_project(pid)
+            except Exception:
+                pass
+
+
+def test_tab_switch_keeps_focus(roost, project):
+    """Switching tabs within a project keeps focus on the terminal."""
+    a = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, a)
+    b = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, b)
+    roost.focus(a)
+    _wait_terminal_focused(roost, what="terminal focused after switching to tab A")
+    roost.focus(b)
+    _wait_terminal_focused(roost, what="terminal focused after switching to tab B")
+
+
+def test_close_tab_focuses_survivor(roost, project):
+    """Closing the active tab lands focus on the surviving tab's
+    terminal (the AdwTabView auto-selects a neighbor)."""
+    a = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, a)
+    b = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, b)
+    roost.focus(b)
+    _wait_terminal_focused(roost, what="terminal focused on active tab before close")
+    roost.close_tab(b)
+    Roost._wait(lambda: roost.tab(b) is None, timeout=5.0, what="closed tab to drop")
+    _wait_terminal_focused(roost, what="surviving tab's terminal focused after close")

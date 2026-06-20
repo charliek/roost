@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Real-click regression for terminal click-to-focus (GTK / Linux).
+"""Real-click regression for terminal keyboard focus (GTK / Linux).
 
-Click-to-focus can't be exercised by the IPC e2e suite: `tab.dispatch_
-mouse_event` writes mouse-report bytes straight to the PTY and never
-enters the `GestureClick` controller that grabs keyboard focus. So this
-check drives a *real* pointer press through the GTK gesture stack.
+Covers the two focus behaviors that only a *real* pointer press can
+exercise — the IPC e2e suite can't reach them because
+`tab.dispatch_mouse_event` writes mouse-report bytes straight to the PTY
+and never enters the GTK gesture stack, and the IPC project switch never
+focuses a sidebar row:
+
+  * click-to-focus — clicking the terminal body grabs keyboard focus.
+  * project-switch focus — clicking a sidebar project row focuses the
+    new project's terminal (without the idle-deferred grab, focus stays
+    on the clicked GtkListBoxRow and the cursor goes hollow).
 
 It is self-contained — it spins up its own headless Xvfb + a throwaway
 Roost instance and injects clicks with `xdotool` (XTEST) — so it needs
@@ -16,14 +22,9 @@ session). It is NOT yet wired into CI; run it locally:
     make test-click-to-focus            # or:
     python3 tools/input/linux/click_to_focus_check.py
 
-The isolation argument: a click in the terminal *body* has no handler
-other than the click-to-focus gesture that would grab focus, so the
-positive result pins the gesture specifically. The sequence:
-
-  1. open a tab            -> terminal holds logical focus (baseline)
-  2. click the sidebar-toggle button (takes focus, no refocus side
-     effect)               -> terminal LOSES focus
-  3. click the terminal body -> terminal REGAINS focus  (the gesture)
+The isolation argument for each check: the target click has no handler
+other than the focus path under test, and a non-terminal click defocuses
+first, so the unfocused->focused transition pins that path specifically.
 
 Focus is read via the `app.active_terminal_focused` IPC op (GTK logical
 focus, observable without a window manager). Exits 0 on PASS, 1 on FAIL,
@@ -119,6 +120,61 @@ def _connect(make_client, timeout: float = 15.0):
     raise TimeoutError(f"could not connect to roost socket: {last}")
 
 
+def _check_click_to_focus(r, click, wait_tab_attached) -> None:
+    """F1: clicking the terminal body grabs keyboard focus."""
+    pid = r.create_project(name="click-focus", cwd="/tmp")
+    tab = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, tab)
+
+    # Move focus OFF the terminal first, so the terminal-body click below
+    # is a real unfocused->focused transition (not a no-op on an already-
+    # focused terminal — the new-tab grab may or may not have landed
+    # depending on startup timing). The sidebar-toggle button (header,
+    # left edge) takes focus and has no terminal-refocus side effect.
+    _click_until(click, (68, 27), r, want=False,
+                 what="move focus off the terminal via the toggle button")
+
+    # Click deep in the terminal body (clear of the sidebar). The ONLY
+    # thing that grabs focus on a terminal-body click is the click-to-
+    # focus gesture under test, so unfocused->focused pins it specifically.
+    m = r.window_metrics()
+    sb = int(m.get("sidebar_width", 0) or 0)
+    w, h = int(m["window_width"]), int(m["window_height"])
+    _click_until(click, (sb + int((w - sb) * 0.6), int(h * 0.55)), r, want=True,
+                 what="grab focus by clicking the terminal body (click-to-focus)")
+
+
+def _check_project_switch_focus(r, click) -> None:
+    """F2: switching projects by clicking a sidebar row grabs focus on
+    the new project's terminal. Real-click only — the IPC switch path
+    doesn't focus a sidebar row, so it never reproduced the strand bug
+    (focus left on the clicked GtkListBoxRow, cursor hollow)."""
+    # Expand the sidebar AND move focus onto the toggle button (off the
+    # terminal): a toggle click flips visibility and takes focus, so
+    # re-expand if that first click collapsed it, then wait for the
+    # expand to settle before reading geometry / clicking a row.
+    click(68, 27)
+    if r.window_metrics().get("sidebar_collapsed"):
+        click(68, 27)
+    r._wait(lambda: not r.window_metrics().get("sidebar_collapsed"),
+            timeout=4.0, what="sidebar expanded for the project-switch click")
+    if r.app_active_terminal_focused():
+        raise AssertionError("expected the terminal unfocused after toggling the sidebar")
+
+    # Click sidebar row 0 — the throwaway-state bootstrap project, never
+    # the active one here (the click-to-focus check left its own project
+    # active), so this is a real project switch. X is derived (mid-
+    # sidebar); Y is the first row under the PROJECTS header, a constant
+    # for the controlled Xvfb screen + default test theme (the test fails
+    # loudly via the timeout below if it drifts). One click is a
+    # deterministic switch; poll for the idle-deferred grab to land —
+    # without the fix, focus stays on the row and this times out.
+    sb = int(r.window_metrics().get("sidebar_width", 0) or 0)
+    click(max(10, sb // 2), 100)
+    r._wait(lambda: r.app_active_terminal_focused(), timeout=8.0,
+            what="terminal focus after switching projects via a sidebar-row click")
+
+
 def main() -> int:
     roost_bin = REPO / "target" / "debug" / "roost"
     if not roost_bin.exists():
@@ -147,6 +203,10 @@ def main() -> int:
         env = {
             **os.environ, "DISPLAY": display,
             "XDG_RUNTIME_DIR": str(xdg), "XDG_STATE_HOME": str(state),
+            # Throwaway state.json so the project list is deterministic
+            # (a fresh bootstrap project at sidebar row 0), independent of
+            # the developer's real workspace.
+            "ROOST_STATE_DIR": str(state),
             "ROOST_TEST_MODE": "1",
         }
         # Roost is a unique GApplication (registers its app-id on the
@@ -171,28 +231,8 @@ def main() -> int:
         r = _connect(lambda: Roost(str(sock)))
         try:
             _wait_window_mapped(display)
-            pid = r.create_project(name="click-focus", cwd="/tmp")
-            tab = r.open_tab(pid, cwd="/tmp")
-            wait_tab_attached(r, tab)
-
-            # Move focus OFF the terminal first, so the terminal-body
-            # click below is a real unfocused->focused transition (not a
-            # no-op on an already-focused terminal — the new-tab grab may
-            # or may not have landed depending on startup timing). The
-            # sidebar-toggle button (header, left edge) takes focus and
-            # has no terminal-refocus side effect.
-            _click_until(click, (68, 27), r, want=False,
-                         what="move focus off the terminal via the toggle button")
-
-            # Click deep in the terminal body (clear of the sidebar). The
-            # ONLY thing that grabs focus on a terminal-body click is the
-            # click-to-focus gesture under test, so unfocused->focused
-            # here pins that gesture specifically.
-            m = r.window_metrics()
-            sb = int(m.get("sidebar_width", 0) or 0)
-            w, h = int(m["window_width"]), int(m["window_height"])
-            _click_until(click, (sb + int((w - sb) * 0.6), int(h * 0.55)), r, want=True,
-                         what="grab focus by clicking the terminal body (click-to-focus)")
+            _check_click_to_focus(r, click, wait_tab_attached)
+            _check_project_switch_focus(r, click)
         finally:
             r.close()
     finally:
@@ -217,7 +257,7 @@ def main() -> int:
             xvfb.kill()
         shutil.rmtree(run, ignore_errors=True)
 
-    print("PASS: terminal click-to-focus grabs keyboard focus")
+    print("PASS: click-to-focus and project-switch both grab terminal focus")
     return 0
 
 
