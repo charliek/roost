@@ -4767,7 +4767,12 @@ impl App {
             return;
         };
         if client.workspace.active().1 != tab_id {
-            let _ = client.workspace.focus_tab(tab_id);
+            // This is the boundary (a GTK signal handler), so log rather
+            // than propagate. The only error is the tab vanishing between
+            // the UI selection and here — benign for a sync.
+            if let Err(e) = client.workspace.focus_tab(tab_id) {
+                tracing::debug!(?e, tab_id, "sync_core_active_tab: focus_tab failed");
+            }
         }
     }
 

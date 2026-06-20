@@ -88,9 +88,10 @@ def test_project_switch_focuses_terminal(roost):
     so it never reproduced the strand bug (focus left on the clicked
     GtkListBoxRow, cursor hollow). The real-click F2 regression lives in
     tools/input/linux/click_to_focus_check.py."""
-    a = roost.create_project(name="focus-a", cwd="/tmp")
-    b = roost.create_project(name="focus-b", cwd="/tmp")
+    a = b = None
     try:
+        a = roost.create_project(name="focus-a", cwd="/tmp")
+        b = roost.create_project(name="focus-b", cwd="/tmp")
         ta = roost.open_tab(a, cwd="/tmp")
         wait_tab_attached(roost, ta)
         tb = roost.open_tab(b, cwd="/tmp")
@@ -105,6 +106,8 @@ def test_project_switch_focuses_terminal(roost):
         _wait_terminal_focused(roost, what="terminal focused after switch to project B")
     finally:
         for pid in (a, b):
+            if pid is None:
+                continue
             try:
                 roost.delete_project(pid)
             except RoostError:
@@ -144,9 +147,10 @@ def test_crossproject_focus_not_overwritten(roost):
     the `ActiveChanged` reaction (`set_active_project`) — otherwise the
     reaction would echo `focus_tab(project's *previously*-selected tab)`
     and clobber the active tab the caller actually asked for."""
-    a = roost.create_project(name="xover-a", cwd="/tmp")
-    b = roost.create_project(name="xover-b", cwd="/tmp")
+    a = b = None
     try:
+        a = roost.create_project(name="xover-a", cwd="/tmp")
+        b = roost.create_project(name="xover-b", cwd="/tmp")
         a1 = roost.open_tab(a, cwd="/tmp")
         wait_tab_attached(roost, a1)
         a2 = roost.open_tab(a, cwd="/tmp")  # a2 becomes A's on-screen selected tab
@@ -174,6 +178,8 @@ def test_crossproject_focus_not_overwritten(roost):
         assert roost.identify()["active_project_id"] == a
     finally:
         for pid in (a, b):
+            if pid is None:
+                continue
             try:
                 roost.delete_project(pid)
             except RoostError:
