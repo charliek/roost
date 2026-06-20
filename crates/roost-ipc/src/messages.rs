@@ -637,6 +637,24 @@ pub struct AppCursorShapeResult {
     pub shape: String,
 }
 
+/// `app.active_terminal_focused` request: report whether the active
+/// tab's TerminalView currently holds GTK *logical* keyboard focus
+/// (`window.focus_widget() == terminal`). Reads logical focus — the
+/// target `grab_focus()` sets, regardless of whether the toplevel owns
+/// the compositor's input focus — so it stays observable under the
+/// bare-Xvfb (no window manager) e2e runner, unlike the global
+/// `:has-focus` property. Not gated — read-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppActiveTerminalFocusedParams {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppActiveTerminalFocusedResult {
+    /// True when the active tab's terminal is the window's logical
+    /// focus widget. False when there is no active terminal.
+    pub focused: bool,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -1051,6 +1069,12 @@ pub mod ops {
     /// the latest OSC 22 payload, or `"default"` if none has landed.
     /// Used by the e2e suite to assert OSC 22 actually applied.
     pub const APP_CURSOR_SHAPE: &str = "app.cursor_shape";
+    /// Ungated read of whether the active tab's terminal holds GTK
+    /// *logical* keyboard focus (`window.focus_widget() == terminal`).
+    /// Used by the e2e suite to assert navigation lands focus on the
+    /// terminal. Reads logical focus, so it works under the WM-less
+    /// Xvfb runner where the toplevel never gains compositor focus.
+    pub const APP_ACTIVE_TERMINAL_FOCUSED: &str = "app.active_terminal_focused";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";
@@ -1570,6 +1594,15 @@ mod tests {
         });
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppCursorShapeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_active_terminal_focused_round_trips() {
+        round_trip(&AppActiveTerminalFocusedParams {});
+        round_trip(&AppActiveTerminalFocusedResult { focused: true });
+        round_trip(&AppActiveTerminalFocusedResult { focused: false });
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppActiveTerminalFocusedParams>(bad).is_err());
     }
 
     #[test]
