@@ -760,6 +760,39 @@ mod tests {
     }
 
     #[test]
+    fn digit_defaults_keep_project_and_tab_switching_separate() {
+        // Pin project_mod+digit -> SwitchProject and ctrl+digit -> SwitchTab
+        // so a rebind that puts project-switch back on Alt+digit (colliding
+        // with the AdwTabView tab shortcuts removed in app.rs) is caught. The
+        // runtime AdwTabView half is covered by the real-input regression in
+        // tools/input/linux/.
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        let project_mod = if cfg!(target_os = "macos") {
+            "super"
+        } else {
+            "alt"
+        };
+        for n in 1..=9u8 {
+            let proj = parse_trigger(&format!("{project_mod}+{n}")).unwrap();
+            assert_eq!(
+                defaults.get(&proj),
+                Some(&KeybindAction::SwitchProject(n)),
+                "{project_mod}+{n} should switch to project {n}"
+            );
+            let tab = parse_trigger(&format!("ctrl+{n}")).unwrap();
+            assert_eq!(
+                defaults.get(&tab),
+                Some(&KeybindAction::SwitchTab(n)),
+                "ctrl+{n} should switch to tab {n}"
+            );
+        }
+        // project_mod+0 is FontReset, NOT a 10th-tab switch — guards against
+        // AdwTabView's ALT_ZERO leaking back into the digit row.
+        let reset = parse_trigger(&format!("{project_mod}+0")).unwrap();
+        assert_eq!(defaults.get(&reset), Some(&KeybindAction::FontReset));
+    }
+
+    #[test]
     fn from_name_parses_dynamic_actions() {
         assert_eq!(
             KeybindAction::from_name("switch_project_3"),

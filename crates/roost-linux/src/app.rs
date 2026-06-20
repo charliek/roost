@@ -1247,6 +1247,12 @@ impl App {
         row.add_controller(row_dblclick);
 
         let tab_view = TabView::new();
+        // Drop AdwTabView's built-in Alt+1..9 / Alt+0 tab shortcuts: on Linux
+        // our project modifier is Alt, so they collide with Alt+digit =
+        // SwitchProject / FontReset (and bypass the core-synced switch path).
+        tab_view.remove_shortcuts(
+            libadwaita::TabViewShortcuts::ALT_DIGITS | libadwaita::TabViewShortcuts::ALT_ZERO,
+        );
         // Hook "close-page" so the daemon learns about the close,
         // even when the user clicks the [×] on a tab pill.
         tab_view.connect_close_page({
