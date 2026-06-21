@@ -298,6 +298,32 @@ def _check_pill_click_syncs_core(r, click, wait_tab_attached) -> None:
         click(sb + 60, 73)
 
 
+def _check_tab_context_menu_no_crash(r, rclick, send_key, wait_tab_attached) -> None:
+    """Right-clicking a tab pill opens the AdwTabView context menu. Re-setting
+    the menu model during the `setup-menu` signal used to segfault AdwTabView
+    mid popover-build (gtk_popover_menu_new_from_model_full); the static-model
+    + stashed-tab-id pattern fixes it. Regression: right-click a pill and
+    assert the app still answers IPC — a crash drops the socket. Real-input
+    only: the menu lives in the GTK pointer/popover stack, unreachable via IPC.
+    """
+    pid = r.identify()["active_project_id"]
+    t = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, t)
+    sb = int(r.window_metrics().get("sidebar_width", 0) or 0)
+    # Right-click the leftmost pill (Y in the tab strip). Pre-fix this
+    # segfaulted the instant the popover menu was built.
+    rclick(sb + 60, 73)
+    time.sleep(0.4)
+    # If the menu-show crashed, the socket is dead and this raises.
+    assert r.identify()["active_project_id"] == pid, \
+        "tab right-click context menu crashed the app (AdwTabView setup-menu segfault)"
+    # NB: a dropped XTEST right-click degrades to a no-op pass rather than a
+    # failure — there's no IPC handle for the GTK popover to positively
+    # confirm it opened. The pill coords match the proven pill-click check
+    # above, so a drop is unlikely.
+    send_key("Escape")  # dismiss the menu so it doesn't shadow later state
+
+
 def main() -> int:
     roost_bin = REPO / "target" / "debug" / "roost"
     if not roost_bin.exists():
@@ -344,12 +370,18 @@ def main() -> int:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        def click(x: int, y: int) -> None:
+        def _xclick(x: int, y: int, button: int) -> None:
             subprocess.run(
-                ["xdotool", "mousemove", str(x), str(y), "click", "1"],
+                ["xdotool", "mousemove", str(x), str(y), "click", str(button)],
                 env=_xenv(display), check=True,
             )
             time.sleep(0.4)
+
+        def click(x: int, y: int) -> None:
+            _xclick(x, y, 1)
+
+        def rclick(x: int, y: int) -> None:
+            _xclick(x, y, 3)
 
         def send_key(combo: str) -> None:
             # No WM under Xvfb, so set X input focus on the Roost window
@@ -370,6 +402,7 @@ def main() -> int:
             _check_ctrl_pagedown_syncs_core(r, send_key, wait_tab_attached)
             _check_cycle_tab_syncs_core(r, send_key, wait_tab_attached)
             _check_pill_click_syncs_core(r, click, wait_tab_attached)
+            _check_tab_context_menu_no_crash(r, rclick, send_key, wait_tab_attached)
         finally:
             r.close()
     finally:
@@ -397,8 +430,8 @@ def main() -> int:
         shutil.rmtree(run, ignore_errors=True)
 
     print("PASS: click-to-focus, project-switch focus, Alt+digit project-only "
-          "switching, and tab-switch core-sync (pill click / Ctrl+PageDown / "
-          "cycle_tab) all verified")
+          "switching, tab-switch core-sync (pill click / Ctrl+PageDown / "
+          "cycle_tab), and tab right-click context menu (no crash) all verified")
     return 0
 
 

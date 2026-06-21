@@ -246,6 +246,12 @@ pub struct App {
     /// synchronously inside the set/append/close, so the bracket covers
     /// it.
     suppress_selected_page_sync: RefCell<bool>,
+    /// Tab id most recently right-clicked, stashed by the AdwTabView
+    /// `setup-menu` handler so the parameterless Rename/Close context-menu
+    /// actions know which tab to act on. (The menu model is static — see
+    /// `build_tab_context_menu` — because re-setting it during `setup-menu`
+    /// segfaults AdwTabView.)
+    context_menu_tab_id: RefCell<i64>,
     /// `ROOST_TEST_MODE=1` was set in the UI's environment at
     /// launch. Read ONCE in `App::new` and stashed here so per-op
     /// dispatch is a cheap bool check rather than a syscall, and so a
@@ -648,6 +654,7 @@ impl App {
             drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
             suppress_selected_page_sync: RefCell::new(false),
+            context_menu_tab_id: RefCell::new(0),
             // Read the env var exactly once at boot so per-op
             // dispatch is deterministic for the life of the process
             // — a tester can't toggle the gate mid-session. Present-
@@ -841,30 +848,27 @@ impl App {
             });
             app.add_action(&delete_action);
 
-            // M8: per-tab context menu actions (Rename / Close).
-            // Tab id is the action target.
-            let rename_tab_action =
-                gtk4::gio::SimpleAction::new("rename-tab", Some(&i64::static_variant_type()));
+            // M8: per-tab context menu actions (Rename / Close). The tab is
+            // the one most recently right-clicked, stashed in
+            // `context_menu_tab_id` by the AdwTabView `setup-menu` handler —
+            // the actions are parameterless (the menu model is static; see
+            // `build_tab_context_menu`).
+            let rename_tab_action = gtk4::gio::SimpleAction::new("rename-tab", None);
             let app_for_rename_tab = app_struct.clone();
-            rename_tab_action.connect_activate(move |_, target| {
-                if let Some(tab_id) = target.and_then(|t| t.get::<i64>()) {
-                    // Resolve the tab's project_id by scanning.
-                    let project_id = app_for_rename_tab.project_for_tab(tab_id);
-                    if let Some(pid) = project_id {
-                        app_for_rename_tab.begin_rename_tab(pid, tab_id);
-                    }
+            rename_tab_action.connect_activate(move |_, _| {
+                let tab_id = *app_for_rename_tab.context_menu_tab_id.borrow();
+                if let Some(pid) = app_for_rename_tab.project_for_tab(tab_id) {
+                    app_for_rename_tab.begin_rename_tab(pid, tab_id);
                 }
             });
             app.add_action(&rename_tab_action);
 
-            let close_tab_action =
-                gtk4::gio::SimpleAction::new("close-tab", Some(&i64::static_variant_type()));
+            let close_tab_action = gtk4::gio::SimpleAction::new("close-tab", None);
             let app_for_close = app_struct.clone();
-            close_tab_action.connect_activate(move |_, target| {
-                if let Some(tab_id) = target.and_then(|t| t.get::<i64>()) {
-                    if let Some(pid) = app_for_close.project_for_tab(tab_id) {
-                        app_for_close.close_tab_async(pid, tab_id);
-                    }
+            close_tab_action.connect_activate(move |_, _| {
+                let tab_id = *app_for_close.context_menu_tab_id.borrow();
+                if let Some(pid) = app_for_close.project_for_tab(tab_id) {
+                    app_for_close.close_tab_async(pid, tab_id);
                 }
             });
             app.add_action(&close_tab_action);
@@ -1367,18 +1371,21 @@ impl App {
             }
         });
         // M8: per-tab context menu (right-click a pill). AdwTabView
-        // calls `setup-menu` with the page being right-clicked (or
-        // `None` when the menu is being torn down) and expects us
-        // to populate `tab_view.menu_model()` via `set_menu_model`.
-        // The model uses detailed-action syntax to carry the tab id.
-        let initial_menu = build_tab_context_menu(0);
-        tab_view.set_menu_model(Some(&initial_menu));
-        tab_view.connect_setup_menu(move |tv, page| {
-            // `page == None` fires on close; nothing to do.
-            let Some(page) = page else { return };
-            if let Some(tab_id) = parse_tab_id_from_page(page) {
-                let model = build_tab_context_menu(tab_id);
-                tv.set_menu_model(Some(&model));
+        // calls `setup-menu` with the page being right-clicked (or `None`
+        // when the menu is torn down). Set the model ONCE here; `setup-menu`
+        // only stashes which tab was clicked (the actions are parameterless
+        // and read `context_menu_tab_id`). Re-setting the model inside the
+        // `setup-menu` handler segfaults AdwTabView mid-popover-build.
+        tab_view.set_menu_model(Some(&build_tab_context_menu()));
+        tab_view.connect_setup_menu({
+            let app = self.clone();
+            move |_tv, page| {
+                // `page == None` fires on close; nothing to stash.
+                if let Some(page) = page {
+                    if let Some(tab_id) = parse_tab_id_from_page(page) {
+                        *app.context_menu_tab_id.borrow_mut() = tab_id;
+                    }
+                }
             }
         });
 
@@ -5386,14 +5393,17 @@ pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
 }
 
-/// Build the per-tab right-click menu model (Rename / Close) with
-/// detailed action names carrying `tab_id` as the parameter. The
-/// resulting model is fed to `adw::TabView::set_menu_model` from
-/// `connect_setup_menu`.
-fn build_tab_context_menu(tab_id: i64) -> gtk4::gio::Menu {
+/// Static tab right-click menu model (Rename / Close), fed once to
+/// `adw::TabView::set_menu_model`. The actions are parameterless: which tab was
+/// right-clicked is stashed in `context_menu_tab_id` by the `setup-menu`
+/// handler. This is the documented AdwTabView pattern — set `menu-model`
+/// ONCE and use `setup-menu` only to prep actions. Rebuilding/re-setting
+/// the model *during* `setup-menu` segfaults AdwTabView mid-popover-build
+/// (`gtk_popover_menu_new_from_model_full`).
+fn build_tab_context_menu() -> gtk4::gio::Menu {
     let menu = gtk4::gio::Menu::new();
-    menu.append(Some("Rename"), Some(&format!("app.rename-tab({tab_id})")));
-    menu.append(Some("Close"), Some(&format!("app.close-tab({tab_id})")));
+    menu.append(Some("Rename"), Some("app.rename-tab"));
+    menu.append(Some("Close"), Some("app.close-tab"));
     menu
 }
 
