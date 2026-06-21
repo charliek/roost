@@ -19,20 +19,20 @@ use std::sync::Arc;
 
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppSetWindowFocusParams, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams,
+    AppCursorShapeParams, AppCursorShapeResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
+    AppSetWindowFocusParams, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -292,6 +292,11 @@ pub enum UiRequest {
     /// terminal holds GTK logical keyboard focus. Ungated (read-only).
     AppActiveTerminalFocused {
         reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    },
+    /// `app.selected_tab_id` — return the active project's on-screen
+    /// selected tab id (UI truth). Ungated (read-only).
+    AppSelectedTabId {
+        reply: tokio::sync::oneshot::Sender<Result<i64, String>>,
     },
 }
 
@@ -948,6 +953,14 @@ async fn dispatch(
                 .await?
                 .map_err(|e| HandlerError::new("internal", e))?;
             encode(&AppActiveTerminalFocusedResult { focused })
+        }
+        ops::APP_SELECTED_TAB_ID => {
+            let _: AppSelectedTabIdParams = decode(params)?;
+            let tab_id = h
+                .ui_call(|reply| UiRequest::AppSelectedTabId { reply })
+                .await?
+                .map_err(|e| HandlerError::new("internal", e))?;
+            encode(&AppSelectedTabIdResult { tab_id })
         }
         ops::EVENTS_SUBSCRIBE => {
             // Honest failure rather than a false ACK: the server never

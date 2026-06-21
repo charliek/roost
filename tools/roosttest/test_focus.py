@@ -140,6 +140,66 @@ def test_close_tab_focuses_survivor(roost, project):
     _wait_terminal_focused(roost, what="surviving tab's terminal focused after close")
 
 
+def test_core_tracks_displayed_tab(roost):
+    """The workspace core (`identify().active_tab_id`) and the on-screen
+    AdwTabView selection (`app.selected_tab_id`) must agree through every
+    programmatic path — open, focus, project switch, close-active-tab
+    survivor. This pins the `selected-page` core-sync guard added for
+    #228/#229: it must suppress the echo on our own programmatic selection
+    changes (so no path desyncs core from UI) while still syncing genuine
+    gestures (covered by the real-input harness). Uses 3 tabs so a
+    survivor-policy mismatch (daemon HashMap order vs AdwTabView visual
+    order) on close would surface."""
+    a = b = None
+    try:
+        a = roost.create_project(name="coreui-a", cwd="/tmp")
+        b = roost.create_project(name="coreui-b", cwd="/tmp")
+        a1 = roost.open_tab(a, cwd="/tmp")
+        wait_tab_attached(roost, a1)
+        a2 = roost.open_tab(a, cwd="/tmp")
+        wait_tab_attached(roost, a2)
+        a3 = roost.open_tab(a, cwd="/tmp")
+        wait_tab_attached(roost, a3)
+        b1 = roost.open_tab(b, cwd="/tmp")
+        wait_tab_attached(roost, b1)
+
+        def assert_core_eq_ui(what: str) -> None:
+            Roost._wait(
+                lambda: roost.identify()["active_tab_id"] == roost.app_selected_tab_id(),
+                timeout=4.0, what=f"core active == displayed tab after {what}")
+
+        assert_core_eq_ui("opening tabs")
+
+        roost.focus(a2)
+        Roost._wait(lambda: roost.identify()["active_tab_id"] == a2,
+                    timeout=4.0, what="a2 active")
+        assert_core_eq_ui("focus a2")
+
+        roost.focus(b1)
+        Roost._wait(lambda: roost.identify()["active_project_id"] == b,
+                    timeout=4.0, what="project b active")
+        assert_core_eq_ui("switch to project b")
+
+        # Close the active tab in A: the survivor must be tracked by BOTH
+        # the core and the displayed selection, with no echo/divergence.
+        roost.focus(a2)
+        Roost._wait(lambda: roost.identify()["active_tab_id"] == a2,
+                    timeout=4.0, what="a2 active again")
+        roost.close_tab(a2)
+        Roost._wait(lambda: roost.tab(a2) is None, timeout=5.0, what="a2 closed")
+        assert_core_eq_ui("closing active tab a2")
+        assert roost.identify()["active_tab_id"] in (a1, a3), \
+            "survivor must be a real surviving tab in project A"
+    finally:
+        for pid in (a, b):
+            if pid is None:
+                continue
+            try:
+                roost.delete_project(pid)
+            except RoostError:
+                pass
+
+
 def test_crossproject_focus_not_overwritten(roost):
     """Core-driven `tab.focus` to a tab in another project must leave the
     core active on that exact tab. Guards the re-entrancy hazard: the

@@ -237,6 +237,21 @@ pub struct App {
     /// workspace. (The same primitive will gate applying a remote
     /// reorder when cross-client convergence lands.)
     suppress_tab_reorder_echo: RefCell<bool>,
+    /// True while we programmatically set the AdwTabView selection (or
+    /// append/remove a page). Every selection change WE make is a UI
+    /// reaction to the core; only a genuine in-widget user gesture (pill
+    /// click, AdwTabView Ctrl-nav) should sync the core back. The
+    /// `selected-page` notify checks this to tell the two apart. Same
+    /// shape as `suppress_tab_reorder_echo`; the notify fires
+    /// synchronously inside the set/append/close, so the bracket covers
+    /// it.
+    suppress_selected_page_sync: RefCell<bool>,
+    /// Tab id most recently right-clicked, stashed by the AdwTabView
+    /// `setup-menu` handler so the parameterless Rename/Close context-menu
+    /// actions know which tab to act on. (The menu model is static — see
+    /// `build_tab_context_menu` — because re-setting it during `setup-menu`
+    /// segfaults AdwTabView.)
+    context_menu_tab_id: RefCell<i64>,
     /// `ROOST_TEST_MODE=1` was set in the UI's environment at
     /// launch. Read ONCE in `App::new` and stashed here so per-op
     /// dispatch is a cheap bool check rather than a syscall, and so a
@@ -638,6 +653,8 @@ impl App {
             drag_original_order: RefCell::new(Vec::new()),
             drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
+            suppress_selected_page_sync: RefCell::new(false),
+            context_menu_tab_id: RefCell::new(0),
             // Read the env var exactly once at boot so per-op
             // dispatch is deterministic for the life of the process
             // — a tester can't toggle the gate mid-session. Present-
@@ -831,30 +848,27 @@ impl App {
             });
             app.add_action(&delete_action);
 
-            // M8: per-tab context menu actions (Rename / Close).
-            // Tab id is the action target.
-            let rename_tab_action =
-                gtk4::gio::SimpleAction::new("rename-tab", Some(&i64::static_variant_type()));
+            // M8: per-tab context menu actions (Rename / Close). The tab is
+            // the one most recently right-clicked, stashed in
+            // `context_menu_tab_id` by the AdwTabView `setup-menu` handler —
+            // the actions are parameterless (the menu model is static; see
+            // `build_tab_context_menu`).
+            let rename_tab_action = gtk4::gio::SimpleAction::new("rename-tab", None);
             let app_for_rename_tab = app_struct.clone();
-            rename_tab_action.connect_activate(move |_, target| {
-                if let Some(tab_id) = target.and_then(|t| t.get::<i64>()) {
-                    // Resolve the tab's project_id by scanning.
-                    let project_id = app_for_rename_tab.project_for_tab(tab_id);
-                    if let Some(pid) = project_id {
-                        app_for_rename_tab.begin_rename_tab(pid, tab_id);
-                    }
+            rename_tab_action.connect_activate(move |_, _| {
+                let tab_id = *app_for_rename_tab.context_menu_tab_id.borrow();
+                if let Some(pid) = app_for_rename_tab.project_for_tab(tab_id) {
+                    app_for_rename_tab.begin_rename_tab(pid, tab_id);
                 }
             });
             app.add_action(&rename_tab_action);
 
-            let close_tab_action =
-                gtk4::gio::SimpleAction::new("close-tab", Some(&i64::static_variant_type()));
+            let close_tab_action = gtk4::gio::SimpleAction::new("close-tab", None);
             let app_for_close = app_struct.clone();
-            close_tab_action.connect_activate(move |_, target| {
-                if let Some(tab_id) = target.and_then(|t| t.get::<i64>()) {
-                    if let Some(pid) = app_for_close.project_for_tab(tab_id) {
-                        app_for_close.close_tab_async(pid, tab_id);
-                    }
+            close_tab_action.connect_activate(move |_, _| {
+                let tab_id = *app_for_close.context_menu_tab_id.borrow();
+                if let Some(pid) = app_for_close.project_for_tab(tab_id) {
+                    app_for_close.close_tab_async(pid, tab_id);
                 }
             });
             app.add_action(&close_tab_action);
@@ -987,6 +1001,9 @@ impl App {
                         }
                         UiRequest::AppActiveTerminalFocused { reply } => {
                             let _ = reply.send(app.ipc_app_active_terminal_focused());
+                        }
+                        UiRequest::AppSelectedTabId { reply } => {
+                            let _ = reply.send(app.ipc_app_selected_tab_id());
                         }
                     }
                 }
@@ -1261,7 +1278,15 @@ impl App {
             move |tv, page| {
                 let tab_id = parse_tab_id_from_page(page);
                 tracing::debug!(project_id, ?tab_id, "close-page signal");
+                // Removing a page makes AdwTabView auto-select a survivor,
+                // firing `selected-page`. That's not a user tab-switch — the
+                // daemon's `close_tab` reassigns the active tab and the
+                // `ActiveChanged` reaction selects it — so guard the survivor
+                // notify out of the core-sync path (every close, user or
+                // server-driven, funnels through here).
+                let prev_sps = app.suppress_selected_page_sync.replace(true);
                 tv.close_page_finish(page, true);
+                app.suppress_selected_page_sync.replace(prev_sps);
                 // Drop the local TabUi entry so cwd / state tracking
                 // for the now-dead tab is freed and the headerbar
                 // subtitle / rollup recompute don't try to look it
@@ -1318,34 +1343,49 @@ impl App {
         tab_view.connect_selected_page_notify({
             let app = self.clone();
             let project_id = project.id;
-            move |_| {
-                if *app.active_project_id.borrow() == project_id {
-                    app.refresh_window_subtitle();
+            move |tab_view| {
+                if *app.active_project_id.borrow() != project_id {
+                    return;
                 }
-                // NB: deliberately does NOT sync the core's active tab.
-                // `selected-page` fires for non-user reasons too — tab
-                // attach, and the bootstrap tab_view re-asserting its
-                // selection when a deleted project's page is removed from
-                // the stack — so a sync here races/overwrites the core's
-                // active tab (it was observed reverting `active()` to the
-                // bootstrap tab). Tab switches sync from the explicit user
-                // gestures instead (`switch_tab_by_index`). Tab-pill mouse
-                // clicks are therefore not yet core-synced — a follow-up.
+                app.refresh_window_subtitle();
+                // Sync the core ONLY for genuine in-widget user gestures —
+                // a tab-pill click (#228) or AdwTabView's Ctrl-nav (#229).
+                // Every selection change WE make (set_selected_page, append,
+                // close survivor) is wrapped in `suppress_selected_page_sync`
+                // so it doesn't echo back: those are UI reactions to the
+                // core, and syncing them would race/overwrite (e.g. revert
+                // `active()` to the bootstrap tab — the PR #227 hazard). The
+                // suppress flag, not this `active_project_id` gate, is what
+                // provides that safety. `sync_core_active_tab` is idempotent;
+                // its `focus_tab` delivers `ActiveChanged` asynchronously, so
+                // the reaction's (guarded) `set_selected_page` can't loop.
+                if *app.suppress_selected_page_sync.borrow() {
+                    return;
+                }
+                if let Some(tab_id) = tab_view
+                    .selected_page()
+                    .and_then(|p| parse_tab_id_from_page(&p))
+                {
+                    app.sync_core_active_tab(tab_id);
+                }
             }
         });
         // M8: per-tab context menu (right-click a pill). AdwTabView
-        // calls `setup-menu` with the page being right-clicked (or
-        // `None` when the menu is being torn down) and expects us
-        // to populate `tab_view.menu_model()` via `set_menu_model`.
-        // The model uses detailed-action syntax to carry the tab id.
-        let initial_menu = build_tab_context_menu(0);
-        tab_view.set_menu_model(Some(&initial_menu));
-        tab_view.connect_setup_menu(move |tv, page| {
-            // `page == None` fires on close; nothing to do.
-            let Some(page) = page else { return };
-            if let Some(tab_id) = parse_tab_id_from_page(page) {
-                let model = build_tab_context_menu(tab_id);
-                tv.set_menu_model(Some(&model));
+        // calls `setup-menu` with the page being right-clicked (or `None`
+        // when the menu is torn down). Set the model ONCE here; `setup-menu`
+        // only stashes which tab was clicked (the actions are parameterless
+        // and read `context_menu_tab_id`). Re-setting the model inside the
+        // `setup-menu` handler segfaults AdwTabView mid-popover-build.
+        tab_view.set_menu_model(Some(&build_tab_context_menu()));
+        tab_view.connect_setup_menu({
+            let app = self.clone();
+            move |_tv, page| {
+                // `page == None` fires on close; nothing to stash.
+                if let Some(page) = page {
+                    if let Some(tab_id) = parse_tab_id_from_page(page) {
+                        *app.context_menu_tab_id.borrow_mut() = tab_id;
+                    }
+                }
             }
         });
 
@@ -1551,7 +1591,12 @@ impl App {
         // menu, the popover would otherwise float over the wrong
         // pill while the RPC silently renames the background tab.
         // CodeRabbit caught this on PR #63.
-        ui.tab_view.set_selected_page(&tab_ui.page);
+        self.select_page_programmatic(&ui.tab_view, &tab_ui.page);
+        // Renaming a background tab switches the UI to it (above), so the
+        // core must follow — the guarded select suppresses the notify
+        // auto-sync, so sync explicitly. No-op when it's already the active
+        // tab (the common Alt+R case).
+        self.sync_core_active_tab(tab_id);
 
         let entry = gtk4::Entry::builder()
             .text(&current_title)
@@ -1745,6 +1790,23 @@ impl App {
         Ok(tab_id)
     }
 
+    /// Set the AdwTabView's selected page as a UI reaction to the core,
+    /// without the `selected-page` notify echoing it back into the core.
+    /// Use this for every programmatic selection change; genuine in-widget
+    /// user gestures (pill click, Ctrl-nav) bypass it and so do sync the
+    /// core. `replace`/restore (not plain `= true/false`) keeps nesting
+    /// safe. See `connect_selected_page_notify` and
+    /// `suppress_selected_page_sync`.
+    fn select_page_programmatic(
+        self: &Rc<Self>,
+        tab_view: &libadwaita::TabView,
+        page: &libadwaita::TabPage,
+    ) {
+        let prev = self.suppress_selected_page_sync.replace(true);
+        tab_view.set_selected_page(page);
+        self.suppress_selected_page_sync.replace(prev);
+    }
+
     /// Select the tab at `position` (0-based; equals open order, so
     /// it matches the saved layout's position) in `project_id`'s
     /// `AdwTabView`, syncing the workspace's active selection. Used at
@@ -1762,7 +1824,7 @@ impl App {
                 return;
             }
             let page = ui.tab_view.nth_page(position.clamp(0, n - 1));
-            ui.tab_view.set_selected_page(&page);
+            self.select_page_programmatic(&ui.tab_view, &page);
             page
         };
         if let Some(tab_id) = parse_tab_id_from_page(&page) {
@@ -1853,7 +1915,13 @@ impl App {
         let session_handle = rt
             .spawn(async move { TabSession::attach(supervisor, tab_id, output_tx, input_capture) });
 
+        // `append` makes the first page of an empty AdwTabView its
+        // selection, firing `selected-page` before the page is named — guard
+        // it so the notify doesn't treat the bootstrap append as a user
+        // gesture. (Subsequent appends don't change the selection.)
+        let prev_sps = self.suppress_selected_page_sync.replace(true);
         let page: libadwaita::TabPage = ui.tab_view.append(terminal.widget());
+        self.suppress_selected_page_sync.replace(prev_sps);
         let page_for_future = page.clone();
         let label = if tab.title.is_empty() {
             format!("Tab {}", tab.id)
@@ -2150,7 +2218,7 @@ impl App {
         });
 
         // Focus the new tab.
-        ui.tab_view.set_selected_page(&page);
+        self.select_page_programmatic(&ui.tab_view, &page);
         terminal.widget().grab_focus();
         drop(projects);
     }
@@ -2357,7 +2425,7 @@ impl App {
                     let projects = self.projects.borrow();
                     if let Some(ui) = projects.get(&project_id) {
                         if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
-                            ui.tab_view.set_selected_page(&tab_ui.page);
+                            self.select_page_programmatic(&ui.tab_view, &tab_ui.page);
                         }
                     }
                 }
@@ -2566,7 +2634,7 @@ impl App {
                 let projects = self.projects.borrow();
                 if let Some(ui) = projects.get(&plan.active_project) {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&plan.active_tab) {
-                        ui.tab_view.set_selected_page(&tab_ui.page);
+                        self.select_page_programmatic(&ui.tab_view, &tab_ui.page);
                     }
                 }
             }
@@ -2781,10 +2849,22 @@ impl App {
             return;
         }
         let target = target_signed as u32;
-        if let Some(obj) = pages.item(target) {
+        let tab_id = if let Some(obj) = pages.item(target) {
             if let Ok(page) = obj.downcast::<libadwaita::TabPage>() {
-                ui.tab_view.set_selected_page(&page);
+                self.select_page_programmatic(&ui.tab_view, &page);
+                parse_tab_id_from_page(&page)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        drop(projects);
+        // Explicit user gesture: sync the core's active tab. The guarded
+        // set above suppresses the `selected-page` auto-sync, so do it here
+        // (mirrors `switch_tab_by_index`).
+        if let Some(tab_id) = tab_id {
+            self.sync_core_active_tab(tab_id);
         }
     }
 
@@ -4464,6 +4544,15 @@ impl App {
         Ok(gtk4::prelude::GtkWindowExt::focus(&self.window) == Some(widget))
     }
 
+    /// `app.selected_tab_id` — the tab id selected in the active project's
+    /// AdwTabView (the on-screen tab), independent of the core's active
+    /// tab. `0` when there's no active project or no selection. Lets tests
+    /// assert the UI selection and `Workspace::active()` agree.
+    fn ipc_app_selected_tab_id(self: &Rc<Self>) -> Result<i64, String> {
+        let pid = *self.active_project_id.borrow();
+        Ok(self.active_tab_id(pid).unwrap_or(0))
+    }
+
     /// `app.window_metrics` — return window size + sidebar pane width +
     /// collapsed flag in logical points. Read-only: always succeeds.
     /// `Widget::width()` returns the allocated logical width; for the
@@ -4535,7 +4624,7 @@ impl App {
         let pages = ui.tab_view.pages();
         let tab_id = if let Some(obj) = pages.item((n - 1) as u32) {
             if let Ok(page) = obj.downcast::<libadwaita::TabPage>() {
-                ui.tab_view.set_selected_page(&page);
+                self.select_page_programmatic(&ui.tab_view, &page);
                 parse_tab_id_from_page(&page)
             } else {
                 None
@@ -5304,14 +5393,17 @@ pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
 }
 
-/// Build the per-tab right-click menu model (Rename / Close) with
-/// detailed action names carrying `tab_id` as the parameter. The
-/// resulting model is fed to `adw::TabView::set_menu_model` from
-/// `connect_setup_menu`.
-fn build_tab_context_menu(tab_id: i64) -> gtk4::gio::Menu {
+/// Static tab right-click menu model (Rename / Close), fed once to
+/// `adw::TabView::set_menu_model`. The actions are parameterless: which tab was
+/// right-clicked is stashed in `context_menu_tab_id` by the `setup-menu`
+/// handler. This is the documented AdwTabView pattern — set `menu-model`
+/// ONCE and use `setup-menu` only to prep actions. Rebuilding/re-setting
+/// the model *during* `setup-menu` segfaults AdwTabView mid-popover-build
+/// (`gtk_popover_menu_new_from_model_full`).
+fn build_tab_context_menu() -> gtk4::gio::Menu {
     let menu = gtk4::gio::Menu::new();
-    menu.append(Some("Rename"), Some(&format!("app.rename-tab({tab_id})")));
-    menu.append(Some("Close"), Some(&format!("app.close-tab({tab_id})")));
+    menu.append(Some("Rename"), Some("app.rename-tab"));
+    menu.append(Some("Close"), Some("app.close-tab"));
     menu
 }
 

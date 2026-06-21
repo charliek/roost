@@ -359,6 +359,14 @@ class Roost:
         # unfocused. The op always sends a JSON bool.
         return bool(res["focused"])
 
+    def app_selected_tab_id(self) -> int:
+        """Return the tab id selected in the active project's AdwTabView —
+        the on-screen tab (UI truth), independent of the core's active tab.
+        Lets tests assert the UI selection and `identify().active_tab_id`
+        agree. Ungated (read-only); 0 when there's no selection."""
+        res = self.call("app.selected_tab_id", {})
+        return int(res["tab_id"])
+
     def tab_expand_selection_at(
         self,
         tab_id: int,

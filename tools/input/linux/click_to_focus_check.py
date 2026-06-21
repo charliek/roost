@@ -233,6 +233,97 @@ def _check_alt_digit_switches_project_not_tab(r, send_key, wait_tab_attached) ->
             what="Alt+2 switches to the 2nd project (SwitchProject still works)")
 
 
+def _two_tabs_first_selected(r, wait_tab_attached):
+    """Open two tabs in the active project and leave the FIRST selected +
+    core-active. Returns (pid, t1, t2). Shared setup for the tab-switch
+    gesture checks below."""
+    pid = r.identify()["active_project_id"]
+    t1 = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, t1)
+    t2 = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, t2)
+    r.focus(t1)
+    r._wait(lambda: r.identify()["active_tab_id"] == t1 and r.app_selected_tab_id() == t1,
+            timeout=4.0, what="first tab active + displayed before the gesture")
+    return pid, t1, t2
+
+
+def _check_ctrl_pagedown_syncs_core(r, send_key, wait_tab_attached) -> None:
+    """#229: AdwTabView's built-in Ctrl+PageDown tab nav must sync the
+    workspace core, not just the on-screen selection. Real-input only: the
+    shortcut lives in the GTK shortcut stack, unreachable over IPC."""
+    _pid, t1, _t2 = _two_tabs_first_selected(r, wait_tab_attached)
+    send_key("ctrl+Page_Down")
+    # Core must follow the displayed tab AND have actually moved off t1.
+    r._wait(lambda: (a := r.identify()["active_tab_id"]) == r.app_selected_tab_id()
+            and a != t1,
+            timeout=6.0, what="Ctrl+PageDown syncs the core to the next tab (#229)")
+
+
+def _check_cycle_tab_syncs_core(r, send_key, wait_tab_attached) -> None:
+    """cycle_tab (Alt+Shift+]) must sync the core too (it set the selection
+    without syncing before this fix). Keybind action; real-input only."""
+    _pid, t1, _t2 = _two_tabs_first_selected(r, wait_tab_attached)
+    send_key("alt+shift+bracketright")
+    r._wait(lambda: (a := r.identify()["active_tab_id"]) == r.app_selected_tab_id()
+            and a != t1,
+            timeout=6.0, what="cycle_tab (Alt+Shift+]) syncs the core to the next tab")
+
+
+def _check_pill_click_syncs_core(r, click, wait_tab_attached) -> None:
+    """#228: clicking a tab pill must sync the workspace core to that tab.
+    Real-input only: tab.dispatch_mouse_event writes PTY bytes and never
+    enters the GTK gesture stack, and the IPC switch routes through the core
+    so it can't reproduce the desync."""
+    pid = r.identify()["active_project_id"]
+    t1 = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, t1)
+    t2 = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, t2)
+    # Newest tab (t2) is selected; click t1's pill (leftmost in the strip).
+    r._wait(lambda: r.app_selected_tab_id() == t2, timeout=4.0,
+            what="newest tab displayed before the pill click")
+    sb = int(r.window_metrics().get("sidebar_width", 0) or 0)
+    # The AdwTabBar pill strip sits just below the headerbar (~Y=73 on the
+    # controlled Xvfb screen + default test theme); the first pill starts
+    # just right of the sidebar, so a point ~60px in lands inside it for
+    # both the expanded and packed pill layouts. The timeout fails loudly
+    # if these drift. Poll-click so a dropped XTEST click is retried.
+    deadline = time.monotonic() + 8.0
+    while True:
+        if r.app_selected_tab_id() == t1 and r.identify()["active_tab_id"] == t1:
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError("pill click did not switch+sync to the first tab (#228)")
+        click(sb + 60, 73)
+
+
+def _check_tab_context_menu_no_crash(r, rclick, send_key, wait_tab_attached) -> None:
+    """Right-clicking a tab pill opens the AdwTabView context menu. Re-setting
+    the menu model during the `setup-menu` signal used to segfault AdwTabView
+    mid popover-build (gtk_popover_menu_new_from_model_full); the static-model
+    + stashed-tab-id pattern fixes it. Regression: right-click a pill and
+    assert the app still answers IPC — a crash drops the socket. Real-input
+    only: the menu lives in the GTK pointer/popover stack, unreachable via IPC.
+    """
+    pid = r.identify()["active_project_id"]
+    t = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, t)
+    sb = int(r.window_metrics().get("sidebar_width", 0) or 0)
+    # Right-click the leftmost pill (Y in the tab strip). Pre-fix this
+    # segfaulted the instant the popover menu was built.
+    rclick(sb + 60, 73)
+    time.sleep(0.4)
+    # If the menu-show crashed, the socket is dead and this raises.
+    assert r.identify()["active_project_id"] == pid, \
+        "tab right-click context menu crashed the app (AdwTabView setup-menu segfault)"
+    # NB: a dropped XTEST right-click degrades to a no-op pass rather than a
+    # failure — there's no IPC handle for the GTK popover to positively
+    # confirm it opened. The pill coords match the proven pill-click check
+    # above, so a drop is unlikely.
+    send_key("Escape")  # dismiss the menu so it doesn't shadow later state
+
+
 def main() -> int:
     roost_bin = REPO / "target" / "debug" / "roost"
     if not roost_bin.exists():
@@ -279,12 +370,18 @@ def main() -> int:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        def click(x: int, y: int) -> None:
+        def _xclick(x: int, y: int, button: int) -> None:
             subprocess.run(
-                ["xdotool", "mousemove", str(x), str(y), "click", "1"],
+                ["xdotool", "mousemove", str(x), str(y), "click", str(button)],
                 env=_xenv(display), check=True,
             )
             time.sleep(0.4)
+
+        def click(x: int, y: int) -> None:
+            _xclick(x, y, 1)
+
+        def rclick(x: int, y: int) -> None:
+            _xclick(x, y, 3)
 
         def send_key(combo: str) -> None:
             # No WM under Xvfb, so set X input focus on the Roost window
@@ -302,6 +399,10 @@ def main() -> int:
             _check_click_to_focus(r, click, wait_tab_attached)
             _check_project_switch_focus(r, click)
             _check_alt_digit_switches_project_not_tab(r, send_key, wait_tab_attached)
+            _check_ctrl_pagedown_syncs_core(r, send_key, wait_tab_attached)
+            _check_cycle_tab_syncs_core(r, send_key, wait_tab_attached)
+            _check_pill_click_syncs_core(r, click, wait_tab_attached)
+            _check_tab_context_menu_no_crash(r, rclick, send_key, wait_tab_attached)
         finally:
             r.close()
     finally:
@@ -328,8 +429,9 @@ def main() -> int:
             xvfb.wait()
         shutil.rmtree(run, ignore_errors=True)
 
-    print("PASS: click-to-focus, project-switch focus, and Alt+digit "
-          "project-only switching all verified")
+    print("PASS: click-to-focus, project-switch focus, Alt+digit project-only "
+          "switching, tab-switch core-sync (pill click / Ctrl+PageDown / "
+          "cycle_tab), and tab right-click context menu (no crash) all verified")
     return 0
 
 
