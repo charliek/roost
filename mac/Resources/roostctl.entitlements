@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Hardened-runtime entitlements for the bundled `roostctl` helper
+    (Contents/Resources/bin/roostctl).
+
+    roostctl is a Rust CLI that dials the running UI over a UNIX socket.
+    It never records audio/video or sends Apple events, so it must NOT
+    inherit the app's capture entitlements (device.audio-input, camera,
+    automation.apple-events). Signing it with its own narrow file keeps
+    least privilege on a binary that ships in every .app and is invoked
+    frequently by Claude hooks. cf. cmux's separate cmux-helper.entitlements.
+
+    com.apple.security.cs.disable-library-validation — carried here to
+    match what the helper was signed with before it got its own file
+    (zero behavior change); roostctl links only platform dylibs, so this
+    could likely be dropped to an empty <dict/> in a follow-up.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

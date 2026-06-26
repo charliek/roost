@@ -261,6 +261,73 @@ jobs:
           [ "$count" -gt 0 ] || { echo "FAIL: $THEMES shipped empty"; exit 1; }
           echo "OK: $count theme files shipped under Contents/Resources"
 
+      - name: Verify TCC capture entitlements + usage strings (signed bundle)
+        run: |
+          set -euo pipefail
+          # The signed bundle is the source of truth: the EntitlementsTests
+          # swift test guards the source templates, but only this proves
+          # bundle.sh actually signed the keys in. Without the capture
+          # entitlements, programs hosted in a Roost tab lose mic/camera/
+          # apple-events access *silently* under the hardened runtime.
+          APP="mac/build/Roost.app"
+          ROOSTCTL="$APP/Contents/Resources/bin/roostctl"
+          INFO="$APP/Contents/Info.plist"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          # Extract each binary's entitlements as a real plist. codesign's text
+          # dump format is unstable across macOS versions (XML on some, a
+          # [Key] listing on others), so we force --xml and parse with
+          # PlistBuddy for exact, substring-proof key lookup.
+          app_ent="$work/app.plist"; ctl_ent="$work/roostctl.plist"
+          codesign -d --entitlements - --xml "$APP"      2>/dev/null > "$app_ent" || true
+          codesign -d --entitlements - --xml "$ROOSTCTL" 2>/dev/null > "$ctl_ent" || true
+
+          has_key() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" >/dev/null 2>&1; }
+          # $1=label $2=plist; remaining args=exact key names.
+          require_keys() {
+            local label="$1" plist="$2"; shift 2
+            for key in "$@"; do
+              has_key "$plist" "$key" \
+                || { echo "FAIL: $label missing $key"; exit 1; }
+            done
+          }
+          forbid_keys() {
+            local label="$1" plist="$2"; shift 2
+            for key in "$@"; do
+              if has_key "$plist" "$key"; then
+                echo "FAIL: $label unexpectedly carries $key"; exit 1
+              fi
+            done
+          }
+
+          CAPTURE=(
+            com.apple.security.device.audio-input
+            com.apple.security.device.camera
+            com.apple.security.automation.apple-events
+          )
+          # Broad / unneeded keys kept out of the app (blast-radius control).
+          BROAD=(
+            com.apple.security.personal-information.addressbook
+            com.apple.security.personal-information.calendars
+            com.apple.security.personal-information.location
+            com.apple.security.personal-information.photos-library
+            com.apple.security.cs.allow-jit
+            com.apple.security.cs.allow-unsigned-executable-memory
+            com.apple.security.app-sandbox
+            com.apple.security.network.client
+            com.apple.security.network.server
+          )
+
+          require_keys "app" "$app_ent" "${CAPTURE[@]}"      # app MUST carry the capture set
+          forbid_keys  "app" "$app_ent" "${BROAD[@]}"        # app MUST NOT carry broad keys
+          forbid_keys  "roostctl" "$ctl_ent" "${CAPTURE[@]}" # helper MUST NOT inherit capture
+          # The signed bundle's Info.plist MUST carry the paired purpose strings.
+          require_keys "Info.plist" "$INFO" \
+            NSMicrophoneUsageDescription \
+            NSCameraUsageDescription \
+            NSAppleEventsUsageDescription
+          echo "OK: capture entitlements + usage strings present; helper + broad keys excluded"
+
   gtk-build:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true'

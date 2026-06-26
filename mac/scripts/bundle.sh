@@ -266,6 +266,10 @@ echo "    Embedded: ${APP_DIR}/Contents/Resources/bin/roostctl"
 # `ROOST_ALLOW_UNSIGNED=1` env var bypasses for the rare dev case where Xcode
 # CLT codesign is missing.
 ENT_FILE="${MAC_DIR}/Resources/Roost.entitlements"
+# The bundled roostctl helper gets a narrower entitlements file: it never
+# records audio/video or sends Apple events, so it must not inherit the app's
+# capture entitlements (least privilege; cf. cmux's cmux-helper.entitlements).
+ROOSTCTL_ENT_FILE="${MAC_DIR}/Resources/roostctl.entitlements"
 SIGN_IDENTITY="${ROOST_DEVELOPER_ID_IDENTITY:--}"
 # `--timestamp` only with a real identity; ad-hoc signing can't be timestamped.
 # Kept as a plain (unquoted-on-use) string so it expands to nothing when empty —
@@ -274,8 +278,8 @@ TS_FLAG=""
 if [ "${SIGN_IDENTITY}" != "-" ]; then
   TS_FLAG="--timestamp"
 fi
-if [ ! -f "${ENT_FILE}" ]; then
-  echo "==> No entitlements file at ${ENT_FILE}; skipping codesign"
+if [ ! -f "${ENT_FILE}" ] || [ ! -f "${ROOSTCTL_ENT_FILE}" ]; then
+  echo "==> Missing entitlements file (${ENT_FILE} or ${ROOSTCTL_ENT_FILE}); skipping codesign"
 elif ! command -v codesign >/dev/null 2>&1; then
   # codesign absent (no Xcode CLT). Honor the fail-hard intent above: a missing
   # signer would silently ship an unsigned bundle, so error out unless the
@@ -294,9 +298,12 @@ else
   fi
   codesign_or_die() {
     local target="$1"
+    # Optional per-target entitlements; defaults to the app's file. The
+    # roostctl helper passes its own narrower file.
+    local ent="${2:-${ENT_FILE}}"
     # shellcheck disable=SC2086  # TS_FLAG must word-split (empty => no flag)
     if codesign --force --sign "${SIGN_IDENTITY}" \
-         --entitlements "${ENT_FILE}" \
+         --entitlements "${ent}" \
          --options runtime \
          ${TS_FLAG} \
          "${target}"
@@ -336,7 +343,7 @@ else
     echo "    error: codesign(${target}) failed (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
     exit 1
   }
-  codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl"
+  codesign_or_die "${APP_DIR}/Contents/Resources/bin/roostctl" "${ROOSTCTL_ENT_FILE}"
   codesign_framework_or_die "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
   codesign_or_die "${APP_DIR}"
 fi
