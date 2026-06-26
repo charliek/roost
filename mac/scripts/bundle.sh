@@ -279,7 +279,16 @@ if [ "${SIGN_IDENTITY}" != "-" ]; then
   TS_FLAG="--timestamp"
 fi
 if [ ! -f "${ENT_FILE}" ] || [ ! -f "${ROOSTCTL_ENT_FILE}" ]; then
-  echo "==> Missing entitlements file (${ENT_FILE} or ${ROOSTCTL_ENT_FILE}); skipping codesign"
+  # The entitlements files are committed and carry the app's TCC capabilities
+  # (mic/camera/Apple-events); a missing one must not silently ship an unsigned
+  # bundle that drops them. Fail hard like the missing-codesign case, unless the
+  # operator explicitly opts into an unsigned build.
+  if [ "${ROOST_ALLOW_UNSIGNED:-0}" = "1" ]; then
+    echo "==> warn: missing entitlements file (${ENT_FILE} or ${ROOSTCTL_ENT_FILE}); ROOST_ALLOW_UNSIGNED=1 set, shipping unsigned"
+  else
+    echo "error: missing entitlements file (${ENT_FILE} or ${ROOSTCTL_ENT_FILE}) (set ROOST_ALLOW_UNSIGNED=1 to bypass)" >&2
+    exit 1
+  fi
 elif ! command -v codesign >/dev/null 2>&1; then
   # codesign absent (no Xcode CLT). Honor the fail-hard intent above: a missing
   # signer would silently ship an unsigned bundle, so error out unless the

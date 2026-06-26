@@ -99,8 +99,9 @@ func appEntitlementsExcludeBroadKeys() throws {
 func infoPlistTemplateHasUsageStrings() throws {
     let info = try plistDict("Info.plist.template")
     for key in usageStringKeys {
+        let value = (info[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(
-            (info[key] as? String)?.isEmpty == false,
+            value?.isEmpty == false,
             "Info.plist.template must carry a non-empty \(key) (paired with the capture entitlement)"
         )
     }

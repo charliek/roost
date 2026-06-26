@@ -279,19 +279,30 @@ jobs:
           # [Key] listing on others), so we force --xml and parse with
           # PlistBuddy for exact, substring-proof key lookup.
           app_ent="$work/app.plist"; ctl_ent="$work/roostctl.plist"
-          codesign -d --entitlements - --xml "$APP"      2>/dev/null > "$app_ent" || true
-          codesign -d --entitlements - --xml "$ROOSTCTL" 2>/dev/null > "$ctl_ent" || true
+          # No `|| true`: a failed extraction (unsigned/unreadable binary) must
+          # fail the job — otherwise the negative-only roostctl check below
+          # would pass vacuously on an empty plist.
+          codesign -d --entitlements - --xml "$APP"      2>/dev/null > "$app_ent"
+          codesign -d --entitlements - --xml "$ROOSTCTL" 2>/dev/null > "$ctl_ent"
 
           has_key() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" >/dev/null 2>&1; }
-          # $1=label $2=plist; remaining args=exact key names.
-          require_keys() {
+          plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true; }
+          # Each takes: $1=label $2=plist; remaining args=exact key names.
+          require_true() {  # key must exist AND be boolean true (not just present)
             local label="$1" plist="$2"; shift 2
             for key in "$@"; do
-              has_key "$plist" "$key" \
-                || { echo "FAIL: $label missing $key"; exit 1; }
+              [ "$(plist_value "$plist" "$key")" = "true" ] \
+                || { echo "FAIL: $label must carry $key=true"; exit 1; }
             done
           }
-          forbid_keys() {
+          require_nonempty() {  # key must exist AND be a non-whitespace string
+            local label="$1" plist="$2"; shift 2
+            for key in "$@"; do
+              [ -n "$(plist_value "$plist" "$key" | tr -d '[:space:]')" ] \
+                || { echo "FAIL: $label missing non-empty $key"; exit 1; }
+            done
+          }
+          forbid_keys() {  # key must be absent
             local label="$1" plist="$2"; shift 2
             for key in "$@"; do
               if has_key "$plist" "$key"; then
@@ -318,15 +329,15 @@ jobs:
             com.apple.security.network.server
           )
 
-          require_keys "app" "$app_ent" "${CAPTURE[@]}"      # app MUST carry the capture set
+          require_true "app" "$app_ent" "${CAPTURE[@]}"      # app MUST carry the capture set (=true)
           forbid_keys  "app" "$app_ent" "${BROAD[@]}"        # app MUST NOT carry broad keys
           forbid_keys  "roostctl" "$ctl_ent" "${CAPTURE[@]}" # helper MUST NOT inherit capture
           # The signed bundle's Info.plist MUST carry the paired purpose strings.
-          require_keys "Info.plist" "$INFO" \
+          require_nonempty "Info.plist" "$INFO" \
             NSMicrophoneUsageDescription \
             NSCameraUsageDescription \
             NSAppleEventsUsageDescription
-          echo "OK: capture entitlements + usage strings present; helper + broad keys excluded"
+          echo "OK: capture entitlements (=true) + usage strings present; helper + broad keys excluded"
 
   gtk-build:
     needs: changes
