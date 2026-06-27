@@ -2173,9 +2173,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         case .tabState(let e):
             // TabState updates light up the status-dot slot M3's
             // TabPillView reserved. Stash and rebuild. Also rebuild
-            // the sidebar so M6's per-project rollup stripe picks up
-            // the new state — `viewFor:item:` recomputes the rollup
-            // from `tabs` on every reload.
+            // the sidebar so the per-project rollup rail picks up the
+            // new state — `reloadData` re-runs `rowViewForItem`, which
+            // recomputes the rollup from `tabs` for the row's rail.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
                 session.liveState = Int32(e.state.rawValue)
                 if session.projectID == activeProjectID {
@@ -4519,16 +4519,8 @@ enum DropIndicator {
 final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
     /// Phase 6a P7: small accent-tinted dot in the right column
     /// when any tab in the project has a pending notification.
-    /// Hidden by default; `configure(with:notifying:rollup:)` flips it.
+    /// Hidden by default; `configure(with:notifying:)` flips it.
     private let badgeDot: NSView
-
-    /// M6 of `goal-mac-parity-2026-05-18.md`: 3px stripe on the
-    /// leading edge colored by the per-project rollup. Hidden when
-    /// the rollup is `.none`. The Linux UI's GTK row uses a CSS
-    /// `box-shadow: inset 3px 0 0 <color>`; we reproduce the same
-    /// visual with an explicit NSView so the row owns the rendering
-    /// (NSTableCellView styling can be subtle).
-    private let stripe: NSView
 
     /// M5 of `goal-mac-parity-2026-05-18.md`: true while the user is
     /// typing into the row's `textField` after a context-menu Rename.
@@ -4563,12 +4555,6 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         dot.isHidden = true
         self.badgeDot = dot
 
-        let stripe = NSView()
-        stripe.translatesAutoresizingMaskIntoConstraints = false
-        stripe.wantsLayer = true
-        stripe.isHidden = true
-        self.stripe = stripe
-
         let top = NSView()
         top.translatesAutoresizingMaskIntoConstraints = false
         top.wantsLayer = true
@@ -4584,18 +4570,12 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         self.dropBottomBand = bottom
 
         super.init(frame: .zero)
-        addSubview(stripe)
         addSubview(field)
         addSubview(dot)
         addSubview(top)
         addSubview(bottom)
         textField = field
         NSLayoutConstraint.activate([
-            stripe.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stripe.topAnchor.constraint(equalTo: topAnchor),
-            stripe.bottomAnchor.constraint(equalTo: bottomAnchor),
-            stripe.widthAnchor.constraint(equalToConstant: 3),
-
             field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             field.trailingAnchor.constraint(equalTo: dot.leadingAnchor, constant: -6),
             field.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -4631,7 +4611,7 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
         dropBottomBand.isHidden = position != .below
     }
 
-    func configure(with project: ProjectSnapshot, notifying: Bool, rollup: RollupState) {
+    func configure(with project: ProjectSnapshot, notifying: Bool) {
         // M5 race guard: while the user is editing this row, never
         // overwrite the textField from the model. A `.projectRenamed`
         // event arriving for *this* project mid-edit updates the model
@@ -4642,12 +4622,6 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
             textField?.stringValue = project.name
         }
         badgeDot.isHidden = !notifying
-        if let color = rollup.nsColor {
-            stripe.layer?.backgroundColor = color.cgColor
-            stripe.isHidden = false
-        } else {
-            stripe.isHidden = true
-        }
         applyLabelColor()
     }
 
@@ -4757,6 +4731,26 @@ final class ProjectRowCellView: NSTableCellView, NSTextFieldDelegate {
 /// We deliberately do NOT override `isEmphasized`: its real value drives a
 /// brighter pill while the sidebar holds focus, so the focus cue survives.
 final class SidebarRowView: NSTableRowView {
+    /// Per-project agent-state rollup color for the leading accent rail
+    /// (`nil` = no rail). Set from `rowViewForItem`. Drawn flush to the
+    /// sidebar's leading edge — outside the inset selection pill, so the two
+    /// never collide — with a vertical gap top/bottom so adjacent active
+    /// projects read as discrete segments rather than one merged bar. This
+    /// mirrors the GTK row's `box-shadow: inset 3px 0 0 <color>` treatment;
+    /// the source-list cell inset is why the old in-cell stripe floated.
+    var rollupColor: NSColor? {
+        didSet { needsDisplay = true }
+    }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        guard let rollupColor else { return }
+        let gap: CGFloat = 5
+        let rail = NSRect(x: 0, y: gap, width: 3, height: max(0, bounds.height - gap * 2))
+        rollupColor.setFill()
+        NSBezierPath(rect: rail).fill()
+    }
+
     override func drawSelection(in dirtyRect: NSRect) {
         guard isSelected else { return }
         // One consistent deep accent fill, regardless of focus. We deliberately
@@ -5386,15 +5380,7 @@ extension RoostApp: NSOutlineViewDelegate {
         // if ANY tab in this project has a pending notification.
         let projectTabs = tabs.filter { $0.projectID == row.project.id }
         let notifying = projectTabs.contains { $0.liveHasNotification }
-        // M6 of `goal-mac-parity-2026-05-18.md`: per-project rollup
-        // stripe colored by the highest-priority tab state. Computed
-        // on every reload — bounded by N tabs in the project.
-        let pairs: [(state: TabAgentState, hookActive: Bool)] = projectTabs.map {
-            (state: TabAgentState.fromProto(Int($0.liveState ?? 0)),
-             hookActive: $0.hookActive)
-        }
-        let rollup = projectRollup(tabs: pairs)
-        cell.configure(with: row.project, notifying: notifying, rollup: rollup)
+        cell.configure(with: row.project, notifying: notifying)
         return cell
     }
 
@@ -5402,7 +5388,25 @@ extension RoostApp: NSOutlineViewDelegate {
         _ outlineView: NSOutlineView,
         rowViewForItem item: Any
     ) -> NSTableRowView? {
-        SidebarRowView()
+        let rowView = SidebarRowView()
+        if let row = item as? ProjectRowItem {
+            rowView.rollupColor = rollupState(forProjectID: row.project.id).nsColor
+        }
+        return rowView
+    }
+
+    /// Per-project agent-state rollup for `projectID`, aggregated over its
+    /// tabs' `(state, hookActive)` pairs (hook-active tabs suppressed). Feeds
+    /// the row view's leading accent rail; kept a single function so the rail
+    /// always agrees with the per-tab pill status.
+    func rollupState(forProjectID projectID: Int64) -> RollupState {
+        let pairs: [(state: TabAgentState, hookActive: Bool)] = tabs
+            .filter { $0.projectID == projectID }
+            .map {
+                (state: TabAgentState.fromProto(Int($0.liveState ?? 0)),
+                 hookActive: $0.hookActive)
+            }
+        return projectRollup(tabs: pairs)
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
