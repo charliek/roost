@@ -630,33 +630,33 @@ impl App {
         tab_row.append(&sidebar_toggle_button);
         tab_row.append(&bar_stack);
         tab_row.append(&new_tab_button);
-        // Hexpanding drag spacer: pushes notifications + window controls to
-        // the trailing edge and gives the window a drag region, so the tabs
-        // stay compact and left-aligned (Mac style) rather than stretching
-        // to fill the row.
-        let tab_row_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        tab_row_spacer.set_hexpand(true);
-        tab_row.append(&tab_row_spacer);
+        // Window-drag region: a GtkWindowHandle around ONLY the hexpanding
+        // spacer, NOT the whole row. A WindowHandle treats its non-button
+        // children as drag-to-move-window area, so wrapping the row made
+        // dragging a tab pill move the whole window instead of reordering —
+        // the pills' own DragSource never won. Wrapping just the spacer keeps
+        // the empty middle draggable (window move) while the pills keep their
+        // drag-reorder. (AdwHeaderBar gave window-drag for free; this restores
+        // it.) The spacer also pushes the trailing controls to the edge so the
+        // tabs stay compact + left-aligned (Mac style).
+        //
+        // CSD/SSD: on Wayland (the primary target — COSMIC/GNOME) the window is
+        // client-side-decorated, so the in-row GtkWindowControls are the only
+        // controls — correct. On X11 under a WM with server-side decorations
+        // they'd be doubled; the right fix is CSD detection (cf. Ghostty's
+        // .csd/.ssd toggle), NOT a blanket set_decorated(false) which strips
+        // Wayland's resize edges + shadow. Deferred to real-compositor checks.
+        let drag_area = gtk4::WindowHandle::builder()
+            .css_classes(["roost-titlebar"])
+            .hexpand(true)
+            .child(&gtk4::Box::new(gtk4::Orientation::Horizontal, 0))
+            .build();
+        tab_row.append(&drag_area);
         tab_row.append(&notif_button);
         tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::End));
-        // AdwHeaderBar gave window-drag for free; without it we wrap the row
-        // in a GtkWindowHandle so empty regions drag the window. Interactive
-        // children (buttons, the tab strip) still receive their own events.
-        //
-        // CSD/SSD: on Wayland (the primary target — COSMIC/GNOME) the window
-        // is client-side-decorated, so these in-row GtkWindowControls are the
-        // only controls — correct. On X11 under a WM that draws server-side
-        // decorations they'd be doubled with the WM titlebar. The right fix is
-        // CSD detection (cf. Ghostty's `.csd`/`.ssd` class toggle) — NOT a
-        // blanket `set_decorated(false)`, which strips Wayland's CSD resize
-        // edges + shadow. Deferred to real-compositor validation.
-        let titlebar = gtk4::WindowHandle::builder()
-            .css_classes(["roost-titlebar"])
-            .child(&tab_row)
-            .build();
 
         let toolbar_view = libadwaita::ToolbarView::new();
-        toolbar_view.add_top_bar(&titlebar);
+        toolbar_view.add_top_bar(&tab_row);
         toolbar_view.set_content(Some(&content_overlay));
         window.set_content(Some(&toolbar_view));
 
