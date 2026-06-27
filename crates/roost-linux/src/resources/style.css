@@ -4,6 +4,33 @@
  * Keep this small — every rule is a surface that can fight a future
  * libadwaita restyle. */
 
+/* Chrome gray palette. Mac's AppKit sidebar/chrome sits at #282828 (the
+ * .darkAqua sidebar material) — distinctly lighter than the terminal,
+ * which gives the window depth. libadwaita's ForceDark default chrome is
+ * ~#1f1f1f (near-black), which reads as one flat black slab against a dark
+ * terminal (the "hard black" look users notice). Pin chrome to #282828 to
+ * match Mac. Terminal-abutting seams (paned separator, tab-stack) stay
+ * dark — see the translucency block — so the terminal edge shows no seam. */
+@define-color roost_chrome_bg #282828;
+
+/* Paint the sidebar column at the chrome gray. A plain GtkBox is
+ * transparent by default, so without this the libadwaita window bg
+ * (~#1f1f1f) shows through. The inner scroller/list are transparent
+ * (below) so this fill is what the user sees. */
+box.roost-sidebar {
+  background-color: @roost_chrome_bg;
+}
+/* Sidebar inner views are transparent in BOTH modes so the box fill
+ * (opaque) — or, when translucent, the alpha tint — shows through,
+ * including the viewport a GtkScrolledWindow may insert. */
+box.roost-sidebar scrolledwindow,
+box.roost-sidebar viewport,
+box.roost-sidebar .navigation-sidebar,
+box.roost-sidebar list {
+  background-color: transparent;
+  background-image: none;
+}
+
 /* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
  * (the name Stack), inset ~6px/1px to match the Mac UI's
  * `bounds.insetBy(dx:6, dy:1)` + 6px-radius pill. Drawing on the child
@@ -113,14 +140,14 @@ button.roost-add-project:active {
  * footer — keeps the top of the sidebar solid (like the Mac UI) instead of
  * letting the translucent tint show through behind the label. */
 .roost-sidebar-header {
-  background-color: #1e1e1e;
+  background-color: @roost_chrome_bg;
 }
 
 /* Footer band holding the "+ New Project" button — a solid strip with a
  * hairline top separator, mirroring the Mac UI's footer. Stays opaque even
  * when the sidebar is translucent, so the button never sits over glass. */
 .roost-sidebar-footer {
-  background-color: #1e1e1e;
+  background-color: @roost_chrome_bg;
   border-top: 1px solid alpha(#ffffff, 0.06);
   padding: 8px;
 }
@@ -251,18 +278,11 @@ window.roost-translucent {
   background-color: transparent;
 }
 window.roost-translucent box.roost-sidebar {
-  background-color: alpha(#1e1e1e, 0.95);
+  background-color: alpha(@roost_chrome_bg, 0.95);
 }
-/* Every node stacked on the tint must be transparent or its opaque
- * view background hides the tint — including the viewport a
- * GtkScrolledWindow may insert. */
-window.roost-translucent box.roost-sidebar scrolledwindow,
-window.roost-translucent box.roost-sidebar viewport,
-window.roost-translucent box.roost-sidebar .navigation-sidebar,
-window.roost-translucent box.roost-sidebar list {
-  background-color: transparent;
-  background-image: none;
-}
+/* (The sidebar inner views are made transparent unconditionally near the
+ * top of this sheet, so the alpha tint shows through in this mode too —
+ * no translucent-gated copy needed here.) */
 window.roost-translucent overlay,
 window.roost-translucent paned {
   background-color: transparent;
