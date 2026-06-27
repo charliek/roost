@@ -31,6 +31,22 @@ box.roost-sidebar list {
   background-image: none;
 }
 
+/* The toolbar top row (tabs + window controls) is SOLID chrome gray — the
+ * Mac UI's top bar is opaque, with only the sidebar carrying vibrancy.
+ * Without this the translucent window (see the .roost-translucent block)
+ * shows straight through the top row, which reads as "very transparent".
+ *
+ * Pinned in BOTH the focused and unfocused (:backdrop) states — when the
+ * window is inactive GTK applies :backdrop, and without an explicit rule the
+ * transparent window bg shows through again. The WindowHandle wrapper
+ * (.roost-titlebar) is pinned too so no seam shows around the row. */
+.roost-tabrow,
+.roost-tabrow:backdrop,
+.roost-titlebar,
+.roost-titlebar:backdrop {
+  background-color: @roost_chrome_bg;
+}
+
 /* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
  * (the name Stack), inset ~6px/1px to match the Mac UI's
  * `bounds.insetBy(dx:6, dy:1)` + 6px-radius pill. Drawing on the child
@@ -370,10 +386,8 @@ window.roost-translucent overlay,
 window.roost-translucent paned {
   background-color: transparent;
 }
-/* Keep the chrome + right pane fully OPAQUE. */
-window.roost-translucent headerbar {
-  background-color: #1e1e1e;
-}
+/* Keep the right-pane seam fully OPAQUE. (The top row is opaqued
+ * unconditionally via .roost-tabrow above; the AdwHeaderBar is gone.) */
 window.roost-translucent paned > separator {
   background-color: #1e1e1e;
 }

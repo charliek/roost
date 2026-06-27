@@ -622,7 +622,10 @@ impl App {
         // toggle + new-project on the left and new-tab + notifications on the
         // right — the affordances the removed header carried, now inline with
         // the tabs.
-        let tab_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let tab_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .css_classes(["roost-tabrow"])
+            .build();
         tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::Start));
         tab_row.append(&sidebar_toggle_button);
         tab_row.append(&bar_stack);
@@ -647,7 +650,10 @@ impl App {
         // CSD detection (cf. Ghostty's `.csd`/`.ssd` class toggle) — NOT a
         // blanket `set_decorated(false)`, which strips Wayland's CSD resize
         // edges + shadow. Deferred to real-compositor validation.
-        let titlebar = gtk4::WindowHandle::builder().child(&tab_row).build();
+        let titlebar = gtk4::WindowHandle::builder()
+            .css_classes(["roost-titlebar"])
+            .child(&tab_row)
+            .build();
 
         let toolbar_view = libadwaita::ToolbarView::new();
         toolbar_view.add_top_bar(&titlebar);
