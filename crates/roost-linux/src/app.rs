@@ -272,12 +272,6 @@ pub struct App {
     /// synchronously inside the set/append/close, so the bracket covers
     /// it.
     suppress_selected_page_sync: RefCell<bool>,
-    /// Tab id most recently right-clicked, stashed by the AdwTabView
-    /// `setup-menu` handler so the parameterless Rename/Close context-menu
-    /// actions know which tab to act on. (The menu model is static — see
-    /// `build_tab_context_menu` — because re-setting it during `setup-menu`
-    /// segfaults AdwTabView.)
-    context_menu_tab_id: RefCell<i64>,
     /// `ROOST_TEST_MODE=1` was set in the UI's environment at
     /// launch. Read ONCE in `App::new` and stashed here so per-op
     /// dispatch is a cheap bool check rather than a syscall, and so a
@@ -722,7 +716,6 @@ impl App {
             drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
             suppress_selected_page_sync: RefCell::new(false),
-            context_menu_tab_id: RefCell::new(0),
             // Read the env var exactly once at boot so per-op
             // dispatch is deterministic for the life of the process
             // — a tester can't toggle the gate mid-session. Present-
@@ -869,30 +862,10 @@ impl App {
             });
             app.add_action(&delete_action);
 
-            // M8: per-tab context menu actions (Rename / Close). The tab is
-            // the one most recently right-clicked, stashed in
-            // `context_menu_tab_id` by the AdwTabView `setup-menu` handler —
-            // the actions are parameterless (the menu model is static; see
-            // `build_tab_context_menu`).
-            let rename_tab_action = gtk4::gio::SimpleAction::new("rename-tab", None);
-            let app_for_rename_tab = app_struct.clone();
-            rename_tab_action.connect_activate(move |_, _| {
-                let tab_id = *app_for_rename_tab.context_menu_tab_id.borrow();
-                if let Some(pid) = app_for_rename_tab.project_for_tab(tab_id) {
-                    app_for_rename_tab.begin_rename_tab(pid, tab_id);
-                }
-            });
-            app.add_action(&rename_tab_action);
-
-            let close_tab_action = gtk4::gio::SimpleAction::new("close-tab", None);
-            let app_for_close = app_struct.clone();
-            close_tab_action.connect_activate(move |_, _| {
-                let tab_id = *app_for_close.context_menu_tab_id.borrow();
-                if let Some(pid) = app_for_close.project_for_tab(tab_id) {
-                    app_for_close.close_tab_async(pid, tab_id);
-                }
-            });
-            app.add_action(&close_tab_action);
+            // (Per-tab Rename / Close live on the per-pill right-click popover
+            // in build_tab_pill now — they call begin_rename_tab / close_page
+            // directly, so the old context_menu_tab_id-based app actions are
+            // gone.)
         }
 
         app_struct.window.present();
@@ -1401,24 +1374,9 @@ impl App {
                 }
             }
         });
-        // M8: per-tab context menu (right-click a pill). AdwTabView
-        // calls `setup-menu` with the page being right-clicked (or `None`
-        // when the menu is torn down). Set the model ONCE here; `setup-menu`
-        // only stashes which tab was clicked (the actions are parameterless
-        // and read `context_menu_tab_id`). Re-setting the model inside the
-        // `setup-menu` handler segfaults AdwTabView mid-popover-build.
-        tab_view.set_menu_model(Some(&build_tab_context_menu()));
-        tab_view.connect_setup_menu({
-            let app = self.clone();
-            move |_tv, page| {
-                // `page == None` fires on close; nothing to stash.
-                if let Some(page) = page {
-                    if let Some(tab_id) = parse_tab_id_from_page(page) {
-                        *app.context_menu_tab_id.borrow_mut() = tab_id;
-                    }
-                }
-            }
-        });
+        // (The per-tab context menu is now a per-pill right-click popover in
+        // build_tab_pill — the AdwTabView setup-menu had no trigger without the
+        // AdwTabBar.)
 
         // Per-project custom tab strip (Mac-style pills) shown in the top-bar
         // `bar_stack`; only the active project's is visible. Pills are built on
@@ -1633,6 +1591,67 @@ impl App {
             move |_, _, _| root.set_opacity(1.0)
         });
         root.add_controller(drag);
+
+        // Right-click context menu — Rename / Close. Replaces the AdwTabBar's
+        // setup-menu (gone with the bar); a small flat popover anchored at the
+        // click, mirroring the Mac pill's right-click affordance.
+        let secondary = gtk4::GestureClick::builder()
+            .button(gtk4::gdk::BUTTON_SECONDARY)
+            .build();
+        secondary.connect_released({
+            let app = self.clone();
+            let root = root.clone();
+            move |_, _, x, y| {
+                let pop = gtk4::Popover::builder()
+                    .has_arrow(false)
+                    .position(gtk4::PositionType::Bottom)
+                    .build();
+                pop.set_parent(&root);
+                pop.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                let rename = gtk4::Button::builder()
+                    .label("Rename")
+                    .css_classes(["flat"])
+                    .build();
+                let close_item = gtk4::Button::builder()
+                    .label("Close")
+                    .css_classes(["flat"])
+                    .build();
+                vbox.append(&rename);
+                vbox.append(&close_item);
+                pop.set_child(Some(&vbox));
+                rename.connect_clicked({
+                    let app = app.clone();
+                    let pop = pop.clone();
+                    move |_| {
+                        pop.popdown();
+                        app.begin_rename_tab(project_id, tab_id);
+                    }
+                });
+                close_item.connect_clicked({
+                    let app = app.clone();
+                    let pop = pop.clone();
+                    move |_| {
+                        pop.popdown();
+                        let pair = {
+                            let projects = app.projects.borrow();
+                            projects.get(&project_id).and_then(|ui| {
+                                ui.tabs
+                                    .borrow()
+                                    .get(&tab_id)
+                                    .map(|t| (ui.tab_view.clone(), t.page.clone()))
+                            })
+                        };
+                        if let Some((tv, page)) = pair {
+                            tv.close_page(&page);
+                        }
+                    }
+                });
+                pop.connect_closed(|p| p.unparent());
+                pop.popup();
+            }
+        });
+        root.add_controller(secondary);
 
         TabPill {
             root,
@@ -1923,11 +1942,17 @@ impl App {
         // Flip the pill into inline-edit mode.
         let pills = ui.pills.borrow();
         if let Some(pill) = pills.get(&tab_id) {
-            let title = page.title();
-            pill.entry.set_text(&title);
+            pill.entry.set_text(&page.title());
             pill.name_stack.set_visible_child_name("entry");
-            pill.entry.grab_focus();
-            pill.entry.select_region(0, -1);
+            // Defer the focus to an idle tick: when this rename also activated
+            // the project (the non-active case), set_active_project scheduled
+            // an idle `focus_active_terminal`; ours runs after it (FIFO) so the
+            // entry keeps focus instead of the terminal stealing it back.
+            let entry = pill.entry.clone();
+            glib::idle_add_local_once(move || {
+                entry.grab_focus();
+                entry.select_region(0, -1);
+            });
         }
     }
 
@@ -3127,19 +3152,6 @@ impl App {
         let ui = projects.get(&project_id)?;
         let page = ui.tab_view.selected_page()?;
         parse_tab_id_from_page(&page)
-    }
-
-    /// Resolve a tab id to its parent project id by scanning. M8's
-    /// per-tab context-menu actions get the tab id from the action
-    /// target but need the project id to dispatch close / rename.
-    fn project_for_tab(self: &Rc<Self>, tab_id: i64) -> Option<i64> {
-        let projects = self.projects.borrow();
-        for (project_id, ui) in projects.iter() {
-            if ui.tabs.borrow().contains_key(&tab_id) {
-                return Some(*project_id);
-            }
-        }
-        None
     }
 
     fn cycle_tab(self: &Rc<Self>, delta: i32) {
@@ -5701,20 +5713,6 @@ fn format_font_size(size_pt: f64) -> String {
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
-}
-
-/// Static tab right-click menu model (Rename / Close), fed once to
-/// `adw::TabView::set_menu_model`. The actions are parameterless: which tab was
-/// right-clicked is stashed in `context_menu_tab_id` by the `setup-menu`
-/// handler. This is the documented AdwTabView pattern — set `menu-model`
-/// ONCE and use `setup-menu` only to prep actions. Rebuilding/re-setting
-/// the model *during* `setup-menu` segfaults AdwTabView mid-popover-build
-/// (`gtk_popover_menu_new_from_model_full`).
-fn build_tab_context_menu() -> gtk4::gio::Menu {
-    let menu = gtk4::gio::Menu::new();
-    menu.append(Some("Rename"), Some("app.rename-tab"));
-    menu.append(Some("Close"), Some("app.close-tab"));
-    menu
 }
 
 /// Render an `Accel` as a platform-appropriate shortcut label (Cmd
