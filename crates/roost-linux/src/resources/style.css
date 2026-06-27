@@ -43,7 +43,11 @@ box.roost-sidebar list {
 .roost-tabrow,
 .roost-tabrow:backdrop,
 .roost-titlebar,
-.roost-titlebar:backdrop {
+.roost-titlebar:backdrop,
+/* Also pin the AdwToolbarView's own top-bar container (behind the row) so the
+ * transparent window can't show through around it, focused or backdrop. */
+toolbarview > .top-bar,
+toolbarview > .top-bar:backdrop {
   background-color: @roost_chrome_bg;
 }
 
@@ -125,9 +129,9 @@ tabbar tab:checked {
   padding: 3px 4px;
 }
 /* Pill: 24px tall, 6px radius (Mac TabPillView). Inactive = transparent
- * with a dimmed label; hover gets a faint wash; active = accent tint with
- * a full-strength label (Mac uses controlAccentColor@18% + labelColor —
- * bumped slightly here so the selection reads on the #282828 chrome). */
+ * with a dimmed label; hover gets a faint wash; active = a near-solid accent
+ * fill + white label, to match the Mac UI's solid-blue active tab (a faint
+ * tint read as gray on the #282828 chrome). 0.85 keeps a hair of depth. */
 .roost-tab-pill {
   border-radius: 6px;
   padding: 0 4px 0 8px;
@@ -135,10 +139,10 @@ tabbar tab:checked {
   background-color: transparent;
 }
 .roost-tab-pill:hover {
-  background-color: alpha(currentColor, 0.06);
+  background-color: alpha(currentColor, 0.10);
 }
 .roost-tab-pill.active {
-  background-color: alpha(@accent_bg_color, 0.30);
+  background-color: alpha(@accent_bg_color, 0.85);
 }
 .roost-tab-pill label.roost-tab-pill-label {
   color: #d1d1d1;
@@ -196,6 +200,14 @@ tabbar tab:checked {
   outline: none;
   color: #ffffff;
   caret-color: #ffffff;
+}
+/* The stripped entry has no default focus ring; give the editing field a
+ * visible state (subtle sunken fill + hairline) so an inline rename is
+ * obvious and easy to keep track of. */
+.roost-tab-pill entry.roost-tab-pill-entry:focus,
+.roost-tab-pill entry.roost-tab-pill-entry:focus-within {
+  background-color: alpha(#000000, 0.35);
+  box-shadow: inset 0 0 0 1px alpha(#ffffff, 0.30);
 }
 
 /* Sidebar section header above the project list. Brighter + bolder to

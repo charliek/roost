@@ -1550,14 +1550,18 @@ impl App {
             move |entry| {
                 ns.set_visible_child_name("label");
                 app.commit_rename_tab(tab_id, entry.text().to_string());
+                // Hand focus back to the terminal — the entry just hid.
+                app.focus_active_terminal();
             }
         });
         let esc = gtk4::EventControllerKey::new();
         esc.connect_key_pressed({
+            let app = self.clone();
             let ns = name_stack.clone();
             move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
                     ns.set_visible_child_name("label");
+                    app.focus_active_terminal();
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -2575,6 +2579,7 @@ impl App {
                     ui.sidebar_label.set_text(&name);
                     if *self.active_project_id.borrow() == project_id {
                         self.window_title.set_title(&name);
+                        self.window.set_title(Some(&name));
                     }
                 }
             }
@@ -2679,6 +2684,16 @@ impl App {
                 for ui in projects.values() {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
                         tab_ui.page.set_needs_attention(has_pending);
+                    }
+                    // Update the pill's trailing badge (Mac shows it on inactive
+                    // notified tabs); the AdwTabPage isn't displayed.
+                    if let Some(pill) = ui.pills.borrow().get(&tab_id) {
+                        let active = ui
+                            .tab_view
+                            .selected_page()
+                            .and_then(|p| parse_tab_id_from_page(&p))
+                            == Some(tab_id);
+                        pill.badge.set_visible(has_pending && !active);
                     }
                 }
                 drop(projects);
@@ -2894,6 +2909,7 @@ impl App {
                         ui.sidebar_label.set_text(&project.name);
                         if active == project.id {
                             self.window_title.set_title(&project.name);
+                            self.window.set_title(Some(&project.name));
                         }
                     }
                 }
