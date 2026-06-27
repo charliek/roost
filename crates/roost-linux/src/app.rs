@@ -245,6 +245,15 @@ pub struct App {
     /// target's motion handler to know which row to live-shuffle.
     /// Set in the drag-source's drag-begin, cleared in drag-end.
     dragged_project_id: RefCell<Option<i64>>,
+    /// Tab id of the pill currently being drag-reordered (None when
+    /// no pill drag is in progress). Set in the pill drag-source's
+    /// drag-begin, cleared in drag-end. The strip's drop target uses
+    /// this as the source of truth instead of the transported value:
+    /// mirroring the sidebar, the reorder must not depend on the
+    /// drop-time value load succeeding (a local i64 ContentProvider
+    /// that fails `get::<i64>()` at drop time would otherwise silently
+    /// no-op the reorder while the highlight still showed).
+    dragged_tab_id: RefCell<Option<i64>>,
     /// M10: snapshot of the sidebar order taken at drag-begin.
     /// Drag-end rolls back to this if the drop didn't persist
     /// (drag cancelled outside the sidebar, or `ReorderProjects`
@@ -718,6 +727,7 @@ impl App {
             link_modifier: resolve_link_modifier(cfg.link_modifier),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
+            dragged_tab_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
             drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
@@ -1407,12 +1417,21 @@ impl App {
         drop.connect_drop({
             let app = self.clone();
             let project_id = project.id;
-            move |_, value, x, _| match value.get::<i64>() {
-                Ok(src_tab) => {
-                    app.drop_reorder_tab(project_id, src_tab, x);
-                    true
+            // Source of truth is `dragged_tab_id` (set at drag-begin), not the
+            // transported value — mirroring the sidebar drop target. The value
+            // is read only as a foreign-content guard (reject e.g. a file drop
+            // from the file manager); the reorder itself must not hinge on the
+            // drop-time i64 load, which can fail on some backends even after the
+            // motion highlight showed.
+            move |_, value, x, _| {
+                if value.get::<i64>().is_err() {
+                    return false;
                 }
-                Err(_) => false,
+                let Some(src_tab) = *app.dragged_tab_id.borrow() else {
+                    return false;
+                };
+                app.drop_reorder_tab(project_id, src_tab, x);
+                true
             }
         });
         tab_strip.add_controller(drop);
@@ -1599,11 +1618,19 @@ impl App {
         });
         drag.connect_drag_begin({
             let root = root.clone();
-            move |_, _| root.set_opacity(0.4)
+            let app = self.clone();
+            move |_, _| {
+                *app.dragged_tab_id.borrow_mut() = Some(tab_id);
+                root.set_opacity(0.4)
+            }
         });
         drag.connect_drag_end({
             let root = root.clone();
-            move |_, _, _| root.set_opacity(1.0)
+            let app = self.clone();
+            move |_, _, _| {
+                *app.dragged_tab_id.borrow_mut() = None;
+                root.set_opacity(1.0)
+            }
         });
         root.add_controller(drag);
 
