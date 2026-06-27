@@ -70,9 +70,14 @@ struct ProjectUi {
     /// starts; cleared on cancel/commit.
     sidebar_entry: gtk4::Entry,
     tab_view: TabView,
-    /// Per-project tab strip (in the top-bar `bar_stack`). Held so the
-    /// rename popover can anchor under its pills.
-    tab_bar: libadwaita::TabBar,
+    /// Custom Mac-style tab strip (a GtkBox of TabPill widgets) shown in the
+    /// top-bar `bar_stack`. The AdwTabView above is the model; this is a view
+    /// of it — pills react to its page-attached/selected signals and drive it
+    /// back on click/close.
+    tab_strip: gtk4::Box,
+    /// Tab id → pill widget, parallel to `tabs`. Built on tab attach, removed
+    /// on close, restyled on selection.
+    pills: RefCell<HashMap<i64, TabPill>>,
     /// Tab id → (TerminalView, TabSession).
     tabs: RefCell<HashMap<i64, TabUi>>,
     /// M9.5: tab ids whose `attach_existing_tab` is in flight (the
@@ -106,6 +111,20 @@ struct TabUi {
     /// when true, the rollup aggregation suppresses this tab's
     /// state so the hook's own UI surface isn't duplicated.
     hook_active: RefCell<bool>,
+}
+
+/// One Mac-style pill in the custom tab strip: `[status dot | label↔entry
+/// stack | notification badge | close ×]`, a composed `GtkBox` (no GObject
+/// subclass) mirroring the Mac `TabPillView`. Held per tab in
+/// `ProjectUi.pills`; a pure view of the project's `AdwTabView`.
+struct TabPill {
+    root: gtk4::Box,
+    dot: gtk4::Box,
+    name_stack: gtk4::Stack,
+    label: gtk4::Label,
+    entry: gtk4::Entry,
+    close: gtk4::Button,
+    badge: gtk4::Box,
 }
 
 pub struct App {
@@ -327,6 +346,21 @@ fn apply_indicator_icon(page: &libadwaita::TabPage, state: TabState) {
         TabState::Idle => Some(embedded_icon(ICON_IDLE)),
     };
     page.set_indicator_icon(icon.as_ref().map(|i| i.upcast_ref::<gtk4::gio::Icon>()));
+}
+
+/// Mirror the per-tab agent state onto a pill's leading dot (the colours
+/// match the indicator SVGs + the rollup stripe). `None` leaves the dot
+/// transparent (it keeps its slot so pills don't reflow).
+fn apply_pill_dot(dot: &gtk4::Box, state: TabState) {
+    for c in ["running", "needs-input", "idle"] {
+        dot.remove_css_class(c);
+    }
+    match state {
+        TabState::None => {}
+        TabState::Running => dot.add_css_class("running"),
+        TabState::NeedsInput => dot.add_css_class("needs-input"),
+        TabState::Idle => dot.add_css_class("idle"),
+    }
 }
 
 /// Render `window` (sidebar + tabs + active terminal) to PNG bytes, at
@@ -1339,6 +1373,10 @@ impl App {
                 if let Some(tab_id) = tab_id {
                     if let Some(ui) = app.projects.borrow().get(&project_id) {
                         ui.tabs.borrow_mut().remove(&tab_id);
+                        // Drop this tab's pill from the custom strip.
+                        if let Some(pill) = ui.pills.borrow_mut().remove(&tab_id) {
+                            ui.tab_strip.remove(&pill.root);
+                        }
                     }
                     let already_server_driven =
                         drain_server_driven_marker(&app.server_driven_closes, tab_id);
@@ -1387,6 +1425,9 @@ impl App {
             let app = self.clone();
             let project_id = project.id;
             move |tab_view| {
+                // Repaint pill highlight on every selection change (incl.
+                // programmatic: close-survivor, Ctrl-nav, bootstrap restore).
+                app.restyle_pills(project_id);
                 if *app.active_project_id.borrow() != project_id {
                     return;
                 }
@@ -1432,17 +1473,19 @@ impl App {
             }
         });
 
-        // Per-project AdwTabBar (compact, always-visible) bound to this
-        // project's view for life; added to the top-bar `bar_stack` so only
-        // the active project's strip shows (Mac parity: one strip at the
-        // window top). A single shared bar rebound via set_view crashes
-        // libadwaita on project switch, hence one bar per project.
-        let tab_bar = libadwaita::TabBar::builder()
-            .view(&tab_view)
-            .autohide(false)
+        // Per-project custom tab strip (Mac-style pills) shown in the top-bar
+        // `bar_stack`; only the active project's is visible. Pills are built on
+        // tab attach (attach_existing_tab) and react to this project's
+        // AdwTabView. Each project keeps its own strip — flipping the visible
+        // stack child switches the shown tabs (a single shared AdwTabBar
+        // rebound via set_view crashed libadwaita).
+        let tab_strip = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["roost-tab-strip"])
             .build();
         self.bar_stack
-            .add_named(&tab_bar, Some(&stack_name(project.id)));
+            .add_named(&tab_strip, Some(&stack_name(project.id)));
 
         // The AdwTabView is the page container (terminal pages), held in the
         // content stack.
@@ -1461,11 +1504,205 @@ impl App {
                 sidebar_label: label,
                 sidebar_entry: entry,
                 tab_view,
-                tab_bar,
+                tab_strip,
+                pills: RefCell::new(HashMap::new()),
                 tabs: RefCell::new(HashMap::new()),
                 pending_attaches: RefCell::new(HashSet::new()),
             },
         );
+    }
+
+    // ----- Phase 3: custom tab pills (Mac-style strip) -------------
+
+    /// Build a Mac-style tab pill for `tab_id` and wire its interactions. The
+    /// pill is a view of `page` in `project_id`'s AdwTabView: clicking selects
+    /// the page (the existing `selected-page` handler syncs the core), double-
+    /// click renames, and the close × closes (the existing `close-page`
+    /// handler removes the pill + fires the RPC). The `name_stack`
+    /// (label↔entry) reuses the sidebar's inline-rename pattern.
+    fn build_tab_pill(
+        self: &Rc<Self>,
+        project_id: i64,
+        tab_id: i64,
+        page: &libadwaita::TabPage,
+        title: &str,
+    ) -> TabPill {
+        let dot = gtk4::Box::builder()
+            .css_classes(["roost-tab-pill-dot"])
+            .valign(gtk4::Align::Center)
+            .build();
+        let label = gtk4::Label::builder()
+            .label(title)
+            .css_classes(["roost-tab-pill-label"])
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .max_width_chars(20)
+            .single_line_mode(true)
+            .build();
+        let entry = gtk4::Entry::builder()
+            .css_classes(["roost-tab-pill-entry"])
+            .max_width_chars(20)
+            .build();
+        let name_stack = gtk4::Stack::builder().hhomogeneous(false).build();
+        name_stack.add_named(&label, Some("label"));
+        name_stack.add_named(&entry, Some("entry"));
+        name_stack.set_visible_child_name("label");
+        let badge = gtk4::Box::builder()
+            .css_classes(["roost-tab-pill-badge"])
+            .valign(gtk4::Align::Center)
+            .visible(false)
+            .build();
+        let close = gtk4::Button::builder()
+            .css_classes(["roost-tab-pill-close", "flat"])
+            .child(&gtk4::Label::new(Some("×")))
+            .valign(gtk4::Align::Center)
+            .visible(false)
+            .build();
+        let root = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(2)
+            .css_classes(["roost-tab-pill"])
+            .build();
+        root.append(&dot);
+        root.append(&name_stack);
+        root.append(&badge);
+        root.append(&close);
+
+        // Click selects the page. We do NOT suppress the selection, so the
+        // existing `selected-page` handler runs and syncs the core (#228). The
+        // projects borrow is dropped before `set_selected_page` so the notify
+        // handler (which may borrow projects) can't double-borrow. Re-focus the
+        // terminal after, since the click lands GTK focus on the pill.
+        let click = gtk4::GestureClick::new();
+        click.connect_released({
+            let app = self.clone();
+            let page = page.clone();
+            move |_, n, _, _| {
+                let tv = app
+                    .projects
+                    .borrow()
+                    .get(&project_id)
+                    .map(|ui| ui.tab_view.clone());
+                if let Some(tv) = tv {
+                    tv.set_selected_page(&page);
+                    // Box pills aren't focusable, so the terminal keeps GTK
+                    // focus across the switch; re-grab the now-active tab's
+                    // terminal so typing goes to it. (A double-click's rename
+                    // below grabs the entry afterwards, so it wins.)
+                    app.focus_active_terminal();
+                }
+                if n == 2 {
+                    app.begin_rename_tab(project_id, tab_id);
+                }
+            }
+        });
+        root.add_controller(click);
+
+        // Close × → close the page (the existing close-page handler removes the
+        // pill entry + fires the RPC). Borrow dropped before `close_page`.
+        close.connect_clicked({
+            let app = self.clone();
+            let page = page.clone();
+            move |_| {
+                let tv = app
+                    .projects
+                    .borrow()
+                    .get(&project_id)
+                    .map(|ui| ui.tab_view.clone());
+                if let Some(tv) = tv {
+                    tv.close_page(&page);
+                }
+            }
+        });
+
+        // Inline rename: begin_rename_tab flips the name_stack to the entry +
+        // focuses it; Enter commits (the SetTabTitle RPC's TabTitle event
+        // updates the label text), Esc or focus-out cancels — back to label.
+        entry.connect_activate({
+            let app = self.clone();
+            let ns = name_stack.clone();
+            move |entry| {
+                ns.set_visible_child_name("label");
+                app.commit_rename_tab(tab_id, entry.text().to_string());
+            }
+        });
+        let esc = gtk4::EventControllerKey::new();
+        esc.connect_key_pressed({
+            let ns = name_stack.clone();
+            move |_, key, _, _| {
+                if key == gtk4::gdk::Key::Escape {
+                    ns.set_visible_child_name("label");
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        entry.add_controller(esc);
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave({
+            let ns = name_stack.clone();
+            move |_| ns.set_visible_child_name("label")
+        });
+        entry.add_controller(focus);
+
+        TabPill {
+            root,
+            dot,
+            name_stack,
+            label,
+            entry,
+            close,
+            badge,
+        }
+    }
+
+    /// Mark the pill of the project's selected tab `.active` (revealing its
+    /// close ×) and clear the others — mirrors the AdwTabBar checked state.
+    /// Called on every selection change, so it tracks programmatic selects
+    /// (close-survivor, Ctrl-nav, bootstrap) too. Cheap (a handful of tabs).
+    fn restyle_pills(self: &Rc<Self>, project_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let selected = ui
+            .tab_view
+            .selected_page()
+            .and_then(|p| parse_tab_id_from_page(&p));
+        let tabs = ui.tabs.borrow();
+        for (tid, pill) in ui.pills.borrow().iter() {
+            let active = Some(*tid) == selected;
+            if active {
+                pill.root.add_css_class("active");
+            } else {
+                pill.root.remove_css_class("active");
+            }
+            pill.close.set_visible(active);
+            // Notification badge: Mac shows it on inactive notified tabs.
+            let notified = tabs.get(tid).is_some_and(|t| t.page.needs_attention());
+            pill.badge.set_visible(notified && !active);
+        }
+    }
+
+    /// Refresh one pill's leading dot (agent state) + notification badge from
+    /// its tab's current state. Called wherever the indicator icon or
+    /// needs-attention is updated, so the pill tracks the AdwTabPage.
+    fn refresh_pill_indicators(self: &Rc<Self>, project_id: i64, tab_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let pills = ui.pills.borrow();
+        let tabs = ui.tabs.borrow();
+        if let (Some(pill), Some(tab_ui)) = (pills.get(&tab_id), tabs.get(&tab_id)) {
+            apply_pill_dot(&pill.dot, *tab_ui.state.borrow());
+            let active = ui
+                .tab_view
+                .selected_page()
+                .and_then(|p| parse_tab_id_from_page(&p))
+                == Some(tab_id);
+            pill.badge.set_visible(tab_ui.page.needs_attention() && !active);
+        }
     }
 
     // ----- M8 + M9: rename / delete project flow -------------------
@@ -1615,15 +1852,15 @@ impl App {
 
     // ----- M8 + M9: rename / close tab flow ------------------------
 
-    /// Open the inline rename popover for `(project_id, tab_id)`.
-    /// Inline rename for tabs uses a `gtk::Popover` pointing at the
-    /// tab pill rather than `connect_setup_menu` (which is the per-page
-    /// context menu, not an inline-edit hook).
+    /// Begin an inline rename of `(project_id, tab_id)` in its pill: flip the
+    /// pill's `name_stack` to the entry, seed + focus it. Enter commits, Esc /
+    /// focus-out cancels (wired once in `build_tab_pill`). Mirrors the Mac
+    /// `TabPillView` inline rename — the entry edits in place on the pill, not
+    /// a popover.
     fn begin_rename_tab(self: &Rc<Self>, project_id: i64, tab_id: i64) {
-        // Renaming a tab in a background project would anchor the popover to a
-        // hidden `bar_stack` child (GTK mis-positions popovers on unmapped
-        // widgets → it lands at 0,0 / offscreen). Activate the project first so
-        // its strip is visible; a no-op for the common active-project case.
+        // Renaming a tab in a background project: activate it first so its strip
+        // (and pill) is the visible bar_stack child. No-op for the common
+        // active-project case.
         if *self.active_project_id.borrow() != project_id {
             self.set_active_project(project_id);
         }
@@ -1631,65 +1868,24 @@ impl App {
         let Some(ui) = projects.get(&project_id) else {
             return;
         };
-        let tabs = ui.tabs.borrow();
-        let Some(tab_ui) = tabs.get(&tab_id) else {
+        // Select the target tab so the strip shows it + the core follows. The
+        // guarded select suppresses the notify auto-sync, so sync explicitly;
+        // no-op when it's already active (the common Alt+R case).
+        let page = ui.tabs.borrow().get(&tab_id).map(|t| t.page.clone());
+        let Some(page) = page else {
             return;
         };
-        let current_title = tab_ui.page.title().to_string();
-
-        // Select the target tab first. AdwTabView positions the
-        // popover above the currently-selected pill (the only
-        // pill-locating affordance the public API gives us), so if
-        // the rename was invoked from a background tab's context
-        // menu, the popover would otherwise float over the wrong
-        // pill while the RPC silently renames the background tab.
-        // CodeRabbit caught this on PR #63.
-        self.select_page_programmatic(&ui.tab_view, &tab_ui.page);
-        // Renaming a background tab switches the UI to it (above), so the
-        // core must follow — the guarded select suppresses the notify
-        // auto-sync, so sync explicitly. No-op when it's already the active
-        // tab (the common Alt+R case).
+        self.select_page_programmatic(&ui.tab_view, &page);
         self.sync_core_active_tab(tab_id);
-
-        let entry = gtk4::Entry::builder()
-            .text(&current_title)
-            .activates_default(true)
-            .build();
-        let popover = gtk4::Popover::builder()
-            .has_arrow(true)
-            .position(gtk4::PositionType::Bottom)
-            .build();
-        popover.set_child(Some(&entry));
-        // Anchor at the AdwTabBar (the pill strip), positioned
-        // pointing-down from the tab strip. M9.5: pre-fix, the
-        // anchor was the TabView itself — whose visual centre is
-        // the terminal area — so the popover floated halfway down
-        // the window. AdwTabBar doesn't expose the individual
-        // pill, but its widget bounds are the strip itself, so a
-        // popover anchored here lands just below the pills.
-        popover.set_parent(&ui.tab_bar);
-
-        let app = self.clone();
-        let popover_for_commit = popover.clone();
-        entry.connect_activate(move |entry| {
-            let new_title = entry.text().to_string();
-            popover_for_commit.popdown();
-            app.commit_rename_tab(tab_id, new_title);
-        });
-        let popover_for_cancel = popover.clone();
-        let entry_keys = gtk4::EventControllerKey::new();
-        entry_keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk4::gdk::Key::Escape {
-                popover_for_cancel.popdown();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        entry.add_controller(entry_keys);
-        popover.connect_closed(|p| p.unparent());
-        popover.popup();
-        entry.grab_focus();
-        entry.select_region(0, -1);
+        // Flip the pill into inline-edit mode.
+        let pills = ui.pills.borrow();
+        if let Some(pill) = pills.get(&tab_id) {
+            let title = page.title();
+            pill.entry.set_text(&title);
+            pill.name_stack.set_visible_child_name("entry");
+            pill.entry.grab_focus();
+            pill.entry.select_region(0, -1);
+        }
     }
 
     /// Commit a tab rename. Same one-way-data-flow rule as
@@ -1992,6 +2188,13 @@ impl App {
             .widget()
             .set_widget_name(&format!("tab-{}", tab.id));
 
+        // Build this tab's pill in the project's custom strip (a view of the
+        // AdwTabView). restyle marks the just-selected pill active.
+        let pill = self.build_tab_pill(tab.project_id, tab.id, &page, &label);
+        ui.tab_strip.append(&pill.root);
+        ui.pills.borrow_mut().insert(tab.id, pill);
+        self.restyle_pills(tab.project_id);
+
         // Defer the rest of the wiring until the session actually
         // spawns. The session_handle's JoinHandle is awaited on the
         // GTK main loop's executor.
@@ -2112,6 +2315,7 @@ impl App {
             apply_indicator_icon(&page_for_future, tab_state);
             page_for_future.set_needs_attention(tab_has_notification);
             app_for_attach.refresh_rollup_for(project_id);
+            app_for_attach.refresh_pill_indicators(project_id, tab_id);
             // Update the headerbar subtitle if this tab belongs to
             // the active project; cheap idempotent refresh.
             app_for_attach.refresh_window_subtitle();
@@ -2310,7 +2514,7 @@ impl App {
                 let mut projects = self.projects.borrow_mut();
                 if let Some(ui) = projects.remove(&project_id) {
                     self.sidebar.remove(&ui.sidebar_row);
-                    self.bar_stack.remove(&ui.tab_bar);
+                    self.bar_stack.remove(&ui.tab_strip);
                     self.tab_stack.remove(
                         &self
                             .tab_stack
@@ -2375,6 +2579,10 @@ impl App {
                 for ui in projects.values() {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
                         tab_ui.page.set_title(&title);
+                    }
+                    // Keep the pill label in sync (the AdwTabPage isn't shown).
+                    if let Some(pill) = ui.pills.borrow().get(&tab_id) {
+                        pill.label.set_label(&title);
                     }
                 }
             }
@@ -2448,6 +2656,7 @@ impl App {
                         if let Some(tab_ui) = tabs.get(&tab_id) {
                             *tab_ui.state.borrow_mut() = state;
                             apply_indicator_icon(&tab_ui.page, state);
+                            self.refresh_pill_indicators(*project_id, tab_id);
                             affected_project = Some(*project_id);
                             break;
                         }
@@ -2573,7 +2782,7 @@ impl App {
             let removed = self.projects.borrow_mut().remove(pid);
             if let Some(ui) = removed {
                 self.sidebar.remove(&ui.sidebar_row);
-                self.bar_stack.remove(&ui.tab_bar);
+                self.bar_stack.remove(&ui.tab_strip);
                 if let Some(child) = self.tab_stack.child_by_name(&stack_name(*pid)) {
                     self.tab_stack.remove(&child);
                 }
@@ -2642,12 +2851,16 @@ impl App {
                         tab.title.clone()
                     };
                     tab_ui.page.set_title(&label);
+                    if let Some(pill) = ui.pills.borrow().get(&tab.id) {
+                        pill.label.set_label(&label);
+                    }
                     let state = TabState::from_ipc(tab.state);
                     *tab_ui.state.borrow_mut() = state;
                     apply_indicator_icon(&tab_ui.page, state);
                     *tab_ui.cwd.borrow_mut() = tab.cwd.clone();
                     tab_ui.page.set_needs_attention(tab.has_notification);
                     *tab_ui.hook_active.borrow_mut() = tab.hook_active;
+                    self.refresh_pill_indicators(project.id, tab.id);
                     affected.insert(project.id);
                 }
             }

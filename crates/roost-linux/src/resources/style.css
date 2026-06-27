@@ -94,9 +94,92 @@ box.roost-sidebar list {
 }
 
 /* Tab bar: subtle accent tint on the checked tab. Only restyle the
- * tab body — leave the close button + indicator dot to libadwaita. */
+ * tab body — leave the close button + indicator dot to libadwaita.
+ * (Retained as the Path-B fallback; the custom strip below is Path A.) */
 tabbar tab:checked {
   background: alpha(@accent_bg_color, 0.18);
+}
+
+/* ---- Custom tab strip (Mac-style pills) -------------------------------
+ * A horizontal GtkBox of pill widgets (one per tab) reacting to the
+ * project's AdwTabView, mirroring the Mac UI's TabPillView strip
+ * (mac/Sources/Roost/App.swift). The AdwTabView stays the model; these
+ * are a pure view of it. Spacing 6px = Mac tab gap. */
+.roost-tab-strip {
+  padding: 3px 4px;
+}
+/* Pill: 24px tall, 6px radius (Mac TabPillView). Inactive = transparent
+ * with a dimmed label; hover gets a faint wash; active = accent tint with
+ * a full-strength label (Mac uses controlAccentColor@18% + labelColor —
+ * bumped slightly here so the selection reads on the #282828 chrome). */
+.roost-tab-pill {
+  border-radius: 6px;
+  padding: 0 4px 0 8px;
+  min-height: 24px;
+  background-color: transparent;
+}
+.roost-tab-pill:hover {
+  background-color: alpha(currentColor, 0.06);
+}
+.roost-tab-pill.active {
+  background-color: alpha(@accent_bg_color, 0.30);
+}
+.roost-tab-pill label.roost-tab-pill-label {
+  color: #d1d1d1;
+  margin: 0 4px;
+}
+.roost-tab-pill.active label.roost-tab-pill-label {
+  color: #ffffff;
+}
+/* Leading status dot (running/needs-input/idle), 8px circle. No class =
+ * no fill (the "none" state); the colour classes mirror the rollup +
+ * indicator SVGs. The element keeps its slot so pills don't reflow when a
+ * dot appears/clears. */
+.roost-tab-pill-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 4px;
+  background-color: transparent;
+}
+.roost-tab-pill-dot.running { background-color: #5fa3f0; }
+.roost-tab-pill-dot.needs-input { background-color: #f0a040; }
+.roost-tab-pill-dot.idle { background-color: #7a7a7a; }
+/* Trailing close button: flat, only visible on the active/hovered pill
+ * (set via .visible in code). Compact so the pill stays Mac-sized. */
+.roost-tab-pill-close {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0;
+  border-radius: 4px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: #d1d1d1;
+}
+.roost-tab-pill-close:hover {
+  background-color: alpha(#ffffff, 0.12);
+}
+/* Trailing notification badge on inactive notified tabs (Mac blue dot). */
+.roost-tab-pill-badge {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 4px;
+  background-color: @accent_bg_color;
+  margin: 0 2px;
+}
+/* Inline-rename entry inside a pill: frameless, sized to stay on the pill
+ * baseline without growing its height (mirrors the sidebar rename entry). */
+.roost-tab-pill entry.roost-tab-pill-entry {
+  min-height: 20px;
+  padding: 0 4px;
+  margin: 0 2px;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  color: #ffffff;
+  caret-color: #ffffff;
 }
 
 /* Sidebar section header above the project list. Brighter + bolder to
