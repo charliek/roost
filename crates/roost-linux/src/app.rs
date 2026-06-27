@@ -313,7 +313,6 @@ const STYLE_CSS: &str = include_str!("resources/style.css");
 /// installed. The SVGs are embedded directly into the binary via
 /// `include_bytes!`, avoiding any gresource compilation step (one less
 /// build-tool dependency).
-const ICON_FOLDER_SYMBOLIC: &[u8] = include_bytes!("resources/icons/folder-symbolic.svg");
 const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
     include_bytes!("resources/icons/sidebar-show-symbolic.svg");
 const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
@@ -489,13 +488,6 @@ impl App {
         // notifications). They live in the top tab-row built below instead of
         // a header bar. Wired below after `app_struct` exists so the handlers
         // can capture an `Rc<App>` clone.
-        let folder_button = gtk4::Button::builder()
-            .child(&gtk4::Image::from_gicon(&embedded_icon(
-                ICON_FOLDER_SYMBOLIC,
-            )))
-            .css_classes(["flat"])
-            .tooltip_text("New project from folder…")
-            .build();
         let sidebar_toggle_button = gtk4::Button::builder()
             .child(&gtk4::Image::from_gicon(&embedded_icon(
                 ICON_SIDEBAR_SHOW_SYMBOLIC,
@@ -639,7 +631,6 @@ impl App {
         let tab_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::Start));
         tab_row.append(&sidebar_toggle_button);
-        tab_row.append(&folder_button);
         tab_row.append(&bar_stack);
         tab_row.append(&new_tab_button);
         // Hexpanding drag spacer: pushes notifications + window controls to
@@ -802,54 +793,7 @@ impl App {
             }
         });
 
-        // Headerbar buttons.
-        // - Folder picker: pop a FileChooser, then create a project
-        //   with the chosen cwd (the "new project from folder" path).
-        folder_button.connect_clicked({
-            let app = app_struct.clone();
-            move |btn| {
-                let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-                // `gtk::FileDialog` is the gtk-4.10 successor to the
-                // deprecated `FileChooserNative`. Async-only API:
-                // `select_folder` takes a callback that receives the
-                // chosen file (or a `Dismissed` error on cancel).
-                let dialog = gtk4::FileDialog::builder()
-                    .title("Choose project folder")
-                    .modal(true)
-                    .accept_label("Open")
-                    .build();
-                let app_for_pick = app.clone();
-                dialog.select_folder(
-                    parent.as_ref(),
-                    None::<&gtk4::gio::Cancellable>,
-                    move |result| match result {
-                        Ok(file) => {
-                            let Some(path) = file.path() else { return };
-                            let path = path.to_string_lossy().to_string();
-                            let app = app_for_pick.clone();
-                            glib::spawn_future_local(async move {
-                                if let Err(err) = app.create_new_project_with_cwd(&path).await {
-                                    tracing::warn!(
-                                        ?err,
-                                        path = %path,
-                                        "folder-picker new_project failed"
-                                    );
-                                }
-                            });
-                        }
-                        Err(err) => {
-                            // The user dismissing the dialog comes
-                            // back as `Dismissed` — that's the happy
-                            // cancel path, not a failure. Anything
-                            // else is logged.
-                            if !err.matches(gtk4::DialogError::Dismissed) {
-                                tracing::warn!(?err, "folder-picker dialog failed");
-                            }
-                        }
-                    },
-                );
-            }
-        });
+        // Chrome buttons.
         // - Sidebar toggle: route through the existing ToggleSidebar
         //   action so both the keybind and the button share one
         //   code path.
@@ -1402,7 +1346,10 @@ impl App {
             let app = self.clone();
             let project_id = project.id;
             move |tv, _moved_page, _new_idx| {
-                // Skip the echo when the reorder is our own
+                // Keep the strip's pills ordered like the AdwTabView pages on
+                // every reorder (user drag, keybind, or daemon resync).
+                app.resync_pill_order(project_id);
+                // Skip the RPC echo when the reorder is our own
                 // programmatic resync, not a user drag.
                 if *app.suppress_tab_reorder_echo.borrow() {
                     return;
@@ -1484,6 +1431,22 @@ impl App {
             .spacing(6)
             .css_classes(["roost-tab-strip"])
             .build();
+        // Drop target for pill drag-reorder: the payload is the dragged tab id
+        // (set by each pill's DragSource); on drop we move its page to the
+        // pointer's insertion index.
+        let drop = gtk4::DropTarget::new(glib::types::Type::I64, gtk4::gdk::DragAction::MOVE);
+        drop.connect_drop({
+            let app = self.clone();
+            let project_id = project.id;
+            move |_, value, x, _| match value.get::<i64>() {
+                Ok(src_tab) => {
+                    app.drop_reorder_tab(project_id, src_tab, x);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        tab_strip.add_controller(drop);
         self.bar_stack
             .add_named(&tab_strip, Some(&stack_name(project.id)));
 
@@ -1645,6 +1608,32 @@ impl App {
         });
         entry.add_controller(focus);
 
+        // Drag-to-reorder: payload = tab_id; suppressed while the pill is in
+        // inline-rename mode (the entry owns focus + pointer). The strip's
+        // DropTarget moves the page; page-reordered resyncs pills + fires RPC.
+        let drag = gtk4::DragSource::new();
+        drag.set_actions(gtk4::gdk::DragAction::MOVE);
+        drag.connect_prepare({
+            let ns = name_stack.clone();
+            move |_, _, _| {
+                if ns.visible_child_name().as_deref() == Some("entry") {
+                    return None;
+                }
+                Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
+                    tab_id,
+                )))
+            }
+        });
+        drag.connect_drag_begin({
+            let root = root.clone();
+            move |_, _| root.set_opacity(0.4)
+        });
+        drag.connect_drag_end({
+            let root = root.clone();
+            move |_, _, _| root.set_opacity(1.0)
+        });
+        root.add_controller(drag);
+
         TabPill {
             root,
             dot,
@@ -1701,7 +1690,61 @@ impl App {
                 .selected_page()
                 .and_then(|p| parse_tab_id_from_page(&p))
                 == Some(tab_id);
-            pill.badge.set_visible(tab_ui.page.needs_attention() && !active);
+            pill.badge
+                .set_visible(tab_ui.page.needs_attention() && !active);
+        }
+    }
+
+    /// Reorder the strip's pills to match the AdwTabView's page order. Called
+    /// from page-reordered, so pills follow the model on any reorder — a user
+    /// drag, a keybind, or a daemon-driven resync.
+    fn resync_pill_order(self: &Rc<Self>, project_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let pills = ui.pills.borrow();
+        let mut prev: Option<gtk4::Widget> = None;
+        for i in 0..ui.tab_view.n_pages() {
+            let page = ui.tab_view.nth_page(i);
+            if let Some(pill) = parse_tab_id_from_page(&page).and_then(|t| pills.get(&t)) {
+                ui.tab_strip.reorder_child_after(&pill.root, prev.as_ref());
+                prev = Some(pill.root.clone().upcast());
+            }
+        }
+    }
+
+    /// Handle a pill drop at strip-x `x`: move the dragged tab's page to the
+    /// index implied by the pointer (its insertion point among the other
+    /// pills), then page-reordered resyncs the pills + fires the RPC.
+    fn drop_reorder_tab(self: &Rc<Self>, project_id: i64, src_tab: i64, x: f64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let pills = ui.pills.borrow();
+        // Insertion index = number of OTHER pills whose centre is left of x,
+        // in the strip's visual (= AdwTabView) order.
+        let mut idx = 0i32;
+        for i in 0..ui.tab_view.n_pages() {
+            let page = ui.tab_view.nth_page(i);
+            let Some(tid) = parse_tab_id_from_page(&page) else {
+                continue;
+            };
+            if tid == src_tab {
+                continue;
+            }
+            if let Some(pill) = pills.get(&tid) {
+                if let Some(b) = pill.root.compute_bounds(&ui.tab_strip) {
+                    if x > (b.x() + b.width() / 2.0) as f64 {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        let src_page = ui.tabs.borrow().get(&src_tab).map(|t| t.page.clone());
+        if let Some(page) = src_page {
+            ui.tab_view.reorder_page(&page, idx);
         }
     }
 
@@ -1921,7 +1964,8 @@ impl App {
         self.tab_stack
             .set_visible_child_name(&stack_name(project_id));
         // Show this project's tab strip in the top-bar stack.
-        self.bar_stack.set_visible_child_name(&stack_name(project_id));
+        self.bar_stack
+            .set_visible_child_name(&stack_name(project_id));
         self.window_title.set_title(&ui.name);
         // Surface the active project in the OS window title (taskbar / alt-tab);
         // the in-chrome title widget was removed for Mac-parity minimal chrome.
