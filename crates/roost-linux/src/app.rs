@@ -1399,6 +1399,11 @@ impl App {
         // (set by each pill's DragSource); on drop we move its page to the
         // pointer's insertion index.
         let drop = gtk4::DropTarget::new(glib::types::Type::I64, gtk4::gdk::DragAction::MOVE);
+        // Keep advertising MOVE for the whole hover so GTK actually delivers
+        // the drop — without a motion handler the target highlights (the user
+        // sees the blue outline) but the ::drop never fires. The sidebar's
+        // working DropTarget has the same motion handler.
+        drop.connect_motion(|_, _, _| gtk4::gdk::DragAction::MOVE);
         drop.connect_drop({
             let app = self.clone();
             let project_id = project.id;

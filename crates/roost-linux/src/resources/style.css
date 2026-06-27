@@ -129,9 +129,11 @@ tabbar tab:checked {
   padding: 3px 4px;
 }
 /* Pill: 24px tall, 6px radius (Mac TabPillView). Inactive = transparent
- * with a dimmed label; hover gets a faint wash; active = a near-solid accent
- * fill + white label, to match the Mac UI's solid-blue active tab (a faint
- * tint read as gray on the #282828 chrome). 0.85 keeps a hair of depth. */
+ * with a dimmed label; hover gets a faint wash; active = a SOLID accent fill
+ * + white label. The Mac UI's active tab is a bright, vivid blue, clearly
+ * distinct from the deeper sidebar-selection #12509d — a faint tint read as
+ * gray and too close to the project pill, so the active tab uses the full
+ * accent (mirrors how the Mac tab uses controlAccentColor at full strength). */
 .roost-tab-pill {
   border-radius: 6px;
   padding: 0 4px 0 8px;
@@ -142,7 +144,7 @@ tabbar tab:checked {
   background-color: alpha(currentColor, 0.10);
 }
 .roost-tab-pill.active {
-  background-color: alpha(@accent_bg_color, 0.85);
+  background-color: @accent_bg_color;
 }
 .roost-tab-pill label.roost-tab-pill-label {
   color: #d1d1d1;
