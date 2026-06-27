@@ -392,7 +392,6 @@ window.roost-translucent paned > separator {
   background-color: #1e1e1e;
 }
 window.roost-translucent .roost-tab-stack,
-window.roost-translucent .roost-tab-stack tabview,
-window.roost-translucent .roost-tab-stack tabbar {
+window.roost-translucent .roost-tab-stack tabview {
   background-color: #1e1e1e;
 }

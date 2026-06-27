@@ -1441,6 +1441,16 @@ impl App {
 
     // ----- Phase 3: custom tab pills (Mac-style strip) -------------
 
+    /// The project's tab view, cloned out so the caller can drop the projects
+    /// borrow before driving it (set/close/reorder fire signals that re-enter
+    /// the borrow). Used by the pill click / close / context-menu handlers.
+    fn project_tab_view(&self, project_id: i64) -> Option<TabView> {
+        self.projects
+            .borrow()
+            .get(&project_id)
+            .map(|ui| ui.tab_view.clone())
+    }
+
     /// Build a Mac-style tab pill for `tab_id` and wire its interactions. The
     /// pill is a view of `page` in `project_id`'s AdwTabView: clicking selects
     /// the page (the existing `selected-page` handler syncs the core), double-
@@ -1504,12 +1514,7 @@ impl App {
             let app = self.clone();
             let page = page.clone();
             move |_, n, _, _| {
-                let tv = app
-                    .projects
-                    .borrow()
-                    .get(&project_id)
-                    .map(|ui| ui.tab_view.clone());
-                if let Some(tv) = tv {
+                if let Some(tv) = app.project_tab_view(project_id) {
                     tv.set_selected_page(&page);
                     // Box pills aren't focusable, so the terminal keeps GTK
                     // focus across the switch; re-grab the now-active tab's
@@ -1530,12 +1535,7 @@ impl App {
             let app = self.clone();
             let page = page.clone();
             move |_| {
-                let tv = app
-                    .projects
-                    .borrow()
-                    .get(&project_id)
-                    .map(|ui| ui.tab_view.clone());
-                if let Some(tv) = tv {
+                if let Some(tv) = app.project_tab_view(project_id) {
                     tv.close_page(&page);
                 }
             }
@@ -1607,6 +1607,7 @@ impl App {
         secondary.connect_released({
             let app = self.clone();
             let root = root.clone();
+            let page = page.clone();
             move |_, _, x, y| {
                 let pop = gtk4::Popover::builder()
                     .has_arrow(false)
@@ -1637,18 +1638,10 @@ impl App {
                 close_item.connect_clicked({
                     let app = app.clone();
                     let pop = pop.clone();
+                    let page = page.clone();
                     move |_| {
                         pop.popdown();
-                        let pair = {
-                            let projects = app.projects.borrow();
-                            projects.get(&project_id).and_then(|ui| {
-                                ui.tabs
-                                    .borrow()
-                                    .get(&tab_id)
-                                    .map(|t| (ui.tab_view.clone(), t.page.clone()))
-                            })
-                        };
-                        if let Some((tv, page)) = pair {
+                        if let Some(tv) = app.project_tab_view(project_id) {
                             tv.close_page(&page);
                         }
                     }
