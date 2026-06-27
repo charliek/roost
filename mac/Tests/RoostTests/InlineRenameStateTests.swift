@@ -17,8 +17,7 @@ func configure_skipsStringValueWhileEditing() {
     let cell = ProjectRowCellView()
     cell.configure(
         with: ProjectSnapshot(id: 42, name: "Original", cwd: "/tmp"),
-        notifying: false,
-        rollup: .none
+        notifying: false
     )
     #expect(cell.textField?.stringValue == "Original")
 
@@ -35,8 +34,7 @@ func configure_skipsStringValueWhileEditing() {
     // The typing buffer ("user-edit") must NOT be overwritten.
     cell.configure(
         with: ProjectSnapshot(id: 42, name: "fromCli", cwd: "/tmp"),
-        notifying: false,
-        rollup: .none
+        notifying: false
     )
     #expect(cell.textField?.stringValue == "user-edit")
     #expect(cell.isEditing == true)
@@ -48,8 +46,7 @@ func configure_resyncsStringValueAfterEdit() {
     let cell = ProjectRowCellView()
     cell.configure(
         with: ProjectSnapshot(id: 1, name: "Alpha", cwd: ""),
-        notifying: false,
-        rollup: .none
+        notifying: false
     )
     cell.beginEdit(initial: "Alpha", onCommit: { _ in }, onCancel: {})
     cell.textField?.stringValue = "in-progress"
@@ -69,30 +66,27 @@ func configure_resyncsStringValueAfterEdit() {
     // should pick it up.
     cell.configure(
         with: ProjectSnapshot(id: 1, name: "Beta", cwd: ""),
-        notifying: false,
-        rollup: .none
+        notifying: false
     )
     #expect(cell.textField?.stringValue == "Beta")
 }
 
 @MainActor
 @Test
-func configure_applyRollupChangeDuringEditDoesNotClobber() {
+func configure_reapplyDuringEditDoesNotClobber() {
     let cell = ProjectRowCellView()
     cell.configure(
         with: ProjectSnapshot(id: 7, name: "P7", cwd: ""),
-        notifying: false,
-        rollup: .none
+        notifying: false
     )
     cell.beginEdit(initial: "P7", onCommit: { _ in }, onCancel: {})
     cell.textField?.stringValue = "still-typing"
 
-    // Stripe arrives via `.tabState` rebuilding the sidebar mid-edit;
-    // typing buffer is preserved.
+    // A reconfigure (e.g. a notification toggling) arrives via a sidebar
+    // rebuild mid-edit; the typing buffer is preserved.
     cell.configure(
         with: ProjectSnapshot(id: 7, name: "P7", cwd: ""),
-        notifying: true,
-        rollup: .needsInput
+        notifying: true
     )
     #expect(cell.textField?.stringValue == "still-typing")
 }
