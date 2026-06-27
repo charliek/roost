@@ -9,6 +9,44 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.13 — 2026-06-26
+
+A microphone/camera permission fix for the macOS app, plus a round of GTK
+tab-focus and selection-sync fixes.
+
+### Features
+
+- **Microphone, camera & AppleScript access for programs run in a tab (macOS,
+  #232)** — Roost.app now declares the capture entitlements (`device.audio-input`,
+  `device.camera`, `automation.apple-events`) plus the paired Info.plist usage
+  strings, so a program launched in a Roost tab (Claude Code's `/voice`, audio
+  recorders, `osascript`) gets a proper *"Roost would like to access the
+  microphone"* prompt instead of failing silently. macOS attributes the request
+  to Roost as the TCC responsible app; granting once covers programs in that
+  session. The broad personal-information entitlements (contacts/calendars/
+  photos/location) are deliberately excluded, and the bundled `roostctl` helper
+  is signed narrowly so it never inherits the capture grants. Note: under the
+  current ad-hoc signing the grant resets on each app update until Developer ID
+  signing lands (#83).
+
+### Fixes
+
+- **GTK terminal focus now matches the Mac UI (#225)** — clicking a tab or
+  switching projects reliably refocuses the terminal, and focus is re-asserted
+  when the window is re-activated.
+- **GTK tab/project clicks sync the workspace core (#228, #229)** — selecting a
+  tab via the AdwTabView (and renaming a background tab) now updates the core's
+  active selection, so `identify`, restore, and notification routing reflect the
+  tab you actually selected.
+- **Fixed two GTK crashes** — a segfault when right-clicking an AdwTabView tab
+  (context menu), and a crash when tearing down the command-palette overlay.
+- **Dropped GTK `Alt+digit` AdwTabView shortcuts** that collided with
+  `SwitchProject`.
+
+### Tests + CI
+
+- **e2e-gtk** now runs the real-click terminal-focus regression (non-gating).
+
 ## v0.0.12 — 2026-06-15
 
 ### Added
