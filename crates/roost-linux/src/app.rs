@@ -22,7 +22,7 @@ use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
+use libadwaita::{ApplicationWindow, TabView, WindowTitle};
 use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project, Tab};
 use tokio::runtime::Handle;
 
@@ -70,9 +70,8 @@ struct ProjectUi {
     /// starts; cleared on cancel/commit.
     sidebar_entry: gtk4::Entry,
     tab_view: TabView,
-    /// AdwTabBar — held so the M9 rename popover can anchor here
-    /// (under the selected pill) instead of at the bottom of the
-    /// TabView's terminal area.
+    /// Per-project tab strip (in the top-bar `bar_stack`). Held so the
+    /// rename popover can anchor under its pills.
     tab_bar: libadwaita::TabBar,
     /// Tab id → (TerminalView, TabSession).
     tabs: RefCell<HashMap<i64, TabUi>>,
@@ -124,9 +123,17 @@ pub struct App {
     /// `gtk::Stack` of TabView widgets, one entry per project id.
     /// Switching the sidebar selection flips the visible child.
     tab_stack: gtk4::Stack,
-    /// `adw::WindowTitle` widget in the headerbar. Title = active
-    /// project name, subtitle = active tab's cwd (tilde-abbreviated).
-    /// Mirrors the Mac UI's `updateWindowTitle` flow.
+    /// Per-project tab strips, stacked in the AdwToolbarView top bar; only
+    /// the active project's is shown (switched on project change). One shared
+    /// AdwTabBar rebound via `set_view` crashes libadwaita on switch
+    /// (g_object_unref), so each project keeps its own bar bound to its own
+    /// view for life and we flip the visible stack child instead.
+    bar_stack: gtk4::Stack,
+    /// `adw::WindowTitle` title-state holder (title = active project name,
+    /// subtitle = active tab's cwd). No longer displayed in-chrome — the
+    /// AdwHeaderBar that showed it was removed for Mac-parity minimal chrome;
+    /// the OS window title is set directly from `set_active_project` instead.
+    /// Kept as the title model pending a possible future in-chrome title.
     window_title: WindowTitle,
     projects: RefCell<HashMap<i64, ProjectUi>>,
     /// Currently focused project (sidebar selection). 0 = no
@@ -438,18 +445,16 @@ impl App {
             tracing::warn!("no default GDK display; skipping chrome CSS load");
         }
 
-        let header = HeaderBar::new();
-        // `adw::WindowTitle` is the libadwaita 1.x analog of NSWindow's
-        // title + subtitle. Title = project name (or status during
-        // bootstrap), subtitle = active tab's cwd. Matches the Mac UI's
-        // two-line title format.
+        // `adw::WindowTitle` is retained for the OS window title (taskbar /
+        // alt-tab) and future use; the AdwHeaderBar that displayed it is
+        // gone — Mac-parity minimal chrome puts the tabs flush at the window
+        // top (see the AdwToolbarView assembled below), with no title row.
         let window_title = WindowTitle::new("Roost", "connecting…");
-        header.set_title_widget(Some(&window_title));
 
-        // Headerbar buttons: folder picker (left) + sidebar toggle
-        // (left) + `+ Tab` (right). Matches the Mac UI chrome — same
-        // icons, same positions. Wired below after `app_struct` exists
-        // so the handlers can capture an `Rc<App>` clone.
+        // Chrome buttons (folder/new-project, sidebar toggle, new tab,
+        // notifications). They live in the top tab-row built below instead of
+        // a header bar. Wired below after `app_struct` exists so the handlers
+        // can capture an `Rc<App>` clone.
         let folder_button = gtk4::Button::builder()
             .child(&gtk4::Image::from_gicon(&embedded_icon(
                 ICON_FOLDER_SYMBOLIC,
@@ -492,10 +497,7 @@ impl App {
             .css_classes(["flat"])
             .tooltip_text("Notifications")
             .build();
-        header.pack_start(&folder_button);
-        header.pack_start(&sidebar_toggle_button);
-        header.pack_end(&new_tab_button);
-        header.pack_end(&notif_button);
+        // (Buttons are packed into the top tab-row below, not a header bar.)
 
         // Sidebar: vertical Box of [section header] / [scrolled project
         // list] / [`+ Project` footer button]. Matches the Mac UI
@@ -588,10 +590,50 @@ impl App {
         // window (sidebar + tabs), pinned just under the tab bar.
         let content_overlay = gtk4::Overlay::builder().child(&paned).build();
 
-        let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        outer.append(&header);
-        outer.append(&content_overlay);
-        window.set_content(Some(&outer));
+        // Per-project tab strips live in this stack (built in add_project_ui),
+        // sitting in the AdwToolbarView top bar so tabs are flush at the
+        // window top (Mac parity). Only the active project's strip is shown.
+        // `hhomogeneous(false)` lets the stack size to the visible strip.
+        let bar_stack = gtk4::Stack::builder()
+            .hhomogeneous(false)
+            .vhomogeneous(false)
+            .build();
+        // Top "title" row: window controls flank the strip, with the sidebar
+        // toggle + new-project on the left and new-tab + notifications on the
+        // right — the affordances the removed header carried, now inline with
+        // the tabs.
+        let tab_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::Start));
+        tab_row.append(&sidebar_toggle_button);
+        tab_row.append(&folder_button);
+        tab_row.append(&bar_stack);
+        tab_row.append(&new_tab_button);
+        // Hexpanding drag spacer: pushes notifications + window controls to
+        // the trailing edge and gives the window a drag region, so the tabs
+        // stay compact and left-aligned (Mac style) rather than stretching
+        // to fill the row.
+        let tab_row_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        tab_row_spacer.set_hexpand(true);
+        tab_row.append(&tab_row_spacer);
+        tab_row.append(&notif_button);
+        tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::End));
+        // AdwHeaderBar gave window-drag for free; without it we wrap the row
+        // in a GtkWindowHandle so empty regions drag the window. Interactive
+        // children (buttons, the tab strip) still receive their own events.
+        //
+        // CSD/SSD: on Wayland (the primary target — COSMIC/GNOME) the window
+        // is client-side-decorated, so these in-row GtkWindowControls are the
+        // only controls — correct. On X11 under a WM that draws server-side
+        // decorations they'd be doubled with the WM titlebar. The right fix is
+        // CSD detection (cf. Ghostty's `.csd`/`.ssd` class toggle) — NOT a
+        // blanket `set_decorated(false)`, which strips Wayland's CSD resize
+        // edges + shadow. Deferred to real-compositor validation.
+        let titlebar = gtk4::WindowHandle::builder().child(&tab_row).build();
+
+        let toolbar_view = libadwaita::ToolbarView::new();
+        toolbar_view.add_top_bar(&titlebar);
+        toolbar_view.set_content(Some(&content_overlay));
+        window.set_content(Some(&toolbar_view));
 
         // Projects-sidebar translucency: tint only when the display
         // supports an alpha visual AND a compositor is present. GDK
@@ -629,6 +671,7 @@ impl App {
             sidebar: sidebar.clone(),
             sidebar_box: sidebar_box.clone(),
             tab_stack: tab_stack.clone(),
+            bar_stack: bar_stack.clone(),
             window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
@@ -1389,18 +1432,21 @@ impl App {
             }
         });
 
-        // `autohide(false)`: libadwaita defaults to hiding the tab bar
-        // when there's only one page (iOS-style minimal chrome). Both
-        // this UI and the Mac UI always show the strip, so single-tab
-        // projects still get a visible tab pill + `×` close affordance.
-        // Without this, users see only the terminal area until a second
-        // tab is opened.
+        // Per-project AdwTabBar (compact, always-visible) bound to this
+        // project's view for life; added to the top-bar `bar_stack` so only
+        // the active project's strip shows (Mac parity: one strip at the
+        // window top). A single shared bar rebound via set_view crashes
+        // libadwaita on project switch, hence one bar per project.
         let tab_bar = libadwaita::TabBar::builder()
             .view(&tab_view)
             .autohide(false)
             .build();
+        self.bar_stack
+            .add_named(&tab_bar, Some(&stack_name(project.id)));
+
+        // The AdwTabView is the page container (terminal pages), held in the
+        // content stack.
         let project_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        project_box.append(&tab_bar);
         project_box.append(&tab_view);
 
         self.tab_stack
@@ -1574,6 +1620,13 @@ impl App {
     /// tab pill rather than `connect_setup_menu` (which is the per-page
     /// context menu, not an inline-edit hook).
     fn begin_rename_tab(self: &Rc<Self>, project_id: i64, tab_id: i64) {
+        // Renaming a tab in a background project would anchor the popover to a
+        // hidden `bar_stack` child (GTK mis-positions popovers on unmapped
+        // widgets → it lands at 0,0 / offscreen). Activate the project first so
+        // its strip is visible; a no-op for the common active-project case.
+        if *self.active_project_id.borrow() != project_id {
+            self.set_active_project(project_id);
+        }
         let projects = self.projects.borrow();
         let Some(ui) = projects.get(&project_id) else {
             return;
@@ -1671,7 +1724,12 @@ impl App {
         };
         self.tab_stack
             .set_visible_child_name(&stack_name(project_id));
+        // Show this project's tab strip in the top-bar stack.
+        self.bar_stack.set_visible_child_name(&stack_name(project_id));
         self.window_title.set_title(&ui.name);
+        // Surface the active project in the OS window title (taskbar / alt-tab);
+        // the in-chrome title widget was removed for Mac-parity minimal chrome.
+        self.window.set_title(Some(&ui.name));
         let subtitle = active_tab_cwd(ui);
         self.window_title.set_subtitle(&subtitle);
         // Sync sidebar selection without re-firing the handler.
@@ -2252,6 +2310,7 @@ impl App {
                 let mut projects = self.projects.borrow_mut();
                 if let Some(ui) = projects.remove(&project_id) {
                     self.sidebar.remove(&ui.sidebar_row);
+                    self.bar_stack.remove(&ui.tab_bar);
                     self.tab_stack.remove(
                         &self
                             .tab_stack
@@ -2514,6 +2573,7 @@ impl App {
             let removed = self.projects.borrow_mut().remove(pid);
             if let Some(ui) = removed {
                 self.sidebar.remove(&ui.sidebar_row);
+                self.bar_stack.remove(&ui.tab_bar);
                 if let Some(child) = self.tab_stack.child_by_name(&stack_name(*pid)) {
                     self.tab_stack.remove(&child);
                 }
@@ -3085,7 +3145,7 @@ impl App {
             None => PaletteOutcome::Close,
         });
 
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3112,7 +3172,7 @@ impl App {
         }
         let root = self.notifications_frame();
         let behavior = self.notifications_behavior();
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3146,7 +3206,7 @@ impl App {
         let commands = RoostConfig::load_default().commands;
         let root = self.launcher_frame(&commands);
         let behavior = self.launcher_behavior(commands);
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3233,7 +3293,7 @@ impl App {
         let providers = RoostConfig::load_default().providers;
         let root = self.provider_list_frame(&providers);
         let behavior = self.provider_list_behavior(providers);
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3776,18 +3836,11 @@ impl App {
         }
     }
 
-    /// Top margin pinning the card under the tab bar: the active
-    /// project's tab-bar height (falling back to ~46px before it's
-    /// allocated) plus the visual gap.
-    fn palette_top_margin(self: &Rc<Self>) -> i32 {
-        let pid = *self.active_project_id.borrow();
-        let projects = self.projects.borrow();
-        let bar_h = projects
-            .get(&pid)
-            .map(|ui| ui.tab_bar.height())
-            .filter(|h| *h > 0)
-            .unwrap_or(46);
-        bar_h + TOP_GAP
+    /// Top margin for the palette card. The tab strip now lives in the
+    /// toolbar top bar, above the content overlay the palette floats in, so
+    /// the card only needs the visual gap from the content top.
+    fn palette_top_margin() -> i32 {
+        TOP_GAP
     }
 
     /// Palette teardown callback: clear the handle + the captured
@@ -4233,7 +4286,7 @@ impl App {
             PaletteOutcome::Close
         });
 
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let dismiss_reply = shared.clone();
         let overlay = PaletteOverlay::present(
