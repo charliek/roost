@@ -1595,8 +1595,17 @@ impl App {
         entry.add_controller(esc);
         let focus = gtk4::EventControllerFocus::new();
         focus.connect_leave({
+            let app = self.clone();
             let ns = name_stack.clone();
-            move |_| ns.set_visible_child_name("label")
+            // Cancel on focus-out, and restore focus to the active terminal
+            // like the Enter/Escape paths — otherwise clicking away from the
+            // entry hides it but leaves GTK focus stranded on the now-hidden
+            // entry. Idempotent with the explicit handlers (their child-switch
+            // also fires leave).
+            move |_| {
+                ns.set_visible_child_name("label");
+                app.focus_active_terminal();
+            }
         });
         entry.add_controller(focus);
 
