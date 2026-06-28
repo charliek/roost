@@ -12,6 +12,11 @@ docs = [
 ]
 test = [
     "pytest>=9.0.3",
+    # Per-test hard cap so one hung test (e.g. a Wayland clipboard/render
+    # stall) fails fast instead of eating a CI step's whole budget. Opt-in
+    # per job via `--timeout=...`; no global default so it can't surprise
+    # the existing X11/Mac jobs.
+    "pytest-timeout>=2.3.0",
 ]
 
 [tool.pytest.ini_options]

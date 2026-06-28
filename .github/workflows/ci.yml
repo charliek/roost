@@ -36,6 +36,7 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - 'mise.toml'
+              - 'clippy.toml'
               - 'crates/**'
               - 'third_party/ghostty/**'
             rust:
@@ -49,6 +50,7 @@ jobs:
             tests:
               - 'tools/roosttest/**'
               - 'tools/input/linux/**'
+              - 'tools/wayland/**'
               - 'pyproject.toml'
               - 'uv.lock'
             ci:
@@ -388,6 +390,25 @@ jobs:
       - name: cargo build -p roost-linux
         run: cargo build -p roost-linux
 
+      # Regression guard: tab + project reorder were converted from GtkDnD to
+      # GtkGestureDrag because the DnD drag-icon surface aborts the process on
+      # Wayland (gdksurface-wayland.c:348:frame_callback), and synthetic input
+      # can't reliably reproduce that in CI. clippy's disallowed-types (see
+      # clippy.toml) forbids the DnD transport types semantically — it resolves
+      # real references, so it ignores the comments that name those types and
+      # catches builder/glob-import forms a text grep would miss. Only
+      # disallowed_types is denied, so roost-linux's other (un-linted) clippy
+      # warnings don't fail the build; rust-lint excludes roost-linux because it
+      # needs the GTK toolchain that this job already has.
+      - name: No reintroduced GtkDnD reorder (clippy disallowed-types)
+        # `-A warnings` first: roost-linux is NOT clippy-clean (that's exactly
+        # why rust-lint excludes it), and the toolchain action sets
+        # RUSTFLAGS=-D warnings — so without allowing the rest, every
+        # pre-existing clippy lint would error here. We deny ONLY the
+        # disallowed_types guard (it survives the `-A warnings` as a later,
+        # more-specific flag).
+        run: cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types
+
   # Functional E2E: launch the real GTK UI headless under Xvfb and drive
   # it through the IPC op set with the pytest harness (tools/roosttest).
   # Required — Linux is the cheap, reliable headless target.
@@ -521,11 +542,16 @@ jobs:
   # legitimately diverge. Promote into ci-success once the profile is clean
   # (mirrors the "real-click focus regression" gather-signal-then-promote
   # pattern above). weston headless drives the IPC suite, not pointer input;
-  # gesture-level drag testing needs ydotool + /dev/uinput, tracked separately.
+  # the real pointer-DRAG guard lives in the separate e2e-gtk-wayland-drag job
+  # (cage + /dev/uinput) below.
   e2e-gtk-wayland:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    # Job-level cap so a hung run can't sprawl (a single hung test ate the 15m
+    # step cap once → the job ran 22m). Sized to survive a cache-COLD run (cold
+    # libghostty-vt + cargo build add ~10m), not the warm ~2m time.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -590,9 +616,16 @@ jobs:
         # X11↔Wayland — not the GDK-Wayland backend this job exists to cover.
         # `timeout-minutes` is the belt-and-suspenders cap so a future hang can
         # never run away again (continue-on-error swallows the timed-out step).
+        # --timeout: per-test hard cap (pytest-timeout) so one hung test fails
+        # fast instead of consuming the whole step (that's what ran the job to
+        # 22m). Derived from the same ROOST_TEST_TIMEOUT_SCALE the harness uses
+        # (30s base * 3 = 90s) so the one knob meant to absorb runner variance
+        # doesn't get bypassed. `thread` method dumps the stack + fails without
+        # relying on SIGALRM landing in a GTK/IPC C call.
         run: >
           tools/wayland/weston-run.sh
           uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
+          --timeout=$((30 * ROOST_TEST_TIMEOUT_SCALE)) --timeout-method=thread
           --ignore=tools/roosttest/test_osc52.py
           --ignore=tools/roosttest/test_selection.py
           --ignore=tools/roosttest/test_shell_integration.py
@@ -612,6 +645,97 @@ jobs:
           path: diagnostics/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Real pointer-DRAG under a headless WAYLAND compositor — the one thing the
+  # IPC-only e2e-gtk-wayland job can't do. Drives an absolute-pointer drag with
+  # the stdlib /dev/uinput injector (tools/input/linux/inject_pointer.py) under
+  # `cage` (a kiosk wlroots compositor that fullscreens its single client, so
+  # window coords == output coords). Guards that the GtkGestureDrag reorder
+  # neither aborts the process nor emits a Wayland surface critical — the X11
+  # real-input job can only exercise the gesture *logic*, not the GDK-Wayland
+  # backend where the old GtkDnD drag-icon surface crashed.
+  #
+  # NON-BLOCKING (continue-on-error + absent from ci-success): synthetic Wayland
+  # input + the seat/libinput/uinput plumbing is new and may be flaky on shared
+  # runners. The check SKIPs cleanly if a dep is missing and reports a clear
+  # FAIL otherwise (ROOST_REQUIRE_REAL_INPUT=1). Promote to a gate once it has
+  # green history on main (same gather-signal pattern as the jobs above). The
+  # developer confirms the real COSMIC/cosmic-comp behavior separately; cage is
+  # generic wlroots Wayland, which is where the crash lived.
+  e2e-gtk-wayland-drag:
+    needs: changes
+    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GTK4 + libadwaita + cage + seatd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev cage seatd
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build the GTK UI + roostctl
+        # roostctl (roost-cli) is what the injector harness drives; a cold
+        # `-p roost-linux` build doesn't produce it, so build both explicitly.
+        run: cargo build -p roost-linux -p roost-cli
+
+      - name: Enable uinput + a seat for synthetic input
+        # Headless wlroots has no input devices; to read the uinput device the
+        # injector creates, cage needs a libinput backend on a seat. modprobe
+        # uinput works on ubuntu-latest; seatd grants the seat to the runner's
+        # group. Best-effort — the check SKIPs/FAILs clearly if this didn't take.
+        run: |
+          sudo modprobe uinput || true
+          sudo chmod 0666 /dev/uinput || true
+          sudo seatd -g "$(id -gn)" >"${RUNNER_TEMP}/seatd.log" 2>&1 &
+          sleep 1
+          echo "LIBSEAT_BACKEND=seatd" >> "$GITHUB_ENV"
+
+      - name: Wayland pointer-drag guard (cage + uinput)
+        continue-on-error: true
+        timeout-minutes: 12
+        env:
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_REQUIRE_REAL_INPUT: "1"
+          WLR_BACKENDS: "headless,libinput"
+          WLR_RENDERER: "pixman"
+        run: uv run --group test python tools/input/linux/wayland_drag_check.py
 
   # Functional E2E against the real Swift app, driven through the IPC op
   # set by the pytest harness (tools/roosttest) — the Mac twin of e2e-gtk.

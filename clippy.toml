@@ -1,0 +1,12 @@
+# Tab + project reorder were converted from GtkDnD to GtkGestureDrag because the
+# DnD drag-icon surface aborts the whole process on Wayland
+# (gdksurface-wayland.c:348:frame_callback — see #236). Forbid the DnD transport
+# types so a reorder can't regress back onto that crash. clippy resolves real
+# type references, so this (unlike a text grep) ignores the comments that name
+# these types to explain their removal, and catches builder/glob-import forms.
+# Enforced by `cargo clippy -p roost-linux -- -D clippy::disallowed_types` in the
+# gtk-build CI job (rust-lint excludes roost-linux — it needs the GTK toolchain).
+disallowed-types = [
+    { path = "gtk4::DragSource", reason = "reorder must use GtkGestureDrag — GtkDnD's drag-icon surface aborts on Wayland (#236)" },
+    { path = "gtk4::DropTarget", reason = "reorder must use GtkGestureDrag — GtkDnD's drag-icon surface aborts on Wayland (#236)" },
+]
