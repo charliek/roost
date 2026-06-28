@@ -182,6 +182,12 @@ wrapper small.
   uinput) via the **`linux-test` skill** / `tools/shed/shed-test.sh`
   (mounts the repo, provisions via `.shed/provision.yaml`, builds
   shed-local, runs the drag guard — mirrors CI's `e2e-gtk-wayland-drag`).
+- **Linux testing natively (Pop!_OS COSMIC)**: on a Linux dev box you
+  don't need a VM — build + run the suite directly. The **`popos-test`
+  skill** covers the apt deps, the e2e-gtk (Xvfb) + weston + headless-cage
+  tiers that run locally, the **seat0 caveat** (the live COSMIC session
+  owns input, so the real-pointer cage+uinput tier can't run locally —
+  use CI/shed), workspace isolation, and the gdb trick for focus criticals.
 - **Visual smoke (screenshots)**: `tools/screenshot/` drives either UI
   through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|gtk>`),
   captures labeled screenshots + a `manifest.md` of per-shot
