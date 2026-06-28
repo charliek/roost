@@ -61,9 +61,12 @@ build() {
 run_drag() {
   log "running the cage+uinput Wayland pointer-drag guard"
   # The startup hook already opened /dev/uinput + the seatd socket this boot.
+  # SCALE=5: a just-booted-from-snapshot VM is cold — the first tab spawns can
+  # be slow enough to trip wait_tab_attached at the CI default (3); the extra
+  # headroom only matters on a cold box and never slows a passing run.
   in_shed "cd ~/roost && \
     ROOST_BIN=$RT/debug/roost ROOSTCTL=$RT/debug/roostctl \
-    ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 ROOST_TEST_TIMEOUT_SCALE=3 \
+    ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 ROOST_TEST_TIMEOUT_SCALE=5 \
     python3 tools/input/linux/wayland_drag_check.py"
 }
 
