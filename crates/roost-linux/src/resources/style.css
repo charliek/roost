@@ -129,11 +129,17 @@ tabbar tab:checked {
   padding: 3px 4px;
 }
 /* Pill: 24px tall, 6px radius (Mac TabPillView). Inactive = transparent
- * with a dimmed label; hover gets a faint wash; active = a SOLID accent fill
- * + white label. The Mac UI's active tab is a bright, vivid blue, clearly
- * distinct from the deeper sidebar-selection #12509d — a faint tint read as
- * gray and too close to the project pill, so the active tab uses the full
- * accent (mirrors how the Mac tab uses controlAccentColor at full strength). */
+ * with a dimmed label; hover gets a faint wash; active = a SOLID blue fill
+ * + white label.
+ *
+ * HARDCODED #007aff (NOT @accent_bg_color): the active tab must read as the
+ * SAME blue as the Mac, whose pill is NSColor.controlAccentColor (#007aff).
+ * @accent_bg_color follows the host desktop accent, which isn't always blue —
+ * on COSMIC it's teal, so the pill came out cyan, way off from the Mac. Same
+ * rationale as the #12509d sidebar-selection hardcode above. The Mac draws the
+ * pill at 18% alpha over a WHITE titlebar (reads pale blue); our chrome is dark
+ * (#282828), where a tint reads gray and too close to the #12509d project pill,
+ * so we use the accent at full strength to stay clearly, distinctly blue. */
 .roost-tab-pill {
   border-radius: 6px;
   padding: 0 4px 0 8px;
@@ -144,7 +150,7 @@ tabbar tab:checked {
   background-color: alpha(currentColor, 0.10);
 }
 .roost-tab-pill.active {
-  background-color: @accent_bg_color;
+  background-color: #007aff;
 }
 .roost-tab-pill label.roost-tab-pill-label {
   color: #d1d1d1;
@@ -181,12 +187,15 @@ tabbar tab:checked {
 .roost-tab-pill-close:hover {
   background-color: alpha(#ffffff, 0.12);
 }
-/* Trailing notification badge on inactive notified tabs (Mac blue dot). */
+/* Trailing notification badge on inactive notified tabs (Mac blue dot).
+ * Hardcoded #007aff for the same reason as the active pill above — the Mac
+ * dot is controlAccentColor (#007aff); @accent_bg_color would render it teal
+ * on COSMIC. */
 .roost-tab-pill-badge {
   min-width: 8px;
   min-height: 8px;
   border-radius: 4px;
-  background-color: @accent_bg_color;
+  background-color: #007aff;
   margin: 0 2px;
 }
 /* Inline-rename entry inside a pill: frameless, sized to stay on the pill
