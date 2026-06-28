@@ -175,7 +175,8 @@ def _check_tab_reorder(r, rc, tmp: Path, cage, w: int, h: int, wait_tab_attached
 def main() -> int:
     if not ROOST_BIN.exists():
         _skip(f"{ROOST_BIN} not built (cargo build -p roost-linux)")
-    if shutil.which("cage") is None:
+    cage_bin = shutil.which("cage")
+    if cage_bin is None:
         _skip("cage not installed")
     if not Path("/dev/uinput").exists():
         _skip("/dev/uinput absent (need `modprobe uinput` + a writable node)")
@@ -216,11 +217,20 @@ def main() -> int:
         # exits, so `cage.poll()` doubles as the app-liveness check.
         with cage_log.open("wb") as cf:
             cage = subprocess.Popen(
-                ["cage", "--", str(ROOST_BIN)], env=env,
+                [cage_bin, "--", str(ROOST_BIN)], env=env,
                 stdout=cf, stderr=subprocess.STDOUT, start_new_session=True,
             )
         rc = [str(ROOSTCTL), "--socket", str(sock)]
-        r = _connect(lambda: Roost(str(sock)))
+        # If cage can't start (no seat/libinput), the socket never appears and
+        # _connect would burn its whole retry budget; turn that into a clean
+        # SKIP instead of a timeout error when cage is the thing that died.
+        try:
+            r = _connect(lambda: Roost(str(sock)))
+        except Exception:
+            if cage.poll() is not None:
+                _skip("cage/Roost exited before its IPC socket appeared "
+                      "(compositor setup failed — likely no seat/libinput for uinput)")
+            raise
         try:
             time.sleep(2.0 * SCALE)  # let cage map + Roost render its first frame
             if cage.poll() is not None:

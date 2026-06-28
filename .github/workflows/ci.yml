@@ -36,6 +36,7 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - 'mise.toml'
+              - 'clippy.toml'
               - 'crates/**'
               - 'third_party/ghostty/**'
             rust:
