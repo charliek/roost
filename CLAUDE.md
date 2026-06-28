@@ -175,6 +175,13 @@ wrapper small.
 - **Test-harness map**: the harnesses are organized in three layers —
   see [`tools/README.md`](tools/README.md) (functional / visual /
   real-input) for which to reach for.
+- **Linux testing on a Mac**: the GTK UI + its three test tiers (X11,
+  weston/Wayland, and the cage+uinput Wayland pointer-drag guard) only
+  run on Linux, and Docker Desktop can't run the drag tier (no
+  `/dev/uinput`). Use a **shed** (Apple VZ Linux microVM, real kernel +
+  uinput) via the **`linux-test` skill** / `tools/shed/shed-test.sh`
+  (mounts the repo, provisions via `.shed/provision.yaml`, builds
+  shed-local, runs the drag guard — mirrors CI's `e2e-gtk-wayland-drag`).
 - **Visual smoke (screenshots)**: `tools/screenshot/` drives either UI
   through `roostctl` (`launch.sh`/`quit.sh`/`smoke.sh <mac|gtk>`),
   captures labeled screenshots + a `manifest.md` of per-shot

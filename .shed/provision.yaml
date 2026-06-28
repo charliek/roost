@@ -1,0 +1,21 @@
+# Shed provisioning for roost's Linux dev/test loop on a Mac.
+#
+# A shed is an Apple VZ Linux microVM (real Ubuntu kernel + /dev/uinput), so it
+# can run the FULL Linux test suite — including the cage+uinput Wayland
+# pointer-drag guard that Docker Desktop can't (its LinuxKit kernel has no
+# uinput). Mount the repo with `shed create <name> --local-dir <repo>`; this
+# file is read from the landing dir (the mount).
+#
+# install: runs ONCE per shed (a state file records it) — system + toolchain
+#          deps. The snapshot in tools/shed/shed-test.sh caches this layer so
+#          fresh sheds skip it.
+# startup: runs EVERY boot — opens /dev/uinput + the boot seatd socket so the
+#          Wayland drag test can inject (the shed user isn't in the `video`
+#          group, and `shed exec` doesn't pick up group changes, so we open the
+#          nodes instead). Cheap + harmless when the drag test isn't run.
+hooks:
+  install: .shed/scripts/install.sh
+  startup: .shed/scripts/startup.sh
+
+# The cold ghostty (zig) + cargo build on first use can be slow under VirtioFS.
+timeout: 30m
