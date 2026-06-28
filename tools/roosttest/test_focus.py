@@ -87,7 +87,7 @@ def test_project_switch_focuses_terminal(roost):
     regression: switching via `tab.focus` doesn't focus a sidebar row,
     so it never reproduced the strand bug (focus left on the clicked
     GtkListBoxRow, cursor hollow). The real-click F2 regression lives in
-    tools/input/linux/click_to_focus_check.py."""
+    tools/input/linux/real_input_check.py."""
     a = b = None
     try:
         a = roost.create_project(name="focus-a", cwd="/tmp")
