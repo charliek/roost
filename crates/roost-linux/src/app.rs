@@ -1413,6 +1413,11 @@ impl App {
                     return;
                 }
                 app.refresh_window_subtitle();
+                // Keep the just-selected tab visible in the strip (Mac parity).
+                // Runs for programmatic selections too (close-survivor,
+                // Ctrl-nav, bootstrap restore) — all are "active tab changed" —
+                // so it's placed before the user-gesture suppress gate below.
+                app.schedule_scroll_active_tab_into_view();
                 // Sync the core ONLY for genuine in-widget user gestures —
                 // a tab-pill click (#228) or AdwTabView's Ctrl-nav (#229).
                 // Every selection change WE make (set_selected_page, append,
@@ -2146,6 +2151,10 @@ impl App {
         self.sidebar.select_row(Some(&ui.sidebar_row));
         drop(projects);
         *self.active_project_id.borrow_mut() = project_id;
+        // Switching projects shows a different strip — scroll it to its active
+        // tab (a project switch doesn't fire `selected-page`). The idle defer
+        // inside reads the now-updated `active_project_id`.
+        self.schedule_scroll_active_tab_into_view();
         // M9.5: clicking a project shouldn't leave focus on the sidebar
         // row — hand focus to the active tab's TerminalView (matches the
         // Mac `selectProject` ending in `makeFirstResponder`).
@@ -2196,6 +2205,77 @@ impl App {
             let subtitle = active_tab_cwd(ui);
             self.window_title.set_subtitle(&subtitle);
         }
+    }
+
+    /// Scroll the tab strip so the active project's selected pill is fully
+    /// visible (Mac parity — `scrollActiveTabIntoView`). Deferred to an idle
+    /// tick because GTK has no synchronous layout: a freshly attached or
+    /// just-selected pill isn't allocated when the notify fires, so its bounds
+    /// (and the scroller's adjustment range) aren't valid until the pending
+    /// resize pass runs. One retry covers the attach case where even the first
+    /// idle still races allocation.
+    fn schedule_scroll_active_tab_into_view(self: &Rc<Self>) {
+        let app = self.clone();
+        glib::idle_add_local_once(move || {
+            if !app.scroll_active_tab_into_view() {
+                let app2 = app.clone();
+                glib::idle_add_local_once(move || {
+                    app2.scroll_active_tab_into_view();
+                });
+            }
+        });
+    }
+
+    /// Reveal the active pill in `tab_scroller`. Returns `false` when the pill
+    /// isn't laid out yet (caller may retry on a later tick); `true` otherwise,
+    /// including the nothing-to-do cases. Only writes the hadjustment when the
+    /// pill is actually off-view, clamped so it never overscrolls. The pill /
+    /// project borrows are dropped before the write so a `value-changed` reentry
+    /// can't hit a live borrow.
+    fn scroll_active_tab_into_view(self: &Rc<Self>) -> bool {
+        let adj = self.tab_scroller.hadjustment();
+        let page = adj.page_size();
+        if page <= 0.0 {
+            return false;
+        }
+        let bounds = {
+            let pid = *self.active_project_id.borrow();
+            let projects = self.projects.borrow();
+            let Some(ui) = projects.get(&pid) else {
+                return true;
+            };
+            let Some(tab_id) = ui
+                .tab_view
+                .selected_page()
+                .and_then(|p| parse_tab_id_from_page(&p))
+            else {
+                return true;
+            };
+            let pills = ui.pills.borrow();
+            let Some(pill) = pills.get(&tab_id) else {
+                return true;
+            };
+            // `compute_bounds` relative to the scroller yields viewport-space x
+            // (content shifted by -value); `None` = not laid out yet → retry.
+            pill.root.compute_bounds(&self.tab_scroller)
+        };
+        let Some(b) = bounds else {
+            return false;
+        };
+        let content_left = adj.value() + b.x() as f64;
+        let content_right = content_left + b.width() as f64;
+        let target = reveal_scroll_value(
+            adj.value(),
+            adj.lower(),
+            adj.upper(),
+            page,
+            content_left,
+            content_right,
+        );
+        if (target - adj.value()).abs() > 0.5 {
+            adj.set_value(target);
+        }
+        true
     }
 
     /// OpenTab RPC → on success, attach the tab to the project's
@@ -5825,6 +5905,31 @@ fn restore_open_specs(saved: &[RestoreTab]) -> Vec<(String, String, bool)> {
     }
 }
 
+/// Compute the scroll-adjustment value that brings `[child_left, child_right]`
+/// fully into a viewport of width `page` currently positioned at `cur`,
+/// clamped to `[lower, upper - page]`. Returns `cur` unchanged when the child
+/// is already fully visible. Pure (no GTK) so the reveal + clamp logic is unit
+/// tested directly; `scroll_active_tab_into_view` feeds it the active pill's
+/// content-space bounds.
+fn reveal_scroll_value(
+    cur: f64,
+    lower: f64,
+    upper: f64,
+    page: f64,
+    child_left: f64,
+    child_right: f64,
+) -> f64 {
+    let max = (upper - page).max(lower);
+    let v = if child_left < cur {
+        child_left
+    } else if child_right > cur + page {
+        child_right - page
+    } else {
+        cur
+    };
+    v.clamp(lower, max)
+}
+
 /// M10 sidebar-reorder pure math. Given a source row sitting at
 /// `source_idx` and the user's desired insertion point in the
 /// *with-source* visual order (`raw_target_idx`), return the
@@ -5970,10 +6075,58 @@ mod tests {
     use super::{
         compute_insert_idx, drain_server_driven_marker, format_font_size,
         is_already_attached_or_pending, notif_tab_id, pick_next_active_project, resolve_launch_cwd,
-        restore_open_specs, tilde_abbreviate_with_home, RestoreTab,
+        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn reveal_scroll_keeps_visible_child_put() {
+        // child [10,50] already inside viewport [0,100] → no movement.
+        assert_eq!(reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 10.0, 50.0), 0.0);
+    }
+
+    #[test]
+    fn reveal_scroll_reveals_child_off_right() {
+        // viewport [0,100], child [120,160] off the right → align right edge.
+        assert_eq!(
+            reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 120.0, 160.0),
+            60.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_reveals_child_off_left() {
+        // scrolled to [80,180], child [10,50] off the left → align left edge.
+        assert_eq!(
+            reveal_scroll_value(80.0, 0.0, 200.0, 100.0, 10.0, 50.0),
+            10.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_partial_right_overlap_scrolls_minimum() {
+        // child [90,130] straddles the right edge of [0,100] → cur = 130-100.
+        assert_eq!(
+            reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 90.0, 130.0),
+            30.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_clamps_to_upper_minus_page() {
+        // child past content end → clamp to max = upper - page = 100.
+        assert_eq!(
+            reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 250.0, 300.0),
+            100.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_clamps_when_content_shorter_than_page() {
+        // content (upper 60) narrower than the viewport (100) → never overscroll.
+        assert_eq!(reveal_scroll_value(0.0, 0.0, 60.0, 100.0, 10.0, 50.0), 0.0);
+    }
 
     /// The notification-row id parser: `notif:<tab>` → the tab id; the
     /// `notif:none` empty sentinel + malformed ids → `None` (so confirm
