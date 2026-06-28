@@ -61,11 +61,29 @@ fi
 
 make_with_hdiutil() {
   ln -s /Applications "${STAGING}/Applications"
-  hdiutil create \
-    -volname "Roost ${VERSION}" \
-    -srcfolder "${STAGING}" \
-    -ov -format UDZO \
-    "${DMG_OUT}" >/dev/null
+  # hdiutil intermittently fails with "Resource busy" on CI runners (transient
+  # device/Spotlight contention, often right after codesign touches the bundle —
+  # not a real error). Retry a few times before giving up. (Proven needed by
+  # shed-desktop's first notarized release.)
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if hdiutil create \
+         -volname "Roost ${VERSION}" \
+         -srcfolder "${STAGING}" \
+         -ov -format UDZO \
+         "${DMG_OUT}" >/dev/null; then
+      return 0
+    fi
+    # Drop any partial/corrupt image on every failure — notarize.sh accepts a
+    # target by existence alone, so a leftover must not survive the final attempt.
+    rm -f "${DMG_OUT}"
+    if [ "${attempt}" -eq 5 ]; then
+      echo "error: hdiutil create failed after ${attempt} attempts" >&2
+      return 1
+    fi
+    echo "    hdiutil create failed (attempt ${attempt}); retrying in 3s…" >&2
+    sleep 3
+  done
 }
 
 if [ "${ROOST_DMG_FANCY:-0}" = "1" ] && command -v create-dmg >/dev/null 2>&1; then
