@@ -31,24 +31,30 @@ box.roost-sidebar list {
   background-image: none;
 }
 
-/* The toolbar top row (tabs + window controls) is SOLID chrome gray — the
- * Mac UI's top bar is opaque, with only the sidebar carrying vibrancy.
- * Without this the translucent window (see the .roost-translucent block)
- * shows straight through the top row, which reads as "very transparent".
+/* Header bar + tab-strip band are SOLID chrome gray — the Mac UI's top bands
+ * are opaque, with only the sidebar carrying vibrancy. Without this the
+ * translucent window (see the .roost-translucent block) shows straight
+ * through them, which reads as "very transparent".
  *
  * Pinned in BOTH the focused and unfocused (:backdrop) states — when the
  * window is inactive GTK applies :backdrop, and without an explicit rule the
- * transparent window bg shows through again. The WindowHandle wrapper
- * (.roost-titlebar) is pinned too so no seam shows around the row. */
-.roost-tabrow,
-.roost-tabrow:backdrop,
-.roost-titlebar,
-.roost-titlebar:backdrop,
-/* Also pin the AdwToolbarView's own top-bar container (behind the row) so the
- * transparent window can't show through around it, focused or backdrop. */
+ * transparent window bg shows through again. The AdwToolbarView's own top-bar
+ * container (behind the header) is pinned too. */
+.roost-headerbar,
+.roost-headerbar:backdrop,
+.roost-tab-band,
+.roost-tab-band:backdrop,
 toolbarview > .top-bar,
 toolbarview > .top-bar:backdrop {
   background-color: @roost_chrome_bg;
+}
+/* Header/content seam: drop libadwaita's default headerbar drop-shadow and
+ * draw a single subtle hairline under the header instead — the Mac shows
+ * exactly this line between the titlebar and the PROJECTS/tabs band. Same
+ * 1px alpha(#fff, 0.06) treatment as the sidebar footer's top hairline. */
+.roost-headerbar {
+  box-shadow: none;
+  border-bottom: 1px solid alpha(#ffffff, 0.06);
 }
 
 /* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
@@ -415,8 +421,10 @@ window.roost-translucent overlay,
 window.roost-translucent paned {
   background-color: transparent;
 }
-/* Keep the right-pane seam fully OPAQUE. (The top row is opaqued
- * unconditionally via .roost-tabrow above; the AdwHeaderBar is gone.) */
+/* Keep the right-pane seam fully OPAQUE. (The header + tab-strip band are
+ * opaqued unconditionally via .roost-headerbar / .roost-tab-band above, so the
+ * relocated strip stays solid over the glass; only the terminal seams need
+ * pinning here.) */
 window.roost-translucent paned > separator {
   background-color: #1e1e1e;
 }
