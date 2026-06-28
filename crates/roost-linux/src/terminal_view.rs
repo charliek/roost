@@ -46,6 +46,7 @@ use crate::focus::safe_grab_focus;
 use crate::key_encoder;
 use crate::keybind::{self, AccelMods};
 use crate::paste_image;
+use crate::shell_escape;
 use crate::sprite;
 use crate::theme::Theme;
 
@@ -528,6 +529,12 @@ impl TerminalView {
             }
         });
         widget.add_controller(scroll_ctrl);
+
+        // Accept files / text dropped onto the terminal: insert the
+        // (shell-escaped) path through the same bracketed-paste path as
+        // Ctrl+Shift+V, so a dragged screenshot resolves as an image
+        // attachment in Claude Code / Codex. See `install_file_drop`.
+        install_file_drop(&widget, &state);
 
         // Drag selection. Anchor on press, update on drag, on release
         // the selection becomes "committed" until the user clicks
@@ -2564,6 +2571,102 @@ fn paste_text_into(state: &Rc<RefCell<TerminalViewState>>, text: String) {
     cb(bytes);
 }
 
+/// Install a destination-only file/text drop handler on the terminal.
+///
+/// `clippy.toml` forbids `gtk4::DropTarget` because GtkDnD's drag-icon surface
+/// aborts on Wayland (#236) — but that crash is on the drag *source* side (the
+/// icon surface created when *initiating* a drag, which is why tab/project
+/// reorder use `GtkGestureDrag`). A destination-only `DropTarget` that merely
+/// *receives* external drops creates no drag-icon surface, so the #236 crash
+/// doesn't apply here. The global lint stays in force for `DragSource` and
+/// every other site; we opt out only on this receiver.
+#[allow(clippy::disallowed_types)]
+fn install_file_drop(widget: &DrawingArea, state: &Rc<RefCell<TerminalViewState>>) {
+    let drop_target = gtk4::DropTarget::new(
+        gtk4::gdk::FileList::static_type(),
+        gtk4::gdk::DragAction::COPY,
+    );
+    // Order matters: GTK picks the first matching type the source offers. A
+    // Nautilus/Files multi-select arrives as a FileList, a single file as a
+    // gio::File, dragged text/links as a String. Mirrors Ghostty's GTK
+    // surface drop-target types.
+    drop_target.set_types(&[
+        gtk4::gdk::FileList::static_type(),
+        gtk4::gio::File::static_type(),
+        glib::types::Type::STRING,
+    ]);
+    drop_target.connect_drop({
+        let state = state.clone();
+        move |_target, value, _x, _y| match drop_value_to_text(value) {
+            Some(text) => {
+                // The `drop` signal fires on the GTK main thread, so the PTY
+                // write can go through `paste_text_into` directly (no idle hop,
+                // unlike the async clipboard reads in `paste_from_clipboard`).
+                paste_text_into(&state, text);
+                true
+            }
+            None => false,
+        }
+    });
+    widget.add_controller(drop_target);
+}
+
+/// Pull the inserted text out of a drop's `glib::Value` — a `gdk::FileList`
+/// (multi-select), a single `gio::File`, or a `String` — and route it through
+/// the pure `drop_text` resolver. Local filesystem paths only; a URI that
+/// yields no local path is ignored.
+fn drop_value_to_text(value: &glib::Value) -> Option<String> {
+    if let Ok(list) = value.get::<gtk4::gdk::FileList>() {
+        let paths: Vec<String> = list
+            .files()
+            .iter()
+            .filter_map(|f| f.path())
+            // Skip non-UTF-8 paths rather than lossily mangling them: a
+            // U+FFFD-substituted path would silently name a different (or
+            // nonexistent) file. A rejected path is a clean no-op. (macOS
+            // enforces Unicode filenames, so the Mac side has no equivalent.)
+            .filter_map(|p| p.to_str().map(String::from))
+            .collect();
+        return drop_text(&paths, None);
+    }
+    if let Ok(file) = value.get::<gtk4::gio::File>() {
+        let paths: Vec<String> = file
+            .path()
+            .iter()
+            .filter_map(|p| p.to_str().map(String::from))
+            .collect();
+        return drop_text(&paths, None);
+    }
+    if let Ok(s) = value.get::<String>() {
+        return drop_text(&[], Some(&s));
+    }
+    None
+}
+
+/// Pure resolver from a drop payload to the text inserted into the PTY: file
+/// paths take priority (shell-escaped, de-duplicated, newline-joined, with any
+/// newline-bearing path dropped — a `\n` would split the join and, at a raw
+/// shell, execute everything after it), else a plain string verbatim (it may be
+/// a command the user wants to run). Returns `None` for an empty payload so the
+/// caller emits no stray `ESC[200~ESC[201~`. Mirrors
+/// `TerminalView.dropContentString` on Mac.
+fn drop_text(file_paths: &[String], string: Option<&str>) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let escaped: Vec<String> = file_paths
+        .iter()
+        .filter(|p| !p.contains('\n') && !p.contains('\r'))
+        .filter(|p| seen.insert(p.as_str()))
+        .map(|p| shell_escape::escape(p))
+        .collect();
+    if !escaped.is_empty() {
+        return Some(escaped.join("\n"));
+    }
+    match string {
+        Some(s) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// Decide which span (word vs line) a double/triple-click should
 /// select for a row of text. Pure helper so the GTK n_press dispatch
 /// stays testable without standing up a `DrawingArea` — same shape
@@ -3310,5 +3413,75 @@ mod tests {
             click_count_span("see /tmp/foo.txt today", 7, 2, "_-+~:@%"),
             Some(WordSpan { col0: 5, col1: 7 })
         );
+    }
+
+    // Drop-payload resolver. Mirrors `DropContentResolverTests` on Mac so the
+    // two drag-and-drop implementations stay at parity.
+
+    fn p(s: &str) -> String {
+        s.to_string()
+    }
+
+    #[test]
+    fn drop_text_single_file_is_escaped() {
+        assert_eq!(
+            drop_text(&[p("/tmp/My File.png")], None),
+            Some("/tmp/My\\ File.png".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_multiple_files_are_newline_joined() {
+        assert_eq!(
+            drop_text(&[p("/tmp/a b.png"), p("/tmp/c.png")], None),
+            Some("/tmp/a\\ b.png\n/tmp/c.png".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_duplicate_files_are_collapsed() {
+        assert_eq!(
+            drop_text(&[p("/tmp/shot.png"), p("/tmp/shot.png")], None),
+            Some("/tmp/shot.png".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_newline_path_is_dropped() {
+        assert_eq!(drop_text(&[p("/tmp/ev\nil.png")], None), None);
+        assert_eq!(
+            drop_text(&[p("/tmp/ev\nil.png"), p("/tmp/ok.png")], None),
+            Some("/tmp/ok.png".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_string_is_not_escaped() {
+        assert_eq!(
+            drop_text(&[], Some("git status && ls")),
+            Some("git status && ls".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_multiline_string_is_preserved() {
+        assert_eq!(
+            drop_text(&[], Some("line one\nline two")),
+            Some("line one\nline two".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_files_take_priority_over_string() {
+        assert_eq!(
+            drop_text(&[p("/tmp/a.png")], Some("ignored")),
+            Some("/tmp/a.png".to_string())
+        );
+    }
+
+    #[test]
+    fn drop_text_empty_payload_is_none() {
+        assert_eq!(drop_text(&[], None), None);
+        assert_eq!(drop_text(&[], Some("")), None);
     }
 }
