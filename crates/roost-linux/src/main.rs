@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use gtk4::glib::{self, LogWriterOutput};
@@ -57,11 +57,73 @@ use crate::app::App;
 // Matches `BundleProfile::gtk().app_id` (roost-common).
 const APP_ID: &str = "ai.stridelabs.Roost.gtk";
 
-/// Drop the cosmetic `g_settings_schema_source_lookup: assertion
-/// 'source != NULL' failed` GLib warning that fires on macOS
-/// Homebrew GTK4 when libadwaita queries a missing GSettings schema
-/// at startup. Harmless — the schema is only used by the system
-/// dark-mode preference — but the line crowds out real diagnostics.
+/// Rate-limit window for the glib log writer. Within each window at most
+/// [`LOG_MAX_PER_WINDOW`] messages reach the default writer; the overflow is
+/// counted and collapsed into one summary line. This bounds the blast radius
+/// of a per-frame glib warning (issue #234): a widget that emits a
+/// `g_warning`/`g_critical` every main-loop iteration can no longer peg a
+/// core formatting timestamps in `log_writer_default`, nor flood a redirected
+/// stderr to gigabytes. The first window's worth still prints, so the warning
+/// text stays diagnosable.
+const LOG_WINDOW: Duration = Duration::from_secs(1);
+/// 20/s sits well above glib's steady-state chatter (near-zero), so normal
+/// diagnostics are never throttled, yet it's low enough that a storm is
+/// bounded almost immediately — and the first window still passes enough
+/// lines to capture the offending warning's text. Storms here are
+/// warnings/criticals, so the limit is applied to every level alike
+/// (exempting criticals would just reopen the blast radius).
+const LOG_MAX_PER_WINDOW: u32 = 20;
+
+struct LogThrottle {
+    window_start: Option<Instant>,
+    emitted: u32,
+    suppressed: u64,
+}
+
+static LOG_THROTTLE: Mutex<LogThrottle> = Mutex::new(LogThrottle {
+    window_start: None,
+    emitted: 0,
+    suppressed: 0,
+});
+
+/// Admit (or drop) one glib message under the fixed-window rate limit,
+/// rolling the window when it elapses. Pure over `t` + `now` (the global
+/// `static` lock lives in the caller) so the window-roll and suppression
+/// accounting are unit-testable. Returns `(allow, suppressed)`: when a window
+/// rolls over, `suppressed` carries the count dropped in the prior window so
+/// the caller emits a single summary line *outside* the lock (and off the
+/// glib writer path, via `tracing`, so it can't re-enter here).
+fn log_throttle_admit(t: &mut LogThrottle, now: Instant) -> (bool, u64) {
+    let rolled = t
+        .window_start
+        .is_none_or(|start| now.duration_since(start) >= LOG_WINDOW);
+    let report = if rolled {
+        let dropped = t.suppressed;
+        t.window_start = Some(now);
+        t.emitted = 0;
+        t.suppressed = 0;
+        dropped
+    } else {
+        0
+    };
+    if t.emitted < LOG_MAX_PER_WINDOW {
+        t.emitted += 1;
+        (true, report)
+    } else {
+        t.suppressed += 1;
+        (false, report)
+    }
+}
+
+/// Filter glib's log output before the default writer. Two jobs:
+///
+/// 1. Drop the cosmetic `g_settings_schema_source_lookup: assertion
+///    'source != NULL' failed` GLib warning that fires on macOS Homebrew
+///    GTK4 when libadwaita queries a missing GSettings schema at startup.
+///    Harmless — the schema is only used by the system dark-mode preference
+///    — but the line crowds out real diagnostics.
+/// 2. Rate-limit everything else (see [`log_throttle_admit`]) so no warning
+///    storm can hang the UI or fill the disk.
 fn install_log_filter() {
     glib::log_set_writer_func(|level, fields| {
         for field in fields {
@@ -72,6 +134,16 @@ fn install_log_filter() {
                     }
                 }
             }
+        }
+        let (allow, suppressed) = {
+            let mut t = LOG_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
+            log_throttle_admit(&mut t, Instant::now())
+        };
+        if suppressed > 0 {
+            tracing::warn!(suppressed, "glib log storm: rate-limited repeated messages");
+        }
+        if !allow {
+            return LogWriterOutput::Handled;
         }
         glib::log_writer_default(level, fields)
     });
@@ -265,4 +337,38 @@ fn main() -> anyhow::Result<()> {
     let exit_code = app.run_with_args::<&str>(&[]);
     rt.shutdown_background();
     std::process::exit(exit_code.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throttle_caps_window_drops_overflow_and_reports_once() {
+        let mut t = LogThrottle {
+            window_start: None,
+            emitted: 0,
+            suppressed: 0,
+        };
+        let base = Instant::now();
+
+        // The window's budget passes through untouched (no suppression yet).
+        for _ in 0..LOG_MAX_PER_WINDOW {
+            assert_eq!(log_throttle_admit(&mut t, base), (true, 0));
+        }
+        // Overflow in the same window is dropped and counted, not reported.
+        for _ in 0..5 {
+            assert_eq!(log_throttle_admit(&mut t, base), (false, 0));
+        }
+        assert_eq!(t.suppressed, 5);
+
+        // Rolling into the next window admits again and reports the prior
+        // window's drop count exactly once.
+        assert_eq!(log_throttle_admit(&mut t, base + LOG_WINDOW), (true, 5));
+        // The roll reset the counter: a later quiet roll reports zero.
+        assert_eq!(
+            log_throttle_admit(&mut t, base + LOG_WINDOW + LOG_WINDOW),
+            (true, 0)
+        );
+    }
 }
