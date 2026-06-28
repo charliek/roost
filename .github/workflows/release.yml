@@ -280,6 +280,9 @@ jobs:
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
+          # The decoded cert must never outlive this step, even on early failure.
+          # (The keychain itself must persist — later steps sign against it.)
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
           kc="$RUNNER_TEMP/roost-signing.keychain-db"
           kp="$(openssl rand -base64 24)"
           security create-keychain -p "$kp" "$kc"
