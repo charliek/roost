@@ -522,6 +522,16 @@ impl PaletteInner {
             return;
         }
         self.closing.set(true);
+        // Sever the toplevel focus from the card subtree while it is still
+        // parented. Removing an overlay child that still holds the window
+        // focus leaves a dangling focus pointer, and the next focus
+        // transition then walks that dead widget → the #234 `GTK_IS_WIDGET`
+        // storm. Clearing here is the always-safe floor; `on_dismiss`
+        // re-grabs the terminal right after, so focus still lands where the
+        // user expects.
+        if let Some(root) = self.overlay.root() {
+            root.set_focus(gtk4::Widget::NONE);
+        }
         if !confirmed {
             let frame_ids: Vec<String> = self
                 .state

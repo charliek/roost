@@ -2137,6 +2137,16 @@ impl App {
     /// post-attach hook so post-chrome-interaction the user can
     /// resume typing without an extra mouse click.
     fn focus_active_terminal(self: &Rc<Self>) {
+        // While a palette is open it owns the keyboard (mirroring the
+        // shortcut suppression in `dispatch_action`). Grabbing the terminal
+        // here would transition focus off the palette's entry; if that entry
+        // is mid-teardown the focus walk hits a dead widget → the #234
+        // `gtk_widget_get_parent: GTK_IS_WIDGET` storm/crash. `dismiss_palette`
+        // clears `self.palette` *before* it refocuses, so the legitimate
+        // post-dismiss grab still runs.
+        if self.palette.borrow().is_some() {
+            return;
+        }
         if let Some(view) = self.active_terminal_view() {
             view.widget().grab_focus();
         }
