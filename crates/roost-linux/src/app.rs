@@ -4357,9 +4357,6 @@ impl App {
         }
     }
 
-    /// Top margin for the palette card. The tab strip now lives in the
-    /// toolbar top bar, above the content overlay the palette floats in, so
-    /// the card only needs the visual gap from the content top.
     /// Top inset for the palette card. The card floats in `content_overlay`,
     /// whose top edge is now the tab band (the strip moved into the content
     /// column), so clear the band's live height before adding the gap — this
