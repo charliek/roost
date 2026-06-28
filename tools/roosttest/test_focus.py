@@ -78,6 +78,102 @@ def test_palette_steals_then_restores_terminal_focus(palette, project):
     _wait_terminal_focused(roost, what="terminal refocused after palette dismiss")
 
 
+def _focus_critical_lines(since: int) -> list[str]:
+    """New `GTK_IS_WIDGET` focus-family criticals appended to the captured UI
+    log past byte offset `since`. The #234 focus-on-dead-widget crash (and its
+    `unset_state_flags` / `set_focus_child` / `get_parent` siblings) all carry
+    that assertion text. Empty when the harness didn't capture a child (e.g. a
+    reused external UI)."""
+    import ui
+
+    log = ui._GTK_LOG
+    if log is None or not log.exists():
+        return []
+    text = log.read_bytes()[since:].decode("utf-8", errors="replace")
+    return [ln for ln in text.splitlines() if "GTK_IS_WIDGET" in ln]
+
+
+def _gtk_log_len() -> int:
+    import ui
+
+    log = ui._GTK_LOG
+    return len(log.read_bytes()) if (log is not None and log.exists()) else 0
+
+
+def test_navigation_with_notifications_palette_open_keeps_focus_ownership(palette, project):
+    """#234 regression: with the notifications palette open, navigating (a
+    project switch here) must NOT steal focus back to a terminal — the palette
+    owns focus until it is dismissed — and must emit no `GTK_IS_WIDGET`
+    focus-family critical.
+
+    Pre-fix, the active-terminal refocus ran while the palette still owned
+    focus; the synchronous tab-pill-click variant grabbed focus off the
+    mid-teardown palette entry and walked a dead widget (the ~1.77M/s
+    `gtk_widget_get_parent: GTK_IS_WIDGET` storm / crash). This drives the
+    focus-ownership invariant over IPC (`focus_active_terminal` no-ops while a
+    palette is open); the real-pointer pill-click path is covered by the
+    Wayland cage guard (tracked follow-up)."""
+    roost = palette
+
+    a = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, a)
+
+    other = roost.create_project(name="notif-234", cwd="/tmp")
+    b = roost.open_tab(other, cwd="/tmp")
+    wait_tab_attached(roost, b)
+
+    roost.focus(a)
+    _wait_terminal_focused(roost, what="terminal focused on the first project")
+    roost.notify(b, "Build finished", "#234")
+
+    log_at = _gtk_log_len()
+
+    # Open the notifications palette (the bell surface) and confirm it took focus.
+    roost.palette_open(kind="commands")
+    roost.palette_activate("view_notifications")
+    Roost._wait(
+        lambda: not roost.app_active_terminal_focused(),
+        timeout=2.0,
+        what="terminal to lose focus when the notifications palette opens",
+    )
+
+    # Navigate to the other project *while the palette is open* — this routes
+    # through `set_active_project` -> `focus_active_terminal`, the grab the fix
+    # gates on palette ownership.
+    roost.focus(b)
+    Roost._wait(
+        lambda: roost.identify().get("active_project_id") == other,
+        timeout=2.0,
+        what="active project to switch while the palette is open",
+    )
+
+    # F1: the navigation must not grab terminal focus; the palette keeps focus
+    # (stays open) until dismissed. The refocus a regression would do is
+    # idle-deferred, so drive several IPC round-trips (each is a main-loop turn)
+    # and assert the invariant holds the whole time — rather than reading once
+    # and racing the idle. Pre-fix this either storms here (the ~1.8M/s
+    # GTK_IS_WIDGET loop → IPC hang → CI per-test timeout) or trips an assert
+    # below as the focus-out dismiss closes the palette.
+    for _ in range(8):
+        assert roost.palette_state().get("open") is True, (
+            "the palette closed on a background navigation — it should own "
+            "focus until explicitly dismissed (#234 focus-ownership regressed)"
+        )
+        assert not roost.app_active_terminal_focused(), (
+            "navigation while the notifications palette is open refocused a "
+            "terminal — the #234 focus-ownership guard regressed"
+        )
+
+    # Dismissing restores terminal focus cleanly.
+    roost.palette_dismiss()
+    _wait_terminal_focused(roost, what="terminal refocused after the palette is dismissed")
+
+    crit = _focus_critical_lines(log_at)
+    assert not crit, "#234 focus-on-dead-widget critical(s):\n" + "\n".join(crit[:10])
+
+    roost.delete_project(other)  # the `project` fixture only owns the first one
+
+
 def test_project_switch_focuses_terminal(roost):
     """Switching the active project lands keyboard focus on the new
     project's active terminal — the Swift `selectProject` ->
