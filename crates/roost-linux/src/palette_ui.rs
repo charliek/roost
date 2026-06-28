@@ -17,6 +17,13 @@
 //! by the executing handler keeps the inner alive even when `on_dismiss`
 //! drops the App's handle mid-callback.
 
+// This module owns the palette search entry; every `grab_focus` here is an
+// intentional immediate focus (a *missed* focus is the bug — the palette must
+// land focus the instant it opens / a sub-frame pushes). The crash-prone
+// terminal grabs are guarded by `crate::focus::safe_grab_focus`; allow the raw
+// method module-wide rather than annotating each entry grab.
+#![allow(clippy::disallowed_methods)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;

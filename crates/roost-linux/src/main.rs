@@ -16,6 +16,7 @@ mod clipboard;
 mod config;
 mod custom_command;
 mod events;
+mod focus;
 mod key_encoder;
 mod keybind;
 mod notification_inbox;

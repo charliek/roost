@@ -10,3 +10,14 @@ disallowed-types = [
     { path = "gtk4::DragSource", reason = "reorder must use GtkGestureDrag — GtkDnD's drag-icon surface aborts on Wayland (#236)" },
     { path = "gtk4::DropTarget", reason = "reorder must use GtkGestureDrag — GtkDnD's drag-icon surface aborts on Wayland (#236)" },
 ]
+
+# Terminal focus grabs must funnel through `crate::focus::safe_grab_focus`, which
+# skips the grab when the target isn't in a toplevel. A raw grab on an un-rooted
+# widget (mid attach / tab switch) walks a dead focus chain and trips
+# `gtk_widget_get_parent: GTK_IS_WIDGET` — the #234 storm/crash. Sites that must
+# always focus (the palette / rename entries, where a *missed* focus is the bug)
+# opt out with a local `#[allow]`. Enforced by `-D clippy::disallowed_methods`
+# in the gtk-build CI job alongside the disallowed-types guard above.
+disallowed-methods = [
+    { path = "gtk4::prelude::WidgetExt::grab_focus", reason = "use crate::focus::safe_grab_focus — a raw grab on an un-rooted widget walks a dead focus chain (#234)" },
+]
