@@ -2680,9 +2680,14 @@ impl App {
             });
         });
 
-        // Focus the new tab.
+        // Focus the new tab — unless a palette currently owns focus. An attach
+        // landing while the palette is open (e.g. a late/background attach) must
+        // not steal focus from it; the palette's dismiss refocuses the active
+        // terminal, matching the `focus_active_terminal` ownership guard (#234).
         self.select_page_programmatic(&ui.tab_view, &page);
-        safe_grab_focus(terminal.widget());
+        if self.palette.borrow().is_none() {
+            safe_grab_focus(terminal.widget());
+        }
         drop(projects);
     }
 

@@ -17,13 +17,6 @@
 //! by the executing handler keeps the inner alive even when `on_dismiss`
 //! drops the App's handle mid-callback.
 
-// This module owns the palette search entry; every `grab_focus` here is an
-// intentional immediate focus (a *missed* focus is the bug — the palette must
-// land focus the instant it opens / a sub-frame pushes). The crash-prone
-// terminal grabs are guarded by `crate::focus::safe_grab_focus`; allow the raw
-// method module-wide rather than annotating each entry grab.
-#![allow(clippy::disallowed_methods)]
-
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -214,6 +207,7 @@ impl PaletteOverlay {
         overlay.add_overlay(&card);
 
         inner.sync_ui();
+        #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
         entry.grab_focus();
         // Arm focus-out dismissal only after the current main-loop
         // iteration settles, so the grab above can't trip it.
@@ -494,6 +488,7 @@ impl PaletteInner {
                     .insert(frame.id.clone(), behavior);
                 self.state.borrow_mut().push(frame);
                 self.sync_ui();
+                #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
                 self.entry.grab_focus();
             }
             PaletteOutcome::None => {}
@@ -516,6 +511,7 @@ impl PaletteInner {
                 }
                 self.behaviors.borrow_mut().remove(&frame.id);
                 self.sync_ui();
+                #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
                 self.entry.grab_focus();
             }
             None => self.dismiss(false),
@@ -644,6 +640,7 @@ impl PaletteInner {
             .insert(frame.id.clone(), behavior);
         self.state.borrow_mut().push(frame);
         self.sync_ui();
+        #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
         self.entry.grab_focus();
     }
 
