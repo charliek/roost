@@ -433,6 +433,12 @@ final class TerminalView: NSView {
         setContentHuggingPriority(.defaultLow - 1, for: .vertical)
         setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        // Accept files (Finder), URLs, and plain text dropped onto the terminal.
+        // The drop inserts the (shell-escaped) path via the same bracketed-paste
+        // path as ⌘V, so a dragged screenshot resolves as an image attachment in
+        // Claude Code / Codex. See the `NSDraggingDestination` overrides below.
+        registerForDraggedTypes(Self.dropTypes)
     }
 
     /// Feed VT bytes into the local libghostty-vt terminal and
@@ -1610,6 +1616,78 @@ final class TerminalView: NSView {
             bytes = wrapped
         }
         onKey?(bytes)
+    }
+
+    // MARK: - Drag-and-drop (file / URL / text → bracketed paste)
+
+    /// Pasteboard types accepted on drop. Mirrors Ghostty's
+    /// `SurfaceView_AppKit.dropTypes`: a Finder file drag lands as `.fileURL`, a
+    /// dragged link as `.URL`, selected text as `.string`. Registered in `init`.
+    static let dropTypes: [NSPasteboard.PasteboardType] = [.fileURL, .URL, .string]
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        dragOperation(for: sender)
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        dragOperation(for: sender)
+    }
+
+    /// `.copy` (shows the copy cursor) when the drag carries a type we accept,
+    /// else `[]`. `availableType(from:)` is the allocation-free membership check
+    /// — `draggingUpdated` fires per pointer-move, so we avoid building a Set of
+    /// the pasteboard's full type list each call.
+    private func dragOperation(for sender: any NSDraggingInfo) -> NSDragOperation {
+        sender.draggingPasteboard.availableType(from: Self.dropTypes) != nil ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        let pb = sender.draggingPasteboard
+        let fileURLs = (pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?
+            .filter(\.isFileURL) ?? []
+        guard let content = Self.dropContentString(
+            fileURLs: fileURLs,
+            url: pb.string(forType: .URL),
+            string: pb.string(forType: .string)
+        ) else { return false }
+        // Defer the insert past the drag-session teardown to avoid reentrancy
+        // (matching Ghostty's `DispatchQueue.main.async` hop). We've already
+        // committed to handling the drop, so report success synchronously.
+        DispatchQueue.main.async { [weak self] in
+            self?.sendBracketedPaste(Data(content.utf8))
+        }
+        return true
+    }
+
+    /// Pure resolver from a drop's pasteboard payload to the text inserted into
+    /// the PTY. Priority: local file paths first (a Finder drag can expose both
+    /// `.fileURL` and `.URL` — we must insert the path, not the `file://` URL),
+    /// then a dragged web URL, then plain text. Paths and URLs are shell-escaped;
+    /// plain text is not (it may be a command the user wants to run). Multiple
+    /// files are newline-joined. Returns nil for an empty payload so the caller
+    /// emits no stray `ESC[200~ESC[201~`. Factored out so it's unit-testable
+    /// without a synthesised `NSDraggingInfo`; mirrors `drop_text` on GTK.
+    static func dropContentString(fileURLs: [URL], url: String?, string: String?) -> String? {
+        // De-duplicate by standardized path (Finder lists one file under several
+        // URL-shaped entries) and drop any path containing a newline — a `\n`
+        // would split the newline-join into bogus extra paths and, at a raw
+        // shell, execute everything after it. Such filenames are pathological;
+        // screenshots never have them.
+        var seen = Set<String>()
+        let paths = fileURLs
+            .map { $0.standardizedFileURL.path }
+            .filter { !$0.contains(where: \.isNewline) }
+            .filter { seen.insert($0).inserted }
+        if !paths.isEmpty {
+            return paths.map { ShellEscape.escape($0) }.joined(separator: "\n")
+        }
+        if let url, !url.isEmpty {
+            return ShellEscape.escape(url)
+        }
+        if let string, !string.isEmpty {
+            return string
+        }
+        return nil
     }
 
     /// Walk the latest render-state snapshot and concatenate the
