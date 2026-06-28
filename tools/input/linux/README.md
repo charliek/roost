@@ -38,34 +38,40 @@ Everything is stdlib Python 3 + bash. No build step.
 | `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, drags. Needs single monitor. |
 | `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
-| `click_to_focus_check.py` | Self-contained real-click focus regression (click-to-focus + project-switch focus). Spins up its own Xvfb + throwaway Roost and clicks with **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
+| `real_input_check.py` | Self-contained real-input regression: focus + core-sync (click-to-focus, project switch, Alt+digit, Ctrl+PageDown, cycle_tab, pill click, context menu) **and** drag reorder (tab pills + project rows). Spins up its own Xvfb + throwaway Roost and drives **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
 
 PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
 layer: [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
 
-## Real-click focus regression (`click_to_focus_check.py`)
+## Real-input regression (`real_input_check.py`)
 
-Two focus behaviors can only be exercised by a **real** pointer press, so the IPC
-e2e suite can't reach them: `tab.dispatch_mouse_event` writes mouse-report bytes
-straight to the PTY and never enters the GTK gesture stack, and the IPC project
-switch never focuses a sidebar row. This check drives real clicks through the GTK
-gesture stack to cover both:
+Several behaviors can only be exercised by **real** pointer/key input through the
+GTK gesture/shortcut stack, so the IPC e2e suite can't reach them
+(`tab.dispatch_mouse_event` writes mouse-report bytes to the PTY without entering
+the gesture stack; the IPC project switch never focuses a row; reorder is a
+gesture, not an op). This check drives real `xdotool` input to cover:
 
-- **click-to-focus** — clicking the terminal body grabs keyboard focus.
-- **project-switch focus** — clicking a sidebar project row focuses the new
-  project's terminal (without the idle-deferred grab, focus stays on the clicked
-  `GtkListBoxRow` and the cursor goes hollow).
+- **focus + core-sync** — click-to-focus, project-switch focus + core-sync (#1),
+  Alt+digit (project-only switching), Ctrl+PageDown / cycle_tab core-sync (#229),
+  pill-click core-sync (#228), and tab right-click context menu (no crash).
+- **drag reorder** — drag a tab pill to reorder tabs, and a sidebar row to reorder
+  projects (the `GtkGestureDrag` path that replaced GTK DnD). The content-area
+  sidebar reorder is the reliable gate; the title-row tab-pill drag is best-effort
+  under Xvfb (the press races the window title-drag), but a tab-drag *crash* still
+  fails. NB: X11/Xvfb can't reproduce the *Wayland* `frame_callback` crash — a true
+  Wayland-crash guard needs ydotool under [`../../wayland/weston-run.sh`](../../wayland/weston-run.sh).
 
 Unlike the `inject_*` tools above (which target a live COSMIC/Wayland session via
 `/dev/uinput`), this one is fully self-contained — it launches its own headless
 Xvfb + a throwaway Roost (private of your session: no shared socket, no session
-bus, isolated `ROOST_STATE_DIR`) and injects clicks with `xdotool`. So it needs
-only `Xvfb` + `xdotool` and runs anywhere, but it does **not** exercise the
-Wayland/uinput path (use the injectors for that). It is **not** wired into CI yet.
+bus, isolated `ROOST_STATE_DIR`) and injects with `xdotool`. So it needs only
+`Xvfb` + `xdotool` and runs anywhere, but it does **not** exercise the
+Wayland/uinput path (use the injectors for that). It runs in CI as the
+`continue-on-error` "Real-input regressions" step in the `e2e-gtk` job.
 
 ```sh
-make test-click-to-focus            # or:
-python3 tools/input/linux/click_to_focus_check.py
+make test-real-input            # or:
+python3 tools/input/linux/real_input_check.py
 ```
 
 Each check defocuses the terminal first (a non-terminal click), so the

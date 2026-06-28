@@ -22,7 +22,7 @@ use anyhow::Context;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use libadwaita::{ApplicationWindow, HeaderBar, TabView, WindowTitle};
+use libadwaita::{ApplicationWindow, TabView, WindowTitle};
 use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project, Tab};
 use tokio::runtime::Handle;
 
@@ -70,10 +70,14 @@ struct ProjectUi {
     /// starts; cleared on cancel/commit.
     sidebar_entry: gtk4::Entry,
     tab_view: TabView,
-    /// AdwTabBar — held so the M9 rename popover can anchor here
-    /// (under the selected pill) instead of at the bottom of the
-    /// TabView's terminal area.
-    tab_bar: libadwaita::TabBar,
+    /// Custom Mac-style tab strip (a GtkBox of TabPill widgets) shown in the
+    /// top-bar `bar_stack`. The AdwTabView above is the model; this is a view
+    /// of it — pills react to its page-attached/selected signals and drive it
+    /// back on click/close.
+    tab_strip: gtk4::Box,
+    /// Tab id → pill widget, parallel to `tabs`. Built on tab attach, removed
+    /// on close, restyled on selection.
+    pills: RefCell<HashMap<i64, TabPill>>,
     /// Tab id → (TerminalView, TabSession).
     tabs: RefCell<HashMap<i64, TabUi>>,
     /// M9.5: tab ids whose `attach_existing_tab` is in flight (the
@@ -109,6 +113,20 @@ struct TabUi {
     hook_active: RefCell<bool>,
 }
 
+/// One Mac-style pill in the custom tab strip: `[status dot | label↔entry
+/// stack | notification badge | close ×]`, a composed `GtkBox` (no GObject
+/// subclass) mirroring the Mac `TabPillView`. Held per tab in
+/// `ProjectUi.pills`; a pure view of the project's `AdwTabView`.
+struct TabPill {
+    root: gtk4::Box,
+    dot: gtk4::Box,
+    name_stack: gtk4::Stack,
+    label: gtk4::Label,
+    entry: gtk4::Entry,
+    close: gtk4::Button,
+    badge: gtk4::Box,
+}
+
 pub struct App {
     window: ApplicationWindow,
     /// `None` before `bootstrap()` connects; closures that need the
@@ -124,9 +142,17 @@ pub struct App {
     /// `gtk::Stack` of TabView widgets, one entry per project id.
     /// Switching the sidebar selection flips the visible child.
     tab_stack: gtk4::Stack,
-    /// `adw::WindowTitle` widget in the headerbar. Title = active
-    /// project name, subtitle = active tab's cwd (tilde-abbreviated).
-    /// Mirrors the Mac UI's `updateWindowTitle` flow.
+    /// Per-project tab strips, stacked in the AdwToolbarView top bar; only
+    /// the active project's is shown (switched on project change). One shared
+    /// AdwTabBar rebound via `set_view` crashes libadwaita on switch
+    /// (g_object_unref), so each project keeps its own bar bound to its own
+    /// view for life and we flip the visible stack child instead.
+    bar_stack: gtk4::Stack,
+    /// `adw::WindowTitle` title-state holder (title = active project name,
+    /// subtitle = active tab's cwd). No longer displayed in-chrome — the
+    /// AdwHeaderBar that showed it was removed for Mac-parity minimal chrome;
+    /// the OS window title is set directly from `set_active_project` instead.
+    /// Kept as the title model pending a possible future in-chrome title.
     window_title: WindowTitle,
     projects: RefCell<HashMap<i64, ProjectUi>>,
     /// Currently focused project (sidebar selection). 0 = no
@@ -215,21 +241,20 @@ pub struct App {
     /// handler to skip the redundant RPC.
     server_driven_closes: RefCell<HashSet<i64>>,
     /// M10: project id of the row currently being dragged (`None`
-    /// when no drag is in progress). Read by the sidebar drop
-    /// target's motion handler to know which row to live-shuffle.
-    /// Set in the drag-source's drag-begin, cleared in drag-end.
+    /// when no drag is in progress). The project row being
+    /// reorder-dragged; doubles as the "armed past threshold" marker for
+    /// the row's `GtkGestureDrag` and tells the live-shuffle which row to
+    /// move. Set when the gesture arms, cleared on drag-end / cancel.
     dragged_project_id: RefCell<Option<i64>>,
-    /// M10: snapshot of the sidebar order taken at drag-begin.
-    /// Drag-end rolls back to this if the drop didn't persist
-    /// (drag cancelled outside the sidebar, or `ReorderProjects`
-    /// RPC failed).
+    /// Tab id of the pill currently being drag-reordered (None when no
+    /// pill drag is in progress); doubles as the "armed past threshold"
+    /// marker for the pill's `GtkGestureDrag`. Set when the gesture arms,
+    /// cleared on drag-end.
+    dragged_tab_id: RefCell<Option<i64>>,
+    /// M10: snapshot of the sidebar order taken when a row drag arms.
+    /// Drag-end rolls back to this if the `ReorderProjects` RPC fails; a
+    /// cancelled drag rolls back to it directly.
     drag_original_order: RefCell<Vec<i64>>,
-    /// M10: set true once `ReorderProjects` persists (or a no-op
-    /// drop is acknowledged). Drag-end consults this to decide
-    /// whether to roll back. Distinct from `gdk::DragAction::MOVE`
-    /// completion since GTK's "drop succeeded" signal covers
-    /// transport, not our application-level persistence.
-    drop_occurred: RefCell<bool>,
     /// True while `reconcile_to_snapshot` is applying programmatic
     /// tab reorders. The `connect_page_reordered` handler checks this
     /// and skips firing a `ReorderTabs` RPC, so a resync that
@@ -246,12 +271,6 @@ pub struct App {
     /// synchronously inside the set/append/close, so the bracket covers
     /// it.
     suppress_selected_page_sync: RefCell<bool>,
-    /// Tab id most recently right-clicked, stashed by the AdwTabView
-    /// `setup-menu` handler so the parameterless Rename/Close context-menu
-    /// actions know which tab to act on. (The menu model is static — see
-    /// `build_tab_context_menu` — because re-setting it during `setup-menu`
-    /// segfaults AdwTabView.)
-    context_menu_tab_id: RefCell<i64>,
     /// `ROOST_TEST_MODE=1` was set in the UI's environment at
     /// launch. Read ONCE in `App::new` and stashed here so per-op
     /// dispatch is a cheap bool check rather than a syscall, and so a
@@ -287,7 +306,6 @@ const STYLE_CSS: &str = include_str!("resources/style.css");
 /// installed. The SVGs are embedded directly into the binary via
 /// `include_bytes!`, avoiding any gresource compilation step (one less
 /// build-tool dependency).
-const ICON_FOLDER_SYMBOLIC: &[u8] = include_bytes!("resources/icons/folder-symbolic.svg");
 const ICON_SIDEBAR_SHOW_SYMBOLIC: &[u8] =
     include_bytes!("resources/icons/sidebar-show-symbolic.svg");
 const ICON_TAB_NEW_SYMBOLIC: &[u8] = include_bytes!("resources/icons/tab-new-symbolic.svg");
@@ -320,6 +338,21 @@ fn apply_indicator_icon(page: &libadwaita::TabPage, state: TabState) {
         TabState::Idle => Some(embedded_icon(ICON_IDLE)),
     };
     page.set_indicator_icon(icon.as_ref().map(|i| i.upcast_ref::<gtk4::gio::Icon>()));
+}
+
+/// Mirror the per-tab agent state onto a pill's leading dot (the colours
+/// match the indicator SVGs + the rollup stripe). `None` leaves the dot
+/// transparent (it keeps its slot so pills don't reflow).
+fn apply_pill_dot(dot: &gtk4::Box, state: TabState) {
+    for c in ["running", "needs-input", "idle"] {
+        dot.remove_css_class(c);
+    }
+    match state {
+        TabState::None => {}
+        TabState::Running => dot.add_css_class("running"),
+        TabState::NeedsInput => dot.add_css_class("needs-input"),
+        TabState::Idle => dot.add_css_class("idle"),
+    }
 }
 
 /// Render `window` (sidebar + tabs + active terminal) to PNG bytes, at
@@ -438,25 +471,16 @@ impl App {
             tracing::warn!("no default GDK display; skipping chrome CSS load");
         }
 
-        let header = HeaderBar::new();
-        // `adw::WindowTitle` is the libadwaita 1.x analog of NSWindow's
-        // title + subtitle. Title = project name (or status during
-        // bootstrap), subtitle = active tab's cwd. Matches the Mac UI's
-        // two-line title format.
+        // `adw::WindowTitle` is retained for the OS window title (taskbar /
+        // alt-tab) and future use; the AdwHeaderBar that displayed it is
+        // gone — Mac-parity minimal chrome puts the tabs flush at the window
+        // top (see the AdwToolbarView assembled below), with no title row.
         let window_title = WindowTitle::new("Roost", "connecting…");
-        header.set_title_widget(Some(&window_title));
 
-        // Headerbar buttons: folder picker (left) + sidebar toggle
-        // (left) + `+ Tab` (right). Matches the Mac UI chrome — same
-        // icons, same positions. Wired below after `app_struct` exists
-        // so the handlers can capture an `Rc<App>` clone.
-        let folder_button = gtk4::Button::builder()
-            .child(&gtk4::Image::from_gicon(&embedded_icon(
-                ICON_FOLDER_SYMBOLIC,
-            )))
-            .css_classes(["flat"])
-            .tooltip_text("New project from folder…")
-            .build();
+        // Chrome buttons (folder/new-project, sidebar toggle, new tab,
+        // notifications). They live in the top tab-row built below instead of
+        // a header bar. Wired below after `app_struct` exists so the handlers
+        // can capture an `Rc<App>` clone.
         let sidebar_toggle_button = gtk4::Button::builder()
             .child(&gtk4::Image::from_gicon(&embedded_icon(
                 ICON_SIDEBAR_SHOW_SYMBOLIC,
@@ -492,10 +516,7 @@ impl App {
             .css_classes(["flat"])
             .tooltip_text("Notifications")
             .build();
-        header.pack_start(&folder_button);
-        header.pack_start(&sidebar_toggle_button);
-        header.pack_end(&new_tab_button);
-        header.pack_end(&notif_button);
+        // (Buttons are packed into the top tab-row below, not a header bar.)
 
         // Sidebar: vertical Box of [section header] / [scrolled project
         // list] / [`+ Project` footer button]. Matches the Mac UI
@@ -588,10 +609,89 @@ impl App {
         // window (sidebar + tabs), pinned just under the tab bar.
         let content_overlay = gtk4::Overlay::builder().child(&paned).build();
 
-        let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        outer.append(&header);
-        outer.append(&content_overlay);
-        window.set_content(Some(&outer));
+        // Per-project tab strips live in this stack (built in add_project_ui),
+        // sitting in the AdwToolbarView top bar so tabs are flush at the
+        // window top (Mac parity). Only the active project's strip is shown.
+        // `hhomogeneous(false)` lets the stack size to the visible strip.
+        let bar_stack = gtk4::Stack::builder()
+            .hhomogeneous(false)
+            .vhomogeneous(false)
+            .build();
+        // Top "title" row: window controls flank the strip, with the sidebar
+        // toggle + new-project on the left and new-tab + notifications on the
+        // right — the affordances the removed header carried, now inline with
+        // the tabs.
+        let tab_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .css_classes(["roost-tabrow"])
+            .build();
+        // The per-project tab strips + the trailing new-tab "+" live in ONE
+        // horizontal scroller so a project with many tabs SCROLLS instead of
+        // widening the whole window, and "+" always hugs the last tab (scrolls
+        // with them). propagate-natural-width=false stops the tab count from
+        // forcing the toplevel wider; hexpand hands the scroller the row's
+        // slack so ~10 tabs stay visible before it scrolls. External hscrollbar
+        // = no scrollbar widget cramping the 24px strip; a vertical wheel over
+        // the strip scrolls it horizontally (vscroll off). Mirrors the Mac,
+        // which keeps the strip width-bounded.
+        let tab_strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        tab_strip_box.append(&bar_stack);
+        tab_strip_box.append(&new_tab_button);
+        let tab_scroller = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::External)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_width(false)
+            .hexpand(true)
+            .child(&tab_strip_box)
+            .build();
+        // A vertical wheel over the strip scrolls it horizontally. GTK doesn't
+        // redirect wheel→hscroll under an External h-policy, so translate it
+        // explicitly onto the scroller's hadjustment — otherwise tabs scrolled
+        // past the viewport (and the trailing "+") are unreachable by mouse.
+        let strip_scroll =
+            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+        strip_scroll.connect_scroll({
+            let adj = tab_scroller.hadjustment();
+            move |_, dx, dy| {
+                let delta = if dx.abs() > dy.abs() { dx } else { dy };
+                adj.set_value(adj.value() + delta * 48.0);
+                glib::Propagation::Stop
+            }
+        });
+        tab_scroller.add_controller(strip_scroll);
+        tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::Start));
+        tab_row.append(&sidebar_toggle_button);
+        tab_row.append(&tab_scroller);
+        // Window-drag handle: a fixed-width GtkWindowHandle between the tab
+        // scroller and the trailing controls. It's a WindowHandle (not a plain
+        // box) so this strip is drag-to-move-window area; the hexpanding
+        // scroller now does the job of pushing the trailing controls to the
+        // edge, so this only needs to be wide enough to grab (the scroller's
+        // own empty tail is non-draggable, an accepted trade for letting the
+        // tabs use the row's full width). It stays OUTSIDE the pills' scroller
+        // so a window-drag here never competes with pill drag-reorder.
+        //
+        // CSD/SSD: on Wayland (the primary target — COSMIC/GNOME) the window is
+        // client-side-decorated, so the in-row GtkWindowControls are the only
+        // controls — correct. On X11 under a WM with server-side decorations
+        // they'd be doubled; the right fix is CSD detection (cf. Ghostty's
+        // .csd/.ssd toggle), NOT a blanket set_decorated(false) which strips
+        // Wayland's resize edges + shadow. Deferred to real-compositor checks.
+        let drag_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        drag_spacer.set_width_request(80);
+        let drag_area = gtk4::WindowHandle::builder()
+            .css_classes(["roost-titlebar"])
+            .hexpand(false)
+            .child(&drag_spacer)
+            .build();
+        tab_row.append(&drag_area);
+        tab_row.append(&notif_button);
+        tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::End));
+
+        let toolbar_view = libadwaita::ToolbarView::new();
+        toolbar_view.add_top_bar(&tab_row);
+        toolbar_view.set_content(Some(&content_overlay));
+        window.set_content(Some(&toolbar_view));
 
         // Projects-sidebar translucency: tint only when the display
         // supports an alpha visual AND a compositor is present. GDK
@@ -629,6 +729,7 @@ impl App {
             sidebar: sidebar.clone(),
             sidebar_box: sidebar_box.clone(),
             tab_stack: tab_stack.clone(),
+            bar_stack: bar_stack.clone(),
             window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
@@ -650,11 +751,10 @@ impl App {
             link_modifier: resolve_link_modifier(cfg.link_modifier),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
+            dragged_tab_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
-            drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
             suppress_selected_page_sync: RefCell::new(false),
-            context_menu_tab_id: RefCell::new(0),
             // Read the env var exactly once at boot so per-op
             // dispatch is deterministic for the life of the process
             // — a tester can't toggle the gate mid-session. Present-
@@ -665,11 +765,10 @@ impl App {
             feed_senders: RefCell::new(HashMap::new()),
             input_captures: RefCell::new(HashMap::new()),
         });
-        // M10: a single drop target on the sidebar listbox owns the
-        // motion (live-shuffle) + drop (persist) handling for all
-        // project rows. Per-row drag sources are wired inside
-        // `add_project_ui`. See `install_sidebar_drop_target`.
-        app_struct.install_sidebar_drop_target();
+        // M10: a single GtkGestureDrag on the sidebar listbox drives project
+        // reorder (pointer-drag, not DnD — see `install_sidebar_reorder_gesture`
+        // for why it lives on the listbox rather than per-row).
+        app_struct.install_sidebar_reorder_gesture();
 
         // Sidebar row selection → switch the active project (UI
         // reaction). This fires for ANY selection change — user click,
@@ -725,54 +824,7 @@ impl App {
             }
         });
 
-        // Headerbar buttons.
-        // - Folder picker: pop a FileChooser, then create a project
-        //   with the chosen cwd (the "new project from folder" path).
-        folder_button.connect_clicked({
-            let app = app_struct.clone();
-            move |btn| {
-                let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-                // `gtk::FileDialog` is the gtk-4.10 successor to the
-                // deprecated `FileChooserNative`. Async-only API:
-                // `select_folder` takes a callback that receives the
-                // chosen file (or a `Dismissed` error on cancel).
-                let dialog = gtk4::FileDialog::builder()
-                    .title("Choose project folder")
-                    .modal(true)
-                    .accept_label("Open")
-                    .build();
-                let app_for_pick = app.clone();
-                dialog.select_folder(
-                    parent.as_ref(),
-                    None::<&gtk4::gio::Cancellable>,
-                    move |result| match result {
-                        Ok(file) => {
-                            let Some(path) = file.path() else { return };
-                            let path = path.to_string_lossy().to_string();
-                            let app = app_for_pick.clone();
-                            glib::spawn_future_local(async move {
-                                if let Err(err) = app.create_new_project_with_cwd(&path).await {
-                                    tracing::warn!(
-                                        ?err,
-                                        path = %path,
-                                        "folder-picker new_project failed"
-                                    );
-                                }
-                            });
-                        }
-                        Err(err) => {
-                            // The user dismissing the dialog comes
-                            // back as `Dismissed` — that's the happy
-                            // cancel path, not a failure. Anything
-                            // else is logged.
-                            if !err.matches(gtk4::DialogError::Dismissed) {
-                                tracing::warn!(?err, "folder-picker dialog failed");
-                            }
-                        }
-                    },
-                );
-            }
-        });
+        // Chrome buttons.
         // - Sidebar toggle: route through the existing ToggleSidebar
         //   action so both the keybind and the button share one
         //   code path.
@@ -848,30 +900,10 @@ impl App {
             });
             app.add_action(&delete_action);
 
-            // M8: per-tab context menu actions (Rename / Close). The tab is
-            // the one most recently right-clicked, stashed in
-            // `context_menu_tab_id` by the AdwTabView `setup-menu` handler —
-            // the actions are parameterless (the menu model is static; see
-            // `build_tab_context_menu`).
-            let rename_tab_action = gtk4::gio::SimpleAction::new("rename-tab", None);
-            let app_for_rename_tab = app_struct.clone();
-            rename_tab_action.connect_activate(move |_, _| {
-                let tab_id = *app_for_rename_tab.context_menu_tab_id.borrow();
-                if let Some(pid) = app_for_rename_tab.project_for_tab(tab_id) {
-                    app_for_rename_tab.begin_rename_tab(pid, tab_id);
-                }
-            });
-            app.add_action(&rename_tab_action);
-
-            let close_tab_action = gtk4::gio::SimpleAction::new("close-tab", None);
-            let app_for_close = app_struct.clone();
-            close_tab_action.connect_activate(move |_, _| {
-                let tab_id = *app_for_close.context_menu_tab_id.borrow();
-                if let Some(pid) = app_for_close.project_for_tab(tab_id) {
-                    app_for_close.close_tab_async(pid, tab_id);
-                }
-            });
-            app.add_action(&close_tab_action);
+            // (Per-tab Rename / Close live on the per-pill right-click popover
+            // in build_tab_pill now — they call begin_rename_tab / close_page
+            // directly, so the old context_menu_tab_id-based app actions are
+            // gone.)
         }
 
         app_struct.window.present();
@@ -1194,10 +1226,9 @@ impl App {
         row.set_child(Some(&name_stack));
         row.set_widget_name(&format!("project-{}", project.id));
         self.sidebar.append(&row);
-        // M10: wire the drag-source so this row can be picked up
-        // and reordered. The matching listbox-level drop target
-        // is installed once in App::new.
-        self.install_row_drag_source(&row, project.id);
+        // M10: project reorder is driven by the single listbox-level
+        // GtkGestureDrag (`install_sidebar_reorder_gesture`), keyed off this
+        // row's `project-<id>` widget name — no per-row controller needed.
 
         // M9: commit the rename on Enter. WatchEvents
         // `ProjectRenamedEvent` is the authoritative state — we
@@ -1296,6 +1327,10 @@ impl App {
                 if let Some(tab_id) = tab_id {
                     if let Some(ui) = app.projects.borrow().get(&project_id) {
                         ui.tabs.borrow_mut().remove(&tab_id);
+                        // Drop this tab's pill from the custom strip.
+                        if let Some(pill) = ui.pills.borrow_mut().remove(&tab_id) {
+                            ui.tab_strip.remove(&pill.root);
+                        }
                     }
                     let already_server_driven =
                         drain_server_driven_marker(&app.server_driven_closes, tab_id);
@@ -1321,7 +1356,10 @@ impl App {
             let app = self.clone();
             let project_id = project.id;
             move |tv, _moved_page, _new_idx| {
-                // Skip the echo when the reorder is our own
+                // Keep the strip's pills ordered like the AdwTabView pages on
+                // every reorder (user drag, keybind, or daemon resync).
+                app.resync_pill_order(project_id);
+                // Skip the RPC echo when the reorder is our own
                 // programmatic resync, not a user drag.
                 if *app.suppress_tab_reorder_echo.borrow() {
                     return;
@@ -1344,6 +1382,9 @@ impl App {
             let app = self.clone();
             let project_id = project.id;
             move |tab_view| {
+                // Repaint pill highlight on every selection change (incl.
+                // programmatic: close-survivor, Ctrl-nav, bootstrap restore).
+                app.restyle_pills(project_id);
                 if *app.active_project_id.borrow() != project_id {
                     return;
                 }
@@ -1370,37 +1411,33 @@ impl App {
                 }
             }
         });
-        // M8: per-tab context menu (right-click a pill). AdwTabView
-        // calls `setup-menu` with the page being right-clicked (or `None`
-        // when the menu is torn down). Set the model ONCE here; `setup-menu`
-        // only stashes which tab was clicked (the actions are parameterless
-        // and read `context_menu_tab_id`). Re-setting the model inside the
-        // `setup-menu` handler segfaults AdwTabView mid-popover-build.
-        tab_view.set_menu_model(Some(&build_tab_context_menu()));
-        tab_view.connect_setup_menu({
-            let app = self.clone();
-            move |_tv, page| {
-                // `page == None` fires on close; nothing to stash.
-                if let Some(page) = page {
-                    if let Some(tab_id) = parse_tab_id_from_page(page) {
-                        *app.context_menu_tab_id.borrow_mut() = tab_id;
-                    }
-                }
-            }
-        });
+        // (The per-tab context menu is now a per-pill right-click popover in
+        // build_tab_pill — the AdwTabView setup-menu had no trigger without the
+        // AdwTabBar.)
 
-        // `autohide(false)`: libadwaita defaults to hiding the tab bar
-        // when there's only one page (iOS-style minimal chrome). Both
-        // this UI and the Mac UI always show the strip, so single-tab
-        // projects still get a visible tab pill + `×` close affordance.
-        // Without this, users see only the terminal area until a second
-        // tab is opened.
-        let tab_bar = libadwaita::TabBar::builder()
-            .view(&tab_view)
-            .autohide(false)
+        // Per-project custom tab strip (Mac-style pills) shown in the top-bar
+        // `bar_stack`; only the active project's is visible. Pills are built on
+        // tab attach (attach_existing_tab) and react to this project's
+        // AdwTabView. Each project keeps its own strip — flipping the visible
+        // stack child switches the shown tabs (a single shared AdwTabBar
+        // rebound via set_view crashed libadwaita).
+        let tab_strip = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["roost-tab-strip"])
             .build();
+        // Reorder is driven by each pill's GtkGestureDrag (see build_tab_pill),
+        // not GTK DnD — so the strip needs no DropTarget. The old DragSource +
+        // DropTarget pair crashed the whole process on Wayland: GTK's drag-icon
+        // surface tripped a `gdksurface-wayland.c:348:frame_callback` assertion
+        // (a frame callback delivered to an already-destroyed surface), and the
+        // press routinely lost the race to the window-move handle.
+        self.bar_stack
+            .add_named(&tab_strip, Some(&stack_name(project.id)));
+
+        // The AdwTabView is the page container (terminal pages), held in the
+        // content stack.
         let project_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        project_box.append(&tab_bar);
         project_box.append(&tab_view);
 
         self.tab_stack
@@ -1415,11 +1452,431 @@ impl App {
                 sidebar_label: label,
                 sidebar_entry: entry,
                 tab_view,
-                tab_bar,
+                tab_strip,
+                pills: RefCell::new(HashMap::new()),
                 tabs: RefCell::new(HashMap::new()),
                 pending_attaches: RefCell::new(HashSet::new()),
             },
         );
+    }
+
+    // ----- Phase 3: custom tab pills (Mac-style strip) -------------
+
+    /// The project's tab view, cloned out so the caller can drop the projects
+    /// borrow before driving it (set/close/reorder fire signals that re-enter
+    /// the borrow). Used by the pill click / close / context-menu handlers.
+    fn project_tab_view(&self, project_id: i64) -> Option<TabView> {
+        self.projects
+            .borrow()
+            .get(&project_id)
+            .map(|ui| ui.tab_view.clone())
+    }
+
+    /// Build a Mac-style tab pill for `tab_id` and wire its interactions. The
+    /// pill is a view of `page` in `project_id`'s AdwTabView: clicking selects
+    /// the page (the existing `selected-page` handler syncs the core), double-
+    /// click renames, and the close × closes (the existing `close-page`
+    /// handler removes the pill + fires the RPC). The `name_stack`
+    /// (label↔entry) reuses the sidebar's inline-rename pattern.
+    fn build_tab_pill(
+        self: &Rc<Self>,
+        project_id: i64,
+        tab_id: i64,
+        page: &libadwaita::TabPage,
+        title: &str,
+    ) -> TabPill {
+        let dot = gtk4::Box::builder()
+            .css_classes(["roost-tab-pill-dot"])
+            .valign(gtk4::Align::Center)
+            .build();
+        let label = gtk4::Label::builder()
+            .label(title)
+            .css_classes(["roost-tab-pill-label"])
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .max_width_chars(20)
+            .single_line_mode(true)
+            .build();
+        let entry = gtk4::Entry::builder()
+            .css_classes(["roost-tab-pill-entry"])
+            .max_width_chars(20)
+            .build();
+        let name_stack = gtk4::Stack::builder().hhomogeneous(false).build();
+        name_stack.add_named(&label, Some("label"));
+        name_stack.add_named(&entry, Some("entry"));
+        name_stack.set_visible_child_name("label");
+        let badge = gtk4::Box::builder()
+            .css_classes(["roost-tab-pill-badge"])
+            .valign(gtk4::Align::Center)
+            .visible(false)
+            .build();
+        let close = gtk4::Button::builder()
+            .css_classes(["roost-tab-pill-close", "flat"])
+            .child(&gtk4::Label::new(Some("×")))
+            .valign(gtk4::Align::Center)
+            .visible(false)
+            .build();
+        let root = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(2)
+            .css_classes(["roost-tab-pill"])
+            .build();
+        root.append(&dot);
+        root.append(&name_stack);
+        root.append(&badge);
+        root.append(&close);
+
+        // Click selects the page. We do NOT suppress the selection, so the
+        // existing `selected-page` handler runs and syncs the core (#228). The
+        // projects borrow is dropped before `set_selected_page` so the notify
+        // handler (which may borrow projects) can't double-borrow. Re-focus the
+        // terminal after, since the click lands GTK focus on the pill.
+        let click = gtk4::GestureClick::new();
+        click.connect_released({
+            let app = self.clone();
+            let page = page.clone();
+            move |_, n, _, _| {
+                if let Some(tv) = app.project_tab_view(project_id) {
+                    tv.set_selected_page(&page);
+                    // Box pills aren't focusable, so the terminal keeps GTK
+                    // focus across the switch; re-grab the now-active tab's
+                    // terminal so typing goes to it. (A double-click's rename
+                    // below grabs the entry afterwards, so it wins.)
+                    app.focus_active_terminal();
+                }
+                if n == 2 {
+                    app.begin_rename_tab(project_id, tab_id);
+                }
+            }
+        });
+        root.add_controller(click);
+
+        // Close × → close the page (the existing close-page handler removes the
+        // pill entry + fires the RPC). Borrow dropped before `close_page`.
+        close.connect_clicked({
+            let app = self.clone();
+            let page = page.clone();
+            move |_| {
+                if let Some(tv) = app.project_tab_view(project_id) {
+                    tv.close_page(&page);
+                }
+            }
+        });
+
+        // Inline rename: begin_rename_tab flips the name_stack to the entry +
+        // focuses it; Enter commits (the SetTabTitle RPC's TabTitle event
+        // updates the label text), Esc or focus-out cancels — back to label.
+        entry.connect_activate({
+            let app = self.clone();
+            let ns = name_stack.clone();
+            move |entry| {
+                ns.set_visible_child_name("label");
+                app.commit_rename_tab(tab_id, entry.text().to_string());
+                // Hand focus back to the terminal — the entry just hid.
+                app.focus_active_terminal();
+            }
+        });
+        let esc = gtk4::EventControllerKey::new();
+        esc.connect_key_pressed({
+            let app = self.clone();
+            let ns = name_stack.clone();
+            move |_, key, _, _| {
+                if key == gtk4::gdk::Key::Escape {
+                    ns.set_visible_child_name("label");
+                    app.focus_active_terminal();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        entry.add_controller(esc);
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave({
+            let app = self.clone();
+            let ns = name_stack.clone();
+            // Cancel on focus-out, and restore focus to the active terminal
+            // like the Enter/Escape paths — otherwise clicking away from the
+            // entry hides it but leaves GTK focus stranded on the now-hidden
+            // entry. Idempotent with the explicit handlers (their child-switch
+            // also fires leave).
+            move |_| {
+                ns.set_visible_child_name("label");
+                app.focus_active_terminal();
+            }
+        });
+        entry.add_controller(focus);
+
+        // Pointer-drag reorder (NOT GTK DnD). A GtkGestureDrag arms once the
+        // pointer crosses a small threshold, claims the event sequence (so the
+        // click gesture is cancelled and the window-move handle never sees the
+        // press — fixing "dragging a pill moves the whole window"), then on
+        // release moves the page via the proven-stable `reorder_page`
+        // (drop_reorder_tab). This replaces the DragSource/DropTarget, whose
+        // Wayland drag-icon surface aborted the process in
+        // `gdksurface-wayland.c:348:frame_callback`. Plain pointer events mean
+        // no drag surface — and unlike DnD it is reproducible with synthetic
+        // input (xdotool/uinput), so CI can gate it. `dragged_tab_id` doubles
+        // as the "armed past threshold" marker: a sub-threshold press stays
+        // unclaimed and falls through to the click gesture (select / rename).
+        let reorder = gtk4::GestureDrag::new();
+        reorder.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        reorder.connect_drag_update({
+            let app = self.clone();
+            let ns = name_stack.clone();
+            let root = root.clone();
+            move |g, off_x, off_y| {
+                // Arm once past the threshold; until then it stays a click.
+                if *app.dragged_tab_id.borrow() != Some(tab_id) {
+                    if app.dragged_tab_id.borrow().is_some() {
+                        return; // a different pill is mid-drag
+                    }
+                    // Don't hijack an inline-rename — the entry owns the pointer.
+                    if ns.visible_child_name().as_deref() == Some("entry") {
+                        return;
+                    }
+                    // Stay a click until past the drag threshold (~8px slop).
+                    if off_x.hypot(off_y) < 8.0 {
+                        return;
+                    }
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                    *app.dragged_tab_id.borrow_mut() = Some(tab_id);
+                    root.set_opacity(0.4);
+                }
+                // Armed: live-shuffle the strip under the pointer so the result
+                // is visible before release (matching the sidebar's feel).
+                app.live_reorder_pill(g, &root, project_id, tab_id);
+            }
+        });
+        reorder.connect_drag_end({
+            let app = self.clone();
+            let root = root.clone();
+            move |g, _off_x, _off_y| {
+                // Only act if this pill armed a drag; otherwise it was a click
+                // (handled by the click gesture) and we must not reorder.
+                if *app.dragged_tab_id.borrow() != Some(tab_id) {
+                    return;
+                }
+                root.set_opacity(1.0);
+                *app.dragged_tab_id.borrow_mut() = None;
+                // Settle the final slot (covers a release the last motion didn't
+                // reach), then persist the resulting order once.
+                app.live_reorder_pill(g, &root, project_id, tab_id);
+                app.persist_tab_order(project_id);
+            }
+        });
+        root.add_controller(reorder);
+
+        // Right-click context menu — Rename / Close. Replaces the AdwTabBar's
+        // setup-menu (gone with the bar); a small flat popover anchored at the
+        // click, mirroring the Mac pill's right-click affordance.
+        let secondary = gtk4::GestureClick::builder()
+            .button(gtk4::gdk::BUTTON_SECONDARY)
+            .build();
+        secondary.connect_released({
+            let app = self.clone();
+            let root = root.clone();
+            let page = page.clone();
+            move |_, _, x, y| {
+                let pop = gtk4::Popover::builder()
+                    .has_arrow(false)
+                    .position(gtk4::PositionType::Bottom)
+                    .build();
+                pop.set_parent(&root);
+                pop.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                let rename = gtk4::Button::builder()
+                    .label("Rename")
+                    .css_classes(["flat"])
+                    .build();
+                let close_item = gtk4::Button::builder()
+                    .label("Close")
+                    .css_classes(["flat"])
+                    .build();
+                vbox.append(&rename);
+                vbox.append(&close_item);
+                pop.set_child(Some(&vbox));
+                rename.connect_clicked({
+                    let app = app.clone();
+                    let pop = pop.clone();
+                    move |_| {
+                        pop.popdown();
+                        app.begin_rename_tab(project_id, tab_id);
+                    }
+                });
+                close_item.connect_clicked({
+                    let app = app.clone();
+                    let pop = pop.clone();
+                    let page = page.clone();
+                    move |_| {
+                        pop.popdown();
+                        if let Some(tv) = app.project_tab_view(project_id) {
+                            tv.close_page(&page);
+                        }
+                    }
+                });
+                pop.connect_closed(|p| p.unparent());
+                pop.popup();
+            }
+        });
+        root.add_controller(secondary);
+
+        TabPill {
+            root,
+            dot,
+            name_stack,
+            label,
+            entry,
+            close,
+            badge,
+        }
+    }
+
+    /// Mark the pill of the project's selected tab `.active` (revealing its
+    /// close ×) and clear the others — mirrors the AdwTabBar checked state.
+    /// Called on every selection change, so it tracks programmatic selects
+    /// (close-survivor, Ctrl-nav, bootstrap) too. Cheap (a handful of tabs).
+    fn restyle_pills(self: &Rc<Self>, project_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let selected = ui
+            .tab_view
+            .selected_page()
+            .and_then(|p| parse_tab_id_from_page(&p));
+        let tabs = ui.tabs.borrow();
+        for (tid, pill) in ui.pills.borrow().iter() {
+            let active = Some(*tid) == selected;
+            if active {
+                pill.root.add_css_class("active");
+            } else {
+                pill.root.remove_css_class("active");
+            }
+            pill.close.set_visible(active);
+            // Notification badge: Mac shows it on inactive notified tabs.
+            let notified = tabs.get(tid).is_some_and(|t| t.page.needs_attention());
+            pill.badge.set_visible(notified && !active);
+        }
+    }
+
+    /// Refresh one pill's leading dot (agent state) + notification badge from
+    /// its tab's current state. Called wherever the indicator icon or
+    /// needs-attention is updated, so the pill tracks the AdwTabPage.
+    fn refresh_pill_indicators(self: &Rc<Self>, project_id: i64, tab_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let pills = ui.pills.borrow();
+        let tabs = ui.tabs.borrow();
+        if let (Some(pill), Some(tab_ui)) = (pills.get(&tab_id), tabs.get(&tab_id)) {
+            apply_pill_dot(&pill.dot, *tab_ui.state.borrow());
+            let active = ui
+                .tab_view
+                .selected_page()
+                .and_then(|p| parse_tab_id_from_page(&p))
+                == Some(tab_id);
+            pill.badge
+                .set_visible(tab_ui.page.needs_attention() && !active);
+        }
+    }
+
+    /// Reorder the strip's pills to match the AdwTabView's page order. Called
+    /// from page-reordered, so pills follow the model on any reorder — a user
+    /// drag, a keybind, or a daemon-driven resync.
+    fn resync_pill_order(self: &Rc<Self>, project_id: i64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let pills = ui.pills.borrow();
+        let mut prev: Option<gtk4::Widget> = None;
+        for i in 0..ui.tab_view.n_pages() {
+            let page = ui.tab_view.nth_page(i);
+            if let Some(pill) = parse_tab_id_from_page(&page).and_then(|t| pills.get(&t)) {
+                ui.tab_strip.reorder_child_after(&pill.root, prev.as_ref());
+                prev = Some(pill.root.clone().upcast());
+            }
+        }
+    }
+
+    /// Handle a pill drop at strip-x `x`: move the dragged tab's page to the
+    /// index implied by the pointer (its insertion point among the other
+    /// pills), then page-reordered resyncs the pills + fires the RPC.
+    fn drop_reorder_tab(self: &Rc<Self>, project_id: i64, src_tab: i64, x: f64) {
+        let projects = self.projects.borrow();
+        let Some(ui) = projects.get(&project_id) else {
+            return;
+        };
+        let pills = ui.pills.borrow();
+        // Insertion index = number of OTHER pills whose centre is left of x,
+        // in the strip's visual (= AdwTabView) order.
+        let mut idx = 0i32;
+        for i in 0..ui.tab_view.n_pages() {
+            let page = ui.tab_view.nth_page(i);
+            let Some(tid) = parse_tab_id_from_page(&page) else {
+                continue;
+            };
+            if tid == src_tab {
+                continue;
+            }
+            if let Some(pill) = pills.get(&tid) {
+                if let Some(b) = pill.root.compute_bounds(&ui.tab_strip) {
+                    if x > (b.x() + b.width() / 2.0) as f64 {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        let src_page = ui.tabs.borrow().get(&src_tab).map(|t| t.page.clone());
+        if let Some(page) = src_page {
+            ui.tab_view.reorder_page(&page, idx);
+        }
+    }
+
+    /// Live-shuffle during a pill drag: move the dragged page to the slot under
+    /// the gesture's *current* pointer, with the reorder RPC echo suppressed so
+    /// the strip reshuffles continuously and the write happens once on drop.
+    /// Reads the gesture's live point (not start+offset) so the index stays
+    /// correct as the dragged pill itself snaps between slots under the cursor —
+    /// start+offset would lag by a pill width after each move and oscillate.
+    fn live_reorder_pill(
+        self: &Rc<Self>,
+        g: &gtk4::GestureDrag,
+        root: &gtk4::Box,
+        project_id: i64,
+        tab_id: i64,
+    ) {
+        let Some((px, py)) = g.point(None) else {
+            return;
+        };
+        let Some(parent) = root.parent() else {
+            return;
+        };
+        let pt = gtk4::graphene::Point::new(px as f32, py as f32);
+        let Some(p) = root.compute_point(&parent, &pt) else {
+            return;
+        };
+        *self.suppress_tab_reorder_echo.borrow_mut() = true;
+        self.drop_reorder_tab(project_id, tab_id, p.x() as f64);
+        *self.suppress_tab_reorder_echo.borrow_mut() = false;
+    }
+
+    /// Persist `project_id`'s current AdwTabView page order via the reorder RPC.
+    /// The pill drag live-shuffles with the echo suppressed, so it calls this
+    /// once on drop to write the settled order.
+    fn persist_tab_order(self: &Rc<Self>, project_id: i64) {
+        let Some(tv) = self.project_tab_view(project_id) else {
+            return;
+        };
+        let n = tv.n_pages();
+        let mut ordered = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            if let Some(tab_id) = parse_tab_id_from_page(&tv.nth_page(i)) {
+                ordered.push(tab_id);
+            }
+        }
+        self.reorder_tabs_async(project_id, ordered);
     }
 
     // ----- M8 + M9: rename / delete project flow -------------------
@@ -1569,74 +2026,46 @@ impl App {
 
     // ----- M8 + M9: rename / close tab flow ------------------------
 
-    /// Open the inline rename popover for `(project_id, tab_id)`.
-    /// Inline rename for tabs uses a `gtk::Popover` pointing at the
-    /// tab pill rather than `connect_setup_menu` (which is the per-page
-    /// context menu, not an inline-edit hook).
+    /// Begin an inline rename of `(project_id, tab_id)` in its pill: flip the
+    /// pill's `name_stack` to the entry, seed + focus it. Enter commits, Esc /
+    /// focus-out cancels (wired once in `build_tab_pill`). Mirrors the Mac
+    /// `TabPillView` inline rename — the entry edits in place on the pill, not
+    /// a popover.
     fn begin_rename_tab(self: &Rc<Self>, project_id: i64, tab_id: i64) {
+        // Renaming a tab in a background project: activate it first so its strip
+        // (and pill) is the visible bar_stack child. No-op for the common
+        // active-project case.
+        if *self.active_project_id.borrow() != project_id {
+            self.set_active_project(project_id);
+        }
         let projects = self.projects.borrow();
         let Some(ui) = projects.get(&project_id) else {
             return;
         };
-        let tabs = ui.tabs.borrow();
-        let Some(tab_ui) = tabs.get(&tab_id) else {
+        // Select the target tab so the strip shows it + the core follows. The
+        // guarded select suppresses the notify auto-sync, so sync explicitly;
+        // no-op when it's already active (the common Alt+R case).
+        let page = ui.tabs.borrow().get(&tab_id).map(|t| t.page.clone());
+        let Some(page) = page else {
             return;
         };
-        let current_title = tab_ui.page.title().to_string();
-
-        // Select the target tab first. AdwTabView positions the
-        // popover above the currently-selected pill (the only
-        // pill-locating affordance the public API gives us), so if
-        // the rename was invoked from a background tab's context
-        // menu, the popover would otherwise float over the wrong
-        // pill while the RPC silently renames the background tab.
-        // CodeRabbit caught this on PR #63.
-        self.select_page_programmatic(&ui.tab_view, &tab_ui.page);
-        // Renaming a background tab switches the UI to it (above), so the
-        // core must follow — the guarded select suppresses the notify
-        // auto-sync, so sync explicitly. No-op when it's already the active
-        // tab (the common Alt+R case).
+        self.select_page_programmatic(&ui.tab_view, &page);
         self.sync_core_active_tab(tab_id);
-
-        let entry = gtk4::Entry::builder()
-            .text(&current_title)
-            .activates_default(true)
-            .build();
-        let popover = gtk4::Popover::builder()
-            .has_arrow(true)
-            .position(gtk4::PositionType::Bottom)
-            .build();
-        popover.set_child(Some(&entry));
-        // Anchor at the AdwTabBar (the pill strip), positioned
-        // pointing-down from the tab strip. M9.5: pre-fix, the
-        // anchor was the TabView itself — whose visual centre is
-        // the terminal area — so the popover floated halfway down
-        // the window. AdwTabBar doesn't expose the individual
-        // pill, but its widget bounds are the strip itself, so a
-        // popover anchored here lands just below the pills.
-        popover.set_parent(&ui.tab_bar);
-
-        let app = self.clone();
-        let popover_for_commit = popover.clone();
-        entry.connect_activate(move |entry| {
-            let new_title = entry.text().to_string();
-            popover_for_commit.popdown();
-            app.commit_rename_tab(tab_id, new_title);
-        });
-        let popover_for_cancel = popover.clone();
-        let entry_keys = gtk4::EventControllerKey::new();
-        entry_keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk4::gdk::Key::Escape {
-                popover_for_cancel.popdown();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        entry.add_controller(entry_keys);
-        popover.connect_closed(|p| p.unparent());
-        popover.popup();
-        entry.grab_focus();
-        entry.select_region(0, -1);
+        // Flip the pill into inline-edit mode.
+        let pills = ui.pills.borrow();
+        if let Some(pill) = pills.get(&tab_id) {
+            pill.entry.set_text(&page.title());
+            pill.name_stack.set_visible_child_name("entry");
+            // Defer the focus to an idle tick: when this rename also activated
+            // the project (the non-active case), set_active_project scheduled
+            // an idle `focus_active_terminal`; ours runs after it (FIFO) so the
+            // entry keeps focus instead of the terminal stealing it back.
+            let entry = pill.entry.clone();
+            glib::idle_add_local_once(move || {
+                entry.grab_focus();
+                entry.select_region(0, -1);
+            });
+        }
     }
 
     /// Commit a tab rename. Same one-way-data-flow rule as
@@ -1671,7 +2100,13 @@ impl App {
         };
         self.tab_stack
             .set_visible_child_name(&stack_name(project_id));
+        // Show this project's tab strip in the top-bar stack.
+        self.bar_stack
+            .set_visible_child_name(&stack_name(project_id));
         self.window_title.set_title(&ui.name);
+        // Surface the active project in the OS window title (taskbar / alt-tab);
+        // the in-chrome title widget was removed for Mac-parity minimal chrome.
+        self.window.set_title(Some(&ui.name));
         let subtitle = active_tab_cwd(ui);
         self.window_title.set_subtitle(&subtitle);
         // Sync sidebar selection without re-firing the handler.
@@ -1934,6 +2369,13 @@ impl App {
             .widget()
             .set_widget_name(&format!("tab-{}", tab.id));
 
+        // Build this tab's pill in the project's custom strip (a view of the
+        // AdwTabView). restyle marks the just-selected pill active.
+        let pill = self.build_tab_pill(tab.project_id, tab.id, &page, &label);
+        ui.tab_strip.append(&pill.root);
+        ui.pills.borrow_mut().insert(tab.id, pill);
+        self.restyle_pills(tab.project_id);
+
         // Defer the rest of the wiring until the session actually
         // spawns. The session_handle's JoinHandle is awaited on the
         // GTK main loop's executor.
@@ -2054,6 +2496,7 @@ impl App {
             apply_indicator_icon(&page_for_future, tab_state);
             page_for_future.set_needs_attention(tab_has_notification);
             app_for_attach.refresh_rollup_for(project_id);
+            app_for_attach.refresh_pill_indicators(project_id, tab_id);
             // Update the headerbar subtitle if this tab belongs to
             // the active project; cheap idempotent refresh.
             app_for_attach.refresh_window_subtitle();
@@ -2245,6 +2688,7 @@ impl App {
                     ui.sidebar_label.set_text(&name);
                     if *self.active_project_id.borrow() == project_id {
                         self.window_title.set_title(&name);
+                        self.window.set_title(Some(&name));
                     }
                 }
             }
@@ -2252,6 +2696,7 @@ impl App {
                 let mut projects = self.projects.borrow_mut();
                 if let Some(ui) = projects.remove(&project_id) {
                     self.sidebar.remove(&ui.sidebar_row);
+                    self.bar_stack.remove(&ui.tab_strip);
                     self.tab_stack.remove(
                         &self
                             .tab_stack
@@ -2317,6 +2762,10 @@ impl App {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
                         tab_ui.page.set_title(&title);
                     }
+                    // Keep the pill label in sync (the AdwTabPage isn't shown).
+                    if let Some(pill) = ui.pills.borrow().get(&tab_id) {
+                        pill.label.set_label(&title);
+                    }
                 }
             }
             WorkspaceEvent::TabCwdChanged { tab_id, cwd } => {
@@ -2344,6 +2793,16 @@ impl App {
                 for ui in projects.values() {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
                         tab_ui.page.set_needs_attention(has_pending);
+                    }
+                    // Update the pill's trailing badge (Mac shows it on inactive
+                    // notified tabs); the AdwTabPage isn't displayed.
+                    if let Some(pill) = ui.pills.borrow().get(&tab_id) {
+                        let active = ui
+                            .tab_view
+                            .selected_page()
+                            .and_then(|p| parse_tab_id_from_page(&p))
+                            == Some(tab_id);
+                        pill.badge.set_visible(has_pending && !active);
                     }
                 }
                 drop(projects);
@@ -2389,6 +2848,7 @@ impl App {
                         if let Some(tab_ui) = tabs.get(&tab_id) {
                             *tab_ui.state.borrow_mut() = state;
                             apply_indicator_icon(&tab_ui.page, state);
+                            self.refresh_pill_indicators(*project_id, tab_id);
                             affected_project = Some(*project_id);
                             break;
                         }
@@ -2514,6 +2974,7 @@ impl App {
             let removed = self.projects.borrow_mut().remove(pid);
             if let Some(ui) = removed {
                 self.sidebar.remove(&ui.sidebar_row);
+                self.bar_stack.remove(&ui.tab_strip);
                 if let Some(child) = self.tab_stack.child_by_name(&stack_name(*pid)) {
                     self.tab_stack.remove(&child);
                 }
@@ -2557,6 +3018,7 @@ impl App {
                         ui.sidebar_label.set_text(&project.name);
                         if active == project.id {
                             self.window_title.set_title(&project.name);
+                            self.window.set_title(Some(&project.name));
                         }
                     }
                 }
@@ -2582,12 +3044,16 @@ impl App {
                         tab.title.clone()
                     };
                     tab_ui.page.set_title(&label);
+                    if let Some(pill) = ui.pills.borrow().get(&tab.id) {
+                        pill.label.set_label(&label);
+                    }
                     let state = TabState::from_ipc(tab.state);
                     *tab_ui.state.borrow_mut() = state;
                     apply_indicator_icon(&tab_ui.page, state);
                     *tab_ui.cwd.borrow_mut() = tab.cwd.clone();
                     tab_ui.page.set_needs_attention(tab.has_notification);
                     *tab_ui.hook_active.borrow_mut() = tab.hook_active;
+                    self.refresh_pill_indicators(project.id, tab.id);
                     affected.insert(project.id);
                 }
             }
@@ -2810,19 +3276,6 @@ impl App {
         let ui = projects.get(&project_id)?;
         let page = ui.tab_view.selected_page()?;
         parse_tab_id_from_page(&page)
-    }
-
-    /// Resolve a tab id to its parent project id by scanning. M8's
-    /// per-tab context-menu actions get the tab id from the action
-    /// target but need the project id to dispatch close / rename.
-    fn project_for_tab(self: &Rc<Self>, tab_id: i64) -> Option<i64> {
-        let projects = self.projects.borrow();
-        for (project_id, ui) in projects.iter() {
-            if ui.tabs.borrow().contains_key(&tab_id) {
-                return Some(*project_id);
-            }
-        }
-        None
     }
 
     fn cycle_tab(self: &Rc<Self>, delta: i32) {
@@ -3085,7 +3538,7 @@ impl App {
             None => PaletteOutcome::Close,
         });
 
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3112,7 +3565,7 @@ impl App {
         }
         let root = self.notifications_frame();
         let behavior = self.notifications_behavior();
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3146,7 +3599,7 @@ impl App {
         let commands = RoostConfig::load_default().commands;
         let root = self.launcher_frame(&commands);
         let behavior = self.launcher_behavior(commands);
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3233,7 +3686,7 @@ impl App {
         let providers = RoostConfig::load_default().providers;
         let root = self.provider_list_frame(&providers);
         let behavior = self.provider_list_behavior(providers);
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3776,18 +4229,11 @@ impl App {
         }
     }
 
-    /// Top margin pinning the card under the tab bar: the active
-    /// project's tab-bar height (falling back to ~46px before it's
-    /// allocated) plus the visual gap.
-    fn palette_top_margin(self: &Rc<Self>) -> i32 {
-        let pid = *self.active_project_id.borrow();
-        let projects = self.projects.borrow();
-        let bar_h = projects
-            .get(&pid)
-            .map(|ui| ui.tab_bar.height())
-            .filter(|h| *h > 0)
-            .unwrap_or(46);
-        bar_h + TOP_GAP
+    /// Top margin for the palette card. The tab strip now lives in the
+    /// toolbar top bar, above the content overlay the palette floats in, so
+    /// the card only needs the visual gap from the content top.
+    fn palette_top_margin() -> i32 {
+        TOP_GAP
     }
 
     /// Palette teardown callback: clear the handle + the captured
@@ -4233,7 +4679,7 @@ impl App {
             PaletteOutcome::Close
         });
 
-        let top_margin = self.palette_top_margin();
+        let top_margin = Self::palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let dismiss_reply = shared.clone();
         let overlay = PaletteOverlay::present(
@@ -5014,102 +5460,125 @@ impl App {
         self.sidebar_order().len()
     }
 
-    /// M10: attach a `gtk::DragSource` to a project row so it can
-    /// be picked up. Dragged content is the project's int64 id.
-    /// Visual feedback: the source row dims to 40% opacity while
-    /// the drag is in flight (CSS `:drop(active)` styling was
-    /// unreliable in our environment so we set opacity directly).
-    /// The drop target on the listbox handles
-    /// motion + persistence; this side just publishes the
-    /// payload and tracks rollback snapshot.
-    fn install_row_drag_source(self: &Rc<Self>, row: &gtk4::ListBoxRow, project_id: i64) {
-        let src = gtk4::DragSource::new();
-        src.set_actions(gtk4::gdk::DragAction::MOVE);
-        // Suppress the drag while the user is renaming inline —
-        // the entry needs to keep focus + own mouse input. We
-        // detect "renaming" by checking the row's name-stack's
-        // visible child (set by M9's begin_rename_project).
-        let row_for_prepare = row.clone();
-        src.connect_prepare(move |_, _, _| {
-            if let Some(stack) = row_for_prepare
-                .child()
-                .and_then(|c| c.downcast::<gtk4::Stack>().ok())
-            {
-                if stack.visible_child_name().as_deref() == Some("entry") {
-                    return None;
+    /// M10 (Wayland-safe): pointer-drag reorder for a project row via
+    /// `GtkGestureDrag` — NOT GTK DnD. The old `DragSource` + listbox
+    /// `DropTarget` created a drag-icon surface that aborted the whole process
+    /// on Wayland in `gdksurface-wayland.c:348:frame_callback` (same class as
+    /// the tab pills; see `build_tab_pill`). The gesture arms past an 8px
+    /// threshold, claims the sequence (so a plain click still selects the row /
+    /// switches project), live-shuffles the rows under the pointer
+    /// (`shuffle_sidebar_toward`), and on release persists the order via
+    /// `reorder_projects_async` (which rolls back on RPC error). A cancelled
+    /// drag rolls back to the pre-drag order. The row dims to 40% opacity while
+    /// dragging (CSS `:drop(active)` was unreliable here, so we set it direct).
+    /// M10 (Wayland-safe): pointer-drag reorder for the project sidebar via a
+    /// single `GtkGestureDrag` on the listbox — NOT GTK DnD. The old
+    /// `DragSource` + `DropTarget` created a drag-icon surface that aborted the
+    /// whole process on Wayland in `gdksurface-wayland.c:348:frame_callback`
+    /// (same class as the tab pills; see `build_tab_pill`). A *per-row* gesture
+    /// is starved by GtkListBox's own selection gesture, so this lives on the
+    /// listbox: it derives the pressed row from the start point, arms past an
+    /// 8px threshold (claiming so a plain click still selects / switches
+    /// project), live-shuffles the rows under the pointer
+    /// (`shuffle_sidebar_toward`), and on release persists the order via
+    /// `reorder_projects_async` (which rolls back on RPC error). A cancelled
+    /// drag rolls back to the pre-drag order. Installed once from `App::new`.
+    fn install_sidebar_reorder_gesture(self: &Rc<Self>) {
+        let reorder = gtk4::GestureDrag::new();
+        reorder.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        // The gesture only *claims* once past the 8px threshold, so a plain
+        // click is never claimed and falls through to the listbox's own
+        // selection (project switch) unchanged — verified against the old DnD
+        // sidebar, which behaves identically for clicks.
+        reorder.connect_drag_update({
+            let app = self.clone();
+            move |g, off_x, off_y| {
+                // Arm once past the threshold; until then it stays a click.
+                if app.dragged_project_id.borrow().is_none() {
+                    if off_x.hypot(off_y) < 8.0 {
+                        return;
+                    }
+                    // Which row was pressed? start_point is in listbox coords
+                    // (the gesture is on the listbox).
+                    let Some((_sx, sy)) = g.start_point() else {
+                        return;
+                    };
+                    let Some(row) = app.sidebar.row_at_y(sy as i32) else {
+                        return; // press landed in empty space
+                    };
+                    // Don't hijack an inline rename — the entry owns the pointer.
+                    if let Some(stack) = row.child().and_then(|c| c.downcast::<gtk4::Stack>().ok())
+                    {
+                        if stack.visible_child_name().as_deref() == Some("entry") {
+                            return;
+                        }
+                    }
+                    let Some(pid) = row
+                        .widget_name()
+                        .strip_prefix("project-")
+                        .and_then(|s| s.parse::<i64>().ok())
+                    else {
+                        return;
+                    };
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                    row.set_opacity(0.4);
+                    *app.dragged_project_id.borrow_mut() = Some(pid);
+                    *app.drag_original_order.borrow_mut() = app.sidebar_order();
+                }
+                // Armed: live-shuffle the rows toward the current pointer.
+                if let Some(pid) = *app.dragged_project_id.borrow() {
+                    if let Some((_px, py)) = g.point(None) {
+                        let raw = app.raw_target_for_y(py);
+                        app.shuffle_sidebar_toward(pid, raw);
+                    }
                 }
             }
-            Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
-                project_id,
-            )))
         });
-        let row_for_begin = row.clone();
-        let app_for_begin = self.clone();
-        src.connect_drag_begin(move |_, _| {
-            row_for_begin.set_opacity(0.4);
-            *app_for_begin.dragged_project_id.borrow_mut() = Some(project_id);
-            *app_for_begin.drag_original_order.borrow_mut() = app_for_begin.sidebar_order();
-            *app_for_begin.drop_occurred.borrow_mut() = false;
-        });
-        let row_for_end = row.clone();
-        let app_for_end = self.clone();
-        src.connect_drag_end(move |_, _, _| {
-            row_for_end.set_opacity(1.0);
-            if !*app_for_end.drop_occurred.borrow() {
-                let snapshot = app_for_end.drag_original_order.borrow().clone();
-                app_for_end.apply_sidebar_order(&snapshot);
+        reorder.connect_drag_end({
+            let app = self.clone();
+            move |g, _off_x, _off_y| {
+                let Some(pid) = *app.dragged_project_id.borrow() else {
+                    return; // never armed → it was a click, not a drag
+                };
+                app.set_row_opacity(pid, 1.0);
+                // Settle the final slot, then persist the order once. The
+                // snapshot lets reorder_projects_async roll back on RPC error.
+                if let Some((_px, py)) = g.point(None) {
+                    let raw = app.raw_target_for_y(py);
+                    app.shuffle_sidebar_toward(pid, raw);
+                }
+                let current = app.sidebar_order();
+                let original = app.drag_original_order.borrow().clone();
+                if current != original {
+                    app.reorder_projects_async(current, original);
+                }
+                *app.dragged_project_id.borrow_mut() = None;
+                app.drag_original_order.borrow_mut().clear();
             }
-            *app_for_end.dragged_project_id.borrow_mut() = None;
-            app_for_end.drag_original_order.borrow_mut().clear();
-            *app_for_end.drop_occurred.borrow_mut() = false;
         });
-        row.add_controller(src);
+        reorder.connect_cancel({
+            let app = self.clone();
+            move |_, _| {
+                let Some(pid) = *app.dragged_project_id.borrow() else {
+                    return;
+                };
+                app.set_row_opacity(pid, 1.0);
+                // Cancelled drag (grab broken) → revert to the pre-drag order.
+                let original = app.drag_original_order.borrow().clone();
+                app.apply_sidebar_order(&original);
+                *app.dragged_project_id.borrow_mut() = None;
+                app.drag_original_order.borrow_mut().clear();
+            }
+        });
+        self.sidebar.add_controller(reorder);
     }
 
-    /// M10: wire the listbox-level drop target. Motion live-
-    /// shuffles the dragged row to the insertion point implied
-    /// by the pointer y; drop persists the resulting order via
-    /// `ReorderProjects` RPC (or skips the write when the order
-    /// is unchanged). Rollback on RPC failure restores the
-    /// drag-begin snapshot. Called once from `App::new`.
-    fn install_sidebar_drop_target(self: &Rc<Self>) {
-        let dst = gtk4::DropTarget::new(glib::types::Type::I64, gtk4::gdk::DragAction::MOVE);
-        let app_for_motion = self.clone();
-        dst.connect_motion(move |_, _, y| {
-            if let Some(src_id) = *app_for_motion.dragged_project_id.borrow() {
-                let raw = app_for_motion.raw_target_for_y(y);
-                app_for_motion.shuffle_sidebar_toward(src_id, raw);
-            }
-            gtk4::gdk::DragAction::MOVE
-        });
-        let app_for_drop = self.clone();
-        dst.connect_drop(move |_, value, _, _| {
-            // The payload value is the project id we set in
-            // `connect_prepare`. We don't strictly need to read
-            // it here — the dragged id is also in
-            // `dragged_project_id` — but failing the type check
-            // is a quick way to reject foreign content (e.g. a
-            // file drop from the file manager).
-            if value.get::<i64>().is_err() {
-                return false;
-            }
-            let current = app_for_drop.sidebar_order();
-            let original = app_for_drop.drag_original_order.borrow().clone();
-            if current == original {
-                // Unchanged drop is still a successful drop —
-                // drag-end mustn't roll back.
-                *app_for_drop.drop_occurred.borrow_mut() = true;
-                return true;
-            }
-            // Mark as persisted optimistically; rollback below
-            // on RPC error reverts both the visual order AND
-            // clears the flag so the drag-end roll-back logic
-            // isn't double-fired.
-            *app_for_drop.drop_occurred.borrow_mut() = true;
-            app_for_drop.reorder_projects_async(current, original);
-            true
-        });
-        self.sidebar.add_controller(dst);
+    /// Set a project's sidebar-row opacity (dims the dragged row to 40% during
+    /// a reorder drag; CSS `:drop(active)` was unreliable here).
+    fn set_row_opacity(&self, project_id: i64, opacity: f64) {
+        if let Some(ui) = self.projects.borrow().get(&project_id) {
+            ui.sidebar_row.set_opacity(opacity);
+        }
     }
 
     /// M10: fire `ReorderProjects` RPC. On error, roll the
@@ -5391,20 +5860,6 @@ fn format_font_size(size_pt: f64) -> String {
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
     let name = page.child().widget_name().to_string();
     name.strip_prefix("tab-").and_then(|n| n.parse().ok())
-}
-
-/// Static tab right-click menu model (Rename / Close), fed once to
-/// `adw::TabView::set_menu_model`. The actions are parameterless: which tab was
-/// right-clicked is stashed in `context_menu_tab_id` by the `setup-menu`
-/// handler. This is the documented AdwTabView pattern — set `menu-model`
-/// ONCE and use `setup-menu` only to prep actions. Rebuilding/re-setting
-/// the model *during* `setup-menu` segfaults AdwTabView mid-popover-build
-/// (`gtk_popover_menu_new_from_model_full`).
-fn build_tab_context_menu() -> gtk4::gio::Menu {
-    let menu = gtk4::gio::Menu::new();
-    menu.append(Some("Rename"), Some("app.rename-tab"));
-    menu.append(Some("Close"), Some("app.close-tab"));
-    menu
 }
 
 /// Render an `Accel` as a platform-appropriate shortcut label (Cmd

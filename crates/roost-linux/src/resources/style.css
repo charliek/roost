@@ -4,6 +4,53 @@
  * Keep this small — every rule is a surface that can fight a future
  * libadwaita restyle. */
 
+/* Chrome gray palette. Mac's AppKit sidebar/chrome sits at #282828 (the
+ * .darkAqua sidebar material) — distinctly lighter than the terminal,
+ * which gives the window depth. libadwaita's ForceDark default chrome is
+ * ~#1f1f1f (near-black), which reads as one flat black slab against a dark
+ * terminal (the "hard black" look users notice). Pin chrome to #282828 to
+ * match Mac. Terminal-abutting seams (paned separator, tab-stack) stay
+ * dark — see the translucency block — so the terminal edge shows no seam. */
+@define-color roost_chrome_bg #282828;
+
+/* Paint the sidebar column at the chrome gray. A plain GtkBox is
+ * transparent by default, so without this the libadwaita window bg
+ * (~#1f1f1f) shows through. The inner scroller/list are transparent
+ * (below) so this fill is what the user sees. */
+box.roost-sidebar {
+  background-color: @roost_chrome_bg;
+}
+/* Sidebar inner views are transparent in BOTH modes so the box fill
+ * (opaque) — or, when translucent, the alpha tint — shows through,
+ * including the viewport a GtkScrolledWindow may insert. */
+box.roost-sidebar scrolledwindow,
+box.roost-sidebar viewport,
+box.roost-sidebar .navigation-sidebar,
+box.roost-sidebar list {
+  background-color: transparent;
+  background-image: none;
+}
+
+/* The toolbar top row (tabs + window controls) is SOLID chrome gray — the
+ * Mac UI's top bar is opaque, with only the sidebar carrying vibrancy.
+ * Without this the translucent window (see the .roost-translucent block)
+ * shows straight through the top row, which reads as "very transparent".
+ *
+ * Pinned in BOTH the focused and unfocused (:backdrop) states — when the
+ * window is inactive GTK applies :backdrop, and without an explicit rule the
+ * transparent window bg shows through again. The WindowHandle wrapper
+ * (.roost-titlebar) is pinned too so no seam shows around the row. */
+.roost-tabrow,
+.roost-tabrow:backdrop,
+.roost-titlebar,
+.roost-titlebar:backdrop,
+/* Also pin the AdwToolbarView's own top-bar container (behind the row) so the
+ * transparent window can't show through around it, focused or backdrop. */
+toolbarview > .top-bar,
+toolbarview > .top-bar:backdrop {
+  background-color: @roost_chrome_bg;
+}
+
 /* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
  * (the name Stack), inset ~6px/1px to match the Mac UI's
  * `bounds.insetBy(dx:6, dy:1)` + 6px-radius pill. Drawing on the child
@@ -67,9 +114,116 @@
 }
 
 /* Tab bar: subtle accent tint on the checked tab. Only restyle the
- * tab body — leave the close button + indicator dot to libadwaita. */
+ * tab body — leave the close button + indicator dot to libadwaita.
+ * (Retained as the Path-B fallback; the custom strip below is Path A.) */
 tabbar tab:checked {
   background: alpha(@accent_bg_color, 0.18);
+}
+
+/* ---- Custom tab strip (Mac-style pills) -------------------------------
+ * A horizontal GtkBox of pill widgets (one per tab) reacting to the
+ * project's AdwTabView, mirroring the Mac UI's TabPillView strip
+ * (mac/Sources/Roost/App.swift). The AdwTabView stays the model; these
+ * are a pure view of it. Spacing 6px = Mac tab gap. */
+.roost-tab-strip {
+  padding: 3px 4px;
+}
+/* Pill: 24px tall, 6px radius (Mac TabPillView). Inactive = transparent
+ * with a dimmed label; hover gets a faint wash; active = a SOLID blue fill
+ * + white label.
+ *
+ * HARDCODED #007aff (NOT @accent_bg_color): the active tab must read as the
+ * SAME blue as the Mac, whose pill is NSColor.controlAccentColor (#007aff).
+ * @accent_bg_color follows the host desktop accent, which isn't always blue —
+ * on COSMIC it's teal, so the pill came out cyan, way off from the Mac. Same
+ * rationale as the #12509d sidebar-selection hardcode above. The Mac draws the
+ * pill at 18% alpha over a WHITE titlebar (reads pale blue); our chrome is dark
+ * (#282828), where a tint reads gray and too close to the #12509d project pill,
+ * so we use the accent at full strength to stay clearly, distinctly blue. */
+.roost-tab-pill {
+  border-radius: 6px;
+  padding: 0 4px 0 8px;
+  min-height: 24px;
+  /* Floor the pill width so a project with many tabs shrinks-and-truncates to
+   * a readable minimum (icon + a few chars) and THEN overflows the tab
+   * scroller (which scrolls) — without a floor the pills collapse to an
+   * unreadable "..." to fit. Mirrors the Mac TabPillView's min-width bound. */
+  min-width: 72px;
+  background-color: transparent;
+}
+.roost-tab-pill:hover {
+  background-color: alpha(currentColor, 0.10);
+}
+.roost-tab-pill.active {
+  background-color: #007aff;
+}
+.roost-tab-pill label.roost-tab-pill-label {
+  color: #d1d1d1;
+  margin: 0 4px;
+}
+.roost-tab-pill.active label.roost-tab-pill-label {
+  color: #ffffff;
+}
+/* Leading status dot (running/needs-input/idle), 8px circle. No class =
+ * no fill (the "none" state); the colour classes mirror the rollup +
+ * indicator SVGs. The element keeps its slot so pills don't reflow when a
+ * dot appears/clears. */
+.roost-tab-pill-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 4px;
+  background-color: transparent;
+}
+.roost-tab-pill-dot.running { background-color: #5fa3f0; }
+.roost-tab-pill-dot.needs-input { background-color: #f0a040; }
+.roost-tab-pill-dot.idle { background-color: #7a7a7a; }
+/* Trailing close button: flat, only visible on the active/hovered pill
+ * (set via .visible in code). Compact so the pill stays Mac-sized. */
+.roost-tab-pill-close {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0;
+  border-radius: 4px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: #d1d1d1;
+}
+.roost-tab-pill-close:hover {
+  background-color: alpha(#ffffff, 0.12);
+}
+/* Trailing notification badge on inactive notified tabs (Mac blue dot).
+ * Hardcoded #007aff for the same reason as the active pill above — the Mac
+ * dot is controlAccentColor (#007aff); @accent_bg_color would render it teal
+ * on COSMIC. */
+.roost-tab-pill-badge {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 4px;
+  background-color: #007aff;
+  margin: 0 2px;
+}
+/* Inline-rename entry inside a pill: frameless, sized to stay on the pill
+ * baseline without growing its height (mirrors the sidebar rename entry). */
+.roost-tab-pill entry.roost-tab-pill-entry {
+  min-height: 20px;
+  padding: 0 4px;
+  margin: 0 2px;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  color: #ffffff;
+  caret-color: #ffffff;
+}
+/* The stripped entry has no default focus ring; give the editing field a
+ * visible state (subtle sunken fill + hairline) so an inline rename is
+ * obvious and easy to keep track of. */
+.roost-tab-pill entry.roost-tab-pill-entry:focus,
+.roost-tab-pill entry.roost-tab-pill-entry:focus-within {
+  background-color: alpha(#000000, 0.35);
+  box-shadow: inset 0 0 0 1px alpha(#ffffff, 0.30);
 }
 
 /* Sidebar section header above the project list. Brighter + bolder to
@@ -113,14 +267,14 @@ button.roost-add-project:active {
  * footer — keeps the top of the sidebar solid (like the Mac UI) instead of
  * letting the translucent tint show through behind the label. */
 .roost-sidebar-header {
-  background-color: #1e1e1e;
+  background-color: @roost_chrome_bg;
 }
 
 /* Footer band holding the "+ New Project" button — a solid strip with a
  * hairline top separator, mirroring the Mac UI's footer. Stays opaque even
  * when the sidebar is translucent, so the button never sits over glass. */
 .roost-sidebar-footer {
-  background-color: #1e1e1e;
+  background-color: @roost_chrome_bg;
   border-top: 1px solid alpha(#ffffff, 0.06);
   padding: 8px;
 }
@@ -251,31 +405,21 @@ window.roost-translucent {
   background-color: transparent;
 }
 window.roost-translucent box.roost-sidebar {
-  background-color: alpha(#1e1e1e, 0.95);
+  background-color: alpha(@roost_chrome_bg, 0.95);
 }
-/* Every node stacked on the tint must be transparent or its opaque
- * view background hides the tint — including the viewport a
- * GtkScrolledWindow may insert. */
-window.roost-translucent box.roost-sidebar scrolledwindow,
-window.roost-translucent box.roost-sidebar viewport,
-window.roost-translucent box.roost-sidebar .navigation-sidebar,
-window.roost-translucent box.roost-sidebar list {
-  background-color: transparent;
-  background-image: none;
-}
+/* (The sidebar inner views are made transparent unconditionally near the
+ * top of this sheet, so the alpha tint shows through in this mode too —
+ * no translucent-gated copy needed here.) */
 window.roost-translucent overlay,
 window.roost-translucent paned {
   background-color: transparent;
 }
-/* Keep the chrome + right pane fully OPAQUE. */
-window.roost-translucent headerbar {
-  background-color: #1e1e1e;
-}
+/* Keep the right-pane seam fully OPAQUE. (The top row is opaqued
+ * unconditionally via .roost-tabrow above; the AdwHeaderBar is gone.) */
 window.roost-translucent paned > separator {
   background-color: #1e1e1e;
 }
 window.roost-translucent .roost-tab-stack,
-window.roost-translucent .roost-tab-stack tabview,
-window.roost-translucent .roost-tab-stack tabbar {
+window.roost-translucent .roost-tab-stack tabview {
   background-color: #1e1e1e;
 }
