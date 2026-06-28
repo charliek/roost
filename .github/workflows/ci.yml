@@ -504,6 +504,99 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Functional E2E against the GTK UI under a headless WAYLAND compositor
+  # (weston) — the twin of e2e-gtk-under-Xvfb. Exists because GTK's
+  # GDK-Wayland backend (gdksurface-wayland.c) is ONLY exercised here: the
+  # Xvfb job forces GDK_BACKEND=x11, so Wayland-only bugs (e.g. the DnD
+  # drag-icon-surface frame_callback abort that crashed tab reorder on
+  # COSMIC) are invisible to it.
+  #
+  # NON-BLOCKING for now (continue-on-error + absent from ci-success) while
+  # we triage the real-runner Wayland pass profile — Wayland clipboard +
+  # selection semantics differ from X11, so a few OSC52/selection tests may
+  # legitimately diverge. Promote into ci-success once the profile is clean
+  # (mirrors the "real-click focus regression" gather-signal-then-promote
+  # pattern above). weston headless drives the IPC suite, not pointer input;
+  # gesture-level drag testing needs ydotool + /dev/uinput, tracked separately.
+  e2e-gtk-wayland:
+    needs: changes
+    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GTK4 + libadwaita + weston + zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev weston wl-clipboard zsh
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build the GTK UI
+        run: cargo build -p roost-linux
+
+      - name: Run E2E (GTK under headless Wayland / weston)
+        continue-on-error: true
+        env:
+          RUST_LOG: warn
+          ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
+          ROOST_TEST_MODE: "1"
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-e2e-wl-logs
+        # weston-run.sh boots a headless weston, points GDK at it
+        # (GDK_BACKEND=wayland) and runs the same IPC-driven suite — tab.dump
+        # reads in-process render state, so no screen capture is involved.
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
+
+      - name: Collect failure diagnostics
+        if: always()
+        run: |
+          mkdir -p diagnostics
+          cp "${RUNNER_TEMP}"/roost-e2e-wl-logs/*.log diagnostics/ 2>/dev/null || true
+          ls -la diagnostics || true
+
+      - name: Upload E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-gtk-wayland-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Functional E2E against the real Swift app, driven through the IPC op
   # set by the pytest harness (tools/roosttest) — the Mac twin of e2e-gtk.
   # Required (in ci-success). The harness clears any stale instance before
