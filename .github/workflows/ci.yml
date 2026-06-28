@@ -400,7 +400,13 @@ jobs:
       # warnings don't fail the build; rust-lint excludes roost-linux because it
       # needs the GTK toolchain that this job already has.
       - name: No reintroduced GtkDnD reorder (clippy disallowed-types)
-        run: cargo clippy -p roost-linux --all-targets -- -D clippy::disallowed_types
+        # `-A warnings` first: roost-linux is NOT clippy-clean (that's exactly
+        # why rust-lint excludes it), and the toolchain action sets
+        # RUSTFLAGS=-D warnings — so without allowing the rest, every
+        # pre-existing clippy lint would error here. We deny ONLY the
+        # disallowed_types guard (it survives the `-A warnings` as a later,
+        # more-specific flag).
+        run: cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types
 
   # Functional E2E: launch the real GTK UI headless under Xvfb and drive
   # it through the IPC op set with the pytest harness (tools/roosttest).
