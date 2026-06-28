@@ -391,19 +391,16 @@ jobs:
 
       # Regression guard: tab + project reorder were converted from GtkDnD to
       # GtkGestureDrag because the DnD drag-icon surface aborts the process on
-      # Wayland (gdksurface-wayland.c:348:frame_callback). Reintroducing the DnD
-      # types would bring the crash back — and synthetic input can't reliably
-      # reproduce it in CI, so guard it statically here (zero-runtime,
-      # zero-flaky). GestureDrag's own `connect_drag_begin` is fine; only the
-      # DnD transport types are forbidden. The terminal's text-selection
-      # GestureDrag is unaffected.
-      - name: No reintroduced GtkDnD reorder (use GestureDrag)
-        run: |
-          if grep -rnE 'DragSource::new|DropTarget::new|gtk4::DragSource|gtk4::DropTarget|ContentProvider::for_value' crates/roost-linux/src/; then
-            echo "::error::GtkDnD types found in roost-linux — tab/project reorder must use GtkGestureDrag (DnD drag-icon surface aborts on Wayland). See #236."
-            exit 1
-          fi
-          echo "ok: no GtkDnD transport types in roost-linux"
+      # Wayland (gdksurface-wayland.c:348:frame_callback), and synthetic input
+      # can't reliably reproduce that in CI. clippy's disallowed-types (see
+      # clippy.toml) forbids the DnD transport types semantically — it resolves
+      # real references, so it ignores the comments that name those types and
+      # catches builder/glob-import forms a text grep would miss. Only
+      # disallowed_types is denied, so roost-linux's other (un-linted) clippy
+      # warnings don't fail the build; rust-lint excludes roost-linux because it
+      # needs the GTK toolchain that this job already has.
+      - name: No reintroduced GtkDnD reorder (clippy disallowed-types)
+        run: cargo clippy -p roost-linux --all-targets -- -D clippy::disallowed_types
 
   # Functional E2E: launch the real GTK UI headless under Xvfb and drive
   # it through the IPC op set with the pytest harness (tools/roosttest).
@@ -613,13 +610,15 @@ jobs:
         # `timeout-minutes` is the belt-and-suspenders cap so a future hang can
         # never run away again (continue-on-error swallows the timed-out step).
         # --timeout: per-test hard cap (pytest-timeout) so one hung test fails
-        # in ~90s instead of consuming the whole step (that's what ran the job
-        # to 22m). `thread` method dumps the stack + fails without relying on
-        # SIGALRM landing in a GTK/IPC C call.
+        # fast instead of consuming the whole step (that's what ran the job to
+        # 22m). Derived from the same ROOST_TEST_TIMEOUT_SCALE the harness uses
+        # (30s base * 3 = 90s) so the one knob meant to absorb runner variance
+        # doesn't get bypassed. `thread` method dumps the stack + fails without
+        # relying on SIGALRM landing in a GTK/IPC C call.
         run: >
           tools/wayland/weston-run.sh
           uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
-          --timeout=90 --timeout-method=thread
+          --timeout=$((30 * ROOST_TEST_TIMEOUT_SCALE)) --timeout-method=thread
           --ignore=tools/roosttest/test_osc52.py
           --ignore=tools/roosttest/test_selection.py
           --ignore=tools/roosttest/test_shell_integration.py
