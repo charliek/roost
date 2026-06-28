@@ -1604,27 +1604,32 @@ impl App {
             let ns = name_stack.clone();
             let root = root.clone();
             move |g, off_x, off_y| {
-                if app.dragged_tab_id.borrow().is_some() {
-                    return; // already armed (this drag or, defensively, another)
+                // Arm once past the threshold; until then it stays a click.
+                if *app.dragged_tab_id.borrow() != Some(tab_id) {
+                    if app.dragged_tab_id.borrow().is_some() {
+                        return; // a different pill is mid-drag
+                    }
+                    // Don't hijack an inline-rename — the entry owns the pointer.
+                    if ns.visible_child_name().as_deref() == Some("entry") {
+                        return;
+                    }
+                    // Stay a click until past the drag threshold (~8px slop).
+                    if off_x.hypot(off_y) < 8.0 {
+                        return;
+                    }
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                    *app.dragged_tab_id.borrow_mut() = Some(tab_id);
+                    root.set_opacity(0.4);
                 }
-                // Don't hijack an inline-rename — the entry owns the pointer.
-                if ns.visible_child_name().as_deref() == Some("entry") {
-                    return;
-                }
-                // Stay a click until past the drag threshold (GTK's default
-                // click-slop is ~8px).
-                if off_x.hypot(off_y) < 8.0 {
-                    return;
-                }
-                g.set_state(gtk4::EventSequenceState::Claimed);
-                *app.dragged_tab_id.borrow_mut() = Some(tab_id);
-                root.set_opacity(0.4);
+                // Armed: live-shuffle the strip under the pointer so the result
+                // is visible before release (matching the sidebar's feel).
+                app.live_reorder_pill(g, &root, project_id, tab_id);
             }
         });
         reorder.connect_drag_end({
             let app = self.clone();
             let root = root.clone();
-            move |g, off_x, off_y| {
+            move |g, _off_x, _off_y| {
                 // Only act if this pill armed a drag; otherwise it was a click
                 // (handled by the click gesture) and we must not reorder.
                 if *app.dragged_tab_id.borrow() != Some(tab_id) {
@@ -1632,17 +1637,10 @@ impl App {
                 }
                 root.set_opacity(1.0);
                 *app.dragged_tab_id.borrow_mut() = None;
-                // Final pointer position (start + offset, in pill coords) →
-                // strip coords → insertion index among the other pills.
-                if let Some((sx, sy)) = g.start_point() {
-                    if let Some(parent) = root.parent() {
-                        let pt =
-                            gtk4::graphene::Point::new((sx + off_x) as f32, (sy + off_y) as f32);
-                        if let Some(p) = root.compute_point(&parent, &pt) {
-                            app.drop_reorder_tab(project_id, tab_id, p.x() as f64);
-                        }
-                    }
-                }
+                // Settle the final slot (covers a release the last motion didn't
+                // reach), then persist the resulting order once.
+                app.live_reorder_pill(g, &root, project_id, tab_id);
+                app.persist_tab_order(project_id);
             }
         });
         root.add_controller(reorder);
@@ -1813,6 +1811,51 @@ impl App {
         if let Some(page) = src_page {
             ui.tab_view.reorder_page(&page, idx);
         }
+    }
+
+    /// Live-shuffle during a pill drag: move the dragged page to the slot under
+    /// the gesture's *current* pointer, with the reorder RPC echo suppressed so
+    /// the strip reshuffles continuously and the write happens once on drop.
+    /// Reads the gesture's live point (not start+offset) so the index stays
+    /// correct as the dragged pill itself snaps between slots under the cursor —
+    /// start+offset would lag by a pill width after each move and oscillate.
+    fn live_reorder_pill(
+        self: &Rc<Self>,
+        g: &gtk4::GestureDrag,
+        root: &gtk4::Box,
+        project_id: i64,
+        tab_id: i64,
+    ) {
+        let Some((px, py)) = g.point(None) else {
+            return;
+        };
+        let Some(parent) = root.parent() else {
+            return;
+        };
+        let pt = gtk4::graphene::Point::new(px as f32, py as f32);
+        let Some(p) = root.compute_point(&parent, &pt) else {
+            return;
+        };
+        *self.suppress_tab_reorder_echo.borrow_mut() = true;
+        self.drop_reorder_tab(project_id, tab_id, p.x() as f64);
+        *self.suppress_tab_reorder_echo.borrow_mut() = false;
+    }
+
+    /// Persist `project_id`'s current AdwTabView page order via the reorder RPC.
+    /// The pill drag live-shuffles with the echo suppressed, so it calls this
+    /// once on drop to write the settled order.
+    fn persist_tab_order(self: &Rc<Self>, project_id: i64) {
+        let Some(tv) = self.project_tab_view(project_id) else {
+            return;
+        };
+        let n = tv.n_pages();
+        let mut ordered = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            if let Some(tab_id) = parse_tab_id_from_page(&tv.nth_page(i)) {
+                ordered.push(tab_id);
+            }
+        }
+        self.reorder_tabs_async(project_id, ordered);
     }
 
     // ----- M8 + M9: rename / delete project flow -------------------
