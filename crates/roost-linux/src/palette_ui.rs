@@ -207,6 +207,7 @@ impl PaletteOverlay {
         overlay.add_overlay(&card);
 
         inner.sync_ui();
+        #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
         entry.grab_focus();
         // Arm focus-out dismissal only after the current main-loop
         // iteration settles, so the grab above can't trip it.
@@ -487,6 +488,7 @@ impl PaletteInner {
                     .insert(frame.id.clone(), behavior);
                 self.state.borrow_mut().push(frame);
                 self.sync_ui();
+                #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
                 self.entry.grab_focus();
             }
             PaletteOutcome::None => {}
@@ -509,6 +511,7 @@ impl PaletteInner {
                 }
                 self.behaviors.borrow_mut().remove(&frame.id);
                 self.sync_ui();
+                #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
                 self.entry.grab_focus();
             }
             None => self.dismiss(false),
@@ -522,6 +525,16 @@ impl PaletteInner {
             return;
         }
         self.closing.set(true);
+        // Sever the toplevel focus from the card subtree while it is still
+        // parented. Removing an overlay child that still holds the window
+        // focus leaves a dangling focus pointer, and the next focus
+        // transition then walks that dead widget → the #234 `GTK_IS_WIDGET`
+        // storm. Clearing here is the always-safe floor; `on_dismiss`
+        // re-grabs the terminal right after, so focus still lands where the
+        // user expects.
+        if let Some(root) = self.overlay.root() {
+            root.set_focus(gtk4::Widget::NONE);
+        }
         if !confirmed {
             let frame_ids: Vec<String> = self
                 .state
@@ -627,6 +640,7 @@ impl PaletteInner {
             .insert(frame.id.clone(), behavior);
         self.state.borrow_mut().push(frame);
         self.sync_ui();
+        #[allow(clippy::disallowed_methods)] // entry must always focus, not skip
         self.entry.grab_focus();
     }
 

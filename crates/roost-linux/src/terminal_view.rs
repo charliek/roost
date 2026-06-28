@@ -42,6 +42,7 @@ use roost_vt::{
 use crate::cell_metrics::{default_font_description, CellMetrics};
 use crate::clipboard;
 use crate::config::CopyOnSelect;
+use crate::focus::safe_grab_focus;
 use crate::key_encoder;
 use crate::keybind::{self, AccelMods};
 use crate::paste_image;
@@ -920,7 +921,7 @@ impl TerminalView {
         focus_click.connect_pressed({
             let widget = widget.clone();
             move |_gesture, _n_press, _x, _y| {
-                widget.grab_focus();
+                safe_grab_focus(&widget);
             }
         });
         widget.add_controller(focus_click);

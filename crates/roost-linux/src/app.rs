@@ -36,6 +36,7 @@ use crate::config;
 use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
+use crate::focus::safe_grab_focus;
 use crate::keybind::{
     canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
 };
@@ -1540,8 +1541,15 @@ impl App {
                     // Box pills aren't focusable, so the terminal keeps GTK
                     // focus across the switch; re-grab the now-active tab's
                     // terminal so typing goes to it. (A double-click's rename
-                    // below grabs the entry afterwards, so it wins.)
-                    app.focus_active_terminal();
+                    // below grabs the entry afterwards, so it wins.) Deferred to
+                    // an idle tick — parity with the sidebar selection path — so
+                    // the grab lands after the page switch settles (a synchronous
+                    // grab can be stranded mid-transition). The #234 crash itself
+                    // is prevented by the focus-ownership guards in
+                    // `focus_active_terminal` / palette dismiss; this defer only
+                    // makes focus reliably stick on the new page.
+                    let app = app.clone();
+                    glib::idle_add_local_once(move || app.focus_active_terminal());
                 }
                 if n == 2 {
                     app.begin_rename_tab(project_id, tab_id);
@@ -1891,6 +1899,7 @@ impl App {
         };
         ui.sidebar_entry.set_text(&ui.name);
         ui.sidebar_name_stack.set_visible_child_name("entry");
+        #[allow(clippy::disallowed_methods)] // rename entry must always focus, not skip
         ui.sidebar_entry.grab_focus();
         ui.sidebar_entry.select_region(0, -1);
     }
@@ -2062,6 +2071,7 @@ impl App {
             // entry keeps focus instead of the terminal stealing it back.
             let entry = pill.entry.clone();
             glib::idle_add_local_once(move || {
+                #[allow(clippy::disallowed_methods)] // rename entry must always focus, not skip
                 entry.grab_focus();
                 entry.select_region(0, -1);
             });
@@ -2137,8 +2147,18 @@ impl App {
     /// post-attach hook so post-chrome-interaction the user can
     /// resume typing without an extra mouse click.
     fn focus_active_terminal(self: &Rc<Self>) {
+        // While a palette is open it owns the keyboard (mirroring the
+        // shortcut suppression in `dispatch_action`). Grabbing the terminal
+        // here would transition focus off the palette's entry; if that entry
+        // is mid-teardown the focus walk hits a dead widget → the #234
+        // `gtk_widget_get_parent: GTK_IS_WIDGET` storm/crash. `dismiss_palette`
+        // clears `self.palette` *before* it refocuses, so the legitimate
+        // post-dismiss grab still runs.
+        if self.palette.borrow().is_some() {
+            return;
+        }
         if let Some(view) = self.active_terminal_view() {
-            view.widget().grab_focus();
+            safe_grab_focus(view.widget());
         }
     }
 
@@ -2660,9 +2680,14 @@ impl App {
             });
         });
 
-        // Focus the new tab.
+        // Focus the new tab — unless a palette currently owns focus. An attach
+        // landing while the palette is open (e.g. a late/background attach) must
+        // not steal focus from it; the palette's dismiss refocuses the active
+        // terminal, matching the `focus_active_terminal` ownership guard (#234).
         self.select_page_programmatic(&ui.tab_view, &page);
-        terminal.widget().grab_focus();
+        if self.palette.borrow().is_none() {
+            safe_grab_focus(terminal.widget());
+        }
         drop(projects);
     }
 

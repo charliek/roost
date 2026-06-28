@@ -16,6 +16,13 @@ import ui
 from client import Roost
 
 
+# GLib domain `*-CRITICAL` lines that are known-benign under the headless e2e
+# environment. Curate from a baseline run — currently EMPTY: the full GTK suite
+# is critical-clean. Add entries as a tight substring + a `# reason`, mirroring
+# the clippy.toml guards, only after confirming the line is environmental.
+_GTK_CRITICAL_ALLOWLIST: list[str] = []
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--roost-target", action="store", default=None, choices=list(ui.TARGETS),
@@ -55,9 +62,33 @@ def _ui_session(target, fresh):
     # (launched it with a throwaway state dir); only then do we quit it +
     # clean up at teardown. A reused dev UI is left running and untouched.
     started_here = ui.start_session(target, fresh=fresh)
+    # Capture the captured-log path up front: `end_session` clears the global,
+    # but the file persists, so the #234 critical gate below can read it after
+    # the UI has fully stopped (complete log, including shutdown-time lines).
+    gtk_log = ui._GTK_LOG if (started_here and target == "gtk") else None
     yield
     if started_here:
         ui.end_session(target)
+    # Gate (#234): with the harness-owned GTK UI now stopped, fail the session
+    # if it emitted any non-allowlisted GLib `*-CRITICAL`. The focus crash was a
+    # `Gtk-CRITICAL` storm no individual test would fail on (a critical doesn't
+    # fail a test on its own); this is the cheap permanent net the panel asked
+    # for. Folded into this fixture — rather than a separate one — so the scan
+    # runs deterministically AFTER `end_session`, not on fragile cross-fixture
+    # teardown order. Surfaces as an ERROR-at-teardown (still a non-zero exit).
+    # (`G_DEBUG=fatal-criticals` as a separate diagnostic lane is a follow-up.)
+    if gtk_log is not None and gtk_log.exists():
+        bad = [
+            line
+            for line in gtk_log.read_text(errors="replace").splitlines()
+            if "-CRITICAL **:" in line
+            and not any(allow in line for allow in _GTK_CRITICAL_ALLOWLIST)
+        ]
+        assert not bad, (
+            f"{len(bad)} non-allowlisted GLib *-CRITICAL line(s) in the GTK UI "
+            "log — a focus/teardown regression like #234 surfaces here. "
+            "First 20:\n" + "\n".join(bad[:20])
+        )
 
 
 @pytest.fixture
