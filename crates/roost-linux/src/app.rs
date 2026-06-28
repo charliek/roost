@@ -1405,36 +1405,12 @@ impl App {
             .spacing(6)
             .css_classes(["roost-tab-strip"])
             .build();
-        // Drop target for pill drag-reorder: the payload is the dragged tab id
-        // (set by each pill's DragSource); on drop we move its page to the
-        // pointer's insertion index.
-        let drop = gtk4::DropTarget::new(glib::types::Type::I64, gtk4::gdk::DragAction::MOVE);
-        // Keep advertising MOVE for the whole hover so GTK actually delivers
-        // the drop — without a motion handler the target highlights (the user
-        // sees the blue outline) but the ::drop never fires. The sidebar's
-        // working DropTarget has the same motion handler.
-        drop.connect_motion(|_, _, _| gtk4::gdk::DragAction::MOVE);
-        drop.connect_drop({
-            let app = self.clone();
-            let project_id = project.id;
-            // Source of truth is `dragged_tab_id` (set at drag-begin), not the
-            // transported value — mirroring the sidebar drop target. The value
-            // is read only as a foreign-content guard (reject e.g. a file drop
-            // from the file manager); the reorder itself must not hinge on the
-            // drop-time i64 load, which can fail on some backends even after the
-            // motion highlight showed.
-            move |_, value, x, _| {
-                if value.get::<i64>().is_err() {
-                    return false;
-                }
-                let Some(src_tab) = *app.dragged_tab_id.borrow() else {
-                    return false;
-                };
-                app.drop_reorder_tab(project_id, src_tab, x);
-                true
-            }
-        });
-        tab_strip.add_controller(drop);
+        // Reorder is driven by each pill's GtkGestureDrag (see build_tab_pill),
+        // not GTK DnD — so the strip needs no DropTarget. The old DragSource +
+        // DropTarget pair crashed the whole process on Wayland: GTK's drag-icon
+        // surface tripped a `gdksurface-wayland.c:348:frame_callback` assertion
+        // (a frame callback delivered to an already-destroyed surface), and the
+        // press routinely lost the race to the window-move handle.
         self.bar_stack
             .add_named(&tab_strip, Some(&stack_name(project.id)));
 
@@ -1609,39 +1585,67 @@ impl App {
         });
         entry.add_controller(focus);
 
-        // Drag-to-reorder: payload = tab_id; suppressed while the pill is in
-        // inline-rename mode (the entry owns focus + pointer). The strip's
-        // DropTarget moves the page; page-reordered resyncs pills + fires RPC.
-        let drag = gtk4::DragSource::new();
-        drag.set_actions(gtk4::gdk::DragAction::MOVE);
-        drag.connect_prepare({
+        // Pointer-drag reorder (NOT GTK DnD). A GtkGestureDrag arms once the
+        // pointer crosses a small threshold, claims the event sequence (so the
+        // click gesture is cancelled and the window-move handle never sees the
+        // press — fixing "dragging a pill moves the whole window"), then on
+        // release moves the page via the proven-stable `reorder_page`
+        // (drop_reorder_tab). This replaces the DragSource/DropTarget, whose
+        // Wayland drag-icon surface aborted the process in
+        // `gdksurface-wayland.c:348:frame_callback`. Plain pointer events mean
+        // no drag surface — and unlike DnD it is reproducible with synthetic
+        // input (xdotool/uinput), so CI can gate it. `dragged_tab_id` doubles
+        // as the "armed past threshold" marker: a sub-threshold press stays
+        // unclaimed and falls through to the click gesture (select / rename).
+        let reorder = gtk4::GestureDrag::new();
+        reorder.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        reorder.connect_drag_update({
+            let app = self.clone();
             let ns = name_stack.clone();
-            move |_, _, _| {
-                if ns.visible_child_name().as_deref() == Some("entry") {
-                    return None;
+            let root = root.clone();
+            move |g, off_x, off_y| {
+                if app.dragged_tab_id.borrow().is_some() {
+                    return; // already armed (this drag or, defensively, another)
                 }
-                Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
-                    tab_id,
-                )))
-            }
-        });
-        drag.connect_drag_begin({
-            let root = root.clone();
-            let app = self.clone();
-            move |_, _| {
+                // Don't hijack an inline-rename — the entry owns the pointer.
+                if ns.visible_child_name().as_deref() == Some("entry") {
+                    return;
+                }
+                // Stay a click until past the drag threshold (GTK's default
+                // click-slop is ~8px).
+                if off_x.hypot(off_y) < 8.0 {
+                    return;
+                }
+                g.set_state(gtk4::EventSequenceState::Claimed);
                 *app.dragged_tab_id.borrow_mut() = Some(tab_id);
-                root.set_opacity(0.4)
+                root.set_opacity(0.4);
             }
         });
-        drag.connect_drag_end({
-            let root = root.clone();
+        reorder.connect_drag_end({
             let app = self.clone();
-            move |_, _, _| {
+            let root = root.clone();
+            move |g, off_x, off_y| {
+                // Only act if this pill armed a drag; otherwise it was a click
+                // (handled by the click gesture) and we must not reorder.
+                if *app.dragged_tab_id.borrow() != Some(tab_id) {
+                    return;
+                }
+                root.set_opacity(1.0);
                 *app.dragged_tab_id.borrow_mut() = None;
-                root.set_opacity(1.0)
+                // Final pointer position (start + offset, in pill coords) →
+                // strip coords → insertion index among the other pills.
+                if let Some((sx, sy)) = g.start_point() {
+                    if let Some(parent) = root.parent() {
+                        let pt =
+                            gtk4::graphene::Point::new((sx + off_x) as f32, (sy + off_y) as f32);
+                        if let Some(p) = root.compute_point(&parent, &pt) {
+                            app.drop_reorder_tab(project_id, tab_id, p.x() as f64);
+                        }
+                    }
+                }
             }
         });
-        root.add_controller(drag);
+        root.add_controller(reorder);
 
         // Right-click context menu — Rename / Close. Replaces the AdwTabBar's
         // setup-menu (gone with the bar); a small flat popover anchored at the
