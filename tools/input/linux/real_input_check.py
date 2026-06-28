@@ -152,16 +152,18 @@ def _screenshot(rc, out: Path, retries: int = 10) -> None:
 
 
 def _active_pill(rc, tmp: Path):
-    """Center of the active tab pill (accent fill #007aff) in the top strip, or
-    None. Cropped to the top band so the similar-blue sidebar selection lower
-    down can't pollute it; requires a real fill, not a few antialiased pixels."""
+    """Center of the active tab pill (Mac-parity fill #243751) in the tab strip,
+    or None. The strip now sits below the AdwHeaderBar, so crop the header + tab
+    band (y<100, above the project rows) to keep the sidebar selection (#13509d)
+    out; tolerance is tight enough to exclude the #282828 chrome (Chebyshev 41
+    away); requires a real fill, not a few antialiased pixels."""
     shot = tmp / "pill.png"
     _screenshot(rc, shot)
     w = int(_png(["info", str(shot)]).split()[0])
     crop = tmp / "pill_top.png"
     subprocess.run([sys.executable, str(PNGTOOL), "crop", str(shot), str(crop),
-                    "0", "0", str(w), "60"], check=True, capture_output=True)
-    box = _png(["findcolor", str(crop), "0", "122", "255", "60"]).split()
+                    "0", "0", str(w), "100"], check=True, capture_output=True)
+    box = _png(["findcolor", str(crop), "36", "55", "81", "22"]).split()
     if box and box[0] != "none" and int(box[4]) >= 100:
         return int(box[5]), int(box[6])
     return None
@@ -203,6 +205,53 @@ def _locate_tab_pill(r, rc, tmp, tab_id: int):
 
 
 # --- focus / core-sync checks -------------------------------------------
+
+def _gtk_critical_lines(log_path: Path) -> list[str]:
+    """Roost-log lines that signal the #234 focus-walk storm — raw GTK criticals
+    (a few land before the rate-limiter engages) or the limiter's storm notice.
+    The uncapped raw stream is on stderr (DEVNULL here), so the file's
+    rate-limited view is what we scan."""
+    try:
+        text = log_path.read_text(errors="replace")
+    except FileNotFoundError:
+        return []
+    markers = ("GTK_IS_WIDGET", "Gtk-CRITICAL", "glib log storm")
+    return [ln for ln in text.splitlines() if any(m in ln for m in markers)]
+
+
+def _check_palette_chrome_click_no_storm(r, click, log_path: Path) -> None:
+    """#234-class regression. Open the command palette, then click a focus-taking
+    header button (the sidebar toggle — the same focus-out path as the
+    notification bell from the bug report). Pre-fix, focus leaving the palette
+    card for a chrome widget tore the card down *inside* GTK's in-flight
+    focus-move → a `gtk_widget_get_parent: GTK_IS_WIDGET` storm that pegged the
+    main loop and hung the UI. Assert the UI stays responsive, the palette
+    dismisses cleanly, and no GTK criticals are logged. Self-restores the
+    sidebar (the toggle click it uses also flips it) so it's order-independent."""
+    was_collapsed = bool(r.window_metrics().get("sidebar_collapsed"))
+    before = _gtk_critical_lines(log_path)
+    r.palette_open()
+    r._wait(lambda: bool(r.palette_state().get("open")), timeout=5.0 * SCALE,
+            what="command palette to open")
+    time.sleep(0.6 * SCALE)  # let the focus-out arming idle settle (armed=True)
+    click(*TOGGLE)
+    # The storm pegs the GTK main loop, so IPC ops (which hop to main) hang —
+    # a clean dismissal + a live identify round-trip proves no storm/hang.
+    r._wait(lambda: not bool(r.palette_state().get("open")), timeout=6.0 * SCALE,
+            what="palette to dismiss after a header click WITHOUT a focus-walk hang")
+    assert r.identify().get("pid"), "UI stopped answering identify after the chrome click"
+    new = [ln for ln in _gtk_critical_lines(log_path) if ln not in before]
+    assert not new, (
+        "palette chrome-click logged GTK criticals (the #234 focus-walk storm):\n"
+        + "\n".join(new[:6])
+    )
+    # Restore the sidebar the toggle click flipped, so later checks are unaffected.
+    if bool(r.window_metrics().get("sidebar_collapsed")) != was_collapsed:
+        click(*TOGGLE)
+        r._wait(lambda: bool(r.window_metrics().get("sidebar_collapsed")) == was_collapsed,
+                timeout=3.0 * SCALE, what="sidebar to restore after the no-storm check")
+    print("  palette chrome-click no-storm OK")
+
 
 def _check_click_to_focus(r, click, wait_tab_attached) -> None:
     """F1: clicking the terminal body grabs keyboard focus."""
@@ -496,6 +545,9 @@ def main() -> int:
             _check_cycle_tab_syncs_core(r, send_key, wait_tab_attached)
             _check_pill_click_syncs_core(r, click, rc, run, wait_tab_attached)
             _check_tab_context_menu_no_crash(r, rclick, send_key, rc, run, wait_tab_attached)
+            # palette teardown must not race a chrome focus-grab (#234); self-
+            # restores the sidebar so the drag checks below are unaffected.
+            _check_palette_chrome_click_no_storm(r, click, state / "roost" / "roost.log")
             # drag reorder (real pointer through the gesture stack)
             subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=env_x, check=False)
             _check_sidebar_reorder(r, rc, env_x, run, roost)
@@ -524,8 +576,8 @@ def main() -> int:
         shutil.rmtree(run, ignore_errors=True)
 
     print("PASS: focus + core-sync (click-to-focus, project switch, Alt+digit, "
-          "Ctrl+PageDown, cycle_tab, pill click, context menu) and drag reorder "
-          "(tab + sidebar) all verified")
+          "Ctrl+PageDown, cycle_tab, pill click, context menu), drag reorder "
+          "(tab + sidebar), and palette chrome-click no-storm all verified")
     return 0
 
 

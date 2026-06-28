@@ -303,13 +303,15 @@ impl PaletteInner {
             }
         });
 
-        // Click-catcher → dismiss (revert).
+        // Click-catcher → dismiss (revert). Deferred (see `schedule_dismiss`):
+        // the press also yanks focus out of the entry, so teardown must not
+        // race GTK's focus-move.
         let click = gtk4::GestureClick::new();
         click.connect_pressed({
             let weak = Rc::downgrade(self);
             move |_, _, _, _| {
                 if let Some(inner) = weak.upgrade() {
-                    inner.dismiss(false);
+                    inner.schedule_dismiss();
                 }
             }
         });
@@ -351,7 +353,7 @@ impl PaletteInner {
             move |_| {
                 if let Some(inner) = weak.upgrade() {
                     if inner.armed.get() && !inner.closing.get() {
-                        inner.dismiss(false);
+                        inner.schedule_dismiss();
                     }
                 }
             }
@@ -520,6 +522,33 @@ impl PaletteInner {
 
     /// Tear down. When not confirmed, fire `on_cancel` for every frame
     /// still on the stack (top-down) so an in-flight preview reverts.
+    /// Defer a dismissal to the next idle tick. `connect_leave` and the catcher
+    /// press both fire from inside a GTK input callback: when focus leaves
+    /// because the user clicked a focus-taking widget *outside* the card (e.g.
+    /// the header notification bell), `connect_leave` runs *during* GTK's
+    /// in-flight entry→other focus move. Tearing the card down there —
+    /// `dismiss` severs focus + removes the overlay — mutates the widget tree
+    /// GTK is still walking → the #234 `gtk_widget_get_parent: GTK_IS_WIDGET`
+    /// focus-walk storm. Running on idle lets the move settle first, so
+    /// `dismiss` operates on a stable tree (the same defer the arming + the
+    /// scroll-into-view above already use for this hazard class). Interim
+    /// hardening; #241's toolkit-managed surface removes the need. Re-checks
+    /// `closing` at run time so a racing synchronous dismiss (Escape / confirm)
+    /// wins once.
+    fn schedule_dismiss(self: &Rc<Self>) {
+        if self.closing.get() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(inner) = weak.upgrade() {
+                if !inner.closing.get() {
+                    inner.dismiss(false);
+                }
+            }
+        });
+    }
+
     fn dismiss(self: &Rc<Self>, confirmed: bool) {
         if self.closing.get() {
             return;
