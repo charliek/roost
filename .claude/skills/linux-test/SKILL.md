@@ -37,6 +37,61 @@ A green run ends with `PASS: Wayland pointer-drag guard — no surface abort`
 (preceded by a `sidebar reorder OK: …` line — the hard gate). That mirrors CI's
 non-blocking `e2e-gtk-wayland-drag` job — same signal, locally, before you push.
 
+## Other tiers in the shed (beyond the drag guard)
+
+`shed-test.sh` runs only the **Wayland drag guard**. The full **pytest `e2e-gtk`
+suite** and the **real-input (XTEST) checks** need extra env knobs — each cost a
+debugging cycle, so they're recorded here.
+
+### pytest e2e-gtk (the required CI gate)
+The pytest harness (`tools/roosttest/ui.py`) **hardcodes `target/debug/roost`**
+(it does NOT read `ROOST_BIN`) and `cargo build`s into it if missing — which on
+the VirtioFS mount is the Mac's arm64 **mach-O** (won't exec on Linux) and would
+clobber the Mac `target/`. So **bind-mount the shed-local Linux binaries over it**
+(guest-namespace only, never written to the mount), like `build-in-shed.sh` does
+for ghostty:
+
+```bash
+tools/shed/shed-test.sh --build-only            # builds ~/rt/debug/{roost,roostctl}
+shed exec roost-dev -- bash -lc '
+  sudo mount --bind ~/rt/debug ~/roost/target/debug
+  trap "sudo umount ~/roost/target/debug" EXIT
+  head -c4 ~/roost/target/debug/roost | grep -q ELF      # the shed has no `file`
+  cd ~/roost
+  GDK_BACKEND=x11 ROOST_TEST_MODE=1 XDG_RUNTIME_DIR=/tmp/xdgrt \
+    xvfb-run -a --server-args="-screen 0 2560x1440x24" \
+    pytest tools/roosttest --roost-target gtk --roost-fresh -q'
+```
+
+Three knobs that each cost a cycle:
+- **`XDG_RUNTIME_DIR`** must be set (a fresh dir). Without it the UI uses the
+  fallback `/tmp/roost-<uid>/roost.sock` but the harness looks at
+  `$XDG_RUNTIME_DIR/roost/roost.sock` → `wait_alive` times out → **~101 "ERROR at
+  setup"**. The #1 trap.
+- **`GDK_BACKEND=x11`** (matches CI). Without it GTK4 hits the libEGL/DRI3 path
+  under Xvfb and the UI never becomes ready.
+- **system `/usr/bin/pytest`** — there is no `uv` in the shed (CI uses `uv run`).
+
+### real-input (XTEST) checks
+`tools/input/linux/real_input_check.py` launches its OWN Xvfb + roost, so it
+needs no bind-mount — just point it at the shed binaries via env (it DOES read
+`ROOST_BIN`/`ROOSTCTL`) and scale timeouts up for the loaded VM:
+
+```bash
+shed exec roost-dev -- bash -lc '
+  cd ~/roost
+  ROOST_BIN=$HOME/rt/debug/roost ROOSTCTL=$HOME/rt/debug/roostctl \
+    ROOST_TEST_MODE=1 ROOST_TEST_TIMEOUT_SCALE=3 \
+    python3 tools/input/linux/real_input_check.py'
+```
+
+### visual screenshot on real Linux
+Launch the shed binary directly under Xvfb (skip the harness), seed via
+`roostctl`, `screenshot` to a mount path, read it on the Mac (`target/` is
+gitignored): `… screenshot --out ~/roost/target/.shot.png` then open
+`target/.shot.png` on the Mac. GTK chrome differs Linux↔macOS, so this is the
+way to see the *real* Linux render (translucency still needs a real compositor).
+
 ## How it works (so you can debug it)
 - **`.shed/provision.yaml`** — an `install` hook (once: GTK4-dev, cage, seatd,
   weston, xvfb, xdotool, pytest, rust/zig via mise) and a `startup` hook (every
@@ -62,3 +117,12 @@ non-blocking `e2e-gtk-wayland-drag` job — same signal, locally, before you pus
 - This is *generic* wlroots Wayland (cage), not cosmic-comp — it guards GTK's
   generic GDK-Wayland path (where the crash lived); COSMIC-specific quirks still
   need a real COSMIC box.
+- Under shed load (concurrent builds + repeated runs) a couple of timing-
+  sensitive checks flake: `test_sidebar_collapsed_state_survives_relaunch` (a
+  deferred palette-toggle racing an immediate `window.metrics` read) and
+  `real_input_check.py`'s `_check_tab_reorder` (many-shell spawn). They flake on
+  a clean tree too — prove regression-vs-env with a same-env baseline run before
+  blaming a change; re-run, or raise `ROOST_TEST_TIMEOUT_SCALE`.
+- Piping a hung test through `| tail` loses its output (Python buffers stdout off
+  a tty, and a kill drops the buffer). Use `python3 -u … > file 2>&1` so partial
+  output survives a hang — essential when the thing you're testing *is* a hang.
