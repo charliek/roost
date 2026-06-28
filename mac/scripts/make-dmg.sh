@@ -74,12 +74,14 @@ make_with_hdiutil() {
          "${DMG_OUT}" >/dev/null; then
       return 0
     fi
+    # Drop any partial/corrupt image on every failure — notarize.sh accepts a
+    # target by existence alone, so a leftover must not survive the final attempt.
+    rm -f "${DMG_OUT}"
     if [ "${attempt}" -eq 5 ]; then
       echo "error: hdiutil create failed after ${attempt} attempts" >&2
       return 1
     fi
     echo "    hdiutil create failed (attempt ${attempt}); retrying in 3s…" >&2
-    rm -f "${DMG_OUT}"
     sleep 3
   done
 }
