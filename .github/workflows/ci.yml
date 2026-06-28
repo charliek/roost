@@ -573,17 +573,29 @@ jobs:
 
       - name: Run E2E (GTK under headless Wayland / weston)
         continue-on-error: true
+        timeout-minutes: 15
         env:
           RUST_LOG: warn
           ROOST_TEST_TIMEOUT_SCALE: "3"   # shared CI runner is slower/variable
           ROOST_TEST_MODE: "1"
           ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-e2e-wl-logs
         # weston-run.sh boots a headless weston, points GDK at it
-        # (GDK_BACKEND=wayland) and runs the same IPC-driven suite — tab.dump
-        # reads in-process render state, so no screen capture is involved.
+        # (GDK_BACKEND=wayland) and runs the IPC-driven suite — tab.dump reads
+        # in-process render state, so no screen capture is involved.
+        #
+        # Curated subset: skip the clipboard/selection + shell-env tests. On
+        # headless Wayland there's no clipboard manager, so a GTK clipboard read
+        # can block indefinitely (the full suite hung ~2h on the runner before
+        # this cap), and those paths test integration semantics that diverge
+        # X11↔Wayland — not the GDK-Wayland backend this job exists to cover.
+        # `timeout-minutes` is the belt-and-suspenders cap so a future hang can
+        # never run away again (continue-on-error swallows the timed-out step).
         run: >
           tools/wayland/weston-run.sh
           uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh -v
+          --ignore=tools/roosttest/test_osc52.py
+          --ignore=tools/roosttest/test_selection.py
+          --ignore=tools/roosttest/test_shell_integration.py
 
       - name: Collect failure diagnostics
         if: always()
