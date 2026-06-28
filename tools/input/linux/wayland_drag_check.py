@@ -18,14 +18,17 @@ uinput device it must run a libinput backend on a seat — see the
 `e2e-gtk-wayland-drag` CI job (`seatd` + `WLR_BACKENDS=headless,libinput`).
 
 Assertions, in priority order:
-  * HARD  — the process survives each drag, AND no `frame_callback` /
-            surface-destroyed / GDK critical/error appears in the captured
-            compositor + UI logs.
-  * BEST-EFFORT — the reorder actually happens (`project.list` / `tab.list`
-            order changes). Synthetic Wayland arming is racy; the
-            content-area SIDEBAR drag is the reliable gate (it leads), the
-            title-row PILL drag is secondary (the X11 harness already concedes
-            this — see real_input_check.py:393).
+  * HARD  — the process survives each drag with no `frame_callback` /
+            surface-destroyed / GDK critical in the captured compositor + UI
+            logs, AND the content-area SIDEBAR drag actually reorders. The
+            sidebar reorder is a hard gate (mirroring the X11 sibling): if it
+            no-ops, the injected uinput pointer never reached the compositor, so
+            the test exercised NOTHING and must fail rather than greenwash —
+            this is what stops a vacuous PASS when seat/libinput setup silently
+            drops the device.
+  * BEST-EFFORT — the title-row PILL drag reorders. Its press races the
+            window-move so synthetic arming is racy; the X11 harness concedes
+            the same (real_input_check.py:393). Best-effort, never fails.
 
 Exits 0 PASS / 1 FAIL / 0 with SKIP when a dependency is missing, unless
 `ROOST_REQUIRE_REAL_INPUT=1` (set in CI) turns a SKIP into a FAIL.
@@ -98,13 +101,17 @@ def _logs_clean(*logs: Path) -> str | None:
     return None
 
 
-def _drag_until_reorder(order, do_drag, proc, label: str, attempts: int = 5) -> bool:
+def _drag_until_reorder(order, do_drag, proc, label: str, *,
+                        hard: bool, attempts: int = 5) -> bool:
     """Retry one drag until the order changes. Process survival each attempt is
-    the HARD gate (raises on a crash); the reorder itself is BEST-EFFORT
-    (synthetic Wayland arming is racy). The drag coords are stable across a
-    no-op attempt — the layout only moves once the drag arms, which breaks the
-    loop — so the caller locates the element ONCE before calling. Returns True
-    if the reorder was observed."""
+    always a HARD gate (raises on a crash). The reorder itself is HARD when
+    `hard=True` (the reliable content-area sidebar drag — a no-op there means the
+    injected input never reached the compositor, so the test did NOTHING and
+    must fail rather than greenwash) and BEST-EFFORT otherwise (the title-row
+    pill drag, whose press races the window-move — the X11 sibling concedes the
+    same). The drag coords are stable across a no-op attempt — the layout only
+    moves once the drag arms, which breaks the loop — so the caller locates the
+    element ONCE before calling. Returns True if the reorder was observed."""
     before = order()
     after = before
     for _ in range(attempts):
@@ -114,8 +121,12 @@ def _drag_until_reorder(order, do_drag, proc, label: str, attempts: int = 5) -> 
         if after != before:
             break
     if after == before:
-        print(f"  {label} reorder: drag did not arm under headless cage "
-              f"(best-effort; process survived)")
+        msg = (f"{label} drag never reordered under headless cage — the injected "
+               f"uinput pointer isn't reaching the compositor (seat/libinput), so "
+               f"the Wayland drag path was NOT exercised")
+        if hard:
+            raise AssertionError(msg + " — hard gate, a no-op means the test did nothing")
+        print(f"  {label} reorder: {msg} (best-effort; process survived)")
         return False
     assert sorted(after) == sorted(before), f"{label} set changed: {before} -> {after}"
     print(f"  {label} reorder OK: {before} -> {after}")
@@ -133,7 +144,7 @@ def _check_sidebar_reorder(r, rc, tmp: Path, cage, w: int, h: int, sb: int) -> N
     _drag_until_reorder(
         lambda: [int(p["id"]) for p in r.list()],
         lambda: _uinput_drag(w, h, x, rows[0], x, rows[-1] + 30),
-        cage, "sidebar")
+        cage, "sidebar", hard=True)
 
 
 def _check_tab_reorder(r, rc, tmp: Path, cage, w: int, h: int, wait_tab_attached) -> None:
@@ -158,7 +169,7 @@ def _check_tab_reorder(r, rc, tmp: Path, cage, w: int, h: int, wait_tab_attached
         return [int(t["id"]) for t in proj["tabs"]]
 
     _drag_until_reorder(order, lambda: _uinput_drag(w, h, cx, cy, cx + 320, cy),
-                        cage, "tab")
+                        cage, "tab", hard=False)
 
 
 def main() -> int:
