@@ -229,7 +229,7 @@ def _check_palette_chrome_click_no_storm(r, click, log_path: Path) -> None:
     dismisses cleanly, and no GTK criticals are logged. Self-restores the
     sidebar (the toggle click it uses also flips it) so it's order-independent."""
     was_collapsed = bool(r.window_metrics().get("sidebar_collapsed"))
-    before = _gtk_critical_lines(log_path)
+    crit_before = len(_gtk_critical_lines(log_path))
     r.palette_open()
     r._wait(lambda: bool(r.palette_state().get("open")), timeout=5.0 * SCALE,
             what="command palette to open")
@@ -240,10 +240,13 @@ def _check_palette_chrome_click_no_storm(r, click, log_path: Path) -> None:
     r._wait(lambda: not bool(r.palette_state().get("open")), timeout=6.0 * SCALE,
             what="palette to dismiss after a header click WITHOUT a focus-walk hang")
     assert r.identify().get("pid"), "UI stopped answering identify after the chrome click"
-    new = [ln for ln in _gtk_critical_lines(log_path) if ln not in before]
-    assert not new, (
-        "palette chrome-click logged GTK criticals (the #234 focus-walk storm):\n"
-        + "\n".join(new[:6])
+    # Count, not set-difference: a storm appends new criticals even if some
+    # repeat text the log already held, so compare counts and show the tail.
+    after = _gtk_critical_lines(log_path)
+    assert len(after) == crit_before, (
+        f"palette chrome-click logged {len(after) - crit_before} new GTK criticals "
+        "(the #234 focus-walk storm):\n"
+        + "\n".join(after[-6:])
     )
     # Restore the sidebar the toggle click flipped, so later checks are unaffected.
     if bool(r.window_metrics().get("sidebar_collapsed")) != was_collapsed:
