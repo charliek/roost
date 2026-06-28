@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Notarize + staple a Roost DMG (or .app).
+# Notarize + staple a Roost DMG. (notarytool needs an archive — a bare .app
+# must be zipped first; the release pipeline always passes the DMG.)
 #
 # No-op (exit 0) when no credentials are configured, so the release pipeline
 # still ships an UNSIGNED DMG until an Apple Developer account is available.
@@ -17,7 +18,7 @@ set -euo pipefail
 
 TARGET="${1:-}"
 if [ -z "${TARGET}" ] || [ ! -e "${TARGET}" ]; then
-  echo "usage: $0 <path-to-dmg-or-app>" >&2
+  echo "usage: $0 <path-to-dmg-or-archive>" >&2
   exit 1
 fi
 

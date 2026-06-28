@@ -49,8 +49,12 @@ from typing import NoReturn
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 PNGTOOL = REPO / "tools" / "screenshot" / "pngtool.py"
-ROOST_BIN = REPO / "target" / "debug" / "roost"
-ROOSTCTL = REPO / "target" / "debug" / "roostctl"
+# Default to the in-tree debug build, but honor ROOST_BIN / ROOSTCTL overrides:
+# when the repo is mounted into a shed (VirtioFS), REPO/target holds the *macOS*
+# binaries, so a Linux build goes to a shed-local CARGO_TARGET_DIR and points
+# these at it. wayland_drag_check.py imports both.
+ROOST_BIN = Path(os.environ.get("ROOST_BIN") or (REPO / "target" / "debug" / "roost"))
+ROOSTCTL = Path(os.environ.get("ROOSTCTL") or (REPO / "target" / "debug" / "roostctl"))
 
 # Scale the (few) readiness waits for shared CI runners via the same env knob
 # the e2e harness uses. Pointer steps stay fixed — paced by xdotool, not load.

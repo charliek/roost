@@ -204,9 +204,11 @@ def main() -> int:
         "GDK_BACKEND": "wayland",
         "GTK_A11Y": "none",
     }
-    # Headless wlroots, software render — keep a caller-provided value (the CI
-    # job sets headless,libinput) else default.
-    env.setdefault("WLR_BACKENDS", "headless")
+    # Headless wlroots + the libinput backend — REQUIRED: libinput is what reads
+    # the /dev/uinput device we inject through, so without it cage comes up with
+    # no input and every drag silently no-ops. Caller can override (the CI job
+    # sets the same value explicitly).
+    env.setdefault("WLR_BACKENDS", "headless,libinput")
     env.setdefault("WLR_RENDERER", "pixman")
     env.pop("DISPLAY", None)
     env.pop("DBUS_SESSION_BUS_ADDRESS", None)

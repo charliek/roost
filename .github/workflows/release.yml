@@ -218,9 +218,13 @@ jobs:
     permissions:
       contents: write
     env:
-      # Surfaced from secrets; empty when unset → ad-hoc signing + no notarization.
-      ROOST_DEVELOPER_ID_IDENTITY: ${{ secrets.ROOST_DEVELOPER_ID_IDENTITY }}
-      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+      # Sign + notarize only when the FULL prerequisite set is present. Any
+      # missing secret → ad-hoc fallback: a Developer-ID-signed but un-notarized
+      # DMG is still Gatekeeper-blocked, so signing without notarizing has no
+      # value, and a partial secret set must not break the build or silently
+      # drop the first-launch note. The identity is handed to the bundle/DMG
+      # steps (below) only when this is true.
+      CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.ROOST_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -266,15 +270,19 @@ jobs:
           key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-release-${{ runner.os }}-
 
-      # Inert until the cert secret exists. When added, imports the Developer ID
-      # Application cert into a throwaway keychain so codesign can use it.
+      # Inert until all six Apple secrets exist (the CAN_NOTARIZE gate). Imports
+      # the Developer ID Application cert into a throwaway keychain so codesign
+      # can use it.
       - name: Import Developer ID certificate
-        if: env.HAS_CERT == 'true'
+        if: env.CAN_NOTARIZE == 'true'
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
+          # The decoded cert must never outlive this step, even on early failure.
+          # (The keychain itself must persist — later steps sign against it.)
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
           kc="$RUNNER_TEMP/roost-signing.keychain-db"
           kp="$(openssl rand -base64 24)"
           security create-keychain -p "$kp" "$kc"
@@ -308,7 +316,12 @@ jobs:
           fi
           echo "SUPublicEDKey is not the throwaway placeholder — ok."
 
+      # The identity reaches bundle.sh / make-dmg.sh only when CAN_NOTARIZE —
+      # otherwise empty, so they take the ad-hoc path (and make-dmg keeps the
+      # FIRST-LAUNCH note).
       - name: Bundle Roost.app
+        env:
+          ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
         run: ROOST_VERSION="${GITHUB_REF_NAME#v}" ./mac/scripts/bundle.sh release
 
       # Validate the *actual shipped artifact*: drive the release bundle
@@ -327,9 +340,12 @@ jobs:
         run: uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh -v
 
       - name: Make DMG
+        env:
+          ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
         run: ./mac/scripts/make-dmg.sh "${GITHUB_REF_NAME#v}"
 
       - name: Notarize + staple (skipped without credentials)
+        if: env.CAN_NOTARIZE == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
