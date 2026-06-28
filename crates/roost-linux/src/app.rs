@@ -625,19 +625,51 @@ impl App {
             .orientation(gtk4::Orientation::Horizontal)
             .css_classes(["roost-tabrow"])
             .build();
+        // The per-project tab strips + the trailing new-tab "+" live in ONE
+        // horizontal scroller so a project with many tabs SCROLLS instead of
+        // widening the whole window, and "+" always hugs the last tab (scrolls
+        // with them). propagate-natural-width=false stops the tab count from
+        // forcing the toplevel wider; hexpand hands the scroller the row's
+        // slack so ~10 tabs stay visible before it scrolls. External hscrollbar
+        // = no scrollbar widget cramping the 24px strip; a vertical wheel over
+        // the strip scrolls it horizontally (vscroll off). Mirrors the Mac,
+        // which keeps the strip width-bounded.
+        let tab_strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        tab_strip_box.append(&bar_stack);
+        tab_strip_box.append(&new_tab_button);
+        let tab_scroller = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::External)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_width(false)
+            .hexpand(true)
+            .child(&tab_strip_box)
+            .build();
+        // A vertical wheel over the strip scrolls it horizontally. GTK doesn't
+        // redirect wheel→hscroll under an External h-policy, so translate it
+        // explicitly onto the scroller's hadjustment — otherwise tabs scrolled
+        // past the viewport (and the trailing "+") are unreachable by mouse.
+        let strip_scroll =
+            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+        strip_scroll.connect_scroll({
+            let adj = tab_scroller.hadjustment();
+            move |_, dx, dy| {
+                let delta = if dx.abs() > dy.abs() { dx } else { dy };
+                adj.set_value(adj.value() + delta * 48.0);
+                glib::Propagation::Stop
+            }
+        });
+        tab_scroller.add_controller(strip_scroll);
         tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::Start));
         tab_row.append(&sidebar_toggle_button);
-        tab_row.append(&bar_stack);
-        tab_row.append(&new_tab_button);
-        // Window-drag region: a GtkWindowHandle around ONLY the hexpanding
-        // spacer, NOT the whole row. A WindowHandle treats its non-button
-        // children as drag-to-move-window area, so wrapping the row made
-        // dragging a tab pill move the whole window instead of reordering —
-        // the pills' own DragSource never won. Wrapping just the spacer keeps
-        // the empty middle draggable (window move) while the pills keep their
-        // drag-reorder. (AdwHeaderBar gave window-drag for free; this restores
-        // it.) The spacer also pushes the trailing controls to the edge so the
-        // tabs stay compact + left-aligned (Mac style).
+        tab_row.append(&tab_scroller);
+        // Window-drag handle: a fixed-width GtkWindowHandle between the tab
+        // scroller and the trailing controls. It's a WindowHandle (not a plain
+        // box) so this strip is drag-to-move-window area; the hexpanding
+        // scroller now does the job of pushing the trailing controls to the
+        // edge, so this only needs to be wide enough to grab (the scroller's
+        // own empty tail is non-draggable, an accepted trade for letting the
+        // tabs use the row's full width). It stays OUTSIDE the pills' scroller
+        // so a window-drag here never competes with pill drag-reorder.
         //
         // CSD/SSD: on Wayland (the primary target — COSMIC/GNOME) the window is
         // client-side-decorated, so the in-row GtkWindowControls are the only
@@ -645,10 +677,12 @@ impl App {
         // they'd be doubled; the right fix is CSD detection (cf. Ghostty's
         // .csd/.ssd toggle), NOT a blanket set_decorated(false) which strips
         // Wayland's resize edges + shadow. Deferred to real-compositor checks.
+        let drag_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        drag_spacer.set_width_request(80);
         let drag_area = gtk4::WindowHandle::builder()
             .css_classes(["roost-titlebar"])
-            .hexpand(true)
-            .child(&gtk4::Box::new(gtk4::Orientation::Horizontal, 0))
+            .hexpand(false)
+            .child(&drag_spacer)
             .build();
         tab_row.append(&drag_area);
         tab_row.append(&notif_button);

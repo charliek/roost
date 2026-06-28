@@ -144,6 +144,11 @@ tabbar tab:checked {
   border-radius: 6px;
   padding: 0 4px 0 8px;
   min-height: 24px;
+  /* Floor the pill width so a project with many tabs shrinks-and-truncates to
+   * a readable minimum (icon + a few chars) and THEN overflows the tab
+   * scroller (which scrolls) — without a floor the pills collapse to an
+   * unreadable "..." to fit. Mirrors the Mac TabPillView's min-width bound. */
+  min-width: 72px;
   background-color: transparent;
 }
 .roost-tab-pill:hover {
