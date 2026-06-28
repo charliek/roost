@@ -485,6 +485,24 @@ jobs:
           ROOST_REQUIRE_REAL_INPUT: "1"
         run: uv run --group test python tools/input/linux/click_to_focus_check.py
 
+      # Real-drag reorder regression: the GtkGestureDrag tab/project reorder
+      # that replaced GTK DnD (whose Wayland drag-icon surface aborted the
+      # process in gdksurface-wayland.c:frame_callback). Drives real xdotool
+      # drags through the gesture stack — the IPC suite can't reach it. Same
+      # self-contained + continue-on-error + ROOST_REQUIRE_REAL_INPUT contract
+      # as the click step. The content-area sidebar reorder is the reliable
+      # gate; the title-row tab-pill drag is best-effort under XTEST/Xvfb (the
+      # press races the title-drag) — see the script — but a tab-drag *crash*
+      # still fails the step.
+      - name: Real-drag reorder regression (Xvfb + xdotool)
+        continue-on-error: true
+        env:
+          GDK_BACKEND: x11
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_REQUIRE_REAL_INPUT: "1"
+        run: uv run --group test python tools/input/linux/drag_reorder_check.py
+
       # Stage the captured UI log into one dir (upload-artifact doesn't
       # expand globs/`~`). The harness writes the launched UI's stdout+stderr
       # to ROOST_E2E_LOG_DIR; grab it whether or not the run failed.
