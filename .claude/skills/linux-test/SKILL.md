@@ -18,8 +18,11 @@ with the repo mounted via VirtioFS (edit on the Mac, build+test in the VM).
 - macOS / Apple Silicon.
 
 ## Run it (one wrapper)
-`tools/shed/shed-test.sh` provisions on first use, caches via a snapshot, and
-builds shed-local so your Mac `target/` + ghostty outputs are never clobbered:
+`tools/shed/shed-test.sh` provisions on first use and builds shed-local so your
+Mac `target/` + ghostty outputs are never clobbered. Run it from the repo root.
+The persistent `roost-dev` box IS the day-to-day cache (stop/start reuses its
+build cache); the **snapshot is opt-in** — a bare run does NOT auto-snapshot, so
+run `--snapshot-base` once if you want fast cold re-creates after a teardown:
 
 ```bash
 tools/shed/shed-test.sh                 # ensure box, build, run the Wayland drag guard
@@ -30,8 +33,9 @@ tools/shed/shed-test.sh --reprovision   # rebuild box + snapshot from scratch
 tools/shed/shed-test.sh --stop          # stop the VM when done (it's a heavy env)
 ```
 
-A green drag run mirrors CI's non-blocking `e2e-gtk-wayland-drag` job — same
-signal, locally, before you push.
+A green run ends with `PASS: Wayland pointer-drag guard — no surface abort`
+(preceded by a `sidebar reorder OK: …` line — the hard gate). That mirrors CI's
+non-blocking `e2e-gtk-wayland-drag` job — same signal, locally, before you push.
 
 ## How it works (so you can debug it)
 - **`.shed/provision.yaml`** — an `install` hook (once: GTK4-dev, cage, seatd,
