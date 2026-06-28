@@ -67,7 +67,12 @@ build identity beyond "last released" is needed (e.g. for `roostctl
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required — same |
 | `SPARKLE_ED_PRIVATE_KEY` | EdDSA signing key for Sparkle appcast, base64-encoded | required for stable releases (a `*-beta`/`*-rc` build skips signing) |
 | `APT_DISPATCH_TOKEN` | Legacy PAT — superseded by the release-bot App; can be removed once you're sure the App-based dispatch is working | optional / deprecated |
-| `MACOS_CERTIFICATE_P12_BASE64` + `MACOS_CERTIFICATE_PASSWORD` + `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `ROOST_DEVELOPER_ID_IDENTITY` | Mac code-signing + notarization | optional — currently unset (Apple Dev account pending, issue #83); DMG ships ad-hoc-signed until then |
+| `MACOS_CERTIFICATE_P12_BASE64` + `MACOS_CERTIFICATE_PASSWORD` + `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `ROOST_DEVELOPER_ID_IDENTITY` | Mac code-signing + notarization | **set** (2026-06-28; #83 closed) — DMG is Developer ID signed + notarized. `MACOS_CERTIFICATE_P12_BASE64` is the `HAS_CERT` gate; unset all six → ad-hoc-signed DMG with the Gatekeeper-bypass note |
+
+The cert + Apple creds are kept locally — git-ignored, synced across machines
+via envsecrets (the `# envsecrets` marker in `.gitignore`) — at
+`.secrets/cert.p12` + `.secrets/apple.env`. `envsecrets pull` restores them on a
+new machine; source `apple.env` for a local notarized build.
 
 ## Branch protection
 
