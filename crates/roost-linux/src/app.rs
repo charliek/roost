@@ -241,30 +241,20 @@ pub struct App {
     /// handler to skip the redundant RPC.
     server_driven_closes: RefCell<HashSet<i64>>,
     /// M10: project id of the row currently being dragged (`None`
-    /// when no drag is in progress). Read by the sidebar drop
-    /// target's motion handler to know which row to live-shuffle.
-    /// Set in the drag-source's drag-begin, cleared in drag-end.
+    /// when no drag is in progress). The project row being
+    /// reorder-dragged; doubles as the "armed past threshold" marker for
+    /// the row's `GtkGestureDrag` and tells the live-shuffle which row to
+    /// move. Set when the gesture arms, cleared on drag-end / cancel.
     dragged_project_id: RefCell<Option<i64>>,
-    /// Tab id of the pill currently being drag-reordered (None when
-    /// no pill drag is in progress). Set in the pill drag-source's
-    /// drag-begin, cleared in drag-end. The strip's drop target uses
-    /// this as the source of truth instead of the transported value:
-    /// mirroring the sidebar, the reorder must not depend on the
-    /// drop-time value load succeeding (a local i64 ContentProvider
-    /// that fails `get::<i64>()` at drop time would otherwise silently
-    /// no-op the reorder while the highlight still showed).
+    /// Tab id of the pill currently being drag-reordered (None when no
+    /// pill drag is in progress); doubles as the "armed past threshold"
+    /// marker for the pill's `GtkGestureDrag`. Set when the gesture arms,
+    /// cleared on drag-end.
     dragged_tab_id: RefCell<Option<i64>>,
-    /// M10: snapshot of the sidebar order taken at drag-begin.
-    /// Drag-end rolls back to this if the drop didn't persist
-    /// (drag cancelled outside the sidebar, or `ReorderProjects`
-    /// RPC failed).
+    /// M10: snapshot of the sidebar order taken when a row drag arms.
+    /// Drag-end rolls back to this if the `ReorderProjects` RPC fails; a
+    /// cancelled drag rolls back to it directly.
     drag_original_order: RefCell<Vec<i64>>,
-    /// M10: set true once `ReorderProjects` persists (or a no-op
-    /// drop is acknowledged). Drag-end consults this to decide
-    /// whether to roll back. Distinct from `gdk::DragAction::MOVE`
-    /// completion since GTK's "drop succeeded" signal covers
-    /// transport, not our application-level persistence.
-    drop_occurred: RefCell<bool>,
     /// True while `reconcile_to_snapshot` is applying programmatic
     /// tab reorders. The `connect_page_reordered` handler checks this
     /// and skips firing a `ReorderTabs` RPC, so a resync that
@@ -729,7 +719,6 @@ impl App {
             dragged_project_id: RefCell::new(None),
             dragged_tab_id: RefCell::new(None),
             drag_original_order: RefCell::new(Vec::new()),
-            drop_occurred: RefCell::new(false),
             suppress_tab_reorder_echo: RefCell::new(false),
             suppress_selected_page_sync: RefCell::new(false),
             // Read the env var exactly once at boot so per-op
@@ -742,11 +731,10 @@ impl App {
             feed_senders: RefCell::new(HashMap::new()),
             input_captures: RefCell::new(HashMap::new()),
         });
-        // M10: a single drop target on the sidebar listbox owns the
-        // motion (live-shuffle) + drop (persist) handling for all
-        // project rows. Per-row drag sources are wired inside
-        // `add_project_ui`. See `install_sidebar_drop_target`.
-        app_struct.install_sidebar_drop_target();
+        // M10: a single GtkGestureDrag on the sidebar listbox drives project
+        // reorder (pointer-drag, not DnD — see `install_sidebar_reorder_gesture`
+        // for why it lives on the listbox rather than per-row).
+        app_struct.install_sidebar_reorder_gesture();
 
         // Sidebar row selection → switch the active project (UI
         // reaction). This fires for ANY selection change — user click,
@@ -1204,10 +1192,9 @@ impl App {
         row.set_child(Some(&name_stack));
         row.set_widget_name(&format!("project-{}", project.id));
         self.sidebar.append(&row);
-        // M10: wire the drag-source so this row can be picked up
-        // and reordered. The matching listbox-level drop target
-        // is installed once in App::new.
-        self.install_row_drag_source(&row, project.id);
+        // M10: project reorder is driven by the single listbox-level
+        // GtkGestureDrag (`install_sidebar_reorder_gesture`), keyed off this
+        // row's `project-<id>` widget name — no per-row controller needed.
 
         // M9: commit the rename on Enter. WatchEvents
         // `ProjectRenamedEvent` is the authoritative state — we
@@ -5439,102 +5426,125 @@ impl App {
         self.sidebar_order().len()
     }
 
-    /// M10: attach a `gtk::DragSource` to a project row so it can
-    /// be picked up. Dragged content is the project's int64 id.
-    /// Visual feedback: the source row dims to 40% opacity while
-    /// the drag is in flight (CSS `:drop(active)` styling was
-    /// unreliable in our environment so we set opacity directly).
-    /// The drop target on the listbox handles
-    /// motion + persistence; this side just publishes the
-    /// payload and tracks rollback snapshot.
-    fn install_row_drag_source(self: &Rc<Self>, row: &gtk4::ListBoxRow, project_id: i64) {
-        let src = gtk4::DragSource::new();
-        src.set_actions(gtk4::gdk::DragAction::MOVE);
-        // Suppress the drag while the user is renaming inline —
-        // the entry needs to keep focus + own mouse input. We
-        // detect "renaming" by checking the row's name-stack's
-        // visible child (set by M9's begin_rename_project).
-        let row_for_prepare = row.clone();
-        src.connect_prepare(move |_, _, _| {
-            if let Some(stack) = row_for_prepare
-                .child()
-                .and_then(|c| c.downcast::<gtk4::Stack>().ok())
-            {
-                if stack.visible_child_name().as_deref() == Some("entry") {
-                    return None;
+    /// M10 (Wayland-safe): pointer-drag reorder for a project row via
+    /// `GtkGestureDrag` — NOT GTK DnD. The old `DragSource` + listbox
+    /// `DropTarget` created a drag-icon surface that aborted the whole process
+    /// on Wayland in `gdksurface-wayland.c:348:frame_callback` (same class as
+    /// the tab pills; see `build_tab_pill`). The gesture arms past an 8px
+    /// threshold, claims the sequence (so a plain click still selects the row /
+    /// switches project), live-shuffles the rows under the pointer
+    /// (`shuffle_sidebar_toward`), and on release persists the order via
+    /// `reorder_projects_async` (which rolls back on RPC error). A cancelled
+    /// drag rolls back to the pre-drag order. The row dims to 40% opacity while
+    /// dragging (CSS `:drop(active)` was unreliable here, so we set it direct).
+    /// M10 (Wayland-safe): pointer-drag reorder for the project sidebar via a
+    /// single `GtkGestureDrag` on the listbox — NOT GTK DnD. The old
+    /// `DragSource` + `DropTarget` created a drag-icon surface that aborted the
+    /// whole process on Wayland in `gdksurface-wayland.c:348:frame_callback`
+    /// (same class as the tab pills; see `build_tab_pill`). A *per-row* gesture
+    /// is starved by GtkListBox's own selection gesture, so this lives on the
+    /// listbox: it derives the pressed row from the start point, arms past an
+    /// 8px threshold (claiming so a plain click still selects / switches
+    /// project), live-shuffles the rows under the pointer
+    /// (`shuffle_sidebar_toward`), and on release persists the order via
+    /// `reorder_projects_async` (which rolls back on RPC error). A cancelled
+    /// drag rolls back to the pre-drag order. Installed once from `App::new`.
+    fn install_sidebar_reorder_gesture(self: &Rc<Self>) {
+        let reorder = gtk4::GestureDrag::new();
+        reorder.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        // The gesture only *claims* once past the 8px threshold, so a plain
+        // click is never claimed and falls through to the listbox's own
+        // selection (project switch) unchanged — verified against the old DnD
+        // sidebar, which behaves identically for clicks.
+        reorder.connect_drag_update({
+            let app = self.clone();
+            move |g, off_x, off_y| {
+                // Arm once past the threshold; until then it stays a click.
+                if app.dragged_project_id.borrow().is_none() {
+                    if off_x.hypot(off_y) < 8.0 {
+                        return;
+                    }
+                    // Which row was pressed? start_point is in listbox coords
+                    // (the gesture is on the listbox).
+                    let Some((_sx, sy)) = g.start_point() else {
+                        return;
+                    };
+                    let Some(row) = app.sidebar.row_at_y(sy as i32) else {
+                        return; // press landed in empty space
+                    };
+                    // Don't hijack an inline rename — the entry owns the pointer.
+                    if let Some(stack) = row.child().and_then(|c| c.downcast::<gtk4::Stack>().ok())
+                    {
+                        if stack.visible_child_name().as_deref() == Some("entry") {
+                            return;
+                        }
+                    }
+                    let Some(pid) = row
+                        .widget_name()
+                        .strip_prefix("project-")
+                        .and_then(|s| s.parse::<i64>().ok())
+                    else {
+                        return;
+                    };
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                    row.set_opacity(0.4);
+                    *app.dragged_project_id.borrow_mut() = Some(pid);
+                    *app.drag_original_order.borrow_mut() = app.sidebar_order();
+                }
+                // Armed: live-shuffle the rows toward the current pointer.
+                if let Some(pid) = *app.dragged_project_id.borrow() {
+                    if let Some((_px, py)) = g.point(None) {
+                        let raw = app.raw_target_for_y(py);
+                        app.shuffle_sidebar_toward(pid, raw);
+                    }
                 }
             }
-            Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
-                project_id,
-            )))
         });
-        let row_for_begin = row.clone();
-        let app_for_begin = self.clone();
-        src.connect_drag_begin(move |_, _| {
-            row_for_begin.set_opacity(0.4);
-            *app_for_begin.dragged_project_id.borrow_mut() = Some(project_id);
-            *app_for_begin.drag_original_order.borrow_mut() = app_for_begin.sidebar_order();
-            *app_for_begin.drop_occurred.borrow_mut() = false;
-        });
-        let row_for_end = row.clone();
-        let app_for_end = self.clone();
-        src.connect_drag_end(move |_, _, _| {
-            row_for_end.set_opacity(1.0);
-            if !*app_for_end.drop_occurred.borrow() {
-                let snapshot = app_for_end.drag_original_order.borrow().clone();
-                app_for_end.apply_sidebar_order(&snapshot);
+        reorder.connect_drag_end({
+            let app = self.clone();
+            move |g, _off_x, _off_y| {
+                let Some(pid) = *app.dragged_project_id.borrow() else {
+                    return; // never armed → it was a click, not a drag
+                };
+                app.set_row_opacity(pid, 1.0);
+                // Settle the final slot, then persist the order once. The
+                // snapshot lets reorder_projects_async roll back on RPC error.
+                if let Some((_px, py)) = g.point(None) {
+                    let raw = app.raw_target_for_y(py);
+                    app.shuffle_sidebar_toward(pid, raw);
+                }
+                let current = app.sidebar_order();
+                let original = app.drag_original_order.borrow().clone();
+                if current != original {
+                    app.reorder_projects_async(current, original);
+                }
+                *app.dragged_project_id.borrow_mut() = None;
+                app.drag_original_order.borrow_mut().clear();
             }
-            *app_for_end.dragged_project_id.borrow_mut() = None;
-            app_for_end.drag_original_order.borrow_mut().clear();
-            *app_for_end.drop_occurred.borrow_mut() = false;
         });
-        row.add_controller(src);
+        reorder.connect_cancel({
+            let app = self.clone();
+            move |_, _| {
+                let Some(pid) = *app.dragged_project_id.borrow() else {
+                    return;
+                };
+                app.set_row_opacity(pid, 1.0);
+                // Cancelled drag (grab broken) → revert to the pre-drag order.
+                let original = app.drag_original_order.borrow().clone();
+                app.apply_sidebar_order(&original);
+                *app.dragged_project_id.borrow_mut() = None;
+                app.drag_original_order.borrow_mut().clear();
+            }
+        });
+        self.sidebar.add_controller(reorder);
     }
 
-    /// M10: wire the listbox-level drop target. Motion live-
-    /// shuffles the dragged row to the insertion point implied
-    /// by the pointer y; drop persists the resulting order via
-    /// `ReorderProjects` RPC (or skips the write when the order
-    /// is unchanged). Rollback on RPC failure restores the
-    /// drag-begin snapshot. Called once from `App::new`.
-    fn install_sidebar_drop_target(self: &Rc<Self>) {
-        let dst = gtk4::DropTarget::new(glib::types::Type::I64, gtk4::gdk::DragAction::MOVE);
-        let app_for_motion = self.clone();
-        dst.connect_motion(move |_, _, y| {
-            if let Some(src_id) = *app_for_motion.dragged_project_id.borrow() {
-                let raw = app_for_motion.raw_target_for_y(y);
-                app_for_motion.shuffle_sidebar_toward(src_id, raw);
-            }
-            gtk4::gdk::DragAction::MOVE
-        });
-        let app_for_drop = self.clone();
-        dst.connect_drop(move |_, value, _, _| {
-            // The payload value is the project id we set in
-            // `connect_prepare`. We don't strictly need to read
-            // it here — the dragged id is also in
-            // `dragged_project_id` — but failing the type check
-            // is a quick way to reject foreign content (e.g. a
-            // file drop from the file manager).
-            if value.get::<i64>().is_err() {
-                return false;
-            }
-            let current = app_for_drop.sidebar_order();
-            let original = app_for_drop.drag_original_order.borrow().clone();
-            if current == original {
-                // Unchanged drop is still a successful drop —
-                // drag-end mustn't roll back.
-                *app_for_drop.drop_occurred.borrow_mut() = true;
-                return true;
-            }
-            // Mark as persisted optimistically; rollback below
-            // on RPC error reverts both the visual order AND
-            // clears the flag so the drag-end roll-back logic
-            // isn't double-fired.
-            *app_for_drop.drop_occurred.borrow_mut() = true;
-            app_for_drop.reorder_projects_async(current, original);
-            true
-        });
-        self.sidebar.add_controller(dst);
+    /// Set a project's sidebar-row opacity (dims the dragged row to 40% during
+    /// a reorder drag; CSS `:drop(active)` was unreliable here).
+    fn set_row_opacity(&self, project_id: i64, opacity: f64) {
+        if let Some(ui) = self.projects.borrow().get(&project_id) {
+            ui.sidebar_row.set_opacity(opacity);
+        }
     }
 
     /// M10: fire `ReorderProjects` RPC. On error, roll the
