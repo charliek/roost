@@ -143,17 +143,23 @@ pub struct App {
     /// `gtk::Stack` of TabView widgets, one entry per project id.
     /// Switching the sidebar selection flips the visible child.
     tab_stack: gtk4::Stack,
-    /// Per-project tab strips, stacked in the AdwToolbarView top bar; only
-    /// the active project's is shown (switched on project change). One shared
-    /// AdwTabBar rebound via `set_view` crashes libadwaita on switch
-    /// (g_object_unref), so each project keeps its own bar bound to its own
-    /// view for life and we flip the visible stack child instead.
+    /// Per-project tab strips, stacked in the tab-strip band beside the
+    /// sidebar (in the content column, above the terminal); only the active
+    /// project's is shown (switched on project change). One shared AdwTabBar
+    /// rebound via `set_view` crashes libadwaita on switch (g_object_unref),
+    /// so each project keeps its own bar bound to its own view for life and we
+    /// flip the visible stack child instead.
     bar_stack: gtk4::Stack,
-    /// `adw::WindowTitle` title-state holder (title = active project name,
-    /// subtitle = active tab's cwd). No longer displayed in-chrome — the
-    /// AdwHeaderBar that showed it was removed for Mac-parity minimal chrome;
-    /// the OS window title is set directly from `set_active_project` instead.
-    /// Kept as the title model pending a possible future in-chrome title.
+    /// Horizontal scroller wrapping the visible tab strip (`bar_stack` + the
+    /// new-tab "+"), living in the tab band atop the content column. Stored so
+    /// the palette can pin its card just under the band using the band's live
+    /// height (the band == this scroller, no extra padding).
+    tab_scroller: gtk4::ScrolledWindow,
+    /// `adw::WindowTitle` shown as the AdwHeaderBar title widget (title =
+    /// active project name, subtitle = active tab's cwd) — Mac titlebar
+    /// parity. `set_active_project` / `refresh_window_subtitle` keep it
+    /// current; `window.set_title` mirrors the same name into the OS window
+    /// title (taskbar / alt-tab).
     window_title: WindowTitle,
     projects: RefCell<HashMap<i64, ProjectUi>>,
     /// Currently focused project (sidebar selection). 0 = no
@@ -177,6 +183,12 @@ pub struct App {
     /// `gtk::Overlay` wrapping the content below the header, so the
     /// command palette card can float centered over the whole window.
     content_overlay: gtk4::Overlay,
+    /// Vertical SizeGroup tying the sidebar "PROJECTS" header band and the
+    /// tab-strip band to one height (Mac parity). Held only to keep the
+    /// constraint alive: a SizeGroup is freed when its last owner drops and
+    /// its members don't ref it back, so without this field the bands drift on
+    /// resize. Never read.
+    _band_size_group: gtk4::SizeGroup,
     /// The open command palette overlay, or `None` when closed.
     palette: RefCell<Option<crate::palette_ui::PaletteOverlay>>,
     /// Monotonic token bumped per provider run, so a superseded run's late
@@ -472,16 +484,16 @@ impl App {
             tracing::warn!("no default GDK display; skipping chrome CSS load");
         }
 
-        // `adw::WindowTitle` is retained for the OS window title (taskbar /
-        // alt-tab) and future use; the AdwHeaderBar that displayed it is
-        // gone — Mac-parity minimal chrome puts the tabs flush at the window
-        // top (see the AdwToolbarView assembled below), with no title row.
+        // `adw::WindowTitle` shown centered in the AdwHeaderBar (built below)
+        // as the Mac-parity titlebar text — title = active project, subtitle =
+        // active tab cwd. `set_active_project` keeps it current and also
+        // mirrors the name into the OS window title (taskbar / alt-tab).
         let window_title = WindowTitle::new("Roost", "connecting…");
 
-        // Chrome buttons (folder/new-project, sidebar toggle, new tab,
-        // notifications). They live in the top tab-row built below instead of
-        // a header bar. Wired below after `app_struct` exists so the handlers
-        // can capture an `Rc<App>` clone.
+        // Chrome buttons (sidebar toggle, new tab, notifications). The toggle
+        // and bell are packed into the AdwHeaderBar; the new-tab "+" rides the
+        // tab strip. Wired below after `app_struct` exists so the handlers can
+        // capture an `Rc<App>` clone.
         let sidebar_toggle_button = gtk4::Button::builder()
             .child(&gtk4::Image::from_gicon(&embedded_icon(
                 ICON_SIDEBAR_SHOW_SYMBOLIC,
@@ -517,7 +529,6 @@ impl App {
             .css_classes(["flat"])
             .tooltip_text("Notifications")
             .build();
-        // (Buttons are packed into the top tab-row below, not a header bar.)
 
         // Sidebar: vertical Box of [section header] / [scrolled project
         // list] / [`+ Project` footer button]. Matches the Mac UI
@@ -596,41 +607,24 @@ impl App {
             .css_classes(["roost-tab-stack"])
             .build();
 
-        let paned = gtk4::Paned::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .resize_start_child(false)
-            .shrink_start_child(false)
-            .position(220)
-            .start_child(&sidebar_box)
-            .end_child(&tab_stack)
-            .build();
-
-        // Wrap the content below the header in a `gtk::Overlay` so the
-        // command palette card can float centered over the whole
-        // window (sidebar + tabs), pinned just under the tab bar.
-        let content_overlay = gtk4::Overlay::builder().child(&paned).build();
-
-        // Per-project tab strips live in this stack (built in add_project_ui),
-        // sitting in the AdwToolbarView top bar so tabs are flush at the
-        // window top (Mac parity). Only the active project's strip is shown.
-        // `hhomogeneous(false)` lets the stack size to the visible strip.
+        // Right pane = a vertical column: the per-project tab strip is a band
+        // ABOVE the terminal stack and to the RIGHT of the sidebar — Mac parity
+        // (tabs beside the project list, not over it). Collapsing the sidebar
+        // lets this whole column take the full window width.
+        //
+        // `bar_stack` holds the per-project tab strips (built in
+        // add_project_ui); only the active project's is shown, switched on
+        // project change. `hhomogeneous(false)` lets the stack size to the
+        // visible strip.
         let bar_stack = gtk4::Stack::builder()
             .hhomogeneous(false)
             .vhomogeneous(false)
-            .build();
-        // Top "title" row: window controls flank the strip, with the sidebar
-        // toggle + new-project on the left and new-tab + notifications on the
-        // right — the affordances the removed header carried, now inline with
-        // the tabs.
-        let tab_row = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .css_classes(["roost-tabrow"])
             .build();
         // The per-project tab strips + the trailing new-tab "+" live in ONE
         // horizontal scroller so a project with many tabs SCROLLS instead of
         // widening the whole window, and "+" always hugs the last tab (scrolls
         // with them). propagate-natural-width=false stops the tab count from
-        // forcing the toplevel wider; hexpand hands the scroller the row's
+        // forcing the toplevel wider; hexpand hands the scroller the column's
         // slack so ~10 tabs stay visible before it scrolls. External hscrollbar
         // = no scrollbar widget cramping the 24px strip; a vertical wheel over
         // the strip scrolls it horizontally (vscroll off). Mirrors the Mac,
@@ -660,37 +654,64 @@ impl App {
             }
         });
         tab_scroller.add_controller(strip_scroll);
-        tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::Start));
-        tab_row.append(&sidebar_toggle_button);
-        tab_row.append(&tab_scroller);
-        // Window-drag handle: a fixed-width GtkWindowHandle between the tab
-        // scroller and the trailing controls. It's a WindowHandle (not a plain
-        // box) so this strip is drag-to-move-window area; the hexpanding
-        // scroller now does the job of pushing the trailing controls to the
-        // edge, so this only needs to be wide enough to grab (the scroller's
-        // own empty tail is non-draggable, an accepted trade for letting the
-        // tabs use the row's full width). It stays OUTSIDE the pills' scroller
-        // so a window-drag here never competes with pill drag-reorder.
-        //
-        // CSD/SSD: on Wayland (the primary target — COSMIC/GNOME) the window is
-        // client-side-decorated, so the in-row GtkWindowControls are the only
-        // controls — correct. On X11 under a WM with server-side decorations
-        // they'd be doubled; the right fix is CSD detection (cf. Ghostty's
-        // .csd/.ssd toggle), NOT a blanket set_decorated(false) which strips
-        // Wayland's resize edges + shadow. Deferred to real-compositor checks.
-        let drag_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        drag_spacer.set_width_request(80);
-        let drag_area = gtk4::WindowHandle::builder()
-            .css_classes(["roost-titlebar"])
-            .hexpand(false)
-            .child(&drag_spacer)
+        // The strip's own band: a solid chrome-gray row carrying the hairline
+        // under the header (`.roost-tab-band` in style.css). Holds only the
+        // scroller; its height is matched to the sidebar header band below.
+        let tab_strip_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .css_classes(["roost-tab-band"])
             .build();
-        tab_row.append(&drag_area);
-        tab_row.append(&notif_button);
-        tab_row.append(&gtk4::WindowControls::new(gtk4::PackType::End));
+        tab_strip_row.append(&tab_scroller);
+
+        let content_column = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        content_column.append(&tab_strip_row);
+        content_column.append(&tab_stack);
+
+        let paned = gtk4::Paned::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .resize_start_child(false)
+            .shrink_start_child(false)
+            .position(220)
+            .start_child(&sidebar_box)
+            .end_child(&content_column)
+            .build();
+
+        // Line up the sidebar "PROJECTS" header band and the tab-strip band to
+        // the same height so the two top bands meet flush across the paned seam
+        // (Mac parity). A vertical SizeGroup is robust where a CSS min-height
+        // would drift with theme + scale factor. A SizeGroup holds refs to its
+        // members but they don't ref it back, so it's stashed on `App`
+        // (`_band_size_group`) to keep the height constraint alive across
+        // resizes — dropping it here would silently let the bands drift.
+        let band_size_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Vertical);
+        band_size_group.add_widget(&sidebar_header_band);
+        band_size_group.add_widget(&tab_strip_row);
+
+        // Wrap the content below the header in a `gtk::Overlay` so the command
+        // palette card can float centered over the whole window (sidebar +
+        // tabs), pinned just under the tab bar.
+        let content_overlay = gtk4::Overlay::builder().child(&paned).build();
+
+        // Header bar = Mac titlebar parity: the project/cwd title centered over
+        // the full window width, the sidebar toggle on the leading edge, the
+        // notifications bell on the trailing edge. AdwHeaderBar gives true
+        // window-width centering of the title, automatic window-drag, and
+        // WM-correct window controls (so a server-side-decoration setup doesn't
+        // double them) — the affordances the old hand-rolled tab row had to
+        // fake with GtkWindowControls + a GtkWindowHandle spacer.
+        let header_row = libadwaita::HeaderBar::builder()
+            .css_classes(["roost-headerbar"])
+            .build();
+        header_row.set_title_widget(Some(&window_title));
+        header_row.pack_start(&sidebar_toggle_button);
+        header_row.pack_end(&notif_button);
 
         let toolbar_view = libadwaita::ToolbarView::new();
-        toolbar_view.add_top_bar(&tab_row);
+        toolbar_view.add_top_bar(&header_row);
         toolbar_view.set_content(Some(&content_overlay));
         window.set_content(Some(&toolbar_view));
 
@@ -731,6 +752,7 @@ impl App {
             sidebar_box: sidebar_box.clone(),
             tab_stack: tab_stack.clone(),
             bar_stack: bar_stack.clone(),
+            tab_scroller: tab_scroller.clone(),
             window_title: window_title.clone(),
             projects: RefCell::new(HashMap::new()),
             active_project_id: RefCell::new(0),
@@ -738,6 +760,7 @@ impl App {
             active_theme_name: RefCell::new(active_theme_name),
             theme_name_at_open: RefCell::new(None),
             content_overlay: content_overlay.clone(),
+            _band_size_group: band_size_group,
             palette: RefCell::new(None),
             provider_req: std::cell::Cell::new(0),
             notification_inbox: RefCell::new(NotificationInbox::new()),
@@ -1390,6 +1413,11 @@ impl App {
                     return;
                 }
                 app.refresh_window_subtitle();
+                // Keep the just-selected tab visible in the strip (Mac parity).
+                // Runs for programmatic selections too (close-survivor,
+                // Ctrl-nav, bootstrap restore) — all are "active tab changed" —
+                // so it's placed before the user-gesture suppress gate below.
+                app.schedule_scroll_active_tab_into_view();
                 // Sync the core ONLY for genuine in-widget user gestures —
                 // a tab-pill click (#228) or AdwTabView's Ctrl-nav (#229).
                 // Every selection change WE make (set_selected_page, append,
@@ -2123,6 +2151,10 @@ impl App {
         self.sidebar.select_row(Some(&ui.sidebar_row));
         drop(projects);
         *self.active_project_id.borrow_mut() = project_id;
+        // Switching projects shows a different strip — scroll it to its active
+        // tab (a project switch doesn't fire `selected-page`). The idle defer
+        // inside reads the now-updated `active_project_id`.
+        self.schedule_scroll_active_tab_into_view();
         // M9.5: clicking a project shouldn't leave focus on the sidebar
         // row — hand focus to the active tab's TerminalView (matches the
         // Mac `selectProject` ending in `makeFirstResponder`).
@@ -2173,6 +2205,77 @@ impl App {
             let subtitle = active_tab_cwd(ui);
             self.window_title.set_subtitle(&subtitle);
         }
+    }
+
+    /// Scroll the tab strip so the active project's selected pill is fully
+    /// visible (Mac parity — `scrollActiveTabIntoView`). Deferred to an idle
+    /// tick because GTK has no synchronous layout: a freshly attached or
+    /// just-selected pill isn't allocated when the notify fires, so its bounds
+    /// (and the scroller's adjustment range) aren't valid until the pending
+    /// resize pass runs. One retry covers the attach case where even the first
+    /// idle still races allocation.
+    fn schedule_scroll_active_tab_into_view(self: &Rc<Self>) {
+        let app = self.clone();
+        glib::idle_add_local_once(move || {
+            if !app.scroll_active_tab_into_view() {
+                let app2 = app.clone();
+                glib::idle_add_local_once(move || {
+                    app2.scroll_active_tab_into_view();
+                });
+            }
+        });
+    }
+
+    /// Reveal the active pill in `tab_scroller`. Returns `false` when the pill
+    /// isn't laid out yet (caller may retry on a later tick); `true` otherwise,
+    /// including the nothing-to-do cases. Only writes the hadjustment when the
+    /// pill is actually off-view, clamped so it never overscrolls. The pill /
+    /// project borrows are dropped before the write so a `value-changed` reentry
+    /// can't hit a live borrow.
+    fn scroll_active_tab_into_view(self: &Rc<Self>) -> bool {
+        let adj = self.tab_scroller.hadjustment();
+        let page = adj.page_size();
+        if page <= 0.0 {
+            return false;
+        }
+        let bounds = {
+            let pid = *self.active_project_id.borrow();
+            let projects = self.projects.borrow();
+            let Some(ui) = projects.get(&pid) else {
+                return true;
+            };
+            let Some(tab_id) = ui
+                .tab_view
+                .selected_page()
+                .and_then(|p| parse_tab_id_from_page(&p))
+            else {
+                return true;
+            };
+            let pills = ui.pills.borrow();
+            let Some(pill) = pills.get(&tab_id) else {
+                return true;
+            };
+            // `compute_bounds` relative to the scroller yields viewport-space x
+            // (content shifted by -value); `None` = not laid out yet → retry.
+            pill.root.compute_bounds(&self.tab_scroller)
+        };
+        let Some(b) = bounds else {
+            return false;
+        };
+        let content_left = adj.value() + b.x() as f64;
+        let content_right = content_left + b.width() as f64;
+        let target = reveal_scroll_value(
+            adj.value(),
+            adj.lower(),
+            adj.upper(),
+            page,
+            content_left,
+            content_right,
+        );
+        if (target - adj.value()).abs() > 0.5 {
+            adj.set_value(target);
+        }
+        true
     }
 
     /// OpenTab RPC → on success, attach the tab to the project's
@@ -3563,7 +3666,7 @@ impl App {
             None => PaletteOutcome::Close,
         });
 
-        let top_margin = Self::palette_top_margin();
+        let top_margin = self.palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3590,7 +3693,7 @@ impl App {
         }
         let root = self.notifications_frame();
         let behavior = self.notifications_behavior();
-        let top_margin = Self::palette_top_margin();
+        let top_margin = self.palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3624,7 +3727,7 @@ impl App {
         let commands = RoostConfig::load_default().commands;
         let root = self.launcher_frame(&commands);
         let behavior = self.launcher_behavior(commands);
-        let top_margin = Self::palette_top_margin();
+        let top_margin = self.palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -3711,7 +3814,7 @@ impl App {
         let providers = RoostConfig::load_default().providers;
         let root = self.provider_list_frame(&providers);
         let behavior = self.provider_list_behavior(providers);
-        let top_margin = Self::palette_top_margin();
+        let top_margin = self.palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let overlay = PaletteOverlay::present(
             &self.content_overlay,
@@ -4254,11 +4357,14 @@ impl App {
         }
     }
 
-    /// Top margin for the palette card. The tab strip now lives in the
-    /// toolbar top bar, above the content overlay the palette floats in, so
-    /// the card only needs the visual gap from the content top.
-    fn palette_top_margin() -> i32 {
-        TOP_GAP
+    /// Top inset for the palette card. The card floats in `content_overlay`,
+    /// whose top edge is now the tab band (the strip moved into the content
+    /// column), so clear the band's live height before adding the gap — this
+    /// keeps the card pinned just under the tabs, as it was when the strip
+    /// lived in the toolbar's top bar (above the overlay). Falls back to a bare
+    /// `TOP_GAP` if the band isn't allocated yet (height 0).
+    fn palette_top_margin(&self) -> i32 {
+        self.tab_scroller.height() + TOP_GAP
     }
 
     /// Palette teardown callback: clear the handle + the captured
@@ -4704,7 +4810,7 @@ impl App {
             PaletteOutcome::Close
         });
 
-        let top_margin = Self::palette_top_margin();
+        let top_margin = self.palette_top_margin();
         let weak_dismiss = Rc::downgrade(self);
         let dismiss_reply = shared.clone();
         let overlay = PaletteOverlay::present(
@@ -5796,6 +5902,31 @@ fn restore_open_specs(saved: &[RestoreTab]) -> Vec<(String, String, bool)> {
     }
 }
 
+/// Compute the scroll-adjustment value that brings `[child_left, child_right]`
+/// fully into a viewport of width `page` currently positioned at `cur`,
+/// clamped to `[lower, upper - page]`. Returns `cur` unchanged when the child
+/// is already fully visible. Pure (no GTK) so the reveal + clamp logic is unit
+/// tested directly; `scroll_active_tab_into_view` feeds it the active pill's
+/// content-space bounds.
+fn reveal_scroll_value(
+    cur: f64,
+    lower: f64,
+    upper: f64,
+    page: f64,
+    child_left: f64,
+    child_right: f64,
+) -> f64 {
+    let max = (upper - page).max(lower);
+    let v = if child_left < cur {
+        child_left
+    } else if child_right > cur + page {
+        child_right - page
+    } else {
+        cur
+    };
+    v.clamp(lower, max)
+}
+
 /// M10 sidebar-reorder pure math. Given a source row sitting at
 /// `source_idx` and the user's desired insertion point in the
 /// *with-source* visual order (`raw_target_idx`), return the
@@ -5941,10 +6072,58 @@ mod tests {
     use super::{
         compute_insert_idx, drain_server_driven_marker, format_font_size,
         is_already_attached_or_pending, notif_tab_id, pick_next_active_project, resolve_launch_cwd,
-        restore_open_specs, tilde_abbreviate_with_home, RestoreTab,
+        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn reveal_scroll_keeps_visible_child_put() {
+        // child [10,50] already inside viewport [0,100] → no movement.
+        assert_eq!(reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 10.0, 50.0), 0.0);
+    }
+
+    #[test]
+    fn reveal_scroll_reveals_child_off_right() {
+        // viewport [0,100], child [120,160] off the right → align right edge.
+        assert_eq!(
+            reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 120.0, 160.0),
+            60.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_reveals_child_off_left() {
+        // scrolled to [80,180], child [10,50] off the left → align left edge.
+        assert_eq!(
+            reveal_scroll_value(80.0, 0.0, 200.0, 100.0, 10.0, 50.0),
+            10.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_partial_right_overlap_scrolls_minimum() {
+        // child [90,130] straddles the right edge of [0,100] → cur = 130-100.
+        assert_eq!(
+            reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 90.0, 130.0),
+            30.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_clamps_to_upper_minus_page() {
+        // child past content end → clamp to max = upper - page = 100.
+        assert_eq!(
+            reveal_scroll_value(0.0, 0.0, 200.0, 100.0, 250.0, 300.0),
+            100.0
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_clamps_when_content_shorter_than_page() {
+        // content (upper 60) narrower than the viewport (100) → never overscroll.
+        assert_eq!(reveal_scroll_value(0.0, 0.0, 60.0, 100.0, 10.0, 50.0), 0.0);
+    }
 
     /// The notification-row id parser: `notif:<tab>` → the tab id; the
     /// `notif:none` empty sentinel + malformed ids → `None` (so confirm

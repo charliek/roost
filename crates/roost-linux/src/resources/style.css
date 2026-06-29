@@ -31,24 +31,30 @@ box.roost-sidebar list {
   background-image: none;
 }
 
-/* The toolbar top row (tabs + window controls) is SOLID chrome gray — the
- * Mac UI's top bar is opaque, with only the sidebar carrying vibrancy.
- * Without this the translucent window (see the .roost-translucent block)
- * shows straight through the top row, which reads as "very transparent".
+/* Header bar + tab-strip band are SOLID chrome gray — the Mac UI's top bands
+ * are opaque, with only the sidebar carrying vibrancy. Without this the
+ * translucent window (see the .roost-translucent block) shows straight
+ * through them, which reads as "very transparent".
  *
  * Pinned in BOTH the focused and unfocused (:backdrop) states — when the
  * window is inactive GTK applies :backdrop, and without an explicit rule the
- * transparent window bg shows through again. The WindowHandle wrapper
- * (.roost-titlebar) is pinned too so no seam shows around the row. */
-.roost-tabrow,
-.roost-tabrow:backdrop,
-.roost-titlebar,
-.roost-titlebar:backdrop,
-/* Also pin the AdwToolbarView's own top-bar container (behind the row) so the
- * transparent window can't show through around it, focused or backdrop. */
+ * transparent window bg shows through again. The AdwToolbarView's own top-bar
+ * container (behind the header) is pinned too. */
+.roost-headerbar,
+.roost-headerbar:backdrop,
+.roost-tab-band,
+.roost-tab-band:backdrop,
 toolbarview > .top-bar,
 toolbarview > .top-bar:backdrop {
   background-color: @roost_chrome_bg;
+}
+/* Header/content seam: drop libadwaita's default headerbar drop-shadow and
+ * draw a single subtle hairline under the header instead — the Mac shows
+ * exactly this line between the titlebar and the PROJECTS/tabs band. Same
+ * 1px alpha(#fff, 0.06) treatment as the sidebar footer's top hairline. */
+.roost-headerbar {
+  box-shadow: none;
+  border-bottom: 1px solid alpha(#ffffff, 0.06);
 }
 
 /* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
@@ -56,7 +62,7 @@ toolbarview > .top-bar:backdrop {
  * `bounds.insetBy(dx:6, dy:1)` + 6px-radius pill. Drawing on the child
  * (not the row) keeps the row's leading `box-shadow` rollup stripe at the
  * TRUE left edge — the stripe must not inset with the pill. Fill is
- * HARDCODED #12509d (not @accent_bg_color): the host accent isn't always
+ * HARDCODED #13509d (not @accent_bg_color): the host accent isn't always
  * blue and libadwaita dims it under :backdrop, but the Mac pill is a
  * constant vivid blue regardless of window focus, so we pin it.
  *
@@ -87,10 +93,10 @@ toolbarview > .top-bar:backdrop {
 }
 .navigation-sidebar > row:selected > *,
 .navigation-sidebar > row:selected:backdrop > * {
-  background-color: #12509d;
+  background-color: #13509d;
 }
 .navigation-sidebar > row:selected:hover > * {
-  background-color: shade(#12509d, 1.08);
+  background-color: shade(#13509d, 1.08);
 }
 /* Clear the row-level hover too, so libadwaita's full-width hover tint
  * doesn't bleed outside the inset pill; the hover fill goes on the child. */
@@ -129,17 +135,17 @@ tabbar tab:checked {
   padding: 3px 4px;
 }
 /* Pill: 24px tall, 6px radius (Mac TabPillView). Inactive = transparent
- * with a dimmed label; hover gets a faint wash; active = a SOLID blue fill
- * + white label.
+ * with a dimmed label; hover gets a faint wash; active = a solid dark-navy
+ * fill + white label.
  *
- * HARDCODED #007aff (NOT @accent_bg_color): the active tab must read as the
- * SAME blue as the Mac, whose pill is NSColor.controlAccentColor (#007aff).
- * @accent_bg_color follows the host desktop accent, which isn't always blue —
- * on COSMIC it's teal, so the pill came out cyan, way off from the Mac. Same
- * rationale as the #12509d sidebar-selection hardcode above. The Mac draws the
- * pill at 18% alpha over a WHITE titlebar (reads pale blue); our chrome is dark
- * (#282828), where a tint reads gray and too close to the #12509d project pill,
- * so we use the accent at full strength to stay clearly, distinctly blue. */
+ * HARDCODED #243751 (NOT @accent_bg_color): this is the Mac active pill's
+ * RESOLVED colour. The Mac draws NSColor.controlAccentColor at 18% alpha over
+ * its titlebar; composited over our dark chrome (#282828),
+ * 0.18*#007aff + 0.82*#282828 ≈ #243751. Pinning the composited value — rather
+ * than a live alpha over @accent_bg_color, which follows the host accent (teal
+ * on COSMIC) — keeps the active tab faithful to the Mac on every desktop. It
+ * stays distinct from the neighbouring selected-project pill (#13509d) via its
+ * white label + always-visible close button. */
 .roost-tab-pill {
   border-radius: 6px;
   padding: 0 4px 0 8px;
@@ -155,7 +161,7 @@ tabbar tab:checked {
   background-color: alpha(currentColor, 0.10);
 }
 .roost-tab-pill.active {
-  background-color: #007aff;
+  background-color: #243751;
 }
 .roost-tab-pill label.roost-tab-pill-label {
   color: #d1d1d1;
@@ -193,9 +199,10 @@ tabbar tab:checked {
   background-color: alpha(#ffffff, 0.12);
 }
 /* Trailing notification badge on inactive notified tabs (Mac blue dot).
- * Hardcoded #007aff for the same reason as the active pill above — the Mac
- * dot is controlAccentColor (#007aff); @accent_bg_color would render it teal
- * on COSMIC. */
+ * Hardcoded #007aff: the Mac dot is NSColor.controlAccentColor (#007aff), and
+ * @accent_bg_color would render it teal on COSMIC. (Unlike the active pill
+ * above — which pins the Mac's *composited* #243751 — this dot is the unblended
+ * accent, so it stays #007aff.) */
 .roost-tab-pill-badge {
   min-width: 8px;
   min-height: 8px;
@@ -414,8 +421,10 @@ window.roost-translucent overlay,
 window.roost-translucent paned {
   background-color: transparent;
 }
-/* Keep the right-pane seam fully OPAQUE. (The top row is opaqued
- * unconditionally via .roost-tabrow above; the AdwHeaderBar is gone.) */
+/* Keep the right-pane seam fully OPAQUE. (The header + tab-strip band are
+ * opaqued unconditionally via .roost-headerbar / .roost-tab-band above, so the
+ * relocated strip stays solid over the glass; only the terminal seams need
+ * pinning here.) */
 window.roost-translucent paned > separator {
   background-color: #1e1e1e;
 }
