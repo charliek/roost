@@ -9,6 +9,42 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.14 — 2026-06-30
+
+Drag files onto the terminal to attach them, a round of GTK chrome work bringing
+it to Mac parity, and the macOS app is now Developer ID signed + notarized.
+
+### Features
+
+- **Drag a file onto the terminal to insert its path (Mac + GTK, #245)** —
+  dragging a file (e.g. a screenshot) from Finder / the file manager onto a
+  terminal tab inserts its shell-escaped path through the same bracketed-paste
+  path as ⌘V, so Claude Code / Codex resolve it as an image and attach it
+  (`[Image #N]`). Mirrors Ghostty's drop behavior; the Mac (Swift) and GTK
+  implementations share byte-identical escaping. Clipboard paste is unchanged.
+- **GTK chrome brought to Mac parity (#231, #236, #244)** — chrome colors, a
+  minimal `AdwHeaderBar` title, custom Mac-style tab pills, the tab strip beside
+  the sidebar, and the active tab kept scrolled into view.
+- **macOS sidebar: flush-left, gapped per-project running rail (#235).**
+
+### Fixes
+
+- **GTK palette focus-walk crash (#234)** — terminal focus grabs now route
+  through a rooted-widget guard (clippy-enforced), with focus-ownership
+  invariants and a rate-limited glib log writer to bound the warning-storm blast
+  radius. Fixes the palette focus crash and the log storms around it.
+- **macOS app is now Developer ID signed + notarized (#240)** — gated on the
+  full secret set; ad-hoc signing remains the fallback when secrets are absent.
+- **release: retry `hdiutil create` on transient "Resource busy" (#243).**
+
+### Tooling & tests
+
+- Wayland pointer-drag guard + CI hardening following #236 (#237); a `popos-test`
+  skill for native Pop!_OS COSMIC testing plus shed-based Linux-testing-on-a-Mac
+  tooling; and an output-only readiness sentinel that fixes the dominant
+  `e2e-mac` flake (`test_env_injected`). Drag-drop's pure-value Mac tests use
+  XCTest to dodge a swift-testing-runner SIGTRAP under Xcode 26.x.
+
 ## v0.0.13 — 2026-06-26
 
 A microphone/camera permission fix for the macOS app, plus a round of GTK
