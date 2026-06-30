@@ -24,8 +24,13 @@ import sys
 
 import pytest
 
-from client import Timeout
-from util import cwd_reaches, precondition, wait_shell_ready, wait_tab_attached
+from util import (
+    cwd_reaches,
+    precondition,
+    run_printf_probe,
+    wait_shell_ready,
+    wait_tab_attached,
+)
 
 # Detect login state per shell: bash via `shopt -q login_shell`, zsh via
 # `[[ -o login ]]`. Anything else POSIX (dash, etc.) reports `skip` —
@@ -184,17 +189,19 @@ def test_env_injected(roost, project):
     # then comes back empty. The printf sentinel proves the shell actually
     # runs a command first. Matches the other shell-integration tests.
     wait_shell_ready(roost, tab)
-    # Emit each field on its OWN short line, not one long line: the UI sizes
-    # the grid to the window, so a single ~83-char marker wraps at narrow
-    # widths and a contiguous-substring match flakes on window size. Short
-    # per-field lines never wrap. Each value appears only in the OUTPUT (the
-    # echoed command shows the literal `%s`/`$VAR`), so a match is genuine.
-    probe = (
-        'printf "ENV_tp=%s\\nENV_si=%s\\nENV_feat=%s\\nENV_term=%s\\n'
-        'ENV_rd=%s\\nENV_done\\n" '
-        '"$TERM_PROGRAM" "$ROOST_SHELL_INTEGRATION" "$ROOST_SHELL_FEATURES" '
-        '"$TERM" "${ROOST_RESOURCES_DIR:+set}"'
-    )
+    # Print each env var via `label=%s` so the value materializes only in the
+    # OUTPUT, never in the echoed command line. `run_printf_probe` owns the
+    # output-only readiness sentinel + re-send-under-load loop (it appends its
+    # own `roost_done=<uuid>` marker); waiting on a literal `ENV_done` here
+    # would match the echo mid-render and dump before the output lands — the
+    # bug that made this the dominant e2e-mac flake.
+    fields = [
+        ("ENV_tp", "$TERM_PROGRAM"),
+        ("ENV_si", "$ROOST_SHELL_INTEGRATION"),
+        ("ENV_feat", "$ROOST_SHELL_FEATURES"),
+        ("ENV_term", "$TERM"),
+        ("ENV_rd", "${ROOST_RESOURCES_DIR:+set}"),
+    ]
     expected = [
         "ENV_tp=Roost",
         "ENV_si=1",
@@ -202,29 +209,7 @@ def test_env_injected(roost, project):
         "ENV_term=xterm-256color",
         "ENV_rd=set",
     ]
-    # Re-send the probe until its output lands. Even after wait_shell_ready, a
-    # loaded macOS CI runner can drop THIS send's keystrokes (the shell briefly
-    # relapses between the readiness sentinel and the probe → an empty
-    # viewport, the dominant e2e-mac flake). Bounded re-send within the same
-    # ~36s budget as the old single 12s×scale wait — the SAME sentinel-retry
-    # shape wait_shell_ready uses, not an unbounded crutch. The echoed command
-    # shows the literal `%s`, so a re-send can never false-match "ENV_done" via
-    # the echo; only the printf OUTPUT contains it, and re-running printf is
-    # idempotent for the contract check below.
-    last_text = ""
-    for _ in range(3):
-        roost.run(tab, probe)
-        try:
-            roost.wait_text(tab, "ENV_done", timeout=4)  # scaled inside _wait
-            break
-        except Timeout:
-            last_text = roost._safe_dump_text(tab)
-    else:
-        raise AssertionError(
-            f"shell-integration env probe produced no output after 3 sends; "
-            f"tab {tab} viewport:\n{last_text}"
-        )
-    text = roost._safe_dump_text(tab)
+    text = run_printf_probe(roost, tab, fields)
     missing = [m for m in expected if m not in text]
     assert not missing, (
         f"shell-integration env contract missing {missing}; tab {tab} "

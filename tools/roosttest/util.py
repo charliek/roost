@@ -180,6 +180,57 @@ def wait_shell_ready(
     )
 
 
+def run_printf_probe(
+    roost,
+    tab_id: int,
+    fields,
+    *,
+    attempts: int = 3,
+    per_attempt_timeout: float = 4.0,
+) -> str:
+    """Run a `printf` probe of `fields` and return the viewport text once its
+    OUTPUT (never the echo) has landed.
+
+    `fields` is a list of `(label, shell_expr)` pairs, printed as `label=%s`
+    with `shell_expr` as the matching positional arg — so the echoed command
+    line shows the literal `%s`/`$expr` and `label=<value>` materializes ONLY
+    when the command actually runs (the in-tree convention,
+    test_shell_integration.py:13-18; same trick `wait_shell_ready` uses).
+
+    Readiness is gated on a FRESH output-only sentinel (`roost_done=%s` + a
+    uuid) appended to the probe, so `wait_text` can never false-match the echoed
+    command line. That false-match is exactly what made `test_env_injected` the
+    dominant e2e-mac flake: a literal sentinel in the format string matched the
+    echo mid-render, so the dump was captured before the output existed and the
+    re-send loop never fired. Building the sentinel here makes every probe
+    output-only by construction.
+
+    Each field is printed on its own short `label=%s` line (never one long
+    line): the UI sizes the grid to the window, so a long line wraps at narrow
+    widths and a contiguous-substring match flakes. Re-sends up to `attempts`
+    times when a send's keystrokes are dropped under CI load. `shell_expr` must
+    be safe inside double quotes (`$VAR`, `${VAR:+set}`); the uuid suffix is
+    `[0-9a-f]`, shell-safe inside single quotes. Raises AssertionError with a
+    viewport dump on exhaustion.
+    """
+    fmt = "".join(f"{label}=%s\\n" for label, _ in fields) + "roost_done=%s\\n"
+    exprs = " ".join(f'"{expr}"' for _, expr in fields)
+    last_text = ""
+    for _ in range(attempts):
+        suffix = uuid.uuid4().hex
+        roost.send(tab_id, f"printf \"{fmt}\" {exprs} '{suffix}'\n")
+        try:
+            # Scaled inside `_wait` via ROOST_TEST_TIMEOUT_SCALE.
+            roost.wait_text(tab_id, f"roost_done={suffix}", timeout=per_attempt_timeout)
+            return roost._safe_dump_text(tab_id)
+        except Timeout:
+            last_text = roost._safe_dump_text(tab_id)
+    raise AssertionError(
+        f"printf probe produced no output after {attempts} sends; "
+        f"tab {tab_id} viewport:\n{last_text}"
+    )
+
+
 def drain(roost, tab_id: int) -> bytes:
     """One-shot drain. Returns whatever bytes the UI has queued
     onto the input channel since the last drain — including empty
