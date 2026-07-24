@@ -2517,25 +2517,23 @@ final class TerminalView: NSView {
             line.draw(at: draw.origin)
         }
 
-        // Cursor (goal-mac-polish-cursor-keys M2 + Claude-cursor follow-up).
-        // Drawn AFTER glyphs but BEFORE selection — selection wants to
-        // visually dominate the cursor cell when the user's mid-drag.
+        // Cursor. Drawn AFTER glyphs but BEFORE selection — selection
+        // wants to visually dominate the cursor cell when the user's
+        // mid-drag.
         //
-        // **Visibility policy**: we deliberately diverge from strict
-        // DECTCEM (mode 25) compliance when the view is focused. TUI
-        // apps like Claude Code disable the system cursor and render
-        // their own placeholder character — but the placeholder
-        // disappears the moment the user starts typing, leaving no
-        // indication of where input lands. We keep the system cursor
-        // visible whenever the view is focused, regardless of
-        // libghostty's `visible` flag, so the user can always see
-        // where their next keystroke will land. This matches cmux's
-        // behavior and is the UX the user requested.
-        //
-        // When the view is NOT focused we still defer to the
-        // visibility flag — background tabs whose TUI apps have
-        // hidden the cursor stay quiet (less visual noise).
-        if let cur = cursorInfo, cur.visible || hasFocus {
+        // Strict DECTCEM (mode 25): a hidden cursor is never drawn, even
+        // when focused (#246; the old #51 focus-override is gone). Shape
+        // + suppression are `cursorRenderMode`'s call — Ghostty
+        // `cursor.zig` `style()` parity.
+        if let cur = cursorInfo,
+           let mode = TerminalView.cursorRenderMode(
+               visible: cur.visible,
+               blinking: cur.blinking,
+               hasFocus: hasFocus,
+               blinkOn: cursorBlinkOn,
+               visualStyle: cur.visualStyle
+           )
+        {
             let cursorRect = NSRect(
                 x: CGFloat(cur.col) * cellW,
                 y: CGFloat(cur.row) * cellH,
@@ -2543,32 +2541,20 @@ final class TerminalView: NSView {
                 height: cellH
             )
             let cursorColor = cur.color ?? theme.cursor
-            if !hasFocus {
-                // Unfocused: hollow outline, always on (no blink).
+            switch mode {
+            case .outline:
                 drawCursorOutline(in: cursorRect, color: cursorColor)
-            } else if cursorBlinkOn {
-                // Focused + blink-on: visual style decides shape.
-                // libghostty-vt can ask for BLOCK_HOLLOW directly
-                // (e.g. some apps via DECSCUSR variants); honor it
-                // by routing to the same outline path as blurred.
-                switch cur.visualStyle {
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
-                    drawCursorBar(in: cursorRect, color: cursorColor)
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
-                    drawCursorUnderline(in: cursorRect, color: cursorColor)
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
-                    drawCursorOutline(in: cursorRect, color: cursorColor)
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
-                    fallthrough
-                default:
-                    drawCursorBlock(
-                        in: cursorRect,
-                        color: cursorColor,
-                        cellFont: cellFont
-                    )
-                }
+            case .bar:
+                drawCursorBar(in: cursorRect, color: cursorColor)
+            case .underline:
+                drawCursorUnderline(in: cursorRect, color: cursorColor)
+            case .block:
+                drawCursorBlock(
+                    in: cursorRect,
+                    color: cursorColor,
+                    cellFont: cellFont
+                )
             }
-            // Focused + !cursorBlinkOn → don't draw; cell shows through.
         }
 
         // Clickable-link underline (PR B). Draw a single-pixel rule
@@ -2664,6 +2650,46 @@ final class TerminalView: NSView {
             }
         }
         return (fg, bg, hasExplicitBg)
+    }
+
+    /// The cursor shapes the renderer can paint, or `nil` for "draw
+    /// nothing this frame". Result of `cursorRenderMode` — the single
+    /// cursor decision `draw(_:)` consumes.
+    enum CursorRenderMode {
+        case block
+        case bar
+        case underline
+        case outline
+    }
+
+    /// Strict DECTCEM cursor decision, mirroring Ghostty's
+    /// `renderer/cursor.zig` `style()` priority chain (#246). Returns
+    /// `nil` to draw nothing. A hidden cursor (DECTCEM mode 25 off)
+    /// wins over focus — a focused pane no longer forces a cursor over
+    /// an app that hid it. A non-blinking style (DECSCUSR 2/4/6)
+    /// ignores the blink phase (Ghostty parity; roost previously
+    /// blinked steady cursors). `nonisolated` because it's pure — see
+    /// `resolveCellColors`.
+    nonisolated static func cursorRenderMode(
+        visible: Bool,
+        blinking: Bool,
+        hasFocus: Bool,
+        blinkOn: Bool,
+        visualStyle: GhosttyRenderStateCursorVisualStyle
+    ) -> CursorRenderMode? {
+        if !visible { return nil }
+        if !hasFocus { return .outline }
+        if blinking && !blinkOn { return nil }
+        switch visualStyle {
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+            return .bar
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+            return .underline
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+            return .outline
+        default:
+            return .block
+        }
     }
 
     /// Synthesise the XTerm-form OSC 10/11/12 query response for
