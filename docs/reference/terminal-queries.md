@@ -21,11 +21,15 @@ wrong and you either double-answer or leave a query unanswered.
   It can't, really: the *embedder* (Roost) owns the palette and theme, so
   only Roost knows the right RGB to report. These replies are
   **embedder-synthesized**.
-- **CSI/DCS device queries** (DA1/DA2, DSR, XTVERSION, ENQ, DECRQM, size
-  reports) — libghostty-vt **does** answer these, via the `write_pty`
-  effects callback. The answers are pure VT bookkeeping (cursor position,
-  mode state, a static attribute string) that the engine already tracks.
-  These replies are **libghostty-answered**.
+- **CSI/DCS device queries** (DA1/DA2/DA3, DSR 5n/6n, XTVERSION, DECRQM,
+  the Kitty keyboard query, mode-2048 resize reports) — libghostty-vt
+  **does** answer these autonomously, via the `write_pty` effects
+  callback. The answers are pure VT bookkeeping (cursor position, mode
+  state, a static attribute string) that the engine already tracks. These
+  replies are **libghostty-answered**. (A second class — ENQ, XTWINOPS
+  14/16/18t size reports, DSR `?996` — needs *additional* provider
+  callbacks that `write_pty` alone does not enable; see Channel 2's
+  "provider-gated set". Those remain unanswered, deferred to #209.)
 
 The two sets are disjoint, so the channels never overlap or double-reply.
 
@@ -63,29 +67,120 @@ Code: `crates/roost-osc/src/lib.rs` (scanner + formatters),
 `crates/roost-linux/src/app.rs` (drain reply arm),
 `mac/Sources/Roost/TerminalView.swift` (`appendBytes` reply arm).
 
-## Channel 2 — libghostty-answered device queries (`write_pty`) — *planned*
+## Channel 2 — libghostty-answered device queries (`write_pty`) — *live*
 
-> **Status: not yet implemented.** The OSC color channel above is live; this
-> device-query channel is the planned follow-up. Until it lands, Roost
-> answers only the OSC color channel, so probing TUIs see a terminal that
-> ignores DA1/DSR/XTVERSION/DECRQM. (Note: this does *not* affect opencode —
-> it falls back gracefully without device-query replies.) The rest of this
-> section describes the intended design.
+> **Status: live (#247).** Roost installs libghostty-vt's `write_pty`
+> effects callback on both UIs, so the engine-autonomous device replies
+> below now reach the PTY. Before this, probing TUIs saw a terminal that
+> ignored DA1/DSR/XTVERSION/DECRQM — most visibly crossterm's
+> `supports_keyboard_enhancement()` blocked ~2 s on an unanswered Kitty
+> query and then never pushed Kitty flags (so Shift+Enter arrived as a
+> bare `\r`).
 
-libghostty-vt's C terminal layer installs trampolines for an effects
-callback set called `write_pty`. When the parser produces a host
-response — DA1/DA2 (`ESC[c` / `ESC[>c`), DSR (`ESC[5n` / `ESC[6n`),
-XTVERSION (`ESC[>q`), ENQ, DECRQM mode reports (`ESC[?Ps$p`), size
-reports — it hands the bytes to `write_pty`. Roost *would* wire that
-callback and forward the bytes to the PTY input.
+libghostty-vt's C terminal layer answers a set of CSI/DCS device queries
+itself, handing the response bytes to the `write_pty` effects callback.
+Roost wires that callback and forwards the bytes onto the same per-tab
+PTY-input channel as keystrokes.
 
-The callback fires **synchronously inside `vt_write`** (mid-parse), so the
-plan is a **collect-then-send** buffer: the callback only appends reply
-bytes to a per-tab buffer, and Roost drains that buffer to `send_input` /
-`onKey` *after* `vt_write` returns. This avoids any reentrancy/borrow
-hazard and keeps replies FIFO-ordered with keystrokes.
+### Answered — engine-autonomous set (enabled by `write_pty` alone)
 
-**Deferred:** DEC mode 2031 (live light/dark color-scheme change
-notifications) is tracked separately — it needs Roost to *proactively*
-emit a DSR when its theme switches at runtime, which is more than wiring
-the reply callback. See the DEC 2031 issue.
+| Query | Sequence | Reply (engine default at the pinned SHA) |
+|---|---|---|
+| DA1 / DA2 / DA3 | `ESC[c` / `ESC[>c` / `ESC[=c` | e.g. DA1 → `ESC[?62;22c` (VT220 + ANSI color) |
+| DSR status | `ESC[5n` | `ESC[0n` ("OK") |
+| DSR cursor position (CPR) | `ESC[6n` | `ESC[<row>;<col>R` |
+| DECRQM mode report | `ESC[?Ps$p` | `ESC[?Ps;<state>$y` |
+| Kitty keyboard query | `ESC[?u` | `ESC[?<flags>u` (e.g. `ESC[?0u` with no flags pushed) |
+| XTVERSION | `ESC[>q` | `DCS >\|libghostty ST` (the literal default; roost ships no override) |
+| CSI 21t title report | `ESC[21t` | the current title (from libghostty's `getTitle`) |
+| Mode-2048 in-band resize report | fires on `resize` when mode 2048 is set | `ESC[48;<rows>;<cols>;<h>;<w>t` |
+
+### NOT answered — provider-gated set (deferred to #209)
+
+These need *separate* libghostty callbacks that don't exist yet, so
+`write_pty` alone does not enable them. They are deliberately out of scope
+(the `write_pty` design owns `OPT_USERDATA` exclusively — see below):
+
+| Query | Sequence | Missing callback |
+|---|---|---|
+| ENQ | `0x05` | `enquiry` (empty default → early return) |
+| XTWINOPS size reports | `ESC[14t` / `ESC[16t` / `ESC[18t` | `size` (`orelse return`) |
+| DSR color-scheme | `ESC[?996n` | `color_scheme` |
+
+### Drain shape — collect-then-send, after `vt_write` **and** `resize`
+
+The callback fires **synchronously inside `vt_write`** (mid-parse) **and
+inside `resize`** — mode 2048 (in-band size reports) emits its report from
+`ghostty_terminal_resize`, *outside* `vt_write`. So Roost uses a
+**collect-then-send** buffer: the callback only appends reply bytes to a
+per-tab buffer, and Roost drains that buffer to `send_input` / `onKey`
+*after* the producing call returns. Draining only after `vt_write` would
+silently drop resize-triggered reports.
+
+Drain points, per UI:
+
+- **macOS** (`mac/Sources/Roost/TerminalView.swift`): the module-level
+  `roostWritePtyCallback` appends to `pendingPtyReplies`;
+  `flushPendingPtyReplies()` drains it into `onKey` at the end of
+  `appendBytes` (post-`vt_write`) and immediately after the
+  `ghostty_terminal_resize` call in `reflowGridForBounds`.
+- **Linux** (`crates/roost-linux/src/terminal_view.rs`): the trampoline
+  (in `crates/roost-vt/src/terminal.rs`) appends to an
+  `Arc<Mutex<Vec<u8>>>`; `TerminalView::drain_write_pty` takes the bytes
+  and dispatches through `input_callback` after `TerminalView::vt_write`
+  and after every `reflow` (each of the three resize call sites).
+
+The buffer take never holds its lock across `vt_write`/`resize` (the
+trampoline locks the same mutex synchronously — a held guard would
+self-deadlock), and the callback is append-only (it must never re-enter
+`vt_write` per libghostty's no-reentrancy contract).
+
+**`OPT_USERDATA` exclusivity.** libghostty exposes a *single* shared
+userdata slot for **all** of its callbacks. The `write_pty` wiring claims
+it exclusively; adding any second callback (bell, title, size, enquiry,
+color-scheme, …) later can't just set its own userdata — it must be
+multiplexed through one shared context struct. That refactor is deferred
+until a second callback actually exists (#209 remainder).
+
+**Cross-channel ordering nuance.** Within a *single mixed chunk*, Channel
+1 (OSC) replies are synthesized *before* `vt_write` while Channel 2
+(device) replies drain *after* it, so replies from one chunk are not
+ordered by byte position across the two channels. This is harmless — the
+query sets are disjoint and each channel is internally ordered.
+
+### DEC 2031 — proactive color-scheme change notification
+
+Mode 2031 (`CSI ? 2031 h`) is an app *opt-in* to be told when the
+terminal's color scheme flips between light and dark at runtime. Unlike
+the Channel 2 queries above, nothing on the PTY output triggers it — it's
+**proactive**: when the user switches Roost's theme mid-session, Roost
+writes a DSR onto the PTY input of every tab whose terminal has mode 2031
+enabled:
+
+| New scheme | Emitted |
+|---|---|
+| dark | `CSI ? 997 ; 1 n` (`ESC[?997;1n`) |
+| light | `CSI ? 997 ; 2 n` (`ESC[?997;2n`) |
+
+Light vs dark is derived from the theme's **background luminance** (Rec.
+709 weighted sum over the sRGB channels, > 0.5 → light) — the same one
+formula on both UIs (`ColorRgb::is_light` in
+`crates/roost-vt/src/render_state.rs`; `Theme.isLight` in
+`mac/Sources/Roost/Theme.swift`). Roost ships only dark themes today, so
+in practice the report is `997;1n` until a light theme is added.
+
+The report is emitted from each UI's runtime theme-switch path
+(`TerminalView::set_theme` on Linux, `TerminalView.setTheme` on macOS),
+routed through the **same per-tab PTY-input sink as keystrokes** (`onKey`
+/ `input_callback` → `send_input`) so it stays FIFO-ordered with input
+and is visible to `tab.capture_pty_input`. Gating: only when the tab's
+terminal reports mode 2031 set (`ghostty_terminal_mode_get`), and only on
+an actual theme switch — merely *enabling* the mode emits nothing (an app
+that wants the current state queries `?996`).
+
+**Still deferred (#209):** the DSR `?996` *query* (`ESC[?996n`, "what
+scheme are you now?") stays unanswered — it needs the `color_scheme`
+provider callback, which conflicts with the buffer-only `OPT_USERDATA`
+design (see the exclusivity note above). So mode 2031 gives apps live
+*change* notifications, but a cold *query* of the current scheme is not
+yet answered.

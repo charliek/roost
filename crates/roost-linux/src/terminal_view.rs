@@ -6,12 +6,13 @@
 //!   1. Pass A: background fills (canvas + per-cell bg).
 //!   2. Pass B: glyphs via Pango layout (one layout reused per frame,
 //!      `set_text` per cell).
-//!   3. Pass C: cursor draw — 4 styles (block / bar / underline /
-//!      hollow), focus-aware. Per `feature/rust-port` commit
-//!      `266dea7` we deliberately keep the cursor visible whenever
-//!      the view has focus, regardless of libghostty's DECTCEM
-//!      `visible` flag. This is the cmux-style UX the user
-//!      requested; matches the Mac UI's TerminalView.draw decision.
+//!   3. Pass C: cursor draw — 4 shapes (block / bar / underline /
+//!      outline). Shape + visibility are `cursor_render_mode`'s call:
+//!      strict DECTCEM (mode 25 hides the cursor even when focused,
+//!      #246), mirroring Ghostty's `renderer/cursor.zig` `style()`
+//!      chain. The mode is computed once per frame and shared by the
+//!      glyph-skip pass and `paint_cursor`; matches the Mac UI's
+//!      TerminalView.draw decision.
 //!   4. Pass D (later): selection overlay. Lands in commit 7.
 //!
 //! Subsequent commits add: PTY round-trip (5), key input (6),
@@ -22,6 +23,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gtk4::cairo;
@@ -202,6 +204,23 @@ impl TerminalView {
         let _ = terminal.set_color_cursor(theme.cursor);
         let _ = terminal.set_color_palette(&theme.palette);
 
+        // #247: install libghostty-vt's write_pty reply buffer before any
+        // vt_write, so the device queries the engine answers autonomously
+        // (DA1/DA2/DA3, DSR 5n/6n, DECRQM, XTVERSION, the Kitty keyboard
+        // query, mode-2048 in-band size reports) get collected instead of
+        // silently dropped. `drain_write_pty` flushes it into
+        // `input_callback` after each vt_write / resize. The view keeps a
+        // clone here (the `Terminal`'s own Arc lives inside its buffer
+        // field) — that clone is what the drain reads. Non-fatal on
+        // failure, like the color pushes above.
+        let write_pty_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        if let Err(err) = terminal.set_write_pty_buffer(write_pty_buffer.clone()) {
+            tracing::warn!(
+                ?err,
+                "failed to install write_pty reply buffer; device queries disabled"
+            );
+        }
+
         let pango_ctx = widget.pango_context();
         let font_desc = default_font_description();
         // Hinting + antialias on so monospace cells align to whole
@@ -237,6 +256,7 @@ impl TerminalView {
             selection: None,
             copy_on_select: CopyOnSelect::default(),
             input_callback: None,
+            write_pty_buffer,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             on_resize: None,
@@ -288,6 +308,9 @@ impl TerminalView {
                 if let Some((Some(cb), cols, rows)) = fire {
                     cb(cols, rows);
                 }
+                // Mode 2048 fires the write_pty callback inside resize
+                // (outside vt_write) — drain the in-band size report (#247).
+                Self::drain_write_pty(&state);
                 widget.queue_draw();
             }
         });
@@ -989,6 +1012,9 @@ impl TerminalView {
         if let Some((Some(cb), cols, rows)) = fire {
             cb(cols, rows);
         }
+        // The reflow above resized the terminal; drain any mode-2048
+        // in-band size report it emitted (#247).
+        Self::drain_write_pty(&self.state);
         self.widget.queue_draw();
     }
 
@@ -1016,6 +1042,9 @@ impl TerminalView {
         if let Some((Some(cb), cols, rows)) = fire {
             cb(cols, rows);
         }
+        // A late-attach reflow can also emit a mode-2048 size report;
+        // drain it (#247). No-op when input_callback isn't installed yet.
+        Self::drain_write_pty(&self.state);
     }
 
     /// Swap the live theme on this terminal. Re-pushes the palette +
@@ -1025,15 +1054,57 @@ impl TerminalView {
     /// pass picks up the default fg/bg/cursor/selection, and queues a
     /// redraw. Drives the command palette's live theme preview.
     pub fn set_theme(&self, theme: &Theme) {
-        {
+        // DEC 2031 (C3): if the app opted into color-scheme reporting,
+        // this runtime theme switch must proactively tell it whether the
+        // new scheme is light or dark, routed through the SAME input sink
+        // as keystrokes + device-query replies so it stays FIFO-ordered
+        // and visible to `tab.capture_pty_input`. Computed under the
+        // borrow, dispatched after it drops (the callback may re-enter).
+        let notify = {
             let mut s = self.state.borrow_mut();
             let _ = s.terminal.set_color_background(theme.background);
             let _ = s.terminal.set_color_foreground(theme.foreground);
             let _ = s.terminal.set_color_cursor(theme.cursor);
             let _ = s.terminal.set_color_palette(&theme.palette);
             s.theme = theme.clone();
+            if s.terminal.mode_get(2031) {
+                s.input_callback.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(cb) = notify {
+            cb(color_scheme_report(theme.background.is_light()).to_vec());
         }
         self.widget.queue_draw();
+    }
+
+    /// Drain the device-query replies libghostty's write_pty callback
+    /// collected into `write_pty_buffer` during the last `vt_write` /
+    /// `resize` (#247) and dispatch them through `input_callback` — the
+    /// same PTY-input route keystrokes take. Callers MUST invoke this
+    /// after **every** `vt_write` AND **every** resize: mode 2048 fires
+    /// the callback inside `resize`, outside `vt_write`.
+    ///
+    /// RefCell discipline (mirrors the focus/keystroke paths): take the
+    /// bytes and clone the callback under the borrow, then DROP the
+    /// borrow before dispatching, so the callback may safely re-enter the
+    /// view. The mutex is locked only for the `mem::take` — never across
+    /// dispatch. If no `input_callback` is installed yet (attach race),
+    /// leave the bytes buffered for a later drain (device queries only
+    /// arrive from a live shell, i.e. post-attach).
+    fn drain_write_pty(state: &Rc<RefCell<TerminalViewState>>) {
+        let s = state.borrow();
+        let Some(cb) = s.input_callback.clone() else {
+            // No sink yet — leave the bytes in the buffer untouched.
+            return;
+        };
+        let bytes =
+            std::mem::take(&mut *s.write_pty_buffer.lock().unwrap_or_else(|p| p.into_inner()));
+        drop(s);
+        if !bytes.is_empty() {
+            cb(bytes);
+        }
     }
 
     /// Feed VT bytes into the terminal. Triggers a redraw so the new
@@ -1066,6 +1137,8 @@ impl TerminalView {
         }
         s.osc_shape_set_in_this_chunk = false;
         drop(s);
+        // Drain replies the vt_write above collected (#247).
+        Self::drain_write_pty(&self.state);
         self.widget.queue_draw();
     }
 
@@ -1314,6 +1387,9 @@ impl TerminalView {
         let already_attached = s.input_callback.is_some();
         s.input_callback = Some(Rc::new(callback));
         drop(s);
+        // Replies buffered while no input sink existed (attach race)
+        // now have somewhere to go.
+        Self::drain_write_pty(&self.state);
         if already_attached {
             return;
         }
@@ -1449,6 +1525,15 @@ struct TerminalViewState {
     /// callback may safely re-enter the view. An `Rc` makes the clone
     /// cheap (atomic-free, single-threaded GTK).
     input_callback: Option<Rc<dyn Fn(Vec<u8>)>>,
+    /// Sink for engine-emitted device-query replies (#247), shared with
+    /// libghostty-vt as `OPT_USERDATA` via `Terminal::set_write_pty_buffer`.
+    /// The trampoline appends reply bytes here synchronously inside
+    /// `vt_write` / `resize` (mode 2048); [`TerminalView::drain_write_pty`]
+    /// takes them and dispatches through `input_callback`. The `Mutex` is
+    /// only for the FFI boundary — every real access is on the GTK main
+    /// thread. Never hold its lock across a `vt_write`/`resize` (the
+    /// trampoline locks it too — self-deadlock); lock only to take.
+    write_pty_buffer: Arc<Mutex<Vec<u8>>>,
     /// Live cell grid. Reflowed from the widget's pixel size on every
     /// `resize` signal; seeded with the `DEFAULT_COLS`/`DEFAULT_ROWS`
     /// the libghostty terminal was allocated with.
@@ -1802,6 +1887,17 @@ impl TerminalViewState {
         // so the block cursor can re-draw the underlying glyph in
         // inverted color in pass C.
         let cursor = self.render_state.cursor();
+        // Strict-DECTCEM cursor decision, computed ONCE per frame so the
+        // glyph-skip pass and `paint_cursor` can't disagree (#246).
+        let cursor_mode = cursor.as_ref().and_then(|c| {
+            cursor_render_mode(
+                c.visible,
+                c.blinking,
+                self.has_focus,
+                self.cursor_blink_on,
+                c.visual_style,
+            )
+        });
         let mut cursor_cell_text: Option<(String, ColorRgb)> = None;
 
         self.render_state
@@ -1845,10 +1941,18 @@ impl TerminalViewState {
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_font_description(Some(&self.font_desc));
         for (row, col, fg, text) in &glyph_pass {
-            // Skip drawing the glyph at the cursor cell when the
-            // cursor's about to redraw it inverted (block cursor).
+            // Skip drawing the glyph at the cursor cell when the block
+            // cursor is about to redraw it inverted. Same per-frame
+            // decision `paint_cursor` uses, so the skip can never
+            // disagree with the paint (blank-cell hazard fixed by
+            // construction). `wide_tail` cells keep their glyph — the
+            // wide-char cell to the left carries the cursor.
             if let Some(c) = cursor.as_ref() {
-                if c.row == *row && c.col == *col as u32 && self.should_invert_cursor_glyph() {
+                if c.row == *row
+                    && c.col == *col as u32
+                    && cursor_mode == Some(CursorRenderMode::Block)
+                    && !c.wide_tail
+                {
                     continue;
                 }
             }
@@ -1871,11 +1975,12 @@ impl TerminalViewState {
         }
 
         // Pass C: cursor.
-        if let Some(c) = cursor.as_ref() {
+        if let (Some(c), Some(mode)) = (cursor.as_ref(), cursor_mode) {
             self.paint_cursor(
                 cr,
                 &layout,
                 c,
+                mode,
                 cursor_cell_text.as_ref(),
                 cell_w,
                 cell_h,
@@ -2310,79 +2415,52 @@ impl TerminalViewState {
         )
     }
 
-    /// Decide whether to skip the per-cell glyph at the cursor and
-    /// let the cursor's own re-draw paint it inverted. True only for
-    /// the focused block cursor in the "on" phase of the blink.
-    fn should_invert_cursor_glyph(&self) -> bool {
-        if !self.has_focus || !self.cursor_blink_on {
-            return false;
-        }
-        match self.render_state.cursor() {
-            Some(c) => matches!(c.visual_style, CursorVisualStyle::Block),
-            None => false,
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn paint_cursor(
         &self,
         cr: &cairo::Context,
         layout: &pango::Layout,
         cursor: &CursorInfo,
+        mode: CursorRenderMode,
         cursor_cell_text: Option<&(String, ColorRgb)>,
         cell_w: f64,
         cell_h: f64,
         cursor_color: ColorRgb,
         canvas_bg: ColorRgb,
     ) {
-        // cmux-style: keep the cursor visible whenever the view has
-        // focus, regardless of libghostty's DECTCEM `visible` flag.
-        // Matches the Mac UI's TerminalView.draw decision merged from
-        // feature/rust-port commit 266dea7.
-        let should_draw = self.has_focus || cursor.visible;
-        if !should_draw || cursor.wide_tail {
+        // `mode` already encodes visibility / focus / blink (see
+        // `cursor_render_mode`, #246); the only drawing-layer concern
+        // left is `wide_tail` — the wide-char cell to the left carries
+        // the cursor, so this tail cell paints nothing.
+        if cursor.wide_tail {
             return;
         }
 
         let x = cursor.col as f64 * cell_w;
         let y = cursor.row as f64 * cell_h;
 
-        if !self.has_focus {
-            // Hollow outline — 1pt stroke inset 0.5pt so the stroke
-            // sits inside the cell rect.
-            set_cairo_color(cr, cursor_color);
-            cr.set_line_width(1.0);
-            cr.rectangle(x + 0.5, y + 0.5, cell_w - 1.0, cell_h - 1.0);
-            let _ = cr.stroke();
-            return;
-        }
-
-        // Blink "off" phase: skip the cursor draw so the underlying
-        // glyph shows through. The next blink tick toggles it back.
-        if !self.cursor_blink_on {
-            return;
-        }
-
-        match cursor.visual_style {
-            CursorVisualStyle::Bar => {
-                // 2pt vertical line at the cell's leading edge.
-                set_cairo_color(cr, cursor_color);
-                cr.rectangle(x, y, 2.0, cell_h);
-                let _ = cr.fill();
-            }
-            CursorVisualStyle::Underline => {
-                // 2pt horizontal line at the cell's bottom edge.
-                set_cairo_color(cr, cursor_color);
-                cr.rectangle(x, y + cell_h - 2.0, cell_w, 2.0);
-                let _ = cr.fill();
-            }
-            CursorVisualStyle::BlockHollow => {
+        match mode {
+            CursorRenderMode::Outline => {
+                // Hollow outline — 1pt stroke inset 0.5pt so the stroke
+                // sits inside the cell rect.
                 set_cairo_color(cr, cursor_color);
                 cr.set_line_width(1.0);
                 cr.rectangle(x + 0.5, y + 0.5, cell_w - 1.0, cell_h - 1.0);
                 let _ = cr.stroke();
             }
-            CursorVisualStyle::Block => {
+            CursorRenderMode::Bar => {
+                // 2pt vertical line at the cell's leading edge.
+                set_cairo_color(cr, cursor_color);
+                cr.rectangle(x, y, 2.0, cell_h);
+                let _ = cr.fill();
+            }
+            CursorRenderMode::Underline => {
+                // 2pt horizontal line at the cell's bottom edge.
+                set_cairo_color(cr, cursor_color);
+                cr.rectangle(x, y + cell_h - 2.0, cell_w, 2.0);
+                let _ = cr.fill();
+            }
+            CursorRenderMode::Block => {
                 // Fill the cell with cursor color, then redraw the
                 // underlying glyph in canvas-bg color so it's
                 // legible against the filled block.
@@ -2421,6 +2499,51 @@ fn set_cairo_color(cr: &cairo::Context, rgb: ColorRgb) {
     cr.set_source_rgb(r, g, b);
 }
 
+/// The cursor shapes the renderer can paint, or `None` for "draw
+/// nothing this frame". Result of [`cursor_render_mode`] — the single
+/// per-frame cursor decision both the glyph-skip pass and
+/// `paint_cursor` consume, so they can never disagree (no blank-cell
+/// hazard by construction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorRenderMode {
+    Block,
+    Bar,
+    Underline,
+    Outline,
+}
+
+/// Strict DECTCEM cursor decision, mirroring Ghostty's
+/// `renderer/cursor.zig` `style()` priority chain (#246). Returns
+/// `None` to draw nothing. A hidden cursor (DECTCEM mode 25 off) wins
+/// over focus — a focused pane no longer forces a cursor over an app
+/// that hid it. A non-blinking style (DECSCUSR 2/4/6) ignores the
+/// blink phase (Ghostty parity; roost previously blinked steady
+/// cursors). Free function so it's unit-testable without a GTK widget;
+/// `wide_tail` stays a drawing-layer concern (see `paint_cursor`).
+fn cursor_render_mode(
+    visible: bool,
+    blinking: bool,
+    has_focus: bool,
+    blink_on: bool,
+    visual_style: CursorVisualStyle,
+) -> Option<CursorRenderMode> {
+    if !visible {
+        return None;
+    }
+    if !has_focus {
+        return Some(CursorRenderMode::Outline);
+    }
+    if blinking && !blink_on {
+        return None;
+    }
+    Some(match visual_style {
+        CursorVisualStyle::Bar => CursorRenderMode::Bar,
+        CursorVisualStyle::Underline => CursorRenderMode::Underline,
+        CursorVisualStyle::BlockHollow => CursorRenderMode::Outline,
+        CursorVisualStyle::Block => CursorRenderMode::Block,
+    })
+}
+
 /// Resolve a cell's effective fg/bg + whether it needs a BG fill,
 /// applying the SGR inverse + bold-accent rules below. Free function
 /// so it's unit-testable without a Cairo context or DrawingArea.
@@ -2457,6 +2580,19 @@ pub(crate) fn resolve_cell_colors(
         }
     }
     (fg, bg, has_explicit_bg)
+}
+
+/// DEC 2031 proactive color-scheme report bytes: `CSI ? 997 ; 2 n` for a
+/// light scheme, `CSI ? 997 ; 1 n` for dark. Emitted onto the PTY input
+/// on a runtime theme switch when the app has enabled mode 2031
+/// (`CSI ? 2031 h`) so 2031-aware TUIs can re-theme live. Mirrors the Mac
+/// formatter in `TerminalView.setTheme` (`mac/Sources/Roost`).
+fn color_scheme_report(light: bool) -> &'static [u8] {
+    if light {
+        b"\x1b[?997;2n"
+    } else {
+        b"\x1b[?997;1n"
+    }
 }
 
 /// Extract the active selection as plain text (trailing whitespace
@@ -3483,5 +3619,111 @@ mod tests {
     fn drop_text_empty_payload_is_none() {
         assert_eq!(drop_text(&[], None), None);
         assert_eq!(drop_text(&[], Some("")), None);
+    }
+
+    // Strict-DECTCEM cursor decision. 1:1 with the Swift suite in
+    // `mac/Tests/RoostTests/CursorRenderModeTests.swift` — both
+    // renderers MUST implement the identical truth table (Ghostty
+    // `renderer/cursor.zig` `style()` parity, #246).
+    use roost_vt::CursorVisualStyle as CVS;
+
+    #[test]
+    fn cursor_mode_hidden_focused_is_none() {
+        // #246: a DECTCEM-hidden cursor must not draw even when focused.
+        assert_eq!(
+            cursor_render_mode(false, true, true, true, CVS::Block),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_mode_hidden_focused_block_skips_no_glyph() {
+        // The glyph-skip trap: a hidden focused block resolves to `None`
+        // so the skip predicate (`== Some(Block)`) never blanks the cell.
+        assert_eq!(
+            cursor_render_mode(false, false, true, true, CVS::Block),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_mode_hidden_unfocused_is_none() {
+        assert_eq!(
+            cursor_render_mode(false, true, false, true, CVS::Block),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_mode_visible_unfocused_is_outline() {
+        assert_eq!(
+            cursor_render_mode(true, true, false, true, CVS::Block),
+            Some(CursorRenderMode::Outline)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_unfocused_outline_is_blink_independent() {
+        assert_eq!(
+            cursor_render_mode(true, true, false, false, CVS::Bar),
+            Some(CursorRenderMode::Outline)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_focused_blinking_blink_off_is_none() {
+        assert_eq!(
+            cursor_render_mode(true, true, true, false, CVS::Block),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_mode_focused_steady_blink_off_is_drawn() {
+        // The pre-existing steady-cursor fix: a non-blinking style
+        // (DECSCUSR 2/4/6) ignores the blink phase (Ghostty parity).
+        assert_eq!(
+            cursor_render_mode(true, false, true, false, CVS::Block),
+            Some(CursorRenderMode::Block)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_focused_block_is_block() {
+        assert_eq!(
+            cursor_render_mode(true, true, true, true, CVS::Block),
+            Some(CursorRenderMode::Block)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_focused_bar_is_bar() {
+        assert_eq!(
+            cursor_render_mode(true, true, true, true, CVS::Bar),
+            Some(CursorRenderMode::Bar)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_focused_underline_is_underline() {
+        assert_eq!(
+            cursor_render_mode(true, true, true, true, CVS::Underline),
+            Some(CursorRenderMode::Underline)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_focused_block_hollow_is_outline() {
+        assert_eq!(
+            cursor_render_mode(true, true, true, true, CVS::BlockHollow),
+            Some(CursorRenderMode::Outline)
+        );
+    }
+
+    #[test]
+    fn color_scheme_report_picks_light_vs_dark_param() {
+        // DEC 2031: light → `CSI ? 997 ; 2 n`, dark → `CSI ? 997 ; 1 n`.
+        assert_eq!(color_scheme_report(true), b"\x1b[?997;2n");
+        assert_eq!(color_scheme_report(false), b"\x1b[?997;1n");
     }
 }

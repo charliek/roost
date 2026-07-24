@@ -22,6 +22,41 @@ import AppKit
 import CGhosttyVT
 import QuartzCore  // CACurrentMediaTime — monotonic clock for the motion throttle.
 
+/// libghostty-vt `write_pty` effects callback (matches
+/// `GhosttyTerminalWritePtyFn`). libghostty invokes this synchronously
+/// from inside `ghostty_terminal_vt_write` **and**
+/// `ghostty_terminal_resize` (mode 2048 in-band size reports), handing
+/// back the `OPT_USERDATA` pointer installed alongside it — an
+/// `Unmanaged.passUnretained(TerminalView)`. It appends the reply bytes
+/// to the view's `pendingPtyReplies`, which `flushPendingPtyReplies`
+/// drains into `onKey` after the producing call.
+///
+/// `MainActor.assumeIsolated` is sound because both call sites
+/// (`appendBytes`, `reflowGridForBounds`) are `@MainActor` — roost never
+/// drives `vt_write`/`resize` off the main actor (CLAUDE.md threading
+/// table). Append-only: it must never re-enter `vt_write`
+/// (`terminal.h` no-reentrancy contract).
+private func roostWritePtyCallback(
+    _ terminal: GhosttyTerminal?,
+    _ userdata: UnsafeMutableRawPointer?,
+    _ data: UnsafePointer<UInt8>?,
+    _ len: Int
+) {
+    guard let userdata, let data, len > 0 else { return }
+    // Copy the reply out (it is only valid for this call's duration) and
+    // reduce the userdata to a bit pattern BEFORE crossing into the main
+    // actor: Swift 6 strict concurrency won't let a raw pointer be
+    // "sent" into the @MainActor closure, but a `[UInt8]` and a `UInt`
+    // are Sendable. `assumeIsolated` runs synchronously — no real hop.
+    let bytes = Array(UnsafeBufferPointer(start: data, count: len))
+    let userdataBits = UInt(bitPattern: userdata)
+    MainActor.assumeIsolated {
+        guard let ud = UnsafeMutableRawPointer(bitPattern: userdataBits) else { return }
+        let view = Unmanaged<TerminalView>.fromOpaque(ud).takeUnretainedValue()
+        view.pendingPtyReplies.append(contentsOf: bytes)
+    }
+}
+
 final class TerminalView: NSView {
     /// Maximum scrollback rows libghostty-vt retains per terminal.
     static let defaultScrollback: size_t = 2000
@@ -81,6 +116,14 @@ final class TerminalView: NSView {
     /// `event.characters`; 5.5c upgrades to libghostty-vt's full
     /// key encoder for arrows / function keys / modifier handling.
     @MainActor var onKey: ((Data) -> Void)?
+
+    /// Buffer for engine-emitted device-query replies (#247). The
+    /// module-level `roostWritePtyCallback` (installed as libghostty-vt's
+    /// `write_pty` effects callback in `init`) appends reply bytes here
+    /// synchronously inside `vt_write` / `resize`; `flushPendingPtyReplies`
+    /// drains it into `onKey` right after those calls. `fileprivate` so
+    /// the same-file callback can reach it.
+    fileprivate var pendingPtyReplies = Data()
 
     /// Set by `TabSession.start` so OSC events parsed out of the
     /// PTY byte stream (Phase 6a P6) ride the existing ReportOsc
@@ -405,6 +448,46 @@ final class TerminalView: NSView {
         }
         self.terminal = handle
 
+        // #247: install libghostty-vt's write_pty effects callback so the
+        // device queries the engine answers autonomously (DA1/DA2/DA3,
+        // DSR 5n/6n, DECRQM, XTVERSION, the Kitty keyboard query, and
+        // mode-2048 in-band size reports) reach the PTY instead of being
+        // silently dropped. userdata is this view, passed unretained (the
+        // view owns and outlives the handle; cleared in deinit before the
+        // free). OPT_USERDATA is a single shared slot for ALL ghostty
+        // callbacks (terminal.h:63) — owned exclusively here until #209
+        // multiplexes a second callback through it.
+        let writePtyUserdataRc = ghostty_terminal_set(
+            handle,
+            GHOSTTY_TERMINAL_OPT_USERDATA,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+        if writePtyUserdataRc.rawValue != 0 {
+            NSLog(
+                "roost-mac: write_pty userdata install failed rc=%d; device queries disabled",
+                writePtyUserdataRc.rawValue
+            )
+        } else {
+            let callback:
+                @convention(c) (
+                    GhosttyTerminal?, UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int
+                ) -> Void = roostWritePtyCallback
+            let writePtyCallbackRc = ghostty_terminal_set(
+                handle,
+                GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                unsafeBitCast(callback, to: UnsafeRawPointer.self)
+            )
+            if writePtyCallbackRc.rawValue != 0 {
+                // Never leave a half-installed callback: clear the
+                // userdata we just set so nothing dangles.
+                _ = ghostty_terminal_set(handle, GHOSTTY_TERMINAL_OPT_USERDATA, nil)
+                NSLog(
+                    "roost-mac: write_pty callback install failed rc=%d; device queries disabled",
+                    writePtyCallbackRc.rawValue
+                )
+            }
+        }
+
         // Phase 6a P3: push the theme's fg / bg / cursor + 256-color
         // palette into libghostty-vt so SGR-color cells render in the
         // theme's palette instead of libghostty's compiled-in default.
@@ -544,6 +627,9 @@ final class TerminalView: NSView {
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             ghostty_terminal_vt_write(terminal, base, data.count)
         }
+        // Drain replies the write_pty callback collected during this
+        // vt_write (#247) into onKey.
+        flushPendingPtyReplies()
         // Alt→primary transition resets the OSC 22 cursor shape so a
         // TUI that owned the alt screen with a `pointer` doesn't
         // leave the cursor stuck on shell prompt. Matches xterm /
@@ -565,6 +651,22 @@ final class TerminalView: NSView {
         needsDisplay = true
     }
 
+    /// Deliver any device-query replies the write_pty callback buffered
+    /// during the last `vt_write` / `resize` (#247) into `onKey` — the
+    /// same PTY-input route OSC replies and keystrokes take. Collect-then-
+    /// send: copy the buffer to a local and clear the stored buffer BEFORE
+    /// calling `onKey`, so the delivery is well-defined even if the sink
+    /// ever re-enters. If `onKey` isn't wired yet (attach race — parity
+    /// with the Linux drain), keep the bytes buffered for the next drain.
+    @MainActor
+    private func flushPendingPtyReplies() {
+        if pendingPtyReplies.isEmpty { return }
+        guard let onKey else { return }
+        let reply = pendingPtyReplies
+        pendingPtyReplies.removeAll(keepingCapacity: true)
+        onKey(reply)
+    }
+
     /// Swap the active theme on a live terminal. Repaints the canvas /
     /// selection / cursor (which read `self.theme` directly in
     /// `draw(_:)`) and re-applies the fg/bg/cursor + palette into
@@ -583,6 +685,17 @@ final class TerminalView: NSView {
         if let terminal {
             Theme.apply(resolved, to: terminal)
         }
+        // DEC 2031 (C3): if the app opted into color-scheme reporting,
+        // proactively tell it whether this runtime theme switch landed on
+        // a light or dark scheme (`CSI ? 997 ; 2 n` / `; 1 n`), routed
+        // through `onKey` — the SAME PTY-input sink as keystrokes +
+        // device-query replies — so it stays FIFO-ordered and visible to
+        // `tab.capture_pty_input`. Enabling the mode does NOT emit (only
+        // theme switches do); 2031-disabled tabs stay silent.
+        if isDecModeEnabled(2031), let onKey {
+            let param = theme.isLight ? 2 : 1
+            onKey(Data("\u{1B}[?997;\(param)n".utf8))
+        }
         needsDisplay = true
     }
 
@@ -598,6 +711,14 @@ final class TerminalView: NSView {
         NotificationCenter.default.removeObserver(self)
         cursorBlinkTimer?.invalidate()
         if let term = terminal {
+            // Clear the write_pty callback + userdata before the free
+            // (#247) so the trampoline can never fire against a torn-down
+            // view. Order: callback first, then userdata — never leave the
+            // callback live with a stale pointer. Same no-concurrent-access
+            // basis as the free itself (callbacks only fire inside
+            // vt_write/resize, which cannot run once deinit has begun).
+            _ = ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, nil)
+            _ = ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_USERDATA, nil)
             ghostty_terminal_free(term)
         }
     }
@@ -2349,15 +2470,26 @@ final class TerminalView: NSView {
         if !dimsChanged && !forceResize { return }
         cols = newCols
         rows = newRows
+        var pendingResizeReport = false
         if let terminal {
             let cellWPx = UInt32(cellSize.width.rounded())
             let cellHPx = UInt32(cellSize.height.rounded())
             _ = ghostty_terminal_resize(terminal, newCols, newRows, cellWPx, cellHPx)
+            pendingResizeReport = true
         }
         invalidateIntrinsicContentSize()
         needsDisplay = true
         if dimsChanged {
             onResize?(newCols, newRows)
+        }
+        // Mode 2048 (in-band size reports) fires the write_pty callback
+        // synchronously inside resize, outside vt_write — drain here too
+        // (#247), or a resize-triggered report leaks. AFTER onResize so
+        // the serial PTY queue applies TIOCSWINSZ before the report:
+        // an app that reads the report then checks TIOCGWINSZ must see
+        // the new size (matches the GTK UI's ordering).
+        if pendingResizeReport {
+            flushPendingPtyReplies()
         }
     }
 
@@ -2517,25 +2649,23 @@ final class TerminalView: NSView {
             line.draw(at: draw.origin)
         }
 
-        // Cursor (goal-mac-polish-cursor-keys M2 + Claude-cursor follow-up).
-        // Drawn AFTER glyphs but BEFORE selection — selection wants to
-        // visually dominate the cursor cell when the user's mid-drag.
+        // Cursor. Drawn AFTER glyphs but BEFORE selection — selection
+        // wants to visually dominate the cursor cell when the user's
+        // mid-drag.
         //
-        // **Visibility policy**: we deliberately diverge from strict
-        // DECTCEM (mode 25) compliance when the view is focused. TUI
-        // apps like Claude Code disable the system cursor and render
-        // their own placeholder character — but the placeholder
-        // disappears the moment the user starts typing, leaving no
-        // indication of where input lands. We keep the system cursor
-        // visible whenever the view is focused, regardless of
-        // libghostty's `visible` flag, so the user can always see
-        // where their next keystroke will land. This matches cmux's
-        // behavior and is the UX the user requested.
-        //
-        // When the view is NOT focused we still defer to the
-        // visibility flag — background tabs whose TUI apps have
-        // hidden the cursor stay quiet (less visual noise).
-        if let cur = cursorInfo, cur.visible || hasFocus {
+        // Strict DECTCEM (mode 25): a hidden cursor is never drawn, even
+        // when focused (#246; the old #51 focus-override is gone). Shape
+        // + suppression are `cursorRenderMode`'s call — Ghostty
+        // `cursor.zig` `style()` parity.
+        if let cur = cursorInfo,
+           let mode = TerminalView.cursorRenderMode(
+               visible: cur.visible,
+               blinking: cur.blinking,
+               hasFocus: hasFocus,
+               blinkOn: cursorBlinkOn,
+               visualStyle: cur.visualStyle
+           )
+        {
             let cursorRect = NSRect(
                 x: CGFloat(cur.col) * cellW,
                 y: CGFloat(cur.row) * cellH,
@@ -2543,32 +2673,20 @@ final class TerminalView: NSView {
                 height: cellH
             )
             let cursorColor = cur.color ?? theme.cursor
-            if !hasFocus {
-                // Unfocused: hollow outline, always on (no blink).
+            switch mode {
+            case .outline:
                 drawCursorOutline(in: cursorRect, color: cursorColor)
-            } else if cursorBlinkOn {
-                // Focused + blink-on: visual style decides shape.
-                // libghostty-vt can ask for BLOCK_HOLLOW directly
-                // (e.g. some apps via DECSCUSR variants); honor it
-                // by routing to the same outline path as blurred.
-                switch cur.visualStyle {
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
-                    drawCursorBar(in: cursorRect, color: cursorColor)
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
-                    drawCursorUnderline(in: cursorRect, color: cursorColor)
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
-                    drawCursorOutline(in: cursorRect, color: cursorColor)
-                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
-                    fallthrough
-                default:
-                    drawCursorBlock(
-                        in: cursorRect,
-                        color: cursorColor,
-                        cellFont: cellFont
-                    )
-                }
+            case .bar:
+                drawCursorBar(in: cursorRect, color: cursorColor)
+            case .underline:
+                drawCursorUnderline(in: cursorRect, color: cursorColor)
+            case .block:
+                drawCursorBlock(
+                    in: cursorRect,
+                    color: cursorColor,
+                    cellFont: cellFont
+                )
             }
-            // Focused + !cursorBlinkOn → don't draw; cell shows through.
         }
 
         // Clickable-link underline (PR B). Draw a single-pixel rule
@@ -2664,6 +2782,46 @@ final class TerminalView: NSView {
             }
         }
         return (fg, bg, hasExplicitBg)
+    }
+
+    /// The cursor shapes the renderer can paint, or `nil` for "draw
+    /// nothing this frame". Result of `cursorRenderMode` — the single
+    /// cursor decision `draw(_:)` consumes.
+    enum CursorRenderMode {
+        case block
+        case bar
+        case underline
+        case outline
+    }
+
+    /// Strict DECTCEM cursor decision, mirroring Ghostty's
+    /// `renderer/cursor.zig` `style()` priority chain (#246). Returns
+    /// `nil` to draw nothing. A hidden cursor (DECTCEM mode 25 off)
+    /// wins over focus — a focused pane no longer forces a cursor over
+    /// an app that hid it. A non-blinking style (DECSCUSR 2/4/6)
+    /// ignores the blink phase (Ghostty parity; roost previously
+    /// blinked steady cursors). `nonisolated` because it's pure — see
+    /// `resolveCellColors`.
+    nonisolated static func cursorRenderMode(
+        visible: Bool,
+        blinking: Bool,
+        hasFocus: Bool,
+        blinkOn: Bool,
+        visualStyle: GhosttyRenderStateCursorVisualStyle
+    ) -> CursorRenderMode? {
+        if !visible { return nil }
+        if !hasFocus { return .outline }
+        if blinking && !blinkOn { return nil }
+        switch visualStyle {
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+            return .bar
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+            return .underline
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+            return .outline
+        default:
+            return .block
+        }
     }
 
     /// Synthesise the XTerm-form OSC 10/11/12 query response for
