@@ -101,3 +101,39 @@ class TestDeviceQueries:
         roost.tab_feed_pty_bytes(tab, b"\x1b[?u")
         captured = drain_until_match(roost, tab, rb"\x1b\[\?0u")
         assert b"\x1b[?0u" in captured, captured
+
+    def test_mode2031_theme_switch_emits_color_scheme_report(self, roost, project):
+        """DEC 2031 proactive notification (C3): once a tab enables mode
+        2031 (`CSI ? 2031 h`), a runtime theme switch must emit
+        `CSI ? 997 ; Ps n` onto its PTY input (Ps=1 dark, 2 light) so
+        2031-aware TUIs re-theme live. All bundled themes are dark, so any
+        switch reports dark (`ESC[?997;1n`).
+
+        Drives the real theme-switch path: filtering the themes sub-frame
+        moves the live-preview highlight to a different theme, which runs
+        the same `set_theme`/`setTheme` broadcast a user gets while
+        arrowing. Preview (not commit) is used deliberately — commit
+        persists to `ROOST_CONFIG`, and dismiss reverts cleanly — so the
+        seed config fixture is left untouched."""
+        tab = roost.open_tab(project, cwd="/tmp")
+        wait_tab_attached(roost, tab)
+        # Opt the tab's terminal into color-scheme reporting.
+        roost.tab_feed_pty_bytes(tab, b"\x1b[?2031h")
+
+        # Drill into the themes frame, then filter to a theme other than
+        # the active one (its row is the current selection). Setting the
+        # query moves the highlight to the top match → live preview fires
+        # `set_theme` on every view, emitting the report for our 2031 tab.
+        roost.palette_open("commands")
+        themes = roost.palette_activate("select_theme")
+        items = themes.get("items", [])
+        assert items, f"no themes in palette: {themes}"
+        selection = themes.get("selection", 0)
+        target_title = items[(selection + 1) % len(items)]["title"]
+        try:
+            roost.palette_query(target_title)
+            captured = drain_until_match(roost, tab, rb"\x1b\[\?997;1n")
+            assert b"\x1b[?997;1n" in captured, captured
+        finally:
+            # Revert the preview without persisting (Esc-equivalent).
+            roost.palette_dismiss()

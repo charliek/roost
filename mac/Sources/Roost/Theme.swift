@@ -63,6 +63,22 @@ struct Theme: Sendable {
     var boldColor: NSColor? = nil
     var palette: [NSColor]  // exactly 256 entries
 
+    /// Whether this theme reads as a *light* color scheme, from the
+    /// background's Rec. 709 luminance (weighted sum over the sRGB
+    /// channels normalized to [0,1], > 0.5 → light). Not gamma-
+    /// linearized — a plain weighted sum is enough to sort a background
+    /// into light vs dark. This is the ONE formula behind the DEC 2031
+    /// color-scheme classification; the Rust side mirrors it in
+    /// `ColorRgb::is_light` (`crates/roost-vt/src/render_state.rs`).
+    /// Backs the `997;2n` (light) / `997;1n` (dark) parameter roost emits
+    /// on a runtime theme switch when the app enabled mode 2031.
+    @MainActor
+    var isLight: Bool {
+        let c = background.usingColorSpace(.sRGB) ?? .black
+        let lum = 0.2126 * c.redComponent + 0.7152 * c.greenComponent + 0.0722 * c.blueComponent
+        return lum > 0.5
+    }
+
     /// Hard-coded fallback so the UI has a sane theme before
     /// `loadBundled(name:)` runs (or when it errors). Mirrors the
     /// "roost-dark" theme's headline colors.

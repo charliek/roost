@@ -30,6 +30,15 @@ private func testTheme() -> Theme {
     )
 }
 
+/// A light-background variant of `testTheme` (near-white) — its `isLight`
+/// luminance is > 0.5, so a switch to it emits the DEC 2031 light report.
+/// Only the background drives the report, so everything else is reused.
+private func lightTestTheme() -> Theme {
+    var theme = testTheme()
+    theme.background = NSColor(srgbRed: 0.98, green: 0.98, blue: 0.98, alpha: 1)
+    return theme
+}
+
 /// DA1 (`ESC[c`) — the primary device-attributes query crossterm blocks
 /// on. The engine's default reply must be delivered via `onKey` within
 /// the same `appendBytes` call that fed the query (collect-then-send).
@@ -135,4 +144,49 @@ func nilOnKey_retainsReplyUntilInstalled() {
 
     let reply = captured.map { String(decoding: $0, as: UTF8.self) }.joined()
     #expect(reply == "\u{1B}[?62;22c", "retained DA1 reply (got \(reply.debugDescription))")
+}
+
+// MARK: - DEC 2031 proactive color-scheme notification (C3)
+
+/// With mode 2031 enabled (`CSI ? 2031 h`), switching to a *light* theme
+/// proactively emits `CSI ? 997 ; 2 n` onto the PTY input via `onKey`.
+@Test @MainActor
+func setTheme_mode2031_emitsLightReport() {
+    let view = TerminalView(cols: 80, rows: 24, theme: testTheme())
+    view.appendBytes(Data("\u{1B}[?2031h".utf8))
+    var captured: [Data] = []
+    view.onKey = { captured.append($0) }
+
+    view.setTheme(lightTestTheme())
+
+    let reply = captured.map { String(decoding: $0, as: UTF8.self) }.joined()
+    #expect(reply == "\u{1B}[?997;2n", "2031 light report (got \(reply.debugDescription))")
+}
+
+/// With mode 2031 enabled, switching to a *dark* theme emits
+/// `CSI ? 997 ; 1 n`.
+@Test @MainActor
+func setTheme_mode2031_emitsDarkReport() {
+    let view = TerminalView(cols: 80, rows: 24, theme: lightTestTheme())
+    view.appendBytes(Data("\u{1B}[?2031h".utf8))
+    var captured: [Data] = []
+    view.onKey = { captured.append($0) }
+
+    view.setTheme(testTheme())
+
+    let reply = captured.map { String(decoding: $0, as: UTF8.self) }.joined()
+    #expect(reply == "\u{1B}[?997;1n", "2031 dark report (got \(reply.debugDescription))")
+}
+
+/// Without mode 2031, a theme switch emits nothing — the mode gates the
+/// notification (enabling it is the opt-in; a plain switch is silent).
+@Test @MainActor
+func setTheme_without2031_emitsNothing() {
+    let view = TerminalView(cols: 80, rows: 24, theme: testTheme())
+    var captured: [Data] = []
+    view.onKey = { captured.append($0) }
+
+    view.setTheme(lightTestTheme())
+
+    #expect(captured.isEmpty, "no report without mode 2031 (got \(captured))")
 }

@@ -1054,13 +1054,27 @@ impl TerminalView {
     /// pass picks up the default fg/bg/cursor/selection, and queues a
     /// redraw. Drives the command palette's live theme preview.
     pub fn set_theme(&self, theme: &Theme) {
-        {
+        // DEC 2031 (C3): if the app opted into color-scheme reporting,
+        // this runtime theme switch must proactively tell it whether the
+        // new scheme is light or dark, routed through the SAME input sink
+        // as keystrokes + device-query replies so it stays FIFO-ordered
+        // and visible to `tab.capture_pty_input`. Computed under the
+        // borrow, dispatched after it drops (the callback may re-enter).
+        let notify = {
             let mut s = self.state.borrow_mut();
             let _ = s.terminal.set_color_background(theme.background);
             let _ = s.terminal.set_color_foreground(theme.foreground);
             let _ = s.terminal.set_color_cursor(theme.cursor);
             let _ = s.terminal.set_color_palette(&theme.palette);
             s.theme = theme.clone();
+            if s.terminal.mode_get(2031) {
+                s.input_callback.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(cb) = notify {
+            cb(color_scheme_report(theme.background.is_light()).to_vec());
         }
         self.widget.queue_draw();
     }
@@ -2568,6 +2582,19 @@ pub(crate) fn resolve_cell_colors(
     (fg, bg, has_explicit_bg)
 }
 
+/// DEC 2031 proactive color-scheme report bytes: `CSI ? 997 ; 2 n` for a
+/// light scheme, `CSI ? 997 ; 1 n` for dark. Emitted onto the PTY input
+/// on a runtime theme switch when the app has enabled mode 2031
+/// (`CSI ? 2031 h`) so 2031-aware TUIs can re-theme live. Mirrors the Mac
+/// formatter in `TerminalView.setTheme` (`mac/Sources/Roost`).
+fn color_scheme_report(light: bool) -> &'static [u8] {
+    if light {
+        b"\x1b[?997;2n"
+    } else {
+        b"\x1b[?997;1n"
+    }
+}
+
 /// Extract the active selection as plain text (trailing whitespace
 /// trimmed per line), or `None` when there is no non-empty selection.
 /// A free function — shared by the explicit copy path and (on Linux)
@@ -3691,5 +3718,12 @@ mod tests {
             cursor_render_mode(true, true, true, true, CVS::BlockHollow),
             Some(CursorRenderMode::Outline)
         );
+    }
+
+    #[test]
+    fn color_scheme_report_picks_light_vs_dark_param() {
+        // DEC 2031: light → `CSI ? 997 ; 2 n`, dark → `CSI ? 997 ; 1 n`.
+        assert_eq!(color_scheme_report(true), b"\x1b[?997;2n");
+        assert_eq!(color_scheme_report(false), b"\x1b[?997;1n");
     }
 }

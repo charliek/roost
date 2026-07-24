@@ -148,8 +148,39 @@ until a second callback actually exists (#209 remainder).
 ordered by byte position across the two channels. This is harmless — the
 query sets are disjoint and each channel is internally ordered.
 
-**Deferred:** DEC mode 2031 (live light/dark color-scheme change
-notifications) is tracked separately — it needs Roost to *proactively*
-emit a DSR when its theme switches at runtime, which is more than wiring
-the reply callback. The DSR `?996` *query* likewise stays unanswered
-(needs the `color_scheme` provider callback). See the DEC 2031 issue.
+### DEC 2031 — proactive color-scheme change notification
+
+Mode 2031 (`CSI ? 2031 h`) is an app *opt-in* to be told when the
+terminal's color scheme flips between light and dark at runtime. Unlike
+the Channel 2 queries above, nothing on the PTY output triggers it — it's
+**proactive**: when the user switches Roost's theme mid-session, Roost
+writes a DSR onto the PTY input of every tab whose terminal has mode 2031
+enabled:
+
+| New scheme | Emitted |
+|---|---|
+| dark | `CSI ? 997 ; 1 n` (`ESC[?997;1n`) |
+| light | `CSI ? 997 ; 2 n` (`ESC[?997;2n`) |
+
+Light vs dark is derived from the theme's **background luminance** (Rec.
+709 weighted sum over the sRGB channels, > 0.5 → light) — the same one
+formula on both UIs (`ColorRgb::is_light` in
+`crates/roost-vt/src/render_state.rs`; `Theme.isLight` in
+`mac/Sources/Roost/Theme.swift`). Roost ships only dark themes today, so
+in practice the report is `997;1n` until a light theme is added.
+
+The report is emitted from each UI's runtime theme-switch path
+(`TerminalView::set_theme` on Linux, `TerminalView.setTheme` on macOS),
+routed through the **same per-tab PTY-input sink as keystrokes** (`onKey`
+/ `input_callback` → `send_input`) so it stays FIFO-ordered with input
+and is visible to `tab.capture_pty_input`. Gating: only when the tab's
+terminal reports mode 2031 set (`ghostty_terminal_mode_get`), and only on
+an actual theme switch — merely *enabling* the mode emits nothing (an app
+that wants the current state queries `?996`).
+
+**Still deferred (#209):** the DSR `?996` *query* (`ESC[?996n`, "what
+scheme are you now?") stays unanswered — it needs the `color_scheme`
+provider callback, which conflicts with the buffer-only `OPT_USERDATA`
+design (see the exclusivity note above). So mode 2031 gives apps live
+*change* notifications, but a cold *query* of the current scheme is not
+yet answered.

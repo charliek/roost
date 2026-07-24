@@ -41,6 +41,23 @@ impl ColorRgb {
             self.b as f64 / 255.0,
         )
     }
+
+    /// Rec. 709 luminance over the sRGB channels normalized to [0,1].
+    /// Not gamma-linearized — a plain weighted sum is enough to sort a
+    /// theme background into "light" vs "dark". This is the ONE formula
+    /// behind the DEC 2031 color-scheme classification; the Mac side
+    /// mirrors it in `Theme.isLight` (`mac/Sources/Roost/Theme.swift`).
+    pub fn relative_luminance(self) -> f64 {
+        let (r, g, b) = self.to_f64();
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// True when the color reads as a light scheme (luminance > 0.5).
+    /// Used to pick the DEC 2031 report parameter (`997;2n` light /
+    /// `997;1n` dark) from a theme's background.
+    pub fn is_light(self) -> bool {
+        self.relative_luminance() > 0.5
+    }
 }
 
 impl From<sys::GhosttyColorRgb> for ColorRgb {
@@ -493,6 +510,26 @@ impl Drop for RenderState {
             sys::ghostty_render_state_row_iterator_free(self.row_iter);
             sys::ghostty_render_state_free(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn is_light_classifies_theme_backgrounds() {
+        // roost-dark (#1e1e1e) and every other bundled theme background
+        // are dark; white and near-white are light. The DEC 2031 report
+        // picks its parameter off exactly this predicate.
+        assert!(!ColorRgb::new(0x1e, 0x1e, 0x1e).is_light());
+        assert!(!ColorRgb::new(0x00, 0x00, 0x00).is_light());
+        assert!(ColorRgb::new(0xff, 0xff, 0xff).is_light());
+        assert!(ColorRgb::new(0xfa, 0xfa, 0xfa).is_light());
+        // Green weighs heaviest (0.7152) — a saturated green reads light,
+        // a saturated blue (0.0722) reads dark.
+        assert!(ColorRgb::new(0x00, 0xff, 0x00).is_light());
+        assert!(!ColorRgb::new(0x00, 0x00, 0xff).is_light());
     }
 }
 

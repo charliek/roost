@@ -685,6 +685,17 @@ final class TerminalView: NSView {
         if let terminal {
             Theme.apply(resolved, to: terminal)
         }
+        // DEC 2031 (C3): if the app opted into color-scheme reporting,
+        // proactively tell it whether this runtime theme switch landed on
+        // a light or dark scheme (`CSI ? 997 ; 2 n` / `; 1 n`), routed
+        // through `onKey` — the SAME PTY-input sink as keystrokes +
+        // device-query replies — so it stays FIFO-ordered and visible to
+        // `tab.capture_pty_input`. Enabling the mode does NOT emit (only
+        // theme switches do); 2031-disabled tabs stay silent.
+        if isDecModeEnabled(2031), let onKey {
+            let param = theme.isLight ? 2 : 1
+            onKey(Data("\u{1B}[?997;\(param)n".utf8))
+        }
         needsDisplay = true
     }
 
