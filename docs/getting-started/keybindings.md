@@ -120,7 +120,7 @@ Anything not bound as an app shortcut flows to the focused terminal through libg
 | Printable characters   | Sent to the shell as typed                                                          |
 | Enter, Backspace, Tab  | Sent to the shell                                                                   |
 | Shift-Tab              | Sent as `\x1b[Z` (back-tab) — used by Claude Code to cycle modes                    |
-| Shift-Enter            | Disambiguated from Enter (xterm modifyOtherKeys form, or Kitty CSI-u when the app opts in) — used by Claude Code for newlines in its prompt |
+| Shift-Enter            | Disambiguated from Enter (xterm modifyOtherKeys form, or Kitty CSI-u when the app opts in) — used by Claude Code for newlines in its prompt. Query-first apps (crossterm's `supports_keyboard_enhancement`) now opt in successfully: roost answers the Kitty keyboard query `ESC[?u` (#247), so the app pushes Kitty flags instead of timing out and receiving a bare `\r` |
 | Arrow keys, Home, End  | Standard CSI in normal mode; SS3 (`\x1bOA/B/C/D`) in application-cursor mode (e.g. inside `vim`'s `:` prompt) |
 | Page Up / Page Down    | Sent as standard CSI sequences                                                      |
 | Esc                    | Sent to the shell                                                                   |

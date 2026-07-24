@@ -46,6 +46,7 @@ silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 | `test_terminal.py` | Program-driven terminal behavior: `test_cwd_tracking_follows_cd` (`cd` + an explicit OSC 7 emit → tracked cwd; cross-platform) and `test_title_follows_cwd` (title derives from cwd; skipped on Mac — shell-OSC-0-driven, see issue #196). |
 | `test_test_ops.py` | Smoke triple for the test-only IPC ops (`tab.feed_pty_bytes`, `tab.capture_pty_input`, `tab.dump_resolved`) — the scaffolding for the byte-level OSC pipeline tests. Skipped without `ROOST_TEST_MODE=1`. |
 | `test_osc_pipeline.py` | End-to-end OSC pipeline: bold + inverse resolver call-site coverage (#142), OSC 10/11/12 set/query reply round-trips (#145), and parity OSC 0/7/9 routing tests. Drives bytes via `tab.feed_pty_bytes`; reads back via `tab.dump_resolved` + `tab.capture_pty_input`. The canonical example for the "OSC-routed regression patterns" section below. |
+| `test_device_queries.py` | End-to-end device-query replies (#247): each engine-autonomous query (DA1, DSR 5n/6n, DECRQM ?25, XTVERSION `libghostty`, Kitty keyboard `ESC[?u`) fed via `tab.feed_pty_bytes` produces its reply on the input side, read back via `tab.capture_pty_input`. Pins the `write_pty` drain wiring both UIs install. Skipped without `ROOST_TEST_MODE=1`. |
 | `fixtures/launcher.conf` | Seed config the harness points the UI at via `ROOST_CONFIG` (see below), giving the launcher tests a deterministic command list. |
 
 The shared `palette` fixture (open from closed, leave closed) lives in

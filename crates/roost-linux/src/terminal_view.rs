@@ -23,6 +23,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gtk4::cairo;
@@ -203,6 +204,23 @@ impl TerminalView {
         let _ = terminal.set_color_cursor(theme.cursor);
         let _ = terminal.set_color_palette(&theme.palette);
 
+        // #247: install libghostty-vt's write_pty reply buffer before any
+        // vt_write, so the device queries the engine answers autonomously
+        // (DA1/DA2/DA3, DSR 5n/6n, DECRQM, XTVERSION, the Kitty keyboard
+        // query, mode-2048 in-band size reports) get collected instead of
+        // silently dropped. `drain_write_pty` flushes it into
+        // `input_callback` after each vt_write / resize. The view keeps a
+        // clone here (the `Terminal`'s own Arc lives inside its buffer
+        // field) — that clone is what the drain reads. Non-fatal on
+        // failure, like the color pushes above.
+        let write_pty_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        if let Err(err) = terminal.set_write_pty_buffer(write_pty_buffer.clone()) {
+            tracing::warn!(
+                ?err,
+                "failed to install write_pty reply buffer; device queries disabled"
+            );
+        }
+
         let pango_ctx = widget.pango_context();
         let font_desc = default_font_description();
         // Hinting + antialias on so monospace cells align to whole
@@ -238,6 +256,7 @@ impl TerminalView {
             selection: None,
             copy_on_select: CopyOnSelect::default(),
             input_callback: None,
+            write_pty_buffer,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             on_resize: None,
@@ -289,6 +308,9 @@ impl TerminalView {
                 if let Some((Some(cb), cols, rows)) = fire {
                     cb(cols, rows);
                 }
+                // Mode 2048 fires the write_pty callback inside resize
+                // (outside vt_write) — drain the in-band size report (#247).
+                Self::drain_write_pty(&state);
                 widget.queue_draw();
             }
         });
@@ -990,6 +1012,9 @@ impl TerminalView {
         if let Some((Some(cb), cols, rows)) = fire {
             cb(cols, rows);
         }
+        // The reflow above resized the terminal; drain any mode-2048
+        // in-band size report it emitted (#247).
+        Self::drain_write_pty(&self.state);
         self.widget.queue_draw();
     }
 
@@ -1017,6 +1042,9 @@ impl TerminalView {
         if let Some((Some(cb), cols, rows)) = fire {
             cb(cols, rows);
         }
+        // A late-attach reflow can also emit a mode-2048 size report;
+        // drain it (#247). No-op when input_callback isn't installed yet.
+        Self::drain_write_pty(&self.state);
     }
 
     /// Swap the live theme on this terminal. Re-pushes the palette +
@@ -1035,6 +1063,34 @@ impl TerminalView {
             s.theme = theme.clone();
         }
         self.widget.queue_draw();
+    }
+
+    /// Drain the device-query replies libghostty's write_pty callback
+    /// collected into `write_pty_buffer` during the last `vt_write` /
+    /// `resize` (#247) and dispatch them through `input_callback` — the
+    /// same PTY-input route keystrokes take. Callers MUST invoke this
+    /// after **every** `vt_write` AND **every** resize: mode 2048 fires
+    /// the callback inside `resize`, outside `vt_write`.
+    ///
+    /// RefCell discipline (mirrors the focus/keystroke paths): take the
+    /// bytes and clone the callback under the borrow, then DROP the
+    /// borrow before dispatching, so the callback may safely re-enter the
+    /// view. The mutex is locked only for the `mem::take` — never across
+    /// dispatch. If no `input_callback` is installed yet (attach race),
+    /// leave the bytes buffered for a later drain (device queries only
+    /// arrive from a live shell, i.e. post-attach).
+    fn drain_write_pty(state: &Rc<RefCell<TerminalViewState>>) {
+        let s = state.borrow();
+        let Some(cb) = s.input_callback.clone() else {
+            // No sink yet — leave the bytes in the buffer untouched.
+            return;
+        };
+        let bytes =
+            std::mem::take(&mut *s.write_pty_buffer.lock().unwrap_or_else(|p| p.into_inner()));
+        drop(s);
+        if !bytes.is_empty() {
+            cb(bytes);
+        }
     }
 
     /// Feed VT bytes into the terminal. Triggers a redraw so the new
@@ -1067,6 +1123,8 @@ impl TerminalView {
         }
         s.osc_shape_set_in_this_chunk = false;
         drop(s);
+        // Drain replies the vt_write above collected (#247).
+        Self::drain_write_pty(&self.state);
         self.widget.queue_draw();
     }
 
@@ -1315,6 +1373,9 @@ impl TerminalView {
         let already_attached = s.input_callback.is_some();
         s.input_callback = Some(Rc::new(callback));
         drop(s);
+        // Replies buffered while no input sink existed (attach race)
+        // now have somewhere to go.
+        Self::drain_write_pty(&self.state);
         if already_attached {
             return;
         }
@@ -1450,6 +1511,15 @@ struct TerminalViewState {
     /// callback may safely re-enter the view. An `Rc` makes the clone
     /// cheap (atomic-free, single-threaded GTK).
     input_callback: Option<Rc<dyn Fn(Vec<u8>)>>,
+    /// Sink for engine-emitted device-query replies (#247), shared with
+    /// libghostty-vt as `OPT_USERDATA` via `Terminal::set_write_pty_buffer`.
+    /// The trampoline appends reply bytes here synchronously inside
+    /// `vt_write` / `resize` (mode 2048); [`TerminalView::drain_write_pty`]
+    /// takes them and dispatches through `input_callback`. The `Mutex` is
+    /// only for the FFI boundary — every real access is on the GTK main
+    /// thread. Never hold its lock across a `vt_write`/`resize` (the
+    /// trampoline locks it too — self-deadlock); lock only to take.
+    write_pty_buffer: Arc<Mutex<Vec<u8>>>,
     /// Live cell grid. Reflowed from the widget's pixel size on every
     /// `resize` signal; seeded with the `DEFAULT_COLS`/`DEFAULT_ROWS`
     /// the libghostty terminal was allocated with.
