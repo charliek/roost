@@ -35,6 +35,7 @@ pub fn encode_key(
     terminal: &Terminal,
     key: gdk::Key,
     gdk_mods: gdk::ModifierType,
+    gdk_consumed_mods: gdk::ModifierType,
 ) -> Vec<u8> {
     // Sync encoder options from the terminal each keystroke — modes
     // change between keystrokes (cursor-key application, Kitty flags,
@@ -85,6 +86,11 @@ pub fn encode_key(
     event.set_action(key_action::PRESS);
     event.set_key(ghostty_key);
     event.set_mods(mods);
+    // GDK knows exactly which modifiers were consumed to produce `key`'s
+    // printable UTF-8. Passing that through keeps Shift+G / Shift+/ as plain
+    // "G" / "?" under Kitty disambiguation while preserving Shift on
+    // non-text keys such as Enter.
+    event.set_consumed_mods(translate_mods(gdk_consumed_mods));
     event.set_composing(false);
     event.set_unshifted_codepoint(unshifted);
     if !utf8_bytes.is_empty() {
@@ -235,5 +241,47 @@ fn translate_key(key: gdk::Key) -> Key {
         K::Caps_Lock => g::GhosttyKey_GHOSTTY_KEY_CAPS_LOCK,
 
         _ => g::GhosttyKey_GHOSTTY_KEY_UNIDENTIFIED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roost_vt::{KeyEncoder, TerminalOptions};
+
+    fn kitty_terminal_and_encoder() -> (Terminal, KeyEncoder) {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .expect("terminal");
+        terminal.vt_write(b"\x1b[>1u");
+        let encoder = KeyEncoder::new().expect("encoder");
+        (terminal, encoder)
+    }
+
+    #[test]
+    fn kitty_consumed_shift_preserves_uppercase_text() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let shift = gdk::ModifierType::SHIFT_MASK;
+        let bytes = encode_key(&mut encoder, &terminal, gdk::Key::G, shift, shift);
+        assert_eq!(bytes, b"G");
+    }
+
+    #[test]
+    fn kitty_consumed_shift_preserves_shifted_punctuation() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let shift = gdk::ModifierType::SHIFT_MASK;
+        let bytes = encode_key(&mut encoder, &terminal, gdk::Key::question, shift, shift);
+        assert_eq!(bytes, b"?");
+    }
+
+    #[test]
+    fn kitty_shift_enter_remains_modified_when_shift_is_consumed() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let shift = gdk::ModifierType::SHIFT_MASK;
+        let bytes = encode_key(&mut encoder, &terminal, gdk::Key::Return, shift, shift);
+        assert_eq!(bytes, b"\x1b[13;2u");
     }
 }

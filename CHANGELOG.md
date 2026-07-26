@@ -9,6 +9,15 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## Unreleased
+
+### Fixes
+
+- **Kitty keyboard mode preserves shifted text (Mac + GTK)** — terminals now
+  tell libghostty when Shift or another layout modifier was consumed to produce
+  printable text, so Strix and other Kitty-aware TUIs receive capitals and
+  shifted punctuation normally while Shift+Enter remains distinguishable.
+
 ## v0.0.14 — 2026-06-30
 
 Drag files onto the terminal to attach them, a round of GTK chrome work bringing

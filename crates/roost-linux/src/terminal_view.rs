@@ -1402,7 +1402,7 @@ impl TerminalView {
                 state: self.state.clone(),
                 widget: self.widget.clone(),
             };
-            move |_ctrl, key, _keycode, mods| {
+            move |ctrl, key, _keycode, mods| {
                 // Commit 7 stop-gap: Ctrl+Shift+C / Ctrl+Shift+V invoke
                 // copy/paste. Full keybind table (with config-file
                 // overrides + Mac-style ⌘C / ⌘V on Mac) lands in
@@ -1423,6 +1423,15 @@ impl TerminalView {
                         _ => {}
                     }
                 }
+                // GDK records which layout modifiers produced the keyval
+                // (Shift for "G" / "?", AltGr on layouts that use it). Feed
+                // that into libghostty so Kitty mode distinguishes translated
+                // text from an effective shortcut modifier.
+                let consumed_mods = ctrl
+                    .current_event()
+                    .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
+                    .map(|event| event.consumed_modifiers())
+                    .unwrap_or_else(gtk4::gdk::ModifierType::empty);
                 let mut s = state.borrow_mut();
                 // A bare modifier (incl. the modifier that begins a copy
                 // chord such as Alt+C / Ctrl+Shift+C) must NOT disturb the
@@ -1450,7 +1459,13 @@ impl TerminalView {
                 // encoder can take `&mut encoder` + `&terminal` at once.
                 let bytes = {
                     let s_mut: &mut TerminalViewState = &mut s;
-                    key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, key, mods)
+                    key_encoder::encode_key(
+                        &mut s_mut.encoder,
+                        &s_mut.terminal,
+                        key,
+                        mods,
+                        consumed_mods,
+                    )
                 };
                 if snapped || had_selection {
                     widget.queue_draw();

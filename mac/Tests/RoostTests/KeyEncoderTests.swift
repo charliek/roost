@@ -151,6 +151,63 @@ func punctuation_passes_through_as_one_byte() {
     }
 }
 
+// MARK: - Kitty shifted printable text
+
+@MainActor
+@Test
+func shift_g_under_kitty_preserves_uppercase_text() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_G),
+            chars: "G",
+            charsIgnoringModifiers: "g",
+            modifiers: [.shift]
+        )
+        #expect(encoder.encode(event) == Data("G".utf8))
+    }
+}
+
+@MainActor
+@Test
+func shift_slash_under_kitty_preserves_question_mark() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_Slash),
+            chars: "?",
+            charsIgnoringModifiers: "/",
+            modifiers: [.shift]
+        )
+        #expect(encoder.encode(event) == Data("?".utf8))
+    }
+}
+
+@MainActor
+@Test
+func option_text_under_kitty_is_not_encoded_as_alt_chord() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_2),
+            chars: "™",
+            charsIgnoringModifiers: "2",
+            modifiers: [.option]
+        )
+        #expect(encoder.encode(event) == Data("™".utf8))
+    }
+}
+
+@MainActor
+@Test
+func shift_enter_under_kitty_remains_modified() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_Return),
+            chars: "\r",
+            modifiers: [.shift]
+        )
+        #expect(encoder.encode(event) == Data("\u{1B}[13;2u".utf8))
+    }
+}
+
 // MARK: - Control-key conventions
 
 @MainActor

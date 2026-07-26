@@ -7,6 +7,8 @@ never the gesture stack):
 
   Focus + core-sync (clicks / keys)
     * click-to-focus            — clicking the terminal body grabs focus.
+    * Kitty shifted text        — consumed Shift preserves capitals and
+                                  punctuation without hiding Shift+Enter.
     * project-switch focus      — clicking a sidebar row focuses the new
                                   project's terminal AND syncs the core (#1).
     * Alt+digit                 — switches PROJECTS only, never tabs.
@@ -127,6 +129,28 @@ def _connect(make_client, timeout: float = 15.0):
             last = e
             time.sleep(0.1)
     raise TimeoutError(f"could not connect to roost socket: {last}")
+
+
+def _check_kitty_shifted_text(r, send_key) -> None:
+    """Exercise GDK's real consumed-modifier metadata under Kitty mode."""
+    tab = r.app_selected_tab_id()
+    r.tab_feed_pty_bytes(tab, b"\x1b[>1u")
+    r.tab_capture_pty_input(tab, drain=True)
+
+    send_key("shift+g")
+    send_key("shift+slash")
+    send_key("shift+Return")
+    captured = r.tab_capture_pty_input(tab, drain=True)
+    expected = b"G?\x1b[13;2u"
+    assert captured == expected, \
+        f"Kitty shifted input mismatch: got {captured!r}, expected {expected!r}"
+
+    # Restore the terminal's keyboard-mode stack and clear the shell's pending
+    # input so this byte-level check cannot influence later shortcut checks.
+    r.tab_feed_pty_bytes(tab, b"\x1b[<u")
+    send_key("ctrl+c")
+    r.tab_capture_pty_input(tab, drain=True)
+    print("  Kitty shifted text OK (G, ?, and distinct Shift+Enter)")
 
 
 # --- pixel / pointer helpers --------------------------------------------
@@ -596,6 +620,7 @@ def main() -> int:
             time.sleep(2.0 * SCALE)  # let the window finish mapping before driving it
             # focus + core-sync (clicks/keys)
             _check_click_to_focus(r, click, wait_tab_attached)
+            _check_kitty_shifted_text(r, send_key)
             _check_project_switch_focus(r, click)
             _check_alt_digit_switches_project_not_tab(r, send_key, wait_tab_attached)
             _check_ctrl_pagedown_syncs_core(r, send_key, wait_tab_attached)
@@ -633,7 +658,8 @@ def main() -> int:
             xvfb.wait()
         shutil.rmtree(run, ignore_errors=True)
 
-    print("PASS: focus + core-sync (click-to-focus, project switch, Alt+digit, "
+    print("PASS: focus + core-sync (click-to-focus, Kitty shifted text, "
+          "project switch, Alt+digit, "
           "Ctrl+PageDown, cycle_tab, pill click, context menu), drag reorder "
           "(tab + sidebar), and palette chrome-click no-storm all verified")
     return 0

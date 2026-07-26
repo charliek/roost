@@ -79,6 +79,7 @@ final class KeyEncoder {
         ghostty_key_event_set_action(event, GHOSTTY_KEY_ACTION_PRESS)
         ghostty_key_event_set_key(event, key)
         ghostty_key_event_set_mods(event, mods)
+        ghostty_key_event_set_consumed_mods(event, 0)
         ghostty_key_event_set_unshifted_codepoint(event, 0)
         ghostty_key_event_set_composing(event, false)
         ghostty_key_event_set_utf8(event, nil, 0)
@@ -121,6 +122,18 @@ final class KeyEncoder {
         ghostty_key_event_set_action(event, action)
         ghostty_key_event_set_key(event, key)
         ghostty_key_event_set_mods(event, mods)
+        // Modifiers used to produce printable text are not effective
+        // terminal-key modifiers. Without this, Kitty disambiguation turns
+        // Shift+G into CSI 103;2u ("g" + Shift) instead of the text "G";
+        // crossterm then exposes the base "g" to apps such as strix. AppKit
+        // does not expose exact consumed modifiers, so match Ghostty's
+        // long-standing heuristic: Shift and Option participate in text
+        // translation, while Control and Command do not. For non-text keys
+        // (Shift+Enter), libghostty ignores consumed_mods and preserves Shift.
+        ghostty_key_event_set_consumed_mods(
+            event,
+            Self.consumedMods(forFlags: nsEvent.modifierFlags)
+        )
         // The unshifted base-layout codepoint (Ctrl+A → "a" = 97). Under
         // the Kitty keyboard protocol the encoder needs this to build a
         // CSI-u entry for letter/digit keys — they're not in the
@@ -243,6 +256,17 @@ final class KeyEncoder {
         if flags.contains(.option)   { mods |= 1 << 2 } // GHOSTTY_MODS_ALT
         if flags.contains(.command)  { mods |= 1 << 3 } // GHOSTTY_MODS_SUPER
         if flags.contains(.capsLock) { mods |= 1 << 4 } // GHOSTTY_MODS_CAPS_LOCK
+        return GhosttyMods(mods)
+    }
+
+    /// AppKit does not report which modifiers were consumed while translating
+    /// a key into text. Ghostty's native Mac adapter treats Shift and Option as
+    /// translation modifiers and leaves Control/Command effective for terminal
+    /// shortcuts. libghostty consults this field only when UTF-8 text exists.
+    private static func consumedMods(forFlags flags: NSEvent.ModifierFlags) -> GhosttyMods {
+        var mods: UInt16 = 0
+        if flags.contains(.shift)  { mods |= 1 << 0 } // GHOSTTY_MODS_SHIFT
+        if flags.contains(.option) { mods |= 1 << 2 } // GHOSTTY_MODS_ALT
         return GhosttyMods(mods)
     }
 
