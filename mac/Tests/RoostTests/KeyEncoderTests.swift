@@ -151,6 +151,105 @@ func punctuation_passes_through_as_one_byte() {
     }
 }
 
+// MARK: - Kitty shifted printable text
+
+@MainActor
+@Test
+func shift_g_under_kitty_preserves_uppercase_text() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_G),
+            chars: "G",
+            charsIgnoringModifiers: "g",
+            modifiers: [.shift]
+        )
+        #expect(encoder.encode(event) == Data("G".utf8))
+    }
+}
+
+@MainActor
+@Test
+func shift_slash_under_kitty_preserves_question_mark() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_Slash),
+            chars: "?",
+            charsIgnoringModifiers: "/",
+            modifiers: [.shift]
+        )
+        #expect(encoder.encode(event) == Data("?".utf8))
+    }
+}
+
+@MainActor
+@Test
+func option_text_under_kitty_is_not_encoded_as_alt_chord() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_2),
+            chars: "™",
+            charsIgnoringModifiers: "2",
+            modifiers: [.option]
+        )
+        #expect(encoder.encode(event) == Data("™".utf8))
+    }
+}
+
+@MainActor
+@Test
+func shift_enter_under_kitty_remains_modified() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_Return),
+            chars: "\r",
+            modifiers: [.shift]
+        )
+        #expect(encoder.encode(event) == Data("\u{1B}[13;2u".utf8))
+    }
+}
+
+// MARK: - Base-layout key numbers (Mac ⇄ Linux parity)
+
+// Kitty CSI-u and fixterms both identify a key by its UNSHIFTED
+// codepoint, which `unshiftedCodepoint(for:)` reads from
+// `characters(byApplyingModifiers: [])`. These pin the wire bytes the
+// GTK encoder is expected to match — `crates/roost-linux/src/key_encoder.rs`
+// has the twin assertions, and it needs a keymap lookup to produce them.
+
+@MainActor
+@Test
+func ctrl_shifted_punctuation_reports_base_layout_key_under_kitty() {
+    withKittyEncoder { encoder in
+        // Ctrl+Shift+/ — AppKit reports the C0 byte as `characters`, so
+        // the encoder derives the key number from the base layout: "/" (47),
+        // NOT the shifted "?" (63).
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_Slash),
+            chars: "\u{1F}",
+            charsIgnoringModifiers: "?",
+            modifiers: [.control, .shift]
+        )
+        #expect(encoder.encode(event) == Data("\u{1B}[47;6u".utf8))
+    }
+}
+
+@MainActor
+@Test
+func ctrl_shifted_punctuation_drops_shift_in_legacy_fixterms() {
+    withEncoder { encoder in
+        // Ctrl+Shift+1 — fixterms drops Shift because "!" was obtained
+        // WITH shift, which libghostty detects by comparing the text
+        // against the unshifted codepoint ("1").
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_1),
+            chars: "!",
+            charsIgnoringModifiers: "!",
+            modifiers: [.control, .shift]
+        )
+        #expect(encoder.encode(event) == Data("\u{1B}[33;5u".utf8))
+    }
+}
+
 // MARK: - Control-key conventions
 
 @MainActor

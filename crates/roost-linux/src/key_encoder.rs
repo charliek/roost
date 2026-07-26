@@ -24,8 +24,44 @@
 //! a "physical" key the encoder doesn't recognize.
 
 use gtk4::gdk;
+use gtk4::prelude::DisplayExtManual;
 
 use roost_vt::{key_action, mods as gmods, Key, KeyEvent, Mods, Terminal};
+
+/// One GDK key press, reduced to the four facts libghostty needs. Kept as
+/// a struct because three of the four can only be recovered from the live
+/// `GdkKeyEvent` + display, so the widget layer gathers them once and the
+/// encoder stays a pure function over them.
+pub struct GdkKeyPress {
+    /// The translated keyval — already shifted ("G", "?").
+    pub key: gdk::Key,
+    /// Modifiers held during the press.
+    pub mods: gdk::ModifierType,
+    /// Modifiers GDK consumed to produce `key` from the physical key.
+    pub consumed_mods: gdk::ModifierType,
+    /// The level-0 keyval for the same physical key in the active layout
+    /// ("g" for Shift+G, "/" for Shift+/). `None` when the display can't
+    /// map the keycode; see [`unshifted_keyval`].
+    pub unshifted: Option<gdk::Key>,
+}
+
+/// The keyval the physical key produces with no modifiers in the layout
+/// group this event was translated under — libghostty's
+/// `unshifted_codepoint`, and the key number Kitty CSI-u sequences report.
+///
+/// Mirrors Ghostty's `apprt/gtk/key.zig:keyvalUnicodeUnshifted`: map the
+/// hardware keycode to its (group, level) table and take the level-0 entry
+/// for the event's own layout. Deriving it from the keyval instead (via
+/// `to_lower`) is only correct for letters — it reports "?" rather than "/"
+/// for Shift+/, which is the wrong key number for every shifted punctuation
+/// key on every layout.
+pub fn unshifted_keyval(display: &gdk::Display, layout: u32, keycode: u32) -> Option<gdk::Key> {
+    display
+        .map_keycode(keycode)?
+        .into_iter()
+        .find(|(entry, _)| entry.level() == 0 && entry.group() == layout as i32)
+        .map(|(_, keyval)| keyval)
+}
 
 /// Encode a single keypress against the given terminal's current
 /// modes. Returns the VT bytes to send into the PTY (empty for
@@ -33,9 +69,14 @@ use roost_vt::{key_action, mods as gmods, Key, KeyEvent, Mods, Terminal};
 pub fn encode_key(
     encoder: &mut roost_vt::KeyEncoder,
     terminal: &Terminal,
-    key: gdk::Key,
-    gdk_mods: gdk::ModifierType,
+    press: &GdkKeyPress,
 ) -> Vec<u8> {
+    let GdkKeyPress {
+        key,
+        mods: gdk_mods,
+        consumed_mods: gdk_consumed_mods,
+        unshifted: unshifted_keyval,
+    } = *press;
     // Sync encoder options from the terminal each keystroke — modes
     // change between keystrokes (cursor-key application, Kitty flags,
     // bracketed paste). Cheap, idempotent.
@@ -58,10 +99,14 @@ pub fn encode_key(
     // for letter/digit keys — they're absent from the functional entry
     // table, so with 0 it emits NOTHING for Ctrl+letter (Claude Code /
     // opencode enable Kitty, so every Ctrl+letter was silently dropped).
-    // Lower-case the keyval first so Ctrl+Shift+K still reports 'k'.
     // Legacy mode derives the C0 byte from the key alone, unaffected.
-    let unshifted = key
-        .to_lower()
+    //
+    // Prefer the layout's real level-0 keyval; `to_lower` is the fallback
+    // for when the display can't map the keycode. It agrees for letters
+    // (Ctrl+Shift+K → 'k') but not for shifted punctuation, so the
+    // fallback is a degraded path, not an equivalent one.
+    let unshifted = unshifted_keyval
+        .unwrap_or_else(|| key.to_lower())
         .to_unicode()
         .filter(|c| !c.is_control() && (*c as u32) < 0xE000)
         .map(|c| c as u32)
@@ -85,6 +130,11 @@ pub fn encode_key(
     event.set_action(key_action::PRESS);
     event.set_key(ghostty_key);
     event.set_mods(mods);
+    // GDK knows exactly which modifiers were consumed to produce `key`'s
+    // printable UTF-8. Passing that through keeps Shift+G / Shift+/ as plain
+    // "G" / "?" under Kitty disambiguation while preserving Shift on
+    // non-text keys such as Enter.
+    event.set_consumed_mods(translate_mods(gdk_consumed_mods));
     event.set_composing(false);
     event.set_unshifted_codepoint(unshifted);
     if !utf8_bytes.is_empty() {
@@ -235,5 +285,141 @@ fn translate_key(key: gdk::Key) -> Key {
         K::Caps_Lock => g::GhosttyKey_GHOSTTY_KEY_CAPS_LOCK,
 
         _ => g::GhosttyKey_GHOSTTY_KEY_UNIDENTIFIED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roost_vt::{KeyEncoder, TerminalOptions};
+
+    const SHIFT: gdk::ModifierType = gdk::ModifierType::SHIFT_MASK;
+    const CTRL: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK;
+    const ALT: gdk::ModifierType = gdk::ModifierType::ALT_MASK;
+    const NONE: gdk::ModifierType = gdk::ModifierType::empty();
+
+    fn kitty_terminal_and_encoder() -> (Terminal, KeyEncoder) {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .expect("terminal");
+        terminal.vt_write(b"\x1b[>1u");
+        let encoder = KeyEncoder::new().expect("encoder");
+        (terminal, encoder)
+    }
+
+    /// A US-layout press: `key` is what the layout produced, `unshifted` is
+    /// the level-0 keyval a real `gdk_display_map_keycode` lookup would
+    /// return for the same physical key.
+    fn press(
+        key: gdk::Key,
+        mods: gdk::ModifierType,
+        consumed_mods: gdk::ModifierType,
+        unshifted: gdk::Key,
+    ) -> GdkKeyPress {
+        GdkKeyPress {
+            key,
+            mods,
+            consumed_mods,
+            unshifted: Some(unshifted),
+        }
+    }
+
+    #[test]
+    fn kitty_consumed_shift_preserves_uppercase_text() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = press(gdk::Key::G, SHIFT, SHIFT, gdk::Key::g);
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"G");
+    }
+
+    #[test]
+    fn kitty_consumed_shift_preserves_shifted_punctuation() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = press(gdk::Key::question, SHIFT, SHIFT, gdk::Key::slash);
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"?");
+    }
+
+    #[test]
+    fn kitty_shift_enter_remains_modified_when_shift_is_consumed() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = press(gdk::Key::Return, SHIFT, SHIFT, gdk::Key::Return);
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[13;2u");
+    }
+
+    /// The deliberate Mac/Linux split: X11 + Wayland don't report Alt as a
+    /// translation modifier on ordinary layouts, so Alt+B stays an Alt chord
+    /// here, while the Mac encoder's AppKit heuristic (Ghostty's — Option
+    /// participates in text translation) sends the composed text instead.
+    /// Both match their platform's native terminals; see
+    /// `mac/Sources/Roost/KeyEncoder.swift`.
+    #[test]
+    fn kitty_alt_letter_stays_a_chord_when_alt_is_not_consumed() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = press(gdk::Key::b, ALT, NONE, gdk::Key::b);
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[98;3u");
+    }
+
+    /// Kitty CSI-u reports the key by its UNSHIFTED codepoint, so Ctrl+? must
+    /// arrive as key 47 ("/") — the same number Ghostty and the Mac encoder
+    /// send. Deriving it from the shifted keyval reported 63 ("?"), a key
+    /// number no other terminal produces.
+    #[test]
+    fn kitty_ctrl_shifted_punctuation_reports_the_base_layout_key() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = press(gdk::Key::question, CTRL | SHIFT, SHIFT, gdk::Key::slash);
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[47;6u");
+    }
+
+    /// Same key number rule outside Kitty mode: fixterms drops Shift when the
+    /// character was obtained WITH shift, which libghostty decides by
+    /// comparing the text against the unshifted codepoint. With the shifted
+    /// keyval standing in for both, they compared equal and Shift was
+    /// reported — `CSI 33;6u` where every other terminal sends `CSI 33;5u`.
+    #[test]
+    fn legacy_ctrl_shifted_punctuation_drops_shift_from_fixterms() {
+        // Default modes: no Kitty flags, no modifyOtherKeys — plain fixterms.
+        let terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .expect("terminal");
+        let mut encoder = KeyEncoder::new().expect("encoder");
+        let p = press(gdk::Key::exclam, CTRL | SHIFT, SHIFT, gdk::Key::_1);
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[33;5u");
+    }
+
+    /// No display to map the keycode against (headless, or a keycode the
+    /// layout doesn't cover): fall back to the keyval, which still gets
+    /// letters right so Ctrl+letter keeps working.
+    #[test]
+    fn missing_layout_lookup_falls_back_to_the_keyval() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = GdkKeyPress {
+            key: gdk::Key::K,
+            mods: CTRL | SHIFT,
+            consumed_mods: SHIFT,
+            unshifted: None,
+        };
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[107;6u");
+    }
+
+    /// …and the limit of that fallback, pinned so it stays a known gap rather
+    /// than a surprise: with no layout lookup, shifted punctuation reports the
+    /// SHIFTED key (63 = "?") instead of the base-layout key (47 = "/"). The
+    /// widget layer logs when it lands here; there is no better guess without
+    /// a keymap, and returning 0 like Ghostty would drop Ctrl+letter entirely.
+    #[test]
+    fn missing_layout_lookup_cannot_recover_shifted_punctuation() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = GdkKeyPress {
+            key: gdk::Key::question,
+            mods: CTRL | SHIFT,
+            consumed_mods: SHIFT,
+            unshifted: None,
+        };
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[63;6u");
     }
 }
