@@ -142,8 +142,18 @@ def _check_kitty_shifted_text(r, send_key) -> None:
     send_key("shift+Return")
     captured = r.tab_capture_pty_input(tab, drain=True)
     expected = b"G?\x1b[13;2u"
-    assert captured == expected, \
-        f"Kitty shifted input mismatch: got {captured!r}, expected {expected!r}"
+    if captured != expected:
+        # The input channel also carries terminal replies to device queries
+        # (DA/DSR/OSC), so a prompt that queries mid-check shows up here as
+        # extra bytes around an otherwise-correct encoding. Name that case
+        # rather than leaving a bare byte-string diff.
+        hint = (" — the encodings are correct but extra bytes are interleaved;"
+                " a device-query reply from the shell prompt likely landed in"
+                " this window") if expected in captured else ""
+        raise AssertionError(
+            f"Kitty shifted input mismatch: got {captured!r}, "
+            f"expected {expected!r}{hint}"
+        )
 
     # Restore the terminal's keyboard-mode stack and clear the shell's pending
     # input so this byte-level check cannot influence later shortcut checks.

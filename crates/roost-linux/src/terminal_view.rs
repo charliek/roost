@@ -1427,11 +1427,24 @@ impl TerminalView {
                 // (Shift for "G" / "?", AltGr on layouts that use it). Feed
                 // that into libghostty so Kitty mode distinguishes translated
                 // text from an effective shortcut modifier.
-                let consumed_mods = ctrl
+                // Falling back to "nothing consumed" silently reinstates the
+                // bug this replaced (Shift+G encoding as CSI 103;2u instead of
+                // "G"), so log it — no current path delivers a key press
+                // without a backing GdkKeyEvent, and if one appears we want a
+                // breadcrumb rather than a mystery regression.
+                let consumed_mods = match ctrl
                     .current_event()
                     .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
-                    .map(|event| event.consumed_modifiers())
-                    .unwrap_or_else(gtk4::gdk::ModifierType::empty);
+                {
+                    Some(event) => event.consumed_modifiers(),
+                    None => {
+                        tracing::debug!(
+                            ?key,
+                            "no GdkKeyEvent for key press; assuming no consumed modifiers"
+                        );
+                        gtk4::gdk::ModifierType::empty()
+                    }
+                };
                 let mut s = state.borrow_mut();
                 // A bare modifier (incl. the modifier that begins a copy
                 // chord such as Alt+C / Ctrl+Shift+C) must NOT disturb the

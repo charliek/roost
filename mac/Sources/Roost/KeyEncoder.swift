@@ -128,8 +128,14 @@ final class KeyEncoder {
         // crossterm then exposes the base "g" to apps such as strix. AppKit
         // does not expose exact consumed modifiers, so match Ghostty's
         // long-standing heuristic: Shift and Option participate in text
-        // translation, while Control and Command do not. For non-text keys
-        // (Shift+Enter), libghostty ignores consumed_mods and preserves Shift.
+        // translation, while Control and Command do not.
+        //
+        // libghostty consults consumed_mods ONLY when utf8 is non-empty
+        // (`KeyEvent.effectiveMods`), and `printableUTF8` below strips C0 —
+        // so Enter/Tab/Escape/Backspace arrive with empty utf8 and keep their
+        // full modifier set. That's what leaves Shift+Enter encoding as
+        // CSI 13;2u. If that C0 filter ever goes away, this consumed-mods
+        // value starts applying to those keys too.
         ghostty_key_event_set_consumed_mods(
             event,
             Self.consumedMods(forFlags: nsEvent.modifierFlags)
@@ -260,14 +266,20 @@ final class KeyEncoder {
     }
 
     /// AppKit does not report which modifiers were consumed while translating
-    /// a key into text. Ghostty's native Mac adapter treats Shift and Option as
-    /// translation modifiers and leaves Control/Command effective for terminal
-    /// shortcuts. libghostty consults this field only when UTF-8 text exists.
+    /// a key into text, so Ghostty applies a heuristic: control and command
+    /// never contribute to translation, assume everything else did. This is
+    /// that heuristic verbatim — Ghostty's `NSEvent.ghosttyKeyEvent` computes
+    /// `ghosttyMods((translationMods ?? modifierFlags).subtracting([.control,
+    /// .command]))`, and its `translationMods` only diverges from
+    /// `modifierFlags` under a non-default `macos-option-as-alt`, which
+    /// libghostty-vt pins to `.false` on every
+    /// `ghostty_key_encoder_setopt_from_terminal` call.
+    ///
+    /// Subtracting from the live flags rather than listing bits keeps this
+    /// aligned with `ghosttyMods` — any modifier that translator learns to
+    /// report is automatically classified the same way Ghostty classifies it.
     private static func consumedMods(forFlags flags: NSEvent.ModifierFlags) -> GhosttyMods {
-        var mods: UInt16 = 0
-        if flags.contains(.shift)  { mods |= 1 << 0 } // GHOSTTY_MODS_SHIFT
-        if flags.contains(.option) { mods |= 1 << 2 } // GHOSTTY_MODS_ALT
-        return GhosttyMods(mods)
+        ghosttyMods(forFlags: flags.subtracting([.control, .command]))
     }
 
     /// Translate NSEvent.keyCode (a Carbon kVK_* value) to the

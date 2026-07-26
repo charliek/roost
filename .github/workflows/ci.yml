@@ -390,6 +390,14 @@ jobs:
       - name: cargo build -p roost-linux
         run: cargo build -p roost-linux
 
+      # The rust-test job runs `--workspace --exclude roost-linux` (no GTK
+      # toolchain there), so this is the ONLY place roost-linux's own tests
+      # can run. Without it the crate's unit tests — including the key
+      # encoder's Kitty-mode guards — compile but never execute anywhere.
+      # Headless-safe: these tests never construct a widget or call gtk_init.
+      - name: cargo test -p roost-linux
+        run: cargo test -p roost-linux
+
       # Regression guard: tab + project reorder were converted from GtkDnD to
       # GtkGestureDrag because the DnD drag-icon surface aborts the process on
       # Wayland (gdksurface-wayland.c:348:frame_callback), and synthetic input

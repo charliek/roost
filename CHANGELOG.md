@@ -17,6 +17,12 @@ release workflow asserts they agree).
   tell libghostty when Shift or another layout modifier was consumed to produce
   printable text, so Strix and other Kitty-aware TUIs receive capitals and
   shifted punctuation normally while Shift+Enter remains distinguishable.
+  On Mac this also applies to Option-produced text (Option+2 → "™"), matching
+  Ghostty's default `macos-option-as-alt = false`: under Kitty mode Option+key
+  now sends the composed character rather than an Alt chord, the same as Roost
+  already did outside Kitty mode. Linux is unchanged here — GDK reports the
+  real per-layout consumed modifiers, and Alt is not one of them, so Alt+key
+  stays an Alt chord there.
 
 ## v0.0.14 — 2026-06-30
 

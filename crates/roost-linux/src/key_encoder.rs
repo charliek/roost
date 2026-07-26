@@ -284,4 +284,24 @@ mod tests {
         let bytes = encode_key(&mut encoder, &terminal, gdk::Key::Return, shift, shift);
         assert_eq!(bytes, b"\x1b[13;2u");
     }
+
+    /// The deliberate Mac/Linux split: X11 + Wayland don't report Alt as a
+    /// translation modifier on ordinary layouts, so Alt+B stays an Alt chord
+    /// here, while the Mac encoder's AppKit heuristic (Ghostty's — Option
+    /// participates in text translation) sends the composed text instead.
+    /// Both match their platform's native terminals; see
+    /// `mac/Sources/Roost/KeyEncoder.swift`.
+    #[test]
+    fn kitty_alt_letter_stays_a_chord_when_alt_is_not_consumed() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let alt = gdk::ModifierType::ALT_MASK;
+        let bytes = encode_key(
+            &mut encoder,
+            &terminal,
+            gdk::Key::b,
+            alt,
+            gdk::ModifierType::empty(),
+        );
+        assert_eq!(bytes, b"\x1b[98;3u");
+    }
 }
