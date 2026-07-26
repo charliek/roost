@@ -127,10 +127,12 @@ height ≈ spacing between rows.
 
 ## Gotchas learned the hard way
 
-- **Sidebar GtkPaned handle.** It sits at the terminal's left edge. A
-  mouse-*down* there grabs the divider and resizes the sidebar instead of
-  selecting. To select text starting at column 0, drag **right-to-left**:
-  mouse-down in the terminal interior, drag left toward the edge.
+- **Sidebar GtkPaned handle.** GtkPaned's stock capture-phase gesture
+  claimed presses well into the terminal's first columns (sidebar resize
+  instead of selection). Fixed by `App::tighten_paned_grab_zone` — the
+  resize hit zone is now the separator ±2px, so left-to-right drags from
+  column 0 select normally (`real_input_check.py::_check_left_edge_drag_selects`
+  guards this). Resize drags must start on the separator itself.
 - **IPC input doesn't clear a selection.** `roostctl tab send` writes straight
   to the PTY; the selection highlight is a UI overlay cleared only by a real
   keypress or a new drag. Don't expect a sent command to drop the highlight.

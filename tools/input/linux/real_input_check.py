@@ -455,6 +455,60 @@ def _check_tab_reorder(r, rc, env_x, tmp: Path, roost, wait_tab_attached) -> Non
     print(f"  tab reorder OK: {before} -> {after}")
 
 
+def _check_left_edge_drag_selects(r, env_x, wait_tab_attached) -> None:
+    """A drag-selection starting on the first columns of a terminal line
+    must select text, not resize the sidebar. GtkPaned's stock
+    capture-phase gesture claimed any press within HANDLE_EXTRA_SIZE of
+    the separator's styled box (~22px into the terminal), so selecting a
+    line from its start silently resized the sidebar instead;
+    `App::tighten_paned_grab_zone` replaces it with a separator-only hit
+    zone. Also proves the separator itself still resizes."""
+    pid = r.create_project(name="edge-drag", cwd="/tmp")
+    tab = r.open_tab(pid, cwd="/tmp")
+    wait_tab_attached(r, tab)
+    r.focus(tab)
+    r.run(tab, "for i in $(seq 1 30); do "
+               "printf 'EDGE-%02d abcdefghijklmnopqrstuvwxyz0123456789\\n' $i;"
+               " done")
+    r._wait(lambda: "EDGE-20" in r.dump_text(tab), timeout=8.0,
+            what="edge-drag tab shows its fill content")
+
+    m = r.window_metrics()
+    sb, h = int(m["sidebar_width"]), int(m["window_height"])
+    y0 = int(h * 0.5)
+
+    # Drag from just inside the terminal's left edge. Pre-fix this press
+    # was claimed by the paned (well within its ~22px zone): the sidebar
+    # resized and no selection ever formed.
+    x0 = sb + 10
+    _drag(env_x, x0, y0, x0 + 300, y0 + 60)
+    sel = r.call("selection.dump", {"tab_id": str(tab)}) or {}
+    text = sel.get("text") or ""
+    after = int(r.window_metrics()["sidebar_width"])
+    assert after == sb, \
+        f"left-edge drag resized the sidebar {sb} -> {after} (paned theft)"
+    assert len(text) > 50, \
+        f"left-edge drag selected only {len(text)} chars: {text!r}"
+
+    # The separator must still resize: probe the few px around the seam
+    # (its exact screen x shifts with the CSD margin).
+    for probe in range(sb + 1, sb + 10):
+        _drag(env_x, probe, y0, probe + 60, y0)
+        now = int(r.window_metrics()["sidebar_width"])
+        if now != sb:
+            # Undo: drag the (moved) separator back to where it was, and
+            # verify it landed — later checks assume this geometry.
+            _drag(env_x, probe + (now - sb), y0, probe, y0)
+            restored = int(r.window_metrics()["sidebar_width"])
+            assert restored == sb, \
+                f"separator undo failed: sidebar width {restored}, expected {sb}"
+            print(f"  left-edge drag selection OK "
+                  f"(selected {len(text)} chars; separator resizes at "
+                  f"x=+{probe - sb})")
+            return
+    raise AssertionError("separator drag never resized the sidebar")
+
+
 def _check_sidebar_reorder(r, rc, env_x, tmp: Path, roost) -> None:
     """Drag the top project row down past the others; the project order must
     change. Retries the drag (XTEST flakiness)."""
@@ -553,6 +607,7 @@ def main() -> int:
             _check_palette_chrome_click_no_storm(r, click, state / "roost" / "roost.log")
             # drag reorder (real pointer through the gesture stack)
             subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=env_x, check=False)
+            _check_left_edge_drag_selects(r, env_x, wait_tab_attached)
             _check_sidebar_reorder(r, rc, env_x, run, roost)
             _check_tab_reorder(r, rc, env_x, run, roost, wait_tab_attached)
         finally:
