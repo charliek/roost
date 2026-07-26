@@ -890,6 +890,9 @@ mod tests {
     }
 
     #[test]
+    // The one-element slice is the point: markup_for takes a list of
+    // match runs, and this case exercises exactly one run.
+    #[allow(clippy::single_range_in_vec_init)]
     fn markup_wraps_matched_runs() {
         // Match the first two chars of "New".
         let m = markup_for("New", &[0..2]);

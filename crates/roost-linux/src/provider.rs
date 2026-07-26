@@ -108,8 +108,9 @@ pub fn parse_provider_line(value: &str) -> Option<Provider> {
     let mut limit = DEFAULT_LIMIT;
 
     for token in tokenize(value) {
-        match token.split_once('=') {
-            Some((key, val)) => match key {
+        // Bare tokens (no `=`) are meaningless for providers.
+        if let Some((key, val)) = token.split_once('=') {
+            match key {
                 "label" => label = val.to_string(),
                 "run" => run = val.to_string(),
                 "title" => title = Some(val.to_string()),
@@ -124,8 +125,7 @@ pub fn parse_provider_line(value: &str) -> Option<Provider> {
                     }
                 }
                 _ => {} // unknown key — forward-compat
-            },
-            None => {} // bare tokens are meaningless for providers
+            }
         }
     }
 

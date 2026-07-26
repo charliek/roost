@@ -186,6 +186,35 @@ pub fn canonical_cursor_shape(name: &str) -> String {
     }
 }
 
+/// Encode the xterm focus-tracking sequence via libghostty-vt's
+/// `ghostty_focus_encode`. CSI I for focus-gained, CSI O for
+/// focus-lost. Returns an empty vector on any FFI hiccup; callers
+/// guard on non-empty before pushing to the PTY.
+///
+/// Sibling of `TerminalView.encodeFocusBytes` on the Mac side. Both
+/// route through the same C API so a regression in libghostty-vt's
+/// encoding lands on both UIs at once.
+pub fn encode_focus_bytes(focused: bool) -> Vec<u8> {
+    use roost_vt::ffi;
+    let event = if focused {
+        ffi::GhosttyFocusEvent_GHOSTTY_FOCUS_GAINED
+    } else {
+        ffi::GhosttyFocusEvent_GHOSTTY_FOCUS_LOST
+    };
+    let mut buf = [0u8; 8];
+    let mut written: usize = 0;
+    // SAFETY: buf is a real local with capacity 8; written is a
+    // real local. ghostty_focus_encode writes at most 8 bytes for
+    // either focus event (CSI I / CSI O — 3 bytes each).
+    let rc = unsafe {
+        ffi::ghostty_focus_encode(event, buf.as_mut_ptr() as *mut _, buf.len(), &mut written)
+    };
+    if rc != 0 || written == 0 {
+        return Vec::new();
+    }
+    buf[..written].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,33 +559,4 @@ mod tests {
         assert_eq!(g[1], l[1]);
         assert_ne!(g[2], l[2]);
     }
-}
-
-/// Encode the xterm focus-tracking sequence via libghostty-vt's
-/// `ghostty_focus_encode`. CSI I for focus-gained, CSI O for
-/// focus-lost. Returns an empty vector on any FFI hiccup; callers
-/// guard on non-empty before pushing to the PTY.
-///
-/// Sibling of `TerminalView.encodeFocusBytes` on the Mac side. Both
-/// route through the same C API so a regression in libghostty-vt's
-/// encoding lands on both UIs at once.
-pub fn encode_focus_bytes(focused: bool) -> Vec<u8> {
-    use roost_vt::ffi;
-    let event = if focused {
-        ffi::GhosttyFocusEvent_GHOSTTY_FOCUS_GAINED
-    } else {
-        ffi::GhosttyFocusEvent_GHOSTTY_FOCUS_LOST
-    };
-    let mut buf = [0u8; 8];
-    let mut written: usize = 0;
-    // SAFETY: buf is a real local with capacity 8; written is a
-    // real local. ghostty_focus_encode writes at most 8 bytes for
-    // either focus event (CSI I / CSI O — 3 bytes each).
-    let rc = unsafe {
-        ffi::ghostty_focus_encode(event, buf.as_mut_ptr() as *mut _, buf.len(), &mut written)
-    };
-    if rc != 0 || written == 0 {
-        return Vec::new();
-    }
-    buf[..written].to_vec()
 }

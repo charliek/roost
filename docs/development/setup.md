@@ -11,7 +11,7 @@ Both link the same vendored `libghostty-vt` static archive built from `third_par
 
 | Tool | Use |
 |---|---|
-| `mise` | Provisions Rust 1.85.0 + Zig 0.15.x at the pinned versions |
+| `mise` | Provisions Rust 1.97.1 + Zig 0.15.x at the pinned versions |
 | Xcode Command Line Tools | Builds the Mac UI (SwiftPM) |
 | GTK4 + libadwaita dev packages | Builds the Linux UI (Linux + macOS dev) |
 | `uv` | Builds the documentation site |
