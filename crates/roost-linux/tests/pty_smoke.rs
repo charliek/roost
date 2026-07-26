@@ -20,12 +20,20 @@ use tokio::time::sleep;
 /// one read, and reproducible on CI, where the runner's `env` spans many
 /// chunks and the capture stopped mid-variable at `CARGO_PKG_DESCRIPTION`.
 ///
-/// `Closed` is the ONLY successful ending. Broadcast hands out every buffered
-/// message before reporting it, and the senders outlive both the reader loop
-/// and the reap task, so it means "the PTY is finished and everything it
-/// produced has been handed over". A merely-quiet stream doesn't prove that —
-/// a slow final chunk would read as success — so exhausting the budget is a
-/// failure, not a completion.
+/// `Closed` is the ideal ending: broadcast hands out every buffered message
+/// before reporting it, so it means "the PTY is finished and everything it
+/// produced has been handed over". But it depends on the reader task's
+/// blocking `read` unblocking and dropping its sender clone, which is not
+/// bounded by any wall-clock guarantee — requiring it within a fixed budget
+/// turned this into a CI flake (5s was enough locally, in a shed VM, and on
+/// the PR run, then wasn't on a loaded GitHub runner).
+///
+/// So the budget expiring returns what was collected rather than failing here,
+/// and correctness rests on the callers instead: each asserts BOTH the exit
+/// status and the expected content. A truncated capture fails those assertions
+/// — which is what caught the original `Exit`-races-`Bytes` bug — and a run
+/// that never saw `Exit` fails on `exit_status`. That keeps the guarantee
+/// without betting on teardown timing.
 async fn collect_until_closed(
     output: &mut broadcast::Receiver<PtyOutputEvent>,
     budget: Duration,
@@ -34,13 +42,7 @@ async fn collect_until_closed(
     let mut collected = Vec::new();
     let mut exit_status = None;
 
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "PTY output channel never closed within {budget:?} \
-             (captured {} byte(s), exit={exit_status:?})",
-            collected.len()
-        );
+    while Instant::now() < deadline {
         match output.try_recv() {
             Ok(PtyOutputEvent::Bytes(bytes)) => collected.extend_from_slice(&bytes),
             Ok(PtyOutputEvent::Exit(status)) => exit_status = Some(status),
@@ -76,9 +78,13 @@ async fn pty_echo_emits_bytes_and_exit() {
         .expect("spawn");
 
     let (collected, exit_status) = collect_until_closed(&mut output, Duration::from_secs(5)).await;
+    // Assert on the actual payload, not just "some bytes arrived": the helper
+    // stops on a budget rather than insisting the channel closes, so content
+    // is what proves nothing was truncated.
+    let text = String::from_utf8_lossy(&collected);
     assert!(
-        !collected.is_empty(),
-        "expected at least one chunk of PTY output"
+        text.contains("hi"),
+        "expected the shell's output, got:\n{text}"
     );
     assert_eq!(exit_status, Some(0), "expected clean exit");
 
