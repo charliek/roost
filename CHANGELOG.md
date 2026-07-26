@@ -9,20 +9,52 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
-## Unreleased
+## v0.0.15 — 2026-07-26
+
+Kitty-mode keyboard input now carries shifted text correctly on both UIs — you
+can type capitals and `?` into Kitty-aware TUIs again — plus a round of terminal
+conformance work (DEC 2031, device-query replies, DECTCEM).
+
+### Features
+
+- **Device queries answered via `write_pty` on both UIs (#247, #248)** — the
+  terminal replies to DA/DSR-style queries through libghostty's reply buffer
+  (`set_write_pty_buffer` in `roost-vt`), so programs that probe the terminal
+  get an answer instead of a timeout.
+- **DEC 2031: apps are notified on runtime theme switch (#248)** — flipping the
+  system/app theme while a TUI is running tells it to re-read its colors.
 
 ### Fixes
 
-- **Kitty keyboard mode preserves shifted text (Mac + GTK)** — terminals now
-  tell libghostty when Shift or another layout modifier was consumed to produce
+- **Kitty keyboard mode preserves shifted text (Mac + GTK, #254)** — the
+  terminals now tell libghostty which modifiers were consumed to produce
   printable text, so Strix and other Kitty-aware TUIs receive capitals and
-  shifted punctuation normally while Shift+Enter remains distinguishable.
-  On Mac this also applies to Option-produced text (Option+2 → "™"), matching
+  shifted punctuation normally while Shift+Enter stays distinguishable.
+  Previously Shift+G reached the app as `CSI 103;2u` ("g" + Shift) rather than
+  the text "G", and no capital or shifted punctuation could be typed.
+  On Mac this also covers Option-produced text (Option+2 → "™"), matching
   Ghostty's default `macos-option-as-alt = false`: under Kitty mode Option+key
-  now sends the composed character rather than an Alt chord, the same as Roost
-  already did outside Kitty mode. Linux is unchanged here — GDK reports the
-  real per-layout consumed modifiers, and Alt is not one of them, so Alt+key
-  stays an Alt chord there.
+  now sends the composed character rather than an Alt chord, as Roost already
+  did outside Kitty mode. Linux is unchanged there — GDK reports the real
+  per-layout consumed modifiers, and Alt isn't one of them.
+- **GTK reports the base-layout key in CSI-u sequences (#254)** — Kitty CSI-u
+  and fixterms identify a key by its *unshifted* codepoint, which GTK derived
+  from the shifted keyval. Ctrl+? encoded as `CSI 63;6u` where Ghostty and the
+  Mac UI send `CSI 47;6u`, and Ctrl+! kept a Shift that fixterms drops. Now
+  looked up from the keymap, closing a Mac/Linux parity gap.
+- **Hidden cursor is never drawn — DECTCEM is respected (#246, #248).**
+- **GTK: left-edge drag-selection no longer stolen by the paned resize handle
+  (#251).**
+
+### Tooling & tests
+
+- **`roost-linux`'s own tests now run in CI (#254)** — `rust-test` excludes the
+  crate (no GTK toolchain), so its ~380 unit tests compiled but executed
+  nowhere; `gtk-build` runs them now. That immediately caught a PTY smoke test
+  whose capture stopped at the first 4 KB chunk, because `Exit` and `Bytes` are
+  independent producers on one broadcast channel and `Exit` can arrive first.
+  The same assumption in the UI is tracked as #255.
+- Rust toolchain 1.85.0 → 1.97.1 (#253).
 
 ## v0.0.14 — 2026-06-30
 
