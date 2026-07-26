@@ -8,12 +8,8 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::sleep;
 
-/// How long the output channel must stay empty after `Exit` before we call
-/// the stream finished.
-const QUIET_AFTER_EXIT: Duration = Duration::from_millis(250);
-
-/// Drain a tab's output channel until the stream goes quiet, returning
-/// everything read plus the exit status.
+/// Drain a tab's output channel until the sending side closes, returning
+/// everything the PTY produced plus the exit status.
 ///
 /// `Exit` does NOT mean "no more bytes". It is published by the reap task the
 /// moment `child.wait()` returns, while the reader task may still be draining
@@ -23,37 +19,33 @@ const QUIET_AFTER_EXIT: Duration = Duration::from_millis(250);
 /// That is invisible on a dev box, where a short command's output arrives in
 /// one read, and reproducible on CI, where the runner's `env` spans many
 /// chunks and the capture stopped mid-variable at `CARGO_PKG_DESCRIPTION`.
-async fn collect_until_quiet(
+///
+/// `Closed` is the ONLY successful ending. Broadcast hands out every buffered
+/// message before reporting it, and the senders outlive both the reader loop
+/// and the reap task, so it means "the PTY is finished and everything it
+/// produced has been handed over". A merely-quiet stream doesn't prove that —
+/// a slow final chunk would read as success — so exhausting the budget is a
+/// failure, not a completion.
+async fn collect_until_closed(
     output: &mut broadcast::Receiver<PtyOutputEvent>,
     budget: Duration,
 ) -> (Vec<u8>, Option<i32>) {
     let deadline = Instant::now() + budget;
     let mut collected = Vec::new();
     let mut exit_status = None;
-    // Set once Exit lands; extended by any bytes that arrive after it.
-    let mut quiet_deadline: Option<Instant> = None;
 
-    while Instant::now() < deadline {
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "PTY output channel never closed within {budget:?} \
+             (captured {} byte(s), exit={exit_status:?})",
+            collected.len()
+        );
         match output.try_recv() {
-            Ok(PtyOutputEvent::Bytes(bytes)) => {
-                collected.extend_from_slice(&bytes);
-                quiet_deadline = quiet_deadline.map(|_| Instant::now() + QUIET_AFTER_EXIT);
-            }
-            Ok(PtyOutputEvent::Exit(status)) => {
-                exit_status = Some(status);
-                quiet_deadline = Some(Instant::now() + QUIET_AFTER_EXIT);
-            }
-            // All senders dropped — the reap task removes the session after
-            // publishing Exit. Broadcast hands out every buffered message
-            // before reporting Closed, so this is the authoritative
-            // end-of-stream and everything the PTY produced is now in hand.
+            Ok(PtyOutputEvent::Bytes(bytes)) => collected.extend_from_slice(&bytes),
+            Ok(PtyOutputEvent::Exit(status)) => exit_status = Some(status),
             Err(TryRecvError::Closed) => break,
-            Err(TryRecvError::Empty) => {
-                if quiet_deadline.is_some_and(|quiet| Instant::now() >= quiet) {
-                    break;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
+            Err(TryRecvError::Empty) => sleep(Duration::from_millis(50)).await,
             // Dropped messages mean a truncated capture; fail loudly rather
             // than letting a content assertion report a confusing near-miss.
             Err(TryRecvError::Lagged(dropped)) => {
@@ -83,7 +75,7 @@ async fn pty_echo_emits_bytes_and_exit() {
         )
         .expect("spawn");
 
-    let (collected, exit_status) = collect_until_quiet(&mut output, Duration::from_secs(5)).await;
+    let (collected, exit_status) = collect_until_closed(&mut output, Duration::from_secs(5)).await;
     assert!(
         !collected.is_empty(),
         "expected at least one chunk of PTY output"
@@ -120,7 +112,8 @@ async fn pty_injects_roost_env_vars() {
         .spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
         .expect("spawn");
 
-    let (collected, _) = collect_until_quiet(&mut output, Duration::from_secs(5)).await;
+    let (collected, exit_status) = collect_until_closed(&mut output, Duration::from_secs(5)).await;
+    assert_eq!(exit_status, Some(0), "expected clean exit");
     let text = String::from_utf8_lossy(&collected);
     assert!(
         text.contains("ROOST_TAB_ID=99"),
