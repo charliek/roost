@@ -679,6 +679,7 @@ impl App {
             .start_child(&sidebar_box)
             .end_child(&content_column)
             .build();
+        Self::tighten_paned_grab_zone(&paned);
 
         // Line up the sidebar "PROJECTS" header band and the tab-strip band to
         // the same height so the two top bands meet flush across the paned seam
@@ -4654,6 +4655,69 @@ impl App {
         let tab_id = parse_tab_id_from_page(&page)?;
         let view = ui.tabs.borrow().get(&tab_id).map(|t| t.view.clone());
         view
+    }
+
+    /// Replace `GtkPaned`'s built-in resize gestures with one whose hit
+    /// zone is the separator itself (±2px), no more.
+    ///
+    /// GTK's internal capture-phase drag gesture claims any press within
+    /// `HANDLE_EXTRA_SIZE` (6px) of the separator's styled box — with the
+    /// Adwaita separator that zone reaches ~22px into the end child. The
+    /// terminal's text starts flush at the seam, so drag-selections that
+    /// begin on the first ~2 columns of a line were claimed by the paned
+    /// (sidebar resize) before the terminal's `GestureDrag` ever saw the
+    /// press (capture phase runs ancestors-first; no child-side fix can
+    /// win). Removing the internal `GestureDrag`/`GesturePan` and
+    /// re-implementing resize with a tight hit test makes "resize"
+    /// engage exactly where the resize cursor shows.
+    fn tighten_paned_grab_zone(paned: &gtk4::Paned) {
+        let controllers = paned.observe_controllers();
+        let mut internal = Vec::new();
+        for i in 0..controllers.n_items() {
+            let Some(obj) = controllers.item(i) else {
+                continue;
+            };
+            if obj.is::<gtk4::GestureDrag>() || obj.is::<gtk4::GesturePan>() {
+                if let Ok(c) = obj.downcast::<gtk4::EventController>() {
+                    internal.push(c);
+                }
+            }
+        }
+        for c in internal {
+            paned.remove_controller(&c);
+        }
+
+        let resize = gtk4::GestureDrag::new();
+        resize.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        resize.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let start_pos = Rc::new(RefCell::new(0i32));
+        resize.connect_drag_begin({
+            let paned = paned.clone();
+            let start_pos = start_pos.clone();
+            move |g, x, _y| {
+                let pos = paned.position();
+                // Separator box: [position .. end-child x]. ±2px slop.
+                let sep_end = paned
+                    .end_child()
+                    .and_then(|c| c.compute_bounds(&paned))
+                    .map(|b| b.x() as i32)
+                    .unwrap_or(pos + 6);
+                if (x as i32) < pos - 2 || (x as i32) > sep_end + 2 {
+                    g.set_state(gtk4::EventSequenceState::Denied);
+                    return;
+                }
+                *start_pos.borrow_mut() = pos;
+                g.set_state(gtk4::EventSequenceState::Claimed);
+            }
+        });
+        resize.connect_drag_update({
+            let paned = paned.clone();
+            let start_pos = start_pos.clone();
+            move |_g, dx, _dy| {
+                paned.set_position(*start_pos.borrow() + dx as i32);
+            }
+        });
+        paned.add_controller(resize);
     }
 
     /// Find the `TerminalView` for any tab id (not just the active one)
