@@ -212,16 +212,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_LABEL: ${{ matrix.label }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          debs=(out/*.deb)
-          # Each matrix job builds exactly one arch, and the `file#label`
-          # syntax needs a single named path rather than a glob. Assert the
-          # count so a build that emitted nothing fails here, with the reason,
-          # instead of passing an unexpanded glob down to gh.
+          # Match on the arch this job's label claims, not any .deb: the
+          # `file#label` syntax needs one concrete path, and a bare glob would
+          # happily hand an arm64 package to the job that labels it Intel/AMD
+          # — the exact mislabeling the labels exist to prevent. Asserting the
+          # count also means a build that emitted nothing fails here, naming
+          # the arch, instead of passing an unexpanded glob down to gh.
+          debs=(out/*_"${ARCH}".deb)
           if [ "${#debs[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one .deb in out/ for ${{ matrix.arch }}, found ${#debs[@]}"
+            echo "::error::expected exactly one out/*_${ARCH}.deb, found ${#debs[@]}"
             exit 1
           fi
           gh release upload "${GITHUB_REF_NAME}" "${debs[0]}#${ASSET_LABEL}" --clobber
