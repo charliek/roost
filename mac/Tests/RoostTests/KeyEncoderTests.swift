@@ -208,6 +208,48 @@ func shift_enter_under_kitty_remains_modified() {
     }
 }
 
+// MARK: - Base-layout key numbers (Mac ⇄ Linux parity)
+
+// Kitty CSI-u and fixterms both identify a key by its UNSHIFTED
+// codepoint, which `unshiftedCodepoint(for:)` reads from
+// `characters(byApplyingModifiers: [])`. These pin the wire bytes the
+// GTK encoder is expected to match — `crates/roost-linux/src/key_encoder.rs`
+// has the twin assertions, and it needs a keymap lookup to produce them.
+
+@MainActor
+@Test
+func ctrl_shifted_punctuation_reports_base_layout_key_under_kitty() {
+    withKittyEncoder { encoder in
+        // Ctrl+Shift+/ — AppKit reports the C0 byte as `characters`, so
+        // the encoder derives the key number from the base layout: "/" (47),
+        // NOT the shifted "?" (63).
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_Slash),
+            chars: "\u{1F}",
+            charsIgnoringModifiers: "?",
+            modifiers: [.control, .shift]
+        )
+        #expect(encoder.encode(event) == Data("\u{1B}[47;6u".utf8))
+    }
+}
+
+@MainActor
+@Test
+func ctrl_shifted_punctuation_drops_shift_in_legacy_fixterms() {
+    withEncoder { encoder in
+        // Ctrl+Shift+1 — fixterms drops Shift because "!" was obtained
+        // WITH shift, which libghostty detects by comparing the text
+        // against the unshifted codepoint ("1").
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_1),
+            chars: "!",
+            charsIgnoringModifiers: "!",
+            modifiers: [.control, .shift]
+        )
+        #expect(encoder.encode(event) == Data("\u{1B}[33;5u".utf8))
+    }
+}
+
 // MARK: - Control-key conventions
 
 @MainActor

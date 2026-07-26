@@ -1402,7 +1402,7 @@ impl TerminalView {
                 state: self.state.clone(),
                 widget: self.widget.clone(),
             };
-            move |ctrl, key, _keycode, mods| {
+            move |ctrl, key, keycode, mods| {
                 // Commit 7 stop-gap: Ctrl+Shift+C / Ctrl+Shift+V invoke
                 // copy/paste. Full keybind table (with config-file
                 // overrides + Mac-style ⌘C / ⌘V on Mac) lands in
@@ -1423,27 +1423,37 @@ impl TerminalView {
                         _ => {}
                     }
                 }
-                // GDK records which layout modifiers produced the keyval
-                // (Shift for "G" / "?", AltGr on layouts that use it). Feed
-                // that into libghostty so Kitty mode distinguishes translated
-                // text from an effective shortcut modifier.
-                // Falling back to "nothing consumed" silently reinstates the
-                // bug this replaced (Shift+G encoding as CSI 103;2u instead of
-                // "G"), so log it — no current path delivers a key press
-                // without a backing GdkKeyEvent, and if one appears we want a
-                // breadcrumb rather than a mystery regression.
-                let consumed_mods = match ctrl
+                // Two facts live only on the GdkKeyEvent + the display, not in
+                // this callback's arguments: which modifiers GDK consumed to
+                // produce the keyval (Shift for "G" / "?", AltGr where a layout
+                // uses it), and the physical key's level-0 keyval. Losing
+                // either degrades encoding silently — no consumed mods puts
+                // Shift+G back to CSI 103;2u, no level-0 keyval makes Ctrl+?
+                // report key 63 instead of 47 — so log when the event is
+                // missing. Nothing forwards key presses today, so this should
+                // never fire.
+                let key_event = ctrl
                     .current_event()
-                    .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok())
-                {
-                    Some(event) => event.consumed_modifiers(),
-                    None => {
-                        tracing::debug!(
-                            ?key,
-                            "no GdkKeyEvent for key press; assuming no consumed modifiers"
-                        );
-                        gtk4::gdk::ModifierType::empty()
-                    }
+                    .and_then(|event| event.downcast::<gtk4::gdk::KeyEvent>().ok());
+                if key_event.is_none() {
+                    tracing::debug!(
+                        ?key,
+                        "key press with no backing GdkKeyEvent; encoding without \
+                         consumed modifiers or layout lookup"
+                    );
+                }
+                let consumed_mods = key_event
+                    .as_ref()
+                    .map(|event| event.consumed_modifiers())
+                    .unwrap_or_else(gtk4::gdk::ModifierType::empty);
+                let unshifted = key_event.as_ref().and_then(|event| {
+                    key_encoder::unshifted_keyval(&widget.display(), event.layout(), keycode)
+                });
+                let press = key_encoder::GdkKeyPress {
+                    key,
+                    mods,
+                    consumed_mods,
+                    unshifted,
                 };
                 let mut s = state.borrow_mut();
                 // A bare modifier (incl. the modifier that begins a copy
@@ -1472,13 +1482,7 @@ impl TerminalView {
                 // encoder can take `&mut encoder` + `&terminal` at once.
                 let bytes = {
                     let s_mut: &mut TerminalViewState = &mut s;
-                    key_encoder::encode_key(
-                        &mut s_mut.encoder,
-                        &s_mut.terminal,
-                        key,
-                        mods,
-                        consumed_mods,
-                    )
+                    key_encoder::encode_key(&mut s_mut.encoder, &s_mut.terminal, &press)
                 };
                 if snapped || had_selection {
                     widget.queue_draw();

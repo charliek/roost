@@ -8,7 +8,8 @@ never the gesture stack):
   Focus + core-sync (clicks / keys)
     * click-to-focus            — clicking the terminal body grabs focus.
     * Kitty shifted text        — consumed Shift preserves capitals and
-                                  punctuation without hiding Shift+Enter.
+                                  punctuation without hiding Shift+Enter,
+                                  and Ctrl+? reports its base-layout key.
     * project-switch focus      — clicking a sidebar row focuses the new
                                   project's terminal AND syncs the core (#1).
     * Alt+digit                 — switches PROJECTS only, never tabs.
@@ -132,16 +133,24 @@ def _connect(make_client, timeout: float = 15.0):
 
 
 def _check_kitty_shifted_text(r, send_key) -> None:
-    """Exercise GDK's real consumed-modifier metadata under Kitty mode."""
+    """Exercise the two pieces of GDK key metadata the unit tests can only
+    stub: the consumed modifiers, and the keymap lookup that turns a shifted
+    keyval back into its base-layout key.
+
+    Ctrl+Shift+/ is the one that needs a live display — the encoder asks
+    `gdk_display_map_keycode` for the level-0 keyval, so a correct run proves
+    the lookup resolved "/" (47) rather than falling back to "?" (63).
+    """
     tab = r.app_selected_tab_id()
     r.tab_feed_pty_bytes(tab, b"\x1b[>1u")
     r.tab_capture_pty_input(tab, drain=True)
 
     send_key("shift+g")
     send_key("shift+slash")
+    send_key("ctrl+shift+slash")
     send_key("shift+Return")
     captured = r.tab_capture_pty_input(tab, drain=True)
-    expected = b"G?\x1b[13;2u"
+    expected = b"G?\x1b[47;6u\x1b[13;2u"
     if captured != expected:
         # The input channel also carries terminal replies to device queries
         # (DA/DSR/OSC), so a prompt that queries mid-check shows up here as
@@ -160,7 +169,7 @@ def _check_kitty_shifted_text(r, send_key) -> None:
     r.tab_feed_pty_bytes(tab, b"\x1b[<u")
     send_key("ctrl+c")
     r.tab_capture_pty_input(tab, drain=True)
-    print("  Kitty shifted text OK (G, ?, and distinct Shift+Enter)")
+    print("  Kitty shifted text OK (G, ?, base-layout Ctrl+?, distinct Shift+Enter)")
 
 
 # --- pixel / pointer helpers --------------------------------------------
