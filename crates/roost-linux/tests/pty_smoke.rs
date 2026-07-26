@@ -1,11 +1,69 @@
 //! PTY supervisor smoke test. Spawns `/bin/sh -c "echo hi"` and
 //! confirms the byte and exit signals propagate.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use roost_linux::daemon::{PtyOutputEvent, PtySupervisor, SupervisorEvent};
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::sleep;
+
+/// How long the output channel must stay empty after `Exit` before we call
+/// the stream finished.
+const QUIET_AFTER_EXIT: Duration = Duration::from_millis(250);
+
+/// Drain a tab's output channel until the stream goes quiet, returning
+/// everything read plus the exit status.
+///
+/// `Exit` does NOT mean "no more bytes". It is published by the reap task the
+/// moment `child.wait()` returns, while the reader task may still be draining
+/// the PTY — two independent producers on one broadcast channel, so their
+/// relative order is not guaranteed. A loop that breaks on `Exit` therefore
+/// truncates the capture at whatever the reader happened to have flushed.
+/// That is invisible on a dev box, where a short command's output arrives in
+/// one read, and reproducible on CI, where the runner's `env` spans many
+/// chunks and the capture stopped mid-variable at `CARGO_PKG_DESCRIPTION`.
+async fn collect_until_quiet(
+    output: &mut broadcast::Receiver<PtyOutputEvent>,
+    budget: Duration,
+) -> (Vec<u8>, Option<i32>) {
+    let deadline = Instant::now() + budget;
+    let mut collected = Vec::new();
+    let mut exit_status = None;
+    // Set once Exit lands; extended by any bytes that arrive after it.
+    let mut quiet_deadline: Option<Instant> = None;
+
+    while Instant::now() < deadline {
+        match output.try_recv() {
+            Ok(PtyOutputEvent::Bytes(bytes)) => {
+                collected.extend_from_slice(&bytes);
+                quiet_deadline = quiet_deadline.map(|_| Instant::now() + QUIET_AFTER_EXIT);
+            }
+            Ok(PtyOutputEvent::Exit(status)) => {
+                exit_status = Some(status);
+                quiet_deadline = Some(Instant::now() + QUIET_AFTER_EXIT);
+            }
+            // All senders dropped — the reap task removes the session after
+            // publishing Exit. Broadcast hands out every buffered message
+            // before reporting Closed, so this is the authoritative
+            // end-of-stream and everything the PTY produced is now in hand.
+            Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Empty) => {
+                if quiet_deadline.is_some_and(|quiet| Instant::now() >= quiet) {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            // Dropped messages mean a truncated capture; fail loudly rather
+            // than letting a content assertion report a confusing near-miss.
+            Err(TryRecvError::Lagged(dropped)) => {
+                panic!("output receiver lagged; {dropped} message(s) dropped")
+            }
+        }
+    }
+
+    (collected, exit_status)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pty_echo_emits_bytes_and_exit() {
@@ -25,22 +83,11 @@ async fn pty_echo_emits_bytes_and_exit() {
         )
         .expect("spawn");
 
-    // Pump until we see Exit.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut saw_bytes = false;
-    let mut exit_status: Option<i32> = None;
-    while std::time::Instant::now() < deadline {
-        match output.try_recv() {
-            Ok(PtyOutputEvent::Bytes(_)) => saw_bytes = true,
-            Ok(PtyOutputEvent::Exit(status)) => {
-                exit_status = Some(status);
-                break;
-            }
-            Err(TryRecvError::Empty) => sleep(Duration::from_millis(50)).await,
-            Err(other) => panic!("output recv error: {other:?}"),
-        }
-    }
-    assert!(saw_bytes, "expected at least one chunk of PTY output");
+    let (collected, exit_status) = collect_until_quiet(&mut output, Duration::from_secs(5)).await;
+    assert!(
+        !collected.is_empty(),
+        "expected at least one chunk of PTY output"
+    );
     assert_eq!(exit_status, Some(0), "expected clean exit");
 
     // Lifecycle channel should also have an Exit event. Use the
@@ -73,16 +120,7 @@ async fn pty_injects_roost_env_vars() {
         .spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
         .expect("spawn");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut collected = Vec::new();
-    while std::time::Instant::now() < deadline {
-        match output.try_recv() {
-            Ok(PtyOutputEvent::Bytes(b)) => collected.extend_from_slice(&b),
-            Ok(PtyOutputEvent::Exit(_)) => break,
-            Err(TryRecvError::Empty) => sleep(Duration::from_millis(50)).await,
-            Err(other) => panic!("output recv error: {other:?}"),
-        }
-    }
+    let (collected, _) = collect_until_quiet(&mut output, Duration::from_secs(5)).await;
     let text = String::from_utf8_lossy(&collected);
     assert!(
         text.contains("ROOST_TAB_ID=99"),
