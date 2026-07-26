@@ -139,9 +139,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `label` is the asset's display name on the Release page. Debian
+        # requires the file itself be `<pkg>_<version>_<arch>.deb` (apt keys
+        # off it), but "amd64" and "arm64" are near-identical at a glance in
+        # adjacent rows, so the label spells the target out. The download
+        # still lands as the real filename.
         include:
-          - { runner: ubuntu-24.04,     arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+          - { runner: ubuntu-24.04,     arch: amd64, label: "Linux — Intel / AMD 64-bit (.deb)" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, label: "Linux — ARM 64-bit (.deb)" }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -206,7 +211,23 @@ jobs:
       - name: Upload .deb to the Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" out/*.deb --clobber
+          ASSET_LABEL: ${{ matrix.label }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # Match on the arch this job's label claims, not any .deb: the
+          # `file#label` syntax needs one concrete path, and a bare glob would
+          # happily hand an arm64 package to the job that labels it Intel/AMD
+          # — the exact mislabeling the labels exist to prevent. Asserting the
+          # count also means a build that emitted nothing fails here, naming
+          # the arch, instead of passing an unexpanded glob down to gh.
+          debs=(out/*_"${ARCH}".deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one out/*_${ARCH}.deb, found ${#debs[@]}"
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${debs[0]}#${ASSET_LABEL}" --clobber
 
   mac:
     needs: create-release
@@ -371,10 +392,15 @@ jobs:
         run: |
           echo "::notice::Roost-${GITHUB_REF_NAME#v}.dmg is NOT notarized — Gatekeeper blocks first launch. Clear it with 'xattr -dr com.apple.quarantine /Applications/Roost.app', or System Settings > Privacy & Security > Open Anyway."
 
+      # The `#...` suffix sets the asset's display name on the Release page;
+      # the file still downloads as Roost-<version>.dmg, which is what the
+      # Sparkle appcast's enclosure URL is built from.
       - name: Upload DMG to the Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg" --clobber
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            "mac/build/Roost-${GITHUB_REF_NAME#v}.dmg#macOS (.dmg)" --clobber
 
       # Sparkle appcast publishing (issue #122). EdDSA-sign the just-uploaded
       # DMG, append a signed <item> to docs/appcast.xml, and push to main as
