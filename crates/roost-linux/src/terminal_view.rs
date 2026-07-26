@@ -1447,7 +1447,23 @@ impl TerminalView {
                     .map(|event| event.consumed_modifiers())
                     .unwrap_or_else(gtk4::gdk::ModifierType::empty);
                 let unshifted = key_event.as_ref().and_then(|event| {
-                    key_encoder::unshifted_keyval(&widget.display(), event.layout(), keycode)
+                    let looked_up =
+                        key_encoder::unshifted_keyval(&widget.display(), event.layout(), keycode);
+                    if looked_up.is_none() {
+                        // Distinct from the branch above: the event is here, but
+                        // the layout has no level-0 entry for this keycode. The
+                        // keyval fallback is right for letters and wrong for
+                        // shifted punctuation (Ctrl+? reports 63, not 47), so
+                        // the degraded case has to be visible in the log.
+                        tracing::debug!(
+                            ?key,
+                            keycode,
+                            layout = event.layout(),
+                            "no level-0 keyval for this keycode; falling back to the \
+                             shifted keyval"
+                        );
+                    }
+                    looked_up
                 });
                 let press = key_encoder::GdkKeyPress {
                     key,

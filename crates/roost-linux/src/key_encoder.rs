@@ -405,4 +405,21 @@ mod tests {
         };
         assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[107;6u");
     }
+
+    /// …and the limit of that fallback, pinned so it stays a known gap rather
+    /// than a surprise: with no layout lookup, shifted punctuation reports the
+    /// SHIFTED key (63 = "?") instead of the base-layout key (47 = "/"). The
+    /// widget layer logs when it lands here; there is no better guess without
+    /// a keymap, and returning 0 like Ghostty would drop Ctrl+letter entirely.
+    #[test]
+    fn missing_layout_lookup_cannot_recover_shifted_punctuation() {
+        let (terminal, mut encoder) = kitty_terminal_and_encoder();
+        let p = GdkKeyPress {
+            key: gdk::Key::question,
+            mods: CTRL | SHIFT,
+            consumed_mods: SHIFT,
+            unshifted: None,
+        };
+        assert_eq!(encode_key(&mut encoder, &terminal, &p), b"\x1b[63;6u");
+    }
 }
