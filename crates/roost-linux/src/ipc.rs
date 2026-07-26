@@ -1035,7 +1035,7 @@ fn map_test_op_err(err: String) -> HandlerError {
 /// covers the JSON envelope (`id` / `ok` / `result` / dims).
 fn screenshot_frame_guard(png_len: usize) -> Result<(), HandlerError> {
     const ENVELOPE_MARGIN: usize = 1024;
-    let encoded = (png_len + 2) / 3 * 4;
+    let encoded = png_len.div_ceil(3) * 4;
     if encoded + ENVELOPE_MARGIN > roost_ipc::MAX_FRAME_BYTES {
         return Err(HandlerError::new(
             "internal",

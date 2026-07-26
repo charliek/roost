@@ -2042,21 +2042,18 @@ impl App {
             Some(&parent),
             None::<&gtk4::gio::Cancellable>,
             move |result| {
-                match result {
-                    Ok(1) => {
-                        let Some(client) = app.client.borrow().clone() else {
-                            return;
-                        };
-                        let rt = app.rt.clone();
-                        rt.spawn(async move {
-                            if let Err(err) = client.delete_project(project_id).await {
-                                tracing::warn!(?err, project_id, "delete_project failed");
-                            }
-                        });
-                    }
-                    // Cancel (0), Dismissed, or any other result is
-                    // the happy abort path.
-                    _ => {}
+                // Cancel (0), Dismissed, or any other result is the
+                // happy abort path.
+                if let Ok(1) = result {
+                    let Some(client) = app.client.borrow().clone() else {
+                        return;
+                    };
+                    let rt = app.rt.clone();
+                    rt.spawn(async move {
+                        if let Err(err) = client.delete_project(project_id).await {
+                            tracing::warn!(?err, project_id, "delete_project failed");
+                        }
+                    });
                 }
             },
         );
@@ -4439,10 +4436,10 @@ impl App {
         PaletteFrame::new("themes", "Select a theme…", items).with_selection(selection)
     }
 
-    /// Theme sub-frame behavior: arrowing previews live, Enter keeps
-    /// + persists, Esc/dismiss reverts. The persist is on Enter only
-    /// — arrowing through every theme would otherwise thrash the
-    /// config file.
+    /// Theme sub-frame behavior: arrowing previews live, Enter
+    /// keeps + persists, Esc/dismiss reverts. The persist is on
+    /// Enter only — arrowing through every theme would otherwise
+    /// thrash the config file.
     fn theme_behavior(self: &Rc<Self>) -> PaletteBehavior {
         let weak_highlight = Rc::downgrade(self);
         let weak_confirm = Rc::downgrade(self);
@@ -4616,7 +4613,7 @@ impl App {
             .iter()
             .map(|family| (family.name().to_string(), family.is_monospace()))
             .collect();
-        installed.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        installed.sort_by_key(|a| a.0.to_lowercase());
 
         let canonical_name = |name: &str| -> Option<String> {
             installed

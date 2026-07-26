@@ -262,7 +262,7 @@ fn draw_block_element(
             aligned_block(cr, x, y, w, h, HAlign::Right, VAlign::Middle, F_HALF, 1.0);
             true
         }
-        0x2591 | 0x2592 | 0x2593 => {
+        0x2591..=0x2593 => {
             // ░ ▒ ▓ shades
             let alpha = [0.25_f64, 0.5, 0.75][(cp - 0x2591) as usize];
             let (r, g, b) = fg.to_f64();
@@ -329,6 +329,9 @@ fn draw_block_element(
 /// Fill a sub-rect of the cell whose size is `(w*fw, h*fh)`, rounded
 /// to integer pixels, then placed by the given alignment. Mirrors
 /// `block.zig:121-152`'s blockShade.
+// Geometry + alignment + scale is irreducibly 9 params; grouping them
+// into a struct would only move the argument list to the call sites.
+#[allow(clippy::too_many_arguments)]
 fn aligned_block(
     cr: &cairo::Context,
     x: f64,
@@ -358,6 +361,7 @@ fn aligned_block(
 /// Paint any combination of the four quadrants. The bottom and right
 /// rects use `(h-half_h)`/`(w-half_w)` so the quadrants tile the cell
 /// exactly even when `h` or `w` is odd.
+#[allow(clippy::too_many_arguments)]
 fn draw_quads(
     cr: &cairo::Context,
     x: f64,
@@ -394,8 +398,9 @@ fn fill_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
 // Layer 2: Box drawing (U+2500–U+257F)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum LineStyle {
+    #[default]
     None,
     Light,
     Heavy,
@@ -408,12 +413,6 @@ struct Lines4 {
     right: LineStyle,
     down: LineStyle,
     left: LineStyle,
-}
-
-impl Default for LineStyle {
-    fn default() -> Self {
-        LineStyle::None
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -2015,6 +2014,7 @@ fn draw_box_lines(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, ln: Lines
 /// the perpendicular pair `(perp1, perp2)` and the parallel pair
 /// `(parallel, this)`, return the coordinate where `this`'s stroke
 /// ends.
+#[allow(clippy::too_many_arguments)]
 fn pick_junction(
     perp1: LineStyle,
     perp2: LineStyle,

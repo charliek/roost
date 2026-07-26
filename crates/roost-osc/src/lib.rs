@@ -974,7 +974,7 @@ mod tests {
         // window title is fine; the alternative is no title at all).
         let mut payload = Vec::with_capacity(MAX_BODY + 1024);
         payload.extend_from_slice(b"\x1b]0;");
-        payload.extend(std::iter::repeat(b'A').take(MAX_BODY + 512));
+        payload.extend(std::iter::repeat_n(b'A', MAX_BODY + 512));
         payload.push(0x07);
         let events = feed_all(&payload);
         assert_eq!(events.len(), 1);
@@ -996,7 +996,7 @@ mod tests {
         payload.extend_from_slice(b"\x1b]52;c;");
         // The base64 doesn't matter — it'll be truncated before the
         // BEL terminator. Just pump enough bytes past the cap.
-        payload.extend(std::iter::repeat(b'A').take(MAX_BODY + 512));
+        payload.extend(std::iter::repeat_n(b'A', MAX_BODY + 512));
         payload.push(0x07);
         let events = feed_all(&payload);
         assert_eq!(events, Vec::<OscEvent>::new());
@@ -1218,7 +1218,7 @@ mod tests {
         // back to "default" on the UI side).
         let mut payload = Vec::with_capacity(MAX_BODY + 1024);
         payload.extend_from_slice(b"\x1b]22;");
-        payload.extend(std::iter::repeat(b'A').take(MAX_BODY + 512));
+        payload.extend(std::iter::repeat_n(b'A', MAX_BODY + 512));
         payload.push(0x07);
         let events = feed_all(&payload);
         assert_eq!(events.len(), 1);

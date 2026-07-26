@@ -2915,19 +2915,17 @@ fn forward_right_button(
 ) {
     let mut s = state.borrow_mut();
     match action {
-        roost_linux::mouse_routing::MouseRoutingAction::Press => {
-            if !s.terminal.mouse_tracking() {
-                s.right_tracking_press_consumed_this_gesture = false;
-                return;
-            }
+        roost_linux::mouse_routing::MouseRoutingAction::Press if !s.terminal.mouse_tracking() => {
+            s.right_tracking_press_consumed_this_gesture = false;
+            return;
         }
-        roost_linux::mouse_routing::MouseRoutingAction::Release => {
-            if !s.right_tracking_press_consumed_this_gesture {
-                // Press wasn't forwarded (tracking was off then, or
-                // never enabled). Drop the release so the TUI's
-                // event queue stays balanced.
-                return;
-            }
+        // Press wasn't forwarded (tracking was off then, or never
+        // enabled). Drop the release so the TUI's event queue stays
+        // balanced.
+        roost_linux::mouse_routing::MouseRoutingAction::Release
+            if !s.right_tracking_press_consumed_this_gesture =>
+        {
+            return;
         }
         _ => {}
     }

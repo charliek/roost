@@ -68,7 +68,7 @@ self-contained for `claude install`.
 
 | Tool | Purpose | Pinned version |
 |---|---|---|
-| Rust | CLI + Linux UI | 1.85.0 (via `mise`) |
+| Rust | CLI + Linux UI | 1.97.1 (via `mise`) |
 | Zig | Builds `libghostty-vt` from the vendored Ghostty source | 0.15.x (via `mise`) |
 | Xcode Command Line Tools | Builds the Mac UI | macOS only |
 | GTK4 + libadwaita dev packages | Linker dependencies for the Linux UI | Linux only |
