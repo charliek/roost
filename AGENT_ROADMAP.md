@@ -78,11 +78,13 @@ Swift, zero GTK, zero parity risk.
 
 ### L2 — Diagnostics
 
-`roostctl doctor` — shell integration loaded? marks supported by this
-shell? socket reachable? hook commands point at a real executable? what
-are this tab's four states? Today every agent-integration bug is
-diagnosed by reading source, which is the single largest tax on
-iterating here.
+`roostctl doctor` — a read-only report covering target/socket
+resolution, UI identity, the shell-integration contract and OSC 133 mark
+capability, the selected tab's four agent axes, and the Claude hook
+install. Every agent-integration bug used to be diagnosed by reading
+source, the single largest tax on iterating here; now the report names
+which check is unhappy. See
+[docs/reference/cli.md#doctor](docs/reference/cli.md#doctor).
 
 ### L3 — Agent UX *(the payoff)*
 
@@ -182,7 +184,7 @@ gauntlet convention; the PR body carries the durable public record.
 | # | Scope | Plan | Status | PR |
 |---|---|---|---|---|
 | 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Shipped | [#259](https://github.com/charliek/roost/pull/259) |
-| — | L2 `roostctl doctor` + diagnostics | *not yet written* | Next | — |
+| 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | — |
 | — | L3 agent UX (tint / overview / switcher) | *not yet written* | Future | — |
 
 ---

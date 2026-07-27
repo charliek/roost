@@ -126,6 +126,11 @@ works on Apple `/bin/bash`, and you can always open a single Homebrew-bash tab
 on demand via `roostctl tab open --argv /opt/homebrew/bin/bash --argv -l`
 (handy as a saved command-launcher entry).
 
+Unsure whether a given tab's shell can even emit the OSC 133 mark?
+`roostctl doctor`'s `shell.marks_capability` check names it directly —
+`ok` for zsh and bash ≥ 4.4, `warn` for Apple's bash 3.2 or any shell
+with no shipped integration, which is exactly why the running dot won't light.
+
 The scripts are gated on `$ROOST_TAB_ID`, idempotent, and interactive-only. They
 emit OSC 7 (cwd) and OSC 0 (a `~`-abbreviated path as the tab title), and set a
 default prompt only when `PS1` is unset or the shell's stock default.
