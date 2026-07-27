@@ -33,6 +33,8 @@
 //!
 //! See `crates/roost-ipc/src/target.rs` for resolution logic.
 
+mod doctor;
+
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -183,6 +185,24 @@ enum Cmd {
     /// Claude Code subcommands (install hook settings file).
     #[command(subcommand)]
     Claude(ClaudeCmd),
+    /// Diagnose the Roost integration: target resolution, socket, UI
+    /// identity, shell-integration contract, the selected tab's four
+    /// agent axes, and the Claude hook install. Read-only — it reports
+    /// and links, it never repairs. Exits 1 if any check fails.
+    Doctor {
+        /// Inspect this tab instead of `$ROOST_TAB_ID` / the UI's active
+        /// tab.
+        ///
+        /// Deliberately NOT `env = "ROOST_TAB_ID"` like every other
+        /// per-tab command: clap would turn an unparseable env value
+        /// into exit 2 instead of a diagnostic, and erase the difference
+        /// between "the user passed --tab" and "clap read the env".
+        /// Doctor reads the env var itself.
+        #[arg(long)]
+        tab: Option<i64>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -453,6 +473,23 @@ async fn main() -> Result<()> {
     // subcommand.
     if let Cmd::Claude(ClaudeCmd::Install { force }) = args.command {
         return claude_install(force);
+    }
+
+    // doctor exists to report "no UI is running", so it must not go
+    // through the connect prologue below, which `?`-exits on exactly
+    // that condition before any match arm runs.
+    if let Cmd::Doctor { tab, json } = args.command {
+        let report = doctor::evaluate(&doctor::collect(&selector(&args), tab).await);
+        {
+            let mut stdout = std::io::stdout().lock();
+            if json {
+                writeln!(stdout, "{}", doctor::render_json(&report)?)?;
+            } else {
+                write!(stdout, "{}", doctor::render_text(&report))?;
+            }
+            stdout.flush()?;
+        }
+        std::process::exit(report.exit_code());
     }
 
     // Everything else needs a live UI socket.
@@ -878,7 +915,7 @@ async fn main() -> Result<()> {
             // Dismissed → print nothing; exit 0 either way.
         }
         // Already handled above before client connect.
-        Cmd::ClaudeHook { .. } | Cmd::Claude(_) => unreachable!(),
+        Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } => unreachable!(),
     }
 
     Ok(())
@@ -943,17 +980,22 @@ fn print_palette(state: &PaletteStateResult, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the [`TargetSelector`] from CLI args and resolve to a
-/// concrete socket path. `probe_alive` controls whether the auto-
-/// detect step actually dials candidate sockets; pass `false` for
-/// fire-and-forget commands (claude-hook) that no-op when the UI
-/// is offline.
-async fn resolve_target(args: &Args, probe_alive: bool) -> Result<ResolvedTarget> {
-    let selector = TargetSelector {
+/// The global flags that pick which UI to talk to. `doctor` needs the
+/// selector itself (it reports *how* resolution went), everything else
+/// only needs the resolved path — one construction either way.
+fn selector(args: &Args) -> TargetSelector {
+    TargetSelector {
         socket_override: args.socket.clone(),
         kind_override: args.target.map(BundleProfileKind::from),
-    };
-    selector
+    }
+}
+
+/// Resolve the CLI args to a concrete socket path. `probe_alive`
+/// controls whether the auto-detect step actually dials candidate
+/// sockets; pass `false` for fire-and-forget commands (claude-hook) that
+/// no-op when the UI is offline.
+async fn resolve_target(args: &Args, probe_alive: bool) -> Result<ResolvedTarget> {
+    selector(args)
         .resolve(probe_alive)
         .await
         .map_err(|e: TargetError| anyhow!(e))
@@ -978,13 +1020,13 @@ async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult> {
 /// `tab.agent_report`. Best-effort — failures don't surface to Claude
 /// (caller wraps in `let _ = ...` and always exits 0).
 async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
-    let tab_id = std::env::var("ROOST_TAB_ID")
+    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
         .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
-    if tab_id == 0 {
+        .as_deref()
+        .and_then(parse_tab_id)
+    else {
         return Ok(());
-    }
+    };
 
     // Drain stdin to a bounded buffer so Claude doesn't block on
     // a closed reader, even though only some events use the payload.
@@ -1054,14 +1096,51 @@ fn with_default_session(payload: serde_json::Value, tab_id: i64) -> serde_json::
     serde_json::Value::Object(obj)
 }
 
+/// `ROOST_TAB_ID` as a usable tab id — the one parse the Claude hook and
+/// `doctor` share, so doctor cannot report `ok` on a value the hook
+/// silently drops.
+///
+/// Deliberately does **not** trim: every other per-tab command reads the
+/// same variable through clap, whose `i64` parser rejects surrounding
+/// whitespace outright, so accepting `" 7 "` here would make doctor bless
+/// a value that exits 2 everywhere else. `0` and negatives are the same
+/// silent no-op as an unparseable value.
+fn parse_tab_id(raw: &str) -> Option<i64> {
+    raw.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
+/// `~/.config/roost/claude-settings.json` — written by `claude install`,
+/// read by `doctor`. One definition so the writer and the reader cannot
+/// drift about where the file lives.
+fn claude_settings_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("roost")
+        .join("claude-settings.json"))
+}
+
+/// This binary's canonical path. `std::env::current_exe()` returns the
+/// canonical path on macOS/Linux (modulo symlinks); `canonicalize`
+/// resolves any remaining symlink layer (e.g. when the .app's
+/// `Contents/Resources/bin/roostctl` is the entry).
+///
+/// `claude install` bakes this into the hook commands and `doctor`
+/// compares those commands against it, so both must resolve it the same
+/// way or a healthy install reads as a mismatch.
+fn self_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
 /// Write `~/.config/roost/claude-settings.json` and print the
 /// `alias claude=…` snippet. The hook command paths point at this
 /// binary's canonical path so they survive PATH changes.
 fn claude_install(force: bool) -> Result<()> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
-    let dir = PathBuf::from(&home).join(".config").join("roost");
-    std::fs::create_dir_all(&dir)?;
-    let settings_path = dir.join("claude-settings.json");
+    let settings_path = claude_settings_path()?;
+    if let Some(dir) = settings_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
 
     if !force && settings_path.exists() {
         eprintln!(
@@ -1071,13 +1150,7 @@ fn claude_install(force: bool) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Resolve the absolute path of the current binary so the hook
-    // commands survive PATH changes. `std::env::current_exe()`
-    // returns the canonical path on macOS/Linux (modulo symlinks);
-    // `canonicalize` resolves any symlink layer (e.g. when the
-    // .app's `Contents/Resources/bin/roostctl` is the entry).
-    let exe = std::env::current_exe()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = self_exe().ok_or_else(|| anyhow!("cannot resolve this binary's path"))?;
     let exe_str = exe.to_string_lossy().to_string();
     let exe_quoted = quote_for_shell(&exe_str);
 

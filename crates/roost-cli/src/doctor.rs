@@ -1,0 +1,4734 @@
+//! `roostctl doctor` — read-only diagnosis of the Roost integration.
+//!
+//! Three scopes, never mixed (plan 003 §3.2): **process** facts describe
+//! the shell that invoked doctor, **ui** facts describe the Roost
+//! instance it reached, **tab** facts describe the selected tab. A
+//! process fact may only judge a tab fact when the selected tab *is*
+//! doctor's own tab.
+//!
+//! The split is [`collect`] (all the I/O, never returns `Err`) →
+//! [`evaluate`] (all the judgement, no I/O) → the renderers. That
+//! inverts CLAUDE.md's "errors are returned, not swallowed" inside
+//! `collect` on purpose: a diagnostic that aborts on the first problem
+//! cannot diagnose. The inversion stops at `collect`'s signature —
+//! every failure lands in an [`Inputs`] field and is judged like any
+//! other fact.
+//!
+//! Doctor reports and links; it never repairs, installs, or mutates.
+
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::net::UnixStream;
+use tokio::process::Command;
+
+use roost_agent::claude::{canonical_hook_event, CLAUDE_HOOK_EVENTS};
+use roost_ipc::agent::{
+    effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, ShellState,
+};
+use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
+use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
+use roost_ipc::{ClientError, IpcClient};
+
+/// `IpcClient` has no read/write timeout of its own, so every leg of the
+/// conversation gets one here — "Roost is hung" must render as a failed
+/// check, not a hung doctor.
+const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(2);
+/// A timeout bounds time, not memory. Version banners are one line.
+const OUTPUT_CAP: u64 = 8 * 1024;
+/// `claude-settings.json` is six hook entries; anything past this is not
+/// a settings file, and reading it unbounded is how a symlink to
+/// `/dev/zero` turns a diagnostic into an OOM.
+const SETTINGS_READ_CAP: u64 = 1024 * 1024;
+
+const SCHEMA_VERSION: u32 = 1;
+
+// ============================================================================
+// Doc links (plan §3.11)
+// ============================================================================
+
+macro_rules! docs_base {
+    () => {
+        "https://charliek.github.io/roost/"
+    };
+}
+
+/// One published-docs target. `url` is built from `page` + `anchor` by
+/// [`doc`], so the link doctor prints and the anchor the test verifies
+/// cannot drift apart.
+/// `page` + `anchor` are read only by `doc_anchors_resolve`, which
+/// resolves them against `docs/` and `mkdocs.yml`'s nav; `url` is what
+/// production emits. Carrying all three on one row built by [`doc`] is
+/// what makes the printed link and the verified anchor impossible to
+/// drift apart — hence the struct-level allow.
+#[derive(Debug, Clone, Copy)]
+struct Doc {
+    #[cfg_attr(not(test), allow(dead_code))]
+    page: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
+    anchor: &'static str,
+    url: &'static str,
+}
+
+macro_rules! doc {
+    ($page:literal, $anchor:literal) => {
+        Doc {
+            page: $page,
+            anchor: $anchor,
+            url: concat!(docs_base!(), $page, "/#", $anchor),
+        }
+    };
+}
+
+#[cfg(test)]
+const DOCS_BASE: &str = docs_base!();
+
+const EXIT_CODES_DOC: Doc = doc!("reference/cli", "exit-codes");
+
+/// Check id → where to read more. Only `fail` and `warn` carry the link;
+/// [`check`] attaches it, so a scored check with no row here is a red
+/// test rather than a dead end for the user.
+const DOC_TARGETS: &[(&str, Doc)] = &[
+    ("env.tab_id", doc!("reference/cli", "environment")),
+    ("env.socket", doc!("reference/cli", "environment")),
+    ("ui.target", doc!("reference/cli", "environment")),
+    ("ui.socket", doc!("reference/cli", "environment")),
+    ("ui.identify", doc!("reference/cli", "identify")),
+    ("ui.version", doc!("guides/claude-code", "verifying")),
+    ("ui.agent_model", doc!("guides/claude-code", "verifying")),
+    ("shell.login", doc!("guides/cwd-tracking", "how-it-loads")),
+    (
+        "shell.integration",
+        doc!("guides/cwd-tracking", "how-it-loads"),
+    ),
+    (
+        "shell.resources",
+        doc!("guides/cwd-tracking", "how-it-loads"),
+    ),
+    (
+        "shell.marks_observed",
+        doc!("guides/cwd-tracking", "how-it-loads"),
+    ),
+    (
+        "shell.marks_feature",
+        doc!("guides/cwd-tracking", "feature-flags"),
+    ),
+    (
+        "shell.marks_capability",
+        doc!(
+            "guides/cwd-tracking",
+            "switching-macos-default-to-homebrew-bash"
+        ),
+    ),
+    ("tab.selection", doc!("reference/cli", "environment")),
+    (
+        "tab.raw_osc",
+        doc!("guides/notifications", "hook-session-osc-suppression"),
+    ),
+    (
+        "claude.binary",
+        doc!("guides/claude-code", "troubleshooting"),
+    ),
+    ("claude.settings", doc!("guides/claude-code", "install")),
+    ("claude.hook_events", doc!("guides/claude-code", "install")),
+    ("claude.hook_command", doc!("guides/claude-code", "install")),
+    (
+        "claude.observed",
+        doc!("guides/claude-code", "troubleshooting"),
+    ),
+];
+
+fn docs_for(check_id: &str) -> Option<&'static str> {
+    DOC_TARGETS
+        .iter()
+        .find(|(id, _)| *id == check_id)
+        .map(|(_, d)| d.url)
+}
+
+// ============================================================================
+// Report
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    Warn,
+    Fail,
+    Info,
+}
+
+impl Status {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Warn => "warn",
+            Status::Fail => "fail",
+            Status::Info => "info",
+        }
+    }
+}
+
+/// Hand-written rather than `rename_all = "snake_case"` so the text and
+/// JSON renderers cannot spell a status differently — the same
+/// one-vocabulary rule §3.9 applies to redaction.
+impl Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Check {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub status: Status,
+    pub detail: String,
+    pub docs_url: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Section {
+    pub id: &'static str,
+    pub title: &'static str,
+    /// Which of the three scopes this section's checks describe.
+    pub scope: &'static str,
+    pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    pub ok: usize,
+    pub warn: usize,
+    pub fail: usize,
+    pub info: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub schema_version: u32,
+    pub roostctl_version: String,
+    pub sections: Vec<Section>,
+}
+
+impl Report {
+    pub fn summary(&self) -> Summary {
+        let mut s = Summary::default();
+        for check in self.checks() {
+            match check.status {
+                Status::Ok => s.ok += 1,
+                Status::Warn => s.warn += 1,
+                Status::Fail => s.fail += 1,
+                Status::Info => s.info += 1,
+            }
+        }
+        s
+    }
+
+    fn checks(&self) -> impl Iterator<Item = &Check> {
+        self.sections.iter().flat_map(|s| &s.checks)
+    }
+
+    /// 0 unless some check is `fail`. `warn` never changes it (plan §3.3).
+    pub fn exit_code(&self) -> i32 {
+        i32::from(self.checks().any(|c| c.status == Status::Fail))
+    }
+}
+
+fn check(
+    id: &'static str,
+    title: &'static str,
+    status: Status,
+    detail: impl Into<String>,
+) -> Check {
+    Check {
+        id,
+        title,
+        status,
+        detail: detail.into(),
+        docs_url: match status {
+            Status::Fail | Status::Warn => docs_for(id),
+            Status::Ok | Status::Info => None,
+        },
+    }
+}
+
+// ============================================================================
+// Inputs — every field an already-resolved fact
+// ============================================================================
+
+/// Outcome of one bounded read-only subprocess (plan §3.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubprocessOutcome {
+    Output(String),
+    /// Not attempted. Carries no reason: the only thing that skips is
+    /// `$SHELL --version` when `$SHELL` fails its guard, and
+    /// `shell.login` already reports that from `shell_path` /
+    /// `shell_usable` — a second copy here was written four times and
+    /// read by nothing.
+    Skipped,
+    /// The binary isn't on PATH / doesn't exist.
+    Missing,
+    TimedOut,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketOutcome {
+    Connected,
+    Missing,
+    NotASocket(String),
+    /// The file outlived its listener.
+    Stale,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketProbe {
+    pub path: PathBuf,
+    /// Set when doctor is reporting per profile because target
+    /// resolution found nothing live (or too much).
+    pub profile: Option<&'static str>,
+    pub outcome: SocketOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetFailure {
+    NoLiveTarget(Vec<PathBuf>),
+    Ambiguous,
+    UnknownProfile(String),
+    Path(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifyFailure {
+    /// The socket never opened, so `identify` was never sent.
+    NoConnection(String),
+    Timeout,
+    Io(String),
+    Protocol(String),
+    Server(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsProbe {
+    /// `$HOME` is unset or not UTF-8, so there is no location to look at.
+    LocationUnknown,
+    Absent,
+    Unreadable(String),
+    Unparseable(String),
+    Parsed,
+}
+
+/// One `command` hook entry out of `claude-settings.json`, with the
+/// filesystem questions about its argv[0] already answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookCommand {
+    pub event: String,
+    pub raw: String,
+    /// `None` when the command's quoting doesn't parse.
+    pub argv: Option<Vec<String>>,
+    pub exe_executable: bool,
+    pub exe_canonical: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Inputs {
+    pub roostctl_version: String,
+    pub roostctl_exe: Option<PathBuf>,
+    pub now_unix: i64,
+
+    pub env_tab_id: Option<String>,
+    pub env_socket: Option<String>,
+    pub env_shell_integration: Option<String>,
+    pub env_shell_features: Option<String>,
+    pub env_resources_dir: Option<String>,
+    pub explicit_tab: Option<i64>,
+
+    pub shell_path: Option<String>,
+    pub shell_usable: bool,
+    pub shell_version: SubprocessOutcome,
+    pub parent_pid: u32,
+    pub parent_comm: SubprocessOutcome,
+    pub resources_script: Option<PathBuf>,
+    pub resources_script_readable: bool,
+
+    pub target_origin: TargetOrigin,
+    pub target_candidates: Vec<PathBuf>,
+    pub target: Result<PathBuf, TargetFailure>,
+    pub sockets: Vec<SocketProbe>,
+
+    pub identify: Result<IdentifyResult, IdentifyFailure>,
+    /// The `tab.list` result as the server sent it. Old-server detection
+    /// (plan §3.5) needs the raw keys; everything else re-decodes this
+    /// into [`TabListResult`] inside [`evaluate`].
+    pub tab_list: Result<serde_json::Value, String>,
+
+    pub claude_version: SubprocessOutcome,
+    /// `None` when `$HOME` gave doctor nowhere to look (F8).
+    pub claude_settings_path: Option<PathBuf>,
+    pub claude_settings: SettingsProbe,
+    pub claude_hook_events: Vec<String>,
+    pub claude_hook_commands: Vec<HookCommand>,
+}
+
+impl Default for Inputs {
+    fn default() -> Self {
+        Inputs {
+            roostctl_version: env!("CARGO_PKG_VERSION").to_string(),
+            roostctl_exe: None,
+            now_unix: 0,
+            env_tab_id: None,
+            env_socket: None,
+            env_shell_integration: None,
+            env_shell_features: None,
+            env_resources_dir: None,
+            explicit_tab: None,
+            shell_path: None,
+            shell_usable: false,
+            shell_version: SubprocessOutcome::Skipped,
+            parent_pid: 0,
+            parent_comm: SubprocessOutcome::Skipped,
+            resources_script: None,
+            resources_script_readable: false,
+            target_origin: TargetOrigin::AutoDetect,
+            target_candidates: Vec::new(),
+            target: Err(TargetFailure::NoLiveTarget(Vec::new())),
+            sockets: Vec::new(),
+            identify: Err(IdentifyFailure::NoConnection("no socket".into())),
+            tab_list: Err("no connection".into()),
+            claude_version: SubprocessOutcome::Missing,
+            claude_settings_path: None,
+            claude_settings: SettingsProbe::LocationUnknown,
+            claude_hook_events: Vec::new(),
+            claude_hook_commands: Vec::new(),
+        }
+    }
+}
+
+// ============================================================================
+// collect — ALL the I/O, never returns Err
+// ============================================================================
+
+pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> Inputs {
+    let shell_path = non_empty_env("SHELL");
+    let shell_usable = shell_path.as_deref().is_some_and(executable_regular_file);
+    let parent_pid = std::os::unix::process::parent_id();
+
+    // Two independent I/O phases, concurrently: the three bounded
+    // subprocesses (§3.8) and the target → socket → IPC chain, which is
+    // ordered internally but depends on none of them. Doctor is reached
+    // for precisely when something is hung, so the wall clock must be
+    // the slower of the two, not their sum.
+    let (shell_version, parent_comm, claude_version, ui) = tokio::join!(
+        shell_version(shell_path.as_deref(), shell_usable),
+        parent_comm(parent_pid),
+        capture_version("claude"),
+        probe_ui(selector),
+    );
+
+    let claude_settings_path = crate::claude_settings_path().ok();
+    let (claude_settings, claude_hook_events, claude_hook_commands) =
+        read_claude_settings(claude_settings_path.as_deref());
+
+    let env_resources_dir = non_empty_env("ROOST_RESOURCES_DIR");
+    let resources_script = shipped_script_path(
+        env_resources_dir.as_deref(),
+        shell_family(shell_path.as_deref()),
+    );
+    // Regular-file first: `ROOST_RESOURCES_DIR` is environment-supplied,
+    // and opening a FIFO for reading blocks until someone writes to it.
+    let resources_script_readable = resources_script
+        .as_deref()
+        .is_some_and(|p| p.is_file() && std::fs::File::open(p).is_ok());
+
+    Inputs {
+        roostctl_version: env!("CARGO_PKG_VERSION").to_string(),
+        roostctl_exe: crate::self_exe(),
+        now_unix: unix_now(),
+        env_tab_id: non_empty_env("ROOST_TAB_ID"),
+        env_socket: non_empty_env("ROOST_SOCKET"),
+        env_shell_integration: non_empty_env("ROOST_SHELL_INTEGRATION"),
+        env_shell_features: non_empty_env("ROOST_SHELL_FEATURES"),
+        env_resources_dir,
+        explicit_tab,
+        resources_script,
+        resources_script_readable,
+        shell_path,
+        shell_usable,
+        shell_version,
+        parent_pid,
+        parent_comm,
+        target_origin: ui.origin,
+        target_candidates: ui.candidates,
+        target: ui.target,
+        sockets: ui.sockets,
+        identify: ui.identify,
+        tab_list: ui.tab_list,
+        claude_version,
+        claude_settings_path,
+        claude_settings,
+        claude_hook_events,
+        claude_hook_commands,
+    }
+}
+
+const NO_SOCKET: &str = "target resolution found no socket to dial";
+
+/// Everything `collect` learns by talking to a UI. Its steps are
+/// genuinely ordered — you cannot dial a path you have not resolved —
+/// so it is one future that runs *beside* the subprocesses.
+struct UiProbe {
+    origin: TargetOrigin,
+    candidates: Vec<PathBuf>,
+    target: Result<PathBuf, TargetFailure>,
+    sockets: Vec<SocketProbe>,
+    identify: Result<IdentifyResult, IdentifyFailure>,
+    tab_list: Result<serde_json::Value, String>,
+}
+
+async fn probe_ui(selector: &TargetSelector) -> UiProbe {
+    let diagnosis = selector.diagnose().await;
+    let target = match diagnosis.resolved {
+        Ok(t) => Ok(t.socket_path),
+        Err(TargetError::Ambiguous) => Err(TargetFailure::Ambiguous),
+        Err(TargetError::NoLiveTarget { tried }) => Err(TargetFailure::NoLiveTarget(tried)),
+        Err(TargetError::UnknownProfile(v)) => Err(TargetFailure::UnknownProfile(v)),
+        Err(TargetError::Path(e)) => Err(TargetFailure::Path(e.to_string())),
+    };
+
+    // `resolve(probe_alive=false)` is a trap here: with nothing set on
+    // macOS it returns the Mac path unconditionally, so with only the
+    // GTK UI running doctor would report "socket missing" against a
+    // path nobody uses. Classify the resolved path when there is one,
+    // otherwise every candidate, per profile.
+    let sockets = match &target {
+        Ok(path) => vec![SocketProbe {
+            path: path.clone(),
+            profile: None,
+            outcome: classify_socket(path).await,
+        }],
+        Err(TargetFailure::NoLiveTarget(_)) | Err(TargetFailure::Ambiguous) => {
+            let mut probes = Vec::with_capacity(diagnosis.candidates.len());
+            for (kind, path) in &diagnosis.candidates {
+                probes.push(SocketProbe {
+                    path: path.clone(),
+                    profile: Some(kind.as_str()),
+                    outcome: classify_socket(path).await,
+                });
+            }
+            probes
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let (identify, tab_list) = match &target {
+        Ok(path) => dial(path).await,
+        Err(_) => (
+            Err(IdentifyFailure::NoConnection(NO_SOCKET.into())),
+            Err(NO_SOCKET.to_string()),
+        ),
+    };
+
+    UiProbe {
+        origin: diagnosis.origin,
+        candidates: diagnosis.candidates.into_iter().map(|(_, p)| p).collect(),
+        target,
+        sockets,
+        identify,
+        tab_list,
+    }
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `$SHELL` is an environment-supplied path doctor is about to execute.
+/// Absolute, existing, executable regular file — and spawned directly,
+/// never PATH-resolved and never handed to a shell (plan §3.8).
+fn executable_regular_file(path: &str) -> bool {
+    let p = Path::new(path);
+    p.is_absolute() && is_executable_regular_file(p)
+}
+
+fn is_executable_regular_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// Resolve a command word the way a shell would: a word containing a
+/// slash is used as a path, anything else is searched on `PATH`.
+///
+/// Doctor never runs these — it only reports whether Claude's hook
+/// command *could* run. A bare `roostctl claude-hook SessionStart` works
+/// whenever `roostctl` is on Claude's PATH (the Linux `.deb` installs
+/// `/usr/bin/roostctl`), so rejecting non-absolute words outright would
+/// fail a healthy install — exactly the false positive §3.3's
+/// applicability rule exists to prevent.
+fn resolve_program(word: &str) -> Option<PathBuf> {
+    if word.contains('/') {
+        let p = Path::new(word);
+        return is_executable_regular_file(p).then(|| p.to_path_buf());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(word))
+        .find(|candidate| is_executable_regular_file(candidate))
+}
+
+/// Doctor must be safe to run blind, so it never opens a path it has not
+/// first confirmed is a **regular file**: a FIFO where a config file
+/// should be blocks `open` forever, and a symlink to `/dev/zero` reads
+/// without end. Both become a diagnostic detail instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileRead {
+    Text(String),
+    Absent,
+    /// Why doctor has nothing to show — a FIFO, an oversized file, a
+    /// permission error. All of them are findings, none is a reason to
+    /// stop the report.
+    Error(String),
+}
+
+fn read_regular_file_capped(path: &Path, cap: u64) -> FileRead {
+    use std::io::Read as _;
+
+    // `metadata` follows symlinks on purpose — a symlinked settings file
+    // is legitimate; a symlink *to a device* is what must be refused.
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileRead::Absent,
+        Err(e) => return FileRead::Error(e.to_string()),
+        Ok(meta) if !meta.is_file() => {
+            return FileRead::Error(format!(
+                "not a regular file ({})",
+                describe_file_type(meta.file_type())
+            ))
+        }
+        Ok(_) => {}
+    }
+    // One byte past the cap, so "exactly at the cap" and "truncated" are
+    // distinguishable.
+    let mut buf = Vec::new();
+    match std::fs::File::open(path).and_then(|f| f.take(cap + 1).read_to_end(&mut buf)) {
+        Err(e) => FileRead::Error(e.to_string()),
+        Ok(_) if buf.len() as u64 > cap => {
+            FileRead::Error(format!("larger than the {cap}-byte read cap"))
+        }
+        Ok(_) => match String::from_utf8(buf) {
+            Ok(text) => FileRead::Text(text),
+            Err(_) => FileRead::Error("not valid UTF-8".to_string()),
+        },
+    }
+}
+
+async fn shell_version(shell: Option<&str>, usable: bool) -> SubprocessOutcome {
+    match (shell, usable) {
+        (None, _) | (Some(_), false) => SubprocessOutcome::Skipped,
+        (Some(path), true) => capture(Command::new(path), ["--version"]).await,
+    }
+}
+
+/// Absolute path on purpose: `ps` is one of three subprocesses doctor
+/// spawns, and a PATH-resolved one would let an attacker-controllable
+/// `PATH` choose the binary. (`claude` stays PATH-resolved — reporting
+/// what the user would actually run is the point — and `$SHELL` is
+/// guarded by [`executable_regular_file`].)
+async fn parent_comm(ppid: u32) -> SubprocessOutcome {
+    capture(
+        Command::new("/bin/ps"),
+        ["-o", "comm=", "-p", &ppid.to_string()],
+    )
+    .await
+}
+
+async fn capture_version(program: &str) -> SubprocessOutcome {
+    capture(Command::new(program), ["--version"]).await
+}
+
+/// Run a read-only command under every bound plan §3.8 pins: stdin from
+/// `/dev/null` (some shells treat an unrecognized `--version` as a
+/// script and block reading stdin), a capped read of each pipe, a
+/// deadline — and, on that deadline, an explicit kill + reap.
+///
+/// `kill_on_drop` alone is documented as best-effort, and a diagnostic
+/// that leaves a process behind is not read-only in any sense the user
+/// cares about. Forked *grand*children still escape; killing the process
+/// group is out of scope (plan §9).
+async fn capture<I, S>(mut cmd: Command, args: I) -> SubprocessOutcome
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SubprocessOutcome::Missing,
+        Err(e) => return SubprocessOutcome::Failed(e.to_string()),
+    };
+
+    match tokio::time::timeout(SUBPROCESS_TIMEOUT, drain_capped(&mut child)).await {
+        Ok(Ok(text)) => SubprocessOutcome::Output(text),
+        Ok(Err(e)) => SubprocessOutcome::Failed(e.to_string()),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            SubprocessOutcome::TimedOut
+        }
+    }
+}
+
+async fn drain_capped(child: &mut tokio::process::Child) -> std::io::Result<String> {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    // Drain both pipes concurrently — reading one to the end while the
+    // other fills its buffer is a deadlock.
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let read_out = async {
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.take(OUTPUT_CAP).read_to_end(&mut out).await;
+        }
+    };
+    let read_err = async {
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.take(OUTPUT_CAP).read_to_end(&mut err).await;
+        }
+    };
+    tokio::join!(read_out, read_err);
+    child.wait().await?;
+    // Some `--version` implementations answer on stderr.
+    let bytes = if out.iter().any(|b| !b.is_ascii_whitespace()) {
+        out
+    } else {
+        err
+    };
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn classify_socket(path: &Path) -> SocketOutcome {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SocketOutcome::Missing,
+        Err(e) => return SocketOutcome::Error(e.to_string()),
+        Ok(meta) => {
+            if !is_socket(meta.file_type()) {
+                return SocketOutcome::NotASocket(describe_file_type(meta.file_type()).to_string());
+            }
+        }
+    }
+    match tokio::time::timeout(IPC_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(_)) => SocketOutcome::Connected,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => SocketOutcome::Stale,
+        Ok(Err(e)) => SocketOutcome::Error(e.to_string()),
+        Err(_) => SocketOutcome::Error("connect timed out".into()),
+    }
+}
+
+/// Mirrors the check `server.rs` performs before unlinking a socket
+/// path, so doctor and the server agree on what "is a socket" means.
+fn is_socket(file_type: std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_socket()
+}
+
+fn describe_file_type(file_type: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "regular file"
+    } else if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_char_device() || file_type.is_block_device() {
+        "device"
+    } else {
+        "unknown file type"
+    }
+}
+
+type Dialed = (
+    Result<IdentifyResult, IdentifyFailure>,
+    Result<serde_json::Value, String>,
+);
+
+/// The only two ops doctor sends, both read-only, each under its own
+/// deadline.
+async fn dial(path: &Path) -> Dialed {
+    let mut client = match tokio::time::timeout(IPC_TIMEOUT, IpcClient::connect(path)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            return (
+                Err(IdentifyFailure::NoConnection(msg.clone())),
+                Err(format!("no connection: {msg}")),
+            );
+        }
+        Err(_) => {
+            return (
+                Err(IdentifyFailure::Timeout),
+                Err("connect timed out".to_string()),
+            )
+        }
+    };
+
+    let identify = match tokio::time::timeout(
+        IPC_TIMEOUT,
+        client.identify(IdentifyParams {
+            client_name: crate::CLIENT_NAME.into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+        }),
+    )
+    .await
+    {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(classify_client_error(e)),
+        Err(_) => Err(IdentifyFailure::Timeout),
+    };
+
+    let tab_list = match tokio::time::timeout(
+        IPC_TIMEOUT,
+        client.call::<_, serde_json::Value>(ops::TAB_LIST, serde_json::json!({})),
+    )
+    .await
+    {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("tab.list timed out".to_string()),
+    };
+
+    (identify, tab_list)
+}
+
+/// `ClientError` keeps `Protocol` (decode) apart from `Io` (transport)
+/// deliberately — schema drift is not a dead wire. Preserve that here.
+fn classify_client_error(e: ClientError) -> IdentifyFailure {
+    match e {
+        ClientError::Protocol(inner) => IdentifyFailure::Protocol(inner.to_string()),
+        ClientError::Io(inner) => IdentifyFailure::Io(inner.to_string()),
+        ClientError::Server { code, message } => {
+            IdentifyFailure::Server(format!("{code} — {message}"))
+        }
+        other => IdentifyFailure::Io(other.to_string()),
+    }
+}
+
+fn read_claude_settings(path: Option<&Path>) -> (SettingsProbe, Vec<String>, Vec<HookCommand>) {
+    // An unavailable `$HOME` means the location is unknown, never a
+    // CWD-relative path: doctor must not diagnose whatever
+    // `.config/roost/claude-settings.json` happens to sit under the
+    // directory it was run from.
+    let Some(path) = path else {
+        return (SettingsProbe::LocationUnknown, Vec::new(), Vec::new());
+    };
+    let raw = match read_regular_file_capped(path, SETTINGS_READ_CAP) {
+        FileRead::Text(s) => s,
+        FileRead::Absent => return (SettingsProbe::Absent, Vec::new(), Vec::new()),
+        FileRead::Error(what) => return (SettingsProbe::Unreadable(what), Vec::new(), Vec::new()),
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                SettingsProbe::Unparseable(e.to_string()),
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+    };
+    let Some(hooks) = doc.get("hooks").and_then(|h| h.as_object()) else {
+        return (
+            SettingsProbe::Unparseable("no `hooks` object".into()),
+            Vec::new(),
+            Vec::new(),
+        );
+    };
+
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    let mut commands = Vec::new();
+    for (event, groups) in hooks {
+        for group in groups.as_array().into_iter().flatten() {
+            for entry in group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(raw) = entry.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                commands.push(resolve_hook_command(event, raw));
+            }
+        }
+    }
+    (SettingsProbe::Parsed, events, commands)
+}
+
+fn resolve_hook_command(event: &str, raw: &str) -> HookCommand {
+    let argv = shell_split(raw);
+    let resolved = argv
+        .as_ref()
+        .and_then(|a| a.first())
+        .and_then(|word| resolve_program(word));
+    HookCommand {
+        event: event.to_string(),
+        raw: raw.to_string(),
+        argv,
+        exe_executable: resolved.is_some(),
+        // Canonicalized on both sides so a relocated `Roost.app` (or a
+        // symlinked install) is not a false positive.
+        exe_canonical: resolved.and_then(|p| std::fs::canonicalize(p).ok()),
+    }
+}
+
+// ============================================================================
+// Pure helpers shared by collect + evaluate
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFamily {
+    Zsh,
+    Bash,
+    Fish,
+    Other,
+    Unknown,
+}
+
+fn shell_family(shell_path: Option<&str>) -> ShellFamily {
+    let Some(path) = shell_path else {
+        return ShellFamily::Unknown;
+    };
+    match Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+    {
+        "zsh" => ShellFamily::Zsh,
+        "bash" => ShellFamily::Bash,
+        "fish" => ShellFamily::Fish,
+        "" => ShellFamily::Unknown,
+        _ => ShellFamily::Other,
+    }
+}
+
+/// The shipped integration script for this family, if one ships. No
+/// `roost.fish` exists, which is why fish is `info` and not `fail`.
+fn shipped_script_path(resources_dir: Option<&str>, family: ShellFamily) -> Option<PathBuf> {
+    let leaf = match family {
+        ShellFamily::Zsh => "roost.zsh",
+        ShellFamily::Bash => "roost.bash",
+        _ => return None,
+    };
+    Some(
+        PathBuf::from(resources_dir?)
+            .join("shell-integration")
+            .join(leaf),
+    )
+}
+
+/// `GNU bash, version 5.3.9(1)-release …` → `(5, 3)`.
+fn bash_version(banner: &str) -> Option<(u32, u32)> {
+    let rest = banner.split("version ").nth(1)?;
+    let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default().trim()
+}
+
+/// POSIX-ish word split — enough to read back what `claude_install`
+/// wrote, including its `'…'` quoting of paths with spaces. `None` when
+/// the quoting doesn't close.
+fn shell_split(input: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => cur.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                started = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => cur.push(chars.next()?),
+                        Some(c) => cur.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                cur.push(chars.next()?);
+            }
+            c => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+// ============================================================================
+// Redaction (plan §3.9) — shape-based, because the data is agent-supplied
+// ============================================================================
+
+const MAX_DISPLAY_CHARS: usize = 120;
+const MAX_KEY_CHARS: usize = 40;
+/// Metadata keys whose values are safe to print. Everything else prints
+/// its length only — `session_title` is derived from the user's own
+/// prompt, and any adapter can invent new keys.
+const METADATA_VALUE_ALLOWLIST: [&str; 4] =
+    ["model", "source", "background_tasks", "session_crons"];
+
+/// Escape control characters so an agent-supplied string cannot inject
+/// fake report lines or ANSI sequences into output a user pastes into an
+/// issue.
+fn escape_controls(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:04x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape, then cap for display — counted in characters, with the true
+/// length shown so a truncation is never mistaken for the whole value.
+fn redact(raw: &str) -> String {
+    redact_to(raw, MAX_DISPLAY_CHARS)
+}
+
+/// Paths are external strings too — `$ROOST_SOCKET`, `--socket`, `$HOME`
+/// and the hook commands all reach the renderer this way, and a newline
+/// in one of them would otherwise forge a whole report line (§3.9).
+fn redact_path(path: &Path) -> String {
+    redact(&path.to_string_lossy())
+}
+
+fn redact_to(raw: &str, cap: usize) -> String {
+    let escaped = escape_controls(raw);
+    if escaped.chars().count() <= cap {
+        return escaped;
+    }
+    let head: String = escaped.chars().take(cap).collect();
+    format!("{head}…({} chars)", raw.chars().count())
+}
+
+/// `session_id` is an opaque token from an agent; print enough to reason
+/// about the `(source, session_id)` matching rule, not enough to be a
+/// credential in a paste.
+fn fingerprint(session_id: &str) -> String {
+    if session_id.is_empty() {
+        return "<none>".to_string();
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in session_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(
+        "fp:{:012x} ({} chars)",
+        hash & 0x0000_ffff_ffff_ffff,
+        session_id.chars().count()
+    )
+}
+
+fn redact_metadata(metadata: &BTreeMap<String, String>) -> String {
+    if metadata.is_empty() {
+        return "none".to_string();
+    }
+    metadata
+        .iter()
+        .map(|(key, value)| {
+            let shown = redact_to(key, MAX_KEY_CHARS);
+            if METADATA_VALUE_ALLOWLIST.contains(&key.as_str()) {
+                format!("{shown}={}", redact(value))
+            } else {
+                format!("{shown}=<{} chars>", value.chars().count())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ============================================================================
+// evaluate — ALL the judgement, no I/O
+// ============================================================================
+
+/// How the inspected tab was chosen (plan §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Flag(i64),
+    Env(i64),
+    Active(i64),
+    None,
+}
+
+impl Selection {
+    fn id(&self) -> Option<i64> {
+        match self {
+            Selection::Flag(id) | Selection::Env(id) | Selection::Active(id) => Some(*id),
+            Selection::None => None,
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            Selection::Flag(_) => "--tab",
+            Selection::Env(_) => "$ROOST_TAB_ID",
+            Selection::Active(_) => "the UI's active tab",
+            Selection::None => "nothing",
+        }
+    }
+}
+
+/// `$ROOST_TAB_ID` as a usable tab id, through the *same* parse the
+/// Claude hook uses — doctor reporting `ok` on a value the hook silently
+/// drops would be it lying about the exact failure it exists to catch.
+fn env_tab_id(inputs: &Inputs) -> Option<i64> {
+    inputs.env_tab_id.as_deref().and_then(crate::parse_tab_id)
+}
+
+/// Roost injects `ROOST_TAB_ID`, `ROOST_SOCKET` and
+/// `ROOST_SHELL_INTEGRATION` together into every shell it spawns, so any
+/// one of them present means the process is inside a tab. `--tab` is
+/// deliberately NOT part of this: it selects which tab to inspect, it
+/// does not make the invoking shell a Roost shell.
+fn inside_roost_tab(inputs: &Inputs) -> bool {
+    inputs.env_tab_id.is_some()
+        || inputs.env_socket.is_some()
+        || inputs.env_shell_integration.is_some()
+}
+
+/// Plan §3.3's applicability sentence for the *process*-scoped checks:
+/// their subject is absent, so they observe rather than fail. Written
+/// once — six checks say it, and they must say it identically.
+fn not_in_tab(id: &'static str, title: &'static str) -> Check {
+    check(id, title, Status::Info, NOT_IN_TAB)
+}
+
+const NOT_IN_TAB: &str = "not running inside a Roost tab";
+
+/// Plan §3.2's correlation rule: a *process*-scoped fact may judge a
+/// *tab*-scoped one only when the selected tab is the tab doctor is
+/// itself running in. Named once because both `shell.marks_observed` and
+/// `claude.observed` gate on it, and two copies of the module's central
+/// rule is one too many.
+fn is_doctors_own_tab(inputs: &Inputs, selection: Selection) -> bool {
+    matches!((selection.id(), env_tab_id(inputs)), (Some(a), Some(b)) if a == b)
+}
+
+fn marks_opted_out(inputs: &Inputs) -> bool {
+    inputs
+        .env_shell_features
+        .as_deref()
+        .is_some_and(|f| f.split(',').any(|part| part.trim() == "no-marks"))
+}
+
+pub fn evaluate(inputs: &Inputs) -> Report {
+    let tab_list = decode_tab_list(&inputs.tab_list);
+    let tabs = match &tab_list {
+        TabList::Decoded { tabs, .. } => Some(tabs),
+        _ => None,
+    };
+
+    let selection = select_tab(inputs);
+    let selected = selection.id().and_then(|id| {
+        tabs.and_then(|t| t.projects.iter().flat_map(|p| &p.tabs).find(|t| t.id == id))
+    });
+    let model = agent_model(&tab_list, selection);
+    let capability = marks_capability(inputs);
+    let can_mark = mark_capability(inputs);
+
+    Report {
+        schema_version: SCHEMA_VERSION,
+        roostctl_version: inputs.roostctl_version.clone(),
+        sections: vec![
+            Section {
+                id: "env",
+                title: "Environment",
+                scope: "process",
+                checks: env_checks(inputs),
+            },
+            Section {
+                id: "ui",
+                title: "Roost UI",
+                scope: "ui",
+                checks: ui_checks(inputs, &tab_list, model),
+            },
+            Section {
+                id: "shell",
+                title: "Shell integration",
+                scope: "process",
+                checks: shell_checks(inputs, &capability, can_mark, selection, selected, model),
+            },
+            Section {
+                id: "tab",
+                title: "Selected tab",
+                scope: "tab",
+                checks: tab_checks(inputs, selection, selected, tabs.is_some(), model),
+            },
+            Section {
+                id: "claude",
+                title: "Claude Code",
+                scope: "process",
+                checks: claude_checks(inputs, selection, selected),
+            },
+        ],
+    }
+}
+
+/// What came back from `tab.list`, decoded once.
+///
+/// The typed copy is what every check reads; the raw copy is the only
+/// thing that can answer "does this server emit the agent axes at all"
+/// (§3.5). They are produced together, from one response, so a shape the
+/// typed decode rejects can never be laundered into "this UI has no
+/// tabs" by the raw walk succeeding on its own.
+enum TabList<'a> {
+    Decoded {
+        tabs: TabListResult,
+        raw: Vec<&'a serde_json::Value>,
+    },
+    /// The server answered, but the answer is not a tab list.
+    Malformed(String),
+    /// The call never produced a response.
+    Failed(&'a str),
+}
+
+fn decode_tab_list(response: &Result<serde_json::Value, String>) -> TabList<'_> {
+    let value = match response {
+        Ok(v) => v,
+        Err(e) => return TabList::Failed(e),
+    };
+    match TabListResult::deserialize(value) {
+        Ok(tabs) => TabList::Decoded {
+            tabs,
+            raw: raw_tab_objects(value),
+        },
+        Err(e) => TabList::Malformed(e.to_string()),
+    }
+}
+
+/// Every tab object exactly as the server sent it — the only signal that
+/// discriminates a pre-plan-002 server (plan §3.5). A borrowed view: the
+/// callers only ever read keys off it. Only ever walked over a value the
+/// typed decode already accepted.
+fn raw_tab_objects(raw: &serde_json::Value) -> Vec<&serde_json::Value> {
+    raw.get("projects")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.get("tabs").and_then(|t| t.as_array()))
+        .flatten()
+        .collect()
+}
+
+/// Whether this server emits the agent axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentModel {
+    Present,
+    /// The tab objects carry no agent axes — a pre-plan-002 server.
+    Absent,
+    /// Nothing to probe: no tabs, or `tab.list` never answered.
+    Undetermined,
+    /// The response was not a tab list, so nothing about it is knowable.
+    Malformed,
+}
+
+fn select_tab(inputs: &Inputs) -> Selection {
+    if let Some(id) = inputs.explicit_tab {
+        return Selection::Flag(id);
+    }
+    if let Some(id) = env_tab_id(inputs) {
+        return Selection::Env(id);
+    }
+    match inputs.identify.as_ref().map(|i| i.active_tab_id) {
+        Ok(id) if id != 0 => Selection::Active(id),
+        _ => Selection::None,
+    }
+}
+
+/// Probe the selected tab's raw object (or any tab, when the selection
+/// is not in the list) for **both** agent axes.
+///
+/// Both, not just `shell_state`: a tab carrying one and not the other
+/// would otherwise pass, and the `tab` section would then print the
+/// serde-filled default for the missing axis as if the server had said
+/// it — the exact fabrication §3.5 exists to prevent.
+fn agent_model(list: &TabList, selection: Selection) -> AgentModel {
+    let TabList::Decoded { raw: raw_tabs, .. } = list else {
+        return match list {
+            TabList::Malformed(_) => AgentModel::Malformed,
+            _ => AgentModel::Undetermined,
+        };
+    };
+    let probe = selection
+        .id()
+        .and_then(|id| {
+            // `Tab::id` goes over the wire as a string (`string_int64`).
+            let want = id.to_string();
+            raw_tabs
+                .iter()
+                .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(want.as_str()))
+        })
+        .or_else(|| raw_tabs.first());
+    match probe {
+        None => AgentModel::Undetermined,
+        Some(t) if t.get("shell_state").is_some() && t.get("agent_lifecycle").is_some() => {
+            AgentModel::Present
+        }
+        Some(_) => AgentModel::Absent,
+    }
+}
+
+// ---------------------------------------------------------------- env
+
+fn env_checks(inputs: &Inputs) -> Vec<Check> {
+    let tab_id = if !inside_roost_tab(inputs) {
+        not_in_tab("env.tab_id", "ROOST_TAB_ID")
+    } else {
+        match (&inputs.env_tab_id, env_tab_id(inputs)) {
+            (_, Some(id)) => check(
+                "env.tab_id",
+                "ROOST_TAB_ID",
+                Status::Ok,
+                format!("ROOST_TAB_ID={id}"),
+            ),
+            (Some(raw), None) => check(
+                "env.tab_id",
+                "ROOST_TAB_ID",
+                Status::Fail,
+                format!(
+                    "ROOST_TAB_ID={} is not a positive integer; every per-tab command \
+                     silently no-ops",
+                    redact(raw)
+                ),
+            ),
+            (None, None) => check(
+                "env.tab_id",
+                "ROOST_TAB_ID",
+                Status::Fail,
+                "unset inside a Roost tab; every per-tab command silently no-ops",
+            ),
+        }
+    };
+
+    let socket = match &inputs.env_socket {
+        Some(path) => check(
+            "env.socket",
+            "ROOST_SOCKET",
+            Status::Ok,
+            format!("ROOST_SOCKET={}", redact(path)),
+        ),
+        None => check(
+            "env.socket",
+            "ROOST_SOCKET",
+            Status::Info,
+            "unset — target resolution falls through to --socket / --target / auto-detect",
+        ),
+    };
+
+    vec![tab_id, socket]
+}
+
+// ----------------------------------------------------------------- ui
+
+/// `a, b` over a path list — the shape every "which sockets" detail uses.
+fn paths(list: &[PathBuf]) -> String {
+    list.iter()
+        .map(|p| redact_path(p))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Check> {
+    let target = {
+        const ID: &str = "ui.target";
+        const TITLE: &str = "Target resolution";
+        let candidates = paths(&inputs.target_candidates);
+        let (status, detail) = match &inputs.target {
+            Ok(path) => (
+                Status::Info,
+                format!(
+                    "{} → {} (auto-detect would try: {candidates})",
+                    inputs.target_origin.as_str(),
+                    redact_path(path)
+                ),
+            ),
+            Err(TargetFailure::NoLiveTarget(tried)) => (
+                Status::Fail,
+                format!("no Roost UI is listening (tried: {})", paths(tried)),
+            ),
+            Err(TargetFailure::Ambiguous) => (
+                Status::Fail,
+                format!(
+                    "two Roost UIs are running ({candidates}); pass --target mac|gtk or set \
+                     ROOST_BUNDLE_PROFILE"
+                ),
+            ),
+            Err(TargetFailure::UnknownProfile(v)) => (
+                Status::Fail,
+                format!("ROOST_BUNDLE_PROFILE={} is not `mac` or `gtk`", redact(v)),
+            ),
+            Err(TargetFailure::Path(e)) => (
+                Status::Fail,
+                format!("path resolution failed: {}", redact(e)),
+            ),
+        };
+        check(ID, TITLE, status, detail)
+    };
+
+    let socket = socket_check(inputs);
+
+    let identify = {
+        const ID: &str = "ui.identify";
+        const TITLE: &str = "UI identity";
+        let (status, detail) = match &inputs.identify {
+            Ok(id) => (
+                Status::Ok,
+                format!(
+                    "{} ({}) pid={} ui_version={} protocol_version={} active_tab={} socket={}",
+                    redact(&id.app_label),
+                    redact(&id.app_id),
+                    id.pid,
+                    redact(&id.ui_version),
+                    id.protocol_version,
+                    id.active_tab_id,
+                    redact(&id.socket_path)
+                ),
+            ),
+            Err(IdentifyFailure::NoConnection(msg)) => {
+                (Status::Fail, format!("no connection: {}", redact(msg)))
+            }
+            Err(IdentifyFailure::Timeout) => (
+                Status::Fail,
+                "timed out after 2s — the UI accepted the connection but did not answer"
+                    .to_string(),
+            ),
+            Err(IdentifyFailure::Io(msg)) => {
+                (Status::Fail, format!("transport failure: {}", redact(msg)))
+            }
+            Err(IdentifyFailure::Protocol(msg)) => (
+                Status::Fail,
+                format!(
+                    "protocol failure (client/server schema drift, not a dead wire): {}",
+                    redact(msg)
+                ),
+            ),
+            Err(IdentifyFailure::Server(msg)) => (
+                Status::Fail,
+                format!("the UI rejected `identify`: {}", redact(msg)),
+            ),
+        };
+        check(ID, TITLE, status, detail)
+    };
+
+    let version = {
+        const ID: &str = "ui.version";
+        const TITLE: &str = "Version skew";
+        let ours = &inputs.roostctl_version;
+        let (status, detail) = match &inputs.identify {
+            Ok(id) if id.ui_version == *ours => {
+                (Status::Ok, format!("roostctl and the UI are both {ours}"))
+            }
+            Ok(id) => (
+                Status::Warn,
+                format!(
+                    "roostctl {ours} against UI {} — restart Roost after upgrading",
+                    redact(&id.ui_version)
+                ),
+            ),
+            Err(_) => (
+                Status::Info,
+                format!("roostctl {ours} — no UI reached, nothing to compare"),
+            ),
+        };
+        check(ID, TITLE, status, detail)
+    };
+
+    let agent_model = {
+        const ID: &str = "ui.agent_model";
+        const TITLE: &str = "Agent state model";
+        let (status, detail) = match model {
+            AgentModel::Present => (
+                Status::Ok,
+                "the UI reports the four-axis agent state model".to_string(),
+            ),
+            AgentModel::Absent => (
+                Status::Fail,
+                "this UI predates the four-axis agent model (its tab objects carry no \
+                 `shell_state` / `agent_lifecycle`); restart Roost to pick up the current build"
+                    .to_string(),
+            ),
+            // A response that does not decode is a protocol failure, not
+            // an empty tab list — collapsing the two would report a
+            // broken server as a healthy UI with nothing open.
+            AgentModel::Malformed => (
+                Status::Fail,
+                match tab_list {
+                    TabList::Malformed(e) => format!(
+                        "the UI's tab.list response is not a tab list (client/server schema \
+                         drift): {}",
+                        redact(e)
+                    ),
+                    _ => "the UI's tab.list response is not a tab list".to_string(),
+                },
+            ),
+            // Nothing to probe is undecidable either way — not a fault.
+            AgentModel::Undetermined => (
+                Status::Info,
+                match tab_list {
+                    TabList::Failed(e) => {
+                        format!("undetermined — tab.list failed: {}", redact(e))
+                    }
+                    _ => "undetermined (no tabs to inspect)".to_string(),
+                },
+            ),
+        };
+        check(ID, TITLE, status, detail)
+    };
+
+    vec![target, socket, identify, version, agent_model]
+}
+
+fn socket_check(inputs: &Inputs) -> Check {
+    if inputs.sockets.is_empty() {
+        return check(
+            "ui.socket",
+            "Socket",
+            Status::Fail,
+            "no socket path to inspect — target resolution failed before a path existed",
+        );
+    }
+    let mut worst = Status::Ok;
+    let mut lines = Vec::with_capacity(inputs.sockets.len());
+    for probe in &inputs.sockets {
+        let label = match probe.profile {
+            Some(p) => format!("{p} {}", redact_path(&probe.path)),
+            None => redact_path(&probe.path),
+        };
+        let (status, note) = match &probe.outcome {
+            SocketOutcome::Connected => (Status::Ok, "connected".to_string()),
+            SocketOutcome::Missing => (
+                Status::Fail,
+                "missing — no Roost UI has bound this path".to_string(),
+            ),
+            SocketOutcome::NotASocket(kind) => (
+                Status::Fail,
+                format!("not a socket ({kind}) — something else owns this path"),
+            ),
+            SocketOutcome::Stale => (
+                Status::Fail,
+                "stale — the socket file outlived its listener; Roost crashed or was killed"
+                    .to_string(),
+            ),
+            SocketOutcome::Error(e) => (Status::Fail, format!("unreachable: {}", redact(e))),
+        };
+        if status == Status::Fail {
+            worst = Status::Fail;
+        }
+        lines.push(format!("{label}: {note}"));
+    }
+    check("ui.socket", "Socket", worst, lines.join("; "))
+}
+
+// --------------------------------------------------------------- shell
+
+/// Can this shell emit the OSC 133 **command-start** mark? A fact, not a
+/// status: `shell.marks_observed` needs the answer too, and reading it
+/// back off `shell.marks_capability`'s `Status` would make one check
+/// depend on another check's *presentation* rather than on the thing
+/// both are reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkCapability {
+    /// Both marks fire — zsh, or bash ≥ 4.4 (where the `C` mark's `PS0`
+    /// is available).
+    Both,
+    /// Only the command-end mark fires, so the running dot never lights.
+    EndOnly,
+    /// No shipped integration for this family at all.
+    None,
+    /// Family or version could not be determined.
+    Undetermined,
+}
+
+fn bash_version_of(inputs: &Inputs) -> Option<(u32, u32)> {
+    match &inputs.shell_version {
+        SubprocessOutcome::Output(text) => bash_version(first_line(text)),
+        _ => None,
+    }
+}
+
+fn mark_capability(inputs: &Inputs) -> MarkCapability {
+    match shell_family(inputs.shell_path.as_deref()) {
+        ShellFamily::Zsh => MarkCapability::Both,
+        ShellFamily::Bash => match bash_version_of(inputs) {
+            Some(v) if v >= (4, 4) => MarkCapability::Both,
+            Some(_) => MarkCapability::EndOnly,
+            None => MarkCapability::Undetermined,
+        },
+        ShellFamily::Fish | ShellFamily::Other => MarkCapability::None,
+        ShellFamily::Unknown => MarkCapability::Undetermined,
+    }
+}
+
+fn marks_capability(inputs: &Inputs) -> Check {
+    const ID: &str = "shell.marks_capability";
+    const TITLE: &str = "Mark capability";
+    // Process-scoped, so §3.3's applicability rule governs it: outside a
+    // Roost tab there is no integration to be capable of, and warning
+    // that fish emits no Roost marks would diagnose an ordinary machine.
+    if !inside_roost_tab(inputs) {
+        return not_in_tab(ID, TITLE);
+    }
+    let family = shell_family(inputs.shell_path.as_deref());
+    let bash = || {
+        let (major, minor) = bash_version_of(inputs).unwrap_or_default();
+        format!("bash {major}.{minor}")
+    };
+    let (status, detail) = match mark_capability(inputs) {
+        MarkCapability::Both if family == ShellFamily::Bash => (
+            Status::Ok,
+            format!("{} supports PS0, so both OSC 133 marks fire", bash()),
+        ),
+        MarkCapability::Both => (
+            Status::Ok,
+            "zsh emits both OSC 133 marks via preexec/precmd".to_string(),
+        ),
+        MarkCapability::EndOnly => (
+            Status::Warn,
+            format!(
+                "{} has no PS0 (needs ≥ 4.4), so only the command-end mark fires; the running \
+                 dot will never light",
+                bash()
+            ),
+        ),
+        MarkCapability::None => (
+            Status::Warn,
+            format!(
+                "no Roost integration ships for {}, so no OSC 133 marks are emitted",
+                inputs
+                    .shell_path
+                    .as_deref()
+                    .map_or_else(|| "this shell".to_string(), redact)
+            ),
+        ),
+        MarkCapability::Undetermined if family == ShellFamily::Bash => (
+            Status::Info,
+            "bash, but its version could not be determined".to_string(),
+        ),
+        MarkCapability::Undetermined => (
+            Status::Info,
+            "shell family undetermined ($SHELL is not set)".to_string(),
+        ),
+    };
+    check(ID, TITLE, status, detail)
+}
+
+/// `shell.current`'s caveat, fitted to the platform doctor is actually
+/// running on: only Linux clips `comm` to the kernel's `TASK_COMM_LEN`,
+/// so telling a macOS user about a Linux truncation is noise. Both arms
+/// keep the "hint, never load-bearing" framing (§3.8).
+const COMM_CAVEAT: &str = if cfg!(target_os = "linux") {
+    " — best-effort: `ps` truncates comm to 16 characters, so treat it as a hint"
+} else {
+    " — best-effort, so treat it as a hint"
+};
+
+fn shell_checks(
+    inputs: &Inputs,
+    capability: &Check,
+    can_mark: MarkCapability,
+    selection: Selection,
+    selected: Option<&Tab>,
+    model: AgentModel,
+) -> Vec<Check> {
+    let in_tab = inside_roost_tab(inputs);
+    let family = shell_family(inputs.shell_path.as_deref());
+    // §3.3: the whole process-scoped shell section observes rather than
+    // judges when doctor is not running inside a Roost tab. An ordinary
+    // terminal with no `$SHELL` is not a Roost fault.
+    let scored = |status: Status| if in_tab { status } else { Status::Info };
+
+    let login = match (&inputs.shell_path, inputs.shell_usable) {
+        (None, _) => check(
+            "shell.login",
+            "Login shell",
+            scored(Status::Warn),
+            "$SHELL is not set",
+        ),
+        (Some(path), false) => check(
+            "shell.login",
+            "Login shell",
+            scored(Status::Warn),
+            format!(
+                "$SHELL={} is not an absolute path to an executable regular file",
+                redact(path)
+            ),
+        ),
+        (Some(path), true) => {
+            let version = match &inputs.shell_version {
+                SubprocessOutcome::Output(text) if !first_line(text).is_empty() => {
+                    redact(first_line(text))
+                }
+                SubprocessOutcome::TimedOut => "version unknown (--version timed out)".to_string(),
+                _ => "version unknown".to_string(),
+            };
+            check(
+                "shell.login",
+                "Login shell",
+                Status::Info,
+                format!("{} — {version}", redact(path)),
+            )
+        }
+    };
+
+    let current = match &inputs.parent_comm {
+        SubprocessOutcome::Output(text) if !first_line(text).is_empty() => {
+            // `comm` is a bare (Linux-truncated at 16 chars) name on
+            // Linux and a full path on macOS, so match on the basename.
+            let name = first_line(text).trim_start_matches('-');
+            let leaf = Path::new(name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(name);
+            let note = if leaf.eq_ignore_ascii_case("roost") || leaf.starts_with("roost-") {
+                " (the Roost UI itself, not a shell)"
+            } else {
+                ""
+            };
+            check(
+                "shell.current",
+                "Current shell",
+                Status::Info,
+                format!(
+                    "parent pid {} is `{}`{note}{COMM_CAVEAT}",
+                    inputs.parent_pid,
+                    redact(name)
+                ),
+            )
+        }
+        _ => check(
+            "shell.current",
+            "Current shell",
+            Status::Info,
+            format!("parent pid {} not detected", inputs.parent_pid),
+        ),
+    };
+
+    let integration = if !in_tab {
+        not_in_tab("shell.integration", "Integration contract")
+    } else if inputs.env_shell_integration.as_deref() == Some("1") {
+        check(
+            "shell.integration",
+            "Integration contract",
+            Status::Ok,
+            "ROOST_SHELL_INTEGRATION=1",
+        )
+    } else {
+        check(
+            "shell.integration",
+            "Integration contract",
+            Status::Fail,
+            format!(
+                "ROOST_SHELL_INTEGRATION={} inside a Roost tab (expected `1`)",
+                inputs
+                    .env_shell_integration
+                    .as_deref()
+                    .map_or_else(|| "<unset>".to_string(), redact)
+            ),
+        )
+    };
+
+    let resources = if !in_tab {
+        not_in_tab("shell.resources", "Shipped scripts")
+    } else if matches!(family, ShellFamily::Fish | ShellFamily::Other) {
+        check(
+            "shell.resources",
+            "Shipped scripts",
+            Status::Info,
+            "not applicable — no integration script ships for this shell",
+        )
+    } else if inputs.env_resources_dir.is_none() {
+        check(
+            "shell.resources",
+            "Shipped scripts",
+            Status::Fail,
+            "ROOST_RESOURCES_DIR is unset, so neither auto-bootstrap can load",
+        )
+    } else {
+        match (&inputs.resources_script, inputs.resources_script_readable) {
+            (Some(path), true) => check(
+                "shell.resources",
+                "Shipped scripts",
+                Status::Ok,
+                format!("{} is readable", redact_path(path)),
+            ),
+            (Some(path), false) => check(
+                "shell.resources",
+                "Shipped scripts",
+                Status::Fail,
+                format!(
+                    "{} is missing, unreadable, or not a regular file",
+                    redact_path(path)
+                ),
+            ),
+            (None, _) => check(
+                "shell.resources",
+                "Shipped scripts",
+                Status::Info,
+                "not applicable — shell family undetermined",
+            ),
+        }
+    };
+
+    let opted_out = marks_opted_out(inputs);
+    let marks_feature = if !in_tab {
+        not_in_tab("shell.marks_feature", "`marks` feature")
+    } else if opted_out {
+        check(
+            "shell.marks_feature",
+            "`marks` feature",
+            Status::Info,
+            "disabled by ROOST_SHELL_FEATURES=no-marks — an opt-out, not a fault",
+        )
+    } else {
+        check(
+            "shell.marks_feature",
+            "`marks` feature",
+            Status::Ok,
+            format!(
+                "enabled (ROOST_SHELL_FEATURES={})",
+                inputs
+                    .env_shell_features
+                    .as_deref()
+                    .map_or_else(|| "<default>".to_string(), redact)
+            ),
+        )
+    };
+
+    let observed = marks_observed(inputs, can_mark, selection, selected, model, opted_out);
+
+    vec![
+        login,
+        current,
+        integration,
+        resources,
+        marks_feature,
+        capability.clone(),
+        observed,
+    ]
+}
+
+/// Plan §3.6's table, scored only when the correlation rule of §3.2
+/// holds — the selected tab must be doctor's *own* tab, because a tab
+/// sitting at a prompt is what a healthy idle tab looks like.
+fn marks_observed(
+    inputs: &Inputs,
+    capability: MarkCapability,
+    selection: Selection,
+    selected: Option<&Tab>,
+    model: AgentModel,
+    opted_out: bool,
+) -> Check {
+    const ID: &str = "shell.marks_observed";
+    const TITLE: &str = "Marks observed";
+
+    if !inside_roost_tab(inputs) {
+        return not_in_tab(ID, TITLE);
+    }
+    if opted_out {
+        return check(
+            ID,
+            TITLE,
+            Status::Info,
+            "not scored — marks are opted out via ROOST_SHELL_FEATURES=no-marks",
+        );
+    }
+    if model == AgentModel::Absent {
+        return check(
+            ID,
+            TITLE,
+            Status::Info,
+            "not scored — the UI predates the agent state model, so its `shell_state` is a \
+             client-side default rather than an observation",
+        );
+    }
+    if !is_doctors_own_tab(inputs, selection) {
+        return check(
+            ID,
+            TITLE,
+            Status::Info,
+            match selection {
+                Selection::None => "not scored — no tab is selected".to_string(),
+                _ => format!(
+                    "not scored — the selected tab came from {} and is not the tab doctor is \
+                     running in",
+                    selection.source()
+                ),
+            },
+        );
+    }
+    let Some(tab) = selected else {
+        return check(
+            ID,
+            TITLE,
+            Status::Info,
+            "not scored — the selected tab was not returned by tab.list",
+        );
+    };
+
+    match tab.shell_state {
+        ShellState::Unknown => check(
+            ID,
+            TITLE,
+            Status::Fail,
+            "no OSC 133 mark has arrived since this PTY was created — the shell integration \
+             is not loaded in this shell",
+        ),
+        ShellState::ForegroundProcess => check(
+            ID,
+            TITLE,
+            Status::Ok,
+            "the last mark was command-start, so both marks are flowing",
+        ),
+        ShellState::AtPrompt if capability == MarkCapability::Both => check(
+            ID,
+            TITLE,
+            Status::Ok,
+            "the last mark was a prompt/command-end mark — the healthy resting state. It \
+             does not confirm the command-start mark: that fires microseconds before \
+             doctor execs, so doctor does not wait for it",
+        ),
+        ShellState::AtPrompt => check(
+            ID,
+            TITLE,
+            Status::Warn,
+            "the last mark was a prompt/command-end mark and this shell's command-start \
+             capability is unconfirmed — the running dot may never light",
+        ),
+    }
+}
+
+// ---------------------------------------------------------------- tab
+
+fn tab_checks(
+    inputs: &Inputs,
+    selection: Selection,
+    selected: Option<&Tab>,
+    listed: bool,
+    model: AgentModel,
+) -> Vec<Check> {
+    let selection_check = match (selection.id(), listed, selected) {
+        (None, _, _) => check(
+            "tab.selection",
+            "Tab selection",
+            Status::Info,
+            "no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an active tab",
+        ),
+        (Some(id), false, _) => check(
+            "tab.selection",
+            "Tab selection",
+            Status::Info,
+            format!(
+                "tab {id} (from {}) — tab.list unavailable",
+                selection.source()
+            ),
+        ),
+        (Some(id), true, Some(_)) => check(
+            "tab.selection",
+            "Tab selection",
+            Status::Info,
+            format!("tab {id}, chosen by {}", selection.source()),
+        ),
+        (Some(id), true, None) => check(
+            "tab.selection",
+            "Tab selection",
+            Status::Fail,
+            format!(
+                "tab {id} (from {}) is not in tab.list — it was closed, or belongs to a \
+                 different Roost instance",
+                selection.source()
+            ),
+        ),
+    };
+
+    let unavailable = |id: &'static str, title: &'static str| {
+        let reason = match model {
+            AgentModel::Absent => "unavailable (server predates the agent state model)",
+            AgentModel::Malformed => "unavailable (the UI's tab.list response did not decode)",
+            _ if !listed => "unavailable (no tab.list from a running UI)",
+            _ => "unavailable (no tab selected)",
+        };
+        check(id, title, Status::Info, reason)
+    };
+
+    let Some(tab) = selected.filter(|_| model != AgentModel::Absent) else {
+        return vec![
+            selection_check,
+            unavailable("tab.shell_state", "Shell axis"),
+            unavailable("tab.agent_lifecycle", "Agent axis"),
+            unavailable("tab.attention", "Attention"),
+            unavailable("tab.ownership", "Ownership"),
+            unavailable("tab.derived", "Derived state"),
+            unavailable("tab.raw_osc", "Raw OSC suppression"),
+        ];
+    };
+
+    let state = tab.agent_state();
+    let lifecycle = effective_lifecycle(&state);
+
+    let ownership = match &tab.ownership {
+        Some(owner) => check(
+            "tab.ownership",
+            "Ownership",
+            Status::Info,
+            format!(
+                "source={} session={} last_event={} detail={} metadata={}",
+                redact(&owner.source),
+                fingerprint(&owner.session_id),
+                describe_age(inputs.now_unix, owner.last_event_at),
+                if owner.detail.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    redact(&owner.detail)
+                },
+                redact_metadata(&owner.metadata),
+            ),
+        ),
+        None => check("tab.ownership", "Ownership", Status::Info, "none"),
+    };
+
+    vec![
+        selection_check,
+        check(
+            "tab.shell_state",
+            "Shell axis",
+            Status::Info,
+            shell_state_name(tab.shell_state),
+        ),
+        check(
+            "tab.agent_lifecycle",
+            "Agent axis",
+            Status::Info,
+            lifecycle_name(tab.agent_lifecycle),
+        ),
+        check(
+            "tab.attention",
+            "Attention",
+            Status::Info,
+            if tab.has_notification {
+                "a notification is pending on this tab"
+            } else {
+                "no notification pending"
+            },
+        ),
+        ownership,
+        check(
+            "tab.derived",
+            "Derived state",
+            Status::Info,
+            format!(
+                // The same spelling `roostctl tab list` and the wire use
+                // — doctor must not invent a second vocabulary for the
+                // legacy state.
+                "state={} hook_active={} lifecycle={}{}",
+                crate::format_state(tab.state),
+                tab.hook_active,
+                lifecycle_name(lifecycle),
+                inactive_explanation(&state, lifecycle),
+            ),
+        ),
+        check(
+            "tab.raw_osc",
+            "Raw OSC suppression",
+            Status::Info,
+            if suppress_raw_osc(&state) {
+                "raw OSC 9/99/777 notifications are suppressed while this agent drives the tab"
+            } else {
+                "raw OSC 9/99/777 notifications are delivered"
+            },
+        ),
+    ]
+}
+
+/// AC 4: when nothing is driving the tab, say which axis is empty rather
+/// than leaving the user staring at an absent dot.
+fn inactive_explanation(
+    state: &roost_ipc::agent::AgentTabState,
+    lifecycle: AgentLifecycle,
+) -> String {
+    if lifecycle != AgentLifecycle::Inactive {
+        return String::new();
+    }
+    match (is_live(state), state.shell) {
+        (false, ShellState::Unknown) => " — no agent owns this tab and no OSC 133 mark has \
+             arrived since the PTY started"
+            .to_string(),
+        (false, _) => " — no agent owns this tab and the shell is sitting at a prompt".to_string(),
+        (true, _) => {
+            let source = state
+                .ownership
+                .as_ref()
+                .map(|o| redact(&o.source))
+                .unwrap_or_default();
+            format!(
+                " — `{source}` still owns this tab as a label, but its lifecycle is inactive \
+                 (a prompt mark cleared it, or the agent finished)"
+            )
+        }
+    }
+}
+
+fn shell_state_name(s: ShellState) -> &'static str {
+    match s {
+        ShellState::Unknown => "unknown — no OSC 133 mark since this PTY started",
+        ShellState::AtPrompt => "at_prompt — last mark was a prompt/command-end mark",
+        ShellState::ForegroundProcess => "foreground_process — last mark was command-start",
+    }
+}
+
+fn lifecycle_name(l: AgentLifecycle) -> &'static str {
+    match l {
+        AgentLifecycle::Inactive => "inactive",
+        AgentLifecycle::Working => "working",
+        AgentLifecycle::Waiting => "waiting",
+        AgentLifecycle::Finished => "finished",
+        AgentLifecycle::Failed => "failed",
+    }
+}
+
+fn describe_age(now: i64, at: i64) -> String {
+    if at <= 0 {
+        return "<never>".to_string();
+    }
+    let delta = now - at;
+    if delta < 0 {
+        return format!("{at} (in the future — clock skew)");
+    }
+    format!("{delta}s ago")
+}
+
+// -------------------------------------------------------------- claude
+
+fn claude_checks(inputs: &Inputs, selection: Selection, selected: Option<&Tab>) -> Vec<Check> {
+    let claude_owns = selected
+        .and_then(|t| t.ownership.as_ref())
+        .is_some_and(|o| o.source == "claude");
+    // A settings file doctor could not even locate is not evidence that
+    // Claude is configured, any more than an absent one is.
+    let settings_present = !matches!(
+        inputs.claude_settings,
+        SettingsProbe::Absent | SettingsProbe::LocationUnknown
+    );
+    let configured = !matches!(inputs.claude_version, SubprocessOutcome::Missing)
+        || settings_present
+        || claude_owns;
+
+    if !configured {
+        let detail = "not configured — no `claude` on PATH, no settings file, and no claude \
+                      ownership on the selected tab";
+        return vec![
+            check("claude.binary", "`claude` on PATH", Status::Info, detail),
+            check("claude.settings", "Settings file", Status::Info, detail),
+            check(
+                "claude.hook_events",
+                "Registered events",
+                Status::Info,
+                detail,
+            ),
+            check("claude.hook_command", "Hook commands", Status::Info, detail),
+            check(
+                "claude.observed",
+                "Hooks reaching Roost",
+                Status::Info,
+                detail,
+            ),
+        ];
+    }
+
+    let binary = match &inputs.claude_version {
+        SubprocessOutcome::Output(text) if !first_line(text).is_empty() => check(
+            "claude.binary",
+            "`claude` on PATH",
+            Status::Ok,
+            redact(first_line(text)),
+        ),
+        SubprocessOutcome::TimedOut => check(
+            "claude.binary",
+            "`claude` on PATH",
+            Status::Warn,
+            "version unknown — `claude --version` did not answer within 2s",
+        ),
+        SubprocessOutcome::Missing => check(
+            "claude.binary",
+            "`claude` on PATH",
+            Status::Info,
+            "not on PATH",
+        ),
+        SubprocessOutcome::Failed(e) => check(
+            "claude.binary",
+            "`claude` on PATH",
+            Status::Warn,
+            format!("version unknown: {}", redact(e)),
+        ),
+        _ => check(
+            "claude.binary",
+            "`claude` on PATH",
+            Status::Warn,
+            "version unknown",
+        ),
+    };
+
+    let path = inputs
+        .claude_settings_path
+        .as_deref()
+        .map_or_else(|| "<unknown>".to_string(), redact_path);
+    let settings = match &inputs.claude_settings {
+        SettingsProbe::LocationUnknown => check(
+            "claude.settings",
+            "Settings file",
+            Status::Info,
+            "$HOME is unset, so the settings file location is unknown",
+        ),
+        SettingsProbe::Parsed => check(
+            "claude.settings",
+            "Settings file",
+            Status::Ok,
+            format!("{path} parses"),
+        ),
+        SettingsProbe::Absent if claude_owns => check(
+            "claude.settings",
+            "Settings file",
+            Status::Fail,
+            format!(
+                "{path} is absent, yet the selected tab is owned by `claude` — something is \
+                 half-wired; run `roostctl claude install --force`"
+            ),
+        ),
+        SettingsProbe::Absent => check(
+            "claude.settings",
+            "Settings file",
+            Status::Info,
+            format!("{path} is absent — run `roostctl claude install`"),
+        ),
+        SettingsProbe::Unreadable(e) => check(
+            "claude.settings",
+            "Settings file",
+            Status::Fail,
+            format!("{path} is unreadable: {}", redact(e)),
+        ),
+        SettingsProbe::Unparseable(e) => check(
+            "claude.settings",
+            "Settings file",
+            Status::Fail,
+            format!("{path} does not parse: {}", redact(e)),
+        ),
+    };
+
+    let events = hook_events_check(inputs);
+    let commands = hook_command_check(inputs);
+
+    let observed = if claude_owns && is_doctors_own_tab(inputs, selection) {
+        check(
+            "claude.observed",
+            "Hooks reaching Roost",
+            Status::Ok,
+            "a Claude hook claimed this tab since its PTY last reset. That is not proof \
+             hooks are arriving right now: a prompt mark keeps the label while dropping the \
+             lifecycle",
+        )
+    } else if claude_owns {
+        check(
+            "claude.observed",
+            "Hooks reaching Roost",
+            Status::Info,
+            "the selected tab is owned by `claude`, but it is not the tab doctor is running in",
+        )
+    } else {
+        check(
+            "claude.observed",
+            "Hooks reaching Roost",
+            Status::Info,
+            "no claude ownership on the selected tab",
+        )
+    };
+
+    vec![binary, settings, events, commands, observed]
+}
+
+/// Why the two settings-derived checks have nothing to say. An absent
+/// file and an unparseable one are different findings, and
+/// `claude.settings` already carries the verdict for each.
+fn unparsed_settings_reason(inputs: &Inputs) -> &'static str {
+    match inputs.claude_settings {
+        SettingsProbe::LocationUnknown => {
+            "not checked — $HOME is unset, so the settings file could not be located"
+        }
+        SettingsProbe::Absent => "not checked — there is no settings file yet",
+        SettingsProbe::Unreadable(_) => "not checked — the settings file is unreadable",
+        _ => "not checked — the settings file did not parse",
+    }
+}
+
+fn hook_events_check(inputs: &Inputs) -> Check {
+    const ID: &str = "claude.hook_events";
+    const TITLE: &str = "Registered events";
+    if !matches!(inputs.claude_settings, SettingsProbe::Parsed) {
+        return check(ID, TITLE, Status::Info, unparsed_settings_reason(inputs));
+    }
+    let missing: Vec<&str> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .copied()
+        .filter(|want| !inputs.claude_hook_events.iter().any(|got| got == want))
+        .collect();
+    let unknown: Vec<String> = inputs
+        .claude_hook_events
+        .iter()
+        .filter(|got| !CLAUDE_HOOK_EVENTS.contains(&got.as_str()))
+        .map(|got| redact(got))
+        .collect();
+    if missing.is_empty() {
+        let extra = if unknown.is_empty() {
+            String::new()
+        } else {
+            format!("; unrecognized keys ignored: {}", unknown.join(", "))
+        };
+        return check(
+            ID,
+            TITLE,
+            Status::Ok,
+            format!("all {} events registered{extra}", CLAUDE_HOOK_EVENTS.len()),
+        );
+    }
+    check(
+        ID,
+        TITLE,
+        Status::Fail,
+        format!(
+            "missing {}; run `roostctl claude install --force`",
+            missing.join(", ")
+        ),
+    )
+}
+
+/// Fold `(event, reason)` pairs into one line per *distinct* reason.
+///
+/// A real install fails the same way on every event — a relocated
+/// `Roost.app` makes all six commands resolve elsewhere — and printing
+/// the identical sentence six times produced a ~500-character wall that
+/// buried the one fact worth reading. Distinct reasons stay distinct;
+/// only exact repeats collapse. First-appearance order is preserved so
+/// the text tracks the settings file's own key order.
+fn group_by_reason(entries: &[(String, String)], total: usize) -> String {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (event, reason) in entries {
+        match groups.iter_mut().find(|(seen, _)| *seen == reason) {
+            Some((_, events)) => events.push(event),
+            None => groups.push((reason, vec![event])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(reason, events)| match events.as_slice() {
+            [only] => format!("{only}: {reason}"),
+            many => format!(
+                "{} of {total} commands ({}): {reason}",
+                many.len(),
+                many.join(", ")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn hook_command_check(inputs: &Inputs) -> Check {
+    const ID: &str = "claude.hook_command";
+    const TITLE: &str = "Hook commands";
+    if !matches!(inputs.claude_settings, SettingsProbe::Parsed) {
+        return check(ID, TITLE, Status::Info, unparsed_settings_reason(inputs));
+    }
+    if inputs.claude_hook_commands.is_empty() {
+        return check(
+            ID,
+            TITLE,
+            Status::Fail,
+            "the settings file registers no command hooks",
+        );
+    }
+
+    let total = inputs.claude_hook_commands.len();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut warnings: Vec<(String, String)> = Vec::new();
+    // Which canonical events a *usable* command actually reaches. Key
+    // presence is not enough: `"StopFailure": []` keeps the key while
+    // guaranteeing the event can never arrive (§3.12's whole point).
+    let mut reached: Vec<&'static str> = Vec::new();
+    for cmd in &inputs.claude_hook_commands {
+        let event = redact(&cmd.event);
+        let Some(argv) = &cmd.argv else {
+            failures.push((event, "command quoting does not parse".to_string()));
+            continue;
+        };
+        // The installer's shape is `<exe> claude-hook <token>`; the token
+        // is where the legacy spellings live, so it — not the key — is
+        // what needs the normalizer.
+        let canonical = match argv.as_slice() {
+            [_, sub, token] if sub == "claude-hook" => match canonical_hook_event(token) {
+                Some(canonical) if canonical == cmd.event => canonical,
+                Some(canonical) => {
+                    failures.push((
+                        event,
+                        format!(
+                            "trailing token `{}` normalizes to {canonical}, not its key",
+                            redact(token)
+                        ),
+                    ));
+                    continue;
+                }
+                None => {
+                    failures.push((
+                        event,
+                        format!("trailing token `{}` is not a hook event", redact(token)),
+                    ));
+                    continue;
+                }
+            },
+            _ => {
+                failures.push((
+                    event,
+                    format!(
+                        "expected `<roostctl> claude-hook <event>`, got `{}`",
+                        redact(&cmd.raw)
+                    ),
+                ));
+                continue;
+            }
+        };
+        if !cmd.exe_executable {
+            let word = argv.first().map_or_else(String::new, |a| redact(a));
+            let reason = if word.contains('/') {
+                format!("`{word}` is missing or not executable")
+            } else {
+                format!("`{word}` is not on PATH and is not an executable file")
+            };
+            failures.push((event, reason));
+            continue;
+        }
+        // A command that runs the wrong binary still reaches the event —
+        // it is a warning, not a hole in the coverage below.
+        reached.push(canonical);
+        if let (Some(theirs), Some(ours)) = (&cmd.exe_canonical, &inputs.roostctl_exe) {
+            if theirs != ours {
+                warnings.push((
+                    event,
+                    format!(
+                        "resolves to {} rather than the running roostctl at {}",
+                        redact_path(theirs),
+                        redact_path(ours)
+                    ),
+                ));
+            }
+        }
+    }
+
+    let unreached: Vec<&str> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .copied()
+        .filter(|want| !reached.contains(want))
+        .collect();
+
+    let mut fatal = Vec::new();
+    if !failures.is_empty() {
+        fatal.push(group_by_reason(&failures, total));
+    }
+    if !unreached.is_empty() {
+        fatal.push(format!(
+            "no usable command for {}; run `roostctl claude install --force`",
+            unreached.join(", ")
+        ));
+    }
+    if !fatal.is_empty() {
+        return check(ID, TITLE, Status::Fail, fatal.join("; "));
+    }
+    if !warnings.is_empty() {
+        return check(ID, TITLE, Status::Warn, group_by_reason(&warnings, total));
+    }
+    check(
+        ID,
+        TITLE,
+        Status::Ok,
+        format!("all {total} hook commands point at this roostctl"),
+    )
+}
+
+// ============================================================================
+// Renderers
+// ============================================================================
+
+/// Plain text on purpose: no color, no glyphs. The CLI has no color
+/// anywhere, and stable plain text is what makes e2e assertions and
+/// issue-pasting work.
+pub fn render_text(report: &Report) -> String {
+    use std::fmt::Write as _;
+
+    // Status column, then the id column; the docs_url continuation line
+    // indents past both so it hangs under its check.
+    const STATUS_W: usize = 5;
+    const ID_W: usize = 24;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "roostctl doctor — roostctl {}",
+        report.roostctl_version
+    );
+    for section in &report.sections {
+        let _ = writeln!(out, "\n{} ({})", section.title, section.scope);
+        for c in &section.checks {
+            let _ = writeln!(
+                out,
+                "  {:<STATUS_W$} {:<ID_W$} {}",
+                c.status.as_str(),
+                c.id,
+                c.detail
+            );
+            if let Some(url) = c.docs_url {
+                let _ = writeln!(out, "{:width$}→ {url}", "", width = 3 + STATUS_W + ID_W + 1);
+            }
+        }
+    }
+    let s = report.summary();
+    let _ = writeln!(
+        out,
+        "\n{} ok, {} warn, {} fail, {} info — exit {} ({})",
+        s.ok,
+        s.warn,
+        s.fail,
+        s.info,
+        report.exit_code(),
+        EXIT_CODES_DOC.url
+    );
+    out
+}
+
+/// The JSON shape. `summary` and `exit_code` are methods on [`Report`]
+/// rather than fields, but a `--json` consumer must not have to
+/// re-derive "did anything fail" from the check list — that would be
+/// exactly the second source of truth the text renderer already avoids.
+#[derive(Serialize)]
+struct ReportView<'a> {
+    #[serde(flatten)]
+    report: &'a Report,
+    summary: Summary,
+    exit_code: i32,
+}
+
+pub fn render_json(report: &Report) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(&ReportView {
+        report,
+        summary: report.summary(),
+        exit_code: report.exit_code(),
+    })?)
+}
+
+// ============================================================================
+// Tests — over synthetic `Inputs`: no UI, no filesystem, no subprocess.
+//
+// Inline because `roost-cli` is `[[bin]]`-only with no lib target, so an
+// integration test cannot reach a private module. Matches every existing
+// CLI test.
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
+    use roost_ipc::messages::TabState;
+
+    // ---------------------------------------------------------- fixtures
+
+    fn identify(active_tab_id: i64, ui_version: &str) -> IdentifyResult {
+        IdentifyResult {
+            socket_path: "/tmp/roost.sock".into(),
+            pid: 4242,
+            active_project_id: 1,
+            active_tab_id,
+            app_label: "Roost".into(),
+            app_id: "ai.stridelabs.Roost".into(),
+            ui_version: ui_version.into(),
+            protocol_version: 1,
+        }
+    }
+
+    fn tab(id: i64) -> Tab {
+        Tab {
+            id,
+            project_id: 1,
+            title: "zsh".into(),
+            cwd: "/tmp".into(),
+            state: TabState::None,
+            has_notification: false,
+            is_active: true,
+            user_titled: false,
+            position: 0,
+            created_at: 1,
+            last_active: 2,
+            hook_active: false,
+            shell_state: ShellState::AtPrompt,
+            agent_lifecycle: AgentLifecycle::Inactive,
+            ownership: None,
+        }
+    }
+
+    fn tab_list(tabs: &[Tab]) -> serde_json::Value {
+        serde_json::json!({
+            "projects": [{
+                "id": "1", "name": "roost", "cwd": "/tmp",
+                "position": 0, "created_at": 0,
+                "tabs": tabs,
+            }]
+        })
+    }
+
+    /// A `tab.list` as a **pre-plan-002** server encodes it: the agent
+    /// axes are simply absent. Built as a raw `Value` on purpose — this
+    /// is the compatibility seam, and a pre-digested `Inputs` would test
+    /// the fixture rather than the detection.
+    fn legacy_tab_list(ids: &[i64]) -> serde_json::Value {
+        let tabs: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id.to_string(), "project_id": "1", "title": "zsh", "cwd": "/tmp",
+                    "state": "none", "has_notification": false, "is_active": true,
+                    "user_titled": false, "position": 0, "created_at": 1,
+                    "last_active": 2, "hook_active": false,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "projects": [{
+                "id": "1", "name": "roost", "cwd": "/tmp",
+                "position": 0, "created_at": 0, "tabs": tabs,
+            }]
+        })
+    }
+
+    /// A healthy zsh session inside tab 7 of a current UI.
+    fn healthy() -> Inputs {
+        Inputs {
+            roostctl_exe: Some(PathBuf::from("/usr/local/bin/roostctl")),
+            now_unix: 1_700_000_100,
+            env_tab_id: Some("7".into()),
+            env_socket: Some("/tmp/roost.sock".into()),
+            env_shell_integration: Some("1".into()),
+            env_shell_features: Some("cwd,title,marks,prompt,ssh-env".into()),
+            env_resources_dir: Some("/opt/roost".into()),
+            shell_path: Some("/bin/zsh".into()),
+            shell_usable: true,
+            shell_version: SubprocessOutcome::Output("zsh 5.9 (arm-apple-darwin24.0)".into()),
+            parent_pid: 100,
+            parent_comm: SubprocessOutcome::Output("-zsh\n".into()),
+            resources_script: Some(PathBuf::from("/opt/roost/shell-integration/roost.zsh")),
+            resources_script_readable: true,
+            target_origin: TargetOrigin::SocketEnv,
+            target_candidates: vec![PathBuf::from("/tmp/roost.sock")],
+            target: Ok(PathBuf::from("/tmp/roost.sock")),
+            sockets: vec![SocketProbe {
+                path: PathBuf::from("/tmp/roost.sock"),
+                profile: None,
+                outcome: SocketOutcome::Connected,
+            }],
+            identify: Ok(identify(7, env!("CARGO_PKG_VERSION"))),
+            tab_list: Ok(tab_list(&[tab(7)])),
+            // $HOME resolved; Claude simply isn't installed here.
+            claude_settings_path: Some(PathBuf::from(
+                "/home/roost/.config/roost/claude-settings.json",
+            )),
+            claude_settings: SettingsProbe::Absent,
+            ..Inputs::default()
+        }
+    }
+
+    fn find<'a>(report: &'a Report, id: &str) -> &'a Check {
+        report
+            .sections
+            .iter()
+            .flat_map(|s| &s.checks)
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("no check `{id}` in the report"))
+    }
+
+    fn status_of(report: &Report, id: &str) -> Status {
+        find(report, id).status
+    }
+
+    // ------------------------------------------------- applicability (AC 7)
+
+    /// AC 7's first half: a machine with no Roost env vars and no Claude
+    /// installed is not broken, so the two process-scoped sections carry
+    /// **no verdict at all** — not one `fail`, not one `warn`. The `ui`
+    /// section is excluded on purpose: its whole job is to report that
+    /// nothing is listening.
+    #[test]
+    fn a_bare_environment_never_scores_the_shell_or_claude_sections() {
+        for shell in [None, Some("/opt/homebrew/bin/fish"), Some("relative/zsh")] {
+            let inputs = Inputs {
+                shell_path: shell.map(str::to_string),
+                shell_usable: false,
+                target: Err(TargetFailure::NoLiveTarget(vec![PathBuf::from(
+                    "/nope/roost.sock",
+                )])),
+                ..Inputs::default()
+            };
+            let report = evaluate(&inputs);
+            for section in report.sections.iter().filter(|s| s.id != "ui") {
+                for c in &section.checks {
+                    assert_eq!(
+                        c.status,
+                        Status::Info,
+                        "{} scored {:?} in a bare environment ({shell:?}): {}",
+                        c.id,
+                        c.status,
+                        c.detail
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC 7's second half, as corrected during C2: with a UI reachable in
+    /// that same bare environment, the **whole report** exits 0.
+    #[test]
+    fn a_bare_environment_with_a_reachable_ui_exits_zero() {
+        let inputs = Inputs {
+            target: Ok(PathBuf::from("/tmp/roost.sock")),
+            sockets: vec![SocketProbe {
+                path: PathBuf::from("/tmp/roost.sock"),
+                profile: None,
+                outcome: SocketOutcome::Connected,
+            }],
+            identify: Ok(identify(0, env!("CARGO_PKG_VERSION"))),
+            tab_list: Ok(tab_list(&[tab(7)])),
+            ..Inputs::default()
+        };
+        let report = evaluate(&inputs);
+        let failed: Vec<&str> = report
+            .sections
+            .iter()
+            .flat_map(|s| &s.checks)
+            .filter(|c| c.status == Status::Fail)
+            .map(|c| c.id)
+            .collect();
+        assert!(failed.is_empty(), "{failed:?}\n{}", render_text(&report));
+        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+    }
+
+    /// F6's regression: an ordinary non-Roost shell is never diagnosed,
+    /// whatever it is or is not.
+    #[test]
+    fn the_shell_section_degrades_whole_outside_a_roost_tab() {
+        let inputs = Inputs {
+            shell_path: Some("/opt/homebrew/bin/fish".into()),
+            shell_usable: true,
+            shell_version: SubprocessOutcome::Output("fish, version 3.7.1".into()),
+            ..Inputs::default()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "shell.marks_capability"), Status::Info);
+        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+
+        // …and the same shell inside a tab still warns, so the degrade is
+        // applicability, not a hole.
+        let in_tab = Inputs {
+            shell_path: Some("/opt/homebrew/bin/fish".into()),
+            shell_version: SubprocessOutcome::Output("fish, version 3.7.1".into()),
+            resources_script: None,
+            ..healthy()
+        };
+        assert_eq!(
+            status_of(&evaluate(&in_tab), "shell.marks_capability"),
+            Status::Warn
+        );
+    }
+
+    #[test]
+    fn env_tab_id_fails_only_inside_a_tab() {
+        // Inside a tab (ROOST_SOCKET present), an unset id is the silent
+        // no-op every per-tab command hits.
+        let inputs = Inputs {
+            env_socket: Some("/tmp/roost.sock".into()),
+            ..Inputs::default()
+        };
+        assert_eq!(status_of(&evaluate(&inputs), "env.tab_id"), Status::Fail);
+
+        for bad in ["0", "-3", "abc", ""] {
+            let inputs = Inputs {
+                env_socket: Some("/tmp/roost.sock".into()),
+                env_tab_id: (!bad.is_empty()).then(|| bad.to_string()),
+                ..Inputs::default()
+            };
+            assert_eq!(
+                status_of(&evaluate(&inputs), "env.tab_id"),
+                Status::Fail,
+                "ROOST_TAB_ID={bad:?}"
+            );
+        }
+
+        // Outside a tab it is an observation, not a fault.
+        assert_eq!(
+            status_of(&evaluate(&Inputs::default()), "env.tab_id"),
+            Status::Info
+        );
+    }
+
+    /// `--tab` selects which tab to inspect; it does not make the
+    /// invoking shell a Roost shell, so the process-scoped checks stay
+    /// `info`.
+    #[test]
+    fn an_explicit_tab_flag_does_not_make_the_process_a_roost_tab() {
+        let inputs = Inputs {
+            explicit_tab: Some(42),
+            ..Inputs::default()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "env.tab_id"), Status::Info);
+        assert_eq!(status_of(&report, "shell.integration"), Status::Info);
+    }
+
+    // ------------------------------------------------------------- sockets
+
+    #[test]
+    fn the_four_socket_outcomes_are_distinct() {
+        let cases = [
+            (SocketOutcome::Connected, Status::Ok, "connected"),
+            (SocketOutcome::Missing, Status::Fail, "missing"),
+            (
+                SocketOutcome::NotASocket("regular file".into()),
+                Status::Fail,
+                "not a socket",
+            ),
+            (SocketOutcome::Stale, Status::Fail, "stale"),
+        ];
+        let mut details = std::collections::HashSet::new();
+        for (outcome, want, needle) in cases {
+            let inputs = Inputs {
+                sockets: vec![SocketProbe {
+                    path: PathBuf::from("/tmp/roost.sock"),
+                    profile: None,
+                    outcome,
+                }],
+                ..Inputs::default()
+            };
+            let check = find(&evaluate(&inputs), "ui.socket").clone();
+            assert_eq!(check.status, want, "{needle}");
+            assert!(check.detail.contains(needle), "{}", check.detail);
+            assert!(
+                details.insert(check.detail),
+                "outcomes must read differently"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_live_reports_per_profile() {
+        let inputs = Inputs {
+            target: Err(TargetFailure::NoLiveTarget(vec![
+                PathBuf::from("/mac/roost.sock"),
+                PathBuf::from("/gtk/roost.sock"),
+            ])),
+            sockets: vec![
+                SocketProbe {
+                    path: PathBuf::from("/mac/roost.sock"),
+                    profile: Some("mac"),
+                    outcome: SocketOutcome::Missing,
+                },
+                SocketProbe {
+                    path: PathBuf::from("/gtk/roost.sock"),
+                    profile: Some("gtk"),
+                    outcome: SocketOutcome::Stale,
+                },
+            ],
+            ..Inputs::default()
+        };
+        let report = evaluate(&inputs);
+        let detail = &find(&report, "ui.socket").detail;
+        assert!(detail.contains("mac /mac/roost.sock: missing"), "{detail}");
+        assert!(detail.contains("gtk /gtk/roost.sock: stale"), "{detail}");
+        assert_eq!(status_of(&report, "ui.target"), Status::Fail);
+    }
+
+    // -------------------------------------------- old server / zero tabs
+
+    #[test]
+    fn an_old_server_fails_the_agent_model_and_blanks_the_tab_section() {
+        let inputs = Inputs {
+            env_tab_id: Some("7".into()),
+            env_socket: Some("/tmp/roost.sock".into()),
+            env_shell_integration: Some("1".into()),
+            identify: Ok(identify(7, "0.0.15")),
+            tab_list: Ok(legacy_tab_list(&[7])),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "ui.agent_model"), Status::Fail);
+        for id in [
+            "tab.shell_state",
+            "tab.agent_lifecycle",
+            "tab.attention",
+            "tab.ownership",
+            "tab.derived",
+            "tab.raw_osc",
+        ] {
+            let c = find(&report, id);
+            assert_eq!(c.status, Status::Info, "{id}");
+            assert!(
+                c.detail.contains("predates the agent state model"),
+                "{id}: {}",
+                c.detail
+            );
+        }
+        // Blaming the shell for the server's age would be wrong.
+        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+        // The selection itself is still knowable from a legacy tab.list.
+        assert_eq!(status_of(&report, "tab.selection"), Status::Info);
+    }
+
+    #[test]
+    fn zero_tabs_leaves_the_agent_model_undetermined() {
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[])),
+            identify: Ok(identify(0, env!("CARGO_PKG_VERSION"))),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        let c = find(&report, "ui.agent_model");
+        assert_eq!(c.status, Status::Info);
+        assert!(c.detail.contains("undetermined"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_current_server_passes_the_agent_model() {
+        assert_eq!(
+            status_of(&evaluate(&healthy()), "ui.agent_model"),
+            Status::Ok
+        );
+    }
+
+    /// A `tab.list` that does not decode is a protocol failure, not an
+    /// empty tab list. Laundering it into `info: undetermined` reported a
+    /// broken server as a healthy UI with nothing open — and exited 0.
+    #[test]
+    fn a_malformed_tab_list_is_a_protocol_failure_not_no_tabs() {
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"projects": null}),
+            serde_json::json!({"projects": [{"tabs": null}]}),
+            serde_json::json!({"projects": "one"}),
+        ] {
+            let inputs = Inputs {
+                tab_list: Ok(malformed.clone()),
+                ..healthy()
+            };
+            let report = evaluate(&inputs);
+            let c = find(&report, "ui.agent_model");
+            assert_eq!(c.status, Status::Fail, "{malformed}: {}", c.detail);
+            assert!(!c.detail.contains("no tabs"), "{}", c.detail);
+            assert_eq!(report.exit_code(), 1, "{malformed}");
+            // …and the tab section says why rather than fabricating.
+            let axis = find(&report, "tab.shell_state");
+            assert_eq!(axis.status, Status::Info);
+            assert!(axis.detail.contains("did not decode"), "{}", axis.detail);
+        }
+        // A genuinely empty list stays `info` — the two must not merge.
+        let empty = Inputs {
+            tab_list: Ok(tab_list(&[])),
+            identify: Ok(identify(0, env!("CARGO_PKG_VERSION"))),
+            ..healthy()
+        };
+        assert_eq!(status_of(&evaluate(&empty), "ui.agent_model"), Status::Info);
+    }
+
+    /// Both axes are probed, not just `shell_state`: a tab carrying one
+    /// and not the other would otherwise pass, and the tab section would
+    /// then print the missing axis's serde default as an observation.
+    #[test]
+    fn a_tab_missing_either_axis_fails_the_agent_model() {
+        for present in ["shell_state", "agent_lifecycle"] {
+            let mut raw = legacy_tab_list(&[7]);
+            raw["projects"][0]["tabs"][0][present] = match present {
+                "shell_state" => serde_json::json!("at_prompt"),
+                _ => serde_json::json!("inactive"),
+            };
+            let inputs = Inputs {
+                tab_list: Ok(raw),
+                ..healthy()
+            };
+            let report = evaluate(&inputs);
+            assert_eq!(
+                status_of(&report, "ui.agent_model"),
+                Status::Fail,
+                "only `{present}` present"
+            );
+            assert_eq!(status_of(&report, "tab.agent_lifecycle"), Status::Info);
+            assert!(find(&report, "tab.agent_lifecycle")
+                .detail
+                .contains("predates the agent state model"));
+        }
+    }
+
+    // -------------------------------------------------------------- shell
+
+    #[test]
+    fn bash_3_2_warns_about_the_command_start_mark() {
+        let inputs = Inputs {
+            shell_path: Some("/bin/bash".into()),
+            shell_version: SubprocessOutcome::Output(
+                "GNU bash, version 3.2.57(1)-release (arm64-apple-darwin24)".into(),
+            ),
+            ..healthy()
+        };
+        let c = find(&evaluate(&inputs), "shell.marks_capability").clone();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("3.2"), "{}", c.detail);
+        assert!(c.docs_url.is_some());
+    }
+
+    #[test]
+    fn modern_bash_and_zsh_support_both_marks() {
+        for banner in [
+            "GNU bash, version 5.3.9(1)-release (aarch64-apple-darwin24.4.0)",
+            "GNU bash, version 4.4.0(1)-release",
+        ] {
+            let inputs = Inputs {
+                shell_path: Some("/opt/homebrew/bin/bash".into()),
+                shell_version: SubprocessOutcome::Output(banner.into()),
+                ..healthy()
+            };
+            assert_eq!(
+                status_of(&evaluate(&inputs), "shell.marks_capability"),
+                Status::Ok,
+                "{banner}"
+            );
+        }
+        assert_eq!(
+            status_of(&evaluate(&healthy()), "shell.marks_capability"),
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn a_shell_with_no_shipped_integration_warns_and_skips_resources() {
+        let inputs = Inputs {
+            shell_path: Some("/opt/homebrew/bin/fish".into()),
+            shell_version: SubprocessOutcome::Output("fish, version 3.7.1".into()),
+            resources_script: None,
+            resources_script_readable: false,
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(
+            status_of(&report, "shell.marks_capability"),
+            Status::Warn,
+            "{}",
+            render_text(&report)
+        );
+        let resources = find(&report, "shell.resources");
+        assert_eq!(resources.status, Status::Info);
+        assert!(resources.detail.contains("not applicable"));
+    }
+
+    #[test]
+    fn a_missing_resources_dir_fails_inside_a_tab() {
+        let inputs = Inputs {
+            env_resources_dir: None,
+            resources_script: None,
+            resources_script_readable: false,
+            ..healthy()
+        };
+        assert_eq!(
+            status_of(&evaluate(&inputs), "shell.resources"),
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn an_unreadable_shipped_script_fails() {
+        let inputs = Inputs {
+            resources_script_readable: false,
+            ..healthy()
+        };
+        assert_eq!(
+            status_of(&evaluate(&inputs), "shell.resources"),
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn a_missing_shell_warns_but_does_not_fail() {
+        let inputs = Inputs {
+            shell_path: None,
+            shell_usable: false,
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "shell.login"), Status::Warn);
+        assert_eq!(status_of(&report, "shell.marks_capability"), Status::Info);
+        assert!(find(&report, "shell.login").docs_url.is_some());
+    }
+
+    #[test]
+    fn a_non_executable_shell_warns() {
+        let inputs = Inputs {
+            shell_path: Some("relative/zsh".into()),
+            shell_usable: false,
+            shell_version: SubprocessOutcome::Skipped,
+            ..healthy()
+        };
+        assert_eq!(status_of(&evaluate(&inputs), "shell.login"), Status::Warn);
+    }
+
+    #[test]
+    fn shell_integration_fails_when_the_contract_is_broken_inside_a_tab() {
+        let inputs = Inputs {
+            env_shell_integration: None,
+            ..healthy()
+        };
+        assert_eq!(
+            status_of(&evaluate(&inputs), "shell.integration"),
+            Status::Fail
+        );
+    }
+
+    // ---------------------------------------------------- marks observed
+
+    #[test]
+    fn marks_observed_fails_when_no_mark_has_ever_arrived() {
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                shell_state: ShellState::Unknown,
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let c = find(&evaluate(&inputs), "shell.marks_observed").clone();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.docs_url.is_some());
+    }
+
+    #[test]
+    fn at_prompt_with_a_capable_shell_is_ok_and_names_the_race() {
+        let c = find(&evaluate(&healthy()), "shell.marks_observed").clone();
+        assert_eq!(c.status, Status::Ok);
+        assert!(
+            c.detail.contains("healthy resting state"),
+            "the detail must not imply a fault: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("microseconds before"),
+            "the detail must name the race: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn at_prompt_without_a_capable_shell_warns() {
+        let inputs = Inputs {
+            shell_path: Some("/bin/bash".into()),
+            shell_version: SubprocessOutcome::Output("GNU bash, version 3.2.57(1)-release".into()),
+            ..healthy()
+        };
+        assert_eq!(
+            status_of(&evaluate(&inputs), "shell.marks_observed"),
+            Status::Warn
+        );
+    }
+
+    #[test]
+    fn foreground_process_is_always_ok() {
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                shell_state: ShellState::ForegroundProcess,
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        assert_eq!(
+            status_of(&evaluate(&inputs), "shell.marks_observed"),
+            Status::Ok
+        );
+    }
+
+    /// The correlation rule of §3.2: a tab sitting at a prompt is exactly
+    /// what a healthy idle tab looks like, so judging someone else's tab
+    /// against this shell would be wrong in the common case.
+    #[test]
+    fn marks_observed_is_never_scored_on_another_tab() {
+        let inputs = Inputs {
+            explicit_tab: Some(9),
+            tab_list: Ok(tab_list(&[
+                tab(7),
+                Tab {
+                    shell_state: ShellState::Unknown,
+                    ..tab(9)
+                },
+            ])),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+    }
+
+    #[test]
+    fn no_marks_downgrades_both_marks_checks_to_info() {
+        let inputs = Inputs {
+            env_shell_features: Some("cwd,title,no-marks,prompt".into()),
+            tab_list: Ok(tab_list(&[Tab {
+                shell_state: ShellState::Unknown,
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "shell.marks_feature"), Status::Info);
+        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    // ---------------------------------------------------------------- tab
+
+    #[test]
+    fn a_nonexistent_tab_fails_selection() {
+        let inputs = Inputs {
+            explicit_tab: Some(999),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        let c = find(&report, "tab.selection");
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("--tab"), "{}", c.detail);
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn selection_records_which_input_chose_the_tab() {
+        for (inputs, needle) in [
+            (
+                Inputs {
+                    explicit_tab: Some(7),
+                    ..healthy()
+                },
+                "--tab",
+            ),
+            (healthy(), "$ROOST_TAB_ID"),
+            (
+                Inputs {
+                    env_tab_id: None,
+                    ..healthy()
+                },
+                "the UI's active tab",
+            ),
+        ] {
+            let report = evaluate(&inputs);
+            let c = find(&report, "tab.selection");
+            assert_eq!(c.status, Status::Info, "{needle}");
+            assert!(c.detail.contains(needle), "{}", c.detail);
+        }
+    }
+
+    /// AC 8 — the `tab` section is observation, not verdict.
+    #[test]
+    fn a_failed_agent_lifecycle_does_not_exit_one() {
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                state: TabState::NeedsInput,
+                agent_lifecycle: AgentLifecycle::Failed,
+                ownership: Some(Ownership {
+                    source: "claude".into(),
+                    session_id: "s-1".into(),
+                    last_event_at: 1_700_000_000,
+                    detail: "rate_limit".into(),
+                    ..Ownership::default()
+                }),
+                ..tab(7)
+            }])),
+            claude_settings: SettingsProbe::Parsed,
+            claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+            claude_hook_commands: hook_commands(&["/usr/local/bin/roostctl"]),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "tab.agent_lifecycle"), Status::Info);
+        assert!(find(&report, "tab.agent_lifecycle")
+            .detail
+            .contains("failed"));
+        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+    }
+
+    /// AC 4 — when nothing drives the tab, say which axis is empty.
+    #[test]
+    fn the_derived_check_names_the_empty_axis() {
+        let cases: [(Tab, &str); 3] = [
+            (
+                Tab {
+                    shell_state: ShellState::Unknown,
+                    ..tab(7)
+                },
+                "no OSC 133 mark has",
+            ),
+            (
+                Tab {
+                    shell_state: ShellState::AtPrompt,
+                    ..tab(7)
+                },
+                "sitting at a prompt",
+            ),
+            (
+                Tab {
+                    shell_state: ShellState::AtPrompt,
+                    agent_lifecycle: AgentLifecycle::Inactive,
+                    ownership: Some(Ownership {
+                        source: "claude".into(),
+                        ..Ownership::default()
+                    }),
+                    ..tab(7)
+                },
+                "still owns this tab as a label",
+            ),
+        ];
+        for (t, needle) in cases {
+            let inputs = Inputs {
+                tab_list: Ok(tab_list(&[t])),
+                ..healthy()
+            };
+            let detail = find(&evaluate(&inputs), "tab.derived").detail.clone();
+            assert!(detail.contains(needle), "{detail}");
+        }
+    }
+
+    /// The legacy `state` must be spelled the way `roostctl tab list` and
+    /// the wire spell it. Debug-formatting the enum here printed
+    /// `NeedsInput` against everything else's `needs_input`.
+    #[test]
+    fn the_derived_state_uses_the_wire_vocabulary() {
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                state: TabState::NeedsInput,
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let detail = find(&evaluate(&inputs), "tab.derived").detail.clone();
+        assert!(detail.contains("state=needs_input"), "{detail}");
+    }
+
+    #[test]
+    fn raw_osc_suppression_is_reported_both_ways() {
+        let driving = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                agent_lifecycle: AgentLifecycle::Working,
+                ownership: Some(Ownership {
+                    source: "claude".into(),
+                    ..Ownership::default()
+                }),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        assert!(find(&evaluate(&driving), "tab.raw_osc")
+            .detail
+            .contains("suppressed"));
+        assert!(find(&evaluate(&healthy()), "tab.raw_osc")
+            .detail
+            .contains("delivered"));
+    }
+
+    // ------------------------------------------------------------ ui legs
+
+    #[test]
+    fn identify_can_succeed_while_tab_list_fails() {
+        let inputs = Inputs {
+            tab_list: Err("server returned error: internal — boom".into()),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "ui.identify"), Status::Ok);
+        let model = find(&report, "ui.agent_model");
+        assert_eq!(model.status, Status::Info);
+        assert!(model.detail.contains("tab.list failed"), "{}", model.detail);
+        // A tab section with no list is unavailable, not fabricated.
+        assert_eq!(status_of(&report, "tab.shell_state"), Status::Info);
+    }
+
+    /// `client.rs` keeps `Protocol` and `Io` apart deliberately; doctor
+    /// must not collapse them back together.
+    #[test]
+    fn protocol_and_io_failures_read_differently() {
+        let protocol = Inputs {
+            identify: Err(IdentifyFailure::Protocol("missing field `app_id`".into())),
+            ..healthy()
+        };
+        let io = Inputs {
+            identify: Err(IdentifyFailure::Io("broken pipe".into())),
+            ..healthy()
+        };
+        let timeout = Inputs {
+            identify: Err(IdentifyFailure::Timeout),
+            ..healthy()
+        };
+        let p = find(&evaluate(&protocol), "ui.identify").detail.clone();
+        let i = find(&evaluate(&io), "ui.identify").detail.clone();
+        let t = find(&evaluate(&timeout), "ui.identify").detail.clone();
+        assert!(p.contains("schema drift"), "{p}");
+        assert!(i.contains("transport failure"), "{i}");
+        assert!(t.contains("timed out"), "{t}");
+        assert_ne!(p, i);
+        assert_ne!(i, t);
+        for inputs in [&protocol, &io, &timeout] {
+            assert_eq!(status_of(&evaluate(inputs), "ui.identify"), Status::Fail);
+        }
+    }
+
+    #[test]
+    fn version_skew_warns_without_failing() {
+        let inputs = Inputs {
+            identify: Ok(identify(7, "0.0.1")),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        let c = find(&report, "ui.version");
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.docs_url.is_some());
+        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+    }
+
+    // ------------------------------------------------------------- claude
+
+    fn hook_commands(exes: &[&str]) -> Vec<HookCommand> {
+        CLAUDE_HOOK_EVENTS
+            .iter()
+            .zip(exes.iter().cycle())
+            .map(|(event, exe)| HookCommand {
+                event: (*event).to_string(),
+                raw: format!("{exe} claude-hook {event}"),
+                argv: Some(vec![
+                    (*exe).to_string(),
+                    "claude-hook".into(),
+                    (*event).to_string(),
+                ]),
+                exe_executable: true,
+                exe_canonical: Some(PathBuf::from(*exe)),
+            })
+            .collect()
+    }
+
+    fn configured(commands: Vec<HookCommand>) -> Inputs {
+        Inputs {
+            claude_version: SubprocessOutcome::Output("2.1.220 (Claude Code)".into()),
+            claude_settings: SettingsProbe::Parsed,
+            claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+            claude_hook_commands: commands,
+            ..healthy()
+        }
+    }
+
+    #[test]
+    fn a_fully_installed_claude_passes() {
+        let report = evaluate(&configured(hook_commands(&["/usr/local/bin/roostctl"])));
+        for id in ["claude.binary", "claude.settings", "claude.hook_events"] {
+            assert_eq!(status_of(&report, id), Status::Ok, "{id}");
+        }
+        assert_eq!(status_of(&report, "claude.hook_command"), Status::Ok);
+    }
+
+    /// The one token `EventKind::parse` used to reject. Every already
+    /// installed settings file on disk carries it, so it must pass.
+    #[test]
+    fn the_legacy_prompt_submit_token_passes() {
+        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
+        for cmd in &mut commands {
+            if cmd.event == "UserPromptSubmit" {
+                cmd.raw = "/usr/local/bin/roostctl claude-hook prompt-submit".into();
+                cmd.argv = Some(vec![
+                    "/usr/local/bin/roostctl".into(),
+                    "claude-hook".into(),
+                    "prompt-submit".into(),
+                ]);
+            }
+        }
+        assert_eq!(
+            status_of(&evaluate(&configured(commands)), "claude.hook_command"),
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn a_token_that_does_not_normalize_to_its_key_fails() {
+        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
+        commands[0].argv = Some(vec![
+            "/usr/local/bin/roostctl".into(),
+            "claude-hook".into(),
+            "Stop".into(),
+        ]);
+        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("not its key"), "{}", c.detail);
+        assert!(c.docs_url.is_some());
+    }
+
+    #[test]
+    fn a_missing_or_non_executable_hook_binary_fails() {
+        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
+        commands[0].exe_executable = false;
+        commands[0].exe_canonical = None;
+        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("not executable"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_hook_pointing_at_a_different_binary_warns() {
+        let c = find(
+            &evaluate(&configured(hook_commands(&["/opt/other/roostctl"]))),
+            "claude.hook_command",
+        )
+        .clone();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("/opt/other/roostctl"), "{}", c.detail);
+    }
+
+    /// The common shape — a relocated binary breaks every command the
+    /// same way — must read as one sentence naming the count and the
+    /// events, not as six near-identical ones.
+    #[test]
+    fn one_reason_shared_by_every_command_collapses_to_one_line() {
+        let n = CLAUDE_HOOK_EVENTS.len();
+        let c = find(
+            &evaluate(&configured(hook_commands(&["/opt/other/roostctl"]))),
+            "claude.hook_command",
+        )
+        .clone();
+        assert_eq!(
+            c.detail.matches("rather than the running roostctl").count(),
+            1,
+            "the shared reason should appear once: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.starts_with(&format!("{n} of {n} commands (")),
+            "{}",
+            c.detail
+        );
+        for event in CLAUDE_HOOK_EVENTS {
+            assert!(c.detail.contains(event), "{event} missing: {}", c.detail);
+        }
+    }
+
+    /// …but two different faults must not be merged into one.
+    #[test]
+    fn distinct_reasons_stay_distinct() {
+        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
+        commands[0].argv = None;
+        commands[1].argv = Some(vec![
+            "/usr/local/bin/roostctl".into(),
+            "claude-hook".into(),
+            "not-an-event".into(),
+        ]);
+        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("does not parse"), "{}", c.detail);
+        assert!(c.detail.contains("is not a hook event"), "{}", c.detail);
+        // Two events, two reasons — each named individually, no grouping.
+        assert!(!c.detail.contains(" commands ("), "{}", c.detail);
+    }
+
+    #[test]
+    fn unparseable_hook_quoting_fails() {
+        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
+        commands[0].argv = None;
+        commands[0].raw = "'/unterminated claude-hook SessionStart".into();
+        assert_eq!(
+            status_of(&evaluate(&configured(commands)), "claude.hook_command"),
+            Status::Fail
+        );
+    }
+
+    /// The keys can all be present and an event still be unreachable —
+    /// `"StopFailure": []` is the shape. Key presence alone reported both
+    /// checks `ok` on a settings file no `StopFailure` can ever traverse.
+    #[test]
+    fn an_event_with_no_usable_command_fails_even_with_every_key_present() {
+        let commands: Vec<HookCommand> = hook_commands(&["/usr/local/bin/roostctl"])
+            .into_iter()
+            .filter(|c| c.event != "StopFailure")
+            .collect();
+        let report = evaluate(&configured(commands));
+        // The keys really are all there.
+        assert_eq!(status_of(&report, "claude.hook_events"), Status::Ok);
+        let c = find(&report, "claude.hook_command");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("StopFailure"), "{}", c.detail);
+        assert!(c.detail.contains("--force"), "{}", c.detail);
+        assert!(c.docs_url.is_some());
+    }
+
+    /// An event whose only command is broken is unreachable too — the
+    /// per-command failure and the coverage hole are both reported.
+    #[test]
+    fn a_broken_command_leaves_its_event_unreached() {
+        let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
+        commands[0].exe_executable = false;
+        commands[0].exe_canonical = None;
+        let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("not executable"), "{}", c.detail);
+        assert!(
+            c.detail.contains(CLAUDE_HOOK_EVENTS[0]),
+            "the unreached event must be named: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn a_settings_file_missing_an_event_names_it() {
+        let inputs = Inputs {
+            claude_hook_events: CLAUDE_HOOK_EVENTS
+                .iter()
+                .filter(|e| **e != "StopFailure")
+                .map(|e| e.to_string())
+                .collect(),
+            ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
+        };
+        let c = find(&evaluate(&inputs), "claude.hook_events").clone();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("StopFailure"), "{}", c.detail);
+        assert!(c.detail.contains("--force"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_unparseable_settings_file_fails() {
+        for probe in [
+            SettingsProbe::Unparseable("expected value at line 1".into()),
+            SettingsProbe::Unreadable("permission denied".into()),
+        ] {
+            let inputs = Inputs {
+                claude_settings: probe,
+                claude_hook_events: Vec::new(),
+                claude_hook_commands: Vec::new(),
+                claude_version: SubprocessOutcome::Output("2.1.220".into()),
+                ..healthy()
+            };
+            let report = evaluate(&inputs);
+            assert_eq!(status_of(&report, "claude.settings"), Status::Fail);
+            // Nothing parsed, so the two downstream checks are `info`
+            // rather than piling on.
+            assert_eq!(status_of(&report, "claude.hook_events"), Status::Info);
+            assert_eq!(status_of(&report, "claude.hook_command"), Status::Info);
+        }
+    }
+
+    /// Half-wired: the tab says Claude owns it, but there is no settings
+    /// file for the hooks that would have said so.
+    #[test]
+    fn claude_ownership_without_settings_fails() {
+        let inputs = Inputs {
+            claude_version: SubprocessOutcome::Missing,
+            claude_settings: SettingsProbe::Absent,
+            tab_list: Ok(tab_list(&[Tab {
+                ownership: Some(Ownership {
+                    source: "claude".into(),
+                    session_id: "s-1".into(),
+                    ..Ownership::default()
+                }),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "claude.settings"), Status::Fail);
+        assert_eq!(status_of(&report, "claude.observed"), Status::Ok);
+    }
+
+    #[test]
+    fn a_slow_claude_binary_warns_while_an_absent_one_informs() {
+        let slow = Inputs {
+            claude_version: SubprocessOutcome::TimedOut,
+            claude_settings: SettingsProbe::Parsed,
+            claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+            claude_hook_commands: hook_commands(&["/usr/local/bin/roostctl"]),
+            ..healthy()
+        };
+        let c = find(&evaluate(&slow), "claude.binary").clone();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("version unknown"), "{}", c.detail);
+        assert!(c.docs_url.is_some());
+
+        let absent = Inputs {
+            claude_version: SubprocessOutcome::Missing,
+            ..slow
+        };
+        assert_eq!(status_of(&evaluate(&absent), "claude.binary"), Status::Info);
+    }
+
+    #[test]
+    fn claude_observed_is_not_scored_on_another_tab() {
+        let inputs = Inputs {
+            explicit_tab: Some(9),
+            tab_list: Ok(tab_list(&[
+                tab(7),
+                Tab {
+                    ownership: Some(Ownership {
+                        source: "claude".into(),
+                        ..Ownership::default()
+                    }),
+                    ..tab(9)
+                },
+            ])),
+            ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
+        };
+        let c = find(&evaluate(&inputs), "claude.observed").clone();
+        assert_eq!(c.status, Status::Info);
+        assert!(c.detail.contains("not the tab doctor is running in"));
+    }
+
+    // ---------------------------------------------------------- redaction
+
+    #[test]
+    fn control_characters_are_escaped() {
+        let raw = "line\nnext\r\x1b[31mred\x07";
+        let out = redact(raw);
+        assert!(!out.contains('\n'), "{out}");
+        assert!(!out.contains('\x1b'), "{out}");
+        assert!(out.contains("\\n"), "{out}");
+        assert!(out.contains("\\u{001b}"), "{out}");
+        assert!(out.contains("\\u{0007}"), "{out}");
+    }
+
+    #[test]
+    fn long_strings_are_capped_in_characters_with_the_true_length() {
+        let raw: String = "é".repeat(500);
+        let out = redact(&raw);
+        assert!(out.contains("…(500 chars)"), "{out}");
+        assert!(out.chars().count() < 200, "cap not applied: {out}");
+    }
+
+    #[test]
+    fn metadata_values_are_allowlisted_and_keys_are_capped() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("model".to_string(), "claude-opus-5".to_string());
+        metadata.insert("session_title".to_string(), "fix the \x07 bug".to_string());
+        metadata.insert("x".repeat(200), "whatever".to_string());
+        let out = redact_metadata(&metadata);
+        assert!(out.contains("model=claude-opus-5"), "{out}");
+        assert!(
+            out.contains("session_title=<13 chars>"),
+            "an unlisted key must print its length only: {out}"
+        );
+        assert!(!out.contains("fix the"), "{out}");
+        assert!(out.contains("…(200 chars)"), "keys are capped too: {out}");
+        assert_eq!(redact_metadata(&BTreeMap::new()), "none");
+    }
+
+    #[test]
+    fn session_ids_are_fingerprinted_not_printed() {
+        let id = "3f2a5c1e-0000-4444-8888-abcdefabcdef";
+        let fp = fingerprint(id);
+        assert!(!fp.contains(id), "{fp}");
+        assert!(fp.starts_with("fp:"), "{fp}");
+        assert!(fp.contains("(36 chars)"), "{fp}");
+        assert_eq!(fingerprint(id), fp, "the fingerprint must be stable");
+        assert_ne!(fingerprint("other"), fp);
+        assert_eq!(fingerprint(""), "<none>");
+    }
+
+    /// §3.9 says *every* externally sourced string, not just the agent
+    /// fields. A newline in a socket path, an `identify` field or the
+    /// settings path used to render as a whole extra report line — a
+    /// convincing forged verdict in output a user pastes into an issue.
+    #[test]
+    fn every_external_string_is_escaped_not_just_the_agent_fields() {
+        const FORGE: &str = "\n  fail  injected.fake";
+        let sock = PathBuf::from(format!("/tmp/nope{FORGE}"));
+        let inputs = Inputs {
+            target_origin: TargetOrigin::SocketFlag,
+            target_candidates: vec![sock.clone()],
+            target: Ok(sock.clone()),
+            sockets: vec![SocketProbe {
+                path: sock.clone(),
+                profile: None,
+                outcome: SocketOutcome::Missing,
+            }],
+            identify: Ok(IdentifyResult {
+                socket_path: format!("/tmp/s{FORGE}"),
+                app_label: format!("Roost{FORGE}"),
+                app_id: format!("ai.stridelabs{FORGE}"),
+                ui_version: format!("9.9.9{FORGE}"),
+                ..identify(7, "9.9.9")
+            }),
+            resources_script: Some(PathBuf::from(format!("/opt/roost/roost.zsh{FORGE}"))),
+            resources_script_readable: false,
+            claude_settings_path: Some(PathBuf::from(format!("/home/u/settings.json{FORGE}"))),
+            claude_settings: SettingsProbe::Parsed,
+            claude_version: SubprocessOutcome::Output("2.1.220".into()),
+            claude_hook_commands: {
+                let mut c = hook_commands(&["/usr/local/bin/roostctl"]);
+                c[0].exe_canonical = Some(PathBuf::from(format!("/other/roostctl{FORGE}")));
+                c
+            },
+            claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        let text = render_text(&report);
+        assert!(
+            !text.contains(FORGE),
+            "a forged report line survived the renderer:\n{text}"
+        );
+        for line in text.lines() {
+            assert!(
+                !line.trim_start().starts_with("fail  injected"),
+                "forged line: {line:?}"
+            );
+        }
+        // The value is still shown — escaped, not dropped.
+        assert!(find(&report, "ui.target").detail.contains("\\n"));
+        assert!(find(&report, "ui.socket").detail.contains("\\n"));
+        assert!(find(&report, "ui.identify").detail.contains("\\n"));
+        assert!(find(&report, "claude.settings").detail.contains("\\n"));
+        assert!(find(&report, "shell.resources").detail.contains("\\n"));
+        assert!(find(&report, "claude.hook_command").detail.contains("\\n"));
+    }
+
+    /// F8: an unavailable `$HOME` means the settings location is unknown,
+    /// never a CWD-relative path that could diagnose an unrelated file.
+    #[test]
+    fn an_unavailable_home_leaves_the_settings_location_unknown() {
+        let inputs = Inputs {
+            claude_settings_path: None,
+            claude_settings: SettingsProbe::LocationUnknown,
+            claude_version: SubprocessOutcome::Output("2.1.220".into()),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        let c = find(&report, "claude.settings");
+        assert_eq!(c.status, Status::Info);
+        assert!(c.detail.contains("$HOME"), "{}", c.detail);
+        assert!(!c.detail.contains(".config/roost"), "{}", c.detail);
+        for id in ["claude.hook_events", "claude.hook_command"] {
+            assert_eq!(status_of(&report, id), Status::Info, "{id}");
+        }
+        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+    }
+
+    #[test]
+    fn an_agent_supplied_ownership_record_is_redacted_in_the_report() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("session_title".into(), "secret prompt text".into());
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                ownership: Some(Ownership {
+                    source: "claude".into(),
+                    session_id: "sess-abcdef123456".into(),
+                    last_event_at: 1_700_000_040,
+                    detail: "permission\x1b[31m_prompt".into(),
+                    metadata,
+                }),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let detail = find(&evaluate(&inputs), "tab.ownership").detail.clone();
+        assert!(!detail.contains("sess-abcdef123456"), "{detail}");
+        assert!(!detail.contains("secret prompt text"), "{detail}");
+        assert!(!detail.contains('\x1b'), "{detail}");
+        assert!(detail.contains("60s ago"), "{detail}");
+    }
+
+    // ------------------------------------------------------- exit + render
+
+    #[test]
+    fn the_exit_code_is_one_iff_some_check_fails() {
+        assert_eq!(evaluate(&healthy()).exit_code(), 0);
+        let failing = Inputs {
+            sockets: vec![SocketProbe {
+                path: PathBuf::from("/tmp/roost.sock"),
+                profile: None,
+                outcome: SocketOutcome::Stale,
+            }],
+            ..healthy()
+        };
+        assert_eq!(evaluate(&failing).exit_code(), 1);
+        // warn alone never changes it.
+        let warning = Inputs {
+            identify: Ok(identify(7, "0.0.1")),
+            ..healthy()
+        };
+        let report = evaluate(&warning);
+        assert!(report.summary().warn > 0);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    /// Count the four statuses without going near [`Report::summary`],
+    /// so swapping two of its counters is a red test rather than a
+    /// tautology. Run over the whole battery: a report with zero `warn`
+    /// and zero `fail` cannot tell those two columns apart.
+    fn count_statuses(report: &Report) -> Summary {
+        let mut s = Summary::default();
+        for section in &report.sections {
+            for c in &section.checks {
+                match c.status {
+                    Status::Ok => s.ok += 1,
+                    Status::Warn => s.warn += 1,
+                    Status::Fail => s.fail += 1,
+                    Status::Info => s.info += 1,
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn the_summary_counts_each_status_independently() {
+        let mut seen = Summary::default();
+        for inputs in doc_url_battery() {
+            let report = evaluate(&inputs);
+            let counted = count_statuses(&report);
+            assert_eq!(report.summary(), counted, "{}", render_text(&report));
+            assert_eq!(
+                counted.ok + counted.warn + counted.fail + counted.info,
+                report
+                    .sections
+                    .iter()
+                    .map(|x| x.checks.len())
+                    .sum::<usize>()
+            );
+            seen.ok += counted.ok;
+            seen.warn += counted.warn;
+            seen.fail += counted.fail;
+            seen.info += counted.info;
+        }
+        // A battery that never produced a warn or a fail would let the
+        // two columns be swapped undetected.
+        for column in [seen.ok, seen.warn, seen.fail, seen.info] {
+            assert!(column > 0, "{seen:?} leaves a status column unexercised");
+        }
+    }
+
+    /// The two renderers read the same `Report`, so redaction cannot
+    /// differ between them — this pins that, plus the summary.
+    #[test]
+    fn the_renderers_agree() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("session_title".into(), "private".into());
+        let inputs = Inputs {
+            identify: Ok(identify(7, "0.0.1")),
+            tab_list: Ok(tab_list(&[Tab {
+                shell_state: ShellState::Unknown,
+                ownership: Some(Ownership {
+                    source: "claude".into(),
+                    session_id: "sess-xyz".into(),
+                    last_event_at: 1_700_000_000,
+                    detail: "bad\nnews".into(),
+                    metadata,
+                }),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let report = evaluate(&inputs);
+        let text = render_text(&report);
+        let json: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
+        // Counted from the checks, not from `summary()`, so the JSON
+        // cannot agree with a wrong summary and still pass.
+        let s = count_statuses(&report);
+        assert_eq!(json["summary"]["ok"], s.ok);
+        assert_eq!(json["summary"]["warn"], s.warn);
+        assert_eq!(json["summary"]["fail"], s.fail);
+        assert_eq!(json["summary"]["info"], s.info);
+        assert!(s.warn > 0 && s.fail > 0, "{s:?} does not separate the two");
+        assert!(text.contains(&format!(
+            "{} ok, {} warn, {} fail, {} info",
+            s.ok, s.warn, s.fail, s.info
+        )));
+
+        // Every check's redacted detail appears verbatim in both.
+        for section in &report.sections {
+            for c in &section.checks {
+                assert!(
+                    text.contains(&c.detail),
+                    "text missing {}: {}",
+                    c.id,
+                    c.detail
+                );
+            }
+        }
+        let json_text = serde_json::to_string(&json).unwrap();
+        for needle in ["sess-xyz", "private"] {
+            assert!(!text.contains(needle), "text leaked {needle}");
+            assert!(!json_text.contains(needle), "json leaked {needle}");
+        }
+        assert!(json_text.contains("fp:"), "json must carry the fingerprint");
+        assert!(text.contains("fp:"), "text must carry the fingerprint");
+    }
+
+    /// `--json` must be valid JSON carrying `schema_version` on *every*
+    /// degraded path (AC 9).
+    #[test]
+    fn json_is_valid_on_every_degraded_path() {
+        let degraded = [
+            Inputs::default(),
+            Inputs {
+                target: Err(TargetFailure::Ambiguous),
+                ..Inputs::default()
+            },
+            Inputs {
+                target: Err(TargetFailure::UnknownProfile("bogus".into())),
+                ..Inputs::default()
+            },
+            Inputs {
+                identify: Err(IdentifyFailure::Timeout),
+                tab_list: Err("timed out".into()),
+                ..healthy()
+            },
+            Inputs {
+                tab_list: Ok(legacy_tab_list(&[7])),
+                ..healthy()
+            },
+        ];
+        for inputs in degraded {
+            let report = evaluate(&inputs);
+            let value: serde_json::Value =
+                serde_json::from_str(&render_json(&report).unwrap()).expect("valid json");
+            assert_eq!(value["schema_version"], SCHEMA_VERSION);
+            assert!(value["summary"].is_object());
+            assert!(!render_text(&report).is_empty());
+        }
+    }
+
+    // ----------------------------------------------------- ids + doc links
+
+    /// Ids are the stable API the e2e asserts on, and the section
+    /// inventory is fixed: all 26 appear in every report, in this order,
+    /// whatever the environment (§3.12). Titles are pinned alongside them
+    /// because several checks build one id from more than one arm, and an
+    /// inconsistent title there would otherwise ship silently.
+    #[test]
+    fn check_ids_and_titles_are_unique_and_stable() {
+        const EXPECTED: &[(&str, &str)] = &[
+            ("env.tab_id", "ROOST_TAB_ID"),
+            ("env.socket", "ROOST_SOCKET"),
+            ("ui.target", "Target resolution"),
+            ("ui.socket", "Socket"),
+            ("ui.identify", "UI identity"),
+            ("ui.version", "Version skew"),
+            ("ui.agent_model", "Agent state model"),
+            ("shell.login", "Login shell"),
+            ("shell.current", "Current shell"),
+            ("shell.integration", "Integration contract"),
+            ("shell.resources", "Shipped scripts"),
+            ("shell.marks_feature", "`marks` feature"),
+            ("shell.marks_capability", "Mark capability"),
+            ("shell.marks_observed", "Marks observed"),
+            ("tab.selection", "Tab selection"),
+            ("tab.shell_state", "Shell axis"),
+            ("tab.agent_lifecycle", "Agent axis"),
+            ("tab.attention", "Attention"),
+            ("tab.ownership", "Ownership"),
+            ("tab.derived", "Derived state"),
+            ("tab.raw_osc", "Raw OSC suppression"),
+            ("claude.binary", "`claude` on PATH"),
+            ("claude.settings", "Settings file"),
+            ("claude.hook_events", "Registered events"),
+            ("claude.hook_command", "Hook commands"),
+            ("claude.observed", "Hooks reaching Roost"),
+        ];
+        // Every fixture the suite has, so a check whose title differs
+        // only on a rare arm is still caught.
+        let battery = doc_url_battery();
+        for inputs in battery {
+            let report = evaluate(&inputs);
+            let seen: Vec<(&str, &str)> = report
+                .sections
+                .iter()
+                .flat_map(|s| &s.checks)
+                .map(|c| (c.id, c.title))
+                .collect();
+            assert_eq!(seen, EXPECTED, "{}", render_text(&report));
+            let unique: std::collections::HashSet<&str> = seen.iter().map(|(id, _)| *id).collect();
+            assert_eq!(unique.len(), seen.len(), "duplicate check id");
+        }
+    }
+
+    /// The widest spread of `Inputs` the suite has — every degraded
+    /// branch a check can take. Shared by the two invariant tests below
+    /// so a newly added check is exercised by both.
+    fn doc_url_battery() -> Vec<Inputs> {
+        let mut commands = hook_commands(&["/opt/other/roostctl"]);
+        commands[0].exe_executable = false;
+        vec![
+            Inputs::default(),
+            healthy(),
+            Inputs {
+                env_socket: Some("/tmp/roost.sock".into()),
+                ..Inputs::default()
+            },
+            Inputs {
+                shell_path: Some("/opt/homebrew/bin/fish".into()),
+                ..healthy()
+            },
+            Inputs {
+                shell_path: Some("/bin/bash".into()),
+                shell_version: SubprocessOutcome::Output("GNU bash, version 3.2.57(1)".into()),
+                tab_list: Ok(tab_list(&[Tab {
+                    shell_state: ShellState::Unknown,
+                    ..tab(7)
+                }])),
+                ..healthy()
+            },
+            Inputs {
+                shell_path: None,
+                shell_usable: false,
+                env_shell_integration: None,
+                env_resources_dir: None,
+                resources_script: None,
+                explicit_tab: Some(999),
+                identify: Ok(identify(7, "0.0.1")),
+                ..healthy()
+            },
+            Inputs {
+                target: Err(TargetFailure::Ambiguous),
+                sockets: Vec::new(),
+                identify: Err(IdentifyFailure::Protocol("drift".into())),
+                ..Inputs::default()
+            },
+            Inputs {
+                target: Err(TargetFailure::UnknownProfile("bogus".into())),
+                ..Inputs::default()
+            },
+            Inputs {
+                target: Err(TargetFailure::Path("no HOME".into())),
+                ..Inputs::default()
+            },
+            Inputs {
+                sockets: vec![SocketProbe {
+                    path: PathBuf::from("/etc/hosts"),
+                    profile: None,
+                    outcome: SocketOutcome::NotASocket("regular file".into()),
+                }],
+                ..Inputs::default()
+            },
+            Inputs {
+                tab_list: Ok(legacy_tab_list(&[7])),
+                ..healthy()
+            },
+            Inputs {
+                tab_list: Ok(serde_json::json!({"projects": null})),
+                ..healthy()
+            },
+            Inputs {
+                claude_settings_path: None,
+                claude_settings: SettingsProbe::LocationUnknown,
+                claude_version: SubprocessOutcome::Output("2.1.220".into()),
+                ..healthy()
+            },
+            configured(commands),
+            Inputs {
+                claude_settings: SettingsProbe::Unparseable("bad".into()),
+                claude_version: SubprocessOutcome::TimedOut,
+                ..healthy()
+            },
+            Inputs {
+                claude_hook_events: Vec::new(),
+                claude_hook_commands: Vec::new(),
+                claude_settings: SettingsProbe::Parsed,
+                claude_version: SubprocessOutcome::Output("2.1.220".into()),
+                ..healthy()
+            },
+        ]
+    }
+
+    #[test]
+    fn every_fail_or_warn_carries_a_docs_url() {
+        let battery = doc_url_battery();
+        let mut seen_scored = std::collections::HashSet::new();
+        for inputs in &battery {
+            for section in &evaluate(inputs).sections {
+                for c in &section.checks {
+                    if matches!(c.status, Status::Fail | Status::Warn) {
+                        assert!(
+                            c.docs_url.is_some(),
+                            "`{}` emitted {:?} with no docs_url — add a DOC_TARGETS row",
+                            c.id,
+                            c.status
+                        );
+                        seen_scored.insert(c.id);
+                    }
+                }
+            }
+        }
+        // Sanity: the battery has to actually exercise the scored paths.
+        assert!(seen_scored.len() >= 14, "only covered {seen_scored:?}");
+    }
+
+    // -- doc anchors -------------------------------------------------------
+
+    fn repo_root() -> PathBuf {
+        // `CARGO_MANIFEST_DIR` is `crates/roost-cli`; walk up two levels
+        // to the workspace root (same trick as `roost-ipc`'s vectors.rs).
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(p.pop()); // pop "roost-cli"
+        assert!(p.pop()); // pop "crates"
+        p
+    }
+
+    /// Conservative stand-in for Python-Markdown's toc slugify: lowercase,
+    /// spaces to hyphens, drop everything that isn't alphanumeric / `-` /
+    /// `_`. Every target below is a plain ASCII heading precisely so the
+    /// two agree.
+    fn slugify(heading: &str) -> String {
+        let mut out = String::new();
+        for c in heading.trim().to_lowercase().chars() {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                out.push(c);
+            } else if c == ' ' {
+                out.push('-');
+            }
+        }
+        out
+    }
+
+    /// Markdown headings only — `#` inside a fenced code block is a shell
+    /// comment, not a heading. `docs/guides/cwd-tracking.md` really does
+    /// carry `# 1. Allow it as a login shell` inside a bash fence, so a
+    /// naive `starts_with('#')` accepts anchors that do not exist.
+    fn headings(body: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut fenced = false;
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                fenced = !fenced;
+                continue;
+            }
+            if !fenced && line.starts_with('#') {
+                out.push(line.trim_start_matches('#'));
+            }
+        }
+        out
+    }
+
+    /// Is `rel` an actual nav entry — `- Title: page.md` or `- page.md` —
+    /// rather than a substring of a comment or a longer path?
+    fn nav_lists(nav: &str, rel: &str) -> bool {
+        nav.lines().any(|line| {
+            let line = line.split('#').next().unwrap_or_default();
+            let Some(entry) = line.trim().strip_prefix("- ") else {
+                return false;
+            };
+            let value = entry.rsplit_once(": ").map_or(entry, |(_, v)| v);
+            value.trim() == rel
+        })
+    }
+
+    /// mkdocs' `nav:` block, bounded at the next top-level key — `extra:`
+    /// follows it today, and its entries are not nav entries.
+    fn nav_block(mkdocs: &str) -> String {
+        mkdocs
+            .split("\nnav:")
+            .nth(1)
+            .expect("mkdocs.yml has a nav:")
+            .lines()
+            .take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Deliberately one-directional: for each `(page, anchor)` doctor can
+    /// emit, assert the page exists, that it is in `mkdocs.yml`'s
+    /// hand-maintained nav (`docs/reference/terminal-queries.md` is the
+    /// counterexample on disk today), and that some heading slugifies to
+    /// the anchor. It does NOT reimplement mkdocs' slugify over every
+    /// heading in the repo — only these URLs matter.
+    #[test]
+    fn doc_anchors_resolve() {
+        let root = repo_root();
+        let mkdocs = std::fs::read_to_string(root.join("mkdocs.yml")).expect("mkdocs.yml");
+        let nav = nav_block(&mkdocs);
+
+        let mut targets: Vec<Doc> = DOC_TARGETS.iter().map(|(_, d)| *d).collect();
+        targets.push(EXIT_CODES_DOC);
+
+        for target in targets {
+            assert!(
+                target.url.starts_with(DOCS_BASE),
+                "{} is not built from DOCS_BASE",
+                target.url
+            );
+            let rel = format!("{}.md", target.page);
+            let path = root.join("docs").join(&rel);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                nav_lists(&nav, &rel),
+                "{rel} is not in mkdocs.yml's nav, so its URL would not publish"
+            );
+            let found = headings(&body)
+                .into_iter()
+                .any(|h| slugify(h) == target.anchor);
+            assert!(
+                found,
+                "no heading in {rel} slugifies to `{}`",
+                target.anchor
+            );
+        }
+    }
+
+    /// The two tighteners above, pinned against exactly what fooled the
+    /// looser versions.
+    #[test]
+    fn the_doc_anchor_helpers_reject_near_misses() {
+        let body = "# Real\n\n```bash\n# 1. Allow it as a login shell\n```\n\n## Also Real\n";
+        assert_eq!(headings(body), vec![" Real", " Also Real"]);
+
+        let nav = "  - CLI: reference/cli.md\n  # - Queries: reference/terminal-queries.md\n";
+        assert!(nav_lists(nav, "reference/cli.md"));
+        assert!(
+            !nav_lists(nav, "reference/terminal-queries.md"),
+            "a commented-out entry does not publish"
+        );
+        assert!(
+            !nav_lists(nav, "cli.md"),
+            "a suffix of a nav path is not a nav entry"
+        );
+        assert!(!nav_lists(
+            &nav_block(&std::fs::read_to_string(repo_root().join("mkdocs.yml")).unwrap()),
+            "reference/terminal-queries.md"
+        ));
+    }
+
+    // -- pure helpers ------------------------------------------------------
+
+    /// `shell_split` is the reader for exactly what `quote_for_shell`
+    /// writes into `claude-settings.json`, so drive it from the producer
+    /// rather than from hand-written literals: the two can only drift if
+    /// nothing feeds one into the other, and the symptom would be doctor
+    /// failing a good install whose path holds a space or a quote.
+    #[test]
+    fn shell_split_reads_back_what_claude_install_wrote() {
+        for exe in [
+            "/usr/local/bin/roostctl",
+            "/Apps/My Roost.app/roostctl",
+            "/it's/roostctl",
+            "/opt/a$b/roostctl",
+        ] {
+            let line = format!("{} claude-hook Stop", crate::quote_for_shell(exe));
+            assert_eq!(
+                shell_split(&line).unwrap(),
+                vec![exe, "claude-hook", "Stop"],
+                "round-trip failed for {exe} (quoted: {line})"
+            );
+        }
+        // Not reachable from the producer, but the reader must not panic.
+        assert_eq!(shell_split("'unterminated"), None);
+    }
+
+    /// F11: doctor and `claude-hook` must agree on what `ROOST_TAB_ID`
+    /// means, or doctor reports `ok` on exactly the silent no-op it
+    /// exists to catch. The shared parser does not trim, because clap
+    /// parses the same variable for every other per-tab command and
+    /// rejects surrounding whitespace outright.
+    #[test]
+    fn doctor_and_the_hook_read_roost_tab_id_identically() {
+        for raw in [" 7 ", "7 ", "\t7", "0", "-3", "abc", "7x", ""] {
+            let inputs = Inputs {
+                env_socket: Some("/tmp/roost.sock".into()),
+                env_tab_id: Some(raw.to_string()),
+                ..Inputs::default()
+            };
+            assert_eq!(env_tab_id(&inputs), crate::parse_tab_id(raw), "{raw:?}");
+            assert_eq!(
+                status_of(&evaluate(&inputs), "env.tab_id"),
+                Status::Fail,
+                "ROOST_TAB_ID={raw:?} is a silent no-op for the hook, so doctor must say so"
+            );
+        }
+        assert_eq!(crate::parse_tab_id("7"), Some(7));
+    }
+
+    /// F5: a bare `roostctl claude-hook …` works whenever `roostctl` is
+    /// on Claude's PATH — the Linux `.deb` puts one at `/usr/bin` — so
+    /// rejecting every non-absolute word failed a healthy install.
+    #[test]
+    fn a_hook_command_word_resolves_through_path() {
+        // `sh` is on PATH and at an absolute path on every platform this
+        // ships to; nothing else about it matters here.
+        let bare = resolve_program("sh").expect("`sh` must resolve through PATH");
+        assert!(bare.is_absolute(), "{}", bare.display());
+        assert_eq!(resolve_program("/bin/sh"), Some(PathBuf::from("/bin/sh")));
+        assert_eq!(resolve_program("roostctl-does-not-exist-xyz"), None);
+        assert_eq!(resolve_program("/nope/roostctl"), None);
+        // A word with a slash is never PATH-searched, even a bare-looking
+        // relative one.
+        assert_eq!(resolve_program("./sh"), None);
+
+        let cmd = resolve_hook_command("Stop", "sh claude-hook stop");
+        assert!(
+            cmd.exe_executable,
+            "a PATH-resolved hook must not read as missing"
+        );
+        assert!(cmd.exe_canonical.is_some());
+    }
+
+    #[test]
+    fn bash_version_parses_the_release_banner() {
+        assert_eq!(
+            bash_version("GNU bash, version 5.3.9(1)-release (aarch64-apple-darwin24.4.0)"),
+            Some((5, 3))
+        );
+        assert_eq!(
+            bash_version("GNU bash, version 3.2.57(1)-release (arm64-apple-darwin24)"),
+            Some((3, 2))
+        );
+        assert_eq!(bash_version("zsh 5.9"), None);
+    }
+
+    #[test]
+    fn shipped_scripts_exist_only_for_bash_and_zsh() {
+        assert_eq!(
+            shipped_script_path(Some("/opt/roost"), ShellFamily::Bash),
+            Some(PathBuf::from("/opt/roost/shell-integration/roost.bash"))
+        );
+        assert_eq!(
+            shipped_script_path(Some("/opt/roost"), ShellFamily::Zsh),
+            Some(PathBuf::from("/opt/roost/shell-integration/roost.zsh"))
+        );
+        assert_eq!(
+            shipped_script_path(Some("/opt/roost"), ShellFamily::Fish),
+            None
+        );
+        assert_eq!(shipped_script_path(None, ShellFamily::Bash), None);
+    }
+
+    // -- collect, for real -------------------------------------------------
+    //
+    // The rest of the suite drives `evaluate` over synthetic `Inputs`,
+    // which is exactly why the hangs and the orphaned child survived
+    // review: neither is reachable from a struct literal. These four run
+    // the real `collect` against a hung socket, a shell that never
+    // returns, a read-only `$HOME`, and a FIFO where a config file should
+    // be. Plan §8's "Integration (Rust)" row.
+
+    /// `collect` reads process-global env, so the tests below serialize
+    /// on this. A tokio mutex rather than a `std` one: it is the only
+    /// kind that may be held across an `.await`.
+    static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores whatever the variable held, so one test's `$HOME` cannot
+    /// leak into the next.
+    struct EnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            EnvVar { key, prev }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// A fresh directory that removes itself, so a failing assertion is
+    /// the only thing a run leaves behind.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "roost-doctor-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("tmpdir");
+            TmpDir(path)
+        }
+
+        fn join(&self, leaf: &str) -> PathBuf {
+            self.0.join(leaf)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every regular file under `root`, by relative path and content.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                    out.push((rel, std::fs::read(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn dead_socket(dir: &TmpDir) -> TargetSelector {
+        TargetSelector {
+            socket_override: Some(dir.join("no-such.sock")),
+            kind_override: None,
+        }
+    }
+
+    /// A UI that accepts the connection and answers nothing must render
+    /// as two failed checks, not as a hung doctor.
+    #[tokio::test]
+    async fn a_hung_ui_fails_the_ipc_checks_and_still_renders_the_report() {
+        let _env = ENV.lock().await;
+        let dir = TmpDir::new("hung");
+        let sock = dir.join("roost.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let selector = TargetSelector {
+            socket_override: Some(sock),
+            kind_override: None,
+        };
+        let started = std::time::Instant::now();
+        let inputs = tokio::time::timeout(Duration::from_secs(30), collect(&selector, None))
+            .await
+            .expect("doctor must not hang on a silent UI");
+        let elapsed = started.elapsed();
+        server.abort();
+
+        assert!(
+            matches!(inputs.identify, Err(IdentifyFailure::Timeout)),
+            "{:?}",
+            inputs.identify
+        );
+        assert!(inputs.tab_list.is_err());
+        assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+
+        let report = evaluate(&inputs);
+        assert_eq!(status_of(&report, "ui.socket"), Status::Ok);
+        assert_eq!(status_of(&report, "ui.identify"), Status::Fail);
+        // The whole inventory still renders (§3.12).
+        assert_eq!(
+            report
+                .sections
+                .iter()
+                .map(|s| s.checks.len())
+                .sum::<usize>(),
+            26
+        );
+        assert!(render_text(&report).contains("ui.identify"));
+    }
+
+    /// A `$SHELL` that never returns must degrade on the deadline **and
+    /// leave nothing behind**: `kill_on_drop` is documented best-effort,
+    /// so the timeout path kills and reaps explicitly.
+    #[tokio::test]
+    async fn a_hanging_shell_times_out_and_its_child_is_reaped() {
+        let _env = ENV.lock().await;
+        let dir = TmpDir::new("slow-shell");
+        let pidfile = dir.join("pid");
+        let script = dir.join("slow-sh");
+        // `exec` so the pid the script reports is the pid tokio spawned:
+        // a forked grandchild would outlive the kill, which is a known
+        // limit (plan §9) rather than what this pins.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _shell = EnvVar::set("SHELL", &script);
+
+        let started = std::time::Instant::now();
+        let inputs = collect(&dead_socket(&dir), None).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(inputs.shell_version, SubprocessOutcome::TimedOut);
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+
+        let pid = std::fs::read_to_string(&pidfile).expect("script must have run");
+        let alive = std::process::Command::new("/bin/ps")
+            .args(["-p", pid.trim()])
+            .output()
+            .expect("ps");
+        assert!(
+            !alive.status.success(),
+            "the timed-out child {} survived doctor",
+            pid.trim()
+        );
+
+        let report = evaluate(&inputs);
+        assert!(find(&report, "shell.login").detail.contains("timed out"));
+    }
+
+    /// AC 12: doctor mutates nothing. Asserted against a `$HOME` doctor
+    /// has every reason to write to — it is where `claude install` puts
+    /// the settings file doctor reads.
+    #[tokio::test]
+    async fn collect_leaves_home_byte_identical() {
+        let _env = ENV.lock().await;
+        let home = TmpDir::new("home");
+        let config = home.join(".config/roost");
+        std::fs::create_dir_all(&config).expect("mkdir");
+        std::fs::write(
+            config.join("claude-settings.json"),
+            r#"{"hooks":{"Stop":[]}}"#,
+        )
+        .expect("write settings");
+
+        let _home = EnvVar::set("HOME", &home.0);
+        // The three subprocesses are out of doctor's control — `claude`
+        // in particular may create its own state — and the guarantee is
+        // about *doctor's own* actions, so point PATH at nothing and give
+        // `$SHELL` a binary that cannot write anywhere.
+        let _path = EnvVar::set("PATH", home.join("empty-bin"));
+        let _shell = EnvVar::set("SHELL", "/bin/sh");
+
+        let before = snapshot(&home.0);
+        assert!(
+            !before.is_empty(),
+            "the fixture must have something to lose"
+        );
+        let inputs = collect(&dead_socket(&home), None).await;
+        assert_eq!(
+            snapshot(&home.0),
+            before,
+            "doctor wrote to the tree under $HOME"
+        );
+
+        assert_eq!(inputs.claude_settings, SettingsProbe::Parsed);
+        assert_eq!(inputs.claude_hook_events, vec!["Stop".to_string()]);
+        assert_eq!(inputs.claude_version, SubprocessOutcome::Missing);
+    }
+
+    /// A FIFO where the settings file belongs blocked `open` forever.
+    /// Doctor has to be safe to run blind, so a non-regular file is a
+    /// diagnostic detail and never a read.
+    #[tokio::test]
+    async fn a_fifo_settings_file_is_a_finding_not_a_hang() {
+        let _env = ENV.lock().await;
+        let home = TmpDir::new("fifo-home");
+        let config = home.join(".config/roost");
+        std::fs::create_dir_all(&config).expect("mkdir");
+        let fifo = config.join("claude-settings.json");
+        assert!(std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success());
+
+        let _home = EnvVar::set("HOME", &home.0);
+        let _path = EnvVar::set("PATH", home.join("empty-bin"));
+        let _shell = EnvVar::set("SHELL", "/bin/sh");
+
+        let inputs =
+            tokio::time::timeout(Duration::from_secs(20), collect(&dead_socket(&home), None))
+                .await
+                .expect("doctor must not block on a FIFO");
+
+        let SettingsProbe::Unreadable(why) = &inputs.claude_settings else {
+            panic!("{:?}", inputs.claude_settings);
+        };
+        assert!(why.contains("fifo"), "{why}");
+        assert_eq!(
+            status_of(&evaluate(&inputs), "claude.settings"),
+            Status::Fail
+        );
+    }
+}

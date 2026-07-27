@@ -1324,6 +1324,41 @@ mod tests {
         assert_eq!(tab.agent_state(), AgentTabState::default());
     }
 
+    /// `roostctl doctor` decides whether a server predates the agent
+    /// state model by looking for the raw `shell_state` **and**
+    /// `agent_lifecycle` keys on the tab objects `tab.list` returns (plan
+    /// 003 §3.5) — nothing else discriminates, since `PROTOCOL_VERSION`
+    /// doesn't bump for additive changes. Adding `skip_serializing_if` to
+    /// either would silently invert that check: doctor would present this
+    /// struct's serde default as something the server said.
+    #[test]
+    fn tab_always_serializes_the_agent_axis_keys() {
+        let tab = Tab {
+            id: 1,
+            project_id: 1,
+            title: String::new(),
+            cwd: String::new(),
+            state: TabState::None,
+            has_notification: false,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: ShellState::default(),
+            agent_lifecycle: AgentLifecycle::default(),
+            ownership: None,
+        };
+        let value = serde_json::to_value(&tab).unwrap();
+        for key in ["shell_state", "agent_lifecycle"] {
+            assert!(
+                value.get(key).is_some(),
+                "{key} must serialize even at its default: {value}"
+            );
+        }
+    }
+
     /// A `failed` tab must still decode on a client that only knows
     /// the four legacy states (plan §3.2 / AC 11). `TabState` is the
     /// closed enum both Swift decoders mirror, so this is the Rust
