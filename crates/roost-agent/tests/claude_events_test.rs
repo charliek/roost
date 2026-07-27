@@ -437,8 +437,12 @@ fn cli_style_aliases_reach_the_same_arm() {
         ("stop-failure", "StopFailure"),
         ("session-end", "SessionEnd"),
     ] {
+        // Non-emptiness first: comparing two empty vectors would pass if
+        // parsing regressed for every spelling at once.
+        let via_alias = claude_event_to_reports(alias, &payload, TAB);
+        assert!(!via_alias.is_empty(), "{alias} must map to a report");
         assert_eq!(
-            claude_event_to_reports(alias, &payload, TAB),
+            via_alias,
             claude_event_to_reports(canonical, &payload, TAB),
             "{alias} vs {canonical}"
         );

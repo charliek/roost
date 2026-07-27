@@ -29,7 +29,7 @@ A notification has four places it can show up. Under normal use three of them mo
 
 One predicate governs the badge, the inbox row, and the banner together:
 
-```
+```text
 suppress := window is active AND the target tab is the active tab
 ```
 

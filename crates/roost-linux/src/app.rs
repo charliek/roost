@@ -3262,11 +3262,11 @@ impl App {
     /// the rollup is `Inactive`). Called whenever an `AgentChanged`
     /// event arrives for one of the project's tabs.
     fn refresh_rollup_for(self: &Rc<Self>, project_id: i64) {
-        // Same try_borrow pattern as `active_tab_cwd`: this can be
-        // invoked from an AgentChanged handler that already sits inside
-        // a synchronously-fired AdwTabView signal, so a bare `borrow()`
-        // can panic. Skipping the refresh in that case is safe — the
-        // next state change will recompute.
+        // `ui.tabs` is read with try_borrow because this can be invoked
+        // from an AgentChanged handler that already sits inside a
+        // synchronously-fired AdwTabView signal, where a `borrow_mut` may
+        // still be live. Skipping the refresh then is safe — the next
+        // state change recomputes it.
         let projects = self.projects.borrow();
         let Some(ui) = projects.get(&project_id) else {
             return;

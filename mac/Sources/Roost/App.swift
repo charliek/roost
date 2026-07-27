@@ -2117,8 +2117,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// the remaining cases.
     @MainActor
     private func handleEvent(_ kind: RoostEvent) {
+        // Save/restore rather than reset to false: today the only
+        // synchronous re-entry path is itself gated by this flag, but a
+        // future arm that commits to the workspace from inside
+        // `handleEvent` would otherwise drop the guard for the rest of
+        // the outer frame.
+        let wasApplyingCoreEvent = applyingCoreEvent
         applyingCoreEvent = true
-        defer { applyingCoreEvent = false }
+        defer { applyingCoreEvent = wasApplyingCoreEvent }
         switch kind {
         case .projectCreated(let e):
             let p = e.project
