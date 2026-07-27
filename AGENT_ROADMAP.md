@@ -184,7 +184,7 @@ gauntlet convention; the PR body carries the durable public record.
 | # | Scope | Plan | Status | PR |
 |---|---|---|---|---|
 | 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Shipped | [#259](https://github.com/charliek/roost/pull/259) |
-| 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | — |
+| 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | [#260](https://github.com/charliek/roost/pull/260) |
 | — | L3 agent UX (tint / overview / switcher) | *not yet written* | Future | — |
 
 ---
