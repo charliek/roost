@@ -261,6 +261,55 @@ def test_ui_checks_ok_against_the_harness_ui(roost, project, target):
     assert checks["ui.agent_model"]["status"] == "ok", checks["ui.agent_model"]
 
 
+def shell_section(report: dict) -> list[dict]:
+    return [c for s in report["sections"] if s["id"] == "shell" for c in s["checks"]]
+
+
+# ---------------------------------------------------------------------------
+# b2. ROOST_SOCKET alone must not be read as "inside a Roost tab"
+# ---------------------------------------------------------------------------
+
+
+def test_socket_env_alone_does_not_claim_a_roost_tab(roost, project, target):
+    """`ROOST_SOCKET` and `ROOST_TAB_ID` are documented *user-settable*
+    targeting variables — `docs/reference/cli.md` says verbatim to "set
+    them by hand only when invoking the CLI from outside a Roost tab (e.g.
+    a CI runner)". Keying doctor's process-scope applicability on them
+    made doing exactly that flip the whole `shell` section into judge
+    mode: `env.tab_id`, `shell.integration` and `shell.resources` all
+    `fail` on a healthy machine, which is the outcome plan §3.3's
+    applicability rule exists to prevent.
+
+    So this asserts the rule directly: from outside a Roost tab (no
+    `ROOST_SHELL_INTEGRATION`, no `ROOST_RESOURCES_DIR` — the two
+    variables nothing but a Roost PTY sets), the `shell` section contains
+    **no `fail`**, no matter which targeting variables are set. The suite
+    previously could not see this class of regression at all: every other
+    test sets `ROOST_SOCKET`/`ROOST_TAB_ID` and none asserts on `shell.*`.
+
+    `ROOST_SOCKET` points at the *live* harness UI, so the run is healthy
+    in every other respect and a failure here is unambiguous.
+    """
+    tab = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, tab)
+
+    base = {k: v for k, v in os.environ.items() if not k.startswith("ROOST_")}
+    for extra in (
+        {"ROOST_SOCKET": str(ui.socket_path(target))},
+        {"ROOST_SOCKET": str(ui.socket_path(target)), "ROOST_TAB_ID": str(tab)},
+    ):
+        code, report = run_doctor([], {**base, **extra})
+        checks = checks_by_id(report)
+
+        assert code == report["exit_code"], (code, report["exit_code"])
+        # The premise: the UI really was reachable, so nothing else can
+        # explain a shell-section failure.
+        assert checks["ui.socket"]["status"] == "ok", (extra, checks["ui.socket"])
+        failed = [c for c in shell_section(report) if c["status"] == "fail"]
+        assert failed == [], (extra, failed)
+        assert checks["env.tab_id"]["status"] != "fail", (extra, checks["env.tab_id"])
+
+
 # ---------------------------------------------------------------------------
 # c. ROOST_SOCKET at a nonexistent path: ui.socket fails, exit 1, full report
 # ---------------------------------------------------------------------------

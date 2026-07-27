@@ -678,6 +678,13 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // These are version *parsers*, and every banner they parse is
+        // translated: `bash --version` says "Version" under de_DE and
+        // "versión" under es_ES, which silently degraded mark capability
+        // to undetermined for every non-English-locale user. The C locale
+        // is the one the parsers target.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
@@ -805,6 +812,20 @@ async fn dial(path: &Path) -> Dialed {
         Ok(Err(e)) => Err(classify_client_error(e)),
         Err(_) => Err(IdentifyFailure::Timeout),
     };
+
+    // A timed-out `identify` was *cancelled*, not answered: the UI may
+    // still write that response, and `IpcClient` matches responses by
+    // monotonic id — so `tab.list` on this connection would read the
+    // stale identify frame and report `IdMismatch`, blaming the tab
+    // section for a failure that never happened. Dial again rather than
+    // inherit a desynchronized stream.
+    if matches!(identify, Err(IdentifyFailure::Timeout)) {
+        client = match tokio::time::timeout(IPC_TIMEOUT, IpcClient::connect(path)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return (identify, Err(format!("no connection: {e}"))),
+            Err(_) => return (identify, Err("connect timed out".to_string())),
+        };
+    }
 
     let tab_list = match tokio::time::timeout(
         IPC_TIMEOUT,
@@ -947,8 +968,14 @@ fn shipped_script_path(resources_dir: Option<&str>, family: ShellFamily) -> Opti
 }
 
 /// `GNU bash, version 5.3.9(1)-release …` → `(5, 3)`.
+///
+/// Case-insensitive as a second line of defence behind [`capture`]'s
+/// `LC_ALL=C`: German bash capitalizes the word.
 fn bash_version(banner: &str) -> Option<(u32, u32)> {
-    let rest = banner.split("version ").nth(1)?;
+    const KEY: &str = "version ";
+    // ASCII-only lowercasing, so byte offsets stay valid in `banner`.
+    let at = banner.to_ascii_lowercase().find(KEY)? + KEY.len();
+    let rest = &banner[at..];
     let mut parts = rest.split(|c: char| !c.is_ascii_digit());
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -1141,15 +1168,19 @@ fn env_tab_id(inputs: &Inputs) -> Option<i64> {
     inputs.env_tab_id.as_deref().and_then(crate::parse_tab_id)
 }
 
-/// Roost injects `ROOST_TAB_ID`, `ROOST_SOCKET` and
-/// `ROOST_SHELL_INTEGRATION` together into every shell it spawns, so any
-/// one of them present means the process is inside a tab. `--tab` is
-/// deliberately NOT part of this: it selects which tab to inspect, it
-/// does not make the invoking shell a Roost shell.
+/// Keyed on the two variables Roost injects that nothing else sets:
+/// `ROOST_SHELL_INTEGRATION` and `ROOST_RESOURCES_DIR`.
+///
+/// `ROOST_SOCKET` and `ROOST_TAB_ID` are deliberately NOT part of this,
+/// even though Roost injects them too. Both are *documented
+/// user-settable targeting variables* (`docs/reference/cli.md`: "Set them
+/// by hand only when invoking the CLI from outside a Roost tab (e.g. a CI
+/// runner)") — so keying on them would make a CI runner doing exactly
+/// that fail the whole process-scoped shell section on a healthy machine,
+/// which is the failure §3.3's applicability rule exists to prevent. They
+/// are *selection* inputs here, like `--tab`, not proof of a Roost PTY.
 fn inside_roost_tab(inputs: &Inputs) -> bool {
-    inputs.env_tab_id.is_some()
-        || inputs.env_socket.is_some()
-        || inputs.env_shell_integration.is_some()
+    inputs.env_shell_integration.is_some() || inputs.env_resources_dir.is_some()
 }
 
 /// Plan §3.3's applicability sentence for the *process*-scoped checks:
@@ -1170,11 +1201,16 @@ fn is_doctors_own_tab(inputs: &Inputs, selection: Selection) -> bool {
     matches!((selection.id(), env_tab_id(inputs)), (Some(a), Some(b)) if a == b)
 }
 
+/// Byte-for-byte what the shipped scripts do: `roost.bash:127-132` and
+/// `roost.zsh:30-35` match `*",no-$1,"*` against the raw variable, so a
+/// token with surrounding whitespace does **not** disable the feature
+/// there. Trimming here would report `marks` disabled on a shell still
+/// emitting them.
 fn marks_opted_out(inputs: &Inputs) -> bool {
     inputs
         .env_shell_features
         .as_deref()
-        .is_some_and(|f| f.split(',').any(|part| part.trim() == "no-marks"))
+        .is_some_and(|f| f.split(',').any(|part| part == "no-marks"))
 }
 
 pub fn evaluate(inputs: &Inputs) -> Report {
@@ -1224,7 +1260,7 @@ pub fn evaluate(inputs: &Inputs) -> Report {
                 id: "claude",
                 title: "Claude Code",
                 scope: "process",
-                checks: claude_checks(inputs, selection, selected),
+                checks: claude_checks(inputs, selection, selected, tabs.is_some(), model),
             },
         ],
     }
@@ -1337,33 +1373,35 @@ fn agent_model(list: &TabList, selection: Selection) -> AgentModel {
 // ---------------------------------------------------------------- env
 
 fn env_checks(inputs: &Inputs) -> Vec<Check> {
-    let tab_id = if !inside_roost_tab(inputs) {
-        not_in_tab("env.tab_id", "ROOST_TAB_ID")
-    } else {
-        match (&inputs.env_tab_id, env_tab_id(inputs)) {
-            (_, Some(id)) => check(
-                "env.tab_id",
-                "ROOST_TAB_ID",
-                Status::Ok,
-                format!("ROOST_TAB_ID={id}"),
+    // The variable is the subject here, not the Roost PTY: a value that
+    // is set but unusable is broken wherever it came from — a CI runner
+    // exporting `ROOST_TAB_ID=abc` gets the same silent no-op. Only the
+    // *unset* case needs §3.3's applicability gate, since outside a tab
+    // there is nothing that should have set it.
+    let tab_id = match (&inputs.env_tab_id, env_tab_id(inputs)) {
+        (_, Some(id)) => check(
+            "env.tab_id",
+            "ROOST_TAB_ID",
+            Status::Ok,
+            format!("ROOST_TAB_ID={id}"),
+        ),
+        (Some(raw), None) => check(
+            "env.tab_id",
+            "ROOST_TAB_ID",
+            Status::Fail,
+            format!(
+                "ROOST_TAB_ID={} is not a positive integer; every per-tab command \
+                 silently no-ops",
+                redact(raw)
             ),
-            (Some(raw), None) => check(
-                "env.tab_id",
-                "ROOST_TAB_ID",
-                Status::Fail,
-                format!(
-                    "ROOST_TAB_ID={} is not a positive integer; every per-tab command \
-                     silently no-ops",
-                    redact(raw)
-                ),
-            ),
-            (None, None) => check(
-                "env.tab_id",
-                "ROOST_TAB_ID",
-                Status::Fail,
-                "unset inside a Roost tab; every per-tab command silently no-ops",
-            ),
-        }
+        ),
+        (None, None) if inside_roost_tab(inputs) => check(
+            "env.tab_id",
+            "ROOST_TAB_ID",
+            Status::Fail,
+            "unset inside a Roost tab; every per-tab command silently no-ops",
+        ),
+        (None, None) => not_in_tab("env.tab_id", "ROOST_TAB_ID"),
     };
 
     let socket = match &inputs.env_socket {
@@ -2007,13 +2045,7 @@ fn tab_checks(
     };
 
     let unavailable = |id: &'static str, title: &'static str| {
-        let reason = match model {
-            AgentModel::Absent => "unavailable (server predates the agent state model)",
-            AgentModel::Malformed => "unavailable (the UI's tab.list response did not decode)",
-            _ if !listed => "unavailable (no tab.list from a running UI)",
-            _ => "unavailable (no tab selected)",
-        };
-        check(id, title, Status::Info, reason)
+        check(id, title, Status::Info, unavailable_reason(model, listed))
     };
 
     let Some(tab) = selected.filter(|_| model != AgentModel::Absent) else {
@@ -2105,6 +2137,20 @@ fn tab_checks(
     ]
 }
 
+/// Why the selected tab's axes are not observable. Shared with
+/// `claude.observed`, which reads the same `ownership` field: the two
+/// sections saying different things about one absent fact — `tab.ownership`
+/// reporting `unavailable` while `claude.observed` asserts "no claude
+/// ownership" six lines later — is the fabrication §3.5 exists to prevent.
+fn unavailable_reason(model: AgentModel, listed: bool) -> &'static str {
+    match model {
+        AgentModel::Absent => "unavailable (server predates the agent state model)",
+        AgentModel::Malformed => "unavailable (the UI's tab.list response did not decode)",
+        _ if !listed => "unavailable (no tab.list from a running UI)",
+        _ => "unavailable (no tab selected)",
+    }
+}
+
 /// AC 4: when nothing is driving the tab, say which axis is empty rather
 /// than leaving the user staring at an absent dot.
 fn inactive_explanation(
@@ -2164,38 +2210,74 @@ fn describe_age(now: i64, at: i64) -> String {
 
 // -------------------------------------------------------------- claude
 
-fn claude_checks(inputs: &Inputs, selection: Selection, selected: Option<&Tab>) -> Vec<Check> {
-    let claude_owns = selected
-        .and_then(|t| t.ownership.as_ref())
-        .is_some_and(|o| o.source == "claude");
+fn claude_checks(
+    inputs: &Inputs,
+    selection: Selection,
+    selected: Option<&Tab>,
+    listed: bool,
+    model: AgentModel,
+) -> Vec<Check> {
+    // `Some(_)` only when the server actually sent the axis. A
+    // pre-plan-002 server omits `ownership` entirely, and the serde
+    // default is `None` — indistinguishable from a real "nobody owns
+    // this tab", so the same guard `tab_checks` applies has to apply
+    // here too.
+    let owns = selected
+        .filter(|_| model != AgentModel::Absent)
+        .map(|t| t.ownership.as_ref().is_some_and(|o| o.source == "claude"));
+    let claude_owns = owns == Some(true);
     // A settings file doctor could not even locate is not evidence that
     // Claude is configured, any more than an absent one is.
     let settings_present = !matches!(
         inputs.claude_settings,
         SettingsProbe::Absent | SettingsProbe::LocationUnknown
     );
+    // Unknown ownership counts as "not owned" here on purpose: it keeps
+    // the whole section `info` rather than inventing a verdict from a
+    // fact the server never sent.
     let configured = !matches!(inputs.claude_version, SubprocessOutcome::Missing)
         || settings_present
         || claude_owns;
 
     if !configured {
-        let detail = "not configured — no `claude` on PATH, no settings file, and no claude \
-                      ownership on the selected tab";
+        let detail = format!(
+            "not configured — no `claude` on PATH, no settings file, and the selected tab's \
+             ownership {}",
+            match owns {
+                Some(_) => "carries no claude source".to_string(),
+                None => format!("is {}", unavailable_reason(model, listed)),
+            }
+        );
         return vec![
-            check("claude.binary", "`claude` on PATH", Status::Info, detail),
-            check("claude.settings", "Settings file", Status::Info, detail),
+            check(
+                "claude.binary",
+                "`claude` on PATH",
+                Status::Info,
+                detail.as_str(),
+            ),
+            check(
+                "claude.settings",
+                "Settings file",
+                Status::Info,
+                detail.as_str(),
+            ),
             check(
                 "claude.hook_events",
                 "Registered events",
                 Status::Info,
-                detail,
+                detail.as_str(),
             ),
-            check("claude.hook_command", "Hook commands", Status::Info, detail),
+            check(
+                "claude.hook_command",
+                "Hook commands",
+                Status::Info,
+                detail.as_str(),
+            ),
             check(
                 "claude.observed",
                 "Hooks reaching Roost",
                 Status::Info,
-                detail,
+                detail.as_str(),
             ),
         ];
     }
@@ -2303,7 +2385,13 @@ fn claude_checks(inputs: &Inputs, selection: Selection, selected: Option<&Tab>) 
             "claude.observed",
             "Hooks reaching Roost",
             Status::Info,
-            "no claude ownership on the selected tab",
+            match owns {
+                Some(_) => "no claude ownership on the selected tab".to_string(),
+                None => format!(
+                    "the selected tab's ownership is {}",
+                    unavailable_reason(model, listed)
+                ),
+            },
         )
     };
 
@@ -2808,32 +2896,75 @@ mod tests {
 
     #[test]
     fn env_tab_id_fails_only_inside_a_tab() {
-        // Inside a tab (ROOST_SOCKET present), an unset id is the silent
-        // no-op every per-tab command hits.
+        // Inside a tab — ROOST_SHELL_INTEGRATION, which nothing but a
+        // Roost PTY sets — an unset id is the silent no-op every per-tab
+        // command hits.
         let inputs = Inputs {
-            env_socket: Some("/tmp/roost.sock".into()),
+            env_shell_integration: Some("1".into()),
             ..Inputs::default()
         };
         assert_eq!(status_of(&evaluate(&inputs), "env.tab_id"), Status::Fail);
 
-        for bad in ["0", "-3", "abc", ""] {
-            let inputs = Inputs {
-                env_socket: Some("/tmp/roost.sock".into()),
-                env_tab_id: (!bad.is_empty()).then(|| bad.to_string()),
-                ..Inputs::default()
-            };
-            assert_eq!(
-                status_of(&evaluate(&inputs), "env.tab_id"),
-                Status::Fail,
-                "ROOST_TAB_ID={bad:?}"
-            );
+        // A set-but-unusable value is broken wherever it came from.
+        for bad in ["0", "-3", "abc"] {
+            for in_tab in [true, false] {
+                let inputs = Inputs {
+                    env_shell_integration: in_tab.then(|| "1".to_string()),
+                    env_tab_id: Some(bad.to_string()),
+                    ..Inputs::default()
+                };
+                assert_eq!(
+                    status_of(&evaluate(&inputs), "env.tab_id"),
+                    Status::Fail,
+                    "ROOST_TAB_ID={bad:?} in_tab={in_tab}"
+                );
+            }
         }
 
-        // Outside a tab it is an observation, not a fault.
+        // Outside a tab an unset id is an observation, not a fault.
         assert_eq!(
             status_of(&evaluate(&Inputs::default()), "env.tab_id"),
             Status::Info
         );
+    }
+
+    /// `ROOST_SOCKET` and `ROOST_TAB_ID` are documented user-settable
+    /// targeting variables — `docs/reference/cli.md` tells CI runners to
+    /// set them by hand from *outside* a Roost tab. Treating either as
+    /// proof of a Roost PTY turned that documented usage into three
+    /// failures and exit 1 on a healthy machine.
+    #[test]
+    fn the_targeting_env_vars_do_not_make_the_process_a_roost_tab() {
+        for inputs in [
+            Inputs {
+                env_socket: Some("/tmp/roost.sock".into()),
+                ..Inputs::default()
+            },
+            Inputs {
+                env_tab_id: Some("7".into()),
+                ..Inputs::default()
+            },
+            Inputs {
+                env_socket: Some("/tmp/roost.sock".into()),
+                env_tab_id: Some("7".into()),
+                ..Inputs::default()
+            },
+        ] {
+            let report = evaluate(&inputs);
+            let shell = report
+                .sections
+                .iter()
+                .find(|s| s.id == "shell")
+                .expect("shell section");
+            let failed: Vec<&str> = shell
+                .checks
+                .iter()
+                .filter(|c| c.status == Status::Fail)
+                .map(|c| c.id)
+                .collect();
+            assert!(failed.is_empty(), "{failed:?}\n{}", render_text(&report));
+            assert_ne!(status_of(&report, "env.tab_id"), Status::Fail);
+        }
     }
 
     /// `--tab` selects which tab to inspect; it does not make the
@@ -2946,6 +3077,56 @@ mod tests {
         assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
         // The selection itself is still knowable from a legacy tab.list.
         assert_eq!(status_of(&report, "tab.selection"), Status::Info);
+        // `claude.observed` reads the same `ownership` field, so it has
+        // to degrade with it: `tab.ownership` reporting `unavailable`
+        // while `claude.observed` asserts "no claude ownership" six lines
+        // later states as an observation something the server never sent.
+        let observed = find(&report, "claude.observed");
+        assert_eq!(observed.status, Status::Info);
+        assert!(
+            observed.detail.contains("predates the agent state model"),
+            "{}",
+            observed.detail
+        );
+    }
+
+    /// The same guard on the section's other exit: with nothing else
+    /// configured the five `claude` checks share one "not configured"
+    /// sentence, and its third clause must not claim an ownership fact
+    /// the server never sent either.
+    #[test]
+    fn the_unconfigured_claude_sentence_does_not_invent_ownership() {
+        let old_server = Inputs {
+            tab_list: Ok(legacy_tab_list(&[7])),
+            claude_version: SubprocessOutcome::Missing,
+            ..healthy()
+        };
+        let report = evaluate(&old_server);
+        for id in [
+            "claude.binary",
+            "claude.settings",
+            "claude.hook_events",
+            "claude.hook_command",
+            "claude.observed",
+        ] {
+            let c = find(&report, id);
+            assert_eq!(c.status, Status::Info, "{id}");
+            assert!(
+                c.detail.contains("predates the agent state model"),
+                "{id}: {}",
+                c.detail
+            );
+        }
+
+        // A current server that really did send `ownership: null` is a
+        // genuine observation, and still reads as one.
+        let current = Inputs {
+            claude_version: SubprocessOutcome::Missing,
+            ..healthy()
+        };
+        let report = evaluate(&current);
+        let detail = &find(&report, "claude.observed").detail;
+        assert!(detail.contains("no claude source"), "{detail}");
     }
 
     #[test]
@@ -4127,8 +4308,10 @@ mod tests {
         vec![
             Inputs::default(),
             healthy(),
+            // Inside a tab (a PTY-only variable is set) with nothing
+            // else wired: `env.tab_id` and `shell.integration` both fail.
             Inputs {
-                env_socket: Some("/tmp/roost.sock".into()),
+                env_resources_dir: Some("/opt/roost".into()),
                 ..Inputs::default()
             },
             Inputs {
@@ -4147,7 +4330,6 @@ mod tests {
             Inputs {
                 shell_path: None,
                 shell_usable: false,
-                env_shell_integration: None,
                 env_resources_dir: None,
                 resources_script: None,
                 explicit_tab: Some(999),
@@ -4419,6 +4601,11 @@ mod tests {
     /// rejecting every non-absolute word failed a healthy install.
     #[test]
     fn a_hook_command_word_resolves_through_path() {
+        // Reads `PATH`, which the `collect` tests below overwrite. libtest
+        // runs them on separate threads and concurrent setenv/getenv is
+        // UB, so this takes the same mutex they do. `blocking_lock` is
+        // safe here precisely because this test has no runtime.
+        let _env = ENV.blocking_lock();
         // `sh` is on PATH and at an absolute path on every platform this
         // ships to; nothing else about it matters here.
         let bare = resolve_program("sh").expect("`sh` must resolve through PATH");
@@ -4449,6 +4636,29 @@ mod tests {
             Some((3, 2))
         );
         assert_eq!(bash_version("zsh 5.9"), None);
+        // bash translates its banner. `capture` forces `LC_ALL=C`, but a
+        // banner that reaches the parser any other way must still read.
+        assert_eq!(
+            bash_version("GNU bash, Version 5.3.9(1)-release (x86_64-pc-linux-gnu)"),
+            Some((5, 3))
+        );
+    }
+
+    /// The scripts match `*",no-$1,"*` against the raw variable
+    /// (`roost.bash:127-132`, `roost.zsh:30-35`), so a token with
+    /// surrounding whitespace does not disable anything there. Doctor
+    /// trimming would report `marks` off on a shell still emitting them.
+    #[test]
+    fn the_marks_opt_out_matches_the_scripts_byte_for_byte() {
+        let features = |v: &str| Inputs {
+            env_shell_features: Some(v.to_string()),
+            ..healthy()
+        };
+        assert!(marks_opted_out(&features("cwd,no-marks,prompt")));
+        assert!(marks_opted_out(&features("no-marks")));
+        assert!(!marks_opted_out(&features("cwd, no-marks")));
+        assert!(!marks_opted_out(&features("cwd,no-marks ")));
+        assert!(!marks_opted_out(&features("cwd,title,marks")));
     }
 
     #[test]
@@ -4610,6 +4820,87 @@ mod tests {
             26
         );
         assert!(render_text(&report).contains("ui.identify"));
+    }
+
+    /// A UI that answers *late* — not never — is the case the hung-UI
+    /// test above cannot see. `identify` is cancelled at the deadline but
+    /// the response is still in flight, and `IpcClient` matches responses
+    /// by monotonic id, so reusing that connection made `tab.list` report
+    /// `IdMismatch`: the tab section blanking for a reason that never
+    /// happened.
+    #[tokio::test]
+    async fn a_late_identify_reply_does_not_poison_tab_list() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let _env = ENV.lock().await;
+        let dir = TmpDir::new("slow-ui");
+        let sock = dir.join("roost.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let id = serde_json::from_str::<serde_json::Value>(&line)
+                            .ok()
+                            .and_then(|v| v.get("id").and_then(serde_json::Value::as_i64))
+                            .unwrap_or(0);
+                        // Well past IPC_TIMEOUT, so every request is
+                        // cancelled with its answer still coming.
+                        tokio::time::sleep(IPC_TIMEOUT + Duration::from_secs(1)).await;
+                        let frame = format!("{{\"id\":{id},\"ok\":true,\"result\":{{}}}}\n");
+                        if w.write_all(frame.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let selector = TargetSelector {
+            socket_override: Some(sock),
+            kind_override: None,
+        };
+        let inputs = tokio::time::timeout(Duration::from_secs(30), collect(&selector, None))
+            .await
+            .expect("doctor must not hang on a slow UI");
+        server.abort();
+
+        assert!(
+            matches!(inputs.identify, Err(IdentifyFailure::Timeout)),
+            "{:?}",
+            inputs.identify
+        );
+        let err = inputs.tab_list.expect_err("tab.list must not succeed here");
+        assert!(
+            !err.contains("id mismatch"),
+            "tab.list inherited the cancelled identify's stream: {err}"
+        );
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// Version banners are translated — `bash --version` says "Version"
+    /// under de_DE — so the parsers get a fixed locale. Asserted through
+    /// the real subprocess, since the env is only set inside [`capture`].
+    #[tokio::test]
+    async fn version_subprocesses_run_under_the_c_locale() {
+        let _env = ENV.lock().await;
+        let dir = TmpDir::new("locale");
+        let script = dir.join("echo-locale");
+        std::fs::write(&script, "#!/bin/sh\necho \"LC_ALL=$LC_ALL LANG=$LANG\"\n")
+            .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _shell = EnvVar::set("SHELL", &script);
+        let _lc = EnvVar::set("LC_ALL", "de_DE.UTF-8");
+        let _lang = EnvVar::set("LANG", "de_DE.UTF-8");
+
+        let inputs = collect(&dead_socket(&dir), None).await;
+
+        assert_eq!(
+            inputs.shell_version,
+            SubprocessOutcome::Output("LC_ALL=C LANG=C\n".to_string())
+        );
     }
 
     /// A `$SHELL` that never returns must degrade on the deadline **and

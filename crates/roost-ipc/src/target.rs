@@ -255,7 +255,12 @@ async fn resolve_auto_detect(probe_alive: bool) -> Result<ResolvedTarget, Target
     // — probing the single shared path twice would report a phantom
     // "mac + gtk both running" ambiguity.
     let [(mac_kind, mac_path), (gtk_kind, gtk_path)] = candidates.as_slice() else {
-        let (kind, path) = &candidates[0];
+        // `auto_detect_candidates` never returns empty, but this sits
+        // under `doctor::collect`, which promises totality — an index
+        // panic there would take out the diagnostic instead of being one.
+        let Some((kind, path)) = candidates.first() else {
+            return Err(TargetError::NoLiveTarget { tried: Vec::new() });
+        };
         if !probe_alive || probe_socket(path).await {
             return Ok(ResolvedTarget {
                 socket_path: path.clone(),
