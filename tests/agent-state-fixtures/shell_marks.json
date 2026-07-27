@@ -122,6 +122,21 @@
       }
     },
     {
+      "name": "combining-mark-body-reads-as-its-base-scalar",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "body": "C\u0301",
+      "expect": {
+        "changed": true,
+        "shell": "foreground_process",
+        "lifecycle": "inactive",
+        "owner_retained": false
+      }
+    },
+    {
       "name": "undefined-mark-is-no-change",
       "state": {
         "shell": "foreground_process",

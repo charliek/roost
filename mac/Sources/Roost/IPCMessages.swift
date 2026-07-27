@@ -28,6 +28,18 @@ enum IPCTabState: String, Codable, Sendable {
     case idle
 }
 
+/// Tab snapshot. Used in `tab.open` / `tab.list` / `tab.agent_report`.
+///
+/// `state` and `hookActive` are **derived** server-side from the three
+/// agent axes below (`Agent.effective` / `Agent.isLive`), not stored
+/// alongside them. They stay on the wire because every shipped client
+/// reads them; `state` stays a closed four-value enum for the reason
+/// spelled out on `Agent.effective`.
+///
+/// The axes themselves decode with `decodeIfPresent` + a default
+/// without exception — this decoder is strict everywhere else, so a
+/// payload from a server predating plan 002 (or from the other UI mid-
+/// rollout) would otherwise throw.
 struct IPCTab: Codable, Equatable, Sendable {
     var id: Int64
     var projectID: Int64
@@ -41,6 +53,9 @@ struct IPCTab: Codable, Equatable, Sendable {
     var createdAt: Int64
     var lastActive: Int64
     var hookActive: Bool
+    var shellState: ShellState
+    var agentLifecycle: AgentLifecycle
+    var ownership: Ownership?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -55,6 +70,9 @@ struct IPCTab: Codable, Equatable, Sendable {
         case createdAt = "created_at"
         case lastActive = "last_active"
         case hookActive = "hook_active"
+        case shellState = "shell_state"
+        case agentLifecycle = "agent_lifecycle"
+        case ownership
     }
 
     init(
@@ -69,7 +87,10 @@ struct IPCTab: Codable, Equatable, Sendable {
         position: Int32,
         createdAt: Int64,
         lastActive: Int64,
-        hookActive: Bool
+        hookActive: Bool,
+        shellState: ShellState,
+        agentLifecycle: AgentLifecycle,
+        ownership: Ownership?
     ) {
         self.id = id
         self.projectID = projectID
@@ -83,6 +104,9 @@ struct IPCTab: Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.lastActive = lastActive
         self.hookActive = hookActive
+        self.shellState = shellState
+        self.agentLifecycle = agentLifecycle
+        self.ownership = ownership
     }
 
     init(from decoder: Decoder) throws {
@@ -99,6 +123,10 @@ struct IPCTab: Codable, Equatable, Sendable {
         self.createdAt = try c.decode(Int64.self, forKey: .createdAt)
         self.lastActive = try c.decode(Int64.self, forKey: .lastActive)
         self.hookActive = try c.decode(Bool.self, forKey: .hookActive)
+        self.shellState = try c.decodeIfPresent(ShellState.self, forKey: .shellState) ?? .unknown
+        self.agentLifecycle =
+            try c.decodeIfPresent(AgentLifecycle.self, forKey: .agentLifecycle) ?? .inactive
+        self.ownership = try c.decodeIfPresent(Ownership.self, forKey: .ownership)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -115,6 +143,11 @@ struct IPCTab: Codable, Equatable, Sendable {
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(lastActive, forKey: .lastActive)
         try c.encode(hookActive, forKey: .hookActive)
+        try c.encode(shellState, forKey: .shellState)
+        try c.encode(agentLifecycle, forKey: .agentLifecycle)
+        // Omitted rather than null when absent, matching the Rust
+        // `skip_serializing_if = "Option::is_none"`.
+        try c.encodeIfPresent(ownership, forKey: .ownership)
     }
 }
 
@@ -367,7 +400,7 @@ enum StringInt64DecodeError: Error, CustomStringConvertible {
     }
 }
 
-private func decodeStringInt64<K: CodingKey>(
+func decodeStringInt64<K: CodingKey>(
     _ c: KeyedDecodingContainer<K>,
     _ key: K
 ) throws -> Int64 {

@@ -5,106 +5,112 @@ import Foundation
 import Testing
 @testable import Roost
 
+/// A tab an agent owns, mid-turn.
+private func owned(_ lifecycle: AgentLifecycle) -> AgentTabState {
+    AgentTabState(
+        shell: .atPrompt,
+        lifecycle: lifecycle,
+        ownership: Ownership(source: "claude", sessionID: "s1")
+    )
+}
+
+/// A plain shell with no agent.
+private func shell(_ shell: ShellState) -> AgentTabState {
+    AgentTabState(shell: shell)
+}
+
+/// The production call shape: tabs in, presented lifecycles out.
+private func rollup(_ tabs: [AgentTabState]) -> AgentLifecycle {
+    projectRollup(tabs.map(Agent.effectiveLifecycle))
+}
+
 @Test
 func projectRollup_emptyListIsNone() {
-    #expect(projectRollup(tabs: []) == .none)
+    #expect(rollup([]) == .inactive)
 }
 
 @Test
-func projectRollup_allNoneIsNone() {
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.none, false),
-        (.none, false),
-    ]
-    #expect(projectRollup(tabs: tabs) == .none)
+func projectRollup_allIdleShellsIsNone() {
+    #expect(rollup([shell(.atPrompt), shell(.unknown)]) == .inactive)
 }
 
 @Test
-func projectRollup_singleRunning() {
-    #expect(projectRollup(tabs: [(.running, false)]) == .running)
-}
-
-@Test
-func projectRollup_singleNeedsInput() {
-    #expect(projectRollup(tabs: [(.needsInput, false)]) == .needsInput)
-}
-
-@Test
-func projectRollup_singleIdle() {
-    #expect(projectRollup(tabs: [(.idle, false)]) == .idle)
+func projectRollup_foregroundProcessIsRunning() {
+    #expect(rollup([shell(.foregroundProcess)]) == .working)
 }
 
 @Test
 func projectRollup_needsInputOutranksRunning() {
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.running, false),
-        (.needsInput, false),
-    ]
-    #expect(projectRollup(tabs: tabs) == .needsInput)
+    #expect(rollup([owned(.working), owned(.waiting)]) == .waiting)
 }
 
 @Test
 func projectRollup_runningOutranksIdle() {
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.idle, false),
-        (.running, false),
-    ]
-    #expect(projectRollup(tabs: tabs) == .running)
+    #expect(rollup([owned(.finished), shell(.foregroundProcess)]) == .working)
 }
 
 @Test
 func projectRollup_idleOutranksNone() {
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.none, false),
-        (.idle, false),
-    ]
-    #expect(projectRollup(tabs: tabs) == .idle)
+    #expect(rollup([shell(.atPrompt), owned(.finished)]) == .finished)
+}
+
+/// `failed` sits above `waiting` — the whole reason the rollup ranks on
+/// the agent axis instead of the legacy `TabState`, which collapses the
+/// two.
+@Test
+func projectRollup_failedOutranksNeedsInput() {
+    #expect(rollup([owned(.waiting), owned(.failed)]) == .failed)
+}
+
+// The three tests below replace `hookActiveSuppressesNeedsInput` /
+// `hookActiveSuppressesRunning` / `hookActiveOnAllFallsBackToNone`,
+// which pinned the behavior plan 002 §2.2(a) reverses: an agent-owned
+// tab used to be dropped from the rollup entirely.
+
+@Test
+func projectRollup_agentOwnedNeedsInputParticipates() {
+    #expect(rollup([owned(.waiting), shell(.foregroundProcess)]) == .waiting)
 }
 
 @Test
-func projectRollup_hookActiveSuppressesNeedsInput() {
-    // If the only NeedsInput tab has its hook active, the rollup falls
-    // back to whatever the other tabs say.
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.needsInput, true),  // hook-active → suppressed
-        (.running, false),
-    ]
-    #expect(projectRollup(tabs: tabs) == .running)
+func projectRollup_agentOwnedRunningParticipates() {
+    #expect(rollup([owned(.working), owned(.finished)]) == .working)
 }
 
 @Test
-func projectRollup_hookActiveSuppressesRunning() {
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.running, true),  // hook-active → suppressed
-        (.idle, false),
-    ]
-    #expect(projectRollup(tabs: tabs) == .idle)
+func projectRollup_allTabsAgentOwnedStillRanks() {
+    #expect(rollup([owned(.working), owned(.waiting)]) == .waiting)
+}
+
+/// Ownership without a live lifecycle falls through to the shell axis —
+/// the `D`/`A` failsafe, seen from the sidebar.
+@Test
+func projectRollup_inactiveOwnerFallsThroughToShell() {
+    var tab = owned(.inactive)
+    tab.shell = .foregroundProcess
+    #expect(rollup([tab]) == .working)
+}
+
+/// A `failed` lifecycle left behind on a tab whose owner is gone must
+/// not outrank live tabs.
+@Test
+func projectRollup_failedWithoutAnOwnerFallsThroughToShell() {
+    let tab = AgentTabState(shell: .atPrompt, lifecycle: .failed, ownership: nil)
+    #expect(rollup([tab]) == .inactive)
 }
 
 @Test
-func projectRollup_hookActiveOnAllFallsBackToNone() {
-    let tabs: [(state: TabAgentState, hookActive: Bool)] = [
-        (.running, true),
-        (.needsInput, true),
-    ]
-    #expect(projectRollup(tabs: tabs) == .none)
+func rollupColor_isNilOnlyForInactive() {
+    #expect(rollupColor(for: .inactive) == nil)
+    #expect(rollupColor(for: .working) != nil)
+    #expect(rollupColor(for: .waiting) != nil)
+    #expect(rollupColor(for: .finished) != nil)
+    #expect(rollupColor(for: .failed) != nil)
 }
 
+/// `failed` must not reuse `waiting`'s colour: distinguishing "the agent
+/// wants you" from "the agent died" is the point of the fifth state.
 @Test
-func tabAgentState_fromProtoMapsCorrectly() {
-    #expect(TabAgentState.fromProto(0) == .none)  // unspecified
-    #expect(TabAgentState.fromProto(1) == .none)
-    #expect(TabAgentState.fromProto(2) == .running)
-    #expect(TabAgentState.fromProto(3) == .needsInput)
-    #expect(TabAgentState.fromProto(4) == .idle)
-    // Unknown defensively maps to none.
-    #expect(TabAgentState.fromProto(99) == .none)
-}
-
-@Test
-func rollupState_nsColorIsNilOnlyForNone() {
-    #expect(RollupState.none.nsColor == nil)
-    #expect(RollupState.running.nsColor != nil)
-    #expect(RollupState.needsInput.nsColor != nil)
-    #expect(RollupState.idle.nsColor != nil)
+func rollupColor_failedIsDistinctFromWaiting() {
+    #expect(rollupColor(for: .failed) != rollupColor(for: .waiting))
 }

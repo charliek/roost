@@ -310,6 +310,12 @@ final class RoostBackend {
         supervisorExitToken = supervisor.subscribe { event in
             MainActor.assumeIsolated {
                 guard case .tabExited(let tabID, _) = event else { return }
+                // The shell that hosted any agent is gone, so its
+                // ownership goes with it. Redundant on the ordinary path
+                // (the close below drops the row outright) but correct
+                // the moment a PTY is replaced without closing the tab —
+                // #170's hard-restart.
+                try? client.workspace.ptyReplaced(tabID)
                 do {
                     try client.closeTab(tabID)
                 } catch Workspace.WorkspaceError.tabNotFound {

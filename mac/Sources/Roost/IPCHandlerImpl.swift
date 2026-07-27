@@ -81,6 +81,8 @@ actor IPCHandlerImpl: IPCHandler {
         case "tab.set_hook_active":
             try await self.tabSetHookActive(params: params)
             return AnyCodable([:] as [String: Any])
+        case "tab.agent_report":
+            return try await encodeResult(self.tabAgentReport(params: params))
         case "notification.create":
             try await self.notificationCreate(params: params)
             return AnyCodable([:] as [String: Any])
@@ -400,13 +402,41 @@ actor IPCHandlerImpl: IPCHandler {
     }
 
     @MainActor
+    private func tabAgentReport(params: AnyCodable?) async throws -> IPCTabAgentReportResult {
+        let p = try decodeParams(
+            params, as: AgentReport.self,
+            expected: Set(AgentReport.CodingKeys.allCases.map(\.rawValue))
+        )
+        // Shape first, so a malformed report is rejected before it can
+        // touch ownership.
+        do {
+            try Agent.validate(p)
+        } catch let err as ReportError {
+            throw IPCHandlerError.invalidParam(err.description)
+        }
+        do {
+            let (accepted, tab) = try client.agentReport(p)
+            return IPCTabAgentReportResult(
+                accepted: accepted,
+                tab: tab.toIPC(isActive: tab.id == client.workspace.activeTabID)
+            )
+        } catch let err as Workspace.WorkspaceError {
+            throw mapWorkspace(err)
+        }
+    }
+
+    @MainActor
     private func notificationCreate(params: AnyCodable?) async throws {
         let p = try decodeParams(
             params, as: IPCNotificationCreateParams.self,
             expected: ["tab_id", "title", "body"]
         )
         do {
-            try client.fireNotification(p.tabID, title: p.title, body: p.body)
+            // `structured` is never gated on agent ownership (plan
+            // §3.4); focus may still drop it, which is not an error.
+            try client.raiseAttention(
+                p.tabID, title: p.title, body: p.body, source: .structured
+            )
         } catch let err as Workspace.WorkspaceError {
             throw mapWorkspace(err)
         }
@@ -1457,6 +1487,18 @@ private struct IPCTabSetHookActiveParams: Codable {
     }
 }
 
+/// `tab.agent_report` reply. The params are `AgentReport`, which lives
+/// in `AgentState.swift` beside the state machine that consumes them.
+///
+/// `accepted` is false when the report lost the ownership check (plan
+/// §3.3) — the tab is then returned unchanged. Callers get the post-
+/// report `Tab` back so an adapter never needs a follow-up `tab.list`
+/// to see what its report did.
+private struct IPCTabAgentReportResult: Codable {
+    let accepted: Bool
+    let tab: IPCTab
+}
+
 private struct IPCNotificationCreateParams: Codable {
     let tabID: Int64
     let title: String
@@ -1501,7 +1543,10 @@ extension Workspace.Tab {
             position: position,
             createdAt: createdAt,
             lastActive: lastActive,
-            hookActive: hookActive
+            hookActive: hookActive,
+            shellState: agent.shell,
+            agentLifecycle: agent.lifecycle,
+            ownership: agent.ownership
         )
     }
 }

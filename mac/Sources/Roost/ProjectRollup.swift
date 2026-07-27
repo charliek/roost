@@ -1,93 +1,45 @@
-// Per-project sidebar rollup state machine.
+// Per-project sidebar rollup.
 //
-// Aggregates each tab's agent state + `hook_active` flag into a single
-// `RollupState` for the project's sidebar row. The 3px colored stripe
-// on `ProjectRowCellView` picks its color from this enum.
+// Reduces a project's tabs to the one colour its sidebar row's 3px
+// leading stripe wears (`ProjectRowCellView`); this module picks which.
 //
-// Mirrors the Linux gtk4-rs port (`crates/roost-linux/src/rollup.rs`)
-// 1:1 so a user on either UI sees identical precedence — needs-input
-// wins, hook-active suppresses noise. The Go GTK binary lacks the
-// hook-active suppression (Linux M6 added it); this is a deliberate
-// extension past Go-parity.
+// Both halves are shared, not local: the per-tab value is
+// `Agent.effectiveLifecycle` (the same value the tab pill's status dot
+// renders) and the ordering is `Agent.rank` (the same function the
+// future agent overview sorts by). So the sidebar can't disagree with
+// the rest of the UI about which tab is loudest.
+//
+// Hook-driven state **participates**. Until plan 002 this module
+// skipped every tab with `hookActive` set, so a project whose only
+// blocked tab was a Claude session showed no stripe at all — the
+// differentiating case, hidden. Kept at parity with the Linux port
+// (`crates/roost-linux/src/rollup.rs`).
 
 import AppKit
 
-/// Per-tab agent state. Mirrors `proto/roost.proto`'s `TabState` enum:
-/// proto 0/1 collapse to `.none`; 2/3/4 → running/needsInput/idle.
-/// Unknown values defensively collapse to `.none`.
-enum TabAgentState {
-    case none
-    case running
-    case needsInput
-    case idle
-
-    /// Map a proto `TabState` raw value to this UI enum.
-    static func fromProto(_ value: Int) -> TabAgentState {
-        switch value {
-        case 2: return .running
-        case 3: return .needsInput
-        case 4: return .idle
-        default: return .none
-        }
-    }
-}
-
-/// Project-level rollup. Drives both the sidebar stripe color and (via
-/// `nsColor`) whether the stripe is rendered at all.
-enum RollupState {
-    case none
-    case running
-    case needsInput
-    case idle
-
-    /// Stripe color for this rollup, or `nil` when no stripe should
-    /// render. Matches Linux M6's CSS palette (`#5fa3f0` / `#f0a040`
-    /// / `#7a7a7a`) verbatim so the two UIs agree visually.
-    var nsColor: NSColor? {
-        switch self {
-        case .none: return nil
-        case .running:    return NSColor(red: 0x5f/255.0, green: 0xa3/255.0, blue: 0xf0/255.0, alpha: 1.0)
-        case .needsInput: return NSColor(red: 0xf0/255.0, green: 0xa0/255.0, blue: 0x40/255.0, alpha: 1.0)
-        case .idle:       return NSColor(red: 0x7a/255.0, green: 0x7a/255.0, blue: 0x7a/255.0, alpha: 1.0)
-        }
-    }
-
-    /// Map a proto `TabState` raw value to the visually-equivalent
-    /// rollup. Lets the per-tab pill dot share the same color palette
-    /// as the sidebar stripe without re-declaring colors. Unknown /
-    /// none → `.none` (no color).
-    init(matchingProto value: Int) {
-        switch TabAgentState.fromProto(value) {
-        case .none:       self = .none
-        case .running:    self = .running
-        case .needsInput: self = .needsInput
-        case .idle:       self = .idle
-        }
-    }
-}
-
-/// Compute the project rollup from a list of `(state, hookActive)`
-/// pairs. Priority: `needsInput > running > idle > none`. When a tab
-/// has `hookActive = true` its state is suppressed — the Claude hook
-/// owns the urgency surface, and promoting the stripe color would
-/// double-count it. Empty list → `.none`.
+/// Compute the project rollup: the highest-`Agent.rank` tab wins.
+/// No tabs → `.inactive`.
 ///
 /// Pure function; no AppKit state. Unit-tested in `ProjectRollupTests`.
-func projectRollup(tabs: [(state: TabAgentState, hookActive: Bool)]) -> RollupState {
-    var needsInput = false
-    var running = false
-    var idle = false
-    for (state, hookActive) in tabs {
-        if hookActive { continue }
-        switch state {
-        case .needsInput: needsInput = true
-        case .running:    running = true
-        case .idle:       idle = true
-        case .none:       break
-        }
+func projectRollup(_ lifecycles: [AgentLifecycle]) -> AgentLifecycle {
+    lifecycles.max { Agent.rank($0) < Agent.rank($1) } ?? .inactive
+}
+
+/// Stripe colour for a rollup, or `nil` for `.inactive` (no colour =
+/// no stripe). Matches the Linux CSS palette (`#5fa3f0` / `#f0a040` /
+/// `#7a7a7a` / `#e05252`) verbatim so the two UIs agree visually.
+///
+/// `failed` is its own colour, not a louder needs-input: the legacy
+/// `tab.state` field collapses the two (it stays a closed four-value
+/// enum, see `Agent.effective`), so the stripe and the pill dot are
+/// the only places a user can tell "the agent wants you" from "the
+/// agent died".
+func rollupColor(for lifecycle: AgentLifecycle) -> NSColor? {
+    switch lifecycle {
+    case .inactive: return nil
+    case .working:  return NSColor(red: 0x5f/255.0, green: 0xa3/255.0, blue: 0xf0/255.0, alpha: 1.0)
+    case .waiting:  return NSColor(red: 0xf0/255.0, green: 0xa0/255.0, blue: 0x40/255.0, alpha: 1.0)
+    case .finished: return NSColor(red: 0x7a/255.0, green: 0x7a/255.0, blue: 0x7a/255.0, alpha: 1.0)
+    case .failed:   return NSColor(red: 0xe0/255.0, green: 0x52/255.0, blue: 0x52/255.0, alpha: 1.0)
     }
-    if needsInput { return .needsInput }
-    if running    { return .running }
-    if idle       { return .idle }
-    return .none
 }

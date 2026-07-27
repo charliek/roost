@@ -32,16 +32,6 @@ struct LocalClientOSCTests {
         #expect(parseOSC7Path("http://example.com/path") == nil)
     }
 
-    @Test func commandMarkStateMapsMarks() {
-        #expect(commandMarkState("C") == .running)
-        #expect(commandMarkState("D") == Workspace.TabState.none)
-        #expect(commandMarkState("D;0") == Workspace.TabState.none)
-        #expect(commandMarkState("A") == Workspace.TabState.none)
-        #expect(commandMarkState("B") == Workspace.TabState.none)
-        #expect(commandMarkState("") == nil)
-        #expect(commandMarkState("Z") == nil)
-    }
-
     @Test func osc777SplitsTitleAndBody() {
         let (title, body) = parseNotificationPayload(
             command: 777, payload: "notify;Build;Passed"
@@ -64,6 +54,90 @@ struct LocalClientOSCTests {
         )
         #expect(title == "Hello")
         #expect(body == "")
+    }
+}
+
+// OSC routing through the workspace. Mirrors the Rust suite in
+// `crates/roost-linux/src/local_client.rs`. No PTY is ever spawned —
+// `applyOSC` only touches the workspace.
+@MainActor
+@Suite("LocalClient OSC routing")
+struct LocalClientOSCRoutingTests {
+    private func clientWithTab() throws -> (LocalClient, Int64) {
+        let workspace = Workspace()
+        let project = workspace.createProject(name: "p", cwd: "")
+        let tab = try workspace.openTab(projectID: project.id, cwd: "/", title: "")
+        // Unfocused: these tests are about the OSC gate, not about
+        // policy §3.5's focus suppression (covered in WorkspaceStateTests).
+        workspace.setWindowFocused(false)
+        let client = LocalClient(
+            workspace: workspace,
+            supervisor: PtySupervisor(),
+            socketPath: "/tmp/roost-localclient-osc-test.sock"
+        )
+        return (client, tab.id)
+    }
+
+    private func claim(_ tabID: Int64, _ lifecycle: AgentLifecycle) -> AgentReport {
+        AgentReport(
+            tabID: tabID,
+            source: "claude",
+            sessionID: "s1",
+            ownershipAction: .claim,
+            lifecycle: lifecycle
+        )
+    }
+
+    /// Plan §2.2(b)/§3.4: raw OSC 9 / 99 / 777 is dropped while a live
+    /// agent session is mid-turn, and works normally outside one. This is
+    /// the documented-but-missing behavior the plan restores.
+    @Test func rawOscNotificationsAreSuppressedUnderALiveAgent() throws {
+        let (client, tabID) = try clientWithTab()
+
+        client.applyOSC(tabID: tabID, command: 9, payload: "Build done")
+        #expect(client.workspace.tab(tabID)?.hasNotification == true)
+
+        try client.workspace.setTabHasNotification(tabID, hasPending: false)
+        try client.workspace.agentReport(claim(tabID, .working))
+        for command in [UInt32(9), 99, 777] {
+            client.applyOSC(tabID: tabID, command: command, payload: "notify;Wrapper;Noise")
+            #expect(
+                client.workspace.tab(tabID)?.hasNotification == false,
+                "OSC \(command) should be suppressed mid-turn"
+            )
+        }
+
+        // The `D` failsafe re-opens the gate even though ownership
+        // survives as a label.
+        client.applyOSC(tabID: tabID, command: 133, payload: "D;0")
+        #expect(client.workspace.tab(tabID)?.hookActive == true)
+        client.applyOSC(tabID: tabID, command: 9, payload: "Build done")
+        #expect(client.workspace.tab(tabID)?.hasNotification == true)
+    }
+
+    /// Only *raw* OSC is gated — an explicit `notification.create` (which
+    /// routes straight at the workspace, not through `applyOSC`) is never
+    /// suppressed.
+    @Test func explicitNotificationsAreNeverSuppressed() throws {
+        let (client, tabID) = try clientWithTab()
+        try client.workspace.agentReport(claim(tabID, .working))
+        #expect(
+            try client.raiseAttention(
+                tabID, title: "Roost", body: "explicit", source: .structured
+            )
+        )
+        #expect(client.workspace.tab(tabID)?.hasNotification == true)
+    }
+
+    @Test func osc133WritesTheShellAxis() throws {
+        let (client, tabID) = try clientWithTab()
+        client.applyOSC(tabID: tabID, command: 133, payload: "C")
+        #expect(client.workspace.tab(tabID)?.state == .running)
+        client.applyOSC(tabID: tabID, command: 133, payload: "D;0")
+        #expect(client.workspace.tab(tabID)?.state == Workspace.TabState.none)
+        // Undefined mark bodies are no-change.
+        client.applyOSC(tabID: tabID, command: 133, payload: "Z")
+        #expect(client.workspace.tab(tabID)?.state == Workspace.TabState.none)
     }
 }
 

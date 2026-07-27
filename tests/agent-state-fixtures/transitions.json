@@ -465,6 +465,47 @@
       }
     },
     {
+      "name": "release-from-a-canonically-equivalent-source-is-rejected",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "caf\u00e9",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "cafe\u0301",
+        "session_id": "s1",
+        "ownership_action": "release"
+      },
+      "expect": {
+        "accepted": false,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "caf\u00e9",
+            "session_id": "s1",
+            "last_event_at": 1700000000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
       "name": "attention-set-carries-title-body-and-severity",
       "now": 1700001000,
       "current": {

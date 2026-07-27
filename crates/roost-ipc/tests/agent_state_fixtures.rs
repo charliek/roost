@@ -175,7 +175,7 @@ fn every_group_is_represented_and_non_trivial() {
         ("derivation", 12),
         ("rank", 5),
         ("transitions", 12),
-        ("shell_marks", 6),
+        ("shell_marks", 7),
     ]
     .into_iter()
     .collect();
