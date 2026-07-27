@@ -1011,6 +1011,7 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     let _ = std::io::stdin().take(1 << 20).read_to_end(&mut stdin_buf);
     let payload: serde_json::Value =
         serde_json::from_slice(&stdin_buf).unwrap_or(serde_json::Value::Null);
+    let payload = with_default_session(payload, tab_id);
 
     let reports = claude_event_to_reports(resolve_hook_event(event), &payload, tab_id);
     if reports.is_empty() {
@@ -1039,6 +1040,35 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
             .await;
     }
     Ok(())
+}
+
+/// Give a payload without a `session_id` a deterministic per-tab one.
+///
+/// Claude always sends `session_id`, but the hook is also driven by hand
+/// with no stdin at all — `docs/development/claude-testing.md` documents
+/// exactly that. The adapter refuses to claim ownership for an empty
+/// session id (a claim supersedes unconditionally, so an id nothing can
+/// match would strand the tab), which would make those bare invocations
+/// silently no-op. Synthesizing one keeps the manual flow self-consistent
+/// — `SessionStart` claims `manual:7` and `SessionEnd` releases the same
+/// — while leaving the adapter strict for real traffic.
+fn with_default_session(payload: serde_json::Value, tab_id: i64) -> serde_json::Value {
+    let has_session = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if has_session {
+        return payload;
+    }
+    let mut obj = match payload {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        "session_id".into(),
+        serde_json::Value::String(format!("manual:{tab_id}")),
+    );
+    serde_json::Value::Object(obj)
 }
 
 /// Write `~/.config/roost/claude-settings.json` and print the
@@ -1273,6 +1303,7 @@ fn order_with_after(ids: &[i64], new: i64, after: i64) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::agent::OwnershipAction;
 
     #[test]
     fn held_argv_wraps_command_and_execs_shell() {
@@ -1379,6 +1410,47 @@ mod tests {
     /// arm as Claude's own `hook_event_name` — otherwise an
     /// already-installed settings file silently stops working the
     /// moment this binary is rebuilt.
+    #[test]
+    #[test]
+    fn a_payloadless_hook_invocation_still_claims_and_releases() {
+        // `docs/development/claude-testing.md` drives the hook by hand
+        // with no stdin. Without a synthesized session id the adapter
+        // drops SessionStart, nothing owns the tab, and every later
+        // manual event is rejected by the server's ownership check.
+        for raw in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({ "session_id": "" }),
+            serde_json::json!("not an object"),
+        ] {
+            let payload = with_default_session(raw.clone(), 7);
+            assert_eq!(
+                payload.get("session_id").and_then(|v| v.as_str()),
+                Some("manual:7"),
+                "no session synthesized for {raw}"
+            );
+
+            let start = claude_event_to_reports(resolve_hook_event("session-start"), &payload, 7);
+            assert_eq!(start.len(), 1, "SessionStart dropped for {raw}");
+            assert_eq!(start[0].ownership_action, OwnershipAction::Claim);
+            assert_eq!(start[0].session_id, "manual:7");
+
+            // The release has to carry the same identity or it won't match.
+            let end = claude_event_to_reports(resolve_hook_event("session-end"), &payload, 7);
+            assert_eq!(end[0].ownership_action, OwnershipAction::Release);
+            assert_eq!(end[0].session_id, "manual:7");
+        }
+    }
+
+    #[test]
+    fn a_real_session_id_is_never_overwritten() {
+        let payload = with_default_session(serde_json::json!({ "session_id": "abc123" }), 7);
+        assert_eq!(
+            payload.get("session_id").and_then(|v| v.as_str()),
+            Some("abc123")
+        );
+    }
+
     #[test]
     fn legacy_claude_install_spellings_reach_the_same_arm_as_canonical() {
         let payload = serde_json::json!({ "session_id": "s-1" });

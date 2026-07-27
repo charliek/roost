@@ -42,7 +42,15 @@ Pre-req: `roostctl tab list` to find a tab id — add `--json` to see the full a
 | `roostctl tab focus --tab N` | Equivalent to clicking the pill; clears the badge as a side effect. |
 | `roostctl screenshot --out /tmp/shot.png` | Render the whole window to a PNG in-process (no OS screen capture) — read it back to *see* the UI state you just drove. Add `--scale 2` for a crisper image. |
 
-`roostctl claude-hook EVENT` driven by hand needs a JSON payload on stdin carrying a **`session_id`** — after the initial `SessionStart` claim, every later event must repeat the *same* `session_id` to be accepted (all but `SessionStart`/`SessionEnd` `preserve` ownership, which matches on the `(source, session_id)` pair; a mismatch is silently dropped). A `SessionStart` with an empty/missing `session_id` is dropped outright rather than claiming — an event that can't identify its own session can't safely evict whatever already owns the tab. Pick any non-empty string and reuse it for the whole sequence:
+`roostctl claude-hook EVENT` works two ways when driven by hand.
+
+**With no stdin at all** — `ROOST_TAB_ID=N roostctl claude-hook session-start` — `roostctl` synthesizes a deterministic `session_id` of `manual:<tab id>`, so a bare sequence is self-consistent: the `SessionStart` claim and the `SessionEnd` release carry the same identity. This is the quickest way to walk the lifecycle by hand.
+
+**With a payload**, which is what Claude Code itself sends, carry a **`session_id`** and repeat the *same* one for every later event. All events but `SessionStart`/`SessionEnd` `preserve` ownership, which matches on the `(source, session_id)` pair, so a mismatch is silently dropped — that is the mechanism keeping a stale session from talking over a live one.
+
+A `SessionStart` whose payload carries an *empty* `session_id` is dropped rather than claiming: a claim supersedes unconditionally, so an event that cannot identify its own session must not evict whatever already owns the tab. (The synthesized `manual:<tab id>` above is why the payloadless form is not affected by this.)
+
+Pick any non-empty string and reuse it for the whole sequence:
 
 | Command | Effect |
 |---|---|

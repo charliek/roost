@@ -80,22 +80,32 @@ def _roostctl() -> str:
     return str(REPO_ROOT / "target/debug/roostctl")
 
 
-def claude_hook(target: str, tab_id: int, event: str, payload: dict) -> None:
+def claude_hook(
+    target: str, tab_id: int, event: str, payload: dict | None = None
+) -> None:
     """Run `roostctl claude-hook EVENT` exactly as Claude Code would:
     the payload on stdin, the tab + socket in the environment.
+
+    `payload=None` sends NO stdin at all, which is how
+    `docs/development/claude-testing.md` documents driving the hook by
+    hand. Both forms must work.
 
     `claude-hook` is fire-and-forget by contract (it always exits 0 so a
     Roost problem can never break the turn it fired from), so the only
     proof it worked is the state assertions the caller makes after."""
-    body = {"cwd": "/tmp", "transcript_path": "/tmp/transcript.jsonl", **payload}
     env = {
         **os.environ,
         "ROOST_TAB_ID": str(tab_id),
         "ROOST_SOCKET": str(ui.socket_path(target)),
     }
+    if payload is None:
+        stdin = b""
+    else:
+        body = {"cwd": "/tmp", "transcript_path": "/tmp/transcript.jsonl", **payload}
+        stdin = json.dumps(body).encode()
     proc = subprocess.run(
         [_roostctl(), "claude-hook", event],
-        input=json.dumps(body).encode(),
+        input=stdin,
         capture_output=True,
         env=env,
         timeout=30,
@@ -331,6 +341,41 @@ def test_legacy_prompt_submit_spelling_still_works(roost, project, target):
     claude_hook(target, tab, "prompt-submit", {"session_id": session, "prompt": "go"})
     roost.wait_lifecycle(tab, "working")
     assert roost.tab(tab)["state"] == "running"
+
+
+def test_payloadless_manual_invocation_drives_a_whole_turn(roost, project, target):
+    """`docs/development/claude-testing.md` drives the hook by hand with
+    NO stdin at all. Claude always sends a payload, so the adapter is
+    strict about a missing `session_id` — it refuses to claim ownership
+    for an empty one, because a claim supersedes unconditionally and an
+    identity nothing can match would strand the tab. `roostctl` therefore
+    synthesizes a deterministic per-tab session for the bare form, which
+    is what keeps the documented manual flow self-consistent: the claim
+    and the release carry the same identity.
+
+    A unit test can't catch this — it would have to pass a payload to
+    call the function at all, which is exactly how the regression hid."""
+    tab = agent_tab(roost, project)
+
+    claude_hook(target, tab, "session-start")
+    roost._wait(
+        lambda: roost.hook_active(tab), 5.0, "payloadless session-start claimed the tab"
+    )
+    assert (roost.ownership(tab) or {}).get("source") == "claude", roost.ownership(tab)
+
+    claude_hook(target, tab, "prompt-submit")
+    roost.wait_lifecycle(tab, "working")
+
+    claude_hook(target, tab, "stop")
+    roost.wait_lifecycle(tab, "finished")
+
+    # The release has to match the identity the claim installed, or
+    # ownership would be stranded — the failure this test exists for.
+    claude_hook(target, tab, "session-end")
+    roost._wait(
+        lambda: not roost.hook_active(tab), 5.0, "payloadless session-end released"
+    )
+    assert roost.ownership(tab) is None, roost.ownership(tab)
 
 
 def test_set_hook_active_alias_still_claims_and_releases(roost, project):
