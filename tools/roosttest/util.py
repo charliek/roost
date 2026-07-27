@@ -122,6 +122,35 @@ def wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
         time.sleep(0.05)
 
 
+def spawned_tab_id(roost, before: set[int], what: str, timeout: float = 5.0) -> int:
+    """Wait for a spawn to add a tab and return its id.
+
+    `before` is the tab-id set captured before the spawn was triggered.
+    """
+    roost._wait(lambda: {int(t["id"]) for t in roost.tabs()} - before, timeout, what)
+    return next(iter({int(t["id"]) for t in roost.tabs()} - before))
+
+
+def wait_spawned_output(roost, tab_id: int, needle: str, timeout: float = 12.0) -> None:
+    """Wait for a freshly spawned tab to print `needle`.
+
+    The base timeout is deliberately generous (and scaled by
+    `ROOST_TEST_TIMEOUT_SCALE`): the tab has to start a shell *and* run
+    its command before anything reaches the viewport, and a cold first
+    spawn under Xvfb on a loaded CI runner is the slowest case. An
+    under-provisioned timeout here reads as a launcher bug when it is
+    really just shell startup — that ambiguity is why the dump below
+    exists.
+    """
+    try:
+        roost.wait_text(tab_id, needle, timeout=timeout)
+    except Timeout:
+        dump = roost._safe_dump_text(tab_id)
+        raise AssertionError(
+            f"tab {tab_id} never showed {needle!r} (shell slow to spawn/run?). Viewport:\n{dump}"
+        )
+
+
 def wait_shell_ready(
     roost,
     tab_id: int,
