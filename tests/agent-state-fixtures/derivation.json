@@ -1,0 +1,230 @@
+{
+  "group": "derivation",
+  "cases": [
+    {
+      "name": "unowned-shell-unknown-is-none",
+      "state": {
+        "shell": "unknown",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "expect": { "effective": "none", "is_live": false, "suppress_raw_osc": false }
+    },
+    {
+      "name": "unowned-shell-at-prompt-is-none",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "expect": { "effective": "none", "is_live": false, "suppress_raw_osc": false }
+    },
+    {
+      "name": "unowned-shell-foreground-is-running",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "expect": { "effective": "running", "is_live": false, "suppress_raw_osc": false }
+    },
+    {
+      "name": "unowned-working-lifecycle-is-ignored",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": null
+      },
+      "expect": { "effective": "none", "is_live": false, "suppress_raw_osc": false }
+    },
+    {
+      "name": "unowned-failed-lifecycle-is-ignored",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "failed",
+        "ownership": null
+      },
+      "expect": { "effective": "running", "is_live": false, "suppress_raw_osc": false }
+    },
+    {
+      "name": "live-owner-inactive-falls-through-to-prompt",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "startup",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "none", "is_live": true, "suppress_raw_osc": false }
+    },
+    {
+      "name": "live-owner-inactive-falls-through-to-foreground",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "inactive",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "running", "is_live": true, "suppress_raw_osc": false }
+    },
+    {
+      "name": "live-owner-working-is-running",
+      "state": {
+        "shell": "unknown",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": { "model": "claude-opus-5" }
+        }
+      },
+      "expect": { "effective": "running", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-working-outranks-at-prompt-shell",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "running", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-waiting-is-needs-input",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "waiting",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "permission_prompt",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "needs_input", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-waiting-outranks-foreground-shell",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "waiting",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "needs_input", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-finished-is-idle",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "idle", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-finished-outranks-foreground-shell",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "idle", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-failed-projects-to-needs-input",
+      "state": {
+        "shell": "unknown",
+        "lifecycle": "failed",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "api_error",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "needs_input", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "live-owner-failed-outranks-foreground-shell",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "failed",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "api_error",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "needs_input", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "manual-owner-with-empty-session-id-is-live",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "manual",
+          "session_id": "",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "running", "is_live": true, "suppress_raw_osc": true }
+    },
+    {
+      "name": "owner-with-empty-source-is-not-live",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "expect": { "effective": "running", "is_live": false, "suppress_raw_osc": false }
+    }
+  ]
+}

@@ -1,0 +1,155 @@
+{
+  "group": "shell_marks",
+  "cases": [
+    {
+      "name": "C-starts-a-foreground-process",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "body": "C",
+      "expect": {
+        "changed": true,
+        "shell": "foreground_process",
+        "lifecycle": "inactive",
+        "owner_retained": false
+      }
+    },
+    {
+      "name": "C-leaves-an-owning-agents-lifecycle-alone",
+      "state": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 100,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "body": "C",
+      "expect": {
+        "changed": true,
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "owner_retained": true
+      }
+    },
+    {
+      "name": "D-drops-lifecycle-but-keeps-the-owner-as-a-label",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 100,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "body": "D",
+      "expect": {
+        "changed": true,
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "owner_retained": true
+      }
+    },
+    {
+      "name": "D-with-exit-code-suffix-is-still-D",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 100,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "body": "D;127",
+      "expect": {
+        "changed": true,
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "owner_retained": true
+      }
+    },
+    {
+      "name": "A-rescues-a-tab-muted-by-a-killed-agent",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "waiting",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 100,
+          "detail": "permission_prompt",
+          "metadata": {}
+        }
+      },
+      "body": "A",
+      "expect": {
+        "changed": true,
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "owner_retained": true
+      }
+    },
+    {
+      "name": "B-behaves-as-a-prompt-mark",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "failed",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 100,
+          "detail": "rate_limit",
+          "metadata": {}
+        }
+      },
+      "body": "B",
+      "expect": {
+        "changed": true,
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "owner_retained": true
+      }
+    },
+    {
+      "name": "undefined-mark-is-no-change",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": null
+      },
+      "body": "Z",
+      "expect": {
+        "changed": false,
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "owner_retained": false
+      }
+    },
+    {
+      "name": "empty-mark-is-no-change",
+      "state": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": null
+      },
+      "body": "",
+      "expect": {
+        "changed": false,
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "owner_retained": false
+      }
+    }
+  ]
+}

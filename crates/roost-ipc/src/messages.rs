@@ -1010,6 +1010,11 @@ pub mod ops {
     pub const TAB_SET_STATE: &str = "tab.set_state";
     pub const TAB_CLEAR_NOTIFICATION: &str = "tab.clear_notification";
     pub const TAB_SET_HOOK_ACTIVE: &str = "tab.set_hook_active";
+    /// The single op every agent adapter writes through: ownership
+    /// claim/preserve/release + lifecycle + attention, applied under
+    /// session scoping. Params + state machine live in
+    /// [`crate::agent`].
+    pub const TAB_AGENT_REPORT: &str = "tab.agent_report";
     pub const NOTIFICATION_CREATE: &str = "notification.create";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     /// Raise + focus the running UI window. Sent by a second launch

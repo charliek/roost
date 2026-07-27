@@ -1,0 +1,754 @@
+{
+  "group": "transitions",
+  "cases": [
+    {
+      "name": "claim-from-unowned-tab",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "claim",
+        "lifecycle": "inactive",
+        "detail": "startup",
+        "metadata": {
+          "model": "claude-opus-5"
+        }
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "startup",
+            "metadata": {
+              "model": "claude-opus-5"
+            }
+          }
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "preserve-sets-working-and-clears-attention",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "startup",
+          "metadata": {
+            "model": "claude-opus-5"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "working",
+        "attention": "clear"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "clear"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "startup",
+            "metadata": {
+              "model": "claude-opus-5"
+            }
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "preserve-with-omitted-lifecycle-leaves-it-unchanged",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "waiting",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "permission_prompt",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "attention": "set",
+        "severity": "info",
+        "title": "Claude Code",
+        "body": "Authenticated"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "set",
+          "title": "Claude Code",
+          "body": "Authenticated",
+          "severity": "info"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "waiting",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "permission_prompt",
+            "metadata": {}
+          }
+        },
+        "effective": "needs_input"
+      }
+    },
+    {
+      "name": "report-with-mismatched-session-id-is-dropped",
+      "now": 1700001000,
+      "current": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s2",
+        "ownership_action": "preserve",
+        "lifecycle": "waiting",
+        "attention": "set",
+        "severity": "warn",
+        "title": "Claude Code",
+        "body": "Needs your permission"
+      },
+      "expect": {
+        "accepted": false,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "foreground_process",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700000000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "report-with-mismatched-source-is-dropped",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "codex",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "finished"
+      },
+      "expect": {
+        "accepted": false,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700000000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "preserve-against-an-unowned-tab-is-dropped",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": null
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "working"
+      },
+      "expect": {
+        "accepted": false,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": null
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "claim-supersedes-a-live-owner",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "waiting",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "permission_prompt",
+          "metadata": {
+            "model": "claude-opus-5"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "manual",
+        "session_id": "",
+        "ownership_action": "claim",
+        "lifecycle": "working"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "manual",
+            "session_id": "",
+            "last_event_at": 1700001000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "claim-with-omitted-lifecycle-keeps-it-across-supersede",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "waiting",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "permission_prompt",
+          "metadata": {
+            "model": "claude-opus-5"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "manual",
+        "session_id": "",
+        "ownership_action": "claim"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "waiting",
+          "ownership": {
+            "source": "manual",
+            "session_id": "",
+            "last_event_at": 1700001000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "needs_input"
+      }
+    },
+    {
+      "name": "release-clears-ownership-and-falls-through-to-shell",
+      "now": 1700001000,
+      "current": {
+        "shell": "foreground_process",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "release",
+        "lifecycle": "inactive",
+        "attention": "clear"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "clear"
+        },
+        "state": {
+          "shell": "foreground_process",
+          "lifecycle": "inactive",
+          "ownership": null
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "release-with-mismatched-session-id-is-rejected",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s2",
+        "ownership_action": "release",
+        "attention": "clear"
+      },
+      "expect": {
+        "accepted": false,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700000000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "release-from-a-different-source-with-the-same-session-id-is-rejected",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "codex",
+        "session_id": "s1",
+        "ownership_action": "release",
+        "attention": "clear"
+      },
+      "expect": {
+        "accepted": false,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700000000,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "attention-set-carries-title-body-and-severity",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "waiting",
+        "attention": "set",
+        "severity": "warn",
+        "title": "Claude Code",
+        "body": "Roost needs your permission",
+        "detail": "permission_prompt"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "set",
+          "title": "Claude Code",
+          "body": "Roost needs your permission",
+          "severity": "warn"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "waiting",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "permission_prompt",
+            "metadata": {}
+          }
+        },
+        "effective": "needs_input"
+      }
+    },
+    {
+      "name": "last-event-at-is-stamped-from-now",
+      "now": 1700009999,
+      "current": {
+        "shell": "unknown",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "unknown",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700009999,
+            "detail": "",
+            "metadata": {}
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "preserve-merges-metadata-and-keeps-prior-detail",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "startup",
+          "metadata": {
+            "model": "claude-opus-5"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "metadata": {
+          "session_crons": "1"
+        }
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "working",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "startup",
+            "metadata": {
+              "model": "claude-opus-5",
+              "session_crons": "1"
+            }
+          }
+        },
+        "effective": "running"
+      }
+    },
+    {
+      "name": "claim-replaces-detail-and-metadata-wholesale",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "finished",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "startup",
+          "metadata": {
+            "model": "claude-opus-5",
+            "session_crons": "1"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s2",
+        "ownership_action": "claim",
+        "lifecycle": "inactive",
+        "detail": "resume",
+        "metadata": {
+          "model": "claude-sonnet-5"
+        }
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": true,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s2",
+            "last_event_at": 1700001000,
+            "detail": "resume",
+            "metadata": {
+              "model": "claude-sonnet-5"
+            }
+          }
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "reclaim-by-the-same-identity-is-not-an-ownership-change",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "inactive",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "startup",
+          "metadata": {
+            "model": "claude-opus-5"
+          }
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "claim",
+        "lifecycle": "inactive",
+        "detail": "resume"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": false,
+        "attention": {
+          "kind": "unchanged"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "inactive",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "resume",
+            "metadata": {}
+          }
+        },
+        "effective": "none"
+      }
+    },
+    {
+      "name": "failed-lifecycle-projects-to-needs-input",
+      "now": 1700001000,
+      "current": {
+        "shell": "at_prompt",
+        "lifecycle": "working",
+        "ownership": {
+          "source": "claude",
+          "session_id": "s1",
+          "last_event_at": 1700000000,
+          "detail": "",
+          "metadata": {}
+        }
+      },
+      "report": {
+        "tab_id": "3",
+        "source": "claude",
+        "session_id": "s1",
+        "ownership_action": "preserve",
+        "lifecycle": "failed",
+        "attention": "set",
+        "severity": "error",
+        "title": "Claude Code",
+        "body": "API error: overloaded",
+        "detail": "api_error"
+      },
+      "expect": {
+        "accepted": true,
+        "ownership_changed": false,
+        "lifecycle_changed": true,
+        "attention": {
+          "kind": "set",
+          "title": "Claude Code",
+          "body": "API error: overloaded",
+          "severity": "error"
+        },
+        "state": {
+          "shell": "at_prompt",
+          "lifecycle": "failed",
+          "ownership": {
+            "source": "claude",
+            "session_id": "s1",
+            "last_event_at": 1700001000,
+            "detail": "api_error",
+            "metadata": {}
+          }
+        },
+        "effective": "needs_input"
+      }
+    }
+  ]
+}
