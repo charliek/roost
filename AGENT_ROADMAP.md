@@ -36,6 +36,12 @@ severity colors, per-agent identity, an agent overview, an agent
 switcher — is blocked on there being somewhere coherent to put the
 information.
 
+This was the state of the model before plan 002. L0 + L1 below (the
+four axes, the derivation, and the `roost-agent` adapter seam) have
+since shipped — see the [plan ledger](#plan-ledger) — so this section
+is retained as the motivating history, not the current model; the
+current one is documented in [`docs/reference/ipc.md`](docs/reference/ipc.md).
+
 ---
 
 ## The layers
@@ -51,7 +57,7 @@ Replace the single overloaded `state` with four independent axes:
 | **Shell state** | `unknown` / `at_prompt` / `foreground_process` | OSC 133 marks |
 | **Agent lifecycle** | `inactive` / `working` / `waiting` / `finished` / `failed` | Agent adapters |
 | **Attention** | pending flag + title/body + severity | Notifications |
-| **Ownership** | `{ source, session_id, last_event_at, detail }` | Agent adapters |
+| **Ownership** | `{ source, session_id, last_event_at, detail, metadata }` | Agent adapters |
 
 The displayed state is **derived** from these, never written directly.
 `tab.state` stays on the wire as a derived, read-only field so existing
@@ -63,7 +69,9 @@ A `roost-agent` crate owning per-agent event→op translation. The Claude
 adapter gets what it's missing today: `notification_type` awareness,
 `StopFailure` (field is `error` + `error_details`), `background_tasks` /
 `session_crons` so a session paused waiting on background work is not
-announced as finished, session-id scoping, and an `agent_id` filter as
+announced as finished, the `session_id` a report needs for the
+workspace's own scoping (the adapter stays pure — it carries the id,
+it doesn't enforce the match), and an `agent_id` filter as
 defense-in-depth for events that fire inside subagents. Adding a second
 agent becomes a new module plus a new `roostctl <agent> install` — zero
 Swift, zero GTK, zero parity risk.
@@ -112,8 +120,10 @@ lands).
 **AD-4 — Raw-OSC suppression is the one real suppression, so it gets the
 failsafe.** Suppressing OSC 9/99/777 while an agent session owns a tab is
 the only place stale ownership is actually harmful. That gate — and only
-that gate — additionally releases on an OSC 133 `D`/`A` mark. Everything
-else follows AD-3.
+that gate — additionally releases on an OSC 133 `A`/`B`/`D` mark (any
+mark meaning "at a prompt"), which also drops the agent lifecycle to
+`inactive` so derivation falls through to shell state, not just the
+raw-OSC gate. Everything else follows AD-3.
 
 **AD-5 — Optimize for working shells.** Roost targets users whose shell
 emits OSC 133 marks. `unknown` stays a distinct shell state precisely so
@@ -121,18 +131,28 @@ emits OSC 133 marks. `unknown` stays a distinct shell state precisely so
 `/bin/bash` 3.2) rather than the UI silently showing nothing forever. Do
 not design to the lowest common denominator; surface it instead.
 
-**AD-6 — Notification policy: suppress banner and unread when
-focused.** A notification for a tab that is active in an active window
-fires no banner and sets no unread badge. The sticky agent-state
-indicator is *not* focus-cleared, so the "I walked away" case is still
-covered by the tab's state dot. Severity may override this later
-(`failed` should interrupt regardless); the model must permit it even
-before the policy uses it.
+**AD-6 — Notification policy: suppress banner, unread badge, and the
+inbox row together when focused.** A notification for a tab that is
+active in an active window fires no banner, sets no unread badge, and
+adds no inbox row — the three are decided as one transaction at
+arrival, not filtered independently per surface. They're coupled on
+purpose: inbox membership derives from the same pending bit the badge
+does, so "keep the row but drop the badge" isn't expressible without a
+separate notification-history store, which is the durable-inbox
+non-goal below. The sticky agent-state indicator is the one exception —
+*not* focus-cleared, so the "I walked away" case is still covered by
+the tab's state dot. Severity may override the suppression later
+(`failed` should interrupt regardless); the model carries `severity`
+now even though v1's policy doesn't yet consult it.
 
 **AD-7 — One extensible report op, not many narrow setters.** Agents
-report through a single `tab.agent_report` carrying an additive struct.
-Adding a metadata field later touches the struct, not the op set, and
-costs no UI work in either implementation.
+report through a single `tab.agent_report`. Its fixed fields cover the
+axes (ownership action, lifecycle, attention, severity); an open
+`metadata` string map is the genuinely additive channel for anything a
+specific agent needs later, because the request struct's
+`deny_unknown_fields` means a new *named* field on the op is not
+actually backward-compatible — both server implementations would have
+to change, where a new `metadata` key costs neither.
 
 **AD-8 — `source` is an open string.** Not a closed enum. A third-party
 agent must not require a wire-schema change.
@@ -159,11 +179,11 @@ consolidation already has its equivalence proof written.
 Each row links a gauntlet plan. Plans live outside the repo per the
 gauntlet convention; the PR body carries the durable public record.
 
-| # | Scope | Plan | Status |
-|---|---|---|---|
-| 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Planned |
-| — | L2 `roostctl doctor` + diagnostics | *not yet written* | Next |
-| — | L3 agent UX (tint / overview / switcher) | *not yet written* | Future |
+| # | Scope | Plan | Status | PR |
+|---|---|---|---|---|
+| 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Shipped | (PR pending) |
+| — | L2 `roostctl doctor` + diagnostics | *not yet written* | Next | — |
+| — | L3 agent UX (tint / overview / switcher) | *not yet written* | Future | — |
 
 ---
 
@@ -202,9 +222,11 @@ hooks: `model` and `session_title` (`SessionStart`), `permission_mode`,
 `cwd`, in-flight `background_tasks`, and compaction state
 (`PreCompact` / `PostCompact` carry `trigger` and `compact_summary`).
 
-*Sequencing note:* the free-form `detail` field exists so these can be
-surfaced without new ops (AD-7). An open `metadata` map is the more
-honest long-term shape — see the plan's report-schema section.
+*Sequencing note:* the free-form `detail` field, plus the open
+`Ownership.metadata` map (both shipped with L0/L1 — see
+[`ipc.md`](docs/reference/ipc.md)), mean this data can already be
+surfaced without a new op (AD-7). What's missing for D2 is purely the
+UI: a surface to render it.
 
 ### D3 — Agent switcher palette frame
 
@@ -258,8 +280,11 @@ wake later". Surfacing that distinction — a tab that is finished vs one
 that will resume on its own — is a genuinely new signal no other
 terminal shows.
 
-*Needs:* the lifecycle mapping to consult those arrays (in scope for the
-L1 Claude adapter), and eventually a distinct visual treatment.
+*Needs:* the lifecycle mapping to consult those arrays — **shipped**
+with the L1 Claude adapter (`crates/roost-agent/src/claude.rs`'s
+`stop()`: non-empty `background_tasks` keeps the lifecycle `working`
+instead of `finished`; counts land in `metadata`). What's left for this
+candidate is purely a distinct visual treatment in the UI.
 
 ### Cross-cutting requirement
 

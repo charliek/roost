@@ -81,7 +81,10 @@ The socket path is the bundle profile's `socket_path` (see
     "position": "<int32>",
     "created_at": "<int64-unix-seconds>",
     "last_active": "<int64-unix-seconds>",
-    "hook_active": "<bool>"
+    "hook_active": "<bool>",
+    "shell_state": "<ShellState>",
+    "agent_lifecycle": "<AgentLifecycle>",
+    "ownership": "<Ownership, omitted when unowned>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -90,6 +93,13 @@ The socket path is the bundle profile's `socket_path` (see
     "position": "<int32>",
     "created_at": "<int64-unix-seconds>",
     "tabs": ["<Tab>"]
+  },
+  "Ownership": {
+    "source": "<string>",
+    "session_id": "<string>",
+    "last_event_at": "<int64-unix-seconds>",
+    "detail": "<string>",
+    "metadata": {"<string>": "<string>"}
   }
 }
 ```
@@ -97,6 +107,58 @@ The socket path is the bundle profile's `socket_path` (see
 `TabState` is a JSON string with values: `"none"`, `"running"`,
 `"needs_input"`, `"idle"`. The legacy `TAB_STATE_UNSPECIFIED` is not
 exposed — the server always picks a concrete state.
+
+`ShellState` is a JSON string with values: `"unknown"`, `"at_prompt"`,
+`"foreground_process"` — written only by OSC 133 shell marks.
+`AgentLifecycle` is a JSON string with values: `"inactive"`,
+`"working"`, `"waiting"`, `"finished"`, `"failed"` — written only by
+agent adapters through `tab.agent_report` (below). The two axes are
+independent: an agent can be `working` while the shell itself sits at
+a prompt (e.g. between tool calls). `Tab.ownership` is present only
+while some source has claimed the tab (omitted otherwise); it carries
+the `(source, session_id)` identity pair, `last_event_at` (the
+server's receipt time of the most recently accepted report — never
+caller-supplied), a free-form `detail`, and an open `metadata` string
+map for forward-compatible extension (see `tab.agent_report`).
+
+### `tab.state` / `hook_active` — derived, and the compatibility contract
+
+`Tab.state` and `Tab.hook_active` are **derived** fields, computed
+server-side from `shell_state` + `agent_lifecycle` + `ownership`, not
+independently settable:
+
+* `hook_active` = `ownership` is present with a non-empty `source`
+  ("is-live").
+* `state`: if ownership is live *and* `agent_lifecycle != "inactive"`,
+  the agent axis wins; otherwise the shell axis does.
+
+| Effective lifecycle | `state` |
+|---|---|
+| agent `inactive`, shell `unknown`/`at_prompt` | `none` |
+| agent `inactive`, shell `foreground_process` | `running` |
+| agent `working` | `running` |
+| agent `waiting` | `needs_input` |
+| agent `finished` | `idle` |
+| agent `failed` | `needs_input` |
+
+**`tab.state` stays a closed four-value enum — it does not gain a
+fifth `failed` value.** This is a pinned compatibility constraint, not
+an oversight: both Swift decoders (`IPCTabState`, `Workspace.TabState`)
+are closed `String` enums with no fallback case, so a fifth wire value
+throws a `DecodingError` on the Mac client, and the **Versioning**
+section below classifies a new enum value as a breaking protocol
+change. `agent_lifecycle: "failed"` therefore projects onto
+`state: "needs_input"` on the wire — the closest of the four legacy
+values ("this tab wants you"). The true failed state is only
+observable on `agent_lifecycle`, which any client that cares (the
+sidebar rollup, the per-tab dot color) reads directly instead of
+re-deriving it from `state`.
+
+`hook_active` is retained on the wire for the same reason: existing
+consumers (`roostctl`, `tools/roosttest/client.py`) read it as a plain
+bool and don't need to change. It is derived from `ownership`'s
+liveness, and `hook_active.changed` continues to fire on every
+ownership claim/release exactly as before.
 
 ## Operations
 
@@ -333,6 +395,17 @@ Request: `{"params": {"tab_id": "3", "title": "build"}}`. Response: `{}`.
 
 Request: `{"params": {"tab_id": "3", "state": "running"}}`. Response: `{}`.
 
+Internally this claims agent ownership as `source: "manual"` (an
+empty `session_id`) — the same `tab.agent_report` machinery any agent
+adapter uses — which is why setting state manually **supersedes** a
+live agent's ownership: a real agent's own reports are dropped until
+its next claim (its next session start). `state: "none"` additionally
+**releases** ownership rather than claiming an inactive one, so the
+tab falls through to shell-derived state — a tab with a live
+foreground process now reads `running` under `none`, not
+unconditionally `none`. See
+[`docs/guides/notifications.md`](../guides/notifications.md#manual-override-tab-set-state).
+
 ### `tab.clear_notification`
 
 Clears `Tab.has_notification` and emits the corresponding
@@ -340,13 +413,85 @@ Clears `Tab.has_notification` and emits the corresponding
 
 Request: `{"params": {"tab_id": "3"}}`. Response: `{}`.
 
-### `tab.set_hook_active`
+### `tab.set_hook_active` *(deprecated — use `tab.agent_report`)*
 
-Marks the tab as owned by a hook session (e.g. Claude Code). While
-hook-active, raw OSC 9/777 from the shell is suppressed — only the
-hook drives notifications.
+Kept working as an alias for backward compatibility; new integrations
+should call `tab.agent_report` directly. `active: true` claims
+ownership as `source: "legacy"` with an empty `session_id`
+(equivalent to `tab.agent_report` with `ownership_action: "claim"`
+and no lifecycle change); `active: false` releases it the same way a
+matching `release` would. `hook_active.changed` fires exactly as
+before.
 
 Request: `{"params": {"tab_id": "3", "active": true}}`. Response: `{}`.
+
+### `tab.agent_report`
+
+The one op every agent adapter writes through — Claude's
+`roostctl claude-hook` today, and any future agent. A report carries
+**explicit patch intent** rather than a full state so a stateless
+adapter never has to read current state to describe an event: which
+axis changes, and how, is spelled out field-by-field; anything
+omitted means "unchanged."
+
+Request:
+```json
+{"id": "9", "op": "tab.agent_report", "params": {
+  "tab_id": "5",
+  "source": "claude",
+  "session_id": "abc123",
+  "ownership_action": "preserve",
+  "lifecycle": "waiting",
+  "attention": "set",
+  "severity": "warn",
+  "title": "Claude Code",
+  "body": "Needs your permission to run a command",
+  "detail": "permission_prompt",
+  "metadata": {"model": "claude-opus-5"}
+}}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `tab_id` | string-int64 | required |
+| `source` | string | open string identifying the agent (`"claude"`, `"manual"`, `"legacy"`, a third-party agent's own name…); must be non-empty (`invalid-param` otherwise) |
+| `session_id` | string | opaque per-source session id; empty for sources with no session concept (`manual`, `legacy`). Ownership identity is the **pair** `(source, session_id)` — not `session_id` alone, since two agents could otherwise collide on an opaque id |
+| `ownership_action` | `"claim"` \| `"preserve"` \| `"release"` | **required, no default** — "take the tab" and "I already own it" have opposite failure modes, so there's no safe implicit choice |
+| `lifecycle` | `AgentLifecycle` | **optional; omitted means "leave the current lifecycle unchanged."** Present only on events that actually move it |
+| `attention` | `"set"` \| `"clear"` \| `"preserve"` | defaults to `"preserve"` |
+| `severity` | `"info"` \| `"warn"` \| `"error"` | defaults to `"info"`. Carried on the model now so a later policy revision can have `failed` interrupt regardless of focus; v1's notification policy does not yet consult it |
+| `title` / `body` | string | required when `attention == "set"` (`invalid-param` if missing), ignored otherwise |
+| `detail` | string | free-form reason for the report (`"permission_prompt"`, `"background_tasks:2"`, an error name…); recorded onto the ownership record when non-empty |
+| `metadata` | map<string, string> | **open extension channel.** The params struct carries `#[serde(deny_unknown_fields)]` per repo convention, so a new *named* field on this op would not actually be additive — both server implementations would need to change. `metadata` is the channel that genuinely is |
+
+`ownership_action` semantics, enforced under one lock so the check and
+the mutation can't race a concurrent report:
+
+* **`claim`** always takes ownership, replacing any existing owner
+  unconditionally — the only path that can take a tab from a live
+  owner (a `SessionStart`, or a manual override via `tab.set_state`).
+* **`preserve`** requires the report's `(source, session_id)` to match
+  the current owner; a mismatch is dropped (see `accepted` below).
+  `detail`/`metadata` **merge** onto the existing owner rather than
+  replacing it — an empty field means "this event says nothing about
+  it," not "clear it," because there is no delete channel in v1 and
+  metadata is expected to accumulate across a session (e.g. `model` at
+  `SessionStart`, a cron count at `Stop`).
+* **`release`** also requires a match; it clears ownership and forces
+  `lifecycle` to `"inactive"`.
+
+Response:
+```json
+{"id": "9", "ok": true, "result": {
+  "accepted": true,
+  "tab": {"...": "the full post-report <Tab>"}
+}}
+```
+
+`accepted` is `false` when the report lost the ownership-matching
+check above — `tab` is then the tab **unchanged**. The full `Tab` is
+always returned so an adapter never needs a follow-up `tab.list` to
+see what its own report did.
 
 ### `notification.create`
 
@@ -482,6 +627,14 @@ emitted.
 * `active.changed`    — `{"project_id": "<id>", "tab_id": "<id>"}` (either may be `"0"`).
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>"}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere.
+* `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
+  Fires whenever an accepted `tab.agent_report` or an OSC 133 shell
+  mark changes the agent record. `tab.state_changed` and
+  `hook_active.changed` still fire for their (derived) slices, so
+  existing subscribers keep working unmodified — this event carries
+  what those two projections lose: which lifecycle, whose session, and
+  the shell axis underneath. `state` is included pre-derived so a
+  subscriber never has to re-run the projection itself.
 
 ## Dropped vs. the legacy proto
 

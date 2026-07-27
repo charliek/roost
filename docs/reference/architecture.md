@@ -17,6 +17,8 @@ For the durable design rationale (why two languages, why in-process, why local U
 | IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |
 | IPC wire types | `mac/Sources/Roost/IPCMessages.swift` (Codable) | `crates/roost-ipc/src/messages.rs` (serde) |
 | OSC scanning | `mac/Sources/Roost/OscScanner.swift` per `TerminalView` | `roost-osc` crate per per-tab drain task |
+| Agent state model (shell/lifecycle/attention/ownership axes, `tab.state` derivation) | `mac/Sources/Roost/AgentState.swift` | `crates/roost-ipc/src/agent.rs` |
+| Agent adapters (Claude Code today) | `roostctl claude-hook` (binary from `crates/roost-cli`, links `crates/roost-agent`) — same binary on both platforms | (same) |
 | Single-instance | `mac/Sources/Roost/SingleInstance.swift` (flock via `@_silgen_name`) | `crates/roost-linux/src/single_instance.rs` (`fs2::FileExt::try_lock_exclusive`) |
 | Shell-integration CLI | `roostctl` (binary from `crates/roost-cli`) — same binary on both platforms | (same) |
 
@@ -27,6 +29,8 @@ The UIs are written separately and idiomatic to their platform; only the JSON IP
 ```text
 crates/
   roost-ipc/              # JSON wire format, framing, client, server, paths, target picker
+  roost-agent/            # Pure agent adapters (Claude Code today) — hook event JSON in,
+                          # tab.agent_report params out; no I/O, no socket, no clap
   roost-vt/               # libghostty-vt FFI wrapper (--features ffi)
   roost-osc/              # OSC scanner + state machine
   roost-cli/              # roostctl binary
