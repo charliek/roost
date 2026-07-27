@@ -144,11 +144,11 @@ def wait_spawned_output(roost, tab_id: int, needle: str, timeout: float = 12.0) 
     """
     try:
         roost.wait_text(tab_id, needle, timeout=timeout)
-    except Timeout:
+    except Timeout as exc:
         dump = roost._safe_dump_text(tab_id)
         raise AssertionError(
             f"tab {tab_id} never showed {needle!r} (shell slow to spawn/run?). Viewport:\n{dump}"
-        )
+        ) from exc
 
 
 def wait_shell_ready(
