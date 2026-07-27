@@ -15,7 +15,8 @@ name = "roostctl"
 path = "src/main.rs"
 
 [dependencies]
-roost-ipc = { path = "../roost-ipc" }
+roost-ipc   = { path = "../roost-ipc" }
+roost-agent = { path = "../roost-agent" }
 
 tokio   = { workspace = true }
 anyhow  = { workspace = true }

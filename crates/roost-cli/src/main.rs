@@ -40,6 +40,7 @@ use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 
+use roost_agent::claude::claude_event_to_reports;
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
@@ -48,7 +49,7 @@ use roost_ipc::messages::{
     ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
     ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams, TabDumpResult,
     TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams,
+    TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -169,9 +170,17 @@ enum Cmd {
     /// notification ops to the running UI, and ALWAYS exits 0 with
     /// `{}` on stdout — Claude treats nonzero as a failed hook.
     ClaudeHook {
-        /// Hook event name. Matches Claude Code's lifecycle:
-        /// `session-start`, `prompt-submit`, `notification`,
-        /// `stop`, `session-end`.
+        /// Hook event name. Accepts Claude Code's own `hook_event_name`
+        /// (`SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`,
+        /// `StopFailure`, `SessionEnd`) as well as the legacy CLI
+        /// spellings this binary wrote into `claude-settings.json`
+        /// before this event set existed (`session-start`,
+        /// `prompt-submit`, `notification`, `stop`, `session-end`) —
+        /// every already-installed settings file uses those. All but
+        /// `prompt-submit` normalize onto the canonical name
+        /// automatically; `prompt-submit` is translated explicitly
+        /// (see `resolve_hook_event`) because it shares no run of
+        /// characters with `UserPromptSubmit`.
         event: String,
     },
     /// Claude Code subcommands (install hook settings file).
@@ -236,7 +245,22 @@ enum TabCmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Set the tab's agent-lifecycle axis by claiming ownership as
+    /// `manual` (plan 002 §3.7). This **supersedes a live agent's
+    /// ownership** — if Claude (or another agent) currently owns the
+    /// tab, its subsequent hook events are dropped until its next
+    /// session start, because taking the wheel is what a manual
+    /// override means.
+    ///
+    /// `--state none` additionally **releases** ownership rather than
+    /// claiming an inactive one, so the tab falls through to
+    /// shell-derived state. This is a behavior change from before plan
+    /// 002: a tab with a live foreground process now shows `running`
+    /// under `none`, not `none` unconditionally.
     SetState {
+        /// `none` releases ownership (falls through to shell state —
+        /// see above); `running`/`needs_input`/`idle` claim ownership
+        /// with that lifecycle.
         #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
         state: String,
         #[arg(long, env = "ROOST_TAB_ID")]
@@ -951,10 +975,27 @@ async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult> {
     Ok(client.call(ops::TAB_LIST, serde_json::json!({})).await?)
 }
 
+/// `roostctl`'s legacy CLI spelling for `UserPromptSubmit`, and the only
+/// one of the five spellings `claude_install` used to write that
+/// doesn't reach `roost-agent`'s parser on its own: separator/case
+/// normalization gets `session-start` to `SessionStart` etc., but
+/// `prompt-submit` shares no run of characters with `UserPromptSubmit`,
+/// so `roost_agent::claude` deliberately pins it as unrecognized.
+/// Every settings file an already-run `claude install` wrote still
+/// spells it this way, so it's translated here rather than renamed.
+fn resolve_hook_event(event: &str) -> &str {
+    if event.eq_ignore_ascii_case("prompt-submit") {
+        "UserPromptSubmit"
+    } else {
+        event
+    }
+}
+
 /// Claude Code hook dispatch. Reads the JSON payload from stdin
-/// (Claude's contract), maps the event name to a sequence of ops
-/// against the running UI. Best-effort — failures don't surface to
-/// Claude (caller wraps in `let _ = ...` and always exits 0).
+/// (Claude's contract), maps the event to the reports
+/// `roost-agent`'s pure adapter derives, and sends each as a
+/// `tab.agent_report`. Best-effort — failures don't surface to Claude
+/// (caller wraps in `let _ = ...` and always exits 0).
 async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     let tab_id = std::env::var("ROOST_TAB_ID")
         .ok()
@@ -965,12 +1006,19 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     }
 
     // Drain stdin to a bounded buffer so Claude doesn't block on
-    // a closed reader, even though only `notification` uses the
-    // payload.
+    // a closed reader, even though only some events use the payload.
     let mut stdin_buf = Vec::with_capacity(4096);
     let _ = std::io::stdin().take(1 << 20).read_to_end(&mut stdin_buf);
-    let parsed: serde_json::Value =
+    let payload: serde_json::Value =
         serde_json::from_slice(&stdin_buf).unwrap_or(serde_json::Value::Null);
+
+    let reports = claude_event_to_reports(resolve_hook_event(event), &payload, tab_id);
+    if reports.is_empty() {
+        if std::env::var("ROOST_DEBUG").is_ok() {
+            eprintln!("roostctl claude-hook: no reports for event: {event}");
+        }
+        return Ok(());
+    }
 
     // `probe_alive=false` so the resolver returns the default Mac
     // path even when no UI is listening — the dial below will fail
@@ -985,114 +1033,10 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    match event {
-        "session-start" => {
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_HOOK_ACTIVE,
-                    TabSetHookActiveParams {
-                        tab_id,
-                        active: true,
-                    },
-                )
-                .await;
-        }
-        "prompt-submit" => {
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_CLEAR_NOTIFICATION,
-                    TabClearNotificationParams { tab_id },
-                )
-                .await;
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_STATE,
-                    TabSetStateParams {
-                        tab_id,
-                        state: TabState::Running,
-                    },
-                )
-                .await;
-        }
-        "notification" => {
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_STATE,
-                    TabSetStateParams {
-                        tab_id,
-                        state: TabState::NeedsInput,
-                    },
-                )
-                .await;
-            let body = parsed
-                .get("message")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("Claude needs input")
-                .to_string();
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::NOTIFICATION_CREATE,
-                    NotificationCreateParams {
-                        tab_id,
-                        title: "Claude Code".into(),
-                        body,
-                    },
-                )
-                .await;
-        }
-        "stop" => {
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_STATE,
-                    TabSetStateParams {
-                        tab_id,
-                        state: TabState::Idle,
-                    },
-                )
-                .await;
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::NOTIFICATION_CREATE,
-                    NotificationCreateParams {
-                        tab_id,
-                        title: "Claude Code".into(),
-                        body: "Turn complete".into(),
-                    },
-                )
-                .await;
-        }
-        "session-end" => {
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_HOOK_ACTIVE,
-                    TabSetHookActiveParams {
-                        tab_id,
-                        active: false,
-                    },
-                )
-                .await;
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_STATE,
-                    TabSetStateParams {
-                        tab_id,
-                        state: TabState::None,
-                    },
-                )
-                .await;
-            let _ = client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_CLEAR_NOTIFICATION,
-                    TabClearNotificationParams { tab_id },
-                )
-                .await;
-        }
-        other => {
-            if std::env::var("ROOST_DEBUG").is_ok() {
-                eprintln!("roostctl claude-hook: unknown event: {other}");
-            }
-        }
+    for report in reports {
+        let _ = client
+            .call::<_, serde_json::Value>(ops::TAB_AGENT_REPORT, report)
+            .await;
     }
     Ok(())
 }
@@ -1132,13 +1076,18 @@ fn claude_install(force: bool) -> Result<()> {
             }]
         }])
     };
+    // Canonical `hook_event_name` spellings, now that `claude-hook`
+    // accepts both (`resolve_hook_event` + `roost-agent`'s own
+    // normalization) — a freshly written settings file no longer needs
+    // the legacy kebab-case aliases an already-installed one carries.
     let doc = serde_json::json!({
         "hooks": {
-            "SessionStart":     hook_for("session-start"),
-            "UserPromptSubmit": hook_for("prompt-submit"),
-            "Notification":     hook_for("notification"),
-            "Stop":             hook_for("stop"),
-            "SessionEnd":       hook_for("session-end"),
+            "SessionStart":     hook_for("SessionStart"),
+            "UserPromptSubmit": hook_for("UserPromptSubmit"),
+            "Notification":     hook_for("Notification"),
+            "Stop":             hook_for("Stop"),
+            "StopFailure":      hook_for("StopFailure"),
+            "SessionEnd":       hook_for("SessionEnd"),
         }
     });
     let body = serde_json::to_string_pretty(&doc)? + "\n";
@@ -1403,5 +1352,50 @@ mod tests {
             BundleProfileKind::from(TargetArg::Gtk),
             BundleProfileKind::Gtk
         ));
+    }
+
+    #[test]
+    fn resolve_hook_event_aliases_only_prompt_submit() {
+        assert_eq!(resolve_hook_event("prompt-submit"), "UserPromptSubmit");
+        assert_eq!(resolve_hook_event("Prompt-Submit"), "UserPromptSubmit");
+        // Every other spelling — legacy or canonical — passes through
+        // unchanged; `roost-agent` normalizes separators/case on its own.
+        for event in [
+            "session-start",
+            "notification",
+            "stop",
+            "session-end",
+            "SessionStart",
+            "UserPromptSubmit",
+            "StopFailure",
+            "unknown-event",
+        ] {
+            assert_eq!(resolve_hook_event(event), event);
+        }
+    }
+
+    /// Every spelling the currently shipped `claude_install` writes into
+    /// `claude-settings.json` must still reach the same `roost-agent`
+    /// arm as Claude's own `hook_event_name` — otherwise an
+    /// already-installed settings file silently stops working the
+    /// moment this binary is rebuilt.
+    #[test]
+    fn legacy_claude_install_spellings_reach_the_same_arm_as_canonical() {
+        let payload = serde_json::json!({ "session_id": "s-1" });
+        for (legacy, canonical) in [
+            ("session-start", "SessionStart"),
+            ("prompt-submit", "UserPromptSubmit"),
+            ("notification", "Notification"),
+            ("stop", "Stop"),
+            ("session-end", "SessionEnd"),
+        ] {
+            let via_legacy = claude_event_to_reports(resolve_hook_event(legacy), &payload, 7);
+            let via_canonical = claude_event_to_reports(canonical, &payload, 7);
+            assert_eq!(via_legacy, via_canonical, "{legacy} vs {canonical}");
+            assert!(
+                !via_canonical.is_empty(),
+                "{canonical} should map to a report"
+            );
+        }
     }
 }
