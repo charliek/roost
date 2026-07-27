@@ -56,14 +56,36 @@ use serde_json::Value;
 /// Ownership `source` for every report this adapter emits.
 pub const SOURCE: &str = "claude";
 
+/// The canonical `hook_event_name` spellings Roost maps. The one
+/// vocabulary: `roostctl claude install` writes these names into
+/// `claude-settings.json`, and [`canonical_hook_event`] resolves every
+/// accepted spelling onto them.
+pub const CLAUDE_HOOK_EVENTS: [&str; 6] = [
+    EventKind::SessionStart.canonical(),
+    EventKind::UserPromptSubmit.canonical(),
+    EventKind::Notification.canonical(),
+    EventKind::Stop.canonical(),
+    EventKind::StopFailure.canonical(),
+    EventKind::SessionEnd.canonical(),
+];
+
 const TITLE: &str = "Claude Code";
+
+/// Resolve any accepted spelling of a hook event to its canonical
+/// `hook_event_name`, or `None` when it isn't one this adapter maps.
+///
+/// Accepts Claude's own spelling (`SessionStart`), CLI-style variants
+/// (`session-start`, `SESSION_END`), and the legacy `prompt-submit`
+/// alias every already-installed `claude-settings.json` still carries.
+pub fn canonical_hook_event(input: &str) -> Option<&'static str> {
+    EventKind::parse(input).map(EventKind::canonical)
+}
 
 /// Map one Claude Code hook event to the reports it implies.
 ///
-/// `event` accepts either the payload's own `hook_event_name`
-/// (`SessionStart`) or a CLI-style alias (`session-start`) — separators
-/// and case are normalized away, so `roostctl`'s subcommand spelling and
-/// Claude's wire spelling reach the same arm.
+/// `event` accepts every spelling [`canonical_hook_event`] does, so
+/// `roostctl`'s subcommand spelling and Claude's wire spelling reach the
+/// same arm.
 ///
 /// Returns an empty vector for an event this adapter has no mapping for,
 /// including a malformed payload. Nothing here fails: a hook that cannot
@@ -266,6 +288,11 @@ impl EventKind {
         for (name, kind) in [
             ("sessionstart", EventKind::SessionStart),
             ("userpromptsubmit", EventKind::UserPromptSubmit),
+            // `roostctl`'s own legacy spelling, which every settings file
+            // an already-run `claude install` wrote still uses. It shares
+            // no run of characters with `UserPromptSubmit`, so
+            // normalization alone can't reach it.
+            ("promptsubmit", EventKind::UserPromptSubmit),
             ("notification", EventKind::Notification),
             ("stopfailure", EventKind::StopFailure),
             ("stop", EventKind::Stop),
@@ -276,6 +303,17 @@ impl EventKind {
             }
         }
         None
+    }
+
+    const fn canonical(self) -> &'static str {
+        match self {
+            EventKind::SessionStart => "SessionStart",
+            EventKind::UserPromptSubmit => "UserPromptSubmit",
+            EventKind::Notification => "Notification",
+            EventKind::Stop => "Stop",
+            EventKind::StopFailure => "StopFailure",
+            EventKind::SessionEnd => "SessionEnd",
+        }
     }
 }
 

@@ -1,7 +1,9 @@
 //! One case per row of plan 002 §3.8, plus the malformed-input and
 //! open-vocabulary edges the mapping is required to survive.
 
-use roost_agent::claude::{claude_event_to_reports, SOURCE};
+use roost_agent::claude::{
+    canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS, SOURCE,
+};
 use roost_ipc::agent::{
     validate_report, AgentLifecycle, AttentionOp, OwnershipAction, Severity, TabAgentReportParams,
 };
@@ -427,11 +429,68 @@ fn a_null_agent_id_reads_as_absent() {
 // ---------------------------------------------------------------------
 
 #[test]
+fn every_canonical_event_round_trips_to_itself() {
+    for event in CLAUDE_HOOK_EVENTS {
+        assert_eq!(canonical_hook_event(event), Some(event), "{event}");
+    }
+}
+
+#[test]
+fn canonical_hook_event_resolves_case_and_separator_variants() {
+    for (spelling, canonical) in [
+        ("session-start", "SessionStart"),
+        ("SESSION_END", "SessionEnd"),
+        ("user_prompt_submit", "UserPromptSubmit"),
+        ("stop-failure", "StopFailure"),
+        ("STOP", "Stop"),
+        ("NoTiFiCaTiOn", "Notification"),
+    ] {
+        assert_eq!(
+            canonical_hook_event(spelling),
+            Some(canonical),
+            "{spelling}"
+        );
+    }
+}
+
+/// Every spelling an older `roostctl claude install` wrote into
+/// `claude-settings.json`. Those files are still on disk and still
+/// invoke `claude-hook` with these names.
+#[test]
+fn legacy_installed_spellings_resolve_to_their_canonical_name() {
+    for (legacy, canonical) in [
+        ("session-start", "SessionStart"),
+        ("prompt-submit", "UserPromptSubmit"),
+        ("notification", "Notification"),
+        ("stop", "Stop"),
+        ("session-end", "SessionEnd"),
+    ] {
+        assert_eq!(canonical_hook_event(legacy), Some(canonical), "{legacy}");
+    }
+}
+
+#[test]
+fn canonical_hook_event_rejects_unrecognized_input() {
+    for event in [
+        "",
+        "SubagentStop",
+        "PreToolUse",
+        "submit",
+        "Sto",
+        "Stopped",
+        "🙂",
+    ] {
+        assert_eq!(canonical_hook_event(event), None, "{event}");
+    }
+}
+
+#[test]
 fn cli_style_aliases_reach_the_same_arm() {
     let payload = json!({ "session_id": "s-1" });
     for (alias, canonical) in [
         ("session-start", "SessionStart"),
         ("user_prompt_submit", "UserPromptSubmit"),
+        ("prompt-submit", "UserPromptSubmit"),
         ("notification", "Notification"),
         ("STOP", "Stop"),
         ("stop-failure", "StopFailure"),
@@ -458,7 +517,6 @@ fn unknown_event_names_map_to_nothing() {
         "SubagentStart",
         "PreCompact",
         "PreToolUse",
-        "prompt-submit",
         "Sto",
         "Stopped",
         "🙂",
