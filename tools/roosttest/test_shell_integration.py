@@ -20,6 +20,7 @@ so `MARKER:<value>` materializes only when the command actually runs
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -31,6 +32,8 @@ from util import (
     wait_shell_ready,
     wait_tab_attached,
 )
+
+_TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 # Detect login state per shell: bash via `shopt -q login_shell`, zsh via
 # `[[ -o login ]]`. Anything else POSIX (dash, etc.) reports `skip` —
@@ -306,25 +309,56 @@ def test_osc133_drives_state(roost, project):
     roost.wait_state(tab, "none", timeout=5)
 
 
-def test_osc133_suppressed_when_hook_active(roost, project):
-    """While a Claude hook owns the tab (hookActive), shell OSC 133 is
-    suppressed — the hook's state wins; releasing it re-enables 133."""
+@pytest.mark.skipif(
+    not _TEST_MODE,
+    reason="feeding OSC 133 / OSC 9 needs ROOST_TEST_MODE=1 in the UI's launch env",
+)
+def test_osc133_records_shell_axis_under_an_agent_owner(roost, project):
+    """OSC 133 is no longer *suppressed* while an agent owns the tab —
+    the shell and agent axes are independent (plan 002 §3.1), so the mark
+    always lands on `shell_state` and derivation decides which axis the
+    tab presents.
+
+    This replaces the old `test_osc133_suppressed_when_hook_active`,
+    which pinned the pre-plan-002 behavior (`hook_active` gating the
+    mark). Four things must hold: the mark records the shell axis; the
+    agent's lifecycle still wins the derived `tab.state`; raw OSC 9 is
+    dropped while the agent drives the tab (it reports its own attention,
+    so a wrapper shell echoing OSC 9 double-notifies); and releasing
+    ownership hands the tab straight back to the shell axis that was
+    being tracked underneath all along.
+
+    A background tab (a second tab steals active) so the OSC 9 assertion
+    can't be satisfied by focus suppression instead of the agent gate.
+    """
     tab = roost.open_tab(project, cwd="/tmp",
                          argv=["/bin/bash", "--norc", "--noprofile"])
-    roost.set_hook_active(tab, True)
-    roost.set_state(tab, "idle")  # as the Claude hook would
-    roost.wait_state(tab, "idle", timeout=5)
-    # Shell emits C; with the hook active the dot must NOT flip to running.
-    roost.run(tab, r"""printf '\033]133;C\033\\'; echo HC1""")
-    roost.wait_text(tab, "HC1", timeout=8)
-    roost.run(tab, "echo HC2")  # second round-trip drains any queued OSC dispatch
-    roost.wait_text(tab, "HC2", timeout=8)
-    assert (roost.tab(tab) or {}).get("state") == "idle", (roost.tab(tab) or {}).get("state")
-    # Release the hook: shell OSC 133 drives state again.
-    roost.set_hook_active(tab, False)
-    roost.run(tab, r"""printf '\033]133;C\033\\'; echo HC3""")
-    roost.wait_text(tab, "HC3", timeout=8)
+    roost.open_tab(project, cwd="/tmp")  # steals active
+    wait_tab_attached(roost, tab)
+
+    roost.agent_report(tab, "claude", "claim", session_id="s1", lifecycle="waiting")
+    roost.wait_state(tab, "needs_input", timeout=5)
+
+    # The shell starts a foreground command…
+    roost.tab_feed_pty_bytes(tab, b"\x1b]133;C\x1b\\")
+    roost.wait_shell_state(tab, "foreground_process", timeout=5)
+    # …but the tab still presents the AGENT axis, not `running`.
+    assert roost.agent_lifecycle(tab) == "waiting", roost.tab(tab)
+    assert roost.tab(tab)["state"] == "needs_input", roost.tab(tab)
+
+    # Raw OSC 9 is dropped while the agent drives the tab. Ordering
+    # barrier: the OSC 0 title feed takes the same dispatch path, so once
+    # the title lands the OSC 9 has already been decided on.
+    roost.tab_feed_pty_bytes(tab, b"\x1b]9;from the wrapper shell\x07")
+    roost.tab_feed_pty_bytes(tab, b"\x1b]0;osc133-barrier\x07")
+    roost._wait(lambda: (roost.tab(tab) or {}).get("title") == "osc133-barrier",
+                timeout=5, what="OSC 0 barrier title")
+    assert roost.has_notification(tab) is False, "raw OSC 9 must be suppressed"
+
+    # Release: the shell axis recorded under the agent takes over.
+    roost.agent_report(tab, "claude", "release", session_id="s1")
     roost.wait_state(tab, "running", timeout=5)
+    assert roost.hook_active(tab) is False
 
 
 def test_bash_marks_emit_wired(roost, project):

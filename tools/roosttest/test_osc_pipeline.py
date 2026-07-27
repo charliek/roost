@@ -288,8 +288,15 @@ class TestOscPipeline:
     def test_osc9_notification_lands_on_tab(self, roost, project):
         """OSC 9 (iTerm2 notification, title-only) flips
         `tab.has_notification = true` via the workspace's
-        notification path — same surface a Claude Code hook drives."""
+        notification path — same surface a Claude Code hook drives.
+
+        The second tab steals active so the tab under test is a
+        background one: notification policy B (plan 002 §3.5) drops a
+        notification for the active tab of an active window, which would
+        otherwise make this test depend on whether the runner's window
+        happens to hold focus."""
         tab = roost.open_tab(project, cwd="/tmp")
+        roost.open_tab(project, cwd="/tmp")  # steals active
         wait_tab_attached(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]9;build complete\x07")
         deadline = time.monotonic() + scaled_timeout(5.0)

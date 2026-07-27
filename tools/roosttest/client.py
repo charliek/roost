@@ -126,7 +126,71 @@ class Roost:
         self.call("tab.set_state", {"tab_id": str(tab_id), "state": state})
 
     def set_hook_active(self, tab_id: int, active: bool) -> None:
+        """Deprecated alias for `tab.agent_report` (plan 002 §3.6):
+        `True` claims ownership as source `legacy`, `False` releases it.
+        Kept because installed hook scripts still call it."""
         self.call("tab.set_hook_active", {"tab_id": str(tab_id), "active": active})
+
+    def agent_report(
+        self,
+        tab_id: int,
+        source: str,
+        ownership_action: str,
+        *,
+        session_id: str = "",
+        lifecycle: str | None = None,
+        attention: str = "preserve",
+        severity: str = "info",
+        title: str = "",
+        body: str = "",
+        detail: str = "",
+        metadata: dict[str, str] | None = None,
+    ) -> dict:
+        """`tab.agent_report` — the one op every agent adapter writes
+        through. Returns `{accepted: bool, tab: {...}}`; `accepted` is
+        False when the report lost the `(source, session_id)` ownership
+        check. `ownership_action` is `claim|preserve|release`;
+        `attention` is `set|clear|preserve` (`set` requires title+body);
+        `lifecycle` omitted means "leave unchanged"."""
+        params: dict = {
+            "tab_id": str(tab_id),
+            "source": source,
+            "session_id": session_id,
+            "ownership_action": ownership_action,
+            "attention": attention,
+            "severity": severity,
+            "title": title,
+            "body": body,
+            "detail": detail,
+            "metadata": metadata or {},
+        }
+        if lifecycle is not None:
+            params["lifecycle"] = lifecycle
+        return self.call("tab.agent_report", params)
+
+    # -- agent axes (read back off `tab.list`) ----------------------------
+    # `state` / `hook_active` are derived projections; these are the
+    # independent axes they're derived from (plan 002 §3.1), so a test can
+    # tell "the agent says waiting" from "the shell has a foreground job".
+
+    def shell_state(self, tab_id: int) -> str:
+        """`unknown` | `at_prompt` | `foreground_process` (OSC 133)."""
+        return (self.tab(tab_id) or {}).get("shell_state", "")
+
+    def agent_lifecycle(self, tab_id: int) -> str:
+        """`inactive` | `working` | `waiting` | `finished` | `failed`."""
+        return (self.tab(tab_id) or {}).get("agent_lifecycle", "")
+
+    def ownership(self, tab_id: int) -> dict | None:
+        """`{source, session_id, last_event_at, detail, metadata}`, or
+        None when no agent owns the tab (the field is omitted then)."""
+        return (self.tab(tab_id) or {}).get("ownership")
+
+    def hook_active(self, tab_id: int) -> bool:
+        return bool((self.tab(tab_id) or {}).get("hook_active"))
+
+    def has_notification(self, tab_id: int) -> bool:
+        return bool((self.tab(tab_id) or {}).get("has_notification"))
 
     def set_title(self, tab_id: int, title: str) -> None:
         self.call("tab.set_title", {"tab_id": str(tab_id), "title": title})
@@ -398,6 +462,18 @@ class Roost:
     def wait_state(self, tab_id: int, state: str, timeout: float = 5.0) -> None:
         self._wait(lambda: (self.tab(tab_id) or {}).get("state") == state,
                    timeout, f"tab {tab_id} state == {state!r}")
+
+    def wait_lifecycle(self, tab_id: int, lifecycle: str, timeout: float = 5.0) -> None:
+        self._wait(lambda: self.agent_lifecycle(tab_id) == lifecycle,
+                   timeout, f"tab {tab_id} agent_lifecycle == {lifecycle!r}")
+
+    def wait_shell_state(self, tab_id: int, shell_state: str, timeout: float = 5.0) -> None:
+        self._wait(lambda: self.shell_state(tab_id) == shell_state,
+                   timeout, f"tab {tab_id} shell_state == {shell_state!r}")
+
+    def wait_notification(self, tab_id: int, pending: bool, timeout: float = 5.0) -> None:
+        self._wait(lambda: self.has_notification(tab_id) is pending,
+                   timeout, f"tab {tab_id} has_notification == {pending}")
 
     def wait_text(self, tab_id: int, needle: str, timeout: float = 5.0) -> None:
         self._wait(lambda: needle in self._safe_dump_text(tab_id),
