@@ -20,12 +20,38 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 
 from client import RoostError, Timeout, scaled_timeout
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def roostctl_path() -> str:
+    """Absolute path to a `roostctl` binary, building one if needed.
+
+    Checked in the order a developer's tree makes them available: an
+    explicit override, the cargo debug build (what CI's GTK job builds),
+    the binary embedded in the Mac bundle (what CI's Mac job builds),
+    then PATH. The cargo fallback mirrors `ui.launch`, which builds the
+    GTK UI the same way when it's missing."""
+    candidates = [
+        os.environ.get("ROOST_ROOSTCTL", ""),
+        str(REPO_ROOT / "target/debug/roostctl"),
+        str(REPO_ROOT / "mac/build/Roost.app/Contents/Resources/bin/roostctl"),
+        shutil.which("roostctl") or "",
+    ]
+    for path in candidates:
+        if path and os.access(path, os.X_OK):
+            return path
+    subprocess.run(["cargo", "build", "-p", "roost-cli"], cwd=REPO_ROOT, check=True)
+    return str(REPO_ROOT / "target/debug/roostctl")
 
 
 def is_fresh() -> bool:
