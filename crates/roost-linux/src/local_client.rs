@@ -14,10 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use roost_ipc::messages::{Project, Tab, TabState};
+use roost_ipc::messages::{Project, Tab};
 use tokio::sync::broadcast;
 
-use crate::daemon::{PtyOutputEvent, PtySupervisor, Workspace};
+use crate::daemon::{AttentionSource, PtyOutputEvent, PtySupervisor, Workspace};
 
 /// In-process workspace + PTY supervisor handle.
 #[derive(Clone)]
@@ -163,34 +163,29 @@ impl LocalClient {
                 // workspace's notification event. The actual
                 // libnotify call happens in the UI layer once it
                 // sees the WorkspaceEvent::NotificationFired event.
+                //
+                // `RawOsc` is dropped while a live agent session is
+                // mid-turn: the agent already reports its own attention
+                // through `tab.agent_report`, and a wrapper shell
+                // echoing OSC 9 on top of that double-notifies. The gate
+                // is read inside `raise_attention`'s lock — reading it
+                // here first would let a concurrent claim slip between
+                // the check and the commit.
                 let (title, body) = parse_notification_payload(command, payload);
-                let _ = self.workspace.set_tab_has_notification(tab_id, true);
-                let _ = self.workspace.fire_notification(tab_id, &title, &body);
+                let _ =
+                    self.workspace
+                        .raise_attention(tab_id, &title, &body, AttentionSource::RawOsc);
             }
             133 => {
-                // OSC 133 prompt/command mark → run state. Suppressed when
-                // a Claude hook owns the tab (set_tab_state_from_osc gates
-                // on hook_active).
-                if let Some(state) = command_mark_state(payload) {
-                    let _ = self.workspace.set_tab_state_from_osc(tab_id, state);
-                }
+                // OSC 133 prompt/command mark → the shell axis. Never
+                // gated: the shell and agent axes are independent, and
+                // derivation decides which one the tab shows.
+                let _ = self.workspace.apply_shell_mark(tab_id, payload);
             }
             _ => {
                 tracing::debug!(tab_id, command, "ignored OSC");
             }
         }
-    }
-}
-
-/// Map an OSC 133 mark body to a run state: `C` (command start) →
-/// `Running`; `A`/`B`/`D` (prompt / command end) → `None` (clear the dot);
-/// other bodies → `Option::None` (no change). Only the first char matters,
-/// so `D;<exit>` keeps the exit code we ignore.
-fn command_mark_state(body: &str) -> Option<TabState> {
-    match body.chars().next() {
-        Some('C') => Some(TabState::Running),
-        Some('A') | Some('B') | Some('D') => Some(TabState::None),
-        _ => None,
     }
 }
 
@@ -237,6 +232,100 @@ fn parse_notification_payload(command: u32, payload: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::agent::{AgentLifecycle, OwnershipAction, TabAgentReportParams};
+    use roost_ipc::messages::TabState;
+
+    /// A client over an empty in-memory workspace, plus one open tab.
+    /// No PTY is ever spawned — `apply_osc` only touches the workspace.
+    fn client_with_tab() -> (LocalClient, i64) {
+        let workspace = Arc::new(Workspace::new());
+        let pid = workspace.create_project("p", "").unwrap().id;
+        let tab_id = workspace.open_tab(pid, "/", "").unwrap().id;
+        // Unfocused: these tests are about the OSC gate, not about
+        // policy §3.5's focus suppression (covered in `daemon::state`).
+        workspace.set_window_focused(false);
+        let client = LocalClient::new(
+            workspace,
+            Arc::new(PtySupervisor::new()),
+            PathBuf::from("/tmp/roost-test.sock"),
+        );
+        (client, tab_id)
+    }
+
+    fn claim(tab_id: i64, lifecycle: AgentLifecycle) -> TabAgentReportParams {
+        TabAgentReportParams {
+            session_id: "s1".into(),
+            ..TabAgentReportParams::sessionless(
+                tab_id,
+                "claude",
+                OwnershipAction::Claim,
+                Some(lifecycle),
+            )
+        }
+    }
+
+    /// Plan §2.2(b)/§3.4: raw OSC 9 / 99 / 777 is dropped while a live
+    /// agent session is mid-turn, and works normally outside one. This
+    /// is the documented-but-missing behavior the plan restores.
+    #[test]
+    fn raw_osc_notifications_are_suppressed_under_a_live_agent() {
+        let (client, tab_id) = client_with_tab();
+
+        client.apply_osc(tab_id, 9, "Build done");
+        assert!(client.workspace.tab(tab_id).unwrap().has_notification);
+
+        let _ = client.workspace.set_tab_has_notification(tab_id, false);
+        client
+            .workspace
+            .agent_report(&claim(tab_id, AgentLifecycle::Working))
+            .unwrap();
+        for command in [9, 99, 777] {
+            client.apply_osc(tab_id, command, "notify;Wrapper;Noise");
+            assert!(
+                !client.workspace.tab(tab_id).unwrap().has_notification,
+                "OSC {command} should be suppressed mid-turn"
+            );
+        }
+
+        // The `D` failsafe re-opens the gate even though ownership
+        // survives as a label.
+        client.apply_osc(tab_id, 133, "D;0");
+        assert!(client.workspace.tab(tab_id).unwrap().hook_active);
+        client.apply_osc(tab_id, 9, "Build done");
+        assert!(client.workspace.tab(tab_id).unwrap().has_notification);
+    }
+
+    /// Only *raw* OSC is gated — an explicit `notification.create`
+    /// (which routes straight at the workspace, not through
+    /// `apply_osc`) is never suppressed.
+    #[test]
+    fn explicit_notifications_are_never_suppressed() {
+        let (client, tab_id) = client_with_tab();
+        client
+            .workspace
+            .agent_report(&claim(tab_id, AgentLifecycle::Working))
+            .unwrap();
+        assert!(client
+            .workspace
+            .raise_attention(tab_id, "Roost", "explicit", AttentionSource::Structured)
+            .unwrap());
+        assert!(client.workspace.tab(tab_id).unwrap().has_notification);
+    }
+
+    #[test]
+    fn osc133_writes_the_shell_axis_through_apply_osc() {
+        let (client, tab_id) = client_with_tab();
+        client.apply_osc(tab_id, 133, "C");
+        assert_eq!(
+            client.workspace.tab(tab_id).unwrap().state,
+            TabState::Running
+        );
+        client.apply_osc(tab_id, 133, "D;0");
+        assert_eq!(client.workspace.tab(tab_id).unwrap().state, TabState::None);
+        // Undefined mark bodies are no-change.
+        client.apply_osc(tab_id, 133, "Z");
+        assert_eq!(client.workspace.tab(tab_id).unwrap().state, TabState::None);
+    }
 
     #[test]
     fn osc7_strips_host_prefix() {
@@ -249,17 +338,6 @@ mod tests {
     #[test]
     fn osc7_handles_empty_host() {
         assert_eq!(parse_osc7_path("file:///tmp"), Some("/tmp".into()));
-    }
-
-    #[test]
-    fn command_mark_state_maps_marks() {
-        assert_eq!(command_mark_state("C"), Some(TabState::Running));
-        assert_eq!(command_mark_state("D"), Some(TabState::None));
-        assert_eq!(command_mark_state("D;0"), Some(TabState::None));
-        assert_eq!(command_mark_state("A"), Some(TabState::None));
-        assert_eq!(command_mark_state("B"), Some(TabState::None));
-        assert_eq!(command_mark_state(""), None);
-        assert_eq!(command_mark_state("Z"), None);
     }
 
     #[test]

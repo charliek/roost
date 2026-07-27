@@ -23,6 +23,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, TabView, WindowTitle};
+use roost_ipc::agent::{self, AgentLifecycle, AgentTabState};
 use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project, Tab};
 use tokio::runtime::Handle;
 
@@ -48,7 +49,7 @@ use crate::palette_ui::{
     PaletteBehavior, PaletteOutcome, PaletteOverlay, PaletteSnapshot, TOP_GAP,
 };
 use crate::provider;
-use crate::rollup::{project_rollup, RollupState, TabState};
+use crate::rollup::{project_rollup, rollup_css_class, ROLLUP_CLASSES};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
@@ -103,15 +104,14 @@ struct TabUi {
     /// `TabSession.liveCwd` field. Updated at attach time and on
     /// every `TabCwdChangedEvent` (OSC 7).
     cwd: RefCell<String>,
-    /// Latest agent state from `TabStateChangedEvent`. Drives the
-    /// per-tab indicator icon (M7) and feeds the project rollup CSS
-    /// stripe via `crate::rollup::project_rollup`.
-    state: RefCell<TabState>,
-    /// Whether the daemon-side Claude hook owns this tab's
-    /// notification surface. Toggled by `HookActiveChangedEvent`;
-    /// when true, the rollup aggregation suppresses this tab's
-    /// state so the hook's own UI surface isn't duplicated.
-    hook_active: RefCell<bool>,
+    /// The tab's three agent axes, tracked from `WorkspaceEvent::
+    /// AgentChanged`. Drives the per-tab indicator icon, the pill dot,
+    /// and the project rollup stripe — all of which read it through
+    /// `agent::effective_lifecycle`, so the three surfaces cannot
+    /// disagree. Supersedes the separate `state` + `hook_active` cache:
+    /// both are projections of this record (`Tab.state` /
+    /// `Tab.hook_active` on the wire).
+    agent: RefCell<AgentTabState>,
 }
 
 /// One Mac-style pill in the custom tab strip: `[status dot | label↔entry
@@ -330,6 +330,7 @@ const ICON_BELL_SYMBOLIC: &[u8] = include_bytes!("resources/icons/bell-symbolic.
 const ICON_RUNNING: &[u8] = include_bytes!("resources/icons/icon_running.svg");
 const ICON_NEEDS_INPUT: &[u8] = include_bytes!("resources/icons/icon_needs_input.svg");
 const ICON_IDLE: &[u8] = include_bytes!("resources/icons/icon_idle.svg");
+const ICON_FAILED: &[u8] = include_bytes!("resources/icons/icon_failed.svg");
 
 /// Wrap an embedded SVG in a `gio::BytesIcon` so it can drive a
 /// `gtk::Image` regardless of the user's icon-theme search path.
@@ -340,31 +341,33 @@ fn embedded_icon(bytes: &'static [u8]) -> gtk4::gio::BytesIcon {
     gtk4::gio::BytesIcon::new(&glib_bytes)
 }
 
-/// Apply the per-tab status indicator icon to `page`. `TabState::None`
-/// clears the indicator (`set_indicator_icon(None)`); the other
-/// three pick the matching SVG.
-fn apply_indicator_icon(page: &libadwaita::TabPage, state: TabState) {
-    let icon: Option<gtk4::gio::BytesIcon> = match state {
-        TabState::None => None,
-        TabState::Running => Some(embedded_icon(ICON_RUNNING)),
-        TabState::NeedsInput => Some(embedded_icon(ICON_NEEDS_INPUT)),
-        TabState::Idle => Some(embedded_icon(ICON_IDLE)),
+/// Apply the per-tab status indicator icon to `page`.
+/// `AgentLifecycle::Inactive` clears the indicator
+/// (`set_indicator_icon(None)`); the rest pick the matching SVG.
+fn apply_indicator_icon(page: &libadwaita::TabPage, lifecycle: AgentLifecycle) {
+    let icon: Option<gtk4::gio::BytesIcon> = match lifecycle {
+        AgentLifecycle::Inactive => None,
+        AgentLifecycle::Working => Some(embedded_icon(ICON_RUNNING)),
+        AgentLifecycle::Waiting => Some(embedded_icon(ICON_NEEDS_INPUT)),
+        AgentLifecycle::Finished => Some(embedded_icon(ICON_IDLE)),
+        AgentLifecycle::Failed => Some(embedded_icon(ICON_FAILED)),
     };
     page.set_indicator_icon(icon.as_ref().map(|i| i.upcast_ref::<gtk4::gio::Icon>()));
 }
 
 /// Mirror the per-tab agent state onto a pill's leading dot (the colours
-/// match the indicator SVGs + the rollup stripe). `None` leaves the dot
-/// transparent (it keeps its slot so pills don't reflow).
-fn apply_pill_dot(dot: &gtk4::Box, state: TabState) {
-    for c in ["running", "needs-input", "idle"] {
+/// match the indicator SVGs + the rollup stripe). `Inactive` leaves the
+/// dot transparent (it keeps its slot so pills don't reflow).
+fn apply_pill_dot(dot: &gtk4::Box, lifecycle: AgentLifecycle) {
+    for c in ["running", "needs-input", "idle", "failed"] {
         dot.remove_css_class(c);
     }
-    match state {
-        TabState::None => {}
-        TabState::Running => dot.add_css_class("running"),
-        TabState::NeedsInput => dot.add_css_class("needs-input"),
-        TabState::Idle => dot.add_css_class("idle"),
+    match lifecycle {
+        AgentLifecycle::Inactive => {}
+        AgentLifecycle::Working => dot.add_css_class("running"),
+        AgentLifecycle::Waiting => dot.add_css_class("needs-input"),
+        AgentLifecycle::Finished => dot.add_css_class("idle"),
+        AgentLifecycle::Failed => dot.add_css_class("failed"),
     }
 }
 
@@ -929,6 +932,19 @@ impl App {
             // in build_tab_pill now — they call begin_rename_tab / close_page
             // directly, so the old context_menu_tab_id-based app actions are
             // gone.)
+        }
+
+        // Feed window focus to the workspace: it is half of the
+        // notification-suppression predicate (plan 002 §3.5), and the
+        // core owns that decision so it can be made atomically with the
+        // state change instead of re-derived when the UI drains events.
+        // GTK main thread only — `notify::is-active` fires there.
+        if let Some(client) = app_struct.client.borrow().clone() {
+            let workspace = client.workspace.clone();
+            workspace.set_window_focused(app_struct.window.is_active());
+            app_struct.window.connect_is_active_notify(move |window| {
+                workspace.set_window_focused(window.is_active());
+            });
         }
 
         app_struct.window.present();
@@ -1807,7 +1823,10 @@ impl App {
         let pills = ui.pills.borrow();
         let tabs = ui.tabs.borrow();
         if let (Some(pill), Some(tab_ui)) = (pills.get(&tab_id), tabs.get(&tab_id)) {
-            apply_pill_dot(&pill.dot, *tab_ui.state.borrow());
+            apply_pill_dot(
+                &pill.dot,
+                agent::effective_lifecycle(&tab_ui.agent.borrow()),
+            );
             let active = ui
                 .tab_view
                 .selected_page()
@@ -2507,9 +2526,9 @@ impl App {
         // Carry the snapshot's accumulated metadata onto the attach so
         // a resync (or any non-fresh tab) reflects ground truth. Fresh
         // tabs from `tab.open` carry defaults, so this is a no-op there.
-        let tab_state = TabState::from_ipc(tab.state);
+        let tab_agent = tab.agent_state();
+        let tab_lifecycle_at_attach = agent::effective_lifecycle(&tab_agent);
         let tab_has_notification = tab.has_notification;
-        let tab_hook_active = tab.hook_active;
         let page_for_cleanup = page.clone();
         glib::spawn_future_local(async move {
             // Helper that clears the pending-attach marker AND tears
@@ -2601,12 +2620,10 @@ impl App {
                         page: page_for_future.clone(),
                         cwd: RefCell::new(tab_cwd),
                         // Seeded from the snapshot `Tab`: fresh tabs from
-                        // `tab.open` carry `None` / `false`; a resync
-                        // carries the accumulated state. Subsequent
-                        // `TabStateChanged` / `HookActiveChanged` events
-                        // keep these current.
-                        state: RefCell::new(tab_state),
-                        hook_active: RefCell::new(tab_hook_active),
+                        // `tab.open` carry defaults; a resync carries the
+                        // accumulated axes. Subsequent `AgentChanged`
+                        // events keep this current.
+                        agent: RefCell::new(tab_agent),
                     },
                 );
             }
@@ -2614,7 +2631,7 @@ impl App {
             // Reflect the snapshot's indicator / attention state on the
             // freshly-attached page (no-op for fresh tabs), then refresh
             // the rollup so a restored notification/state shows up.
-            apply_indicator_icon(&page_for_future, tab_state);
+            apply_indicator_icon(&page_for_future, tab_lifecycle_at_attach);
             page_for_future.set_needs_attention(tab_has_notification);
             app_for_attach.refresh_rollup_for(project_id);
             app_for_attach.refresh_pill_indicators(project_id, tab_id);
@@ -2738,6 +2755,15 @@ impl App {
                         }
                         TabOutput::Exit { status, reason } => {
                             tracing::info!(tab_id, status, %reason, "PTY exited");
+                            // The shell that hosted any agent is gone, so
+                            // its ownership goes with it. Redundant on the
+                            // ordinary path (the close below drops the row
+                            // outright) but correct the moment a PTY is
+                            // replaced without closing the tab — #170's
+                            // hard-restart.
+                            if let Some(client) = app_for_exit.client.borrow().clone() {
+                                let _ = client.workspace.pty_replaced(tab_id);
+                            }
                             // M9.5: close the page directly from the
                             // drain task on PTY exit — a unified close
                             // path through the close-page signal handler
@@ -2915,6 +2941,11 @@ impl App {
                 tab_id,
                 has_pending,
             } => {
+                // Verbatim: policy B (plan 002 §3.5) is decided in the
+                // workspace, atomically with the state change. If this
+                // event exists, it was not suppressed — re-deriving the
+                // predicate here would evaluate it against a selection
+                // the user may have changed since the commit.
                 let projects = self.projects.borrow();
                 for ui in projects.values() {
                     if let Some(tab_ui) = ui.tabs.borrow().get(&tab_id) {
@@ -2964,16 +2995,26 @@ impl App {
                 }
                 self.fire_desktop_notification(tab_id, &title, &body);
             }
-            WorkspaceEvent::TabStateChanged { tab_id, state } => {
-                let state = TabState::from_ipc(state);
+            WorkspaceEvent::TabStateChanged { .. } | WorkspaceEvent::HookActiveChanged { .. } => {
+                // Derived slices of `AgentChanged`, emitted alongside it
+                // for the not-yet-implemented `events.subscribe` stream.
+                // The UI reads the superset: reacting here too would
+                // apply the same change twice, and `TabStateChanged`'s
+                // closed four-value enum can't express `failed`.
+            }
+            WorkspaceEvent::AgentChanged {
+                tab_id,
+                agent: axes,
+            } => {
+                let lifecycle = agent::effective_lifecycle(&axes);
                 let mut affected_project: Option<i64> = None;
                 {
                     let projects = self.projects.borrow();
                     for (project_id, ui) in projects.iter() {
                         let tabs = ui.tabs.borrow();
                         if let Some(tab_ui) = tabs.get(&tab_id) {
-                            *tab_ui.state.borrow_mut() = state;
-                            apply_indicator_icon(&tab_ui.page, state);
+                            *tab_ui.agent.borrow_mut() = axes.clone();
+                            apply_indicator_icon(&tab_ui.page, lifecycle);
                             self.refresh_pill_indicators(*project_id, tab_id);
                             affected_project = Some(*project_id);
                             break;
@@ -2983,25 +3024,7 @@ impl App {
                 if let Some(project_id) = affected_project {
                     self.refresh_rollup_for(project_id);
                 }
-                tracing::debug!(tab_id, ?state, "tab.state_changed applied");
-            }
-            WorkspaceEvent::HookActiveChanged { tab_id, active } => {
-                let mut affected_project: Option<i64> = None;
-                {
-                    let projects = self.projects.borrow();
-                    for (project_id, ui) in projects.iter() {
-                        let tabs = ui.tabs.borrow();
-                        if let Some(tab_ui) = tabs.get(&tab_id) {
-                            *tab_ui.hook_active.borrow_mut() = active;
-                            affected_project = Some(*project_id);
-                            break;
-                        }
-                    }
-                }
-                if let Some(project_id) = affected_project {
-                    self.refresh_rollup_for(project_id);
-                }
-                tracing::debug!(tab_id, hook_active = active, "hook_active.changed applied");
+                tracing::debug!(tab_id, ?lifecycle, "agent_report.changed applied");
             }
             WorkspaceEvent::ActiveChanged { project_id, tab_id } => {
                 if project_id != 0 {
@@ -3173,12 +3196,11 @@ impl App {
                     if let Some(pill) = ui.pills.borrow().get(&tab.id) {
                         pill.label.set_label(&label);
                     }
-                    let state = TabState::from_ipc(tab.state);
-                    *tab_ui.state.borrow_mut() = state;
-                    apply_indicator_icon(&tab_ui.page, state);
+                    let axes = tab.agent_state();
+                    apply_indicator_icon(&tab_ui.page, agent::effective_lifecycle(&axes));
+                    *tab_ui.agent.borrow_mut() = axes;
                     *tab_ui.cwd.borrow_mut() = tab.cwd.clone();
                     tab_ui.page.set_needs_attention(tab.has_notification);
-                    *tab_ui.hook_active.borrow_mut() = tab.hook_active;
                     self.refresh_pill_indicators(project.id, tab.id);
                     affected.insert(project.id);
                 }
@@ -3235,17 +3257,16 @@ impl App {
     }
 
     /// Recompute the sidebar rollup CSS stripe for `project_id` from
-    /// its tabs' current `(state, hook_active)`. Drops every
-    /// `roost-rollup-*` class on the row first, then applies the
-    /// active one (or none, if the rollup is `RollupState::None`).
-    /// Called whenever a `TabStateChangedEvent` or
-    /// `HookActiveChangedEvent` arrives for one of the project's tabs.
+    /// its tabs' current agent records. Drops every `roost-rollup-*`
+    /// class on the row first, then applies the active one (or none, if
+    /// the rollup is `Inactive`). Called whenever an `AgentChanged`
+    /// event arrives for one of the project's tabs.
     fn refresh_rollup_for(self: &Rc<Self>, project_id: i64) {
         // Same try_borrow pattern as `active_tab_cwd`: this can be
-        // invoked from a TabState / HookActive handler that already
-        // sits inside a synchronously-fired AdwTabView signal, so a
-        // bare `borrow()` can panic. Skipping the refresh in that
-        // case is safe — the next state change will recompute.
+        // invoked from an AgentChanged handler that already sits inside
+        // a synchronously-fired AdwTabView signal, so a bare `borrow()`
+        // can panic. Skipping the refresh in that case is safe — the
+        // next state change will recompute.
         let projects = self.projects.borrow();
         let Some(ui) = projects.get(&project_id) else {
             return;
@@ -3253,15 +3274,14 @@ impl App {
         let Ok(tabs) = ui.tabs.try_borrow() else {
             return;
         };
-        let pairs: Vec<(TabState, bool)> = tabs
-            .values()
-            .map(|t| (*t.state.borrow(), *t.hook_active.borrow()))
-            .collect();
-        let rollup = project_rollup(&pairs);
-        for cls in RollupState::all_classes() {
+        let rollup = project_rollup(
+            tabs.values()
+                .map(|t| agent::effective_lifecycle(&t.agent.borrow())),
+        );
+        for cls in ROLLUP_CLASSES {
             ui.sidebar_row.remove_css_class(cls);
         }
-        if let Some(cls) = rollup.css_class() {
+        if let Some(cls) = rollup_css_class(rollup) {
             ui.sidebar_row.add_css_class(cls);
         }
     }

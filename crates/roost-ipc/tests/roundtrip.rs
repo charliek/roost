@@ -93,6 +93,9 @@ fn event_envelope_round_trip() {
                 created_at: 1_700_000_000,
                 last_active: 1_700_000_000,
                 hook_active: false,
+                shell_state: Default::default(),
+                agent_lifecycle: Default::default(),
+                ownership: None,
             },
         })
         .unwrap(),

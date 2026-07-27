@@ -1,0 +1,19 @@
+{
+  "id": "9",
+  "op": "tab.agent_report",
+  "params": {
+    "tab_id": "5",
+    "source": "claude",
+    "session_id": "abc123",
+    "ownership_action": "preserve",
+    "lifecycle": "waiting",
+    "attention": "set",
+    "severity": "warn",
+    "title": "Claude Code",
+    "body": "Needs your permission to run a command",
+    "detail": "permission_prompt",
+    "metadata": {
+      "model": "claude-opus-5"
+    }
+  }
+}

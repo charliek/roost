@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn osc133_bare_no_body() {
         // Malformed (no kind letter) -> empty mark; harmless, the consumer
-        // (command_mark_state) maps "" to no state change.
+        // (agent::apply_shell_mark) maps "" to no state change.
         assert_eq!(
             feed_all(b"\x1b]133\x07"),
             vec![OscEvent::CommandMark(String::new())]

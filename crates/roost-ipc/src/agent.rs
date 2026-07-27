@@ -158,6 +158,36 @@ pub struct TabAgentReportParams {
     pub metadata: BTreeMap<String, String>,
 }
 
+impl TabAgentReportParams {
+    /// A report from a source with no session concept — the legacy
+    /// `tab.set_state` / `tab.set_hook_active` adapters, and any caller
+    /// that only needs the ownership + lifecycle axes.
+    ///
+    /// `ownership_action` stays a required argument: it deliberately has
+    /// no `Default` (see [`OwnershipAction`]), so there is no
+    /// `..Default::default()` form of this that isn't a guess.
+    pub fn sessionless(
+        tab_id: i64,
+        source: impl Into<String>,
+        ownership_action: OwnershipAction,
+        lifecycle: Option<AgentLifecycle>,
+    ) -> Self {
+        Self {
+            tab_id,
+            source: source.into(),
+            session_id: String::new(),
+            ownership_action,
+            lifecycle,
+            attention: AttentionOp::Preserve,
+            severity: Severity::Info,
+            title: String::new(),
+            body: String::new(),
+            detail: String::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
 /// Why a report is malformed. Returned by [`validate_report`] so the op
 /// dispatcher can reject with `invalid-param` before mutating anything.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -202,7 +232,34 @@ pub fn is_live(state: &AgentTabState) -> bool {
     matches!(&state.ownership, Some(o) if !o.source.is_empty())
 }
 
-/// Project the axes onto the legacy `tab.state` field (plan §3.2).
+/// Whether the agent axis wins derivation: a live owner that is doing
+/// something. The single expression of plan §3.2's precedence rule —
+/// [`effective_lifecycle`] and [`suppress_raw_osc`] are both this
+/// predicate, so a dead agent can never keep driving one of them while
+/// having released the other.
+fn agent_drives(state: &AgentTabState) -> bool {
+    is_live(state) && state.lifecycle != AgentLifecycle::Inactive
+}
+
+/// The lifecycle a tab actually presents (plan §3.2): the agent's own
+/// when it drives, otherwise the shell axis lifted onto the same enum.
+///
+/// This — not [`effective`] — is what the UIs render, because it keeps
+/// `Failed` distinct from `Waiting`; `effective` collapses the two for
+/// the legacy wire field. Both UIs rank, colour, and icon off this, so
+/// the sidebar stripe cannot disagree with the tab's own dot.
+pub fn effective_lifecycle(state: &AgentTabState) -> AgentLifecycle {
+    if agent_drives(state) {
+        return state.lifecycle;
+    }
+    match state.shell {
+        ShellState::ForegroundProcess => AgentLifecycle::Working,
+        ShellState::Unknown | ShellState::AtPrompt => AgentLifecycle::Inactive,
+    }
+}
+
+/// Project the axes onto the legacy `tab.state` field (plan §3.2) — the
+/// lossy half of [`effective_lifecycle`].
 ///
 /// `AgentLifecycle::Failed` maps to [`TabState::NeedsInput`] on
 /// purpose. `TabState` stays a **closed four-value enum** — the Swift
@@ -212,23 +269,11 @@ pub fn is_live(state: &AgentTabState) -> bool {
 /// failure is observable on the agent lifecycle axis instead. Do not
 /// "fix" this by adding a `Failed` variant to `TabState`.
 pub fn effective(state: &AgentTabState) -> TabState {
-    let agent_derived = match state.lifecycle {
-        AgentLifecycle::Inactive => None,
-        AgentLifecycle::Working => Some(TabState::Running),
-        AgentLifecycle::Waiting => Some(TabState::NeedsInput),
-        AgentLifecycle::Finished => Some(TabState::Idle),
-        AgentLifecycle::Failed => Some(TabState::NeedsInput),
-    };
-    match agent_derived {
-        Some(derived) if is_live(state) => derived,
-        _ => shell_derived(state.shell),
-    }
-}
-
-fn shell_derived(shell: ShellState) -> TabState {
-    match shell {
-        ShellState::ForegroundProcess => TabState::Running,
-        ShellState::Unknown | ShellState::AtPrompt => TabState::None,
+    match effective_lifecycle(state) {
+        AgentLifecycle::Inactive => TabState::None,
+        AgentLifecycle::Working => TabState::Running,
+        AgentLifecycle::Waiting | AgentLifecycle::Failed => TabState::NeedsInput,
+        AgentLifecycle::Finished => TabState::Idle,
     }
 }
 
@@ -252,7 +297,7 @@ pub fn rank(lifecycle: AgentLifecycle) -> u8 {
 /// an agent is actively driving the tab (plan §3.4). Explicit
 /// `notification.create` is never suppressed — only raw OSC.
 pub fn suppress_raw_osc(state: &AgentTabState) -> bool {
-    is_live(state) && state.lifecycle != AgentLifecycle::Inactive
+    agent_drives(state)
 }
 
 /// Apply an OSC 133 shell mark. Returns `None` for a body the spec
@@ -439,17 +484,8 @@ mod tests {
 
     fn report(source: &str, session: &str, action: OwnershipAction) -> TabAgentReportParams {
         TabAgentReportParams {
-            tab_id: 3,
-            source: source.into(),
             session_id: session.into(),
-            ownership_action: action,
-            lifecycle: None,
-            attention: AttentionOp::Preserve,
-            severity: Severity::Info,
-            title: String::new(),
-            body: String::new(),
-            detail: String::new(),
-            metadata: BTreeMap::new(),
+            ..TabAgentReportParams::sessionless(3, source, action, None)
         }
     }
 

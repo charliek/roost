@@ -131,6 +131,44 @@ fn request_vectors_have_required_envelope_shape() {
     }
 }
 
+/// `tab.agent_report` is the one op whose params carry a state machine
+/// rather than a flat payload, so its vector is also checked against the
+/// typed struct: a vector that only round-trips as a `Value` could still
+/// be missing `ownership_action` or spell `lifecycle` wrong and nothing
+/// would notice until an adapter shipped. The rest of the corpus stays
+/// deliberately schema-agnostic (see the module docs).
+#[test]
+fn agent_report_vector_decodes_into_its_typed_params() {
+    use roost_ipc::agent::{AgentLifecycle, AttentionOp, OwnershipAction, TabAgentReportParams};
+    use roost_ipc::messages::{ops, RawRequest, TabAgentReportResult};
+
+    let mut path = vectors_dir();
+    path.push("tab.agent_report.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::TAB_AGENT_REPORT);
+    let params: TabAgentReportParams =
+        serde_json::from_value(req.params).expect("decode agent_report params");
+    assert_eq!(params.ownership_action, OwnershipAction::Preserve);
+    assert_eq!(params.lifecycle, Some(AgentLifecycle::Waiting));
+    assert_eq!(params.attention, AttentionOp::Set);
+    assert!(roost_ipc::agent::validate_report(&params).is_ok());
+
+    let mut path = vectors_dir();
+    path.push("tab.agent_report.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let result: TabAgentReportResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode result");
+    assert!(result.accepted);
+    // The wire `state` / `hook_active` must be what the axes derive to,
+    // or the vector documents a state the server cannot produce.
+    let agent = result.tab.agent_state();
+    assert_eq!(result.tab.state, roost_ipc::agent::effective(&agent));
+    assert_eq!(result.tab.hook_active, roost_ipc::agent::is_live(&agent));
+}
+
 #[test]
 fn event_vectors_have_required_envelope_shape() {
     let dir = vectors_dir();
