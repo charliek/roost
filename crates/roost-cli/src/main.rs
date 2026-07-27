@@ -1405,12 +1405,6 @@ mod tests {
         }
     }
 
-    /// Every spelling the currently shipped `claude_install` writes into
-    /// `claude-settings.json` must still reach the same `roost-agent`
-    /// arm as Claude's own `hook_event_name` — otherwise an
-    /// already-installed settings file silently stops working the
-    /// moment this binary is rebuilt.
-    #[test]
     #[test]
     fn a_payloadless_hook_invocation_still_claims_and_releases() {
         // `docs/development/claude-testing.md` drives the hook by hand
@@ -1451,6 +1445,11 @@ mod tests {
         );
     }
 
+    /// Every spelling the currently shipped `claude_install` writes into
+    /// `claude-settings.json` must still reach the same `roost-agent`
+    /// arm as Claude's own `hook_event_name` — otherwise an
+    /// already-installed settings file silently stops working the
+    /// moment this binary is rebuilt.
     #[test]
     fn legacy_claude_install_spellings_reach_the_same_arm_as_canonical() {
         let payload = serde_json::json!({ "session_id": "s-1" });
