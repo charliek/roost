@@ -3,6 +3,10 @@
 Rust workspace for the Roost UIs and supporting crates:
 
 - `roost-ipc` — JSON IPC wire format + client/server (shared by both UIs and the CLI).
+- `roost-agent` — pure agent adapters (Claude Code today): hook event JSON in,
+  `tab.agent_report` params out. No I/O, no socket, no clap — the policy is
+  unit-testable without a running Roost, and session scoping stays in the
+  workspace where the current owner is actually known.
 - `roost-cli` — shell-integration CLI; binary is `roostctl`.
 - `roost-linux` — gtk4-rs + libadwaita Linux UI; embeds the workspace + PTY supervisor in-process.
 - `roost-vt` / `roost-osc` — libghostty-vt FFI wrapper + OSC scanner.
