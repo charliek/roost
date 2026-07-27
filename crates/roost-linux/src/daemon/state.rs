@@ -26,6 +26,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use roost_ipc::agent::{
+    self, AgentLifecycle, AgentTabState, AttentionEffect, OwnershipAction, TabAgentReportParams,
+};
 use roost_ipc::messages::{Project, Tab, TabState};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -52,16 +55,21 @@ struct TabRow {
     project_id: i64,
     title: String,
     cwd: String,
-    state: TabState,
+    /// The three agent axes. `Tab.state` and `Tab.hook_active` are
+    /// derived from this on the way out (`wire_tab`), never stored
+    /// beside it.
+    ///
+    /// **Not persisted.** `TabSnapshot` stays `{title, cwd, position,
+    /// user_titled}`; run state has never been in `state.json` and this
+    /// plan does not put it there (plan 002 §2.6).
+    agent: AgentTabState,
     has_notification: bool,
     user_titled: bool,
     position: i32,
     created_at: i64,
     last_active: i64,
-    hook_active: bool,
 }
 
-#[derive(Default)]
 struct Inner {
     projects: BTreeMap<i64, ProjectRow>,
     tabs: BTreeMap<i64, TabRow>,
@@ -72,10 +80,35 @@ struct Inner {
     /// `set_sidebar_collapsed`; persisted so a relaunch restores it
     /// (GTK parity with the Mac UI's `RoostSidebarVisible`).
     sidebar_collapsed: bool,
+    /// Whether the UI window currently has focus. Half of the
+    /// notification-suppression predicate (plan §3.5); reported by the
+    /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
+    /// is a property of the running session, not of the layout.
+    window_focused: bool,
     /// Monotonic commit counter, bumped each time a persistable
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
     persist_seq: u64,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            projects: BTreeMap::new(),
+            tabs: BTreeMap::new(),
+            next_id: 0,
+            active_project_id: 0,
+            active_tab_id: 0,
+            sidebar_collapsed: false,
+            // Focused until a UI says otherwise: a headless or IPC-only
+            // workspace never reports focus, and the alternative default
+            // would leave the active tab permanently "unseen" — silently
+            // routing every notification the opposite way from what a
+            // real window would.
+            window_focused: true,
+            persist_seq: 0,
+        }
+    }
 }
 
 /// A persisted project's tab layout, surfaced to the UI bootstrap.
@@ -148,6 +181,12 @@ pub enum WorkspaceEvent {
     HookActiveChanged {
         tab_id: i64,
         active: bool,
+    },
+    /// The full agent record after an accepted report or shell mark;
+    /// see [`roost_ipc::messages::AgentReportChangedEvent`].
+    AgentChanged {
+        tab_id: i64,
+        agent: AgentTabState,
     },
     NotificationFired {
         tab_id: i64,
@@ -345,6 +384,17 @@ impl Workspace {
         }
         inner.sidebar_collapsed = collapsed;
         self.commit(inner, Vec::new(), Persist::Write);
+    }
+
+    /// Report the UI window's focus state. Half of the notification
+    /// suppression predicate (plan §3.5); the other half — which tab is
+    /// active — the workspace already owns, so [`raise_attention`] can
+    /// decide suppression atomically instead of the UI re-deriving it
+    /// after the fact.
+    ///
+    /// [`raise_attention`]: Workspace::raise_attention
+    pub fn set_window_focused(&self, focused: bool) {
+        self.inner.lock().unwrap().window_focused = focused;
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent> {
@@ -571,7 +621,7 @@ impl Workspace {
             project_id,
             title: derived_title.clone(),
             cwd: cwd.to_string(),
-            state: TabState::None,
+            agent: AgentTabState::default(),
             has_notification: false,
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
@@ -587,27 +637,13 @@ impl Workspace {
             position,
             created_at: now,
             last_active: now,
-            hook_active: false,
         };
         inner.tabs.insert(id, row.clone());
         // New tabs steal the active selection.
         inner.active_project_id = project_id;
         inner.active_tab_id = id;
 
-        let tab = Tab {
-            id: row.id,
-            project_id: row.project_id,
-            title: row.title,
-            cwd: row.cwd,
-            state: row.state,
-            has_notification: row.has_notification,
-            is_active: true,
-            user_titled: row.user_titled,
-            position: row.position,
-            created_at: row.created_at,
-            last_active: row.last_active,
-            hook_active: row.hook_active,
-        };
+        let tab = self.to_wire_tab(&row, &inner);
         self.commit(
             inner,
             vec![
@@ -779,46 +815,244 @@ impl Workspace {
         Ok(())
     }
 
+    /// Raise a tab's attention — pending badge, inbox row, and desktop
+    /// banner — as **one transaction**. Returns whether it was delivered.
+    ///
+    /// Every gate lives here, under the same lock as the mutation,
+    /// because each is a race otherwise. Reading the agent gate and then
+    /// committing lets a concurrent `tab.agent_report` claim the tab in
+    /// between; leaving focus to the UI's event drain re-evaluates it
+    /// against a selection the user may have changed since, which both
+    /// loses notifications and resurrects them retroactively.
+    ///
+    /// A suppressed raise is dropped **entirely** — no pending bit, no
+    /// events. That is what makes plan §3.5's "switching away afterwards
+    /// does not retroactively produce a badge" true by construction
+    /// rather than by a UI write-back.
+    pub fn raise_attention(
+        &self,
+        tab_id: i64,
+        title: &str,
+        body: &str,
+        source: AttentionSource,
+    ) -> Result<bool, WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let focus_suppressed = inner.attention_suppressed_by_focus(tab_id);
+        // A 'lookup' error rather than a silent drop: hook tools racing
+        // a tab close need to tell "gone" from "suppressed".
+        let row = inner
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        // Only *raw* OSC is gated on ownership. A structured
+        // `notification.create` / `roostctl notify` is never suppressed
+        // this way (plan §3.4) — the agent's own adapter is what emits
+        // those, so gating them would mute the very source it protects.
+        if source == AttentionSource::RawOsc && agent::suppress_raw_osc(&row.agent) {
+            tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
+            return Ok(false);
+        }
+        if focus_suppressed {
+            return Ok(false);
+        }
+        row.has_notification = true;
+        // Notification state isn't in the persisted snapshot — emit only.
+        self.commit(
+            inner,
+            vec![
+                WorkspaceEvent::TabNotification {
+                    tab_id,
+                    has_pending: true,
+                },
+                WorkspaceEvent::NotificationFired {
+                    tab_id,
+                    title: title.to_string(),
+                    body: body.to_string(),
+                },
+            ],
+            Persist::Skip,
+        );
+        Ok(true)
+    }
+
+    /// `tab.agent_report` — the one op every agent adapter writes
+    /// through. Session scoping, ownership supersede, and the patch
+    /// semantics all live in [`agent::apply_report`]; this method owns
+    /// only the mutation and the event fan-out.
+    ///
+    /// Returns the post-report tab plus whether the report was accepted
+    /// (false = dropped on an ownership mismatch, tab unchanged).
+    pub fn agent_report(
+        &self,
+        report: &TabAgentReportParams,
+    ) -> Result<(bool, Tab), WorkspaceError> {
+        self.apply_agent_reports(report, None)
+    }
+
+    /// Legacy `tab.set_state`, re-expressed on the agent axis per plan
+    /// §3.7. Each value claims ownership as `manual` (an empty session
+    /// id) so the user's override supersedes a live agent — that is
+    /// what taking the wheel means.
+    ///
+    /// `none` additionally releases: "no state" most closely means "no
+    /// agent owns this tab", so derivation falls back to the shell axis
+    /// (`none` at a prompt, `running` under a live foreground process).
+    /// It claims *before* releasing because a bare release is scoped to
+    /// the current owner — claiming first is the only path that can
+    /// take the tab from someone else, and it keeps the matching rule
+    /// inside `agent::apply_report` rather than duplicated here.
     pub fn set_tab_state(&self, tab_id: i64, state: TabState) -> Result<(), WorkspaceError> {
+        let lifecycle = match state {
+            TabState::Running => AgentLifecycle::Working,
+            TabState::NeedsInput => AgentLifecycle::Waiting,
+            TabState::Idle => AgentLifecycle::Finished,
+            TabState::None => AgentLifecycle::Inactive,
+        };
+        let claim = TabAgentReportParams::sessionless(
+            tab_id,
+            SOURCE_MANUAL,
+            OwnershipAction::Claim,
+            Some(lifecycle),
+        );
+        let release = (state == TabState::None).then(|| {
+            TabAgentReportParams::sessionless(tab_id, SOURCE_MANUAL, OwnershipAction::Release, None)
+        });
+        self.apply_agent_reports(&claim, release.as_ref())
+            .map(|_| ())
+    }
+
+    /// Deprecated `tab.set_hook_active` alias (plan §3.6): claim or
+    /// release as `legacy` with an empty session id. Release is scoped
+    /// like any other, so it cannot revoke a real agent's ownership.
+    pub fn set_tab_hook_active(&self, tab_id: i64, active: bool) -> Result<(), WorkspaceError> {
+        let action = if active {
+            OwnershipAction::Claim
+        } else {
+            OwnershipAction::Release
+        };
+        let report = TabAgentReportParams::sessionless(tab_id, SOURCE_LEGACY, action, None);
+        self.apply_agent_reports(&report, None).map(|_| ())
+    }
+
+    /// OSC 133 prompt/command mark → the **shell** axis, ungated.
+    ///
+    /// The old `hook_active` gate is gone: the axes are independent, so
+    /// there is nothing to suppress — derivation decides which one
+    /// shows. `A`/`B`/`D` additionally drop the lifecycle to `inactive`
+    /// (keeping ownership as a label), which is the failsafe against a
+    /// killed agent muting the tab forever. See [`agent::apply_shell_mark`].
+    pub fn apply_shell_mark(&self, tab_id: i64, body: &str) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        row.state = state;
-        // Run-state isn't in the persisted snapshot — emit only.
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::TabStateChanged { tab_id, state }],
-            Persist::Skip,
-        );
+        let Some(next) = agent::apply_shell_mark(&row.agent, body) else {
+            return Ok(()); // undefined mark body — no change
+        };
+        let events = replace_agent(row, next);
+        // Run state isn't in the persisted snapshot — emit only.
+        self.commit(inner, events, Persist::Skip);
         Ok(())
     }
 
-    /// OSC 133 prompt/command mark → run state. Suppressed while a Claude
-    /// hook owns the tab (`hook_active`): the hook's per-turn state wins.
-    /// Mirrors `set_tab_title_from_osc`'s `user_titled` gate — NOT
-    /// `set_tab_state` (the hook's own `tab.set_state` op must stay ungated).
-    pub fn set_tab_state_from_osc(
-        &self,
-        tab_id: i64,
-        state: TabState,
-    ) -> Result<(), WorkspaceError> {
+    /// The tab's PTY was replaced: the shell that hosted any agent is
+    /// gone, so both axes and ownership reset.
+    ///
+    /// Stated as a rule about the PTY rather than about closing —
+    /// closing drops the whole row, so it needs no help. #170's
+    /// hard-restart keeps the row and is this call.
+    pub fn pty_replaced(&self, tab_id: i64) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        if row.hook_active {
-            return Ok(());
-        }
-        row.state = state;
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::TabStateChanged { tab_id, state }],
-            Persist::Skip,
-        );
+        let events = replace_agent(row, AgentTabState::default());
+        self.commit(inner, events, Persist::Skip);
         Ok(())
+    }
+
+    /// Apply `first` and then `then` under one lock, emitting the
+    /// derived-state deltas once for the net result.
+    ///
+    /// The second slot exists for exactly one caller — `set-state none`,
+    /// a claim followed by a release. Applying the pair under one lock
+    /// keeps it atomic and stops the intermediate claim from reaching
+    /// subscribers as a real state.
+    fn apply_agent_reports(
+        &self,
+        first: &TabAgentReportParams,
+        then: Option<&TabAgentReportParams>,
+    ) -> Result<(bool, Tab), WorkspaceError> {
+        let tab_id = first.tab_id;
+        let now = unix_now();
+        let mut inner = self.inner.lock().unwrap();
+        let is_active = inner.active_tab_id == tab_id;
+        let focus_suppressed = inner.attention_suppressed_by_focus(tab_id);
+        let row = inner
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+
+        let mut next = row.agent.clone();
+        let mut accepted = false;
+        let mut attention = AttentionEffect::Unchanged;
+        for report in std::iter::once(first).chain(then) {
+            let outcome = agent::apply_report(&next, report, now);
+            if !outcome.accepted {
+                continue;
+            }
+            accepted = true;
+            next = outcome.state;
+            if outcome.attention != AttentionEffect::Unchanged {
+                attention = outcome.attention;
+            }
+        }
+
+        let mut events = replace_agent(row, next);
+        match attention {
+            // Same focus predicate as `raise_attention`, applied here
+            // rather than by delegating because the report's own
+            // mutation must stay in this transaction: a Claude
+            // notification for the tab you are looking at is suppressed
+            // exactly like any other, but its lifecycle change is not.
+            //
+            // `severity` stops here in v1 by design: policy B (plan
+            // §3.5) suppresses on focus alone, and "failed overrides
+            // suppression" is a later slice. It stays readable on the
+            // report itself rather than being plumbed through an event
+            // nobody reads yet.
+            AttentionEffect::Set {
+                title,
+                body,
+                severity: _,
+            } if !focus_suppressed => {
+                row.has_notification = true;
+                events.push(WorkspaceEvent::TabNotification {
+                    tab_id,
+                    has_pending: true,
+                });
+                events.push(WorkspaceEvent::NotificationFired {
+                    tab_id,
+                    title,
+                    body,
+                });
+            }
+            AttentionEffect::Set { .. } => {}
+            AttentionEffect::Clear => {
+                row.has_notification = false;
+                events.push(WorkspaceEvent::TabNotification {
+                    tab_id,
+                    has_pending: false,
+                });
+            }
+            AttentionEffect::Unchanged => {}
+        }
+        let tab = wire_tab(row, is_active);
+        // Run state isn't in the persisted snapshot — emit only.
+        self.commit(inner, events, Persist::Skip);
+        Ok((accepted, tab))
     }
 
     pub fn set_tab_has_notification(
@@ -839,22 +1073,6 @@ impl Workspace {
                 tab_id,
                 has_pending,
             }],
-            Persist::Skip,
-        );
-        Ok(())
-    }
-
-    pub fn set_tab_hook_active(&self, tab_id: i64, active: bool) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let row = inner
-            .tabs
-            .get_mut(&tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
-        row.hook_active = active;
-        // Hook-active flag isn't in the persisted snapshot — emit only.
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::HookActiveChanged { tab_id, active }],
             Persist::Skip,
         );
         Ok(())
@@ -887,33 +1105,6 @@ impl Workspace {
             persist,
         );
         Ok(prev)
-    }
-
-    pub fn fire_notification(
-        &self,
-        tab_id: i64,
-        title: &str,
-        body: &str,
-    ) -> Result<(), WorkspaceError> {
-        // Drop a 'lookup' error if the tab is gone — useful for
-        // hook tools that race tab close. Hold the lock across the
-        // existence check + publish so the event can't be reordered
-        // past a concurrent close of the same tab.
-        let inner = self.inner.lock().unwrap();
-        if !inner.tabs.contains_key(&tab_id) {
-            return Err(WorkspaceError::TabNotFound(tab_id));
-        }
-        // Transient notification — nothing persisted, emit only.
-        self.commit(
-            inner,
-            vec![WorkspaceEvent::NotificationFired {
-                tab_id,
-                title: title.to_string(),
-                body: body.to_string(),
-            }],
-            Persist::Skip,
-        );
-        Ok(())
     }
 
     pub fn reorder_tabs(&self, project_id: i64, tab_ids: &[i64]) -> Result<(), WorkspaceError> {
@@ -1013,29 +1204,16 @@ impl Workspace {
 
     pub fn tab(&self, tab_id: i64) -> Result<Tab, WorkspaceError> {
         let inner = self.inner.lock().unwrap();
+        let is_active = inner.active_tab_id == tab_id;
         let row = inner
             .tabs
             .get(&tab_id)
-            .ok_or(WorkspaceError::TabNotFound(tab_id))?
-            .clone();
-        Ok(self.to_wire_tab(&row, &inner))
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        Ok(wire_tab(row, is_active))
     }
 
     fn to_wire_tab(&self, row: &TabRow, inner: &Inner) -> Tab {
-        Tab {
-            id: row.id,
-            project_id: row.project_id,
-            title: row.title.clone(),
-            cwd: row.cwd.clone(),
-            state: row.state,
-            has_notification: row.has_notification,
-            is_active: inner.active_tab_id == row.id,
-            user_titled: row.user_titled,
-            position: row.position,
-            created_at: row.created_at,
-            last_active: row.last_active,
-            hook_active: row.hook_active,
-        }
+        wire_tab(row, inner.active_tab_id == row.id)
     }
 
     /// Persist `snapshot` to `state.json`, tagged with its commit
@@ -1116,10 +1294,20 @@ impl Workspace {
     }
 }
 
+/// Where an attention-raise came from. The only behavioral difference
+/// is the agent gate: raw OSC is dropped while a live agent owns the tab
+/// (plan §3.4), a structured `notification.create` / `roostctl notify`
+/// never is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionSource {
+    RawOsc,
+    Structured,
+}
+
 /// Whether a `commit()` should write `state.json`. `Write` for layout
 /// changes (projects/tabs/order/active selection); `Skip` for state
-/// that isn't in the persisted snapshot (run-state, notification +
-/// hook flags) — those emit an event but never touch disk.
+/// that isn't in the persisted snapshot (the agent axes, notification
+/// flags) — those emit an event but never touch disk.
 enum Persist {
     Skip,
     Write,
@@ -1132,6 +1320,13 @@ impl Default for Workspace {
 }
 
 impl Inner {
+    /// Plan §3.5's suppression predicate: a notification for the tab the
+    /// user is actively looking at is considered seen, so it raises no
+    /// banner, no badge, and no inbox row.
+    fn attention_suppressed_by_focus(&self, tab_id: i64) -> bool {
+        self.window_focused && self.active_tab_id == tab_id
+    }
+
     fn alloc_id(&mut self) -> i64 {
         self.next_id = self.next_id.max(1) + 1;
         self.next_id
@@ -1222,6 +1417,60 @@ impl Inner {
     }
 }
 
+/// Ownership source for a hand-driven `roostctl tab set-state`.
+const SOURCE_MANUAL: &str = "manual";
+/// Ownership source for the deprecated `tab.set_hook_active` alias.
+const SOURCE_LEGACY: &str = "legacy";
+
+fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
+    Tab {
+        id: row.id,
+        project_id: row.project_id,
+        title: row.title.clone(),
+        cwd: row.cwd.clone(),
+        state: agent::effective(&row.agent),
+        has_notification: row.has_notification,
+        is_active,
+        user_titled: row.user_titled,
+        position: row.position,
+        created_at: row.created_at,
+        last_active: row.last_active,
+        hook_active: agent::is_live(&row.agent),
+        shell_state: row.agent.shell,
+        agent_lifecycle: row.agent.lifecycle,
+        ownership: row.agent.ownership.clone(),
+    }
+}
+
+/// Swap a tab's agent record and return the events the swap implies.
+///
+/// `AgentChanged` carries the full record; `TabStateChanged` and
+/// `HookActiveChanged` carry its two derived projections and each fires
+/// only when its own projection moved. An identical record emits
+/// nothing — repeated prompt marks are the common case and should not
+/// churn the UI.
+fn replace_agent(row: &mut TabRow, next: AgentTabState) -> Vec<WorkspaceEvent> {
+    if row.agent == next {
+        return Vec::new();
+    }
+    let tab_id = row.id;
+    let prev = std::mem::replace(&mut row.agent, next);
+    let mut events = Vec::with_capacity(3);
+    let state = agent::effective(&row.agent);
+    if state != agent::effective(&prev) {
+        events.push(WorkspaceEvent::TabStateChanged { tab_id, state });
+    }
+    let active = agent::is_live(&row.agent);
+    if active != agent::is_live(&prev) {
+        events.push(WorkspaceEvent::HookActiveChanged { tab_id, active });
+    }
+    events.push(WorkspaceEvent::AgentChanged {
+        tab_id,
+        agent: row.agent.clone(),
+    });
+    events
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1252,6 +1501,7 @@ fn derive_title(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::agent::{AttentionOp, ShellState};
 
     #[test]
     fn open_tab_emits_tab_opened() {
@@ -1458,19 +1708,465 @@ mod tests {
         assert_eq!(derive_title("/usr/local"), "local");
     }
 
-    #[test]
-    fn set_tab_state_from_osc_respects_hook_active() {
+    // ------------------------------------------------------------------
+    // Agent state model (plan 002)
+    // ------------------------------------------------------------------
+
+    /// A one-tab workspace with the window reported **unfocused**, so
+    /// these tests exercise the agent axis without policy §3.5's focus
+    /// suppression in the way. `attention_policy_*` covers the matrix.
+    fn agent_ws() -> (Workspace, i64) {
         let ws = Workspace::new();
         let pid = ws.create_project("p", "").unwrap().id;
         let tid = ws.open_tab(pid, "/", "").unwrap().id;
-        // Hook owns the tab: OSC 133 state is suppressed.
-        ws.set_tab_hook_active(tid, true).unwrap();
-        ws.set_tab_state_from_osc(tid, TabState::Running).unwrap();
-        assert_eq!(ws.tab(tid).unwrap().state, TabState::None);
-        // Release the hook: OSC 133 state applies.
-        ws.set_tab_hook_active(tid, false).unwrap();
-        ws.set_tab_state_from_osc(tid, TabState::Running).unwrap();
+        ws.set_window_focused(false);
+        (ws, tid)
+    }
+
+    fn report(
+        tab_id: i64,
+        source: &str,
+        session: &str,
+        action: OwnershipAction,
+        lifecycle: Option<AgentLifecycle>,
+    ) -> TabAgentReportParams {
+        TabAgentReportParams {
+            session_id: session.to_string(),
+            ..TabAgentReportParams::sessionless(tab_id, source, action, lifecycle)
+        }
+    }
+
+    /// A workspace whose one tab is already claimed by `claude`/`s1`.
+    fn owned_ws(lifecycle: AgentLifecycle) -> (Workspace, i64) {
+        let (ws, tid) = agent_ws();
+        ws.agent_report(&report(
+            tid,
+            "claude",
+            "s1",
+            OwnershipAction::Claim,
+            Some(lifecycle),
+        ))
+        .unwrap();
+        (ws, tid)
+    }
+
+    /// Replaces `set_tab_state_from_osc_respects_hook_active`: the gate
+    /// it pinned is gone. OSC 133 now writes the shell axis
+    /// unconditionally, and derivation — not a suppression rule —
+    /// decides which axis the tab shows.
+    #[test]
+    fn shell_marks_write_the_shell_axis_under_agent_ownership() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Waiting);
+
+        // The mark lands on the shell axis even while an agent owns the
+        // tab; the agent's lifecycle still wins the derived state.
+        ws.apply_shell_mark(tid, "C").unwrap();
+        let tab = ws.tab(tid).unwrap();
+        assert_eq!(tab.shell_state, ShellState::ForegroundProcess);
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Waiting);
+        assert_eq!(tab.state, TabState::NeedsInput);
+    }
+
+    #[test]
+    fn shell_marks_drive_the_state_without_an_owner() {
+        let (ws, tid) = agent_ws();
+        ws.apply_shell_mark(tid, "C").unwrap();
         assert_eq!(ws.tab(tid).unwrap().state, TabState::Running);
+        ws.apply_shell_mark(tid, "D;0").unwrap();
+        assert_eq!(ws.tab(tid).unwrap().state, TabState::None);
+    }
+
+    /// The `D`/`A` failsafe end to end: a killed agent's ownership
+    /// survives as a label but stops driving derivation, and raw OSC
+    /// re-opens.
+    #[test]
+    fn prompt_mark_reopens_raw_osc_for_a_dead_agent() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+        assert!(!ws
+            .raise_attention(tid, "Wrapper", "noise", AttentionSource::RawOsc)
+            .unwrap());
+        assert!(!ws.tab(tid).unwrap().has_notification);
+
+        ws.apply_shell_mark(tid, "D;0").unwrap();
+        let tab = ws.tab(tid).unwrap();
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+        assert!(tab.hook_active, "ownership survives as a label");
+        assert_eq!(tab.state, TabState::None, "falls through to shell");
+        assert!(ws
+            .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+            .unwrap());
+        assert!(ws.tab(tid).unwrap().has_notification);
+    }
+
+    /// Session scoping is enforced in the workspace, atomically with
+    /// the mutation (plan §3.3). A report from a different session is
+    /// dropped whole — lifecycle *and* attention.
+    #[test]
+    fn report_from_a_foreign_session_is_dropped() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+
+        let mut stale = report(
+            tid,
+            "claude",
+            "s2",
+            OwnershipAction::Preserve,
+            Some(AgentLifecycle::Finished),
+        );
+        stale.attention = AttentionOp::Set;
+        stale.title = "Claude Code".into();
+        stale.body = "Turn complete".into();
+        let (accepted, tab) = ws.agent_report(&stale).unwrap();
+        assert!(!accepted);
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Working);
+        assert!(!tab.has_notification, "a dropped report fires nothing");
+
+        // Same session id, different source: still a mismatch.
+        let (accepted, _) = ws
+            .agent_report(&report(
+                tid,
+                "codex",
+                "s1",
+                OwnershipAction::Preserve,
+                Some(AgentLifecycle::Finished),
+            ))
+            .unwrap();
+        assert!(!accepted);
+    }
+
+    #[test]
+    fn claim_supersedes_a_live_owner_and_release_is_scoped() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+
+        let (accepted, tab) = ws
+            .agent_report(&report(
+                tid,
+                "codex",
+                "s9",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Waiting),
+            ))
+            .unwrap();
+        assert!(accepted, "claim is the supersede path");
+        assert_eq!(tab.ownership.unwrap().source, "codex");
+
+        // The displaced owner can no longer release.
+        let (accepted, tab) = ws
+            .agent_report(&report(tid, "claude", "s1", OwnershipAction::Release, None))
+            .unwrap();
+        assert!(!accepted);
+        assert!(tab.hook_active);
+
+        let (accepted, tab) = ws
+            .agent_report(&report(tid, "codex", "s9", OwnershipAction::Release, None))
+            .unwrap();
+        assert!(accepted);
+        assert!(!tab.hook_active);
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+    }
+
+    /// Attention effects are the workspace's to apply: `set` raises the
+    /// pending flag and fires, `clear` drops it.
+    #[test]
+    fn attention_set_and_clear_drive_the_notification_flag() {
+        let (ws, tid) = agent_ws();
+        let mut claim = report(tid, "claude", "s1", OwnershipAction::Claim, None);
+        claim.attention = AttentionOp::Set;
+        claim.title = "Claude Code".into();
+        claim.body = "Needs your permission".into();
+        let (_, tab) = ws.agent_report(&claim).unwrap();
+        assert!(tab.has_notification);
+
+        let mut clear = report(tid, "claude", "s1", OwnershipAction::Preserve, None);
+        clear.attention = AttentionOp::Clear;
+        let (_, tab) = ws.agent_report(&clear).unwrap();
+        assert!(!tab.has_notification);
+    }
+
+    // ------------------------------------------------------------------
+    // Attention policy B (plan §3.5) — one transaction, one predicate
+    // ------------------------------------------------------------------
+
+    /// A report that sets attention on the focused, active tab. Returns
+    /// the tab plus every event the report emitted.
+    fn attention_report(tab_id: i64) -> TabAgentReportParams {
+        let mut r = report(tab_id, "claude", "s1", OwnershipAction::Claim, None);
+        r.attention = AttentionOp::Set;
+        r.title = "Claude Code".into();
+        r.body = "Turn complete".into();
+        r
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<WorkspaceEvent>) -> Vec<WorkspaceEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn has_attention_events(events: &[WorkspaceEvent]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                WorkspaceEvent::NotificationFired { .. }
+                    | WorkspaceEvent::TabNotification {
+                        has_pending: true,
+                        ..
+                    }
+            )
+        })
+    }
+
+    /// The tab you are looking at is the tab you have seen: a structured
+    /// notification for it is dropped whole — no pending bit, no events.
+    /// Emitting nothing is what makes "switch away afterwards and the
+    /// badge does not appear" true by construction.
+    #[test]
+    fn attention_policy_drops_a_notification_for_the_focused_active_tab() {
+        let (ws, tid) = agent_ws();
+        ws.set_window_focused(true);
+        let mut rx = ws.subscribe();
+
+        let (accepted, tab) = ws.agent_report(&attention_report(tid)).unwrap();
+        assert!(accepted, "the report itself still applies");
+        assert!(!tab.has_notification);
+        assert!(!has_attention_events(&drain(&mut rx)));
+
+        // Switching away must not resurrect it.
+        let other = ws
+            .open_tab(ws.tab(tid).unwrap().project_id, "/", "")
+            .unwrap()
+            .id;
+        assert_ne!(other, tid);
+        assert!(!ws.tab(tid).unwrap().has_notification);
+    }
+
+    #[test]
+    fn attention_policy_delivers_when_the_window_is_unfocused() {
+        let (ws, tid) = agent_ws();
+        ws.set_window_focused(false);
+        let mut rx = ws.subscribe();
+
+        let (_, tab) = ws.agent_report(&attention_report(tid)).unwrap();
+        assert!(tab.has_notification);
+        assert!(has_attention_events(&drain(&mut rx)));
+    }
+
+    #[test]
+    fn attention_policy_delivers_when_another_tab_is_active() {
+        let (ws, tid) = agent_ws();
+        let pid = ws.tab(tid).unwrap().project_id;
+        let other = ws.open_tab(pid, "/", "").unwrap().id;
+        ws.focus_tab(other).unwrap();
+        ws.set_window_focused(true);
+        let mut rx = ws.subscribe();
+
+        let (_, tab) = ws.agent_report(&attention_report(tid)).unwrap();
+        assert!(tab.has_notification);
+        assert!(has_attention_events(&drain(&mut rx)));
+    }
+
+    /// Structured attention is NEVER gated on agent ownership (plan
+    /// §3.4) — `notification.create` / `roostctl notify` must get
+    /// through even mid-turn, since that is how the agent itself speaks.
+    #[test]
+    fn structured_attention_is_never_gated_by_a_live_agent() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+
+        assert!(ws
+            .raise_attention(tid, "Roost", "explicit", AttentionSource::Structured)
+            .unwrap());
+        assert!(ws.tab(tid).unwrap().has_notification);
+
+        // …and the same is true through the report path.
+        ws.set_tab_has_notification(tid, false).unwrap();
+        let mut r = attention_report(tid);
+        r.ownership_action = OwnershipAction::Preserve;
+        let (accepted, tab) = ws.agent_report(&r).unwrap();
+        assert!(accepted);
+        assert!(tab.has_notification);
+    }
+
+    /// Raw OSC is the one thing the agent gate drops, and the `D` mark
+    /// failsafe re-opens it (plan §3.4).
+    #[test]
+    fn raw_osc_attention_is_gated_by_a_live_agent_until_a_prompt_mark() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+
+        assert!(!ws
+            .raise_attention(tid, "Wrapper", "noise", AttentionSource::RawOsc)
+            .unwrap());
+        assert!(!ws.tab(tid).unwrap().has_notification);
+
+        ws.apply_shell_mark(tid, "D;0").unwrap();
+        assert!(ws
+            .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+            .unwrap());
+        assert!(ws.tab(tid).unwrap().has_notification);
+    }
+
+    #[test]
+    fn raise_attention_on_a_missing_tab_is_an_error() {
+        let ws = Workspace::new();
+        assert!(matches!(
+            ws.raise_attention(999, "t", "b", AttentionSource::Structured),
+            Err(WorkspaceError::TabNotFound(999))
+        ));
+    }
+
+    /// Focus defaults to *focused* before any UI reports it, so a
+    /// headless / IPC-only workspace routes exactly as a real window
+    /// would. The active tab is therefore suppressed, and — the half
+    /// that keeps the default safe — an inactive tab still delivers.
+    #[test]
+    fn window_focus_defaults_to_focused() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let active = ws.open_tab(pid, "/", "a").unwrap().id;
+        let background = ws.open_tab(pid, "/", "b").unwrap().id;
+        ws.focus_tab(active).unwrap();
+
+        assert!(!ws
+            .raise_attention(active, "t", "b", AttentionSource::Structured)
+            .unwrap());
+        assert!(ws
+            .raise_attention(background, "t", "b", AttentionSource::Structured)
+            .unwrap());
+        assert!(ws.tab(background).unwrap().has_notification);
+    }
+
+    /// Plan §3.7's transition table. `running`/`needs_input`/`idle`
+    /// produce their pre-change `tab.state`; `none` is the one genuine
+    /// behavior change — it releases, so the shell axis shows through.
+    #[test]
+    fn legacy_set_state_follows_the_transition_table() {
+        let (ws, tid) = agent_ws();
+        for (legacy, lifecycle) in [
+            (TabState::Running, AgentLifecycle::Working),
+            (TabState::NeedsInput, AgentLifecycle::Waiting),
+            (TabState::Idle, AgentLifecycle::Finished),
+        ] {
+            ws.set_tab_state(tid, legacy).unwrap();
+            let tab = ws.tab(tid).unwrap();
+            assert_eq!(tab.state, legacy, "legacy projection must not move");
+            assert_eq!(tab.agent_lifecycle, lifecycle);
+            assert_eq!(tab.ownership.as_ref().unwrap().source, SOURCE_MANUAL);
+            assert_eq!(tab.ownership.as_ref().unwrap().session_id, "");
+        }
+
+        // `none` releases; with a live foreground process the shell axis
+        // now shows `running` rather than `none`.
+        ws.apply_shell_mark(tid, "C").unwrap();
+        ws.set_tab_state(tid, TabState::None).unwrap();
+        let tab = ws.tab(tid).unwrap();
+        assert!(!tab.hook_active, "set-state none releases ownership");
+        assert_eq!(tab.ownership, None);
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+        assert_eq!(tab.state, TabState::Running, "shell-derived");
+    }
+
+    /// A manual override takes the tab from a live agent — the user has
+    /// the wheel — and `none` releases even though the release itself is
+    /// scoped to `manual`.
+    #[test]
+    fn manual_override_supersedes_a_live_agent() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+
+        ws.set_tab_state(tid, TabState::NeedsInput).unwrap();
+        assert_eq!(
+            ws.tab(tid).unwrap().ownership.unwrap().source,
+            SOURCE_MANUAL
+        );
+
+        // Claude's next in-session event is now out of scope.
+        let (accepted, _) = ws
+            .agent_report(&report(
+                tid,
+                "claude",
+                "s1",
+                OwnershipAction::Preserve,
+                Some(AgentLifecycle::Finished),
+            ))
+            .unwrap();
+        assert!(!accepted);
+
+        // And `none` still releases, despite `claude` having held it.
+        ws.set_tab_state(tid, TabState::None).unwrap();
+        assert_eq!(ws.tab(tid).unwrap().ownership, None);
+    }
+
+    #[test]
+    fn set_hook_active_claims_and_releases_as_legacy() {
+        let (ws, tid) = agent_ws();
+        ws.set_tab_hook_active(tid, true).unwrap();
+        let tab = ws.tab(tid).unwrap();
+        assert!(tab.hook_active);
+        assert_eq!(tab.ownership.unwrap().source, SOURCE_LEGACY);
+        assert_eq!(
+            tab.state,
+            TabState::None,
+            "ownership alone doesn't move the legacy state"
+        );
+
+        ws.set_tab_hook_active(tid, false).unwrap();
+        assert!(!ws.tab(tid).unwrap().hook_active);
+    }
+
+    #[test]
+    fn pty_replacement_clears_ownership() {
+        let (ws, tid) = owned_ws(AgentLifecycle::Working);
+        ws.apply_shell_mark(tid, "C").unwrap();
+
+        ws.pty_replaced(tid).unwrap();
+        let tab = ws.tab(tid).unwrap();
+        assert_eq!(tab.ownership, None);
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+        assert_eq!(tab.shell_state, ShellState::Unknown);
+        assert_eq!(tab.state, TabState::None);
+    }
+
+    /// The derived slices ride along with the full record, so the two
+    /// UIs and any external subscriber see one consistent story.
+    #[test]
+    fn accepted_report_emits_state_hook_and_agent_events() {
+        let (ws, tid) = agent_ws();
+        let mut rx = ws.subscribe();
+        ws.agent_report(&report(
+            tid,
+            "claude",
+            "s1",
+            OwnershipAction::Claim,
+            Some(AgentLifecycle::Waiting),
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::TabStateChanged {
+                state: TabState::NeedsInput,
+                ..
+            })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::HookActiveChanged { active: true, .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::AgentChanged { .. })
+        ));
+
+        // A report that changes nothing emits nothing — repeated prompt
+        // marks are the common case and must not churn the UI.
+        ws.apply_shell_mark(tid, "Z").unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The converse of a dropped report (which succeeds with
+    /// `accepted: false`): a tab that doesn't exist is an error.
+    #[test]
+    fn agent_report_on_a_missing_tab_is_an_error() {
+        let ws = Workspace::new();
+        assert!(matches!(
+            ws.agent_report(&report(999, "claude", "s1", OwnershipAction::Claim, None)),
+            Err(WorkspaceError::TabNotFound(999))
+        ));
     }
 
     #[test]

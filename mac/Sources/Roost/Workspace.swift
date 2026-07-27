@@ -44,13 +44,31 @@ final class Workspace {
         var projectId: Int64
         var title: String
         var cwd: String
-        var state: TabState
+        /// The three agent axes. `state` and `hookActive` are **derived**
+        /// from this, never stored beside it, so the projection can't
+        /// drift.
+        ///
+        /// **Not persisted.** `TabSnapshot` stays `{title, cwd, position,
+        /// userTitled}`; run state has never been in `state.json` and
+        /// plan 002 §2.6 does not put it there.
+        var agent: AgentTabState
         var hasNotification: Bool
         var userTitled: Bool
         var position: Int32
         var createdAt: Int64
         var lastActive: Int64
-        var hookActive: Bool
+
+        var state: TabState { Agent.effective(agent) }
+        var hookActive: Bool { Agent.isLive(agent) }
+    }
+
+    /// Where an attention-raise came from. The only behavioral
+    /// difference is the agent gate: raw OSC is dropped while a live
+    /// agent owns the tab (plan §3.4), a structured
+    /// `notification.create` / `roostctl notify` never is.
+    enum AttentionSource: Sendable {
+        case rawOsc
+        case structured
     }
 
     enum Event: Sendable {
@@ -65,6 +83,12 @@ final class Workspace {
         case projectDeleted(projectID: Int64)
         case activeChanged(projectID: Int64, tabID: Int64)
         case hookActiveChanged(tabID: Int64, active: Bool)
+        /// The full agent record after an accepted report or shell mark.
+        /// `tabStateChanged` + `hookActiveChanged` still fire for their
+        /// derived slices; this carries what those two projections lose
+        /// — which lifecycle, whose session, and the shell axis
+        /// underneath.
+        case agentChanged(tabID: Int64, agent: AgentTabState)
         case notificationFired(tabID: Int64, title: String, body: String)
         /// Fired after `reorderTabs`. The `tabIDs` payload is the
         /// post-reorder display order (the `tabIDs` argument
@@ -104,6 +128,16 @@ final class Workspace {
     /// the live `tabs` map — the live tabs are the fresh shells the
     /// UI re-opens from these descriptors.
     private var restoreLayout: RestoreLayout?
+    /// Whether the UI window currently has focus — half of the
+    /// notification-suppression predicate (plan §3.5), reported by the
+    /// UI via `setWindowFocused`. Never persisted: focus is a property
+    /// of the running session, not of the layout.
+    ///
+    /// Focused until a UI says otherwise. A headless or IPC-only
+    /// workspace never reports focus, and the other default would leave
+    /// the active tab permanently "unseen" — routing every notification
+    /// the opposite way from what a real window would.
+    private var windowFocused = true
     /// Set by `flush()` on clean exit, *after* it writes the final
     /// layout. Once set, `persist()` is a no-op so a teardown cascade
     /// (e.g. `applicationWillTerminate` closing every tab, which can
@@ -365,13 +399,12 @@ final class Workspace {
             projectId: projectID,
             title: derivedTitle,
             cwd: cwd,
-            state: .none,
+            agent: AgentTabState(),
             hasNotification: false,
             userTitled: false,
             position: position,
             createdAt: now,
-            lastActive: now,
-            hookActive: false
+            lastActive: now
         )
         tabs[id] = tab
         activeProjectID = projectID
@@ -496,24 +529,134 @@ final class Workspace {
         commit(events, persist: true)
     }
 
+    /// Ownership source for a hand-driven `roostctl tab set-state`.
+    static let manualSource = "manual"
+    /// Ownership source for the deprecated `tab.set_hook_active` alias.
+    static let legacySource = "legacy"
+
+    /// Legacy `tab.set_state`, re-expressed on the agent axis per plan
+    /// §3.7. Each value claims ownership as `manual` (an empty session
+    /// id) so the user's override supersedes a live agent — that is what
+    /// taking the wheel means.
+    ///
+    /// `none` additionally releases: "no state" most closely means "no
+    /// agent owns this tab", so derivation falls back to the shell axis
+    /// (`none` at a prompt, `running` under a live foreground process).
+    /// It claims *before* releasing because a bare release is scoped to
+    /// the current owner — claiming first is the only path that can take
+    /// the tab from someone else, and it keeps the matching rule inside
+    /// `Agent.applyReport` rather than duplicated here.
     func setTabState(_ tabID: Int64, state: TabState) throws {
-        guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
-        t.state = state
-        tabs[tabID] = t
-        // Run-state isn't in the persisted snapshot — emit only.
-        commit([.tabStateChanged(tabID: tabID, state: state)], persist: false)
+        let lifecycle: AgentLifecycle
+        switch state {
+        case .running: lifecycle = .working
+        case .needsInput: lifecycle = .waiting
+        case .idle: lifecycle = .finished
+        case .none: lifecycle = .inactive
+        }
+        let claim = AgentReport(
+            tabID: tabID,
+            source: Self.manualSource,
+            ownershipAction: .claim,
+            lifecycle: lifecycle
+        )
+        let release = state == .none
+            ? AgentReport(tabID: tabID, source: Self.manualSource, ownershipAction: .release)
+            : nil
+        _ = try applyAgentReports(claim, then: release)
     }
 
-    /// OSC 133 prompt/command mark → run state. Suppressed while a Claude
-    /// hook owns the tab (`hookActive`): the hook's per-turn state wins.
-    /// Mirrors `setTabTitleFromOSC`'s `userTitled` gate. NOT `setTabState`
-    /// — the hook's own `tab.set_state` op must stay ungated.
-    func setTabStateFromOSC(_ tabID: Int64, state: TabState) throws {
+    /// `tab.agent_report` — the one op every agent adapter writes
+    /// through. Session scoping, ownership supersede, and the patch
+    /// semantics all live in `Agent.applyReport`; this owns only the
+    /// mutation and the event fan-out.
+    ///
+    /// Returns the post-report tab plus whether the report was accepted
+    /// (false = dropped on an ownership mismatch, tab unchanged).
+    @discardableResult
+    func agentReport(_ report: AgentReport) throws -> (accepted: Bool, tab: Tab) {
+        try applyAgentReports(report, then: nil)
+    }
+
+    /// Deprecated `tab.set_hook_active` alias (plan §3.6): claim or
+    /// release as `legacy` with an empty session id. Release is scoped
+    /// like any other, so it cannot revoke a real agent's ownership.
+    func setTabHookActive(_ tabID: Int64, active: Bool) throws {
+        let report = AgentReport(
+            tabID: tabID,
+            source: Self.legacySource,
+            ownershipAction: active ? .claim : .release
+        )
+        _ = try applyAgentReports(report, then: nil)
+    }
+
+    /// OSC 133 prompt/command mark → the **shell** axis, ungated.
+    ///
+    /// The old `hookActive` gate is gone: the axes are independent, so
+    /// there is nothing to suppress — derivation decides which one
+    /// shows. `A`/`B`/`D` additionally drop the lifecycle to `inactive`
+    /// (keeping ownership as a label), the failsafe against a killed
+    /// agent muting the tab forever. See `Agent.applyShellMark`.
+    func applyShellMark(_ tabID: Int64, body: String) throws {
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
-        if t.hookActive { return }
-        t.state = state
+        guard let next = Agent.applyShellMark(t.agent, body: body) else {
+            return  // undefined mark body — no change
+        }
+        let events = replaceAgent(&t, with: next)
         tabs[tabID] = t
-        commit([.tabStateChanged(tabID: tabID, state: state)], persist: false)
+        // Run state isn't in the persisted snapshot — emit only.
+        commit(events, persist: false)
+    }
+
+    /// The tab's PTY was replaced: the shell that hosted any agent is
+    /// gone, so both axes and ownership reset.
+    ///
+    /// Stated as a rule about the PTY rather than about closing —
+    /// closing drops the whole row, so it needs no help. #170's
+    /// hard-restart keeps the row and is this call.
+    func ptyReplaced(_ tabID: Int64) throws {
+        guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
+        let events = replaceAgent(&t, with: AgentTabState())
+        tabs[tabID] = t
+        commit(events, persist: false)
+    }
+
+    /// Raise a tab's attention — pending badge, inbox row, and desktop
+    /// banner. Returns whether it was delivered.
+    ///
+    /// Every gate lives here, beside the mutation: the tab-exists check,
+    /// the raw-OSC agent gate, and the focus decision. A suppressed
+    /// raise is dropped **entirely** — no pending bit, no events. That
+    /// is what makes plan §3.5's "switching away afterwards does not
+    /// retroactively produce a badge" true by construction rather than
+    /// by a UI write-back.
+    @discardableResult
+    func raiseAttention(
+        _ tabID: Int64,
+        title: String,
+        body: String,
+        source: AttentionSource
+    ) throws -> Bool {
+        // A `lookup` error rather than a silent drop: hook tools racing
+        // a tab close need to tell "gone" from "suppressed".
+        guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
+        // Only *raw* OSC is gated on ownership. A structured
+        // `notification.create` / `roostctl notify` is never suppressed
+        // this way (plan §3.4) — the agent's own adapter is what emits
+        // those, so gating them would mute the very source it protects.
+        if source == .rawOsc && Agent.suppressRawOsc(t.agent) { return false }
+        if attentionSuppressedByFocus(tabID) { return false }
+        t.hasNotification = true
+        tabs[tabID] = t
+        // Notification state isn't in the persisted snapshot — emit only.
+        commit(
+            [
+                .tabNotification(tabID: tabID, hasPending: true),
+                .notificationFired(tabID: tabID, title: title, body: body),
+            ],
+            persist: false
+        )
+        return true
     }
 
     func setTabHasNotification(_ tabID: Int64, hasPending: Bool) throws {
@@ -524,12 +667,99 @@ final class Workspace {
         commit([.tabNotification(tabID: tabID, hasPending: hasPending)], persist: false)
     }
 
-    func setTabHookActive(_ tabID: Int64, active: Bool) throws {
+    /// Report the UI window's focus state. Half of the notification
+    /// suppression predicate (plan §3.5); the other half — which tab is
+    /// active — the workspace already owns, so `raiseAttention` decides
+    /// suppression in one place instead of the UI re-deriving it after
+    /// the fact.
+    func setWindowFocused(_ focused: Bool) {
+        windowFocused = focused
+    }
+
+    /// Plan §3.5's suppression predicate: a notification for the tab the
+    /// user is actively looking at is considered seen, so it raises no
+    /// banner, no badge, and no inbox row.
+    private func attentionSuppressedByFocus(_ tabID: Int64) -> Bool {
+        windowFocused && activeTabID == tabID
+    }
+
+    /// Apply `first` and then `then`, emitting the derived-state deltas
+    /// once for the net result.
+    ///
+    /// The second slot exists for exactly one caller — `set-state none`,
+    /// a claim followed by a release — so the intermediate claim never
+    /// reaches subscribers as a real state.
+    private func applyAgentReports(
+        _ first: AgentReport,
+        then: AgentReport?
+    ) throws -> (accepted: Bool, tab: Tab) {
+        let tabID = first.tabID
+        let now = unixNow()
         guard var t = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
-        t.hookActive = active
+        let focusSuppressed = attentionSuppressedByFocus(tabID)
+
+        var next = t.agent
+        var accepted = false
+        var attention = AttentionEffect.unchanged
+        for report in [first, then].compactMap({ $0 }) {
+            let outcome = Agent.applyReport(next, report, now: now)
+            guard outcome.accepted else { continue }
+            accepted = true
+            next = outcome.state
+            if outcome.attention != .unchanged { attention = outcome.attention }
+        }
+
+        var events = replaceAgent(&t, with: next)
+        switch attention {
+        // Same focus predicate as `raiseAttention`, applied here rather
+        // than by delegating because the report's own mutation belongs
+        // with it: a Claude notification for the tab you are looking at
+        // is suppressed exactly like any other, but its lifecycle change
+        // is not.
+        //
+        // `severity` stops here in v1 by design: policy B (plan §3.5)
+        // suppresses on focus alone, and "failed overrides suppression"
+        // is a later slice.
+        case .set(let title, let body, _) where !focusSuppressed:
+            t.hasNotification = true
+            events.append(.tabNotification(tabID: tabID, hasPending: true))
+            events.append(.notificationFired(tabID: tabID, title: title, body: body))
+        case .set:
+            break
+        case .clear:
+            t.hasNotification = false
+            events.append(.tabNotification(tabID: tabID, hasPending: false))
+        case .unchanged:
+            break
+        }
         tabs[tabID] = t
-        // Hook-active flag isn't in the persisted snapshot — emit only.
-        commit([.hookActiveChanged(tabID: tabID, active: active)], persist: false)
+        // Run state isn't in the persisted snapshot — emit only.
+        commit(events, persist: false)
+        return (accepted, t)
+    }
+
+    /// Swap a tab's agent record and return the events the swap implies.
+    ///
+    /// `agentChanged` carries the full record; `tabStateChanged` and
+    /// `hookActiveChanged` carry its two derived projections and each
+    /// fires only when its own projection moved. An identical record
+    /// emits nothing — repeated prompt marks are the common case and
+    /// should not churn the UI.
+    private func replaceAgent(_ tab: inout Tab, with next: AgentTabState) -> [Event] {
+        if tab.agent == next { return [] }
+        let previous = tab.agent
+        tab.agent = next
+        var events: [Event] = []
+        let state = Agent.effective(next)
+        if state != Agent.effective(previous) {
+            events.append(.tabStateChanged(tabID: tab.id, state: state))
+        }
+        let live = Agent.isLive(next)
+        if live != Agent.isLive(previous) {
+            events.append(.hookActiveChanged(tabID: tab.id, active: live))
+        }
+        events.append(.agentChanged(tabID: tab.id, agent: next))
+        return events
     }
 
     func focusTab(_ tabID: Int64) throws -> (previousProject: Int64, previousTab: Int64) {
@@ -543,12 +773,6 @@ final class Workspace {
         let changed = prev != (row.projectId, row.id)
         commit([.activeChanged(projectID: row.projectId, tabID: row.id)], persist: changed)
         return prev
-    }
-
-    func fireNotification(_ tabID: Int64, title: String, body: String) throws {
-        guard tabs[tabID] != nil else { throw WorkspaceError.tabNotFound(tabID) }
-        // Transient notification — nothing persisted, emit only.
-        commit([.notificationFired(tabID: tabID, title: title, body: body)], persist: false)
     }
 
     /// Ensure a default project exists; return its id. Used by
@@ -604,7 +828,7 @@ final class Workspace {
     /// mutator. No lock to manage (`@MainActor`, single-threaded), so
     /// this is simply "persist (per policy), then emit". `persist:
     /// false` is for state that isn't part of the persisted snapshot
-    /// (tab run-state, notification + hook flags) — emit only.
+    /// (the agent axes, notification flags) — emit only.
     private func commit(_ events: [Event], persist shouldPersist: Bool) {
         if shouldPersist { persist() }
         for event in events { emit(event) }

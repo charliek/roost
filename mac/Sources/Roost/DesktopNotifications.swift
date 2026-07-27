@@ -118,10 +118,15 @@ final class DesktopNotifications: NSObject, UNUserNotificationCenterDelegate {
     // MARK: - UNUserNotificationCenterDelegate
 
     /// Required to make banners visible while the app is in the
-    /// foreground. Without this, macOS suppresses banners when the
-    /// originating app is frontmost — which is exactly the case
-    /// where a Claude session in a Roost tab triggers one. Return
-    /// `.banner` + `.sound` so banners fire regardless of frontmost.
+    /// foreground: macOS otherwise suppresses banners when the
+    /// originating app is frontmost.
+    ///
+    /// Under plan 002's policy B (§3.5) a notification for the tab you
+    /// are looking at never reaches this class — the workspace drops it
+    /// at arrival, along with the badge and the inbox row. So forcing
+    /// foreground presentation here now means exactly one thing:
+    /// deliver banners for *background* tabs while the Roost window is
+    /// focused. That is the case this override exists for.
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,

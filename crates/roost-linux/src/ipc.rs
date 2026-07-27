@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
@@ -26,13 +27,14 @@ use roost_ipc::messages::{
     PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams,
+    SelectionDumpResult, SelectionSetParams, TabAgentReportResult, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -310,7 +312,7 @@ pub enum ClipboardOp {
 }
 
 use crate::daemon::state::WorkspaceError;
-use crate::daemon::{PtySupervisor, Workspace};
+use crate::daemon::{AttentionSource, PtySupervisor, Workspace};
 
 /// Glue between the JSON IPC server and the in-process workspace +
 /// PTY supervisor.
@@ -583,23 +585,33 @@ async fn dispatch(
             Ok(serde_json::json!({}))
         }
         ops::TAB_SET_HOOK_ACTIVE => {
+            // Deprecated alias for `tab.agent_report` — claim/release as
+            // `legacy` with an empty session id (plan 002 §3.6).
             let p: TabSetHookActiveParams = decode(params)?;
             h.workspace
                 .set_tab_hook_active(p.tab_id, p.active)
                 .map_err(ws_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::TAB_AGENT_REPORT => {
+            let p: TabAgentReportParams = decode(params)?;
+            // Shape first, so a malformed report is rejected before it
+            // can touch ownership.
+            agent::validate_report(&p).map_err(|e| HandlerError::invalid_param(e.to_string()))?;
+            let (accepted, tab) = h.workspace.agent_report(&p).map_err(ws_err)?;
+            encode(&TabAgentReportResult { accepted, tab })
+        }
         ops::NOTIFICATION_CREATE => {
             let p: NotificationCreateParams = decode(params)?;
-            // Mark the tab as having a pending notification; emit
-            // the lifecycle event for any subscriber. The actual
-            // OS-level notification (libnotify / NSUserNotification)
-            // is the UI layer's job in M3b.
+            // One transaction: pending bit + the event the UI turns into
+            // a banner and an inbox row. Two separate commits let a
+            // concurrent `tab.clear_notification` land between them and
+            // leave an inbox row with `has_notification = false`.
+            //
+            // `Structured` is never gated on agent ownership (plan
+            // §3.4); focus may still drop it, which is not an error.
             h.workspace
-                .set_tab_has_notification(p.tab_id, true)
-                .map_err(ws_err)?;
-            h.workspace
-                .fire_notification(p.tab_id, &p.title, &p.body)
+                .raise_attention(p.tab_id, &p.title, &p.body, AttentionSource::Structured)
                 .map_err(ws_err)?;
             Ok(serde_json::json!({}))
         }

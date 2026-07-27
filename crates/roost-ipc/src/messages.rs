@@ -16,6 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
+
 // ============================================================================
 // Shared types
 // ============================================================================
@@ -34,6 +36,16 @@ pub enum TabState {
 }
 
 /// Tab snapshot. Used in `tab.open` / `tab.list` / `tab.opened` event.
+///
+/// `state` and `hook_active` are **derived** from the three agent axes
+/// below (`crate::agent::effective` / `crate::agent::is_live`), not
+/// stored alongside them. They stay on the wire because every shipped
+/// client reads them; `state` stays a closed four-value enum for the
+/// reason spelled out on [`crate::agent::effective`].
+///
+/// The axes themselves carry `#[serde(default)]` without exception so an
+/// older client decoding a newer server — and the reverse — keeps
+/// working while the two UIs land in separate commits (plan 002 §3.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tab {
     #[serde(with = "string_int64")]
@@ -50,6 +62,26 @@ pub struct Tab {
     pub created_at: i64,
     pub last_active: i64,
     pub hook_active: bool,
+    #[serde(default)]
+    pub shell_state: ShellState,
+    #[serde(default)]
+    pub agent_lifecycle: AgentLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<Ownership>,
+}
+
+impl Tab {
+    /// The three agent axes as the one record `crate::agent` operates
+    /// on. Consumers that need to re-derive (the sidebar rollup, a
+    /// reconnecting UI rebuilding its per-tab cache) go through this
+    /// rather than reading `state` / `hook_active` back off the wire.
+    pub fn agent_state(&self) -> AgentTabState {
+        AgentTabState {
+            shell: self.shell_state,
+            lifecycle: self.agent_lifecycle,
+            ownership: self.ownership.clone(),
+        }
+    }
 }
 
 /// Project snapshot. Used in `project.create` / `tab.list` /
@@ -811,6 +843,20 @@ pub struct TabSetHookActiveParams {
     pub active: bool,
 }
 
+/// `tab.agent_report` reply. The params live in
+/// [`crate::agent::TabAgentReportParams`] alongside the state machine
+/// that consumes them.
+///
+/// `accepted` is false when the report lost the ownership check (plan
+/// §3.3) — the tab is then returned unchanged. Callers get the post-
+/// report `Tab` back so an adapter never needs a follow-up `tab.list`
+/// to see what its report did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabAgentReportResult {
+    pub accepted: bool,
+    pub tab: Tab,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationCreateParams {
@@ -988,6 +1034,29 @@ pub struct NotificationFiredEvent {
     pub body: String,
 }
 
+/// `agent_report.changed` — the full agent record after an accepted
+/// report or shell mark.
+///
+/// `TabStateChangedEvent` and `HookActiveChangedEvent` still fire for
+/// their (derived) slices so existing consumers keep working; this
+/// carries what those two projections lose — which lifecycle, whose
+/// session, and the shell axis underneath.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReportChangedEvent {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    #[serde(default)]
+    pub shell_state: ShellState,
+    #[serde(default)]
+    pub agent_lifecycle: AgentLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<Ownership>,
+    /// The projection this record produces on `Tab.state`, so a
+    /// subscriber never re-derives it.
+    pub state: TabState,
+    pub hook_active: bool,
+}
+
 // ============================================================================
 // Operation name constants — used by client + server dispatcher
 // ============================================================================
@@ -1010,6 +1079,11 @@ pub mod ops {
     pub const TAB_SET_STATE: &str = "tab.set_state";
     pub const TAB_CLEAR_NOTIFICATION: &str = "tab.clear_notification";
     pub const TAB_SET_HOOK_ACTIVE: &str = "tab.set_hook_active";
+    /// The single op every agent adapter writes through: ownership
+    /// claim/preserve/release + lifecycle + attention, applied under
+    /// session scoping. Params + state machine live in
+    /// [`crate::agent`].
+    pub const TAB_AGENT_REPORT: &str = "tab.agent_report";
     pub const NOTIFICATION_CREATE: &str = "notification.create";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     /// Raise + focus the running UI window. Sent by a second launch
@@ -1108,6 +1182,7 @@ pub mod ops {
     pub const EVENT_ACTIVE_CHANGED: &str = "active.changed";
     pub const EVENT_HOOK_ACTIVE_CHANGED: &str = "hook_active.changed";
     pub const EVENT_NOTIFICATION_FIRED: &str = "notification.fired";
+    pub const EVENT_AGENT_REPORT_CHANGED: &str = "agent_report.changed";
 }
 
 // ============================================================================
@@ -1219,6 +1294,9 @@ mod tests {
             created_at: 1_700_000_000,
             last_active: 1_700_000_500,
             hook_active: false,
+            shell_state: ShellState::ForegroundProcess,
+            agent_lifecycle: AgentLifecycle::Inactive,
+            ownership: None,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -1226,6 +1304,74 @@ mod tests {
             json.contains("\"id\":\"12345\""),
             "id must be string: {json}"
         );
+    }
+
+    /// The agent axes are additive: a `Tab` encoded by a pre-plan-002
+    /// server still decodes, and every axis lands on its default.
+    /// Non-negotiable while the two UIs ship in separate commits.
+    #[test]
+    fn tab_decodes_without_the_agent_axes() {
+        let legacy = r#"{
+            "id":"5","project_id":"1","title":"zsh","cwd":"/tmp",
+            "state":"running","has_notification":false,"is_active":true,
+            "user_titled":false,"position":0,"created_at":1,"last_active":2,
+            "hook_active":false
+        }"#;
+        let tab: Tab = serde_json::from_str(legacy).unwrap();
+        assert_eq!(tab.shell_state, ShellState::Unknown);
+        assert_eq!(tab.agent_lifecycle, AgentLifecycle::Inactive);
+        assert_eq!(tab.ownership, None);
+        assert_eq!(tab.agent_state(), AgentTabState::default());
+    }
+
+    /// A `failed` tab must still decode on a client that only knows
+    /// the four legacy states (plan §3.2 / AC 11). `TabState` is the
+    /// closed enum both Swift decoders mirror, so this is the Rust
+    /// half of that guard.
+    #[test]
+    fn failed_lifecycle_projects_onto_the_legacy_state_enum() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyTabState {
+            None,
+            Running,
+            NeedsInput,
+            Idle,
+        }
+        let state = crate::agent::effective(&AgentTabState {
+            shell: ShellState::AtPrompt,
+            lifecycle: AgentLifecycle::Failed,
+            ownership: Some(Ownership {
+                source: "claude".into(),
+                ..Ownership::default()
+            }),
+        });
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LegacyTabState>(&encoded).unwrap(),
+            LegacyTabState::NeedsInput
+        );
+    }
+
+    #[test]
+    fn agent_report_changed_event_round_trips() {
+        let ev = AgentReportChangedEvent {
+            tab_id: 3,
+            shell_state: ShellState::AtPrompt,
+            agent_lifecycle: AgentLifecycle::Waiting,
+            ownership: Some(Ownership {
+                source: "claude".into(),
+                session_id: "abc123".into(),
+                last_event_at: 1_700_000_000,
+                detail: "permission_prompt".into(),
+                metadata: Default::default(),
+            }),
+            state: TabState::NeedsInput,
+            hook_active: true,
+        };
+        round_trip(&ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"tab_id\":\"3\""), "got: {json}");
     }
 
     #[test]

@@ -18,6 +18,9 @@ fn tab(id: i64, project_id: i64, position: i32, is_active: bool) -> Tab {
         created_at: 0,
         last_active: 0,
         hook_active: false,
+        shell_state: Default::default(),
+        agent_lifecycle: Default::default(),
+        ownership: None,
     }
 }
 

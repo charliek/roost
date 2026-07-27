@@ -21,6 +21,7 @@ enum RoostEvent: Sendable {
     case tabNotification(RoostTabNotificationEvent)
     case notification(RoostNotificationEvent)
     case hookActive(RoostHookActiveChangedEvent)
+    case agentChanged(RoostAgentChangedEvent)
     case tabsReordered(RoostTabsReorderedEvent)
     case projectsReordered(RoostProjectsReorderedEvent)
     case active(RoostActiveChangedEvent)
@@ -95,6 +96,16 @@ struct RoostHookActiveChangedEvent: Sendable {
     let active: Bool
 }
 
+/// The full agent record after an accepted report or shell mark
+/// (`agent_report.changed` on the wire). `RoostTabStateChangedEvent`
+/// and `RoostHookActiveChangedEvent` still fire for their derived
+/// slices; this carries what those two projections lose — which
+/// lifecycle, whose session, and the shell axis underneath.
+struct RoostAgentChangedEvent: Sendable {
+    let tabID: Int64
+    let agent: AgentTabState
+}
+
 struct RoostTabsReorderedEvent: Sendable {
     let projectID: Int64
     let tabIds: [Int64]
@@ -112,7 +123,9 @@ struct RoostActiveChangedEvent: Sendable {
 /// Mac-side tab snapshot — what `RoostTabOpenedEvent` carries.
 /// Mirrors the legacy `Roost_V1_Tab` proto message's field
 /// shape so the App.swift consumers don't change. The `state`
-/// field is `RoostTabStateValue` rather than the proto's enum.
+/// field is `RoostTabStateValue` rather than the proto's enum,
+/// and `state` / `hookActive` are the derived projections of
+/// `agent` (plan 002 §3.2).
 struct RoostTabSnapshot: Sendable {
     let id: Int64
     let projectID: Int64
@@ -126,6 +139,7 @@ struct RoostTabSnapshot: Sendable {
     let createdAt: Int64
     let lastActive: Int64
     let hookActive: Bool
+    let agent: AgentTabState
 }
 
 // MARK: - Workspace.Event → RoostEvent conversion
@@ -163,7 +177,8 @@ extension Workspace.Event {
                         position: t.position,
                         createdAt: t.createdAt,
                         lastActive: t.lastActive,
-                        hookActive: t.hookActive
+                        hookActive: t.hookActive,
+                        agent: t.agent
                     )
                 )
             )
@@ -183,6 +198,8 @@ extension Workspace.Event {
             return .active(.init(projectID: projectID, tabID: tabID))
         case .hookActiveChanged(let tabID, let active):
             return .hookActive(.init(tabID: tabID, active: active))
+        case .agentChanged(let tabID, let agent):
+            return .agentChanged(.init(tabID: tabID, agent: agent))
         case .notificationFired(let tabID, let title, let body):
             return .notification(.init(tabID: tabID, title: title, body: body))
         case .tabsReordered(let projectID, let tabIDs):

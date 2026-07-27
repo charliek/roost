@@ -183,6 +183,7 @@ tabbar tab:checked {
 .roost-tab-pill-dot.running { background-color: #5fa3f0; }
 .roost-tab-pill-dot.needs-input { background-color: #f0a040; }
 .roost-tab-pill-dot.idle { background-color: #7a7a7a; }
+.roost-tab-pill-dot.failed { background-color: #e05252; }
 /* Trailing close button: flat, only visible on the active/hovered pill
  * (set via .visible in code). Compact so the pill stays Mac-sized. */
 .roost-tab-pill-close {
@@ -291,10 +292,8 @@ button.roost-add-project:active {
  * inset is used instead of border-left because libadwaita reserves
  * the row's leading margin for the selection state — a real border
  * would shift the label. needs-input wins; running is informational;
- * idle is muted. The "none" state has no class, no stripe. The
- * daemon's TabState enum has no ERROR variant; if the daemon grows
- * one later, add a `.roost-rollup-error` rule alongside these three
- * and the matching `RollupState::Error` variant in `rollup.rs`.
+ * idle is muted. The "none" state has no class, no stripe. Ranking is
+ * `roost_ipc::agent::rank` — failed > needs-input > running > idle.
  *
  * Colors mirror the per-tab indicator SVGs. Hard-coded rather than
  * @accent_bg_color etc. because the indicator meaning is semantic,
@@ -307,6 +306,14 @@ button.roost-add-project:active {
 }
 .navigation-sidebar > row.roost-rollup-idle {
   box-shadow: inset 3px 0 0 #7a7a7a;
+}
+/* `failed` is its own colour, not a louder needs-input: the legacy
+ * `tab.state` field collapses the two (it stays a closed four-value
+ * enum, see roost-ipc's agent::effective), so the stripe is one of the
+ * only places a user can tell "the agent wants you" from "the agent
+ * died". */
+.navigation-sidebar > row.roost-rollup-failed {
+  box-shadow: inset 3px 0 0 #e05252;
 }
 
 /* Command palette (Cmd+Shift+P / Alt+Shift+P). Explicit Swift hex

@@ -106,8 +106,12 @@ fmt:  ## Format Rust (cargo fmt --all)
 fmt-check:  ## Check formatting (what CI's rust-lint runs)
 	cargo fmt --all -- --check
 
-clippy:  ## Lint Rust (cargo clippy --workspace)
-	cargo clippy --workspace --all-targets
+clippy:  ## Lint Rust at CI parity (warnings are errors)
+	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
+	# passed while CI failed, which is worse than no local gate at all.
+	# roost-linux is linted separately (it needs GTK), mirroring CI's split.
+	cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
+	cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types -D clippy::disallowed_methods
 
 themes-check:  ## Assert the Rust + Mac bundled-theme copies are byte-identical
 	diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes

@@ -152,6 +152,16 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private var activeProjectID: Int64?
     private var activeSessionByProject: [Int64: TabSession] = [:]
 
+    /// True while `handleEvent` applies a core-driven change. UI
+    /// selection is pushed back to the core (`syncCoreActiveTab`), and
+    /// a reaction must not push: `focusTab` walks through the project's
+    /// *remembered* tab before landing on the requested one, so echoing
+    /// that intermediate selection would emit a second `active.changed`
+    /// the UI then reacts to — the two selections ping-pong forever.
+    /// GTK draws the same line by syncing only from
+    /// `activate_project_from_ui`, never from `set_active_project`.
+    private var applyingCoreEvent = false
+
     /// M5 of `goal-mac-parity-2026-05-18.md`: cell views per project,
     /// reused across `reloadData` so inline rename's typing buffer
     /// survives a sibling-driven sidebar refresh. The Mac UI grows
@@ -505,6 +515,27 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         self.window = window
 
+        // Feed window focus to the workspace: it is half of the
+        // notification-suppression predicate (plan 002 §3.5), and the
+        // core owns that decision so it can be made atomically with the
+        // state change instead of re-derived when the UI drains events.
+        // AppKit posts all four notifications on the main thread.
+        let center = NotificationCenter.default
+        for (name, sender) in [
+            (NSWindow.didBecomeKeyNotification, window as Any?),
+            (NSWindow.didResignKeyNotification, window as Any?),
+            (NSApplication.didBecomeActiveNotification, nil),
+            (NSApplication.didResignActiveNotification, nil),
+        ] {
+            center.addObserver(
+                self,
+                selector: #selector(windowFocusChanged(_:)),
+                name: name,
+                object: sender
+            )
+        }
+        publishWindowFocus()
+
         // Round-6 R6.B: seat the divider at the persisted (or
         // default) sidebar width AFTER the window has been ordered
         // front and the initial layout pass has settled. Calling
@@ -828,6 +859,30 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Window key / app activation changed → re-publish the workspace's
+    /// half of policy B's suppression predicate. Synchronous on purpose:
+    /// an async hop would leave the core briefly believing the window is
+    /// still focused, which is exactly the interval in which a
+    /// notification would be wrongly dropped.
+    @objc @MainActor
+    private func windowFocusChanged(_ notification: Notification) {
+        publishWindowFocus()
+    }
+
+    /// The Mac reading of plan §3.5's `window_active` term. Not simply
+    /// `isKeyWindow`: the command palette is a child `NSPanel` that takes
+    /// key while the user is very much still looking at the window, and a
+    /// key-only test would report "unfocused" every time it opens. A
+    /// panel never becomes *main*, so `isMainWindow` survives that —
+    /// while `NSApp.isActive` still goes false when Roost drops to the
+    /// background, and both go false when the window is minimized.
+    @MainActor
+    private func publishWindowFocus() {
+        let focused = NSApp.isActive
+            && (window?.isKeyWindow == true || window?.isMainWindow == true)
+        RoostBackend.shared.workspace?.setWindowFocused(focused)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1966,7 +2021,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// it for a tab already shown is a no-op. Shared by the `.tabOpened`
     /// event arm (cross-client `tab.open`) and the boot-gap reconcile.
     @MainActor
-    private func attachExistingTab(id: Int64, projectID: Int64, title: String, cwd: String) {
+    private func attachExistingTab(
+        id: Int64,
+        projectID: Int64,
+        title: String,
+        cwd: String,
+        agent: AgentTabState
+    ) {
         guard !tabs.contains(where: { $0.id == id }) else { return }
         let session = TabSession(
             projectID: projectID,
@@ -1980,6 +2041,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         )
         session.liveTitle = title
         session.liveCwd = cwd.isEmpty ? nil : cwd
+        // Seeded from the workspace snapshot: a fresh `tab.open` carries
+        // defaults, a resync carries the accumulated axes. Subsequent
+        // `.agentChanged` events keep it current.
+        session.agent = agent
         tabs.append(session)
         session.attach(socketPath: socketPath, tabID: id)
         if projectID == activeProjectID {
@@ -1989,24 +2054,60 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     }
 
     /// Heal the boot gap. The event subscription is callback-based with
-    /// no replay, so a tab opened via IPC between the server binding and
-    /// the subscription registering had its `tabOpened` dropped — the UI
-    /// would never materialize it. Driven by the `.resync` event the
-    /// subscription emits as its first event (so it can't race the async
-    /// restore opens at bootstrap): attach any workspace tab the UI is
-    /// missing. Mirrors GTK's resync-on-subscribe
-    /// (`crates/roost-linux/src/events.rs`); idempotent — a tab opened in
-    /// the sliver between subscribe and the snapshot is just deduped.
+    /// no replay, so anything that happened between the server binding
+    /// and the subscription registering was dropped. Driven by the
+    /// `.resync` event the subscription emits as its first event (so it
+    /// can't race the async restore opens at bootstrap). Mirrors GTK's
+    /// `reconcile_to_snapshot`; idempotent — a tab opened in the sliver
+    /// between subscribe and the snapshot is just deduped.
+    ///
+    /// Two halves, because the gap swallows two kinds of change: a tab
+    /// the UI never materialized (its `tabOpened` was dropped) is
+    /// attached, and a tab the UI already holds has its agent record
+    /// refreshed (its `agent_report.changed` was dropped). Skipping the
+    /// second leaves an agent that reported `failed` before subscription
+    /// showing an inactive pill + rollup indefinitely, while `tab.list`
+    /// reports the truth.
     @MainActor
-    private func attachMissingWorkspaceTabs() {
+    private func reconcileFromWorkspaceSnapshot() {
         guard let workspace = RoostBackend.shared.workspace else { return }
-        for project in workspace.snapshot() {
-            for tab in workspace.tabs(in: project.id)
-            where !tabs.contains(where: { $0.id == tab.id }) {
-                attachExistingTab(
-                    id: tab.id, projectID: tab.projectId, title: tab.title, cwd: tab.cwd
-                )
-            }
+        let snapshot = workspace.snapshot().flatMap { workspace.tabs(in: $0.id) }
+        for tab in snapshot where !tabs.contains(where: { $0.id == tab.id }) {
+            attachExistingTab(
+                id: tab.id,
+                projectID: tab.projectId,
+                title: tab.title,
+                cwd: tab.cwd,
+                agent: tab.agent
+            )
+        }
+        let stale = Set(
+            Self.staleAgentTabIDs(
+                snapshot: snapshot.map { (id: $0.id, agent: $0.agent) },
+                sessions: tabs.map { (id: $0.id, agent: $0.agent) }
+            )
+        )
+        guard !stale.isEmpty else { return }
+        for tab in snapshot where stale.contains(tab.id) {
+            tabs.first(where: { $0.id == tab.id })?.agent = tab.agent
+        }
+        rebuildTabBar()
+        rebuildSidebar()
+    }
+
+    /// Tabs the UI already holds a session for whose cached agent record
+    /// has drifted from the workspace — the half of the `.resync`
+    /// reconcile the attach loop cannot cover, since that only sees tabs
+    /// with no session at all. Extracted so the drift rule is testable
+    /// without an AppKit window; mirrors step 6 of GTK's
+    /// `reconcile_to_snapshot`.
+    static func staleAgentTabIDs(
+        snapshot: [(id: Int64, agent: AgentTabState)],
+        sessions: [(id: Int64?, agent: AgentTabState)]
+    ) -> [Int64] {
+        snapshot.compactMap { tab in
+            guard let session = sessions.first(where: { $0.id == tab.id }) else { return nil }
+            return session.agent == tab.agent ? nil : tab.id
         }
     }
 
@@ -2016,6 +2117,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// the remaining cases.
     @MainActor
     private func handleEvent(_ kind: RoostEvent) {
+        // Save/restore rather than reset to false: today the only
+        // synchronous re-entry path is itself gated by this flag, but a
+        // future arm that commits to the workspace from inside
+        // `handleEvent` would otherwise drop the guard for the rest of
+        // the outer frame.
+        let wasApplyingCoreEvent = applyingCoreEvent
+        applyingCoreEvent = true
+        defer { applyingCoreEvent = wasApplyingCoreEvent }
         switch kind {
         case .projectCreated(let e):
             let p = e.project
@@ -2121,15 +2230,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 id: newTab.id,
                 projectID: newTab.projectID,
                 title: newTab.title,
-                cwd: newTab.cwd
+                cwd: newTab.cwd,
+                agent: newTab.agent
             )
         case .active(let e):
-            // Workspace-driven active-selection change. The UI is
-            // authoritative for focus it initiates itself (pill click,
-            // new-tab open, restore, cascade-close fallback): those
-            // paths update the local selection *before* this echo
-            // arrives, so the guard below makes us a no-op and avoids a
-            // selectTab → focusTab → `.active` feedback loop. When the
+            // Workspace-driven active-selection change. Focus the UI
+            // initiates itself (pill click, new-tab open, restore,
+            // cascade-close fallback) still routes through the core, but
+            // those paths update the local selection *before* the
+            // `syncCoreActiveTab` push that produces this echo — so the
+            // guard below makes us a no-op and avoids a selectTab →
+            // focusTab → `.active` feedback loop. When the
             // change originates *outside* the UI — `roostctl tab focus`,
             // or any future external client — the UI hasn't switched
             // yet, so bring the requested tab forward (without raising
@@ -2170,14 +2281,22 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-        case .tabState(let e):
-            // TabState updates light up the status-dot slot M3's
+        case .tabState, .hookActive:
+            // Derived slices of `.agentChanged`, kept for the wire
+            // contract (the Mac's `events.subscribe` is not implemented
+            // yet, so nothing consumes them in-process). The UI reads the
+            // superset: reacting here too would apply the same change
+            // twice, and `tabState`'s closed four-value enum can't
+            // express `failed`.
+            break
+        case .agentChanged(let e):
+            // The agent axes light up the status-dot slot M3's
             // TabPillView reserved. Stash and rebuild. Also rebuild
             // the sidebar so the per-project rollup rail picks up the
             // new state — `reloadData` re-runs `rowViewForItem`, which
             // recomputes the rollup from `tabs` for the row's rail.
             if let session = tabs.first(where: { $0.id == e.tabID }) {
-                session.liveState = Int32(e.state.rawValue)
+                session.agent = e.agent
                 if session.projectID == activeProjectID {
                     rebuildTabBar()
                 }
@@ -2224,26 +2343,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 ))
                 refreshDockBadge()
             }
-            // Phase 6a P8: route the daemon-emitted notification
-            // to a macOS banner via UNUserNotificationCenter.
-            // The daemon already applied hook_active suppression
-            // in P5; by the time we see a NotificationEvent here
-            // the surface is ours to render.
+            // Route the notification to a macOS banner via
+            // UNUserNotificationCenter. Every gate — the raw-OSC agent
+            // check and policy B's focus predicate — was applied in the
+            // workspace, atomically with the state change (plan 002
+            // §3.4 / §3.5). If this event exists it was not suppressed;
+            // re-deriving either gate here would evaluate it against a
+            // selection the user may have changed since the commit.
             desktopNotifications.emit(
                 tabID: e.tabID,
                 title: e.title,
                 body: e.body
             )
-        case .hookActive(let e):
-            // M6 of `goal-mac-parity-2026-05-18.md`: hookActive suppresses
-            // the per-tab agent state from the sidebar rollup. The pill
-            // dot still tracks the raw state — only the project-level
-            // rollup demotes. Mirrors Linux `crates/roost-linux/src/rollup.rs`
-            // semantics.
-            if let session = tabs.first(where: { $0.id == e.tabID }) {
-                session.hookActive = e.active
-                rebuildSidebar()
-            }
         case .tabsReordered(let e):
             // M2 of `goal-mac-parity-2026-05-18.md`: apply daemon-
             // authoritative tab order so a Mac drag + a sibling
@@ -2257,9 +2368,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // selected through the rebuild.
             applyProjectsReorder(newOrder: e.projectIds)
         case .resync:
-            // First event after the subscription registers: attach any
-            // tab opened before it went live (the boot gap).
-            attachMissingWorkspaceTabs()
+            // First event after the subscription registers: reconcile
+            // everything that changed before it went live (the boot gap).
+            reconcileFromWorkspaceSnapshot()
         }
     }
 
@@ -2765,6 +2876,46 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: nextIndex)
     }
 
+    /// Push a UI-originating selection onto the core, so the workspace's
+    /// active tab is what is actually on screen. Everything that reads
+    /// it — `identify`, the persisted layout, and plan 002 §3.5's
+    /// notification-suppression predicate — is otherwise judging by a
+    /// stale tab: attention for the visible tab would be recorded and
+    /// surface retroactively on the next switch, and attention for a
+    /// background tab would be dropped. Mirrors GTK's
+    /// `sync_core_active_tab` (vision.md DL-11).
+    ///
+    /// Selection only — no `NSApp.activate`. Guarded on the read, and
+    /// skipped entirely while reacting to a core event, so nothing
+    /// echoes back.
+    @MainActor
+    private func syncCoreActiveTab(_ tabID: Int64) {
+        guard Self.shouldSyncCoreActiveTab(
+            selected: tabID,
+            coreActive: RoostBackend.shared.workspace?.activeTabID ?? 0,
+            applyingCoreEvent: applyingCoreEvent
+        ) else { return }
+        do {
+            _ = try RoostBackend.shared.localClient?.focusTab(tabID)
+        } catch {
+            // The only failure is the tab vanishing between the UI
+            // selection and here; its `.tabDeleted` is already in flight.
+            RoostLogger.shared.warn("syncCoreActiveTab: focusTab(\(tabID)) failed: \(error)")
+        }
+    }
+
+    /// The `syncCoreActiveTab` decision, extracted so both halves are
+    /// testable without an AppKit window: push when the UI moved the
+    /// selection itself, stay silent when the core already agrees or
+    /// when this selection *is* the UI reacting to the core.
+    static func shouldSyncCoreActiveTab(
+        selected: Int64,
+        coreActive: Int64,
+        applyingCoreEvent: Bool
+    ) -> Bool {
+        !applyingCoreEvent && coreActive != selected
+    }
+
     @MainActor
     private func selectTab(at indexInActiveProject: Int) {
         guard let activeProjectID else { return }
@@ -2795,6 +2946,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         activeSessionByProject[activeProjectID] = session
         window?.makeFirstResponder(view)
+        // The local selection is committed *before* this, so the
+        // `.active` echo the core fires back finds `alreadyShown` true
+        // and is a no-op.
+        if let tabID = session.id {
+            syncCoreActiveTab(tabID)
+        }
 
         // Phase 6a P7: focusing a notified tab clears its badge
         // — fire ClearTabNotification daemon-side so every other
@@ -3604,17 +3761,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         return pathDisplay(path, home: home, max: Int.max)
     }
 
-    /// Resolve the status-dot color for a tab pill based on
-    /// `liveState`. The proto's `TabState` enum is: 0=Unspecified,
-    /// 1=None, 2=Running, 3=NeedsInput, 4=Idle (matches
-    /// `proto/roost.proto`'s `TabState`). The dot picks the same
-    /// palette as the M6 sidebar rollup so the two indicators agree:
-    /// running → blue, needs-input → orange, idle → gray. None /
-    /// unknown → no dot (M3's empty slot).
+    /// Resolve the status-dot color for a tab pill from its agent axes.
+    /// Shares `rollupColor` with the sidebar rollup so the two
+    /// indicators agree: working → blue, waiting → orange, finished →
+    /// gray, failed → red. `.inactive` → no dot (M3's empty slot).
     @MainActor
     private func pillStatusColor(for session: TabSession) -> NSColor? {
-        guard let state = session.liveState else { return nil }
-        return RollupState(matchingProto: Int(state)).nsColor
+        rollupColor(for: Agent.effectiveLifecycle(session.agent))
     }
 
     // MARK: - Keybind table → NSMenuItem (Phase 6a P1)
@@ -5390,23 +5543,21 @@ extension RoostApp: NSOutlineViewDelegate {
     ) -> NSTableRowView? {
         let rowView = SidebarRowView()
         if let row = item as? ProjectRowItem {
-            rowView.rollupColor = rollupState(forProjectID: row.project.id).nsColor
+            rowView.rollupColor = rollupColor(for: rollupLifecycle(forProjectID: row.project.id))
         }
         return rowView
     }
 
-    /// Per-project agent-state rollup for `projectID`, aggregated over its
-    /// tabs' `(state, hookActive)` pairs (hook-active tabs suppressed). Feeds
-    /// the row view's leading accent rail; kept a single function so the rail
-    /// always agrees with the per-tab pill status.
-    func rollupState(forProjectID projectID: Int64) -> RollupState {
-        let pairs: [(state: TabAgentState, hookActive: Bool)] = tabs
-            .filter { $0.projectID == projectID }
-            .map {
-                (state: TabAgentState.fromProto(Int($0.liveState ?? 0)),
-                 hookActive: $0.hookActive)
-            }
-        return projectRollup(tabs: pairs)
+    /// Per-project agent-state rollup for `projectID`: the highest-ranked
+    /// of its tabs' presented lifecycles. Feeds the row view's leading
+    /// accent rail; kept a single function so the rail always agrees with
+    /// the per-tab pill status.
+    func rollupLifecycle(forProjectID projectID: Int64) -> AgentLifecycle {
+        projectRollup(
+            tabs
+                .filter { $0.projectID == projectID }
+                .map { Agent.effectiveLifecycle($0.agent) }
+        )
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {

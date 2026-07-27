@@ -40,26 +40,24 @@ final class TabSession {
     private(set) var id: Int64?
 
     /// Live tab metadata mirrored from `RoostEvent.tabTitle` /
-    /// `RoostEvent.tabCwd` / `RoostEvent.tabState` (which the
-    /// `Workspace.subscribe` bridge produces). `nil` when no event
-    /// has fired yet; the tab pill falls back to "Tab N" labels
-    /// until cwd / title arrive.
+    /// `RoostEvent.tabCwd` (which the `Workspace.subscribe` bridge
+    /// produces). `nil` when no event has fired yet; the tab pill falls
+    /// back to "Tab N" labels until cwd / title arrive.
     var liveTitle: String?
     var liveCwd: String?
-    var liveState: Int32?
     /// Phase 6a P7: tracks `TabNotificationEvent.has_pending` so
     /// the tab pill + sidebar row can render an accent badge.
     /// Cleared via `ClearTabNotification` when the user focuses
     /// the tab.
     var liveHasNotification: Bool = false
 
-    /// M6 of `goal-mac-parity-2026-05-18.md`: tracks
-    /// `HookActiveChangedEvent.active`. While true, the tab's agent
-    /// state is suppressed in the per-project sidebar rollup — the
-    /// Claude hook owns the urgency surface and promoting a colored
-    /// stripe alongside would double-count it. Mirrors the Linux
-    /// `crates/roost-linux/src/rollup.rs` semantics.
-    var hookActive: Bool = false
+    /// The tab's three agent axes, tracked from
+    /// `RoostEvent.agentChanged`. Drives the pill's status dot and the
+    /// project rollup stripe — both read it through
+    /// `Agent.effectiveLifecycle`, so the two surfaces cannot disagree.
+    /// Supersedes the separate `liveState` + `hookActive` cache: both
+    /// are projections of this record (plan 002 §3.2).
+    var agent = AgentTabState()
 
     /// Project the tab belongs to. Set at construction so the window
     /// can filter tabs by project before `start()` ever runs — the

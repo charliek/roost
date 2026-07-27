@@ -22,7 +22,9 @@
             "position": 0,
             "created_at": 1700000000,
             "last_active": 1700000050,
-            "hook_active": false
+            "hook_active": false,
+            "shell_state": "foreground_process",
+            "agent_lifecycle": "inactive"
           }
         ]
       }

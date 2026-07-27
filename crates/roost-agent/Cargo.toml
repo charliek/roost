@@ -1,0 +1,19 @@
+[package]
+name        = "roost-agent"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Pure agent adapters: hook event JSON in, `tab.agent_report` params out. No I/O, no socket, no CLI — unit-testable on its own."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+roost-ipc  = { path = "../roost-ipc" }
+serde_json = "1.0"
+
+[lints]
+workspace = true

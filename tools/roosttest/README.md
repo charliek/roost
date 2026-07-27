@@ -34,13 +34,14 @@ silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 
 | File | What |
 |---|---|
-| `client.py` | `Roost` — a thin JSON-IPC client (direct Unix socket). Op methods (`open_tab`, `set_state`, `dump`, …) + no-`sleep` waits (`wait_state`, `wait_text`, `wait_gone`) + `run()` (wait for prompt, then send a command). |
+| `client.py` | `Roost` — a thin JSON-IPC client (direct Unix socket). Op methods (`open_tab`, `set_state`, `agent_report`, `dump`, …), the agent-axis readers (`shell_state`, `agent_lifecycle`, `ownership`, `hook_active`) + no-`sleep` waits (`wait_state`, `wait_lifecycle`, `wait_shell_state`, `wait_notification`, `wait_text`, `wait_gone`) + `run()` (wait for prompt, then send a command). |
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), `fresh` (`--roost-fresh`/`ROOST_TEST_FRESH`), a session fixture that owns/ensures the UI (hermetic in fresh mode), `roost` (a client), `project` (a throwaway, cascade-cleaned project). Also the `SKIPS: N` terminal summary. |
 | `util.py` | Cross-file helpers: `precondition` / `skip_on_ci` (the skip policy), `cwd_reaches` (scaled cwd poll), `wait_tab_attached`, `wait_shell_ready` (pre-input race-fix for shells that emit pre-prompt content), drain helpers. |
 | `test_smoke.py` | The smoke suite: content via `tab.dump`, state progression, notifications, focus, title-lock, cascade-close. |
 | `test_palette.py` | The command palette as a driveable surface: open, introspect rows, filter, activate (which dispatches the same command its keybind would), push a sub-frame, dismiss. |
 | `test_notifications.py` | The multi-project notification inbox: `view_notifications` frame, jump-to-notification (focuses the tab + clears its badge), clear-all. |
+| `test_agent_lifecycle.py` | The agent state model end to end: synthetic Claude hook payloads driven through the **real `roostctl claude-hook` binary** (adapter → CLI → IPC → workspace → the derived `state` / `hook_active` / axis fields on `tab.list`). Covers the full turn, `Stop` with in-flight `background_tasks`, `StopFailure` (and that `tab.state` stays a closed four-value enum), unknown `notification_type`, `agent_id` events, foreign-session rejection, the legacy `prompt-submit` spelling, the deprecated `tab.set_hook_active` alias, and the OSC 133 `D`/`A` failsafe. |
 | `test_launcher.py` | The custom-command launcher (Cmd/Alt+Shift+T): lists the seeded commands + activating one spawns a tab that runs it. |
 | `test_newtab_cwd.py` | New-tab cwd inheritance: `palette.activate("new_tab")` (Cmd-T / Ctrl-T) and the launcher both spawn in the active tab's live (OSC 7) cwd, not the project cwd. Emits OSC 7 itself so it's shell-independent. |
 | `test_terminal.py` | Program-driven terminal behavior: `test_cwd_tracking_follows_cd` (`cd` + an explicit OSC 7 emit → tracked cwd; cross-platform) and `test_title_follows_cwd` (title derives from cwd; skipped on Mac — shell-OSC-0-driven, see issue #196). |

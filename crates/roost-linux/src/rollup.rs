@@ -1,204 +1,212 @@
 //! Per-project sidebar rollup state machine.
 //!
-//! Aggregates each tab's [`TabState`] + `hook_active` flag into a
-//! single [`RollupState`] for the project's sidebar row. The CSS
-//! stripe lives in `resources/style.css` (`.roost-rollup-*`); this
-//! module picks which one to apply.
+//! Reduces a project's tabs to the one CSS stripe its sidebar row wears.
+//! The stripe itself lives in `resources/style.css` (`.roost-rollup-*`);
+//! this module picks which one.
 //!
-//! Kept at parity with the Mac UI's per-project state rollup so users
-//! moving between the two UIs see the same precedence (needs-input
-//! wins, hook-active suppresses noise).
+//! Both halves are shared, not local: the per-tab value is
+//! [`agent::effective_lifecycle`] (the same value the tab's own dot and
+//! indicator icon render) and the ordering is [`agent::rank`] (the same
+//! function the future agent overview sorts by). So the sidebar can't
+//! disagree with the rest of the UI about which tab is loudest.
+//!
+//! Hook-driven state **participates**. Until plan 002 this module
+//! skipped every tab with `hook_active` set, so a project whose only
+//! blocked tab was a Claude session showed no stripe at all — the
+//! differentiating case, hidden. Kept at parity with the Mac UI's
+//! `ProjectRollup.swift`.
 
-/// Per-tab agent state as exposed by the daemon's `TabStateChangedEvent`.
-/// The proto numeric mapping is:
+use roost_ipc::agent::{self, AgentLifecycle};
+
+/// Every `roost-rollup-*` class, for clearing stale ones before
+/// applying the current stripe.
+pub const ROLLUP_CLASSES: [&str; 4] = [
+    "roost-rollup-running",
+    "roost-rollup-needs-input",
+    "roost-rollup-idle",
+    "roost-rollup-failed",
+];
+
+/// Sidebar stripe for a rollup, or `None` for `Inactive` (no class = no
+/// stripe).
+pub fn rollup_css_class(lifecycle: AgentLifecycle) -> Option<&'static str> {
+    match lifecycle {
+        AgentLifecycle::Inactive => None,
+        AgentLifecycle::Working => Some("roost-rollup-running"),
+        AgentLifecycle::Waiting => Some("roost-rollup-needs-input"),
+        AgentLifecycle::Finished => Some("roost-rollup-idle"),
+        AgentLifecycle::Failed => Some("roost-rollup-failed"),
+    }
+}
+
+/// Compute the project rollup: the highest-[`agent::rank`] tab wins.
+/// No tabs → `Inactive`.
 ///
-/// * 0 / `Unspecified` — no state set yet (treated as `None`).
-/// * 1 / `None` — no agent activity.
-/// * 2 / `Running` — agent is working.
-/// * 3 / `NeedsInput` — agent is waiting on the user.
-/// * 4 / `Idle` — agent finished, no pending input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TabState {
-    None,
-    Running,
-    NeedsInput,
-    Idle,
-}
-
-impl TabState {
-    /// Map the roost-ipc `TabState` enum to our local enum. The
-    /// workspace is the source of truth post-M3b; the legacy proto
-    /// integer mapping (`from_proto`) is gone with the daemon.
-    pub fn from_ipc(value: roost_ipc::messages::TabState) -> Self {
-        use roost_ipc::messages::TabState as Ipc;
-        match value {
-            Ipc::Running => Self::Running,
-            Ipc::NeedsInput => Self::NeedsInput,
-            Ipc::Idle => Self::Idle,
-            Ipc::None => Self::None,
-        }
-    }
-}
-
-/// Project-level rollup as drawn by the sidebar CSS class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RollupState {
-    None,
-    Running,
-    NeedsInput,
-    Idle,
-}
-
-impl RollupState {
-    /// CSS class to apply to the sidebar row, or `None` when the
-    /// rollup is `None` (no class = no stripe).
-    pub fn css_class(self) -> Option<&'static str> {
-        match self {
-            Self::None => None,
-            Self::Running => Some("roost-rollup-running"),
-            Self::NeedsInput => Some("roost-rollup-needs-input"),
-            Self::Idle => Some("roost-rollup-idle"),
-        }
-    }
-
-    /// All possible class names, in order — used to clear stale
-    /// classes before applying the current one. Returned as a slice
-    /// so callers can iterate without owning a Vec.
-    pub const fn all_classes() -> &'static [&'static str] {
-        &[
-            "roost-rollup-running",
-            "roost-rollup-needs-input",
-            "roost-rollup-idle",
-        ]
-    }
-}
-
-/// Compute the project rollup from a list of `(state, hook_active)`
-/// pairs. Priority: `NeedsInput > Running > Idle > None`. When a tab
-/// has `hook_active = true` its state is suppressed (the Claude hook
-/// owns the notification surface; promoting the rollup color would
-/// duplicate the urgency signal). Empty list → `None`.
-///
-/// Pure function — no GTK, no env, no allocation. Used by [`crate::app`]
-/// when applying rollup CSS classes; tested directly without spinning
-/// up the GTK runtime.
-pub fn project_rollup(tabs: &[(TabState, bool)]) -> RollupState {
-    let mut needs_input = false;
-    let mut running = false;
-    let mut idle = false;
-    for (state, hook_active) in tabs {
-        if *hook_active {
-            continue;
-        }
-        match state {
-            TabState::NeedsInput => needs_input = true,
-            TabState::Running => running = true,
-            TabState::Idle => idle = true,
-            TabState::None => {}
-        }
-    }
-    if needs_input {
-        RollupState::NeedsInput
-    } else if running {
-        RollupState::Running
-    } else if idle {
-        RollupState::Idle
-    } else {
-        RollupState::None
-    }
+/// Pure function — no GTK, no env, no allocation. Used by
+/// [`crate::app`] when applying rollup CSS classes; tested directly
+/// without spinning up the GTK runtime.
+pub fn project_rollup(tabs: impl IntoIterator<Item = AgentLifecycle>) -> AgentLifecycle {
+    tabs.into_iter()
+        .max_by_key(|l| agent::rank(*l))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::agent::{AgentTabState, Ownership, ShellState};
+
+    /// A tab an agent owns, mid-turn.
+    fn owned(lifecycle: AgentLifecycle) -> AgentTabState {
+        AgentTabState {
+            shell: ShellState::AtPrompt,
+            lifecycle,
+            ownership: Some(Ownership {
+                source: "claude".into(),
+                session_id: "s1".into(),
+                ..Ownership::default()
+            }),
+        }
+    }
+
+    /// A plain shell with no agent.
+    fn shell(shell: ShellState) -> AgentTabState {
+        AgentTabState {
+            shell,
+            ..AgentTabState::default()
+        }
+    }
+
+    /// The production call shape: tabs in, presented lifecycles out.
+    fn rollup(tabs: &[AgentTabState]) -> AgentLifecycle {
+        project_rollup(tabs.iter().map(agent::effective_lifecycle))
+    }
 
     #[test]
     fn empty_list_is_none() {
-        assert_eq!(project_rollup(&[]), RollupState::None);
+        assert_eq!(rollup(&[]), AgentLifecycle::Inactive);
     }
 
     #[test]
-    fn all_none_is_none() {
-        let tabs = [(TabState::None, false), (TabState::None, false)];
-        assert_eq!(project_rollup(&tabs), RollupState::None);
+    fn all_idle_shells_is_none() {
+        let tabs = [shell(ShellState::AtPrompt), shell(ShellState::Unknown)];
+        assert_eq!(rollup(&tabs), AgentLifecycle::Inactive);
     }
 
     #[test]
-    fn single_running() {
+    fn foreground_process_is_running() {
         assert_eq!(
-            project_rollup(&[(TabState::Running, false)]),
-            RollupState::Running
+            rollup(&[shell(ShellState::ForegroundProcess)]),
+            AgentLifecycle::Working
         );
     }
 
     #[test]
     fn needs_input_outranks_running() {
-        let tabs = [(TabState::Running, false), (TabState::NeedsInput, false)];
-        assert_eq!(project_rollup(&tabs), RollupState::NeedsInput);
+        let tabs = [
+            owned(AgentLifecycle::Working),
+            owned(AgentLifecycle::Waiting),
+        ];
+        assert_eq!(rollup(&tabs), AgentLifecycle::Waiting);
     }
 
     #[test]
     fn running_outranks_idle() {
-        let tabs = [(TabState::Idle, false), (TabState::Running, false)];
-        assert_eq!(project_rollup(&tabs), RollupState::Running);
+        let tabs = [
+            owned(AgentLifecycle::Finished),
+            shell(ShellState::ForegroundProcess),
+        ];
+        assert_eq!(rollup(&tabs), AgentLifecycle::Working);
     }
 
     #[test]
     fn idle_outranks_none() {
-        let tabs = [(TabState::None, false), (TabState::Idle, false)];
-        assert_eq!(project_rollup(&tabs), RollupState::Idle);
+        let tabs = [shell(ShellState::AtPrompt), owned(AgentLifecycle::Finished)];
+        assert_eq!(rollup(&tabs), AgentLifecycle::Finished);
     }
 
+    /// `failed` sits above `waiting` — the whole reason the rollup
+    /// ranks on the agent axis instead of the legacy `TabState`, which
+    /// collapses the two.
     #[test]
-    fn hook_active_suppresses_needs_input() {
-        // If the only NeedsInput tab has its hook active, the rollup
-        // falls back to whatever the other tabs say.
+    fn failed_outranks_needs_input() {
         let tabs = [
-            (TabState::NeedsInput, true), // hook-active → suppressed
-            (TabState::Running, false),
+            owned(AgentLifecycle::Waiting),
+            owned(AgentLifecycle::Failed),
         ];
-        assert_eq!(project_rollup(&tabs), RollupState::Running);
+        assert_eq!(rollup(&tabs), AgentLifecycle::Failed);
     }
 
+    // The three tests below replace `hook_active_suppresses_needs_input`
+    // / `hook_active_suppresses_running` / `hook_active_on_all_falls_
+    // back_to_none`, which pinned the behavior plan 002 §2.2(a) reverses:
+    // an agent-owned tab used to be dropped from the rollup entirely.
+
     #[test]
-    fn hook_active_suppresses_running() {
+    fn agent_owned_needs_input_participates() {
         let tabs = [
-            (TabState::Running, true), // hook-active → suppressed
-            (TabState::Idle, false),
+            owned(AgentLifecycle::Waiting),
+            shell(ShellState::ForegroundProcess),
         ];
-        assert_eq!(project_rollup(&tabs), RollupState::Idle);
+        assert_eq!(rollup(&tabs), AgentLifecycle::Waiting);
     }
 
     #[test]
-    fn hook_active_on_all_falls_back_to_none() {
-        let tabs = [(TabState::Running, true), (TabState::NeedsInput, true)];
-        assert_eq!(project_rollup(&tabs), RollupState::None);
+    fn agent_owned_running_participates() {
+        let tabs = [
+            owned(AgentLifecycle::Working),
+            owned(AgentLifecycle::Finished),
+        ];
+        assert_eq!(rollup(&tabs), AgentLifecycle::Working);
     }
 
     #[test]
-    fn from_ipc_maps_correctly() {
-        use roost_ipc::messages::TabState as Ipc;
-        assert_eq!(TabState::from_ipc(Ipc::None), TabState::None);
-        assert_eq!(TabState::from_ipc(Ipc::Running), TabState::Running);
-        assert_eq!(TabState::from_ipc(Ipc::NeedsInput), TabState::NeedsInput);
-        assert_eq!(TabState::from_ipc(Ipc::Idle), TabState::Idle);
+    fn all_tabs_agent_owned_still_ranks() {
+        let tabs = [
+            owned(AgentLifecycle::Working),
+            owned(AgentLifecycle::Waiting),
+        ];
+        assert_eq!(rollup(&tabs), AgentLifecycle::Waiting);
+    }
+
+    /// Ownership without a live lifecycle falls through to the shell
+    /// axis — the `D`/`A` failsafe, seen from the sidebar.
+    #[test]
+    fn inactive_owner_falls_through_to_shell() {
+        let mut tab = owned(AgentLifecycle::Inactive);
+        tab.shell = ShellState::ForegroundProcess;
+        assert_eq!(rollup(&[tab]), AgentLifecycle::Working);
+    }
+
+    /// A `Failed` lifecycle left behind on a tab whose owner is gone
+    /// must not outrank live tabs.
+    #[test]
+    fn failed_without_an_owner_falls_through_to_shell() {
+        let tab = AgentTabState {
+            shell: ShellState::AtPrompt,
+            lifecycle: AgentLifecycle::Failed,
+            ownership: None,
+        };
+        assert_eq!(rollup(&[tab]), AgentLifecycle::Inactive);
     }
 
     #[test]
     fn css_class_mapping_round_trip() {
-        // Every rollup state except None must report exactly one of
-        // `all_classes()` so the M7 sidebar-row update doesn't try to
-        // apply a class M3's CSS doesn't define.
-        let all: std::collections::HashSet<_> =
-            RollupState::all_classes().iter().copied().collect();
-        for state in [
-            RollupState::Running,
-            RollupState::NeedsInput,
-            RollupState::Idle,
+        // Every lifecycle except Inactive must report exactly one of
+        // `ROLLUP_CLASSES` so the sidebar-row update doesn't try to
+        // apply a class the CSS doesn't define.
+        for lifecycle in [
+            AgentLifecycle::Working,
+            AgentLifecycle::Waiting,
+            AgentLifecycle::Finished,
+            AgentLifecycle::Failed,
         ] {
-            let cls = state.css_class().expect("non-None rollup has a class");
-            assert!(all.contains(cls), "class {cls} not in all_classes()");
+            let cls = rollup_css_class(lifecycle).expect("non-Inactive rollup has a class");
+            assert!(
+                ROLLUP_CLASSES.contains(&cls),
+                "class {cls} not in ROLLUP_CLASSES"
+            );
         }
-        assert!(RollupState::None.css_class().is_none());
+        assert!(rollup_css_class(AgentLifecycle::Inactive).is_none());
     }
 }

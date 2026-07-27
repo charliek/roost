@@ -21,38 +21,47 @@ import Testing
 
 @testable import Roost
 
+/// Build a handler over a fresh workspace on `socket`. Returns the
+/// workspace too, so a suite that needs a tab can add one without
+/// respawning the stack (`tab.open` would fork a real PTY).
+@MainActor
+private func makeTestHandler(socket: String) -> (IPCHandlerImpl, Workspace) {
+    let workspace = Workspace()
+    let supervisor = PtySupervisor()
+    let client = LocalClient(workspace: workspace, supervisor: supervisor, socketPath: socket)
+    let handler = IPCHandlerImpl(
+        client: client,
+        socketPath: socket,
+        appLabel: "Roost-test",
+        appID: "ai.stridelabs.Roost.test"
+    )
+    return (handler, workspace)
+}
+
+/// Assert that `handle` throws an `IPCHandlerError` with `code`.
+private func expectError(
+    _ code: String,
+    _ op: String,
+    _ params: AnyCodable?,
+    on handler: IPCHandlerImpl
+) async {
+    do {
+        _ = try await handler.handle(op: op, params: params)
+        Issue.record("expected \(op) to throw \(code)")
+    } catch let e as IPCHandlerError {
+        #expect(e.code == code, "expected code \(code), got \(e.code): \(e.message)")
+    } catch {
+        Issue.record("expected IPCHandlerError, got \(error)")
+    }
+}
+
 @Suite("IPC handler dispatch")
 struct IPCHandlerDispatchTests {
     private let socket = "/tmp/roost-ipc-handler-test.sock"
 
     @MainActor
     private func makeHandler() -> IPCHandlerImpl {
-        let workspace = Workspace()
-        let supervisor = PtySupervisor()
-        let client = LocalClient(workspace: workspace, supervisor: supervisor, socketPath: socket)
-        return IPCHandlerImpl(
-            client: client,
-            socketPath: socket,
-            appLabel: "Roost-test",
-            appID: "ai.stridelabs.Roost.test"
-        )
-    }
-
-    /// Assert that `handle` throws an `IPCHandlerError` with `code`.
-    private func expectError(
-        _ code: String,
-        _ op: String,
-        _ params: AnyCodable?,
-        on handler: IPCHandlerImpl
-    ) async {
-        do {
-            _ = try await handler.handle(op: op, params: params)
-            Issue.record("expected \(op) to throw \(code)")
-        } catch let e as IPCHandlerError {
-            #expect(e.code == code, "expected code \(code), got \(e.code): \(e.message)")
-        } catch {
-            Issue.record("expected IPCHandlerError, got \(error)")
-        }
+        makeTestHandler(socket: socket).0
     }
 
     // MARK: cross-cutting error paths
@@ -166,5 +175,158 @@ struct IPCHandlerDispatchTests {
         // A freshly created project has no tabs; this also asserts the
         // `tabs` key encodes as a (here empty) array.
         #expect((projects?.first?["tabs"] as? [[String: Any]])?.isEmpty == true)
+    }
+}
+
+// `tab.agent_report` (plan 002 §3.6) + the `Tab` wire fields it moves.
+@Suite("IPC agent report dispatch")
+struct IPCAgentReportDispatchTests {
+    private let socket = "/tmp/roost-ipc-agent-report-test.sock"
+
+    /// A handler over a workspace with one tab. The tab is opened
+    /// straight on the workspace rather than through `tab.open`, which
+    /// would spawn a real PTY (the SIGTRAP the other suites avoid).
+    @MainActor
+    private func makeHandlerWithTab() throws -> (IPCHandlerImpl, Int64) {
+        let (handler, workspace) = makeTestHandler(socket: socket)
+        let project = workspace.createProject(name: "p", cwd: "")
+        let tab = try workspace.openTab(projectID: project.id, cwd: "/", title: "")
+        // Unfocused so attention isn't dropped by policy §3.5 — that
+        // matrix is covered in WorkspaceStateTests.
+        workspace.setWindowFocused(false)
+        return (handler, tab.id)
+    }
+
+    private func expectReportError(
+        _ code: String,
+        _ params: [String: Any],
+        on handler: IPCHandlerImpl
+    ) async {
+        await expectError(code, "tab.agent_report", AnyCodable(params), on: handler)
+    }
+
+    @Test func agentReportClaimsAndReturnsTheDerivedTab() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        let result = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID),
+                "source": "claude",
+                "session_id": "abc123",
+                "ownership_action": "claim",
+                "lifecycle": "waiting",
+                "attention": "set",
+                "severity": "warn",
+                "title": "Claude Code",
+                "body": "Needs your permission",
+                "detail": "permission_prompt",
+                "metadata": ["model": "claude-opus-5"],
+            ] as [String: Any])
+        )
+        let dict = result?.value as? [String: Any]
+        #expect(dict?["accepted"] as? Bool == true)
+        let tab = dict?["tab"] as? [String: Any]
+        // `state` + `hook_active` are the derived projections.
+        #expect(tab?["state"] as? String == "needs_input")
+        #expect(tab?["hook_active"] as? Bool == true)
+        #expect(tab?["agent_lifecycle"] as? String == "waiting")
+        #expect(tab?["shell_state"] as? String == "unknown")
+        #expect(tab?["has_notification"] as? Bool == true)
+        let ownership = tab?["ownership"] as? [String: Any]
+        #expect(ownership?["source"] as? String == "claude")
+        #expect(ownership?["session_id"] as? String == "abc123")
+        #expect(ownership?["detail"] as? String == "permission_prompt")
+    }
+
+    /// A report from a foreign session is a successful op with
+    /// `accepted: false` — not an error.
+    @Test func agentReportFromAForeignSessionIsAcceptedFalse() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        _ = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s1",
+                "ownership_action": "claim", "lifecycle": "working",
+            ] as [String: Any])
+        )
+        let result = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s2",
+                "ownership_action": "preserve", "lifecycle": "finished",
+            ] as [String: Any])
+        )
+        let dict = result?.value as? [String: Any]
+        #expect(dict?["accepted"] as? Bool == false)
+        #expect((dict?["tab"] as? [String: Any])?["agent_lifecycle"] as? String == "working")
+    }
+
+    @Test func agentReportRejectsUnknownField() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        await expectReportError(
+            "unknown-field",
+            [
+                "tab_id": String(tabID), "source": "claude",
+                "ownership_action": "claim", "last_event_at": 5,
+            ],
+            on: handler
+        )
+    }
+
+    @Test func agentReportSetWithoutTitleIsInvalidParam() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        await expectReportError(
+            "invalid-param",
+            [
+                "tab_id": String(tabID), "source": "claude",
+                "ownership_action": "claim", "attention": "set", "body": "no title",
+            ],
+            on: handler
+        )
+    }
+
+    @Test func agentReportOnAMissingTabIsNotFound() async throws {
+        let (handler, _) = try await makeHandlerWithTab()
+        await expectReportError(
+            "not-found",
+            ["tab_id": "999999", "source": "claude", "ownership_action": "claim"],
+            on: handler
+        )
+    }
+
+    /// AC 11: a `failed` tab must still decode on a client that only
+    /// knows the four legacy states. `IPCTabState` is that closed enum,
+    /// so decoding the emitted payload is the guard.
+    @Test func failedLifecycleProjectsOntoTheLegacyStateEnum() async throws {
+        let (handler, tabID) = try await makeHandlerWithTab()
+        let result = try await handler.handle(
+            op: "tab.agent_report",
+            params: AnyCodable([
+                "tab_id": String(tabID), "source": "claude", "session_id": "s1",
+                "ownership_action": "claim", "lifecycle": "failed",
+            ] as [String: Any])
+        )
+        let raw = (result?.value as? [String: Any])?["tab"] as? [String: Any]
+        let encoded = try JSONSerialization.data(withJSONObject: raw ?? [:])
+        let decoded = try JSONDecoder().decode(IPCTab.self, from: encoded)
+        #expect(decoded.state == .needsInput)
+        #expect(decoded.agentLifecycle == .failed)
+    }
+
+    /// The agent axes are additive: a `Tab` encoded by a server
+    /// predating plan 002 still decodes, with every axis on its default.
+    /// `IPCTab`'s decoder is strict (`try c.decode`) everywhere else, so
+    /// this is the field-by-field guard that the new keys used
+    /// `decodeIfPresent`.
+    @Test func tabDecodesWithoutTheAgentAxes() throws {
+        let legacy = """
+        {"id":"5","project_id":"1","title":"zsh","cwd":"/tmp","state":"running",
+         "has_notification":false,"is_active":true,"user_titled":false,"position":0,
+         "created_at":1,"last_active":2,"hook_active":false}
+        """
+        let tab = try JSONDecoder().decode(IPCTab.self, from: Data(legacy.utf8))
+        #expect(tab.shellState == .unknown)
+        #expect(tab.agentLifecycle == .inactive)
+        #expect(tab.ownership == nil)
     }
 }

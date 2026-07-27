@@ -305,6 +305,72 @@ Two distinct roles, one shared core:
 Both remain thin adapters onto the one command core (DL-11): a Lua action
 and a pytest step invoke the same ops.
 
+### DL-13: The agent state model — four axes, one derivation (2026-07-27)
+
+Replaced the two-field agent model (`Tab.state` + `Tab.hook_active`,
+three unrelated writers sharing one field) with four independent axes
+— shell state (OSC 133 marks), agent lifecycle (agent adapters),
+attention (notifications), and ownership (`{source, session_id,
+last_event_at, detail, metadata}`) — living in `roost-ipc::agent`
+(`crates/roost-ipc/src/agent.rs`) and mirrored in
+`mac/Sources/Roost/AgentState.swift`. `tab.state` on the wire becomes a
+**derived projection**, computed by a pure function
+(`agent::effective`) rather than written directly by any of the three
+former writers; `Tab.hook_active` is likewise derived, from ownership's
+liveness. `AgentLifecycle::Failed` projects onto `TabState::NeedsInput`
+— not a new wire value — because `tab.state` is pinned as a closed
+four-value enum for both Swift decoders (`IPCTabState`,
+`Workspace.TabState` have no fallback case) and this doc's own
+Versioning section (see [`ipc.md`](../reference/ipc.md)), which
+classifies a new enum value as a breaking change. The full mapping,
+the op that writes it (`tab.agent_report`), and the compatibility
+contract are in [`ipc.md`](../reference/ipc.md).
+
+Parity between the two UIs is pinned the same way `tests/word-fixtures/`
+already pins tokenization: a shared, language-neutral corpus —
+`tests/agent-state-fixtures/*.json` — drives both
+`crates/roost-ipc/tests/agent_state_fixtures.rs` and
+`mac/Tests/RoostTests/AgentStateFixtureTests.swift`. It covers
+derivation, the `rank()` ordering the sidebar rollup and (eventually)
+the agent switcher share, and report-transition semantics — the
+higher-risk half, since it's state-machine logic, not a pure function
+over static input. A behavioral drift between the two ports surfaces
+as a red fixture test, not a bug report. See `AGENT_ROADMAP.md` (repo
+root) for the full layer sequencing (L0 state model, L1 agent adapter
+seam, L2 diagnostics, L3 agent UX) this decision is part of.
+
+### DL-14: Ownership is a label, not a suppression switch (2026-07-27)
+
+Ownership identity is the **pair** `(source, session_id)`, not
+`session_id` alone — two agents could otherwise collide on an opaque
+id from a different source. There is deliberately **no TTL or
+heartbeat**: Claude fires no periodic hook, so a long tool call would
+look stale and get released mid-turn under any lease scheme, which is
+worse than the alternative. Instead, a stale owner degrades
+*cosmetically* — because derivation falls through to shell state the
+moment the agent axis stops driving (`agent_lifecycle == inactive` or
+no live ownership), a dead agent leaves a tab mislabeled ("this tab
+still says `claude`") rather than broken. Ownership is cleared only by
+an explicit rule: a matching release, an unconditional `claim`
+(supersede — the only path that can take a tab from a live owner), or
+PTY replacement (tab close today; #170's hard-restart lands the same
+rule without a hardcoded path, since it's stated as "the PTY was
+replaced," not "the tab was closed").
+
+Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
+tab) is the **one exception that gets a real failsafe**, because it's
+the one place a stale owner is actually harmful — muting a tab's
+notifications forever with no agent left to unmute it. An OSC 133
+`A`/`B`/`D` mark (the shell reaching a prompt, which only happens once
+whatever the agent was running has exited) drops the lifecycle to
+`inactive` while keeping ownership as a label, which simultaneously
+re-derives shell state and re-opens raw OSC. Every other consumer of
+ownership (the tab tint, the rollup, the switcher) needs no equivalent
+failsafe, because AD-3's cosmetic-degradation argument already covers
+them. See `AGENT_ROADMAP.md` (repo root, AD-3/AD-4) and
+[`notifications.md`](../guides/notifications.md#hook-session-osc-suppression)
+for the user-facing behavior.
+
 ## Migration history
 
 The Rust + Swift port is **complete** (cutover to `main` 2026-05-23). The

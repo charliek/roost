@@ -7,9 +7,24 @@ this exercises the inbox surface a user actually triages through.
 
 from __future__ import annotations
 
+import pytest
+
+from client import Timeout
+
 
 def _wait(roost, pred, what, timeout=4.0):
     roost._wait(pred, timeout, what)
+
+
+def _delivered(roost, tab_id, timeout=2.0) -> bool:
+    """Whether a notification for `tab_id` produced a badge within a
+    bounded wait. Used where the ANSWER is the assertion (policy B's
+    suppression), so a negative result must not raise."""
+    try:
+        roost.wait_notification(tab_id, True, timeout=timeout)
+        return True
+    except Timeout:
+        return False
 
 
 def _inbox_ids(palette):
@@ -25,9 +40,15 @@ def _inbox_ids(palette):
 
 def test_inbox_lists_pending_via_palette(roost, project, palette):
     """`view_notifications` drills into the inbox frame, one `notif:<tab>`
-    row per pending notification, carrying its title + body."""
+    row per pending notification, carrying its title + body.
+
+    Both notified tabs are background tabs (the third steals active):
+    under notification policy B (plan 002 §3.5) a notification for the
+    active tab of an active window produces no inbox row at all, so
+    notifying the active tab would make this depend on window focus."""
     a = roost.open_tab(project, cwd="/tmp")
     b = roost.open_tab(project, cwd="/tmp")
+    roost.open_tab(project, cwd="/tmp")  # steals active
     roost.notify(a, "AlphaBuild", "passed")
     roost.notify(b, "BetaBuild", "failed")
     # The inbox populates via an event that can lag the workspace badge,
@@ -86,6 +107,52 @@ def test_jump_to_unread_focuses_notified_tab(roost, project, palette):
     palette.palette_activate("jump_to_unread")  # → focuses the unread tab
     _wait(roost, lambda: roost.identify()["active_tab_id"] == a, "jumped to unread a")
     _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a cleared by jump")
+
+
+def test_focused_active_tab_gets_no_badge_and_no_inbox_row(roost, project, palette):
+    """Notification policy B (plan 002 §3.5): `suppress := window_active
+    && tab_active`. When it holds there is no badge AND no inbox row —
+    the two are coupled because inbox membership derives from the same
+    `has_notification` bit. A notification for the tab you are actively
+    looking at is considered seen.
+
+    Both halves of the predicate are asserted: a background tab in the
+    same window always gets both, and (when the environment gives the
+    window focus at all) the active tab gets neither — including after
+    the user switches away, which must not retroactively produce a badge.
+    """
+    bg = roost.open_tab(project, cwd="/tmp")
+    active = roost.open_tab(project, cwd="/tmp")  # steals active
+    _wait(roost, lambda: roost.identify()["active_tab_id"] == active, "second tab is active")
+
+    # tab_active is false -> never suppressed, whatever the window is doing.
+    roost.notify(bg, "Background", "delivered")
+    assert _delivered(roost, bg), "a background tab's notification must always land"
+    roost._wait(lambda: f"notif:{bg}" in _inbox_ids(palette), 5.0, "inbox lists the background tab")
+
+    roost.notify(active, "Foreground", "should be suppressed")
+    if _delivered(roost, active):
+        # The window half of the predicate is false: a headless GTK UI
+        # under xvfb (no window manager) never becomes active, so the
+        # suppression arm is genuinely unobservable here. Not a silent
+        # gap — the full four-way matrix is covered by the workspace
+        # unit tests on both UIs.
+        pytest.skip(
+            "the UI window is not active in this environment, so the "
+            "`window_active` half of policy B can't be exercised "
+            "[alt-coverage: daemon::state attention_policy_* (Rust) + "
+            "WorkspaceStateTests.attentionPolicy* (Swift)]"
+        )
+
+    assert roost.has_notification(active) is False
+    assert f"notif:{active}" not in _inbox_ids(palette)
+
+    # Switching away must not resurrect it: the raise was dropped
+    # entirely, so there is no pending bit to re-evaluate later.
+    roost.focus(bg)
+    _wait(roost, lambda: roost.identify()["active_tab_id"] == bg, "switched away from `active`")
+    assert not _delivered(roost, active, timeout=1.0), "no retroactive badge"
+    assert f"notif:{active}" not in _inbox_ids(palette)
 
 
 def test_clear_all_empties_inbox(roost, project, palette):

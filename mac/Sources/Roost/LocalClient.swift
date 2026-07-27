@@ -128,6 +128,11 @@ final class LocalClient {
         try workspace.setTabHookActive(tabID, active: active)
     }
 
+    @discardableResult
+    func agentReport(_ report: AgentReport) throws -> (accepted: Bool, tab: Workspace.Tab) {
+        try workspace.agentReport(report)
+    }
+
     func clearTabNotification(_ tabID: Int64) throws {
         try workspace.setTabHasNotification(tabID, hasPending: false)
     }
@@ -136,9 +141,16 @@ final class LocalClient {
         try workspace.focusTab(tabID)
     }
 
-    func fireNotification(_ tabID: Int64, title: String, body: String) throws {
-        try workspace.setTabHasNotification(tabID, hasPending: true)
-        try workspace.fireNotification(tabID, title: title, body: body)
+    /// A `false` return is suppression (plan §3.4 / §3.5), not failure —
+    /// only a missing tab throws.
+    @discardableResult
+    func raiseAttention(
+        _ tabID: Int64,
+        title: String,
+        body: String,
+        source: Workspace.AttentionSource
+    ) throws -> Bool {
+        try workspace.raiseAttention(tabID, title: title, body: body, source: source)
     }
 
     // MARK: PTY I/O
@@ -180,34 +192,23 @@ final class LocalClient {
                 try? workspace.setTabCwd(tabID, cwd: path)
             }
         case 9, 99, 777:
+            // `rawOsc` is dropped while a live agent session is mid-turn:
+            // the agent already reports its own attention through
+            // `tab.agent_report`, and a wrapper shell echoing OSC 9 on
+            // top of that double-notifies. The gate lives inside
+            // `raiseAttention` alongside the mutation (plan §3.4).
             let (title, body) = parseNotificationPayload(command: command, payload: payload)
-            try? workspace.setTabHasNotification(tabID, hasPending: true)
-            try? workspace.fireNotification(tabID, title: title, body: body)
+            _ = try? raiseAttention(tabID, title: title, body: body, source: .rawOsc)
         case 133:
-            // OSC 133 prompt/command mark → run state. Suppressed when a
-            // Claude hook owns the tab (setTabStateFromOSC gates on
-            // hookActive).
-            if let state = commandMarkState(payload) {
-                try? workspace.setTabStateFromOSC(tabID, state: state)
-            }
+            // OSC 133 prompt/command mark → the shell axis. Never gated:
+            // the shell and agent axes are independent, and derivation
+            // decides which one the tab shows.
+            try? workspace.applyShellMark(tabID, body: payload)
         default:
             // Other OSC commands are ignored — the spec doesn't
             // route them to workspace state.
             break
         }
-    }
-}
-
-/// Map an OSC 133 mark body to a run state: `C` (command start) →
-/// running; `A`/`B`/`D` (prompt / command end) → none (clear the dot);
-/// other bodies → nil (no change). Only the first char matters, so
-/// `D;<exit>` keeps the exit code we ignore.
-func commandMarkState(_ body: String) -> Workspace.TabState? {
-    guard let mark = body.first else { return nil }
-    switch mark {
-    case "C": return .running
-    case "A", "B", "D": return Workspace.TabState.none
-    default: return nil
     }
 }
 

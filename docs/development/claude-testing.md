@@ -9,38 +9,59 @@ verify any UI change in the area, or to demo the integration.
 
 | Surface | What it means | Where it lives |
 |---|---|---|
-| **Pill dot** (10pt circle, leading edge of a tab pill) | The tab's agent state. Color encodes which state. | `TabPillView.statusSlot` (Mac); Linux uses an `Adw.TabPage` icon. |
-| **Sidebar stripe** (3pt vertical band on the leading edge of a project row) | The *rollup* of all tabs in the project's agent states. Priority: `needs_input > running > idle > none`. Tabs with `hook_active=true` are SKIPPED in the rollup math (Claude owns the urgency signal on those). | `ProjectRowCellView.stripe` (Mac); Linux uses a CSS class on the row. |
+| **Pill dot** (10pt circle, leading edge of a tab pill) | The tab's *effective* agent state — blue (running), orange (needs-input), gray (idle), red (failed), or none. Derived from the shell axis (OSC 133 marks) when no agent owns the tab, or the owning agent's own lifecycle when one does. | `TabPillView.statusSlot` (Mac); Linux uses an `Adw.TabPage` icon. |
+| **Sidebar stripe** (3pt vertical band on the leading edge of a project row) | The *rollup* of all tabs in the project's effective states. Ranked `failed > needs_input > running > idle` (`crates/roost-ipc/src/agent.rs::rank`, shared with the per-tab dot). Every tab participates, including one a hook currently owns — a project whose only blocked tab is a live Claude session gets a stripe, not silence. | `ProjectRowCellView.stripe` (Mac); Linux uses a CSS class on the row. |
 | **Tab pill badge dot** (8pt accent circle, trailing edge of inactive notified pills) | The tab has a pending notification. Cleared when the user focuses the tab. | `TabPillView.badgeDot` (Mac). |
 | **Project row badge dot** (sidebar trailing-edge dot on a project row) | At least one tab in this project has a pending notification. Same focus-clear behavior. | `ProjectRowCellView.badgeDot` (Mac). |
-| **Desktop banner** | A macOS banner (UNUserNotificationCenter) with title + body. Clicking it brings Roost to front and focuses the originating tab. | `DesktopNotifications` (Mac); Linux uses `NotificationCenter`. |
+| **Desktop banner** | A macOS banner (`UNUserNotificationCenter`) with title + body. Clicking it brings Roost to front and focuses the originating tab. | `DesktopNotifications` (Mac); Linux uses `gio.Notification`. |
 
 ## State model
 
-| State | Pill dot color | Set via CLI | Triggered by Claude hook |
-|---|---|---|---|
-| `none` | no dot | `tab set-state --state none --tab N` | `session-end` |
-| `running` | blue (`#5fa3f0`) | `tab set-state --state running --tab N` | `prompt-submit` |
-| `needs_input` | amber (`#f0a040`) | `tab set-state --state needs_input --tab N` | `notification` |
-| `idle` | gray (`#7a7a7a`) | `tab set-state --state idle --tab N` | `stop` |
+The dot/stripe color is a **derived** projection of independent axes — shell state (OSC 133 marks) and agent lifecycle (agent adapters) — not a single field any of the old three writers set directly. Full wire-level detail is in [`ipc.md`](../reference/ipc.md).
+
+| Effective state (dot color) | Driven by | Manual CLI |
+|---|---|---|
+| none (no dot) | no live agent + shell `at_prompt`/`unknown` | `tab set-state --state none --tab N` (**releases** ownership — see below) |
+| running (blue) | agent lifecycle `working`, **or** no agent + shell `foreground_process` | `tab set-state --state running --tab N` |
+| needs_input (orange) | agent lifecycle `waiting` | `tab set-state --state needs_input --tab N` |
+| idle (gray) | agent lifecycle `finished` | `tab set-state --state idle --tab N` |
+| failed (red) | agent lifecycle `failed` (collapses to `needs_input` on the legacy wire `state` field, but renders as its own color in the UI) | not reachable via `tab set-state` (its accepted values are `{none, running, needs_input, idle}`) — drive it with a `StopFailure` hook payload (T5b below) or a raw `tab.agent_report` |
+
+`tab set-state` claims ownership as `manual`, which **supersedes** whatever currently owns the tab, a live Claude session included — see [Notifications → Manual override](../guides/notifications.md#manual-override-tab-set-state). Claude's own hook → state mapping is documented in full in [Claude Code Hooks](../guides/claude-code.md); this doc's CLI cheatsheet below reproduces just enough of it to drive by hand.
 
 ## CLI cheatsheet
 
-Pre-req: `roostctl tab list` to find a tab id. Either `export ROOST_TAB_ID=<id>` or pass `--tab <id>` explicitly to each command. (When a shell is running inside a Roost tab, `ROOST_TAB_ID` is set automatically.)
+Pre-req: `roostctl tab list` to find a tab id — add `--json` to see the full agent record (`shell_state` / `agent_lifecycle` / `ownership`); the plain-text form only prints the legacy 4-value `state`. Either `export ROOST_TAB_ID=<id>` or pass `--tab <id>` explicitly to each command. (When a shell is running inside a Roost tab, `ROOST_TAB_ID` is set automatically.)
 
 | Command | Effect |
 |---|---|
-| `roostctl tab list` | Print all tabs grouped by project + their current state. |
-| `roostctl tab set-state --state STATE --tab N` | Set state. `STATE ∈ {none, running, needs_input, idle}`. |
-| `roostctl notify --title "Hi" --body "..." --tab N` | Fire a desktop banner + set the pill badge. |
+| `roostctl tab list` / `roostctl tab list --json` | Print all tabs grouped by project + their state (plain), or the full `Tab` record including the agent axes (`--json`). |
+| `roostctl tab set-state --state STATE --tab N` | Set state. `STATE ∈ {none, running, needs_input, idle}`. Claims ownership as `manual`; supersedes a live agent. |
+| `roostctl notify --title "Hi" --body "..." --tab N` | Fire a desktop banner + set the pill badge. Never suppressed by hook ownership — only the raw-OSC path is gated. |
 | `roostctl tab clear-notification --tab N` | Clear the pill badge (state unchanged). |
 | `roostctl tab focus --tab N` | Equivalent to clicking the pill; clears the badge as a side effect. |
 | `roostctl screenshot --out /tmp/shot.png` | Render the whole window to a PNG in-process (no OS screen capture) — read it back to *see* the UI state you just drove. Add `--scale 2` for a crisper image. |
-| `ROOST_TAB_ID=N roostctl claude-hook session-start` | Engages `hook_active` suppression on the tab. (OSC 9/777 from the shell becomes a no-op; only `create-notification` RPCs emit banners.) |
-| `echo '{"message":"need input"}' \| ROOST_TAB_ID=N roostctl claude-hook notification` | Sets `needs_input` + fires "Claude Code" banner. |
-| `ROOST_TAB_ID=N roostctl claude-hook stop` | Sets `idle` + fires "Turn complete" banner. |
-| `ROOST_TAB_ID=N roostctl claude-hook session-end` | Releases `hook_active` + sets `none`. |
-| `ROOST_TAB_ID=N roostctl claude-hook prompt-submit` | Sets `running` + clears pending notification. |
+
+`roostctl claude-hook EVENT` works two ways when driven by hand.
+
+**With no stdin at all** — `ROOST_TAB_ID=N roostctl claude-hook session-start` — `roostctl` synthesizes a deterministic `session_id` of `manual:<tab id>`, so a bare sequence is self-consistent: the `SessionStart` claim and the `SessionEnd` release carry the same identity. This is the quickest way to walk the lifecycle by hand.
+
+**With a payload**, which is what Claude Code itself sends, carry a **`session_id`** and repeat the *same* one for every later event. All events but `SessionStart`/`SessionEnd` `preserve` ownership, which matches on the `(source, session_id)` pair, so a mismatch is silently dropped — that is the mechanism keeping a stale session from talking over a live one.
+
+A `SessionStart` whose payload carries an *empty* `session_id` is dropped rather than claiming: a claim supersedes unconditionally, so an event that cannot identify its own session must not evict whatever already owns the tab. (The synthesized `manual:<tab id>` above is why the payloadless form is not affected by this.)
+
+Pick any non-empty string and reuse it for the whole sequence:
+
+| Command | Effect |
+|---|---|
+| `echo '{"session_id":"t1"}' \| ROOST_TAB_ID=N roostctl claude-hook session-start` | Claims ownership as `claude`/`t1`; lifecycle → inactive. No visible dot change yet, but raw OSC 9/99/777 is now suppressed on this tab. |
+| `echo '{"session_id":"t1"}' \| ROOST_TAB_ID=N roostctl claude-hook prompt-submit` | Lifecycle → working (blue dot); clears any pending notification. |
+| `echo '{"session_id":"t1","notification_type":"permission_prompt","message":"choose a path"}' \| ROOST_TAB_ID=N roostctl claude-hook notification` | Lifecycle → waiting (orange dot); fires a warn banner "Claude Code: choose a path". |
+| `echo '{"session_id":"t1"}' \| ROOST_TAB_ID=N roostctl claude-hook stop` | No `background_tasks` → lifecycle → finished (gray dot); fires an info banner "Turn complete". Add `"background_tasks":[{"id":"1","type":"shell","status":"running","description":"build"}]` to the payload and lifecycle stays `working` instead — this is how Roost tells "done" apart from "paused, waiting on background work." |
+| `echo '{"session_id":"t1","error":"rate_limit"}' \| ROOST_TAB_ID=N roostctl claude-hook stop-failure` | Lifecycle → failed (red dot); fires an error banner naming the error. |
+| `echo '{"session_id":"t1"}' \| ROOST_TAB_ID=N roostctl claude-hook session-end` | Releases ownership; lifecycle → inactive; clears any pending notification. Tab falls back to shell-derived state. |
+
+Both the canonical `hook_event_name` spelling Claude Code itself sends (`SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`, `SessionEnd`) and the kebab-case spelling used above (what `roostctl claude install` wrote before this event set existed) are accepted — see [Claude Code Hooks](../guides/claude-code.md).
 
 ## Test checklist
 
@@ -53,7 +74,9 @@ Pre-req: `roostctl tab list` to find a tab id. Either `export ROOST_TAB_ID=<id>`
 3. `tab set-state --state needs_input --tab N`
    → pill dot amber; sidebar stripe amber.
 4. `tab set-state --state none --tab N`
-   → pill dot disappears; sidebar stripe reflects the next-highest state in the project (or hides).
+   → releases ownership. If the tab's shell is at a prompt, the dot disappears; if a foreground process happens to be live in the tab, the dot instead shows running (blue) — `none` falls through to shell state rather than forcing the dot blank. Sidebar stripe reflects the next-highest state in the project (or hides).
+
+(`failed`/red isn't reachable from `tab set-state` — see T5b.)
 
 ### T2 — notification banner + per-tab badge
 
@@ -67,14 +90,21 @@ Pre-req: focus a *different* tab in the same project so the test tab is inactive
 3. Re-fire `notify`, then `tab clear-notification --tab N`.
    → Badge clears without focusing. State stays whatever it was.
 
-### T3 — hook suppression + sidebar rollup
+### T3 — hook ownership participates in the sidebar rollup
 
-1. With 2+ tabs in a project, set Tab A `running` and Tab B `needs_input`.
-   → Sidebar stripe = amber (`needs_input` wins).
-2. `ROOST_TAB_ID=<Tab B id> roostctl claude-hook session-start`.
-   → Sidebar stripe drops to **blue** (Tab B's `needs_input` is now suppressed in rollup; Tab A's `running` becomes max).
-3. `ROOST_TAB_ID=<Tab B id> roostctl claude-hook session-end`.
-   → Stripe back to amber. Tab B's state goes to `none`.
+Before plan 002 a tab a hook owned was **excluded** from the rollup math entirely, so a project whose only blocked tab was a live Claude session showed no stripe at all. This checks the fix.
+
+1. In a project with a single tab, claim it as Claude and put it in `needs_input`:
+   ```bash
+   echo '{"session_id":"t1"}' | ROOST_TAB_ID=<tab id> roostctl claude-hook session-start
+   echo '{"session_id":"t1","notification_type":"permission_prompt","message":"go ahead?"}' \
+     | ROOST_TAB_ID=<tab id> roostctl claude-hook notification
+   ```
+   → Sidebar stripe is **amber** — the Claude-owned tab's `needs_input` is visible, not hidden.
+2. Add a second, plain-shell tab to the same project with a foreground process running (`running`, blue).
+   → Stripe stays amber — `needs_input` still outranks `running`.
+3. `echo '{"session_id":"t1"}' | ROOST_TAB_ID=<tab id> roostctl claude-hook session-end` on the first tab.
+   → Stripe drops to blue (only the plain-shell tab's `running` remains).
 
 ### T4 — project-row badge (separate from per-tab badge)
 
@@ -86,20 +116,28 @@ Pre-req: focus a *different* tab in the same project so the test tab is inactive
 
 ### T5 — end-to-end Claude lifecycle simulation
 
-1. `ROOST_TAB_ID=N roostctl claude-hook session-start`.
-   → No visible change (Claude hook engages silently).
-   → Internally: `hook_active=true` so OSC 9/777 from the shell is now suppressed.
-2. `ROOST_TAB_ID=N roostctl claude-hook prompt-submit`.
-   → Pill dot blue; sidebar stripe blue (no other tabs with higher-priority state).
+Uses a fixed `session_id` (`t1`) across every step — see the CLI cheatsheet above for why that matters.
+
+1. `echo '{"session_id":"t1"}' | ROOST_TAB_ID=N roostctl claude-hook session-start`.
+   → No visible dot change. Internally: ownership claimed by `claude`/`t1`, so raw OSC 9/99/777 from the shell is now suppressed on this tab.
+2. `echo '{"session_id":"t1"}' | ROOST_TAB_ID=N roostctl claude-hook prompt-submit`.
+   → Pill dot blue; sidebar stripe reflects it if it's the highest-ranked tab in the project.
    → Any prior pending notification is cleared.
-3. `echo '{"message":"choose a path"}' | ROOST_TAB_ID=N roostctl claude-hook notification`.
-   → Pill dot amber; banner "Claude Code: choose a path";
-     sidebar stripe NOT updated (hook-active demotes this tab in rollup).
+3. `echo '{"session_id":"t1","notification_type":"permission_prompt","message":"choose a path"}' | ROOST_TAB_ID=N roostctl claude-hook notification`.
+   → Pill dot amber; banner "Claude Code: choose a path"; sidebar stripe **reflects** this tab if it's the project's highest-ranked one (T3 — hook ownership no longer hides it from the rollup).
 4. Click the banner → focuses Tab N. Pill badge clears.
-5. `ROOST_TAB_ID=N roostctl claude-hook stop`.
+5. `echo '{"session_id":"t1"}' | ROOST_TAB_ID=N roostctl claude-hook stop`.
    → Pill dot gray; banner "Claude Code: Turn complete".
-6. `ROOST_TAB_ID=N roostctl claude-hook session-end`.
-   → Pill dot disappears; sidebar stripe drops to next-highest-priority tab in the project (or hides).
+6. `echo '{"session_id":"t1"}' | ROOST_TAB_ID=N roostctl claude-hook session-end`.
+   → Pill dot disappears (or falls back to whatever the shell's own state is); sidebar stripe drops to the next-highest-priority tab in the project (or hides).
+
+### T5b — `StopFailure` and the OSC 133 failsafe
+
+1. Repeat T5 steps 1–2 to get the tab owned and running.
+2. `echo '{"session_id":"t1","error":"rate_limit","error_details":"Rate limited, retry later"}' | ROOST_TAB_ID=N roostctl claude-hook stop-failure`.
+   → Pill dot **red**; error banner "Claude Code: Rate limited, retry later". If another tab in the same project is merely `needs_input`, the stripe stays on this tab's color — `failed` outranks `needs_input`.
+3. Without a `session-end`, get the shell to a fresh prompt (press enter on an empty line in the tab is the real trigger — an OSC 133 `A`/`D` mark).
+   → Lifecycle drops to inactive; the dot falls back to shell state, and raw OSC 9/99/777 is no longer suppressed on this tab. This is the failsafe against a killed/crashed agent muting a tab forever — see [Notifications → Hook-session OSC suppression](../guides/notifications.md#hook-session-osc-suppression).
 
 ### T6 — UI log inspection
 
@@ -114,11 +152,10 @@ tail -f ~/Library/Logs/Roost/roost.log
 tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/roost/roost.log"
 ```
 
-Each CLI command above lands as a corresponding log entry —
-`set_tab_state`, `set_hook_active`, `tab_notification`,
-`create_notification`. If the UI doesn't react to an expected
-event, the log line tells you whether the UI received the
-IPC request at all.
+If the UI doesn't react to an expected command, this is the fastest
+way to tell "the IPC request never arrived" from "it arrived but
+didn't do what I expected" — correlate by timestamp against when you
+ran the CLI command.
 
 ### T7 — visual verification via screenshot
 
@@ -145,18 +182,18 @@ automatically when you run a session:
 roostctl claude install
 ```
 
-This writes `~/.config/roost/claude-settings.json` with hook
-commands for each lifecycle event, then prints an alias line:
+This writes `~/.config/roost/claude-settings.json` with hook commands
+for each of the six lifecycle events — `SessionStart`,
+`UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`,
+`SessionEnd` — then prints an alias line:
 
 ```bash
 alias claude='claude --settings ~/.config/roost/claude-settings.json'
 ```
 
-Add that alias to your shell rc. Now every `claude` session
-inside a Roost tab automatically drives the integration:
-
-- Start of session → `claude-hook session-start` (engages hook_active).
-- Each prompt submission → `claude-hook prompt-submit` (state=running).
-- Claude needs input (e.g. tool approval) → `claude-hook notification` (state=needs_input + banner).
-- Claude finishes a turn → `claude-hook stop` (state=idle + "Turn complete" banner).
-- End of session → `claude-hook session-end` (releases hook_active).
+Add that alias to your shell rc. Now every `claude` session inside a
+Roost tab automatically drives the integration — see
+[Claude Code Hooks](../guides/claude-code.md) for the full event →
+effect mapping, including the `background_tasks` / `StopFailure` /
+unrecognized-`notification_type` cases the manual cheatsheet above
+walks through by hand.

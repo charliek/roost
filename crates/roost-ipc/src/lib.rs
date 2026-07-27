@@ -10,6 +10,9 @@
 //! * [`messages`] — serde structs for every operation, response, and
 //!   event listed in the spec, plus shared types (`Tab`, `Project`,
 //!   `TabState`).
+//! * [`agent`] — the agent state model (shell / lifecycle / ownership
+//!   axes) and the pure state machine that derives `TabState` from it.
+//!   Shared with the Swift port via `tests/agent-state-fixtures/`.
 //! * [`framing`] — newline-delimited JSON read/write over a
 //!   `tokio::net::UnixStream`. Enforces the 16 MiB line limit.
 //! * [`paths`] — `BundleProfile` path resolution. The Mac UI's Swift
@@ -26,6 +29,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod agent;
 pub mod framing;
 pub mod messages;
 pub mod paths;

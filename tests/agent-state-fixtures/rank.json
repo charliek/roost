@@ -1,0 +1,11 @@
+{
+  "group": "rank",
+  "order_high_to_low": ["failed", "waiting", "working", "finished", "inactive"],
+  "cases": [
+    { "name": "failed-is-4", "lifecycle": "failed", "expect": { "rank": 4 } },
+    { "name": "waiting-is-3", "lifecycle": "waiting", "expect": { "rank": 3 } },
+    { "name": "working-is-2", "lifecycle": "working", "expect": { "rank": 2 } },
+    { "name": "finished-is-1", "lifecycle": "finished", "expect": { "rank": 1 } },
+    { "name": "inactive-is-0", "lifecycle": "inactive", "expect": { "rank": 0 } }
+  ]
+}

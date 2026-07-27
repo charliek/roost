@@ -467,8 +467,14 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      - name: Build the GTK UI
-        run: cargo build -p roost-linux
+      # roostctl too: `test_agent_lifecycle.py` drives synthetic Claude
+      # hook payloads through the real `roostctl claude-hook` binary, so
+      # the adapter -> CLI -> IPC -> workspace path runs end to end. (The
+      # harness can build it on demand, but that would land inside the
+      # pytest step.) The Mac leg gets it from bundle.sh, which embeds
+      # roostctl in the .app.
+      - name: Build the GTK UI + roostctl
+        run: cargo build -p roost-linux -p roost-cli
 
       - name: Run E2E (GTK under Xvfb)
         env:
@@ -603,8 +609,10 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      - name: Build the GTK UI
-        run: cargo build -p roost-linux
+      # roostctl too — same reason as the Xvfb job above (the pytest
+      # suite's Claude-hook test shells out to the real binary).
+      - name: Build the GTK UI + roostctl
+        run: cargo build -p roost-linux -p roost-cli
 
       - name: Run E2E (GTK under headless Wayland / weston)
         continue-on-error: true

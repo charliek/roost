@@ -7,6 +7,8 @@
 #   * roost-osc   — OSC scanner that lifts (command, payload) pairs out of
 #                   PTY byte streams. Used by both the Linux UI and the
 #                   roost-osc test fixtures.
+#   * roost-agent — pure agent adapters: hook event JSON in,
+#                   `tab.agent_report` params out. No I/O.
 #   * roost-linux — gtk4-rs + libadwaita Linux UI. Embeds the workspace,
 #                   PTY supervisor, and IPC server in-process.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
@@ -28,6 +30,7 @@ members = [
     "crates/roost-vt",
     "crates/roost-osc",
     "crates/roost-url",
+    "crates/roost-agent",
     "crates/roost-cli",
     "crates/roost-linux",
 ]
