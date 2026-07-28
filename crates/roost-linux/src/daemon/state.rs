@@ -267,6 +267,12 @@ pub enum WorkspaceError {
 
 /// Repair persisted project positions that collide, in place.
 ///
+/// **Projects only, deliberately.** A persisted *tab* collision needs no
+/// repair: `TabSnapshot` carries no id, and the bootstrap re-opens every
+/// restore descriptor through `open_tab` into an empty project, so tab
+/// positions are freshly allocated on each launch and a tie self-heals.
+/// Project rows are the ones that keep their persisted position.
+///
 /// Live project rows load their `position` verbatim, so a tie written
 /// by a pre-#80 build (which allocated from `len()`) survives every
 /// relaunch. Walk the projects in display order — `(position, id)`,

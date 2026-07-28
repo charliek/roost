@@ -858,6 +858,13 @@ final class Workspace {
     /// by — and pushes each one to at least `previous + 1`. The mirror
     /// of the Rust `normalize_project_positions`; keep the two in step.
     ///
+    /// **Projects only, deliberately.** A persisted *tab* collision
+    /// needs no repair: `SnapshotFile.TabSnapshot` carries no id, and
+    /// the bootstrap re-opens every restore descriptor through
+    /// `openTab` into an empty project, so tab positions are freshly
+    /// allocated on each launch and a tie self-heals. Project rows are
+    /// the ones that keep their persisted position.
+    ///
     /// **Returned in the file's order, not display order.** The repair
     /// is computed over the display walk but handed back in the input's
     /// order, because the caller inserts into an id-keyed dictionary

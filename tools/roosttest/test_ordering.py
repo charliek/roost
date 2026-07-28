@@ -59,7 +59,7 @@ def test_tab_close_mid_list_then_open_keeps_unique_positions(roost, project):
 
     positions = [roost.tab(tid)["position"] for tid in ids]
     assert len(set(positions)) == len(positions), (
-        f"duplicate positions after a mid-list close: {list(zip(ids, positions))}"
+        f"duplicate positions after a mid-list close: {list(zip(ids, positions, strict=True))}"
     )
     assert ids[-1] == t4, f"newest tab must sort last in display order, got {ids}"
 
@@ -120,10 +120,10 @@ def test_project_delete_mid_list_then_create_keeps_unique_positions(roost):
         positions = [by_id[pid]["position"] for pid in ours]
 
         assert len(set(positions)) == len(positions), (
-            f"duplicate project positions: {list(zip(ours, positions))}"
+            f"duplicate project positions: {list(zip(ours, positions, strict=True))}"
         )
         assert positions == sorted(positions), (
-            f"project creation order not preserved: {list(zip(ours, positions))}"
+            f"project creation order not preserved: {list(zip(ours, positions, strict=True))}"
         )
     finally:
         for pid in created:
