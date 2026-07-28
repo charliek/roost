@@ -164,12 +164,21 @@ final class Workspace {
         self.statePath = statePath
         if let snapshot = Self.readSnapshot(at: statePath) {
             self.nextID = max(1, snapshot.nextID)
-            for p in snapshot.projects {
+            // A pre-fix file can hold colliding project positions, and
+            // unlike tabs (re-opened through `openTab`, so freshly
+            // allocated) projects load their position verbatim — the
+            // tie would survive every relaunch. Repair before any row
+            // is built. `restoreLayout` below carries no project
+            // position, so both consumers stay consistent. The pairs
+            // come back in the file's order, so this loop's insertion
+            // order — which picks the survivor when a file repeats an
+            // `id` — is what it was before the repair existed.
+            for (p, position) in Self.normalizedProjectPositions(snapshot.projects) {
                 self.projects[p.id] = Project(
                     id: p.id,
                     name: p.name,
                     cwd: p.cwd,
-                    position: p.position,
+                    position: position,
                     createdAt: p.createdAt
                 )
             }
@@ -841,6 +850,56 @@ final class Workspace {
     private static func afterMax(_ highest: Int32?) -> Int32 {
         guard let highest else { return 0 }
         return highest == .max ? .max : highest + 1
+    }
+
+    /// Each decoded project paired with its repaired position, for a
+    /// snapshot whose projects may collide. Walks them in display
+    /// order — `(position, id)`, the comparator `snapshot()` sorts
+    /// by — and pushes each one to at least `previous + 1`. The mirror
+    /// of the Rust `normalize_project_positions`; keep the two in step.
+    ///
+    /// **Returned in the file's order, not display order.** The repair
+    /// is computed over the display walk but handed back in the input's
+    /// order, because the caller inserts into an id-keyed dictionary
+    /// and `state.json` is user-editable: two rows sharing an `id`
+    /// collapse last-write-wins, so insertion order decides which one
+    /// survives. Rust repairs through `&mut` borrows and leaves its
+    /// slice in file order for exactly this reason; returning display
+    /// order here would pick a different survivor on macOS than on
+    /// Linux from the same file.
+    ///
+    /// The seed is `nil`, not `-1`, so the walk is a true no-op on
+    /// already-unique input **including negative positions**:
+    /// `position` decodes as a plain `Int32` with no non-negativity
+    /// check, and a `-1` seed would rewrite a perfectly ordered
+    /// `[-5, -3]` to `[0, 1]`.
+    ///
+    /// Gaps are preserved — `[0, 5, 5]` becomes `[0, 5, 6]`, not
+    /// `[0, 1, 2]`. Positions are sparse by design; the invariant is
+    /// uniqueness within a parent, never density, so densifying would
+    /// rewrite rows that were never wrong.
+    ///
+    /// `Int32.max` clamps (via `afterMax`) rather than trapping: a
+    /// workspace that reached it is corrupt input, and degrading to a
+    /// tie beats failing to launch. The ceiling is therefore a
+    /// tie-degradation boundary, **not** a uniqueness guarantee —
+    /// repairing `[Int32.max - 1, Int32.max - 1]` yields
+    /// `[Int32.max - 1, Int32.max]`, and the next `createProject`
+    /// clamps onto that `Int32.max` (plan 004 §3.1).
+    private static func normalizedProjectPositions(
+        _ projects: [SnapshotFile.ProjectSnapshot]
+    ) -> [(project: SnapshotFile.ProjectSnapshot, position: Int32)] {
+        var repaired = projects.map(\.position)
+        var previous: Int32?
+        let displayOrder = projects.indices.sorted {
+            (projects[$0].position, projects[$0].id) < (projects[$1].position, projects[$1].id)
+        }
+        for index in displayOrder {
+            let position = previous.map { max(afterMax($0), repaired[index]) } ?? repaired[index]
+            repaired[index] = position
+            previous = position
+        }
+        return zip(projects, repaired).map { (project: $0, position: $1) }
     }
 
     /// Persist the current layout with `fsync` and then freeze further
