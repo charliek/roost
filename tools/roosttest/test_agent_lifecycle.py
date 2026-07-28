@@ -34,16 +34,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 
 import ui
-from util import wait_tab_attached
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from util import roostctl_path, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -57,27 +53,6 @@ LEGACY_STATES = {"none", "running", "needs_input", "idle"}
 # ---------------------------------------------------------------------------
 # Driving the real CLI
 # ---------------------------------------------------------------------------
-
-
-def _roostctl() -> str:
-    """Absolute path to a `roostctl` binary, building one if needed.
-
-    Checked in the order a developer's tree makes them available: an
-    explicit override, the cargo debug build (what CI's GTK job builds),
-    the binary embedded in the Mac bundle (what CI's Mac job builds),
-    then PATH. The cargo fallback mirrors `ui.launch`, which builds the
-    GTK UI the same way when it's missing."""
-    candidates = [
-        os.environ.get("ROOST_ROOSTCTL", ""),
-        str(REPO_ROOT / "target/debug/roostctl"),
-        str(REPO_ROOT / "mac/build/Roost.app/Contents/Resources/bin/roostctl"),
-        shutil.which("roostctl") or "",
-    ]
-    for path in candidates:
-        if path and os.access(path, os.X_OK):
-            return path
-    subprocess.run(["cargo", "build", "-p", "roost-cli"], cwd=REPO_ROOT, check=True)
-    return str(REPO_ROOT / "target/debug/roostctl")
 
 
 def claude_hook(
@@ -104,7 +79,7 @@ def claude_hook(
         body = {"cwd": "/tmp", "transcript_path": "/tmp/transcript.jsonl", **payload}
         stdin = json.dumps(body).encode()
     proc = subprocess.run(
-        [_roostctl(), "claude-hook", event],
+        [roostctl_path(), "claude-hook", event],
         input=stdin,
         capture_output=True,
         env=env,

@@ -10,7 +10,7 @@ keeps its own config); CI always launches fresh, so it runs there.
 
 from __future__ import annotations
 
-from util import precondition
+from util import precondition, spawned_tab_id, wait_spawned_output
 
 SEED_LABELS = ("Echo Marker", "List Tmp")
 
@@ -45,12 +45,7 @@ def test_launcher_launches_command_in_new_tab(roost, project, palette):
     st = palette.palette_activate(items["Echo Marker"])
     assert st["open"] is False  # launching confirms + closes the palette
 
-    roost._wait(
-        lambda: {int(t["id"]) for t in roost.tabs()} - before,
-        5.0,
-        "launcher spawned a tab",
-    )
-    new_id = next(iter({int(t["id"]) for t in roost.tabs()} - before))
+    new_id = spawned_tab_id(roost, before, "launcher spawned a tab")
     # `hold=true` keeps the shell open, so the command's output stays on
     # screen and dumpable.
-    roost.wait_text(new_id, "LAUNCH_MARKER=ok", timeout=8)
+    wait_spawned_output(roost, new_id, "LAUNCH_MARKER=ok")

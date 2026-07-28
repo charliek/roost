@@ -17,8 +17,7 @@ the *live* cwd, not the project cwd.
 
 from __future__ import annotations
 
-from client import Timeout
-from util import cwd_reaches, precondition
+from util import cwd_reaches, precondition, spawned_tab_id, wait_spawned_output
 
 # Live cwd distinct from the project fixture's /tmp, and real on both
 # Linux and macOS (note: /tmp is a symlink on macOS, /usr is not — we
@@ -48,31 +47,6 @@ def _active_tab_in_live_cwd(roost, project):
     return tab
 
 
-def _new_tab_id(roost, before, what):
-    roost._wait(
-        lambda: {int(t["id"]) for t in roost.tabs()} - before,
-        5.0,
-        what,
-    )
-    return next(iter({int(t["id"]) for t in roost.tabs()} - before))
-
-
-def _wait_pwd_output(roost, tab_id, needle, timeout=12.0):
-    """Wait for a spawned tab's `pwd` marker, dumping the tab on timeout so
-    a flake is diagnosable instead of an opaque wait failure. The base
-    timeout is generous (scaled by ROOST_TEST_TIMEOUT_SCALE) because the
-    spawned shell must start + run its command under CI load before output
-    appears."""
-    try:
-        roost.wait_text(tab_id, needle, timeout=timeout)
-    except Timeout:
-        dump = roost._safe_dump_text(tab_id)
-        raise AssertionError(
-            f"tab {tab_id} never showed {needle!r} (shell slow to spawn/run?). "
-            f"Viewport:\n{dump}"
-        )
-
-
 def test_new_tab_inherits_active_cwd(roost, project, palette):
     """Cmd-T / Ctrl-T (palette `new_tab`) opens the new tab in the active
     tab's live cwd (/usr), not the project cwd (/tmp)."""
@@ -84,11 +58,11 @@ def test_new_tab_inherits_active_cwd(roost, project, palette):
     state = palette.palette_activate("new_tab")
     assert state["open"] is False  # activating new_tab confirms + closes
 
-    new_id = _new_tab_id(roost, before, "new_tab spawned a tab")
+    new_id = spawned_tab_id(roost, before, "new_tab spawned a tab")
     # Ask the new shell where it is — proves the *spawn* cwd directly,
     # independent of the new tab's own OSC 7 timing.
     roost.run(new_id, "echo NEWTAB_PWD=$(pwd)")
-    _wait_pwd_output(roost, new_id, f"NEWTAB_PWD={LIVE_CWD}")
+    wait_spawned_output(roost, new_id, f"NEWTAB_PWD={LIVE_CWD}")
 
 
 def test_launcher_runs_in_active_cwd(roost, project, palette):
@@ -104,5 +78,5 @@ def test_launcher_runs_in_active_cwd(roost, project, palette):
     before = {int(t["id"]) for t in roost.tabs()}
     state = palette.palette_activate(items["Print Pwd"])
     assert state["open"] is False
-    new_id = _new_tab_id(roost, before, "launcher spawned a tab")
-    _wait_pwd_output(roost, new_id, f"LAUNCH_PWD={LIVE_CWD}")
+    new_id = spawned_tab_id(roost, before, "launcher spawned a tab")
+    wait_spawned_output(roost, new_id, f"LAUNCH_PWD={LIVE_CWD}")

@@ -18,4 +18,4 @@
 
 pub mod claude;
 
-pub use claude::claude_event_to_reports;
+pub use claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};

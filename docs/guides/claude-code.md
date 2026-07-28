@@ -56,6 +56,13 @@ To uninstall, remove the alias from your shell rc and delete the file:
 rm ~/.config/roost/claude-settings.json
 ```
 
+Run `roostctl doctor` any time to check the install without guessing:
+`claude.hook_events` confirms the settings file registers all six
+lifecycle events (naming any it's missing), and `claude.hook_command`
+confirms each one resolves to a runnable `roostctl` — `fail` if a
+command's path is missing or not executable, `warn` if it resolves to a
+different `roostctl` than the one you're running.
+
 ## Verifying
 
 Open a fresh Roost tab, source your rc if needed, then:
@@ -64,7 +71,7 @@ Open a fresh Roost tab, source your rc if needed, then:
 roostctl identify
 ```
 
-You should see a JSON object describing the running app. If it errors, the GUI isn't running or `ROOST_SOCKET` is unset — re-launch `roost` and try again.
+You should see a handful of `key=value` lines (`socket`, `pid`, `active_tab`, `ui_version`, …) describing the running app — not JSON. If it errors, the GUI isn't running or `ROOST_SOCKET` is unset — re-launch `roost` and try again.
 
 Now run `claude` and submit a prompt. Watch the tab indicator:
 
@@ -94,9 +101,13 @@ Roost deliberately doesn't edit your `~/.claude/settings.json`. The alias approa
 
 ## Troubleshooting
 
-- **Hooks don't fire** — check `which claude`. If it points to the real binary instead of the alias, the alias didn't take effect (rc not sourced, or running in a non-interactive shell).
+Run `roostctl doctor` first. It's read-only, covers most of the cases
+below in one pass, and names exactly which check is unhappy instead of
+you guessing from the symptom.
+
+- **Hooks don't fire** — check `which claude`. If it points to the real binary instead of the alias, the alias didn't take effect (rc not sourced, or running in a non-interactive shell). Doctor's `claude.hook_events` and `claude.hook_command` checks confirm the settings file itself is correct; `claude.observed` says whether Roost has actually seen a hook fire on this tab.
 - **Click-through doesn't focus** — on Linux, your notification daemon must support default actions (mako, dunst, GNOME Shell all do). On Wayland without an XDG-activation token, the window may only request attention rather than raise.
-- **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost (no ownership claimed, so raw OSC isn't suppressed). Check `roostctl identify` and re-source your rc.
+- **OSC 9 banners still appear from inside Claude** — that means the `SessionStart` hook didn't reach Roost (no ownership claimed, so raw OSC isn't suppressed). Doctor's `tab.raw_osc` check reports whether suppression is currently active on the tab; check `roostctl identify` and re-source your rc if it isn't.
 - **The dot stopped moving after Claude errored out mid-session** — if Claude was killed or crashed without a `SessionEnd`, an OSC 133 prompt mark from the shell (reaching a fresh prompt) automatically releases the stale lifecycle and falls back to shell state; typing a command and pressing enter should clear it. See [Notifications → Hook-session OSC suppression](notifications.md#hook-session-osc-suppression) for the mechanism.
 
 See [Notifications](notifications.md) for the full pipeline architecture.

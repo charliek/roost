@@ -28,6 +28,7 @@ roostctl [--socket <PATH>] <COMMAND>
 | `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
 | `claude install` | Generate Claude Code hook settings + print the alias snippet |
 | `claude-hook` | Internal: invoked by Claude on each hook event |
+| `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, Claude hooks) |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket.
 
@@ -81,17 +82,16 @@ roostctl set-title --title "deploy" --tab 3
 roostctl identify
 ```
 
-```json
-{
-  "socket": "/Users/charliek/Library/Caches/Roost/roost.sock",
-  "pid": 14138,
-  "version": "0.1.0",
-  "active_project_id": 1,
-  "active_tab_id": 5
-}
+```text
+socket=/Users/charliek/Library/Caches/Roost/roost.sock
+pid=14138
+active_project=1
+active_tab=5
+ui_version=0.1.0
+proto_version=1
 ```
 
-Useful for verifying the socket is reachable and the env vars are wired correctly.
+Prints `key=value` lines, not JSON. Useful for verifying the socket is reachable and the env vars are wired correctly.
 
 ## `tab focus`
 
@@ -223,6 +223,76 @@ roostctl claude install --force   # overwrite an existing file
 
 Internal: invoked by Claude Code via the generated settings file. Reads the hook payload from stdin, looks up `$ROOST_TAB_ID`, and translates lifecycle events into IPC calls. Always exits 0 with `{}` on stdout (Claude treats nonzero hooks as failures). Silently no-ops when run outside a Roost tab.
 
+## `doctor`
+
+A **read-only** diagnostic for the Roost integration — it reports and
+links, it never repairs, installs, or mutates anything, so it's safe to
+run blind whenever something looks broken (a dot that won't light, hooks
+that don't fire, a stale socket).
+
+```bash
+roostctl doctor
+roostctl doctor --tab 7
+roostctl doctor --json
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Read directly from the env var rather than clap's `env = "ROOST_TAB_ID"`, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of a silent clap exit 2 |
+| `--json` | flag | `false` | Machine-readable report |
+
+The report is five sections. Each declares one of three scopes: **process**
+(the shell/process that invoked doctor), **ui** (the Roost instance doctor
+reached), **tab** (the selected tab) — a *process* fact is never used to
+judge a *tab* fact unless the selected tab is doctor's own tab.
+
+| Section | Scope | Answers |
+|---|---|---|
+| `env` | process | Are `ROOST_TAB_ID` / `ROOST_SOCKET` set, and valid? |
+| `ui` | ui | Which UI did target resolution pick, is its socket reachable, does `identify` succeed, does its version match `roostctl`'s, and does it speak the current agent-state wire format? |
+| `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
+| `tab` | tab | The selected tab's four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, and whether raw OSC 9/99/777 is currently suppressed. Observation only — nothing in this section fails. |
+| `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does the hook settings file parse and register all six lifecycle events, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? |
+
+Every check carries a stable `id` (`env.tab_id`, `ui.socket`,
+`shell.marks_capability`, `claude.hook_command`, …) and one of four
+statuses: `ok`, `warn`, `fail`, `info`. `info` is an observation with no
+verdict — a resolved path, an axis that doesn't apply here, a section
+that degrades because Claude isn't configured. Every `fail`/`warn` prints
+a link to the doc page that explains it.
+
+Trimmed real output, pointed at a socket nobody is listening on:
+
+```text
+roostctl doctor — roostctl 0.0.15
+
+Environment (process)
+  ok    env.tab_id               ROOST_TAB_ID=2254
+  ok    env.socket               ROOST_SOCKET=/nonexistent/path.sock
+
+Roost UI (ui)
+  fail  ui.socket                /nonexistent/path.sock: missing — no Roost UI has bound this path
+                                 → https://charliek.github.io/roost/reference/cli/#environment
+  fail  ui.identify              no connection: io error: No such file or directory (os error 2)
+                                 → https://charliek.github.io/roost/reference/cli/#identify
+  info  ui.agent_model           undetermined — tab.list failed: no connection: io error: No such file or directory (os error 2)
+
+  […]
+
+Claude Code (process)
+  ok    claude.binary            2.1.220 (Claude Code)
+  fail  claude.hook_events       missing StopFailure; run `roostctl claude install --force`
+                                 → https://charliek.github.io/roost/guides/claude-code/#install
+
+8 ok, 0 warn, 4 fail, 14 info — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes)
+```
+
+`--json` carries the same facts as JSON — a top-level `schema_version`,
+an explicit `exit_code` (so a script never has to re-derive "did
+anything fail" from the check list), and every check's stable `id` and
+`status`. That's the shape to script against; the text output's column
+widths are not.
+
 ## Environment
 
 | Variable | Effect |
@@ -241,3 +311,9 @@ Internal: invoked by Claude Code via the generated settings file. Reads the hook
 | 0 | Success |
 | 1 | RPC error or connection failure |
 | 2 | Bad command-line input |
+
+`doctor` exits 1 when **any** check's status is `fail`; `warn` never
+affects the exit code. Note that "no Roost UI is running" is itself a
+failed check (`ui.socket` / `ui.target`), so `roostctl doctor` exits 1
+whenever nothing is listening — that's by design, not a bug: the whole
+point of the `ui` section is to fail when there's nothing there.

@@ -33,6 +33,8 @@
 //!
 //! See `crates/roost-ipc/src/target.rs` for resolution logic.
 
+mod doctor;
+
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -40,7 +42,7 @@ use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 
-use roost_agent::claude::claude_event_to_reports;
+use roost_agent::claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
@@ -176,16 +178,31 @@ enum Cmd {
         /// spellings this binary wrote into `claude-settings.json`
         /// before this event set existed (`session-start`,
         /// `prompt-submit`, `notification`, `stop`, `session-end`) —
-        /// every already-installed settings file uses those. All but
-        /// `prompt-submit` normalize onto the canonical name
-        /// automatically; `prompt-submit` is translated explicitly
-        /// (see `resolve_hook_event`) because it shares no run of
-        /// characters with `UserPromptSubmit`.
+        /// every already-installed settings file uses those.
+        /// `roost_agent::canonical_hook_event` resolves them all.
         event: String,
     },
     /// Claude Code subcommands (install hook settings file).
     #[command(subcommand)]
     Claude(ClaudeCmd),
+    /// Diagnose the Roost integration: target resolution, socket, UI
+    /// identity, shell-integration contract, the selected tab's four
+    /// agent axes, and the Claude hook install. Read-only — it reports
+    /// and links, it never repairs. Exits 1 if any check fails.
+    Doctor {
+        /// Inspect this tab instead of `$ROOST_TAB_ID` / the UI's active
+        /// tab.
+        ///
+        /// Deliberately NOT `env = "ROOST_TAB_ID"` like every other
+        /// per-tab command: clap would turn an unparseable env value
+        /// into exit 2 instead of a diagnostic, and erase the difference
+        /// between "the user passed --tab" and "clap read the env".
+        /// Doctor reads the env var itself.
+        #[arg(long)]
+        tab: Option<i64>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -456,6 +473,23 @@ async fn main() -> Result<()> {
     // subcommand.
     if let Cmd::Claude(ClaudeCmd::Install { force }) = args.command {
         return claude_install(force);
+    }
+
+    // doctor exists to report "no UI is running", so it must not go
+    // through the connect prologue below, which `?`-exits on exactly
+    // that condition before any match arm runs.
+    if let Cmd::Doctor { tab, json } = args.command {
+        let report = doctor::evaluate(&doctor::collect(&selector(&args), tab).await);
+        {
+            let mut stdout = std::io::stdout().lock();
+            if json {
+                writeln!(stdout, "{}", doctor::render_json(&report)?)?;
+            } else {
+                write!(stdout, "{}", doctor::render_text(&report))?;
+            }
+            stdout.flush()?;
+        }
+        std::process::exit(report.exit_code());
     }
 
     // Everything else needs a live UI socket.
@@ -881,7 +915,7 @@ async fn main() -> Result<()> {
             // Dismissed → print nothing; exit 0 either way.
         }
         // Already handled above before client connect.
-        Cmd::ClaudeHook { .. } | Cmd::Claude(_) => unreachable!(),
+        Cmd::ClaudeHook { .. } | Cmd::Claude(_) | Cmd::Doctor { .. } => unreachable!(),
     }
 
     Ok(())
@@ -946,17 +980,22 @@ fn print_palette(state: &PaletteStateResult, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the [`TargetSelector`] from CLI args and resolve to a
-/// concrete socket path. `probe_alive` controls whether the auto-
-/// detect step actually dials candidate sockets; pass `false` for
-/// fire-and-forget commands (claude-hook) that no-op when the UI
-/// is offline.
-async fn resolve_target(args: &Args, probe_alive: bool) -> Result<ResolvedTarget> {
-    let selector = TargetSelector {
+/// The global flags that pick which UI to talk to. `doctor` needs the
+/// selector itself (it reports *how* resolution went), everything else
+/// only needs the resolved path — one construction either way.
+fn selector(args: &Args) -> TargetSelector {
+    TargetSelector {
         socket_override: args.socket.clone(),
         kind_override: args.target.map(BundleProfileKind::from),
-    };
-    selector
+    }
+}
+
+/// Resolve the CLI args to a concrete socket path. `probe_alive`
+/// controls whether the auto-detect step actually dials candidate
+/// sockets; pass `false` for fire-and-forget commands (claude-hook) that
+/// no-op when the UI is offline.
+async fn resolve_target(args: &Args, probe_alive: bool) -> Result<ResolvedTarget> {
+    selector(args)
         .resolve(probe_alive)
         .await
         .map_err(|e: TargetError| anyhow!(e))
@@ -975,35 +1014,19 @@ async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult> {
     Ok(client.call(ops::TAB_LIST, serde_json::json!({})).await?)
 }
 
-/// `roostctl`'s legacy CLI spelling for `UserPromptSubmit`, and the only
-/// one of the five spellings `claude_install` used to write that
-/// doesn't reach `roost-agent`'s parser on its own: separator/case
-/// normalization gets `session-start` to `SessionStart` etc., but
-/// `prompt-submit` shares no run of characters with `UserPromptSubmit`,
-/// so `roost_agent::claude` deliberately pins it as unrecognized.
-/// Every settings file an already-run `claude install` wrote still
-/// spells it this way, so it's translated here rather than renamed.
-fn resolve_hook_event(event: &str) -> &str {
-    if event.eq_ignore_ascii_case("prompt-submit") {
-        "UserPromptSubmit"
-    } else {
-        event
-    }
-}
-
 /// Claude Code hook dispatch. Reads the JSON payload from stdin
 /// (Claude's contract), maps the event to the reports
 /// `roost-agent`'s pure adapter derives, and sends each as a
 /// `tab.agent_report`. Best-effort — failures don't surface to Claude
 /// (caller wraps in `let _ = ...` and always exits 0).
 async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
-    let tab_id = std::env::var("ROOST_TAB_ID")
+    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
         .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
-    if tab_id == 0 {
+        .as_deref()
+        .and_then(parse_tab_id)
+    else {
         return Ok(());
-    }
+    };
 
     // Drain stdin to a bounded buffer so Claude doesn't block on
     // a closed reader, even though only some events use the payload.
@@ -1013,7 +1036,9 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
         serde_json::from_slice(&stdin_buf).unwrap_or(serde_json::Value::Null);
     let payload = with_default_session(payload, tab_id);
 
-    let reports = claude_event_to_reports(resolve_hook_event(event), &payload, tab_id);
+    let reports = canonical_hook_event(event)
+        .map(|name| claude_event_to_reports(name, &payload, tab_id))
+        .unwrap_or_default();
     if reports.is_empty() {
         if std::env::var("ROOST_DEBUG").is_ok() {
             eprintln!("roostctl claude-hook: no reports for event: {event}");
@@ -1071,14 +1096,51 @@ fn with_default_session(payload: serde_json::Value, tab_id: i64) -> serde_json::
     serde_json::Value::Object(obj)
 }
 
+/// `ROOST_TAB_ID` as a usable tab id — the one parse the Claude hook and
+/// `doctor` share, so doctor cannot report `ok` on a value the hook
+/// silently drops.
+///
+/// Deliberately does **not** trim: every other per-tab command reads the
+/// same variable through clap, whose `i64` parser rejects surrounding
+/// whitespace outright, so accepting `" 7 "` here would make doctor bless
+/// a value that exits 2 everywhere else. `0` and negatives are the same
+/// silent no-op as an unparseable value.
+fn parse_tab_id(raw: &str) -> Option<i64> {
+    raw.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
+/// `~/.config/roost/claude-settings.json` — written by `claude install`,
+/// read by `doctor`. One definition so the writer and the reader cannot
+/// drift about where the file lives.
+fn claude_settings_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("roost")
+        .join("claude-settings.json"))
+}
+
+/// This binary's canonical path. `std::env::current_exe()` returns the
+/// canonical path on macOS/Linux (modulo symlinks); `canonicalize`
+/// resolves any remaining symlink layer (e.g. when the .app's
+/// `Contents/Resources/bin/roostctl` is the entry).
+///
+/// `claude install` bakes this into the hook commands and `doctor`
+/// compares those commands against it, so both must resolve it the same
+/// way or a healthy install reads as a mismatch.
+fn self_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
 /// Write `~/.config/roost/claude-settings.json` and print the
 /// `alias claude=…` snippet. The hook command paths point at this
 /// binary's canonical path so they survive PATH changes.
 fn claude_install(force: bool) -> Result<()> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
-    let dir = PathBuf::from(&home).join(".config").join("roost");
-    std::fs::create_dir_all(&dir)?;
-    let settings_path = dir.join("claude-settings.json");
+    let settings_path = claude_settings_path()?;
+    if let Some(dir) = settings_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
 
     if !force && settings_path.exists() {
         eprintln!(
@@ -1088,38 +1150,11 @@ fn claude_install(force: bool) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Resolve the absolute path of the current binary so the hook
-    // commands survive PATH changes. `std::env::current_exe()`
-    // returns the canonical path on macOS/Linux (modulo symlinks);
-    // `canonicalize` resolves any symlink layer (e.g. when the
-    // .app's `Contents/Resources/bin/roostctl` is the entry).
-    let exe = std::env::current_exe()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = self_exe().ok_or_else(|| anyhow!("cannot resolve this binary's path"))?;
     let exe_str = exe.to_string_lossy().to_string();
     let exe_quoted = quote_for_shell(&exe_str);
 
-    let hook_for = |event: &str| -> serde_json::Value {
-        serde_json::json!([{
-            "hooks": [{
-                "type": "command",
-                "command": format!("{} claude-hook {}", exe_quoted, event),
-            }]
-        }])
-    };
-    // Canonical `hook_event_name` spellings, now that `claude-hook`
-    // accepts both (`resolve_hook_event` + `roost-agent`'s own
-    // normalization) — a freshly written settings file no longer needs
-    // the legacy kebab-case aliases an already-installed one carries.
-    let doc = serde_json::json!({
-        "hooks": {
-            "SessionStart":     hook_for("SessionStart"),
-            "UserPromptSubmit": hook_for("UserPromptSubmit"),
-            "Notification":     hook_for("Notification"),
-            "Stop":             hook_for("Stop"),
-            "StopFailure":      hook_for("StopFailure"),
-            "SessionEnd":       hook_for("SessionEnd"),
-        }
-    });
+    let doc = claude_settings_document(&exe_quoted);
     let body = serde_json::to_string_pretty(&doc)? + "\n";
     std::fs::write(&settings_path, body)?;
 
@@ -1146,6 +1181,29 @@ fn claude_install(force: bool) -> Result<()> {
         quote_for_shell(&settings_path.to_string_lossy())
     );
     Ok(())
+}
+
+/// The `claude-settings.json` document: one command hook per canonical
+/// event in [`CLAUDE_HOOK_EVENTS`], each dialing back into this binary's
+/// `claude-hook` subcommand. `exe_quoted` is already shell-quoted.
+///
+/// A freshly written file uses Claude's own `hook_event_name` spellings;
+/// the legacy kebab-case aliases an already-installed file carries keep
+/// working through `canonical_hook_event`.
+fn claude_settings_document(exe_quoted: &str) -> serde_json::Value {
+    let hooks: serde_json::Map<String, serde_json::Value> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .map(|event| {
+            let entry = serde_json::json!([{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{exe_quoted} claude-hook {event}"),
+                }]
+            }]);
+            ((*event).to_string(), entry)
+        })
+        .collect();
+    serde_json::json!({ "hooks": hooks })
 }
 
 fn quote_for_shell(s: &str) -> String {
@@ -1386,23 +1444,85 @@ mod tests {
     }
 
     #[test]
-    fn resolve_hook_event_aliases_only_prompt_submit() {
-        assert_eq!(resolve_hook_event("prompt-submit"), "UserPromptSubmit");
-        assert_eq!(resolve_hook_event("Prompt-Submit"), "UserPromptSubmit");
-        // Every other spelling — legacy or canonical — passes through
-        // unchanged; `roost-agent` normalizes separators/case on its own.
-        for event in [
-            "session-start",
-            "notification",
-            "stop",
-            "session-end",
-            "SessionStart",
-            "UserPromptSubmit",
-            "StopFailure",
-            "unknown-event",
-        ] {
-            assert_eq!(resolve_hook_event(event), event);
-        }
+    fn claude_settings_document_matches_the_shipped_file() {
+        // Frozen literal, not a re-derivation: an already-installed
+        // `claude-settings.json` is only equivalent to a fresh one if
+        // these exact bytes keep coming out.
+        let doc = claude_settings_document("/usr/local/bin/roostctl");
+        let expected = r#"{
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook Notification",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook SessionEnd",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook SessionStart",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook Stop",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook StopFailure",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "/usr/local/bin/roostctl claude-hook UserPromptSubmit",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+        assert_eq!(serde_json::to_string_pretty(&doc).unwrap(), expected);
+    }
+
+    #[test]
+    fn claude_settings_document_embeds_the_quoted_exe_verbatim() {
+        let doc = claude_settings_document("'/Apps/My Roost.app/roostctl'");
+        assert_eq!(
+            doc["hooks"]["Stop"][0]["hooks"][0]["command"],
+            serde_json::json!("'/Apps/My Roost.app/roostctl' claude-hook Stop")
+        );
     }
 
     #[test]
@@ -1424,13 +1544,13 @@ mod tests {
                 "no session synthesized for {raw}"
             );
 
-            let start = claude_event_to_reports(resolve_hook_event("session-start"), &payload, 7);
+            let start = claude_event_to_reports("session-start", &payload, 7);
             assert_eq!(start.len(), 1, "SessionStart dropped for {raw}");
             assert_eq!(start[0].ownership_action, OwnershipAction::Claim);
             assert_eq!(start[0].session_id, "manual:7");
 
             // The release has to carry the same identity or it won't match.
-            let end = claude_event_to_reports(resolve_hook_event("session-end"), &payload, 7);
+            let end = claude_event_to_reports("session-end", &payload, 7);
             assert_eq!(end[0].ownership_action, OwnershipAction::Release);
             assert_eq!(end[0].session_id, "manual:7");
         }
@@ -1445,7 +1565,7 @@ mod tests {
         );
     }
 
-    /// Every spelling the currently shipped `claude_install` writes into
+    /// Every spelling a previously shipped `claude_install` wrote into
     /// `claude-settings.json` must still reach the same `roost-agent`
     /// arm as Claude's own `hook_event_name` — otherwise an
     /// already-installed settings file silently stops working the
@@ -1460,7 +1580,9 @@ mod tests {
             ("stop", "Stop"),
             ("session-end", "SessionEnd"),
         ] {
-            let via_legacy = claude_event_to_reports(resolve_hook_event(legacy), &payload, 7);
+            let resolved = canonical_hook_event(legacy);
+            assert_eq!(resolved, Some(canonical), "{legacy}");
+            let via_legacy = claude_event_to_reports(resolved.unwrap(), &payload, 7);
             let via_canonical = claude_event_to_reports(canonical, &payload, 7);
             assert_eq!(via_legacy, via_canonical, "{legacy} vs {canonical}");
             assert!(

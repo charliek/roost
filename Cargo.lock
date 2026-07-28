@@ -1061,6 +1061,7 @@ dependencies = [
  "clap",
  "roost-agent",
  "roost-ipc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
