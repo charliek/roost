@@ -234,12 +234,16 @@ that don't fire, a stale socket).
 roostctl doctor
 roostctl doctor --tab 7
 roostctl doctor --json
+roostctl doctor -v
+roostctl doctor --color=always
 ```
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Read directly from the env var rather than clap's `env = "ROOST_TAB_ID"`, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of a silent clap exit 2 |
 | `--json` | flag | `false` | Machine-readable report |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 26 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
 The report is five sections. Each declares one of three scopes: **process**
 (the shell/process that invoked doctor), **ui** (the Roost instance doctor
@@ -251,47 +255,112 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `env` | process | Are `ROOST_TAB_ID` / `ROOST_SOCKET` set, and valid? |
 | `ui` | ui | Which UI did target resolution pick, is its socket reachable, does `identify` succeed, does its version match `roostctl`'s, and does it speak the current agent-state wire format? |
 | `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
-| `tab` | tab | The selected tab's four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, and whether raw OSC 9/99/777 is currently suppressed. Observation only — nothing in this section fails. |
+| `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, and whether raw OSC 9/99/777 is currently suppressed. Those six are observations, not verdicts. |
 | `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does the hook settings file parse and register all six lifecycle events, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? |
 
-Every check carries a stable `id` (`env.tab_id`, `ui.socket`,
-`shell.marks_capability`, `claude.hook_command`, …) and one of four
-statuses: `ok`, `warn`, `fail`, `info`. `info` is an observation with no
-verdict — a resolved path, an axis that doesn't apply here, a section
-that degrades because Claude isn't configured. Every `fail`/`warn` prints
-a link to the doc page that explains it.
+Every entry carries a stable `id` (`env.tab_id`, `ui.socket`,
+`shell.marks_capability`, `claude.hook_command`, …) and a `kind`: `check`
+or `observation`.
 
-Trimmed real output, pointed at a socket nobody is listening on:
+**Checks** carry a verdict — one of `ok`, `warn`, `fail`, `skipped`.
+`skipped` is not a fourth verdict so much as the *absence* of one: the
+check's subject is absent (not inside a Roost tab, Claude not
+configured) or doctor genuinely cannot tell (a shell whose family or
+version it can't identify).
+
+**Observations** carry no verdict at all — `status` is `null` — because
+they report a fact with no correct value: the selected tab's four agent
+axes (plus the state derived from them and whether raw OSC 9/99/777 is
+suppressed), `ROOST_SOCKET`, and the current shell. The exception worth
+naming: those same six `tab.*` axes carry `skipped` rather than `null`
+when the UI predates the agent state model, because then they genuinely
+cannot be observed — `tab.ownership: null` ("nothing owns it") and
+`tab.ownership: "skipped"` ("can't tell") are different findings, and a
+`--json` consumer shouldn't have to parse prose to know which.
+
+Every `fail`/`warn` still prints a link to the doc page that explains
+it; `skipped` entries and observations do not — there's nothing to go
+read about a fact.
+
+Real output, captured on a dev checkout with no Roost UI running and
+`ROOST_SOCKET` / `ROOST_TAB_ID` unset. This is the default view — one
+line per section, clipped to a fixed width so it stays scannable in a
+narrow terminal:
+
+```text
+roostctl doctor — roostctl 0.0.15 (run `roostctl doctor -v` for the full report)
+
+[–] Environment         not running inside a Roost tab
+[✗] Roost UI            no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost…
+[–] Shell integration   not running inside a Roost tab
+[–] Selected tab        no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an active tab
+[!] Claude Code         6 of 6 commands (Notification, SessionEnd, SessionStart, Stop, StopFailure,…
+
+• 4 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
+    ✗ ui.target            → https://charliek.github.io/roost/reference/cli/#environment
+    ✗ ui.socket            → https://charliek.github.io/roost/reference/cli/#environment
+    ✗ ui.identify          → https://charliek.github.io/roost/reference/cli/#identify
+    ! claude.hook_command  → https://charliek.github.io/roost/guides/claude-code/#install
+```
+
+`-v` prints all 26 entries grouped by section, with the status column
+blank for `null`-status observations (not for `skipped` — that word
+still prints, because it *is* a status) and a doc link under every
+`fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
+that show every row shape — the elided ones are "Shell integration" and
+"Selected tab", both all `skipped` here because nothing is inside a
+Roost tab:
 
 ```text
 roostctl doctor — roostctl 0.0.15
 
 Environment (process)
-  ok    env.tab_id               ROOST_TAB_ID=2254
-  ok    env.socket               ROOST_SOCKET=/nonexistent/path.sock
+  skipped env.tab_id               not running inside a Roost tab
+          env.socket               unset — target resolution falls through to --socket / --target / auto-detect
 
 Roost UI (ui)
-  fail  ui.socket                /nonexistent/path.sock: missing — no Roost UI has bound this path
-                                 → https://charliek.github.io/roost/reference/cli/#environment
-  fail  ui.identify              no connection: io error: No such file or directory (os error 2)
-                                 → https://charliek.github.io/roost/reference/cli/#identify
-  info  ui.agent_model           undetermined — tab.list failed: no connection: io error: No such file or directory (os error 2)
+  fail    ui.target                no Roost UI is listening (tried: /Users/charliek/Library/Caches/Roost/roost.sock, /Users/charliek/Library/Caches/Roost-gtk/roost.sock)
+                                   → https://charliek.github.io/roost/reference/cli/#environment
+  fail    ui.socket                mac /Users/charliek/Library/Caches/Roost/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed; gtk /Users/charliek/Library/Caches/Roost-gtk/roost.sock: stale — the socket file outlived its listener; Roost crashed or was killed
+                                   → https://charliek.github.io/roost/reference/cli/#environment
+  fail    ui.identify              no connection: target resolution found no socket to dial
+                                   → https://charliek.github.io/roost/reference/cli/#identify
+  skipped ui.version               roostctl 0.0.15 — no UI reached, nothing to compare
+  skipped ui.agent_model           undetermined — tab.list failed: target resolution found no socket to dial
 
   […]
 
 Claude Code (process)
-  ok    claude.binary            2.1.220 (Claude Code)
-  fail  claude.hook_events       missing StopFailure; run `roostctl claude install --force`
-                                 → https://charliek.github.io/roost/guides/claude-code/#install
+  ok      claude.binary            2.1.220 (Claude Code)
+  ok      claude.settings          /Users/charliek/.config/roost/claude-settings.json parses
+  ok      claude.hook_events       all 6 events registered
+  warn    claude.hook_command      6 of 6 commands (Notification, SessionEnd, SessionStart, Stop, StopFailure, UserPromptSubmit): resolves to /Users/charliek/projects/roost/mac/build/Roost.app/Contents/Resources/bin/roostctl rather than the running roostctl at /Users/charliek/projects/roost/target/debug/roostctl
+                                   → https://charliek.github.io/roost/guides/claude-code/#install
+  skipped claude.observed          the selected tab's ownership is unavailable (no tab.list from a running UI)
 
-8 ok, 0 warn, 4 fail, 14 info — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes)
+• 4 issues found — exit 1 (https://charliek.github.io/roost/reference/cli/#exit-codes):
+    ✗ ui.target            → https://charliek.github.io/roost/reference/cli/#environment
+    ✗ ui.socket            → https://charliek.github.io/roost/reference/cli/#environment
+    ✗ ui.identify          → https://charliek.github.io/roost/reference/cli/#identify
+    ! claude.hook_command  → https://charliek.github.io/roost/guides/claude-code/#install
 ```
 
-`--json` carries the same facts as JSON — a top-level `schema_version`,
+Paths are this machine's own (`/Users/charliek/...`) — expect your own
+absolute paths, not these. The `claude.hook_command` warning above is
+this dev checkout's own noise, not a real problem: the installed hook
+settings still point at a `mac/build/Roost.app` bundle from an earlier
+session, not this session's `target/debug/roostctl` — a release install
+wouldn't show it.
+
+`--json` carries the same facts as JSON — a top-level `schema_version: 2`,
 an explicit `exit_code` (so a script never has to re-derive "did
-anything fail" from the check list), and every check's stable `id` and
-`status`. That's the shape to script against; the text output's column
-widths are not.
+anything fail" from the check list), and every entry's stable `id`,
+`kind` (`check` or `observation`), and `status` — `null` for
+observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
+shape to script against; the text output's column widths are not.
+`--json` is also unaffected by `-v` and `--color`: it always carries all
+26 entries and never contains a color escape, regardless of either
+flag.
 
 ## Environment
 
@@ -313,7 +382,10 @@ widths are not.
 | 2 | Bad command-line input |
 
 `doctor` exits 1 when **any** check's status is `fail`; `warn` never
-affects the exit code. Note that "no Roost UI is running" is itself a
-failed check (`ui.socket` / `ui.target`), so `roostctl doctor` exits 1
-whenever nothing is listening — that's by design, not a bug: the whole
-point of the `ui` section is to fail when there's nothing there.
+affects the exit code, and neither does `skipped` — a check that
+couldn't be judged is not a check that failed. Observations don't enter
+into it either, since they carry no status to fail with. Note that "no
+Roost UI is running" is itself a failed check (`ui.socket` / `ui.target`),
+so `roostctl doctor` exits 1 whenever nothing is listening — that's by
+design, not a bug: the whole point of the `ui` section is to fail when
+there's nothing there.
