@@ -35,7 +35,7 @@
 
 mod doctor;
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -202,6 +202,14 @@ enum Cmd {
         tab: Option<i64>,
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Print the full per-check report instead of one line per
+        /// section. Ignored by `--json`, which always carries everything.
+        #[arg(short, long, default_value_t = false)]
+        verbose: bool,
+        /// When to color the text output. `auto` colors only a TTY, and
+        /// honours `NO_COLOR` and `TERM=dumb`. Ignored by `--json`.
+        #[arg(long, value_enum, default_value = "auto")]
+        color: doctor::ColorMode,
     },
 }
 
@@ -478,15 +486,34 @@ async fn main() -> Result<()> {
     // doctor exists to report "no UI is running", so it must not go
     // through the connect prologue below, which `?`-exits on exactly
     // that condition before any match arm runs.
-    if let Cmd::Doctor { tab, json } = args.command {
+    //
+    // Destructuring by value moves out of `args`, so `selector(&args)`
+    // below only compiles while every field here is `Copy` — which is
+    // why `--color` is a `Copy` `ValueEnum` rather than a `String`.
+    if let Cmd::Doctor {
+        tab,
+        json,
+        verbose,
+        color,
+    } = args.command
+    {
+        // The three impure probes live here, in the thin I/O layer;
+        // `color_enabled` itself stays pure so its precedence is
+        // table-testable.
+        let no_color = std::env::var("NO_COLOR").ok();
+        let term = std::env::var("TERM").ok();
+        let style = doctor::Style {
+            color: doctor::color_enabled(
+                color,
+                std::io::stdout().is_terminal(),
+                no_color.as_deref(),
+                term.as_deref(),
+            ),
+        };
         let report = doctor::evaluate(&doctor::collect(&selector(&args), tab).await);
         {
             let mut stdout = std::io::stdout().lock();
-            if json {
-                writeln!(stdout, "{}", doctor::render_json(&report)?)?;
-            } else {
-                write!(stdout, "{}", doctor::render_text(&report))?;
-            }
+            write!(stdout, "{}", doctor::render(&report, json, style, verbose)?)?;
             stdout.flush()?;
         }
         std::process::exit(report.exit_code());
