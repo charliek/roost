@@ -1142,7 +1142,12 @@ impl Workspace {
             .filter(|t| t.project_id == project_id && !tab_ids.contains(&t.id))
             .map(|t| t.id)
             .collect();
-        unlisted.sort_by_key(|tid| inner.tabs.get(tid).map(|r| r.position).unwrap_or(0));
+        // `(position, id)`, not position alone: the loop below assigns
+        // `position = next_pos++` from this order, so a tie must not be
+        // left to the container. `BTreeMap` + a stable sort already
+        // yields ascending id here — state the rule rather than inherit
+        // it (#262).
+        unlisted.sort_by_key(|tid| (inner.tabs.get(tid).map(|r| r.position).unwrap_or(0), *tid));
         for tid in &unlisted {
             if let Some(row) = inner.tabs.get_mut(tid) {
                 row.position = next_pos;
@@ -1184,7 +1189,12 @@ impl Workspace {
             .filter(|p| !project_ids.contains(&p.id))
             .map(|p| p.id)
             .collect();
-        unlisted.sort_by_key(|pid| inner.projects.get(pid).map(|r| r.position).unwrap_or(0));
+        unlisted.sort_by_key(|pid| {
+            (
+                inner.projects.get(pid).map(|r| r.position).unwrap_or(0),
+                *pid,
+            )
+        });
         for pid in &unlisted {
             if let Some(row) = inner.projects.get_mut(pid) {
                 row.position = next_pos;
@@ -1335,12 +1345,17 @@ impl Inner {
     /// Next free project position: `max(position) + 1`, or 0 when
     /// empty. `len()` would collide after a delete-then-create
     /// because positions are sparse, not dense (#80).
+    ///
+    /// Saturating: positions decode straight from a user-editable
+    /// `state.json`, so a plain `m + 1` at `i32::MAX` panics at launch
+    /// in debug. A workspace that reached `i32::MAX` is corrupt input,
+    /// not a supported state — degrade it to a tie instead.
     fn next_project_position(&self) -> i32 {
         self.projects
             .values()
             .map(|p| p.position)
             .max()
-            .map_or(0, |m| m + 1)
+            .map_or(0, |m| m.saturating_add(1))
     }
 
     /// Next free tab position within `project_id`: `max(position) + 1`,
@@ -1351,7 +1366,23 @@ impl Inner {
             .filter(|t| t.project_id == project_id)
             .map(|t| t.position)
             .max()
-            .map_or(0, |m| m + 1)
+            .map_or(0, |m| m.saturating_add(1))
+    }
+
+    /// A project's tabs in display order: `position`, with `id`
+    /// breaking ties. Returns rows, not snapshots, because
+    /// `TabSnapshot` carries no id — sorting after the map could only
+    /// key on `position` and would leave ties to `BTreeMap` iteration
+    /// order: correct today, but by accident of the container rather
+    /// than by statement.
+    fn tabs_in_display_order(&self, project_id: i64) -> Vec<&TabRow> {
+        let mut rows: Vec<&TabRow> = self
+            .tabs
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .collect();
+        rows.sort_by_key(|t| (t.position, t.id));
+        rows
     }
 
     /// Snapshot the persistable state plus a fresh commit sequence.
@@ -1372,13 +1403,10 @@ impl Inner {
             .tabs
             .get(&self.active_tab_id)
             .map(|active| {
-                let mut siblings: Vec<&TabRow> = self
-                    .tabs
-                    .values()
-                    .filter(|t| t.project_id == active.project_id)
-                    .collect();
-                siblings.sort_by_key(|t| (t.position, t.id));
-                siblings.iter().position(|t| t.id == active.id).unwrap_or(0) as i32
+                self.tabs_in_display_order(active.project_id)
+                    .into_iter()
+                    .position(|t| t.id == active.id)
+                    .unwrap_or(0) as i32
             })
             .unwrap_or(0);
         let snapshot = SnapshotFile {
@@ -1390,10 +1418,9 @@ impl Inner {
                 .projects
                 .values()
                 .map(|p| {
-                    let mut tabs: Vec<TabSnapshot> = self
-                        .tabs
-                        .values()
-                        .filter(|t| t.project_id == p.id)
+                    let tabs: Vec<TabSnapshot> = self
+                        .tabs_in_display_order(p.id)
+                        .into_iter()
                         .map(|t| TabSnapshot {
                             title: t.title.clone(),
                             cwd: t.cwd.clone(),
@@ -1401,7 +1428,6 @@ impl Inner {
                             user_titled: t.user_titled,
                         })
                         .collect();
-                    tabs.sort_by_key(|t| t.position);
                     ProjectSnapshot {
                         id: p.id,
                         name: p.name.clone(),
@@ -2191,6 +2217,57 @@ mod tests {
         ws.close_tab(t0.id).unwrap();
         let t2 = ws.open_tab(a.id, "/", "t2").unwrap();
         assert_eq!(t2.position, 2, "new tab position collided after close");
+    }
+
+    /// A `state.json` is user-editable, so `i32::MAX` is representable
+    /// in a position. `max + 1` there panics in debug; the allocators
+    /// clamp to a tie instead so the UI still starts.
+    #[test]
+    fn next_position_saturates_at_i32_max() {
+        let ws = Workspace::new();
+        let p = ws.create_project("p", "").unwrap().id;
+        let t = ws.open_tab(p, "/", "t").unwrap().id;
+        {
+            let mut inner = ws.inner.lock().unwrap();
+            inner.projects.get_mut(&p).unwrap().position = i32::MAX;
+            inner.tabs.get_mut(&t).unwrap().position = i32::MAX;
+            assert_eq!(inner.next_project_position(), i32::MAX);
+            assert_eq!(inner.next_tab_position(p), i32::MAX);
+        }
+        assert_eq!(ws.create_project("q", "").unwrap().position, i32::MAX);
+        assert_eq!(ws.open_tab(p, "/", "u").unwrap().position, i32::MAX);
+    }
+
+    /// States the rule rather than reproducing a bug: this test cannot
+    /// fail against the previous implementation (`sort_by_key(|t|
+    /// t.position)`, no id in the key). `self.tabs` is a `BTreeMap`, so
+    /// `.values()` always yields ascending id; `sort_by_key` is stable;
+    /// a stable sort on `position` alone therefore always preserves
+    /// ascending-id order among ties — identical to sorting on
+    /// `(position, id)` for every input, not just this one. The id key
+    /// is here so the ordering guarantee is a stated rule instead of an
+    /// accident of the container choice (#262) — kept as an explicit
+    /// statement-of-intent guard, not a regression reproduction.
+    #[test]
+    fn persist_sorts_tabs_by_position_then_id() {
+        let ws = Workspace::new();
+        let p = ws.create_project("p", "").unwrap().id;
+        let a = ws.open_tab(p, "/", "a").unwrap().id;
+        let _b = ws.open_tab(p, "/", "b").unwrap().id;
+        let c = ws.open_tab(p, "/", "c").unwrap().id;
+        let (snapshot, _seq) = {
+            let mut inner = ws.inner.lock().unwrap();
+            // c (the highest id) ties with a at position 0; b keeps 1.
+            inner.tabs.get_mut(&c).unwrap().position = 0;
+            inner.snapshot_for_persist()
+        };
+        assert!(a < c);
+        let titles: Vec<&str> = snapshot.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["a", "c", "b"]);
     }
 
     #[test]

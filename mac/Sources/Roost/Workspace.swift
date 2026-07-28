@@ -250,7 +250,7 @@ final class Workspace {
     func createProject(name: String, cwd: String) -> Project {
         let id = allocID()
         let chosenName = name.isEmpty ? "Untitled \(projects.count + 1)" : name
-        let position = Int32(projects.count)
+        let position = nextProjectPosition()
         let project = Project(
             id: id,
             name: chosenName,
@@ -337,9 +337,14 @@ final class Workspace {
             tabs[tid]?.position = next
             next += 1
         }
-        let unlisted = tabs.values
-            .filter { $0.projectId == projectID && !tabIDs.contains($0.id) }
-            .sorted { $0.position < $1.position }
+        // Display order (`tabs(in:)` — `position` with `id` breaking
+        // ties), not raw `Dictionary.values`: the loop below *assigns*
+        // `position = next++` from this sequence, so an untiebroken tie
+        // would scramble the trailing tabs permanently, and differently
+        // on every run — dictionary iteration order is seeded per
+        // process.
+        let unlisted = tabs(in: projectID)
+            .filter { !tabIDs.contains($0.id) }
             .map { $0.id }
         for tid in unlisted {
             tabs[tid]?.position = next
@@ -363,9 +368,9 @@ final class Workspace {
             projects[pid]?.position = next
             next += 1
         }
-        let unlisted = projects.values
+        // Display order for the same reason as `reorderTabs`.
+        let unlisted = snapshot()
             .filter { !projectIDs.contains($0.id) }
-            .sorted { $0.position < $1.position }
             .map { $0.id }
         for pid in unlisted {
             projects[pid]?.position = next
@@ -381,7 +386,7 @@ final class Workspace {
             throw WorkspaceError.projectNotFound(projectID)
         }
         let id = allocID()
-        let position = Int32(tabs.values.lazy.filter { $0.projectId == projectID }.count)
+        let position = nextTabPosition(in: projectID)
         let derivedTitle = title.isEmpty ? deriveTitle(cwd: cwd) : title
         let now = unixNow()
         // Always start with userTitled=false. The caller-supplied
@@ -809,6 +814,35 @@ final class Workspace {
         return nextID
     }
 
+    /// Next free project position: `max(position) + 1`, or 0 when
+    /// empty. `projects.count` would collide after a delete-then-create
+    /// because positions are sparse, not dense (#80, #262).
+    private func nextProjectPosition() -> Int32 {
+        Self.afterMax(projects.values.lazy.map(\.position).max())
+    }
+
+    /// Next free tab position within `projectID`: `max(position) + 1`,
+    /// or 0 when the project has no tabs. See `nextProjectPosition`.
+    private func nextTabPosition(in projectID: Int64) -> Int32 {
+        Self.afterMax(
+            tabs.values.lazy
+                .filter { $0.projectId == projectID }
+                .map(\.position)
+                .max()
+        )
+    }
+
+    /// `max + 1`, saturating, or 0 for an empty parent. Positions
+    /// decode straight from a user-editable `state.json`, so
+    /// `Int32.max + 1` is a launch-time trap in an otherwise
+    /// carefully-defended path. A workspace that reached `Int32.max` is
+    /// corrupt input, not a supported state: degrade it to a tie rather
+    /// than crash the app.
+    private static func afterMax(_ highest: Int32?) -> Int32 {
+        guard let highest else { return 0 }
+        return highest == .max ? .max : highest + 1
+    }
+
     /// Persist the current layout with `fsync` and then freeze further
     /// persistence. Call once on a clean exit (App.swift wires it into
     /// `applicationWillTerminate`). The `fsync` re-asserts physical
@@ -846,19 +880,14 @@ final class Workspace {
         // on restore (the UI selects the nth tab). #95 review.
         let activeTabPosition: Int32 = {
             guard let active = tabs[activeTabID] else { return 0 }
-            let siblings = tabs.values
-                .filter { $0.projectId == active.projectId }
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+            let siblings = tabs(in: active.projectId)
             return Int32(siblings.firstIndex { $0.id == active.id } ?? 0)
         }()
         let snapshot = SnapshotFile(
             nextID: nextID,
-            projects: projects.values
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+            projects: snapshot()
                 .map { p in
-                    let projectTabs = tabs.values
-                        .filter { $0.projectId == p.id }
-                        .sorted { $0.position < $1.position }
+                    let projectTabs = tabs(in: p.id)
                         .map {
                             SnapshotFile.TabSnapshot(
                                 title: $0.title,

@@ -194,6 +194,55 @@ struct WorkspaceStateTests {
         #expect(order == [c.id, a.id, b.id])
     }
 
+    /// Ported from the Rust twin `position_is_max_plus_one_after_delete`
+    /// (`crates/roost-linux/src/daemon/state.rs`). Swift allocated from
+    /// `count` until #262, which collides after a mid-list delete
+    /// because positions are sparse, not dense (#80).
+    @Test func positionIsMaxPlusOneAfterDelete() async throws {
+        let ws = await Workspace()
+        let a = await ws.createProject(name: "a", cwd: "")
+        let b = await ws.createProject(name: "b", cwd: "")
+        let c = await ws.createProject(name: "c", cwd: "")
+        #expect([a.position, b.position, c.position] == [0, 1, 2])
+
+        // Delete the middle project, then create a new one. The old
+        // `count` rule would reuse position 2 (colliding with c); the
+        // fix must hand out max(0, 2) + 1 = 3.
+        _ = try await ws.deleteProject(b.id)
+        let d = await ws.createProject(name: "d", cwd: "")
+        #expect(d.position == 3, "new project position collided after delete")
+
+        // Same invariant for tabs within a project.
+        let t0 = try await ws.openTab(projectID: a.id, cwd: "/", title: "t0")
+        let t1 = try await ws.openTab(projectID: a.id, cwd: "/", title: "t1")
+        #expect([t0.position, t1.position] == [0, 1])
+        try await ws.closeTab(t0.id)
+        let t2 = try await ws.openTab(projectID: a.id, cwd: "/", title: "t2")
+        #expect(t2.position == 2, "new tab position collided after close")
+        #expect(await ws.tabs(in: a.id).map(\.id) == [t1.id, t2.id])
+    }
+
+    /// The user-visible symptom (#262): closing from the *front* drops
+    /// `count` below every surviving position, so the pre-fix rule
+    /// handed a brand-new tab a position the strip renders earlier — a
+    /// new tab appearing to the left of an older one. No collision is
+    /// even required; `count < max + 1` is enough.
+    @Test func tabOpenedAfterFrontCloseSortsLast() async throws {
+        let ws = await Workspace()
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let a = try await ws.openTab(projectID: p.id, cwd: "/", title: "a")
+        let b = try await ws.openTab(projectID: p.id, cwd: "/", title: "b")
+        let c = try await ws.openTab(projectID: p.id, cwd: "/", title: "c")
+        try await ws.closeTab(a.id)
+        try await ws.closeTab(b.id)
+        let d = try await ws.openTab(projectID: p.id, cwd: "/", title: "d")
+        #expect(d.position > c.position)
+        #expect(
+            await ws.tabs(in: p.id).map(\.id) == [c.id, d.id],
+            "a newly-opened tab must sort after every survivor"
+        )
+    }
+
     @Test func eventsFireOnMutation() async {
         let ws = await Workspace()
         let captured = EventCapture()
@@ -788,5 +837,193 @@ struct WorkspaceStatePersistenceTests {
             restore.projects.first?.tabs.first?.cwd == "/flushed",
             "a post-flush mutation must not have reached disk"
         )
+    }
+
+    /// A `state.json` whose projects share a position — the only seam
+    /// that can still produce a tie, since `createProject` now hands
+    /// out `max + 1` and project positions are loaded verbatim
+    /// (`Workspace.init(statePath:)`). Written by a pre-#262 Mac build
+    /// or a pre-#80 GTK build after a mid-list project delete.
+    private func tiedProjectsState() -> String {
+        // p1 alone at 0, p2…p5 tied at 1 — the shape both callers assert.
+        let rows = (1...5).map { id in
+            """
+            { "id": \(id), "name": "p\(id)", "cwd": "/tmp",
+              "position": \(id == 1 ? 0 : 1), "created_at": \(id), "tabs": [] }
+            """
+        }
+        return """
+        { "next_id": 100, "projects": [\(rows.joined(separator: ","))] }
+        """
+    }
+
+    private func decodeSnapshot(at path: String) throws -> Workspace.SnapshotFile {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        return try JSONDecoder().decode(Workspace.SnapshotFile.self, from: data)
+    }
+
+    /// `reorderProjects` sorts the *unlisted* rows out of
+    /// `Dictionary.values` — unspecified order, seeded per process —
+    /// and then **assigns** `position = next++` from that order. Without
+    /// the id tiebreak a tie scrambles the sidebar permanently, and
+    /// differently on every launch.
+    @Test func reorderProjectsBreaksPositionTiesById() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try tiedProjectsState().write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        #expect(
+            await ws.snapshot().map(\.position) == [0, 1, 1, 1, 1],
+            "the tie must survive the load — otherwise this tests nothing"
+        )
+        // Partial reorder: only project 1 is listed, so 2…5 trail it in
+        // `(position, id)` order and are renumbered from that order.
+        try await ws.reorderProjects([1])
+        #expect(await ws.snapshot().map(\.id) == [1, 2, 3, 4, 5])
+        #expect(await ws.snapshot().map(\.position) == [0, 1, 2, 3, 4])
+    }
+
+    /// `persist()` must write each project in the order the sidebar
+    /// shows it, ties included — a nondeterministic file order means a
+    /// relaunch can swap two rows relative to what was on screen.
+    @Test func persistWritesTiedProjectsInDisplayOrder() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try tiedProjectsState().write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        // Any mutation persists; renaming leaves every position alone.
+        try await ws.renameProject(1, name: "renamed")
+        let written = try decodeSnapshot(at: path)
+        #expect(written.projects.map(\.position) == [0, 1, 1, 1, 1], "tie preserved")
+        #expect(written.projects.map(\.id) == (await ws.snapshot().map(\.id)))
+    }
+
+    /// Regression test for the allocator's sparse-position output
+    /// (`max + 1` after a mid-project close), not for the `(position,
+    /// id)` id tiebreak. It fails against pre-fix code: the old
+    /// allocator sized a new position off the project's *live* tab
+    /// count, which shrinks on close, so the tab opened after the two
+    /// closes below got a position lower than the still-open `c` and
+    /// sorted ahead of it — this test's positions/cwd-order assertions
+    /// catch that. It is NOT a tiebreak test: no seam can create a live
+    /// tab-position tie in Swift post-fix (`openTab` is the sole
+    /// allocator; restored tabs come back as descriptors, never live
+    /// rows), so there is nothing here to tie-break. The tiebreak rule
+    /// itself is stated by the Rust twin,
+    /// `persist_sorts_tabs_by_position_then_id` — see its own comment:
+    /// that one can't fail either, for a different, provable reason.
+    @Test func persistWritesTabsInDisplayOrder() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let ws = await Workspace(statePath: path)
+        let p = await ws.createProject(name: "p", cwd: "/")
+        let a = try await ws.openTab(projectID: p.id, cwd: "/a", title: "a")
+        let b = try await ws.openTab(projectID: p.id, cwd: "/b", title: "b")
+        _ = try await ws.openTab(projectID: p.id, cwd: "/c", title: "c")
+        // Close from the middle and the front so positions go sparse.
+        try await ws.closeTab(b.id)
+        try await ws.closeTab(a.id)
+        _ = try await ws.openTab(projectID: p.id, cwd: "/d", title: "d")
+
+        let displayed = await ws.tabs(in: p.id)
+        #expect(displayed.map(\.position) == [2, 3], "positions stay sparse")
+        let written = try decodeSnapshot(at: path)
+        let writtenTabs = try #require(written.projects.first?.tabs)
+        #expect(writtenTabs.map(\.cwd) == displayed.map(\.cwd))
+        #expect(writtenTabs.map(\.cwd) == ["/c", "/d"])
+    }
+
+    /// `Int32.max + 1` traps in Swift, and positions decode straight
+    /// from a user-editable `state.json`. A workspace at `Int32.max` is
+    /// corrupt input, not a supported state: the allocator degrades it
+    /// to a tie rather than crashing the app at launch.
+    @Test func projectPositionAtInt32MaxClampsInsteadOfTrapping() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let maxed = """
+        {
+            "next_id": 10,
+            "projects": [{
+                "id": 1, "name": "maxed", "cwd": "/tmp",
+                "position": 2147483647, "created_at": 1, "tabs": []
+            }]
+        }
+        """
+        try maxed.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        let next = await ws.createProject(name: "next", cwd: "/tmp")
+        #expect(next.position == Int32.max, "clamped to a tie, not trapped")
+        // The tab allocator shares the clamp; a tab at `Int32.max` is
+        // unreachable in Swift (tabs never restore as live rows), so
+        // `next_position_saturates_at_i32_max` covers that half in Rust.
+        let tab = try await ws.openTab(projectID: 1, cwd: "/tmp", title: "t")
+        #expect(tab.position == 0)
+    }
+
+    /// The clamp above deliberately produces a *tie* rather than
+    /// trapping — this is the downstream half: once two projects sit
+    /// at `Int32.max`, nothing may lose data, crash, or reorder
+    /// nondeterministically. Loads the tie directly (rather than via
+    /// `createProject`, which `projectPositionAtInt32MaxClampsInsteadOfTrapping`
+    /// already covers) so this test is about survival after the tie
+    /// exists, not about how it got there.
+    @Test func projectsTiedAtInt32MaxSurviveLoadAndRoundTrip() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let tied = """
+        {
+            "next_id": 10,
+            "projects": [
+                { "id": 1, "name": "p1", "cwd": "/tmp",
+                  "position": 2147483647, "created_at": 1, "tabs": [] },
+                { "id": 2, "name": "p2", "cwd": "/tmp",
+                  "position": 2147483647, "created_at": 2, "tabs": [] }
+            ]
+        }
+        """
+        try tied.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        #expect(
+            await ws.snapshot().map(\.id) == [1, 2],
+            "both projects survive the load — the tie must not lose one"
+        )
+        #expect(await ws.snapshot().map(\.position) == [Int32.max, Int32.max])
+
+        // Any persisting mutator round-trips the tie through disk.
+        try await ws.renameProject(1, name: "renamed")
+        let ws2 = await Workspace(statePath: path)
+        #expect(
+            await ws2.snapshot().map(\.id) == [1, 2],
+            "the tie survives a reopen in the same relative order"
+        )
+        #expect(await ws2.snapshot().map(\.name) == ["renamed", "p2"])
+    }
+
+    /// `afterMax` isn't just a max-boundary clamp — plain `highest + 1`
+    /// must still hold below it. Positions decode straight from
+    /// `state.json` with no validation, so a negative value (e.g. from
+    /// hand-editing, or a future allocator bug) is representable input.
+    @Test func negativeProjectPositionAllocatesNextUp() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let negative = """
+        {
+            "next_id": 10,
+            "projects": [{
+                "id": 1, "name": "negative", "cwd": "/tmp",
+                "position": -5, "created_at": 1, "tabs": []
+            }]
+        }
+        """
+        try negative.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        let next = await ws.createProject(name: "next", cwd: "/tmp")
+        #expect(next.position == -4, "max + 1 must hold below -1, not just near Int32.max")
     }
 }
