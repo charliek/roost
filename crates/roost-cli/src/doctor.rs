@@ -4556,8 +4556,15 @@ mod tests {
                 let c = char::from_u32(cp).unwrap();
                 assert_eq!(redact(&format!("a{c}b")), format!("a\\u{{{cp:04x}}}b"));
             }
-            for cp in [lo - 1, hi + 1] {
-                let c = char::from_u32(cp).unwrap();
+            // Skip neighbours that are not scalars at all: a future range
+            // starting at U+0000 would underflow, and one bordering the
+            // surrogate block has no neighbour to probe. Both would panic
+            // instead of failing, which defeats the point of walking the
+            // table rather than hand-listing it.
+            for cp in [lo.checked_sub(1), hi.checked_add(1)].into_iter().flatten() {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
                 assert!(!is_format(c), "U+{cp:04X} is not a format character");
                 // U+2029 borders the bidi range and is escaped by the Zl/Zp
                 // arm, so only the neighbours no other arm claims can be
