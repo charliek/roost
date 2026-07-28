@@ -110,6 +110,30 @@ suites. This is the same pattern already proven by `tests/word-fixtures/`
 and `tests/url-fixtures/`. Behavioral drift between the two UIs surfaces
 as a red test rather than a bug report.
 
+**The parity-corpus rule this generalizes to (plan 004 §3.4):**
+
+> Use a **golden fixture corpus** (AD-2) when the thing to pin is a pure
+> function with a large case space — derivation, `rank()`, transition
+> tables — where the value is exhaustiveness and the function has no
+> direct op of its own. Use the **dual-target e2e** (`tools/roosttest/`,
+> run against both `mac` and `gtk`, both required CI gates) when the
+> behavior is a small invariant already observable through an existing
+> op, and a corpus would mean inventing a pure seam on both sides purely
+> to have something to tabulate.
+
+Not a clean either/or: `tab.agent_report` plus `tab.list` *can* observe a
+derivation divergence, and the e2e does exercise some of it. The question
+is which tool is cheaper for the case space in hand — 200 derivation rows
+belong in a table, one ordering invariant belongs in an op-level test
+(plan 004 §3.4 walks through that trade for #262: a new corpus would have
+cost ~250–650 hand-written lines across two languages, against ~80 for
+the e2e).
+
+The e2e's blind spot, stated plainly: it exercises live op behavior, not
+the restore path. That is why plan 004 mirrored its load-time position
+normalizer into both languages rather than relying on the e2e to notice
+an asymmetry it structurally cannot see.
+
 **AD-3 — Ownership is a label, not a suppression switch.** Because
 effective state falls through to shell state when no live agent state is
 present, a stale owner contributes nothing and degrades *cosmetically*
@@ -174,6 +198,23 @@ function over a plain struct with no I/O and no platform types (the most
 liftable shape available), and AD-2's shared fixtures mean an eventual
 consolidation already has its equivalence proof written.
 
+**[#262](https://github.com/charliek/roost/issues/262) is the concrete
+evidence for that argument.** Rust fixed a tab/project position allocator
+bug — `max(position) + 1`, not `count` — in `58b79c8`
+([PR #86](https://github.com/charliek/roost/pull/86), closing issue #80),
+and guarded it with `position_is_max_plus_one_after_delete`; Swift kept
+the `count`-based allocator for months, because ordering lived in no
+shared corpus for the divergence to surface in. The user-visible cost was
+a tab strip whose order did not match the order tabs were created in, so
+an agent's state dot appeared to land on the wrong row. The same shape existed one layer down, in the
+load-time repair path: both loaders copy a persisted project `position`
+verbatim, so a collided file survives a restart on either UI, and
+pre-#80 GTK builds could produce one. Plan 004 brought Swift's allocator
+up to the Rust rule and added the load-time repair to **both** languages
+— deliberately, rather than Mac-only, because a one-sided repair would
+have opened a fresh divergence inside the fix for this one (see the
+[ledger](#plan-ledger)).
+
 ---
 
 ## Plan ledger
@@ -185,6 +226,7 @@ gauntlet convention; the PR body carries the durable public record.
 |---|---|---|---|---|
 | 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Shipped | [#259](https://github.com/charliek/roost/pull/259) |
 | 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | [#260](https://github.com/charliek/roost/pull/260) |
+| 004 | Tab/project position parity + `roostctl doctor` output UX | `~/.claude/plans/roost/004-tab-order-and-doctor-ux.md` | In review | — |
 | — | L3 agent UX (tint / overview / switcher) | *not yet written* | Future | — |
 
 ---
@@ -235,10 +277,10 @@ UI: a surface to render it.
 Jump between agents from the palette, showing directory, name, status,
 and age.
 
-*Needs:* nothing beyond D2's data. The existing `view_notifications`
-frame is a structurally identical template (one row per interesting tab,
-`<project> · <tab>` title, activate → jump), so this is largely
-assembly.
+*Needs:* nothing beyond D2's data — including the row-order dependency
+noted there. The existing `view_notifications` frame is a structurally
+identical template (one row per interesting tab, `<project> · <tab>`
+title, activate → jump), so this is largely assembly.
 
 *Needs from L0 specifically:* the shared `rank()` ordering, so the
 switcher, the overview, and the sidebar stripe agree on what "most
