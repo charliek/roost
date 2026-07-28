@@ -701,6 +701,36 @@ struct WorkspaceStatePersistenceTests {
         #expect(again == nil)
     }
 
+    /// Tied persisted tab positions are reachable — the `state.json`
+    /// captured for #262 holds `[2, 3, 3]` — and the restore layout is
+    /// the order the bootstrap re-opens tabs in, so the tie decides the
+    /// restored tab strip. `sorted(by:)` is documented as **not** stable
+    /// while Rust's `sort_by_key` is stable by contract, so without the
+    /// index tiebreak the same file could restore in a different order on
+    /// Mac than on Linux. The twin is
+    /// `restore_layout_breaks_tied_tab_positions_by_file_order`; the
+    /// fixture's file order is neither ascending nor descending in
+    /// `position`, so a sort that ignored the index could not pass by luck.
+    @Test func restoreLayoutBreaksTiedTabPositionsByFileOrder() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try """
+        { "next_id": 200, "active_project_id": 100,
+          "projects": [
+            { "id": 100, "name": "p", "cwd": "/tmp", "position": 0, "created_at": 100,
+              "tabs": [
+                { "title": "a", "cwd": "/a", "position": 3, "user_titled": false },
+                { "title": "b", "cwd": "/b", "position": 1, "user_titled": false },
+                { "title": "c", "cwd": "/c", "position": 3, "user_titled": false }
+              ] }
+          ] }
+        """.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        let restore = try #require(await ws.takeRestoreLayout())
+        #expect(restore.projects.first?.tabs.map(\.title) == ["b", "a", "c"])
+    }
+
     /// Issue #196 follow-up: `userTitled` is persisted across
     /// relaunch so a manually-renamed tab keeps its rename — and so
     /// the model's `setTabCwd` re-derivation (also #196) doesn't
@@ -1252,6 +1282,29 @@ struct WorkspaceStatePersistenceTests {
         #expect(
             snap.map(\.name) == ["low"] && snap.map(\.position) == [0],
             "the last row in the file wins, not the last in display order"
+        )
+    }
+
+    /// Two rows sharing an `id` **and** a `position` make `(position, id)`
+    /// a non-total order, and `sorted(by:)` on a predicate that is not a
+    /// strict weak ordering has no defined result — so the repair walk
+    /// needs the file index as a final key to be defined at all. Rust
+    /// reaches the same order for free (`sort_by_key` is stable). The
+    /// walk order decides the *positions*; which row survives insertion
+    /// is the file's order either way, which
+    /// `duplicateProjectIDsKeepTheFileOrderSurvivor` pins.
+    @Test func duplicateProjectRowsRepairInFileOrder() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try projectsState([(7, "first", 5), (7, "second", 5)])
+            .write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        let snap = await ws.snapshot()
+        #expect(snap.map(\.name) == ["second"], "the last row in the file wins")
+        #expect(
+            snap.map(\.position) == [6],
+            "the second row is the one pushed up, because it walks second"
         )
     }
 

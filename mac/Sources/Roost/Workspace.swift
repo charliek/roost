@@ -187,12 +187,28 @@ final class Workspace {
                     RestoreProject(
                         projectID: p.id,
                         tabs: p.tabs
-                            .sorted { $0.position < $1.position }
+                            // The file index is the tie-break, and it is
+                            // load-bearing for *parity*, not just for
+                            // determinism: `sorted(by:)` is documented as
+                            // **not** stable, while Rust's counterpart
+                            // (`tabs.sort_by_key(|(pos, _)| *pos)`) is
+                            // stable by contract, so a file with two tabs
+                            // at one position — captured user files have
+                            // `[2, 3, 3]` — could otherwise restore in a
+                            // different order on Mac than on Linux. A
+                            // `TabSnapshot` carries no id, so the index is
+                            // the only key available, and it is exactly
+                            // what a stable sort would have kept.
+                            .enumerated()
+                            .sorted {
+                                ($0.element.position, $0.offset)
+                                    < ($1.element.position, $1.offset)
+                            }
                             .map {
                                 RestoreTab(
-                                    cwd: $0.cwd,
-                                    title: $0.title,
-                                    userTitled: $0.userTitled
+                                    cwd: $0.element.cwd,
+                                    title: $0.element.title,
+                                    userTitled: $0.element.userTitled
                                 )
                             }
                     )
@@ -893,13 +909,32 @@ final class Workspace {
     /// repairing `[Int32.max - 1, Int32.max - 1]` yields
     /// `[Int32.max - 1, Int32.max]`, and the next `createProject`
     /// clamps onto that `Int32.max` (plan 004 §3.1).
+    ///
+    /// Everything above holds **below the ceiling**; at it, the display
+    /// order is not preserved either. Clamping collapses a row onto
+    /// `Int32.max`, and the `(position, id)` comparator then re-breaks
+    /// that *new* tie by id, which can let a row overtake a sibling:
+    /// `B@(max-1, id2), C@(max-1, id3), A@(max, id1)` displays
+    /// `B, C, A` and repairs to `B@max-1, C@max, A@max` — which
+    /// displays `B, A, C`. Corrupt input degrading to a reshuffle is
+    /// the accepted cost of not failing to launch; the guarantee is for
+    /// positions a real workspace can reach.
     private static func normalizedProjectPositions(
         _ projects: [SnapshotFile.ProjectSnapshot]
     ) -> [(project: SnapshotFile.ProjectSnapshot, position: Int32)] {
         var repaired = projects.map(\.position)
         var previous: Int32?
+        // The index is the last key because `(position, id)` is not a
+        // total order on a *file*: `state.json` is user-editable, so two
+        // rows can share both, and `sorted(by:)` given a non-strict-weak
+        // ordering has no defined result. Rust reaches the same order
+        // through a stable `sort_by_key` over the file's rows. This fixes
+        // only where such a row lands in the walk — which of two rows
+        // sharing an `id` survives insertion is still the file's order,
+        // per the note above.
         let displayOrder = projects.indices.sorted {
-            (projects[$0].position, projects[$0].id) < (projects[$1].position, projects[$1].id)
+            (projects[$0].position, projects[$0].id, $0)
+                < (projects[$1].position, projects[$1].id, $1)
         }
         for index in displayOrder {
             let position = previous.map { max(afterMax($0), repaired[index]) } ?? repaired[index]

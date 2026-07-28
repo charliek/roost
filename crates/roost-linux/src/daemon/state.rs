@@ -297,6 +297,16 @@ pub enum WorkspaceError {
 /// guarantee — repairing `[i32::MAX - 1, i32::MAX - 1]` yields
 /// `[i32::MAX - 1, i32::MAX]`, and the next `create_project` clamps
 /// onto that `i32::MAX` (plan 004 §3.1).
+///
+/// Everything above holds **below the ceiling**; at it, the display
+/// order is not preserved either. Clamping collapses a row onto
+/// `i32::MAX`, and the `(position, id)` comparator then re-breaks that
+/// *new* tie by id, which can let a row overtake a sibling:
+/// `B@(MAX-1, id2), C@(MAX-1, id3), A@(MAX, id1)` displays `B, C, A`
+/// and repairs to `B@MAX-1, C@MAX, A@MAX` — which displays `B, A, C`.
+/// Corrupt input degrading to a reshuffle is the accepted cost of not
+/// failing to launch; the guarantee is for positions a real workspace
+/// can reach.
 fn normalize_project_positions(projects: &mut [ProjectSnapshot]) {
     // Sort borrows of the rows, not the slice: the caller's order is
     // the order `RestoreLayout` (and hence the bootstrap) walks, and
@@ -2535,6 +2545,44 @@ mod tests {
                 .map(|t| t.cwd.as_str())
                 .collect::<Vec<_>>(),
             vec!["/c", "/a", "/b"]
+        );
+    }
+
+    /// Tied persisted tab positions are reachable — the `state.json`
+    /// captured for #262 holds `[2, 3, 3]` — and the restore layout is
+    /// the order the bootstrap re-opens tabs in, so the tie decides the
+    /// restored tab strip. `sort_by_key` is stable, which makes that
+    /// order the file's; Swift's `sorted(by:)` is documented as *not*
+    /// stable, so its twin
+    /// `restoreLayoutBreaksTiedTabPositionsByFileOrder` needs an explicit
+    /// index tiebreak to land here. The fixture's file order is neither
+    /// ascending nor descending in `position`, so a sort that ignored the
+    /// index could not pass by luck.
+    #[test]
+    fn restore_layout_breaks_tied_tab_positions_by_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{ "next_id": 200, "active_project_id": 100,
+                 "projects": [
+                   { "id": 100, "name": "p", "cwd": "/tmp", "position": 0, "created_at": 100,
+                     "tabs": [
+                       { "title": "a", "cwd": "/a", "position": 3, "user_titled": false },
+                       { "title": "b", "cwd": "/b", "position": 1, "user_titled": false },
+                       { "title": "c", "cwd": "/c", "position": 3, "user_titled": false }
+                     ] }
+                 ] }"#,
+        )
+        .unwrap();
+        let restore = Workspace::open(path).take_restore_layout().unwrap();
+        assert_eq!(
+            restore.projects[0]
+                .tabs
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "c"]
         );
     }
 

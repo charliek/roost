@@ -245,8 +245,8 @@ pub struct Section {
     /// grades nothing, rendered `•` rather than a green tick.
     pub status: Option<Status>,
     /// The one line the default view prints for this section — always a
-    /// copy of some entry's `detail` with its whitespace runs collapsed
-    /// (see [`collapse_whitespace`]), never new prose (§3.9).
+    /// copy of some entry's `detail` with its blank runs collapsed
+    /// (see [`collapse_blanks`]), never new prose (§3.9).
     pub headline: String,
     pub checks: Vec<Check>,
 }
@@ -361,35 +361,42 @@ fn worst_adverse(statuses: impl Iterator<Item = Status>) -> Option<Status> {
         .max_by_key(|s| severity(*s))
 }
 
-/// Squeeze every run of whitespace to a single space and trim the ends.
+/// Squeeze every run of blank-rendering scalars to a single space and
+/// trim the ends.
 ///
 /// This is the vector [`escape_controls`] cannot see: a space is not a
 /// control character, so a long run of them inside a headline positions
 /// whatever follows at a column of the attacker's choosing — including
 /// the exact column a narrow terminal wraps a [`SUMMARY_W`] row, where
 /// the wrapped remainder reads as a genuine `[✗] Selected tab` section
-/// line. A headline is a one-line summary, so a *run* of whitespace in
-/// one has no legitimate purpose; collapsing costs nothing and takes the
-/// aim away.
+/// line. A headline is a one-line summary, so a *run* of blanks in one
+/// has no legitimate purpose; collapsing costs nothing and takes the aim
+/// away.
 ///
-/// Unicode `White_Space` via `char::is_whitespace`, not `== ' '`: NBSP,
-/// U+2000–U+200A and the ideographic space pad just as well, and U+2028 /
-/// U+2029 are line separators that `char::is_control` does *not* cover,
-/// so this is the last place they can be neutralized. It is also exactly
-/// the set that cannot collide with the escaping already applied —
-/// [`escape_controls`] has rewritten a tab as the two characters `\` and
-/// `t`, neither of which is whitespace.
+/// "Blank" is deliberately wider than Unicode `White_Space` (see
+/// [`renders_blank`]): what makes a scalar usable as padding is that the
+/// cell draws empty, not which category it landed in, and U+2800 BRAILLE
+/// PATTERN BLANK (So) and the Hangul fillers (Lo) substitute for a space
+/// 1:1 in every terminal font. The collapse cannot collide with the
+/// escaping already applied — [`escape_controls`] rewrote a tab as the
+/// two characters `\` and `t`, and neither is blank.
 ///
-/// The residual limit, stated honestly: no CLI can stop a long enough
-/// user-controlled string from wrapping at *some* terminal width. What
-/// this removes is the *aimable* version of the attack — the attacker can
-/// no longer choose the column the forged text starts at — which is the
-/// part that makes a forgery convincing.
-fn collapse_whitespace(s: &str) -> String {
+/// The residual, precisely: this closes the *invisible* padding, not
+/// every route to a column. The budget that keeps a summary row to one
+/// line counts **scalars, not display columns**
+/// (`chars().count() <= SUMMARY_W`), so an East Asian Wide character —
+/// visible, and two columns for one scalar — still lets an attacker move
+/// the forged text while that check passes. Closing *that* needs real
+/// display-width computation, i.e. the `unicode-width` crate; not taken,
+/// because a vendored width table needs Unicode-version upkeep forever to
+/// harden one diagnostic line, and the remaining attack has to pad with
+/// glyphs the reader can see. What is gone is the aim an invisible run
+/// bought.
+fn collapse_blanks(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pending = false;
     for c in s.chars() {
-        if c.is_whitespace() {
+        if renders_blank(c) {
             pending = !out.is_empty();
         } else {
             if pending {
@@ -400,6 +407,28 @@ fn collapse_whitespace(s: &str) -> String {
         }
     }
     out
+}
+
+/// Scalars that draw as an empty cell, for [`collapse_blanks`]: Unicode
+/// `White_Space` — NBSP, U+2000–U+200A and the ideographic space all pad
+/// as well as a space does — plus the blank-rendering scalars outside that
+/// property. U+2028/U+2029 are in it too, and are line separators
+/// `char::is_control` does not cover, so this is their last stop if a
+/// detail ever reaches a headline unescaped.
+fn renders_blank(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            // BRAILLE PATTERN BLANK — a braille cell with no dots raised.
+            '\u{2800}'
+            // HANGUL FILLER, CHOSEONG / JUNGSEONG FILLER, HALFWIDTH
+            // HANGUL FILLER — placeholder jamo, drawn as nothing.
+            | '\u{3164}' | '\u{115f}' | '\u{1160}' | '\u{ffa0}'
+            // MONGOLIAN VOWEL SEPARATOR, which is Cf: a *detail* can never
+            // carry it this far ([`escape_controls`] gets there first), so
+            // this arm is for direct callers only.
+            | '\u{180e}'
+        )
 }
 
 /// Assemble a section, computing §3.8's roll-up and §3.9's headline here
@@ -419,7 +448,7 @@ fn collapse_whitespace(s: &str) -> String {
 /// `$SHELL` carrying a newline could forge a whole section line. Every
 /// detail has already been through [`redact`]/[`escape_controls`], so
 /// the headline inherits that for free — plus
-/// [`collapse_whitespace`], which the *detail* deliberately does not get:
+/// [`collapse_blanks`], which the *detail* deliberately does not get:
 /// `-v` and `--json` carry the value as it actually is, while the
 /// one-line summary cannot afford printable padding.
 fn section(
@@ -450,7 +479,7 @@ fn section(
         title,
         scope,
         status,
-        headline: source.map_or_else(String::new, |c| collapse_whitespace(&c.detail)),
+        headline: source.map_or_else(String::new, |c| collapse_blanks(&c.detail)),
         checks,
     }
 }
@@ -1263,6 +1292,24 @@ const METADATA_VALUE_ALLOWLIST: [&str; 4] =
 /// Escape control characters so an agent-supplied string cannot inject
 /// fake report lines or ANSI sequences into output a user pastes into an
 /// issue.
+///
+/// Two categories beyond Cc, neither of which `char::is_control` sees,
+/// both admitted by the same reading of plan 003 §3.9 — the threat model
+/// is output a user *pastes* into an issue, so the renderers there count,
+/// not just the terminal:
+///
+/// * **Zl/Zp** (U+2028/U+2029). Terminals don't break on them; plenty of
+///   paste targets do, which is the forged-report-line vector this
+///   escaping exists to close.
+/// * **Cf** (format, see [`is_format`]). One step further and a policy
+///   fix rather than a patched instance: a raw U+202E RIGHT-TO-LEFT
+///   OVERRIDE reverses the rest of the line, and GitHub and every browser
+///   honor it, so `$SHELL=<RLO>bat detceleS ]✗[` pastes as a convincing
+///   `[✗] Selected tab`. U+2066–U+2069 do the same by isolate, and
+///   U+200B–U+200F hide text outright. A format character has no
+///   legitimate place in a diagnostic string, so the whole category goes —
+///   which closes the class for *every* detail rather than only for the
+///   headlines that also get [`collapse_blanks`].
 fn escape_controls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1270,22 +1317,51 @@ fn escape_controls(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            // U+2028/U+2029 are categories Zl/Zp, not `is_control()`, so they
-            // slip past the arm below. Terminals don't break on them, but
-            // plan 003 §3.9's threat model is output a user *pastes* into an
-            // issue, and plenty of renderers there do treat them as line
-            // breaks — which is the forged-report-line vector this escaping
-            // exists to close.
-            '\u{2028}' | '\u{2029}' => {
-                let _ = write!(out, "\\u{{{:04x}}}", c as u32);
-            }
-            c if c.is_control() => {
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || is_format(c) => {
                 let _ = write!(out, "\\u{{{:04x}}}", c as u32);
             }
             c => out.push(c),
         }
     }
     out
+}
+
+/// `General_Category=Cf`, as ranges. `char` exposes `is_control` (Cc) and
+/// nothing else, and a Unicode-table crate is a large dependency to carry
+/// for one diagnostic string, so the category is spelled out here:
+/// Unicode 16.0's Cf, coalesced from a full scalar-by-scalar walk of
+/// `UnicodeData.txt`.
+///
+/// Two ranges are widened past the real category to keep the table short.
+/// U+2065 and U+E0002–U+E001F are unassigned holes inside a format block;
+/// over-broad is the safe direction here, since escaping an unassigned
+/// scalar costs a diagnostic nothing while a missed range costs it the
+/// vector in [`escape_controls`].
+const FORMAT_RANGES: [(u32, u32); 19] = [
+    (0x00ad, 0x00ad),           // SOFT HYPHEN
+    (0x0600, 0x0605),           // ARABIC NUMBER SIGN … ARABIC NUMBER MARK ABOVE
+    (0x061c, 0x061c),           // ARABIC LETTER MARK
+    (0x06dd, 0x06dd),           // ARABIC END OF AYAH
+    (0x070f, 0x070f),           // SYRIAC ABBREVIATION MARK
+    (0x0890, 0x0891),           // ARABIC POUND / PIASTRE MARK ABOVE
+    (0x08e2, 0x08e2),           // ARABIC DISPUTED END OF AYAH
+    (0x180e, 0x180e),           // MONGOLIAN VOWEL SEPARATOR
+    (0x200b, 0x200f),           // ZWSP, ZWNJ, ZWJ, LRM, RLM
+    (0x202a, 0x202e),           // LRE, RLE, PDF, LRO, RLO — the bidi overrides
+    (0x2060, 0x206f),           // WORD JOINER … the deprecated format controls
+    (0xfeff, 0xfeff),           // ZERO WIDTH NO-BREAK SPACE (BOM)
+    (0xfff9, 0xfffb),           // INTERLINEAR ANNOTATION ANCHOR/SEPARATOR/TERMINATOR
+    (0x0001_10bd, 0x0001_10bd), // KAITHI NUMBER SIGN
+    (0x0001_10cd, 0x0001_10cd), // KAITHI NUMBER SIGN ABOVE
+    (0x0001_3430, 0x0001_343f), // EGYPTIAN HIEROGLYPH format controls
+    (0x0001_bca0, 0x0001_bca3), // SHORTHAND FORMAT letter overlap … up step
+    (0x0001_d173, 0x0001_d17a), // MUSICAL SYMBOL BEGIN BEAM … END PHRASE
+    (0x000e_0001, 0x000e_007f), // LANGUAGE TAG + the TAG characters
+];
+
+fn is_format(c: char) -> bool {
+    let cp = c as u32;
+    FORMAT_RANGES.iter().any(|(lo, hi)| cp >= *lo && cp <= *hi)
 }
 
 /// Escape, then cap for display — counted in characters, with the true
@@ -1644,6 +1720,13 @@ fn env_checks(inputs: &Inputs) -> Vec<Check> {
     // Set or unset, neither is the correct value: unset is the ordinary
     // shape outside a Roost tab, and set is the documented way to target
     // one from a CI runner. So it observes rather than judges (§3.7).
+    //
+    // The one status change here that *removes a positive verdict*: the set
+    // arm was `ok` before the status/kind split, so this id migrates
+    // `ok → null` — not `info → null` like the unset arm, whose `info` had
+    // no spelling left to keep. Anyone exporting `ROOST_SOCKET` therefore
+    // sees `summary.ok` drop by one, and a `jq` check for `status == "ok"`
+    // on `env.socket` now fails where it used to pass.
     let socket = match &inputs.env_socket {
         Some(path) => observation(
             "env.socket",
@@ -4453,6 +4536,84 @@ mod tests {
         assert!(separators.contains("\\u{2029}"), "{separators}");
     }
 
+    /// The bidi half of §3.9's threat model, and the reason the escaping is
+    /// stated as a *category* rather than a list of the characters someone
+    /// happened to try: `Cf` is neither `is_control()` nor whitespace, so a
+    /// raw U+202E RIGHT-TO-LEFT OVERRIDE used to reach the row verbatim.
+    /// GitHub and every browser honor it, which is exactly the paste target
+    /// the policy is written for — `$SHELL=<RLO>bat detceleS ]✗[` reads
+    /// there as `[✗] Selected tab`.
+    #[test]
+    fn format_characters_are_escaped() {
+        // Both endpoints of every range, so a mistyped bound cannot pass,
+        // and both *neighbours* of every range, because escaping a category
+        // must not quietly become escaping its neighbourhood — a legitimate
+        // path has to stay readable in the output that exists to explain it.
+        // Walked off the table rather than hand-listed so a range added
+        // later is covered by construction.
+        for (lo, hi) in FORMAT_RANGES {
+            for cp in [lo, hi] {
+                let c = char::from_u32(cp).unwrap();
+                assert_eq!(redact(&format!("a{c}b")), format!("a\\u{{{cp:04x}}}b"));
+            }
+            for cp in [lo - 1, hi + 1] {
+                let c = char::from_u32(cp).unwrap();
+                assert!(!is_format(c), "U+{cp:04X} is not a format character");
+                // U+2029 borders the bidi range and is escaped by the Zl/Zp
+                // arm, so only the neighbours no other arm claims can be
+                // asserted to reach the output verbatim.
+                if !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}') {
+                    let raw = format!("a{c}b");
+                    assert_eq!(redact(&raw), raw, "U+{cp:04X}");
+                }
+            }
+        }
+        // The ones that carry the attack, by name, so a table that drifted
+        // into covering the wrong block still fails here.
+        for c in [
+            '\u{202e}', '\u{2066}', '\u{2069}', '\u{200b}', '\u{200e}', '\u{feff}', '\u{ad}',
+        ] {
+            assert!(is_format(c), "U+{:04X}", c as u32);
+        }
+        // The blank-rendering scalars belong to `collapse_blanks`, not
+        // here — they are legitimate text in a detail, just not padding in
+        // a headline.
+        for c in ['\u{2800}', '\u{3164}', '\u{115f}', '\u{1160}', '\u{ffa0}'] {
+            assert!(!is_format(c), "U+{:04X}", c as u32);
+        }
+        // Ordinary non-ASCII text, spelled the way a user would have it.
+        for raw in ["/Users/münchen/日本語/bin/zsh", "café ✓ 🐦 — ok"] {
+            assert_eq!(redact(raw), raw);
+        }
+        // Sorted, non-empty and disjoint, so `is_format`'s linear scan is a
+        // table anyone can read against `UnicodeData.txt` rather than a pile.
+        for pair in FORMAT_RANGES.windows(2) {
+            assert!(pair[0].0 <= pair[0].1, "{pair:?}");
+            assert!(pair[0].1 < pair[1].0, "{pair:?}");
+        }
+
+        // End to end, with the review's own repro: the reversal must not
+        // survive into any of the three views.
+        let report = evaluate(&Inputs {
+            shell_path: Some("\u{202e}bat detceleS ]✗[".into()),
+            shell_usable: false,
+            env_shell_integration: None,
+            env_resources_dir: None,
+            ..healthy()
+        });
+        for text in [
+            summary_text(&report),
+            verbose_text(&report),
+            render_json(&report).unwrap(),
+        ] {
+            assert!(
+                !text.contains('\u{202e}'),
+                "a raw RLO reached the output:\n{text}"
+            );
+            assert!(text.contains("\\u{202e}"), "{text}");
+        }
+    }
+
     #[test]
     fn long_strings_are_capped_in_characters_with_the_true_length() {
         let raw: String = "é".repeat(500);
@@ -4593,7 +4754,7 @@ mod tests {
     }
 
     /// The third vector in the same battery, and the one the two above
-    /// cannot reach: a space is **not** a control character, so
+    /// cannot reach: a blank cell is **not** a control character, so
     /// `escape_controls` passes a run of them through untouched and the
     /// row-counting assertions see one logical line. A long enough run
     /// positions the text after it at the exact column a narrow terminal
@@ -4601,33 +4762,40 @@ mod tests {
     /// column 80 — and the wrapped remainder reads as a real section line.
     #[test]
     fn a_padded_headline_cannot_be_aimed_at_a_terminals_wrap_column() {
-        // The whitespace definition first, because the escaping and the
+        // The blank definition first, because the escaping and the
         // collapse have to compose in exactly one direction.
-        assert_eq!(collapse_whitespace("  a   b  "), "a b");
+        assert_eq!(collapse_blanks("  a   b  "), "a b");
         // Unicode `White_Space`, not just `' '`: NBSP, the en quad and the
         // ideographic space all pad, and U+2028 is a line separator that
-        // `char::is_control` does not cover — so `escape_controls` lets it
-        // through and this is the last place it can be neutralized.
-        assert_eq!(collapse_whitespace("a\u{a0}\u{2003}\u{3000}b"), "a b");
-        assert_eq!(collapse_whitespace("a\u{2028}\u{2029}b"), "a b");
+        // `char::is_control` does not cover.
+        assert_eq!(collapse_blanks("a\u{a0}\u{2003}\u{3000}b"), "a b");
+        assert_eq!(collapse_blanks("a\u{2028}\u{2029}b"), "a b");
+        // …and *wider* than `White_Space`, which is what the first round of
+        // this fix got wrong: U+2800 BRAILLE PATTERN BLANK is `So` and the
+        // Hangul fillers are `Lo`, so neither `char::is_whitespace` nor
+        // `char::is_control` sees them, yet every terminal font draws them
+        // as an empty cell — a 1:1 substitute for the space.
+        assert_eq!(collapse_blanks("a\u{2800}\u{2800}\u{2800}b"), "a b");
+        assert_eq!(collapse_blanks("a\u{3164}\u{115f}\u{1160}\u{ffa0}b"), "a b");
+        assert_eq!(collapse_blanks("a\u{180e}b"), "a b");
         // …and what the escaping already rewrote is *text*: `\t` is a
-        // backslash and a `t`, neither of which is whitespace, so a
-        // collapse cannot eat an escape or fuse it to its neighbour.
-        assert_eq!(collapse_whitespace(&escape_controls("a\tb")), "a\\tb");
-        assert_eq!(collapse_whitespace(&escape_controls("a\n\nb")), "a\\n\\nb");
+        // backslash and a `t`, neither of which is blank, so a collapse
+        // cannot eat an escape or fuse it to its neighbour.
+        assert_eq!(collapse_blanks(&escape_controls("a\tb")), "a\\tb");
+        assert_eq!(collapse_blanks(&escape_controls("a\n\nb")), "a\\n\\nb");
 
         // Codex's repro in shape: outside a Roost tab an unusable `$SHELL`
         // is `shell.login`'s skipped detail, which is the section headline.
         const FORGED: &str = "[✗] Selected tab";
-        let hostile = |pad: usize| Inputs {
-            shell_path: Some(format!("{}{FORGED}", " ".repeat(pad))),
+        let hostile = |pad: char, n: usize| Inputs {
+            shell_path: Some(format!("{}{FORGED}", String::from(pad).repeat(n))),
             shell_usable: false,
             env_shell_integration: None,
             env_resources_dir: None,
             ..healthy()
         };
-        let row_for = |pad: usize| {
-            let report = evaluate(&hostile(pad));
+        let row_for = |pad: char, n: usize| {
+            let report = evaluate(&hostile(pad, n));
             let summary = summary_text(&report);
             summary_rows(&summary)
                 .into_iter()
@@ -4636,48 +4804,68 @@ mod tests {
                 .to_string()
         };
 
-        // The whole attack is aim, so the property that kills it is that
-        // the padding width no longer moves anything: 49 spaces (aimed at
-        // an 80-column wrap) and 89 (aimed at 120) render one same row.
-        // Both stay under `MAX_DISPLAY_CHARS`, or `redact` would truncate
-        // one of them and the rows would differ for an unrelated reason.
-        assert_eq!(row_for(49), row_for(89));
+        // Every scalar that pads, not just the ones Unicode calls
+        // whitespace. U+180E is deliberately absent: it is `Cf`, so
+        // `escape_controls` rewrites it to an 8-character escape before a
+        // headline exists (`format_characters_are_escaped` covers it), and
+        // 49 of those trip `redact`'s cap — a different neutralization, not
+        // this one.
+        for pad in [
+            ' ', '\u{a0}', '\u{2003}', '\u{3000}', '\u{2800}', '\u{3164}', '\u{115f}', '\u{1160}',
+            '\u{ffa0}',
+        ] {
+            let label = format!("pad U+{:04X}", pad as u32);
+            // The whole attack is aim, so the property that kills it is
+            // that the padding width no longer moves anything: 49 pads
+            // (aimed at an 80-column wrap) and 89 (aimed at 120) render one
+            // same row. Both stay under `MAX_DISPLAY_CHARS`, or `redact`
+            // would truncate one of them and the rows would differ for an
+            // unrelated reason.
+            assert_eq!(row_for(pad, 49), row_for(pad, 89), "{label}");
 
-        let report = evaluate(&hostile(49));
-        let row = row_for(49);
-        let (title_w, _) = summary_columns(&report);
-        let headline: String = row.chars().skip(MARKER_W + title_w).collect();
-        assert!(
-            !headline.contains("  "),
-            "a padding run survived past the title column: {headline:?}"
-        );
-        assert!(row.chars().count() <= SUMMARY_W, "{row:?}");
+            let report = evaluate(&hostile(pad, 49));
+            let row = row_for(pad, 49);
+            let (title_w, _) = summary_columns(&report);
+            let headline: Vec<char> = row.chars().skip(MARKER_W + title_w).collect();
+            assert!(
+                !headline
+                    .windows(2)
+                    .any(|w| w.iter().all(|c| renders_blank(*c))),
+                "{label}: a padding run survived past the title column: {headline:?}"
+            );
+            assert!(row.chars().count() <= SUMMARY_W, "{label}: {row:?}");
 
-        // And with the padding gone the forged marker sits at a column
-        // fixed by the real prose, which no common terminal wraps at.
-        let at = row
-            .find(FORGED)
-            .unwrap_or_else(|| panic!("the fixture no longer carries the forgery: {row:?}"));
-        let col = row[..at].chars().count();
-        for w in [40, 60, 80, 100, 120, 132] {
-            assert_ne!(col % w, 0, "forgery aimed at a {w}-column wrap: {row:?}");
+            // And with the padding gone the forged marker sits at a column
+            // fixed by the real prose, which no common terminal wraps at.
+            let at = row.find(FORGED).unwrap_or_else(|| {
+                panic!("{label}: the fixture no longer carries the forgery: {row:?}")
+            });
+            let col = row[..at].chars().count();
+            for w in [40, 60, 80, 100, 120, 132] {
+                assert_ne!(col % w, 0, "{label}: forgery aimed at a {w}-column wrap");
+            }
+
+            // `detail` is untouched, which is the point of collapsing the
+            // headline only: `-v` and `--json` still report what `$SHELL`
+            // actually is, padding and all.
+            let raw_pad = String::from(pad).repeat(49);
+            assert!(
+                find(&report, "shell.login").detail.contains(&raw_pad),
+                "{label}"
+            );
+            assert!(verbose_text(&report).contains(&raw_pad), "{label}");
+            let json = render_json(&report).unwrap();
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&json).unwrap()["sections"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| s["checks"].as_array().unwrap())
+                    .any(|c| c["id"] == "shell.login"
+                        && c["detail"].as_str().unwrap().contains(&raw_pad)),
+                "{label}"
+            );
         }
-
-        // `detail` is untouched, which is the point of collapsing the
-        // headline only: `-v` and `--json` still report what `$SHELL`
-        // actually is, padding and all.
-        let pad = " ".repeat(49);
-        assert!(find(&report, "shell.login").detail.contains(&pad));
-        assert!(verbose_text(&report).contains(&pad));
-        let json = render_json(&report).unwrap();
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&json).unwrap()["sections"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|s| s["checks"].as_array().unwrap())
-                .any(|c| c["id"] == "shell.login" && c["detail"].as_str().unwrap().contains(&pad))
-        );
     }
 
     /// F8: an unavailable `$HOME` means the settings location is unknown,
