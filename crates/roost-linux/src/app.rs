@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Context;
 use gtk4::glib;
@@ -39,6 +40,7 @@ use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::focus::safe_grab_focus;
+use crate::git_metrics;
 use crate::keybind::{
     canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
 };
@@ -196,6 +198,14 @@ pub struct App {
     /// result (provider A in flight, user picks B) is dropped rather than
     /// pushing a stale frame onto the current one.
     provider_req: std::cell::Cell<u64>,
+    /// The agents palette's git-metrics probe pipeline (plan 005 §3.7).
+    /// Holds the runner, the per-command timeout, and the concurrency
+    /// permit pool, so the cap is process-wide rather than per batch.
+    git_probe: Arc<git_metrics::GitProbe>,
+    /// Resolved metrics for the *open* palette session, keyed by repo
+    /// root. A live-refresh rebuild reuses these instead of re-probing;
+    /// a dismiss → reopen starts a new session and discards them.
+    metrics_cache: RefCell<git_metrics::MetricsCache>,
     /// Live inbox of pending agent notifications, surfaced through the
     /// command palette ("View Notifications") + the HeaderBar button.
     /// Membership is driven off the `has_notification` edges in
@@ -769,6 +779,8 @@ impl App {
             _band_size_group: band_size_group,
             palette: RefCell::new(None),
             provider_req: std::cell::Cell::new(0),
+            git_probe: Arc::new(git_metrics::GitProbe::new()),
+            metrics_cache: RefCell::new(git_metrics::MetricsCache::default()),
             notification_inbox: RefCell::new(NotificationInbox::new()),
             notif_badge: notif_badge.clone(),
             font_family: RefCell::new(cfg.font_family.clone()),
@@ -3778,13 +3790,19 @@ impl App {
             },
         );
         *self.palette.borrow_mut() = Some(overlay);
+        self.start_agent_metrics();
     }
 
     /// The agents frame, built from the **core** workspace snapshot (not
     /// a UI-side cache), so the palette reads the same state `tab.list`
-    /// would report.
+    /// would report. Rows carry whatever git metrics the open session has
+    /// already resolved; the rest stay pending until their probe lands.
     fn agents_frame(self: &Rc<Self>) -> PaletteFrame {
-        agent_palette::agent_frame(&self.workspace_snapshot(), agent_palette::now_unix())
+        let snapshot = self.workspace_snapshot();
+        let cwds = agent_palette::agent_tab_cwds(&snapshot);
+        let mut frame = agent_palette::agent_frame(&snapshot, agent_palette::now_unix());
+        self.apply_metrics_cache(&cwds, &mut frame.items);
+        frame
     }
 
     fn workspace_snapshot(self: &Rc<Self>) -> Vec<Project> {
@@ -3834,16 +3852,169 @@ impl App {
     /// query is untouched and the highlighted row is preserved by id.
     /// A no-op when the agents frame isn't on the stack.
     fn refresh_agent_palette(self: &Rc<Self>) {
-        let driver = self.palette.borrow().as_ref().map(|o| o.driver());
-        let Some(driver) = driver else {
+        let Some((session, driver)) = self.agents_palette_target() else {
             return;
         };
-        if !driver.has_frame(agent_palette::FRAME_ID) {
+        let snapshot = self.workspace_snapshot();
+        let cwds = agent_palette::agent_tab_cwds(&snapshot);
+        let mut items = agent_palette::agent_items(&snapshot, agent_palette::now_unix());
+        self.apply_metrics_cache(&cwds, &mut items);
+        driver.update_items(agent_palette::FRAME_ID, items);
+        // A rebuild can introduce a tab (and so a repo) the session has
+        // never measured; already-resolved and in-flight cwds are skipped.
+        self.spawn_agent_metrics(session, &cwds);
+    }
+
+    // MARK: agent palette — git metrics (plan 005 §3.7)
+
+    /// The live palette's session id + driver, but only while the agents
+    /// frame is somewhere on its stack. This *is* the generation guard
+    /// on the result side: an async metrics result is applied only if
+    /// this still reports the session that asked for it.
+    fn agents_palette_target(self: &Rc<Self>) -> Option<(u64, crate::palette_ui::PaletteDriver)> {
+        let palette = self.palette.borrow();
+        let overlay = palette.as_ref()?;
+        let driver = overlay.driver();
+        driver
+            .has_frame(agent_palette::FRAME_ID)
+            .then(|| (overlay.id(), driver))
+    }
+
+    /// Start probing for a frame the caller is about to show or push.
+    /// Keyed off the open palette's session id rather than frame
+    /// presence — the frame isn't on the stack yet at either call site.
+    /// The rows render immediately with metrics absent (pending); each
+    /// probe resolves to a value or `—`.
+    fn start_agent_metrics(self: &Rc<Self>) {
+        let Some(session) = self.palette.borrow().as_ref().map(|o| o.id()) else {
+            return;
+        };
+        let snapshot = self.workspace_snapshot();
+        self.spawn_agent_metrics(session, &agent_palette::agent_tab_cwds(&snapshot));
+    }
+
+    /// Probe every agent tab's repo that this palette session hasn't
+    /// measured yet. The work runs on the tokio runtime (never the GTK
+    /// thread) and the result hops back to the main context the way the
+    /// provider subprocess path does — `glib::spawn_future_local`
+    /// awaiting an `rt.spawn` handle.
+    fn spawn_agent_metrics(self: &Rc<Self>, session: u64, cwds: &HashMap<i64, String>) {
+        let (claimed, known) = {
+            let mut cache = self.metrics_cache.borrow_mut();
+            // A reopened palette is a new session: everything the last
+            // one resolved is discarded, so it re-probes.
+            cache.begin_session(session);
+            (
+                cache.claim_unprobed(cwds.values().cloned()),
+                // Roots this session already measured: the batch reuses
+                // their text instead of re-running git for a new tab in
+                // an old repo.
+                cache.known_roots(),
+            )
+        };
+        if claimed.is_empty() {
             return;
         }
-        let items =
-            agent_palette::agent_items(&self.workspace_snapshot(), agent_palette::now_unix());
-        driver.update_items(agent_palette::FRAME_ID, items);
+        let probe = self.git_probe.clone();
+        let rt = self.rt.clone();
+        let weak = Rc::downgrade(self);
+        let batch = claimed.clone();
+        glib::spawn_future_local(async move {
+            let outcomes = rt
+                .spawn(git_metrics::probe_batch(probe, batch, known))
+                .await;
+            // Back on the GTK main context from here.
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            // Generation guard on INGESTION is session-only: the cache is
+            // session-scoped data, and storing must happen even when the
+            // user escaped back to the root frame mid-probe — storing is
+            // what clears `pending`, so skipping it would leave those
+            // rows pending for the rest of the session after a re-drill.
+            // The frame-presence half of the guard lives where the UI is
+            // actually touched: `refresh_agent_palette` no-ops unless the
+            // agents frame is on the stack. Dismiss → reopen still cannot
+            // be filled with old numbers — that is the session check.
+            {
+                let mut cache = app.metrics_cache.borrow_mut();
+                if cache.session() != session {
+                    return;
+                }
+                match outcomes {
+                    Ok(outcomes) => app.ingest_agent_metrics(&mut cache, outcomes),
+                    Err(e) => {
+                        // The task itself died (panic / runtime shutdown).
+                        // Every claimed cwd must still resolve or its row
+                        // stays pending forever — plan 005 §3.7's "every
+                        // probe always resolves".
+                        tracing::warn!(error = %e, "git metrics task failed");
+                        for cwd in &claimed {
+                            cache.store_unresolved(cwd);
+                        }
+                    }
+                }
+            }
+            app.refresh_agent_palette();
+        });
+    }
+
+    /// Fold one batch's outcomes into the session cache. The probe
+    /// returns errors rather than swallowing them; this is the boundary
+    /// that handles them, and every failure renders as `—`.
+    fn ingest_agent_metrics(
+        self: &Rc<Self>,
+        cache: &mut git_metrics::MetricsCache,
+        outcomes: Vec<git_metrics::ProbeOutcome>,
+    ) {
+        for outcome in outcomes {
+            let Some(root) = outcome.root.clone() else {
+                if let git_metrics::ProbeValue::Measured(Err(e)) = &outcome.value {
+                    tracing::debug!(cwd = %outcome.cwd, reason = %e, "no git metrics");
+                }
+                cache.store_unresolved(&outcome.cwd);
+                continue;
+            };
+            let text = match outcome.value {
+                git_metrics::ProbeValue::Reused(text) => text,
+                git_metrics::ProbeValue::Measured(Ok(metrics)) => metrics.text(),
+                git_metrics::ProbeValue::Measured(Err(e)) => {
+                    tracing::debug!(cwd = %outcome.cwd, reason = %e, "no git metrics");
+                    git_metrics::UNKNOWN.to_string()
+                }
+            };
+            cache.store_root(&outcome.cwd, &root, text);
+        }
+    }
+
+    /// Fill in the metrics column on every row whose tab cwd the **open**
+    /// palette session has already resolved. Rows left `None` render as
+    /// pending; rows sharing a repo root all get the same string from one
+    /// probe.
+    ///
+    /// Keyed on the live overlay's session id, so a frame built for a
+    /// palette that isn't up yet (a direct open) or for a session the
+    /// cache doesn't hold (dismiss → reopen, before `begin_session`
+    /// clears it) starts fully pending instead of flashing the previous
+    /// session's numbers.
+    fn apply_metrics_cache(
+        self: &Rc<Self>,
+        cwds: &HashMap<i64, String>,
+        items: &mut [PaletteItem],
+    ) {
+        let Some(session) = self.palette.borrow().as_ref().map(|o| o.id()) else {
+            return;
+        };
+        let cache = self.metrics_cache.borrow();
+        for item in items.iter_mut() {
+            let Some(tab_id) = agent_palette::agent_tab_id(&item.id) else {
+                continue;
+            };
+            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab_id)) else {
+                continue;
+            };
+            agent.metrics_text = cache.text_for_session(session, cwd).map(str::to_string);
+        }
     }
 
     // MARK: command launcher (Cmd+Shift+T / Alt+Shift+T)
@@ -4507,7 +4678,9 @@ impl App {
             return PaletteOutcome::Push(self.font_frame(), self.font_behavior());
         }
         if item.id == PaletteCommands::VIEW_AGENTS_ID {
-            return PaletteOutcome::Push(self.agents_frame(), self.agents_behavior());
+            let frame = self.agents_frame();
+            self.start_agent_metrics();
+            return PaletteOutcome::Push(frame, self.agents_behavior());
         }
         if item.id == PaletteCommands::VIEW_NOTIFICATIONS_ID {
             return PaletteOutcome::Push(self.notifications_frame(), self.notifications_behavior());

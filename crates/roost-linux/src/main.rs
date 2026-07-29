@@ -18,6 +18,7 @@ mod config;
 mod custom_command;
 mod events;
 mod focus;
+mod git_metrics;
 mod key_encoder;
 mod keybind;
 mod notification_inbox;

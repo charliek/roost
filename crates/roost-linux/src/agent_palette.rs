@@ -16,6 +16,7 @@
 //! To be mirrored by the Mac side — `mac/Sources/Roost/` has no agents
 //! frame yet, so this is the reference implementation of the mapping.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use roost_ipc::agent::{self, AgentLifecycle, Ownership, SOURCE_LEGACY, SOURCE_MANUAL};
@@ -70,15 +71,9 @@ pub fn agent_items(projects: &[Project], now: i64) -> Vec<PaletteItem> {
     for project in projects {
         for tab in &project.tabs {
             let axes = tab.agent_state();
-            if !agent::is_live(&axes) {
-                continue;
-            }
-            let Some(owner) = axes.ownership.as_ref() else {
+            let Some(owner) = agent_owner(&axes) else {
                 continue;
             };
-            if NON_AGENT_SOURCES.contains(&owner.source.as_str()) {
-                continue;
-            }
             rows.push(row_for(
                 project,
                 tab,
@@ -103,6 +98,35 @@ pub fn agent_items(projects: &[Project], now: i64) -> Vec<PaletteItem> {
             .then(a.tab_id.cmp(&b.tab_id))
     });
     rows.into_iter().map(|r| r.item).collect()
+}
+
+/// The working directory of every tab that gets a row, keyed by tab id.
+///
+/// The row payload carries no path (it renders none), but the git-metrics
+/// probe and the fill both key off the tab's cwd — so the population
+/// filter is shared with [`agent_items`] rather than re-spelled in
+/// `app.rs`, where it could drift.
+pub fn agent_tab_cwds(projects: &[Project]) -> HashMap<i64, String> {
+    let mut cwds = HashMap::new();
+    for project in projects {
+        for tab in &project.tabs {
+            if agent_owner(&tab.agent_state()).is_some() {
+                cwds.insert(tab.id, tab.cwd.clone());
+            }
+        }
+    }
+    cwds
+}
+
+/// The ownership record of a tab that belongs in the palette: live
+/// ownership from a source that isn't one of Roost's own internal
+/// (non-agent) claims. `None` means "no row for this tab".
+fn agent_owner(axes: &agent::AgentTabState) -> Option<&Ownership> {
+    if !agent::is_live(axes) {
+        return None;
+    }
+    let owner = axes.ownership.as_ref()?;
+    (!NON_AGENT_SOURCES.contains(&owner.source.as_str())).then_some(owner)
 }
 
 /// The tab id an agent row activates, or `None` for the empty sentinel
@@ -480,6 +504,33 @@ mod tests {
             .map(|i| i.id)
             .collect();
         assert_eq!(ids, vec!["agent:5", "agent:2"]);
+    }
+
+    #[test]
+    fn tab_cwds_cover_exactly_the_listed_rows() {
+        // The metrics probe keys off this map, so it must match the row
+        // population one-for-one — an extra entry probes git for a tab
+        // with no row, a missing one leaves a row pending forever.
+        let mut agent_tab = owned(tab(2, "claude"), "claude", AgentLifecycle::Working, NOW);
+        agent_tab.cwd = "/w/roost".to_string();
+        let projects = vec![project(
+            1,
+            "roost",
+            vec![
+                tab(1, "plain shell"),
+                agent_tab,
+                owned(tab(3, "manual"), "manual", AgentLifecycle::Working, NOW),
+            ],
+        )];
+        let cwds = agent_tab_cwds(&projects);
+        assert_eq!(cwds.len(), 1);
+        assert_eq!(cwds.get(&2).map(String::as_str), Some("/w/roost"));
+
+        let ids: Vec<Option<i64>> = agent_items(&projects, NOW)
+            .iter()
+            .map(|i| agent_tab_id(&i.id))
+            .collect();
+        assert_eq!(ids, vec![Some(2)]);
     }
 
     #[test]
