@@ -105,6 +105,22 @@ enum AgentPalette {
         return rows.map(\.item)
     }
 
+    /// Working directory of every tab that gets a row, by tab id — the
+    /// input to the git-metrics probe (plan 005 §3.7). Built from the
+    /// same population filter as `agentItems`, so a row and its probe can
+    /// never disagree about which tabs are in play. A tab with no cwd
+    /// maps to `""`, which the probe resolves to `—` (never skipped:
+    /// skipping would leave the row pending forever).
+    static func agentTabCwds(tabs: [Workspace.Tab]) -> [Int64: String] {
+        var cwds: [Int64: String] = [:]
+        for tab in tabs {
+            guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { continue }
+            if nonAgentSources.contains(owner.source) { continue }
+            cwds[tab.id] = tab.cwd
+        }
+        return cwds
+    }
+
     /// The tab id an agent row activates, or nil for the empty sentinel
     /// (and any other row id).
     static func tabID(fromRowID rowID: String) -> Int64? {

@@ -239,6 +239,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// dismissed without confirming.
     private var palette: PalettePanel?
     private var paletteOpen = false
+    /// The agents palette's git-metrics probe pipeline (plan 005 §3.7).
+    /// One instance for the app's lifetime so its concurrency cap bounds
+    /// every palette session's git processes together.
+    private let gitProbe = GitProbe()
+    /// Resolved metrics for the *open* palette session, keyed by repo
+    /// root. Discarded when the session id changes (dismiss → reopen).
+    private var metricsCache = MetricsCache()
     private var themeNameAtOpen: String?
     /// Font family captured when the palette opened, restored on
     /// dismiss-without-confirm so an in-flight live preview reverts.
@@ -1009,16 +1016,22 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
         palette = panel
         panel.present()
+        startAgentMetrics()
     }
 
     /// The agents frame, built from the **core** workspace snapshot (not
     /// the UI's `tabs` list), so the palette reads the same state
-    /// `tab.list` would report.
+    /// `tab.list` would report. Rows carry whatever git metrics the open
+    /// session has already resolved; the rest stay pending until their
+    /// probe lands.
     @MainActor
     private func agentsFrame() -> PaletteFrame {
         let snapshot = workspaceSnapshot()
-        return AgentPalette.agentFrame(
+        var frame = AgentPalette.agentFrame(
             projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
+        applyMetricsCache(
+            cwds: AgentPalette.agentTabCwds(tabs: snapshot.tabs), items: &frame.items)
+        return frame
     }
 
     /// Projects + their tabs straight from the workspace, in the
@@ -1071,13 +1084,147 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// stack.
     @MainActor
     private func refreshAgentPalette() {
-        guard let panel = palette, panel.hasFrame(AgentPalette.frameID) else { return }
+        guard let (session, panel) = agentsPaletteTarget() else { return }
         let snapshot = workspaceSnapshot()
-        panel.driveUpdateItems(
-            frameID: AgentPalette.frameID,
-            items: AgentPalette.agentItems(
-                projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
-        )
+        let cwds = AgentPalette.agentTabCwds(tabs: snapshot.tabs)
+        var items = AgentPalette.agentItems(
+            projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
+        applyMetricsCache(cwds: cwds, items: &items)
+        panel.driveUpdateItems(frameID: AgentPalette.frameID, items: items)
+        // A rebuild can introduce a tab (and so a repo) the session has
+        // never measured; already-resolved and in-flight cwds are skipped.
+        spawnAgentMetrics(session: session, cwds: cwds)
+    }
+
+    // MARK: agent palette — git metrics (plan 005 §3.7)
+
+    /// The live panel's session id + the panel, but only while the agents
+    /// frame is somewhere on its stack. This *is* the repaint half of the
+    /// generation guard: an async metrics result touches the UI only if
+    /// this still reports the session that asked for it.
+    @MainActor
+    private func agentsPaletteTarget() -> (session: Int, panel: PalettePanel)? {
+        guard let panel = palette, panel.hasFrame(AgentPalette.frameID) else { return nil }
+        return (panel.generation, panel)
+    }
+
+    /// Start probing for a frame the caller is about to show or push.
+    /// Keyed off the open panel's generation rather than frame presence —
+    /// the frame isn't on the stack yet at either call site. The rows
+    /// render immediately with metrics absent (pending); each probe
+    /// resolves to a value or `—`.
+    @MainActor
+    private func startAgentMetrics() {
+        guard let session = palette?.generation else { return }
+        spawnAgentMetrics(session: session, cwds: AgentPalette.agentTabCwds(tabs: workspaceSnapshot().tabs))
+    }
+
+    /// Probe every agent tab's repo that this palette session hasn't
+    /// measured yet. The batch runs off the main actor (`Task.detached`,
+    /// and the runner spawns + waits on a background queue); the result
+    /// hops back to `@MainActor` before it touches the cache or the panel.
+    @MainActor
+    private func spawnAgentMetrics(session: Int, cwds: [Int64: String]) {
+        // A reopened palette is a new session: everything the last one
+        // resolved is discarded, so it re-probes.
+        metricsCache.beginSession(session)
+        let claimed = metricsCache.claimUnprobed(cwds.values)
+        guard !claimed.isEmpty else { return }
+        // Roots this session already measured: the batch reuses their
+        // text instead of re-running git for a new tab in an old repo.
+        let known = metricsCache.knownRoots()
+        let probe = gitProbe
+        let work = Task.detached(priority: .userInitiated) { () async throws -> [ProbeOutcome] in
+            try Task.checkCancellation()
+            return await probe.probeBatch(cwds: claimed, known: known)
+        }
+        Task { @MainActor [weak self] in
+            let result: Result<[ProbeOutcome], Error>
+            do {
+                result = .success(try await work.value)
+            } catch {
+                result = .failure(error)
+            }
+            self?.finishAgentMetrics(session: session, claimed: claimed, result: result)
+        }
+    }
+
+    /// Fold one batch's outcomes into the session cache, then repaint.
+    ///
+    /// The guard on INGESTION is session-only: the cache is
+    /// session-scoped data, and storing must happen even when the user
+    /// escaped back to the root frame mid-probe — storing is what clears
+    /// `pending`, so skipping it would leave those rows pending for the
+    /// rest of the session after a re-drill. The frame-presence half of
+    /// the guard lives where the UI is actually touched:
+    /// `refreshAgentPalette` no-ops unless the agents frame is on the
+    /// stack. Dismiss → reopen still cannot be filled with old numbers —
+    /// that is the session check.
+    @MainActor
+    private func finishAgentMetrics(
+        session: Int, claimed: [String], result: Result<[ProbeOutcome], Error>
+    ) {
+        guard metricsCache.session == session else { return }
+        switch result {
+        case .success(let outcomes):
+            ingestAgentMetrics(outcomes)
+        case .failure(let error):
+            // The probe task itself died (cancelled, or the app tore the
+            // Task down). Every claimed cwd must still resolve or its row
+            // stays pending forever — plan 005 §3.7's "every probe always
+            // resolves".
+            RoostLogger.shared.warn("git metrics task failed: \(error)")
+            for cwd in claimed { metricsCache.storeUnresolved(cwd: cwd) }
+        }
+        refreshAgentPalette()
+    }
+
+    /// Fold one batch's outcomes into the session cache. The probe
+    /// returns errors rather than swallowing them; this is the boundary
+    /// that handles them, and every failure renders as `—`.
+    @MainActor
+    private func ingestAgentMetrics(_ outcomes: [ProbeOutcome]) {
+        for outcome in outcomes {
+            guard let root = outcome.root else {
+                if case .measured(.failure(let error)) = outcome.value {
+                    RoostLogger.shared.info("no git metrics for \(outcome.cwd): \(error)")
+                }
+                metricsCache.storeUnresolved(cwd: outcome.cwd)
+                continue
+            }
+            let text: String
+            switch outcome.value {
+            case .reused(let reused):
+                text = reused
+            case .measured(.success(let metrics)):
+                text = metrics.text()
+            case .measured(.failure(let error)):
+                RoostLogger.shared.info("no git metrics for \(outcome.cwd): \(error)")
+                text = GitMetrics.unknown
+            }
+            metricsCache.storeRoot(cwd: outcome.cwd, root: root, text: text)
+        }
+    }
+
+    /// Fill in the metrics column on every row whose tab cwd the **open**
+    /// palette session has already resolved. Rows left nil render as
+    /// pending; rows sharing a repo root all get the same string from one
+    /// probe.
+    ///
+    /// Keyed on the live panel's generation, so a frame built for a
+    /// palette that isn't up yet (a direct open) or for a session the
+    /// cache doesn't hold (dismiss → reopen, before `beginSession` clears
+    /// it) starts fully pending instead of flashing the previous
+    /// session's numbers.
+    @MainActor
+    private func applyMetricsCache(cwds: [Int64: String], items: inout [PaletteItem]) {
+        guard let session = palette?.generation else { return }
+        for index in items.indices {
+            guard let tabID = AgentPalette.tabID(fromRowID: items[index].id),
+                items[index].agent != nil, let cwd = cwds[tabID]
+            else { continue }
+            items[index].agent?.metricsText = metricsCache.text(forSession: session, cwd: cwd)
+        }
     }
 
     // MARK: - Command launcher (Cmd+Shift+T)
@@ -1365,7 +1512,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         case PaletteCommands.selectFontID:
             return .push(fontFrame(), fontBehavior())
         case PaletteCommands.viewAgentsID:
-            return .push(agentsFrame(), agentsBehavior())
+            let frame = agentsFrame()
+            startAgentMetrics()
+            return .push(frame, agentsBehavior())
         case PaletteCommands.viewNotificationsID:
             return .push(notificationsFrame(), notificationsBehavior())
         case PaletteCommands.clearNotificationsID:

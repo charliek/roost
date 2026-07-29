@@ -1453,7 +1453,10 @@ struct IPCPaletteAgentRow: Codable, Equatable, Sendable {
     let name: String
     let statusText: String
     let timeText: String
-    let metricsText: String?
+    /// `var` alone among the columns: the row is built with metrics
+    /// pending and the async probe fills this one field in place, the way
+    /// the GTK side assigns `agent.metrics_text` on the built item.
+    var metricsText: String?
     enum CodingKeys: String, CodingKey {
         case effectiveLifecycle = "effective_lifecycle"
         case project
