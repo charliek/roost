@@ -1,7 +1,7 @@
 """`roostctl doctor` E2E — proves wiring, not logic (plan 003 §8).
 
 pytest is **not** running inside a Roost tab, so most of doctor's
-process-scoped checks legitimately report `info` here, and the overall
+process-scoped checks legitimately report `skipped` here, and the overall
 process exit code is **not** reliably 0 — `ui.target` / `ui.socket` fail
 whenever nothing is reachable at the default profile paths, which is the
 documented meaning of "no Roost UI is running" (plan §3.3 / AC 7). Every
@@ -69,8 +69,9 @@ EXPECTED_CHECK_IDS = {
 }
 
 # The `tab` section's six axis checks (everything but `tab.selection`).
-# When no tab could be resolved they are all replaced by one shared
-# placeholder line, which is what `axes_are_resolved` discriminates on.
+# They are observations: a resolved tab gives each a status-less fact,
+# and when no tab could be resolved all six carry `skipped` plus one
+# shared placeholder line. `axes_are_resolved` discriminates on both.
 TAB_AXIS_IDS = (
     "tab.shell_state",
     "tab.agent_lifecycle",
@@ -138,13 +139,16 @@ def axes_are_resolved(checks: dict[str, dict]) -> bool:
     """Whether the `tab` section is reporting a real tab rather than its
     "unavailable" placeholder.
 
-    Structural, not textual: the placeholder branch gives all six axis
-    checks one *identical* detail (they share a single reason string),
-    while a resolved tab gives each its own. So "more than one distinct
-    detail" is the discriminator, with no prose baked into the test.
+    Structural, not textual, on two independent signals. A resolved axis
+    is a plain fact (`status: null`); an unobservable one is `skipped` —
+    that split is the machine-readable half of schema 2. The placeholder
+    branch also gives all six axes one *identical* detail (they share a
+    single reason string), while a resolved tab gives each its own, so
+    "more than one distinct detail" still holds with no prose baked in.
     """
+    statuses = {checks[cid]["status"] for cid in TAB_AXIS_IDS}
     details = {checks[cid]["detail"] for cid in TAB_AXIS_IDS}
-    return len(details) > 1
+    return statuses == {None} and len(details) > 1
 
 
 def isolated_home(tmp_path: Path) -> tuple[Path, Path]:
@@ -219,7 +223,7 @@ def test_json_shape_and_full_check_inventory():
     env = dict(os.environ)
     code, report = run_doctor([], env)
 
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
     assert isinstance(report["exit_code"], int)
     assert report["exit_code"] in (0, 1)
     assert code == report["exit_code"], (code, report["exit_code"])
@@ -369,7 +373,7 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
     would try sockets under the tmp tree instead of the harness UI.
 
     Three phases, one throwaway `HOME` (plan §8 bullet 4):
-      1. no settings file, no `claude` on PATH -> the whole section is `info`.
+      1. no settings file, no `claude` on PATH -> the whole section is `skipped`.
       2. a settings file missing `StopFailure` -> `claude.hook_events` fails.
       3. `roostctl claude install --force` into that `HOME` -> it passes.
     """
@@ -382,7 +386,7 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
         "ROOST_SOCKET": str(ui.socket_path(target)),
         "ROOST_TAB_ID": str(tab),
         # An EMPTY directory, not a minimal system PATH: phase 1 asserts
-        # the whole claude section is `info`, which requires no `claude`
+        # the whole claude section is `skipped`, which requires no `claude`
         # binary to be reachable — and `/usr/bin:/bin` cannot promise
         # that. See `isolated_home`.
         "PATH": str(empty_bin),
@@ -395,7 +399,7 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
     claude_ids = [cid for cid in EXPECTED_CHECK_IDS if cid.startswith("claude.")]
     assert claude_ids, "sanity: the claude.* id set must be non-empty"
     for cid in claude_ids:
-        assert checks[cid]["status"] == "info", (cid, checks[cid])
+        assert checks[cid]["status"] == "skipped", (cid, checks[cid])
 
     # 2. A settings file that omits StopFailure.
     write_claude_settings(home, tuple(e for e in CLAUDE_EVENTS if e != "StopFailure"))
@@ -476,21 +480,21 @@ def test_doctor_is_read_only(tmp_path, roost, project, target):
     # Not vacuous: doctor really read the settings file and really
     # resolved this tab. `tab.selection != "fail"` alone would NOT show
     # that — the branch taken when `tab.list` was never read reports
-    # `info` by design — so the proof is assembled from statuses that pin
-    # each step:
+    # `skipped` by design — so the proof is assembled from statuses that
+    # pin each step:
     #   ui.agent_model == ok   -> tab.list answered, decoded, and its tab
     #                             objects carry the agent axes
     #   env.tab_id     == ok   -> $ROOST_TAB_ID parsed, so a tab IS selected
-    #   tab.selection  == info -> with a selection and a decoded list, the
-    #                             only non-`fail` outcome is "found in
-    #                             tab.list"
+    #   tab.selection  == ok   -> the selected tab was found in tab.list;
+    #                             the other arms are `skipped` (no
+    #                             selection / no list) or `fail`
     # Together those force the resolved branch of the `tab` section,
     # which `axes_are_resolved` re-confirms structurally.
     assert code == report["exit_code"], (code, report["exit_code"])
     assert checks["claude.hook_events"]["status"] == "ok", checks["claude.hook_events"]
     assert checks["ui.agent_model"]["status"] == "ok", checks["ui.agent_model"]
     assert checks["env.tab_id"]["status"] == "ok", checks["env.tab_id"]
-    assert checks["tab.selection"]["status"] == "info", checks["tab.selection"]
+    assert checks["tab.selection"]["status"] == "ok", checks["tab.selection"]
     assert axes_are_resolved(checks), [checks[cid] for cid in TAB_AXIS_IDS]
 
     after_tab = agent_axes()

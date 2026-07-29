@@ -56,7 +56,9 @@ To uninstall, remove the alias from your shell rc and delete the file:
 rm ~/.config/roost/claude-settings.json
 ```
 
-Run `roostctl doctor` any time to check the install without guessing:
+Run `roostctl doctor` any time to check the install without guessing.
+By default it prints one line for the whole `Claude Code` section;
+`roostctl doctor -v` breaks it into the individual checks —
 `claude.hook_events` confirms the settings file registers all six
 lifecycle events (naming any it's missing), and `claude.hook_command`
 confirms each one resolves to a runnable `roostctl` — `fail` if a

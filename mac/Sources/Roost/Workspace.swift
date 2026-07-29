@@ -164,12 +164,21 @@ final class Workspace {
         self.statePath = statePath
         if let snapshot = Self.readSnapshot(at: statePath) {
             self.nextID = max(1, snapshot.nextID)
-            for p in snapshot.projects {
+            // A pre-fix file can hold colliding project positions, and
+            // unlike tabs (re-opened through `openTab`, so freshly
+            // allocated) projects load their position verbatim — the
+            // tie would survive every relaunch. Repair before any row
+            // is built. `restoreLayout` below carries no project
+            // position, so both consumers stay consistent. The pairs
+            // come back in the file's order, so this loop's insertion
+            // order — which picks the survivor when a file repeats an
+            // `id` — is what it was before the repair existed.
+            for (p, position) in Self.normalizedProjectPositions(snapshot.projects) {
                 self.projects[p.id] = Project(
                     id: p.id,
                     name: p.name,
                     cwd: p.cwd,
-                    position: p.position,
+                    position: position,
                     createdAt: p.createdAt
                 )
             }
@@ -178,12 +187,28 @@ final class Workspace {
                     RestoreProject(
                         projectID: p.id,
                         tabs: p.tabs
-                            .sorted { $0.position < $1.position }
+                            // The file index is the tie-break, and it is
+                            // load-bearing for *parity*, not just for
+                            // determinism: `sorted(by:)` is documented as
+                            // **not** stable, while Rust's counterpart
+                            // (`tabs.sort_by_key(|(pos, _)| *pos)`) is
+                            // stable by contract, so a file with two tabs
+                            // at one position — captured user files have
+                            // `[2, 3, 3]` — could otherwise restore in a
+                            // different order on Mac than on Linux. A
+                            // `TabSnapshot` carries no id, so the index is
+                            // the only key available, and it is exactly
+                            // what a stable sort would have kept.
+                            .enumerated()
+                            .sorted {
+                                ($0.element.position, $0.offset)
+                                    < ($1.element.position, $1.offset)
+                            }
                             .map {
                                 RestoreTab(
-                                    cwd: $0.cwd,
-                                    title: $0.title,
-                                    userTitled: $0.userTitled
+                                    cwd: $0.element.cwd,
+                                    title: $0.element.title,
+                                    userTitled: $0.element.userTitled
                                 )
                             }
                     )
@@ -250,7 +275,7 @@ final class Workspace {
     func createProject(name: String, cwd: String) -> Project {
         let id = allocID()
         let chosenName = name.isEmpty ? "Untitled \(projects.count + 1)" : name
-        let position = Int32(projects.count)
+        let position = nextProjectPosition()
         let project = Project(
             id: id,
             name: chosenName,
@@ -337,9 +362,14 @@ final class Workspace {
             tabs[tid]?.position = next
             next += 1
         }
-        let unlisted = tabs.values
-            .filter { $0.projectId == projectID && !tabIDs.contains($0.id) }
-            .sorted { $0.position < $1.position }
+        // Display order (`tabs(in:)` — `position` with `id` breaking
+        // ties), not raw `Dictionary.values`: the loop below *assigns*
+        // `position = next++` from this sequence, so an untiebroken tie
+        // would scramble the trailing tabs permanently, and differently
+        // on every run — dictionary iteration order is seeded per
+        // process.
+        let unlisted = tabs(in: projectID)
+            .filter { !tabIDs.contains($0.id) }
             .map { $0.id }
         for tid in unlisted {
             tabs[tid]?.position = next
@@ -363,9 +393,9 @@ final class Workspace {
             projects[pid]?.position = next
             next += 1
         }
-        let unlisted = projects.values
+        // Display order for the same reason as `reorderTabs`.
+        let unlisted = snapshot()
             .filter { !projectIDs.contains($0.id) }
-            .sorted { $0.position < $1.position }
             .map { $0.id }
         for pid in unlisted {
             projects[pid]?.position = next
@@ -381,7 +411,7 @@ final class Workspace {
             throw WorkspaceError.projectNotFound(projectID)
         }
         let id = allocID()
-        let position = Int32(tabs.values.lazy.filter { $0.projectId == projectID }.count)
+        let position = nextTabPosition(in: projectID)
         let derivedTitle = title.isEmpty ? deriveTitle(cwd: cwd) : title
         let now = unixNow()
         // Always start with userTitled=false. The caller-supplied
@@ -809,6 +839,111 @@ final class Workspace {
         return nextID
     }
 
+    /// Next free project position: `max(position) + 1`, or 0 when
+    /// empty. `projects.count` would collide after a delete-then-create
+    /// because positions are sparse, not dense (#80, #262).
+    private func nextProjectPosition() -> Int32 {
+        Self.afterMax(projects.values.lazy.map(\.position).max())
+    }
+
+    /// Next free tab position within `projectID`: `max(position) + 1`,
+    /// or 0 when the project has no tabs. See `nextProjectPosition`.
+    private func nextTabPosition(in projectID: Int64) -> Int32 {
+        Self.afterMax(
+            tabs.values.lazy
+                .filter { $0.projectId == projectID }
+                .map(\.position)
+                .max()
+        )
+    }
+
+    /// `max + 1`, saturating, or 0 for an empty parent. Positions
+    /// decode straight from a user-editable `state.json`, so
+    /// `Int32.max + 1` is a launch-time trap in an otherwise
+    /// carefully-defended path. A workspace that reached `Int32.max` is
+    /// corrupt input, not a supported state: degrade it to a tie rather
+    /// than crash the app.
+    private static func afterMax(_ highest: Int32?) -> Int32 {
+        guard let highest else { return 0 }
+        return highest == .max ? .max : highest + 1
+    }
+
+    /// Each decoded project paired with its repaired position, for a
+    /// snapshot whose projects may collide. Walks them in display
+    /// order — `(position, id)`, the comparator `snapshot()` sorts
+    /// by — and pushes each one to at least `previous + 1`. The mirror
+    /// of the Rust `normalize_project_positions`; keep the two in step.
+    ///
+    /// **Projects only, deliberately.** A persisted *tab* collision
+    /// needs no repair: `SnapshotFile.TabSnapshot` carries no id, and
+    /// the bootstrap re-opens every restore descriptor through
+    /// `openTab` into an empty project, so tab positions are freshly
+    /// allocated on each launch and a tie self-heals. Project rows are
+    /// the ones that keep their persisted position.
+    ///
+    /// **Returned in the file's order, not display order.** The repair
+    /// is computed over the display walk but handed back in the input's
+    /// order, because the caller inserts into an id-keyed dictionary
+    /// and `state.json` is user-editable: two rows sharing an `id`
+    /// collapse last-write-wins, so insertion order decides which one
+    /// survives. Rust repairs through `&mut` borrows and leaves its
+    /// slice in file order for exactly this reason; returning display
+    /// order here would pick a different survivor on macOS than on
+    /// Linux from the same file.
+    ///
+    /// The seed is `nil`, not `-1`, so the walk is a true no-op on
+    /// already-unique input **including negative positions**:
+    /// `position` decodes as a plain `Int32` with no non-negativity
+    /// check, and a `-1` seed would rewrite a perfectly ordered
+    /// `[-5, -3]` to `[0, 1]`.
+    ///
+    /// Gaps are preserved — `[0, 5, 5]` becomes `[0, 5, 6]`, not
+    /// `[0, 1, 2]`. Positions are sparse by design; the invariant is
+    /// uniqueness within a parent, never density, so densifying would
+    /// rewrite rows that were never wrong.
+    ///
+    /// `Int32.max` clamps (via `afterMax`) rather than trapping: a
+    /// workspace that reached it is corrupt input, and degrading to a
+    /// tie beats failing to launch. The ceiling is therefore a
+    /// tie-degradation boundary, **not** a uniqueness guarantee —
+    /// repairing `[Int32.max - 1, Int32.max - 1]` yields
+    /// `[Int32.max - 1, Int32.max]`, and the next `createProject`
+    /// clamps onto that `Int32.max` (plan 004 §3.1).
+    ///
+    /// Everything above holds **below the ceiling**; at it, the display
+    /// order is not preserved either. Clamping collapses a row onto
+    /// `Int32.max`, and the `(position, id)` comparator then re-breaks
+    /// that *new* tie by id, which can let a row overtake a sibling:
+    /// `B@(max-1, id2), C@(max-1, id3), A@(max, id1)` displays
+    /// `B, C, A` and repairs to `B@max-1, C@max, A@max` — which
+    /// displays `B, A, C`. Corrupt input degrading to a reshuffle is
+    /// the accepted cost of not failing to launch; the guarantee is for
+    /// positions a real workspace can reach.
+    private static func normalizedProjectPositions(
+        _ projects: [SnapshotFile.ProjectSnapshot]
+    ) -> [(project: SnapshotFile.ProjectSnapshot, position: Int32)] {
+        var repaired = projects.map(\.position)
+        var previous: Int32?
+        // The index is the last key because `(position, id)` is not a
+        // total order on a *file*: `state.json` is user-editable, so two
+        // rows can share both, and `sorted(by:)` given a non-strict-weak
+        // ordering has no defined result. Rust reaches the same order
+        // through a stable `sort_by_key` over the file's rows. This fixes
+        // only where such a row lands in the walk — which of two rows
+        // sharing an `id` survives insertion is still the file's order,
+        // per the note above.
+        let displayOrder = projects.indices.sorted {
+            (projects[$0].position, projects[$0].id, $0)
+                < (projects[$1].position, projects[$1].id, $1)
+        }
+        for index in displayOrder {
+            let position = previous.map { max(afterMax($0), repaired[index]) } ?? repaired[index]
+            repaired[index] = position
+            previous = position
+        }
+        return zip(projects, repaired).map { (project: $0, position: $1) }
+    }
+
     /// Persist the current layout with `fsync` and then freeze further
     /// persistence. Call once on a clean exit (App.swift wires it into
     /// `applicationWillTerminate`). The `fsync` re-asserts physical
@@ -846,19 +981,14 @@ final class Workspace {
         // on restore (the UI selects the nth tab). #95 review.
         let activeTabPosition: Int32 = {
             guard let active = tabs[activeTabID] else { return 0 }
-            let siblings = tabs.values
-                .filter { $0.projectId == active.projectId }
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+            let siblings = tabs(in: active.projectId)
             return Int32(siblings.firstIndex { $0.id == active.id } ?? 0)
         }()
         let snapshot = SnapshotFile(
             nextID: nextID,
-            projects: projects.values
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
+            projects: snapshot()
                 .map { p in
-                    let projectTabs = tabs.values
-                        .filter { $0.projectId == p.id }
-                        .sorted { $0.position < $1.position }
+                    let projectTabs = tabs(in: p.id)
                         .map {
                             SnapshotFile.TabSnapshot(
                                 title: $0.title,

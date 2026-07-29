@@ -33,7 +33,7 @@ use roost_ipc::messages::{Project, Tab, TabState};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::daemon::store_json::{persist_state, read_state, SnapshotFile};
+use crate::daemon::store_json::{persist_state, read_state, ProjectSnapshot, SnapshotFile};
 
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
@@ -265,6 +265,69 @@ pub enum WorkspaceError {
     Json(#[from] serde_json::Error),
 }
 
+/// Repair persisted project positions that collide, in place.
+///
+/// **Projects only, deliberately.** A persisted *tab* collision needs no
+/// repair: `TabSnapshot` carries no id, and the bootstrap re-opens every
+/// restore descriptor through `open_tab` into an empty project, so tab
+/// positions are freshly allocated on each launch and a tie self-heals.
+/// Project rows are the ones that keep their persisted position.
+///
+/// Live project rows load their `position` verbatim, so a tie written
+/// by a pre-#80 build (which allocated from `len()`) survives every
+/// relaunch. Walk the projects in display order — `(position, id)`,
+/// the same comparator the sidebar sorts by — and push each one to at
+/// least `previous + 1`. The mirror of the Swift
+/// `normalizedProjectPositions`; keep the two in step.
+///
+/// The seed is `None`, not `-1`, so the walk is a true no-op on
+/// already-unique input **including negative positions**: `position`
+/// deserializes as a plain `i32` with no non-negativity check, and a
+/// `-1` seed would rewrite a perfectly ordered `[-5, -3]` to `[0, 1]`.
+///
+/// Gaps are preserved — `[0, 5, 5]` becomes `[0, 5, 6]`, not
+/// `[0, 1, 2]`. Positions are sparse by design; the invariant is
+/// uniqueness within a parent, never density, so densifying would
+/// rewrite rows that were never wrong.
+///
+/// `i32::MAX` saturates rather than panicking, matching
+/// `next_project_position`: a workspace that reached it is corrupt
+/// input, and degrading to a tie beats failing to launch. The ceiling
+/// is therefore a tie-degradation boundary, **not** a uniqueness
+/// guarantee — repairing `[i32::MAX - 1, i32::MAX - 1]` yields
+/// `[i32::MAX - 1, i32::MAX]`, and the next `create_project` clamps
+/// onto that `i32::MAX` (plan 004 §3.1).
+///
+/// Everything above holds **below the ceiling**; at it, the display
+/// order is not preserved either. Clamping collapses a row onto
+/// `i32::MAX`, and the `(position, id)` comparator then re-breaks that
+/// *new* tie by id, which can let a row overtake a sibling:
+/// `B@(MAX-1, id2), C@(MAX-1, id3), A@(MAX, id1)` displays `B, C, A`
+/// and repairs to `B@MAX-1, C@MAX, A@MAX` — which displays `B, A, C`.
+/// Corrupt input degrading to a reshuffle is the accepted cost of not
+/// failing to launch; the guarantee is for positions a real workspace
+/// can reach.
+fn normalize_project_positions(projects: &mut [ProjectSnapshot]) {
+    // Sort borrows of the rows, not the slice: the caller's order is
+    // the order `RestoreLayout` (and hence the bootstrap) walks, and
+    // the order rows are inserted into the id-keyed `projects` map.
+    // `state.json` is user-editable, so two rows can share an `id` and
+    // collapse last-write-wins — reordering the slice here would
+    // silently change which one survives, and Swift's
+    // `normalizedProjectPositions` returns file order to match.
+    let mut order: Vec<&mut ProjectSnapshot> = projects.iter_mut().collect();
+    order.sort_by_key(|p| (p.position, p.id));
+    let mut previous: Option<i32> = None;
+    for p in order {
+        let position = match previous {
+            None => p.position,
+            Some(prev) => prev.saturating_add(1).max(p.position),
+        };
+        p.position = position;
+        previous = Some(position);
+    }
+}
+
 impl Workspace {
     /// Construct an empty in-memory workspace. Used by tests.
     pub fn new() -> Self {
@@ -282,7 +345,7 @@ impl Workspace {
     /// Construct a workspace backed by `state_path`. Loads the file
     /// if present; corrupt or absent → empty workspace (warn-log).
     pub fn open(state_path: PathBuf) -> Self {
-        let snapshot = match read_state(&state_path) {
+        let mut snapshot = match read_state(&state_path) {
             Ok(Some(s)) => s,
             Ok(None) => SnapshotFile::default(),
             Err(err) => {
@@ -294,6 +357,9 @@ impl Workspace {
                 SnapshotFile::default()
             }
         };
+        // Before anything reads a position: a pre-#80 file can hold
+        // colliding project positions, and those survive the load.
+        normalize_project_positions(&mut snapshot.projects);
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut inner = Inner {
             next_id: snapshot.next_id.max(1),
@@ -1142,7 +1208,12 @@ impl Workspace {
             .filter(|t| t.project_id == project_id && !tab_ids.contains(&t.id))
             .map(|t| t.id)
             .collect();
-        unlisted.sort_by_key(|tid| inner.tabs.get(tid).map(|r| r.position).unwrap_or(0));
+        // `(position, id)`, not position alone: the loop below assigns
+        // `position = next_pos++` from this order, so a tie must not be
+        // left to the container. `BTreeMap` + a stable sort already
+        // yields ascending id here — state the rule rather than inherit
+        // it (#262).
+        unlisted.sort_by_key(|tid| (inner.tabs.get(tid).map(|r| r.position).unwrap_or(0), *tid));
         for tid in &unlisted {
             if let Some(row) = inner.tabs.get_mut(tid) {
                 row.position = next_pos;
@@ -1184,7 +1255,12 @@ impl Workspace {
             .filter(|p| !project_ids.contains(&p.id))
             .map(|p| p.id)
             .collect();
-        unlisted.sort_by_key(|pid| inner.projects.get(pid).map(|r| r.position).unwrap_or(0));
+        unlisted.sort_by_key(|pid| {
+            (
+                inner.projects.get(pid).map(|r| r.position).unwrap_or(0),
+                *pid,
+            )
+        });
         for pid in &unlisted {
             if let Some(row) = inner.projects.get_mut(pid) {
                 row.position = next_pos;
@@ -1335,12 +1411,17 @@ impl Inner {
     /// Next free project position: `max(position) + 1`, or 0 when
     /// empty. `len()` would collide after a delete-then-create
     /// because positions are sparse, not dense (#80).
+    ///
+    /// Saturating: positions decode straight from a user-editable
+    /// `state.json`, so a plain `m + 1` at `i32::MAX` panics at launch
+    /// in debug. A workspace that reached `i32::MAX` is corrupt input,
+    /// not a supported state — degrade it to a tie instead.
     fn next_project_position(&self) -> i32 {
         self.projects
             .values()
             .map(|p| p.position)
             .max()
-            .map_or(0, |m| m + 1)
+            .map_or(0, |m| m.saturating_add(1))
     }
 
     /// Next free tab position within `project_id`: `max(position) + 1`,
@@ -1351,7 +1432,23 @@ impl Inner {
             .filter(|t| t.project_id == project_id)
             .map(|t| t.position)
             .max()
-            .map_or(0, |m| m + 1)
+            .map_or(0, |m| m.saturating_add(1))
+    }
+
+    /// A project's tabs in display order: `position`, with `id`
+    /// breaking ties. Returns rows, not snapshots, because
+    /// `TabSnapshot` carries no id — sorting after the map could only
+    /// key on `position` and would leave ties to `BTreeMap` iteration
+    /// order: correct today, but by accident of the container rather
+    /// than by statement.
+    fn tabs_in_display_order(&self, project_id: i64) -> Vec<&TabRow> {
+        let mut rows: Vec<&TabRow> = self
+            .tabs
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .collect();
+        rows.sort_by_key(|t| (t.position, t.id));
+        rows
     }
 
     /// Snapshot the persistable state plus a fresh commit sequence.
@@ -1372,13 +1469,10 @@ impl Inner {
             .tabs
             .get(&self.active_tab_id)
             .map(|active| {
-                let mut siblings: Vec<&TabRow> = self
-                    .tabs
-                    .values()
-                    .filter(|t| t.project_id == active.project_id)
-                    .collect();
-                siblings.sort_by_key(|t| (t.position, t.id));
-                siblings.iter().position(|t| t.id == active.id).unwrap_or(0) as i32
+                self.tabs_in_display_order(active.project_id)
+                    .into_iter()
+                    .position(|t| t.id == active.id)
+                    .unwrap_or(0) as i32
             })
             .unwrap_or(0);
         let snapshot = SnapshotFile {
@@ -1390,10 +1484,9 @@ impl Inner {
                 .projects
                 .values()
                 .map(|p| {
-                    let mut tabs: Vec<TabSnapshot> = self
-                        .tabs
-                        .values()
-                        .filter(|t| t.project_id == p.id)
+                    let tabs: Vec<TabSnapshot> = self
+                        .tabs_in_display_order(p.id)
+                        .into_iter()
                         .map(|t| TabSnapshot {
                             title: t.title.clone(),
                             cwd: t.cwd.clone(),
@@ -1401,7 +1494,6 @@ impl Inner {
                             user_titled: t.user_titled,
                         })
                         .collect();
-                    tabs.sort_by_key(|t| t.position);
                     ProjectSnapshot {
                         id: p.id,
                         name: p.name.clone(),
@@ -2193,6 +2285,57 @@ mod tests {
         assert_eq!(t2.position, 2, "new tab position collided after close");
     }
 
+    /// A `state.json` is user-editable, so `i32::MAX` is representable
+    /// in a position. `max + 1` there panics in debug; the allocators
+    /// clamp to a tie instead so the UI still starts.
+    #[test]
+    fn next_position_saturates_at_i32_max() {
+        let ws = Workspace::new();
+        let p = ws.create_project("p", "").unwrap().id;
+        let t = ws.open_tab(p, "/", "t").unwrap().id;
+        {
+            let mut inner = ws.inner.lock().unwrap();
+            inner.projects.get_mut(&p).unwrap().position = i32::MAX;
+            inner.tabs.get_mut(&t).unwrap().position = i32::MAX;
+            assert_eq!(inner.next_project_position(), i32::MAX);
+            assert_eq!(inner.next_tab_position(p), i32::MAX);
+        }
+        assert_eq!(ws.create_project("q", "").unwrap().position, i32::MAX);
+        assert_eq!(ws.open_tab(p, "/", "u").unwrap().position, i32::MAX);
+    }
+
+    /// States the rule rather than reproducing a bug: this test cannot
+    /// fail against the previous implementation (`sort_by_key(|t|
+    /// t.position)`, no id in the key). `self.tabs` is a `BTreeMap`, so
+    /// `.values()` always yields ascending id; `sort_by_key` is stable;
+    /// a stable sort on `position` alone therefore always preserves
+    /// ascending-id order among ties — identical to sorting on
+    /// `(position, id)` for every input, not just this one. The id key
+    /// is here so the ordering guarantee is a stated rule instead of an
+    /// accident of the container choice (#262) — kept as an explicit
+    /// statement-of-intent guard, not a regression reproduction.
+    #[test]
+    fn persist_sorts_tabs_by_position_then_id() {
+        let ws = Workspace::new();
+        let p = ws.create_project("p", "").unwrap().id;
+        let a = ws.open_tab(p, "/", "a").unwrap().id;
+        let _b = ws.open_tab(p, "/", "b").unwrap().id;
+        let c = ws.open_tab(p, "/", "c").unwrap().id;
+        let (snapshot, _seq) = {
+            let mut inner = ws.inner.lock().unwrap();
+            // c (the highest id) ties with a at position 0; b keeps 1.
+            inner.tabs.get_mut(&c).unwrap().position = 0;
+            inner.snapshot_for_persist()
+        };
+        assert!(a < c);
+        let titles: Vec<&str> = snapshot.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["a", "c", "b"]);
+    }
+
     #[test]
     fn reorder_tabs_partial_keeps_unlisted() {
         let ws = Workspace::new();
@@ -2405,6 +2548,44 @@ mod tests {
         );
     }
 
+    /// Tied persisted tab positions are reachable — the `state.json`
+    /// captured for #262 holds `[2, 3, 3]` — and the restore layout is
+    /// the order the bootstrap re-opens tabs in, so the tie decides the
+    /// restored tab strip. `sort_by_key` is stable, which makes that
+    /// order the file's; Swift's `sorted(by:)` is documented as *not*
+    /// stable, so its twin
+    /// `restoreLayoutBreaksTiedTabPositionsByFileOrder` needs an explicit
+    /// index tiebreak to land here. The fixture's file order is neither
+    /// ascending nor descending in `position`, so a sort that ignored the
+    /// index could not pass by luck.
+    #[test]
+    fn restore_layout_breaks_tied_tab_positions_by_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{ "next_id": 200, "active_project_id": 100,
+                 "projects": [
+                   { "id": 100, "name": "p", "cwd": "/tmp", "position": 0, "created_at": 100,
+                     "tabs": [
+                       { "title": "a", "cwd": "/a", "position": 3, "user_titled": false },
+                       { "title": "b", "cwd": "/b", "position": 1, "user_titled": false },
+                       { "title": "c", "cwd": "/c", "position": 3, "user_titled": false }
+                     ] }
+                 ] }"#,
+        )
+        .unwrap();
+        let restore = Workspace::open(path).take_restore_layout().unwrap();
+        assert_eq!(
+            restore.projects[0]
+                .tabs
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "c"]
+        );
+    }
+
     #[test]
     fn cwd_changes_write_through() {
         // No throttle: every `set_tab_cwd` writes through, so a reopen
@@ -2447,6 +2628,289 @@ mod tests {
         assert_eq!(
             restore.projects[0].tabs[0].cwd, "/flushed",
             "a post-flush mutation must not have reached disk"
+        );
+    }
+
+    // Load-path repair of colliding project positions (#262).
+    //
+    // Persisted *tabs* re-open through `open_tab` (the UI bootstrap),
+    // so their positions are freshly allocated and a persisted tab
+    // collision self-heals. Persisted *projects* load their position
+    // verbatim, so a collision written by a pre-#80 GTK build survives
+    // every relaunch until `normalize_project_positions` breaks the
+    // tie. The Swift `WorkspaceStatePersistenceTests` mirror these.
+
+    /// Load a hand-written `state.json` and return the restored
+    /// `(name, position)` pairs in display order.
+    fn restored_project_positions(json: &str) -> Vec<(String, i32)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, json).unwrap();
+        Workspace::open(path)
+            .snapshot()
+            .into_iter()
+            .map(|p| (p.name, p.position))
+            .collect()
+    }
+
+    fn project_json(rows: &[(i64, &str, i32)]) -> String {
+        project_json_active(rows, 0)
+    }
+
+    fn project_json_active(rows: &[(i64, &str, i32)], active_project_id: i64) -> String {
+        let projects: Vec<String> = rows
+            .iter()
+            .map(|(id, name, position)| {
+                format!(
+                    r#"{{ "id": {id}, "name": "{name}", "cwd": "/tmp",
+                          "position": {position}, "created_at": {id}, "tabs": [] }}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{ "next_id": 200, "active_project_id": {active_project_id},
+                  "projects": [{}] }}"#,
+            projects.join(",")
+        )
+    }
+
+    #[test]
+    fn colliding_project_positions_are_repaired_on_load() {
+        let restored = restored_project_positions(&project_json(&[
+            (100, "AAA", 0),
+            (101, "BBB", 2),
+            (102, "CCC", 2),
+        ]));
+        assert_eq!(
+            restored,
+            vec![
+                ("AAA".to_string(), 0),
+                ("BBB".to_string(), 2),
+                ("CCC".to_string(), 3),
+            ],
+            "the tie breaks by pushing the loser up; relative order is preserved"
+        );
+    }
+
+    /// Positions are sparse by design — the invariant is uniqueness
+    /// within a parent, never density. `[0, 5, 5]` must repair to
+    /// `[0, 5, 6]`, not `[0, 1, 2]`: densifying would rewrite the two
+    /// rows that were never wrong.
+    #[test]
+    fn project_position_repair_preserves_gaps() {
+        let restored = restored_project_positions(&project_json(&[
+            (100, "AAA", 0),
+            (101, "BBB", 5),
+            (102, "CCC", 5),
+        ]));
+        assert_eq!(
+            restored.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![0, 5, 6]
+        );
+    }
+
+    /// Repairing an already-repaired file changes nothing: load the
+    /// collision, persist the repair, reload.
+    #[test]
+    fn project_position_repair_is_idempotent_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            project_json(&[(100, "AAA", 0), (101, "BBB", 2), (102, "CCC", 2)]),
+        )
+        .unwrap();
+
+        {
+            let ws = Workspace::open(path.clone());
+            assert_eq!(
+                ws.snapshot().iter().map(|p| p.position).collect::<Vec<_>>(),
+                vec![0, 2, 3]
+            );
+            // Any persisting mutator writes the repair back to disk.
+            ws.rename_project(100, "AAA").unwrap();
+        }
+
+        let ws2 = Workspace::open(path);
+        assert_eq!(
+            ws2.snapshot()
+                .iter()
+                .map(|p| p.position)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3],
+            "normalizing twice equals normalizing once"
+        );
+    }
+
+    /// The overwhelmingly common case: nobody's positions collide. The
+    /// repair must not touch them, gaps included.
+    #[test]
+    fn unique_project_positions_are_left_alone() {
+        let restored = restored_project_positions(&project_json(&[
+            (100, "AAA", 0),
+            (101, "BBB", 5),
+            (102, "CCC", 9),
+        ]));
+        assert_eq!(
+            restored.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![0, 5, 9]
+        );
+    }
+
+    /// The reason the walk seeds `previous` with `None` rather than
+    /// `-1`. `position` deserializes as a plain `i32` with no
+    /// non-negativity check, so a hand-edited file can hold negatives;
+    /// a `-1` seed would rewrite a unique, correctly-ordered
+    /// `[-5, -3]` to `[0, 1]`, breaking the no-op guarantee on input
+    /// that was never wrong.
+    #[test]
+    fn unique_negative_project_positions_are_left_alone() {
+        let restored =
+            restored_project_positions(&project_json(&[(100, "AAA", -5), (101, "BBB", -3)]));
+        assert_eq!(
+            restored.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![-5, -3]
+        );
+    }
+
+    /// The repair's boundary case: `previous + 1` at `i32::MAX` would
+    /// panic in a debug build. Positions come straight off a
+    /// user-editable file, so it saturates instead — the result is
+    /// still a tie, which is accepted (corrupt input degrades, it does
+    /// not crash the launch).
+    #[test]
+    fn project_positions_tied_at_i32_max_load_without_panicking() {
+        let restored = restored_project_positions(&project_json(&[
+            (100, "AAA", i32::MAX),
+            (101, "BBB", i32::MAX),
+        ]));
+        assert_eq!(
+            restored,
+            vec![("AAA".to_string(), i32::MAX), ("BBB".to_string(), i32::MAX),],
+            "both projects survive; the clamp degrades to a tie"
+        );
+    }
+
+    /// The accepted degradation at the ceiling, end to end: repairing
+    /// `[i32::MAX - 1, i32::MAX - 1]` pushes the loser to `i32::MAX`,
+    /// and the next `create_project` clamps onto that same value. Two
+    /// projects then share `i32::MAX`.
+    ///
+    /// **This is the pinned behavior, not a defect** (plan 004 §3.1): a
+    /// workspace at the integer ceiling is corrupt input, not a
+    /// supported state, so the arithmetic degrades to a tie rather than
+    /// panicking at launch. The repair is a *uniqueness* pass below the
+    /// ceiling and a *survival* pass at it — it is explicitly **not** a
+    /// uniqueness guarantee. The Swift
+    /// `ceilingRepairDegradesToATieOnTheNextAllocation` mirrors this.
+    #[test]
+    fn ceiling_repair_degrades_to_a_tie_on_the_next_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            project_json(&[(100, "AAA", i32::MAX - 1), (101, "BBB", i32::MAX - 1)]),
+        )
+        .unwrap();
+
+        let ws = Workspace::open(path);
+        assert_eq!(
+            ws.snapshot().iter().map(|p| p.position).collect::<Vec<_>>(),
+            vec![i32::MAX - 1, i32::MAX],
+            "the repair spends the last position in the range"
+        );
+
+        let next = ws.create_project("CCC", "/tmp").unwrap();
+        assert_eq!(
+            next.position,
+            i32::MAX,
+            "max + 1 saturates onto the row the repair just placed"
+        );
+        assert_eq!(
+            ws.snapshot().iter().map(|p| p.position).collect::<Vec<_>>(),
+            vec![i32::MAX - 1, i32::MAX, i32::MAX],
+            "accepted tie at the ceiling"
+        );
+    }
+
+    /// A file with no projects must load as an empty workspace rather
+    /// than tripping the normalizer's walk (`previous` never leaves
+    /// `None`) or the restore-layout build.
+    #[test]
+    fn empty_project_list_loads_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, project_json(&[])).unwrap();
+
+        let ws = Workspace::open(path);
+        assert!(ws.snapshot().is_empty());
+        let restore = ws.take_restore_layout().unwrap();
+        assert!(restore.projects.is_empty());
+    }
+
+    /// A file whose row order differs from display order, with a
+    /// collision inside it. The repair must be computed over the
+    /// *display* walk while everything ordered by file position — the
+    /// restore layout, the active-project resolution — is untouched,
+    /// and `snapshot()` must still come back by `(position, id)`.
+    ///
+    /// File order `C@5, A@0, B@5`; display order `A@0, C@5, B@5`. The
+    /// tie is between C and B, and only the walk order reveals which
+    /// of them moves. The Swift
+    /// `fileOrderDifferingFromDisplayOrderRepairsAndRestores` mirrors it.
+    #[test]
+    fn file_order_differing_from_display_order_repairs_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            project_json_active(&[(1, "C", 5), (2, "A", 0), (3, "B", 5)], 3),
+        )
+        .unwrap();
+
+        let ws = Workspace::open(path);
+        assert_eq!(
+            ws.snapshot()
+                .iter()
+                .map(|p| (p.name.as_str(), p.position))
+                .collect::<Vec<_>>(),
+            vec![("A", 0), ("C", 5), ("B", 6)],
+            "snapshot is by (position, id); B loses the tie to the lower id"
+        );
+
+        let restore = ws.take_restore_layout().unwrap();
+        assert_eq!(
+            restore
+                .projects
+                .iter()
+                .map(|p| p.project_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the restore layout keeps the file's row order"
+        );
+        assert_eq!(restore.active_project_id, 3);
+        assert!(
+            ws.snapshot().iter().any(|p| p.id == 3),
+            "the active project still resolves against the repaired rows"
+        );
+    }
+
+    /// Two rows sharing an `id` — corrupt input the loader accepts. The
+    /// id-keyed map collapses them last-write-wins, so **insertion
+    /// order picks the survivor**, and insertion order is the file's.
+    /// The collapse itself is pre-existing and out of scope; what this
+    /// pins is that the load-path repair does not change it, and that
+    /// Swift agrees. `duplicateProjectIDsKeepTheFileOrderSurvivor`
+    /// asserts the same literal fixture on the Mac side; if the two
+    /// ever disagree, the same `state.json` yields a different project
+    /// identity, metadata and tab layout per platform.
+    #[test]
+    fn duplicate_project_ids_keep_the_file_order_survivor() {
+        let restored = restored_project_positions(&project_json(&[(7, "high", 10), (7, "low", 0)]));
+        assert_eq!(
+            restored,
+            vec![("low".to_string(), 0)],
+            "the last row in the file wins, not the last in display order"
         );
     }
 }

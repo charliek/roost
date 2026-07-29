@@ -16,7 +16,9 @@
 //!
 //! Doctor reports and links; it never repairs, installs, or mutates.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -47,7 +49,7 @@ const OUTPUT_CAP: u64 = 8 * 1024;
 /// `/dev/zero` turns a diagnostic into an OOM.
 const SETTINGS_READ_CAP: u64 = 1024 * 1024;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 // ============================================================================
 // Doc links (plan §3.11)
@@ -155,12 +157,15 @@ fn docs_for(check_id: &str) -> Option<&'static str> {
 // Report
 // ============================================================================
 
+/// A verdict. `Skipped` is the *absence* of one — the subject was
+/// absent, or the answer could not be determined — which is why an
+/// observation may carry it while it can never carry `Ok`/`Warn`/`Fail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Ok,
     Warn,
     Fail,
-    Info,
+    Skipped,
 }
 
 impl Status {
@@ -169,7 +174,25 @@ impl Status {
             Status::Ok => "ok",
             Status::Warn => "warn",
             Status::Fail => "fail",
-            Status::Info => "info",
+            Status::Skipped => "skipped",
+        }
+    }
+}
+
+/// The other axis (§3.6): does this entry assert something about the
+/// user's setup, or is it a fact with no correct value? `tab.ownership`
+/// reporting "none" is not worse than reporting "claude", so it observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Check,
+    Observation,
+}
+
+impl Kind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Kind::Check => "check",
+            Kind::Observation => "observation",
         }
     }
 }
@@ -183,13 +206,32 @@ impl Serialize for Status {
     }
 }
 
+impl Serialize for Kind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// One report entry. Build it through [`check`], [`observation`] or
+/// [`unavailable`] — never by literal — so §3.6's invariant (a check
+/// always carries a verdict; an observation carries `None` or
+/// `Some(Skipped)`) cannot be violated by accident.
+///
+/// `status` is `Option` with no `skip_serializing_if`: a `--json`
+/// consumer must be able to read `"status": null` as "this is a fact",
+/// and a dropped key would be indistinguishable from an older schema.
+///
+/// The fields are private for that reason: `mod tests` is a descendant
+/// so it still reads them, but no sibling module can spell a `Check`
+/// literal that the constructors would have refused.
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
-    pub id: &'static str,
-    pub title: &'static str,
-    pub status: Status,
-    pub detail: String,
-    pub docs_url: Option<&'static str>,
+    id: &'static str,
+    title: &'static str,
+    kind: Kind,
+    status: Option<Status>,
+    detail: String,
+    docs_url: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,15 +240,27 @@ pub struct Section {
     pub title: &'static str,
     /// Which of the three scopes this section's checks describe.
     pub scope: &'static str,
+    /// The section's rolled-up verdict (§3.8). `None` is an
+    /// observational section with nothing adverse in it — a section that
+    /// grades nothing, rendered `•` rather than a green tick.
+    pub status: Option<Status>,
+    /// The one line the default view prints for this section — always a
+    /// copy of some entry's `detail` with its blank runs collapsed
+    /// (see [`collapse_blanks`]), never new prose (§3.9).
+    pub headline: String,
     pub checks: Vec<Check>,
 }
 
+/// One column per state an entry can be in, so
+/// `ok + warn + fail + skipped + facts` is the whole inventory (§3.13).
+/// `facts` counts entries carrying no status at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Summary {
     pub ok: usize,
     pub warn: usize,
     pub fail: usize,
-    pub info: usize,
+    pub skipped: usize,
+    pub facts: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,10 +275,11 @@ impl Report {
         let mut s = Summary::default();
         for check in self.checks() {
             match check.status {
-                Status::Ok => s.ok += 1,
-                Status::Warn => s.warn += 1,
-                Status::Fail => s.fail += 1,
-                Status::Info => s.info += 1,
+                Some(Status::Ok) => s.ok += 1,
+                Some(Status::Warn) => s.warn += 1,
+                Some(Status::Fail) => s.fail += 1,
+                Some(Status::Skipped) => s.skipped += 1,
+                None => s.facts += 1,
             }
         }
         s
@@ -234,9 +289,20 @@ impl Report {
         self.sections.iter().flat_map(|s| &s.checks)
     }
 
-    /// 0 unless some check is `fail`. `warn` never changes it (plan §3.3).
+    /// The entries a user can act on, stated next to [`exit_code`] so
+    /// "actionable" and "exit 1" cannot drift apart. `skipped` and the
+    /// observations are excluded: neither asks anyone to do anything.
+    ///
+    /// [`exit_code`]: Report::exit_code
+    fn issues(&self) -> impl Iterator<Item = &Check> {
+        self.checks()
+            .filter(|c| matches!(c.status, Some(Status::Fail | Status::Warn)))
+    }
+
+    /// 0 unless some check is `fail`. `warn`, `skipped` and the
+    /// status-less observations never change it (plan §3.3).
     pub fn exit_code(&self) -> i32 {
-        i32::from(self.checks().any(|c| c.status == Status::Fail))
+        i32::from(self.checks().any(|c| c.status == Some(Status::Fail)))
     }
 }
 
@@ -249,12 +315,184 @@ fn check(
     Check {
         id,
         title,
-        status,
+        kind: Kind::Check,
+        status: Some(status),
         detail: detail.into(),
         docs_url: match status {
             Status::Fail | Status::Warn => docs_for(id),
-            Status::Ok | Status::Info => None,
+            Status::Ok | Status::Skipped => None,
         },
+    }
+}
+
+/// A fact with no correct value (§3.7). Never carries a `docs_url`:
+/// there is nothing here to go read about.
+fn observation(id: &'static str, title: &'static str, detail: impl Into<String>) -> Check {
+    Check {
+        id,
+        title,
+        kind: Kind::Observation,
+        status: None,
+        detail: detail.into(),
+        docs_url: None,
+    }
+}
+
+/// How much a status weighs in a section roll-up. `Ok` scores 0 because
+/// §3.8 rolls up the *adverse* states only — a section with nothing
+/// adverse in it takes its marker from the section's own kind, not from
+/// whether some entry happened to pass.
+fn severity(status: Status) -> u8 {
+    match status {
+        Status::Ok => 0,
+        Status::Skipped => 1,
+        Status::Warn => 2,
+        Status::Fail => 3,
+    }
+}
+
+/// §3.8's ordering, asked once. `None` when nothing in the run is
+/// adverse. Both roll-ups — the section's and the footer bullet's — fold
+/// through here, so a change to the ordering cannot move one and leave
+/// the other behind.
+fn worst_adverse(statuses: impl Iterator<Item = Status>) -> Option<Status> {
+    statuses
+        .filter(|s| severity(*s) > 0)
+        .max_by_key(|s| severity(*s))
+}
+
+/// Squeeze every run of blank-rendering scalars to a single space and
+/// trim the ends.
+///
+/// This is the vector [`escape_controls`] cannot see: a space is not a
+/// control character, so a long run of them inside a headline positions
+/// whatever follows at a column of the attacker's choosing — including
+/// the exact column a narrow terminal wraps a [`SUMMARY_W`] row, where
+/// the wrapped remainder reads as a genuine `[✗] Selected tab` section
+/// line. A headline is a one-line summary, so a *run* of blanks in one
+/// has no legitimate purpose; collapsing costs nothing and takes the aim
+/// away.
+///
+/// "Blank" is deliberately wider than Unicode `White_Space` (see
+/// [`renders_blank`]): what makes a scalar usable as padding is that the
+/// cell draws empty, not which category it landed in, and U+2800 BRAILLE
+/// PATTERN BLANK (So) and the Hangul fillers (Lo) substitute for a space
+/// 1:1 in every terminal font. The collapse cannot collide with the
+/// escaping already applied — [`escape_controls`] rewrote a tab as the
+/// two characters `\` and `t`, and neither is blank.
+///
+/// The residual, precisely: this closes the *invisible* padding, not
+/// every route to a column. The budget that keeps a summary row to one
+/// line counts **scalars, not display columns**
+/// (`chars().count() <= SUMMARY_W`), so an East Asian Wide character —
+/// visible, and two columns for one scalar — still lets an attacker move
+/// the forged text while that check passes. Closing *that* needs real
+/// display-width computation, i.e. the `unicode-width` crate; not taken,
+/// because a vendored width table needs Unicode-version upkeep forever to
+/// harden one diagnostic line, and the remaining attack has to pad with
+/// glyphs the reader can see. What is gone is the aim an invisible run
+/// bought.
+fn collapse_blanks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending = false;
+    for c in s.chars() {
+        if renders_blank(c) {
+            pending = !out.is_empty();
+        } else {
+            if pending {
+                out.push(' ');
+                pending = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Scalars that draw as an empty cell, for [`collapse_blanks`]: Unicode
+/// `White_Space` — NBSP, U+2000–U+200A and the ideographic space all pad
+/// as well as a space does — plus the blank-rendering scalars outside that
+/// property. U+2028/U+2029 are in it too, and are line separators
+/// `char::is_control` does not cover, so this is their last stop if a
+/// detail ever reaches a headline unescaped.
+fn renders_blank(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            // BRAILLE PATTERN BLANK — a braille cell with no dots raised.
+            '\u{2800}'
+            // HANGUL FILLER, CHOSEONG / JUNGSEONG FILLER, HALFWIDTH
+            // HANGUL FILLER — placeholder jamo, drawn as nothing.
+            | '\u{3164}' | '\u{115f}' | '\u{1160}' | '\u{ffa0}'
+            // MONGOLIAN VOWEL SEPARATOR, which is Cf: a *detail* can never
+            // carry it this far ([`escape_controls`] gets there first), so
+            // this arm is for direct callers only.
+            | '\u{180e}'
+        )
+}
+
+/// Assemble a section, computing §3.8's roll-up and §3.9's headline here
+/// — in `evaluate`, which already holds every derived fact — so the two
+/// renderers cannot disagree and a test can assert both without
+/// rendering.
+///
+/// `kind` is a **static property of the section**, not a fold over its
+/// entries. `tab` is the only observational one: everything in it
+/// reports a fact, and `tab.selection` is there to say *which* tab the
+/// facts describe rather than to grade the setup, so an `ok` there must
+/// not paint a green tick on a section that grades nothing.
+///
+/// The headline is always a copy of an existing entry's `detail`.
+/// Synthesizing a fresh sentence would be a second source of truth for
+/// facts the details already carry, and a new unredacted surface — a
+/// `$SHELL` carrying a newline could forge a whole section line. Every
+/// detail has already been through [`redact`]/[`escape_controls`], so
+/// the headline inherits that for free — plus
+/// [`collapse_blanks`], which the *detail* deliberately does not get:
+/// `-v` and `--json` carry the value as it actually is, while the
+/// one-line summary cannot afford printable padding.
+fn section(
+    id: &'static str,
+    title: &'static str,
+    scope: &'static str,
+    kind: Kind,
+    headline_id: &'static str,
+    checks: Vec<Check>,
+) -> Section {
+    let worst = worst_adverse(checks.iter().filter_map(|c| c.status));
+    let status = match (worst, kind) {
+        (Some(s), _) => Some(s),
+        (None, Kind::Check) => Some(Status::Ok),
+        (None, Kind::Observation) => None,
+    };
+    // Adverse states name the worst entry, ties broken by position;
+    // anything else names the section's pinned headline entry, which
+    // `check_ids_and_titles_are_unique_and_stable` guarantees is present.
+    let source = match status {
+        Some(Status::Fail | Status::Warn | Status::Skipped) => {
+            checks.iter().find(|c| c.status == status)
+        }
+        Some(Status::Ok) | None => checks.iter().find(|c| c.id == headline_id),
+    };
+    Section {
+        id,
+        title,
+        scope,
+        status,
+        headline: source.map_or_else(String::new, |c| collapse_blanks(&c.detail)),
+        checks,
+    }
+}
+
+/// An observation whose subject could not be observed. Machine-readable
+/// on purpose: `tab.ownership: null` ("nothing owns it") and
+/// `tab.ownership: "skipped"` ("the UI predates the agent model") are
+/// different findings, and a `--json` consumer must not have to regex
+/// the prose to tell them apart.
+fn unavailable(id: &'static str, title: &'static str, reason: impl Into<String>) -> Check {
+    Check {
+        status: Some(Status::Skipped),
+        ..observation(id, title, reason)
     }
 }
 
@@ -953,7 +1191,7 @@ fn shell_family(shell_path: Option<&str>) -> ShellFamily {
 }
 
 /// The shipped integration script for this family, if one ships. No
-/// `roost.fish` exists, which is why fish is `info` and not `fail`.
+/// `roost.fish` exists, which is why fish is `skipped` and not `fail`.
 fn shipped_script_path(resources_dir: Option<&str>, family: ShellFamily) -> Option<PathBuf> {
     let leaf = match family {
         ShellFamily::Zsh => "roost.zsh",
@@ -1054,21 +1292,76 @@ const METADATA_VALUE_ALLOWLIST: [&str; 4] =
 /// Escape control characters so an agent-supplied string cannot inject
 /// fake report lines or ANSI sequences into output a user pastes into an
 /// issue.
+///
+/// Two categories beyond Cc, neither of which `char::is_control` sees,
+/// both admitted by the same reading of plan 003 §3.9 — the threat model
+/// is output a user *pastes* into an issue, so the renderers there count,
+/// not just the terminal:
+///
+/// * **Zl/Zp** (U+2028/U+2029). Terminals don't break on them; plenty of
+///   paste targets do, which is the forged-report-line vector this
+///   escaping exists to close.
+/// * **Cf** (format, see [`is_format`]). One step further and a policy
+///   fix rather than a patched instance: a raw U+202E RIGHT-TO-LEFT
+///   OVERRIDE reverses the rest of the line, and GitHub and every browser
+///   honor it, so `$SHELL=<RLO>bat detceleS ]✗[` pastes as a convincing
+///   `[✗] Selected tab`. U+2066–U+2069 do the same by isolate, and
+///   U+200B–U+200F hide text outright. A format character has no
+///   legitimate place in a diagnostic string, so the whole category goes —
+///   which closes the class for *every* detail rather than only for the
+///   headlines that also get [`collapse_blanks`].
 fn escape_controls(s: &str) -> String {
-    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || is_format(c) => {
                 let _ = write!(out, "\\u{{{:04x}}}", c as u32);
             }
             c => out.push(c),
         }
     }
     out
+}
+
+/// `General_Category=Cf`, as ranges. `char` exposes `is_control` (Cc) and
+/// nothing else, and a Unicode-table crate is a large dependency to carry
+/// for one diagnostic string, so the category is spelled out here:
+/// Unicode 16.0's Cf, coalesced from a full scalar-by-scalar walk of
+/// `UnicodeData.txt`.
+///
+/// Two ranges are widened past the real category to keep the table short.
+/// U+2065 and U+E0002–U+E001F are unassigned holes inside a format block;
+/// over-broad is the safe direction here, since escaping an unassigned
+/// scalar costs a diagnostic nothing while a missed range costs it the
+/// vector in [`escape_controls`].
+const FORMAT_RANGES: [(u32, u32); 19] = [
+    (0x00ad, 0x00ad),           // SOFT HYPHEN
+    (0x0600, 0x0605),           // ARABIC NUMBER SIGN … ARABIC NUMBER MARK ABOVE
+    (0x061c, 0x061c),           // ARABIC LETTER MARK
+    (0x06dd, 0x06dd),           // ARABIC END OF AYAH
+    (0x070f, 0x070f),           // SYRIAC ABBREVIATION MARK
+    (0x0890, 0x0891),           // ARABIC POUND / PIASTRE MARK ABOVE
+    (0x08e2, 0x08e2),           // ARABIC DISPUTED END OF AYAH
+    (0x180e, 0x180e),           // MONGOLIAN VOWEL SEPARATOR
+    (0x200b, 0x200f),           // ZWSP, ZWNJ, ZWJ, LRM, RLM
+    (0x202a, 0x202e),           // LRE, RLE, PDF, LRO, RLO — the bidi overrides
+    (0x2060, 0x206f),           // WORD JOINER … the deprecated format controls
+    (0xfeff, 0xfeff),           // ZERO WIDTH NO-BREAK SPACE (BOM)
+    (0xfff9, 0xfffb),           // INTERLINEAR ANNOTATION ANCHOR/SEPARATOR/TERMINATOR
+    (0x0001_10bd, 0x0001_10bd), // KAITHI NUMBER SIGN
+    (0x0001_10cd, 0x0001_10cd), // KAITHI NUMBER SIGN ABOVE
+    (0x0001_3430, 0x0001_343f), // EGYPTIAN HIEROGLYPH format controls
+    (0x0001_bca0, 0x0001_bca3), // SHORTHAND FORMAT letter overlap … up step
+    (0x0001_d173, 0x0001_d17a), // MUSICAL SYMBOL BEGIN BEAM … END PHRASE
+    (0x000e_0001, 0x000e_007f), // LANGUAGE TAG + the TAG characters
+];
+
+fn is_format(c: char) -> bool {
+    let cp = c as u32;
+    FORMAT_RANGES.iter().any(|(lo, hi)| cp >= *lo && cp <= *hi)
 }
 
 /// Escape, then cap for display — counted in characters, with the true
@@ -1086,11 +1379,20 @@ fn redact_path(path: &Path) -> String {
 
 fn redact_to(raw: &str, cap: usize) -> String {
     let escaped = escape_controls(raw);
-    if escaped.chars().count() <= cap {
-        return escaped;
+    match cut_to_chars(&escaped, cap) {
+        Some(head) => format!("{head}…({} chars)", raw.chars().count()),
+        None => escaped,
     }
-    let head: String = escaped.chars().take(cap).collect();
-    format!("{head}…({} chars)", raw.chars().count())
+}
+
+/// The one place a display string is cut, shared by the redaction cap
+/// above and the summary view's column budget. Counted in
+/// **characters** — a byte cut would split the `—` and `→` that details
+/// routinely carry mid-scalar. `None` when `s` already fits, so a
+/// caller's "this was cut" marker is added only when something was
+/// actually dropped.
+fn cut_to_chars(s: &str, cap: usize) -> Option<String> {
+    (s.chars().count() > cap).then(|| s.chars().take(cap).collect())
 }
 
 /// `session_id` is an opaque token from an agent; print enough to reason
@@ -1184,10 +1486,11 @@ fn inside_roost_tab(inputs: &Inputs) -> bool {
 }
 
 /// Plan §3.3's applicability sentence for the *process*-scoped checks:
-/// their subject is absent, so they observe rather than fail. Written
-/// once — six checks say it, and they must say it identically.
+/// their subject is absent, so they are skipped rather than failed —
+/// still checks, just with nothing to judge. Written once — six checks
+/// say it, and they must say it identically.
 fn not_in_tab(id: &'static str, title: &'static str) -> Check {
-    check(id, title, Status::Info, NOT_IN_TAB)
+    check(id, title, Status::Skipped, NOT_IN_TAB)
 }
 
 const NOT_IN_TAB: &str = "not running inside a Roost tab";
@@ -1232,36 +1535,46 @@ pub fn evaluate(inputs: &Inputs) -> Report {
         schema_version: SCHEMA_VERSION,
         roostctl_version: inputs.roostctl_version.clone(),
         sections: vec![
-            Section {
-                id: "env",
-                title: "Environment",
-                scope: "process",
-                checks: env_checks(inputs),
-            },
-            Section {
-                id: "ui",
-                title: "Roost UI",
-                scope: "ui",
-                checks: ui_checks(inputs, &tab_list, model),
-            },
-            Section {
-                id: "shell",
-                title: "Shell integration",
-                scope: "process",
-                checks: shell_checks(inputs, &capability, can_mark, selection, selected, model),
-            },
-            Section {
-                id: "tab",
-                title: "Selected tab",
-                scope: "tab",
-                checks: tab_checks(inputs, selection, selected, tabs.is_some(), model),
-            },
-            Section {
-                id: "claude",
-                title: "Claude Code",
-                scope: "process",
-                checks: claude_checks(inputs, selection, selected, tabs.is_some(), model),
-            },
+            section(
+                "env",
+                "Environment",
+                "process",
+                Kind::Check,
+                "env.tab_id",
+                env_checks(inputs),
+            ),
+            section(
+                "ui",
+                "Roost UI",
+                "ui",
+                Kind::Check,
+                "ui.identify",
+                ui_checks(inputs, &tab_list, model),
+            ),
+            section(
+                "shell",
+                "Shell integration",
+                "process",
+                Kind::Check,
+                "shell.marks_observed",
+                shell_checks(inputs, &capability, can_mark, selection, selected, model),
+            ),
+            section(
+                "tab",
+                "Selected tab",
+                "tab",
+                Kind::Observation,
+                "tab.derived",
+                tab_checks(inputs, selection, selected, tabs.is_some(), model),
+            ),
+            section(
+                "claude",
+                "Claude Code",
+                "process",
+                Kind::Check,
+                "claude.hook_events",
+                claude_checks(inputs, selection, selected, tabs.is_some(), model),
+            ),
         ],
     }
 }
@@ -1404,17 +1717,25 @@ fn env_checks(inputs: &Inputs) -> Vec<Check> {
         (None, None) => not_in_tab("env.tab_id", "ROOST_TAB_ID"),
     };
 
+    // Set or unset, neither is the correct value: unset is the ordinary
+    // shape outside a Roost tab, and set is the documented way to target
+    // one from a CI runner. So it observes rather than judges (§3.7).
+    //
+    // The one status change here that *removes a positive verdict*: the set
+    // arm was `ok` before the status/kind split, so this id migrates
+    // `ok → null` — not `info → null` like the unset arm, whose `info` had
+    // no spelling left to keep. Anyone exporting `ROOST_SOCKET` therefore
+    // sees `summary.ok` drop by one, and a `jq` check for `status == "ok"`
+    // on `env.socket` now fails where it used to pass.
     let socket = match &inputs.env_socket {
-        Some(path) => check(
+        Some(path) => observation(
             "env.socket",
             "ROOST_SOCKET",
-            Status::Ok,
             format!("ROOST_SOCKET={}", redact(path)),
         ),
-        None => check(
+        None => observation(
             "env.socket",
             "ROOST_SOCKET",
-            Status::Info,
             "unset — target resolution falls through to --socket / --target / auto-detect",
         ),
     };
@@ -1439,7 +1760,7 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
         let candidates = paths(&inputs.target_candidates);
         let (status, detail) = match &inputs.target {
             Ok(path) => (
-                Status::Info,
+                Status::Ok,
                 format!(
                     "{} → {} (auto-detect would try: {candidates})",
                     inputs.target_origin.as_str(),
@@ -1530,7 +1851,7 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
                 ),
             ),
             Err(_) => (
-                Status::Info,
+                Status::Skipped,
                 format!("roostctl {ours} — no UI reached, nothing to compare"),
             ),
         };
@@ -1567,7 +1888,7 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
             ),
             // Nothing to probe is undecidable either way — not a fault.
             AgentModel::Undetermined => (
-                Status::Info,
+                Status::Skipped,
                 match tab_list {
                     TabList::Failed(e) => {
                         format!("undetermined — tab.list failed: {}", redact(e))
@@ -1705,11 +2026,11 @@ fn marks_capability(inputs: &Inputs) -> Check {
             ),
         ),
         MarkCapability::Undetermined if family == ShellFamily::Bash => (
-            Status::Info,
+            Status::Skipped,
             "bash, but its version could not be determined".to_string(),
         ),
         MarkCapability::Undetermined => (
-            Status::Info,
+            Status::Skipped,
             "shell family undetermined ($SHELL is not set)".to_string(),
         ),
     };
@@ -1736,22 +2057,27 @@ fn shell_checks(
 ) -> Vec<Check> {
     let in_tab = inside_roost_tab(inputs);
     let family = shell_family(inputs.shell_path.as_deref());
-    // §3.3: the whole process-scoped shell section observes rather than
-    // judges when doctor is not running inside a Roost tab. An ordinary
-    // terminal with no `$SHELL` is not a Roost fault.
-    let scored = |status: Status| if in_tab { status } else { Status::Info };
+    // §3.3, for `shell.login`'s two unusable arms only: an ordinary
+    // terminal with no usable `$SHELL` is not a Roost fault, so they
+    // judge only inside a Roost tab. The rest of this process-scoped
+    // section reaches the same policy through `not_in_tab`.
+    let unusable_shell = if in_tab {
+        Status::Warn
+    } else {
+        Status::Skipped
+    };
 
     let login = match (&inputs.shell_path, inputs.shell_usable) {
         (None, _) => check(
             "shell.login",
             "Login shell",
-            scored(Status::Warn),
+            unusable_shell,
             "$SHELL is not set",
         ),
         (Some(path), false) => check(
             "shell.login",
             "Login shell",
-            scored(Status::Warn),
+            unusable_shell,
             format!(
                 "$SHELL={} is not an absolute path to an executable regular file",
                 redact(path)
@@ -1765,10 +2091,13 @@ fn shell_checks(
                 SubprocessOutcome::TimedOut => "version unknown (--version timed out)".to_string(),
                 _ => "version unknown".to_string(),
             };
+            // Deliberately not gated on `in_tab`: a usable `$SHELL` is a
+            // verdict about the machine, true whether or not doctor is
+            // running inside a Roost tab.
             check(
                 "shell.login",
                 "Login shell",
-                Status::Info,
+                Status::Ok,
                 format!("{} — {version}", redact(path)),
             )
         }
@@ -1788,10 +2117,9 @@ fn shell_checks(
             } else {
                 ""
             };
-            check(
+            observation(
                 "shell.current",
                 "Current shell",
-                Status::Info,
                 format!(
                     "parent pid {} is `{}`{note}{COMM_CAVEAT}",
                     inputs.parent_pid,
@@ -1799,10 +2127,9 @@ fn shell_checks(
                 ),
             )
         }
-        _ => check(
+        _ => observation(
             "shell.current",
             "Current shell",
-            Status::Info,
             format!("parent pid {} not detected", inputs.parent_pid),
         ),
     };
@@ -1837,7 +2164,7 @@ fn shell_checks(
         check(
             "shell.resources",
             "Shipped scripts",
-            Status::Info,
+            Status::Skipped,
             "not applicable — no integration script ships for this shell",
         )
     } else if inputs.env_resources_dir.is_none() {
@@ -1867,7 +2194,7 @@ fn shell_checks(
             (None, _) => check(
                 "shell.resources",
                 "Shipped scripts",
-                Status::Info,
+                Status::Skipped,
                 "not applicable — shell family undetermined",
             ),
         }
@@ -1880,7 +2207,7 @@ fn shell_checks(
         check(
             "shell.marks_feature",
             "`marks` feature",
-            Status::Info,
+            Status::Skipped,
             "disabled by ROOST_SHELL_FEATURES=no-marks — an opt-out, not a fault",
         )
     } else {
@@ -1932,7 +2259,7 @@ fn marks_observed(
         return check(
             ID,
             TITLE,
-            Status::Info,
+            Status::Skipped,
             "not scored — marks are opted out via ROOST_SHELL_FEATURES=no-marks",
         );
     }
@@ -1940,7 +2267,7 @@ fn marks_observed(
         return check(
             ID,
             TITLE,
-            Status::Info,
+            Status::Skipped,
             "not scored — the UI predates the agent state model, so its `shell_state` is a \
              client-side default rather than an observation",
         );
@@ -1949,7 +2276,7 @@ fn marks_observed(
         return check(
             ID,
             TITLE,
-            Status::Info,
+            Status::Skipped,
             match selection {
                 Selection::None => "not scored — no tab is selected".to_string(),
                 _ => format!(
@@ -1964,7 +2291,7 @@ fn marks_observed(
         return check(
             ID,
             TITLE,
-            Status::Info,
+            Status::Skipped,
             "not scored — the selected tab was not returned by tab.list",
         );
     };
@@ -2014,13 +2341,13 @@ fn tab_checks(
         (None, _, _) => check(
             "tab.selection",
             "Tab selection",
-            Status::Info,
+            Status::Skipped,
             "no tab selected — pass --tab, set ROOST_TAB_ID, or give the UI an active tab",
         ),
         (Some(id), false, _) => check(
             "tab.selection",
             "Tab selection",
-            Status::Info,
+            Status::Skipped,
             format!(
                 "tab {id} (from {}) — tab.list unavailable",
                 selection.source()
@@ -2029,7 +2356,7 @@ fn tab_checks(
         (Some(id), true, Some(_)) => check(
             "tab.selection",
             "Tab selection",
-            Status::Info,
+            Status::Ok,
             format!("tab {id}, chosen by {}", selection.source()),
         ),
         (Some(id), true, None) => check(
@@ -2044,19 +2371,19 @@ fn tab_checks(
         ),
     };
 
-    let unavailable = |id: &'static str, title: &'static str| {
-        check(id, title, Status::Info, unavailable_reason(model, listed))
+    let axis_unavailable = |id: &'static str, title: &'static str| {
+        unavailable(id, title, unavailable_reason(model, listed))
     };
 
     let Some(tab) = selected.filter(|_| model != AgentModel::Absent) else {
         return vec![
             selection_check,
-            unavailable("tab.shell_state", "Shell axis"),
-            unavailable("tab.agent_lifecycle", "Agent axis"),
-            unavailable("tab.attention", "Attention"),
-            unavailable("tab.ownership", "Ownership"),
-            unavailable("tab.derived", "Derived state"),
-            unavailable("tab.raw_osc", "Raw OSC suppression"),
+            axis_unavailable("tab.shell_state", "Shell axis"),
+            axis_unavailable("tab.agent_lifecycle", "Agent axis"),
+            axis_unavailable("tab.attention", "Attention"),
+            axis_unavailable("tab.ownership", "Ownership"),
+            axis_unavailable("tab.derived", "Derived state"),
+            axis_unavailable("tab.raw_osc", "Raw OSC suppression"),
         ];
     };
 
@@ -2064,10 +2391,9 @@ fn tab_checks(
     let lifecycle = effective_lifecycle(&state);
 
     let ownership = match &tab.ownership {
-        Some(owner) => check(
+        Some(owner) => observation(
             "tab.ownership",
             "Ownership",
-            Status::Info,
             format!(
                 "source={} session={} last_event={} detail={} metadata={}",
                 redact(&owner.source),
@@ -2081,27 +2407,24 @@ fn tab_checks(
                 redact_metadata(&owner.metadata),
             ),
         ),
-        None => check("tab.ownership", "Ownership", Status::Info, "none"),
+        None => observation("tab.ownership", "Ownership", "none"),
     };
 
     vec![
         selection_check,
-        check(
+        observation(
             "tab.shell_state",
             "Shell axis",
-            Status::Info,
             shell_state_name(tab.shell_state),
         ),
-        check(
+        observation(
             "tab.agent_lifecycle",
             "Agent axis",
-            Status::Info,
             lifecycle_name(tab.agent_lifecycle),
         ),
-        check(
+        observation(
             "tab.attention",
             "Attention",
-            Status::Info,
             if tab.has_notification {
                 "a notification is pending on this tab"
             } else {
@@ -2109,10 +2432,9 @@ fn tab_checks(
             },
         ),
         ownership,
-        check(
+        observation(
             "tab.derived",
             "Derived state",
-            Status::Info,
             format!(
                 // The same spelling `roostctl tab list` and the wire use
                 // — doctor must not invent a second vocabulary for the
@@ -2124,10 +2446,9 @@ fn tab_checks(
                 inactive_explanation(&state, lifecycle),
             ),
         ),
-        check(
+        observation(
             "tab.raw_osc",
             "Raw OSC suppression",
-            Status::Info,
             if suppress_raw_osc(&state) {
                 "raw OSC 9/99/777 notifications are suppressed while this agent drives the tab"
             } else {
@@ -2233,7 +2554,7 @@ fn claude_checks(
         SettingsProbe::Absent | SettingsProbe::LocationUnknown
     );
     // Unknown ownership counts as "not owned" here on purpose: it keeps
-    // the whole section `info` rather than inventing a verdict from a
+    // the whole section `skipped` rather than inventing a verdict from a
     // fact the server never sent.
     let configured = !matches!(inputs.claude_version, SubprocessOutcome::Missing)
         || settings_present
@@ -2248,38 +2569,15 @@ fn claude_checks(
                 None => format!("is {}", unavailable_reason(model, listed)),
             }
         );
-        return vec![
-            check(
-                "claude.binary",
-                "`claude` on PATH",
-                Status::Info,
-                detail.as_str(),
-            ),
-            check(
-                "claude.settings",
-                "Settings file",
-                Status::Info,
-                detail.as_str(),
-            ),
-            check(
-                "claude.hook_events",
-                "Registered events",
-                Status::Info,
-                detail.as_str(),
-            ),
-            check(
-                "claude.hook_command",
-                "Hook commands",
-                Status::Info,
-                detail.as_str(),
-            ),
-            check(
-                "claude.observed",
-                "Hooks reaching Roost",
-                Status::Info,
-                detail.as_str(),
-            ),
-        ];
+        return [
+            ("claude.binary", "`claude` on PATH"),
+            ("claude.settings", "Settings file"),
+            ("claude.hook_events", "Registered events"),
+            ("claude.hook_command", "Hook commands"),
+            ("claude.observed", "Hooks reaching Roost"),
+        ]
+        .map(|(id, title)| check(id, title, Status::Skipped, detail.as_str()))
+        .to_vec();
     }
 
     let binary = match &inputs.claude_version {
@@ -2298,7 +2596,7 @@ fn claude_checks(
         SubprocessOutcome::Missing => check(
             "claude.binary",
             "`claude` on PATH",
-            Status::Info,
+            Status::Skipped,
             "not on PATH",
         ),
         SubprocessOutcome::Failed(e) => check(
@@ -2323,7 +2621,7 @@ fn claude_checks(
         SettingsProbe::LocationUnknown => check(
             "claude.settings",
             "Settings file",
-            Status::Info,
+            Status::Skipped,
             "$HOME is unset, so the settings file location is unknown",
         ),
         SettingsProbe::Parsed => check(
@@ -2344,7 +2642,7 @@ fn claude_checks(
         SettingsProbe::Absent => check(
             "claude.settings",
             "Settings file",
-            Status::Info,
+            Status::Skipped,
             format!("{path} is absent — run `roostctl claude install`"),
         ),
         SettingsProbe::Unreadable(e) => check(
@@ -2377,14 +2675,14 @@ fn claude_checks(
         check(
             "claude.observed",
             "Hooks reaching Roost",
-            Status::Info,
+            Status::Skipped,
             "the selected tab is owned by `claude`, but it is not the tab doctor is running in",
         )
     } else {
         check(
             "claude.observed",
             "Hooks reaching Roost",
-            Status::Info,
+            Status::Skipped,
             match owns {
                 Some(_) => "no claude ownership on the selected tab".to_string(),
                 None => format!(
@@ -2416,7 +2714,7 @@ fn hook_events_check(inputs: &Inputs) -> Check {
     const ID: &str = "claude.hook_events";
     const TITLE: &str = "Registered events";
     if !matches!(inputs.claude_settings, SettingsProbe::Parsed) {
-        return check(ID, TITLE, Status::Info, unparsed_settings_reason(inputs));
+        return check(ID, TITLE, Status::Skipped, unparsed_settings_reason(inputs));
     }
     let missing: Vec<&str> = CLAUDE_HOOK_EVENTS
         .iter()
@@ -2487,7 +2785,7 @@ fn hook_command_check(inputs: &Inputs) -> Check {
     const ID: &str = "claude.hook_command";
     const TITLE: &str = "Hook commands";
     if !matches!(inputs.claude_settings, SettingsProbe::Parsed) {
-        return check(ID, TITLE, Status::Info, unparsed_settings_reason(inputs));
+        return check(ID, TITLE, Status::Skipped, unparsed_settings_reason(inputs));
     }
     if inputs.claude_hook_commands.is_empty() {
         return check(
@@ -2607,50 +2905,287 @@ fn hook_command_check(inputs: &Inputs) -> Check {
 // Renderers
 // ============================================================================
 
-/// Plain text on purpose: no color, no glyphs. The CLI has no color
-/// anywhere, and stable plain text is what makes e2e assertions and
-/// issue-pasting work.
-pub fn render_text(report: &Report) -> String {
-    use std::fmt::Write as _;
+/// When to color. `Auto` is the only mode that probes anything; the
+/// probes themselves live in `main.rs` so [`color_enabled`] stays a pure
+/// function of four explicit inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
 
-    // Status column, then the id column; the docs_url continuation line
-    // indents past both so it hangs under its check.
-    const STATUS_W: usize = 5;
-    const ID_W: usize = 24;
+/// Whether to emit SGR escapes, as a pure function so every combination
+/// is table-testable — the gating *precedence* is the part that is easy
+/// to get wrong, and a crate would bury it behind process-global env
+/// reads.
+///
+/// `NO_COLOR` disables when **present and non-empty**, per
+/// <https://no-color.org/>: `NO_COLOR=` (empty) is not an opt-out.
+pub fn color_enabled(
+    mode: ColorMode,
+    is_tty: bool,
+    no_color: Option<&str>,
+    term: Option<&str>,
+) -> bool {
+    match mode {
+        ColorMode::Never => false,
+        ColorMode::Always => true,
+        ColorMode::Auto => {
+            is_tty && !no_color.is_some_and(|v| !v.is_empty()) && term != Some("dumb")
+        }
+    }
+}
 
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
+/// How the text renderer decorates. `Default` is uncolored, so a test
+/// that does not opt in is asserting on the bytes a pipe would see.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Style {
+    pub color: bool,
+}
+
+impl Style {
+    /// Color goes *around* text already sanitized by
+    /// [`escape_controls`], never inside it — the escapes this adds are
+    /// the renderer's own, and every detail reaching it is escape-free.
+    fn paint(self, sgr: &str, text: &str) -> String {
+        if self.color {
+            format!("{sgr}{text}{RESET}")
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+/// The marker for a rolled-up section or a footer row; see
+/// [`Section::status`] for why `None` is neither a tick nor a cross.
+fn glyph(status: Option<Status>) -> &'static str {
+    match status {
+        Some(Status::Ok) => "✓",
+        Some(Status::Warn) => "!",
+        Some(Status::Fail) => "✗",
+        Some(Status::Skipped) => "–",
+        None => "•",
+    }
+}
+
+fn sgr(status: Option<Status>) -> &'static str {
+    match status {
+        Some(Status::Ok) => GREEN,
+        Some(Status::Warn) => YELLOW,
+        Some(Status::Fail) => RED,
+        Some(Status::Skipped) | None => DIM,
+    }
+}
+
+/// A status marker in its own colour — the [`glyph`]/[`sgr`] pairing that
+/// every summary and footer row opens with.
+fn marker(style: Style, status: Option<Status>) -> String {
+    style.paint(sgr(status), glyph(status))
+}
+
+/// The dim `→ url` continuation both the full view and the footer append.
+fn doc_link(style: Style, url: &str) -> String {
+    style.paint(DIM, &format!("→ {url}"))
+}
+
+/// Rendered text. Plan 003's "no color, no glyphs" is deliberately
+/// reversed (§3.12): it justified plain text with the e2e assertions,
+/// and the e2e is `--json`-only, so nothing outside this module's own
+/// tests reads the layout. Color is TTY-gated by [`color_enabled`] and
+/// applied only around already-escaped strings; the `→`/`—` glyphs are
+/// **not** gated, because they have been unconditional since #260 and an
+/// ASCII fallback would be a promise the rest of the output breaks.
+///
+/// `verbose` picks the view: the default is one rolled-up line per
+/// section (§3.10) — clipped to [`SUMMARY_W`] so "one line" survives a
+/// narrow terminal — and `-v` is the full per-check report, where the
+/// clipped detail is carried whole. Both end in the same footer, and
+/// neither reaches `--json`.
+pub fn render_text(report: &Report, style: Style, verbose: bool) -> String {
     let mut out = String::new();
-    let _ = writeln!(
+    render_header(report, style, verbose, &mut out);
+    if verbose {
+        render_full(report, style, &mut out);
+    } else {
+        render_summary(report, style, &mut out);
+    }
+    render_footer(report, style, &mut out);
+    out
+}
+
+/// The one line both views open on, shared for the same reason the footer
+/// is: two renderers given two chances to spell the program's own name
+/// will eventually spell it two ways. Only the `-v` pointer differs.
+fn render_header(report: &Report, style: Style, verbose: bool, out: &mut String) {
+    let _ = write!(
         out,
         "roostctl doctor — roostctl {}",
         report.roostctl_version
     );
+    if !verbose {
+        let _ = write!(
+            out,
+            " {}",
+            style.paint(DIM, "(run `roostctl doctor -v` for the full report)")
+        );
+    }
+    out.push('\n');
+}
+
+/// `[{glyph}] ` — the marker column every summary row opens with.
+const MARKER_W: usize = 4;
+/// Gap between the title column and the headline.
+const TITLE_GAP: usize = 3;
+/// The whole point of the summary is that it is scannable, and a row
+/// that wraps is not — the `claude.hook_command` and `ui.target` details
+/// run past 200 characters. A **fixed** budget rather than the
+/// terminal's width: [`render_text`] is a pure function, and output that
+/// changes with `$COLUMNS` is neither reproducible nor testable. The
+/// full sentence is one `-v` away, which the header line names.
+const SUMMARY_W: usize = 100;
+
+/// A summary row's two data-dependent column widths: the title field,
+/// widened past the longest title so the headlines line up, and whatever
+/// the fixed budget leaves the headline. Derived rather than
+/// hand-counted so the two cannot drift.
+fn summary_columns(report: &Report) -> (usize, usize) {
+    let title_w = report
+        .sections
+        .iter()
+        .map(|s| s.title.chars().count())
+        .max()
+        .unwrap_or(0)
+        + TITLE_GAP;
+    (title_w, SUMMARY_W.saturating_sub(MARKER_W + title_w))
+}
+
+/// Fit an already-escaped string into `cap` columns, marking any cut
+/// with `…` so a clipped headline is never mistaken for the whole
+/// message. Cutting escaped text cannot forge an escape: the worst a cut
+/// does is leave a partial `\u{00`, which is still ordinary text.
+fn ellipsize(s: &str, cap: usize) -> Cow<'_, str> {
+    // The marker is paid for out of `cap`, so a budget with no room for
+    // it has no room for a clipped string either: emit nothing rather
+    // than a bare `…` one column past the width the row promises.
+    // Unreachable while the section titles are constants, but the
+    // row-width contract should hold by construction, not by luck.
+    if cap == 0 {
+        return Cow::Borrowed("");
+    }
+    match cut_to_chars(s, cap) {
+        // `String::pop` drops a whole character, and the marker spends
+        // one of the budget's columns rather than overrunning it, so a
+        // cut row is exactly `cap` characters wide.
+        Some(mut head) => {
+            head.pop();
+            head.push('…');
+            Cow::Owned(head)
+        }
+        None => Cow::Borrowed(s),
+    }
+}
+
+fn render_summary(report: &Report, style: Style, out: &mut String) {
+    // The marker is painted outside the padded field, or the escape
+    // bytes would count toward the width.
+    let (title_w, headline_w) = summary_columns(report);
+    out.push('\n');
+    for s in &report.sections {
+        let _ = writeln!(
+            out,
+            "[{}] {:<title_w$}{}",
+            marker(style, s.status),
+            s.title,
+            ellipsize(&s.headline, headline_w)
+        );
+    }
+}
+
+fn render_full(report: &Report, style: Style, out: &mut String) {
+    // Status column, then the id column; the docs_url continuation line
+    // indents past both so it hangs under its check. The column shows a
+    // verdict, so it goes blank on `status: None` — not on `kind ==
+    // Observation`, which still prints `skipped` when its subject could
+    // not be observed. Width is sized for that longest word.
+    const STATUS_W: usize = 7;
+    const ID_W: usize = 24;
+
     for section in &report.sections {
         let _ = writeln!(out, "\n{} ({})", section.title, section.scope);
         for c in &section.checks {
+            let word = format!("{:<STATUS_W$}", c.status.map_or("", |s| s.as_str()));
             let _ = writeln!(
                 out,
-                "  {:<STATUS_W$} {:<ID_W$} {}",
-                c.status.as_str(),
+                "  {} {:<ID_W$} {}",
+                style.paint(sgr(c.status), &word),
                 c.id,
                 c.detail
             );
             if let Some(url) = c.docs_url {
-                let _ = writeln!(out, "{:width$}→ {url}", "", width = 3 + STATUS_W + ID_W + 1);
+                let _ = writeln!(
+                    out,
+                    "{:width$}{}",
+                    "",
+                    doc_link(style, url),
+                    width = 3 + STATUS_W + ID_W + 1
+                );
             }
         }
     }
-    let s = report.summary();
+}
+
+/// The one line both views end on. It keeps the exit code and the
+/// exit-codes link the pre-summary footer carried: that link is the only
+/// in-band explanation for why doctor exits 1 when no UI is running.
+/// Rows name **check ids**, not section titles — one section can hold
+/// two different failures, and the id is the stable API a user greps and
+/// pastes. The counts moved to `--json`.
+fn render_footer(report: &Report, style: Style, out: &mut String) {
+    let issues: Vec<&Check> = report.issues().collect();
+    let worst = worst_adverse(issues.iter().filter_map(|c| c.status)).unwrap_or(Status::Ok);
+    let bullet = style.paint(sgr(Some(worst)), "•");
+    let link = style.paint(DIM, &format!("({})", EXIT_CODES_DOC.url));
+    let exit = report.exit_code();
+
+    if issues.is_empty() {
+        let _ = writeln!(out, "\n{bullet} No issues found! — exit {exit} {link}");
+        return;
+    }
+    let noun = if issues.len() == 1 { "issue" } else { "issues" };
     let _ = writeln!(
         out,
-        "\n{} ok, {} warn, {} fail, {} info — exit {} ({})",
-        s.ok,
-        s.warn,
-        s.fail,
-        s.info,
-        report.exit_code(),
-        EXIT_CODES_DOC.url
+        "\n{bullet} {} {noun} found — exit {exit} {link}:",
+        issues.len()
     );
-    out
+    let id_w = issues
+        .iter()
+        .map(|c| c.id.chars().count())
+        .max()
+        .unwrap_or(0);
+    for c in issues {
+        let marker = marker(style, c.status);
+        match c.docs_url {
+            Some(url) => {
+                let _ = writeln!(
+                    out,
+                    "    {marker} {:<id_w$}  {}",
+                    c.id,
+                    doc_link(style, url)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "    {marker} {}", c.id);
+            }
+        }
+    }
 }
 
 /// The JSON shape. `summary` and `exit_code` are methods on [`Report`]
@@ -2671,6 +3206,20 @@ pub fn render_json(report: &Report) -> anyhow::Result<String> {
         summary: report.summary(),
         exit_code: report.exit_code(),
     })?)
+}
+
+/// Exactly the bytes doctor writes to stdout. The one place the two
+/// renderers are chosen between, so `--json`'s independence from `-v`
+/// and `--color` is a property a test can assert rather than a shape
+/// `main.rs` happens to have.
+pub fn render(report: &Report, json: bool, style: Style, verbose: bool) -> anyhow::Result<String> {
+    if json {
+        let mut out = render_json(report)?;
+        out.push('\n');
+        Ok(out)
+    } else {
+        Ok(render_text(report, style, verbose))
+    }
 }
 
 // ============================================================================
@@ -2801,19 +3350,67 @@ mod tests {
             .unwrap_or_else(|| panic!("no check `{id}` in the report"))
     }
 
-    fn status_of(report: &Report, id: &str) -> Status {
+    fn status_of(report: &Report, id: &str) -> Option<Status> {
         find(report, id).status
     }
+
+    /// The full per-check report, uncolored — `-v`, and the view every
+    /// assertion that names a check id is written against. `Style`'s
+    /// `Default` is the uncolored one, so this is also the byte stream a
+    /// pipe sees.
+    fn verbose_text(report: &Report) -> String {
+        render_text(report, Style::default(), true)
+    }
+
+    /// The default view: one rolled-up line per section, uncolored.
+    fn summary_text(report: &Report) -> String {
+        render_text(report, Style::default(), false)
+    }
+
+    /// `assert_eq!(status_of(…), Some(Status::Skipped))` overflows the
+    /// line at most call sites; this keeps each assertion on one line and
+    /// puts the entry's own `detail` in the failure message. `status_of`
+    /// stays for the sites that need `assert_ne!`, `None`, or their own
+    /// loop-variable message.
+    #[track_caller]
+    fn assert_status(report: &Report, id: &str, want: Status) {
+        let c = find(report, id);
+        assert_eq!(c.status, Some(want), "{id}: {}", c.detail);
+    }
+
+    /// The fixed inventory (§3.7): 18 checks + 8 observations.
+    const CHECK_COUNT: usize = 26;
 
     // ------------------------------------------------- applicability (AC 7)
 
     /// AC 7's first half: a machine with no Roost env vars and no Claude
     /// installed is not broken, so the two process-scoped sections carry
-    /// **no verdict at all** — not one `fail`, not one `warn`. The `ui`
-    /// section is excluded on purpose: its whole job is to report that
-    /// nothing is listening.
+    /// **no adverse verdict at all** — not one `fail`, not one `warn` —
+    /// and every check whose subject is absent says `skipped` rather than
+    /// passing silently. The `ui` section is excluded on purpose: its
+    /// whole job is to report that nothing is listening.
+    ///
+    /// Deliberately not "everything is skipped": `shell.login` and
+    /// `claude.binary` are legitimately `ok` on a bare machine whose
+    /// subjects are present and fine. This fixture has neither — the
+    /// three `$SHELL`s are all unusable — so both land on the absent
+    /// list below.
     #[test]
     fn a_bare_environment_never_scores_the_shell_or_claude_sections() {
+        const ABSENT: &[&str] = &[
+            "env.tab_id",
+            "shell.login",
+            "shell.integration",
+            "shell.resources",
+            "shell.marks_feature",
+            "shell.marks_capability",
+            "shell.marks_observed",
+            "claude.binary",
+            "claude.settings",
+            "claude.hook_events",
+            "claude.hook_command",
+            "claude.observed",
+        ];
         for shell in [None, Some("/opt/homebrew/bin/fish"), Some("relative/zsh")] {
             let inputs = Inputs {
                 shell_path: shell.map(str::to_string),
@@ -2826,15 +3423,22 @@ mod tests {
             let report = evaluate(&inputs);
             for section in report.sections.iter().filter(|s| s.id != "ui") {
                 for c in &section.checks {
-                    assert_eq!(
-                        c.status,
-                        Status::Info,
+                    assert!(
+                        !matches!(c.status, Some(Status::Warn | Status::Fail)),
                         "{} scored {:?} in a bare environment ({shell:?}): {}",
                         c.id,
                         c.status,
                         c.detail
                     );
                 }
+            }
+            for id in ABSENT {
+                assert_eq!(
+                    status_of(&report, id),
+                    Some(Status::Skipped),
+                    "{id} ({shell:?}): {}",
+                    find(&report, id).detail
+                );
             }
         }
     }
@@ -2859,11 +3463,11 @@ mod tests {
             .sections
             .iter()
             .flat_map(|s| &s.checks)
-            .filter(|c| c.status == Status::Fail)
+            .filter(|c| c.status == Some(Status::Fail))
             .map(|c| c.id)
             .collect();
-        assert!(failed.is_empty(), "{failed:?}\n{}", render_text(&report));
-        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+        assert!(failed.is_empty(), "{failed:?}\n{}", verbose_text(&report));
+        assert_eq!(report.exit_code(), 0, "{}", verbose_text(&report));
     }
 
     /// F6's regression: an ordinary non-Roost shell is never diagnosed,
@@ -2877,8 +3481,8 @@ mod tests {
             ..Inputs::default()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "shell.marks_capability"), Status::Info);
-        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+        assert_status(&report, "shell.marks_capability", Status::Skipped);
+        assert_status(&report, "shell.marks_observed", Status::Skipped);
 
         // …and the same shell inside a tab still warns, so the degrade is
         // applicability, not a hole.
@@ -2888,10 +3492,7 @@ mod tests {
             resources_script: None,
             ..healthy()
         };
-        assert_eq!(
-            status_of(&evaluate(&in_tab), "shell.marks_capability"),
-            Status::Warn
-        );
+        assert_status(&evaluate(&in_tab), "shell.marks_capability", Status::Warn);
     }
 
     #[test]
@@ -2903,7 +3504,7 @@ mod tests {
             env_shell_integration: Some("1".into()),
             ..Inputs::default()
         };
-        assert_eq!(status_of(&evaluate(&inputs), "env.tab_id"), Status::Fail);
+        assert_status(&evaluate(&inputs), "env.tab_id", Status::Fail);
 
         // A set-but-unusable value is broken wherever it came from.
         for bad in ["0", "-3", "abc"] {
@@ -2915,17 +3516,14 @@ mod tests {
                 };
                 assert_eq!(
                     status_of(&evaluate(&inputs), "env.tab_id"),
-                    Status::Fail,
+                    Some(Status::Fail),
                     "ROOST_TAB_ID={bad:?} in_tab={in_tab}"
                 );
             }
         }
 
         // Outside a tab an unset id is an observation, not a fault.
-        assert_eq!(
-            status_of(&evaluate(&Inputs::default()), "env.tab_id"),
-            Status::Info
-        );
+        assert_status(&evaluate(&Inputs::default()), "env.tab_id", Status::Skipped);
     }
 
     /// `ROOST_SOCKET` and `ROOST_TAB_ID` are documented user-settable
@@ -2959,17 +3557,17 @@ mod tests {
             let failed: Vec<&str> = shell
                 .checks
                 .iter()
-                .filter(|c| c.status == Status::Fail)
+                .filter(|c| c.status == Some(Status::Fail))
                 .map(|c| c.id)
                 .collect();
-            assert!(failed.is_empty(), "{failed:?}\n{}", render_text(&report));
-            assert_ne!(status_of(&report, "env.tab_id"), Status::Fail);
+            assert!(failed.is_empty(), "{failed:?}\n{}", verbose_text(&report));
+            assert_ne!(status_of(&report, "env.tab_id"), Some(Status::Fail));
         }
     }
 
     /// `--tab` selects which tab to inspect; it does not make the
     /// invoking shell a Roost shell, so the process-scoped checks stay
-    /// `info`.
+    /// `skipped`.
     #[test]
     fn an_explicit_tab_flag_does_not_make_the_process_a_roost_tab() {
         let inputs = Inputs {
@@ -2977,8 +3575,8 @@ mod tests {
             ..Inputs::default()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "env.tab_id"), Status::Info);
-        assert_eq!(status_of(&report, "shell.integration"), Status::Info);
+        assert_status(&report, "env.tab_id", Status::Skipped);
+        assert_status(&report, "shell.integration", Status::Skipped);
     }
 
     // ------------------------------------------------------------- sockets
@@ -3006,7 +3604,7 @@ mod tests {
                 ..Inputs::default()
             };
             let check = find(&evaluate(&inputs), "ui.socket").clone();
-            assert_eq!(check.status, want, "{needle}");
+            assert_eq!(check.status, Some(want), "{needle}");
             assert!(check.detail.contains(needle), "{}", check.detail);
             assert!(
                 details.insert(check.detail),
@@ -3040,7 +3638,7 @@ mod tests {
         let detail = &find(&report, "ui.socket").detail;
         assert!(detail.contains("mac /mac/roost.sock: missing"), "{detail}");
         assert!(detail.contains("gtk /gtk/roost.sock: stale"), "{detail}");
-        assert_eq!(status_of(&report, "ui.target"), Status::Fail);
+        assert_status(&report, "ui.target", Status::Fail);
     }
 
     // -------------------------------------------- old server / zero tabs
@@ -3056,7 +3654,7 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "ui.agent_model"), Status::Fail);
+        assert_status(&report, "ui.agent_model", Status::Fail);
         for id in [
             "tab.shell_state",
             "tab.agent_lifecycle",
@@ -3066,7 +3664,11 @@ mod tests {
             "tab.raw_osc",
         ] {
             let c = find(&report, id);
-            assert_eq!(c.status, Status::Info, "{id}");
+            // An observation that could not be observed: `skipped` is
+            // what makes "unavailable" machine-readable rather than a
+            // sentence a consumer has to parse out of `detail`.
+            assert_eq!(c.kind, Kind::Observation, "{id}");
+            assert_eq!(c.status, Some(Status::Skipped), "{id}");
             assert!(
                 c.detail.contains("predates the agent state model"),
                 "{id}: {}",
@@ -3074,15 +3676,15 @@ mod tests {
             );
         }
         // Blaming the shell for the server's age would be wrong.
-        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+        assert_status(&report, "shell.marks_observed", Status::Skipped);
         // The selection itself is still knowable from a legacy tab.list.
-        assert_eq!(status_of(&report, "tab.selection"), Status::Info);
+        assert_status(&report, "tab.selection", Status::Ok);
         // `claude.observed` reads the same `ownership` field, so it has
         // to degrade with it: `tab.ownership` reporting `unavailable`
         // while `claude.observed` asserts "no claude ownership" six lines
         // later states as an observation something the server never sent.
         let observed = find(&report, "claude.observed");
-        assert_eq!(observed.status, Status::Info);
+        assert_eq!(observed.status, Some(Status::Skipped));
         assert!(
             observed.detail.contains("predates the agent state model"),
             "{}",
@@ -3110,7 +3712,7 @@ mod tests {
             "claude.observed",
         ] {
             let c = find(&report, id);
-            assert_eq!(c.status, Status::Info, "{id}");
+            assert_eq!(c.status, Some(Status::Skipped), "{id}");
             assert!(
                 c.detail.contains("predates the agent state model"),
                 "{id}: {}",
@@ -3138,20 +3740,17 @@ mod tests {
         };
         let report = evaluate(&inputs);
         let c = find(&report, "ui.agent_model");
-        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.status, Some(Status::Skipped));
         assert!(c.detail.contains("undetermined"), "{}", c.detail);
     }
 
     #[test]
     fn a_current_server_passes_the_agent_model() {
-        assert_eq!(
-            status_of(&evaluate(&healthy()), "ui.agent_model"),
-            Status::Ok
-        );
+        assert_status(&evaluate(&healthy()), "ui.agent_model", Status::Ok);
     }
 
     /// A `tab.list` that does not decode is a protocol failure, not an
-    /// empty tab list. Laundering it into `info: undetermined` reported a
+    /// empty tab list. Laundering it into `skipped: undetermined` reported a
     /// broken server as a healthy UI with nothing open — and exited 0.
     #[test]
     fn a_malformed_tab_list_is_a_protocol_failure_not_no_tabs() {
@@ -3168,21 +3767,21 @@ mod tests {
             };
             let report = evaluate(&inputs);
             let c = find(&report, "ui.agent_model");
-            assert_eq!(c.status, Status::Fail, "{malformed}: {}", c.detail);
+            assert_eq!(c.status, Some(Status::Fail), "{malformed}: {}", c.detail);
             assert!(!c.detail.contains("no tabs"), "{}", c.detail);
             assert_eq!(report.exit_code(), 1, "{malformed}");
             // …and the tab section says why rather than fabricating.
             let axis = find(&report, "tab.shell_state");
-            assert_eq!(axis.status, Status::Info);
+            assert_eq!(axis.status, Some(Status::Skipped));
             assert!(axis.detail.contains("did not decode"), "{}", axis.detail);
         }
-        // A genuinely empty list stays `info` — the two must not merge.
+        // A genuinely empty list stays `skipped` — the two must not merge.
         let empty = Inputs {
             tab_list: Ok(tab_list(&[])),
             identify: Ok(identify(0, env!("CARGO_PKG_VERSION"))),
             ..healthy()
         };
-        assert_eq!(status_of(&evaluate(&empty), "ui.agent_model"), Status::Info);
+        assert_status(&evaluate(&empty), "ui.agent_model", Status::Skipped);
     }
 
     /// Both axes are probed, not just `shell_state`: a tab carrying one
@@ -3203,10 +3802,10 @@ mod tests {
             let report = evaluate(&inputs);
             assert_eq!(
                 status_of(&report, "ui.agent_model"),
-                Status::Fail,
+                Some(Status::Fail),
                 "only `{present}` present"
             );
-            assert_eq!(status_of(&report, "tab.agent_lifecycle"), Status::Info);
+            assert_status(&report, "tab.agent_lifecycle", Status::Skipped);
             assert!(find(&report, "tab.agent_lifecycle")
                 .detail
                 .contains("predates the agent state model"));
@@ -3225,7 +3824,7 @@ mod tests {
             ..healthy()
         };
         let c = find(&evaluate(&inputs), "shell.marks_capability").clone();
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.status, Some(Status::Warn));
         assert!(c.detail.contains("3.2"), "{}", c.detail);
         assert!(c.docs_url.is_some());
     }
@@ -3243,14 +3842,11 @@ mod tests {
             };
             assert_eq!(
                 status_of(&evaluate(&inputs), "shell.marks_capability"),
-                Status::Ok,
+                Some(Status::Ok),
                 "{banner}"
             );
         }
-        assert_eq!(
-            status_of(&evaluate(&healthy()), "shell.marks_capability"),
-            Status::Ok
-        );
+        assert_status(&evaluate(&healthy()), "shell.marks_capability", Status::Ok);
     }
 
     #[test]
@@ -3265,12 +3861,12 @@ mod tests {
         let report = evaluate(&inputs);
         assert_eq!(
             status_of(&report, "shell.marks_capability"),
-            Status::Warn,
+            Some(Status::Warn),
             "{}",
-            render_text(&report)
+            verbose_text(&report)
         );
         let resources = find(&report, "shell.resources");
-        assert_eq!(resources.status, Status::Info);
+        assert_eq!(resources.status, Some(Status::Skipped));
         assert!(resources.detail.contains("not applicable"));
     }
 
@@ -3282,10 +3878,7 @@ mod tests {
             resources_script_readable: false,
             ..healthy()
         };
-        assert_eq!(
-            status_of(&evaluate(&inputs), "shell.resources"),
-            Status::Fail
-        );
+        assert_status(&evaluate(&inputs), "shell.resources", Status::Fail);
     }
 
     #[test]
@@ -3294,10 +3887,7 @@ mod tests {
             resources_script_readable: false,
             ..healthy()
         };
-        assert_eq!(
-            status_of(&evaluate(&inputs), "shell.resources"),
-            Status::Fail
-        );
+        assert_status(&evaluate(&inputs), "shell.resources", Status::Fail);
     }
 
     #[test]
@@ -3308,8 +3898,8 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "shell.login"), Status::Warn);
-        assert_eq!(status_of(&report, "shell.marks_capability"), Status::Info);
+        assert_status(&report, "shell.login", Status::Warn);
+        assert_status(&report, "shell.marks_capability", Status::Skipped);
         assert!(find(&report, "shell.login").docs_url.is_some());
     }
 
@@ -3321,7 +3911,7 @@ mod tests {
             shell_version: SubprocessOutcome::Skipped,
             ..healthy()
         };
-        assert_eq!(status_of(&evaluate(&inputs), "shell.login"), Status::Warn);
+        assert_status(&evaluate(&inputs), "shell.login", Status::Warn);
     }
 
     #[test]
@@ -3330,10 +3920,7 @@ mod tests {
             env_shell_integration: None,
             ..healthy()
         };
-        assert_eq!(
-            status_of(&evaluate(&inputs), "shell.integration"),
-            Status::Fail
-        );
+        assert_status(&evaluate(&inputs), "shell.integration", Status::Fail);
     }
 
     // ---------------------------------------------------- marks observed
@@ -3348,14 +3935,14 @@ mod tests {
             ..healthy()
         };
         let c = find(&evaluate(&inputs), "shell.marks_observed").clone();
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.docs_url.is_some());
     }
 
     #[test]
     fn at_prompt_with_a_capable_shell_is_ok_and_names_the_race() {
         let c = find(&evaluate(&healthy()), "shell.marks_observed").clone();
-        assert_eq!(c.status, Status::Ok);
+        assert_eq!(c.status, Some(Status::Ok));
         assert!(
             c.detail.contains("healthy resting state"),
             "the detail must not imply a fault: {}",
@@ -3375,10 +3962,7 @@ mod tests {
             shell_version: SubprocessOutcome::Output("GNU bash, version 3.2.57(1)-release".into()),
             ..healthy()
         };
-        assert_eq!(
-            status_of(&evaluate(&inputs), "shell.marks_observed"),
-            Status::Warn
-        );
+        assert_status(&evaluate(&inputs), "shell.marks_observed", Status::Warn);
     }
 
     #[test]
@@ -3390,10 +3974,7 @@ mod tests {
             }])),
             ..healthy()
         };
-        assert_eq!(
-            status_of(&evaluate(&inputs), "shell.marks_observed"),
-            Status::Ok
-        );
+        assert_status(&evaluate(&inputs), "shell.marks_observed", Status::Ok);
     }
 
     /// The correlation rule of §3.2: a tab sitting at a prompt is exactly
@@ -3413,12 +3994,12 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
-        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+        assert_status(&report, "shell.marks_observed", Status::Skipped);
+        assert_eq!(report.exit_code(), 0, "{}", verbose_text(&report));
     }
 
     #[test]
-    fn no_marks_downgrades_both_marks_checks_to_info() {
+    fn no_marks_downgrades_both_marks_checks_to_skipped() {
         let inputs = Inputs {
             env_shell_features: Some("cwd,title,no-marks,prompt".into()),
             tab_list: Ok(tab_list(&[Tab {
@@ -3428,8 +4009,8 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "shell.marks_feature"), Status::Info);
-        assert_eq!(status_of(&report, "shell.marks_observed"), Status::Info);
+        assert_status(&report, "shell.marks_feature", Status::Skipped);
+        assert_status(&report, "shell.marks_observed", Status::Skipped);
         assert_eq!(report.exit_code(), 0);
     }
 
@@ -3443,7 +4024,7 @@ mod tests {
         };
         let report = evaluate(&inputs);
         let c = find(&report, "tab.selection");
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("--tab"), "{}", c.detail);
         assert_eq!(report.exit_code(), 1);
     }
@@ -3469,7 +4050,7 @@ mod tests {
         ] {
             let report = evaluate(&inputs);
             let c = find(&report, "tab.selection");
-            assert_eq!(c.status, Status::Info, "{needle}");
+            assert_eq!(c.status, Some(Status::Ok), "{needle}");
             assert!(c.detail.contains(needle), "{}", c.detail);
         }
     }
@@ -3496,11 +4077,13 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "tab.agent_lifecycle"), Status::Info);
-        assert!(find(&report, "tab.agent_lifecycle")
-            .detail
-            .contains("failed"));
-        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+        let c = find(&report, "tab.agent_lifecycle");
+        // A resolved axis is a fact: `failed` is what the agent reported,
+        // not a verdict on the user's setup.
+        assert_eq!(c.kind, Kind::Observation);
+        assert_eq!(c.status, None);
+        assert!(c.detail.contains("failed"));
+        assert_eq!(report.exit_code(), 0, "{}", verbose_text(&report));
     }
 
     /// AC 4 — when nothing drives the tab, say which axis is empty.
@@ -3590,12 +4173,12 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "ui.identify"), Status::Ok);
+        assert_status(&report, "ui.identify", Status::Ok);
         let model = find(&report, "ui.agent_model");
-        assert_eq!(model.status, Status::Info);
+        assert_eq!(model.status, Some(Status::Skipped));
         assert!(model.detail.contains("tab.list failed"), "{}", model.detail);
         // A tab section with no list is unavailable, not fabricated.
-        assert_eq!(status_of(&report, "tab.shell_state"), Status::Info);
+        assert_status(&report, "tab.shell_state", Status::Skipped);
     }
 
     /// `client.rs` keeps `Protocol` and `Io` apart deliberately; doctor
@@ -3623,7 +4206,7 @@ mod tests {
         assert_ne!(p, i);
         assert_ne!(i, t);
         for inputs in [&protocol, &io, &timeout] {
-            assert_eq!(status_of(&evaluate(inputs), "ui.identify"), Status::Fail);
+            assert_status(&evaluate(inputs), "ui.identify", Status::Fail);
         }
     }
 
@@ -3635,9 +4218,9 @@ mod tests {
         };
         let report = evaluate(&inputs);
         let c = find(&report, "ui.version");
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.status, Some(Status::Warn));
         assert!(c.docs_url.is_some());
-        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+        assert_eq!(report.exit_code(), 0, "{}", verbose_text(&report));
     }
 
     // ------------------------------------------------------------- claude
@@ -3674,9 +4257,9 @@ mod tests {
     fn a_fully_installed_claude_passes() {
         let report = evaluate(&configured(hook_commands(&["/usr/local/bin/roostctl"])));
         for id in ["claude.binary", "claude.settings", "claude.hook_events"] {
-            assert_eq!(status_of(&report, id), Status::Ok, "{id}");
+            assert_status(&report, id, Status::Ok);
         }
-        assert_eq!(status_of(&report, "claude.hook_command"), Status::Ok);
+        assert_status(&report, "claude.hook_command", Status::Ok);
     }
 
     /// The one token `EventKind::parse` used to reject. Every already
@@ -3694,9 +4277,10 @@ mod tests {
                 ]);
             }
         }
-        assert_eq!(
-            status_of(&evaluate(&configured(commands)), "claude.hook_command"),
-            Status::Ok
+        assert_status(
+            &evaluate(&configured(commands)),
+            "claude.hook_command",
+            Status::Ok,
         );
     }
 
@@ -3709,7 +4293,7 @@ mod tests {
             "Stop".into(),
         ]);
         let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("not its key"), "{}", c.detail);
         assert!(c.docs_url.is_some());
     }
@@ -3720,7 +4304,7 @@ mod tests {
         commands[0].exe_executable = false;
         commands[0].exe_canonical = None;
         let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("not executable"), "{}", c.detail);
     }
 
@@ -3731,7 +4315,7 @@ mod tests {
             "claude.hook_command",
         )
         .clone();
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.status, Some(Status::Warn));
         assert!(c.detail.contains("/opt/other/roostctl"), "{}", c.detail);
     }
 
@@ -3773,7 +4357,7 @@ mod tests {
             "not-an-event".into(),
         ]);
         let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("does not parse"), "{}", c.detail);
         assert!(c.detail.contains("is not a hook event"), "{}", c.detail);
         // Two events, two reasons — each named individually, no grouping.
@@ -3785,9 +4369,10 @@ mod tests {
         let mut commands = hook_commands(&["/usr/local/bin/roostctl"]);
         commands[0].argv = None;
         commands[0].raw = "'/unterminated claude-hook SessionStart".into();
-        assert_eq!(
-            status_of(&evaluate(&configured(commands)), "claude.hook_command"),
-            Status::Fail
+        assert_status(
+            &evaluate(&configured(commands)),
+            "claude.hook_command",
+            Status::Fail,
         );
     }
 
@@ -3802,9 +4387,9 @@ mod tests {
             .collect();
         let report = evaluate(&configured(commands));
         // The keys really are all there.
-        assert_eq!(status_of(&report, "claude.hook_events"), Status::Ok);
+        assert_status(&report, "claude.hook_events", Status::Ok);
         let c = find(&report, "claude.hook_command");
-        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert_eq!(c.status, Some(Status::Fail), "{}", c.detail);
         assert!(c.detail.contains("StopFailure"), "{}", c.detail);
         assert!(c.detail.contains("--force"), "{}", c.detail);
         assert!(c.docs_url.is_some());
@@ -3818,7 +4403,7 @@ mod tests {
         commands[0].exe_executable = false;
         commands[0].exe_canonical = None;
         let c = find(&evaluate(&configured(commands)), "claude.hook_command").clone();
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("not executable"), "{}", c.detail);
         assert!(
             c.detail.contains(CLAUDE_HOOK_EVENTS[0]),
@@ -3838,7 +4423,7 @@ mod tests {
             ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
         };
         let c = find(&evaluate(&inputs), "claude.hook_events").clone();
-        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.status, Some(Status::Fail));
         assert!(c.detail.contains("StopFailure"), "{}", c.detail);
         assert!(c.detail.contains("--force"), "{}", c.detail);
     }
@@ -3857,11 +4442,11 @@ mod tests {
                 ..healthy()
             };
             let report = evaluate(&inputs);
-            assert_eq!(status_of(&report, "claude.settings"), Status::Fail);
-            // Nothing parsed, so the two downstream checks are `info`
-            // rather than piling on.
-            assert_eq!(status_of(&report, "claude.hook_events"), Status::Info);
-            assert_eq!(status_of(&report, "claude.hook_command"), Status::Info);
+            assert_status(&report, "claude.settings", Status::Fail);
+            // Nothing parsed, so the two downstream checks are
+            // `skipped` rather than piling on.
+            assert_status(&report, "claude.hook_events", Status::Skipped);
+            assert_status(&report, "claude.hook_command", Status::Skipped);
         }
     }
 
@@ -3883,12 +4468,12 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "claude.settings"), Status::Fail);
-        assert_eq!(status_of(&report, "claude.observed"), Status::Ok);
+        assert_status(&report, "claude.settings", Status::Fail);
+        assert_status(&report, "claude.observed", Status::Ok);
     }
 
     #[test]
-    fn a_slow_claude_binary_warns_while_an_absent_one_informs() {
+    fn a_slow_claude_binary_warns_while_an_absent_one_is_skipped() {
         let slow = Inputs {
             claude_version: SubprocessOutcome::TimedOut,
             claude_settings: SettingsProbe::Parsed,
@@ -3897,7 +4482,7 @@ mod tests {
             ..healthy()
         };
         let c = find(&evaluate(&slow), "claude.binary").clone();
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.status, Some(Status::Warn));
         assert!(c.detail.contains("version unknown"), "{}", c.detail);
         assert!(c.docs_url.is_some());
 
@@ -3905,7 +4490,7 @@ mod tests {
             claude_version: SubprocessOutcome::Missing,
             ..slow
         };
-        assert_eq!(status_of(&evaluate(&absent), "claude.binary"), Status::Info);
+        assert_status(&evaluate(&absent), "claude.binary", Status::Skipped);
     }
 
     #[test]
@@ -3925,7 +4510,7 @@ mod tests {
             ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
         };
         let c = find(&evaluate(&inputs), "claude.observed").clone();
-        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.status, Some(Status::Skipped));
         assert!(c.detail.contains("not the tab doctor is running in"));
     }
 
@@ -3940,6 +4525,100 @@ mod tests {
         assert!(out.contains("\\n"), "{out}");
         assert!(out.contains("\\u{001b}"), "{out}");
         assert!(out.contains("\\u{0007}"), "{out}");
+
+        // U+2028/U+2029 are Zl/Zp, not `is_control()`, so they need their own
+        // arm — a paste target that honors them would otherwise get a forged
+        // report line out of a string this function claims to have neutered.
+        let separators = redact("a\u{2028}b\u{2029}c");
+        assert!(!separators.contains('\u{2028}'), "{separators}");
+        assert!(!separators.contains('\u{2029}'), "{separators}");
+        assert!(separators.contains("\\u{2028}"), "{separators}");
+        assert!(separators.contains("\\u{2029}"), "{separators}");
+    }
+
+    /// The bidi half of §3.9's threat model, and the reason the escaping is
+    /// stated as a *category* rather than a list of the characters someone
+    /// happened to try: `Cf` is neither `is_control()` nor whitespace, so a
+    /// raw U+202E RIGHT-TO-LEFT OVERRIDE used to reach the row verbatim.
+    /// GitHub and every browser honor it, which is exactly the paste target
+    /// the policy is written for — `$SHELL=<RLO>bat detceleS ]✗[` reads
+    /// there as `[✗] Selected tab`.
+    #[test]
+    fn format_characters_are_escaped() {
+        // Both endpoints of every range, so a mistyped bound cannot pass,
+        // and both *neighbours* of every range, because escaping a category
+        // must not quietly become escaping its neighbourhood — a legitimate
+        // path has to stay readable in the output that exists to explain it.
+        // Walked off the table rather than hand-listed so a range added
+        // later is covered by construction.
+        for (lo, hi) in FORMAT_RANGES {
+            for cp in [lo, hi] {
+                let c = char::from_u32(cp).unwrap();
+                assert_eq!(redact(&format!("a{c}b")), format!("a\\u{{{cp:04x}}}b"));
+            }
+            // Skip neighbours that are not scalars at all: a future range
+            // starting at U+0000 would underflow, and one bordering the
+            // surrogate block has no neighbour to probe. Both would panic
+            // instead of failing, which defeats the point of walking the
+            // table rather than hand-listing it.
+            for cp in [lo.checked_sub(1), hi.checked_add(1)].into_iter().flatten() {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                assert!(!is_format(c), "U+{cp:04X} is not a format character");
+                // U+2029 borders the bidi range and is escaped by the Zl/Zp
+                // arm, so only the neighbours no other arm claims can be
+                // asserted to reach the output verbatim.
+                if !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}') {
+                    let raw = format!("a{c}b");
+                    assert_eq!(redact(&raw), raw, "U+{cp:04X}");
+                }
+            }
+        }
+        // The ones that carry the attack, by name, so a table that drifted
+        // into covering the wrong block still fails here.
+        for c in [
+            '\u{202e}', '\u{2066}', '\u{2069}', '\u{200b}', '\u{200e}', '\u{feff}', '\u{ad}',
+        ] {
+            assert!(is_format(c), "U+{:04X}", c as u32);
+        }
+        // The blank-rendering scalars belong to `collapse_blanks`, not
+        // here — they are legitimate text in a detail, just not padding in
+        // a headline.
+        for c in ['\u{2800}', '\u{3164}', '\u{115f}', '\u{1160}', '\u{ffa0}'] {
+            assert!(!is_format(c), "U+{:04X}", c as u32);
+        }
+        // Ordinary non-ASCII text, spelled the way a user would have it.
+        for raw in ["/Users/münchen/日本語/bin/zsh", "café ✓ 🐦 — ok"] {
+            assert_eq!(redact(raw), raw);
+        }
+        // Sorted, non-empty and disjoint, so `is_format`'s linear scan is a
+        // table anyone can read against `UnicodeData.txt` rather than a pile.
+        for pair in FORMAT_RANGES.windows(2) {
+            assert!(pair[0].0 <= pair[0].1, "{pair:?}");
+            assert!(pair[0].1 < pair[1].0, "{pair:?}");
+        }
+
+        // End to end, with the review's own repro: the reversal must not
+        // survive into any of the three views.
+        let report = evaluate(&Inputs {
+            shell_path: Some("\u{202e}bat detceleS ]✗[".into()),
+            shell_usable: false,
+            env_shell_integration: None,
+            env_resources_dir: None,
+            ..healthy()
+        });
+        for text in [
+            summary_text(&report),
+            verbose_text(&report),
+            render_json(&report).unwrap(),
+        ] {
+            assert!(
+                !text.contains('\u{202e}'),
+                "a raw RLO reached the output:\n{text}"
+            );
+            assert!(text.contains("\\u{202e}"), "{text}");
+        }
     }
 
     #[test]
@@ -3985,56 +4664,215 @@ mod tests {
     /// convincing forged verdict in output a user pastes into an issue.
     #[test]
     fn every_external_string_is_escaped_not_just_the_agent_fields() {
-        const FORGE: &str = "\n  fail  injected.fake";
-        let sock = PathBuf::from(format!("/tmp/nope{FORGE}"));
-        let inputs = Inputs {
-            target_origin: TargetOrigin::SocketFlag,
-            target_candidates: vec![sock.clone()],
-            target: Ok(sock.clone()),
-            sockets: vec![SocketProbe {
-                path: sock.clone(),
-                profile: None,
-                outcome: SocketOutcome::Missing,
-            }],
-            identify: Ok(IdentifyResult {
-                socket_path: format!("/tmp/s{FORGE}"),
-                app_label: format!("Roost{FORGE}"),
-                app_id: format!("ai.stridelabs{FORGE}"),
-                ui_version: format!("9.9.9{FORGE}"),
-                ..identify(7, "9.9.9")
-            }),
-            resources_script: Some(PathBuf::from(format!("/opt/roost/roost.zsh{FORGE}"))),
-            resources_script_readable: false,
-            claude_settings_path: Some(PathBuf::from(format!("/home/u/settings.json{FORGE}"))),
-            claude_settings: SettingsProbe::Parsed,
-            claude_version: SubprocessOutcome::Output("2.1.220".into()),
-            claude_hook_commands: {
-                let mut c = hook_commands(&["/usr/local/bin/roostctl"]);
-                c[0].exe_canonical = Some(PathBuf::from(format!("/other/roostctl{FORGE}")));
-                c
-            },
-            claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+        // Shaped like a real `-v` row — `{:<7}` status column, two-space
+        // indent — so the assertion below is about escaping rather than
+        // about the forgery missing by a space.
+        const FORGE: &str = "\n  fail    injected.fake";
+        // …and the same trick aimed at the default view, whose rows are
+        // `[✗] Title  headline`. A section line is the *only* thing a
+        // summary reader sees, so a forged one is worth more to an
+        // attacker than a forged check row — and the row above would not
+        // catch it.
+        const SECTION_FORGE: &str = "\n[✗] Roost UI            everything is broken";
+
+        let hostile = |forge: &str| {
+            let sock = PathBuf::from(format!("/tmp/nope{forge}"));
+            Inputs {
+                target_origin: TargetOrigin::SocketFlag,
+                target_candidates: vec![sock.clone()],
+                target: Ok(sock.clone()),
+                sockets: vec![SocketProbe {
+                    path: sock.clone(),
+                    profile: None,
+                    outcome: SocketOutcome::Missing,
+                }],
+                identify: Ok(IdentifyResult {
+                    socket_path: format!("/tmp/s{forge}"),
+                    app_label: format!("Roost{forge}"),
+                    app_id: format!("ai.stridelabs{forge}"),
+                    ui_version: format!("9.9.9{forge}"),
+                    ..identify(7, "9.9.9")
+                }),
+                resources_script: Some(PathBuf::from(format!("/opt/roost/roost.zsh{forge}"))),
+                resources_script_readable: false,
+                claude_settings_path: Some(PathBuf::from(format!("/home/u/settings.json{forge}"))),
+                claude_settings: SettingsProbe::Parsed,
+                claude_version: SubprocessOutcome::Output("2.1.220".into()),
+                claude_hook_commands: {
+                    let mut c = hook_commands(&["/usr/local/bin/roostctl"]);
+                    c[0].exe_canonical = Some(PathBuf::from(format!("/other/roostctl{forge}")));
+                    c
+                },
+                claude_hook_events: CLAUDE_HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+                ..healthy()
+            }
+        };
+
+        for forge in [FORGE, SECTION_FORGE] {
+            let report = evaluate(&hostile(forge));
+            let summary = summary_text(&report);
+            for text in [&verbose_text(&report), &summary] {
+                assert!(
+                    !text.contains(forge),
+                    "a forged report line survived the renderer:\n{text}"
+                );
+                for line in text.lines() {
+                    assert!(
+                        !line.trim_start().starts_with(forge.trim_start()),
+                        "forged line: {line:?}"
+                    );
+                }
+            }
+            // A summary reader sees section lines and nothing else, so
+            // the count of them is the forgery budget.
+            let rows = summary_rows(&summary);
+            assert_eq!(rows.len(), report.sections.len());
+            // The headline is a copy of an already-escaped detail, so it
+            // inherits the escaping rather than adding a surface.
+            for s in &report.sections {
+                assert!(!s.headline.contains('\n'), "{}: {}", s.id, s.headline);
+                assert!(!s.headline.contains('\x1b'), "{}: {}", s.id, s.headline);
+            }
+            // …and the summary's column budget cuts that escaped copy, so
+            // the escaping has to survive the cut too: a clip can leave a
+            // partial `\u{00`, which is still text, but it can never
+            // reassemble a control character or a second line. This
+            // fixture is long enough that the cut is actually exercised.
+            assert!(
+                rows.iter().any(|r| r.ends_with('…')),
+                "the forged fixture no longer exercises the clip:\n{summary}"
+            );
+            for row in &rows {
+                assert!(row.chars().count() <= SUMMARY_W, "{row:?}");
+                assert!(!row.contains('\x1b'), "{row:?}");
+            }
+            // The value is still shown — escaped, not dropped.
+            for id in [
+                "ui.target",
+                "ui.socket",
+                "ui.identify",
+                "claude.settings",
+                "shell.resources",
+                "claude.hook_command",
+            ] {
+                assert!(find(&report, id).detail.contains("\\n"), "{id}");
+            }
+        }
+    }
+
+    /// The third vector in the same battery, and the one the two above
+    /// cannot reach: a blank cell is **not** a control character, so
+    /// `escape_controls` passes a run of them through untouched and the
+    /// row-counting assertions see one logical line. A long enough run
+    /// positions the text after it at the exact column a narrow terminal
+    /// wraps a `SUMMARY_W` row — codex's repro aims `[✗] Selected tab` at
+    /// column 80 — and the wrapped remainder reads as a real section line.
+    #[test]
+    fn a_padded_headline_cannot_be_aimed_at_a_terminals_wrap_column() {
+        // The blank definition first, because the escaping and the
+        // collapse have to compose in exactly one direction.
+        assert_eq!(collapse_blanks("  a   b  "), "a b");
+        // Unicode `White_Space`, not just `' '`: NBSP, the en quad and the
+        // ideographic space all pad, and U+2028 is a line separator that
+        // `char::is_control` does not cover.
+        assert_eq!(collapse_blanks("a\u{a0}\u{2003}\u{3000}b"), "a b");
+        assert_eq!(collapse_blanks("a\u{2028}\u{2029}b"), "a b");
+        // …and *wider* than `White_Space`, which is what the first round of
+        // this fix got wrong: U+2800 BRAILLE PATTERN BLANK is `So` and the
+        // Hangul fillers are `Lo`, so neither `char::is_whitespace` nor
+        // `char::is_control` sees them, yet every terminal font draws them
+        // as an empty cell — a 1:1 substitute for the space.
+        assert_eq!(collapse_blanks("a\u{2800}\u{2800}\u{2800}b"), "a b");
+        assert_eq!(collapse_blanks("a\u{3164}\u{115f}\u{1160}\u{ffa0}b"), "a b");
+        assert_eq!(collapse_blanks("a\u{180e}b"), "a b");
+        // …and what the escaping already rewrote is *text*: `\t` is a
+        // backslash and a `t`, neither of which is blank, so a collapse
+        // cannot eat an escape or fuse it to its neighbour.
+        assert_eq!(collapse_blanks(&escape_controls("a\tb")), "a\\tb");
+        assert_eq!(collapse_blanks(&escape_controls("a\n\nb")), "a\\n\\nb");
+
+        // Codex's repro in shape: outside a Roost tab an unusable `$SHELL`
+        // is `shell.login`'s skipped detail, which is the section headline.
+        const FORGED: &str = "[✗] Selected tab";
+        let hostile = |pad: char, n: usize| Inputs {
+            shell_path: Some(format!("{}{FORGED}", String::from(pad).repeat(n))),
+            shell_usable: false,
+            env_shell_integration: None,
+            env_resources_dir: None,
             ..healthy()
         };
-        let report = evaluate(&inputs);
-        let text = render_text(&report);
-        assert!(
-            !text.contains(FORGE),
-            "a forged report line survived the renderer:\n{text}"
-        );
-        for line in text.lines() {
+        let row_for = |pad: char, n: usize| {
+            let report = evaluate(&hostile(pad, n));
+            let summary = summary_text(&report);
+            summary_rows(&summary)
+                .into_iter()
+                .find(|r| r.contains("$SHELL="))
+                .unwrap_or_else(|| panic!("no shell row in:\n{summary}"))
+                .to_string()
+        };
+
+        // Every scalar that pads, not just the ones Unicode calls
+        // whitespace. U+180E is deliberately absent: it is `Cf`, so
+        // `escape_controls` rewrites it to an 8-character escape before a
+        // headline exists (`format_characters_are_escaped` covers it), and
+        // 49 of those trip `redact`'s cap — a different neutralization, not
+        // this one.
+        for pad in [
+            ' ', '\u{a0}', '\u{2003}', '\u{3000}', '\u{2800}', '\u{3164}', '\u{115f}', '\u{1160}',
+            '\u{ffa0}',
+        ] {
+            let label = format!("pad U+{:04X}", pad as u32);
+            // The whole attack is aim, so the property that kills it is
+            // that the padding width no longer moves anything: 49 pads
+            // (aimed at an 80-column wrap) and 89 (aimed at 120) render one
+            // same row. Both stay under `MAX_DISPLAY_CHARS`, or `redact`
+            // would truncate one of them and the rows would differ for an
+            // unrelated reason.
+            assert_eq!(row_for(pad, 49), row_for(pad, 89), "{label}");
+
+            let report = evaluate(&hostile(pad, 49));
+            let row = row_for(pad, 49);
+            let (title_w, _) = summary_columns(&report);
+            let headline: Vec<char> = row.chars().skip(MARKER_W + title_w).collect();
             assert!(
-                !line.trim_start().starts_with("fail  injected"),
-                "forged line: {line:?}"
+                !headline
+                    .windows(2)
+                    .any(|w| w.iter().all(|c| renders_blank(*c))),
+                "{label}: a padding run survived past the title column: {headline:?}"
+            );
+            assert!(row.chars().count() <= SUMMARY_W, "{label}: {row:?}");
+
+            // And with the padding gone the forged marker sits at a column
+            // fixed by the real prose, which no common terminal wraps at.
+            let at = row.find(FORGED).unwrap_or_else(|| {
+                panic!("{label}: the fixture no longer carries the forgery: {row:?}")
+            });
+            let col = row[..at].chars().count();
+            for w in [40, 60, 80, 100, 120, 132] {
+                assert_ne!(col % w, 0, "{label}: forgery aimed at a {w}-column wrap");
+            }
+
+            // `detail` is untouched, which is the point of collapsing the
+            // headline only: `-v` and `--json` still report what `$SHELL`
+            // actually is, padding and all.
+            let raw_pad = String::from(pad).repeat(49);
+            assert!(
+                find(&report, "shell.login").detail.contains(&raw_pad),
+                "{label}"
+            );
+            assert!(verbose_text(&report).contains(&raw_pad), "{label}");
+            let json = render_json(&report).unwrap();
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&json).unwrap()["sections"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| s["checks"].as_array().unwrap())
+                    .any(|c| c["id"] == "shell.login"
+                        && c["detail"].as_str().unwrap().contains(&raw_pad)),
+                "{label}"
             );
         }
-        // The value is still shown — escaped, not dropped.
-        assert!(find(&report, "ui.target").detail.contains("\\n"));
-        assert!(find(&report, "ui.socket").detail.contains("\\n"));
-        assert!(find(&report, "ui.identify").detail.contains("\\n"));
-        assert!(find(&report, "claude.settings").detail.contains("\\n"));
-        assert!(find(&report, "shell.resources").detail.contains("\\n"));
-        assert!(find(&report, "claude.hook_command").detail.contains("\\n"));
     }
 
     /// F8: an unavailable `$HOME` means the settings location is unknown,
@@ -4049,13 +4887,13 @@ mod tests {
         };
         let report = evaluate(&inputs);
         let c = find(&report, "claude.settings");
-        assert_eq!(c.status, Status::Info);
+        assert_eq!(c.status, Some(Status::Skipped));
         assert!(c.detail.contains("$HOME"), "{}", c.detail);
         assert!(!c.detail.contains(".config/roost"), "{}", c.detail);
         for id in ["claude.hook_events", "claude.hook_command"] {
-            assert_eq!(status_of(&report, id), Status::Info, "{id}");
+            assert_status(&report, id, Status::Skipped);
         }
-        assert_eq!(report.exit_code(), 0, "{}", render_text(&report));
+        assert_eq!(report.exit_code(), 0, "{}", verbose_text(&report));
     }
 
     #[test]
@@ -4115,10 +4953,11 @@ mod tests {
         for section in &report.sections {
             for c in &section.checks {
                 match c.status {
-                    Status::Ok => s.ok += 1,
-                    Status::Warn => s.warn += 1,
-                    Status::Fail => s.fail += 1,
-                    Status::Info => s.info += 1,
+                    Some(Status::Ok) => s.ok += 1,
+                    Some(Status::Warn) => s.warn += 1,
+                    Some(Status::Fail) => s.fail += 1,
+                    Some(Status::Skipped) => s.skipped += 1,
+                    None => s.facts += 1,
                 }
             }
         }
@@ -4131,9 +4970,9 @@ mod tests {
         for inputs in doc_url_battery() {
             let report = evaluate(&inputs);
             let counted = count_statuses(&report);
-            assert_eq!(report.summary(), counted, "{}", render_text(&report));
+            assert_eq!(report.summary(), counted, "{}", verbose_text(&report));
             assert_eq!(
-                counted.ok + counted.warn + counted.fail + counted.info,
+                counted.ok + counted.warn + counted.fail + counted.skipped + counted.facts,
                 report
                     .sections
                     .iter()
@@ -4143,12 +4982,28 @@ mod tests {
             seen.ok += counted.ok;
             seen.warn += counted.warn;
             seen.fail += counted.fail;
-            seen.info += counted.info;
+            seen.skipped += counted.skipped;
+            seen.facts += counted.facts;
         }
         // A battery that never produced a warn or a fail would let the
         // two columns be swapped undetected.
-        for column in [seen.ok, seen.warn, seen.fail, seen.info] {
+        for column in [seen.ok, seen.warn, seen.fail, seen.skipped, seen.facts] {
             assert!(column > 0, "{seen:?} leaves a status column unexercised");
+        }
+    }
+
+    /// §3.13's identity: the five columns partition the whole inventory,
+    /// so a state the summary forgets to count shows up as a hole rather
+    /// than as a quietly missing row.
+    #[test]
+    fn the_summary_partitions_the_whole_inventory() {
+        for inputs in doc_url_battery() {
+            let s = evaluate(&inputs).summary();
+            assert_eq!(
+                s.ok + s.warn + s.fail + s.skipped + s.facts,
+                CHECK_COUNT,
+                "{s:?}"
+            );
         }
     }
 
@@ -4174,7 +5029,7 @@ mod tests {
             ..healthy()
         };
         let report = evaluate(&inputs);
-        let text = render_text(&report);
+        let text = verbose_text(&report);
         let json: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
@@ -4184,12 +5039,44 @@ mod tests {
         assert_eq!(json["summary"]["ok"], s.ok);
         assert_eq!(json["summary"]["warn"], s.warn);
         assert_eq!(json["summary"]["fail"], s.fail);
-        assert_eq!(json["summary"]["info"], s.info);
+        assert_eq!(json["summary"]["skipped"], s.skipped);
+        assert_eq!(json["summary"]["facts"], s.facts);
         assert!(s.warn > 0 && s.fail > 0, "{s:?} does not separate the two");
-        assert!(text.contains(&format!(
-            "{} ok, {} warn, {} fail, {} info",
-            s.ok, s.warn, s.fail, s.info
-        )));
+        // The counts are a `--json`-only surface now (§3.10): the text
+        // footer names the offending ids instead, which is what a user
+        // can act on.
+        assert!(!text.contains("facts"), "{text}");
+
+        // Both axes survive the envelope's `flatten`, and a fact's
+        // `status` key is present-and-null rather than dropped.
+        let entry = |id: &str| {
+            json["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|s| s["checks"].as_array().unwrap())
+                .find(|c| c["id"] == id)
+                .unwrap_or_else(|| panic!("no `{id}` in the json"))
+                .clone()
+        };
+        let fact = entry("shell.current");
+        assert_eq!(fact["kind"], "observation");
+        assert_eq!(fact.get("status"), Some(&serde_json::Value::Null), "{fact}");
+        assert_eq!(entry("ui.identify")["kind"], "check");
+
+        // …and in text that fact prints no status word, with the id
+        // column still lined up under the scored rows above it.
+        let observed_row = text.lines().find(|l| l.contains("shell.current")).unwrap();
+        let scored_row = text.lines().find(|l| l.contains("ui.identify")).unwrap();
+        assert!(
+            observed_row.trim_start().starts_with("shell.current"),
+            "{observed_row:?}"
+        );
+        assert_eq!(
+            observed_row.find("shell.current"),
+            scored_row.find("ui.identify"),
+            "the id column must line up whether or not there is a status word"
+        );
 
         // Every check's redacted detail appears verbatim in both.
         for section in &report.sections {
@@ -4241,8 +5128,654 @@ mod tests {
                 serde_json::from_str(&render_json(&report).unwrap()).expect("valid json");
             assert_eq!(value["schema_version"], SCHEMA_VERSION);
             assert!(value["summary"].is_object());
-            assert!(!render_text(&report).is_empty());
+            assert!(!verbose_text(&report).is_empty());
         }
+    }
+
+    // ------------------------------------------------- roll-up + headline
+
+    /// §3.9's pinned headline entry per section — the one whose detail
+    /// speaks for the section when nothing in it is adverse.
+    const HEADLINE_ENTRIES: &[(&str, &str)] = &[
+        ("env", "env.tab_id"),
+        ("ui", "ui.identify"),
+        ("shell", "shell.marks_observed"),
+        ("tab", "tab.derived"),
+        ("claude", "claude.hook_events"),
+    ];
+
+    fn section_of<'a>(report: &'a Report, id: &str) -> &'a Section {
+        report
+            .sections
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("no section `{id}` in the report"))
+    }
+
+    /// Everything green, including `claude.observed`: a configured Claude
+    /// whose hooks have actually claimed doctor's own tab. `configured()`
+    /// alone leaves that one `skipped`, which would roll the whole
+    /// section up to `–`.
+    fn fully_wired() -> Inputs {
+        Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                ownership: Some(Ownership {
+                    source: "claude".into(),
+                    session_id: "s-1".into(),
+                    last_event_at: 1_700_000_040,
+                    ..Ownership::default()
+                }),
+                ..tab(7)
+            }])),
+            ..configured(hook_commands(&["/usr/local/bin/roostctl"]))
+        }
+    }
+
+    /// A shell that is fine but has no Roost PTY around it: `shell.login`
+    /// stays `ok` while the six in-tab checks skip, so the section's
+    /// first skipped entry is **not** its headline entry.
+    fn usable_shell_outside_a_tab() -> Inputs {
+        Inputs {
+            shell_path: Some("/bin/zsh".into()),
+            shell_usable: true,
+            shell_version: SubprocessOutcome::Output("zsh 5.9 (arm-apple-darwin24.0)".into()),
+            ..Inputs::default()
+        }
+    }
+
+    /// §3.8's roll-up and §3.9's headline, for every section in every
+    /// state it can reach — not just the healthy one. The `id` on the
+    /// right is the entry whose `detail` the headline must copy: the
+    /// worst entry for an adverse roll-up (ties by position), the pinned
+    /// headline entry otherwise.
+    #[test]
+    fn a_section_rolls_up_to_its_worst_entry_and_headlines_it() {
+        let cases: Vec<(&str, Inputs, &str, Option<Status>, &str)> = vec![
+            ("env ok", healthy(), "env", Some(Status::Ok), "env.tab_id"),
+            (
+                "env skipped",
+                Inputs::default(),
+                "env",
+                Some(Status::Skipped),
+                "env.tab_id",
+            ),
+            (
+                "env fail",
+                Inputs {
+                    env_shell_integration: Some("1".into()),
+                    ..Inputs::default()
+                },
+                "env",
+                Some(Status::Fail),
+                "env.tab_id",
+            ),
+            ("ui ok", healthy(), "ui", Some(Status::Ok), "ui.identify"),
+            (
+                "ui warn",
+                Inputs {
+                    identify: Ok(identify(7, "0.0.1")),
+                    ..healthy()
+                },
+                "ui",
+                Some(Status::Warn),
+                "ui.version",
+            ),
+            (
+                "ui skipped",
+                Inputs {
+                    tab_list: Ok(tab_list(&[])),
+                    identify: Ok(identify(0, env!("CARGO_PKG_VERSION"))),
+                    ..healthy()
+                },
+                "ui",
+                Some(Status::Skipped),
+                "ui.agent_model",
+            ),
+            (
+                "ui fail",
+                Inputs::default(),
+                "ui",
+                Some(Status::Fail),
+                "ui.target",
+            ),
+            (
+                "shell ok",
+                healthy(),
+                "shell",
+                Some(Status::Ok),
+                "shell.marks_observed",
+            ),
+            (
+                "shell warn",
+                Inputs {
+                    shell_path: Some("/opt/homebrew/bin/fish".into()),
+                    shell_version: SubprocessOutcome::Output("fish, version 3.7.1".into()),
+                    resources_script: None,
+                    resources_script_readable: false,
+                    ..healthy()
+                },
+                "shell",
+                Some(Status::Warn),
+                "shell.marks_capability",
+            ),
+            (
+                "shell skipped",
+                usable_shell_outside_a_tab(),
+                "shell",
+                Some(Status::Skipped),
+                "shell.integration",
+            ),
+            (
+                "shell fail",
+                Inputs {
+                    env_shell_integration: None,
+                    ..healthy()
+                },
+                "shell",
+                Some(Status::Fail),
+                "shell.integration",
+            ),
+            ("tab observational", healthy(), "tab", None, "tab.derived"),
+            (
+                "tab skipped",
+                Inputs {
+                    tab_list: Ok(legacy_tab_list(&[7])),
+                    ..healthy()
+                },
+                "tab",
+                Some(Status::Skipped),
+                "tab.shell_state",
+            ),
+            (
+                "tab fail",
+                Inputs {
+                    explicit_tab: Some(999),
+                    ..healthy()
+                },
+                "tab",
+                Some(Status::Fail),
+                "tab.selection",
+            ),
+            (
+                "claude ok",
+                fully_wired(),
+                "claude",
+                Some(Status::Ok),
+                "claude.hook_events",
+            ),
+            (
+                "claude warn",
+                configured(hook_commands(&["/opt/other/roostctl"])),
+                "claude",
+                Some(Status::Warn),
+                "claude.hook_command",
+            ),
+            (
+                "claude skipped",
+                healthy(),
+                "claude",
+                Some(Status::Skipped),
+                "claude.binary",
+            ),
+            (
+                "claude fail",
+                configured({
+                    let mut c = hook_commands(&["/usr/local/bin/roostctl"]);
+                    c[0].exe_executable = false;
+                    c[0].exe_canonical = None;
+                    c
+                }),
+                "claude",
+                Some(Status::Fail),
+                "claude.hook_command",
+            ),
+        ];
+
+        let mut covered: Vec<(&str, Option<Status>)> = Vec::new();
+        for (label, inputs, section_id, want_status, want_headline) in cases {
+            let report = evaluate(&inputs);
+            let s = section_of(&report, section_id);
+            assert_eq!(s.status, want_status, "{label}: {}", verbose_text(&report));
+            assert_eq!(
+                s.headline,
+                find(&report, want_headline).detail,
+                "{label}: the headline must copy `{want_headline}`"
+            );
+            covered.push((section_id, want_status));
+        }
+        // Every section reached all three of §3.8's outcomes: adverse
+        // (fail or warn), skipped, and the non-adverse marker.
+        for (section_id, headline_id) in HEADLINE_ENTRIES {
+            // `tab` is the observational section, so its non-adverse
+            // marker is `None`, not a tick (§3.8).
+            let non_adverse = (*section_id != "tab").then_some(Status::Ok);
+            for want in [Some(Status::Skipped), non_adverse] {
+                assert!(
+                    covered.contains(&(*section_id, want)),
+                    "`{section_id}` (headline `{headline_id}`) has no {want:?} case"
+                );
+            }
+            assert!(
+                covered.contains(&(*section_id, Some(Status::Fail)))
+                    || covered.contains(&(*section_id, Some(Status::Warn))),
+                "`{section_id}` has no adverse case"
+            );
+        }
+    }
+
+    /// The anti-synthesis guarantee (§3.9), swept over every fixture the
+    /// suite has: a headline is always **some entry's** `detail`, so it
+    /// inherits that entry's redaction and adds no second source of
+    /// truth. The pick is re-derived here rather than read off the
+    /// production fold — the same hand-rolled-duplicate pattern
+    /// `count_statuses` uses, so the rule has to be changed twice.
+    #[test]
+    fn every_headline_copies_an_entrys_detail_and_never_invents_prose() {
+        for inputs in doc_url_battery() {
+            let report = evaluate(&inputs);
+            assert_eq!(report.sections.len(), HEADLINE_ENTRIES.len());
+            for (s, (section_id, headline_id)) in report.sections.iter().zip(HEADLINE_ENTRIES) {
+                assert_eq!(s.id, *section_id);
+                let want = match s.status {
+                    Some(Status::Fail | Status::Warn | Status::Skipped) => s
+                        .checks
+                        .iter()
+                        .find(|c| c.status == s.status)
+                        .expect("an adverse roll-up names an adverse entry"),
+                    Some(Status::Ok) | None => s
+                        .checks
+                        .iter()
+                        .find(|c| c.id == *headline_id)
+                        .expect("the pinned headline entry"),
+                };
+                assert_eq!(s.headline, want.detail, "section `{}`", s.id);
+                assert!(
+                    s.checks.iter().any(|c| c.detail == s.headline),
+                    "section `{}` headline is not any entry's detail",
+                    s.id
+                );
+            }
+        }
+    }
+
+    /// §3.8's one carve-out, both ways. `tab` grades nothing, so a
+    /// healthy tab section is `•` rather than a green tick — but the
+    /// carve-out is a *default*, not a mute: against a server predating
+    /// the agent model the same section rolls up `–`.
+    #[test]
+    fn the_tab_section_observes_rather_than_grades() {
+        let healthy_report = evaluate(&healthy());
+        let tab = section_of(&healthy_report, "tab");
+        assert_status(&healthy_report, "tab.selection", Status::Ok);
+        assert_eq!(tab.status, None, "an `ok` selection must not tick");
+        assert_eq!(glyph(tab.status), "•");
+        assert!(summary_text(&healthy_report).contains("[•] Selected tab"));
+
+        let old = evaluate(&Inputs {
+            tab_list: Ok(legacy_tab_list(&[7])),
+            ..healthy()
+        });
+        let tab = section_of(&old, "tab");
+        assert_status(&old, "tab.selection", Status::Ok);
+        assert_eq!(tab.status, Some(Status::Skipped));
+        assert_eq!(glyph(tab.status), "–");
+        assert!(summary_text(&old).contains("[–] Selected tab"));
+
+        // Every other section still ticks when it is clean, so `•` is a
+        // property of `tab`, not of the roll-up giving up everywhere.
+        for s in &healthy_report.sections {
+            if s.id != "tab" && s.checks.iter().all(|c| c.status != Some(Status::Skipped)) {
+                assert_eq!(s.status, Some(Status::Ok), "{}", s.id);
+            }
+        }
+    }
+
+    // -------------------------------------------------------- the two views
+
+    /// The default view is one line per section and the footer — no
+    /// per-check rows — while `-v` keeps the full report. Both name the
+    /// same issues (AC 12).
+    #[test]
+    fn the_summary_view_is_one_line_per_section_and_v_is_the_full_report() {
+        let report = evaluate(&Inputs::default());
+        let summary = summary_text(&report);
+        let verbose = verbose_text(&report);
+
+        assert!(summary.contains("run `roostctl doctor -v` for the full report"));
+        for s in &report.sections {
+            assert!(
+                summary.contains(&format!("[{}] {}", glyph(s.status), s.title)),
+                "no `{}` row in:\n{summary}",
+                s.title
+            );
+        }
+        // The section rows carry headlines, not check ids.
+        let rows = summary_rows(&summary);
+        assert_eq!(rows.len(), report.sections.len());
+        for c in report.checks() {
+            assert!(
+                verbose.contains(c.id),
+                "`-v` dropped `{}`:\n{verbose}",
+                c.id
+            );
+        }
+        assert!(
+            !rows.iter().any(|r| r.contains("env.socket")),
+            "the summary must not list per-check rows: {rows:?}"
+        );
+        // Same issues in both, named by id.
+        let issues: Vec<&str> = report
+            .checks()
+            .filter(|c| matches!(c.status, Some(Status::Fail | Status::Warn)))
+            .map(|c| c.id)
+            .collect();
+        assert!(!issues.is_empty());
+        for id in issues {
+            assert!(summary.contains(id), "summary footer lost `{id}`");
+            assert!(verbose.contains(id));
+        }
+    }
+
+    /// The headline column, read the way the renderer reads it.
+    fn summary_headline(report: &Report, row: &str) -> String {
+        let (title_w, _) = summary_columns(report);
+        row.chars().skip(MARKER_W + title_w).collect()
+    }
+
+    fn summary_rows(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| l.starts_with('[')).collect()
+    }
+
+    /// "One line per section" against a real overlong detail:
+    /// `claude.hook_command`'s warn names all six events and two absolute
+    /// paths — past 200 characters in the field, which wraps to three or
+    /// four lines in an 80-column terminal and destroys the scan the
+    /// rolled-up view exists to provide. `-v` and `--json` keep the whole
+    /// sentence, and the header line names `-v`.
+    #[test]
+    fn an_overlong_headline_is_clipped_in_the_summary_but_whole_in_v_and_json() {
+        let report = evaluate(&configured(hook_commands(&["/opt/other/roostctl"])));
+        let claude = section_of(&report, "claude");
+        let (_, headline_w) = summary_columns(&report);
+        assert!(
+            claude.headline.chars().count() > headline_w,
+            "the fixture no longer overflows the budget: {}",
+            claude.headline
+        );
+
+        let summary = summary_text(&report);
+        let rows = summary_rows(&summary);
+        assert_eq!(rows.len(), report.sections.len(), "{summary}");
+        let row = rows
+            .iter()
+            .find(|r| r.starts_with("[!] Claude Code"))
+            .unwrap_or_else(|| panic!("no clipped claude row in:\n{summary}"));
+        assert!(row.ends_with('…'), "a clip must be visible: {row:?}");
+        assert_eq!(row.chars().count(), SUMMARY_W, "{row:?}");
+        // What survived is a prefix of the real thing, not new prose.
+        let shown = summary_headline(&report, row);
+        assert_eq!(shown.chars().count(), headline_w, "{shown:?}");
+        assert!(
+            claude.headline.starts_with(shown.trim_end_matches('…')),
+            "{shown:?}"
+        );
+        // No row overruns the budget, clipped or not.
+        for r in &rows {
+            assert!(r.chars().count() <= SUMMARY_W, "{r:?}");
+        }
+
+        // The full detail is one keystroke away, and machine-readable.
+        assert!(
+            verbose_text(&report).contains(&claude.headline),
+            "`-v` must carry the whole sentence"
+        );
+        let json: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let section = json["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "claude")
+            .unwrap()
+            .clone();
+        assert_eq!(section["headline"], claude.headline);
+        assert_eq!(
+            section["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "claude.hook_command")
+                .unwrap()["detail"],
+            claude.headline
+        );
+    }
+
+    /// The cap is inclusive, and the marker is paid for out of the budget
+    /// rather than added past it — the two off-by-ones a column budget
+    /// invites.
+    #[test]
+    fn the_headline_cap_is_inclusive_and_the_marker_fits_inside_it() {
+        const CAP: usize = 10;
+        for n in [0, 1, CAP - 1, CAP] {
+            let fits = "x".repeat(n);
+            assert_eq!(ellipsize(&fits, CAP), fits, "{n} characters must survive");
+        }
+        let over = "x".repeat(CAP + 1);
+        assert_eq!(ellipsize(&over, CAP), format!("{}…", "x".repeat(CAP - 1)));
+        assert_eq!(ellipsize(&over, CAP).chars().count(), CAP);
+
+        // A budget with no room for the marker emits nothing: pushing `…`
+        // anyway is how a row promised at `SUMMARY_W` comes out one
+        // character wider. Cap 1 spends its single column on the marker.
+        assert_eq!(ellipsize("anything", 0), "");
+        assert_eq!(ellipsize("", 0), "");
+        assert_eq!(ellipsize("ab", 1), "…");
+        assert_eq!(ellipsize("a", 1), "a");
+
+        // End to end, at the width that actually produces a zero budget:
+        // unreachable while the section titles are constants, so the
+        // contract has to hold by construction rather than by luck.
+        let widest = "T".repeat(SUMMARY_W - MARKER_W - TITLE_GAP);
+        let mut report = evaluate(&healthy());
+        report.sections[0].title = Box::leak(widest.into_boxed_str());
+        assert_eq!(summary_columns(&report).1, 0, "the fixture must starve it");
+        for row in summary_rows(&summary_text(&report)) {
+            assert!(row.chars().count() <= SUMMARY_W, "{row:?}");
+        }
+    }
+
+    /// A byte cut would split a `—`, a `→` or an emoji mid-scalar, and
+    /// details carry all three. Asserted on the cut itself and then
+    /// end-to-end, with the multibyte run early enough in the detail to
+    /// land under the budget rather than past it.
+    #[test]
+    fn a_multibyte_headline_clips_on_a_character_boundary() {
+        const CAP: usize = 20;
+        let wide = "—→🎉".repeat(20);
+
+        let cut = ellipsize(&wide, CAP);
+        // Characters, not display columns: the budget counts scalars, so
+        // a double-width emoji spends exactly one of them.
+        assert_eq!(cut.chars().count(), CAP, "{cut:?}");
+        assert!(cut.ends_with('…'), "{cut:?}");
+        assert!(wide.starts_with(cut.trim_end_matches('…')), "{cut:?}");
+
+        let sock = PathBuf::from(format!("/tmp/{wide}.sock"));
+        let report = evaluate(&Inputs {
+            target: Err(TargetFailure::NoLiveTarget(vec![sock.clone()])),
+            target_candidates: vec![sock.clone()],
+            sockets: vec![SocketProbe {
+                path: sock,
+                profile: None,
+                outcome: SocketOutcome::Missing,
+            }],
+            ..Inputs::default()
+        });
+        let ui = section_of(&report, "ui");
+        let (_, headline_w) = summary_columns(&report);
+        let summary = summary_text(&report);
+        let row = summary_rows(&summary)
+            .into_iter()
+            .find(|r| r.starts_with("[✗] Roost UI"))
+            .unwrap_or_else(|| panic!("no ui row in:\n{summary}"));
+        let shown = summary_headline(&report, row);
+        assert_eq!(row.chars().count(), SUMMARY_W, "{row:?}");
+        assert_eq!(shown.chars().count(), headline_w, "{shown:?}");
+        assert!(shown.ends_with('…'), "{shown:?}");
+        // The cut landed inside the multibyte run…
+        assert!(shown.contains('—') && shown.contains('🎉'), "{shown:?}");
+        // …and still produced a whole-character prefix of the untouched
+        // headline, one character short of the budget to pay for the `…`.
+        let head = shown.trim_end_matches('…');
+        assert!(ui.headline.starts_with(head), "{head:?}");
+        assert_eq!(head.chars().count(), headline_w - 1);
+    }
+
+    /// The footer, both ways. It keeps the exit code and the exit-codes
+    /// link the pre-summary footer carried — that link is the only
+    /// in-band explanation for doctor exiting 1 when no UI is running —
+    /// and it names **check ids**, because one section can hold two
+    /// different failures.
+    #[test]
+    fn the_footer_names_the_issues_and_keeps_the_exit_code_and_link() {
+        let clean = evaluate(&fully_wired());
+        assert_eq!(clean.exit_code(), 0);
+        for text in [summary_text(&clean), verbose_text(&clean)] {
+            assert!(text.contains("• No issues found! — exit 0"), "{text}");
+            assert!(text.contains(EXIT_CODES_DOC.url), "{text}");
+        }
+
+        // Two failures inside one section: a footer keyed on section
+        // titles would collapse them into one row.
+        let broken = evaluate(&Inputs::default());
+        assert_eq!(broken.exit_code(), 1);
+        for text in [summary_text(&broken), verbose_text(&broken)] {
+            assert!(
+                text.contains(&format!("issues found — exit 1 ({}):", EXIT_CODES_DOC.url)),
+                "{text}"
+            );
+            for id in ["ui.target", "ui.socket", "ui.identify"] {
+                let row = text
+                    .lines()
+                    .find(|l| l.trim_start().starts_with(&format!("✗ {id}")))
+                    .unwrap_or_else(|| panic!("no footer row for `{id}`:\n{text}"));
+                assert!(row.contains("→ https://"), "{row}");
+            }
+        }
+
+        // Singular reads as English, and a `warn`-only report still
+        // exits 0 while naming the issue.
+        let warned = evaluate(&Inputs {
+            identify: Ok(identify(7, "0.0.1")),
+            ..healthy()
+        });
+        assert_eq!(warned.exit_code(), 0);
+        let text = summary_text(&warned);
+        assert!(text.contains("• 1 issue found — exit 0"), "{text}");
+        assert!(text.contains("! ui.version"), "{text}");
+    }
+
+    // ------------------------------------------------------------- color
+
+    /// The gating precedence, exhaustively — this is the part that is
+    /// easy to get wrong, and the reason it is a pure function of four
+    /// inputs rather than a block that reads the environment.
+    #[test]
+    fn color_gating_follows_mode_then_tty_then_no_color_then_term() {
+        for &is_tty in &[true, false] {
+            for no_color in [None, Some(""), Some("1")] {
+                for term in [None, Some("xterm-256color"), Some("dumb")] {
+                    assert!(
+                        !color_enabled(ColorMode::Never, is_tty, no_color, term),
+                        "never must never color"
+                    );
+                    assert!(
+                        color_enabled(ColorMode::Always, is_tty, no_color, term),
+                        "always bypasses every probe"
+                    );
+                    let want = is_tty && no_color != Some("1") && term != Some("dumb");
+                    assert_eq!(
+                        color_enabled(ColorMode::Auto, is_tty, no_color, term),
+                        want,
+                        "auto tty={is_tty} NO_COLOR={no_color:?} TERM={term:?}"
+                    );
+                }
+            }
+        }
+        // <https://no-color.org/>: "present and not an empty string".
+        // `NO_COLOR=` is not an opt-out, and getting this backwards is
+        // the exact mistake the plan's first draft made.
+        assert!(color_enabled(
+            ColorMode::Auto,
+            true,
+            Some(""),
+            Some("xterm-256color")
+        ));
+        assert!(!color_enabled(
+            ColorMode::Auto,
+            true,
+            Some("0"),
+            Some("xterm-256color")
+        ));
+        assert_eq!(ColorMode::default(), ColorMode::Auto);
+    }
+
+    /// Escapes are the renderer's own and appear only when asked for.
+    /// `Style::default()` is uncolored, so every other test in this file
+    /// is asserting on the bytes a pipe would see.
+    #[test]
+    fn no_escape_survives_an_uncolored_style_and_one_appears_with_color() {
+        let colored = Style { color: true };
+        for inputs in doc_url_battery() {
+            let report = evaluate(&inputs);
+            for verbose in [false, true] {
+                let plain = render_text(&report, Style::default(), verbose);
+                assert!(!plain.contains('\x1b'), "verbose={verbose}:\n{plain}");
+                let painted = render_text(&report, colored, verbose);
+                assert!(painted.contains('\x1b'), "verbose={verbose}");
+                // Color decorates; it never changes the words.
+                assert_eq!(
+                    painted
+                        .replace(GREEN, "")
+                        .replace(YELLOW, "")
+                        .replace(RED, "")
+                        .replace(DIM, "")
+                        .replace(RESET, ""),
+                    plain
+                );
+                // Glyphs are not gated (§3.11): they have been
+                // unconditional since #260, so an ASCII fallback would be
+                // a promise the rest of the output breaks.
+                assert!(plain.contains('—'), "verbose={verbose}");
+            }
+        }
+    }
+
+    /// AC 15: `--json` always carries everything, and neither `-v` nor
+    /// `--color` can reach it.
+    #[test]
+    fn json_is_byte_identical_across_verbose_and_color() {
+        let report = evaluate(&Inputs {
+            identify: Ok(identify(7, "0.0.1")),
+            ..healthy()
+        });
+        let baseline = render(&report, true, Style::default(), false).unwrap();
+        for style in [Style::default(), Style { color: true }] {
+            for verbose in [false, true] {
+                assert_eq!(render(&report, true, style, verbose).unwrap(), baseline);
+            }
+        }
+        assert!(!baseline.contains('\x1b'), "{baseline}");
+        assert!(baseline.ends_with("}\n"), "one trailing newline");
+        // …while the same two knobs demonstrably move the text output,
+        // so the equality above is a property rather than a tautology.
+        assert_ne!(
+            render(&report, false, Style::default(), false).unwrap(),
+            render(&report, false, Style::default(), true).unwrap()
+        );
+        assert_ne!(
+            render(&report, false, Style::default(), false).unwrap(),
+            render(&report, false, Style { color: true }, false).unwrap()
+        );
     }
 
     // ----------------------------------------------------- ids + doc links
@@ -4282,6 +5815,7 @@ mod tests {
             ("claude.hook_command", "Hook commands"),
             ("claude.observed", "Hooks reaching Roost"),
         ];
+        assert_eq!(EXPECTED.len(), CHECK_COUNT);
         // Every fixture the suite has, so a check whose title differs
         // only on a rare arm is still caught.
         let battery = doc_url_battery();
@@ -4293,10 +5827,93 @@ mod tests {
                 .flat_map(|s| &s.checks)
                 .map(|c| (c.id, c.title))
                 .collect();
-            assert_eq!(seen, EXPECTED, "{}", render_text(&report));
+            assert_eq!(seen, EXPECTED, "{}", verbose_text(&report));
             let unique: std::collections::HashSet<&str> = seen.iter().map(|(id, _)| *id).collect();
             assert_eq!(unique.len(), seen.len(), "duplicate check id");
         }
+    }
+
+    /// §3.6's invariant, over every fixture the suite has: a check always
+    /// carries a verdict, and an observation never carries one — only
+    /// `skipped`, which is the absence of a verdict rather than one.
+    /// The three constructors are what enforce it; this is what catches a
+    /// `Check` literal written around them.
+    #[test]
+    fn the_kind_and_status_axes_cannot_disagree() {
+        // Pinned here as well as in the constructors: which ids observe
+        // is a product decision (§3.7), not an implementation detail.
+        const OBSERVATIONS: &[&str] = &[
+            "env.socket",
+            "shell.current",
+            "tab.shell_state",
+            "tab.agent_lifecycle",
+            "tab.attention",
+            "tab.ownership",
+            "tab.derived",
+            "tab.raw_osc",
+        ];
+        for inputs in doc_url_battery() {
+            let report = evaluate(&inputs);
+            for c in report.checks() {
+                let want = if OBSERVATIONS.contains(&c.id) {
+                    Kind::Observation
+                } else {
+                    Kind::Check
+                };
+                assert_eq!(c.kind, want, "{}", c.id);
+                match (c.kind, c.status) {
+                    (Kind::Check, Some(_)) => {}
+                    (Kind::Observation, None | Some(Status::Skipped)) => {}
+                    (kind, status) => {
+                        panic!("{}: {kind:?} carries {status:?}: {}", c.id, c.detail)
+                    }
+                }
+                if c.kind == Kind::Observation {
+                    assert!(c.docs_url.is_none(), "{}", c.id);
+                }
+            }
+            assert_eq!(
+                report
+                    .checks()
+                    .filter(|c| c.kind == Kind::Observation)
+                    .count(),
+                OBSERVATIONS.len()
+            );
+        }
+    }
+
+    /// The wire vocabulary, pinned directly: the text and JSON renderers
+    /// read the same `as_str`, so a rename here is a break for every
+    /// `--json` consumer and for every issue-pasted report.
+    #[test]
+    fn the_status_and_kind_spellings_are_pinned() {
+        for (status, want) in [
+            (Status::Ok, "ok"),
+            (Status::Warn, "warn"),
+            (Status::Fail, "fail"),
+            (Status::Skipped, "skipped"),
+        ] {
+            assert_eq!(status.as_str(), want);
+            assert_eq!(serde_json::to_value(status).unwrap(), want);
+        }
+        for (kind, want) in [(Kind::Check, "check"), (Kind::Observation, "observation")] {
+            assert_eq!(kind.as_str(), want);
+            assert_eq!(serde_json::to_value(kind).unwrap(), want);
+        }
+
+        let json = |c: Check| serde_json::to_value(c).unwrap();
+        let fact = json(observation("x.fact", "Fact", "d"));
+        assert_eq!(fact["kind"], "observation");
+        // Present and null, never omitted: a dropped key is
+        // indistinguishable from an older schema, and a consumer must be
+        // able to read "this is a fact" straight off the field.
+        assert_eq!(fact.get("status"), Some(&serde_json::Value::Null), "{fact}");
+        let gone = json(unavailable("x.gone", "Gone", "why"));
+        assert_eq!(gone["kind"], "observation");
+        assert_eq!(gone["status"], "skipped");
+        let scored = json(check("x.scored", "Scored", Status::Ok, "d"));
+        assert_eq!(scored["kind"], "check");
+        assert_eq!(scored["status"], "ok");
     }
 
     /// The widest spread of `Inputs` the suite has — every degraded
@@ -4395,7 +6012,7 @@ mod tests {
         for inputs in &battery {
             for section in &evaluate(inputs).sections {
                 for c in &section.checks {
-                    if matches!(c.status, Status::Fail | Status::Warn) {
+                    if matches!(c.status, Some(Status::Fail | Status::Warn)) {
                         assert!(
                             c.docs_url.is_some(),
                             "`{}` emitted {:?} with no docs_url — add a DOC_TARGETS row",
@@ -4589,7 +6206,7 @@ mod tests {
             assert_eq!(env_tab_id(&inputs), crate::parse_tab_id(raw), "{raw:?}");
             assert_eq!(
                 status_of(&evaluate(&inputs), "env.tab_id"),
-                Status::Fail,
+                Some(Status::Fail),
                 "ROOST_TAB_ID={raw:?} is a silent no-op for the hook, so doctor must say so"
             );
         }
@@ -4808,8 +6425,8 @@ mod tests {
         assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
 
         let report = evaluate(&inputs);
-        assert_eq!(status_of(&report, "ui.socket"), Status::Ok);
-        assert_eq!(status_of(&report, "ui.identify"), Status::Fail);
+        assert_status(&report, "ui.socket", Status::Ok);
+        assert_status(&report, "ui.identify", Status::Fail);
         // The whole inventory still renders (§3.12).
         assert_eq!(
             report
@@ -4817,9 +6434,9 @@ mod tests {
                 .iter()
                 .map(|s| s.checks.len())
                 .sum::<usize>(),
-            26
+            CHECK_COUNT
         );
-        assert!(render_text(&report).contains("ui.identify"));
+        assert!(verbose_text(&report).contains("ui.identify"));
     }
 
     /// A UI that answers *late* — not never — is the case the hung-UI
@@ -5017,9 +6634,6 @@ mod tests {
             panic!("{:?}", inputs.claude_settings);
         };
         assert!(why.contains("fifo"), "{why}");
-        assert_eq!(
-            status_of(&evaluate(&inputs), "claude.settings"),
-            Status::Fail
-        );
+        assert_status(&evaluate(&inputs), "claude.settings", Status::Fail);
     }
 }
