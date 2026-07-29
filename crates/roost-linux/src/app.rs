@@ -436,6 +436,7 @@ fn palette_state_from(s: &PaletteSnapshot) -> PaletteStateResult {
                 id: id.clone(),
                 title: title.clone(),
                 subtitle: subtitle.clone(),
+                agent: None,
             })
             .collect(),
         selected_in_view: s.selected_in_view,

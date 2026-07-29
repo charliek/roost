@@ -377,12 +377,50 @@ pub struct PaletteDismissParams {}
 
 /// One visible palette row. `id` is the activation key (a KeybindAction
 /// id for command rows; a theme name / notification id in sub-frames).
+/// `agent` is present only on rows the agents frame (`kind: "agents"`)
+/// builds — absent on every other row. Because this type is shared with
+/// `palette.present` requests, an `agent` supplied there is ignored
+/// (those rows render generic) — including a *malformed* one: the field
+/// decodes leniently to `None` rather than failing the request, matching
+/// the pre-agent behavior where the key was unknown and dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteItemView {
     pub id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_agent_row"
+    )]
+    pub agent: Option<PaletteAgentRow>,
+}
+
+fn lenient_agent_row<'de, D>(de: D) -> Result<Option<PaletteAgentRow>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// The agents palette frame's per-row payload (§3.9). Wired from the
+/// tab's `effective_lifecycle` (`crate::agent::effective_lifecycle`) —
+/// the same value the tab pill and sidebar rollup render — so dot color,
+/// status text, and rank can never disagree with them. `metrics_text` is
+/// absent while a git-metrics probe is still pending and always present
+/// once resolved (`"—"` or the formatted string), so pending vs. resolved
+/// is observable on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteAgentRow {
+    pub effective_lifecycle: AgentLifecycle,
+    pub project: String,
+    pub name: String,
+    pub status_text: String,
+    pub time_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_text: Option<String>,
 }
 
 /// Snapshot of the palette after an op. `open` is false when no palette
@@ -1645,11 +1683,13 @@ mod tests {
                     id: "new_tab".into(),
                     title: "New Tab".into(),
                     subtitle: None,
+                    agent: None,
                 },
                 PaletteItemView {
                     id: "n:7".into(),
                     title: "Build done".into(),
                     subtitle: Some("exit 0".into()),
+                    agent: None,
                 },
             ],
             selected_in_view: Some(true),
@@ -1679,11 +1719,13 @@ mod tests {
                     id: "web".into(),
                     title: "shed: web".into(),
                     subtitle: Some("../shed/web".into()),
+                    agent: None,
                 },
                 PaletteItemView {
                     id: "api".into(),
                     title: "shed: api".into(),
                     subtitle: None,
+                    agent: None,
                 },
             ],
         };

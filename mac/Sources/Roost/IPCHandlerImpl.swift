@@ -1409,11 +1409,57 @@ private struct IPCPaletteActivateParams: Codable {
     enum CodingKeys: String, CodingKey { case id }
 }
 
-private struct IPCPaletteItemView: Codable {
+/// Mirrors `roost_ipc::messages::PaletteAgentRow` (the agents palette
+/// frame's per-row payload, plan 005 §3.9). `metricsText` is nil while a
+/// git-metrics probe is still pending; encoding omits the key in that
+/// case (Swift drops nil optionals), matching the Rust
+/// `skip_serializing_if`. Internal (not `private`) so
+/// `IPCPaletteItemViewTests` can decode/encode it directly, matching
+/// `IPCTab`'s visibility for the same reason.
+struct IPCPaletteAgentRow: Codable {
+    let effectiveLifecycle: AgentLifecycle
+    let project: String
+    let name: String
+    let statusText: String
+    let timeText: String
+    let metricsText: String?
+    enum CodingKeys: String, CodingKey {
+        case effectiveLifecycle = "effective_lifecycle"
+        case project
+        case name
+        case statusText = "status_text"
+        case timeText = "time_text"
+        case metricsText = "metrics_text"
+    }
+}
+
+/// Mirrors `roost_ipc::messages::PaletteItemView`. `agent` is present
+/// only on rows the agents frame builds — absent on every other row.
+/// A malformed `agent` (possible on `palette.present` requests, where
+/// the payload is caller-supplied and documented as ignored) decodes to
+/// nil rather than failing the request, matching the Rust side's
+/// lenient deserializer and the pre-agent unknown-key behavior.
+struct IPCPaletteItemView: Codable {
     let id: String
     let title: String
     let subtitle: String?
-    enum CodingKeys: String, CodingKey { case id, title, subtitle }
+    let agent: IPCPaletteAgentRow?
+    enum CodingKeys: String, CodingKey { case id, title, subtitle, agent }
+
+    init(id: String, title: String, subtitle: String?, agent: IPCPaletteAgentRow?) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.agent = agent
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.title = try c.decode(String.self, forKey: .title)
+        self.subtitle = try c.decodeIfPresent(String.self, forKey: .subtitle)
+        self.agent = try? c.decodeIfPresent(IPCPaletteAgentRow.self, forKey: .agent)
+    }
 }
 
 /// `palette.*` response. Mirrors `roost_ipc::messages::PaletteStateResult`
@@ -1433,7 +1479,7 @@ private struct IPCPaletteStateResult: Codable {
         self.query = s.query
         self.selection = s.selection
         self.items = s.items.map {
-            IPCPaletteItemView(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+            IPCPaletteItemView(id: $0.id, title: $0.title, subtitle: $0.subtitle, agent: nil)
         }
     }
 }

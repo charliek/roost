@@ -330,3 +330,81 @@ struct IPCAgentReportDispatchTests {
         #expect(tab.ownership == nil)
     }
 }
+
+/// `IPCPaletteItemView.agent` is additive (plan 005 §3.9): absent on
+/// every non-agent row, present only on rows the (not-yet-built) agents
+/// frame produces. These decode/re-encode fixtures pin both shapes so a
+/// drift in `IPCPaletteAgentRow`'s `CodingKeys` or the omit-when-nil
+/// behavior surfaces here rather than in the agents-frame commit.
+@Suite("IPC palette item view — agent payload")
+struct IPCPaletteItemViewTests {
+    @Test func decodesWithoutAnAgentPayload() throws {
+        let json = """
+        {"id":"new_tab","title":"New Tab"}
+        """
+        let item = try JSONDecoder().decode(IPCPaletteItemView.self, from: Data(json.utf8))
+        #expect(item.subtitle == nil)
+        #expect(item.agent == nil)
+
+        let encoded = try JSONEncoder().encode(item)
+        let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        #expect(obj?["agent"] == nil)
+    }
+
+    @Test func decodesAndReencodesAFullAgentPayload() throws {
+        let json = """
+        {"id":"agent:3","title":"roost · slauth-refactor",
+         "agent":{"effective_lifecycle":"waiting","project":"roost",
+                  "name":"slauth-refactor","status_text":"Waiting for input",
+                  "time_text":"2m","metrics_text":"4f +86 -12"}}
+        """
+        let item = try JSONDecoder().decode(IPCPaletteItemView.self, from: Data(json.utf8))
+        let agent = try #require(item.agent)
+        #expect(agent.effectiveLifecycle == .waiting)
+        #expect(agent.project == "roost")
+        #expect(agent.name == "slauth-refactor")
+        #expect(agent.statusText == "Waiting for input")
+        #expect(agent.timeText == "2m")
+        #expect(agent.metricsText == "4f +86 -12")
+
+        let encoded = try JSONEncoder().encode(item)
+        let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        let reencodedAgent = obj?["agent"] as? [String: Any]
+        #expect(reencodedAgent?["metrics_text"] as? String == "4f +86 -12")
+    }
+
+    /// A malformed `agent` payload (possible on caller-supplied
+    /// `palette.present` items, documented as ignored) must decode to
+    /// nil, not fail the whole request — mirrors the Rust side's
+    /// lenient deserializer.
+    @Test func malformedAgentPayloadDecodesToNil() throws {
+        for junk in [
+            #"{"id":"x","title":"t","agent":"garbage"}"#,
+            #"{"id":"x","title":"t","agent":{"effective_lifecycle":"no-such"}}"#,
+            #"{"id":"x","title":"t","agent":7}"#,
+        ] {
+            let item = try JSONDecoder().decode(IPCPaletteItemView.self, from: Data(junk.utf8))
+            #expect(item.agent == nil)
+            #expect(item.id == "x")
+        }
+    }
+
+    /// `metrics_text` absent (pending probe) is a distinct, observable
+    /// wire shape from `metrics_text` present — the agents frame relies
+    /// on this to show a row before its git metrics resolve.
+    @Test func pendingMetricsOmitsTheKeyOnReencode() throws {
+        let json = """
+        {"id":"agent:4","title":"roost · pending-metrics",
+         "agent":{"effective_lifecycle":"working","project":"roost",
+                  "name":"pending-metrics","status_text":"Working","time_text":"41s"}}
+        """
+        let item = try JSONDecoder().decode(IPCPaletteItemView.self, from: Data(json.utf8))
+        #expect(item.agent?.metricsText == nil)
+
+        let encoded = try JSONEncoder().encode(item)
+        let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        let reencodedAgent = obj?["agent"] as? [String: Any]
+        #expect(reencodedAgent != nil)
+        #expect(reencodedAgent?["metrics_text"] == nil)
+    }
+}
