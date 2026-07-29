@@ -31,6 +31,7 @@ use roost_linux::daemon::{RestoreTab, WorkspaceEvent};
 use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
+use crate::agent_palette;
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::clipboard;
 use crate::config;
@@ -423,20 +424,20 @@ fn render_window_png(
 /// Map a GTK [`PaletteSnapshot`] to the wire [`PaletteStateResult`] for
 /// an open palette. The closed state (`open: false`) is built directly
 /// as `PaletteStateResult::default()` by the caller.
-fn palette_state_from(s: &PaletteSnapshot) -> PaletteStateResult {
+fn palette_state_from(s: PaletteSnapshot) -> PaletteStateResult {
     PaletteStateResult {
         open: true,
-        frame: Some(s.frame.clone()),
-        query: s.query.clone(),
+        frame: Some(s.frame),
+        query: s.query,
         selection: s.selection as u32,
         items: s
             .items
-            .iter()
-            .map(|(id, title, subtitle)| PaletteItemView {
-                id: id.clone(),
-                title: title.clone(),
-                subtitle: subtitle.clone(),
-                agent: None,
+            .into_iter()
+            .map(|item| PaletteItemView {
+                id: item.id,
+                title: item.title,
+                subtitle: item.subtitle,
+                agent: item.agent,
             })
             .collect(),
         selected_in_view: s.selected_in_view,
@@ -900,7 +901,10 @@ impl App {
             let app_for_focus = app_struct.clone();
             focus_action.connect_activate(move |_, target| {
                 if let Some(target) = target.and_then(|t| t.get::<i64>()) {
-                    app_for_focus.focus_tab_by_id(target);
+                    // An OS-banner click is a notification jump like any
+                    // other: reveal the sidebar so the user can see which
+                    // project they landed in.
+                    app_for_focus.reveal_and_focus_tab(target);
                 }
             });
             app.add_action(&focus_action);
@@ -3055,6 +3059,16 @@ impl App {
                 self.reconcile_to_snapshot(projects);
             }
         }
+        // Live refresh (plan 005 §3.8). Once here rather than opted into
+        // per arm: an agent row is a pure re-derivation of the whole
+        // core snapshot, so *any* event that can move a rendered column
+        // — agent state, but also a rename (the bold project cell), a
+        // project delete, a resync, a tab open — must rebuild it or the
+        // open palette shows stale rows. Per-arm opt-in had already
+        // missed ProjectRenamed / ProjectDeleted / Resync / TabOpened.
+        // Cheap by construction: a no-op unless the agents frame is
+        // actually on the palette stack.
+        self.refresh_agent_palette();
     }
 
     /// Mark `tab_id` server-driven and close its `AdwTabPage`. The
@@ -3334,6 +3348,7 @@ impl App {
             KeybindAction::CommandPalette
                 | KeybindAction::CommandLauncher
                 | KeybindAction::CustomPalette
+                | KeybindAction::AgentPalette
         );
         if !is_picker_toggle && self.palette.borrow().is_some() {
             return;
@@ -3342,6 +3357,7 @@ impl App {
             KeybindAction::CommandPalette => self.show_command_palette(),
             KeybindAction::CommandLauncher => self.show_command_launcher(),
             KeybindAction::CustomPalette => self.show_custom_palette(),
+            KeybindAction::AgentPalette => self.show_agent_palette(),
             KeybindAction::NewTab => {
                 let pid = *self.active_project_id.borrow();
                 if pid == 0 {
@@ -3658,16 +3674,24 @@ impl App {
         for (accel, action) in bindings {
             reverse.entry(action).or_insert(accel);
         }
-        // The two notification commands sit just below the Select Theme… /
-        // Select Font… drill-ins; built dynamically so "View Notifications"
-        // carries the live pending count.
+        // The agent drill-in and the two notification commands sit just
+        // below the Select Theme… / Select Font… drill-ins, in that
+        // order; built dynamically so "View Notifications" carries the
+        // live pending count.
         let mut items = command_items(|action| reverse.get(&action).and_then(accel_label));
-        let notif = self.notification_command_items();
+        let mut dynamic = vec![
+            PaletteItem::new(PaletteCommands::VIEW_AGENTS_ID, "Go to Agent…").with_trailing(
+                reverse
+                    .get(&KeybindAction::AgentPalette)
+                    .and_then(accel_label),
+            ),
+        ];
+        dynamic.extend(self.notification_command_items());
         let at = items
             .iter()
             .position(|i| i.id == PaletteCommands::SELECT_FONT_ID)
             .map_or(items.len(), |i| i + 1);
-        items.splice(at..at, notif);
+        items.splice(at..at, dynamic);
         // Surface the custom palette (script-backed providers) as a
         // drill-in row, but only when at least one provider is configured
         // — otherwise the command palette stays uncluttered.
@@ -3726,6 +3750,100 @@ impl App {
             },
         );
         *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    // MARK: agent palette (Cmd+Shift+O / Alt+Shift+O)
+
+    /// Open the palette directly on the agent switcher — one row per
+    /// agent-owned tab, ordered by urgency (plan 005 §3.1). Presented as
+    /// the root frame (so Esc closes). No-op while any palette is open,
+    /// matching every other picker.
+    fn show_agent_palette(self: &Rc<Self>) {
+        if self.palette.borrow().is_some() {
+            return;
+        }
+        let root = self.agents_frame();
+        let behavior = self.agents_behavior();
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    /// The agents frame, built from the **core** workspace snapshot (not
+    /// a UI-side cache), so the palette reads the same state `tab.list`
+    /// would report.
+    fn agents_frame(self: &Rc<Self>) -> PaletteFrame {
+        agent_palette::agent_frame(&self.workspace_snapshot(), agent_palette::now_unix())
+    }
+
+    fn workspace_snapshot(self: &Rc<Self>) -> Vec<Project> {
+        match self.client.borrow().as_ref() {
+            Some(client) => client.workspace.snapshot(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Confirm on an agent row → reveal the sidebar and jump to that
+    /// tab. The `agents:empty` sentinel is non-actionable (never reaches
+    /// here); a stale id (its tab closed between build and confirm) is a
+    /// no-op that leaves the palette open.
+    fn agents_behavior(self: &Rc<Self>) -> PaletteBehavior {
+        self.jump_to_tab_behavior(agent_palette::agent_tab_id)
+    }
+
+    /// Shared confirm handler for the frames whose rows are "go to this
+    /// tab" (agents, notifications): parse the row id, and on a hit
+    /// reveal the sidebar and focus the tab. A row `parse` rejects (an
+    /// empty-state sentinel) is a no-op that leaves the palette open.
+    ///
+    /// The jump is deferred to an idle tick so the palette tears down
+    /// before the focus runs.
+    fn jump_to_tab_behavior(self: &Rc<Self>, parse: fn(&str) -> Option<i64>) -> PaletteBehavior {
+        let weak = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            let Some(app) = weak.upgrade() else {
+                return PaletteOutcome::Close;
+            };
+            let Some(tab_id) = parse(&item.id) else {
+                return PaletteOutcome::None;
+            };
+            let weak2 = Rc::downgrade(&app);
+            glib::idle_add_local_once(move || {
+                if let Some(app) = weak2.upgrade() {
+                    app.reveal_and_focus_tab(tab_id);
+                }
+            });
+            PaletteOutcome::Close
+        })
+    }
+
+    /// Live refresh (plan 005 §3.8): rebuild the agents frame's rows
+    /// from the core snapshot whenever agent state — or a tab's
+    /// existence, title, or cwd — changes while the palette is open. The
+    /// query is untouched and the highlighted row is preserved by id.
+    /// A no-op when the agents frame isn't on the stack.
+    fn refresh_agent_palette(self: &Rc<Self>) {
+        let driver = self.palette.borrow().as_ref().map(|o| o.driver());
+        let Some(driver) = driver else {
+            return;
+        };
+        if !driver.has_frame(agent_palette::FRAME_ID) {
+            return;
+        }
+        let items =
+            agent_palette::agent_items(&self.workspace_snapshot(), agent_palette::now_unix());
+        driver.update_items(agent_palette::FRAME_ID, items);
     }
 
     // MARK: command launcher (Cmd+Shift+T / Alt+Shift+T)
@@ -4231,28 +4349,9 @@ impl App {
 
     /// Confirm on a notification row → focus that project + tab (which
     /// clears the tab's notification → drops the row). The "No
-    /// notifications" sentinel is a no-op. Deferred to an idle tick so
-    /// the palette tears down before the focus/present runs (mirrors the
-    /// command path).
+    /// notifications" sentinel is a no-op.
     fn notifications_behavior(self: &Rc<Self>) -> PaletteBehavior {
-        let weak = Rc::downgrade(self);
-        PaletteBehavior::new(move |item| {
-            let Some(app) = weak.upgrade() else {
-                return PaletteOutcome::Close;
-            };
-            match notif_tab_id(&item.id) {
-                Some(tab_id) => {
-                    let weak2 = Rc::downgrade(&app);
-                    glib::idle_add_local_once(move || {
-                        if let Some(app) = weak2.upgrade() {
-                            app.focus_tab_by_id(tab_id);
-                        }
-                    });
-                    PaletteOutcome::Close
-                }
-                None => PaletteOutcome::None, // "No notifications" sentinel
-            }
-        })
+        self.jump_to_tab_behavior(notif_tab_id)
     }
 
     /// "Clear All Notifications": clear each pending tab's notification
@@ -4406,6 +4505,9 @@ impl App {
         }
         if item.id == PaletteCommands::SELECT_FONT_ID {
             return PaletteOutcome::Push(self.font_frame(), self.font_behavior());
+        }
+        if item.id == PaletteCommands::VIEW_AGENTS_ID {
+            return PaletteOutcome::Push(self.agents_frame(), self.agents_behavior());
         }
         if item.id == PaletteCommands::VIEW_NOTIFICATIONS_ID {
             return PaletteOutcome::Push(self.notifications_frame(), self.notifications_behavior());
@@ -4796,6 +4898,7 @@ impl App {
         match kind {
             "launcher" => self.show_command_launcher(),
             "custom" => self.show_custom_palette(),
+            "agents" => self.show_agent_palette(),
             _ => self.show_command_palette(),
         }
         self.ipc_palette_state()
@@ -4805,7 +4908,7 @@ impl App {
     /// (`open: false`) when none is up.
     fn ipc_palette_state(self: &Rc<Self>) -> PaletteStateResult {
         match self.palette.borrow().as_ref() {
-            Some(overlay) => palette_state_from(&overlay.driver().snapshot()),
+            Some(overlay) => palette_state_from(overlay.driver().snapshot()),
             None => PaletteStateResult::default(),
         }
     }
@@ -5242,18 +5345,59 @@ impl App {
         Ok(())
     }
 
+    /// Reveal the projects sidebar if it's collapsed, persisting the
+    /// change. Idempotent.
+    ///
+    /// Called on every jump that sends the user to another project's tab
+    /// (notification jump, jump-to-unread, agent-row activation): landing
+    /// in a different project with the sidebar hidden leaves no visible
+    /// cue about where you are. Mirrors the Mac app's
+    /// `ensureSidebarVisible()` — the GTK side lacked it (plan 005 §3.11).
+    ///
+    /// Prefer [`reveal_and_focus_tab`](Self::reveal_and_focus_tab) over
+    /// calling this directly on a jump: the reveal has to be guarded on
+    /// the target still existing.
+    fn ensure_sidebar_visible(self: &Rc<Self>) {
+        self.set_sidebar_visible(true);
+    }
+
+    /// The shared body of every "go to this tab" jump — an agent row, a
+    /// notification row, the OS notification banner, jump-to-unread.
+    ///
+    /// The reveal happens **after** the focus succeeds: a jump whose tab
+    /// closed between the row/banner being built and the click must not
+    /// uncollapse the sidebar — and persist `sidebar_collapsed = false`
+    /// — for a navigation that then doesn't happen. Focus-then-reveal
+    /// makes that atomic (the core's `focus_tab` is the single
+    /// existence check), where a separate exists-probe left a window
+    /// for the tab to vanish in between. Both land in the same main-loop
+    /// iteration, so the ordering is invisible on screen.
+    fn reveal_and_focus_tab(self: &Rc<Self>, tab_id: i64) {
+        if self.focus_tab_by_id(tab_id) {
+            self.ensure_sidebar_visible();
+        }
+    }
+
     fn toggle_sidebar(self: &Rc<Self>) {
-        // Hide the entire sidebar container — header + list + footer
-        // button — so the Paned divider snaps to the left edge. Pre-M5
-        // we toggled only the list, leaving the Projects header and
-        // `+ Project` button orphaned in a thin strip.
-        let visible = self.sidebar_box.is_visible();
-        self.sidebar_box.set_visible(!visible);
-        // Persist the choice so it survives relaunch (GTK parity with the
-        // Mac UI's RoostSidebarVisible). New visibility is `!visible`, so
-        // collapsed == `visible` (the prior state).
+        self.set_sidebar_visible(!self.sidebar_box.is_visible());
+    }
+
+    /// Show or hide the sidebar and persist the choice. Idempotent.
+    ///
+    /// Hides the entire sidebar container — header + list + footer
+    /// button — so the Paned divider snaps to the left edge. Pre-M5 we
+    /// toggled only the list, leaving the Projects header and
+    /// `+ Project` button orphaned in a thin strip.
+    ///
+    /// The persisted flag is `collapsed`, i.e. the inverse (GTK parity
+    /// with the Mac UI's RoostSidebarVisible).
+    fn set_sidebar_visible(self: &Rc<Self>, visible: bool) {
+        if self.sidebar_box.is_visible() == visible {
+            return;
+        }
+        self.sidebar_box.set_visible(visible);
         if let Some(client) = self.client.borrow().clone() {
-            client.workspace.set_sidebar_collapsed(visible);
+            client.workspace.set_sidebar_collapsed(!visible);
         }
     }
 
@@ -5443,9 +5587,9 @@ impl App {
     /// AdwTabView, select the matching page, then raise the window.
     /// Wired via the `app.focus-tab` action; click-handler in the
     /// gio::Notification's default action target.
-    fn focus_tab_by_id(self: &Rc<Self>, tab_id: i64) {
+    fn focus_tab_by_id(self: &Rc<Self>, tab_id: i64) -> bool {
         let Some(client) = self.client.borrow().clone() else {
-            return;
+            return false;
         };
         // Route through the core: `focus_tab` updates `workspace.active()`
         // (so `identify` / `tab.focus` report the tab the user was sent
@@ -5455,7 +5599,7 @@ impl App {
         // active tab stale vs. what's on screen — the UI as its own source
         // of truth rather than a reaction to the core.
         if client.workspace.focus_tab(tab_id).is_err() {
-            return; // tab vanished between the inbox snapshot and the jump
+            return false; // tab vanished between the inbox snapshot and the jump
         }
         // Bring the window forward (jump-specific; ActiveChanged handles
         // the on-screen selection).
@@ -5464,6 +5608,7 @@ impl App {
         // pending notification, which drops the inbox row + the tab's
         // needs-attention badge via the `TabNotification` false-edge.
         let _ = client.workspace.set_tab_has_notification(tab_id, false);
+        true
     }
 
     /// Make `project_id` active from a UI action (sidebar click, project
@@ -5522,7 +5667,7 @@ impl App {
                 .map(|r| r.tab_id)
         };
         if let Some(tab_id) = target {
-            self.focus_tab_by_id(tab_id);
+            self.reveal_and_focus_tab(tab_id);
         }
     }
 

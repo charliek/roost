@@ -379,6 +379,74 @@ button.roost-add-project:active {
   font-size: 12px;
 }
 
+/* Agent palette rows (plan 005). The lifecycle colours are the
+ * repo-wide set the tab pill dot and the sidebar stripes use, so a row
+ * can't disagree with the chrome; `inactive` is the finished grey at
+ * 50% alpha, which distinguishes "idle shell" from "agent finished".
+ * The dot is a fixed 8px box rounded into a circle. */
+.command-palette-card .palette-agent-dot {
+  border-radius: 4px;
+}
+.command-palette-card .palette-agent-dot.agent-working {
+  background-color: #5fa3f0;
+}
+.command-palette-card .palette-agent-dot.agent-waiting {
+  background-color: #f0a040;
+}
+.command-palette-card .palette-agent-dot.agent-finished {
+  background-color: #7a7a7a;
+}
+.command-palette-card .palette-agent-dot.agent-failed {
+  background-color: #e05252;
+}
+.command-palette-card .palette-agent-dot.agent-inactive {
+  background-color: alpha(#7a7a7a, 0.5);
+}
+.command-palette-card .palette-agent-project {
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: bold;
+}
+.command-palette-card .palette-agent-name {
+  color: #ffffff;
+  font-size: 14px;
+}
+.command-palette-card .palette-agent-status {
+  font-size: 13px;
+}
+.command-palette-card .palette-agent-status.agent-working {
+  color: #5fa3f0;
+}
+.command-palette-card .palette-agent-status.agent-waiting {
+  color: #f0a040;
+}
+.command-palette-card .palette-agent-status.agent-finished {
+  color: #7a7a7a;
+}
+.command-palette-card .palette-agent-status.agent-failed {
+  color: #e05252;
+}
+.command-palette-card .palette-agent-status.agent-inactive {
+  color: alpha(#7a7a7a, 0.5);
+}
+/* Right column: the UI fixed-pitch font (not the terminal font), so
+ * metrics and times line up down the list. */
+.command-palette-card .palette-agent-metrics,
+.command-palette-card .palette-agent-time {
+  font-family: monospace;
+  font-size: 12px;
+  color: #7a7a7a;
+}
+
+/* Footer hint bar — only frames that set `footer_hints` show one. */
+.command-palette-card .palette-footer {
+  color: #9e9e9e;
+  font-size: 12px;
+  border-top: 1px solid alpha(#ffffff, 0.10);
+  margin-top: 8px;
+  padding: 8px 10px 2px 10px;
+}
+
 /* HeaderBar notifications button: a bell with a small count badge
  * overlaid top-right. The badge is a GtkLabel inside a GtkOverlay; the
  * button stays flat to match the other headerbar chrome. Hidden as a

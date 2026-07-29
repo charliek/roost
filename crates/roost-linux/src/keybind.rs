@@ -66,6 +66,10 @@ pub enum KeybindAction {
     /// Alt+Shift+E on Linux. (`…+shift+r` is RenameProject; users who
     /// prefer the "R for Run" mnemonic rebind via config.)
     CustomPalette,
+    /// Open the agent palette — one row per agent-owned tab, ordered by
+    /// urgency (plan 005). Default `projectMod+shift+o` — Cmd+Shift+O on
+    /// macOS-GTK, Alt+Shift+O on Linux.
+    AgentPalette,
     /// Unbind a trigger; removes any default action attached to it.
     Unbind,
     /// `switch_project_N` where N is 1..=9.
@@ -98,6 +102,7 @@ impl KeybindAction {
             "command_palette" => Some(Self::CommandPalette),
             "command_launcher" => Some(Self::CommandLauncher),
             "custom_palette" => Some(Self::CustomPalette),
+            "agent_palette" => Some(Self::AgentPalette),
             "unbind" => Some(Self::Unbind),
             other => {
                 if let Some(n) = other.strip_prefix("switch_project_") {
@@ -356,6 +361,15 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &mut out,
         &format!("{project_mod}+shift+e"),
         KeybindAction::CustomPalette,
+    );
+
+    // Agent palette: Cmd+Shift+O on macOS-GTK, Alt+Shift+O on Linux.
+    // `…+shift+o` is unclaimed by every other default and by the
+    // terminal key encoder ("O for Overview" / "go to agent").
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+o"),
+        KeybindAction::AgentPalette,
     );
 
     // Browser-style font sizing on the active terminal. `Cmd-+` on
@@ -650,6 +664,23 @@ mod tests {
             Some(&KeybindAction::RenameProject),
             "custom_palette default must not steal RenameProject's binding"
         );
+    }
+
+    #[test]
+    fn agent_palette_action_and_default() {
+        assert_eq!(
+            KeybindAction::from_name("agent_palette"),
+            Some(KeybindAction::AgentPalette)
+        );
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // projectMod+shift+o: Cmd+Shift+O on macOS, Alt+Shift+O on Linux
+        // (parity with the Swift app's ⌘⇧O).
+        let trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+o").unwrap()
+        } else {
+            parse_trigger("alt+shift+o").unwrap()
+        };
+        assert_eq!(defaults.get(&trigger), Some(&KeybindAction::AgentPalette));
     }
 
     #[test]

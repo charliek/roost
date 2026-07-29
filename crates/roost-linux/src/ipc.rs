@@ -670,9 +670,12 @@ async fn dispatch(
         }
         ops::PALETTE_OPEN => {
             let p: PaletteOpenParams = decode(params)?;
-            if !matches!(p.kind.as_str(), "" | "commands" | "launcher" | "custom") {
+            if !matches!(
+                p.kind.as_str(),
+                "" | "commands" | "launcher" | "custom" | "agents"
+            ) {
                 return Err(HandlerError::invalid_param(format!(
-                    "unknown palette kind {:?} (want \"commands\", \"launcher\", or \"custom\")",
+                    "unknown palette kind {:?} (want \"commands\", \"launcher\", \"custom\", or \"agents\")",
                     p.kind
                 )));
             }

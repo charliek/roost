@@ -10,6 +10,19 @@ use std::ops::Range;
 
 use crate::keybind::KeybindAction;
 
+/// The agents frame's per-row payload (plan 005 §3.4): everything the
+/// multi-column agent row renders. Built by [`crate::agent_palette`].
+///
+/// This *is* the wire type — the UI row and `palette.state`'s row carry
+/// exactly the same six fields, so aliasing keeps `app.rs`'s snapshot
+/// mapping a move instead of a hand-written field copy that a new
+/// column could silently fall out of.
+///
+/// `effective_lifecycle` drives the dot colour, the status colour, and
+/// the row order — the same value the tab pill and the sidebar rollup
+/// render, so the palette can never disagree with them.
+pub use roost_ipc::messages::PaletteAgentRow as AgentRowData;
+
 /// One row in the palette. `id` is the stable handle the overlay maps
 /// back to an action (a command id or a theme file name); `title` is
 /// both what's shown and what the fuzzy matcher scores against, so
@@ -28,6 +41,9 @@ pub struct PaletteItem {
     /// disabled states (e.g. a provider's "No results" row, the overflow
     /// hint). Defaults to `true`.
     pub actionable: bool,
+    /// Present only on agents-frame rows; the overlay renders the
+    /// multi-column agent layout instead of the title/subtitle one.
+    pub agent: Option<AgentRowData>,
 }
 
 impl PaletteItem {
@@ -38,6 +54,7 @@ impl PaletteItem {
             subtitle: None,
             trailing_text: None,
             actionable: true,
+            agent: None,
         }
     }
 
@@ -53,6 +70,11 @@ impl PaletteItem {
 
     pub fn with_actionable(mut self, actionable: bool) -> Self {
         self.actionable = actionable;
+        self
+    }
+
+    pub fn with_agent(mut self, agent: AgentRowData) -> Self {
+        self.agent = Some(agent);
         self
     }
 }
@@ -176,6 +198,11 @@ impl PaletteCommands {
     /// `SELECT_THEME_ID`, not a `KeybindAction` — built dynamically in
     /// `App::command_items` so its title can carry the live count.
     pub const VIEW_NOTIFICATIONS_ID: &'static str = "view_notifications";
+    /// Palette-only drill-in into the agent switcher (plan 005 §3.1).
+    /// Like the notification commands, built dynamically in
+    /// `App::show_command_palette` — it sits directly under Select
+    /// Font…, ahead of the notification rows.
+    pub const VIEW_AGENTS_ID: &'static str = "view_agents";
     /// Palette-only command: empty the inbox + clear all pending dots.
     pub const CLEAR_NOTIFICATIONS_ID: &'static str = "clear_notifications";
 
@@ -209,6 +236,10 @@ pub struct PaletteFrame {
     pub items: Vec<PaletteItem>,
     pub query: String,
     pub selection: usize,
+    /// Muted one-line hint bar under the list (the agents frame's
+    /// "↑↓ move  ↵ go to tab  esc close"). `None` on every other frame,
+    /// which renders no footer. Not exposed on the wire.
+    pub footer_hints: Option<String>,
 }
 
 impl PaletteFrame {
@@ -223,6 +254,7 @@ impl PaletteFrame {
             items,
             query: String::new(),
             selection: 0,
+            footer_hints: None,
         }
     }
 
@@ -230,6 +262,11 @@ impl PaletteFrame {
     /// pre-highlights the active theme).
     pub fn with_selection(mut self, selection: usize) -> Self {
         self.selection = selection;
+        self
+    }
+
+    pub fn with_footer_hints(mut self, hints: impl Into<String>) -> Self {
+        self.footer_hints = Some(hints.into());
         self
     }
 }
@@ -266,36 +303,29 @@ impl PaletteState {
         &self.stack
     }
 
-    /// Filtered + ranked rows for the current frame's query. Empty
-    /// query returns every item in input order (no highlight ranges).
-    pub fn matches(&self) -> Vec<PaletteMatch> {
-        let frame = self.current();
+    /// Filtered + ranked rows for the current frame's query, **borrowed**.
+    /// Empty query yields every item in input order (no highlight
+    /// ranges).
+    ///
+    /// [`matches`](Self::matches) is this plus a clone per row. An agent
+    /// row carries up to nine `String`s and the list is re-derived on
+    /// every keystroke, arrow key, and live refresh, so the callers that
+    /// only need a count or an id go through here instead.
+    fn ranked(&self) -> Vec<(&PaletteItem, Vec<Range<usize>>)> {
+        Self::ranked_of(self.current())
+    }
+
+    fn ranked_of(frame: &PaletteFrame) -> Vec<(&PaletteItem, Vec<Range<usize>>)> {
         let query = frame.query.trim();
         if query.is_empty() {
-            return frame
-                .items
-                .iter()
-                .map(|item| PaletteMatch {
-                    item: item.clone(),
-                    ranges: Vec::new(),
-                })
-                .collect();
+            return frame.items.iter().map(|item| (item, Vec::new())).collect();
         }
-        let mut scored: Vec<(usize, i64, PaletteMatch)> = frame
+        let mut scored: Vec<(usize, i64, &PaletteItem, Vec<Range<usize>>)> = frame
             .items
             .iter()
             .enumerate()
             .filter_map(|(offset, item)| {
-                fuzzy_match(query, &item.title).map(|(score, ranges)| {
-                    (
-                        offset,
-                        score,
-                        PaletteMatch {
-                            item: item.clone(),
-                            ranges,
-                        },
-                    )
-                })
+                fuzzy_match(query, &item.title).map(|(score, ranges)| (offset, score, item, ranges))
             })
             .collect();
         // Higher score first; stable by original order on ties.
@@ -306,13 +336,38 @@ impl PaletteState {
                 a.0.cmp(&b.0)
             }
         });
-        scored.into_iter().map(|(_, _, m)| m).collect()
+        scored
+            .into_iter()
+            .map(|(_, _, item, ranges)| (item, ranges))
+            .collect()
+    }
+
+    /// Filtered + ranked rows for the current frame's query. Empty
+    /// query returns every item in input order (no highlight ranges).
+    pub fn matches(&self) -> Vec<PaletteMatch> {
+        self.ranked()
+            .into_iter()
+            .map(|(item, ranges)| PaletteMatch {
+                item: item.clone(),
+                ranges,
+            })
+            .collect()
+    }
+
+    /// How many rows the current filter yields — [`matches`](Self::matches)
+    /// without the per-row clone.
+    pub fn match_count(&self) -> usize {
+        self.ranked().len()
     }
 
     /// The highlighted item, or `None` when the filter yields nothing.
     pub fn selected_item(&self) -> Option<PaletteItem> {
-        let m = self.matches();
-        m.get(self.current().selection).map(|m| m.item.clone())
+        self.selected_ranked().map(|(item, _)| item.clone())
+    }
+
+    fn selected_ranked(&self) -> Option<(&PaletteItem, Vec<Range<usize>>)> {
+        let selection = self.current().selection;
+        self.ranked().into_iter().nth(selection)
     }
 
     /// Replace the current frame's query; reset selection to the top
@@ -326,7 +381,7 @@ impl PaletteState {
     /// Set the highlight to an explicit row (a mouse click), clamped to
     /// the result bounds.
     pub fn set_selection(&mut self, index: usize) {
-        let count = self.matches().len();
+        let count = self.match_count();
         if count == 0 {
             return;
         }
@@ -335,13 +390,49 @@ impl PaletteState {
 
     /// Move the highlight, clamped to the result bounds (no wrap).
     pub fn move_selection(&mut self, delta: isize) {
-        let count = self.matches().len();
+        let count = self.match_count();
         if count == 0 {
             self.current_mut().selection = 0;
             return;
         }
         let next = (self.current().selection as isize + delta).clamp(0, count as isize - 1);
         self.current_mut().selection = next as usize;
+    }
+
+    /// Replace the items of the frame with `frame_id` in place, leaving
+    /// its query untouched and keeping the *same row* highlighted
+    /// wherever it landed. Returns false when no frame on the stack has
+    /// that id (the caller's target was popped).
+    ///
+    /// Selection is preserved by row **id**, not index: the agents frame
+    /// rebuilds on every agent event and re-ranks, so the row under the
+    /// cursor moves. A row that disappeared falls back to the old index,
+    /// clamped.
+    pub fn update_items(&mut self, frame_id: &str, items: Vec<PaletteItem>) -> bool {
+        let Some(index) = self.stack.iter().position(|f| f.id == frame_id) else {
+            return false;
+        };
+        // Preserve by id even for a frame under the top one: its
+        // selection isn't visible now, but it is restored on pop, so a
+        // refresh that reorders or removes rows must re-anchor (and
+        // clamp) it the same way it does for the showing frame.
+        let frame = &self.stack[index];
+        let selected_id = Self::ranked_of(frame)
+            .into_iter()
+            .nth(frame.selection)
+            .map(|(item, _)| item.id.clone());
+        self.stack[index].items = items;
+        let frame = &self.stack[index];
+        let ranked_ids: Vec<&str> = Self::ranked_of(frame)
+            .into_iter()
+            .map(|(item, _)| item.id.as_str())
+            .collect();
+        let selection = selected_id
+            .as_deref()
+            .and_then(|id| ranked_ids.iter().position(|candidate| *candidate == id))
+            .unwrap_or_else(|| frame.selection.min(ranked_ids.len().saturating_sub(1)));
+        self.stack[index].selection = selection;
+        true
     }
 
     /// Drill into a sub-list (starts with an empty query).
@@ -518,6 +609,95 @@ mod tests {
     }
 
     #[test]
+    fn update_items_keeps_the_highlighted_row_by_id() {
+        let mut state = PaletteState::new(cmd_frame());
+        state.move_selection(2);
+        assert_eq!(state.selected_item().unwrap().id, "new_project");
+        // Rebuild with the rows re-ranked and one dropped: the same row
+        // stays highlighted at its new position.
+        assert!(state.update_items(
+            "commands",
+            vec![
+                PaletteItem::new("new_project", "New Project"),
+                PaletteItem::new("new_tab", "New Tab"),
+            ],
+        ));
+        assert_eq!(state.current().selection, 0);
+        assert_eq!(state.selected_item().unwrap().id, "new_project");
+    }
+
+    #[test]
+    fn update_items_leaves_the_query_alone_and_clamps_a_vanished_row() {
+        let mut state = PaletteState::new(cmd_frame());
+        state.set_query("new");
+        state.move_selection(1);
+        assert_eq!(state.selected_item().unwrap().id, "new_project");
+        state.update_items("commands", vec![PaletteItem::new("new_tab", "New Tab")]);
+        // Query survives the rebuild; the vanished row falls back to the
+        // old index, clamped to the new match count.
+        assert_eq!(state.current().query, "new");
+        assert_eq!(state.current().selection, 0);
+        assert_eq!(state.selected_item().unwrap().id, "new_tab");
+    }
+
+    #[test]
+    fn update_items_reaches_a_frame_under_the_top_one() {
+        let mut state = PaletteState::new(cmd_frame());
+        state.push(PaletteFrame::new(
+            "themes",
+            "Select a theme…",
+            vec![PaletteItem::new("Dracula", "Dracula")],
+        ));
+        assert!(state.update_items("commands", vec![PaletteItem::new("only", "Only")]));
+        // The visible frame is untouched…
+        assert_eq!(state.matches().len(), 1);
+        assert_eq!(state.selected_item().unwrap().id, "Dracula");
+        // …and the parent carries the new rows once popped back to.
+        state.pop();
+        assert_eq!(state.selected_item().unwrap().id, "only");
+    }
+
+    #[test]
+    fn update_items_re_anchors_a_covered_frames_selection_by_id() {
+        let mut state = PaletteState::new(cmd_frame());
+        state.move_selection(2);
+        assert_eq!(state.selected_item().unwrap().id, "new_project");
+        state.push(PaletteFrame::new(
+            "themes",
+            "Select a theme…",
+            vec![PaletteItem::new("Dracula", "Dracula")],
+        ));
+        // Refresh the covered frame with its rows re-ranked and one
+        // dropped: the remembered selection must follow the row id, not
+        // point at whatever now sits at the old index.
+        assert!(state.update_items(
+            "commands",
+            vec![
+                PaletteItem::new("new_project", "New Project"),
+                PaletteItem::new("new_tab", "New Tab"),
+            ],
+        ));
+        state.pop();
+        assert_eq!(state.selected_item().unwrap().id, "new_project");
+        assert_eq!(state.current().selection, 0);
+    }
+
+    #[test]
+    fn update_items_unknown_frame_is_a_no_op() {
+        let mut state = PaletteState::new(cmd_frame());
+        assert!(!state.update_items("agents", vec![PaletteItem::new("x", "X")]));
+        assert_eq!(state.matches().len(), 3);
+    }
+
+    #[test]
+    fn footer_hints_default_to_none() {
+        let frame = cmd_frame();
+        assert_eq!(frame.footer_hints, None);
+        let with_hints = cmd_frame().with_footer_hints("esc close");
+        assert_eq!(with_hints.footer_hints.as_deref(), Some("esc close"));
+    }
+
+    #[test]
     fn pop_at_root_returns_none() {
         let mut state = PaletteState::new(cmd_frame());
         assert!(state.is_root());
@@ -611,6 +791,17 @@ mod tests {
             .iter()
             .all(|(id, _)| *id != PaletteCommands::VIEW_NOTIFICATIONS_ID
                 && *id != PaletteCommands::CLEAR_NOTIFICATIONS_ID));
+    }
+
+    #[test]
+    fn view_agents_is_a_palette_only_sentinel() {
+        // Same contract as the notification sentinels: dynamic row, not
+        // in SPECS, and never a keybind id (`agent_palette` is the
+        // keybind that opens the same frame).
+        assert!(KeybindAction::from_name(PaletteCommands::VIEW_AGENTS_ID).is_none());
+        assert!(PaletteCommands::SPECS
+            .iter()
+            .all(|(id, _)| *id != PaletteCommands::VIEW_AGENTS_ID));
     }
 
     #[test]
