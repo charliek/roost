@@ -72,9 +72,15 @@ def test_inbox_lists_pending_via_palette(roost, project, palette):
     assert by_id[f"notif:{a}"].get("subtitle") == "passed"
 
 
-def test_jump_to_notification_focuses_and_clears(roost, project, palette):
+def test_jump_to_notification_focuses_and_clears(roost, project, palette, target):
     """Activating an inbox row jumps to that tab (the triage action) and
-    clears its badge — closing the palette."""
+    clears its badge — closing the palette.
+
+    GTK-only extra (plan 005 §3.11): `ensure_sidebar_visible()` was added
+    to the agent-row jump and retrofitted onto this pre-existing
+    notification-jump path (a cross-UI divergence from Mac's
+    `ensureSidebarVisible()` this plan's review surfaced), so a jump from
+    a collapsed sidebar must reveal it."""
     a = roost.open_tab(project, cwd="/tmp")
     b = roost.open_tab(project, cwd="/tmp")  # b is active
     roost.notify(a, "JumpMe")
@@ -82,6 +88,14 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette):
     # Wait until the inbox registers a before navigating to jump (it lags
     # the badge on Mac; the frame snapshots at push).
     roost._wait(lambda: f"notif:{a}" in _inbox_ids(palette), 5.0, "inbox registers a")
+
+    if target == "gtk":
+        if not roost.window_metrics()["sidebar_collapsed"]:
+            palette.palette_open()
+            palette.palette_activate("toggle_sidebar")
+            roost._wait(
+                lambda: roost.window_metrics()["sidebar_collapsed"], 5.0, "sidebar collapses"
+            )
 
     palette.palette_open()
     palette.palette_activate("view_notifications")
@@ -91,6 +105,13 @@ def test_jump_to_notification_focuses_and_clears(roost, project, palette):
     # identify reflects where the user was sent.
     _wait(roost, lambda: roost.identify()["active_tab_id"] == a, "jumped to a (core active)")
     _wait(roost, lambda: roost.tab(a).get("has_notification") is False, "a badge cleared by jump")
+
+    if target == "gtk":
+        _wait(
+            roost,
+            lambda: not roost.window_metrics()["sidebar_collapsed"],
+            "sidebar reappears after the notification jump (§3.11)",
+        )
 
 
 def test_jump_to_unread_focuses_notified_tab(roost, project, palette):
