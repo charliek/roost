@@ -136,3 +136,96 @@ func popAtRootReturnsNil() {
     #expect(state.pop() == nil)
     #expect(state.isRoot)
 }
+
+// MARK: - In-place row refresh (updateItems)
+//
+// The agents frame rebuilds on every workspace event while it's open
+// (plan 005 §3.8), so the refresh must not disturb the query or the
+// user's highlight. Mirrors the GTK `update_items` cases in
+// `crates/roost-linux/src/palette.rs`.
+
+@Test
+func updateItemsKeepsTheHighlightedRowByID() {
+    var state = PaletteState(root: sampleRoot())
+    state.moveSelection(by: 2)
+    #expect(state.selectedItem?.id == "toggle_sidebar")
+    // Rebuild with the rows re-ranked and one dropped: the same row
+    // stays highlighted at its new position.
+    let refreshed = state.updateItems(
+        frameID: "commands",
+        items: [
+            PaletteItem(id: "toggle_sidebar", title: "Toggle Sidebar"),
+            PaletteItem(id: "new_tab", title: "New Tab"),
+        ])
+    #expect(refreshed)
+    #expect(state.current.selection == 0)
+    #expect(state.selectedItem?.id == "toggle_sidebar")
+}
+
+@Test
+func updateItemsLeavesTheQueryAloneAndClampsAVanishedRow() {
+    var state = PaletteState(root: sampleRoot())
+    state.setQuery("ta")
+    #expect(state.matches.count == 2)
+    let survivor = state.matches[0].item
+    state.moveSelection(by: 1)
+    #expect(state.selectedItem?.id != survivor.id)
+    state.updateItems(frameID: "commands", items: [survivor])
+    // Query survives the rebuild; the vanished row falls back to the old
+    // index, clamped to the new match count.
+    #expect(state.current.query == "ta")
+    #expect(state.current.selection == 0)
+    #expect(state.selectedItem?.id == survivor.id)
+}
+
+@Test
+func updateItemsReachesAFrameUnderTheTopOne() {
+    var state = PaletteState(root: sampleRoot())
+    state.push(themeFrame())
+    let refreshed = state.updateItems(
+        frameID: "commands", items: [PaletteItem(id: "only", title: "Only")])
+    #expect(refreshed)
+    // The visible frame is untouched…
+    #expect(state.matches.count == 2)
+    #expect(state.selectedItem?.id == "Dracula")
+    // …and the parent carries the new rows once popped back to.
+    state.pop()
+    #expect(state.selectedItem?.id == "only")
+}
+
+@Test
+func updateItemsReAnchorsACoveredFramesSelectionByID() {
+    var state = PaletteState(root: sampleRoot())
+    state.moveSelection(by: 2)
+    #expect(state.selectedItem?.id == "toggle_sidebar")
+    state.push(themeFrame())
+    // Refresh the covered frame with its rows re-ranked and one dropped:
+    // the remembered selection must follow the row id, not point at
+    // whatever now sits at the old index.
+    let refreshed = state.updateItems(
+        frameID: "commands",
+        items: [
+            PaletteItem(id: "toggle_sidebar", title: "Toggle Sidebar"),
+            PaletteItem(id: "new_tab", title: "New Tab"),
+        ])
+    #expect(refreshed)
+    state.pop()
+    #expect(state.selectedItem?.id == "toggle_sidebar")
+    #expect(state.current.selection == 0)
+}
+
+@Test
+func updateItemsUnknownFrameIsANoOp() {
+    var state = PaletteState(root: sampleRoot())
+    let refreshed = state.updateItems(frameID: "agents", items: [PaletteItem(id: "x", title: "X")])
+    #expect(!refreshed)
+    #expect(state.matches.count == 3)
+}
+
+@Test
+func footerHintsDefaultToNil() {
+    #expect(sampleRoot().footerHints == nil)
+    let hinted = PaletteFrame(
+        id: "agents", placeholder: "Go to agent…", items: [], footerHints: "esc close")
+    #expect(hinted.footerHints == "esc close")
+}

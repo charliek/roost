@@ -147,6 +147,17 @@ struct PaletteSnapshot: Sendable {
         let id: String
         let title: String
         let subtitle: String?
+        /// The agents frame's per-row payload; nil on every other row
+        /// (plan 005 §3.9). `palette.present` callers may supply one —
+        /// it is ignored, so this is only ever populated on the way out.
+        let agent: IPCPaletteAgentRow?
+
+        init(id: String, title: String, subtitle: String?, agent: IPCPaletteAgentRow? = nil) {
+            self.id = id
+            self.title = title
+            self.subtitle = subtitle
+            self.agent = agent
+        }
     }
 
     static let closed = PaletteSnapshot(

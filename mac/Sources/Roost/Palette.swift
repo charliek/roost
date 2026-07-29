@@ -11,6 +11,20 @@ import Foundation
 
 // MARK: - Items
 
+/// The agents frame's per-row payload (plan 005 §3.4): everything the
+/// multi-column agent row renders. Built by `AgentPalette`.
+///
+/// This *is* the wire type — the UI row and `palette.state`'s row carry
+/// exactly the same six fields, so `RoostApp.paletteSnapshot()` stays a
+/// move instead of a hand-written field copy a new column could
+/// silently fall out of. Mirrors the GTK
+/// `pub use roost_ipc::messages::PaletteAgentRow as AgentRowData`.
+///
+/// `effectiveLifecycle` drives the dot colour, the status colour, and
+/// the row order — the same value the tab pill and the sidebar rollup
+/// render, so the palette can never disagree with them.
+typealias AgentRowData = IPCPaletteAgentRow
+
 /// One row in the palette. `id` is the stable handle the panel maps
 /// back to an action (a command id or a theme file name); `title` is
 /// both what's shown and what the fuzzy matcher scores against, so
@@ -26,16 +40,20 @@ struct PaletteItem: Equatable {
     /// disabled states (a provider's "No results" row, the overflow hint).
     /// Defaults to `true`.
     var actionable: Bool
+    /// Present only on agents-frame rows; the panel renders the
+    /// multi-column agent layout instead of the title/subtitle one.
+    var agent: AgentRowData?
 
     init(
         id: String, title: String, subtitle: String? = nil, trailingText: String? = nil,
-        actionable: Bool = true
+        actionable: Bool = true, agent: AgentRowData? = nil
     ) {
         self.id = id
         self.title = title
         self.subtitle = subtitle
         self.trailingText = trailingText
         self.actionable = actionable
+        self.agent = agent
     }
 }
 
@@ -145,6 +163,12 @@ enum PaletteCommands {
     /// `selectThemeID`, not a `KeybindAction` — built dynamically in
     /// `paletteCommandItems()` so its title can carry the live count.
     static let viewNotificationsID = "view_notifications"
+    /// Palette-only drill-in into the agent switcher (plan 005 §3.1).
+    /// Like the notification commands, built dynamically in
+    /// `paletteCommandItems()` — it sits directly under Select Font…,
+    /// ahead of the notification rows. `agent_palette` is the keybind
+    /// action that opens the same frame.
+    static let viewAgentsID = "view_agents"
     /// Palette-only command: empty the inbox + clear all pending dots.
     static let clearNotificationsID = "clear_notifications"
 
@@ -176,16 +200,24 @@ enum PaletteCommands {
 struct PaletteFrame {
     let id: String
     let placeholder: String
-    let items: [PaletteItem]
+    var items: [PaletteItem]
     var query: String = ""
     var selection: Int = 0
+    /// Muted one-line hint bar under the list (the agents frame's
+    /// "↑↓ move  ↵ go to tab  esc close"). `nil` on every other frame,
+    /// which renders no footer. Not exposed on the wire.
+    let footerHints: String?
 
-    init(id: String, placeholder: String, items: [PaletteItem], query: String = "", selection: Int = 0) {
+    init(
+        id: String, placeholder: String, items: [PaletteItem], query: String = "",
+        selection: Int = 0, footerHints: String? = nil
+    ) {
         self.id = id
         self.placeholder = placeholder
         self.items = items
         self.query = query
         self.selection = selection
+        self.footerHints = footerHints
     }
 }
 
@@ -205,8 +237,12 @@ struct PaletteState {
 
     /// Filtered + ranked rows for the current frame's query. Empty
     /// query returns every item in input order (no highlight ranges).
-    var matches: [PaletteMatch] {
-        let frame = current
+    var matches: [PaletteMatch] { Self.ranked(current) }
+
+    /// `matches` for an arbitrary frame — the covered frames on the
+    /// stack need it too, since `updateItems` re-anchors their selection
+    /// by row id.
+    private static func ranked(_ frame: PaletteFrame) -> [PaletteMatch] {
         let query = frame.query.trimmingCharacters(in: .whitespaces)
         if query.isEmpty {
             return frame.items.map { PaletteMatch(item: $0, ranges: []) }
@@ -253,6 +289,36 @@ struct PaletteState {
         }
         let next = current.selection + delta
         stack[stack.count - 1].selection = min(max(next, 0), count - 1)
+    }
+
+    /// Replace the items of the frame with `frameID` in place, leaving
+    /// its query untouched and keeping the *same row* highlighted
+    /// wherever it landed. Returns false when no frame on the stack has
+    /// that id (the caller's target was popped).
+    ///
+    /// Selection is preserved by row **id**, not index: the agents frame
+    /// rebuilds on every agent event and re-ranks, so the row under the
+    /// cursor moves. A row that disappeared falls back to the old index,
+    /// clamped.
+    @discardableResult
+    mutating func updateItems(frameID: String, items: [PaletteItem]) -> Bool {
+        guard let index = stack.firstIndex(where: { $0.id == frameID }) else { return false }
+        // Preserve by id even for a frame under the top one: its
+        // selection isn't visible now, but it is restored on pop, so a
+        // refresh that reorders or removes rows must re-anchor (and
+        // clamp) it the same way it does for the showing frame.
+        let before = Self.ranked(stack[index])
+        let selectedID = before.indices.contains(stack[index].selection)
+            ? before[stack[index].selection].item.id
+            : nil
+        stack[index].items = items
+        let after = Self.ranked(stack[index])
+        if let selectedID, let found = after.firstIndex(where: { $0.item.id == selectedID }) {
+            stack[index].selection = found
+        } else {
+            stack[index].selection = min(stack[index].selection, max(after.count - 1, 0))
+        }
+        return true
     }
 
     /// Drill into a sub-list (starts with an empty query).

@@ -58,9 +58,21 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let field = NSTextField()
     private let table = NSTableView()
     private let card = NSView()
+    /// Muted hint bar under the list. Height collapses to zero for
+    /// frames without `footerHints`, so every existing picker keeps its
+    /// current chrome.
+    private let footer = NSTextField(labelWithString: "")
+    private var footerHeight: NSLayoutConstraint!
     private var cardCenterX: NSLayoutConstraint!
     private var cardTop: NSLayoutConstraint!
     private var isClosing = false
+
+    /// Monotonic panel generation — the token an async git-metrics fill
+    /// captures at spawn so a dismiss→reopen can't let a stale result
+    /// mutate the new palette (plan 005 §3.7's ABA guard; the GTK twin
+    /// is `PaletteInner::session_id`). Consumed by C5.
+    let generation: Int
+    private static var nextGeneration = 0
 
     private static let cardWidth: CGFloat = 660
     private static let cardHeight: CGFloat = 440
@@ -82,6 +94,8 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         self.onDismiss = onDismiss
         self.hostWindow = parent
         self.contentRegion = contentRegion
+        Self.nextGeneration += 1
+        self.generation = Self.nextGeneration
         super.init(
             contentRect: parent.frame,
             styleMask: [.borderless],
@@ -180,8 +194,18 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         divider.translatesAutoresizingMaskIntoConstraints = false
         divider.boxType = .separator
 
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.font = .systemFont(ofSize: 12)
+        footer.textColor = paletteMutedColor
+        footer.isHidden = true
+        // Zero-height (not just hidden) so the scroll view keeps the
+        // card's original bottom padding on every frame that sets no
+        // hints — a hidden view still occupies its constraints.
+        footerHeight = footer.heightAnchor.constraint(equalToConstant: 0)
+
         card.addSubview(divider)
         card.addSubview(scroll)
+        card.addSubview(footer)
         NSLayoutConstraint.activate([
             field.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
             field.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
@@ -195,7 +219,12 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
             scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 6),
-            scroll.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
+            scroll.bottomAnchor.constraint(equalTo: footer.topAnchor),
+
+            footer.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            footer.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            footer.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
+            footerHeight,
         ])
     }
 
@@ -309,10 +338,10 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// order), for `palette.state`.
     func driveSnapshot() -> (
         frame: String, query: String, selection: Int,
-        items: [(id: String, title: String, subtitle: String?)]
+        items: [(id: String, title: String, subtitle: String?, agent: AgentRowData?)]
     ) {
         let items = state.matches.map {
-            (id: $0.item.id, title: $0.item.title, subtitle: $0.item.subtitle)
+            (id: $0.item.id, title: $0.item.title, subtitle: $0.item.subtitle, agent: $0.item.agent)
         }
         return (state.current.id, state.current.query, state.current.selection, items)
     }
@@ -356,6 +385,23 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         syncUI()
     }
 
+    /// Whether `frameID` is anywhere on the live frame stack — the
+    /// live-refresh guard (the agents frame can be the root or a
+    /// sub-frame pushed from the command palette).
+    func hasFrame(_ frameID: String) -> Bool {
+        state.stack.contains { $0.id == frameID }
+    }
+
+    /// Replace one frame's rows in place — the live-refresh path for the
+    /// agents frame (plan 005 §3.8). The query is untouched and the
+    /// highlighted row is preserved by id, so a rebuild triggered by an
+    /// agent event can't steal the user's selection or their filter.
+    func driveUpdateItems(frameID: String, items: [PaletteItem]) {
+        guard state.updateItems(frameID: frameID, items: items) else { return }
+        table.reloadData()
+        selectCurrentRow()
+    }
+
     /// True while the panel is still on screen (not torn down). The
     /// provider spawn checks this before pushing a late-arriving result.
     var isLive: Bool { !isClosing }
@@ -367,10 +413,22 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if field.stringValue != state.current.query {
             field.stringValue = state.current.query
         }
+        syncFooter()
         table.reloadData()
         selectCurrentRow()
         fireHighlight()
     }
+
+    /// Show the hint bar for frames that carry one (only the agents
+    /// frame today), collapse it to nothing otherwise.
+    private func syncFooter() {
+        let hints = state.current.footerHints
+        footer.stringValue = hints ?? ""
+        footer.isHidden = hints == nil
+        footerHeight.constant = hints == nil ? 0 : Self.footerHeightVisible
+    }
+
+    private static let footerHeightVisible: CGFloat = 24
 
     private func selectCurrentRow() {
         let count = state.matches.count
@@ -439,6 +497,17 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let matches = state.matches
         guard row < matches.count else { return nil }
+        // Two disjoint row layouts, so two reuse queues: the agents
+        // frame's multi-column row shares no widget with the generic
+        // title/subtitle one (GTK splits the same way, `build_agent_row`
+        // vs the generic builder).
+        if let agent = matches[row].item.agent {
+            let cell =
+                (tableView.makeView(withIdentifier: PaletteAgentCellView.id, owner: self)
+                    as? PaletteAgentCellView) ?? PaletteAgentCellView()
+            cell.configure(agent)
+            return cell
+        }
         let cell = (tableView.makeView(withIdentifier: PaletteCellView.id, owner: self) as? PaletteCellView) ?? PaletteCellView()
         cell.configure(matches[row])
         return cell
@@ -572,5 +641,107 @@ private final class PaletteCellView: NSView {
             )
         }
         return base
+    }
+}
+
+/// The agents-frame row (plan 005 §3.4): status dot, bold project, name,
+/// colored status, then right-aligned monospace metrics + elapsed time.
+/// Its own cell class — and so its own `NSTableView` reuse queue —
+/// because it shares no widget with the generic title/subtitle row.
+private final class PaletteAgentCellView: NSView {
+    static let id = NSUserInterfaceItemIdentifier("PaletteAgentCell")
+    private let dot = NSView()
+    private let project = NSTextField(labelWithString: "")
+    private let name = NSTextField(labelWithString: "")
+    private let status = NSTextField(labelWithString: "")
+    private let metrics = NSTextField(labelWithString: "")
+    private let time = NSTextField(labelWithString: "")
+    private let left = NSStackView()
+    private let right = NSStackView()
+
+    /// Diameter of the leading status dot. Matches the GTK
+    /// `AGENT_DOT_PX`.
+    private static let dotSize: CGFloat = 8
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        identifier = Self.id
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = Self.dotSize / 2
+
+        project.font = .systemFont(ofSize: 14, weight: .bold)
+        project.textColor = .white
+        name.font = .systemFont(ofSize: 14)
+        name.textColor = .white
+        name.lineBreakMode = .byTruncatingTail
+        status.font = .systemFont(ofSize: 13)
+        status.lineBreakMode = .byTruncatingTail
+        for label in [metrics, time] {
+            label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            label.textColor = paletteMutedColor
+            label.alignment = .right
+        }
+
+        // The left group reads dot → project → name → status; the slack
+        // sits between the status and the right column, so status trails
+        // the name instead of floating away from it. The name truncates
+        // first, then the status; project, metrics, and time are never
+        // truncated (§3.2).
+        project.setContentCompressionResistancePriority(.required, for: .horizontal)
+        status.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for label in [metrics, time] {
+            label.setContentCompressionResistancePriority(.required, for: .horizontal)
+            label.setContentHuggingPriority(.required, for: .horizontal)
+        }
+
+        left.translatesAutoresizingMaskIntoConstraints = false
+        left.orientation = .horizontal
+        left.alignment = .centerY
+        left.spacing = 8
+        left.addArrangedSubview(dot)
+        left.addArrangedSubview(project)
+        left.addArrangedSubview(name)
+        left.addArrangedSubview(status)
+
+        right.translatesAutoresizingMaskIntoConstraints = false
+        right.orientation = .horizontal
+        right.alignment = .centerY
+        right.spacing = 8
+        right.addArrangedSubview(metrics)
+        right.addArrangedSubview(time)
+
+        addSubview(left)
+        addSubview(right)
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: Self.dotSize),
+            dot.heightAnchor.constraint(equalToConstant: Self.dotSize),
+            left.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            left.centerYAnchor.constraint(equalTo: centerYAnchor),
+            left.trailingAnchor.constraint(lessThanOrEqualTo: right.leadingAnchor, constant: -12),
+            right.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            right.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// No fuzzy-match highlighting — the multi-label layout has no
+    /// single string to mark up, and the mockup shows none.
+    ///
+    /// A nil `metricsText` is the *pending* state and renders nothing; a
+    /// resolved probe renders its string (which may itself be `"—"`).
+    func configure(_ agent: AgentRowData) {
+        let color = AgentPalette.statusColor(for: agent.effectiveLifecycle)
+        dot.layer?.backgroundColor = color.cgColor
+        project.stringValue = agent.project
+        name.stringValue = agent.name
+        status.stringValue = agent.statusText
+        status.textColor = color
+        metrics.stringValue = agent.metricsText ?? ""
+        metrics.isHidden = agent.metricsText == nil
+        time.stringValue = agent.timeText
     }
 }
