@@ -10,6 +10,7 @@
 //!    `roostctl` and Claude hooks have a target.
 //! 5. Hands a `LocalClient` to the gtk4-rs `App`.
 
+mod agent_palette;
 mod app;
 mod cell_metrics;
 mod clipboard;
@@ -17,6 +18,7 @@ mod config;
 mod custom_command;
 mod events;
 mod focus;
+mod git_metrics;
 mod key_encoder;
 mod keybind;
 mod notification_inbox;

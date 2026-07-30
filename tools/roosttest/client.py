@@ -288,6 +288,61 @@ class Roost:
             "palette.present", {"title": title, "placeholder": placeholder, "items": items}
         )
 
+    # -- agent palette (plan 005) ------------------------------------------
+    # Rows carry an optional `agent` payload (absent on every non-agent
+    # row): {effective_lifecycle, project, name, status_text, time_text,
+    # metrics_text?}. `metrics_text` is omitted while a git-metrics probe
+    # is still pending and always present once resolved.
+
+    def palette_items(self, kind: str = "agents") -> list[dict]:
+        """Snapshot a palette frame's rows by (re)opening it fresh.
+
+        A frame fixes its row set at push time and `show_*_palette`
+        no-ops while a palette is already open (every picker's shared
+        semantics), so reading the *current* population means dismissing
+        first — mirrors `test_notifications.py`'s `_inbox_ids` helper.
+        Leaves the palette closed."""
+        self.palette_dismiss()
+        st = self.palette_open(kind=kind)
+        items = st.get("items", [])
+        self.palette_dismiss()
+        return items
+
+    def palette_row(self, kind: str, row_id: str) -> dict | None:
+        """One row from `palette_items(kind)`, or None if absent."""
+        return next((it for it in self.palette_items(kind) if it["id"] == row_id), None)
+
+    def wait_palette_row_field(
+        self, kind: str, row_id: str, field: str, expected: object, timeout: float = 5.0
+    ) -> dict:
+        """Poll (dismiss + reopen) `kind`'s frame until row `row_id`'s
+        `field` equals `expected`, then return that row. `field` names a
+        top-level item key (`"title"`) or an `agent.<key>` path into the
+        agent payload (`"agent.status_text"`).
+
+        This re-push-per-poll form is for state that only changes what a
+        *fresh* open would build (e.g. a shell-driven OSC mark moving the
+        effective lifecycle). To assert the live-refresh behavior of a
+        palette session that must stay open across the wait, poll
+        `palette_state()` directly instead — dismissing here would defeat
+        that test. Raises `client.Timeout` on overrun."""
+        box: dict = {"row": None}
+
+        def pred() -> bool:
+            row = self.palette_row(kind, row_id)
+            box["row"] = row
+            if row is None:
+                return False
+            value: object = row
+            for part in field.split("."):
+                if not isinstance(value, dict):
+                    return False
+                value = value.get(part)
+            return value == expected
+
+        self._wait(pred, timeout, f"palette[{kind!r}] row {row_id!r} {field} == {expected!r}")
+        return box["row"]
+
     # -- selection + clipboard (test ops) --------------------------------
     # Mirror the user-driven drag flow (`selection.set` ~ mouseDown +
     # drag), reading back via `selection.dump`. The host clipboard is

@@ -28,6 +28,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use roost_ipc::agent::{
     self, AgentLifecycle, AgentTabState, AttentionEffect, OwnershipAction, TabAgentReportParams,
+    SOURCE_LEGACY, SOURCE_MANUAL,
 };
 use roost_ipc::messages::{Project, Tab, TabState};
 use tokio::sync::broadcast;
@@ -1509,11 +1510,6 @@ impl Inner {
     }
 }
 
-/// Ownership source for a hand-driven `roostctl tab set-state`.
-const SOURCE_MANUAL: &str = "manual";
-/// Ownership source for the deprecated `tab.set_hook_active` alias.
-const SOURCE_LEGACY: &str = "legacy";
-
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
     Tab {
         id: row.id,
@@ -1700,6 +1696,31 @@ mod tests {
         let t = ws.tab(tid).unwrap();
         assert_eq!(t.title, "manual");
         assert!(t.user_titled);
+    }
+
+    /// A closed tab stops resolving, and `focus_tab` on it is an error.
+    ///
+    /// This pair is what the UI's stale-jump guard rides on: an agent
+    /// row, a notification row, or an OS banner can outlive its tab, and
+    /// `App::reveal_and_focus_tab` asks `tab()` before uncollapsing the
+    /// sidebar so a jump that won't happen can't persist
+    /// `sidebar_collapsed = false`.
+    #[test]
+    fn a_closed_tab_no_longer_resolves_or_focuses() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let keep = ws.open_tab(pid, "/tmp", "").unwrap().id;
+        let doomed = ws.open_tab(pid, "/tmp", "").unwrap().id;
+        assert!(ws.tab(doomed).is_ok());
+
+        ws.close_tab(doomed).unwrap();
+        assert!(
+            matches!(ws.tab(doomed), Err(WorkspaceError::TabNotFound(id)) if id == doomed),
+            "a closed tab must report gone, not resolve stale"
+        );
+        assert!(ws.focus_tab(doomed).is_err());
+        // The surviving sibling is untouched by the guard's probe.
+        assert!(ws.tab(keep).is_ok());
     }
 
     /// Issue #196: `set_tab_cwd` re-derives the tab title from cwd

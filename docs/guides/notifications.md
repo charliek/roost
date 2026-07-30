@@ -46,6 +46,7 @@ Pending notifications are also a navigable list, so you can jump straight to wha
 - **Jump to unread** (`Cmd-Shift-U` / `Alt-Shift-U`) focuses the next tab with a pending notification — the active project first, then the others. Focusing the tab clears its badge, so repeating the shortcut walks through everything pending.
 - **The notification inbox** is the command palette's **View Notifications** entry: one row per pending tab, labeled `<project> · <tab>` with the message body. Activating a row jumps to that tab and clears it.
 - **Clear All Notifications** (also in the command palette) empties the inbox and drops every pending badge at once.
+- **Sidebar reveal.** Every "jump to a tab" path — jump-to-unread, activating a notification-inbox row, and activating a row in the agent palette (`Cmd-Shift-O` / `Alt-Shift-O`; see [Keybindings](../getting-started/keybindings.md)) — reveals the projects sidebar if it was collapsed, on **both** Mac and GTK. The reveal only happens once the jump actually succeeds (the target tab still exists); a jump at a since-closed tab leaves the sidebar exactly as it was.
 
 ## Tab targeting
 

@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Context;
 use gtk4::glib;
@@ -31,6 +32,7 @@ use roost_linux::daemon::{RestoreTab, WorkspaceEvent};
 use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
+use crate::agent_palette;
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::clipboard;
 use crate::config;
@@ -38,6 +40,7 @@ use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::focus::safe_grab_focus;
+use crate::git_metrics;
 use crate::keybind::{
     canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
 };
@@ -195,6 +198,14 @@ pub struct App {
     /// result (provider A in flight, user picks B) is dropped rather than
     /// pushing a stale frame onto the current one.
     provider_req: std::cell::Cell<u64>,
+    /// The agents palette's git-metrics probe pipeline (plan 005 §3.7).
+    /// Holds the runner, the per-command timeout, and the concurrency
+    /// permit pool, so the cap is process-wide rather than per batch.
+    git_probe: Arc<git_metrics::GitProbe>,
+    /// Resolved metrics for the *open* palette session, keyed by repo
+    /// root. A live-refresh rebuild reuses these instead of re-probing;
+    /// a dismiss → reopen starts a new session and discards them.
+    metrics_cache: RefCell<git_metrics::MetricsCache>,
     /// Live inbox of pending agent notifications, surfaced through the
     /// command palette ("View Notifications") + the HeaderBar button.
     /// Membership is driven off the `has_notification` edges in
@@ -423,19 +434,20 @@ fn render_window_png(
 /// Map a GTK [`PaletteSnapshot`] to the wire [`PaletteStateResult`] for
 /// an open palette. The closed state (`open: false`) is built directly
 /// as `PaletteStateResult::default()` by the caller.
-fn palette_state_from(s: &PaletteSnapshot) -> PaletteStateResult {
+fn palette_state_from(s: PaletteSnapshot) -> PaletteStateResult {
     PaletteStateResult {
         open: true,
-        frame: Some(s.frame.clone()),
-        query: s.query.clone(),
+        frame: Some(s.frame),
+        query: s.query,
         selection: s.selection as u32,
         items: s
             .items
-            .iter()
-            .map(|(id, title, subtitle)| PaletteItemView {
-                id: id.clone(),
-                title: title.clone(),
-                subtitle: subtitle.clone(),
+            .into_iter()
+            .map(|item| PaletteItemView {
+                id: item.id,
+                title: item.title,
+                subtitle: item.subtitle,
+                agent: item.agent,
             })
             .collect(),
         selected_in_view: s.selected_in_view,
@@ -767,6 +779,8 @@ impl App {
             _band_size_group: band_size_group,
             palette: RefCell::new(None),
             provider_req: std::cell::Cell::new(0),
+            git_probe: Arc::new(git_metrics::GitProbe::new()),
+            metrics_cache: RefCell::new(git_metrics::MetricsCache::default()),
             notification_inbox: RefCell::new(NotificationInbox::new()),
             notif_badge: notif_badge.clone(),
             font_family: RefCell::new(cfg.font_family.clone()),
@@ -899,7 +913,10 @@ impl App {
             let app_for_focus = app_struct.clone();
             focus_action.connect_activate(move |_, target| {
                 if let Some(target) = target.and_then(|t| t.get::<i64>()) {
-                    app_for_focus.focus_tab_by_id(target);
+                    // An OS-banner click is a notification jump like any
+                    // other: reveal the sidebar so the user can see which
+                    // project they landed in.
+                    app_for_focus.reveal_and_focus_tab(target);
                 }
             });
             app.add_action(&focus_action);
@@ -3054,6 +3071,16 @@ impl App {
                 self.reconcile_to_snapshot(projects);
             }
         }
+        // Live refresh (plan 005 §3.8). Once here rather than opted into
+        // per arm: an agent row is a pure re-derivation of the whole
+        // core snapshot, so *any* event that can move a rendered column
+        // — agent state, but also a rename (the bold project cell), a
+        // project delete, a resync, a tab open — must rebuild it or the
+        // open palette shows stale rows. Per-arm opt-in had already
+        // missed ProjectRenamed / ProjectDeleted / Resync / TabOpened.
+        // Cheap by construction: a no-op unless the agents frame is
+        // actually on the palette stack.
+        self.refresh_agent_palette();
     }
 
     /// Mark `tab_id` server-driven and close its `AdwTabPage`. The
@@ -3333,6 +3360,7 @@ impl App {
             KeybindAction::CommandPalette
                 | KeybindAction::CommandLauncher
                 | KeybindAction::CustomPalette
+                | KeybindAction::AgentPalette
         );
         if !is_picker_toggle && self.palette.borrow().is_some() {
             return;
@@ -3341,6 +3369,7 @@ impl App {
             KeybindAction::CommandPalette => self.show_command_palette(),
             KeybindAction::CommandLauncher => self.show_command_launcher(),
             KeybindAction::CustomPalette => self.show_custom_palette(),
+            KeybindAction::AgentPalette => self.show_agent_palette(),
             KeybindAction::NewTab => {
                 let pid = *self.active_project_id.borrow();
                 if pid == 0 {
@@ -3657,16 +3686,24 @@ impl App {
         for (accel, action) in bindings {
             reverse.entry(action).or_insert(accel);
         }
-        // The two notification commands sit just below the Select Theme… /
-        // Select Font… drill-ins; built dynamically so "View Notifications"
-        // carries the live pending count.
+        // The agent drill-in and the two notification commands sit just
+        // below the Select Theme… / Select Font… drill-ins, in that
+        // order; built dynamically so "View Notifications" carries the
+        // live pending count.
         let mut items = command_items(|action| reverse.get(&action).and_then(accel_label));
-        let notif = self.notification_command_items();
+        let mut dynamic = vec![
+            PaletteItem::new(PaletteCommands::VIEW_AGENTS_ID, "Go to Agent…").with_trailing(
+                reverse
+                    .get(&KeybindAction::AgentPalette)
+                    .and_then(accel_label),
+            ),
+        ];
+        dynamic.extend(self.notification_command_items());
         let at = items
             .iter()
             .position(|i| i.id == PaletteCommands::SELECT_FONT_ID)
             .map_or(items.len(), |i| i + 1);
-        items.splice(at..at, notif);
+        items.splice(at..at, dynamic);
         // Surface the custom palette (script-backed providers) as a
         // drill-in row, but only when at least one provider is configured
         // — otherwise the command palette stays uncluttered.
@@ -3725,6 +3762,259 @@ impl App {
             },
         );
         *self.palette.borrow_mut() = Some(overlay);
+    }
+
+    // MARK: agent palette (Cmd+Shift+O / Alt+Shift+O)
+
+    /// Open the palette directly on the agent switcher — one row per
+    /// agent-owned tab, ordered by urgency (plan 005 §3.1). Presented as
+    /// the root frame (so Esc closes). No-op while any palette is open,
+    /// matching every other picker.
+    fn show_agent_palette(self: &Rc<Self>) {
+        if self.palette.borrow().is_some() {
+            return;
+        }
+        let root = self.agents_frame();
+        let behavior = self.agents_behavior();
+        let top_margin = self.palette_top_margin();
+        let weak_dismiss = Rc::downgrade(self);
+        let overlay = PaletteOverlay::present(
+            &self.content_overlay,
+            root,
+            behavior,
+            top_margin,
+            move || {
+                if let Some(app) = weak_dismiss.upgrade() {
+                    app.dismiss_palette();
+                }
+            },
+        );
+        *self.palette.borrow_mut() = Some(overlay);
+        self.start_agent_metrics();
+    }
+
+    /// The agents frame, built from the **core** workspace snapshot (not
+    /// a UI-side cache), so the palette reads the same state `tab.list`
+    /// would report. Rows carry whatever git metrics the open session has
+    /// already resolved; the rest stay pending until their probe lands.
+    fn agents_frame(self: &Rc<Self>) -> PaletteFrame {
+        let snapshot = self.workspace_snapshot();
+        let cwds = agent_palette::agent_tab_cwds(&snapshot);
+        let mut frame = agent_palette::agent_frame(&snapshot, agent_palette::now_unix());
+        self.apply_metrics_cache(&cwds, &mut frame.items);
+        frame
+    }
+
+    fn workspace_snapshot(self: &Rc<Self>) -> Vec<Project> {
+        match self.client.borrow().as_ref() {
+            Some(client) => client.workspace.snapshot(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Confirm on an agent row → reveal the sidebar and jump to that
+    /// tab. The `agents:empty` sentinel is non-actionable (never reaches
+    /// here); a stale id (its tab closed between build and confirm) is a
+    /// no-op that leaves the palette open.
+    fn agents_behavior(self: &Rc<Self>) -> PaletteBehavior {
+        self.jump_to_tab_behavior(agent_palette::agent_tab_id)
+    }
+
+    /// Shared confirm handler for the frames whose rows are "go to this
+    /// tab" (agents, notifications): parse the row id, and on a hit
+    /// reveal the sidebar and focus the tab. A row `parse` rejects (an
+    /// empty-state sentinel) is a no-op that leaves the palette open.
+    ///
+    /// The jump is deferred to an idle tick so the palette tears down
+    /// before the focus runs.
+    fn jump_to_tab_behavior(self: &Rc<Self>, parse: fn(&str) -> Option<i64>) -> PaletteBehavior {
+        let weak = Rc::downgrade(self);
+        PaletteBehavior::new(move |item| {
+            let Some(app) = weak.upgrade() else {
+                return PaletteOutcome::Close;
+            };
+            let Some(tab_id) = parse(&item.id) else {
+                return PaletteOutcome::None;
+            };
+            let weak2 = Rc::downgrade(&app);
+            glib::idle_add_local_once(move || {
+                if let Some(app) = weak2.upgrade() {
+                    app.reveal_and_focus_tab(tab_id);
+                }
+            });
+            PaletteOutcome::Close
+        })
+    }
+
+    /// Live refresh (plan 005 §3.8): rebuild the agents frame's rows
+    /// from the core snapshot whenever agent state — or a tab's
+    /// existence, title, or cwd — changes while the palette is open. The
+    /// query is untouched and the highlighted row is preserved by id.
+    /// A no-op when the agents frame isn't on the stack.
+    fn refresh_agent_palette(self: &Rc<Self>) {
+        let Some((session, driver)) = self.agents_palette_target() else {
+            return;
+        };
+        let snapshot = self.workspace_snapshot();
+        let cwds = agent_palette::agent_tab_cwds(&snapshot);
+        let mut items = agent_palette::agent_items(&snapshot, agent_palette::now_unix());
+        self.apply_metrics_cache(&cwds, &mut items);
+        driver.update_items(agent_palette::FRAME_ID, items);
+        // A rebuild can introduce a tab (and so a repo) the session has
+        // never measured; already-resolved and in-flight cwds are skipped.
+        self.spawn_agent_metrics(session, &cwds);
+    }
+
+    // MARK: agent palette — git metrics (plan 005 §3.7)
+
+    /// The live palette's session id + driver, but only while the agents
+    /// frame is somewhere on its stack. This *is* the generation guard
+    /// on the result side: an async metrics result is applied only if
+    /// this still reports the session that asked for it.
+    fn agents_palette_target(self: &Rc<Self>) -> Option<(u64, crate::palette_ui::PaletteDriver)> {
+        let palette = self.palette.borrow();
+        let overlay = palette.as_ref()?;
+        let driver = overlay.driver();
+        driver
+            .has_frame(agent_palette::FRAME_ID)
+            .then(|| (overlay.id(), driver))
+    }
+
+    /// Start probing for a frame the caller is about to show or push.
+    /// Keyed off the open palette's session id rather than frame
+    /// presence — the frame isn't on the stack yet at either call site.
+    /// The rows render immediately with metrics absent (pending); each
+    /// probe resolves to a value or `—`.
+    fn start_agent_metrics(self: &Rc<Self>) {
+        let Some(session) = self.palette.borrow().as_ref().map(|o| o.id()) else {
+            return;
+        };
+        let snapshot = self.workspace_snapshot();
+        self.spawn_agent_metrics(session, &agent_palette::agent_tab_cwds(&snapshot));
+    }
+
+    /// Probe every agent tab's repo that this palette session hasn't
+    /// measured yet. The work runs on the tokio runtime (never the GTK
+    /// thread) and the result hops back to the main context the way the
+    /// provider subprocess path does — `glib::spawn_future_local`
+    /// awaiting an `rt.spawn` handle.
+    fn spawn_agent_metrics(self: &Rc<Self>, session: u64, cwds: &HashMap<i64, String>) {
+        let (claimed, known) = {
+            let mut cache = self.metrics_cache.borrow_mut();
+            // A reopened palette is a new session: everything the last
+            // one resolved is discarded, so it re-probes.
+            cache.begin_session(session);
+            (
+                cache.claim_unprobed(cwds.values().cloned()),
+                // Roots this session already measured: the batch reuses
+                // their text instead of re-running git for a new tab in
+                // an old repo.
+                cache.known_roots(),
+            )
+        };
+        if claimed.is_empty() {
+            return;
+        }
+        let probe = self.git_probe.clone();
+        let rt = self.rt.clone();
+        let weak = Rc::downgrade(self);
+        let batch = claimed.clone();
+        glib::spawn_future_local(async move {
+            let outcomes = rt
+                .spawn(git_metrics::probe_batch(probe, batch, known))
+                .await;
+            // Back on the GTK main context from here.
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            // Generation guard on INGESTION is session-only: the cache is
+            // session-scoped data, and storing must happen even when the
+            // user escaped back to the root frame mid-probe — storing is
+            // what clears `pending`, so skipping it would leave those
+            // rows pending for the rest of the session after a re-drill.
+            // The frame-presence half of the guard lives where the UI is
+            // actually touched: `refresh_agent_palette` no-ops unless the
+            // agents frame is on the stack. Dismiss → reopen still cannot
+            // be filled with old numbers — that is the session check.
+            {
+                let mut cache = app.metrics_cache.borrow_mut();
+                if cache.session() != session {
+                    return;
+                }
+                match outcomes {
+                    Ok(outcomes) => app.ingest_agent_metrics(&mut cache, outcomes),
+                    Err(e) => {
+                        // The task itself died (panic / runtime shutdown).
+                        // Every claimed cwd must still resolve or its row
+                        // stays pending forever — plan 005 §3.7's "every
+                        // probe always resolves".
+                        tracing::warn!(error = %e, "git metrics task failed");
+                        for cwd in &claimed {
+                            cache.store_unresolved(cwd);
+                        }
+                    }
+                }
+            }
+            app.refresh_agent_palette();
+        });
+    }
+
+    /// Fold one batch's outcomes into the session cache. The probe
+    /// returns errors rather than swallowing them; this is the boundary
+    /// that handles them, and every failure renders as `—`.
+    fn ingest_agent_metrics(
+        self: &Rc<Self>,
+        cache: &mut git_metrics::MetricsCache,
+        outcomes: Vec<git_metrics::ProbeOutcome>,
+    ) {
+        for outcome in outcomes {
+            let Some(root) = outcome.root.clone() else {
+                if let git_metrics::ProbeValue::Measured(Err(e)) = &outcome.value {
+                    tracing::debug!(cwd = %outcome.cwd, reason = %e, "no git metrics");
+                }
+                cache.store_unresolved(&outcome.cwd);
+                continue;
+            };
+            let text = match outcome.value {
+                git_metrics::ProbeValue::Reused(text) => text,
+                git_metrics::ProbeValue::Measured(Ok(metrics)) => metrics.text(),
+                git_metrics::ProbeValue::Measured(Err(e)) => {
+                    tracing::debug!(cwd = %outcome.cwd, reason = %e, "no git metrics");
+                    git_metrics::UNKNOWN.to_string()
+                }
+            };
+            cache.store_root(&outcome.cwd, &root, text);
+        }
+    }
+
+    /// Fill in the metrics column on every row whose tab cwd the **open**
+    /// palette session has already resolved. Rows left `None` render as
+    /// pending; rows sharing a repo root all get the same string from one
+    /// probe.
+    ///
+    /// Keyed on the live overlay's session id, so a frame built for a
+    /// palette that isn't up yet (a direct open) or for a session the
+    /// cache doesn't hold (dismiss → reopen, before `begin_session`
+    /// clears it) starts fully pending instead of flashing the previous
+    /// session's numbers.
+    fn apply_metrics_cache(
+        self: &Rc<Self>,
+        cwds: &HashMap<i64, String>,
+        items: &mut [PaletteItem],
+    ) {
+        let Some(session) = self.palette.borrow().as_ref().map(|o| o.id()) else {
+            return;
+        };
+        let cache = self.metrics_cache.borrow();
+        for item in items.iter_mut() {
+            let Some(tab_id) = agent_palette::agent_tab_id(&item.id) else {
+                continue;
+            };
+            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab_id)) else {
+                continue;
+            };
+            agent.metrics_text = cache.text_for_session(session, cwd).map(str::to_string);
+        }
     }
 
     // MARK: command launcher (Cmd+Shift+T / Alt+Shift+T)
@@ -4230,28 +4520,9 @@ impl App {
 
     /// Confirm on a notification row → focus that project + tab (which
     /// clears the tab's notification → drops the row). The "No
-    /// notifications" sentinel is a no-op. Deferred to an idle tick so
-    /// the palette tears down before the focus/present runs (mirrors the
-    /// command path).
+    /// notifications" sentinel is a no-op.
     fn notifications_behavior(self: &Rc<Self>) -> PaletteBehavior {
-        let weak = Rc::downgrade(self);
-        PaletteBehavior::new(move |item| {
-            let Some(app) = weak.upgrade() else {
-                return PaletteOutcome::Close;
-            };
-            match notif_tab_id(&item.id) {
-                Some(tab_id) => {
-                    let weak2 = Rc::downgrade(&app);
-                    glib::idle_add_local_once(move || {
-                        if let Some(app) = weak2.upgrade() {
-                            app.focus_tab_by_id(tab_id);
-                        }
-                    });
-                    PaletteOutcome::Close
-                }
-                None => PaletteOutcome::None, // "No notifications" sentinel
-            }
-        })
+        self.jump_to_tab_behavior(notif_tab_id)
     }
 
     /// "Clear All Notifications": clear each pending tab's notification
@@ -4405,6 +4676,11 @@ impl App {
         }
         if item.id == PaletteCommands::SELECT_FONT_ID {
             return PaletteOutcome::Push(self.font_frame(), self.font_behavior());
+        }
+        if item.id == PaletteCommands::VIEW_AGENTS_ID {
+            let frame = self.agents_frame();
+            self.start_agent_metrics();
+            return PaletteOutcome::Push(frame, self.agents_behavior());
         }
         if item.id == PaletteCommands::VIEW_NOTIFICATIONS_ID {
             return PaletteOutcome::Push(self.notifications_frame(), self.notifications_behavior());
@@ -4795,6 +5071,7 @@ impl App {
         match kind {
             "launcher" => self.show_command_launcher(),
             "custom" => self.show_custom_palette(),
+            "agents" => self.show_agent_palette(),
             _ => self.show_command_palette(),
         }
         self.ipc_palette_state()
@@ -4804,7 +5081,7 @@ impl App {
     /// (`open: false`) when none is up.
     fn ipc_palette_state(self: &Rc<Self>) -> PaletteStateResult {
         match self.palette.borrow().as_ref() {
-            Some(overlay) => palette_state_from(&overlay.driver().snapshot()),
+            Some(overlay) => palette_state_from(overlay.driver().snapshot()),
             None => PaletteStateResult::default(),
         }
     }
@@ -5241,18 +5518,59 @@ impl App {
         Ok(())
     }
 
+    /// Reveal the projects sidebar if it's collapsed, persisting the
+    /// change. Idempotent.
+    ///
+    /// Called on every jump that sends the user to another project's tab
+    /// (notification jump, jump-to-unread, agent-row activation): landing
+    /// in a different project with the sidebar hidden leaves no visible
+    /// cue about where you are. Mirrors the Mac app's
+    /// `ensureSidebarVisible()` — the GTK side lacked it (plan 005 §3.11).
+    ///
+    /// Prefer [`reveal_and_focus_tab`](Self::reveal_and_focus_tab) over
+    /// calling this directly on a jump: the reveal has to be guarded on
+    /// the target still existing.
+    fn ensure_sidebar_visible(self: &Rc<Self>) {
+        self.set_sidebar_visible(true);
+    }
+
+    /// The shared body of every "go to this tab" jump — an agent row, a
+    /// notification row, the OS notification banner, jump-to-unread.
+    ///
+    /// The reveal happens **after** the focus succeeds: a jump whose tab
+    /// closed between the row/banner being built and the click must not
+    /// uncollapse the sidebar — and persist `sidebar_collapsed = false`
+    /// — for a navigation that then doesn't happen. Focus-then-reveal
+    /// makes that atomic (the core's `focus_tab` is the single
+    /// existence check), where a separate exists-probe left a window
+    /// for the tab to vanish in between. Both land in the same main-loop
+    /// iteration, so the ordering is invisible on screen.
+    fn reveal_and_focus_tab(self: &Rc<Self>, tab_id: i64) {
+        if self.focus_tab_by_id(tab_id) {
+            self.ensure_sidebar_visible();
+        }
+    }
+
     fn toggle_sidebar(self: &Rc<Self>) {
-        // Hide the entire sidebar container — header + list + footer
-        // button — so the Paned divider snaps to the left edge. Pre-M5
-        // we toggled only the list, leaving the Projects header and
-        // `+ Project` button orphaned in a thin strip.
-        let visible = self.sidebar_box.is_visible();
-        self.sidebar_box.set_visible(!visible);
-        // Persist the choice so it survives relaunch (GTK parity with the
-        // Mac UI's RoostSidebarVisible). New visibility is `!visible`, so
-        // collapsed == `visible` (the prior state).
+        self.set_sidebar_visible(!self.sidebar_box.is_visible());
+    }
+
+    /// Show or hide the sidebar and persist the choice. Idempotent.
+    ///
+    /// Hides the entire sidebar container — header + list + footer
+    /// button — so the Paned divider snaps to the left edge. Pre-M5 we
+    /// toggled only the list, leaving the Projects header and
+    /// `+ Project` button orphaned in a thin strip.
+    ///
+    /// The persisted flag is `collapsed`, i.e. the inverse (GTK parity
+    /// with the Mac UI's RoostSidebarVisible).
+    fn set_sidebar_visible(self: &Rc<Self>, visible: bool) {
+        if self.sidebar_box.is_visible() == visible {
+            return;
+        }
+        self.sidebar_box.set_visible(visible);
         if let Some(client) = self.client.borrow().clone() {
-            client.workspace.set_sidebar_collapsed(visible);
+            client.workspace.set_sidebar_collapsed(!visible);
         }
     }
 
@@ -5442,9 +5760,9 @@ impl App {
     /// AdwTabView, select the matching page, then raise the window.
     /// Wired via the `app.focus-tab` action; click-handler in the
     /// gio::Notification's default action target.
-    fn focus_tab_by_id(self: &Rc<Self>, tab_id: i64) {
+    fn focus_tab_by_id(self: &Rc<Self>, tab_id: i64) -> bool {
         let Some(client) = self.client.borrow().clone() else {
-            return;
+            return false;
         };
         // Route through the core: `focus_tab` updates `workspace.active()`
         // (so `identify` / `tab.focus` report the tab the user was sent
@@ -5454,7 +5772,7 @@ impl App {
         // active tab stale vs. what's on screen — the UI as its own source
         // of truth rather than a reaction to the core.
         if client.workspace.focus_tab(tab_id).is_err() {
-            return; // tab vanished between the inbox snapshot and the jump
+            return false; // tab vanished between the inbox snapshot and the jump
         }
         // Bring the window forward (jump-specific; ActiveChanged handles
         // the on-screen selection).
@@ -5463,6 +5781,7 @@ impl App {
         // pending notification, which drops the inbox row + the tab's
         // needs-attention badge via the `TabNotification` false-edge.
         let _ = client.workspace.set_tab_has_notification(tab_id, false);
+        true
     }
 
     /// Make `project_id` active from a UI action (sidebar click, project
@@ -5521,7 +5840,7 @@ impl App {
                 .map(|r| r.tab_id)
         };
         if let Some(tab_id) = target {
-            self.focus_tab_by_id(tab_id);
+            self.reveal_and_focus_tab(tab_id);
         }
     }
 

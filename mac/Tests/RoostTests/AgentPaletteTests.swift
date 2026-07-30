@@ -1,0 +1,404 @@
+// Pure-logic tests for the agents palette frame (plan 005 §3.2–§3.6).
+//
+// Mirrors `crates/roost-linux/src/agent_palette.rs`'s `mod tests` case
+// for case: the same status vocabulary, time buckets, ordering
+// tiebreaks, population filter, name fallback, and normalization rules,
+// asserted on the same strings. A divergence between the two UIs is a
+// red test here rather than a user noticing the palettes disagree.
+
+import AppKit
+import Testing
+
+@testable import Roost
+
+private let NOW: Int64 = 1_700_000_000
+
+private func tab(_ id: Int64, _ title: String, projectID: Int64 = 1) -> Workspace.Tab {
+    Workspace.Tab(
+        id: id,
+        projectId: projectID,
+        title: title,
+        cwd: "/tmp",
+        agent: AgentTabState(shell: .atPrompt, lifecycle: .inactive, ownership: nil),
+        hasNotification: false,
+        userTitled: false,
+        position: 0,
+        createdAt: 0,
+        lastActive: 0
+    )
+}
+
+private func owned(
+    _ tab: Workspace.Tab, _ source: String, _ lifecycle: AgentLifecycle, _ at: Int64
+) -> Workspace.Tab {
+    var t = tab
+    t.agent.lifecycle = lifecycle
+    t.agent.ownership = Ownership(source: source, sessionID: "s1", lastEventAt: at)
+    return t
+}
+
+/// Mutate an owned tab's `Ownership`. Fails loudly rather than silently
+/// skipping if the tab isn't owned, so a mis-built fixture can't test
+/// the wrong thing.
+private func withOwner(_ tab: Workspace.Tab, _ edit: (inout Ownership) -> Void) -> Workspace.Tab {
+    var t = tab
+    guard var owner = t.agent.ownership else {
+        Issue.record("fixture tab is not owned")
+        return t
+    }
+    edit(&owner)
+    t.agent.ownership = owner
+    return t
+}
+
+private func project(_ id: Int64, _ name: String, position: Int32 = 0) -> Workspace.Project {
+    Workspace.Project(id: id, name: name, cwd: "/tmp", position: position, createdAt: 0)
+}
+
+private func items(_ projects: [Workspace.Project], _ tabs: [Workspace.Tab], now: Int64 = NOW)
+    -> [PaletteItem]
+{
+    AgentPalette.agentItems(projects: projects, tabs: tabs, now: now)
+}
+
+private func agentOf(_ item: PaletteItem) -> AgentRowData {
+    guard let agent = item.agent else {
+        Issue.record("expected an agent row payload on \(item.id)")
+        return AgentRowData(
+            effectiveLifecycle: .inactive, project: "", name: "", statusText: "", timeText: "",
+            metricsText: nil)
+    }
+    return agent
+}
+
+// MARK: - Status text
+
+@Test
+func agentStatusTextCoversEveryLifecycle() {
+    #expect(AgentPalette.statusText(effective: .working, raw: .working, detail: "") == "Working")
+    #expect(
+        AgentPalette.statusText(effective: .waiting, raw: .waiting, detail: "")
+            == "Waiting for input")
+    #expect(AgentPalette.statusText(effective: .finished, raw: .finished, detail: "") == "Finished")
+    #expect(AgentPalette.statusText(effective: .failed, raw: .failed, detail: "") == "Failed")
+    #expect(AgentPalette.statusText(effective: .inactive, raw: .inactive, detail: "") == "Idle")
+}
+
+@Test
+func agentFailedAppendsItsDetail() {
+    #expect(
+        AgentPalette.statusText(effective: .failed, raw: .failed, detail: "rate_limit")
+            == "Failed · rate_limit")
+}
+
+@Test
+func agentFailedDetailIsCappedAtFortyChars() {
+    let long = String(repeating: "x", count: 60)
+    let text = AgentPalette.statusText(effective: .failed, raw: .failed, detail: long)
+    let detail = String(text.dropFirst("Failed · ".count))
+    #expect(detail.count == 40)
+    #expect(detail.hasSuffix("…"))
+    // Exactly 40 is left alone.
+    let exact = String(repeating: "y", count: 40)
+    #expect(
+        AgentPalette.statusText(effective: .failed, raw: .failed, detail: exact)
+            == "Failed · \(exact)")
+}
+
+@Test
+func agentBackgroundTasksDetailRendersSingularAndPlural() {
+    #expect(
+        AgentPalette.statusText(effective: .working, raw: .working, detail: "background_tasks:1")
+            == "Working · 1 bg task")
+    #expect(
+        AgentPalette.statusText(effective: .working, raw: .working, detail: "background_tasks:2")
+            == "Working · 2 bg tasks")
+}
+
+@Test
+func agentMalformedBackgroundTasksFallsBackToPlainWorking() {
+    for detail in [
+        "background_tasks:",
+        "background_tasks:abc",
+        "background_tasks:0",
+        "background_tasks:-3",
+        "background_tasks:1.5",
+        "background tasks:2",
+    ] {
+        #expect(
+            AgentPalette.statusText(effective: .working, raw: .working, detail: detail) == "Working",
+            "detail \(detail) must not render a count")
+    }
+}
+
+@Test
+func agentForeignDetailOnAWorkingRowIsIgnored() {
+    // `applyReport` preserves prior detail on empty-detail reports, so a
+    // non-Claude adapter can leave stale detail behind.
+    #expect(
+        AgentPalette.statusText(effective: .working, raw: .working, detail: "permission_prompt")
+            == "Working")
+}
+
+@Test
+func agentShellDerivedWorkingNeverShowsABackgroundCount() {
+    // Effective is working (foreground process) while the agent axis is
+    // inactive — the count belongs to the agent, not the shell.
+    #expect(
+        AgentPalette.statusText(effective: .working, raw: .inactive, detail: "background_tasks:2")
+            == "Working")
+}
+
+@Test
+func agentStatusTextNormalizesControlCharacters() {
+    #expect(
+        AgentPalette.statusText(
+            effective: .failed, raw: .failed, detail: "rate\nlimit\r\u{1b}[31m")
+            == "Failed · ratelimit[31m")
+}
+
+// MARK: - Elapsed time
+
+@Test
+func agentElapsedBucketEdges() {
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW) == "0s")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 59) == "59s")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 60) == "1m")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 3_599) == "59m")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 3_600) == "1h")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 86_399) == "23h")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 86_400) == "1d")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW - 172_800) == "2d")
+}
+
+@Test
+func agentElapsedClampsAFutureStamp() {
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: NOW + 5) == "0s")
+    #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: Int64.max) == "0s")
+}
+
+// MARK: - Population
+
+@Test
+func agentOnlyAgentOwnedTabsAreListed() {
+    let tabs = [
+        tab(1, "plain shell"),
+        owned(tab(2, "claude"), "claude", .working, NOW),
+        owned(tab(3, "manual"), Workspace.manualSource, .working, NOW),
+        owned(tab(4, "legacy"), Workspace.legacySource, .working, NOW),
+        owned(tab(5, "codex"), "codex", .waiting, NOW),
+    ]
+    #expect(items([project(1, "roost")], tabs).map(\.id) == ["agent:5", "agent:2"])
+}
+
+@Test
+func agentAnEmptySourceIsNotLive() {
+    let ghost = withOwner(owned(tab(1, "ghost"), "claude", .working, NOW)) { $0.source = "" }
+    #expect(items([project(1, "roost")], [ghost])[0].id == AgentPalette.emptyRowID)
+}
+
+@Test
+func agentATabWithNoProjectIsSkipped() {
+    // The Mac workspace keeps projects and tabs in separate maps; a tab
+    // whose project vanished mid-snapshot has no bold cell to render.
+    let orphan = owned(tab(1, "claude", projectID: 99), "claude", .working, NOW)
+    #expect(items([project(1, "roost")], [orphan])[0].id == AgentPalette.emptyRowID)
+}
+
+@Test
+func agentAFreshlyClaimedAndAFailsafedTabStillAppear() {
+    // SessionStart claims with raw `inactive`; the dead-agent failsafe
+    // forces raw `inactive` while keeping ownership. Both fall through
+    // to the shell axis.
+    var fresh = owned(tab(1, "claude"), "claude", .inactive, NOW)
+    fresh.agent.shell = .atPrompt
+    var busy = owned(tab(2, "claude"), "claude", .inactive, NOW)
+    busy.agent.shell = .foregroundProcess
+    let rows = items([project(1, "roost")], [fresh, busy])
+    #expect(rows.count == 2)
+    // Shell-derived: the busy one ranks above the idle one.
+    #expect(rows[0].id == "agent:2")
+    #expect(agentOf(rows[0]).statusText == "Working")
+    #expect(agentOf(rows[1]).statusText == "Idle")
+}
+
+@Test
+func agentEmptyPopulationYieldsOneNonActionableRow() {
+    let rows = items([project(1, "roost")], [tab(1, "shell")])
+    #expect(rows.count == 1)
+    #expect(rows[0].id == AgentPalette.emptyRowID)
+    #expect(rows[0].title == AgentPalette.emptyRowTitle)
+    #expect(rows[0].actionable == false)
+    #expect(rows[0].agent == nil)
+    // The sentinel must not parse as a jump target.
+    #expect(AgentPalette.tabID(fromRowID: AgentPalette.emptyRowID) == nil)
+}
+
+@Test
+func agentRowIDRoundTripsToATabID() {
+    #expect(AgentPalette.tabID(fromRowID: "agent:42") == 42)
+    #expect(AgentPalette.tabID(fromRowID: "agent:") == nil)
+    #expect(AgentPalette.tabID(fromRowID: "agent:x") == nil)
+    #expect(AgentPalette.tabID(fromRowID: "notif:7") == nil)
+}
+
+// MARK: - Name + title
+
+@Test
+func agentNamePrefersSessionTitleThenTabTitleThenPlaceholder() {
+    let withMeta = withOwner(owned(tab(1, "zsh"), "claude", .working, NOW)) {
+        $0.metadata[AgentPalette.sessionTitleKey] = "slauth-refactor"
+    }
+    let withTitle = owned(tab(2, "zsh"), "claude", .working, NOW)
+    let untitled = owned(tab(3, ""), "claude", .working, NOW)
+
+    let rows = items([project(1, "roost")], [withMeta, withTitle, untitled])
+    func byID(_ id: String) -> PaletteItem {
+        guard let row = rows.first(where: { $0.id == id }) else {
+            Issue.record("row \(id) missing")
+            return PaletteItem(id: id, title: "")
+        }
+        return row
+    }
+    #expect(agentOf(byID("agent:1")).name == "slauth-refactor")
+    #expect(agentOf(byID("agent:2")).name == "zsh")
+    #expect(agentOf(byID("agent:3")).name == "Tab 3")
+    // Title composition is the filter input, verbatim.
+    #expect(byID("agent:1").title == "roost · slauth-refactor")
+}
+
+@Test
+func agentABlankSessionTitleFallsThroughToTheTabTitle() {
+    let t = withOwner(owned(tab(1, "zsh"), "claude", .working, NOW)) {
+        $0.metadata[AgentPalette.sessionTitleKey] = "  \n "
+    }
+    #expect(agentOf(items([project(1, "roost")], [t])[0]).name == "zsh")
+}
+
+@Test
+func agentNamesAreNormalizedToOneLine() {
+    let t = withOwner(owned(tab(1, "zsh"), "claude", .working, NOW)) {
+        $0.metadata[AgentPalette.sessionTitleKey] = "line one\nline two\r\t x"
+    }
+    let rows = items([project(1, "roost\nnope")], [t])
+    #expect(agentOf(rows[0]).name == "line oneline two x")
+    #expect(agentOf(rows[0]).project == "roostnope")
+    #expect(rows[0].title == "roostnope · line oneline two x")
+}
+
+@Test
+func agentComposeTitleWithoutAProjectIsJustTheName() {
+    #expect(AgentPalette.composeTitle(project: "", name: "claude") == "claude")
+    #expect(AgentPalette.composeTitle(project: "roost", name: "claude") == "roost · claude")
+}
+
+// MARK: - Ordering
+
+@Test
+func agentRowsOrderByRankThenRecency() {
+    let tabs = [
+        owned(tab(1, "finished"), "claude", .finished, NOW),
+        owned(tab(2, "working"), "claude", .working, NOW),
+        owned(tab(3, "failed"), "claude", .failed, NOW),
+        owned(tab(4, "waiting-old"), "claude", .waiting, NOW - 500),
+        owned(tab(5, "waiting-new"), "claude", .waiting, NOW),
+    ]
+    #expect(
+        items([project(1, "roost")], tabs).map(\.id)
+            == ["agent:3", "agent:5", "agent:4", "agent:2", "agent:1"])
+}
+
+@Test
+func agentSameSecondTiesBreakByProjectThenTabPositionThenID() {
+    // Whole-second stamps make ties the common case, so the positional
+    // tiebreaks decide the visible order.
+    var laterTab = owned(tab(20, "b"), "claude", .working, NOW)
+    laterTab.position = 5
+    var samePositionHighID = owned(tab(30, "c"), "claude", .working, NOW)
+    samePositionHighID.position = 0
+    var samePositionLowID = owned(tab(3, "d"), "claude", .working, NOW)
+    samePositionLowID.position = 0
+    let secondProjectTab = owned(tab(10, "a", projectID: 2), "claude", .working, NOW)
+
+    let projects = [project(2, "shed", position: 1), project(1, "roost", position: 0)]
+    let tabs = [secondProjectTab, laterTab, samePositionHighID, samePositionLowID]
+    // Project position 0 first (despite its tabs coming later in the
+    // input), then tab position, then tab id within a position.
+    #expect(items(projects, tabs).map(\.id) == ["agent:3", "agent:30", "agent:20", "agent:10"])
+}
+
+// MARK: - Row payload + frame
+
+@Test
+func agentRowPayloadCarriesTheEffectiveLifecycleAndPendingMetrics() {
+    let t = withOwner(owned(tab(7, "zsh"), "claude", .waiting, NOW - 120)) {
+        $0.detail = "permission_prompt"
+    }
+    let row = agentOf(items([project(1, "roost")], [t])[0])
+    #expect(row.effectiveLifecycle == .waiting)
+    #expect(row.project == "roost")
+    #expect(row.name == "zsh")
+    #expect(row.statusText == "Waiting for input")
+    #expect(row.timeText == "2m")
+    #expect(row.metricsText == nil, "metrics are pending until probed")
+}
+
+@Test
+func agentFrameCarriesTheFooterHintsAndPlaceholder() {
+    let frame = AgentPalette.agentFrame(projects: [], tabs: [], now: NOW)
+    #expect(frame.id == AgentPalette.frameID)
+    #expect(frame.placeholder == AgentPalette.placeholder)
+    #expect(frame.footerHints == AgentPalette.footerHints)
+    #expect(frame.items.count == 1)
+    #expect(frame.items[0].id == AgentPalette.emptyRowID)
+}
+
+@Test
+func agentLifecycleColorsAreDistinctAndInactiveIsHalfAlpha() {
+    let colors: [AgentLifecycle] = [.working, .waiting, .finished, .failed, .inactive]
+    let described = Set(colors.map { AgentPalette.statusColor(for: $0).description })
+    #expect(described.count == colors.count)
+    // The four live colours are the shipped rollup hexes verbatim.
+    for lifecycle: AgentLifecycle in [.working, .waiting, .finished, .failed] {
+        #expect(AgentPalette.statusColor(for: lifecycle) == rollupColor(for: lifecycle))
+    }
+    // `inactive` has no stripe colour; the palette renders `finished`'s
+    // gray at 50% alpha so the two read differently.
+    let inactive = AgentPalette.statusColor(for: .inactive)
+    #expect(inactive.alphaComponent == 0.5)
+    let finished = AgentPalette.statusColor(for: .finished)
+    #expect(inactive.redComponent == finished.redComponent)
+    #expect(inactive.greenComponent == finished.greenComponent)
+    #expect(inactive.blueComponent == finished.blueComponent)
+}
+
+// MARK: - Normalization helpers
+
+@Test
+func agentNormalizeLineStripsControlsAndTrims() {
+    #expect(AgentPalette.normalizeLine("  hi\tthere\n ") == "hithere")
+    #expect(AgentPalette.normalizeLine("\u{1b}[31mred\u{7}") == "[31mred")
+    #expect(AgentPalette.normalizeLine("") == "")
+}
+
+@Test
+func agentTruncateCountsTheEllipsis() {
+    #expect(AgentPalette.truncate("abcdef", max: 6) == "abcdef")
+    #expect(AgentPalette.truncate("abcdef", max: 5) == "abcd…")
+    #expect(AgentPalette.truncate("abcdef", max: 1) == "…")
+}
+
+// MARK: - Relative-time reuse
+
+@Test
+func relativeTimeLabelSecondsMatchesTheDateOverload() {
+    #expect(relativeTimeLabel(seconds: 0) == "just now")
+    #expect(relativeTimeLabel(seconds: -10) == "just now")
+    #expect(relativeTimeLabel(seconds: 120) == "2m")
+    #expect(relativeTimeLabel(seconds: 3600) == "1h")
+    #expect(relativeTimeLabel(seconds: 172_800) == "2d")
+    let now = Date()
+    #expect(
+        relativeTimeLabel(from: now.addingTimeInterval(-7200), now: now)
+            == relativeTimeLabel(seconds: 7200))
+}

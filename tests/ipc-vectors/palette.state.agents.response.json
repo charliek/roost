@@ -1,0 +1,24 @@
+{
+  "id": "10",
+  "ok": true,
+  "result": {
+    "open": true,
+    "frame": "agents",
+    "query": "",
+    "selection": 0,
+    "items": [
+      {
+        "id": "agent:3",
+        "title": "roost · slauth-refactor",
+        "agent": {
+          "effective_lifecycle": "waiting",
+          "project": "roost",
+          "name": "slauth-refactor",
+          "status_text": "Waiting for input",
+          "time_text": "2m",
+          "metrics_text": "4f +86 -12"
+        }
+      }
+    ]
+  }
+}

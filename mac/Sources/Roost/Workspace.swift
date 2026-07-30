@@ -560,9 +560,14 @@ final class Workspace {
     }
 
     /// Ownership source for a hand-driven `roostctl tab set-state`.
-    static let manualSource = "manual"
+    ///
+    /// `nonisolated` because these are contract, not state: the agent
+    /// palette's population filter (`AgentPalette`, pure and actor-free)
+    /// reads them to exclude non-agent owners, and it must name the same
+    /// strings this adapter writes.
+    nonisolated static let manualSource = "manual"
     /// Ownership source for the deprecated `tab.set_hook_active` alias.
-    static let legacySource = "legacy"
+    nonisolated static let legacySource = "legacy"
 
     /// Legacy `tab.set_state`, re-expressed on the agent axis per plan
     /// §3.7. Each value claims ownership as `manual` (an empty session

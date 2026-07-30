@@ -221,6 +221,17 @@ pub fn validate_report(report: &TabAgentReportParams) -> Result<(), ReportError>
 // Derivation
 // ============================================================================
 
+/// Ownership source for a hand-driven `roostctl tab set-state`.
+///
+/// Lives here, beside the state machine, because it is contract rather
+/// than implementation: the producer (the workspace's `tab.set_state`
+/// adapter) and every consumer that has to tell "an agent owns this"
+/// from "a human poked it" must agree on the exact string.
+pub const SOURCE_MANUAL: &str = "manual";
+/// Ownership source for the deprecated `tab.set_hook_active` alias.
+/// See [`SOURCE_MANUAL`] for why it lives here.
+pub const SOURCE_LEGACY: &str = "legacy";
+
 /// Ownership is "live" iff it is present with a non-empty source.
 ///
 /// There is deliberately **no timestamp or TTL heuristic** (AD-3):

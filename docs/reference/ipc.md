@@ -553,18 +553,42 @@ follow-up `palette.state`:
 ```
 
 `open` is false when no palette is up (the other fields are then
-empty/default). When open, `frame` is the current frame id (`commands` |
-`launcher` | `themes` | `notifications`), and `items` are the filtered
-rows in display order (`subtitle` present on rows that have one).
+empty/default). When open, `frame` is the current frame id — `commands` |
+`launcher` | `custom` | `themes` | `fonts` | `notifications` | `present` |
+`agents` (a provider drill-in sub-frame gets a generated
+`provider:items:<n>` id instead) — and `items` are the filtered rows in
+display order (`subtitle` present on rows that have one).
+
+The **agents** frame (`kind: "agents"`) lists one row per tab an agent
+owns, ordered by urgency (running Claude/Codex/etc. sessions; excludes
+tabs Roost itself claimed via `manual`/`legacy` ownership). Its rows carry
+an additional `agent` object, absent on every other frame's rows:
+
+```json
+{"id": "agent:3", "title": "roost · slauth-refactor",
+ "agent": {"effective_lifecycle": "waiting", "project": "roost",
+           "name": "slauth-refactor", "status_text": "Waiting for input",
+           "time_text": "2m", "metrics_text": "4f +86 -12"}}
+```
+
+`effective_lifecycle` is one of `working` / `waiting` / `finished` /
+`failed` / `inactive` — the same value the tab pill and sidebar rollup
+render, so this row can never disagree with them. `metrics_text` is
+**absent while the row's git-metrics probe is still pending** and always
+present once resolved — `"—"` for a clean repo, a non-repo cwd, or any
+probe failure/timeout; otherwise `"<n>f +<adds> -<dels>"` (minus is
+ASCII `-`) — so pending vs. resolved is observable on the wire. Activating
+an `agent:<id>` row jumps to that tab (revealing the sidebar if it was
+collapsed); the empty-state row (`"agents:empty"`) is not actionable.
 
 | Op | Request params | Notes |
 |---|---|---|
-| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette. Other values → `invalid-param`. |
+| `palette.open` | `{"kind": "commands"}` | `kind`: `""`/`commands` → command palette; `launcher` → custom-command launcher; `custom` → the script-backed provider palette; `agents` → the agent-jump palette. Other values → `invalid-param`. |
 | `palette.state` | `{}` | Read the current state. |
 | `palette.query` | `{"query": "theme"}` | Set the current frame's filter (resets selection to the top match). |
 | `palette.activate` | `{"id": "new_tab"}` | Confirm the visible row with this id — runs its command or drills into its sub-frame. `not-found` if no palette is open or no row matches. |
 | `palette.dismiss` | `{}` | Close any open palette. |
-| `palette.present` | `{"title": "Open shed", "items": [{"id": "web", "title": "shed: web"}]}` | Open the palette on a caller-supplied list and **block** until the user picks a row or dismisses. Replies `{"selected_id"?, "dismissed"}` — `selected_id` is omitted on dismissal. `invalid-param` if `items` is empty. The programmatic twin of the command palette; items are `{id, title, subtitle?}` (the `actionable` flag a [provider](../guides/extending.md#3-dynamic-providers) can set is *not* carried here — present rows are always selectable in v1). v1 limitation: if the client disconnects while blocked, the palette stays open until the user dismisses it (no server-side cancellation yet). |
+| `palette.present` | `{"title": "Open shed", "items": [{"id": "web", "title": "shed: web"}]}` | Open the palette on a caller-supplied list and **block** until the user picks a row or dismisses. Replies `{"selected_id"?, "dismissed"}` — `selected_id` is omitted on dismissal. `invalid-param` if `items` is empty. The programmatic twin of the command palette; items are `{id, title, subtitle?}` (the `actionable` flag a [provider](../guides/extending.md#3-dynamic-providers) can set is *not* carried here — present rows are always selectable in v1). An `agent` object on a supplied item is ignored — including a malformed one, which decodes leniently to absent rather than erroring — so present rows always render generic, never the agent layout. v1 limitation: if the client disconnects while blocked, the palette stays open until the user dismisses it (no server-side cancellation yet). |
 
 ### Selection + clipboard test ops (`selection.*` / `clipboard.*`)
 

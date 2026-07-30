@@ -87,7 +87,16 @@ extension NotificationInbox {
 /// Compact relative-time label ("just now", "2m", "1h", "3d") for the
 /// inbox row's trailing text. Mirrors the GTK `relative_time`.
 func relativeTimeLabel(from date: Date, now: Date = Date()) -> String {
-    let secs = max(0, Int(now.timeIntervalSince(date)))
+    relativeTimeLabel(seconds: Int64(now.timeIntervalSince(date)))
+}
+
+/// The same label from an already-computed elapsed span. Split out so
+/// the agents palette — which stamps in whole unix seconds, not `Date`s
+/// — shares the m/h/d bucket edges instead of re-deriving them
+/// (`AgentPalette.elapsedText` only overrides the sub-minute bucket).
+/// Negative spans clamp to zero.
+func relativeTimeLabel(seconds: Int64) -> String {
+    let secs = max(0, seconds)
     if secs < 60 { return "just now" }
     if secs < 3600 { return "\(secs / 60)m" }
     if secs < 86400 { return "\(secs / 3600)h" }

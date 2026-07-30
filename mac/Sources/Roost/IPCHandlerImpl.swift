@@ -477,13 +477,40 @@ actor IPCHandlerImpl: IPCHandler {
     // Each returns the resulting `PaletteStateResult` so a driver needs
     // no follow-up `palette.state`.
 
+    /// Rust `{:?}` string formatting: double-quoted with `\"`, `\\`,
+    /// `\n`, `\r`, `\t`, and `\u{…}` for other control scalars —
+    /// printable text passes through untouched.
+    static func rustDebugQuoted(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case "\0": out += "\\0"
+            default:
+                if scalar.properties.generalCategory == .control {
+                    out += "\\u{\(String(scalar.value, radix: 16))}"
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out + "\""
+    }
+
     @MainActor
     private func paletteOpen(params: AnyCodable?) async throws -> IPCPaletteStateResult {
         let p = try decodeParams(params, as: IPCPaletteOpenParams.self, expected: ["kind"])
         let kind = p.kind ?? ""
-        guard ["", "commands", "launcher", "custom"].contains(kind) else {
+        guard ["", "commands", "launcher", "custom", "agents"].contains(kind) else {
+            // rustDebugQuoted keeps the message byte-identical to the GTK
+            // side's `{:?}` formatting for kinds carrying quotes/escapes.
             throw IPCHandlerError.invalidParam(
-                "unknown palette kind \"\(kind)\" (want \"commands\", \"launcher\", or \"custom\")")
+                "unknown palette kind \(Self.rustDebugQuoted(kind)) "
+                    + "(want \"commands\", \"launcher\", \"custom\", or \"agents\")")
         }
         let ui = try paletteUI()
         return IPCPaletteStateResult(ui.openPalette(kind: kind))
@@ -1409,11 +1436,65 @@ private struct IPCPaletteActivateParams: Codable {
     enum CodingKeys: String, CodingKey { case id }
 }
 
-private struct IPCPaletteItemView: Codable {
+/// Mirrors `roost_ipc::messages::PaletteAgentRow` (the agents palette
+/// frame's per-row payload, plan 005 §3.9). `metricsText` is nil while a
+/// git-metrics probe is still pending; encoding omits the key in that
+/// case (Swift drops nil optionals), matching the Rust
+/// `skip_serializing_if`. Internal (not `private`) so
+/// `IPCPaletteItemViewTests` can decode/encode it directly, matching
+/// `IPCTab`'s visibility for the same reason.
+///
+/// Doubles as the UI-side row payload (`AgentRowData` in Palette.swift),
+/// the way the GTK `PaletteItem.agent` aliases the same Rust type —
+/// one struct, so a new column can't reach the renderer without
+/// reaching the wire.
+struct IPCPaletteAgentRow: Codable, Equatable, Sendable {
+    let effectiveLifecycle: AgentLifecycle
+    let project: String
+    let name: String
+    let statusText: String
+    let timeText: String
+    /// `var` alone among the columns: the row is built with metrics
+    /// pending and the async probe fills this one field in place, the way
+    /// the GTK side assigns `agent.metrics_text` on the built item.
+    var metricsText: String?
+    enum CodingKeys: String, CodingKey {
+        case effectiveLifecycle = "effective_lifecycle"
+        case project
+        case name
+        case statusText = "status_text"
+        case timeText = "time_text"
+        case metricsText = "metrics_text"
+    }
+}
+
+/// Mirrors `roost_ipc::messages::PaletteItemView`. `agent` is present
+/// only on rows the agents frame builds — absent on every other row.
+/// A malformed `agent` (possible on `palette.present` requests, where
+/// the payload is caller-supplied and documented as ignored) decodes to
+/// nil rather than failing the request, matching the Rust side's
+/// lenient deserializer and the pre-agent unknown-key behavior.
+struct IPCPaletteItemView: Codable {
     let id: String
     let title: String
     let subtitle: String?
-    enum CodingKeys: String, CodingKey { case id, title, subtitle }
+    let agent: IPCPaletteAgentRow?
+    enum CodingKeys: String, CodingKey { case id, title, subtitle, agent }
+
+    init(id: String, title: String, subtitle: String?, agent: IPCPaletteAgentRow?) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.agent = agent
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.title = try c.decode(String.self, forKey: .title)
+        self.subtitle = try c.decodeIfPresent(String.self, forKey: .subtitle)
+        self.agent = try? c.decodeIfPresent(IPCPaletteAgentRow.self, forKey: .agent)
+    }
 }
 
 /// `palette.*` response. Mirrors `roost_ipc::messages::PaletteStateResult`
@@ -1433,7 +1514,7 @@ private struct IPCPaletteStateResult: Codable {
         self.query = s.query
         self.selection = s.selection
         self.items = s.items.map {
-            IPCPaletteItemView(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+            IPCPaletteItemView(id: $0.id, title: $0.title, subtitle: $0.subtitle, agent: $0.agent)
         }
     }
 }

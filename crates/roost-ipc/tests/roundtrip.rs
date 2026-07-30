@@ -2,6 +2,7 @@
 //! against the library's public API the same way external callers
 //! would.
 
+use roost_ipc::agent::AgentLifecycle;
 use roost_ipc::messages::*;
 
 fn round_trip_to_value<T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug>(
@@ -116,6 +117,113 @@ fn tab_state_enum_values() {
         let back: TabState = serde_json::from_value(json).unwrap();
         assert_eq!(back, state);
     }
+}
+
+#[test]
+fn palette_state_agent_rows_round_trip_and_omit_absent_fields() {
+    let with_agent = PaletteItemView {
+        id: "agent:3".into(),
+        title: "roost · slauth-refactor".into(),
+        subtitle: None,
+        agent: Some(PaletteAgentRow {
+            effective_lifecycle: AgentLifecycle::Waiting,
+            project: "roost".into(),
+            name: "slauth-refactor".into(),
+            status_text: "Waiting for input".into(),
+            time_text: "2m".into(),
+            metrics_text: Some("4f +86 -12".into()),
+        }),
+    };
+    let pending_metrics = PaletteItemView {
+        id: "agent:4".into(),
+        title: "roost · pending-metrics".into(),
+        subtitle: None,
+        agent: Some(PaletteAgentRow {
+            effective_lifecycle: AgentLifecycle::Working,
+            project: "roost".into(),
+            name: "pending-metrics".into(),
+            status_text: "Working".into(),
+            time_text: "41s".into(),
+            metrics_text: None,
+        }),
+    };
+    let no_agent = PaletteItemView {
+        id: "new_tab".into(),
+        title: "New Tab".into(),
+        subtitle: None,
+        agent: None,
+    };
+
+    let result = PaletteStateResult {
+        open: true,
+        frame: Some("agents".into()),
+        query: "".into(),
+        selection: 0,
+        items: vec![
+            with_agent.clone(),
+            pending_metrics.clone(),
+            no_agent.clone(),
+        ],
+        selected_in_view: Some(true),
+    };
+    let json = round_trip_to_value(&result);
+    let back: PaletteStateResult = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(back, result);
+
+    let no_agent_json = serde_json::to_string(&no_agent).unwrap();
+    assert!(
+        !no_agent_json.contains("agent"),
+        "non-agent row must omit the agent key: {no_agent_json}"
+    );
+
+    let pending_json = serde_json::to_string(&pending_metrics).unwrap();
+    assert!(
+        !pending_json.contains("metrics_text"),
+        "pending metrics must omit metrics_text: {pending_json}"
+    );
+    assert!(pending_json.contains("\"agent\""));
+}
+
+#[test]
+fn agents_vector_file_decodes_as_typed_palette_state() {
+    let raw = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/ipc-vectors/palette.state.agents.response.json"
+    ))
+    .expect("vector file readable");
+    let envelope: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let result: PaletteStateResult =
+        serde_json::from_value(envelope["result"].clone()).expect("vector decodes typed");
+    assert_eq!(result.frame.as_deref(), Some("agents"));
+    let agent = result.items[0].agent.as_ref().expect("agent payload");
+    assert_eq!(agent.effective_lifecycle, AgentLifecycle::Waiting);
+    assert_eq!(agent.status_text, "Waiting for input");
+    assert_eq!(agent.time_text, "2m");
+    assert_eq!(agent.metrics_text.as_deref(), Some("4f +86 -12"));
+    let reencoded = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        reencoded, envelope["result"],
+        "typed re-encode must match the vector byte-for-byte"
+    );
+}
+
+#[test]
+fn malformed_agent_payload_decodes_to_none_not_error() {
+    for junk in [
+        r#"{"id": "x", "title": "t", "agent": "garbage"}"#,
+        r#"{"id": "x", "title": "t", "agent": {"effective_lifecycle": "no-such"}}"#,
+        r#"{"id": "x", "title": "t", "agent": 7}"#,
+    ] {
+        let item: PaletteItemView =
+            serde_json::from_str(junk).expect("malformed agent must not fail the item");
+        assert_eq!(item.agent, None);
+    }
+    let ok: PaletteItemView = serde_json::from_str(
+        r#"{"id": "x", "title": "t", "agent": {"effective_lifecycle": "waiting",
+            "project": "p", "name": "n", "status_text": "s", "time_text": "1s"}}"#,
+    )
+    .unwrap();
+    assert!(ok.agent.is_some(), "well-formed agent must still decode");
 }
 
 #[test]

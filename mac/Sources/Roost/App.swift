@@ -239,6 +239,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// dismissed without confirming.
     private var palette: PalettePanel?
     private var paletteOpen = false
+    /// The agents palette's git-metrics probe pipeline (plan 005 §3.7).
+    /// One instance for the app's lifetime so its concurrency cap bounds
+    /// every palette session's git processes together.
+    private let gitProbe = GitProbe()
+    /// Resolved metrics for the *open* palette session, keyed by repo
+    /// root. Discarded when the session id changes (dismiss → reopen).
+    private var metricsCache = MetricsCache()
     private var themeNameAtOpen: String?
     /// Font family captured when the palette opened, restored on
     /// dismiss-without-confirm so an in-flight live preview reverts.
@@ -989,6 +996,240 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         focusActiveTerminal()
     }
 
+    // MARK: - Agent palette (Cmd+Shift+O)
+
+    /// Open the palette directly on the agent switcher — one row per
+    /// agent-owned tab, ordered by urgency (plan 005 §3.1). Presented as
+    /// the root frame (so Esc closes). No-op while any palette is open,
+    /// matching every other picker.
+    @objc @MainActor
+    private func showAgentPalette(_ sender: Any?) {
+        guard palette == nil, let window else { return }
+        paletteOpen = true
+        let panel = PalettePanel(
+            parent: window,
+            contentRegion: terminalContainer,
+            root: agentsFrame(),
+            behavior: agentsBehavior()
+        ) { [weak self] in
+            self?.dismissPalette()
+        }
+        palette = panel
+        panel.present()
+        startAgentMetrics()
+    }
+
+    /// The agents frame, built from the **core** workspace snapshot (not
+    /// the UI's `tabs` list), so the palette reads the same state
+    /// `tab.list` would report. Rows carry whatever git metrics the open
+    /// session has already resolved; the rest stay pending until their
+    /// probe lands.
+    @MainActor
+    private func agentsFrame() -> PaletteFrame {
+        let snapshot = workspaceSnapshot()
+        var frame = AgentPalette.agentFrame(
+            projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
+        applyMetricsCache(
+            cwds: AgentPalette.agentTabCwds(projects: snapshot.projects, tabs: snapshot.tabs), items: &frame.items)
+        return frame
+    }
+
+    /// Projects + their tabs straight from the workspace, in the
+    /// workspace's own order. Empty before the backend is up (the
+    /// palette then shows its empty sentinel, and the resync reconcile
+    /// has nothing to attach).
+    @MainActor
+    private func workspaceSnapshot() -> (projects: [Workspace.Project], tabs: [Workspace.Tab]) {
+        guard let workspace = RoostBackend.shared.workspace else { return ([], []) }
+        let projects = workspace.snapshot()
+        return (projects, projects.flatMap { workspace.tabs(in: $0.id) })
+    }
+
+    /// Confirm on an agent row → jump to that tab and reveal the
+    /// sidebar. The `agents:empty` sentinel is non-actionable (never
+    /// reaches here); a stale id (its tab closed between build and
+    /// confirm) closes the palette without navigating.
+    ///
+    /// The reveal happens **after** the focus succeeds: a jump whose tab
+    /// vanished between the row being built and the click must not
+    /// uncollapse the sidebar — and persist that — for a navigation that
+    /// then doesn't happen. `focusTab` throwing is the single existence
+    /// check, so the ordering is atomic (GTK's `reveal_and_focus_tab`
+    /// does the same; the older notification jump still reveals first,
+    /// left alone here).
+    @MainActor
+    private func agentsBehavior() -> PaletteBehavior {
+        PaletteBehavior(onConfirm: { [weak self] item in
+            guard let self else { return .close }
+            guard let tabID = AgentPalette.tabID(fromRowID: item.id) else {
+                return .none  // "No agent sessions" sentinel
+            }
+            // Update the *core* active tab (so identify / tab.focus
+            // report the jump target), not just UI selection — the
+            // `.active` event then drives the project switch + tab
+            // select, exactly like the notification jump.
+            guard let client = RoostBackend.shared.localClient,
+                (try? client.focusTab(tabID)) != nil
+            else { return .close }
+            self.ensureSidebarVisible()
+            return .close
+        })
+    }
+
+    /// Live refresh (plan 005 §3.8): rebuild the agents frame's rows
+    /// from the core snapshot whenever agent state — or a tab's
+    /// existence, title, or cwd, or a project's name — changes while the
+    /// palette is open. The query is untouched and the highlighted row
+    /// is preserved by id. A no-op when the agents frame isn't on the
+    /// stack.
+    @MainActor
+    private func refreshAgentPalette() {
+        guard let (session, panel) = agentsPaletteTarget() else { return }
+        let snapshot = workspaceSnapshot()
+        let cwds = AgentPalette.agentTabCwds(projects: snapshot.projects, tabs: snapshot.tabs)
+        var items = AgentPalette.agentItems(
+            projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
+        applyMetricsCache(cwds: cwds, items: &items)
+        panel.driveUpdateItems(frameID: AgentPalette.frameID, items: items)
+        // A rebuild can introduce a tab (and so a repo) the session has
+        // never measured; already-resolved and in-flight cwds are skipped.
+        spawnAgentMetrics(session: session, cwds: cwds)
+    }
+
+    // MARK: agent palette — git metrics (plan 005 §3.7)
+
+    /// The live panel's session id + the panel, but only while the agents
+    /// frame is somewhere on its stack. This *is* the repaint half of the
+    /// generation guard: an async metrics result touches the UI only if
+    /// this still reports the session that asked for it.
+    @MainActor
+    private func agentsPaletteTarget() -> (session: Int, panel: PalettePanel)? {
+        guard let panel = palette, panel.hasFrame(AgentPalette.frameID) else { return nil }
+        return (panel.generation, panel)
+    }
+
+    /// Start probing for a frame the caller is about to show or push.
+    /// Keyed off the open panel's generation rather than frame presence —
+    /// the frame isn't on the stack yet at either call site. The rows
+    /// render immediately with metrics absent (pending); each probe
+    /// resolves to a value or `—`.
+    @MainActor
+    private func startAgentMetrics() {
+        guard let session = palette?.generation else { return }
+        spawnAgentMetrics(session: session, cwds: {
+            let snap = workspaceSnapshot()
+            return AgentPalette.agentTabCwds(projects: snap.projects, tabs: snap.tabs)
+        }())
+    }
+
+    /// Probe every agent tab's repo that this palette session hasn't
+    /// measured yet. The batch runs off the main actor (`Task.detached`,
+    /// and the runner spawns + waits on a background queue); the result
+    /// hops back to `@MainActor` before it touches the cache or the panel.
+    @MainActor
+    private func spawnAgentMetrics(session: Int, cwds: [Int64: String]) {
+        // A reopened palette is a new session: everything the last one
+        // resolved is discarded, so it re-probes.
+        metricsCache.beginSession(session)
+        let claimed = metricsCache.claimUnprobed(cwds.values)
+        guard !claimed.isEmpty else { return }
+        // Roots this session already measured: the batch reuses their
+        // text instead of re-running git for a new tab in an old repo.
+        let known = metricsCache.knownRoots()
+        let probe = gitProbe
+        let work = Task.detached(priority: .userInitiated) { () async throws -> [ProbeOutcome] in
+            try Task.checkCancellation()
+            return await probe.probeBatch(cwds: claimed, known: known)
+        }
+        Task { @MainActor [weak self] in
+            let result: Result<[ProbeOutcome], Error>
+            do {
+                result = .success(try await work.value)
+            } catch {
+                result = .failure(error)
+            }
+            self?.finishAgentMetrics(session: session, claimed: claimed, result: result)
+        }
+    }
+
+    /// Fold one batch's outcomes into the session cache, then repaint.
+    ///
+    /// The guard on INGESTION is session-only: the cache is
+    /// session-scoped data, and storing must happen even when the user
+    /// escaped back to the root frame mid-probe — storing is what clears
+    /// `pending`, so skipping it would leave those rows pending for the
+    /// rest of the session after a re-drill. The frame-presence half of
+    /// the guard lives where the UI is actually touched:
+    /// `refreshAgentPalette` no-ops unless the agents frame is on the
+    /// stack. Dismiss → reopen still cannot be filled with old numbers —
+    /// that is the session check.
+    @MainActor
+    private func finishAgentMetrics(
+        session: Int, claimed: [String], result: Result<[ProbeOutcome], Error>
+    ) {
+        guard metricsCache.session == session else { return }
+        switch result {
+        case .success(let outcomes):
+            ingestAgentMetrics(outcomes)
+        case .failure(let error):
+            // The probe task itself died (cancelled, or the app tore the
+            // Task down). Every claimed cwd must still resolve or its row
+            // stays pending forever — plan 005 §3.7's "every probe always
+            // resolves".
+            RoostLogger.shared.warn("git metrics task failed: \(error)")
+            for cwd in claimed { metricsCache.storeUnresolved(cwd: cwd) }
+        }
+        refreshAgentPalette()
+    }
+
+    /// Fold one batch's outcomes into the session cache. The probe
+    /// returns errors rather than swallowing them; this is the boundary
+    /// that handles them, and every failure renders as `—`.
+    @MainActor
+    private func ingestAgentMetrics(_ outcomes: [ProbeOutcome]) {
+        for outcome in outcomes {
+            guard let root = outcome.root else {
+                if case .measured(.failure(let error)) = outcome.value {
+                    RoostLogger.shared.info("no git metrics for \(outcome.cwd): \(error)")
+                }
+                metricsCache.storeUnresolved(cwd: outcome.cwd)
+                continue
+            }
+            let text: String
+            switch outcome.value {
+            case .reused(let reused):
+                text = reused
+            case .measured(.success(let metrics)):
+                text = metrics.text()
+            case .measured(.failure(let error)):
+                RoostLogger.shared.info("no git metrics for \(outcome.cwd): \(error)")
+                text = GitMetrics.unknown
+            }
+            metricsCache.storeRoot(cwd: outcome.cwd, root: root, text: text)
+        }
+    }
+
+    /// Fill in the metrics column on every row whose tab cwd the **open**
+    /// palette session has already resolved. Rows left nil render as
+    /// pending; rows sharing a repo root all get the same string from one
+    /// probe.
+    ///
+    /// Keyed on the live panel's generation, so a frame built for a
+    /// palette that isn't up yet (a direct open) or for a session the
+    /// cache doesn't hold (dismiss → reopen, before `beginSession` clears
+    /// it) starts fully pending instead of flashing the previous
+    /// session's numbers.
+    @MainActor
+    private func applyMetricsCache(cwds: [Int64: String], items: inout [PaletteItem]) {
+        guard let session = palette?.generation else { return }
+        for index in items.indices {
+            guard let tabID = AgentPalette.tabID(fromRowID: items[index].id),
+                items[index].agent != nil, let cwd = cwds[tabID]
+            else { continue }
+            items[index].agent?.metricsText = metricsCache.text(forSession: session, cwd: cwd)
+        }
+    }
+
     // MARK: - Command launcher (Cmd+Shift+T)
 
     /// Open the custom command launcher directly on the configured
@@ -1273,6 +1514,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             return .push(themeFrame(), themeBehavior())
         case PaletteCommands.selectFontID:
             return .push(fontFrame(), fontBehavior())
+        case PaletteCommands.viewAgentsID:
+            let frame = agentsFrame()
+            startAgentMetrics()
+            return .push(frame, agentsBehavior())
         case PaletteCommands.viewNotificationsID:
             return .push(notificationsFrame(), notificationsBehavior())
         case PaletteCommands.clearNotificationsID:
@@ -1306,12 +1551,17 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
         let count = notificationInbox.count
         let viewTitle = count > 0 ? "View Notifications (\(count))" : "View Notifications"
-        let notifItems = [
+        // The agent drill-in sits directly under Select Font…, ahead of
+        // the notification rows (plan 005 §3.1).
+        let dynamicItems = [
+            PaletteItem(
+                id: PaletteCommands.viewAgentsID, title: "Go to Agent…",
+                trailingText: shortcutText(for: KeybindAction.agentPalette)),
             PaletteItem(id: PaletteCommands.viewNotificationsID, title: viewTitle),
             PaletteItem(id: PaletteCommands.clearNotificationsID, title: "Clear All Notifications"),
         ]
         let insertAt = (items.firstIndex { $0.id == PaletteCommands.selectFontID }).map { $0 + 1 } ?? items.count
-        items.insert(contentsOf: notifItems, at: insertAt)
+        items.insert(contentsOf: dynamicItems, at: insertAt)
         // Surface the custom palette (script-backed providers) as a
         // drill-in row, but only when at least one provider is configured.
         if !RoostConfig.load().providers.isEmpty {
@@ -1812,13 +2062,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// palette toggle itself stays enabled (re-press is a no-op).
     @objc @MainActor
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        // The picker toggles (palette + launcher) stay live while a
-        // palette is open; both `show*` guard on `palette == nil`, so a
-        // re-press is a harmless no-op.
+        // The picker toggles (palette + launcher + custom + agents) stay
+        // live while a palette is open; every `show*` guards on
+        // `palette == nil`, so a re-press is a harmless no-op.
         if paletteOpen,
             menuItem.action != #selector(showCommandPalette(_:)),
             menuItem.action != #selector(showCommandLauncher(_:)),
-            menuItem.action != #selector(showCustomPalette(_:))
+            menuItem.action != #selector(showCustomPalette(_:)),
+            menuItem.action != #selector(showAgentPalette(_:))
         {
             return false
         }
@@ -2070,8 +2321,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// reports the truth.
     @MainActor
     private func reconcileFromWorkspaceSnapshot() {
-        guard let workspace = RoostBackend.shared.workspace else { return }
-        let snapshot = workspace.snapshot().flatMap { workspace.tabs(in: $0.id) }
+        let snapshot = workspaceSnapshot().tabs
         for tab in snapshot where !tabs.contains(where: { $0.id == tab.id }) {
             attachExistingTab(
                 id: tab.id,
@@ -2372,6 +2622,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // everything that changed before it went live (the boot gap).
             reconcileFromWorkspaceSnapshot()
         }
+        // Live refresh (plan 005 §3.8). Once here rather than opted into
+        // per arm: an agent row is a pure re-derivation of the whole
+        // core snapshot, so *any* event that can move a rendered column
+        // — agent state, but also a rename (the bold project cell), a
+        // project delete, a resync, a tab open — must rebuild it or the
+        // open palette shows stale rows. Cheap by construction: a no-op
+        // unless the agents frame is actually on the palette stack.
+        refreshAgentPalette()
     }
 
     // MARK: - Project management
@@ -3555,6 +3813,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         launcherItem.target = self
         bind(launcherItem, to: KeybindAction.commandLauncher)
         viewMenu.addItem(launcherItem)
+        let agentPaletteItem = NSMenuItem(
+            title: "Agent Palette…",
+            action: #selector(showAgentPalette(_:)),
+            keyEquivalent: ""
+        )
+        agentPaletteItem.target = self
+        bind(agentPaletteItem, to: KeybindAction.agentPalette)
+        viewMenu.addItem(agentPaletteItem)
         let customPaletteItem = NSMenuItem(
             title: "Custom Commands…",
             action: #selector(showCustomPalette(_:)),
@@ -5132,6 +5398,7 @@ extension RoostApp: UiBridge {
         switch kind {
         case "launcher": showCommandLauncher(nil)
         case "custom": showCustomPalette(nil)
+        case "agents": showAgentPalette(nil)
         default: showCommandPalette(nil)
         }
         return paletteSnapshot()
@@ -5365,7 +5632,8 @@ extension RoostApp: UiBridge {
             query: s.query,
             selection: s.selection,
             items: s.items.map {
-                PaletteSnapshot.Item(id: $0.id, title: $0.title, subtitle: $0.subtitle)
+                PaletteSnapshot.Item(
+                    id: $0.id, title: $0.title, subtitle: $0.subtitle, agent: $0.agent)
             }
         )
     }

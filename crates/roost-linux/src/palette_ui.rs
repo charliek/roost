@@ -26,12 +26,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use crate::palette::{PaletteFrame, PaletteItem, PaletteState};
+use crate::agent_palette;
+use crate::palette::{AgentRowData, PaletteFrame, PaletteItem, PaletteState};
 
 /// Accent blue for fuzzy-matched characters (Zed-style — the hit pops
 /// as you type). Matches the running-state stripe blue used elsewhere
 /// in the chrome so the palette feels of-a-piece.
 const MATCH_ACCENT: &str = "#5fa3f0";
+
+/// Diameter of an agent row's leading status dot, in px. Rendered as a
+/// fixed-size box with a CSS border-radius (see `.palette-agent-dot`).
+const AGENT_DOT_PX: i32 = 8;
 
 /// Gap below the tab bar so the card floats under the tabs (~1cm),
 /// mirroring the Swift panel's `topGap`. Added to the measured tab-bar
@@ -107,6 +112,10 @@ struct PaletteInner {
     /// scroll the highlighted row into view (GtkListBox doesn't do this
     /// itself when focus stays on the search entry).
     scroll: gtk4::ScrolledWindow,
+    /// Muted hint bar under the list. Visible only for frames that set
+    /// `footer_hints` (the agents frame); hidden otherwise, so every
+    /// existing picker keeps its current chrome.
+    footer: gtk4::Label,
     /// Set while we programmatically rewrite the entry text (query
     /// restore on push/pop) so the `changed` handler ignores the echo.
     suppress_changed: Cell<bool>,
@@ -162,6 +171,12 @@ impl PaletteOverlay {
 
         let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
 
+        let footer = gtk4::Label::builder()
+            .xalign(0.0)
+            .visible(false)
+            .css_classes(["palette-footer"])
+            .build();
+
         let card = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .width_request(660)
@@ -173,6 +188,7 @@ impl PaletteOverlay {
         card.append(&entry);
         card.append(&separator);
         card.append(&scroll);
+        card.append(&footer);
 
         // Transparent click-catcher behind the card. No dim — the
         // terminal stays visible; a click anywhere outside the card
@@ -194,6 +210,7 @@ impl PaletteOverlay {
             entry: entry.clone(),
             list: list.clone(),
             scroll: scroll.clone(),
+            footer: footer.clone(),
             suppress_changed: Cell::new(false),
             closing: Cell::new(false),
             armed: Cell::new(false),
@@ -364,12 +381,19 @@ impl PaletteInner {
     /// Re-render the field placeholder + rows for the current frame and
     /// fire the highlight preview for the selected row.
     fn sync_ui(self: &Rc<Self>) {
-        let (placeholder, query) = {
+        let (placeholder, query, footer_hints) = {
             let state = self.state.borrow();
             let f = state.current();
-            (f.placeholder.clone(), f.query.clone())
+            (
+                f.placeholder.clone(),
+                f.query.clone(),
+                f.footer_hints.clone(),
+            )
         };
         self.entry.set_placeholder_text(Some(&placeholder));
+        self.footer
+            .set_label(footer_hints.as_deref().unwrap_or_default());
+        self.footer.set_visible(footer_hints.is_some());
         if self.entry.text() != query.as_str() {
             self.suppress_changed.set(true);
             self.entry.set_text(&query);
@@ -395,7 +419,7 @@ impl PaletteInner {
     fn select_current_row(self: &Rc<Self>) {
         let (count, selection) = {
             let state = self.state.borrow();
-            (state.matches().len(), state.current().selection)
+            (state.match_count(), state.current().selection)
         };
         if count == 0 {
             self.list.unselect_all();
@@ -613,11 +637,7 @@ impl PaletteInner {
             frame: frame.id.clone(),
             query: frame.query.clone(),
             selection: frame.selection,
-            items: state
-                .matches()
-                .into_iter()
-                .map(|m| (m.item.id, m.item.title, m.item.subtitle))
-                .collect(),
+            items: state.matches().into_iter().map(|m| m.item).collect(),
             selected_in_view: self.selected_row_in_view(),
         }
     }
@@ -673,6 +693,18 @@ impl PaletteInner {
         self.entry.grab_focus();
     }
 
+    /// Replace one frame's rows in place — the live-refresh path for
+    /// the agents frame (plan 005 §3.8). The query is untouched and the
+    /// highlighted row is preserved by id, so a rebuild triggered by an
+    /// agent event can't steal the user's selection or their filter.
+    fn drive_update_items(self: &Rc<Self>, frame_id: &str, items: Vec<PaletteItem>) {
+        if !self.state.borrow_mut().update_items(frame_id, items) {
+            return;
+        }
+        self.rebuild_rows();
+        self.select_current_row();
+    }
+
     /// Select the visible row whose item id matches, then confirm it —
     /// the same `confirm` a click/Enter runs (so it pushes a sub-frame or
     /// dispatches the command). False if no visible row has that id.
@@ -691,14 +723,14 @@ impl PaletteInner {
 }
 
 /// A read of the live palette frame for the IPC bridge: current frame
-/// id, its filter + highlighted row, and the visible rows as
-/// `(id, title, subtitle)` in display order. GTK-free; `app.rs` maps it
-/// to `roost_ipc::messages::PaletteStateResult`.
+/// id, its filter + highlighted row, and the visible rows in display
+/// order. GTK-free; `app.rs` maps it to
+/// `roost_ipc::messages::PaletteStateResult`.
 pub struct PaletteSnapshot {
     pub frame: String,
     pub query: String,
     pub selection: usize,
-    pub items: Vec<(String, String, Option<String>)>,
+    pub items: Vec<PaletteItem>,
     /// Whether the highlighted row is fully within the scrolled viewport
     /// (`None` = can't tell yet — pre-layout or no selection).
     pub selected_in_view: Option<bool>,
@@ -741,6 +773,22 @@ impl PaletteDriver {
     pub fn activate(&self, id: &str) -> bool {
         self.inner.drive_activate(id)
     }
+    /// Whether `frame_id` is anywhere on the live frame stack — the
+    /// live-refresh guard (the agents frame can be the root or a
+    /// sub-frame pushed from the command palette).
+    pub fn has_frame(&self, frame_id: &str) -> bool {
+        self.inner
+            .state
+            .borrow()
+            .frames()
+            .iter()
+            .any(|f| f.id == frame_id)
+    }
+    /// Rebuild one frame's rows in place. See
+    /// [`PaletteInner::drive_update_items`].
+    pub fn update_items(&self, frame_id: &str, items: Vec<PaletteItem>) {
+        self.inner.drive_update_items(frame_id, items)
+    }
     pub fn dismiss(&self) {
         self.inner.dismiss(false);
     }
@@ -754,10 +802,90 @@ impl PaletteDriver {
     }
 }
 
-/// Build one list row: a title label with Pango markup for the matched
+/// Build one list row: the agent layout for agents-frame rows, else the
+/// generic title (+ subtitle, + trailing hint) one.
+fn build_row(item: &PaletteItem, ranges: &[Range<usize>]) -> gtk4::ListBoxRow {
+    let content = match &item.agent {
+        Some(agent) => build_agent_row(agent),
+        None => build_generic_row(item, ranges),
+    };
+    gtk4::ListBoxRow::builder()
+        .child(&content)
+        .css_classes(["palette-row"])
+        .build()
+}
+
+/// The agents frame's row (plan 005 §3.4): status dot, bold project,
+/// name, colored status text, then right-aligned monospace metrics +
+/// elapsed time. No fuzzy-match highlighting — the multi-label layout
+/// has no single string to mark up, and the mockup shows none.
+///
+/// A `None` `metrics_text` is the *pending* state and renders nothing;
+/// a resolved probe renders its string (which may itself be `"—"`).
+fn build_agent_row(agent: &AgentRowData) -> gtk4::Box {
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let lifecycle = agent_palette::lifecycle_class(agent.effective_lifecycle);
+
+    let dot = gtk4::Box::builder()
+        .width_request(AGENT_DOT_PX)
+        .height_request(AGENT_DOT_PX)
+        .valign(gtk4::Align::Center)
+        .css_classes(["palette-agent-dot", lifecycle])
+        .build();
+    hbox.append(&dot);
+
+    let project = gtk4::Label::builder()
+        .label(&agent.project)
+        .xalign(0.0)
+        .css_classes(["palette-agent-project"])
+        .build();
+    hbox.append(&project);
+
+    // The left group reads project → name → status, all left-aligned;
+    // the slack sits between the status and the right column, so status
+    // trails the name instead of floating away from it. Both labels
+    // ellipsize (the name first, being the longer of the two); project,
+    // metrics, and time are never truncated (§3.2).
+    let name = gtk4::Label::builder()
+        .label(&agent.name)
+        .xalign(0.0)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(["palette-agent-name"])
+        .build();
+    hbox.append(&name);
+
+    let status = gtk4::Label::builder()
+        .label(&agent.status_text)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(["palette-agent-status", lifecycle])
+        .build();
+    hbox.append(&status);
+
+    if let Some(metrics) = &agent.metrics_text {
+        let metrics = gtk4::Label::builder()
+            .label(metrics)
+            .xalign(1.0)
+            .css_classes(["palette-agent-metrics"])
+            .build();
+        hbox.append(&metrics);
+    }
+
+    let time = gtk4::Label::builder()
+        .label(&agent.time_text)
+        .xalign(1.0)
+        .css_classes(["palette-agent-time"])
+        .build();
+    hbox.append(&time);
+
+    hbox
+}
+
+/// The default row: a title label with Pango markup for the matched
 /// ranges, an optional second line (subtitle — the notification message
 /// body), and an optional right-aligned shortcut/time hint.
-fn build_row(item: &PaletteItem, ranges: &[Range<usize>]) -> gtk4::ListBoxRow {
+fn build_generic_row(item: &PaletteItem, ranges: &[Range<usize>]) -> gtk4::Box {
     let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
 
     // Title + optional subtitle stacked vertically so a two-line
@@ -796,10 +924,7 @@ fn build_row(item: &PaletteItem, ranges: &[Range<usize>]) -> gtk4::ListBoxRow {
         hbox.append(&shortcut);
     }
 
-    gtk4::ListBoxRow::builder()
-        .child(&hbox)
-        .css_classes(["palette-row"])
-        .build()
+    hbox
 }
 
 /// Build Pango markup for `title`, wrapping the matched character

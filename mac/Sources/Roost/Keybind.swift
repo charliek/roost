@@ -62,6 +62,10 @@ enum KeybindAction {
     /// "R for Run" mnemonic but RenameProject owns it; `…+shift+e`
     /// ("Extensions") is free. Users rebind to `…+shift+r` via config.
     static let customPalette = "custom_palette"
+    /// Cmd+Shift+O agent palette — the agent switcher (plan 005 §3.1).
+    /// ⌘⇧O for "Open agent"; no default binding used `o`. Peer of the
+    /// GTK `AgentPalette` (Alt+Shift+O).
+    static let agentPalette = "agent_palette"
     static let unbind        = "unbind"
 
     /// `switch_project_N` (1..9). Defined as a function rather than
@@ -78,6 +82,7 @@ enum KeybindAction {
         paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
         jumpToUnread, commandPalette, commandLauncher, customPalette,
+        agentPalette,
     ]
 
     /// True if `action` is a recognized name (including the
@@ -243,6 +248,8 @@ func defaultBindingsMac() -> [String: [String]] {
         // ⌘⇧E — custom palette (providers). ⌘⇧R is RenameProject, so
         // "E for Extensions" rather than steal it.
         KeybindAction.customPalette: ["\(primary)+shift+e"],
+        // ⌘⇧O — agent palette. No other default binds `o`.
+        KeybindAction.agentPalette: ["\(primary)+shift+o"],
         // Browser-style font sizing. + and = both bind because
         // cmd-+ on US layouts is really cmd-shift-=, and many
         // users hit cmd-= without the shift.

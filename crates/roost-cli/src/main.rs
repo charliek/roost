@@ -404,7 +404,8 @@ enum TabCmd {
 enum PaletteCmd {
     /// Open a palette root frame and print its rows.
     Open {
-        /// Which frame to open: `commands` (default) or `launcher`.
+        /// Which frame to open: `commands` (default), `launcher`,
+        /// `custom`, or `agents`.
         #[arg(long, default_value = "commands")]
         kind: String,
         #[arg(long, default_value_t = false)]
