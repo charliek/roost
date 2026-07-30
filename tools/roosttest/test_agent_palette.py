@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from client import RoostError
+from client import RoostError, Timeout
 from test_agent_lifecycle import agent_tab, claude_hook
 from util import is_fresh, wait_tab_attached
 
@@ -69,19 +69,29 @@ def _seed(
     if name is not None:
         roost.set_title(tab_id, name)
     wait_tab_attached(roost, tab_id)
-    # The shell's own first prompt must land BEFORE we claim: Roost
+    # The shell's own first prompt should land BEFORE we claim: Roost
     # auto-bootstraps roost.bash/roost.zsh, whose PROMPT_COMMAND emits
     # OSC 133;D, and an A/B/D mark resets a seeded lifecycle to
     # `inactive` (the plan-002 dead-agent failsafe). The marks precede
-    # the PS1 bytes in the same write, so a non-empty screen means they
-    # are already drained. Without this, a seeded lifecycle survives
-    # only until the real prompt paints — a ~100ms window that made the
-    # live-refresh test flake under load (plan 006 §Verified).
-    roost._wait(
-        lambda: roost.dump_text(tab_id).strip() != "",
-        10.0,
-        f"tab {tab_id}'s shell painted its first prompt",
-    )
+    # the PS1 bytes in the same write, so a non-empty screen (or a
+    # shell_state already moved off `unknown`) means they are drained.
+    # Without this, a seeded lifecycle survives only until the real
+    # prompt paints — a ~100ms window that made the live-refresh test
+    # flake under load (plan 006 §Verified).
+    #
+    # Best-effort, not a hard gate: a shell that never paints (CI spawn
+    # anomalies) emits no late mark either, so the race this settles
+    # cannot occur there — proceed on the fed mark below rather than
+    # failing a test that never needed the real shell.
+    try:
+        roost._wait(
+            lambda: roost.dump_text(tab_id).strip() != ""
+            or roost.shell_state(tab_id) != "unknown",
+            5.0,
+            f"tab {tab_id}'s shell painted its first prompt",
+        )
+    except Timeout:
+        pass
     if TEST_MODE:
         # CI shells have no OSC 133 integration (Apple bash 3.2 is
         # skipped by the autobootstrap), so waiting for a real prompt
