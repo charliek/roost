@@ -69,10 +69,24 @@ def _seed(
     if name is not None:
         roost.set_title(tab_id, name)
     wait_tab_attached(roost, tab_id)
+    # The shell's own first prompt must land BEFORE we claim: Roost
+    # auto-bootstraps roost.bash/roost.zsh, whose PROMPT_COMMAND emits
+    # OSC 133;D, and an A/B/D mark resets a seeded lifecycle to
+    # `inactive` (the plan-002 dead-agent failsafe). The marks precede
+    # the PS1 bytes in the same write, so a non-empty screen means they
+    # are already drained. Without this, a seeded lifecycle survives
+    # only until the real prompt paints — a ~100ms window that made the
+    # live-refresh test flake under load (plan 006 §Verified).
+    roost._wait(
+        lambda: roost.dump_text(tab_id).strip() != "",
+        10.0,
+        f"tab {tab_id}'s shell painted its first prompt",
+    )
     if TEST_MODE:
-        # CI shells have no OSC 133 integration, so waiting for a real
-        # prompt mark hangs there. Feed the A mark ourselves — same
-        # settled end-state, deterministic, and it still exercises the
+        # CI shells have no OSC 133 integration (Apple bash 3.2 is
+        # skipped by the autobootstrap), so waiting for a real prompt
+        # mark hangs there. Feed the A mark ourselves — same settled
+        # end-state, deterministic, and it still exercises the
         # late-mark-can't-reset property the passive wait was for.
         roost.tab_feed_pty_bytes(tab_id, b"\x1b]133;A\x07")
     roost.wait_shell_state(tab_id, "at_prompt", timeout=15.0)
