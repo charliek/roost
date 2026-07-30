@@ -430,11 +430,17 @@ button.roost-add-project:active {
   color: alpha(#7a7a7a, 0.5);
 }
 /* Right column: the UI fixed-pitch font (not the terminal font), so
- * metrics and times line up down the list. */
+ * metrics and times line up down the list. The metrics label colours
+ * itself per segment with Pango markup (added/deleted counts are
+ * green/red), so only the time is coloured here — and this #7a7a7a
+ * must stay in sync with `MetricsRole::Muted` in `agent_palette.rs` or
+ * the two halves of the column stop matching. */
 .command-palette-card .palette-agent-metrics,
 .command-palette-card .palette-agent-time {
   font-family: monospace;
   font-size: 12px;
+}
+.command-palette-card .palette-agent-time {
   color: #7a7a7a;
 }
 

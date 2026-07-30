@@ -845,12 +845,15 @@ fn build_agent_row(agent: &AgentRowData) -> gtk4::Box {
     hbox.append(&status);
 
     if let Some(metrics) = &agent.metrics_text {
-        let metrics = gtk4::Label::builder()
-            .label(metrics)
+        // Per-segment colour (added/deleted counts) lives in the markup,
+        // not in CSS — the class still carries the mono font + size.
+        let label = gtk4::Label::builder()
+            .use_markup(true)
             .xalign(1.0)
             .css_classes(["palette-agent-metrics"])
             .build();
-        hbox.append(&metrics);
+        label.set_markup(&metrics_markup(metrics));
+        hbox.append(&label);
     }
 
     let time = gtk4::Label::builder()
@@ -940,6 +943,23 @@ fn markup_for(title: &str, ranges: &[Range<usize>]) -> String {
     out
 }
 
+/// Build Pango markup for the agent row's git-metrics column, one span
+/// per segment of [`agent_palette::metrics_segments`]. *Every* segment
+/// carries an explicit `foreground`, muted ones included, so the CSS
+/// colour can never drift against the Rust hex for part of the string;
+/// each segment is markup-escaped.
+fn metrics_markup(text: &str) -> String {
+    let mut out = String::new();
+    for (segment, role) in agent_palette::metrics_segments(text) {
+        out.push_str(&format!(
+            "<span foreground=\"{}\">{}</span>",
+            agent_palette::metrics_role_hex(role),
+            glib::markup_escape_text(segment)
+        ));
+    }
+    out
+}
+
 /// Minimal vertical scroll offset that brings a row spanning
 /// `[y, y + height)` fully into a viewport of height `page` currently
 /// scrolled to `offset`: scroll up if the row is above the viewport,
@@ -1017,6 +1037,36 @@ mod tests {
             format!(
                 "<span foreground=\"{c}\" weight=\"bold\">N</span>ew <span foreground=\"{c}\" weight=\"bold\">T</span>ab",
                 c = MATCH_ACCENT
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_metrics_markup_colors_every_segment() {
+        assert_eq!(
+            metrics_markup("4f +86 -12"),
+            concat!(
+                "<span foreground=\"#7a7a7a\">4f</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#7fbf7f\">+86</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#e05252\">-12</span>",
+            )
+        );
+    }
+
+    #[test]
+    fn metrics_markup_escapes_segment_text() {
+        // A cwd-derived string can't reach this column today, but the
+        // label parses markup — an unescaped `<` would break the row.
+        assert_eq!(
+            metrics_markup("<3f & +2"),
+            concat!(
+                "<span foreground=\"#7a7a7a\">&lt;3f</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#7a7a7a\">&amp;</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#7fbf7f\">+2</span>",
             )
         );
     }

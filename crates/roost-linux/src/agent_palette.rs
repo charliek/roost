@@ -193,6 +193,73 @@ pub fn compose_title(project: &str, name: &str) -> String {
     notification_inbox::compose_title(project, name)
 }
 
+/// The colour role of one segment of the git-metrics column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsRole {
+    Muted,
+    Adds,
+    Dels,
+}
+
+/// Split the metrics string into rendered segments, alternating
+/// non-whitespace tokens with standalone whitespace runs. Concatenating
+/// every segment's text reproduces the input byte-for-byte, so the
+/// column can never render text the probe didn't produce.
+///
+/// The grammar is `git_metrics`' own (`"{files}f +{adds} -{dels}"` or
+/// `"—"`), but the rule here is deliberately shape-based rather than a
+/// parse of that grammar: a sign followed by at least one digit is a
+/// count, everything else — the file count, the unknown dash, a bare
+/// sign, an unrecognized token — stays muted.
+pub fn metrics_segments(text: &str) -> Vec<(&str, MetricsRole)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let space = rest.starts_with(char::is_whitespace);
+        let end = rest
+            .find(|c: char| c.is_whitespace() != space)
+            .unwrap_or(rest.len());
+        let (segment, tail) = rest.split_at(end);
+        let role = if space {
+            MetricsRole::Muted
+        } else {
+            token_role(segment)
+        };
+        out.push((segment, role));
+        rest = tail;
+    }
+    out
+}
+
+fn token_role(token: &str) -> MetricsRole {
+    let (role, rest) = if let Some(rest) = token.strip_prefix('+') {
+        (MetricsRole::Adds, rest)
+    } else if let Some(rest) = token.strip_prefix('-') {
+        (MetricsRole::Dels, rest)
+    } else {
+        return MetricsRole::Muted;
+    };
+    if rest.starts_with(|c: char| c.is_ascii_digit()) {
+        role
+    } else {
+        MetricsRole::Muted
+    }
+}
+
+/// The colour a role renders in.
+///
+/// `#7a7a7a` is also the `.palette-agent-time` colour in
+/// `resources/style.css` — the time label sits next to the metrics in
+/// the right column and is still CSS-coloured, so the two must be
+/// changed together or the column stops matching itself.
+pub fn metrics_role_hex(role: MetricsRole) -> &'static str {
+    match role {
+        MetricsRole::Muted => "#7a7a7a",
+        MetricsRole::Adds => "#7fbf7f",
+        MetricsRole::Dels => "#e05252",
+    }
+}
+
 /// A row plus its sort keys.
 struct Row {
     rank: u8,
@@ -295,6 +362,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_metrics::UNKNOWN;
     use roost_ipc::agent::ShellState;
     use roost_ipc::messages::TabState;
     use std::collections::BTreeMap;
@@ -479,6 +547,107 @@ mod tests {
     fn elapsed_clamps_a_future_stamp() {
         assert_eq!(elapsed_text(NOW, NOW + 5), "0s");
         assert_eq!(elapsed_text(NOW, i64::MAX), "0s");
+    }
+
+    // ----- metrics segmentation --------------------------------------
+
+    /// Every segmentation case in this section, so the concat-identity
+    /// property is checked against the same inputs the role assertions
+    /// use.
+    const METRICS_CASES: [&str; 10] = [
+        "4f +86 -12",
+        UNKNOWN,
+        "1f +0 -0",
+        "12f +4021 -998",
+        "",
+        "+",
+        "-",
+        "+abc",
+        "-abc",
+        "<3f & +2",
+    ];
+
+    #[test]
+    fn canonical_metrics_split_into_five_segments() {
+        use MetricsRole::*;
+        assert_eq!(
+            metrics_segments("4f +86 -12"),
+            vec![
+                ("4f", Muted),
+                (" ", Muted),
+                ("+86", Adds),
+                (" ", Muted),
+                ("-12", Dels),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_unknown_dash_is_one_muted_segment() {
+        assert_eq!(
+            metrics_segments(UNKNOWN),
+            vec![(UNKNOWN, MetricsRole::Muted)]
+        );
+    }
+
+    #[test]
+    fn zero_counts_keep_their_roles() {
+        use MetricsRole::*;
+        assert_eq!(
+            metrics_segments("1f +0 -0"),
+            vec![
+                ("1f", Muted),
+                (" ", Muted),
+                ("+0", Adds),
+                (" ", Muted),
+                ("-0", Dels),
+            ]
+        );
+    }
+
+    #[test]
+    fn large_counts_keep_their_roles() {
+        use MetricsRole::*;
+        assert_eq!(
+            metrics_segments("12f +4021 -998"),
+            vec![
+                ("12f", Muted),
+                (" ", Muted),
+                ("+4021", Adds),
+                (" ", Muted),
+                ("-998", Dels),
+            ]
+        );
+    }
+
+    #[test]
+    fn degenerate_metrics_tokens_stay_muted() {
+        assert!(metrics_segments("").is_empty());
+        for text in ["+", "-", "+abc", "-abc"] {
+            assert_eq!(
+                metrics_segments(text),
+                vec![(text, MetricsRole::Muted)],
+                "{text:?} must not be colored as a count"
+            );
+        }
+    }
+
+    #[test]
+    fn segments_concatenate_back_to_the_input() {
+        for text in METRICS_CASES {
+            let joined: String = metrics_segments(text)
+                .into_iter()
+                .map(|(segment, _)| segment)
+                .collect();
+            assert_eq!(joined, text, "segments must reproduce {text:?} exactly");
+        }
+    }
+
+    #[test]
+    fn role_colors_are_pinned() {
+        assert_eq!(metrics_role_hex(MetricsRole::Muted), "#7a7a7a");
+        assert_eq!(metrics_role_hex(MetricsRole::Adds), "#7fbf7f");
+        assert_eq!(metrics_role_hex(MetricsRole::Dels), "#e05252");
     }
 
     // ----- population -----------------------------------------------
