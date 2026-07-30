@@ -92,7 +92,6 @@ fn user_prompt_submit_works_and_clears_attention() {
 fn blocking_notification_types_wait() {
     for kind in [
         "permission_prompt",
-        "idle_prompt",
         "agent_needs_input",
         "elicitation_dialog",
     ] {
@@ -110,6 +109,24 @@ fn blocking_notification_types_wait() {
         assert_eq!(report.ownership_action, OwnershipAction::Preserve, "{kind}");
         assert_eq!(report.detail, kind);
     }
+}
+
+#[test]
+fn idle_prompt_notifies_without_flipping_lifecycle() {
+    // Deliberately declassified (plan 006): `idle_prompt` is Claude's
+    // post-turn timer nag, not a modal block. Leaving lifecycle alone
+    // keeps a finished session reading "Finished" instead of flipping
+    // to a false "Waiting for input" when the nag fires; the
+    // notification itself still reaches the user.
+    let report = only(
+        "Notification",
+        &json!({ "session_id": "s-1", "message": "m", "notification_type": "idle_prompt" }),
+    );
+    assert_eq!(report.lifecycle, None);
+    assert_eq!(report.severity, Severity::Info);
+    assert_eq!(report.attention, AttentionOp::Set);
+    assert_eq!(report.detail, "idle_prompt");
+    assert_eq!(report.ownership_action, OwnershipAction::Preserve);
 }
 
 #[test]
