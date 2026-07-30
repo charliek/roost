@@ -29,8 +29,6 @@ use crate::palette::{AgentRowData, PaletteFrame, PaletteItem};
 /// reports.
 pub const FRAME_ID: &str = "agents";
 pub const PLACEHOLDER: &str = "Go to agent…";
-/// Muted hint bar under the list.
-pub const FOOTER_HINTS: &str = "↑↓ move  ↵ go to tab  esc close";
 /// The empty-state row. Deliberately not parseable as `agent:<id>`.
 pub const EMPTY_ROW_ID: &str = "agents:empty";
 pub const EMPTY_ROW_TITLE: &str = "No agent sessions";
@@ -61,7 +59,6 @@ pub fn now_unix() -> i64 {
 /// The root/sub frame for the agents palette.
 pub fn agent_frame(projects: &[Project], now: i64) -> PaletteFrame {
     PaletteFrame::new(FRAME_ID, PLACEHOLDER, agent_items(projects, now))
-        .with_footer_hints(FOOTER_HINTS)
 }
 
 /// Rows for every agent-owned tab in the snapshot, in `rank` order.
@@ -733,11 +730,10 @@ mod tests {
     }
 
     #[test]
-    fn frame_carries_the_footer_hints_and_placeholder() {
+    fn frame_carries_the_placeholder() {
         let frame = agent_frame(&[], NOW);
         assert_eq!(frame.id, FRAME_ID);
         assert_eq!(frame.placeholder, PLACEHOLDER);
-        assert_eq!(frame.footer_hints.as_deref(), Some(FOOTER_HINTS));
         assert_eq!(frame.items.len(), 1);
         assert_eq!(frame.items[0].id, EMPTY_ROW_ID);
     }

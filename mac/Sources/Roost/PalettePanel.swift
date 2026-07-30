@@ -58,11 +58,6 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let field = NSTextField()
     private let table = NSTableView()
     private let card = NSView()
-    /// Muted hint bar under the list. Height collapses to zero for
-    /// frames without `footerHints`, so every existing picker keeps its
-    /// current chrome.
-    private let footer = NSTextField(labelWithString: "")
-    private var footerHeight: NSLayoutConstraint!
     private var cardCenterX: NSLayoutConstraint!
     private var cardTop: NSLayoutConstraint!
     private var isClosing = false
@@ -194,18 +189,8 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         divider.translatesAutoresizingMaskIntoConstraints = false
         divider.boxType = .separator
 
-        footer.translatesAutoresizingMaskIntoConstraints = false
-        footer.font = .systemFont(ofSize: 12)
-        footer.textColor = paletteMutedColor
-        footer.isHidden = true
-        // Zero-height (not just hidden) so the scroll view keeps the
-        // card's original bottom padding on every frame that sets no
-        // hints — a hidden view still occupies its constraints.
-        footerHeight = footer.heightAnchor.constraint(equalToConstant: 0)
-
         card.addSubview(divider)
         card.addSubview(scroll)
-        card.addSubview(footer)
         NSLayoutConstraint.activate([
             field.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
             field.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
@@ -219,12 +204,7 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
             scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 6),
-            scroll.bottomAnchor.constraint(equalTo: footer.topAnchor),
-
-            footer.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            footer.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            footer.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
-            footerHeight,
+            scroll.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
         ])
     }
 
@@ -413,22 +393,10 @@ final class PalettePanel: NSPanel, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if field.stringValue != state.current.query {
             field.stringValue = state.current.query
         }
-        syncFooter()
         table.reloadData()
         selectCurrentRow()
         fireHighlight()
     }
-
-    /// Show the hint bar for frames that carry one (only the agents
-    /// frame today), collapse it to nothing otherwise.
-    private func syncFooter() {
-        let hints = state.current.footerHints
-        footer.stringValue = hints ?? ""
-        footer.isHidden = hints == nil
-        footerHeight.constant = hints == nil ? 0 : Self.footerHeightVisible
-    }
-
-    private static let footerHeightVisible: CGFloat = 24
 
     private func selectCurrentRow() {
         let count = state.matches.count

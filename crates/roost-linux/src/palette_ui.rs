@@ -112,10 +112,6 @@ struct PaletteInner {
     /// scroll the highlighted row into view (GtkListBox doesn't do this
     /// itself when focus stays on the search entry).
     scroll: gtk4::ScrolledWindow,
-    /// Muted hint bar under the list. Visible only for frames that set
-    /// `footer_hints` (the agents frame); hidden otherwise, so every
-    /// existing picker keeps its current chrome.
-    footer: gtk4::Label,
     /// Set while we programmatically rewrite the entry text (query
     /// restore on push/pop) so the `changed` handler ignores the echo.
     suppress_changed: Cell<bool>,
@@ -171,12 +167,6 @@ impl PaletteOverlay {
 
         let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
 
-        let footer = gtk4::Label::builder()
-            .xalign(0.0)
-            .visible(false)
-            .css_classes(["palette-footer"])
-            .build();
-
         let card = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .width_request(660)
@@ -188,7 +178,6 @@ impl PaletteOverlay {
         card.append(&entry);
         card.append(&separator);
         card.append(&scroll);
-        card.append(&footer);
 
         // Transparent click-catcher behind the card. No dim — the
         // terminal stays visible; a click anywhere outside the card
@@ -210,7 +199,6 @@ impl PaletteOverlay {
             entry: entry.clone(),
             list: list.clone(),
             scroll: scroll.clone(),
-            footer: footer.clone(),
             suppress_changed: Cell::new(false),
             closing: Cell::new(false),
             armed: Cell::new(false),
@@ -381,19 +369,12 @@ impl PaletteInner {
     /// Re-render the field placeholder + rows for the current frame and
     /// fire the highlight preview for the selected row.
     fn sync_ui(self: &Rc<Self>) {
-        let (placeholder, query, footer_hints) = {
+        let (placeholder, query) = {
             let state = self.state.borrow();
             let f = state.current();
-            (
-                f.placeholder.clone(),
-                f.query.clone(),
-                f.footer_hints.clone(),
-            )
+            (f.placeholder.clone(), f.query.clone())
         };
         self.entry.set_placeholder_text(Some(&placeholder));
-        self.footer
-            .set_label(footer_hints.as_deref().unwrap_or_default());
-        self.footer.set_visible(footer_hints.is_some());
         if self.entry.text() != query.as_str() {
             self.suppress_changed.set(true);
             self.entry.set_text(&query);

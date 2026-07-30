@@ -344,11 +344,10 @@ func agentRowPayloadCarriesTheEffectiveLifecycleAndPendingMetrics() {
 }
 
 @Test
-func agentFrameCarriesTheFooterHintsAndPlaceholder() {
+func agentFrameCarriesThePlaceholder() {
     let frame = AgentPalette.agentFrame(projects: [], tabs: [], now: NOW)
     #expect(frame.id == AgentPalette.frameID)
     #expect(frame.placeholder == AgentPalette.placeholder)
-    #expect(frame.footerHints == AgentPalette.footerHints)
     #expect(frame.items.count == 1)
     #expect(frame.items[0].id == AgentPalette.emptyRowID)
 }

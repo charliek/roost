@@ -21,8 +21,6 @@ enum AgentPalette {
     /// reports.
     static let frameID = "agents"
     static let placeholder = "Go to agent…"
-    /// Muted hint bar under the list.
-    static let footerHints = "↑↓ move  ↵ go to tab  esc close"
     /// The empty-state row. Deliberately not parseable as `agent:<id>`.
     static let emptyRowID = "agents:empty"
     static let emptyRowTitle = "No agent sessions"
@@ -57,8 +55,7 @@ enum AgentPalette {
         PaletteFrame(
             id: frameID,
             placeholder: placeholder,
-            items: agentItems(projects: projects, tabs: tabs, now: now),
-            footerHints: footerHints
+            items: agentItems(projects: projects, tabs: tabs, now: now)
         )
     }
 
