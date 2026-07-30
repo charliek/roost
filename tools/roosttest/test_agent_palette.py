@@ -86,7 +86,7 @@ def _seed(
     try:
         roost._wait(
             lambda: roost.dump_text(tab_id).strip() != ""
-            or roost.shell_state(tab_id) != "unknown",
+            or roost.shell_state(tab_id) in {"at_prompt", "foreground_process"},
             5.0,
             f"tab {tab_id}'s shell painted its first prompt",
         )
