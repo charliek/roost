@@ -69,6 +69,12 @@ def _seed(
     if name is not None:
         roost.set_title(tab_id, name)
     wait_tab_attached(roost, tab_id)
+    if TEST_MODE:
+        # CI shells have no OSC 133 integration, so waiting for a real
+        # prompt mark hangs there. Feed the A mark ourselves — same
+        # settled end-state, deterministic, and it still exercises the
+        # late-mark-can't-reset property the passive wait was for.
+        roost.tab_feed_pty_bytes(tab_id, b"\x1b]133;A\x07")
     roost.wait_shell_state(tab_id, "at_prompt", timeout=15.0)
     src = source or _agent_source("seed")
     roost.agent_report(
