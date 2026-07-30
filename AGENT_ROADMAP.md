@@ -235,7 +235,7 @@ gauntlet convention; the PR body carries the durable public record.
 | 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Shipped | [#259](https://github.com/charliek/roost/pull/259) |
 | 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | [#260](https://github.com/charliek/roost/pull/260) |
 | 004 | Tab/project position parity ([#262](https://github.com/charliek/roost/issues/262)) + `roostctl doctor` output UX | `~/.claude/plans/roost/004-tab-order-and-doctor-ux.md` | Shipped | [#263](https://github.com/charliek/roost/pull/263) |
-| 005 | D3 agent switcher palette frame (+ async git metrics) — first L3 feature | `~/.claude/plans/roost/005-agent-palette.md` | In review (`feature/plan-005-agent-palette`) | TBD |
+| 005 | D3 agent switcher palette frame (+ async git metrics) — first L3 feature | `~/.claude/plans/roost/005-agent-palette.md` | In review | [#265](https://github.com/charliek/roost/pull/265) |
 | — | L3 agent UX (tint / overview) | *not yet written* | Future | — |
 
 ---
