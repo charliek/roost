@@ -630,6 +630,8 @@ private final class PaletteAgentCellView: NSView {
     /// Diameter of the leading status dot. Matches the GTK
     /// `AGENT_DOT_PX`.
     private static let dotSize: CGFloat = 8
+    private static let metricsFont = NSFont.monospacedSystemFont(
+        ofSize: 12, weight: .regular)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -645,9 +647,12 @@ private final class PaletteAgentCellView: NSView {
         name.lineBreakMode = .byTruncatingTail
         status.font = .systemFont(ofSize: 13)
         status.lineBreakMode = .byTruncatingTail
+        // The right column is its own gray: `AgentPalette`'s muted role
+        // (#7a7a7a), shared with the GTK `.palette-agent-time` CSS, so
+        // the time label matches the muted metrics segments beside it.
         for label in [metrics, time] {
-            label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-            label.textColor = paletteMutedColor
+            label.font = Self.metricsFont
+            label.textColor = AgentPalette.metricsColor(.muted)
             label.alignment = .right
         }
 
@@ -708,8 +713,14 @@ private final class PaletteAgentCellView: NSView {
         name.stringValue = agent.name
         status.stringValue = agent.statusText
         status.textColor = color
-        metrics.stringValue = agent.metricsText ?? ""
-        metrics.isHidden = agent.metricsText == nil
+        if let text = agent.metricsText {
+            metrics.attributedStringValue = AgentPalette.metricsAttributed(
+                text, font: Self.metricsFont)
+            metrics.isHidden = false
+        } else {
+            metrics.stringValue = ""
+            metrics.isHidden = true
+        }
         time.stringValue = agent.timeText
     }
 }
