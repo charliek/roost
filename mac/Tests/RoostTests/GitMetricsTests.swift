@@ -720,8 +720,17 @@ private func scratchPath() -> String {
     noCwd.id = 5
     noCwd.cwd = ""
 
-    let cwds = AgentPalette.agentTabCwds(tabs: [owned, manual, unowned, noCwd])
+    var orphan = owned
+    orphan.id = 6
+    orphan.projectId = 99
+    orphan.cwd = "/w/orphan"
+
+    let projects = [Workspace.Project(id: 1, name: "roost", cwd: "/tmp", position: 0, createdAt: 0)]
+    let cwds = AgentPalette.agentTabCwds(
+        projects: projects, tabs: [owned, manual, unowned, noCwd, orphan])
     // manual/legacy and unowned tabs get no row, so they get no probe;
-    // a cwd-less agent tab is still claimed (it resolves to `—`).
+    // a cwd-less agent tab is still claimed (it resolves to `—`); a tab
+    // whose project vanished mid-snapshot gets no row, so no probe
+    // either (the filter must match agentItems exactly).
     #expect(cwds == [2: "/w/roost", 5: ""])
 }

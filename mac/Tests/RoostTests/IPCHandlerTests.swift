@@ -336,13 +336,14 @@ struct IPCAgentReportDispatchTests {
 /// frame produces. These decode/re-encode fixtures pin both shapes so a
 /// drift in `IPCPaletteAgentRow`'s `CodingKeys` or the omit-when-nil
 /// behavior surfaces here rather than in the agents-frame commit.
-@Suite("IPC palette item view — agent payload")
 /// Byte-parity with GTK's `{:?}` in the invalid-kind message
 /// (crates/roost-linux/src/ipc.rs) — quotes and escapes must not
 /// diverge between the two UIs.
+@Suite("Rust {:?} string parity")
 struct RustDebugQuotedTests {
     @Test func matchesRustDebugFormatting() {
         #expect(IPCHandlerImpl.rustDebugQuoted("bogus") == "\"bogus\"")
+        #expect(IPCHandlerImpl.rustDebugQuoted("n\0l") == "\"n\\0l\"")
         #expect(IPCHandlerImpl.rustDebugQuoted("x\"y") == "\"x\\\"y\"")
         #expect(IPCHandlerImpl.rustDebugQuoted("a\\b") == "\"a\\\\b\"")
         #expect(IPCHandlerImpl.rustDebugQuoted("t\ta") == "\"t\\ta\"")
@@ -351,6 +352,7 @@ struct RustDebugQuotedTests {
     }
 }
 
+@Suite("IPC palette item view — agent payload")
 struct IPCPaletteItemViewTests {
     @Test func decodesWithoutAnAgentPayload() throws {
         let json = """

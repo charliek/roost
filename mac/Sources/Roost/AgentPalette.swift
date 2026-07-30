@@ -111,11 +111,15 @@ enum AgentPalette {
     /// never disagree about which tabs are in play. A tab with no cwd
     /// maps to `""`, which the probe resolves to `—` (never skipped:
     /// skipping would leave the row pending forever).
-    static func agentTabCwds(tabs: [Workspace.Tab]) -> [Int64: String] {
+    static func agentTabCwds(
+        projects: [Workspace.Project], tabs: [Workspace.Tab]
+    ) -> [Int64: String] {
+        let byID = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var cwds: [Int64: String] = [:]
         for tab in tabs {
             guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { continue }
             if nonAgentSources.contains(owner.source) { continue }
+            guard byID[tab.projectId] != nil else { continue }
             cwds[tab.id] = tab.cwd
         }
         return cwds

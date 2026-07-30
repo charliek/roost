@@ -489,6 +489,7 @@ actor IPCHandlerImpl: IPCHandler {
             case "\n": out += "\\n"
             case "\r": out += "\\r"
             case "\t": out += "\\t"
+            case "\0": out += "\\0"
             default:
                 if scalar.properties.generalCategory == .control {
                     out += "\\u{\(String(scalar.value, radix: 16))}"

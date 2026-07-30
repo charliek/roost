@@ -1030,7 +1030,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         var frame = AgentPalette.agentFrame(
             projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
         applyMetricsCache(
-            cwds: AgentPalette.agentTabCwds(tabs: snapshot.tabs), items: &frame.items)
+            cwds: AgentPalette.agentTabCwds(projects: snapshot.projects, tabs: snapshot.tabs), items: &frame.items)
         return frame
     }
 
@@ -1086,7 +1086,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func refreshAgentPalette() {
         guard let (session, panel) = agentsPaletteTarget() else { return }
         let snapshot = workspaceSnapshot()
-        let cwds = AgentPalette.agentTabCwds(tabs: snapshot.tabs)
+        let cwds = AgentPalette.agentTabCwds(projects: snapshot.projects, tabs: snapshot.tabs)
         var items = AgentPalette.agentItems(
             projects: snapshot.projects, tabs: snapshot.tabs, now: AgentPalette.nowUnix())
         applyMetricsCache(cwds: cwds, items: &items)
@@ -1116,7 +1116,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func startAgentMetrics() {
         guard let session = palette?.generation else { return }
-        spawnAgentMetrics(session: session, cwds: AgentPalette.agentTabCwds(tabs: workspaceSnapshot().tabs))
+        spawnAgentMetrics(session: session, cwds: {
+            let snap = workspaceSnapshot()
+            return AgentPalette.agentTabCwds(projects: snap.projects, tabs: snap.tabs)
+        }())
     }
 
     /// Probe every agent tab's repo that this palette session hasn't
