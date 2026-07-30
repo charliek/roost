@@ -235,7 +235,8 @@ gauntlet convention; the PR body carries the durable public record.
 | 002 | L0 state model + L1 agent adapter + parity fixtures + e2e lifecycle | `~/.claude/plans/roost/002-agent-state-model.md` | Shipped | [#259](https://github.com/charliek/roost/pull/259) |
 | 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | [#260](https://github.com/charliek/roost/pull/260) |
 | 004 | Tab/project position parity ([#262](https://github.com/charliek/roost/issues/262)) + `roostctl doctor` output UX | `~/.claude/plans/roost/004-tab-order-and-doctor-ux.md` | Shipped | [#263](https://github.com/charliek/roost/pull/263) |
-| — | L3 agent UX (tint / overview / switcher) | *not yet written* | Future | — |
+| 005 | D3 agent switcher palette frame (+ async git metrics) — first L3 feature | `~/.claude/plans/roost/005-agent-palette.md` | In review (`feature/plan-005-agent-palette`) | TBD |
+| — | L3 agent UX (tint / overview) | *not yet written* | Future | — |
 
 ---
 
@@ -277,23 +278,32 @@ hooks: `model` and `session_title` (`SessionStart`), `permission_mode`,
 *Sequencing note:* the free-form `detail` field, plus the open
 `Ownership.metadata` map (both shipped with L0/L1 — see
 [`ipc.md`](docs/reference/ipc.md)), mean this data can already be
-surfaced without a new op (AD-7). What's missing for D2 is purely the
-UI: a surface to render it.
+surfaced without a new op (AD-7). Plan 005 (D3) now renders a filtered
+slice of it — one row per live agent-owned tab, not every tab — so what's
+missing for the *full* D2 overview is narrower than before but still
+purely UI: a surface listing all tabs (owned or not), not just the
+agent-owned subset the switcher shows.
 
-### D3 — Agent switcher palette frame
+### D3 — Agent switcher palette frame — shipped (plan 005)
 
 Jump between agents from the palette, showing directory, name, status,
 and age.
 
-*Needs:* nothing beyond D2's data — including the row-order dependency
-noted there. The existing `view_notifications` frame is a structurally
-identical template (one row per interesting tab, `<project> · <tab>`
-title, activate → jump), so this is largely assembly.
+**Shipped** via plan 005 (`~/.claude/plans/roost/005-agent-palette.md`):
+a new `"agents"` palette frame (⌘⇧O / Alt⇧O, and `view_agents` in the
+command palette) lists one row per agent-owned tab — project, name,
+status text, elapsed time, and (async, feasibility-gated) git metrics —
+ordered by `rank()` then recency then layout position. It renders the
+D2-metadata subset that fits a switcher: `session_title` (name),
+`detail` (status text for `failed`/background-tasks), the
+`background_tasks:N` count folded into `detail`, and `last_event_at`
+(age). See [`ipc.md`](docs/reference/ipc.md#command-palette-palette)
+for the wire shape.
 
-*Needs from L0 specifically:* the shared `rank()` ordering, so the
-switcher, the overview, and the sidebar stripe agree on what "most
-urgent" means. That is why rank is a function pinned by fixtures rather
-than an if-chain.
+*Needed from L0 (confirmed, not just planned):* the shared `rank()`
+ordering, so the switcher, the (future) overview, and the sidebar stripe
+agree on what "most urgent" means — rank is a function pinned by
+fixtures rather than an if-chain, exactly as anticipated here.
 
 ### D4 — Severity-aware notifications
 
@@ -335,8 +345,12 @@ terminal shows.
 *Needs:* the lifecycle mapping to consult those arrays — **shipped**
 with the L1 Claude adapter (`crates/roost-agent/src/claude.rs`'s
 `stop()`: non-empty `background_tasks` keeps the lifecycle `working`
-instead of `finished`; counts land in `metadata`). What's left for this
-candidate is purely a distinct visual treatment in the UI.
+instead of `finished`; counts land in `metadata`). Plan 005's agent
+palette (D3) now gives this a first visual treatment — a `working` row
+whose `detail` is `background_tasks:N` renders "Working · N bg task(s)"
+in its status column — but that is one status string in one surface;
+what's left for this candidate is a distinct treatment on the tab pill /
+sidebar rollup themselves.
 
 ### Cross-cutting requirement
 

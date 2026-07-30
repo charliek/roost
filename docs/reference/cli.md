@@ -201,14 +201,17 @@ roostctl screenshot > shot.png            # raw PNG bytes to stdout
 Drive the command-palette overlay: open it, inspect its rows, filter, activate a row, dismiss. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.
 
 ```bash
-roostctl palette open                      # the command palette (or: --kind launcher)
+roostctl palette open                      # the command palette
+roostctl palette open --kind launcher      # the command launcher
+roostctl palette open --kind custom        # the script-backed provider palette
+roostctl palette open --kind agents        # the agent-jump palette
 roostctl palette state                     # current rows / filter / selection
 roostctl palette query theme               # set the filter
 roostctl palette activate new_tab          # confirm the row (runs its command)
 roostctl palette dismiss
 ```
 
-`palette activate <id>` errors `not-found` if no palette is open or no visible row has that id. Backed by the `palette.*` IPC ops — see [ipc.md](ipc.md).
+`--kind` is `commands` (default), `launcher`, `custom`, or `agents`; any other value errors `invalid-param`. `palette activate <id>` errors `not-found` if no palette is open or no visible row has that id. Backed by the `palette.*` IPC ops — see [ipc.md](ipc.md).
 
 ## `claude install`
 
