@@ -6304,6 +6304,12 @@ impl App {
                     // a row — drop any agent target it parked.
                     app.pending_agent_click.set(None);
                     row.set_opacity(0.4);
+                    // Flatten every project to its bare row for the drag:
+                    // the reorder index math (`raw_target_for_y`,
+                    // `shuffle_sidebar_toward`) assumes one row per
+                    // project, and hiding beats recomputing it against
+                    // taller agent-row geometry on every motion tick.
+                    app.set_agent_rows_visible(false);
                     *app.dragged_project_id.borrow_mut() = Some(pid);
                     *app.drag_original_order.borrow_mut() = app.sidebar_order();
                 }
@@ -6330,6 +6336,13 @@ impl App {
                     let raw = app.raw_target_for_y(py);
                     app.shuffle_sidebar_toward(pid, raw);
                 }
+                // Restore only after the settle: the whole drag was
+                // hit-tested against flattened rows, so re-showing the agent
+                // rows first would resolve the drop against taller geometry
+                // than the user was given feedback on. Restore to the
+                // toggle's value, not unconditionally visible, or flipping
+                // the setting mid-drag is undone on release.
+                app.set_agent_rows_visible(*app.show_sidebar_agents.borrow());
                 let current = app.sidebar_order();
                 let original = app.drag_original_order.borrow().clone();
                 if current != original {
@@ -6347,6 +6360,8 @@ impl App {
                     return;
                 };
                 app.set_row_opacity(pid, 1.0);
+                // Restore to the toggle's current value — see connect_drag_end.
+                app.set_agent_rows_visible(*app.show_sidebar_agents.borrow());
                 // Cancelled drag (grab broken) → revert to the pre-drag order.
                 let original = app.drag_original_order.borrow().clone();
                 app.apply_sidebar_order(&original);
@@ -6362,6 +6377,15 @@ impl App {
     fn set_row_opacity(&self, project_id: i64, opacity: f64) {
         if let Some(ui) = self.projects.borrow().get(&project_id) {
             ui.sidebar_row.set_opacity(opacity);
+        }
+    }
+
+    /// Show or hide every project's `sidebar_agents_box`, independent of
+    /// `show_sidebar_agents` — used to flatten the sidebar to one row per
+    /// project for the duration of a reorder drag.
+    fn set_agent_rows_visible(&self, visible: bool) {
+        for ui in self.projects.borrow().values() {
+            ui.sidebar_agents_box.set_visible(visible);
         }
     }
 
