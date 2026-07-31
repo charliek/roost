@@ -3395,7 +3395,16 @@ impl App {
     /// post-event block next to `refresh_agent_palette` is the only
     /// event-driven call site.
     fn refresh_agent_rows(self: &Rc<Self>) {
-        let agents_visible = *self.show_sidebar_agents.borrow();
+        // A reorder drag flattens the sidebar to one row per project
+        // (`set_agent_rows_visible(false)`), and this refresh runs after
+        // *every* workspace event — including ones a running agent emits
+        // mid-drag. Honouring the toggle unconditionally would re-show the
+        // rows underneath the drag and break the index math; fold the
+        // in-flight drag into the decision instead.
+        let agents_visible = agent_rows_visible(
+            *self.show_sidebar_agents.borrow(),
+            self.dragged_project_id.borrow().is_some(),
+        );
         let now = agent_palette::now_unix();
         let snapshot = self.workspace_snapshot();
         let active_tab = self.active_tab_id(*self.active_project_id.borrow());
@@ -5752,25 +5761,31 @@ impl App {
         let projects_ui = self.projects.borrow();
         let projects = snapshot
             .iter()
-            .filter_map(|project| {
-                let ui = projects_ui.get(&project.id)?;
-                let agents = ui
-                    .rendered_agents
-                    .borrow()
-                    .iter()
-                    .map(|entry| SidebarDumpAgentRow {
-                        tab_id: entry.row.tab_id,
-                        name: entry.row.name.clone(),
-                        lifecycle: entry.row.lifecycle,
-                        status_text: entry.row.status_text.clone(),
-                        time_text: entry.row.time_text.clone(),
-                        is_active: entry.is_active,
+            .map(|project| {
+                // Every snapshot project is reported, in sidebar order (plan
+                // 007 §3.8) — a project whose `ProjectCreated` hasn't been
+                // drained into the UI map yet has no rows, not no entry.
+                let agents = projects_ui
+                    .get(&project.id)
+                    .map(|ui| {
+                        ui.rendered_agents
+                            .borrow()
+                            .iter()
+                            .map(|entry| SidebarDumpAgentRow {
+                                tab_id: entry.row.tab_id,
+                                name: entry.row.name.clone(),
+                                lifecycle: entry.row.lifecycle,
+                                status_text: entry.row.status_text.clone(),
+                                time_text: entry.row.time_text.clone(),
+                                is_active: entry.is_active,
+                            })
+                            .collect()
                     })
-                    .collect();
-                Some(SidebarDumpProject {
+                    .unwrap_or_default();
+                SidebarDumpProject {
                     project_id: project.id,
                     agents,
-                })
+                }
             })
             .collect();
         Ok(SidebarDumpResult {
@@ -6832,16 +6847,33 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
     })
 }
 
+/// Whether a project's `sidebar_agents_box` should be visible: the user's
+/// toggle, except a reorder drag flattens the sidebar to one row per project
+/// for its whole duration (the drag's index math assumes that geometry), so a
+/// mid-drag refresh must not re-show the rows.
+fn agent_rows_visible(toggle_on: bool, dragging: bool) -> bool {
+    toggle_on && !dragging
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_target, compute_insert_idx, drain_server_driven_marker, format_font_size,
-        is_already_attached_or_pending, notif_tab_id, pick_next_active_project, resolve_launch_cwd,
-        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, ActivationTarget,
-        RestoreTab,
+        activation_target, agent_rows_visible, compute_insert_idx, drain_server_driven_marker,
+        format_font_size, is_already_attached_or_pending, notif_tab_id, pick_next_active_project,
+        resolve_launch_cwd, restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home,
+        ActivationTarget, RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn agent_rows_stay_hidden_while_a_reorder_drag_is_armed() {
+        assert!(agent_rows_visible(true, false));
+        assert!(!agent_rows_visible(false, false));
+        // Mid-drag an event-driven refresh must not undo the flattening.
+        assert!(!agent_rows_visible(true, true));
+        assert!(!agent_rows_visible(false, true));
+    }
 
     #[test]
     fn a_pending_agent_click_wins_only_within_its_own_project() {

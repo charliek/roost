@@ -265,8 +265,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Live `show-sidebar-agents` setting (plan 007 §3.7). Seeded
     /// from `config` at launch; `toggleSidebarAgents` flips it and
-    /// writes back through `RoostConfig.setKey`. C2 wires the
-    /// setting only — nothing reads this yet.
+    /// writes back through `RoostConfig.setKey`. Read by
+    /// `refreshSidebarAgentModel` (whether agent items are handed to the
+    /// outline at all) and by `sidebarDump` (the `agents_visible` field).
     private var showSidebarAgents: Bool = true
 
     /// Command palette (Cmd+Shift+P). Nil when closed. `paletteOpen`
@@ -5587,18 +5588,20 @@ extension RoostApp: UiBridge {
     }
 
     /// `app.sidebar_dump`: every project's last-rendered agent rows, in
-    /// sidebar order, plus the agents-visible toggle. `renderedAgents`
-    /// keeps an entry for every project (populated by
-    /// `refreshSidebarAgentModel`, including zero-agent projects), so a
-    /// missing lookup here would itself indicate a stale cache — that
-    /// case is treated as "no rows yet" rather than skipping the
-    /// project, since the contract requires all projects to appear.
+    /// sidebar order, plus the agents-visible toggle. Order and
+    /// membership come from the **workspace** snapshot, not the UI's
+    /// `projects` array: a project created through IPC lands in the
+    /// workspace immediately but only reaches `projects` once
+    /// `.projectCreated` drains, and plan 007 §3.8 requires *all*
+    /// projects to appear. Row content still comes only from the
+    /// `renderedAgents` cache — a project with no entry yet reports an
+    /// empty list rather than being dropped.
     func sidebarDump() -> (
         agentsVisible: Bool, projects: [(projectID: Int64, agents: [RenderedAgentRow])]
     ) {
         (
             agentsVisible: showSidebarAgents,
-            projects: projects.map { ($0.id, renderedAgents[$0.id] ?? []) }
+            projects: workspaceSnapshot().projects.map { ($0.id, renderedAgents[$0.id] ?? []) }
         )
     }
 
@@ -5888,15 +5891,33 @@ extension RoostApp: NSOutlineViewDataSource {
         pasteboardWriterForItem item: Any
     ) -> NSPasteboardWriting? {
         guard let row = item as? ProjectRowItem else { return nil }
-        // Plan 007 §3.6: flatten here rather than in
-        // `draggingSession(_:willBeginAt:)` — this fires before AppKit
-        // captures the drag image, whereas reloading from `willBeginAt`
-        // can invalidate the dragged row and cancel the session.
-        isDraggingProjects = true
-        reloadSidebarOutline()
         let writer = NSPasteboardItem()
         writer.setString(String(row.project.id), forType: .roostProjectID)
         return writer
+    }
+
+    /// Plan 007 §3.6: flatten the sidebar to one row per project for the
+    /// duration of the drag.
+    ///
+    /// This is the flag's set site rather than
+    /// `pasteboardWriterForItem` because only `willBeginAt` is
+    /// guaranteed to pair with `draggingSession(_:endedAt:operation:)`:
+    /// returning a non-nil writer does not guarantee a session starts,
+    /// and a session that never starts would strand `isDraggingProjects`
+    /// at `true`, leaving the sidebar permanently flattened.
+    ///
+    /// Reloading from here is safe: `sidebarChildCount` only drops the
+    /// *child* agent rows — every top-level project row, including the
+    /// dragged one, survives the reload, so the session's dragged item
+    /// is never invalidated.
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        draggingSession session: NSDraggingSession,
+        willBeginAt screenPoint: NSPoint,
+        forItems draggedItems: [Any]
+    ) {
+        isDraggingProjects = true
+        reloadSidebarOutline()
     }
 
     /// Accept drops between top-level rows only. NSOutlineView

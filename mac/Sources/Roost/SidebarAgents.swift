@@ -176,6 +176,10 @@ final class AgentRowCellView: NSTableCellView {
         time.stringValue = row.timeText
         time.textColor = sidebarAgentTimeColor(for: row.lifecycle)
         toolTip = row.statusText
+        // The hit button is transparent and titleless, so VoiceOver has
+        // nothing to announce without this — name plus status is what a
+        // sighted user reads off the row.
+        hit.setAccessibilityLabel("\(row.name), \(row.statusText)")
         self.onActivate = onActivate
         setActive(isActive)
     }

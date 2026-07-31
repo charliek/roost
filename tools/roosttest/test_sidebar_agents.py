@@ -176,6 +176,24 @@ def test_project_with_zero_agents_still_appears_with_empty_list(roost, project):
     assert proj["agents"] == [], proj
 
 
+def test_freshly_created_project_appears_in_dump_immediately(roost):
+    """The dump's membership must come from the workspace, not from
+    whatever the UI has drained so far: `project.create` returns once the
+    project exists in the workspace, and §3.8 ("ALL projects appear")
+    holds from that instant — a project whose `ProjectCreated` event
+    hasn't reached the UI's project map yet reports an empty `agents`
+    list, it is never omitted."""
+    p = roost.create_project(name=f"pytest-sidebar-agents-new-{uuid.uuid4().hex[:6]}", cwd="/tmp")
+    try:
+        # Deliberately unpolled: the assertion is that the very first read
+        # after the create reply already sees the project.
+        proj = _project_row(roost.sidebar_dump(), p)
+        assert proj is not None, roost.sidebar_dump()
+        assert proj["agents"] == [], proj
+    finally:
+        roost.delete_project(p)
+
+
 # ---------------------------------------------------------------------------
 # A3/A9: exactly one active row, following tab.focus
 # ---------------------------------------------------------------------------
