@@ -189,42 +189,6 @@ enum AgentPalette {
         return rows.map(\.row)
     }
 
-    /// One row in the sidebar's flat display order: a project header or
-    /// one of its agent rows. Generic over the caller's own project
-    /// payload (`Project`) and agent-row payload (`Agent`) so this stays
-    /// pure data with no dependency on `NSOutlineView`'s item types —
-    /// mirrors `agent_palette.rs`'s `SidebarRow<P, A>` /
-    /// `flatten_sidebar_rows`.
-    enum SidebarRow<P: Equatable, A: Equatable>: Equatable {
-        case project(P)
-        case agent(A)
-    }
-
-    /// Interleave each project with its already-ordered agent rows into
-    /// one flat display list (plan 007 §3.6). Agent rows are dropped —
-    /// every project renders alone — when the toggle is off, or while a
-    /// project drag is in flight: the drag case exists so index-based
-    /// reorder math never has to account for agent rows shifting
-    /// underneath it.
-    ///
-    /// Generic type params are named `P`/`A` rather than `Project`/
-    /// `Agent` to avoid shadowing this file's `Agent` namespace enum.
-    static func flattenSidebarRows<P: Equatable, A: Equatable>(
-        projects: [(project: P, agents: [A])],
-        agentsVisible: Bool,
-        isDragging: Bool
-    ) -> [SidebarRow<P, A>] {
-        let showAgents = agentsVisible && !isDragging
-        var out: [SidebarRow<P, A>] = []
-        for entry in projects {
-            out.append(.project(entry.project))
-            if showAgents {
-                out.append(contentsOf: entry.agents.map { .agent($0) })
-            }
-        }
-        return out
-    }
-
     /// The tab id an agent row activates, or nil for the empty sentinel
     /// (and any other row id).
     static func tabID(fromRowID rowID: String) -> Int64? {
