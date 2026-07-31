@@ -43,6 +43,18 @@ func renderedSidebarAgents(
     }
 }
 
+/// How many child rows the sidebar outline reports for a project.
+///
+/// `agentCount` is already 0 when the toggle is off (the model drops the
+/// items). Mid-drag the sidebar flattens to one row per project so
+/// AppKit only ever proposes top-level drops — see
+/// `outlineView(_:pasteboardWriterForItem:)`.
+///
+/// Pure; unit-tested in `SidebarAgentRowTests`.
+func sidebarChildCount(agentCount: Int, isDraggingProjects: Bool) -> Int {
+    isDraggingProjects ? 0 : agentCount
+}
+
 /// `NSOutlineView` with the disclosure triangle suppressed: agent rows
 /// are auto-expanded and have no per-project collapse this pass, so the
 /// triangle would be a control that does nothing but steal the leading

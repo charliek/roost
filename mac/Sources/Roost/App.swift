@@ -208,6 +208,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// callbacks.
     private var dropIndicatorIndex: Int?
 
+    /// Plan 007 §3.6: true for the duration of a sidebar project drag.
+    /// While set the outline reports no children, so `validateDrop` /
+    /// `acceptDrop` see one row per project — the geometry they were
+    /// written against, before agent rows made project rows expandable.
+    fileprivate var isDraggingProjects = false
+
     private var socketPath: String = ""
 
     /// Monotonic counter for provider sub-frame ids (see
@@ -2721,6 +2727,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func reloadSidebarOutline() {
         guard let outline = projectsOutlineView else { return }
         outline.reloadData()
+        guard !isDraggingProjects else { return }
         for item in projectRowItems.values where !item.agents.isEmpty {
             outline.expandItem(item)
         }
@@ -5837,7 +5844,9 @@ extension RoostApp: UiBridge {
 extension RoostApp: NSOutlineViewDataSource {
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         if item == nil { return projectCountForSidebar() }
-        return (item as? ProjectRowItem)?.agents.count ?? 0
+        guard let project = item as? ProjectRowItem else { return 0 }
+        return sidebarChildCount(
+            agentCount: project.agents.count, isDraggingProjects: isDraggingProjects)
     }
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
@@ -5847,7 +5856,8 @@ extension RoostApp: NSOutlineViewDataSource {
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         guard let project = item as? ProjectRowItem else { return false }
-        return !project.agents.isEmpty
+        return sidebarChildCount(
+            agentCount: project.agents.count, isDraggingProjects: isDraggingProjects) > 0
     }
 
     // MARK: - M3 drag-and-drop
@@ -5862,6 +5872,12 @@ extension RoostApp: NSOutlineViewDataSource {
         pasteboardWriterForItem item: Any
     ) -> NSPasteboardWriting? {
         guard let row = item as? ProjectRowItem else { return nil }
+        // Plan 007 §3.6: flatten here rather than in
+        // `draggingSession(_:willBeginAt:)` — this fires before AppKit
+        // captures the drag image, whereas reloading from `willBeginAt`
+        // can invalidate the dragged row and cancel the session.
+        isDraggingProjects = true
+        reloadSidebarOutline()
         let writer = NSPasteboardItem()
         writer.setString(String(row.project.id), forType: .roostProjectID)
         return writer
@@ -5965,6 +5981,12 @@ extension RoostApp: NSOutlineViewDataSource {
     /// even when the user releases outside the outline view (cancelled
     /// drag). Without this, a cancelled drag would leave a stray
     /// indicator band visible until the next drag.
+    ///
+    /// Plan 007 §3.6 also restores the agent rows here, and this is the
+    /// right place: AppKit runs `acceptDrop` first, so the drop is
+    /// resolved against the same flattened geometry the whole drag was
+    /// hit-tested against. Un-flattening any earlier would resolve the
+    /// drop against taller, restored rows.
     func outlineView(
         _ outlineView: NSOutlineView,
         draggingSession session: NSDraggingSession,
@@ -5972,6 +5994,9 @@ extension RoostApp: NSOutlineViewDataSource {
         operation: NSDragOperation
     ) {
         updateDropIndicator(to: nil)
+        isDraggingProjects = false
+        reloadSidebarOutline()
+        applySidebarSelection()
     }
 }
 

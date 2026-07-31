@@ -182,3 +182,16 @@ private func shellTab(_ id: Int64, project: Int64) -> Workspace.Tab {
     #expect(sidebarAgentTimeColor(for: .finished) == muted)
     #expect(sidebarAgentTimeColor(for: .inactive) == muted)
 }
+
+// MARK: - drag flatten (§3.6)
+
+@Test func sidebarChildCountFlattensProjectRowsWhileDragging() {
+    // Agents shown, agents hidden (the model empties the list), and a
+    // project that has no agents at all.
+    #expect(sidebarChildCount(agentCount: 3, isDraggingProjects: false) == 3)
+    #expect(sidebarChildCount(agentCount: 0, isDraggingProjects: false) == 0)
+
+    // Mid-drag every project is a leaf, whatever the model holds.
+    #expect(sidebarChildCount(agentCount: 3, isDraggingProjects: true) == 0)
+    #expect(sidebarChildCount(agentCount: 0, isDraggingProjects: true) == 0)
+}
