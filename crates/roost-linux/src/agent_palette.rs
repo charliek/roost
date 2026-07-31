@@ -1041,7 +1041,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_leading_agent_marker_is_stripped_from_the_name() {
         // Claude Code's own window-title prefix, U+2733 + space.
         assert_eq!(
