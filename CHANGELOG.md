@@ -9,6 +9,76 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.17 — 2026-07-31
+
+Agents move out of the palette and into the sidebar. Every running agent now
+appears as a row under its project — lifecycle dot, name, elapsed time — with
+the active one highlighted, so "what is running, and how long has it been
+waiting?" is answerable at rest instead of by opening a palette.
+
+### Features
+
+- **Agents in the project sidebar, both UIs (#270)** — one indented row per
+  agent-owned tab under its project: a lifecycle-coloured dot, the agent's name,
+  and a right-aligned elapsed time, with the full status as tooltip. Rows reuse
+  the agent palette's own filter, name fallback, status vocabulary and ordering,
+  so the two surfaces cannot disagree about what is most urgent. Clicking a row
+  jumps to that tab and switches the project with it.
+- **The active agent and the selected project are visible at once (#270)** — the
+  row whose tab is active carries its own subtle highlight, derived from the
+  active tab rather than from widget selection, because neither `NSOutlineView`
+  nor `GtkListBox` can express two selections. It tracks focus however it moves:
+  tab click, palette jump, notification, or `tab.focus` over IPC.
+- **`show-sidebar-agents` toggle (#270)** — visible by default; flip it with
+  ⌘⇧A / Alt⇧A, the "Toggle Sidebar Agents" palette row, the Mac View menu, or the
+  config key. Toggling writes back to `config.conf`, so it survives a restart.
+- **`app.sidebar_dump` (#270)** — a read-only, ungated op reporting the sidebar's
+  *last-rendered* rows on both UIs, so a refresh the UI failed to run surfaces as
+  a failing assertion instead of staying invisible. Documented in
+  [`ipc.md`](docs/reference/ipc.md).
+
+### Fixes
+
+- **The agent's own title marker is stripped from row names (#270)** — Claude
+  Code prefixes its window title with `✳ `, so a renamed session rendered with
+  two status glyphs, its own and ours. Leading marker glyphs are now dropped
+  structurally, so a second adapter's marker needs no code change; ASCII titles
+  (paths, `[wip] name`) are untouched.
+- **The agent dot aligns with the project label (#270)** on both UIs, and the row
+  highlight with the project's selection pill, so agents read as a nested list
+  rather than an inset block.
+- **GTK: the rollup stripe is scoped to the project row (#270)** — it ran the
+  full height of the row, which since this release also contains the agent rows,
+  double-counting what the per-agent dots already say. It now matches Mac, and
+  survives selection (the rules clearing the row background used the `background`
+  shorthand, which also resets the stripe's `background-image`).
+- **GTK: a cancelled press on an agent row no longer hijacks the next click
+  (#270)** — a press nudged past the click threshold but short of the drag
+  threshold left a stale jump target that redirected the project's next
+  activation, including one arriving by keyboard.
+- **Both UIs: `app.sidebar_dump` reports every project (#270)**, including one
+  whose creation event has not yet reached the UI, rather than dropping it.
+- **Mac: the sidebar flattens for the duration of a project drag (#270)** —
+  without it, AppKit proposes child-relative drops once a project is expanded and
+  `validateDrop` rejects them, turning most of that project's rows into a dead
+  drop zone. GTK flattens for the same reason.
+- **Mac: the agent row's activation control carries an accessibility label
+  (#270)** — it is transparent and titleless, so VoiceOver announced an
+  unlabelled button with no way to tell which agent it focused.
+
+### Tooling & tests
+
+- **Sidebar↔palette parity is now pinned (#270)** — the two surfaces share pure
+  builders, but nothing asserted they agree; a dual-target e2e test now checks
+  membership, per-project ordering, and per-row content.
+- **Dot-layout pixel guards (#270)** — the four lifecycle colours and the dots'
+  shared left edge, asserted from real screenshots on both targets. Deliberately
+  narrow to stay non-flaky: only solid fills we own, never golden images, text
+  metrics, or the Mac selection pill (which follows the system accent colour).
+- **The e2e harness no longer writes to a tracked fixture (#270)** — the seed
+  config is copied into each session's throwaway state dir, so a test that
+  toggles a config key cannot mutate the repo or race the other target.
+
 ## v0.0.16 — 2026-07-30
 
 The agent release. The overloaded two-field agent model is replaced by four
