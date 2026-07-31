@@ -14,7 +14,7 @@
 //! `Projects/TabsReordered` arm re-applies the canonical order so
 //! cross-client UIs converge.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
 use crate::agent_palette;
+use crate::agent_palette::SidebarAgentRow;
 use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::clipboard;
 use crate::config;
@@ -74,6 +75,13 @@ struct ProjectUi {
     /// inline rename. Populated with the current name when rename
     /// starts; cleared on cancel/commit.
     sidebar_entry: gtk4::Entry,
+    /// Rebuilt wholesale by `refresh_agent_rows`; hidden when
+    /// `show-sidebar-agents` is off.
+    sidebar_agents_box: gtk4::Box,
+    /// What `sidebar_agents_box` currently shows, written by the same
+    /// refresh that builds the widgets (plan 007 §3.8) so a missed
+    /// refresh is observable over IPC rather than invisible.
+    rendered_agents: RefCell<Vec<RenderedAgentRow>>,
     tab_view: TabView,
     /// Custom Mac-style tab strip (a GtkBox of TabPill widgets) shown in the
     /// top-bar `bar_stack`. The AdwTabView above is the model; this is a view
@@ -95,6 +103,12 @@ struct ProjectUi {
     /// (success or failure), so a failed attach doesn't leave the
     /// id permanently marked.
     pending_attaches: RefCell<HashSet<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedAgentRow {
+    row: SidebarAgentRow,
+    is_active: bool,
 }
 
 #[allow(dead_code)] // view + session held to keep the TerminalView + StreamPty alive for the tab's lifetime.
@@ -252,9 +266,16 @@ pub struct App {
     word_break_chars: RefCell<String>,
     /// `show-sidebar-agents` from the config (default `true`, plan
     /// 007 §3.7). `RefCell` so `toggle_sidebar_agents` can flip it at
-    /// runtime; new sidebar renders read the current value. C2 wires
-    /// the setting + write-back only — nothing reads this yet.
+    /// runtime; `refresh_agent_rows` reads it on every rebuild.
     show_sidebar_agents: RefCell<bool>,
+    /// `(project_id, tab_id)` of the agent row the pointer last pressed,
+    /// consumed by `row-activated` (plan 007 §3.5). The press cannot
+    /// claim the gesture sequence — claiming would stop `GtkListBox`
+    /// selecting the row — so the click reaches the listbox as a normal
+    /// row activation and this cell says which agent it landed on.
+    /// Cleared on every path that can't consume it — a stranded value
+    /// would redirect the next unrelated project click.
+    pending_agent_click: Cell<Option<(i64, i64)>>,
     /// Resolved `link-modifier` (Cmd on macOS / Alt on Linux by
     /// default; `link-modifier` config overrides). Held during a
     /// hover/click over a URL to reveal + open it. Passed to every new
@@ -796,6 +817,7 @@ impl App {
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
             show_sidebar_agents: RefCell::new(cfg.show_sidebar_agents),
+            pending_agent_click: Cell::new(None),
             link_modifier: resolve_link_modifier(cfg.link_modifier),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
@@ -843,13 +865,22 @@ impl App {
         // Sidebar row *activation* (genuine user click / Enter — never a
         // programmatic selection or a structural change) → sync the core's
         // active selection to the activated project's active tab.
+        // A click that landed on one of the project's agent rows targets
+        // that agent's tab instead (plan 007 §3.5).
         sidebar.connect_row_activated({
             let app = app_struct.clone();
             move |_, row| {
+                let pending = app.pending_agent_click.take();
                 if let Some(name) = row.widget_name().to_string().strip_prefix("project-") {
                     if let Ok(id) = name.parse::<i64>() {
-                        if let Some(tab_id) = app.active_tab_id(id) {
-                            app.sync_core_active_tab(tab_id);
+                        match activation_target(pending, id, app.active_tab_id(id)) {
+                            Some(ActivationTarget::Agent(tab_id)) => {
+                                app.reveal_and_focus_tab(tab_id)
+                            }
+                            Some(ActivationTarget::ProjectActive(tab_id)) => {
+                                app.sync_core_active_tab(tab_id)
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -1281,13 +1312,30 @@ impl App {
             // every row tall. The pill height is then set by the CSS
             // `min-height` on the row child.
             .vhomogeneous(false)
+            .css_classes(["roost-sidebar-namerow"])
             .build();
         name_stack.add_named(&label, Some("label"));
         name_stack.add_named(&entry, Some("entry"));
         name_stack.set_visible_child_name("label");
 
+        // Plan 007 §3.5: the row's single child is a body wrapper holding
+        // the name row above the agent rows. It must stay the ONLY direct
+        // child — the selection pill is drawn on the row's child, so a
+        // second one would paint a second pill.
+        let agents_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["roost-sidebar-agents"])
+            .visible(*self.show_sidebar_agents.borrow())
+            .build();
+        let row_body = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["roost-sidebar-rowbody"])
+            .build();
+        row_body.append(&name_stack);
+        row_body.append(&agents_box);
+
         let row = gtk4::ListBoxRow::new();
-        row.set_child(Some(&name_stack));
+        row.set_child(Some(&row_body));
         row.set_widget_name(&format!("project-{}", project.id));
         self.sidebar.append(&row);
         // M10: project reorder is driven by the single listbox-level
@@ -1343,20 +1391,26 @@ impl App {
         row.add_controller(row_click);
 
         // M9: double-click also enters rename mode. Button 1 (primary)
-        // double-press.
-        let row_dblclick = gtk4::GestureClick::builder()
+        // double-press. Attached to the name row, not the whole
+        // ListBoxRow — on the row it would also fire for double-clicks
+        // landing on an agent row (plan 007 §3.5). Deliberately does not
+        // claim the sequence, so a single click still reaches
+        // `row-activated`.
+        let name_dblclick = gtk4::GestureClick::builder()
             .button(gtk4::gdk::BUTTON_PRIMARY)
             .build();
-        row_dblclick.connect_pressed({
+        name_dblclick.connect_pressed({
             let app = self.clone();
             let project_id = project.id;
             move |_, n, _, _| {
+                // Not an agent row — drop any parked agent target.
+                app.pending_agent_click.set(None);
                 if n == 2 {
                     app.begin_rename_project(project_id);
                 }
             }
         });
-        row.add_controller(row_dblclick);
+        name_stack.add_controller(name_dblclick);
 
         let tab_view = TabView::new();
         // Drop AdwTabView's built-in Alt+1..9 / Alt+0 tab shortcuts: on Linux
@@ -1520,6 +1574,8 @@ impl App {
                 sidebar_name_stack: name_stack,
                 sidebar_label: label,
                 sidebar_entry: entry,
+                sidebar_agents_box: agents_box,
+                rendered_agents: RefCell::new(Vec::new()),
                 tab_view,
                 tab_strip,
                 pills: RefCell::new(HashMap::new()),
@@ -3087,6 +3143,10 @@ impl App {
         // Cheap by construction: a no-op unless the agents frame is
         // actually on the palette stack.
         self.refresh_agent_palette();
+        // Same argument, same place, for the sidebar's agent rows (plan
+        // 007 §3.5) — including the active-tab highlight, which moves on
+        // `ActiveChanged`.
+        self.refresh_agent_rows();
     }
 
     /// Mark `tab_id` server-driven and close its `AdwTabPage`. The
@@ -3319,6 +3379,158 @@ impl App {
         }
     }
 
+    /// Rebuild every project's sidebar agent rows from the core snapshot
+    /// (plan 007 §3.5). The snapshot — not `ProjectUi.tabs` — is the
+    /// source: it is what the agent palette reads, and it carries
+    /// `tab.position`, without which the two surfaces would order the
+    /// same agents differently.
+    ///
+    /// Rows are a pure re-derivation of the snapshot, so the blanket
+    /// post-event block next to `refresh_agent_palette` is the only
+    /// event-driven call site.
+    fn refresh_agent_rows(self: &Rc<Self>) {
+        let agents_visible = *self.show_sidebar_agents.borrow();
+        let now = agent_palette::now_unix();
+        let snapshot = self.workspace_snapshot();
+        let active_tab = self.active_tab_id(*self.active_project_id.borrow());
+
+        let projects = self.projects.borrow();
+        for project in &snapshot {
+            let Some(ui) = projects.get(&project.id) else {
+                continue;
+            };
+            // `tabs` isn't read here, but a live `borrow_mut` means
+            // this project is mid-mutation inside a synchronously
+            // fired AdwTabView signal (see `refresh_rollup_for`), so
+            // its rows would render a half-applied state. Skipping is
+            // safe — the next event recomputes.
+            if ui.tabs.try_borrow().is_err() {
+                continue;
+            }
+            let rendered: Vec<RenderedAgentRow> = agent_palette::sidebar_agents(project, now)
+                .into_iter()
+                .map(|row| RenderedAgentRow {
+                    is_active: active_tab == Some(row.tab_id),
+                    row,
+                })
+                .collect();
+            // A shell prompt alone fires TabTitleChanged, so this runs
+            // several times a second with output that is usually
+            // identical; rebuilding would relayout the sidebar for
+            // nothing.
+            let changed = *ui.rendered_agents.borrow() != rendered;
+            if changed {
+                while let Some(child) = ui.sidebar_agents_box.first_child() {
+                    ui.sidebar_agents_box.remove(&child);
+                }
+                for entry in &rendered {
+                    ui.sidebar_agents_box.append(&self.build_agent_row(
+                        project.id,
+                        &entry.row,
+                        entry.is_active,
+                    ));
+                }
+                *ui.rendered_agents.borrow_mut() = rendered;
+            }
+            ui.sidebar_agents_box.set_visible(agents_visible);
+        }
+
+        // A pending target whose row is gone (tab closed, agent went
+        // non-live, project deleted) must not redirect the next click.
+        if let Some((pid, tab_id)) = self.pending_agent_click.get() {
+            let still_rendered = projects.get(&pid).is_some_and(|ui| {
+                ui.rendered_agents
+                    .borrow()
+                    .iter()
+                    .any(|r| r.row.tab_id == tab_id)
+            });
+            if !still_rendered {
+                self.pending_agent_click.set(None);
+            }
+        }
+    }
+
+    /// Plain non-focusable `Box`/`Label`s — a `Button` or `Entry` here
+    /// would swallow the click and `row-activated` would stop firing.
+    fn build_agent_row(
+        self: &Rc<Self>,
+        project_id: i64,
+        row: &SidebarAgentRow,
+        is_active: bool,
+    ) -> gtk4::Box {
+        let lifecycle_class = agent_palette::lifecycle_class(row.lifecycle);
+        let dot = gtk4::Box::builder()
+            .width_request(8)
+            .height_request(8)
+            .valign(gtk4::Align::Center)
+            .css_classes(["roost-sidebar-agent-dot", lifecycle_class])
+            .build();
+        let name = gtk4::Label::builder()
+            .label(&row.name)
+            .halign(gtk4::Align::Start)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .max_width_chars(24)
+            .css_classes(["roost-sidebar-agent-name"])
+            .build();
+        let time = gtk4::Label::builder()
+            .label(&row.time_text)
+            .halign(gtk4::Align::End)
+            .css_classes(["roost-sidebar-agent-time", lifecycle_class])
+            .build();
+
+        let root = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .can_focus(false)
+            .tooltip_text(&row.status_text)
+            .css_classes(["roost-sidebar-agent"])
+            .build();
+        if is_active {
+            root.add_css_class("active");
+        }
+        root.append(&dot);
+        root.append(&name);
+        root.append(&time);
+
+        // Park the target for `row-activated` rather than claiming the
+        // sequence: a claimed press never reaches GtkListBox, so the row
+        // would neither select nor activate.
+        let click = gtk4::GestureClick::builder()
+            .button(gtk4::gdk::BUTTON_PRIMARY)
+            .build();
+        click.connect_pressed({
+            let app = self.clone();
+            let tab_id = row.tab_id;
+            move |_, _, _, _| {
+                app.pending_agent_click.set(Some((project_id, tab_id)));
+            }
+        });
+        // Every way a press can end WITHOUT activating the row has to drop
+        // the parked target, or it redirects this project's next activation
+        // — including one arriving by keyboard. `stopped` is the one that
+        // catches a press nudged past the click threshold but short of the
+        // 8px reorder arm, which still delivers a paired release. Clearing
+        // on `released` instead would break the feature: these gestures run
+        // in the bubble phase, so the agent row's release is handled before
+        // the listbox's, i.e. before `row-activated`.
+        click.connect_stopped({
+            let app = self.clone();
+            move |_| app.pending_agent_click.set(None)
+        });
+        click.connect_unpaired_release({
+            let app = self.clone();
+            move |_, _, _, _, _| app.pending_agent_click.set(None)
+        });
+        click.connect_cancel({
+            let app = self.clone();
+            move |_, _| app.pending_agent_click.set(None)
+        });
+        root.add_controller(click);
+        root
+    }
+
     /// Load `~/.config/roost/config.conf`, merge user keybinds with
     /// the Linux defaults, and install each `(Accel, action)` pair on
     /// the window's ShortcutController.
@@ -3458,6 +3670,14 @@ impl App {
         let ui = projects.get(&project_id)?;
         let page = ui.tab_view.selected_page()?;
         parse_tab_id_from_page(&page)
+    }
+
+    fn project_is_renaming(self: &Rc<Self>, project_id: i64) -> bool {
+        let projects = self.projects.borrow();
+        projects
+            .get(&project_id)
+            .and_then(|ui| ui.sidebar_name_stack.visible_child_name())
+            .is_some_and(|name| name == "entry")
     }
 
     fn cycle_tab(self: &Rc<Self>, delta: i32) {
@@ -5563,16 +5783,16 @@ impl App {
     }
 
     /// `toggle_sidebar_agents` action handler (plan 007 §3.7). Flips
-    /// the live setting and persists it, mirroring `commit_theme` /
-    /// `apply_font_size_to_all`'s write-back pattern. C2 wires the
-    /// flag only — no sidebar rendering reads it yet, so there is
-    /// nothing here to refresh.
+    /// the live setting, repaints the sidebar, and persists it,
+    /// mirroring `commit_theme` / `apply_font_size_to_all`'s write-back
+    /// pattern.
     fn toggle_sidebar_agents(self: &Rc<Self>) {
         let new_value = {
             let mut v = self.show_sidebar_agents.borrow_mut();
             *v = !*v;
             *v
         };
+        self.refresh_agent_rows();
         if let Err(e) = write_back_show_sidebar_agents(new_value) {
             tracing::warn!(
                 error = %e,
@@ -6064,13 +6284,6 @@ impl App {
                     let Some(row) = app.sidebar.row_at_y(sy as i32) else {
                         return; // press landed in empty space
                     };
-                    // Don't hijack an inline rename — the entry owns the pointer.
-                    if let Some(stack) = row.child().and_then(|c| c.downcast::<gtk4::Stack>().ok())
-                    {
-                        if stack.visible_child_name().as_deref() == Some("entry") {
-                            return;
-                        }
-                    }
                     let Some(pid) = row
                         .widget_name()
                         .strip_prefix("project-")
@@ -6078,7 +6291,18 @@ impl App {
                     else {
                         return;
                     };
+                    // Don't hijack an inline rename — the entry owns the
+                    // pointer. Read the project's own stack rather than
+                    // walking down from `row.child()`: the original
+                    // downcast failed soft via `.ok()`, so nesting the row
+                    // body silently stopped the guard from guarding.
+                    if app.project_is_renaming(pid) {
+                        return;
+                    }
                     g.set_state(gtk4::EventSequenceState::Claimed);
+                    // The press became a drag, so it will never activate
+                    // a row — drop any agent target it parked.
+                    app.pending_agent_click.set(None);
                     row.set_opacity(0.4);
                     *app.dragged_project_id.borrow_mut() = Some(pid);
                     *app.drag_original_order.borrow_mut() = app.sidebar_order();
@@ -6098,6 +6322,7 @@ impl App {
                 let Some(pid) = *app.dragged_project_id.borrow() else {
                     return; // never armed → it was a click, not a drag
                 };
+                app.pending_agent_click.set(None);
                 app.set_row_opacity(pid, 1.0);
                 // Settle the final slot, then persist the order once. The
                 // snapshot lets reorder_projects_async roll back on RPC error.
@@ -6117,6 +6342,7 @@ impl App {
         reorder.connect_cancel({
             let app = self.clone();
             move |_, _| {
+                app.pending_agent_click.set(None);
                 let Some(pid) = *app.dragged_project_id.borrow() else {
                     return;
                 };
@@ -6190,6 +6416,32 @@ impl App {
 
 fn stack_name(project_id: i64) -> String {
     format!("project-{project_id}")
+}
+
+/// A sidebar row's widget tree, reduced to what the inline-rename guard
+/// needs. Generic over the node so the walk is unit-testable — the
+/// crate's test module has no GTK display to build real widgets in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationTarget {
+    Agent(i64),
+    ProjectActive(i64),
+}
+
+/// Where a sidebar row activation should land. A press on an agent row
+/// parks its `(project, tab)` in `pending_agent_click`; the row's own
+/// activation then fires. The pending target is honoured only when it
+/// belongs to the activated project — a press that was cancelled, or
+/// that turned into a drag, otherwise redirects the next unrelated
+/// project click to a stale tab.
+fn activation_target(
+    pending: Option<(i64, i64)>,
+    project_id: i64,
+    project_active_tab: Option<i64>,
+) -> Option<ActivationTarget> {
+    match pending {
+        Some((pid, tab_id)) if pid == project_id => Some(ActivationTarget::Agent(tab_id)),
+        _ => project_active_tab.map(ActivationTarget::ProjectActive),
+    }
 }
 
 /// Parse a notification row's item id (`notif:<tab_id>`) into the tab
@@ -6513,12 +6765,35 @@ fn build_shortcut_trigger(accel: &Accel) -> gtk4::ShortcutTrigger {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_insert_idx, drain_server_driven_marker, format_font_size,
+        activation_target, compute_insert_idx, drain_server_driven_marker, format_font_size,
         is_already_attached_or_pending, notif_tab_id, pick_next_active_project, resolve_launch_cwd,
-        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, RestoreTab,
+        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, ActivationTarget,
+        RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn a_pending_agent_click_wins_only_within_its_own_project() {
+        assert_eq!(
+            activation_target(Some((7, 42)), 7, Some(9)),
+            Some(ActivationTarget::Agent(42))
+        );
+        assert_eq!(
+            activation_target(Some((7, 42)), 8, Some(9)),
+            Some(ActivationTarget::ProjectActive(9))
+        );
+    }
+
+    #[test]
+    fn activation_falls_back_to_the_projects_active_tab() {
+        assert_eq!(
+            activation_target(None, 3, Some(11)),
+            Some(ActivationTarget::ProjectActive(11))
+        );
+        assert_eq!(activation_target(None, 3, None), None);
+        assert_eq!(activation_target(Some((4, 42)), 3, None), None);
+    }
 
     #[test]
     fn reveal_scroll_keeps_visible_child_put() {

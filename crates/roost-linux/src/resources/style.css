@@ -82,7 +82,16 @@ toolbarview > .top-bar:backdrop {
    * height below so rows are compact like the Mac sidebar. */
   min-height: 0;
 }
-.navigation-sidebar > row > * {
+/* Plan 007 §3.5: the row's direct child is now a body wrapper holding the
+ * name row + the agent rows, so every rule below targets
+ * `.roost-sidebar-namerow` — a `> *` rule would paint the selection pill
+ * and the 28px min-height across the agent rows too. */
+.navigation-sidebar > row .roost-sidebar-rowbody {
+  background: transparent;
+  margin: 0;
+  min-height: 0;
+}
+.navigation-sidebar > row .roost-sidebar-namerow {
   border-radius: 6px;
   margin: 1px 6px;
   min-height: 28px;
@@ -91,11 +100,11 @@ toolbarview > .top-bar:backdrop {
 .navigation-sidebar > row:selected:backdrop {
   background: transparent;
 }
-.navigation-sidebar > row:selected > *,
-.navigation-sidebar > row:selected:backdrop > * {
+.navigation-sidebar > row:selected .roost-sidebar-namerow,
+.navigation-sidebar > row:selected:backdrop .roost-sidebar-namerow {
   background-color: #13509d;
 }
-.navigation-sidebar > row:selected:hover > * {
+.navigation-sidebar > row:selected:hover .roost-sidebar-namerow {
   background-color: shade(#13509d, 1.08);
 }
 /* Clear the row-level hover too, so libadwaita's full-width hover tint
@@ -103,20 +112,79 @@ toolbarview > .top-bar:backdrop {
 .navigation-sidebar > row:hover:not(:selected) {
   background: transparent;
 }
-.navigation-sidebar > row:hover:not(:selected) > * {
+.navigation-sidebar > row:hover:not(:selected) .roost-sidebar-namerow {
   background-color: alpha(currentColor, 0.06);
 }
 /* Row label tone + weight: Mac uses NSColor(white:0.82)=#d1d1d1 unselected,
  * white when selected, in a semibold-ish face so the names read with weight
  * like the Mac sidebar. Near-default size so the text fills the pill rather
- * than leaving padding. */
-.navigation-sidebar > row label {
+ * than leaving padding. These are descendant (not child) rules, so they are
+ * scoped to the name row — otherwise the agent labels inherit bold #d1d1d1
+ * and flip to white whenever the project is selected. */
+.navigation-sidebar > row .roost-sidebar-namerow label {
   color: #d1d1d1;
   font-size: 1em;
   font-weight: bold;
 }
-.navigation-sidebar > row:selected label {
+.navigation-sidebar > row:selected .roost-sidebar-namerow label {
   color: #ffffff;
+}
+
+/* Agent rows under a project (plan 007 §3.2). The lifecycle hexes are
+ * the repo-wide set the rollup stripes and the palette dots use; they
+ * are not reachable from `rollup.rs` (which returns class names only),
+ * so they are restated here. Written at `> row .roost-sidebar-…`
+ * specificity so the name-row label rules above cannot outrank them. */
+.navigation-sidebar > row .roost-sidebar-agents {
+  margin-bottom: 2px;
+}
+.navigation-sidebar > row .roost-sidebar-agent {
+  border-radius: 5px;
+  margin: 0 6px 0 20px;
+  padding: 1px 6px;
+  min-height: 20px;
+}
+.navigation-sidebar > row .roost-sidebar-agent.active {
+  background-color: alpha(currentColor, 0.08);
+}
+.navigation-sidebar > row .roost-sidebar-agent.active .roost-sidebar-agent-name {
+  font-weight: 600;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot {
+  border-radius: 4px;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-working {
+  background-color: #5fa3f0;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-waiting {
+  background-color: #f0a040;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-finished {
+  background-color: #7a7a7a;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-failed {
+  background-color: #e05252;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-inactive {
+  background-color: alpha(#7a7a7a, 0.5);
+}
+.navigation-sidebar > row .roost-sidebar-agent-name {
+  color: #d1d1d1;
+  font-size: 0.9em;
+  font-weight: normal;
+}
+/* Elapsed time takes the lifecycle colour only for the two states that
+ * want attention; everything else is muted so the column reads as chrome. */
+.navigation-sidebar > row .roost-sidebar-agent-time {
+  font-size: 0.85em;
+  font-weight: normal;
+  color: #7a7a7a;
+}
+.navigation-sidebar > row .roost-sidebar-agent-time.agent-waiting {
+  color: #f0a040;
+}
+.navigation-sidebar > row .roost-sidebar-agent-time.agent-failed {
+  color: #e05252;
 }
 
 /* Tab bar: subtle accent tint on the checked tab. Only restyle the
