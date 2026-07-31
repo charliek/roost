@@ -424,3 +424,45 @@ struct IPCPaletteItemViewTests {
         #expect(reencodedAgent?["metrics_text"] == nil)
     }
 }
+
+/// `app.sidebar_dump`'s Codable mirror (plan 007 §3.8, A8). Generic
+/// golden-vector round-tripping only proves the fixture is valid JSON;
+/// this decodes into the typed struct so a field-name/string-id
+/// mismatch against the Rust side (`SidebarDumpResult` in
+/// `crates/roost-ipc/src/messages.rs`) fails here, matching the
+/// pinned wire example in the plan.
+struct IPCSidebarDumpResultTests {
+    @Test func decodesStringIdsAndAllProjectsIncludingEmptyOnes() throws {
+        let json = """
+        {"agents_visible":true,
+         "projects":[{"project_id":"1",
+                       "agents":[{"tab_id":"7","name":"slauth-refactor",
+                                  "lifecycle":"waiting","status_text":"Waiting for input",
+                                  "time_text":"2m","is_active":false}]},
+                      {"project_id":"2","agents":[]}]}
+        """
+        let result = try JSONDecoder().decode(IPCSidebarDumpResult.self, from: Data(json.utf8))
+        #expect(result.agentsVisible)
+        #expect(result.projects.count == 2)
+        #expect(result.projects[0].projectID == 1)
+        #expect(result.projects[0].agents.count == 1)
+        let row = try #require(result.projects[0].agents.first)
+        #expect(row.tabID == 7)
+        #expect(row.name == "slauth-refactor")
+        #expect(row.lifecycle == .waiting)
+        #expect(row.statusText == "Waiting for input")
+        #expect(row.timeText == "2m")
+        #expect(!row.isActive)
+        #expect(result.projects[1].projectID == 2)
+        #expect(result.projects[1].agents.isEmpty)
+
+        let encoded = try JSONEncoder().encode(result)
+        let obj = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        let projects = obj?["projects"] as? [[String: Any]]
+        #expect(projects?[0]["project_id"] as? String == "1")
+        let agents = projects?[0]["agents"] as? [[String: Any]]
+        #expect(agents?[0]["tab_id"] as? String == "7")
+        #expect(projects?[1]["project_id"] as? String == "2")
+        #expect((projects?[1]["agents"] as? [[String: Any]])?.isEmpty == true)
+    }
+}

@@ -90,6 +90,8 @@ actor IPCHandlerImpl: IPCHandler {
             return try await encodeResult(self.screenshotCapture(params: params))
         case "app.window_metrics":
             return try await encodeResult(self.windowMetrics(params: params))
+        case "app.sidebar_dump":
+            return try await encodeResult(self.sidebarDump(params: params))
         case "window.resize":
             try await self.windowResize(params: params)
             return AnyCodable([:] as [String: Any])
@@ -1007,6 +1009,40 @@ actor IPCHandlerImpl: IPCHandler {
         )
     }
 
+    /// `app.sidebar_dump`: the sidebar's last-rendered agent rows per
+    /// project, plus the agents-visible toggle (plan 007 §3.8). Reads
+    /// `RoostApp.renderedAgents` through the `UiBridge`, the same cache
+    /// the sidebar paints from — not a fresh derivation from the
+    /// workspace snapshot — so a missed refresh is a wire-visible test
+    /// failure instead of an invisible one. Always available (no
+    /// test-mode gate; read-only).
+    @MainActor
+    private func sidebarDump(params: AnyCodable?) async throws -> IPCSidebarDumpResult {
+        _ = try decodeParams(params, as: IPCEmptyParams.self, expected: [])
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI for app.sidebar_dump")
+        }
+        let dump = ui.sidebarDump()
+        return IPCSidebarDumpResult(
+            agentsVisible: dump.agentsVisible,
+            projects: dump.projects.map { entry in
+                IPCSidebarDumpProject(
+                    projectID: entry.projectID,
+                    agents: entry.agents.map { row in
+                        IPCSidebarDumpAgentRow(
+                            tabID: row.row.tabID,
+                            name: row.row.name,
+                            lifecycle: row.row.lifecycle,
+                            statusText: row.row.statusText,
+                            timeText: row.row.timeText,
+                            isActive: row.isActive
+                        )
+                    }
+                )
+            }
+        )
+    }
+
     /// `window.resize` (test-mode only): programmatically set the window's
     /// logical size. Gated for the same reason as the PTY drain ops —
     /// only a harness should be driving window geometry; a real user
@@ -1278,6 +1314,44 @@ private struct IPCWindowMetricsResult: Codable {
         case windowHeight = "window_height"
         case sidebarWidth = "sidebar_width"
         case sidebarCollapsed = "sidebar_collapsed"
+    }
+}
+
+/// `app.sidebar_dump` response — mirrors `SidebarDumpResult` /
+/// `SidebarDumpProject` / `SidebarDumpAgentRow` in
+/// `crates/roost-ipc/src/messages.rs`. Ids are string-wrapped int64 on
+/// the wire (`@StringInt64`), matching every other op.
+struct IPCSidebarDumpAgentRow: Codable {
+    @StringInt64 var tabID: Int64
+    let name: String
+    let lifecycle: AgentLifecycle
+    let statusText: String
+    let timeText: String
+    let isActive: Bool
+    enum CodingKeys: String, CodingKey {
+        case tabID = "tab_id"
+        case name, lifecycle
+        case statusText = "status_text"
+        case timeText = "time_text"
+        case isActive = "is_active"
+    }
+}
+
+struct IPCSidebarDumpProject: Codable {
+    @StringInt64 var projectID: Int64
+    let agents: [IPCSidebarDumpAgentRow]
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case agents
+    }
+}
+
+struct IPCSidebarDumpResult: Codable {
+    let agentsVisible: Bool
+    let projects: [IPCSidebarDumpProject]
+    enum CodingKeys: String, CodingKey {
+        case agentsVisible = "agents_visible"
+        case projects
     }
 }
 

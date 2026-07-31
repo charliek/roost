@@ -25,7 +25,10 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, TabView, WindowTitle};
 use roost_ipc::agent::{self, AgentLifecycle, AgentTabState};
-use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project, Tab};
+use roost_ipc::messages::{
+    PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
+    SidebarDumpResult, Tab,
+};
 use tokio::runtime::Handle;
 
 use roost_linux::daemon::{RestoreTab, WorkspaceEvent};
@@ -1099,6 +1102,9 @@ impl App {
                         }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
+                        }
+                        UiRequest::SidebarDump { reply } => {
+                            let _ = reply.send(app.ipc_sidebar_dump());
                         }
                         UiRequest::WindowResize {
                             width,
@@ -5731,6 +5737,46 @@ impl App {
             self.sidebar_box.width() as f64
         };
         Ok((w, h, sw, collapsed))
+    }
+
+    /// `app.sidebar_dump` — read every project's *last-rendered* agent
+    /// rows from `ProjectUi::rendered_agents`, the same cache
+    /// `refresh_agent_rows` writes in the same pass it builds the
+    /// widgets, so a missed refresh is a wire-visible test failure
+    /// instead of an invisible one (plan 007 §3.8). Order comes from
+    /// the workspace snapshot (sidebar order); row *content* comes only
+    /// from the cache, never re-derived here.
+    fn ipc_sidebar_dump(self: &Rc<Self>) -> Result<SidebarDumpResult, String> {
+        let agents_visible = *self.show_sidebar_agents.borrow();
+        let snapshot = self.workspace_snapshot();
+        let projects_ui = self.projects.borrow();
+        let projects = snapshot
+            .iter()
+            .filter_map(|project| {
+                let ui = projects_ui.get(&project.id)?;
+                let agents = ui
+                    .rendered_agents
+                    .borrow()
+                    .iter()
+                    .map(|entry| SidebarDumpAgentRow {
+                        tab_id: entry.row.tab_id,
+                        name: entry.row.name.clone(),
+                        lifecycle: entry.row.lifecycle,
+                        status_text: entry.row.status_text.clone(),
+                        time_text: entry.row.time_text.clone(),
+                        is_active: entry.is_active,
+                    })
+                    .collect();
+                Some(SidebarDumpProject {
+                    project_id: project.id,
+                    agents,
+                })
+            })
+            .collect();
+        Ok(SidebarDumpResult {
+            agents_visible,
+            projects,
+        })
     }
 
     /// `window.resize` (test-mode only) — programmatically resize the

@@ -977,6 +977,48 @@ pub struct WindowMetricsResult {
     pub sidebar_collapsed: bool,
 }
 
+/// `app.sidebar_dump` request — nullary envelope (`{}`), matching
+/// `WindowMetricsParams`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarDumpParams {}
+
+/// One agent row as actually rendered under a project in the sidebar
+/// (plan 007 §3.8), plus whether it is the active tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpAgentRow {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    pub name: String,
+    pub lifecycle: AgentLifecycle,
+    pub status_text: String,
+    pub time_text: String,
+    pub is_active: bool,
+}
+
+/// One project's rendered agent rows, in sidebar order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpProject {
+    #[serde(with = "string_int64")]
+    pub project_id: i64,
+    pub agents: Vec<SidebarDumpAgentRow>,
+}
+
+/// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
+/// rows, read from the same per-project cache the sidebar paints from
+/// (`RenderedAgentRow` on both UIs), not re-derived from the workspace
+/// snapshot. That makes a missed refresh a wire-visible test failure
+/// instead of an invisible one. `agents_visible` is the config/feature
+/// toggle only; `projects[].agents` stays populated when the toggle is
+/// off or mid-drag — those are transient UI state, not part of this
+/// contract. All projects appear, in sidebar order, including ones
+/// with zero agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpResult {
+    pub agents_visible: bool,
+    pub projects: Vec<SidebarDumpProject>,
+}
+
 /// `window.resize` request — programmatically set the window's logical
 /// size. Test-mode only (gated by `ROOST_TEST_MODE=1`); see the op
 /// const comment block below for the rationale.
@@ -1135,6 +1177,12 @@ pub mod ops {
     /// Used by the sidebar-holds-width regression tests; always available
     /// (no test-mode gate — it's read-only).
     pub const WINDOW_METRICS: &str = "app.window_metrics";
+    /// The sidebar's last-rendered agent rows, per project, plus the
+    /// agents-visible toggle. Read-only, ungated: it reads the same
+    /// per-project cache the sidebar paints from, so a missed refresh
+    /// is a wire-visible test failure rather than an invisible one
+    /// (plan 007 §3.8).
+    pub const SIDEBAR_DUMP: &str = "app.sidebar_dump";
 
     /// Command-palette overlay: open a root frame, read the current
     /// frame's rows, set the filter, activate a row (same dispatch as its
@@ -1779,6 +1827,37 @@ mod tests {
             sidebar_width: 0.0,
             sidebar_collapsed: true,
         });
+    }
+
+    #[test]
+    fn sidebar_dump_result_round_trip() {
+        round_trip(&SidebarDumpResult {
+            agents_visible: true,
+            projects: vec![
+                SidebarDumpProject {
+                    project_id: 1,
+                    agents: vec![SidebarDumpAgentRow {
+                        tab_id: 7,
+                        name: "slauth-refactor".to_string(),
+                        lifecycle: AgentLifecycle::Waiting,
+                        status_text: "Waiting for input".to_string(),
+                        time_text: "2m".to_string(),
+                        is_active: false,
+                    }],
+                },
+                SidebarDumpProject {
+                    project_id: 2,
+                    agents: Vec::new(),
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn sidebar_dump_params_reject_unknown_field() {
+        round_trip(&SidebarDumpParams {});
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<SidebarDumpParams>(bad).is_err());
     }
 
     #[test]

@@ -27,14 +27,14 @@ use roost_ipc::messages::{
     PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams,
+    SelectionDumpResult, SelectionSetParams, SidebarDumpParams, SidebarDumpResult,
+    TabAgentReportResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -59,6 +59,10 @@ type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), 
 /// every sibling reply (so the shared `ui_call` helper works), but
 /// the UI side always answers `Ok` — GTK widget queries never fail.
 type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<(f64, f64, f64, bool), String>>;
+
+/// Reply for [`UiRequest::SidebarDump`]. Read-only: always answers
+/// `Ok`, matching `WindowMetricsReply`.
+type SidebarDumpReply = tokio::sync::oneshot::Sender<Result<SidebarDumpResult, String>>;
 
 /// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
 /// error message (e.g. tab not found / no live terminal) on failure.
@@ -261,6 +265,11 @@ pub enum UiRequest {
     /// collapsed flag (logical points). Backs the sidebar-holds-width
     /// regression suite. Ungated (read-only).
     WindowMetrics { reply: WindowMetricsReply },
+    /// `app.sidebar_dump` — read the sidebar's last-rendered agent rows
+    /// per project, plus the agents-visible toggle. Ungated (read-only);
+    /// reads `ProjectUi::rendered_agents`, the same cache the sidebar
+    /// paints from (plan 007 §3.8).
+    SidebarDump { reply: SidebarDumpReply },
     /// `window.resize` — programmatically set the window's logical
     /// size. Gated for the same reason as the PTY drain ops.
     WindowResize {
@@ -667,6 +676,14 @@ async fn dispatch(
                 sidebar_width: sw,
                 sidebar_collapsed: collapsed,
             })
+        }
+        ops::SIDEBAR_DUMP => {
+            let _p: SidebarDumpParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::SidebarDump { reply })
+                .await?
+                .map_err(|m| HandlerError::new("internal", m))?;
+            encode(&result)
         }
         ops::PALETTE_OPEN => {
             let p: PaletteOpenParams = decode(params)?;

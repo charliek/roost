@@ -5586,6 +5586,22 @@ extension RoostApp: UiBridge {
         return (width: w, collapsed: w < 1)
     }
 
+    /// `app.sidebar_dump`: every project's last-rendered agent rows, in
+    /// sidebar order, plus the agents-visible toggle. `renderedAgents`
+    /// keeps an entry for every project (populated by
+    /// `refreshSidebarAgentModel`, including zero-agent projects), so a
+    /// missing lookup here would itself indicate a stale cache — that
+    /// case is treated as "no rows yet" rather than skipping the
+    /// project, since the contract requires all projects to appear.
+    func sidebarDump() -> (
+        agentsVisible: Bool, projects: [(projectID: Int64, agents: [RenderedAgentRow])]
+    ) {
+        (
+            agentsVisible: showSidebarAgents,
+            projects: projects.map { ($0.id, renderedAgents[$0.id] ?? []) }
+        )
+    }
+
     // MARK: command palette — IPC drive surface (palette.* ops)
     //
     // The IPC handler reaches the live `PalettePanel` through these (same
