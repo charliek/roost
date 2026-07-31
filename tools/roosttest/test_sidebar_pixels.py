@@ -67,14 +67,21 @@ LIFECYCLE_COLORS: dict[str, tuple[int, int, int]] = {
 
 # Left edge (x, in the screenshot's pixels — `app.screenshot` at scale 1
 # renders one pixel per logical point on both UIs) shared by every agent
-# dot. Measured on both targets at 1100x700; both land on 25, from the
-# same intent (the dot sits on the project label's left edge) reached by
-# constraints on Mac and CSS padding on GTK.
-DOT_LEFT_X = {"gtk": 25, "mac": 25}
-# Measured on macOS (Homebrew GTK for the gtk target). The band absorbs a
-# libadwaita-minor difference on a Linux runner without letting a real
-# indent regression through — see the assertion for the reasoning.
-DOT_LEFT_TOLERANCE = 3
+# dot: the centre of the band it must fall in, per target.
+#
+# The dot sits a fixed distance inside its ROW (our own margin+padding),
+# but the row's own origin is set by the toolkit's padding, and that is
+# not the same everywhere: the gtk target measures x=25 against macOS
+# Homebrew GTK and x=29 against libadwaita on the Ubuntu CI runner. The
+# gtk band is therefore centred between them and widened to cover both;
+# AppKit does not vary that way, so mac keeps a tight band.
+#
+# This is deliberately a coarse guard. The precise, platform-independent
+# invariant — every dot on one edge — is asserted exactly below; this
+# band only catches gross indentation, which is the regression it exists
+# for (the dot was 10px past the project name and still is caught).
+DOT_LEFT_X = {"gtk": 27, "mac": 25}
+DOT_LEFT_TOLERANCE = {"gtk": 6, "mac": 3}
 
 # Both UIs draw an 8x8 dot with a 4px corner radius; the fully-saturated
 # core measures 6x6, with the corners antialiased into the background.
@@ -255,7 +262,8 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
     # regression this guards — the dot indented past the project name — was
     # 10px, so the band still catches it. Asserting the label's own edge
     # instead would mean measuring antialiased text, which is genuinely flaky.
-    assert abs(observed[0] - expected_x) <= DOT_LEFT_TOLERANCE, (
+    tolerance = DOT_LEFT_TOLERANCE[target]
+    assert abs(observed[0] - expected_x) <= tolerance, (
         f"agent dots start at x={observed[0]} on {target}, expected "
-        f"{expected_x}±{DOT_LEFT_TOLERANCE} (screenshot: {shot_path})"
+        f"{expected_x}±{tolerance} (screenshot: {shot_path})"
     )
