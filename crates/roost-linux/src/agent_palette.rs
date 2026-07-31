@@ -115,6 +115,95 @@ pub fn agent_tab_cwds(projects: &[Project]) -> HashMap<i64, String> {
     cwds
 }
 
+/// One row under a project in the sidebar (plan 007 §3.1) — the same
+/// fields the palette renders, scoped to a single project. There is no
+/// `project` field: the sidebar nests this row under its project
+/// visually, so the row never needs to say which one it's in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarAgentRow {
+    pub tab_id: i64,
+    pub name: String,
+    pub lifecycle: AgentLifecycle,
+    pub status_text: String,
+    pub time_text: String,
+}
+
+/// A single project's agent rows, in the palette's within-project order:
+/// rank ↓, `last_event_at` ↓, tab position, tab id. `project_position`
+/// drops out of the key relative to [`agent_items`]'s — every row here
+/// already shares one project, so ordering across projects is the
+/// caller's problem (it owns the project list order already).
+pub fn sidebar_agents(project: &Project, now: i64) -> Vec<SidebarAgentRow> {
+    struct Keyed {
+        rank: u8,
+        last_event_at: i64,
+        tab_position: i32,
+        tab_id: i64,
+        row: SidebarAgentRow,
+    }
+    let mut rows: Vec<Keyed> = Vec::new();
+    for tab in &project.tabs {
+        let axes = tab.agent_state();
+        let Some(owner) = agent_owner(&axes) else {
+            continue;
+        };
+        let effective = agent::effective_lifecycle(&axes);
+        rows.push(Keyed {
+            rank: agent::rank(effective),
+            last_event_at: owner.last_event_at,
+            tab_position: tab.position,
+            tab_id: tab.id,
+            row: SidebarAgentRow {
+                tab_id: tab.id,
+                name: row_name(tab, owner),
+                lifecycle: effective,
+                status_text: status_text(effective, tab.agent_lifecycle, &owner.detail),
+                time_text: elapsed_text(now, owner.last_event_at),
+            },
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.rank
+            .cmp(&a.rank)
+            .then(b.last_event_at.cmp(&a.last_event_at))
+            .then(a.tab_position.cmp(&b.tab_position))
+            .then(a.tab_id.cmp(&b.tab_id))
+    });
+    rows.into_iter().map(|k| k.row).collect()
+}
+
+/// One row in the sidebar's flat display order: a project header or one
+/// of its agent rows. Generic over the caller's own project payload
+/// (`P`) and agent-row payload (`A`) so this stays pure data with no
+/// dependency on either UI's row/item types — GTK and (via the mirrored
+/// Swift type) Mac each flatten their own structs through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarRow<P, A> {
+    Project(P),
+    Agent(A),
+}
+
+/// Interleave each project with its already-ordered agent rows into one
+/// flat display list (plan 007 §3.6). Agent rows are dropped — every
+/// project renders alone — when the toggle is off, or while a project
+/// drag is in flight: the drag case exists so index-based reorder math
+/// never has to account for agent rows shifting underneath it.
+pub fn flatten_sidebar_rows<P, A>(
+    projects: Vec<(P, Vec<A>)>,
+    agents_visible: bool,
+    is_dragging: bool,
+) -> Vec<SidebarRow<P, A>> {
+    let show_agents = agents_visible && !is_dragging;
+    let mut out = Vec::new();
+    for (project, agents) in projects {
+        out.push(SidebarRow::Project(project));
+        if show_agents {
+            out.extend(agents.into_iter().map(SidebarRow::Agent));
+        }
+    }
+    out
+}
+
 /// The ownership record of a tab that belongs in the palette: live
 /// ownership from a source that isn't one of Roost's own internal
 /// (non-agent) claims. `None` means "no row for this tab".
@@ -878,6 +967,205 @@ mod tests {
         // Project position 0 first (despite being second in the input),
         // then tab position, then tab id within a position.
         assert_eq!(ids, vec!["agent:3", "agent:30", "agent:20", "agent:10"]);
+    }
+
+    // ----- sidebar_agents ---------------------------------------------
+
+    #[test]
+    fn sidebar_agents_excludes_manual_legacy_and_dead_tabs() {
+        let p = project(
+            1,
+            "roost",
+            vec![
+                tab(1, "plain shell"),
+                owned(tab(2, "claude"), "claude", AgentLifecycle::Working, NOW),
+                owned(tab(3, "manual"), "manual", AgentLifecycle::Working, NOW),
+                owned(tab(4, "legacy"), "legacy", AgentLifecycle::Working, NOW),
+                owned(tab(5, "codex"), "codex", AgentLifecycle::Waiting, NOW),
+            ],
+        );
+        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+            .into_iter()
+            .map(|r| r.tab_id)
+            .collect();
+        assert_eq!(ids, vec![5, 2]);
+    }
+
+    // The older row is given the lower position AND the lower id, so the
+    // assertion fails if recency is dropped from the comparator and a later
+    // key decides instead.
+    #[test]
+    fn sidebar_agents_orders_same_lifecycle_by_recency_first() {
+        let mut newer = owned(tab(9, "newer"), "claude", AgentLifecycle::Waiting, NOW);
+        newer.position = 7;
+        let mut older = owned(
+            tab(2, "older"),
+            "claude",
+            AgentLifecycle::Waiting,
+            NOW - 500,
+        );
+        older.position = 0;
+
+        let p = project(1, "p", vec![older, newer]);
+        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+            .into_iter()
+            .map(|r| r.tab_id)
+            .collect();
+        assert_eq!(ids, vec![9, 2]);
+    }
+
+    #[test]
+    fn sidebar_agents_orders_by_rank_then_recency_then_tab_position_then_id() {
+        let mut later_tab = owned(tab(20, "b"), "claude", AgentLifecycle::Working, NOW);
+        later_tab.position = 5;
+        let mut same_position_high_id = owned(tab(30, "c"), "claude", AgentLifecycle::Working, NOW);
+        same_position_high_id.position = 0;
+        let mut same_position_low_id = owned(tab(3, "d"), "claude", AgentLifecycle::Working, NOW);
+        same_position_low_id.position = 0;
+        let failed = owned(tab(1, "failed"), "claude", AgentLifecycle::Failed, NOW);
+        let waiting_old = owned(
+            tab(4, "waiting-old"),
+            "claude",
+            AgentLifecycle::Waiting,
+            NOW - 500,
+        );
+
+        let p = project(
+            1,
+            "roost",
+            vec![
+                later_tab,
+                same_position_high_id,
+                same_position_low_id,
+                failed,
+                waiting_old,
+            ],
+        );
+        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+            .into_iter()
+            .map(|r| r.tab_id)
+            .collect();
+        // rank: Failed > Waiting > Working; then within Working, position
+        // 0 before position 5, then id 3 before id 30.
+        assert_eq!(ids, vec![1, 4, 3, 30, 20]);
+    }
+
+    #[test]
+    fn sidebar_agents_name_fallback_chain() {
+        let with_meta = with_owner(
+            owned(tab(1, "zsh"), "claude", AgentLifecycle::Working, NOW),
+            |owner| {
+                owner
+                    .metadata
+                    .insert(SESSION_TITLE_KEY.to_string(), "slauth-refactor".to_string());
+            },
+        );
+        let with_title = owned(tab(2, "zsh"), "claude", AgentLifecycle::Working, NOW);
+        let untitled = owned(tab(3, ""), "claude", AgentLifecycle::Working, NOW);
+
+        let rows = sidebar_agents(
+            &project(1, "roost", vec![with_meta, with_title, untitled]),
+            NOW,
+        );
+        let by_id = |id: i64| rows.iter().find(|r| r.tab_id == id).expect("row present");
+        assert_eq!(by_id(1).name, "slauth-refactor");
+        assert_eq!(by_id(2).name, "zsh");
+        assert_eq!(by_id(3).name, "Tab 3");
+    }
+
+    #[test]
+    fn sidebar_agents_normalizes_and_truncates_like_the_palette() {
+        let long_detail = "x".repeat(60);
+        let t = with_owner(
+            owned(tab(1, "zsh\nx"), "claude", AgentLifecycle::Failed, NOW),
+            |owner| owner.detail = long_detail.clone(),
+        );
+        let rows = sidebar_agents(&project(1, "roost", vec![t]), NOW);
+        assert_eq!(rows[0].name, "zshx");
+        let detail = rows[0]
+            .status_text
+            .strip_prefix("Failed · ")
+            .expect("detail suffix");
+        assert_eq!(detail.chars().count(), 40);
+        assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn sidebar_agents_on_an_empty_project_is_empty() {
+        assert_eq!(sidebar_agents(&project(1, "roost", vec![]), NOW), vec![]);
+        assert_eq!(
+            sidebar_agents(&project(1, "roost", vec![tab(1, "shell")]), NOW),
+            vec![]
+        );
+    }
+
+    // ----- flatten_sidebar_rows ----------------------------------------
+
+    fn dummy_agent(tab_id: i64) -> SidebarAgentRow {
+        SidebarAgentRow {
+            tab_id,
+            name: format!("agent-{tab_id}"),
+            lifecycle: AgentLifecycle::Working,
+            status_text: "Working".to_string(),
+            time_text: "1s".to_string(),
+        }
+    }
+
+    #[test]
+    fn flatten_shows_agents_when_visible_and_not_dragging() {
+        let projects = vec![
+            (1i64, vec![dummy_agent(10), dummy_agent(11)]),
+            (2i64, vec![dummy_agent(20)]),
+        ];
+        let rows = flatten_sidebar_rows(projects, true, false);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::Project(1),
+                SidebarRow::Agent(dummy_agent(10)),
+                SidebarRow::Agent(dummy_agent(11)),
+                SidebarRow::Project(2),
+                SidebarRow::Agent(dummy_agent(20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_hides_agents_when_both_off_and_dragging() {
+        let projects = vec![(1i64, vec![dummy_agent(10)])];
+        assert_eq!(
+            flatten_sidebar_rows(projects, false, true),
+            vec![SidebarRow::Project(1)]
+        );
+    }
+
+    #[test]
+    fn flatten_hides_agents_when_the_toggle_is_off() {
+        let projects = vec![(1i64, vec![dummy_agent(10)]), (2i64, vec![dummy_agent(20)])];
+        let rows = flatten_sidebar_rows(projects, false, false);
+        assert_eq!(rows, vec![SidebarRow::Project(1), SidebarRow::Project(2)]);
+    }
+
+    #[test]
+    fn flatten_hides_agents_mid_drag_even_when_the_toggle_is_on() {
+        let projects = vec![(1i64, vec![dummy_agent(10)]), (2i64, vec![dummy_agent(20)])];
+        let rows = flatten_sidebar_rows(projects, true, true);
+        assert_eq!(rows, vec![SidebarRow::Project(1), SidebarRow::Project(2)]);
+    }
+
+    #[test]
+    fn flatten_handles_zero_agent_projects() {
+        let projects: Vec<(i64, Vec<SidebarAgentRow>)> =
+            vec![(1i64, vec![]), (2i64, vec![dummy_agent(20)])];
+        let rows = flatten_sidebar_rows(projects, true, false);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::Project(1),
+                SidebarRow::Project(2),
+                SidebarRow::Agent(dummy_agent(20)),
+            ]
+        );
     }
 
     // ----- row payload ----------------------------------------------

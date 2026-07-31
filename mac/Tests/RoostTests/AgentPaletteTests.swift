@@ -450,6 +450,170 @@ func agentSameSecondTiesBreakByProjectThenTabPositionThenID() {
     #expect(items(projects, tabs).map(\.id) == ["agent:3", "agent:30", "agent:20", "agent:10"])
 }
 
+// MARK: - sidebarAgents
+
+private func sidebarRows(
+    _ project: Workspace.Project, _ tabs: [Workspace.Tab], now: Int64 = NOW
+) -> [AgentPalette.SidebarAgentRow] {
+    AgentPalette.sidebarAgents(project: project, tabs: tabs, now: now)
+}
+
+@Test
+func sidebarAgentsExcludesManualLegacyAndDeadTabs() {
+    let tabs = [
+        tab(1, "plain shell"),
+        owned(tab(2, "claude"), "claude", .working, NOW),
+        owned(tab(3, "manual"), Workspace.manualSource, .working, NOW),
+        owned(tab(4, "legacy"), Workspace.legacySource, .working, NOW),
+        owned(tab(5, "codex"), "codex", .waiting, NOW),
+    ]
+    #expect(sidebarRows(project(1, "roost"), tabs).map(\.tabID) == [5, 2])
+}
+
+@Test
+func sidebarAgentsOnlyIncludesItsOwnProjectsTabs() {
+    let tabs = [
+        owned(tab(1, "claude", projectID: 1), "claude", .working, NOW),
+        owned(tab(2, "claude", projectID: 2), "claude", .working, NOW),
+    ]
+    #expect(sidebarRows(project(1, "roost"), tabs).map(\.tabID) == [1])
+}
+
+// The older row is given the lower position AND the lower id, so the
+// assertion fails if recency is dropped from the comparator and a later
+// key decides instead.
+@Test
+func sidebarAgentsOrdersSameLifecycleByRecencyFirst() {
+    var newer = owned(tab(9, "newer"), "claude", .waiting, NOW)
+    newer.position = 7
+    var older = owned(tab(2, "older"), "claude", .waiting, NOW - 500)
+    older.position = 0
+
+    #expect(sidebarRows(project(1, "roost"), [older, newer]).map(\.tabID) == [9, 2])
+}
+
+@Test
+func sidebarAgentsOrdersByRankThenRecencyThenTabPositionThenID() {
+    var laterTab = owned(tab(20, "b"), "claude", .working, NOW)
+    laterTab.position = 5
+    var samePositionHighID = owned(tab(30, "c"), "claude", .working, NOW)
+    samePositionHighID.position = 0
+    var samePositionLowID = owned(tab(3, "d"), "claude", .working, NOW)
+    samePositionLowID.position = 0
+    let failed = owned(tab(1, "failed"), "claude", .failed, NOW)
+    let waitingOld = owned(tab(4, "waiting-old"), "claude", .waiting, NOW - 500)
+
+    let tabs = [laterTab, samePositionHighID, samePositionLowID, failed, waitingOld]
+    // rank: failed > waiting > working; then within working, position 0
+    // before position 5, then id 3 before id 30.
+    #expect(sidebarRows(project(1, "roost"), tabs).map(\.tabID) == [1, 4, 3, 30, 20])
+}
+
+@Test
+func sidebarAgentsNameFallbackChain() {
+    let withMeta = withOwner(owned(tab(1, "zsh"), "claude", .working, NOW)) {
+        $0.metadata[AgentPalette.sessionTitleKey] = "slauth-refactor"
+    }
+    let withTitle = owned(tab(2, "zsh"), "claude", .working, NOW)
+    let untitled = owned(tab(3, ""), "claude", .working, NOW)
+
+    let rows = sidebarRows(project(1, "roost"), [withMeta, withTitle, untitled])
+    func byID(_ id: Int64) -> AgentPalette.SidebarAgentRow {
+        guard let row = rows.first(where: { $0.tabID == id }) else {
+            Issue.record("row \(id) missing")
+            return AgentPalette.SidebarAgentRow(
+                tabID: id, name: "", lifecycle: .inactive, statusText: "", timeText: "")
+        }
+        return row
+    }
+    #expect(byID(1).name == "slauth-refactor")
+    #expect(byID(2).name == "zsh")
+    #expect(byID(3).name == "Tab 3")
+}
+
+@Test
+func sidebarAgentsNormalizesAndTruncatesLikeThePalette() {
+    let long = String(repeating: "x", count: 60)
+    let t = withOwner(owned(tab(1, "zsh\nx"), "claude", .failed, NOW)) { $0.detail = long }
+    let rows = sidebarRows(project(1, "roost"), [t])
+    #expect(rows[0].name == "zshx")
+    let detail = String(rows[0].statusText.dropFirst("Failed · ".count))
+    #expect(detail.count == 40)
+    #expect(detail.hasSuffix("…"))
+}
+
+@Test
+func sidebarAgentsOnAnEmptyProjectIsEmpty() {
+    #expect(sidebarRows(project(1, "roost"), []).isEmpty)
+    #expect(sidebarRows(project(1, "roost"), [tab(1, "shell")]).isEmpty)
+}
+
+// MARK: - flattenSidebarRows
+
+private func dummyAgent(_ tabID: Int64) -> AgentPalette.SidebarAgentRow {
+    AgentPalette.SidebarAgentRow(
+        tabID: tabID, name: "agent-\(tabID)", lifecycle: .working, statusText: "Working",
+        timeText: "1s")
+}
+
+@Test
+func flattenShowsAgentsWhenVisibleAndNotDragging() {
+    let projects: [(project: Int64, agents: [AgentPalette.SidebarAgentRow])] = [
+        (1, [dummyAgent(10), dummyAgent(11)]),
+        (2, [dummyAgent(20)]),
+    ]
+    let rows = AgentPalette.flattenSidebarRows(
+        projects: projects, agentsVisible: true, isDragging: false)
+    #expect(
+        rows == [
+            .project(1),
+            .agent(dummyAgent(10)),
+            .agent(dummyAgent(11)),
+            .project(2),
+            .agent(dummyAgent(20)),
+        ])
+}
+
+@Test
+func flattenHidesAgentsWhenBothOffAndDragging() {
+    let projects: [(project: Int64, agents: [AgentPalette.SidebarAgentRow])] = [
+        (1, [dummyAgent(10)])
+    ]
+    let rows = AgentPalette.flattenSidebarRows(
+        projects: projects, agentsVisible: false, isDragging: true)
+    #expect(rows == [.project(1)])
+}
+
+@Test
+func flattenHidesAgentsWhenTheToggleIsOff() {
+    let projects: [(project: Int64, agents: [AgentPalette.SidebarAgentRow])] = [
+        (1, [dummyAgent(10)]), (2, [dummyAgent(20)]),
+    ]
+    let rows = AgentPalette.flattenSidebarRows(
+        projects: projects, agentsVisible: false, isDragging: false)
+    #expect(rows == [.project(1), .project(2)])
+}
+
+@Test
+func flattenHidesAgentsMidDragEvenWhenTheToggleIsOn() {
+    let projects: [(project: Int64, agents: [AgentPalette.SidebarAgentRow])] = [
+        (1, [dummyAgent(10)]), (2, [dummyAgent(20)]),
+    ]
+    let rows = AgentPalette.flattenSidebarRows(
+        projects: projects, agentsVisible: true, isDragging: true)
+    #expect(rows == [.project(1), .project(2)])
+}
+
+@Test
+func flattenHandlesZeroAgentProjects() {
+    let projects: [(project: Int64, agents: [AgentPalette.SidebarAgentRow])] = [
+        (1, []), (2, [dummyAgent(20)]),
+    ]
+    let rows = AgentPalette.flattenSidebarRows(
+        projects: projects, agentsVisible: true, isDragging: false)
+    #expect(rows == [.project(1), .project(2), .agent(dummyAgent(20))])
+}
+
 // MARK: - Row payload + frame
 
 @Test

@@ -59,6 +59,15 @@ enum AgentPalette {
         )
     }
 
+    /// The ownership record of a tab that belongs in the palette: live
+    /// ownership from a source that isn't one of Roost's own internal
+    /// (non-agent) claims. `nil` means "no row for this tab". Mirrors
+    /// `agent_palette.rs`'s `agent_owner`.
+    private static func agentOwner(tab: Workspace.Tab) -> Ownership? {
+        guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { return nil }
+        return nonAgentSources.contains(owner.source) ? nil : owner
+    }
+
     /// Rows for every agent-owned tab in the snapshot, in `rank` order.
     /// Empty populations yield the single non-actionable sentinel row.
     ///
@@ -71,8 +80,7 @@ enum AgentPalette {
         let byID = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var rows: [Row] = []
         for tab in tabs {
-            guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { continue }
-            if nonAgentSources.contains(owner.source) { continue }
+            guard let owner = agentOwner(tab: tab) else { continue }
             guard let project = byID[tab.projectId] else { continue }
             rows.append(
                 rowFor(
@@ -114,12 +122,107 @@ enum AgentPalette {
         let byID = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var cwds: [Int64: String] = [:]
         for tab in tabs {
-            guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { continue }
-            if nonAgentSources.contains(owner.source) { continue }
+            guard agentOwner(tab: tab) != nil else { continue }
             guard byID[tab.projectId] != nil else { continue }
             cwds[tab.id] = tab.cwd
         }
         return cwds
+    }
+
+    /// One row under a project in the sidebar (plan 007 §3.1) — the same
+    /// fields the palette renders, scoped to a single project. There is
+    /// no `project` field: the sidebar nests this row under its project
+    /// visually, so the row never needs to say which one it's in.
+    struct SidebarAgentRow: Equatable {
+        let tabID: Int64
+        let name: String
+        let lifecycle: AgentLifecycle
+        let statusText: String
+        let timeText: String
+    }
+
+    /// A single project's agent rows, in the palette's within-project
+    /// order: rank ↓, `lastEventAt` ↓, tab position, tab id.
+    /// `projectPosition` drops out of the key relative to `agentItems`'s
+    /// — every row here already shares one project.
+    ///
+    /// The Mac workspace is flat (no `Project.tabs`), so `tabs` is the
+    /// full tab list and this filters to `project.id` itself, mirroring
+    /// how `agentItems` looks projects up from a flat tab list rather
+    /// than the other way around.
+    static func sidebarAgents(
+        project: Workspace.Project, tabs: [Workspace.Tab], now: Int64
+    ) -> [SidebarAgentRow] {
+        struct Keyed {
+            let rank: Int
+            let lastEventAt: Int64
+            let tabPosition: Int32
+            let tabID: Int64
+            let row: SidebarAgentRow
+        }
+        var rows: [Keyed] = []
+        for tab in tabs where tab.projectId == project.id {
+            guard let owner = agentOwner(tab: tab) else { continue }
+            let effective = Agent.effectiveLifecycle(tab.agent)
+            rows.append(
+                Keyed(
+                    rank: Agent.rank(effective),
+                    lastEventAt: owner.lastEventAt,
+                    tabPosition: tab.position,
+                    tabID: tab.id,
+                    row: SidebarAgentRow(
+                        tabID: tab.id,
+                        name: rowName(tab: tab, owner: owner),
+                        lifecycle: effective,
+                        statusText: statusText(
+                            effective: effective, raw: tab.agent.lifecycle, detail: owner.detail),
+                        timeText: elapsedText(now: now, lastEventAt: owner.lastEventAt)
+                    )
+                ))
+        }
+        rows.sort { a, b in
+            if a.rank != b.rank { return a.rank > b.rank }
+            if a.lastEventAt != b.lastEventAt { return a.lastEventAt > b.lastEventAt }
+            if a.tabPosition != b.tabPosition { return a.tabPosition < b.tabPosition }
+            return a.tabID < b.tabID
+        }
+        return rows.map(\.row)
+    }
+
+    /// One row in the sidebar's flat display order: a project header or
+    /// one of its agent rows. Generic over the caller's own project
+    /// payload (`Project`) and agent-row payload (`Agent`) so this stays
+    /// pure data with no dependency on `NSOutlineView`'s item types —
+    /// mirrors `agent_palette.rs`'s `SidebarRow<P, A>` /
+    /// `flatten_sidebar_rows`.
+    enum SidebarRow<P: Equatable, A: Equatable>: Equatable {
+        case project(P)
+        case agent(A)
+    }
+
+    /// Interleave each project with its already-ordered agent rows into
+    /// one flat display list (plan 007 §3.6). Agent rows are dropped —
+    /// every project renders alone — when the toggle is off, or while a
+    /// project drag is in flight: the drag case exists so index-based
+    /// reorder math never has to account for agent rows shifting
+    /// underneath it.
+    ///
+    /// Generic type params are named `P`/`A` rather than `Project`/
+    /// `Agent` to avoid shadowing this file's `Agent` namespace enum.
+    static func flattenSidebarRows<P: Equatable, A: Equatable>(
+        projects: [(project: P, agents: [A])],
+        agentsVisible: Bool,
+        isDragging: Bool
+    ) -> [SidebarRow<P, A>] {
+        let showAgents = agentsVisible && !isDragging
+        var out: [SidebarRow<P, A>] = []
+        for entry in projects {
+            out.append(.project(entry.project))
+            if showAgents {
+                out.append(contentsOf: entry.agents.map { .agent($0) })
+            }
+        }
+        return out
     }
 
     /// The tab id an agent row activates, or nil for the empty sentinel
