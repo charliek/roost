@@ -41,6 +41,12 @@ pub enum KeybindAction {
     Copy,
     Paste,
     ToggleSidebar,
+    /// Show/hide the per-agent rows nested under each project in the
+    /// sidebar (plan 007 §3.7). Default `projectMod+shift+a` —
+    /// Cmd+Shift+A on macOS-GTK, Alt+Shift+A on Linux. Not a picker
+    /// toggle — `dispatch_action`'s `is_picker_toggle` allowlist
+    /// doesn't include it.
+    ToggleSidebarAgents,
     /// Browser-style font sizing on the active tab's terminal.
     /// Defaults to `primary+plus`/`primary+equal` (both are bound
     /// because `Cmd-+` on US layouts is really `Cmd-Shift-=` and
@@ -96,6 +102,7 @@ impl KeybindAction {
             "copy" => Some(Self::Copy),
             "paste" => Some(Self::Paste),
             "toggle_sidebar" => Some(Self::ToggleSidebar),
+            "toggle_sidebar_agents" => Some(Self::ToggleSidebarAgents),
             "font_increase" => Some(Self::FontIncrease),
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
@@ -333,6 +340,14 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &mut out,
         &format!("{project_mod}+b"),
         KeybindAction::ToggleSidebar,
+    );
+
+    // Toggle sidebar agents: Cmd+Shift+A on macOS-GTK, Alt+Shift+A on
+    // Linux. Verified free — no other default uses `…+shift+a`.
+    add(
+        &mut out,
+        &format!("{project_mod}+shift+a"),
+        KeybindAction::ToggleSidebarAgents,
     );
 
     // Command palette: Cmd+Shift+P on macOS-GTK, Alt+Shift+P on Linux
@@ -681,6 +696,25 @@ mod tests {
             parse_trigger("alt+shift+o").unwrap()
         };
         assert_eq!(defaults.get(&trigger), Some(&KeybindAction::AgentPalette));
+    }
+
+    #[test]
+    fn toggle_sidebar_agents_action_and_default() {
+        assert_eq!(
+            KeybindAction::from_name("toggle_sidebar_agents"),
+            Some(KeybindAction::ToggleSidebarAgents)
+        );
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        // projectMod+shift+a: Cmd+Shift+A on macOS, Alt+Shift+A on Linux.
+        let trigger = if cfg!(target_os = "macos") {
+            parse_trigger("super+shift+a").unwrap()
+        } else {
+            parse_trigger("alt+shift+a").unwrap()
+        };
+        assert_eq!(
+            defaults.get(&trigger),
+            Some(&KeybindAction::ToggleSidebarAgents)
+        );
     }
 
     #[test]

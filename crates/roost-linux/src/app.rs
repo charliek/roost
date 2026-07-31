@@ -250,6 +250,11 @@ pub struct App {
     /// at construction. `RefCell` for the same future-reload reason
     /// as `copy_on_select`.
     word_break_chars: RefCell<String>,
+    /// `show-sidebar-agents` from the config (default `true`, plan
+    /// 007 §3.7). `RefCell` so `toggle_sidebar_agents` can flip it at
+    /// runtime; new sidebar renders read the current value. C2 wires
+    /// the setting + write-back only — nothing reads this yet.
+    show_sidebar_agents: RefCell<bool>,
     /// Resolved `link-modifier` (Cmd on macOS / Alt on Linux by
     /// default; `link-modifier` config overrides). Held during a
     /// hover/click over a URL to reveal + open it. Passed to every new
@@ -790,6 +795,7 @@ impl App {
             copy_on_select: RefCell::new(cfg.copy_on_select),
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
+            show_sidebar_agents: RefCell::new(cfg.show_sidebar_agents),
             link_modifier: resolve_link_modifier(cfg.link_modifier),
             server_driven_closes: RefCell::new(HashSet::new()),
             dragged_project_id: RefCell::new(None),
@@ -3420,6 +3426,7 @@ impl App {
             KeybindAction::Copy => self.copy_active_selection(),
             KeybindAction::Paste => self.paste_into_active(),
             KeybindAction::ToggleSidebar => self.toggle_sidebar(),
+            KeybindAction::ToggleSidebarAgents => self.toggle_sidebar_agents(),
             KeybindAction::FontIncrease => self.adjust_font_size(1.0),
             KeybindAction::FontDecrease => self.adjust_font_size(-1.0),
             KeybindAction::FontReset => {
@@ -5555,6 +5562,26 @@ impl App {
         self.set_sidebar_visible(!self.sidebar_box.is_visible());
     }
 
+    /// `toggle_sidebar_agents` action handler (plan 007 §3.7). Flips
+    /// the live setting and persists it, mirroring `commit_theme` /
+    /// `apply_font_size_to_all`'s write-back pattern. C2 wires the
+    /// flag only — no sidebar rendering reads it yet, so there is
+    /// nothing here to refresh.
+    fn toggle_sidebar_agents(self: &Rc<Self>) {
+        let new_value = {
+            let mut v = self.show_sidebar_agents.borrow_mut();
+            *v = !*v;
+            *v
+        };
+        if let Err(e) = write_back_show_sidebar_agents(new_value) {
+            tracing::warn!(
+                error = %e,
+                value = new_value,
+                "failed to persist show-sidebar-agents to config.conf"
+            );
+        }
+    }
+
     /// Show or hide the sidebar and persist the choice. Idempotent.
     ///
     /// Hides the entire sidebar container — header + list + footer
@@ -6396,6 +6423,22 @@ fn write_back_font_size(size_pt: f64) -> std::io::Result<()> {
     };
     let formatted = format_font_size(size_pt);
     config::set_key(&path, "font-size", &formatted)
+}
+
+/// Persist `show-sidebar-agents = true|false` to the user's config
+/// file. Same error-return contract as `write_back_theme` — the
+/// caller logs once at the toggle boundary; a failed write leaves the
+/// live `App::show_sidebar_agents` value changed for the rest of the
+/// session.
+fn write_back_show_sidebar_agents(value: bool) -> std::io::Result<()> {
+    let Some(path) = config::config_path() else {
+        return Ok(());
+    };
+    config::set_key(
+        &path,
+        "show-sidebar-agents",
+        if value { "true" } else { "false" },
+    )
 }
 
 /// Format a font size in points for the config file. Whole numbers

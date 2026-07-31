@@ -209,6 +209,10 @@ impl PaletteCommands {
     pub const SPECS: &'static [(&'static str, &'static str)] = &[
         (Self::SELECT_THEME_ID, "Select Theme…"),
         (Self::SELECT_FONT_ID, "Select Font…"),
+        // Positioned so `show_command_palette`'s dynamic splice (which
+        // lands right after `SELECT_FONT_ID`) pushes this entry to sit
+        // immediately after "Clear All Notifications" — plan 007 §3.7.
+        ("toggle_sidebar_agents", "Toggle Sidebar Agents"),
         ("new_tab", "New Tab"),
         ("close_tab", "Close Tab"),
         ("rename_tab", "Rename Tab"),

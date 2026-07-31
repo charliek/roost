@@ -58,6 +58,13 @@ pub struct RoostConfig {
     /// Linux). Set `link-modifier = ctrl` for traditional Ctrl+click.
     /// GTK-only today — the Swift UI's modifier is fixed to Cmd.
     pub link_modifier: Option<AccelMods>,
+
+    /// `show-sidebar-agents` — whether the sidebar renders one row
+    /// per agent-owned tab under its project (plan 007). Defaults to
+    /// `true`. Toggled at runtime via the `toggle_sidebar_agents`
+    /// keybind / palette row / Mac View menu item, which writes the
+    /// live value straight back here through `set_key`.
+    pub show_sidebar_agents: bool,
 }
 
 impl Default for RoostConfig {
@@ -73,6 +80,7 @@ impl Default for RoostConfig {
             clipboard_write: ClipboardWrite::default(),
             word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
             link_modifier: None,
+            show_sidebar_agents: true,
         }
     }
 }
@@ -133,6 +141,29 @@ impl CopyOnSelect {
             "clipboard" | "both" => Some(Self::Clipboard),
             _ => None,
         }
+    }
+}
+
+/// Parse a plain boolean config value (`true | yes` / `false | no`).
+/// Mirrors `ClipboardWrite::parse` / `CopyOnSelect::parse`'s
+/// `Option`-returning shape so every boolean key in the parse loop
+/// below shares one `if let Some(v) = ... else { warn }` pattern.
+/// Quotes and `\r` are stripped here rather than relying on the parse
+/// loop: the loop strips surrounding quotes only for `font-family`, and
+/// the Swift mirror's line trim excludes `\r`, so a `theme = "dark"` or
+/// a CRLF file already parses differently on the two platforms. Doing it
+/// locally keeps at least this key identical across the pair.
+fn parse_bool_like(s: &str) -> Option<bool> {
+    match s
+        .trim()
+        .trim_matches(['"', '\'', '\r'])
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "yes" => Some(true),
+        "false" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -207,6 +238,16 @@ impl RoostConfig {
                         );
                     }
                 }
+                "show-sidebar-agents" => {
+                    if let Some(v) = parse_bool_like(value) {
+                        cfg.show_sidebar_agents = v;
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown show-sidebar-agents value; falling back to default `true`"
+                        );
+                    }
+                }
                 "word-break-chars" => {
                     // Empty value is a deliberate user choice meaning
                     // "Unicode letters/digits only" — distinct from
@@ -275,7 +316,7 @@ impl RoostConfig {
 /// `command = …` entries are accumulated by the parser into vectors;
 /// calling `set_key("keybind", …)` would collapse every keybind line
 /// into one. Restrict callers to single-valued keys (`theme`,
-/// `font-family`, `font-size`).
+/// `font-family`, `font-size`, `show-sidebar-agents`).
 ///
 /// `value` is written verbatim — callers are responsible for adding
 /// surrounding quotes when the value contains spaces (`font-family`
@@ -669,6 +710,36 @@ mod tests {
         // default (Allow) wins. This test pins the contract so phase 2
         // remembers to update the parser.
         assert_eq!(cfg.clipboard_write, ClipboardWrite::Allow);
+    }
+
+    #[test]
+    fn show_sidebar_agents_defaults_to_true() {
+        let cfg = RoostConfig::parse("");
+        assert!(cfg.show_sidebar_agents);
+    }
+
+    #[test]
+    fn show_sidebar_agents_accepts_true_and_false() {
+        assert!(RoostConfig::parse("show-sidebar-agents = true").show_sidebar_agents);
+        assert!(RoostConfig::parse("show-sidebar-agents = yes").show_sidebar_agents);
+        assert!(!RoostConfig::parse("show-sidebar-agents = false").show_sidebar_agents);
+        assert!(!RoostConfig::parse("show-sidebar-agents = no").show_sidebar_agents);
+    }
+
+    // Quoted and CRLF forms must agree with the Swift mirror, whose
+    // shared parse loop strips quotes globally and leaves `\r` behind.
+    #[test]
+    fn show_sidebar_agents_accepts_quoted_and_crlf_values() {
+        assert!(!RoostConfig::parse("show-sidebar-agents = \"false\"").show_sidebar_agents);
+        assert!(!RoostConfig::parse("show-sidebar-agents = 'false'").show_sidebar_agents);
+        assert!(!RoostConfig::parse("show-sidebar-agents = false\r\n").show_sidebar_agents);
+        assert!(!RoostConfig::parse("show-sidebar-agents = \"false\"\r\n").show_sidebar_agents);
+    }
+
+    #[test]
+    fn show_sidebar_agents_unknown_value_keeps_default() {
+        let cfg = RoostConfig::parse("show-sidebar-agents = pancakes");
+        assert!(cfg.show_sidebar_agents);
     }
 
     #[test]

@@ -232,6 +232,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// re-reads `config.conf`.
     private var activeThemeName: String = "roost-dark"
 
+    /// Live `show-sidebar-agents` setting (plan 007 §3.7). Seeded
+    /// from `config` at launch; `toggleSidebarAgents` flips it and
+    /// writes back through `RoostConfig.setKey`. C2 wires the
+    /// setting only — nothing reads this yet.
+    private var showSidebarAgents: Bool = true
+
     /// Command palette (Cmd+Shift+P). Nil when closed. `paletteOpen`
     /// gates app shortcuts (defense-in-depth in `validateMenuItem`) and
     /// the focus-snap in `applicationDidBecomeActive` while it's up.
@@ -367,6 +373,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // `.monospacedSystemFont(ofSize: 14)` unless the user
         // overrides `font-family` / `font-size`.
         self.config = RoostConfig.load()
+        self.showSidebarAgents = config.showSidebarAgents
         self.activeThemeName = config.themeName ?? "roost-dark"
         self.activeTheme = Theme.loadBundled(name: activeThemeName)
         self.activeFontFamily = config.fontFamily
@@ -1981,6 +1988,28 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         RoostConfig.setKey("font-size", value: formatFontSize(size))
     }
 
+    /// Persist `show-sidebar-agents = true|false` to config. Same
+    /// error-return contract as `writeBackTheme` — the caller logs
+    /// once at the toggle boundary; a failed write leaves the live
+    /// `showSidebarAgents` value changed for the rest of the session.
+    @MainActor
+    @discardableResult
+    private func writeBackShowSidebarAgents(_ value: Bool) -> Error? {
+        RoostConfig.setKey("show-sidebar-agents", value: value ? "true" : "false")
+    }
+
+    /// `toggle_sidebar_agents` action handler (plan 007 §3.7). Flips
+    /// the live setting and persists it. C2 wires the flag only — no
+    /// sidebar rendering reads it yet, so there is nothing here to
+    /// refresh.
+    @objc @MainActor
+    private func toggleSidebarAgents(_ sender: Any?) {
+        showSidebarAgents.toggle()
+        if let err = writeBackShowSidebarAgents(showSidebarAgents) {
+            NSLog("roost-mac: failed to persist show-sidebar-agents to config.conf: %@", "\(err)")
+        }
+    }
+
     /// Format a font size for the config file. Whole numbers render
     /// as integers; non-whole values keep up to two decimals (trailing
     /// zeros trimmed) so a `font-size = 14.5` round-trips cleanly.
@@ -2024,6 +2053,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         case KeybindAction.renameProject: renameActiveProject(nil)
         case KeybindAction.closeProject:  closeActiveProject(nil)
         case KeybindAction.toggleSidebar: toggleSidebar(nil)
+        case KeybindAction.toggleSidebarAgents: toggleSidebarAgents(nil)
         case KeybindAction.jumpToUnread:  jumpToUnread(nil)
         case KeybindAction.fontIncrease:  fontIncrease(nil)
         case KeybindAction.fontDecrease:  fontDecrease(nil)
@@ -3865,6 +3895,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         toggleSidebarItem.target = self
         bind(toggleSidebarItem, to: KeybindAction.toggleSidebar)
         viewMenu.addItem(toggleSidebarItem)
+        // Plan 007 §3.7: show/hide the sidebar's per-agent rows.
+        let toggleSidebarAgentsItem = NSMenuItem(
+            title: "Toggle Sidebar Agents",
+            action: #selector(toggleSidebarAgents(_:)),
+            keyEquivalent: ""
+        )
+        toggleSidebarAgentsItem.target = self
+        bind(toggleSidebarAgentsItem, to: KeybindAction.toggleSidebarAgents)
+        viewMenu.addItem(toggleSidebarAgentsItem)
         viewMenu.addItem(.separator())
         // Phase 6a P7: jump-to-unread shortcut.
         let jumpItem = NSMenuItem(

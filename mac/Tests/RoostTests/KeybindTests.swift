@@ -26,6 +26,13 @@ func customPaletteBoundToSuperShiftEAndNotStealingRenameProject() throws {
 }
 
 @Test
+func toggleSidebarAgentsBoundToSuperShiftAByDefault() throws {
+    let table = canonicalizeBindings(defaults: defaultBindingsMac(), user: [], warn: noWarn)
+    let accel = try #require(triggerToAccel("super+shift+a"))
+    #expect(table[accel] == KeybindAction.toggleSidebarAgents)
+}
+
+@Test
 func userCanUnbindCommandPalette() throws {
     let table = canonicalizeBindings(
         defaults: defaultBindingsMac(),
