@@ -510,6 +510,26 @@ func sidebarAgentsOrdersByRankThenRecencyThenTabPositionThenID() {
 }
 
 @Test
+func aLeadingAgentMarkerIsStrippedFromTheName() {
+    // Claude Code's own window-title prefix, U+2733 + space.
+    #expect(AgentPalette.stripLeadingMarker("\u{2733} slaudio-refactor") == "slaudio-refactor")
+    #expect(AgentPalette.stripLeadingMarker("\u{2733}\u{FE0F} Claude Code") == "Claude Code")
+    #expect(AgentPalette.stripLeadingMarker("\u{1F7E2} \u{1F47B} two") == "two")
+}
+
+@Test
+func strippingLeavesASCIIAndNonLatinTitlesAlone() {
+    for keep in ["/tmp", "~/src/roost", "[wip] refactor", "-n", "café", "日本語", "1password"] {
+        #expect(AgentPalette.stripLeadingMarker(keep) == keep, "must not strip \(keep)")
+    }
+}
+
+@Test
+func anAllMarkerTitleSurvivesRatherThanEmptying() {
+    #expect(AgentPalette.stripLeadingMarker("\u{2733}") == "\u{2733}")
+}
+
+@Test
 func sidebarAgentsNameFallbackChain() {
     let withMeta = withOwner(owned(tab(1, "zsh"), "claude", .working, NOW)) {
         $0.metadata[AgentPalette.sessionTitleKey] = "slauth-refactor"

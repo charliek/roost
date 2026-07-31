@@ -381,11 +381,35 @@ enum AgentPalette {
     /// The agent's own session name when it published one, else the tab
     /// title, else a stable placeholder.
     private static func rowName(tab: Workspace.Tab, owner: Ownership) -> String {
-        let sessionTitle = normalizeLine(owner.metadata[sessionTitleKey] ?? "")
+        let sessionTitle = stripLeadingMarker(normalizeLine(owner.metadata[sessionTitleKey] ?? ""))
         if !sessionTitle.isEmpty { return sessionTitle }
-        let title = normalizeLine(tab.title)
+        let title = stripLeadingMarker(normalizeLine(tab.title))
         if !title.isEmpty { return title }
         return "Tab \(tab.id)"
+    }
+
+    /// Drop a leading marker glyph from an agent's title — Claude Code
+    /// prefixes its window title with `✳ ` (U+2733), so a renamed
+    /// session arrives as `✳ my-session` and the row would render the
+    /// glyph twice over: once as our own lifecycle dot, once as the
+    /// agent's.
+    ///
+    /// Symbols are recognised structurally (non-ASCII and
+    /// non-alphanumeric) rather than by listing known markers, so a
+    /// second adapter's glyph is stripped without a code change. ASCII
+    /// stays untouched, so a title that is a path (`/tmp`, `~/src`) or
+    /// bracketed (`[wip] name`) is unharmed, and non-Latin scripts are
+    /// alphanumeric so they survive.
+    ///
+    /// Mirrors `agent_palette.rs::strip_leading_marker`.
+    static func stripLeadingMarker(_ text: String) -> String {
+        let stripped = text.drop { ch in
+            ch.isWhitespace
+                || (!ch.unicodeScalars.allSatisfy { $0.isASCII } && !(ch.isLetter || ch.isNumber))
+        }
+        // An all-glyph title would strip to nothing; keep it rather than
+        // falling through to `Tab <id>`.
+        return stripped.isEmpty ? text : String(stripped)
     }
 
     /// Non-nil for a working agent reporting `background_tasks:N` with

@@ -138,10 +138,14 @@ toolbarview > .top-bar:backdrop {
 .navigation-sidebar > row .roost-sidebar-agents {
   margin-bottom: 2px;
 }
+/* The 6px margin puts this row's highlight on the same left edge as the
+ * project row's selection pill, and the 10px padding lands the dot on
+ * the same left edge as the project label (which sits 6px + its own
+ * 10px in). Agents read as a nested list rather than an inset block. */
 .navigation-sidebar > row .roost-sidebar-agent {
   border-radius: 5px;
-  margin: 0 6px 0 20px;
-  padding: 1px 6px;
+  margin: 0 6px;
+  padding: 1px 6px 1px 10px;
   min-height: 20px;
 }
 .navigation-sidebar > row .roost-sidebar-agent.active {

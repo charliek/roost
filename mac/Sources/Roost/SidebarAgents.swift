@@ -142,12 +142,15 @@ final class AgentRowCellView: NSTableCellView {
         textField = name
 
         NSLayoutConstraint.activate([
-            highlight.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            // 6pt matches the project row's selection-pill inset and 8pt
+            // matches its label, so the dot lands on the same left edge
+            // as the project name rather than reading as an inset block.
+            highlight.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             highlight.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             highlight.topAnchor.constraint(equalTo: topAnchor),
             highlight.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
             dot.widthAnchor.constraint(equalToConstant: 8),
             dot.heightAnchor.constraint(equalToConstant: 8),

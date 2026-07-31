@@ -365,16 +365,38 @@ fn row_name(tab: &Tab, owner: &Ownership) -> String {
     let session_title = owner
         .metadata
         .get(SESSION_TITLE_KEY)
-        .map(|t| normalize_line(t))
+        .map(|t| strip_leading_marker(&normalize_line(t)))
         .unwrap_or_default();
     if !session_title.is_empty() {
         return session_title;
     }
-    let title = normalize_line(&tab.title);
+    let title = strip_leading_marker(&normalize_line(&tab.title));
     if !title.is_empty() {
         return title;
     }
     format!("Tab {}", tab.id)
+}
+
+/// Drop a leading marker glyph from an agent's title — Claude Code
+/// prefixes its window title with `✳ ` (U+2733), so a renamed session
+/// arrives as `✳ my-session` and the row would render the glyph twice
+/// over: once as our own lifecycle dot, once as the agent's.
+///
+/// Symbols are recognised structurally (non-ASCII and non-alphanumeric)
+/// rather than by listing known markers, so a second adapter's glyph is
+/// stripped without a code change. ASCII stays untouched, so a title
+/// that is a path (`/tmp`, `~/src`) or bracketed (`[wip] name`) is
+/// unharmed, and non-Latin scripts are alphanumeric so they survive.
+fn strip_leading_marker(text: &str) -> String {
+    let stripped = text
+        .trim_start_matches(|c: char| c.is_whitespace() || (!c.is_ascii() && !c.is_alphanumeric()));
+    // An all-glyph title would strip to nothing; keep it rather than
+    // falling through to `Tab <id>`.
+    if stripped.is_empty() {
+        text.to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 /// `Some(n)` for a working agent reporting `background_tasks:N` with
@@ -1016,6 +1038,41 @@ mod tests {
         // rank: Failed > Waiting > Working; then within Working, position
         // 0 before position 5, then id 3 before id 30.
         assert_eq!(ids, vec![1, 4, 3, 30, 20]);
+    }
+
+    #[test]
+    #[test]
+    fn a_leading_agent_marker_is_stripped_from_the_name() {
+        // Claude Code's own window-title prefix, U+2733 + space.
+        assert_eq!(
+            strip_leading_marker("\u{2733} slaudio-refactor"),
+            "slaudio-refactor"
+        );
+        assert_eq!(
+            strip_leading_marker("\u{2733}\u{fe0f} Claude Code"),
+            "Claude Code"
+        );
+        assert_eq!(strip_leading_marker("\u{1f7e2} \u{1f47b} two"), "two");
+    }
+
+    #[test]
+    fn stripping_leaves_ascii_and_non_latin_titles_alone() {
+        for keep in [
+            "/tmp",
+            "~/src/roost",
+            "[wip] refactor",
+            "-n",
+            "café",
+            "日本語",
+            "1password",
+        ] {
+            assert_eq!(strip_leading_marker(keep), keep, "must not strip {keep}");
+        }
+    }
+
+    #[test]
+    fn an_all_marker_title_survives_rather_than_emptying() {
+        assert_eq!(strip_leading_marker("\u{2733}"), "\u{2733}");
     }
 
     #[test]
