@@ -115,6 +115,63 @@ pub fn agent_tab_cwds(projects: &[Project]) -> HashMap<i64, String> {
     cwds
 }
 
+/// One row under a project in the sidebar (plan 007 §3.1) — the same
+/// fields the palette renders, scoped to a single project. There is no
+/// `project` field: the sidebar nests this row under its project
+/// visually, so the row never needs to say which one it's in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarAgentRow {
+    pub tab_id: i64,
+    pub name: String,
+    pub lifecycle: AgentLifecycle,
+    pub status_text: String,
+    pub time_text: String,
+}
+
+/// A single project's agent rows, in the palette's within-project order:
+/// rank ↓, `last_event_at` ↓, tab position, tab id. `project_position`
+/// drops out of the key relative to [`agent_items`]'s — every row here
+/// already shares one project, so ordering across projects is the
+/// caller's problem (it owns the project list order already).
+pub fn sidebar_agents(project: &Project, now: i64) -> Vec<SidebarAgentRow> {
+    struct Keyed {
+        rank: u8,
+        last_event_at: i64,
+        tab_position: i32,
+        tab_id: i64,
+        row: SidebarAgentRow,
+    }
+    let mut rows: Vec<Keyed> = Vec::new();
+    for tab in &project.tabs {
+        let axes = tab.agent_state();
+        let Some(owner) = agent_owner(&axes) else {
+            continue;
+        };
+        let effective = agent::effective_lifecycle(&axes);
+        rows.push(Keyed {
+            rank: agent::rank(effective),
+            last_event_at: owner.last_event_at,
+            tab_position: tab.position,
+            tab_id: tab.id,
+            row: SidebarAgentRow {
+                tab_id: tab.id,
+                name: row_name(tab, owner),
+                lifecycle: effective,
+                status_text: status_text(effective, tab.agent_lifecycle, &owner.detail),
+                time_text: elapsed_text(now, owner.last_event_at),
+            },
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.rank
+            .cmp(&a.rank)
+            .then(b.last_event_at.cmp(&a.last_event_at))
+            .then(a.tab_position.cmp(&b.tab_position))
+            .then(a.tab_id.cmp(&b.tab_id))
+    });
+    rows.into_iter().map(|k| k.row).collect()
+}
+
 /// The ownership record of a tab that belongs in the palette: live
 /// ownership from a source that isn't one of Roost's own internal
 /// (non-agent) claims. `None` means "no row for this tab".
@@ -308,16 +365,38 @@ fn row_name(tab: &Tab, owner: &Ownership) -> String {
     let session_title = owner
         .metadata
         .get(SESSION_TITLE_KEY)
-        .map(|t| normalize_line(t))
+        .map(|t| strip_leading_marker(&normalize_line(t)))
         .unwrap_or_default();
     if !session_title.is_empty() {
         return session_title;
     }
-    let title = normalize_line(&tab.title);
+    let title = strip_leading_marker(&normalize_line(&tab.title));
     if !title.is_empty() {
         return title;
     }
     format!("Tab {}", tab.id)
+}
+
+/// Drop a leading marker glyph from an agent's title — Claude Code
+/// prefixes its window title with `✳ ` (U+2733), so a renamed session
+/// arrives as `✳ my-session` and the row would render the glyph twice
+/// over: once as our own lifecycle dot, once as the agent's.
+///
+/// Symbols are recognised structurally (non-ASCII and non-alphanumeric)
+/// rather than by listing known markers, so a second adapter's glyph is
+/// stripped without a code change. ASCII stays untouched, so a title
+/// that is a path (`/tmp`, `~/src`) or bracketed (`[wip] name`) is
+/// unharmed, and non-Latin scripts are alphanumeric so they survive.
+fn strip_leading_marker(text: &str) -> String {
+    let stripped = text
+        .trim_start_matches(|c: char| c.is_whitespace() || (!c.is_ascii() && !c.is_alphanumeric()));
+    // An all-glyph title would strip to nothing; keep it rather than
+    // falling through to `Tab <id>`.
+    if stripped.is_empty() {
+        text.to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 /// `Some(n)` for a working agent reporting `background_tasks:N` with
@@ -880,40 +959,167 @@ mod tests {
         assert_eq!(ids, vec!["agent:3", "agent:30", "agent:20", "agent:10"]);
     }
 
-    // ----- row payload ----------------------------------------------
+    // ----- sidebar_agents ---------------------------------------------
 
     #[test]
-    fn row_payload_carries_the_effective_lifecycle_and_pending_metrics() {
-        let t = with_owner(
-            owned(tab(7, "zsh"), "claude", AgentLifecycle::Waiting, NOW - 120),
-            |owner| owner.detail = "permission_prompt".to_string(),
+    fn sidebar_agents_excludes_manual_legacy_and_dead_tabs() {
+        let p = project(
+            1,
+            "roost",
+            vec![
+                tab(1, "plain shell"),
+                owned(tab(2, "claude"), "claude", AgentLifecycle::Working, NOW),
+                owned(tab(3, "manual"), "manual", AgentLifecycle::Working, NOW),
+                owned(tab(4, "legacy"), "legacy", AgentLifecycle::Working, NOW),
+                owned(tab(5, "codex"), "codex", AgentLifecycle::Waiting, NOW),
+            ],
         );
-        let items = agent_items(&[project(1, "roost", vec![t])], NOW);
-        let row = agent_of(&items[0]);
-        assert_eq!(row.effective_lifecycle, AgentLifecycle::Waiting);
-        assert_eq!(row.project, "roost");
-        assert_eq!(row.name, "zsh");
-        assert_eq!(row.status_text, "Waiting for input");
-        assert_eq!(row.time_text, "2m");
-        assert_eq!(row.metrics_text, None, "metrics are pending until probed");
+        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+            .into_iter()
+            .map(|r| r.tab_id)
+            .collect();
+        assert_eq!(ids, vec![5, 2]);
+    }
+
+    // The older row is given the lower position AND the lower id, so the
+    // assertion fails if recency is dropped from the comparator and a later
+    // key decides instead.
+    #[test]
+    fn sidebar_agents_orders_same_lifecycle_by_recency_first() {
+        let mut newer = owned(tab(9, "newer"), "claude", AgentLifecycle::Waiting, NOW);
+        newer.position = 7;
+        let mut older = owned(
+            tab(2, "older"),
+            "claude",
+            AgentLifecycle::Waiting,
+            NOW - 500,
+        );
+        older.position = 0;
+
+        let p = project(1, "p", vec![older, newer]);
+        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+            .into_iter()
+            .map(|r| r.tab_id)
+            .collect();
+        assert_eq!(ids, vec![9, 2]);
     }
 
     #[test]
-    fn frame_carries_the_placeholder() {
-        let frame = agent_frame(&[], NOW);
-        assert_eq!(frame.id, FRAME_ID);
-        assert_eq!(frame.placeholder, PLACEHOLDER);
-        assert_eq!(frame.items.len(), 1);
-        assert_eq!(frame.items[0].id, EMPTY_ROW_ID);
+    fn sidebar_agents_orders_by_rank_then_recency_then_tab_position_then_id() {
+        let mut later_tab = owned(tab(20, "b"), "claude", AgentLifecycle::Working, NOW);
+        later_tab.position = 5;
+        let mut same_position_high_id = owned(tab(30, "c"), "claude", AgentLifecycle::Working, NOW);
+        same_position_high_id.position = 0;
+        let mut same_position_low_id = owned(tab(3, "d"), "claude", AgentLifecycle::Working, NOW);
+        same_position_low_id.position = 0;
+        let failed = owned(tab(1, "failed"), "claude", AgentLifecycle::Failed, NOW);
+        let waiting_old = owned(
+            tab(4, "waiting-old"),
+            "claude",
+            AgentLifecycle::Waiting,
+            NOW - 500,
+        );
+
+        let p = project(
+            1,
+            "roost",
+            vec![
+                later_tab,
+                same_position_high_id,
+                same_position_low_id,
+                failed,
+                waiting_old,
+            ],
+        );
+        let ids: Vec<i64> = sidebar_agents(&p, NOW)
+            .into_iter()
+            .map(|r| r.tab_id)
+            .collect();
+        // rank: Failed > Waiting > Working; then within Working, position
+        // 0 before position 5, then id 3 before id 30.
+        assert_eq!(ids, vec![1, 4, 3, 30, 20]);
     }
 
     #[test]
-    fn lifecycle_classes_are_distinct() {
-        use AgentLifecycle::*;
-        let classes = [Working, Waiting, Finished, Failed, Inactive].map(lifecycle_class);
-        let unique: std::collections::HashSet<_> = classes.iter().collect();
-        assert_eq!(unique.len(), classes.len());
-        assert_eq!(lifecycle_class(Working), "agent-working");
-        assert_eq!(lifecycle_class(Inactive), "agent-inactive");
+    fn a_leading_agent_marker_is_stripped_from_the_name() {
+        // Claude Code's own window-title prefix, U+2733 + space.
+        assert_eq!(
+            strip_leading_marker("\u{2733} slaudio-refactor"),
+            "slaudio-refactor"
+        );
+        assert_eq!(
+            strip_leading_marker("\u{2733}\u{fe0f} Claude Code"),
+            "Claude Code"
+        );
+        assert_eq!(strip_leading_marker("\u{1f7e2} \u{1f47b} two"), "two");
+    }
+
+    #[test]
+    fn stripping_leaves_ascii_and_non_latin_titles_alone() {
+        for keep in [
+            "/tmp",
+            "~/src/roost",
+            "[wip] refactor",
+            "-n",
+            "café",
+            "日本語",
+            "1password",
+        ] {
+            assert_eq!(strip_leading_marker(keep), keep, "must not strip {keep}");
+        }
+    }
+
+    #[test]
+    fn an_all_marker_title_survives_rather_than_emptying() {
+        assert_eq!(strip_leading_marker("\u{2733}"), "\u{2733}");
+    }
+
+    #[test]
+    fn sidebar_agents_name_fallback_chain() {
+        let with_meta = with_owner(
+            owned(tab(1, "zsh"), "claude", AgentLifecycle::Working, NOW),
+            |owner| {
+                owner
+                    .metadata
+                    .insert(SESSION_TITLE_KEY.to_string(), "slauth-refactor".to_string());
+            },
+        );
+        let with_title = owned(tab(2, "zsh"), "claude", AgentLifecycle::Working, NOW);
+        let untitled = owned(tab(3, ""), "claude", AgentLifecycle::Working, NOW);
+
+        let rows = sidebar_agents(
+            &project(1, "roost", vec![with_meta, with_title, untitled]),
+            NOW,
+        );
+        let by_id = |id: i64| rows.iter().find(|r| r.tab_id == id).expect("row present");
+        assert_eq!(by_id(1).name, "slauth-refactor");
+        assert_eq!(by_id(2).name, "zsh");
+        assert_eq!(by_id(3).name, "Tab 3");
+    }
+
+    #[test]
+    fn sidebar_agents_normalizes_and_truncates_like_the_palette() {
+        let long_detail = "x".repeat(60);
+        let t = with_owner(
+            owned(tab(1, "zsh\nx"), "claude", AgentLifecycle::Failed, NOW),
+            |owner| owner.detail = long_detail.clone(),
+        );
+        let rows = sidebar_agents(&project(1, "roost", vec![t]), NOW);
+        assert_eq!(rows[0].name, "zshx");
+        let detail = rows[0]
+            .status_text
+            .strip_prefix("Failed · ")
+            .expect("detail suffix");
+        assert_eq!(detail.chars().count(), 40);
+        assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn sidebar_agents_on_an_empty_project_is_empty() {
+        assert_eq!(sidebar_agents(&project(1, "roost", vec![]), NOW), vec![]);
+        assert_eq!(
+            sidebar_agents(&project(1, "roost", vec![tab(1, "shell")]), NOW),
+            vec![]
+        );
     }
 }

@@ -256,6 +256,15 @@ class Roost:
         """Test-mode only — set the window's logical size."""
         self.call("window.resize", {"width": float(width), "height": float(height)})
 
+    def sidebar_dump(self) -> dict:
+        """{agents_visible, projects: [{project_id, agents: [{tab_id,
+        name, lifecycle, status_text, time_text, is_active}]}]}. The
+        sidebar's *last-rendered* agent rows, read from the same
+        per-project cache the sidebar paints from — a missed refresh
+        is observable here rather than invisible. Ungated, read-only
+        (plan 007 §3.8)."""
+        return self.call("app.sidebar_dump", {})
+
     # -- command palette --------------------------------------------------
     # Each op returns the resulting palette state:
     #   {open: bool, frame?: str, query: str, selection: int,

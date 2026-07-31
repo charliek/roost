@@ -535,6 +535,36 @@ Errors: `internal` when there is no window to capture, the window is
 minimized (Mac) or not yet realized (Linux), or PNG encoding fails;
 `invalid-param` for an out-of-range `scale`.
 
+### `app.sidebar_dump`
+
+Read the sidebar's **last-rendered** agent rows, per project, plus the
+`show-sidebar-agents` toggle. Both UIs keep an explicit
+`rendered_agents` cache per project, written in the same refresh pass
+that rebuilds the sidebar widgets; this op reads that cache rather than
+re-deriving the rows from the workspace snapshot, so a refresh a UI
+forgot to run is a wire-visible test failure instead of an invisible
+one.
+
+Request: `{"params": {}}`.
+
+Response:
+```json
+{ "agents_visible": true,
+  "projects": [ { "project_id": "1",
+                  "agents": [ { "tab_id": "7", "name": "slauth-refactor",
+                                "lifecycle": "waiting", "status_text": "Waiting for input",
+                                "time_text": "2m", "is_active": false } ] } ] }
+```
+
+All ids are string-wrapped int64s, matching every other op. `agents_visible`
+reflects the config/feature toggle only — nothing else. **All** projects
+appear, in sidebar order, including projects with zero agents.
+`projects[].agents` stays populated even when the toggle is off or a
+project drag is in progress: hiding the rows and flattening the sidebar
+during a drag are transient UI state, not part of this contract.
+
+Ungated, read-only — always available, matching `app.window_metrics`.
+
 ### Command palette (`palette.*`)
 
 Drive the command-palette overlay — open it, read its rows, filter,

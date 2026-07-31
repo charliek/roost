@@ -37,6 +37,14 @@ protocol UiBridge: AnyObject {
     /// sidebar is collapsed. Drives `app.window_metrics`, used by the
     /// sidebar-holds-width regression suite.
     func sidebarMetrics() -> (width: CGFloat, collapsed: Bool)
+    /// The sidebar's last-rendered agent rows, per project, plus the
+    /// agents-visible toggle. Drives `app.sidebar_dump`: reads the same
+    /// `renderedAgents` cache the sidebar paints from, not a fresh
+    /// derivation, so a missed refresh is observable over IPC rather
+    /// than invisible (plan 007 §3.8).
+    func sidebarDump() -> (
+        agentsVisible: Bool, projects: [(projectID: Int64, agents: [RenderedAgentRow])]
+    )
     /// Read a tab's terminal viewport as text (`tab.dump`); `nil` when
     /// no live tab holds that id.
     func dumpTab(tabID: Int64) -> TerminalView.Dump?

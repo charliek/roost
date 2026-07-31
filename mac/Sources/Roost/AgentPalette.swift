@@ -59,6 +59,15 @@ enum AgentPalette {
         )
     }
 
+    /// The ownership record of a tab that belongs in the palette: live
+    /// ownership from a source that isn't one of Roost's own internal
+    /// (non-agent) claims. `nil` means "no row for this tab". Mirrors
+    /// `agent_palette.rs`'s `agent_owner`.
+    private static func agentOwner(tab: Workspace.Tab) -> Ownership? {
+        guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { return nil }
+        return nonAgentSources.contains(owner.source) ? nil : owner
+    }
+
     /// Rows for every agent-owned tab in the snapshot, in `rank` order.
     /// Empty populations yield the single non-actionable sentinel row.
     ///
@@ -71,8 +80,7 @@ enum AgentPalette {
         let byID = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var rows: [Row] = []
         for tab in tabs {
-            guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { continue }
-            if nonAgentSources.contains(owner.source) { continue }
+            guard let owner = agentOwner(tab: tab) else { continue }
             guard let project = byID[tab.projectId] else { continue }
             rows.append(
                 rowFor(
@@ -114,12 +122,71 @@ enum AgentPalette {
         let byID = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var cwds: [Int64: String] = [:]
         for tab in tabs {
-            guard Agent.isLive(tab.agent), let owner = tab.agent.ownership else { continue }
-            if nonAgentSources.contains(owner.source) { continue }
+            guard agentOwner(tab: tab) != nil else { continue }
             guard byID[tab.projectId] != nil else { continue }
             cwds[tab.id] = tab.cwd
         }
         return cwds
+    }
+
+    /// One row under a project in the sidebar (plan 007 §3.1) — the same
+    /// fields the palette renders, scoped to a single project. There is
+    /// no `project` field: the sidebar nests this row under its project
+    /// visually, so the row never needs to say which one it's in.
+    struct SidebarAgentRow: Equatable {
+        let tabID: Int64
+        let name: String
+        let lifecycle: AgentLifecycle
+        let statusText: String
+        let timeText: String
+    }
+
+    /// A single project's agent rows, in the palette's within-project
+    /// order: rank ↓, `lastEventAt` ↓, tab position, tab id.
+    /// `projectPosition` drops out of the key relative to `agentItems`'s
+    /// — every row here already shares one project.
+    ///
+    /// The Mac workspace is flat (no `Project.tabs`), so `tabs` is the
+    /// full tab list and this filters to `project.id` itself, mirroring
+    /// how `agentItems` looks projects up from a flat tab list rather
+    /// than the other way around.
+    static func sidebarAgents(
+        project: Workspace.Project, tabs: [Workspace.Tab], now: Int64
+    ) -> [SidebarAgentRow] {
+        struct Keyed {
+            let rank: Int
+            let lastEventAt: Int64
+            let tabPosition: Int32
+            let tabID: Int64
+            let row: SidebarAgentRow
+        }
+        var rows: [Keyed] = []
+        for tab in tabs where tab.projectId == project.id {
+            guard let owner = agentOwner(tab: tab) else { continue }
+            let effective = Agent.effectiveLifecycle(tab.agent)
+            rows.append(
+                Keyed(
+                    rank: Agent.rank(effective),
+                    lastEventAt: owner.lastEventAt,
+                    tabPosition: tab.position,
+                    tabID: tab.id,
+                    row: SidebarAgentRow(
+                        tabID: tab.id,
+                        name: rowName(tab: tab, owner: owner),
+                        lifecycle: effective,
+                        statusText: statusText(
+                            effective: effective, raw: tab.agent.lifecycle, detail: owner.detail),
+                        timeText: elapsedText(now: now, lastEventAt: owner.lastEventAt)
+                    )
+                ))
+        }
+        rows.sort { a, b in
+            if a.rank != b.rank { return a.rank > b.rank }
+            if a.lastEventAt != b.lastEventAt { return a.lastEventAt > b.lastEventAt }
+            if a.tabPosition != b.tabPosition { return a.tabPosition < b.tabPosition }
+            return a.tabID < b.tabID
+        }
+        return rows.map(\.row)
     }
 
     /// The tab id an agent row activates, or nil for the empty sentinel
@@ -314,11 +381,35 @@ enum AgentPalette {
     /// The agent's own session name when it published one, else the tab
     /// title, else a stable placeholder.
     private static func rowName(tab: Workspace.Tab, owner: Ownership) -> String {
-        let sessionTitle = normalizeLine(owner.metadata[sessionTitleKey] ?? "")
+        let sessionTitle = stripLeadingMarker(normalizeLine(owner.metadata[sessionTitleKey] ?? ""))
         if !sessionTitle.isEmpty { return sessionTitle }
-        let title = normalizeLine(tab.title)
+        let title = stripLeadingMarker(normalizeLine(tab.title))
         if !title.isEmpty { return title }
         return "Tab \(tab.id)"
+    }
+
+    /// Drop a leading marker glyph from an agent's title — Claude Code
+    /// prefixes its window title with `✳ ` (U+2733), so a renamed
+    /// session arrives as `✳ my-session` and the row would render the
+    /// glyph twice over: once as our own lifecycle dot, once as the
+    /// agent's.
+    ///
+    /// Symbols are recognised structurally (non-ASCII and
+    /// non-alphanumeric) rather than by listing known markers, so a
+    /// second adapter's glyph is stripped without a code change. ASCII
+    /// stays untouched, so a title that is a path (`/tmp`, `~/src`) or
+    /// bracketed (`[wip] name`) is unharmed, and non-Latin scripts are
+    /// alphanumeric so they survive.
+    ///
+    /// Mirrors `agent_palette.rs::strip_leading_marker`.
+    static func stripLeadingMarker(_ text: String) -> String {
+        let stripped = text.drop { ch in
+            ch.isWhitespace
+                || (!ch.unicodeScalars.allSatisfy { $0.isASCII } && !(ch.isLetter || ch.isNumber))
+        }
+        // An all-glyph title would strip to nothing; keep it rather than
+        // falling through to `Tab <id>`.
+        return stripped.isEmpty ? text : String(stripped)
     }
 
     /// Non-nil for a working agent reporting `background_tasks:N` with

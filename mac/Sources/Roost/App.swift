@@ -169,6 +169,31 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// purged on `.projectDeleted`.
     private var projectRowCellViews: [Int64: ProjectRowCellView] = [:]
 
+    /// Outline items per project id. Cached — not rebuilt per
+    /// `child(ofItem:)` call — because NSOutlineView keys
+    /// expansion state and `row(forItem:)` on pointer identity. Each
+    /// instance is *refreshed* by `refreshSidebarAgentModel()` on every
+    /// rebuild; see `ProjectRowItem` for why that is mandatory.
+    /// Purged on `.projectDeleted` alongside `projectRowCellViews`.
+    private var projectRowItems: [Int64: ProjectRowItem] = [:]
+
+    /// Agent outline items keyed by tab id, same identity requirement.
+    /// Rebuilt wholesale by `refreshSidebarAgentModel()`, which is also
+    /// what prunes it: a tab that closed or an agent that went non-live
+    /// simply isn't in the new map.
+    private var agentRowItems: [Int64: AgentRowItem] = [:]
+
+    /// Agent cell views keyed by tab id. Same lifetime + pruning rule
+    /// as `agentRowItems`.
+    private var agentRowCellViews: [Int64: AgentRowCellView] = [:]
+
+    /// What the sidebar's agent rows currently show, per project id.
+    /// Written by the same refresh that updates the views, so a dropped
+    /// refresh is observable over IPC rather than invisible. Stays
+    /// populated when the toggle is off; sidebar order comes from
+    /// `projects`, which owns it.
+    private var renderedAgents: [Int64: [RenderedAgentRow]] = [:]
+
     /// Round-3 R5: cached tab pill views keyed by daemon tab id, so
     /// the pill survives `rebuildTabBar` while the user is mid-inline-
     /// rename. Mirrors the sidebar `projectRowCellViews` pattern.
@@ -182,6 +207,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// projects.count. Cleared on `acceptDrop` and on session-end
     /// callbacks.
     private var dropIndicatorIndex: Int?
+
+    /// Plan 007 §3.6: true for the duration of a sidebar project drag.
+    /// While set the outline reports no children, so `validateDrop` /
+    /// `acceptDrop` see one row per project — the geometry they were
+    /// written against, before agent rows made project rows expandable.
+    fileprivate var isDraggingProjects = false
 
     private var socketPath: String = ""
 
@@ -231,6 +262,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// palette and to express revert-by-name. Not persisted — relaunch
     /// re-reads `config.conf`.
     private var activeThemeName: String = "roost-dark"
+
+    /// Live `show-sidebar-agents` setting (plan 007 §3.7). Seeded
+    /// from `config` at launch; `toggleSidebarAgents` flips it and
+    /// writes back through `RoostConfig.setKey`. Read by
+    /// `refreshSidebarAgentModel` (whether agent items are handed to the
+    /// outline at all) and by `sidebarDump` (the `agents_visible` field).
+    private var showSidebarAgents: Bool = true
 
     /// Command palette (Cmd+Shift+P). Nil when closed. `paletteOpen`
     /// gates app shortcuts (defense-in-depth in `validateMenuItem`) and
@@ -367,6 +405,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // `.monospacedSystemFont(ofSize: 14)` unless the user
         // overrides `font-family` / `font-size`.
         self.config = RoostConfig.load()
+        self.showSidebarAgents = config.showSidebarAgents
         self.activeThemeName = config.themeName ?? "roost-dark"
         self.activeTheme = Theme.loadBundled(name: activeThemeName)
         self.activeFontFamily = config.fontFamily
@@ -601,7 +640,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         pane.addSubview(header)
 
         // ---- Outline view --------------------------------------------------
-        let outline = NSOutlineView()
+        let outline = SidebarOutlineView()
         outline.headerView = nil
         outline.style = .sourceList
         outline.rowSizeStyle = .default
@@ -1981,6 +2020,30 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         RoostConfig.setKey("font-size", value: formatFontSize(size))
     }
 
+    /// Persist `show-sidebar-agents = true|false` to config. Same
+    /// error-return contract as `writeBackTheme` — the caller logs
+    /// once at the toggle boundary; a failed write leaves the live
+    /// `showSidebarAgents` value changed for the rest of the session.
+    @MainActor
+    @discardableResult
+    private func writeBackShowSidebarAgents(_ value: Bool) -> Error? {
+        RoostConfig.setKey("show-sidebar-agents", value: value ? "true" : "false")
+    }
+
+    /// `toggle_sidebar_agents` action handler (plan 007 §3.7).
+    ///
+    /// Refreshes the rows directly, as GTK's handler does: flipping the
+    /// setting emits no workspace event, so the blanket post-event
+    /// refresh never runs for it.
+    @objc @MainActor
+    private func toggleSidebarAgents(_ sender: Any?) {
+        showSidebarAgents.toggle()
+        refreshSidebarAgentRows()
+        if let err = writeBackShowSidebarAgents(showSidebarAgents) {
+            NSLog("roost-mac: failed to persist show-sidebar-agents to config.conf: %@", "\(err)")
+        }
+    }
+
     /// Format a font size for the config file. Whole numbers render
     /// as integers; non-whole values keep up to two decimals (trailing
     /// zeros trimmed) so a `font-size = 14.5` round-trips cleanly.
@@ -2024,6 +2087,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         case KeybindAction.renameProject: renameActiveProject(nil)
         case KeybindAction.closeProject:  closeActiveProject(nil)
         case KeybindAction.toggleSidebar: toggleSidebar(nil)
+        case KeybindAction.toggleSidebarAgents: toggleSidebarAgents(nil)
         case KeybindAction.jumpToUnread:  jumpToUnread(nil)
         case KeybindAction.fontIncrease:  fontIncrease(nil)
         case KeybindAction.fontDecrease:  fontDecrease(nil)
@@ -2251,6 +2315,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // unbounded. If the row was being edited at the moment of
         // delete the entry just vanishes — no orphan edit state.
         projectRowCellViews.removeValue(forKey: id)
+        projectRowItems.removeValue(forKey: id)
     }
 
     /// Append `snap` to `projects` and rebuild the sidebar unless a row
@@ -2504,6 +2569,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             {
                 focusTab(tabID: e.tabID, activate: false)
             }
+            // Outside the guard on purpose: when the tab is already
+            // shown locally the branch above is a no-op, but the agent
+            // row that should wear the active highlight may still have
+            // changed (plan 007 §3.3).
+            refreshAgentRowActiveStates()
         case .tabTitle(let e):
             // Phase 6a P6: OSC 0/1/2 changed a tab's title. Mirror
             // into the matching TabSession so rebuildTabBar uses
@@ -2630,14 +2700,20 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // open palette shows stale rows. Cheap by construction: a no-op
         // unless the agents frame is actually on the palette stack.
         refreshAgentPalette()
+        // Same argument, same place, for the sidebar's agent rows (plan
+        // 007 §3.5) — including the active-tab highlight, which moves on
+        // `.active`. Per-arm wiring had already missed `.tabDeleted`
+        // (closed agent's row left rendered) and `.tabTitle` (stale name).
+        refreshSidebarAgentRows()
     }
 
     // MARK: - Project management
 
     @MainActor
     private func rebuildSidebar() {
-        guard let outline = projectsOutlineView else { return }
-        outline.reloadData()
+        guard projectsOutlineView != nil else { return }
+        refreshSidebarAgentModel()
+        reloadSidebarOutline()
         applySidebarSelection()
         updateWindowTitle()
         // Window menu's Project section is driven off `projects`; keep
@@ -2645,20 +2721,131 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         rebuildWindowMenu()
     }
 
+    /// `reloadData()` has exactly one call site (here), so this is the
+    /// one place expansion has to be re-asserted; there is no
+    /// per-project collapse this pass.
+    @MainActor
+    private func reloadSidebarOutline() {
+        guard let outline = projectsOutlineView else { return }
+        outline.reloadData()
+        guard !isDraggingProjects else { return }
+        for item in projectRowItems.values where !item.agents.isEmpty {
+            outline.expandItem(item)
+        }
+    }
+
+    /// Blanket post-event refresh of the sidebar's agent rows, mirroring
+    /// GTK's `refresh_agent_rows`. The model is recomputed every time —
+    /// it is what IPC reports — but the outline is only reloaded when the
+    /// rendered rows actually moved: a shell prompt alone fires a title
+    /// change several times a second, and reloading would tear down every
+    /// cell view for output that is usually identical.
+    @MainActor
+    private func refreshSidebarAgentRows() {
+        guard refreshSidebarAgentModel() else { return }
+        reloadSidebarOutline()
+        applySidebarSelection()
+    }
+
+    /// The snapshot is deliberately *not* applied here —
+    /// `refreshSidebarAgentModel()` owns that, so there is exactly one
+    /// place where staleness can creep in.
+    @MainActor
+    fileprivate func cachedProjectRowItem(_ project: ProjectSnapshot) -> ProjectRowItem {
+        if let existing = projectRowItems[project.id] { return existing }
+        let item = ProjectRowItem(project)
+        projectRowItems[project.id] = item
+        return item
+    }
+
+    /// Agent *items* are dropped when the toggle is off — that is what
+    /// hides the rows — but `renderedAgents` stays populated: the IPC
+    /// contract reports what the model holds, not what is on screen.
+    ///
+    /// Returns whether the rows the outline would draw changed, so a
+    /// caller can skip `reloadData()`. An unchanged row set has the same
+    /// tab ids, so the item count only moves when the toggle flipped.
+    @MainActor
+    @discardableResult
+    private func refreshSidebarAgentModel() -> Bool {
+        let snapshot = workspaceSnapshot()
+        let byID = Dictionary(
+            snapshot.projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let rowsByProject = Dictionary(
+            renderedSidebarAgents(
+                projects: projects.compactMap { byID[$0.id] },
+                tabs: snapshot.tabs,
+                activeTabID: activeSidebarTabID(),
+                now: AgentPalette.nowUnix()
+            ).map { ($0.projectID, $0.agents) },
+            uniquingKeysWith: { a, _ in a })
+
+        var rendered: [Int64: [RenderedAgentRow]] = [:]
+        var items: [Int64: AgentRowItem] = [:]
+        for snap in projects {
+            let rows = rowsByProject[snap.id] ?? []
+            rendered[snap.id] = rows
+            let agentItems: [AgentRowItem] = showSidebarAgents
+                ? rows.map { entry in
+                    let item = agentRowItems[entry.row.tabID]
+                        ?? AgentRowItem(tabID: entry.row.tabID, projectID: snap.id)
+                    items[entry.row.tabID] = item
+                    return item
+                }
+                : []
+            cachedProjectRowItem(snap).update(project: snap, agents: agentItems)
+        }
+
+        let changed = rendered != renderedAgents || items.count != agentRowItems.count
+        renderedAgents = rendered
+        agentRowItems = items
+        agentRowCellViews = agentRowCellViews.filter { items[$0.key] != nil }
+        return changed
+    }
+
+    @MainActor
+    private func activeSidebarTabID() -> Int64? {
+        guard let activeProjectID else { return nil }
+        return activeSessionByProject[activeProjectID]?.id
+    }
+
+    /// Repaint the old and new active agent rows without a full sidebar
+    /// rebuild.
+    ///
+    /// The highlight is derived from "is this row's tab the active tab",
+    /// not from selection — and neither path that changes the active tab
+    /// touches the sidebar on its own: the `.active` event handler
+    /// short-circuits when the tab is already shown locally, and
+    /// `selectTab` rebuilds only the tab bar. Without this, a
+    /// UI-originated switch would leave the highlight on the old row.
+    @MainActor
+    private func refreshAgentRowActiveStates() {
+        let active = activeSidebarTabID()
+        for (projectID, rows) in renderedAgents {
+            for (index, row) in rows.enumerated()
+            where (row.row.tabID == active) != row.isActive {
+                let isActive = !row.isActive
+                renderedAgents[projectID]?[index] = RenderedAgentRow(
+                    row: row.row, isActive: isActive)
+                agentRowCellViews[row.row.tabID]?.setActive(isActive)
+            }
+        }
+    }
+
     /// Match the outline view's selected row to `activeProjectID`.
     /// Wrapped in `isSyncingSidebarSelection` so the corresponding
     /// `outlineViewSelectionDidChange` callback doesn't bounce the
     /// selection back through `selectProject(id:)`.
+    ///
+    /// Resolved through `row(forItem:)`, not the project's array index:
+    /// expanded projects put agent rows between them, so outline row
+    /// index and project index diverge.
     @MainActor
     private func applySidebarSelection() {
         guard let outline = projectsOutlineView else { return }
-        let row: Int
-        if let activeProjectID,
-           let idx = projects.firstIndex(where: { $0.id == activeProjectID })
-        {
-            row = idx
-        } else {
-            row = -1
+        var row = -1
+        if let activeProjectID, let item = projectRowItems[activeProjectID] {
+            row = outline.row(forItem: item)
         }
         isSyncingSidebarSelection = true
         if row >= 0 {
@@ -2751,13 +2938,14 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// AppKit sets `NSOutlineView.clickedRow` to the row under the
     /// cursor at the moment the menu popped — which is what we want
     /// even if the row isn't the selected one. Returns `nil` if the
-    /// click landed in empty space below the rows.
+    /// click landed in empty space below the rows — or on an agent row,
+    /// which has no project-level context menu.
     @MainActor
     private func projectForClickedSidebarRow() -> ProjectSnapshot? {
         guard let outline = projectsOutlineView else { return nil }
         let row = outline.clickedRow
-        guard row >= 0, row < projects.count else { return nil }
-        return projects[row]
+        guard row >= 0, let item = outline.item(atRow: row) as? ProjectRowItem else { return nil }
+        return item.project
     }
 
     @objc @MainActor
@@ -2776,16 +2964,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     @MainActor
     private func beginRenameProject(id: Int64) {
         guard let outline = projectsOutlineView,
-              let idx = projects.firstIndex(where: { $0.id == id })
+              let idx = projects.firstIndex(where: { $0.id == id }),
+              let item = projectRowItems[id]
         else { return }
         ensureSidebarVisible()
         // Trigger a viewFor:item: call for this row so the cached
         // cell view is in the hierarchy. `makeIfNecessary: true`
         // is what asks AppKit to materialize a row that may be
         // offscreen / not realized yet.
-        guard let cell = outline.view(
+        let row = outline.row(forItem: item)
+        guard row >= 0, let cell = outline.view(
             atColumn: 0,
-            row: idx,
+            row: row,
             makeIfNecessary: true
         ) as? ProjectRowCellView else { return }
 
@@ -3235,6 +3425,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // other call site that triggers updateWindowTitle) only fires
         // when projects mutate, not tab focus.
         updateWindowTitle()
+        // Same reason: this is the local half of the tab switch and it
+        // doesn't touch the sidebar, so the agent highlight has to be
+        // moved explicitly.
+        refreshAgentRowActiveStates()
     }
 
     /// Pure helper extracted so unit tests can hit the pill-index math
@@ -3865,6 +4059,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         toggleSidebarItem.target = self
         bind(toggleSidebarItem, to: KeybindAction.toggleSidebar)
         viewMenu.addItem(toggleSidebarItem)
+        // Plan 007 §3.7: show/hide the sidebar's per-agent rows.
+        let toggleSidebarAgentsItem = NSMenuItem(
+            title: "Toggle Sidebar Agents",
+            action: #selector(toggleSidebarAgents(_:)),
+            keyEquivalent: ""
+        )
+        toggleSidebarAgentsItem.target = self
+        bind(toggleSidebarAgentsItem, to: KeybindAction.toggleSidebarAgents)
+        viewMenu.addItem(toggleSidebarAgentsItem)
         viewMenu.addItem(.separator())
         // Phase 6a P7: jump-to-unread shortcut.
         let jumpItem = NSMenuItem(
@@ -5384,6 +5587,24 @@ extension RoostApp: UiBridge {
         return (width: w, collapsed: w < 1)
     }
 
+    /// `app.sidebar_dump`: every project's last-rendered agent rows, in
+    /// sidebar order, plus the agents-visible toggle. Order and
+    /// membership come from the **workspace** snapshot, not the UI's
+    /// `projects` array: a project created through IPC lands in the
+    /// workspace immediately but only reaches `projects` once
+    /// `.projectCreated` drains, and plan 007 §3.8 requires *all*
+    /// projects to appear. Row content still comes only from the
+    /// `renderedAgents` cache — a project with no entry yet reports an
+    /// empty list rather than being dropped.
+    func sidebarDump() -> (
+        agentsVisible: Bool, projects: [(projectID: Int64, agents: [RenderedAgentRow])]
+    ) {
+        (
+            agentsVisible: showSidebarAgents,
+            projects: workspaceSnapshot().projects.map { ($0.id, renderedAgents[$0.id] ?? []) }
+        )
+    }
+
     // MARK: command palette — IPC drive surface (palette.* ops)
     //
     // The IPC handler reaches the live `PalettePanel` through these (same
@@ -5641,18 +5862,21 @@ extension RoostApp: UiBridge {
 
 extension RoostApp: NSOutlineViewDataSource {
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-        item == nil ? projectCountForSidebar() : 0
+        if item == nil { return projectCountForSidebar() }
+        guard let project = item as? ProjectRowItem else { return 0 }
+        return sidebarChildCount(
+            agentCount: project.agents.count, isDraggingProjects: isDraggingProjects)
     }
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-        // The model is flat — there's never a non-nil parent. Return
-        // the project at `index` boxed in a tiny reference type so
-        // NSOutlineView's identity-based caching stays consistent.
-        projectRowItem(at: index)
+        if let project = item as? ProjectRowItem { return project.agents[index] }
+        return projectRowItem(at: index)
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        false
+        guard let project = item as? ProjectRowItem else { return false }
+        return sidebarChildCount(
+            agentCount: project.agents.count, isDraggingProjects: isDraggingProjects) > 0
     }
 
     // MARK: - M3 drag-and-drop
@@ -5670,6 +5894,30 @@ extension RoostApp: NSOutlineViewDataSource {
         let writer = NSPasteboardItem()
         writer.setString(String(row.project.id), forType: .roostProjectID)
         return writer
+    }
+
+    /// Plan 007 §3.6: flatten the sidebar to one row per project for the
+    /// duration of the drag.
+    ///
+    /// This is the flag's set site rather than
+    /// `pasteboardWriterForItem` because only `willBeginAt` is
+    /// guaranteed to pair with `draggingSession(_:endedAt:operation:)`:
+    /// returning a non-nil writer does not guarantee a session starts,
+    /// and a session that never starts would strand `isDraggingProjects`
+    /// at `true`, leaving the sidebar permanently flattened.
+    ///
+    /// Reloading from here is safe: `sidebarChildCount` only drops the
+    /// *child* agent rows — every top-level project row, including the
+    /// dragged one, survives the reload, so the session's dragged item
+    /// is never invalidated.
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        draggingSession session: NSDraggingSession,
+        willBeginAt screenPoint: NSPoint,
+        forItems draggedItems: [Any]
+    ) {
+        isDraggingProjects = true
+        reloadSidebarOutline()
     }
 
     /// Accept drops between top-level rows only. NSOutlineView
@@ -5770,6 +6018,12 @@ extension RoostApp: NSOutlineViewDataSource {
     /// even when the user releases outside the outline view (cancelled
     /// drag). Without this, a cancelled drag would leave a stray
     /// indicator band visible until the next drag.
+    ///
+    /// Plan 007 §3.6 also restores the agent rows here, and this is the
+    /// right place: AppKit runs `acceptDrop` first, so the drop is
+    /// resolved against the same flattened geometry the whole drag was
+    /// hit-tested against. Un-flattening any earlier would resolve the
+    /// drop against taller, restored rows.
     func outlineView(
         _ outlineView: NSOutlineView,
         draggingSession session: NSDraggingSession,
@@ -5777,6 +6031,9 @@ extension RoostApp: NSOutlineViewDataSource {
         operation: NSDragOperation
     ) {
         updateDropIndicator(to: nil)
+        isDraggingProjects = false
+        reloadSidebarOutline()
+        applySidebarSelection()
     }
 }
 
@@ -5786,6 +6043,7 @@ extension RoostApp: NSOutlineViewDelegate {
         viewFor tableColumn: NSTableColumn?,
         item: Any
     ) -> NSView? {
+        if let agent = item as? AgentRowItem { return agentCellView(for: agent) }
         guard let row = item as? ProjectRowItem else { return nil }
         // M5 of `goal-mac-parity-2026-05-18.md`: reuse cell views per
         // project so inline rename's typing buffer survives reload.
@@ -5805,15 +6063,64 @@ extension RoostApp: NSOutlineViewDelegate {
         return cell
     }
 
+    /// The agent cell for `item`, cached by tab id so the row survives
+    /// `reloadData`. Pruned in `refreshSidebarAgentModel()`.
+    @MainActor
+    private func agentCellView(for item: AgentRowItem) -> NSView? {
+        guard let rendered = renderedAgents[item.projectID]?
+            .first(where: { $0.row.tabID == item.tabID })
+        else { return nil }
+        let cell = agentRowCellViews[item.tabID] ?? AgentRowCellView()
+        agentRowCellViews[item.tabID] = cell
+        let tabID = item.tabID
+        cell.configure(with: rendered.row, isActive: rendered.isActive) { [weak self] in
+            self?.focusAgentRowTab(tabID)
+        }
+        return cell
+    }
+
+    /// Agent-row click: update the *core* active tab and let the
+    /// resulting `.active` event drive the project switch + tab select,
+    /// exactly like the agent palette's jump. Never the local
+    /// `focusTab` — that would make the UI its own source of truth.
+    @MainActor
+    private func focusAgentRowTab(_ tabID: Int64) {
+        guard let client = RoostBackend.shared.localClient,
+              (try? client.focusTab(tabID)) != nil
+        else { return }
+        ensureSidebarVisible()
+    }
+
     func outlineView(
         _ outlineView: NSOutlineView,
         rowViewForItem item: Any
     ) -> NSTableRowView? {
+        // Agent rows get a plain row view: the rollup rail and the
+        // accent selection pill are project-row semantics.
+        guard let row = item as? ProjectRowItem else { return NSTableRowView() }
         let rowView = SidebarRowView()
-        if let row = item as? ProjectRowItem {
-            rowView.rollupColor = rollupColor(for: rollupLifecycle(forProjectID: row.project.id))
-        }
+        rowView.rollupColor = rollupColor(for: rollupLifecycle(forProjectID: row.project.id))
         return rowView
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
+        item is AgentRowItem ? AgentRowCellView.rowHeight : outlineView.rowHeight
+    }
+
+    /// Sidebar selection stays project-only (plan 007 §3.3) — the agent
+    /// row's own highlight is derived from the active tab instead, so
+    /// both can be visible at once.
+    func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+        !(item is AgentRowItem)
+    }
+
+    /// There is no per-project collapse this pass. Suppressing the
+    /// disclosure triangle only hides the control; Left-arrow on a
+    /// selected project row still collapses it, and the rows would stay
+    /// hidden until the next full rebuild. Expansion needs no mirror —
+    /// allowing it is already the default, and it is what we want.
+    func outlineView(_ outlineView: NSOutlineView, shouldCollapseItem item: Any) -> Bool {
+        false
     }
 
     /// Per-project agent-state rollup for `projectID`: the highest-ranked
@@ -5832,8 +6139,8 @@ extension RoostApp: NSOutlineViewDelegate {
         guard !isSyncingSidebarSelection else { return }
         guard let outline = projectsOutlineView else { return }
         let row = outline.selectedRow
-        guard row >= 0, row < projects.count else { return }
-        let projectID = projects[row].id
+        guard row >= 0, let item = outline.item(atRow: row) as? ProjectRowItem else { return }
+        let projectID = item.project.id
         guard projectID != activeProjectID else { return }
         selectProject(id: projectID)
     }
@@ -6022,22 +6329,45 @@ extension RoostApp: NSMenuDelegate {
     }
 }
 
-// Reference-typed row item — NSOutlineView caches items by identity,
-// so passing a value type through `child(ofItem:)` would defeat the
-// outline view's row-recycling. Wrapping `ProjectSnapshot` in a class
-// gives the outline view a stable reference per project for the
-// duration of a single `reloadData` cycle.
+// Reference-typed row items — NSOutlineView tracks expansion state and
+// `row(forItem:)` by pointer identity, so both types are cached per id
+// on `RoostApp` (`projectRowItems` / `agentRowItems`) and live across
+// `reloadData()` cycles rather than being reallocated per call.
+//
+// That is exactly why `project` and `agents` are `var`: a cached item
+// holding a `let` snapshot would freeze at the values it was created
+// with, and renames, cwd changes and reorders would stop reaching the
+// sidebar. Every rebuild must call `update(project:agents:)`.
 @MainActor
 final class ProjectRowItem {
-    let project: ProjectSnapshot
-    init(_ project: ProjectSnapshot) { self.project = project }
+    var project: ProjectSnapshot
+    var agents: [AgentRowItem]
+
+    init(_ project: ProjectSnapshot) {
+        self.project = project
+        self.agents = []
+    }
+
+    func update(project: ProjectSnapshot, agents: [AgentRowItem]) {
+        self.project = project
+        self.agents = agents
+    }
+}
+
+/// A single agent row under its project. Holds ids only — the rendered
+/// content is looked up from `renderedAgents` at `viewFor:item:` time,
+/// so an item can never carry a stale name or elapsed time.
+@MainActor
+final class AgentRowItem {
+    let tabID: Int64
+    let projectID: Int64
+    init(tabID: Int64, projectID: Int64) {
+        self.tabID = tabID
+        self.projectID = projectID
+    }
 }
 
 extension RoostApp {
-    /// Bridge between the outline view's flat data-source API and
-    /// our `projects` array. Returns one `ProjectRowItem` per project,
-    /// rebuilt fresh on every `reloadData()` cycle (cheap — bounded
-    /// by the number of projects the user has).
     @MainActor
     fileprivate func projectCountForSidebar() -> Int {
         projects.count
@@ -6045,6 +6375,6 @@ extension RoostApp {
 
     @MainActor
     fileprivate func projectRowItem(at index: Int) -> ProjectRowItem {
-        ProjectRowItem(projects[index])
+        cachedProjectRowItem(projects[index])
     }
 }

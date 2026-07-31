@@ -450,77 +450,120 @@ func agentSameSecondTiesBreakByProjectThenTabPositionThenID() {
     #expect(items(projects, tabs).map(\.id) == ["agent:3", "agent:30", "agent:20", "agent:10"])
 }
 
-// MARK: - Row payload + frame
+// MARK: - sidebarAgents
+
+private func sidebarRows(
+    _ project: Workspace.Project, _ tabs: [Workspace.Tab], now: Int64 = NOW
+) -> [AgentPalette.SidebarAgentRow] {
+    AgentPalette.sidebarAgents(project: project, tabs: tabs, now: now)
+}
 
 @Test
-func agentRowPayloadCarriesTheEffectiveLifecycleAndPendingMetrics() {
-    let t = withOwner(owned(tab(7, "zsh"), "claude", .waiting, NOW - 120)) {
-        $0.detail = "permission_prompt"
+func sidebarAgentsExcludesManualLegacyAndDeadTabs() {
+    let tabs = [
+        tab(1, "plain shell"),
+        owned(tab(2, "claude"), "claude", .working, NOW),
+        owned(tab(3, "manual"), Workspace.manualSource, .working, NOW),
+        owned(tab(4, "legacy"), Workspace.legacySource, .working, NOW),
+        owned(tab(5, "codex"), "codex", .waiting, NOW),
+    ]
+    #expect(sidebarRows(project(1, "roost"), tabs).map(\.tabID) == [5, 2])
+}
+
+@Test
+func sidebarAgentsOnlyIncludesItsOwnProjectsTabs() {
+    let tabs = [
+        owned(tab(1, "claude", projectID: 1), "claude", .working, NOW),
+        owned(tab(2, "claude", projectID: 2), "claude", .working, NOW),
+    ]
+    #expect(sidebarRows(project(1, "roost"), tabs).map(\.tabID) == [1])
+}
+
+// The older row is given the lower position AND the lower id, so the
+// assertion fails if recency is dropped from the comparator and a later
+// key decides instead.
+@Test
+func sidebarAgentsOrdersSameLifecycleByRecencyFirst() {
+    var newer = owned(tab(9, "newer"), "claude", .waiting, NOW)
+    newer.position = 7
+    var older = owned(tab(2, "older"), "claude", .waiting, NOW - 500)
+    older.position = 0
+
+    #expect(sidebarRows(project(1, "roost"), [older, newer]).map(\.tabID) == [9, 2])
+}
+
+@Test
+func sidebarAgentsOrdersByRankThenRecencyThenTabPositionThenID() {
+    var laterTab = owned(tab(20, "b"), "claude", .working, NOW)
+    laterTab.position = 5
+    var samePositionHighID = owned(tab(30, "c"), "claude", .working, NOW)
+    samePositionHighID.position = 0
+    var samePositionLowID = owned(tab(3, "d"), "claude", .working, NOW)
+    samePositionLowID.position = 0
+    let failed = owned(tab(1, "failed"), "claude", .failed, NOW)
+    let waitingOld = owned(tab(4, "waiting-old"), "claude", .waiting, NOW - 500)
+
+    let tabs = [laterTab, samePositionHighID, samePositionLowID, failed, waitingOld]
+    // rank: failed > waiting > working; then within working, position 0
+    // before position 5, then id 3 before id 30.
+    #expect(sidebarRows(project(1, "roost"), tabs).map(\.tabID) == [1, 4, 3, 30, 20])
+}
+
+@Test
+func aLeadingAgentMarkerIsStrippedFromTheName() {
+    // Claude Code's own window-title prefix, U+2733 + space.
+    #expect(AgentPalette.stripLeadingMarker("\u{2733} slaudio-refactor") == "slaudio-refactor")
+    #expect(AgentPalette.stripLeadingMarker("\u{2733}\u{FE0F} Claude Code") == "Claude Code")
+    #expect(AgentPalette.stripLeadingMarker("\u{1F7E2} \u{1F47B} two") == "two")
+}
+
+@Test
+func strippingLeavesASCIIAndNonLatinTitlesAlone() {
+    for keep in ["/tmp", "~/src/roost", "[wip] refactor", "-n", "café", "日本語", "1password"] {
+        #expect(AgentPalette.stripLeadingMarker(keep) == keep, "must not strip \(keep)")
     }
-    let row = agentOf(items([project(1, "roost")], [t])[0])
-    #expect(row.effectiveLifecycle == .waiting)
-    #expect(row.project == "roost")
-    #expect(row.name == "zsh")
-    #expect(row.statusText == "Waiting for input")
-    #expect(row.timeText == "2m")
-    #expect(row.metricsText == nil, "metrics are pending until probed")
 }
 
 @Test
-func agentFrameCarriesThePlaceholder() {
-    let frame = AgentPalette.agentFrame(projects: [], tabs: [], now: NOW)
-    #expect(frame.id == AgentPalette.frameID)
-    #expect(frame.placeholder == AgentPalette.placeholder)
-    #expect(frame.items.count == 1)
-    #expect(frame.items[0].id == AgentPalette.emptyRowID)
+func anAllMarkerTitleSurvivesRatherThanEmptying() {
+    #expect(AgentPalette.stripLeadingMarker("\u{2733}") == "\u{2733}")
 }
 
 @Test
-func agentLifecycleColorsAreDistinctAndInactiveIsHalfAlpha() {
-    let colors: [AgentLifecycle] = [.working, .waiting, .finished, .failed, .inactive]
-    let described = Set(colors.map { AgentPalette.statusColor(for: $0).description })
-    #expect(described.count == colors.count)
-    // The four live colours are the shipped rollup hexes verbatim.
-    for lifecycle: AgentLifecycle in [.working, .waiting, .finished, .failed] {
-        #expect(AgentPalette.statusColor(for: lifecycle) == rollupColor(for: lifecycle))
+func sidebarAgentsNameFallbackChain() {
+    let withMeta = withOwner(owned(tab(1, "zsh"), "claude", .working, NOW)) {
+        $0.metadata[AgentPalette.sessionTitleKey] = "slauth-refactor"
     }
-    // `inactive` has no stripe colour; the palette renders `finished`'s
-    // gray at 50% alpha so the two read differently.
-    let inactive = AgentPalette.statusColor(for: .inactive)
-    #expect(inactive.alphaComponent == 0.5)
-    let finished = AgentPalette.statusColor(for: .finished)
-    #expect(inactive.redComponent == finished.redComponent)
-    #expect(inactive.greenComponent == finished.greenComponent)
-    #expect(inactive.blueComponent == finished.blueComponent)
-}
+    let withTitle = owned(tab(2, "zsh"), "claude", .working, NOW)
+    let untitled = owned(tab(3, ""), "claude", .working, NOW)
 
-// MARK: - Normalization helpers
-
-@Test
-func agentNormalizeLineStripsControlsAndTrims() {
-    #expect(AgentPalette.normalizeLine("  hi\tthere\n ") == "hithere")
-    #expect(AgentPalette.normalizeLine("\u{1b}[31mred\u{7}") == "[31mred")
-    #expect(AgentPalette.normalizeLine("") == "")
+    let rows = sidebarRows(project(1, "roost"), [withMeta, withTitle, untitled])
+    func byID(_ id: Int64) -> AgentPalette.SidebarAgentRow {
+        guard let row = rows.first(where: { $0.tabID == id }) else {
+            Issue.record("row \(id) missing")
+            return AgentPalette.SidebarAgentRow(
+                tabID: id, name: "", lifecycle: .inactive, statusText: "", timeText: "")
+        }
+        return row
+    }
+    #expect(byID(1).name == "slauth-refactor")
+    #expect(byID(2).name == "zsh")
+    #expect(byID(3).name == "Tab 3")
 }
 
 @Test
-func agentTruncateCountsTheEllipsis() {
-    #expect(AgentPalette.truncate("abcdef", max: 6) == "abcdef")
-    #expect(AgentPalette.truncate("abcdef", max: 5) == "abcd…")
-    #expect(AgentPalette.truncate("abcdef", max: 1) == "…")
+func sidebarAgentsNormalizesAndTruncatesLikeThePalette() {
+    let long = String(repeating: "x", count: 60)
+    let t = withOwner(owned(tab(1, "zsh\nx"), "claude", .failed, NOW)) { $0.detail = long }
+    let rows = sidebarRows(project(1, "roost"), [t])
+    #expect(rows[0].name == "zshx")
+    let detail = String(rows[0].statusText.dropFirst("Failed · ".count))
+    #expect(detail.count == 40)
+    #expect(detail.hasSuffix("…"))
 }
 
-// MARK: - Relative-time reuse
-
 @Test
-func relativeTimeLabelSecondsMatchesTheDateOverload() {
-    #expect(relativeTimeLabel(seconds: 0) == "just now")
-    #expect(relativeTimeLabel(seconds: -10) == "just now")
-    #expect(relativeTimeLabel(seconds: 120) == "2m")
-    #expect(relativeTimeLabel(seconds: 3600) == "1h")
-    #expect(relativeTimeLabel(seconds: 172_800) == "2d")
-    let now = Date()
-    #expect(
-        relativeTimeLabel(from: now.addingTimeInterval(-7200), now: now)
-            == relativeTimeLabel(seconds: 7200))
+func sidebarAgentsOnAnEmptyProjectIsEmpty() {
+    #expect(sidebarRows(project(1, "roost"), []).isEmpty)
+    #expect(sidebarRows(project(1, "roost"), [tab(1, "shell")]).isEmpty)
 }

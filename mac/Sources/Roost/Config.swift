@@ -75,6 +75,25 @@ enum ClipboardWrite: Sendable {
     }
 }
 
+/// Parse a plain boolean config value (`true | yes` / `false | no`).
+/// Mirrors `ClipboardWrite.parse` / `CopyOnSelect.parse`'s
+/// optional-returning shape so every boolean key in `parse(_:)` below
+/// shares one pattern.
+/// `\r` and quotes are stripped here rather than relying on `parse(_:)`:
+/// its line trim uses `.whitespaces`, which excludes `\r`, and the Rust
+/// mirror's loop strips quotes only for `font-family`. Doing it locally
+/// keeps at least this key identical across the pair.
+func parseBoolLike(_ s: String) -> Bool? {
+    switch s
+        .trimmingCharacters(in: CharacterSet(charactersIn: "\"' \t\r\n"))
+        .lowercased()
+    {
+    case "true", "yes": return true
+    case "false", "no": return false
+    default: return nil
+    }
+}
+
 struct RoostConfig: Sendable {
     var themeName: String?
     var fontFamily: String?
@@ -111,6 +130,11 @@ struct RoostConfig: Sendable {
     /// `-break-` name (kept for Ghostty compatibility) the value is
     /// the EXTRA word-char set, not the break-char set.
     var wordBreakChars: String = WordSelection.defaultWordChars
+    /// `show-sidebar-agents` — whether the sidebar renders one row
+    /// per agent-owned tab under its project (plan 007). Defaults to
+    /// `true`. Mirrors
+    /// `crates/roost-linux/src/config.rs::RoostConfig::show_sidebar_agents`.
+    var showSidebarAgents: Bool = true
 
     static let empty = RoostConfig(
         themeName: nil,
@@ -123,7 +147,8 @@ struct RoostConfig: Sendable {
         providers: [],
         copyOnSelect: .default,
         clipboardWrite: .default,
-        wordBreakChars: WordSelection.defaultWordChars
+        wordBreakChars: WordSelection.defaultWordChars,
+        showSidebarAgents: true
     )
 
     /// Read `~/.config/roost/config.conf`. Returns `.empty` when
@@ -169,7 +194,8 @@ struct RoostConfig: Sendable {
     /// `command = …` entries are accumulated by the parser into
     /// arrays; calling `setKey("keybind", …)` would collapse every
     /// keybind line into one. Restrict callers to single-valued
-    /// keys (`theme`, `font-family`, `font-size`).
+    /// keys (`theme`, `font-family`, `font-size`,
+    /// `show-sidebar-agents`).
     ///
     /// Mirrors `crates/roost-linux/src/config.rs::set_key`.
     @discardableResult
@@ -353,6 +379,15 @@ func parse(_ text: String) -> RoostConfig {
             } else {
                 NSLog(
                     "roost-mac: unknown clipboard-write value '%@'; keeping default 'allow'",
+                    value
+                )
+            }
+        case "show-sidebar-agents":
+            if let v = parseBoolLike(value) {
+                cfg.showSidebarAgents = v
+            } else {
+                NSLog(
+                    "roost-mac: unknown show-sidebar-agents value '%@'; keeping default 'true'",
                     value
                 )
             }

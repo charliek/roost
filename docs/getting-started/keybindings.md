@@ -25,6 +25,7 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
+| `Cmd-Shift-A`        | Toggle agent rows under each project in the sidebar |
 | `Cmd-Shift-U`        | Jump to the next tab with a pending notification (active project first, then others) |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
 
@@ -79,6 +80,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
+| `Alt-Shift-A`        | Toggle agent rows under each project in the sidebar |
 | `Alt-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
 
@@ -221,6 +223,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `rename_project`      | `super+shift+r` / `alt+shift+r`                        |
 | `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |
+| `toggle_sidebar_agents` | `super+shift+a` / `alt+shift+a`                      |
 | `jump_to_unread`      | `super+shift+u` / `alt+shift+u`                        |
 | `command_palette`     | `super+shift+p` / `alt+shift+p`                        |
 | `command_launcher`    | `super+shift+t` / `alt+shift+t`                        |

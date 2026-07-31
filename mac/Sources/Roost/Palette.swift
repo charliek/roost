@@ -175,6 +175,10 @@ enum PaletteCommands {
     static let specs: [(id: String, title: String)] = [
         (selectThemeID, "Select Theme…"),
         (selectFontID, "Select Font…"),
+        // Positioned so `paletteCommandItems()`'s dynamic insert (which
+        // lands right after `selectFontID`) pushes this entry to sit
+        // immediately after "Clear All Notifications" — plan 007 §3.7.
+        (KeybindAction.toggleSidebarAgents, "Toggle Sidebar Agents"),
         (KeybindAction.newTab, "New Tab"),
         (KeybindAction.closeTab, "Close Tab"),
         (KeybindAction.renameTab, "Rename Tab"),

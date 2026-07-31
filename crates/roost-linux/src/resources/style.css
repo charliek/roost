@@ -60,7 +60,7 @@ toolbarview > .top-bar:backdrop {
 /* Sidebar selection: a deep-blue rounded pill drawn on the row's CHILD
  * (the name Stack), inset ~6px/1px to match the Mac UI's
  * `bounds.insetBy(dx:6, dy:1)` + 6px-radius pill. Drawing on the child
- * (not the row) keeps the row's leading `box-shadow` rollup stripe at the
+ * (not the row) keeps the row's leading rollup stripe at the
  * TRUE left edge — the stripe must not inset with the pill. Fill is
  * HARDCODED #13509d (not @accent_bg_color): the host accent isn't always
  * blue and libadwaita dims it under :backdrop, but the Mac pill is a
@@ -70,7 +70,7 @@ toolbarview > .top-bar:backdrop {
  * rule targets the `.navigation-sidebar` style class directly rather than
  * an element prefix that wouldn't match. */
 /* Flatten libadwaita's own row chrome: it gives the row a border-radius
- * (which would round the inset box-shadow rollup stripe into a curve) and
+ * (which would round the rollup stripe into a curve) and
  * a horizontal margin (which would push the stripe off the true left
  * edge). Zero both so the stripe is a straight bar flush to the edge; the
  * rounded selection comes from the child pill below, not the row. */
@@ -82,41 +82,116 @@ toolbarview > .top-bar:backdrop {
    * height below so rows are compact like the Mac sidebar. */
   min-height: 0;
 }
-.navigation-sidebar > row > * {
+/* Plan 007 §3.5: the row's direct child is now a body wrapper holding the
+ * name row + the agent rows, so every rule below targets
+ * `.roost-sidebar-namerow` — a `> *` rule would paint the selection pill
+ * and the 28px min-height across the agent rows too. */
+.navigation-sidebar > row .roost-sidebar-rowbody {
+  background: transparent;
+  margin: 0;
+  min-height: 0;
+}
+.navigation-sidebar > row .roost-sidebar-namerow {
   border-radius: 6px;
   margin: 1px 6px;
   min-height: 28px;
 }
+/* `background-color`, not the `background` shorthand: the shorthand also
+ * resets `background-image`, which carries the rollup stripe — the stripe
+ * would vanish exactly while a project is selected or hovered. */
 .navigation-sidebar > row:selected,
 .navigation-sidebar > row:selected:backdrop {
-  background: transparent;
+  background-color: transparent;
 }
-.navigation-sidebar > row:selected > *,
-.navigation-sidebar > row:selected:backdrop > * {
+.navigation-sidebar > row:selected .roost-sidebar-namerow,
+.navigation-sidebar > row:selected:backdrop .roost-sidebar-namerow {
   background-color: #13509d;
 }
-.navigation-sidebar > row:selected:hover > * {
+.navigation-sidebar > row:selected:hover .roost-sidebar-namerow {
   background-color: shade(#13509d, 1.08);
 }
 /* Clear the row-level hover too, so libadwaita's full-width hover tint
  * doesn't bleed outside the inset pill; the hover fill goes on the child. */
 .navigation-sidebar > row:hover:not(:selected) {
-  background: transparent;
+  background-color: transparent;
 }
-.navigation-sidebar > row:hover:not(:selected) > * {
+.navigation-sidebar > row:hover:not(:selected) .roost-sidebar-namerow {
   background-color: alpha(currentColor, 0.06);
 }
 /* Row label tone + weight: Mac uses NSColor(white:0.82)=#d1d1d1 unselected,
  * white when selected, in a semibold-ish face so the names read with weight
  * like the Mac sidebar. Near-default size so the text fills the pill rather
- * than leaving padding. */
-.navigation-sidebar > row label {
+ * than leaving padding. These are descendant (not child) rules, so they are
+ * scoped to the name row — otherwise the agent labels inherit bold #d1d1d1
+ * and flip to white whenever the project is selected. */
+.navigation-sidebar > row .roost-sidebar-namerow label {
   color: #d1d1d1;
   font-size: 1em;
   font-weight: bold;
 }
-.navigation-sidebar > row:selected label {
+.navigation-sidebar > row:selected .roost-sidebar-namerow label {
   color: #ffffff;
+}
+
+/* Agent rows under a project (plan 007 §3.2). The lifecycle hexes are
+ * the repo-wide set the rollup stripes and the palette dots use; they
+ * are not reachable from `rollup.rs` (which returns class names only),
+ * so they are restated here. Written at `> row .roost-sidebar-…`
+ * specificity so the name-row label rules above cannot outrank them. */
+.navigation-sidebar > row .roost-sidebar-agents {
+  margin-bottom: 2px;
+}
+/* The 6px margin puts this row's highlight on the same left edge as the
+ * project row's selection pill, and the 10px padding lands the dot on
+ * the same left edge as the project label (which sits 6px + its own
+ * 10px in). Agents read as a nested list rather than an inset block. */
+.navigation-sidebar > row .roost-sidebar-agent {
+  border-radius: 5px;
+  margin: 0 6px;
+  padding: 1px 6px 1px 10px;
+  min-height: 20px;
+}
+.navigation-sidebar > row .roost-sidebar-agent.active {
+  background-color: alpha(currentColor, 0.08);
+}
+.navigation-sidebar > row .roost-sidebar-agent.active .roost-sidebar-agent-name {
+  font-weight: 600;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot {
+  border-radius: 4px;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-working {
+  background-color: #5fa3f0;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-waiting {
+  background-color: #f0a040;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-finished {
+  background-color: #7a7a7a;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-failed {
+  background-color: #e05252;
+}
+.navigation-sidebar > row .roost-sidebar-agent-dot.agent-inactive {
+  background-color: alpha(#7a7a7a, 0.5);
+}
+.navigation-sidebar > row .roost-sidebar-agent-name {
+  color: #d1d1d1;
+  font-size: 0.9em;
+  font-weight: normal;
+}
+/* Elapsed time takes the lifecycle colour only for the two states that
+ * want attention; everything else is muted so the column reads as chrome. */
+.navigation-sidebar > row .roost-sidebar-agent-time {
+  font-size: 0.85em;
+  font-weight: normal;
+  color: #7a7a7a;
+}
+.navigation-sidebar > row .roost-sidebar-agent-time.agent-waiting {
+  color: #f0a040;
+}
+.navigation-sidebar > row .roost-sidebar-agent-time.agent-failed {
+  color: #e05252;
 }
 
 /* Tab bar: subtle accent tint on the checked tab. Only restyle the
@@ -288,24 +363,44 @@ button.roost-add-project:active {
 }
 
 /* Project row agent-state rollup: a 3px left-edge stripe coloured by
- * the highest-severity state across the project's tabs. box-shadow
- * inset is used instead of border-left because libadwaita reserves
- * the row's leading margin for the selection state — a real border
- * would shift the label. needs-input wins; running is informational;
- * idle is muted. The "none" state has no class, no stripe. Ranking is
- * `roost_ipc::agent::rank` — failed > needs-input > running > idle.
+ * the highest-severity state across the project's tabs. needs-input
+ * wins; running is informational; idle is muted. The "none" state has
+ * no class, no stripe. Ranking is `roost_ipc::agent::rank` — failed >
+ * needs-input > running > idle.
+ *
+ * Drawn as a left-anchored gradient with a hard stop at the name row's
+ * 28px, rather than `box-shadow: inset` or `border-left`. A border
+ * would shift the label, since libadwaita reserves the row's leading
+ * margin for the selection state. An inset shadow spans the whole
+ * element, and since plan 007 the row also contains the agent rows —
+ * the stripe would run down the full stack and double up on what the
+ * per-agent dots already say. The Mac UI, whose agent rows are separate
+ * outline rows, naturally scopes its rail to the project row; this
+ * matches it.
  *
  * Colors mirror the per-tab indicator SVGs. Hard-coded rather than
  * @accent_bg_color etc. because the indicator meaning is semantic,
  * not theme-dependent. */
+/* One 3px bar, 28px tall, pinned to the row's top-left: `background-size`
+ * is what scopes the stripe to the name row, so each rule above only has
+ * to name its colour. */
+.navigation-sidebar > row.roost-rollup-running,
+.navigation-sidebar > row.roost-rollup-needs-input,
+.navigation-sidebar > row.roost-rollup-idle,
+.navigation-sidebar > row.roost-rollup-failed {
+  background-repeat: no-repeat;
+  background-position: left top;
+  background-size: 3px 28px;
+}
+
 .navigation-sidebar > row.roost-rollup-running {
-  box-shadow: inset 3px 0 0 #5fa3f0;
+  background-image: linear-gradient(#5fa3f0, #5fa3f0);
 }
 .navigation-sidebar > row.roost-rollup-needs-input {
-  box-shadow: inset 3px 0 0 #f0a040;
+  background-image: linear-gradient(#f0a040, #f0a040);
 }
 .navigation-sidebar > row.roost-rollup-idle {
-  box-shadow: inset 3px 0 0 #7a7a7a;
+  background-image: linear-gradient(#7a7a7a, #7a7a7a);
 }
 /* `failed` is its own colour, not a louder needs-input: the legacy
  * `tab.state` field collapses the two (it stays a closed four-value
@@ -313,7 +408,7 @@ button.roost-add-project:active {
  * only places a user can tell "the agent wants you" from "the agent
  * died". */
 .navigation-sidebar > row.roost-rollup-failed {
-  box-shadow: inset 3px 0 0 #e05252;
+  background-image: linear-gradient(#e05252, #e05252);
 }
 
 /* Command palette (Cmd+Shift+P / Alt+Shift+P). Explicit Swift hex

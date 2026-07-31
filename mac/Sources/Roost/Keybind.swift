@@ -10,7 +10,7 @@
 //   new_tab close_tab rename_tab new_project rename_project
 //   cycle_tab_prev cycle_tab_next paste copy
 //   font_increase font_decrease font_reset
-//   toggle_sidebar
+//   toggle_sidebar toggle_sidebar_agents
 //   switch_project_1..9 switch_tab_1..9
 //   unbind  (special — removes the matching default)
 //
@@ -46,6 +46,10 @@ enum KeybindAction {
     static let fontDecrease  = "font_decrease"
     static let fontReset     = "font_reset"
     static let toggleSidebar = "toggle_sidebar"
+    /// Show/hide the per-agent rows nested under each project in the
+    /// sidebar (plan 007 §3.7). Default ⌘⇧A on Mac, Alt+Shift+A on
+    /// Linux.
+    static let toggleSidebarAgents = "toggle_sidebar_agents"
     /// Phase 6a P7: jump to the next unread (notified) tab
     /// (cmux-inspired ⌘⇧U convention).
     static let jumpToUnread  = "jump_to_unread"
@@ -81,6 +85,7 @@ enum KeybindAction {
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
         paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
+        toggleSidebarAgents,
         jumpToUnread, commandPalette, commandLauncher, customPalette,
         agentPalette,
     ]
@@ -239,6 +244,9 @@ func defaultBindingsMac() -> [String: [String]] {
         KeybindAction.renameProject: ["\(projectMod)+shift+r"],
         KeybindAction.closeProject:  ["\(projectMod)+shift+w"],
         KeybindAction.toggleSidebar: ["\(projectMod)+b"],
+        // ⌘⇧A — toggle the sidebar's per-agent rows. No other default
+        // uses `…+shift+a`.
+        KeybindAction.toggleSidebarAgents: ["\(projectMod)+shift+a"],
         // ⌘⇧U — cmux's "jump to latest unread" convention.
         KeybindAction.jumpToUnread:  ["\(primary)+shift+u"],
         // ⌘⇧P — VS Code / Zed command-palette convention.

@@ -169,6 +169,47 @@ fn agent_report_vector_decodes_into_its_typed_params() {
     assert_eq!(result.tab.hook_active, roost_ipc::agent::is_live(&agent));
 }
 
+/// `app.sidebar_dump` is the newest read-only UI-state op; generic
+/// vector round-tripping (above) only proves the fixture is valid
+/// JSON, not that it matches `SidebarDumpResult`'s field names/types
+/// (string ids, `lifecycle` spelling, nesting). Decode it into the
+/// typed struct so a schema drift fails here, not in an adapter.
+#[test]
+fn sidebar_dump_vector_decodes_into_its_typed_params() {
+    use roost_ipc::agent::AgentLifecycle;
+    use roost_ipc::messages::{ops, RawRequest, SidebarDumpParams, SidebarDumpResult};
+
+    let mut path = vectors_dir();
+    path.push("app.sidebar_dump.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::SIDEBAR_DUMP);
+    let _params: SidebarDumpParams =
+        serde_json::from_value(req.params).expect("decode sidebar_dump params");
+
+    let mut path = vectors_dir();
+    path.push("app.sidebar_dump.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let result: SidebarDumpResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode result");
+
+    assert!(result.agents_visible);
+    assert_eq!(result.projects.len(), 2);
+    assert_eq!(result.projects[0].project_id, 1);
+    assert_eq!(result.projects[0].agents.len(), 1);
+    let row = &result.projects[0].agents[0];
+    assert_eq!(row.tab_id, 7);
+    assert_eq!(row.name, "slauth-refactor");
+    assert_eq!(row.lifecycle, AgentLifecycle::Waiting);
+    assert_eq!(row.status_text, "Waiting for input");
+    assert_eq!(row.time_text, "2m");
+    assert!(!row.is_active);
+    assert_eq!(result.projects[1].project_id, 2);
+    assert!(result.projects[1].agents.is_empty());
+}
+
 #[test]
 fn event_vectors_have_required_envelope_shape() {
     let dir = vectors_dir();

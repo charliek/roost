@@ -60,6 +60,13 @@ TARGETS = ("mac", "gtk")
 # fixtures/launcher.conf + test_launcher.py). Applies only to UIs this
 # harness launches; a developer's already-running UI keeps its own config
 # (the launcher tests skip when the seed isn't active).
+#
+# This is the TRACKED template. A harness-launched UI is never pointed at
+# it directly: `start_session` copies it into the session's throwaway
+# state dir (`_session_config_path()`), and every launch/relaunch of that
+# UI uses the copy instead. Otherwise a test that writes back a config key
+# (e.g. `show-sidebar-agents`, plan 007) would mutate this repo file and
+# race whichever target runs concurrently in CI.
 SEED_CONFIG = Path(__file__).resolve().parent / "fixtures" / "launcher.conf"
 
 # Throwaway UserDefaults suite for a harness-launched Mac app, so sidebar
@@ -193,6 +200,16 @@ def _materializes(c: Roost, tab_id: int, deadline: float, window: float = 3.0) -
     return False
 
 
+def _session_config_path() -> Path:
+    """The session's throwaway copy of `SEED_CONFIG`, inside the session
+    state dir. Both targets get their own state dir (each test run only
+    drives one target at a time), so the copy never races the other
+    target — and a test that toggles `show-sidebar-agents` writes back
+    into this copy instead of mutating the tracked fixture."""
+    assert _SESSION_STATE_DIR is not None, "session config requires an active session"
+    return _SESSION_STATE_DIR / "launcher.conf"
+
+
 def start_session(target: str, *, fresh: bool) -> bool:
     """Ensure a UI is running for the test session. Returns True if the
     harness started (and therefore owns) it — the caller quits it at
@@ -216,6 +233,14 @@ def start_session(target: str, *, fresh: bool) -> bool:
     if is_alive(target):
         return False  # reuse the developer's running UI (non-fresh)
     _SESSION_STATE_DIR = Path(tempfile.mkdtemp(prefix="roost-e2e-state-"))
+    shutil.copyfile(SEED_CONFIG, _session_config_path())
+    # `config.rs`'s provider discovery resolves `providers/` as a sibling
+    # of the config file path (`providers_dir()`), so the copy needs that
+    # sibling too or `test_provider.py`'s fixture-provider discovery goes
+    # dark under the isolated copy.
+    seed_providers_dir = SEED_CONFIG.parent / "providers"
+    if seed_providers_dir.is_dir():
+        shutil.copytree(seed_providers_dir, _SESSION_STATE_DIR / "providers")
     launch(target, state_dir=_SESSION_STATE_DIR, force=fresh)
     return True
 
@@ -268,7 +293,7 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn")}
         for leaked in _UI_ENV_SANITIZE:
             env.pop(leaked, None)
-        env["ROOST_CONFIG"] = str(SEED_CONFIG)
+        env["ROOST_CONFIG"] = str(_session_config_path() if state_dir is not None else SEED_CONFIG)
         if state_dir is not None:
             env["ROOST_STATE_DIR"] = str(state_dir)
         # Capture stdout+stderr (the UI tees its log to stdout, and an early
@@ -317,9 +342,10 @@ def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
         # launch path inherits parent env directly via `**os.environ`.
         # This hand-maintained allowlist is the one place a new override
         # can silently no-op on Mac, so keep it in sync with `launch`.
+        config_path = _session_config_path() if state_dir is not None else SEED_CONFIG
         argv = [
             "open",
-            "--env", f"ROOST_CONFIG={SEED_CONFIG}",
+            "--env", f"ROOST_CONFIG={config_path}",
         ]
         if "ROOST_TEST_MODE" in os.environ:
             argv += ["--env", f"ROOST_TEST_MODE={os.environ['ROOST_TEST_MODE']}"]
