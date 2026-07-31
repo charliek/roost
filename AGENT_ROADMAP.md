@@ -237,7 +237,7 @@ gauntlet convention; the PR body carries the durable public record.
 | 004 | Tab/project position parity ([#262](https://github.com/charliek/roost/issues/262)) + `roostctl doctor` output UX | `~/.claude/plans/roost/004-tab-order-and-doctor-ux.md` | Shipped | [#263](https://github.com/charliek/roost/pull/263) |
 | 005 | D3 agent switcher palette frame (+ async git metrics) — first L3 feature | `~/.claude/plans/roost/005-agent-palette.md` | Shipped | [#265](https://github.com/charliek/roost/pull/265) |
 | 006 | Palette refinements post-005: `idle_prompt` declassified from the blocking set, footer bar removed, per-segment git-metric colors | `~/.claude/plans/roost/006-palette-refinements.md` | Shipped | [#269](https://github.com/charliek/roost/pull/269) |
-| 007 | Agents in the project sidebar: one indented row per live agent under its project (lifecycle dot, name, elapsed), active-tab highlight, `show-sidebar-agents` toggle, `app.sidebar_dump` | `~/.claude/plans/roost/007-sidebar-agents.md` | Shipped | [#270](https://github.com/charliek/roost/pull/270) |
+| 007 | Agents in the project sidebar: one indented row per live agent under its project (lifecycle dot, name, elapsed), active-tab highlight, `show-sidebar-agents` toggle, `app.sidebar_dump`, plus sidebar↔palette parity and dot-layout e2e guards ([#271](https://github.com/charliek/roost/issues/271) tracks the Mac real-input harness the click/drag checks still need) | `~/.claude/plans/roost/007-sidebar-agents.md` | Shipped | [#270](https://github.com/charliek/roost/pull/270) |
 | — | L3 agent UX (tint / overview) | *not yet written* | Future | — |
 
 ---
@@ -335,6 +335,12 @@ per-project mute so eight agents finishing at midnight do not all shout.
 
 *Needs:* `rank()` plus the attention axis being separate from lifecycle
 — both L0. Mute is then one flag consulted at the notification boundary.
+
+*Reframed by plan 007:* the sidebar now lists the agents themselves, so
+"how many need attention" is legible directly when the rows are shown. A
+count is still worth having for the collapsed case (`show-sidebar-agents
+= false`, where only the rollup stripe remains); the mute half is
+untouched and remains the larger win.
 
 ### D7 — Background-work awareness
 
