@@ -68,6 +68,19 @@ def _wait_agent_row_gone(roost, project_id: int, tab_id: int, timeout: float = 5
     )
 
 
+def _palette_agent_tab_id(item: dict) -> int | None:
+    """The tab id an agent row activates, or None for any other row —
+    the Python twin of `agent_tab_id` in `agent_palette.rs`. The empty
+    sentinel (`agents:empty`) deliberately doesn't parse."""
+    rest = item["id"].removeprefix("agent:")
+    return int(rest) if rest != item["id"] and rest.isdigit() else None
+
+
+def _palette_agent_tab_ids(items: list[dict]) -> list[int]:
+    """The palette's flat agent list as tab ids, in wire order."""
+    return [t for t in (_palette_agent_tab_id(it) for it in items) if t is not None]
+
+
 def _toggle_sidebar_agents(roost) -> dict:
     """Drive the toggle through the command palette, the same way a user
     or `roostctl` would (plan 007 §3.7 — `palette.activate` is the one
@@ -192,6 +205,96 @@ def test_freshly_created_project_appears_in_dump_immediately(roost):
         assert proj["agents"] == [], proj
     finally:
         roost.delete_project(p)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar ↔ agent-palette parity
+# ---------------------------------------------------------------------------
+
+
+def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, project):
+    """The two surfaces share the pure builders in `agent_palette.rs` /
+    `AgentPalette.swift` (`sidebar_agents` vs `agent_items`), but nothing
+    else pins that they agree — the drift a later ordering or naming
+    change would introduce lands silently, because each surface has its
+    own tests. This is the cross-surface pin: same population, same
+    per-project order, same rendered strings.
+
+    Five agents over two projects covering all four lifecycles, with
+    three in one project so within-project ordering is load-bearing.
+    Every assertion is scoped to the ids seeded here — a dev UI driving
+    the same instance may have other agents live, and the palette's list
+    is global (it interleaves other projects' rows by rank), so the
+    per-project comparison filters the palette's flat order down to this
+    project's seeded tabs.
+    """
+    p2 = roost.create_project(name=f"pytest-sidebar-parity-{uuid.uuid4().hex[:6]}", cwd="/tmp")
+    try:
+        seeds = [
+            (project, "working", "par-p1-working", ""),
+            (project, "waiting", "par-p1-waiting", ""),
+            (project, "finished", "par-p1-finished", ""),
+            (p2, "failed", "par-p2-failed", "rate_limit"),
+            (p2, "working", "par-p2-working", ""),
+        ]
+        by_project: dict[int, list[int]] = {project: [], p2: []}
+        for pid, lifecycle, name, detail in seeds:
+            tab = roost.open_tab(pid, cwd="/tmp")
+            _seed(roost, tab, lifecycle=lifecycle, name=name, detail=detail)
+            by_project[pid].append(tab)
+        seeded = {t for tabs in by_project.values() for t in tabs}
+
+        def _both_surfaces_ready() -> bool:
+            dump_ids = {
+                int(a["tab_id"]) for p in roost.sidebar_dump()["projects"] for a in p["agents"]
+            }
+            pal_ids = set(_palette_agent_tab_ids(roost.palette_items("agents")))
+            return seeded <= dump_ids and seeded <= pal_ids
+
+        roost._wait(_both_surfaces_ready, 10.0, "all five seeded agents reach both surfaces")
+
+        dump = roost.sidebar_dump()
+        items = roost.palette_items("agents")
+        palette_order = _palette_agent_tab_ids(items)
+        palette_rows = {
+            t: it for it in items if (t := _palette_agent_tab_id(it)) is not None
+        }
+
+        # (1) Same population. Compared as the intersection with what this
+        # test seeded, so other live agents on the instance are ignored —
+        # but a tab present on exactly one surface still fails.
+        dump_ids = {int(a["tab_id"]) for p in dump["projects"] for a in p["agents"]}
+        assert dump_ids & seeded == seeded, sorted(dump_ids & seeded)
+        assert set(palette_order) & seeded == seeded, sorted(set(palette_order) & seeded)
+
+        for pid, tabs in by_project.items():
+            want = set(tabs)
+            proj = _project_row(dump, pid)
+            assert proj is not None, dump
+            sidebar_seq = [t for t in (int(a["tab_id"]) for a in proj["agents"]) if t in want]
+            palette_seq = [t for t in palette_order if t in want]
+            # (2) Same order. The palette is ranked across all projects,
+            # the sidebar per project — so the palette's flat order
+            # filtered to this project's rows must reproduce the
+            # sidebar's list exactly.
+            assert sidebar_seq == palette_seq, (
+                f"project {pid}: sidebar order {sidebar_seq} != palette order {palette_seq}"
+            )
+            # A project's rows must not leak into the other project's list.
+            assert not (set(sidebar_seq) & (seeded - want)), sidebar_seq
+
+        # (3) Same rendered strings. `time_text` is elapsed-derived and
+        # drifts between the two reads, so it is excluded by design.
+        for tab in sorted(seeded):
+            pid = project if tab in by_project[project] else p2
+            row = _agent_row(dump, pid, tab)
+            agent = palette_rows[tab]["agent"]
+            assert row is not None, (pid, tab, dump)
+            assert row["name"] == agent["name"], (row, agent)
+            assert row["lifecycle"] == agent["effective_lifecycle"], (row, agent)
+            assert row["status_text"] == agent["status_text"], (row, agent)
+    finally:
+        roost.delete_project(p2)
 
 
 # ---------------------------------------------------------------------------
