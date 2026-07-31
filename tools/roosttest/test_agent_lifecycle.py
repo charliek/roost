@@ -244,6 +244,45 @@ def test_unknown_notification_type_notifies_without_moving_lifecycle(roost, proj
     assert roost.tab(tab)["state"] == "running"
 
 
+def test_idle_prompt_after_stop_keeps_finished(roost, project, target):
+    """`idle_prompt` is the nag Claude fires ~60s after a turn already
+    ended — a timer, not evidence of a block. Plan 006 §3.1 declassified
+    it out of the blocking set: it still notifies, but a `finished`
+    session must stay gray "Finished" instead of flipping to a false
+    orange "Waiting for input" indistinguishable from a real
+    `permission_prompt` (which stays blocking — see
+    `test_full_turn_through_the_real_hook_binary`)."""
+    tab = agent_tab(roost, project)
+    session = "sess-idle-prompt"
+    claude_hook(target, tab, "SessionStart", {"session_id": session, "source": "startup"})
+    roost._wait(lambda: roost.hook_active(tab), 5.0, "SessionStart claimed the tab")
+
+    claude_hook(target, tab, "UserPromptSubmit", {"session_id": session, "prompt": "go"})
+    roost.wait_lifecycle(tab, "working")
+
+    claude_hook(target, tab, "Stop", {"session_id": session, "stop_hook_active": False})
+    roost.wait_lifecycle(tab, "finished")
+    assert roost.tab(tab)["state"] == "idle"
+
+    claude_hook(target, tab, "Notification", {
+        "session_id": session,
+        "notification_type": "idle_prompt",
+        "message": "Claude is waiting for your input",
+    })
+    # `wait_notification` would order nothing here — the preceding Stop
+    # already set the pending bit, so it returns on the stale value. The
+    # adapter stamps `detail` unconditionally, so that is the barrier.
+    roost._wait(
+        lambda: (roost.ownership(tab) or {}).get("detail") == "idle_prompt",
+        5.0,
+        "the idle_prompt notification landed",
+    )
+
+    assert roost.agent_lifecycle(tab) == "finished", roost.tab(tab)
+    assert roost.tab(tab)["state"] == "idle"
+    assert roost.has_notification(tab), "the nag still reaches the user"
+
+
 def test_event_carrying_agent_id_leaves_lifecycle_unchanged(roost, project, target):
     """An event that fired inside a subagent describes the subagent's
     turn, not the tab owner's — its notification still reaches the user

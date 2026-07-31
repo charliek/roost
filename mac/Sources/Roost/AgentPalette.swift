@@ -21,8 +21,6 @@ enum AgentPalette {
     /// reports.
     static let frameID = "agents"
     static let placeholder = "Go to agent…"
-    /// Muted hint bar under the list.
-    static let footerHints = "↑↓ move  ↵ go to tab  esc close"
     /// The empty-state row. Deliberately not parseable as `agent:<id>`.
     static let emptyRowID = "agents:empty"
     static let emptyRowTitle = "No agent sessions"
@@ -57,8 +55,7 @@ enum AgentPalette {
         PaletteFrame(
             id: frameID,
             placeholder: placeholder,
-            items: agentItems(projects: projects, tabs: tabs, now: now),
-            footerHints: footerHints
+            items: agentItems(projects: projects, tabs: tabs, now: now)
         )
     }
 
@@ -186,6 +183,87 @@ enum AgentPalette {
     static func composeTitle(project: String, name: String) -> String {
         if project.isEmpty { return name }
         return NotificationInbox.composeTitle(project: project, tab: name)
+    }
+
+    /// The colour role of one segment of the git-metrics column.
+    enum MetricsRole {
+        case muted
+        case adds
+        case dels
+    }
+
+    /// Split the metrics string into rendered segments, alternating
+    /// non-whitespace tokens with standalone whitespace runs.
+    /// Concatenating every segment's text reproduces the input exactly,
+    /// so the column can never render text the probe didn't produce.
+    ///
+    /// The grammar is `GitMetrics`' own (`"{files}f +{adds} -{dels}"` or
+    /// `"—"`), but the rule here is deliberately shape-based rather than
+    /// a parse of that grammar: a sign followed by at least one digit is
+    /// a count, everything else — the file count, the unknown dash, a
+    /// bare sign, an unrecognized token — stays muted.
+    static func metricsSegments(_ text: String) -> [(String, MetricsRole)] {
+        var out: [(String, MetricsRole)] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            let space = text[start].isWhitespace
+            var end = start
+            while end < text.endIndex, text[end].isWhitespace == space {
+                end = text.index(after: end)
+            }
+            let segment = String(text[start..<end])
+            out.append((segment, space ? .muted : tokenRole(segment)))
+            start = end
+        }
+        return out
+    }
+
+    private static func tokenRole(_ token: String) -> MetricsRole {
+        let role: MetricsRole
+        switch token.first {
+        case "+": role = .adds
+        case "-": role = .dels
+        default: return .muted
+        }
+        guard let next = token.dropFirst().first, next.isASCII, next.isNumber else {
+            return .muted
+        }
+        return role
+    }
+
+    /// The colour a role renders in. The hexes are the GTK twins in
+    /// `agent_palette.rs`'s `metrics_role_hex` — `#7a7a7a` muted,
+    /// `#7fbf7f` adds, `#e05252` dels — so the two palettes can't drift.
+    /// The muted one is also the elapsed-time colour on both UIs (the
+    /// `.palette-agent-time` CSS class over there), since the time label
+    /// sits next to the metrics in the same right column.
+    static func metricsColor(_ role: MetricsRole) -> NSColor {
+        switch role {
+        case .muted: return metricsMutedColor
+        case .adds: return metricsAddsColor
+        case .dels: return metricsDelsColor
+        }
+    }
+
+    private static let metricsMutedColor = NSColor(
+        red: 0x7a / 255.0, green: 0x7a / 255.0, blue: 0x7a / 255.0, alpha: 1.0)
+    private static let metricsAddsColor = NSColor(
+        red: 0x7f / 255.0, green: 0xbf / 255.0, blue: 0x7f / 255.0, alpha: 1.0)
+    private static let metricsDelsColor = NSColor(
+        red: 0xe0 / 255.0, green: 0x52 / 255.0, blue: 0x52 / 255.0, alpha: 1.0)
+
+    /// The metrics column as one attributed string: every segment in its
+    /// role's colour, all of them in `font`. The GTK twin is
+    /// `palette_ui.rs`'s `metrics_markup`.
+    static func metricsAttributed(_ text: String, font: NSFont) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        for (segment, role) in metricsSegments(text) {
+            out.append(
+                NSAttributedString(
+                    string: segment,
+                    attributes: [.foregroundColor: metricsColor(role), .font: font]))
+        }
+        return out
     }
 
     // MARK: - Internals

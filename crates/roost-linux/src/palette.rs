@@ -236,10 +236,6 @@ pub struct PaletteFrame {
     pub items: Vec<PaletteItem>,
     pub query: String,
     pub selection: usize,
-    /// Muted one-line hint bar under the list (the agents frame's
-    /// "↑↓ move  ↵ go to tab  esc close"). `None` on every other frame,
-    /// which renders no footer. Not exposed on the wire.
-    pub footer_hints: Option<String>,
 }
 
 impl PaletteFrame {
@@ -254,7 +250,6 @@ impl PaletteFrame {
             items,
             query: String::new(),
             selection: 0,
-            footer_hints: None,
         }
     }
 
@@ -262,11 +257,6 @@ impl PaletteFrame {
     /// pre-highlights the active theme).
     pub fn with_selection(mut self, selection: usize) -> Self {
         self.selection = selection;
-        self
-    }
-
-    pub fn with_footer_hints(mut self, hints: impl Into<String>) -> Self {
-        self.footer_hints = Some(hints.into());
         self
     }
 }
@@ -687,14 +677,6 @@ mod tests {
         let mut state = PaletteState::new(cmd_frame());
         assert!(!state.update_items("agents", vec![PaletteItem::new("x", "X")]));
         assert_eq!(state.matches().len(), 3);
-    }
-
-    #[test]
-    fn footer_hints_default_to_none() {
-        let frame = cmd_frame();
-        assert_eq!(frame.footer_hints, None);
-        let with_hints = cmd_frame().with_footer_hints("esc close");
-        assert_eq!(with_hints.footer_hints.as_deref(), Some("esc close"));
     }
 
     #[test]

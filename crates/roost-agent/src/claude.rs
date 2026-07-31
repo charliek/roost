@@ -170,15 +170,23 @@ fn user_prompt_submit(mut report: TabAgentReportParams) -> TabAgentReportParams 
 fn notification(mut report: TabAgentReportParams, payload: &Value) -> TabAgentReportParams {
     let kind = field(payload, "notification_type");
 
-    // Only the four blocking types move the lifecycle. Every other value
+    // Only the three blocking types move the lifecycle. Every other value
     // — the known informational ones and any string this build has never
     // seen — fires the notification but leaves lifecycle alone. That
     // asymmetry is deliberate: `notification_type` is an open string, so
     // new values are expected, and a false `waiting` is worse than a
     // missed one because the state dot is sticky and would wrongly read
     // "blocked" while the notification reaches the user either way.
+    //
+    // `idle_prompt` is excluded for exactly that reason: it is a timer nag
+    // Claude fires after a turn has already ended, not evidence the
+    // session is blocked. Treating it as blocking flipped a finished
+    // session's gray "Finished" to a false orange "Waiting for input"
+    // ~60s later, indistinguishable from a real permission prompt. The
+    // nag still notifies — at info severity, via the lifecycle-derived
+    // severity below — only the lifecycle stays untouched.
     report.lifecycle = match kind {
-        "permission_prompt" | "idle_prompt" | "agent_needs_input" | "elicitation_dialog" => {
+        "permission_prompt" | "agent_needs_input" | "elicitation_dialog" => {
             Some(AgentLifecycle::Waiting)
         }
         _ => None,

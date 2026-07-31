@@ -177,6 +177,129 @@ func agentElapsedClampsAFutureStamp() {
     #expect(AgentPalette.elapsedText(now: NOW, lastEventAt: Int64.max) == "0s")
 }
 
+// MARK: - metrics segmentation
+
+/// Every segmentation case in this section, so the concat-identity
+/// property is checked against the same inputs the role assertions use.
+private let metricsCases: [String] = [
+    "4f +86 -12",
+    GitMetrics.unknown,
+    "1f +0 -0",
+    "12f +4021 -998",
+    "",
+    "+",
+    "-",
+    "+abc",
+    "-abc",
+    "<3f & +2",
+]
+
+private func expectSegments(
+    _ text: String, _ expected: [(String, AgentPalette.MetricsRole)],
+    sourceLocation: SourceLocation = #_sourceLocation
+) {
+    let actual = AgentPalette.metricsSegments(text)
+    #expect(
+        actual.count == expected.count, "\(text) segment count",
+        sourceLocation: sourceLocation)
+    for (a, e) in zip(actual, expected) {
+        #expect(a.0 == e.0, "\(text) segment text", sourceLocation: sourceLocation)
+        #expect(a.1 == e.1, "\(text) segment role", sourceLocation: sourceLocation)
+    }
+}
+
+@Test
+func agentCanonicalMetricsSplitIntoFiveSegments() {
+    expectSegments(
+        "4f +86 -12",
+        [("4f", .muted), (" ", .muted), ("+86", .adds), (" ", .muted), ("-12", .dels)])
+}
+
+@Test
+func agentTheUnknownDashIsOneMutedSegment() {
+    expectSegments(GitMetrics.unknown, [(GitMetrics.unknown, .muted)])
+}
+
+@Test
+func agentZeroCountsKeepTheirRoles() {
+    expectSegments(
+        "1f +0 -0",
+        [("1f", .muted), (" ", .muted), ("+0", .adds), (" ", .muted), ("-0", .dels)])
+}
+
+@Test
+func agentLargeCountsKeepTheirRoles() {
+    expectSegments(
+        "12f +4021 -998",
+        [("12f", .muted), (" ", .muted), ("+4021", .adds), (" ", .muted), ("-998", .dels)])
+}
+
+@Test
+func agentDegenerateMetricsTokensStayMuted() {
+    #expect(AgentPalette.metricsSegments("").isEmpty)
+    for text in ["+", "-", "+abc", "-abc"] {
+        expectSegments(text, [(text, .muted)])
+    }
+}
+
+@Test
+func agentSegmentsConcatenateBackToTheInput() {
+    for text in metricsCases {
+        let joined = AgentPalette.metricsSegments(text).map(\.0).joined()
+        #expect(joined == text, "segments must reproduce \(text) exactly")
+    }
+}
+
+@Test
+func agentMetricsRoleColorsArePinned() {
+    func expectRGB(
+        _ role: AgentPalette.MetricsRole, _ r: Int, _ g: Int, _ b: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        let color = AgentPalette.metricsColor(role)
+        #expect(
+            abs(color.redComponent - CGFloat(r) / 255.0) < 0.001,
+            sourceLocation: sourceLocation)
+        #expect(
+            abs(color.greenComponent - CGFloat(g) / 255.0) < 0.001,
+            sourceLocation: sourceLocation)
+        #expect(
+            abs(color.blueComponent - CGFloat(b) / 255.0) < 0.001,
+            sourceLocation: sourceLocation)
+        #expect(color.alphaComponent == 1.0, sourceLocation: sourceLocation)
+    }
+    // The GTK twins in `agent_palette.rs`'s `metrics_role_hex`.
+    expectRGB(.muted, 0x7a, 0x7a, 0x7a)
+    expectRGB(.adds, 0x7f, 0xbf, 0x7f)
+    expectRGB(.dels, 0xe0, 0x52, 0x52)
+}
+
+// The GTK side also pins markup escaping (`metrics_markup_escapes_segment_text`);
+// `NSAttributedString` carries no markup, so that pair has no Swift counterpart.
+
+@Test
+func agentMetricsAttributedColorsEachSegment() {
+    let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    let text = "4f +86 -12"
+    let attributed = AgentPalette.metricsAttributed(text, font: font)
+    #expect(attributed.string == text)
+    #expect(attributed.attribute(.font, at: 0, effectiveRange: nil) as? NSFont == font)
+    for (token, role) in [
+        ("4f", AgentPalette.MetricsRole.muted), ("+86", .adds), ("-12", .dels),
+    ] {
+        // Per index rather than per attribute run: adjacent muted
+        // segments (a token and the space after it) coalesce into one
+        // run, so a run's extent says nothing about a segment's.
+        let range = (text as NSString).range(of: token)
+        for offset in 0..<range.length {
+            let color =
+                attributed.attribute(
+                    .foregroundColor, at: range.location + offset, effectiveRange: nil) as? NSColor
+            #expect(color == AgentPalette.metricsColor(role), "\(token) color at +\(offset)")
+        }
+    }
+}
+
 // MARK: - Population
 
 @Test
@@ -344,11 +467,10 @@ func agentRowPayloadCarriesTheEffectiveLifecycleAndPendingMetrics() {
 }
 
 @Test
-func agentFrameCarriesTheFooterHintsAndPlaceholder() {
+func agentFrameCarriesThePlaceholder() {
     let frame = AgentPalette.agentFrame(projects: [], tabs: [], now: NOW)
     #expect(frame.id == AgentPalette.frameID)
     #expect(frame.placeholder == AgentPalette.placeholder)
-    #expect(frame.footerHints == AgentPalette.footerHints)
     #expect(frame.items.count == 1)
     #expect(frame.items[0].id == AgentPalette.emptyRowID)
 }

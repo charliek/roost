@@ -112,10 +112,6 @@ struct PaletteInner {
     /// scroll the highlighted row into view (GtkListBox doesn't do this
     /// itself when focus stays on the search entry).
     scroll: gtk4::ScrolledWindow,
-    /// Muted hint bar under the list. Visible only for frames that set
-    /// `footer_hints` (the agents frame); hidden otherwise, so every
-    /// existing picker keeps its current chrome.
-    footer: gtk4::Label,
     /// Set while we programmatically rewrite the entry text (query
     /// restore on push/pop) so the `changed` handler ignores the echo.
     suppress_changed: Cell<bool>,
@@ -171,12 +167,6 @@ impl PaletteOverlay {
 
         let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
 
-        let footer = gtk4::Label::builder()
-            .xalign(0.0)
-            .visible(false)
-            .css_classes(["palette-footer"])
-            .build();
-
         let card = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .width_request(660)
@@ -188,7 +178,6 @@ impl PaletteOverlay {
         card.append(&entry);
         card.append(&separator);
         card.append(&scroll);
-        card.append(&footer);
 
         // Transparent click-catcher behind the card. No dim — the
         // terminal stays visible; a click anywhere outside the card
@@ -210,7 +199,6 @@ impl PaletteOverlay {
             entry: entry.clone(),
             list: list.clone(),
             scroll: scroll.clone(),
-            footer: footer.clone(),
             suppress_changed: Cell::new(false),
             closing: Cell::new(false),
             armed: Cell::new(false),
@@ -381,19 +369,12 @@ impl PaletteInner {
     /// Re-render the field placeholder + rows for the current frame and
     /// fire the highlight preview for the selected row.
     fn sync_ui(self: &Rc<Self>) {
-        let (placeholder, query, footer_hints) = {
+        let (placeholder, query) = {
             let state = self.state.borrow();
             let f = state.current();
-            (
-                f.placeholder.clone(),
-                f.query.clone(),
-                f.footer_hints.clone(),
-            )
+            (f.placeholder.clone(), f.query.clone())
         };
         self.entry.set_placeholder_text(Some(&placeholder));
-        self.footer
-            .set_label(footer_hints.as_deref().unwrap_or_default());
-        self.footer.set_visible(footer_hints.is_some());
         if self.entry.text() != query.as_str() {
             self.suppress_changed.set(true);
             self.entry.set_text(&query);
@@ -864,12 +845,15 @@ fn build_agent_row(agent: &AgentRowData) -> gtk4::Box {
     hbox.append(&status);
 
     if let Some(metrics) = &agent.metrics_text {
-        let metrics = gtk4::Label::builder()
-            .label(metrics)
+        // Per-segment colour (added/deleted counts) lives in the markup,
+        // not in CSS — the class still carries the mono font + size.
+        let label = gtk4::Label::builder()
+            .use_markup(true)
             .xalign(1.0)
             .css_classes(["palette-agent-metrics"])
             .build();
-        hbox.append(&metrics);
+        label.set_markup(&metrics_markup(metrics));
+        hbox.append(&label);
     }
 
     let time = gtk4::Label::builder()
@@ -959,6 +943,23 @@ fn markup_for(title: &str, ranges: &[Range<usize>]) -> String {
     out
 }
 
+/// Build Pango markup for the agent row's git-metrics column, one span
+/// per segment of [`agent_palette::metrics_segments`]. *Every* segment
+/// carries an explicit `foreground`, muted ones included, so the CSS
+/// colour can never drift against the Rust hex for part of the string;
+/// each segment is markup-escaped.
+fn metrics_markup(text: &str) -> String {
+    let mut out = String::new();
+    for (segment, role) in agent_palette::metrics_segments(text) {
+        out.push_str(&format!(
+            "<span foreground=\"{}\">{}</span>",
+            agent_palette::metrics_role_hex(role),
+            glib::markup_escape_text(segment)
+        ));
+    }
+    out
+}
+
 /// Minimal vertical scroll offset that brings a row spanning
 /// `[y, y + height)` fully into a viewport of height `page` currently
 /// scrolled to `offset`: scroll up if the row is above the viewport,
@@ -1036,6 +1037,36 @@ mod tests {
             format!(
                 "<span foreground=\"{c}\" weight=\"bold\">N</span>ew <span foreground=\"{c}\" weight=\"bold\">T</span>ab",
                 c = MATCH_ACCENT
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_metrics_markup_colors_every_segment() {
+        assert_eq!(
+            metrics_markup("4f +86 -12"),
+            concat!(
+                "<span foreground=\"#7a7a7a\">4f</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#7fbf7f\">+86</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#e05252\">-12</span>",
+            )
+        );
+    }
+
+    #[test]
+    fn metrics_markup_escapes_segment_text() {
+        // A cwd-derived string can't reach this column today, but the
+        // label parses markup — an unescaped `<` would break the row.
+        assert_eq!(
+            metrics_markup("<3f & +2"),
+            concat!(
+                "<span foreground=\"#7a7a7a\">&lt;3f</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#7a7a7a\">&amp;</span>",
+                "<span foreground=\"#7a7a7a\"> </span>",
+                "<span foreground=\"#7fbf7f\">+2</span>",
             )
         );
     }

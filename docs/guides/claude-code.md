@@ -10,8 +10,8 @@ Roost ships a `roostctl claude-hook EVENT` subcommand that Claude Code invokes f
 |---|---|---|
 | `SessionStart` | Claims ownership as `claude`; lifecycle → inactive | No visible dot change yet, but raw OSC 9/99/777 from inside the shell is now suppressed while this session owns the tab |
 | `UserPromptSubmit` | Lifecycle → running; clears pending notification | Blue dot |
-| `Notification` — `permission_prompt`, `idle_prompt`, `agent_needs_input`, `elicitation_dialog` | Lifecycle → needs-input; fires a warn-severity banner | Orange dot + banner |
-| `Notification` — `auth_success`, `elicitation_complete`, `elicitation_response`, `agent_completed`, or any **other/unrecognized** `notification_type` | Lifecycle **unchanged**; fires an info-severity banner | The banner still reaches you, but the dot doesn't move — see below for why |
+| `Notification` — `permission_prompt`, `agent_needs_input`, `elicitation_dialog` | Lifecycle → needs-input; fires a warn-severity banner | Orange dot + banner |
+| `Notification` — `idle_prompt` (the post-turn idle nag — deliberately non-blocking so a finished session doesn't re-render as blocked), `auth_success`, `elicitation_complete`, `elicitation_response`, `agent_completed`, or any **other/unrecognized** `notification_type` | Lifecycle **unchanged**; fires an info-severity banner | The banner still reaches you, but the dot doesn't move — see below for why |
 | `Stop`, no in-flight `background_tasks` | Lifecycle → idle ("finished"); fires an info banner ("Turn complete") | Gray dot |
 | `Stop`, **non-empty** `background_tasks` | Lifecycle **stays running** ("working"), not idle; banner names the in-flight count | Distinguishes "the turn is done" from "paused, will resume when background work wakes it" — a scheduled `session_crons` entry alone does *not* count as in-flight |
 | `StopFailure` | Lifecycle → failed; fires an error-severity banner naming Claude's reported `error` | Red dot — distinct from needs-input everywhere except on the legacy wire `state` field, which has no fifth value (see [`ipc.md`](../reference/ipc.md)) |

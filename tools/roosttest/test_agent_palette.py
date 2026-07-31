@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from client import RoostError
+from client import RoostError, Timeout
 from test_agent_lifecycle import agent_tab, claude_hook
 from util import is_fresh, wait_tab_attached
 
@@ -69,10 +69,34 @@ def _seed(
     if name is not None:
         roost.set_title(tab_id, name)
     wait_tab_attached(roost, tab_id)
+    # The shell's own first prompt should land BEFORE we claim: Roost
+    # auto-bootstraps roost.bash/roost.zsh, whose PROMPT_COMMAND emits
+    # OSC 133;D, and an A/B/D mark resets a seeded lifecycle to
+    # `inactive` (the plan-002 dead-agent failsafe). The marks precede
+    # the PS1 bytes in the same write, so a non-empty screen (or a
+    # shell_state already moved off `unknown`) means they are drained.
+    # Without this, a seeded lifecycle survives only until the real
+    # prompt paints — a ~100ms window that made the live-refresh test
+    # flake under load (plan 006 §Verified).
+    #
+    # Best-effort, not a hard gate: a shell that never paints (CI spawn
+    # anomalies) emits no late mark either, so the race this settles
+    # cannot occur there — proceed on the fed mark below rather than
+    # failing a test that never needed the real shell.
+    try:
+        roost._wait(
+            lambda: roost.dump_text(tab_id).strip() != ""
+            or roost.shell_state(tab_id) in {"at_prompt", "foreground_process"},
+            5.0,
+            f"tab {tab_id}'s shell painted its first prompt",
+        )
+    except Timeout:
+        pass
     if TEST_MODE:
-        # CI shells have no OSC 133 integration, so waiting for a real
-        # prompt mark hangs there. Feed the A mark ourselves — same
-        # settled end-state, deterministic, and it still exercises the
+        # CI shells have no OSC 133 integration (Apple bash 3.2 is
+        # skipped by the autobootstrap), so waiting for a real prompt
+        # mark hangs there. Feed the A mark ourselves — same settled
+        # end-state, deterministic, and it still exercises the
         # late-mark-can't-reset property the passive wait was for.
         roost.tab_feed_pty_bytes(tab_id, b"\x1b]133;A\x07")
     roost.wait_shell_state(tab_id, "at_prompt", timeout=15.0)
@@ -343,6 +367,63 @@ def test_subagent_event_via_real_claude_hook_leaves_row_unchanged(roost, project
     after = roost.palette_row("agents", row_id)
     assert after is not None
     assert after["agent"]["status_text"] == "Working", after
+
+
+def test_idle_prompt_and_permission_prompt_diverge_in_palette(roost, project, target):
+    """The plan 006 §3.1 declassification, read off the rows a user
+    actually scans: two finished sessions, one nagged by `idle_prompt`
+    and one genuinely blocked by `permission_prompt`. Before the fix both
+    rows read "Waiting for input", so a real block was indistinguishable
+    from a timer. Now the idle nag leaves its row "Finished" while the
+    permission prompt still escalates — asserted in a SINGLE palette
+    state read, so the divergence is pinned in one frame rather than
+    across two snapshots."""
+    tab_a = agent_tab(roost, project)
+    tab_b = agent_tab(roost, project)
+    sess_a = f"sess-idle-nag-{uuid.uuid4().hex[:6]}"
+    sess_b = f"sess-real-block-{uuid.uuid4().hex[:6]}"
+    row_a, row_b = f"agent:{tab_a}", f"agent:{tab_b}"
+
+    for tab, session in ((tab_a, sess_a), (tab_b, sess_b)):
+        claude_hook(target, tab, "SessionStart", {"session_id": session, "source": "startup"})
+        claude_hook(target, tab, "UserPromptSubmit", {"session_id": session, "prompt": "go"})
+        roost.wait_lifecycle(tab, "working")
+        claude_hook(target, tab, "Stop", {"session_id": session, "stop_hook_active": False})
+        roost.wait_lifecycle(tab, "finished")
+
+    # A: the nag. `wait_notification` is no barrier here — the preceding
+    # Stop already set the pending bit — but the adapter stamps `detail`
+    # unconditionally, so that is what orders the read.
+    claude_hook(target, tab_a, "Notification", {
+        "session_id": sess_a,
+        "notification_type": "idle_prompt",
+        "message": "Claude is waiting for your input",
+    })
+    roost._wait(
+        lambda: (roost.ownership(tab_a) or {}).get("detail") == "idle_prompt",
+        5.0,
+        "tab A's idle_prompt landed",
+    )
+    row = roost.palette_row("agents", row_a)
+    assert row is not None and row["agent"]["status_text"] == "Finished", row
+
+    # B: the real block, same shape of event, opposite outcome.
+    claude_hook(target, tab_b, "Notification", {
+        "session_id": sess_b,
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission to use Bash",
+    })
+    roost._wait(
+        lambda: (roost.ownership(tab_b) or {}).get("detail") == "permission_prompt",
+        5.0,
+        "tab B's permission_prompt landed",
+    )
+    roost.wait_lifecycle(tab_b, "waiting")
+
+    by_id = {it["id"]: it for it in roost.palette_items("agents")}
+    assert row_a in by_id and row_b in by_id, sorted(by_id)
+    assert by_id[row_a]["agent"]["status_text"] == "Finished", by_id[row_a]
+    assert by_id[row_b]["agent"]["status_text"] == "Waiting for input", by_id[row_b]
 
 
 # ---------------------------------------------------------------------------

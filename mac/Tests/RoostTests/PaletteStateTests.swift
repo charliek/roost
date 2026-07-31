@@ -222,10 +222,3 @@ func updateItemsUnknownFrameIsANoOp() {
     #expect(state.matches.count == 3)
 }
 
-@Test
-func footerHintsDefaultToNil() {
-    #expect(sampleRoot().footerHints == nil)
-    let hinted = PaletteFrame(
-        id: "agents", placeholder: "Go to agent…", items: [], footerHints: "esc close")
-    #expect(hinted.footerHints == "esc close")
-}

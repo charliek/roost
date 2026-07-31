@@ -203,21 +203,16 @@ struct PaletteFrame {
     var items: [PaletteItem]
     var query: String = ""
     var selection: Int = 0
-    /// Muted one-line hint bar under the list (the agents frame's
-    /// "↑↓ move  ↵ go to tab  esc close"). `nil` on every other frame,
-    /// which renders no footer. Not exposed on the wire.
-    let footerHints: String?
 
     init(
         id: String, placeholder: String, items: [PaletteItem], query: String = "",
-        selection: Int = 0, footerHints: String? = nil
+        selection: Int = 0
     ) {
         self.id = id
         self.placeholder = placeholder
         self.items = items
         self.query = query
         self.selection = selection
-        self.footerHints = footerHints
     }
 }
 
