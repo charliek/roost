@@ -9,6 +9,90 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
+## v0.0.16 — 2026-07-30
+
+The agent release. The overloaded two-field agent model is replaced by four
+independent axes with a derived display state, Claude hook handling moves into a
+pure adapter crate, `roostctl doctor` makes the whole integration legible, and
+the first agent-UX surface ships on both UIs: an agent palette (⌘⇧O / Alt⇧O)
+listing every agent-owned tab with live status and git metrics.
+
+### Features
+
+- **Agent state model — four axes instead of one field (#259)** — shell state
+  (OSC 133), agent lifecycle, attention, and ownership are now independent, and
+  the displayed state is *derived*, never written. `tab.state` stays a closed
+  four-value enum on the wire (`failed` projects onto `needs_input`), and
+  `hook_active` is derived from ownership. Documented in `AGENT_ROADMAP.md`.
+- **`roost-agent`, a pure Claude hook adapter (#259)** — hook JSON in,
+  `tab.agent_report` ops out; no I/O, no clap, no socket. `roostctl claude-hook`
+  routes through it, so a second agent is a new module plus an `install`
+  subcommand — zero Swift, zero GTK. One canonical hook-event vocabulary
+  (`CLAUDE_HOOK_EVENTS` + `canonical_hook_event()`) replaces three copies with
+  drifting alias policy.
+- **`roostctl doctor` — read-only agent-integration diagnostics (#260)** — 26
+  checks across five sections, each scoped (process / ui / tab) so a process
+  fact never judges a tab fact. Names *which axis is empty* rather than leaving
+  you staring at an absent dot; distinguishes missing / not-a-socket / stale
+  sockets, and detects a pre-#259 server exactly via raw-key presence. Never
+  repairs, installs, or mutates.
+- **Doctor's two-axis status model and summary view (#263)** — checks carry
+  `ok`/`warn`/`fail`/`skipped`; observations carry no status. Default output is
+  one line per section, `-v` gives the full report, with color.
+- **Agent palette — ⌘⇧O / Alt⇧O switcher (#265, roadmap D3)** — lists every
+  agent-owned tab with a status dot, project, agent name, status text, elapsed
+  age, and async git metrics; up/down/enter to jump, escape to close, rows
+  refresh live while open. Pure UI work on the plan-002 state model — no new IPC
+  op; `PaletteItemView` gains an optional, additive `agent` payload. Shipped at
+  parity on GTK and Mac, with git metrics gathered via short-timeout
+  `--no-optional-locks` git subprocesses behind a session-scoped cache.
+- **Per-segment colors on the palette's git-metrics column (#269)** — the
+  ahead/behind/insertions/deletions segments are colored individually on both
+  UIs instead of rendering as one dim run.
+
+### Fixes
+
+- **`idle_prompt` no longer flips a finished session to "Waiting for input"
+  (#269)** — Claude fires an idle nag ~60s after a turn ends; it was classified
+  as blocking, so a finished session went gray and then orange, indistinguishable
+  from one genuinely stuck on a permission prompt. The blocking set is now
+  `permission_prompt | agent_needs_input | elicitation_dialog`. Adapter-only, so
+  both UIs got it for free.
+- **Mac: tab and project positions are allocated from `max + 1`, not `count`
+  (#262, #263)** — closing a tab from the middle made the next one reuse a live
+  position, and closing from the *front* could render a brand-new tab to the
+  left of one that predates it. That's the real cause of "the third tab asked for
+  input but the second one turned orange" — the agent model was correct; the row
+  it sat next to wasn't. Rust had this fix since #86; Swift never got it. Loading
+  a `state.json` with colliding positions now repairs them on both UIs, and four
+  position-only sorts gained an `id` tiebreak (they sorted unordered dictionary
+  values).
+- **The project rollup no longer hides trusted agent state (#259)** — a project
+  whose only blocked tab was an agent showed no stripe.
+- **Raw OSC 9/99/777 suppression during an agent session (#259)** — documented
+  but never implemented.
+- **One notification focus predicate (#259)** — banner, unread badge, and inbox
+  row disagreed with each other and with the docs.
+- **`roostctl`: payloadless claude-hook invocations keep working (#259)**, and
+  format characters in doctor output are escaped, closing a padding-aim vector
+  (#263).
+- **Footer hint bar removed from the palettes (#269)**, mechanism and all.
+
+### Tooling & tests
+
+- **Dual-target e2e coverage for the agent stack** — full lifecycle through the
+  real `roostctl claude-hook` binary (#259), `roostctl doctor` end to end (#260),
+  tab ordering (#263), and 15 agent-palette cases driving production IPC —
+  exact status strings, rank order, effective-vs-raw lifecycle via OSC 133 marks,
+  subagent immunity, live refresh, and git metrics against a throwaway repo
+  (#265).
+- **Palette e2e seeds settle on explicit ready shell states** rather than
+  "not unknown", via a fed OSC 133 mark under test mode (#265, #269).
+- **`make check` lints at CI parity (#259).**
+- **Release assets are labeled by target, not filename (#257)** — "Linux — ARM
+  64-bit (.deb)" instead of `roost_0.0.15_arm64.deb`; the download still lands
+  under the real name, so apt is unaffected.
+
 ## v0.0.15 — 2026-07-26
 
 Kitty-mode keyboard input now carries shifted text correctly on both UIs — you
