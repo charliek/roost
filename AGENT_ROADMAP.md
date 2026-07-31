@@ -236,6 +236,7 @@ gauntlet convention; the PR body carries the durable public record.
 | 003 | L2 `roostctl doctor` + diagnostics | `~/.claude/plans/roost/003-roostctl-doctor.md` | Shipped | [#260](https://github.com/charliek/roost/pull/260) |
 | 004 | Tab/project position parity ([#262](https://github.com/charliek/roost/issues/262)) + `roostctl doctor` output UX | `~/.claude/plans/roost/004-tab-order-and-doctor-ux.md` | Shipped | [#263](https://github.com/charliek/roost/pull/263) |
 | 005 | D3 agent switcher palette frame (+ async git metrics) — first L3 feature | `~/.claude/plans/roost/005-agent-palette.md` | Shipped | [#265](https://github.com/charliek/roost/pull/265) |
+| 006 | Palette refinements post-005: `idle_prompt` declassified from the blocking set, footer bar removed, per-segment git-metric colors | `~/.claude/plans/roost/006-palette-refinements.md` | Shipped | [#269](https://github.com/charliek/roost/pull/269) |
 | — | L3 agent UX (tint / overview) | *not yet written* | Future | — |
 
 ---
