@@ -940,6 +940,40 @@ Commit boundary: `cc6daac` (logical focus) was pushed and Actions run
 tests, skip removal, Make/Actions changes, and this reviewed plan land together
 as the next independently green commit.
 
+### CI follow-up mini-plan: tolerate delayed Iced palette layout
+
+Evidence: commit `aeaf6e6` passed twelve repeated local macOS/wgpu launches and
+the pre-push macOS plus shed wgpu/tiny-skia X11/Wayland matrix, but Actions run
+`30694544039` timed out waiting for the first theme-row visibility measurement
+on macOS/wgpu and Linux Wayland/tiny-skia. Every preceding test passed. The
+adapter currently abandons a `Visibility::Missing` result after two 16 ms
+ticks, so a widget tree that takes more than roughly 32 ms to materialize can
+never resynchronize until an unrelated resize or palette mutation occurs.
+
+Scope: keep the same revisioned locate/reveal/remeasure operation and expand
+only its missing-layout recovery policy. A named, bounded retry budget covers
+slow debug builds and software renderers; one retry is scheduled per completed
+`Missing` result, never as a blocking loop. Palette session/revision changes
+reset the budget and stale results remain discarded. Exhaustion leaves
+`selected_in_view` unavailable (`None`) and emits one warning containing
+session, revision, and retry count; `false` remains reserved for a genuinely
+measured but clipped row. A genuine `Visible(false)` answer is not retried.
+
+Invariants: retries never outlive their palette session/revision, manual
+scroll still supersedes an older reveal request, no operation runs while state
+is locked, no renderer-specific branch or test skip is introduced, and the
+normal already-laid-out path still completes in one operation. The retry limit
+is expressed as a constant and unit-tested at its boundary so a future timing
+change cannot silently restore the two-tick assumption.
+
+Acceptance: unit tests prove first, penultimate, and exhausted `Missing`
+transitions plus stale-result rejection; the focused theme/resize E2E passes
+repeatedly on macOS/wgpu and in the shed under wgpu/tiny-skia on X11 and
+Wayland; Iced format, tests, warnings-denied clippy, dependency checks, the
+complete local gate, and GTK theme regression stay green; the fix is committed
+and pushed separately, and Actions is green in all four Iced matrix jobs before
+the next feature slice begins.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

@@ -47,6 +47,12 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 const TAB_BAR_HEIGHT: f32 = 44.0;
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
+// Widget operations can observe an incomplete tree while a slower renderer or
+// compositor is still materializing a newly-pushed palette frame. Retry on
+// later application ticks for roughly two seconds at the 60 Hz subscription,
+// while keeping the work bounded and revision-scoped.
+const PALETTE_GEOMETRY_RETRY_LIMIT: u8 = 120;
+
 fn sidebar_width(collapsed: bool) -> f32 {
     if collapsed {
         0.0
@@ -173,7 +179,7 @@ fn queue_visibility_request(
 }
 
 fn missing_geometry_retry(retries: u8, reveal: bool) -> Option<(u8, PaletteVisibilityRequest)> {
-    (retries < 2).then(|| {
+    (retries < PALETTE_GEOMETRY_RETRY_LIMIT).then(|| {
         (
             retries + 1,
             if reveal {
@@ -1484,10 +1490,11 @@ impl App {
                     self.palette_visibility_retries = retries;
                     self.palette_visibility_request = self.palette_visibility_request.merge(retry);
                 } else {
-                    tracing::debug!(
+                    tracing::warn!(
                         session,
                         revision,
-                        "palette geometry unavailable after retry"
+                        retries = self.palette_visibility_retries,
+                        "palette geometry unavailable after bounded retries"
                     );
                 }
             }
@@ -2915,16 +2922,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_palette_geometry_retries_twice_then_stops() {
+    fn missing_palette_geometry_retries_to_the_named_limit() {
         assert_eq!(
             missing_geometry_retry(0, true),
             Some((1, PaletteVisibilityRequest::Reveal))
         );
         assert_eq!(
-            missing_geometry_retry(1, false),
-            Some((2, PaletteVisibilityRequest::Measure))
+            missing_geometry_retry(PALETTE_GEOMETRY_RETRY_LIMIT - 1, false),
+            Some((
+                PALETTE_GEOMETRY_RETRY_LIMIT,
+                PaletteVisibilityRequest::Measure
+            ))
         );
-        assert_eq!(missing_geometry_retry(2, true), None);
+        assert_eq!(
+            missing_geometry_retry(PALETTE_GEOMETRY_RETRY_LIMIT, true),
+            None
+        );
     }
 
     #[test]
