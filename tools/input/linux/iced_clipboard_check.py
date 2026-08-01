@@ -292,41 +292,78 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
     x0 = 220 + 12 + 4
     x1 = 220 + 12 + int((len(marker) - 0.5) * 8.4)
     y = 44 + 12 + 9
+    # Keep the press, motion, and release as separate XTEST submissions. The
+    # tiny-skia event loop can process a single batched xdotool sequence only
+    # after its release, coalescing away the drag motion. IPC observation while
+    # the button is still held is the synchronization fence; sleeps in
+    # terminal_pointer are not the correctness mechanism.
     launch.terminal_pointer(
-        [
-            "mousemove",
-            "--window",
-            launch.window,
-            str(x0),
-            str(y),
-            "sleep",
-            "0.15",
-            "mousedown",
-            "1",
-            "sleep",
-            "0.15",
-            "mousemove",
-            "--window",
-            launch.window,
-            str(x1),
-            str(y),
-            "sleep",
-            "0.15",
-            "mouseup",
-            "1",
-        ]
+        ["mousemove", "--window", launch.window, str(x0), str(y)]
     )
-    deadline = time.monotonic() + 5 * SCALE
-    selection = {}
-    while time.monotonic() < deadline:
+    selection: dict = {}
+
+    def held_drag_is_observed() -> bool:
+        nonlocal selection
         selection = launch.client.selection_dump(launch.tab)
-        if selection.get("text") == marker:
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError(
-            f"real drag did not select {marker!r}; selection={selection!r}"
+        return (
+            selection.get("text") == marker
+            and launch.client.clipboard_dump("system") == baseline
+            and launch.client.clipboard_dump("selection") == baseline
         )
+
+    pending_error: BaseException | None = None
+    try:
+        # Guard the injection itself: xdotool can press successfully and then
+        # fail or be interrupted before terminal_pointer's trailing delay.
+        # An unmatched XTEST mouseup is harmless if the press never landed.
+        launch.terminal_pointer(["mousedown", "1"])
+        midpoint = (x0 + x1) // 2
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(midpoint), str(y)]
+        )
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(x1), str(y)]
+        )
+        try:
+            _wait_until(
+                held_drag_is_observed,
+                f"held drag selection {marker!r}",
+                timeout=5,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"held drag did not select {marker!r}; selection={selection!r}"
+            ) from error
+    except BaseException as error:
+        pending_error = error
+        raise
+    finally:
+        try:
+            launch.terminal_pointer(["mouseup", "1"])
+        except Exception as release_error:
+            if pending_error is None:
+                raise
+            print(
+                f"failed to release held drag while handling {pending_error!r}: "
+                f"{release_error}",
+                file=sys.stderr,
+            )
+
+    def committed_selection_is_exact() -> bool:
+        nonlocal selection
+        selection = launch.client.selection_dump(launch.tab)
+        return selection.get("text") == marker
+
+    try:
+        _wait_until(
+            committed_selection_is_exact,
+            f"committed drag selection {marker!r}",
+            timeout=5,
+        )
+    except AssertionError as error:
+        raise AssertionError(
+            f"released drag changed {marker!r}; selection={selection!r}"
+        ) from error
     _wait_until(
         lambda: launch.client.clipboard_dump("system") == marker,
         "copy-on-select system write after real drag",
