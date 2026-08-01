@@ -1449,6 +1449,14 @@ GTK/Swift difference. Full-window pixel equality remains inappropriate, but
 subjective resemblance alone is also insufficient. The final POC cannot claim
 visual or product parity while the inventory contains an unnamed material gap.
 
+The active measured register, baseline method, ordered closure slices, and
+first deterministic-capture contract now live in
+[`iced-parity-inventory.md`](iced-parity-inventory.md). It records the stock
+Iced control styling and missing direct manipulation paths as P0 gaps; the
+walking skeleton must not be described as visually or functionally equivalent
+until that register is closed or every remaining difference is explicitly
+accepted as toolkit-native.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.
