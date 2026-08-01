@@ -33,6 +33,16 @@ from client import RoostError, Timeout, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# A shell with NO startup files, therefore no Roost shell integration,
+# therefore no OSC 133 marks the test didn't feed itself. Any tab whose
+# agent lifecycle a test seeds MUST be opened with this argv: a real
+# integrated shell can emit an A/B/D mark at any point after the claim
+# (a WINCH-driven prompt redraw at view attach, say), and the plan-002
+# dead-agent failsafe resets the seeded lifecycle to `inactive` when it
+# lands. `test_agent_lifecycle.agent_tab` has always used this argv for
+# exactly that reason; `test_agent_palette._seed` requires it.
+BARE_SHELL_ARGV = ["/bin/bash", "--norc", "--noprofile"]
+
 
 def roostctl_path() -> str:
     """Absolute path to a `roostctl` binary, building one if needed.

@@ -40,7 +40,7 @@ import pytest
 
 import ui
 from client import scaled_timeout
-from util import roostctl_path, wait_tab_attached
+from util import BARE_SHELL_ARGV, roostctl_path, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -101,8 +101,7 @@ def claude_hook(
 def agent_tab(roost, project) -> int:
     """A bare-shell agent tab that is NOT the active tab (see module
     docstring), attached and ready to be fed PTY bytes."""
-    tab = roost.open_tab(project, cwd="/tmp",
-                         argv=["/bin/bash", "--norc", "--noprofile"])
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     # Attach-wait BEFORE the decoy: two concurrent spawns + two view
     # attachments otherwise race the attach budget. Order is the only
     # thing that changes — the decoy still opens (and steals active)

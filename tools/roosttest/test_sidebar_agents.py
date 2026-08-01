@@ -28,6 +28,7 @@ from __future__ import annotations
 import uuid
 
 from test_agent_palette import TIME_TEXT_RE, _seed
+from util import BARE_SHELL_ARGV
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +124,9 @@ def test_seeded_agents_appear_under_their_project_in_palette_order(roost, projec
     status_text per row."""
     p2 = roost.create_project(name=f"pytest-sidebar-agents2-{uuid.uuid4().hex[:6]}", cwd="/tmp")
     try:
-        t_working = roost.open_tab(project, cwd="/tmp")
-        t_failed = roost.open_tab(project, cwd="/tmp")
-        t_other = roost.open_tab(p2, cwd="/tmp")
+        t_working = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        t_failed = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        t_other = roost.open_tab(p2, cwd="/tmp", argv=BARE_SHELL_ARGV)
 
         _seed(roost, t_working, lifecycle="working", name="sb-working")
         _seed(roost, t_failed, lifecycle="failed", name="sb-failed", detail="rate_limit")
@@ -239,7 +240,7 @@ def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, 
         ]
         by_project: dict[int, list[int]] = {project: [], p2: []}
         for pid, lifecycle, name, detail in seeds:
-            tab = roost.open_tab(pid, cwd="/tmp")
+            tab = roost.open_tab(pid, cwd="/tmp", argv=BARE_SHELL_ARGV)
             _seed(roost, tab, lifecycle=lifecycle, name=name, detail=detail)
             by_project[pid].append(tab)
         seeded = {t for tabs in by_project.values() for t in tabs}
@@ -303,8 +304,8 @@ def test_sidebar_and_agent_palette_agree_on_membership_order_and_content(roost, 
 
 
 def test_exactly_one_row_is_active_and_follows_tab_focus(roost, project):
-    tab_a = roost.open_tab(project, cwd="/tmp")
-    tab_b = roost.open_tab(project, cwd="/tmp")
+    tab_a = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    tab_b = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab_a, lifecycle="working", name="sb-active-a")
     _seed(roost, tab_b, lifecycle="working", name="sb-active-b")
 
@@ -342,7 +343,7 @@ def test_exactly_one_row_is_active_and_follows_tab_focus(roost, project):
 
 
 def test_toggle_flips_agents_visible_and_keeps_rows_populated_when_off(roost, project):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="waiting", name="sb-toggle")
     _wait_agent_row(roost, project, tab)
 
@@ -373,7 +374,7 @@ def test_toggle_flips_agents_visible_and_keeps_rows_populated_when_off(roost, pr
 
 
 def test_row_disappears_when_agent_releases_ownership(roost, project):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     session = uuid.uuid4().hex
     source = _seed(roost, tab, lifecycle="working", name="sb-release", session=session)
     _wait_agent_row(roost, project, tab)
@@ -389,7 +390,7 @@ def test_row_disappears_when_agent_releases_ownership(roost, project):
 
 
 def test_row_disappears_when_tab_closes(roost, project):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="waiting", name="sb-close")
     _wait_agent_row(roost, project, tab)
 
@@ -399,7 +400,7 @@ def test_row_disappears_when_tab_closes(roost, project):
 
 def test_row_disappears_when_project_deleted(roost):
     p = roost.create_project(name=f"pytest-sidebar-agents-del-{uuid.uuid4().hex[:6]}", cwd="/tmp")
-    tab = roost.open_tab(p, cwd="/tmp")
+    tab = roost.open_tab(p, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="waiting", name="sb-project-delete")
     _wait_agent_row(roost, p, tab)
 
