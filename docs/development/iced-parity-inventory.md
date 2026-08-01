@@ -58,6 +58,16 @@ The first tooling slice must add one deterministic, explicitly named workspace
 scenario and a manifest that distinguishes application-owned content from
 native window chrome. Full-window pixel equality remains inappropriate.
 
+The resulting `make visual-parity` fixture was then captured locally for all
+three macOS targets and in the Linux shed for GTK plus Iced under X11/Wayland
+with both wgpu and tiny-skia. Visual review found a renderer correctness defect:
+tiny-skia starts its terminal body at x=440/y=88 while wgpu starts at the
+expected sidebar edge x=220/y=44. The defect reproduces on both Linux display
+backends and
+therefore precedes cosmetic chrome work. Captures are under the ignored
+`target/visual-parity-shed/` tree; their manifests identify display backend and
+renderer so results cannot be confused or overwritten.
+
 Measured baseline facts:
 
 | Surface | Swift | GTK | Iced at `dea73a5` |
@@ -106,6 +116,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Mostly inherited stock theme states | P1 | Renderer-neutral state-style unit tests plus real pointer/keyboard capture |
 | File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using UI-owned native adapters | No Iced drop or image-paste adapter | P1 | Text/file/image payload tests, shell escaping parity, platform launch smoke |
 | Native chrome | Platform-appropriate window controls and title/subtitle behavior | Native winit decorations; renderer screenshot cannot compare them directly | P2 | Platform launch artifacts and manual checklist, separate from content pixels |
+| Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | wgpu begins at x=220/y=44; tiny-skia incorrectly offsets the surface to x=440/y=88 on X11 and Wayland | P0 | Product-generated wgpu/tiny-skia captures on both display backends plus focused terminal viewport geometry regression |
 
 ## Functional interaction gap register
 
@@ -140,30 +151,34 @@ does not justify a second state machine.
 Every slice remains launchable, adds focused tests, runs under both Iced
 renderers, and is pushed only after the complete applicable gate is green.
 
-1. **Deterministic parity capture:** add one named workspace/palette fixture,
-   comparable artifact manifests for all three targets, focused shell
-   geometry/color assertions, and durable artifact hashes or tracked
-   comparison assets. Do not compare native decoration pixels across toolkits.
-2. **Chrome foundation and tab close:** introduce Iced-owned chrome tokens and
+1. **Deterministic comparison capture:** add one named workspace/palette fixture,
+   comparable artifact manifests for all three targets, reusable shell
+   geometry/color measurements, and provenance hashes. Visual inspection is
+   the parity gate; hashes are not golden assertions. Do not compare native
+   decoration pixels across toolkits.
+2. **Renderer correctness:** fix the tiny-skia terminal viewport width defect,
+   preserve wgpu behavior, and add a focused geometry regression independent of
+   visual-parity assertions.
+3. **Chrome foundation and tab close:** introduce Iced-owned chrome tokens and
    state styles; replace stock project, agent, tab, add-tab, notification, and
    sidebar controls; use shared lifecycle/rollup derivation; add a real active
    tab close control; reduce band and row density. Preserve all engine APIs and
-   satisfy the focused capture assertions introduced by slice 1.
-3. **Scrollable navigation and shortcut safety:** make the sidebar list and
+   compare the resulting named captures against GTK and Swift.
+4. **Scrollable navigation and shortcut safety:** make the sidebar list and
    terminal scrollback reachable, then dispatch every configured workspace
    shortcut before terminal encoding so missing UI commands cannot leak bytes.
-4. **Project manipulation:** portal/native directory selection, create,
+5. **Project manipulation:** portal/native directory selection, create,
    rename, delete, reorder, and the shared `new_project` command route.
-5. **Tab manipulation:** inline rename, drag reorder/overflow, hover-close
+6. **Tab manipulation:** inline rename, drag reorder/overflow, hover-close
    behavior, and restoration coverage.
-6. **Sidebar resizing and transient states:** 160–400 pt pointer resize,
+7. **Sidebar resizing and transient states:** 160–400 pt pointer resize,
    persistence, empty/loading/error treatment, hover/focus/disabled states.
-7. **Palette convergence:** scrim, panel elevation, row density, semantic
+8. **Palette convergence:** scrim, panel elevation, row density, semantic
    status/trailing columns, and command/agent/provider/notification captures.
-8. **Terminal visual/input convergence:** measured padding/font/baseline,
+9. **Terminal visual/input convergence:** measured padding/font/baseline,
    font commands, cursor/selection/link colors and geometry, file/image drops,
    then both-renderer artifacts.
-9. **Final gap closure:** repeat the inventory against the named fixture;
+10. **Final gap closure:** repeat the inventory against the named fixture;
    accept only explicitly documented native-toolkit differences.
 
 ## First slice contract
@@ -172,21 +187,25 @@ The deterministic-capture commit is intentionally tooling-first so later
 visual changes cannot grade themselves against subjective resemblance.
 
 - Scope: harness-owned state/config, one deterministic workspace and palette
-  seed, per-target screenshot/manifest output, and focused application-content
-  measurements. No production UI behavior changes.
+  seed, per-target screenshot/manifest output, and reusable application-content
+  measurements. No production UI behavior changes and no dedicated parity CI
+  job.
 - Invariants: all three launches remain hermetic; the fixture uses only common
   IPC/test operations; native decorations are excluded from cross-toolkit pixel
   assertions; text antialiasing is not treated as a stable pixel oracle.
-- Failure behavior: a missing component, refused trustworthy geometry, or
-  unavailable screenshot produces a named diagnostic and preserves the latest
-  PNG; it never silently substitutes another target or stale capture.
-- Tests: fixture model/unit tests, all three macOS captures, Iced wgpu and
-  tiny-skia X11/Wayland captures, manifest completeness, and focused color/
-  geometry assertions for sidebar, band, selected row, agent dot, tab pill,
-  badge, and terminal origin.
+- Failure behavior: a missing component or refused trustworthy geometry
+  produces a named diagnostic and preserves the latest PNG; an unsupported
+  product-capture surface is recorded explicitly. The tool never silently
+  substitutes another target or stale capture.
+- Tests: small unit tests for the reusable pixel/provenance helpers, all three
+  macOS captures, and local/shed Iced wgpu and tiny-skia X11/Wayland captures.
+  Existing focused product tests—not a long-running parity suite—protect
+  behavior after convergence.
 - Acceptance: one command produces comparable named artifacts for Swift, GTK,
-  and Iced; current failures describe the known Iced gaps; the following chrome
-  commit can turn each assertion green without changing the fixture.
+  and Iced; visual review makes the current gaps concrete; the following chrome
+  commit can reuse the same fixture without changing its semantics. AppKit's
+  product screenshot currently excludes its palette child panel, which is
+  declared in metadata rather than represented by a misleading image.
 
 ## Current named deferrals
 

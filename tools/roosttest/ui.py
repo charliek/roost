@@ -123,6 +123,15 @@ SEED_CONFIG = Path(__file__).resolve().parent / "fixtures" / "launcher.conf"
 MAC_TEST_DEFAULTS_SUITE = "ai.stridelabs.Roost.e2e"
 
 
+def _clear_mac_test_defaults() -> None:
+    subprocess.run(
+        ["defaults", "delete", MAC_TEST_DEFAULTS_SUITE],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def socket_path(target: str) -> Path:
     try:
         spec = TARGET_SPECS[target]
@@ -310,6 +319,11 @@ def start_session(target: str, *, fresh: bool) -> bool:
         quit(target)
     if is_alive(target):
         return False  # reuse the developer's running UI (non-fresh)
+    if fresh and target == "mac":
+        # A killed/interrupted prior test cannot leave sidebar preferences in
+        # the fixed isolated suite. Mid-test relaunches call launch() directly
+        # and therefore retain the current test's preferences as intended.
+        _clear_mac_test_defaults()
     _SESSION_STATE_DIR = Path(tempfile.mkdtemp(prefix="roost-e2e-state-"))
     shutil.copyfile(SEED_CONFIG, _session_config_path())
     # `config.rs`'s provider discovery resolves `providers/` as a sibling
@@ -337,8 +351,7 @@ def end_session(target: str) -> None:
         shutil.rmtree(_SESSION_STATE_DIR, ignore_errors=True)
         _SESSION_STATE_DIR = None
     if target == "mac":
-        subprocess.run(["defaults", "delete", MAC_TEST_DEFAULTS_SUITE],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        _clear_mac_test_defaults()
 
 
 def _cleanup_owned_rust_runtime(target: str) -> None:

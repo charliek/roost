@@ -22,6 +22,16 @@ import ui  # noqa: E402
 
 
 class TargetContractTests(unittest.TestCase):
+    @patch("ui.subprocess.run")
+    def test_mac_test_defaults_cleanup_is_scoped_and_best_effort(self, run) -> None:
+        ui._clear_mac_test_defaults()
+        run.assert_called_once_with(
+            ["defaults", "delete", ui.MAC_TEST_DEFAULTS_SUITE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
     def test_target_table_has_three_explicit_profiles(self) -> None:
         self.assertEqual(ui.TARGETS, ("mac", "gtk", "iced"))
         self.assertEqual(ui.TARGET_SPECS["iced"].rust_package, "roost-iced")

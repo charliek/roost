@@ -45,6 +45,11 @@ tools/screenshot/smoke.sh mac /tmp/ut-mac
 tools/screenshot/smoke.sh gtk /tmp/ut-gtk
 tools/screenshot/smoke.sh iced /tmp/ut-iced
 
+# Hermetic same-fixture comparison. Defaults to mac+gtk+iced on macOS and
+# gtk+iced on Linux; every environment gets a unique provenance directory.
+make visual-parity
+python3 tools/screenshot/parity.py --out target/visual-parity --targets iced
+
 # Quit cleanly (exercises fsync-on-exit; next launch restores the layout)
 tools/screenshot/quit.sh mac
 ```
@@ -52,6 +57,37 @@ tools/screenshot/quit.sh mac
 `smoke.sh` is self-contained: it creates a throwaway `uitest` project +
 two tabs, walks the scenario, and cascade-closes the project at the end,
 so it doesn't depend on or disturb your existing projects.
+
+**Warning:** `parity.py` passes `--roost-fresh`, which force-quits any running
+instance of each requested target before launching a throwaway state/config.
+Save work in live Roost sessions before running it. The disposable fixture never
+reads or writes developer state, but closing the existing UI is destructive.
+Each target receives exactly one `Parity Project` with four fixed lifecycle tabs,
+one inactive notification, a visible 220pt sidebar, and the root command
+palette. It writes `shell.png`, a palette capture where the product API supports
+it, and `measurements.json`, then aggregates current-run documents into
+`manifest.md`.
+Artifacts are keyed by target, OS, display backend, renderer, scale, commit,
+and run ID so X11/Wayland or wgpu/tiny-skia output cannot overwrite each other.
+PNG hashes are provenance, not golden assertions. The captures and their basic
+geometry/color measurements are reusable after the POC; visual inspection is
+the acceptance gate while Iced converges, and focused product tests protect the
+behavior afterward. This is an opt-in local/shed review tool, not a dedicated
+long-running CI parity suite. Cursor shape is seeded steady; elapsed agent times
+remain dynamic and are explicitly excluded from visual comparison.
+
+Local runs rebuild every requested target before capture and record both dirty
+source state and the launched executable's path/SHA-256. In the Linux shed,
+build with `tools/shed/shed-test.sh --build-only`, point `ROOST_GTK_BIN` or
+`ROOST_ICED_BIN` at the shed-local `~/rt/debug` executable, and pass
+`--no-build`; this prevents Linux outputs from overwriting macOS artifacts on
+the shared mount.
+
+AppKit's product screenshot renders the main window content view but not its
+child `NSPanel`, so the Mac document records the palette capture as unavailable
+and does not write a misleading `palette.png`. Shell captures compare all three
+targets; palette captures compare GTK and Iced. A future AppKit compositor for
+child panels can remove that declared capability gap.
 
 ## How verification works
 
