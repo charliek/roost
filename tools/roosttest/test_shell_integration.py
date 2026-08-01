@@ -29,7 +29,9 @@ from util import (
     cwd_reaches,
     precondition,
     run_printf_probe,
+    spawned_tab_id,
     wait_shell_ready,
+    wait_spawned_output,
     wait_tab_attached,
 )
 
@@ -132,9 +134,11 @@ def test_native_cwd_inherits_cd(roost, project, palette, target):
     state = palette.palette_open(kind="commands")
     assert "new_tab" in roost.palette_item_ids(state), roost.palette_item_ids(state)
     palette.palette_activate("new_tab")
-    roost._wait(lambda: {int(t["id"]) for t in roost.tabs()} - before,
-                5.0, "new_tab spawned a tab")
-    new_id = next(iter({int(t["id"]) for t in roost.tabs()} - before))
+    new_id = spawned_tab_id(roost, before, "new_tab spawned a tab")
+    # The send needs a live, interactable shell: anchor on attach, then
+    # on the shell actually executing a command, before driving it.
+    wait_tab_attached(roost, new_id)
+    wait_shell_ready(roost, new_id)
 
     # The new tab spawned in the active shell's cwd (/usr), proven by its
     # own pwd — independent of the new tab's OSC 7 timing.
@@ -164,10 +168,8 @@ def test_launcher_inherits_native_cwd(roost, project, palette, target):
     state = palette.palette_open(kind="launcher")
     items = {it["title"]: it["id"] for it in state["items"]}
     palette.palette_activate(items["Print Pwd"])
-    roost._wait(lambda: {int(t["id"]) for t in roost.tabs()} - before,
-                5.0, "launcher spawned a tab")
-    new_id = next(iter({int(t["id"]) for t in roost.tabs()} - before))
-    roost.wait_text(new_id, "LAUNCH_PWD=/usr", timeout=8)
+    new_id = spawned_tab_id(roost, before, "launcher spawned a tab")
+    wait_spawned_output(roost, new_id, "LAUNCH_PWD=/usr")
 
 
 def test_env_injected(roost, project):
