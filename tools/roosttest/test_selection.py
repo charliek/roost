@@ -64,9 +64,19 @@ def test_selection_clear(roost, project):
     `None` (`#[serde(skip_serializing_if = "Option::is_none")]`), so
     use `.get()` rather than subscript."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _seed_lines(roost, tab, n=3)
-    roost.selection_set(tab, anchor=(0, 0), cursor=(3, 0))
-    assert roost.selection_dump(tab).get("text") is not None
+    marker = _seed_lines(roost, tab, n=3)
+    dump = roost.dump(tab)
+    target = f"{marker}-row01"
+    rows_text = dump["rows_text"]
+    row_idx = next(i for i, line in enumerate(rows_text) if target in line)
+    col_start = rows_text[row_idx].index(target)
+    col_end = col_start + len(target)
+    roost.selection_set(
+        tab,
+        anchor=(col_start, row_idx),
+        cursor=(col_end - 1, row_idx),
+    )
+    assert roost.selection_dump(tab).get("text") == target
     roost.selection_clear(tab)
     sel = roost.selection_dump(tab)
     assert sel.get("text") is None
