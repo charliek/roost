@@ -48,14 +48,6 @@ def owned_rust_config(target):
 
 
 @pytest.fixture
-def owned_gtk_config(owned_rust_config, target):
-    """Stop before any family-only fixture can mutate an Iced session."""
-    if target != "gtk":
-        pytest.skip("font-family discovery and preview remain a named Iced gap")
-    return owned_rust_config
-
-
-@pytest.fixture
 def rust_project(owned_rust_config, roost):
     """Rust UI project created after the harness ownership guard succeeds."""
     project_id = roost.create_project(
@@ -156,29 +148,66 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
     assert ui.SEED_CONFIG.read_bytes() == seed_before
 
 
-def test_gtk_font_preview_dismiss_and_confirmation_are_commit_bounded(
-    owned_gtk_config, roost, rust_project, rust_palette
+def test_rust_font_preview_dismiss_and_confirmation_are_commit_bounded(
+    owned_rust_config, roost, rust_project, rust_palette
 ):
-    config_path = owned_gtk_config
+    config_path = owned_rust_config
     seed_before = ui.SEED_CONFIG.read_bytes()
     config_before = config_path.read_bytes()
     active_tab = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    hidden_tab = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_attached(roost, active_tab)
+    wait_tab_attached(roost, hidden_tab)
+    roost.window_resize(960, 640)
+    baseline_grid = _grid(roost, hidden_tab)
+    roost.focus(active_tab)
+    roost._wait(
+        lambda: _grid(roost, active_tab) == baseline_grid,
+        5.0,
+        "both live tabs receive the same opening family metrics",
+    )
+    roost.focus(hidden_tab)
 
     rust_palette.palette_open()
     fonts = rust_palette.palette_activate("select_font")
-    if len(fonts["items"]) < 2:
-        pytest.skip("GTK font preview requires at least two installed monospace families")
+    assert len(fonts["items"]) >= 2, (
+        "required Rust-UI font parity lane needs two installed monospace families; "
+        f"discovered {fonts['items']}"
+    )
     original = fonts["items"][fonts["selection"]]
     candidates = [item for item in reversed(fonts["items"]) if item["id"] != original["id"]]
     target_font = candidates[0]
-
     preview = rust_palette.palette_query(target_font["title"])
     assert preview["items"][preview["selection"]]["id"] == target_font["id"]
+    roost._wait(
+        lambda: roost.window_metrics().get("terminal_font_family")
+        == target_font["id"],
+        5.0,
+        "font preview reaches the live renderer family token",
+    )
+    target_grid = _grid(roost, active_tab)
+    if target_grid != baseline_grid:
+        roost._wait(
+            lambda: _grid(roost, hidden_tab) == target_grid,
+            5.0,
+            "font preview reflows a hidden live tab when metrics differ",
+        )
     assert config_path.read_bytes() == config_before
 
     dismissed = rust_palette.palette_dismiss()
     assert dismissed["open"] is False
+    roost._wait(
+        lambda: roost.window_metrics().get("terminal_font_family") == original["id"],
+        5.0,
+        "font dismissal restores the opening renderer family token",
+    )
+    if target_grid != baseline_grid:
+        for tab_id in (active_tab, hidden_tab):
+            roost._wait(
+                lambda tab_id=tab_id: _grid(roost, tab_id) == baseline_grid,
+                5.0,
+                f"font dismissal restores opening metrics on tab {tab_id}",
+            )
     assert config_path.read_bytes() == config_before
 
     try:
@@ -186,9 +215,28 @@ def test_gtk_font_preview_dismiss_and_confirmation_are_commit_bounded(
         rust_palette.palette_activate("select_font")
         confirmed = rust_palette.palette_activate(target_font["id"])
         assert confirmed["open"] is False
+        assert roost.window_metrics()["terminal_font_family"] == target_font["id"]
+        if target_grid != baseline_grid:
+            for tab_id in (active_tab, hidden_tab):
+                roost._wait(
+                    lambda tab_id=tab_id: _grid(roost, tab_id) == target_grid,
+                    5.0,
+                    f"font confirmation reflows live tab {tab_id}",
+                )
         assert _config_lines(config_path, "font-family") == [
             f'font-family = "{target_font["id"]}"'
         ]
+        inherited_tab = roost.open_tab(
+            rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV
+        )
+        wait_tab_attached(roost, inherited_tab)
+        assert roost.window_metrics()["terminal_font_family"] == target_font["id"]
+        if target_grid != baseline_grid:
+            roost._wait(
+                lambda: _grid(roost, inherited_tab) == target_grid,
+                5.0,
+                "a new tab inherits the confirmed live family metrics",
+            )
         assert ui.SEED_CONFIG.read_bytes() == seed_before
     finally:
         rust_palette.palette_dismiss()

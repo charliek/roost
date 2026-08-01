@@ -1,5 +1,6 @@
 mod app;
 mod chrome;
+mod font_registry;
 mod input;
 mod palette_scroll;
 mod screenshot;

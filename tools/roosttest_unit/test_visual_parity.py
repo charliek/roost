@@ -146,6 +146,24 @@ class PixelMeasurementTests(unittest.TestCase):
                 second = parity.central_region_digest(path)
             self.assertNotEqual(first, second)
 
+    def test_region_digest_isolated_terminal_text_from_sidebar_changes(self):
+        black = (0, 0, 0)
+        fills = [black] * 48
+        baseline = image(8, 6, fills)
+        sidebar_changed = list(fills)
+        sidebar_changed[2 * 8] = (255, 0, 0)
+        terminal_changed = list(fills)
+        terminal_changed[2 * 8 + 5] = (255, 255, 255)
+        bounds = (3, 1, 8, 4)
+        self.assertEqual(
+            parity.image_region_digest(baseline, bounds),
+            parity.image_region_digest(image(8, 6, sidebar_changed), bounds),
+        )
+        self.assertNotEqual(
+            parity.image_region_digest(baseline, bounds),
+            parity.image_region_digest(image(8, 6, terminal_changed), bounds),
+        )
+
     def test_atomic_json_replaces_complete_documents(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "measurements.json"
@@ -189,6 +207,20 @@ class ManifestTests(unittest.TestCase):
                     for name in parity.PALETTE_VARIANTS
                 },
             },
+            "font_comparison": {
+                "fixture": "Latin | bold | italic | é | 界",
+                "baseline_font": "JetBrains Mono",
+                "baseline_png": "shell.png",
+                "baseline_sha256": "a" * 64,
+                "terminal_text_bounds": [220, 34, 1100, 154],
+                "baseline_text_sha256": "d" * 64,
+                "alternate_available": True,
+                "alternate_font": "PT Mono",
+                "alternate_png": "terminal-font-alternate.png",
+                "alternate_sha256": "e" * 64,
+                "alternate_text_sha256": "f" * 64,
+                "alternate_extent": [1100, 700],
+            },
         }
 
     def test_manifest_names_run_commit_and_environment(self):
@@ -202,6 +234,9 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertIn(
             "[provider](iced-linux-x11-wgpu-1/palette-provider.png)", rendered
+        )
+        self.assertIn(
+            "[after](iced-linux-x11-wgpu-1/terminal-font-alternate.png)", rendered
         )
         self.assertIn("dirty", rendered)
         self.assertIn("`" + "c" * 64 + "`", rendered)
@@ -226,6 +261,44 @@ class ManifestTests(unittest.TestCase):
         del document["palette"]["variants"]["provider"]
         with self.assertRaisesRegex(ValueError, "provider palette provenance"):
             parity.validate_measurement(document, "run-7", "abc123")
+
+    def test_font_comparison_requires_provenance_and_a_changed_terminal_region(self):
+        document = self.document()
+        del document["font_comparison"]["alternate_png"]
+        with self.assertRaisesRegex(ValueError, "font comparison alternate_png"):
+            parity.validate_measurement(document, "run-7", "abc123")
+
+        document = self.document()
+        document["font_comparison"]["alternate_text_sha256"] = (
+            document["font_comparison"]["baseline_text_sha256"]
+        )
+        with self.assertRaisesRegex(ValueError, "terminal regions are identical"):
+            parity.validate_measurement(document, "run-7", "abc123")
+
+    def test_artifact_validation_requires_the_alternate_file_and_digest(self):
+        document = self.document()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "shell.png").write_bytes(b"shell")
+            (root / "palette.png").write_bytes(b"palette")
+            for name, variant in document["palette"]["variants"].items():
+                (root / variant["png"]).write_bytes(name.encode())
+            document["shell"]["sha256"] = parity.sha256(root / "shell.png")
+            document["palette"]["sha256"] = parity.sha256(root / "palette.png")
+            document["font_comparison"]["baseline_sha256"] = document["shell"][
+                "sha256"
+            ]
+            for name, variant in document["palette"]["variants"].items():
+                variant["sha256"] = parity.sha256(root / variant["png"])
+            with self.assertRaisesRegex(ValueError, "terminal-font-alternate.png"):
+                parity.validate_artifact_files(document, root)
+
+            alternate = root / "terminal-font-alternate.png"
+            alternate.write_bytes(b"alternate")
+            document["font_comparison"]["alternate_sha256"] = parity.sha256(
+                alternate
+            )
+            parity.validate_artifact_files(document, root)
 
 
 class RunnerTests(unittest.TestCase):

@@ -33,7 +33,7 @@ use roost_ipc::messages::{
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
-use roost_ui_model::typography::{self, TerminalTypography};
+use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
@@ -50,6 +50,7 @@ use roost_vt::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::palette_scroll::Visibility;
 use crate::terminal_widget::{
     resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
@@ -451,6 +452,19 @@ fn persist_font_size_with(
     write(path, "font-size", &typography::format_font_size(size_pt))
 }
 
+fn persist_font_family_with(
+    config: &mut RoostConfig,
+    path: Option<&Path>,
+    family: &str,
+    write: impl FnOnce(&Path, &str, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    config.font_family = Some(family.to_string());
+    let Some(path) = path else {
+        return Ok(());
+    };
+    write(path, "font-family", &typography::quote_font_family(family))
+}
+
 fn finish_theme_confirmation(
     palette: &mut Option<palette::PaletteState>,
     theme_at_open: &mut Option<String>,
@@ -465,12 +479,17 @@ fn finish_theme_confirmation(
     }
 }
 
-fn font_palette_frame() -> palette::PaletteFrame {
-    palette::PaletteFrame::new(
-        "fonts",
-        "Select a font…",
-        vec![palette::PaletteItem::new("font:monospace", "Monospace")],
-    )
+fn font_palette_frame(registry: &FontRegistry, resolved: &str) -> palette::PaletteFrame {
+    let names = registry.picker_names();
+    let selection = names
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(resolved))
+        .unwrap_or(0);
+    let items = names
+        .iter()
+        .map(|name| palette::PaletteItem::new(name.clone(), name.clone()))
+        .collect();
+    palette::PaletteFrame::new("fonts", "Select a font…", items).with_selection(selection)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -961,9 +980,33 @@ struct AgentMetricsResult {
 struct ProviderRunResult {
     palette_session: u64,
     request: u64,
+    origin_frame: String,
     provider: provider::Provider,
     phase: provider::Phase,
     outcome: Result<provider::ProviderOutput, String>,
+}
+
+fn provider_result_is_current(
+    palette_present: bool,
+    palette_session: u64,
+    provider_request: u64,
+    current_frame: Option<&str>,
+    result: &ProviderRunResult,
+) -> bool {
+    palette_present
+        && result.palette_session == palette_session
+        && result.request == provider_request
+        && current_frame == Some(result.origin_frame.as_str())
+}
+
+fn report_palette_query_result(
+    status: &mut StatusBanner,
+    result: Result<(), String>,
+    now: Instant,
+) {
+    if let Err(error) = result {
+        status.set_at(error, now);
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1104,6 +1147,7 @@ enum FontSizeTransition {
 
 fn font_size_candidate(
     current: &TerminalTypography,
+    font: Font,
     transition: FontSizeTransition,
 ) -> Result<Option<(TerminalTypography, TerminalMetrics)>, String> {
     let mut candidate = current.clone();
@@ -1114,7 +1158,7 @@ fn font_size_candidate(
     if !changed {
         return Ok(None);
     }
-    let metrics = TerminalMetrics::measure(candidate.current_size_pt())?;
+    let metrics = TerminalMetrics::measure_with_font(candidate.current_size_pt(), font)?;
     Ok(Some((candidate, metrics)))
 }
 
@@ -1915,6 +1959,7 @@ pub struct App {
     status: StatusBanner,
     config: RoostConfig,
     typography: TerminalTypography,
+    font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
     keybindings: HashMap<Accel, KeybindAction>,
@@ -1922,6 +1967,8 @@ pub struct App {
     palette: Option<palette::PaletteState>,
     palette_session: u64,
     palette_theme_at_open: Option<String>,
+    palette_family_at_open: Option<Option<String>>,
+    palette_resolved_family_at_open: Option<String>,
     palette_input_id: Id,
     palette_scroll_id: Id,
     palette_focus_requested: bool,
@@ -1953,23 +2000,32 @@ pub struct App {
 impl App {
     pub fn bootstrap(profile: &BundleProfile, lock: InstanceLock) -> Result<Self> {
         let config = RoostConfig::load_default();
-        let configured_typography = TerminalTypography::new(None, config.font_size);
-        let (typography, terminal_metrics) =
-            match TerminalMetrics::measure(configured_typography.current_size_pt()) {
-                Ok(metrics) => (configured_typography, metrics),
-                Err(error) => {
-                    tracing::warn!(
-                        configured_size = configured_typography.current_size_pt(),
-                        %error,
-                        "configured font size cannot be rendered by Iced; using Rust UI default"
-                    );
-                    let fallback = TerminalTypography::new(None, None);
-                    let metrics = TerminalMetrics::measure(fallback.current_size_pt())
-                        .map_err(anyhow::Error::msg)
-                        .context("measure default Iced terminal font")?;
-                    (fallback, metrics)
-                }
-            };
+        let font_registry = system_font_registry();
+        let configured_typography =
+            TerminalTypography::new(config.font_family.clone(), config.font_size);
+        let configured_font = font_registry.resolve(configured_typography.effective_family());
+        let (typography, terminal_metrics) = match TerminalMetrics::measure_with_font(
+            configured_typography.current_size_pt(),
+            configured_font.font,
+        ) {
+            Ok(metrics) => (configured_typography, metrics),
+            Err(error) => {
+                tracing::warn!(
+                    configured_size = configured_typography.current_size_pt(),
+                    %error,
+                    "configured font size cannot be rendered by Iced; using Rust UI default"
+                );
+                let fallback = TerminalTypography::new(None, None);
+                let fallback_font = font_registry.resolve(fallback.effective_family());
+                let metrics = TerminalMetrics::measure_with_font(
+                    fallback.current_size_pt(),
+                    fallback_font.font,
+                )
+                .map_err(anyhow::Error::msg)
+                .context("measure default Iced terminal font")?;
+                (fallback, metrics)
+            }
+        };
         let keybindings = keybind::canonicalize_bindings(
             keybind::default_bindings(),
             config.keybinds.clone(),
@@ -2033,6 +2089,7 @@ impl App {
             status: StatusBanner::default(),
             config,
             typography,
+            font_registry,
             terminal_metrics,
             metric_generation: 1,
             keybindings,
@@ -2040,6 +2097,8 @@ impl App {
             palette: None,
             palette_session: 0,
             palette_theme_at_open: None,
+            palette_family_at_open: None,
+            palette_resolved_family_at_open: None,
             palette_input_id: Id::unique(),
             palette_scroll_id: Id::unique(),
             palette_focus_requested: false,
@@ -2367,9 +2426,25 @@ impl App {
     }
 
     fn apply_font_size_transition(&mut self, transition: FontSizeTransition) -> Result<(), String> {
-        let Some((candidate, metrics)) = font_size_candidate(&self.typography, transition)? else {
+        let Some((candidate, metrics)) =
+            font_size_candidate(&self.typography, self.terminal_metrics.font, transition)?
+        else {
             return Ok(());
         };
+        self.apply_typography_candidate(candidate, metrics, "font size")?;
+
+        let size_pt = self.typography.current_size_pt();
+        let path = config::config_path();
+        persist_font_size_with(&mut self.config, path.as_deref(), size_pt, config::set_key)
+            .map_err(|error| format!("persist font size: {error}"))
+    }
+
+    fn apply_typography_candidate(
+        &mut self,
+        candidate: TerminalTypography,
+        metrics: TerminalMetrics,
+        operation: &str,
+    ) -> Result<(), String> {
         let metric_generation = self.metric_generation.wrapping_add(1).max(1);
         let (cols, rows) = terminal_grid(
             self.window_size,
@@ -2384,7 +2459,7 @@ impl App {
             rows,
             metrics,
             metric_generation,
-            |operation| match operation {
+            |batch_operation| match batch_operation {
                 GeometryBatchOperation::Apply {
                     tab_id,
                     cols,
@@ -2395,14 +2470,14 @@ impl App {
                     .tabs
                     .get_mut(&tab_id)
                     .ok_or_else(|| {
-                        format!("tab {tab_id} disappeared during font-size application")
+                        format!("tab {tab_id} disappeared during {operation} application")
                     })?
                     .apply_geometry(cols, rows, metrics, metric_generation)
                     .map_err(|error| error.to_string()),
                 GeometryBatchOperation::Rollback { tab_id, previous } => self
                     .tabs
                     .get_mut(&tab_id)
-                    .ok_or_else(|| format!("tab {tab_id} disappeared during font-size rollback"))?
+                    .ok_or_else(|| format!("tab {tab_id} disappeared during {operation} rollback"))?
                     .rollback_geometry(previous)
                     .map(|()| None)
                     .map_err(|error| error.to_string()),
@@ -2410,7 +2485,7 @@ impl App {
         )
         .map_err(|failure| {
             let mut message = format!(
-                "apply font size to tab {}: {}",
+                "apply {operation} to tab {}: {}",
                 failure.tab_id, failure.apply
             );
             for (tab_id, error) in failure.rollback {
@@ -2434,7 +2509,7 @@ impl App {
                 Ok(release) => pointer_releases.push((*tab_id, release)),
                 Err(error) => {
                     let mut message = format!(
-                        "stage pointer release for tab {tab_id} before font-size commit: {error}"
+                        "stage pointer release for tab {tab_id} before {operation} commit: {error}"
                     );
                     for (rollback_id, applied_change) in applied.iter().rev() {
                         let Some(previous) = applied_change.previous else {
@@ -2445,7 +2520,7 @@ impl App {
                             .get_mut(rollback_id)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "tab {rollback_id} disappeared during font-size rollback"
+                                    "tab {rollback_id} disappeared during {operation} rollback"
                                 )
                             })
                             .and_then(|tab| tab.rollback_geometry(previous))
@@ -2473,11 +2548,50 @@ impl App {
                 tab.commit_geometry(change);
             }
         }
+        Ok(())
+    }
 
-        let size_pt = self.typography.current_size_pt();
+    fn apply_font_family(&mut self, family: Option<String>) -> Result<(), String> {
+        let mut candidate = self.typography.clone();
+        let changed = candidate.set_family(family);
+        let resolved = self.font_registry.resolve(candidate.effective_family());
+        let metrics =
+            TerminalMetrics::measure_with_font(candidate.current_size_pt(), resolved.font)?;
+        if !changed && metrics == self.terminal_metrics {
+            return Ok(());
+        }
+        self.apply_typography_candidate(candidate, metrics, "font family")
+    }
+
+    fn preview_font_family(&mut self, name: &str) -> Result<(), String> {
+        self.apply_font_family(Some(name.to_string()))
+    }
+
+    fn commit_font_family(&mut self, name: &str) -> Result<Option<String>, String> {
+        let opened = self
+            .palette_family_at_open
+            .clone()
+            .ok_or_else(|| "font palette has no at-open family snapshot".to_string())?;
+        let resolved_opened = self
+            .palette_resolved_family_at_open
+            .clone()
+            .ok_or_else(|| "font palette has no resolved at-open family".to_string())?;
+        let live = self.typography.family().map(str::to_owned);
+        let confirmation =
+            typography::confirm_family(opened.as_deref(), &resolved_opened, live.as_deref(), name);
+        match confirmation.apply {
+            FamilyApply::Keep => {}
+            FamilyApply::Set(family) => self.apply_font_family(family)?,
+        }
+        let Some(persist) = confirmation.persist else {
+            return Ok(None);
+        };
         let path = config::config_path();
-        persist_font_size_with(&mut self.config, path.as_deref(), size_pt, config::set_key)
-            .map_err(|error| format!("persist font size: {error}"))
+        Ok(
+            persist_font_family_with(&mut self.config, path.as_deref(), &persist, config::set_key)
+                .err()
+                .map(|error| format!("persist font family: {error}")),
+        )
     }
 
     fn copy_active_selection(&mut self) -> UiTask {
@@ -3157,7 +3271,8 @@ impl App {
     }
 
     pub fn palette_query_changed(&mut self, query: &str) {
-        let _ = self.query_palette(query);
+        let result = self.query_palette(query);
+        report_palette_query_result(&mut self.status, result.map(drop), Instant::now());
     }
 
     pub fn palette_activate(&mut self, id: &str) {
@@ -3173,7 +3288,9 @@ impl App {
     }
 
     pub fn palette_pointer_dismiss(&mut self) {
-        self.dismiss_palette();
+        if let Err(error) = self.try_dismiss_palette() {
+            self.set_status(error);
+        }
     }
 
     fn open_palette(&mut self, kind: &str) -> Result<(), String> {
@@ -3191,9 +3308,16 @@ impl App {
             "custom" => provider_palette_frame(&self.config.providers),
             _ => return Err(format!("unknown palette kind {kind:?}")),
         };
-        self.dismiss_palette();
+        self.try_dismiss_palette()?;
         self.palette_session = self.palette_session.wrapping_add(1).max(1);
         self.palette_theme_at_open = Some(self.active_theme_name.clone());
+        self.palette_family_at_open = Some(self.typography.family().map(str::to_owned));
+        self.palette_resolved_family_at_open = Some(
+            self.font_registry
+                .resolve(self.typography.effective_family())
+                .name
+                .to_string(),
+        );
         self.palette = Some(palette::PaletteState::new(frame));
         self.palette_focus_requested = true;
         self.refresh_agent_palette();
@@ -3208,7 +3332,10 @@ impl App {
         items: Vec<(String, String, Option<String>)>,
         reply: tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>,
     ) {
-        self.dismiss_palette();
+        if let Err(error) = self.try_dismiss_palette() {
+            let _ = reply.send(Err(error));
+            return;
+        }
         self.palette_session = self.palette_session.wrapping_add(1).max(1);
         let placeholder = if !placeholder.is_empty() {
             placeholder
@@ -3476,7 +3603,7 @@ impl App {
             .ok_or_else(|| "no palette open".to_string())?;
         state.set_query(query);
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
-        self.preview_selected_theme()?;
+        self.preview_selected_palette_item()?;
         Ok(self.palette_state_result())
     }
 
@@ -3484,7 +3611,7 @@ impl App {
         if let Some(state) = &mut self.palette {
             state.move_selection(delta);
         }
-        if let Err(error) = self.preview_selected_theme() {
+        if let Err(error) = self.preview_selected_palette_item() {
             self.set_status(error);
         }
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
@@ -3530,7 +3657,11 @@ impl App {
                 }
                 palette::PaletteCommands::SELECT_FONT_ID => {
                     if let Some(state) = &mut self.palette {
-                        state.push(font_palette_frame());
+                        let resolved = self
+                            .palette_resolved_family_at_open
+                            .as_deref()
+                            .unwrap_or("Monospace");
+                        state.push(font_palette_frame(self.font_registry, resolved));
                     }
                 }
                 palette::PaletteCommands::VIEW_AGENTS_ID => {
@@ -3555,21 +3686,18 @@ impl App {
                             first_error.get_or_insert_with(|| error.to_string());
                         }
                     }
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     if let Some(error) = first_error {
                         return Err(error);
                     }
                 }
                 "new_tab" => {
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.new_tab();
                 }
                 "close_tab" => {
                     let tab_id = self.workspace.active().1;
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.runtime
                         .block_on(self.client.close_tab(tab_id))
                         .map_err(|error| error.to_string())?;
@@ -3577,37 +3705,30 @@ impl App {
                 }
                 "cycle_tab_next" => {
                     self.cycle_tab(1)?;
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                 }
                 "cycle_tab_prev" => {
                     self.cycle_tab(-1)?;
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                 }
                 "toggle_sidebar" => {
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.toggle_sidebar();
                 }
                 "toggle_sidebar_agents" => {
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.toggle_sidebar_agents();
                 }
                 "font_increase" => {
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
                 }
                 "font_decrease" => {
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.apply_font_size_transition(FontSizeTransition::Adjust(-1.0))?;
                 }
                 "font_reset" => {
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                     self.apply_font_size_transition(FontSizeTransition::Reset)?;
                 }
                 "jump_to_unread" => {
@@ -3619,8 +3740,7 @@ impl App {
                     if let Some(tab_id) = target {
                         self.focus_tab_and_clear(tab_id, true)?;
                     }
-                    self.palette = None;
-                    self.palette_theme_at_open = None;
+                    self.clear_palette_state();
                 }
                 "custom_commands" => {
                     if let Some(state) = &mut self.palette {
@@ -3642,8 +3762,7 @@ impl App {
                 let cwd = self.launch_cwd(project_id);
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
                 let argv = custom_command::launch_argv(&shell, &command);
-                self.palette = None;
-                self.palette_theme_at_open = None;
+                self.clear_palette_state();
                 self.runtime
                     .block_on(self.client.open_tab(
                         project_id,
@@ -3665,24 +3784,27 @@ impl App {
                     persistence_error,
                     Instant::now(),
                 );
+                self.palette_family_at_open = None;
+                self.palette_resolved_family_at_open = None;
             }
             "fonts" => {
-                self.palette = None;
-                self.palette_theme_at_open = None;
+                let persistence_error = self.commit_font_family(&item.id)?;
+                self.clear_palette_state();
+                if let Some(error) = persistence_error {
+                    self.set_status(error);
+                }
             }
             agent_palette::FRAME_ID => {
                 let tab_id = agent_palette::agent_tab_id(&item.id)
                     .ok_or_else(|| format!("agent row {:?} cannot be activated", item.id))?;
                 self.focus_tab_and_clear(tab_id, true)?;
-                self.palette = None;
-                self.palette_theme_at_open = None;
+                self.clear_palette_state();
             }
             "notifications" => {
                 let tab_id = notification_inbox::tab_id(&item.id)
                     .ok_or_else(|| format!("notification row {:?} cannot be activated", item.id))?;
                 self.focus_tab_and_clear(tab_id, true)?;
-                self.palette = None;
-                self.palette_theme_at_open = None;
+                self.clear_palette_state();
             }
             "custom" => {
                 let index = provider::provider_index(&item.id)
@@ -3701,8 +3823,7 @@ impl App {
                         dismissed: false,
                     }));
                 }
-                self.palette = None;
-                self.palette_theme_at_open = None;
+                self.clear_palette_state();
             }
             frame if frame.starts_with("provider:items:") => {
                 let provider = self
@@ -3726,16 +3847,17 @@ impl App {
         Ok(self.palette_state_result())
     }
 
-    fn preview_selected_theme(&mut self) -> Result<(), String> {
+    fn preview_selected_palette_item(&mut self) -> Result<(), String> {
         let selected = self.palette.as_ref().and_then(|state| {
-            (state.current().id == "themes")
-                .then(|| state.selected_item().map(|item| item.id))
-                .flatten()
+            state
+                .selected_item()
+                .map(|item| (state.current().id.clone(), item.id))
         });
-        if let Some(name) = selected {
-            self.apply_theme_name(&name)?;
+        match selected {
+            Some((frame, name)) if frame == "themes" => self.apply_theme_name(&name),
+            Some((frame, name)) if frame == "fonts" => self.preview_font_family(&name),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn apply_theme_name(&mut self, name: &str) -> Result<(), String> {
@@ -3782,28 +3904,46 @@ impl App {
             .as_ref()
             .is_none_or(palette::PaletteState::is_root);
         if is_root {
-            self.dismiss_palette();
+            if let Err(error) = self.try_dismiss_palette() {
+                self.set_status(error);
+            }
             return;
         }
-        let was_theme = self
+        let frame = self
             .palette
             .as_ref()
-            .is_some_and(|state| state.current().id == "themes");
+            .map(|state| state.current().id.clone())
+            .unwrap_or_default();
+        let restored = match frame.as_str() {
+            "themes" => self.restore_palette_theme(),
+            "fonts" => self.restore_palette_family(),
+            _ => Ok(()),
+        };
+        if let Err(error) = restored {
+            self.set_status(error);
+            return;
+        }
         if let Some(state) = &mut self.palette {
             let _ = state.pop();
         }
-        if was_theme {
-            self.restore_palette_theme();
-        }
+        self.provider_request = self.provider_request.wrapping_add(1).max(1);
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
-    fn dismiss_palette(&mut self) {
-        self.restore_palette_theme();
+    fn try_dismiss_palette(&mut self) -> Result<(), String> {
+        self.restore_palette_theme()?;
+        self.restore_palette_family()?;
+        self.clear_palette_state();
+        Ok(())
+    }
+
+    fn clear_palette_state(&mut self) {
         self.palette = None;
         self.palette_theme_at_open = None;
+        self.palette_family_at_open = None;
+        self.palette_resolved_family_at_open = None;
         self.clear_palette_geometry();
-        self.provider_request = self.provider_request.wrapping_add(1);
+        self.provider_request = self.provider_request.wrapping_add(1).max(1);
         self.provider_frames.clear();
         if let Some(reply) = self.palette_present_reply.take() {
             let _ = reply.send(Ok(PalettePresentResult {
@@ -3813,12 +3953,18 @@ impl App {
         }
     }
 
-    fn restore_palette_theme(&mut self) {
+    fn restore_palette_theme(&mut self) -> Result<(), String> {
         if let Some(name) = self.palette_theme_at_open.clone() {
-            if let Err(error) = self.apply_theme_name(&name) {
-                self.set_status(error);
-            }
+            self.apply_theme_name(&name)?;
         }
+        Ok(())
+    }
+
+    fn restore_palette_family(&mut self) -> Result<(), String> {
+        if let Some(family) = self.palette_family_at_open.clone() {
+            self.apply_font_family(family)?;
+        }
+        Ok(())
     }
 
     fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
@@ -4276,6 +4422,11 @@ impl App {
         self.provider_request = self.provider_request.wrapping_add(1).max(1);
         let request = self.provider_request;
         let palette_session = self.palette_session;
+        let origin_frame = self
+            .palette
+            .as_ref()
+            .map(|state| state.current().id.clone())
+            .unwrap_or_default();
         let context = self.provider_context(selected_id);
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let argv =
@@ -4313,6 +4464,7 @@ impl App {
             let _ = tx.send(ProviderRunResult {
                 palette_session,
                 request,
+                origin_frame,
                 provider: result_provider,
                 phase,
                 outcome,
@@ -4352,10 +4504,17 @@ impl App {
 
     fn service_provider_results(&mut self) {
         while let Ok(result) = self.provider_rx.try_recv() {
-            if self.palette.is_none()
-                || result.palette_session != self.palette_session
-                || result.request != self.provider_request
-            {
+            let current_frame = self
+                .palette
+                .as_ref()
+                .map(|state| state.current().id.as_str());
+            if !provider_result_is_current(
+                self.palette.is_some(),
+                self.palette_session,
+                self.provider_request,
+                current_frame,
+                &result,
+            ) {
                 continue;
             }
             let before_layout = self.palette_layout_signature();
@@ -4364,7 +4523,9 @@ impl App {
                 Ok(output)
                     if result.phase == provider::Phase::Activate && output.items.is_empty() =>
                 {
-                    self.dismiss_palette();
+                    if let Err(error) = self.try_dismiss_palette() {
+                        self.set_status(error);
+                    }
                 }
                 Ok(output) => {
                     let placeholder = if output.placeholder.is_empty() {
@@ -4480,12 +4641,18 @@ impl App {
                 }
                 UiRequest::WindowMetrics { reply } => {
                     let collapsed = self.workspace.sidebar_collapsed();
+                    let resolved_family = self
+                        .font_registry
+                        .resolve(self.typography.effective_family())
+                        .name
+                        .to_string();
                     let _ = reply.send(Ok((
                         f64::from(self.window_size.width),
                         f64::from(self.window_size.height),
                         f64::from(sidebar_width(collapsed)),
                         collapsed,
                         Some(f64::from(chrome::BAND_HEIGHT)),
+                        Some(resolved_family),
                     )));
                 }
                 UiRequest::WindowResize {
@@ -4560,8 +4727,10 @@ impl App {
                     let _ = reply.send(self.activate_palette(&id));
                 }
                 UiRequest::PaletteDismiss { reply } => {
-                    self.dismiss_palette();
-                    let _ = reply.send(Ok(self.palette_state_result()));
+                    let result = self
+                        .try_dismiss_palette()
+                        .map(|()| self.palette_state_result());
+                    let _ = reply.send(result);
                 }
                 UiRequest::PalettePresent {
                     title,
@@ -4944,6 +5113,70 @@ mod tests {
         status.set_at("clear me", now);
         status.clear();
         assert_eq!(status.message(), None);
+    }
+
+    #[test]
+    fn typed_palette_query_errors_are_visible_without_hiding_prior_state() {
+        let now = Instant::now();
+        let mut status = StatusBanner::default();
+        status.set_at("prior status", now - Duration::from_secs(1));
+        report_palette_query_result(
+            &mut status,
+            Err("font preview rollback: injected failure".to_string()),
+            now,
+        );
+        assert_eq!(
+            status.message(),
+            Some("font preview rollback: injected failure")
+        );
+        assert_eq!(status.expires_at, Some(now + STATUS_BANNER_DURATION));
+    }
+
+    #[test]
+    fn provider_result_must_match_the_frame_that_spawned_it() {
+        let result = ProviderRunResult {
+            palette_session: 7,
+            request: 11,
+            origin_frame: "custom".to_string(),
+            provider: provider::Provider {
+                label: "Fixture".to_string(),
+                run: "fixture-provider".to_string(),
+                title: "Fixture".to_string(),
+                timeout_secs: 1,
+                limit: 10,
+                shell_interpret: false,
+            },
+            phase: provider::Phase::List,
+            outcome: Err("unused fixture outcome".to_string()),
+        };
+        assert!(provider_result_is_current(
+            true,
+            7,
+            11,
+            Some("custom"),
+            &result
+        ));
+        assert!(!provider_result_is_current(
+            true,
+            7,
+            11,
+            Some("fonts"),
+            &result
+        ));
+        assert!(!provider_result_is_current(
+            true,
+            7,
+            12,
+            Some("custom"),
+            &result
+        ));
+        assert!(!provider_result_is_current(
+            false,
+            7,
+            11,
+            Some("custom"),
+            &result
+        ));
     }
 
     #[test]
@@ -6743,15 +6976,16 @@ mod tests {
         let mut current = TerminalTypography::new(None, Some(f64::MAX));
         assert_eq!(current.adjust_size(-1.0), Some(72.0));
         let before = current.clone();
-        assert!(font_size_candidate(&current, FontSizeTransition::Reset).is_err());
+        assert!(font_size_candidate(&current, Font::MONOSPACE, FontSizeTransition::Reset).is_err());
         assert_eq!(
             current, before,
             "candidate measurement cannot mutate live state"
         );
 
-        let candidate = font_size_candidate(&current, FontSizeTransition::Adjust(-1.0))
-            .expect("measurable candidate")
-            .expect("changed candidate");
+        let candidate =
+            font_size_candidate(&current, Font::MONOSPACE, FontSizeTransition::Adjust(-1.0))
+                .expect("measurable candidate")
+                .expect("changed candidate");
         assert_eq!(candidate.0.current_size_pt(), 71.0);
         assert_eq!(current, before);
     }
@@ -6785,6 +7019,48 @@ mod tests {
         .expect_err("writer failure must be returned to the UI boundary");
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(failed.font_size, Some(15.0));
+        assert_eq!(std::fs::read(&path).expect("read after failure"), before);
+    }
+
+    #[test]
+    fn font_family_persistence_handles_absence_reload_and_failure() {
+        let mut absent = RoostConfig::default();
+        persist_font_family_with(&mut absent, None, "JetBrains Mono", |_, _, _| {
+            panic!("absent path must not invoke the writer")
+        })
+        .expect("absent path is a silent success");
+        assert_eq!(absent.font_family.as_deref(), Some("JetBrains Mono"));
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.conf");
+        std::fs::write(&path, "# keep me\nfont-size = 14\n").expect("seed config");
+        let mut successful = RoostConfig::default();
+        persist_font_family_with(
+            &mut successful,
+            Some(&path),
+            "JetBrains Mono",
+            config::set_key,
+        )
+        .expect("persist font family");
+        assert_eq!(successful.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read persisted config"),
+            "# keep me\nfont-size = 14\nfont-family = \"JetBrains Mono\"\n"
+        );
+        assert_eq!(
+            RoostConfig::load_from(&path).font_family.as_deref(),
+            Some("JetBrains Mono"),
+            "the next bootstrap observes the exact committed family"
+        );
+
+        let before = std::fs::read(&path).expect("read before failure");
+        let mut failed = RoostConfig::default();
+        let error = persist_font_family_with(&mut failed, Some(&path), "SF Mono", |_, _, _| {
+            Err(io::Error::other("injected writer failure"))
+        })
+        .expect_err("writer failure must be returned to the UI boundary");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(failed.font_family.as_deref(), Some("SF Mono"));
         assert_eq!(std::fs::read(&path).expect("read after failure"), before);
     }
 

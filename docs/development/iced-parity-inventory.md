@@ -139,7 +139,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Notification entry | Header bell with count badge opens the inbox palette | Text button in the tab band | P1 | Bell/count capture and click-to-palette E2E |
 | Terminal padding | Compact consistent inset around the grid | 12 pt inset, visibly close but not yet measured against both references | P1 | Cell-origin and viewport-edge assertions at fixed size |
 | Terminal scrollback | Wheel/page navigation scrolls retained history locally when mouse reporting is off; alternate-screen behavior follows terminal modes | Wheel parity is implemented through shared GTK/Iced `roost-vt` policy: retained history, exact bottom state, next-terminal-key snap, mouse-report precedence, and alternate-screen arrows. Dedicated PageUp/PageDown local navigation remains | P1 | Physical X11 wheel under both renderers; route/unit and GTK regressions; add PageUp/PageDown fixture in the later command slice |
-| Terminal typography | Configured family/size, baseline and cell metrics stable across styles and graphemes | PTY and glyph rendering work; font selection is currently a one-row placeholder and baseline parity is unmeasured | P0 | Latin/wide/combined/style fixture under wgpu and tiny-skia; font selection E2E |
+| Terminal typography | Configured family/size, baseline and cell metrics stable across styles and graphemes | Renderer-measured size and installed-family selection now reflow every live tab atomically, persist through the shared config policy, and reach new/restored tabs; focused glyph baseline/style comparison remains | P1 | Latin/wide/combined/style fixture under wgpu and tiny-skia; shared GTK/Iced font selection E2E |
 | Terminal cursor/selection/link | Shared colors and modes with reference-like cursor, selection, and link feedback | Functional coverage exists; geometry/color comparison remains incomplete | P1 | Focused cursor/selection/link screenshots plus existing real-input gates |
 | Palette placement | Centered, elevated compact panel over an undimmed terminal, styled semantic rows, keyboard focus, and scrolling | Closed for the visual-feasibility slice: exact reference neutrals, border/shadow, content-sized 660 pt card capped at 500 pt, compact command/agent/notification/provider rows, shortcut hints, fuzzy-match accents, disabled state, and a narrow neutral scrollbar | closed | Five named GTK/Iced captures; focus/scroll tests plus real row/card/outside pointer routing |
 | Empty/loading/error states | Deliberate shell placeholders without changing hierarchy | Plain `Starting terminal…`; status errors are appended to the sidebar | P1 | Seeded empty/loading/error snapshots and recovery tests |
@@ -169,9 +169,9 @@ does not justify a second state machine.
 | Notifications inbox | shared model/UI port | implemented | Replace text control with bell/badge without changing model |
 | Command/agent/provider palettes | shared model/UI port | implemented | Visual/focus polish; provider activation behavior remains shared |
 | New Project command | shared command ID | reports unimplemented | Route through the same Iced directory-picker port as the footer |
-| Select Font command | shared command ID | placeholder/no-op | Enumerate/select fonts through a UI adapter and apply to live/new tabs |
-| Configured workspace shortcuts | shared keybinding IDs | exhaustive dispatch is implemented; supported actions route to the workspace/UI port and unavailable project/font actions show a deterministic status without PTY bytes | Implement the remaining project/font adapters behind the already-safe action routes |
-| Font increase/decrease/reset | shared keybinding IDs/config | missing | UI adapter updates effective metrics and resizes every terminal deterministically |
+| Select Font command | shared command ID | implemented | Shared ordering/resolution/confirmation policy drives toolkit discovery adapters; preview/cancel/confirm and config persistence are covered by the target-neutral Rust-UI E2E |
+| Configured workspace shortcuts | shared keybinding IDs | exhaustive dispatch is implemented; supported actions route to the workspace/UI port and unavailable project actions show a deterministic status without PTY bytes | Implement the remaining project adapters behind the already-safe action routes |
+| Font increase/decrease/reset | shared keybinding IDs/config | implemented | Renderer-measured metrics reflow all live tabs atomically and persist exact values; new tabs inherit the live typography |
 | Terminal scrollback | shared VT policy | wheel implemented | Add explicit PageUp/PageDown local commands; preserve the shared mode precedence and physical wheel gate |
 | Text/file/image drop | UI-owned native adapter | missing | Normalize payloads, reuse shared escaping where possible, then send explicit PTY bytes |
 | Native notifications | engine action exists | deferred | Add platform adapter only; never issue native UI calls from engine locks |
@@ -246,8 +246,9 @@ approval pause is required. Direct manipulation is the next implementation and
 cost-validation milestone: project or tab editing must still demonstrate that
 focus, text editing, drag feedback, accessibility, and maintenance cost can be
 competitive with GTK. The footer, project/tab manipulation, sidebar resizing,
-terminal scrollback/font handling, and several native adapters remain material
-P0/P1 work elsewhere in this register.
+dedicated PageUp/PageDown scrollback handling, terminal glyph-level visual
+comparison, and several native adapters remain material P0/P1 work elsewhere
+in this register.
 
 ## First slice contract
 

@@ -968,7 +968,7 @@ pub struct WindowMetricsParams {}
 /// `app.window_metrics` response — logical (point) measurements of the
 /// running UI's window + sidebar. Used by the sidebar layout regression
 /// tests to assert the sidebar holds its width across window resizes.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowMetricsResult {
     pub window_width: f64,
     pub window_height: f64,
@@ -979,6 +979,11 @@ pub struct WindowMetricsResult {
     /// their existing response shape until they expose equivalent geometry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_top: Option<f64>,
+    /// Renderer-resolved terminal family, when the adapter can report it.
+    /// This is diagnostic state rather than a config echo: fallback chains
+    /// report the installed family actually used by the live terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_family: Option<String>,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -1823,6 +1828,7 @@ mod tests {
             sidebar_width: 220.0,
             sidebar_collapsed: false,
             terminal_top: Some(34.0),
+            terminal_font_family: Some("JetBrains Mono".to_string()),
         });
         let native = WindowMetricsResult {
             window_width: 1800.0,
@@ -1830,6 +1836,7 @@ mod tests {
             sidebar_width: 0.0,
             sidebar_collapsed: true,
             terminal_top: None,
+            terminal_font_family: None,
         };
         let json = serde_json::to_string(&native).unwrap();
         assert!(
@@ -1843,6 +1850,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.terminal_top, None);
+        assert_eq!(old.terminal_font_family, None);
     }
 
     #[test]

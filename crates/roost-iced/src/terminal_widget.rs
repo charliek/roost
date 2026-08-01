@@ -31,6 +31,11 @@ pub struct TerminalMetrics {
 impl TerminalMetrics {
     /// Resolve the generic monospace grid from a Rust UI point size.
     pub fn measure(size_pt: f64) -> Result<Self, String> {
+        Self::measure_with_font(size_pt, Font::MONOSPACE)
+    }
+
+    /// Resolve a supplied renderer family at a Rust UI point size.
+    pub fn measure_with_font(size_pt: f64, font: Font) -> Result<Self, String> {
         let pixels = size_pt * POINT_TO_LOGICAL_PIXEL;
         if !pixels.is_finite() || pixels <= 0.0 || pixels > f64::from(f32::MAX) {
             return Err(format!(
@@ -44,7 +49,6 @@ impl TerminalMetrics {
             ));
         }
 
-        let font = Font::MONOSPACE;
         type Paragraph = <Renderer as text::Renderer>::Paragraph;
         let paragraph = Paragraph::with_text(text::Text {
             content: "M",
@@ -86,6 +90,33 @@ impl TerminalMetrics {
             cell_width,
             cell_height,
         }
+    }
+}
+
+fn draw_font(base: Font, text: &str, bold: bool, italic: bool) -> Font {
+    Font {
+        family: if UnicodeWidthStr::width(text) > 1 {
+            // Cosmic Text's named and generic monospace families do not
+            // discover every platform fallback (notably CJK on macOS). Each
+            // render cell already owns its fixed terminal advance, so wide
+            // clusters may use the system fallback chain across their
+            // allotted cells without changing the grid. Ordinary and
+            // combining cells must retain the configured renderer family.
+            iced::font::Family::SansSerif
+        } else {
+            base.family
+        },
+        weight: if bold {
+            iced::font::Weight::Bold
+        } else {
+            iced::font::Weight::Normal
+        },
+        style: if italic {
+            iced::font::Style::Italic
+        } else {
+            iced::font::Style::Normal
+        },
+        ..base
     }
 }
 
@@ -559,32 +590,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                     );
                 }
                 if !cell.text.is_empty() && cell.text != " " {
-                    let font = Font {
-                        family: if UnicodeWidthStr::width(cell.text.as_str()) > 1 {
-                            // Cosmic Text's generic monospace family does not
-                            // discover every platform fallback (notably CJK on
-                            // macOS). Each render cell already owns its fixed
-                            // terminal advance, so wide clusters can use the
-                            // system fallback chain across their allotted cells
-                            // without changing the grid. Single-cell Unicode
-                            // (including combining clusters, Greek, and box
-                            // drawing) retains the monospace family.
-                            iced::font::Family::SansSerif
-                        } else {
-                            iced::font::Family::Monospace
-                        },
-                        weight: if cell.bold {
-                            iced::font::Weight::Bold
-                        } else {
-                            iced::font::Weight::Normal
-                        },
-                        style: if cell.italic {
-                            iced::font::Style::Italic
-                        } else {
-                            iced::font::Style::Normal
-                        },
-                        ..metrics.font
-                    };
+                    let font = draw_font(metrics.font, cell.text.as_str(), cell.bold, cell.italic);
                     renderer.fill_text(
                         text::Text {
                             content: cell.text.clone(),
@@ -814,6 +820,27 @@ mod tests {
         assert!(larger.font_pixels > default.font_pixels);
         assert!(larger.cell_width >= default.cell_width);
         assert!(larger.cell_height > default.cell_height);
+    }
+
+    #[test]
+    fn supplied_font_family_reaches_metrics_and_style_variants() {
+        let selected = Font::with_name("Roost Test Family");
+        let metrics = TerminalMetrics::measure_with_font(13.0, selected)
+            .expect("named family metrics fall back safely when unavailable");
+        assert_eq!(metrics.font, selected);
+        let normal = draw_font(metrics.font, "M", false, false);
+        let bold = draw_font(metrics.font, "M", true, false);
+        let italic = draw_font(metrics.font, "e\u{301}", false, true);
+        assert_eq!(normal.family, selected.family);
+        assert_eq!(bold.family, selected.family);
+        assert_eq!(italic.family, selected.family);
+        assert_eq!(bold.weight, iced::font::Weight::Bold);
+        assert_eq!(italic.style, iced::font::Style::Italic);
+        assert_eq!(
+            draw_font(metrics.font, "界", false, false).family,
+            iced::font::Family::SansSerif,
+            "wide cells retain the intentional platform fallback policy"
+        );
     }
 
     #[test]

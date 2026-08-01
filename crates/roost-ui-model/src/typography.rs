@@ -13,6 +13,28 @@ pub const MIN_FONT_SIZE_PT: f64 = 6.0;
 /// Largest size reachable through a zoom command.
 pub const MAX_FONT_SIZE_PT: f64 = 72.0;
 
+/// Programming-oriented picker order shared by the Rust UI adapters.
+pub const CURATED_FONT_FAMILIES: &[&str] = &[
+    "JetBrains Mono",
+    "JetBrainsMono Nerd Font",
+    "Fira Code",
+    "Fira Mono",
+    "Hack",
+    "Source Code Pro",
+    "Cascadia Code",
+    "Cascadia Mono",
+    "IBM Plex Mono",
+    "Inconsolata",
+    "Iosevka",
+    "DejaVu Sans Mono",
+    "Ubuntu Mono",
+    "Liberation Mono",
+    "Noto Sans Mono",
+    "SF Mono",
+    "Menlo",
+    "Monaco",
+];
+
 const TRANSITION_EPSILON: f64 = 0.01;
 
 /// Owned live terminal typography state.
@@ -118,11 +140,11 @@ pub struct FamilyConfirmation {
 /// the deterministic transition.
 pub fn confirm_family(
     opened: Option<&str>,
+    resolved_opened: &str,
     live: Option<&str>,
     selected: &str,
 ) -> FamilyConfirmation {
-    let opened_primary = opened.and_then(primary_family);
-    if opened_primary.is_some_and(|primary| primary.eq_ignore_ascii_case(selected)) {
+    if resolved_opened.eq_ignore_ascii_case(selected) {
         let apply = if live == opened {
             FamilyApply::Keep
         } else {
@@ -142,11 +164,85 @@ pub fn confirm_family(
     }
 }
 
-fn primary_family(value: &str) -> Option<&str> {
-    value
+/// Whether a discovered family can round-trip through Roost's scalar config
+/// grammar and comma-delimited family chain without an escape syntax.
+pub fn font_family_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && !name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '"' | ','))
+}
+
+/// Curated-first, case-insensitively deduplicated installed monospace names.
+///
+/// Adapters own discovery. Curated entries are retained when installed even
+/// if platform metadata fails to mark them monospace, matching the historical
+/// GTK/Swift picker policy. The generic alias is always present exactly once
+/// so an unavailable configured chain can be represented and preselected.
+pub fn ordered_monospace_families(
+    installed: impl IntoIterator<Item = (String, bool)>,
+) -> Vec<String> {
+    let mut installed = installed
+        .into_iter()
+        .filter(|(name, _)| font_family_name_is_safe(name))
+        .collect::<Vec<_>>();
+    installed.sort_by(|(left, _), (right, _)| {
+        left.to_lowercase()
+            .cmp(&right.to_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut output = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for curated in CURATED_FONT_FAMILIES {
+        if let Some((canonical, _)) = installed
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(curated))
+        {
+            let key = canonical.to_lowercase();
+            if seen.insert(key) {
+                output.push(canonical.clone());
+            }
+        }
+    }
+    for (name, is_monospace) in installed {
+        if !is_monospace {
+            continue;
+        }
+        let key = name.to_lowercase();
+        if seen.insert(key) {
+            output.push(name);
+        }
+    }
+    if !output
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("Monospace"))
+    {
+        output.push("Monospace".to_string());
+    }
+    output
+}
+
+/// Resolves a comma-delimited family chain against adapter-owned installed
+/// names. The generic alias is returned when named entries are unavailable.
+pub fn resolve_family_name(chain: &str, installed: &[String]) -> String {
+    for requested in chain
         .split(',')
         .map(str::trim)
-        .find(|part| !part.is_empty())
+        .filter(|name| !name.is_empty())
+    {
+        if requested.eq_ignore_ascii_case("monospace") {
+            return "Monospace".to_string();
+        }
+        if let Some(canonical) = installed
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(requested))
+        {
+            return canonical.clone();
+        }
+    }
+    "Monospace".to_string()
 }
 
 /// Formats a point size for the config file.
@@ -254,6 +350,7 @@ mod tests {
         assert_eq!(
             confirm_family(
                 Some("JetBrains Mono, Monospace"),
+                "JetBrains Mono",
                 Some("Fira Code"),
                 "jetbrains mono",
             ),
@@ -265,6 +362,7 @@ mod tests {
         assert_eq!(
             confirm_family(
                 Some("JetBrains Mono, Monospace"),
+                "JetBrains Mono",
                 Some("JetBrains Mono, Monospace"),
                 "JetBrains Mono",
             ),
@@ -278,18 +376,126 @@ mod tests {
     #[test]
     fn confirming_a_different_or_unconfigured_family_applies_and_persists() {
         assert_eq!(
-            confirm_family(Some("Hack, Monospace"), Some("Hack"), "Fira Code"),
+            confirm_family(Some("Hack, Monospace"), "Hack", Some("Hack"), "Fira Code",),
             FamilyConfirmation {
                 apply: FamilyApply::Set(Some("Fira Code".into())),
                 persist: Some("Fira Code".into()),
             }
         );
         assert_eq!(
-            confirm_family(None, None, "Monospace"),
+            confirm_family(None, "Menlo", None, "Monospace"),
             FamilyConfirmation {
                 apply: FamilyApply::Set(Some("Monospace".into())),
                 persist: Some("Monospace".into()),
             }
+        );
+    }
+
+    #[test]
+    fn confirming_the_resolved_default_or_fallback_preserves_raw_policy() {
+        assert_eq!(
+            confirm_family(None, "Monospace", Some("Fira Code"), "monospace"),
+            FamilyConfirmation {
+                apply: FamilyApply::Set(None),
+                persist: None,
+            }
+        );
+        assert_eq!(
+            confirm_family(
+                Some("Missing, Fira Code, Monospace"),
+                "Fira Code",
+                Some("Fira Code"),
+                "fira code",
+            ),
+            FamilyConfirmation {
+                apply: FamilyApply::Set(Some("Missing, Fira Code, Monospace".into())),
+                persist: None,
+            }
+        );
+        assert_eq!(
+            confirm_family(
+                Some("Missing One, Missing Two"),
+                "Monospace",
+                Some("Hack"),
+                "Monospace",
+            ),
+            FamilyConfirmation {
+                apply: FamilyApply::Set(Some("Missing One, Missing Two".into())),
+                persist: None,
+            }
+        );
+    }
+
+    #[test]
+    fn installed_family_order_is_curated_safe_and_deduplicated() {
+        let ordered = ordered_monospace_families([
+            ("zeta Mono".to_string(), true),
+            ("fira code".to_string(), true),
+            ("Fira Code".to_string(), true),
+            ("Arial".to_string(), false),
+            ("Alpha Mono".to_string(), true),
+            ("Hack".to_string(), false),
+            ("bad,name".to_string(), true),
+            ("bad\nname".to_string(), true),
+            ("bad\"name".to_string(), true),
+            (" padded family ".to_string(), true),
+        ]);
+        assert_eq!(
+            ordered,
+            ["Fira Code", "Hack", "Alpha Mono", "zeta Mono", "Monospace"]
+        );
+    }
+
+    #[test]
+    fn installed_family_order_has_a_generic_empty_fallback() {
+        assert_eq!(
+            ordered_monospace_families([
+                ("Arial".to_string(), false),
+                ("bad,name".to_string(), true),
+            ]),
+            ["Monospace"]
+        );
+        for safe in ["JetBrains Mono", "日本語等幅", "Back\\slash"] {
+            assert!(font_family_name_is_safe(safe));
+            let quoted = quote_font_family(safe);
+            assert_eq!(
+                quoted.strip_prefix('"').and_then(|v| v.strip_suffix('"')),
+                Some(safe)
+            );
+        }
+        for unsafe_name in [
+            "",
+            "bad,name",
+            "bad\"name",
+            "bad\nname",
+            "bad\0name",
+            " padded family ",
+        ] {
+            assert!(!font_family_name_is_safe(unsafe_name));
+        }
+    }
+
+    #[test]
+    fn family_chain_resolution_preserves_canonical_names_and_fallbacks() {
+        let installed = vec![
+            "Arial".to_string(),
+            "Fira Code".to_string(),
+            "Menlo".to_string(),
+        ];
+        assert_eq!(
+            resolve_family_name("Missing, fira code, Monospace", &installed),
+            "Fira Code"
+        );
+        assert_eq!(
+            resolve_family_name("Missing, Monospace, Menlo", &installed),
+            "Monospace"
+        );
+        assert_eq!(resolve_family_name("Missing", &installed), "Monospace");
+        assert_eq!(resolve_family_name("", &installed), "Monospace");
+        assert_eq!(
+            resolve_family_name("Arial, Monospace", &installed),
+            "Arial",
+            "an adapter diagnostic must retain an installed proportional primary"
         );
     }
 

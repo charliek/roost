@@ -33,6 +33,7 @@ TAB_LIFECYCLES = (
     ("Finished", "finished"),
     ("Failed", "failed"),
 )
+FONT_VISUAL_TEXT = "Latin normal | bold | italic | e\u0301 | \u754c"
 
 
 def _semantic_fixture_observation(roost, project_id: int, tabs: dict[str, int]) -> dict:
@@ -143,6 +144,7 @@ def _write_measurements(
     palette_variants: dict[str, Path],
     metrics: dict,
     fixture: dict,
+    font_comparison: dict,
 ) -> dict:
     sidebar_width = round(float(metrics["sidebar_width"]))
     shell = parity.measure_shell(
@@ -190,6 +192,7 @@ def _write_measurements(
         "window_metrics": metrics,
         "shell": shell,
         "palette": palette_measurement,
+        "font_comparison": font_comparison,
     }
     parity.atomic_json(output / "measurements.json", document)
     return document
@@ -285,6 +288,15 @@ def test_capture_visual_parity_fixture(roost, target):
     # DEC cursor style 2 is a steady block. Blink phase is otherwise a dynamic
     # pixel region that can make equally-correct captures look different.
     roost.tab_feed_pty_bytes(tabs["Failed"], b"\x1b[2 q")
+    roost.tab_feed_pty_bytes(
+        tabs["Failed"],
+        ("\r\nLatin normal | \x1b[1mbold\x1b[0m | \x1b[3mitalic\x1b[0m | e\u0301 | \u754c").encode(),
+    )
+    roost._wait(
+        lambda: FONT_VISUAL_TEXT in roost.dump_text(tabs["Failed"]),
+        10.0,
+        "font comparison text reaches the active renderer",
+    )
 
     shell_path = output / "shell.png"
     shell_extent = _capture_settled(roost, shell_path)
@@ -391,6 +403,88 @@ def test_capture_visual_parity_fixture(roost, target):
         palette_variants["provider"] = path
         palette_variant_extents["provider"] = extent
 
+    roost.palette_dismiss()
+    roost.palette_open("commands")
+    state = roost.palette_activate("select_font")
+    assert state["frame"] == "fonts" and state["items"]
+    if target != "mac":
+        path, extent, previous_palette_digest = _capture_palette_variant(
+            roost, output, "palette-fonts.png", {previous_palette_digest}
+        )
+        palette_variants["fonts"] = path
+        palette_variant_extents["fonts"] = extent
+
+    original_font = state["items"][state["selection"]]["id"]
+    alternate_fonts = [
+        item
+        for item in reversed(state["items"])
+        if item["id"] != original_font
+        and item["id"].casefold() != "monospace"
+    ]
+    alternate_fonts.extend(
+        item
+        for item in state["items"]
+        if item["id"] != original_font and item["id"].casefold() == "monospace"
+    )
+    font_comparison = {
+        "fixture": FONT_VISUAL_TEXT,
+        "baseline_font": original_font,
+        "baseline_png": shell_path.name,
+        "baseline_sha256": parity.sha256(shell_path),
+        "alternate_available": False,
+    }
+    terminal_top = metrics.get("terminal_top")
+    if not isinstance(terminal_top, (int, float)):
+        terminal_top = parity.measure_shell(
+            shell_path, round(float(metrics["sidebar_width"]))
+        )["terminal_top"]
+    assert isinstance(terminal_top, int | float)
+    terminal_text_bounds = (
+        round(float(metrics["sidebar_width"])),
+        round(float(terminal_top)),
+        shell_extent[0],
+        min(shell_extent[1], round(float(terminal_top)) + 120),
+    )
+    baseline_text_digest = parity.region_digest(shell_path, terminal_text_bounds)
+    font_comparison["terminal_text_bounds"] = list(terminal_text_bounds)
+    font_comparison["baseline_text_sha256"] = baseline_text_digest
+    if not alternate_fonts:
+        font_comparison["reason"] = "no alternate installed monospace family"
+        roost.palette_dismiss()
+    else:
+        alternate_path = output / "terminal-font-alternate.png"
+        for index, alternate_font in enumerate(alternate_fonts):
+            if index > 0:
+                roost.palette_open("commands")
+                state = roost.palette_activate("select_font")
+                assert state["frame"] == "fonts"
+            state = roost.palette_activate(alternate_font["id"])
+            assert state["open"] is False
+            alternate_extent = _capture_settled(roost, alternate_path)
+            alternate_sha = parity.sha256(alternate_path)
+            alternate_text_digest = parity.region_digest(
+                alternate_path, terminal_text_bounds
+            )
+            if alternate_text_digest == baseline_text_digest:
+                continue
+            font_comparison.update(
+                {
+                    "alternate_available": True,
+                    "alternate_font": alternate_font["id"],
+                    "alternate_png": alternate_path.name,
+                    "alternate_sha256": alternate_sha,
+                    "alternate_text_sha256": alternate_text_digest,
+                    "alternate_extent": list(alternate_extent),
+                }
+            )
+            break
+        if not font_comparison["alternate_available"]:
+            alternate_path.unlink(missing_ok=True)
+            font_comparison["reason"] = (
+                "no installed alternate produced distinct terminal glyphs; "
+                "generic aliases may resolve to the same physical face"
+            )
+
     fixture = {
         "project": PROJECT_NAME,
         "tabs": [
@@ -406,7 +500,14 @@ def test_capture_visual_parity_fixture(roost, target):
             "frame": command_state["frame"],
             "query": command_state["query"],
             "selection": command_state["selection"],
-            "variants": ["commands", "query", "agents", "notifications", "provider"],
+            "variants": [
+                "commands",
+                "query",
+                "agents",
+                "notifications",
+                "provider",
+                "fonts",
+            ],
         },
     }
     document = _write_measurements(
@@ -417,6 +518,7 @@ def test_capture_visual_parity_fixture(roost, target):
         palette_variants,
         metrics,
         fixture,
+        font_comparison,
     )
 
     # Validate reusable measurement availability after both PNGs and the atomic

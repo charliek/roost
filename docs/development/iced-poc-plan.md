@@ -2002,6 +2002,167 @@ inspection found no GTK/libadwaita/Pango/Cairo/`roost-linux` edge from Iced and
 no GTK/Iced edge from the engine; inverse trees show both `roost-linux` and
 `roost-iced` depending independently on `roost-engine`.
 
+### Shared installed-font and Iced family-adapter commit plan
+
+Scope: replace Iced's one-row generic `Monospace` placeholder with the common
+Rust font-family picker behavior: installed monospace discovery, curated-first
+ordering, live preview on keyboard/query selection, dismissal/back restoration,
+confirmation, exact quoted config persistence, all-live-tab reflow, and
+inheritance by future tabs. Also make Iced honor a valid installed configured
+family at launch. This slice updates the measured typography register and
+removes the family-only functional skip; it does not add config file watching,
+font feature/weight controls, bundled font distribution, or renderer code to
+the engine.
+
+Shared ownership: `roost-ui-model::typography` will own the curated family
+order and a pure function that accepts adapter-discovered `(name,
+is_monospace)` facts. It case-insensitively canonicalizes and deduplicates,
+places installed curated programming fonts first, appends other monospace
+families alphabetically, and supplies the generic `Monospace` alias exactly
+once even when concrete families are available. GTK will pass Pango family
+facts through this function instead of owning a second curated list. Iced will snapshot family
+facts from the released public
+`iced::advanced::graphics::text::font_system()` database and pass them through
+the same function. Discovery, installed/missing diagnostics,
+Iced `Font` construction, Pango access, and glyph measurement remain adapter
+responsibilities; no font database, GTK, Iced, AppKit, renderer, IO, or runtime
+type enters `roost-engine` or `roost-ui-model`.
+
+Released-Iced constraint: Iced 0.14's public `Font::with_name` requires a
+`&'static str`, even for a system-discovered family. The Iced adapter will use
+one process-wide immutable `OnceLock<FontRegistry>` containing owned canonical
+names and case-insensitive lookup keys. Access through the static registry
+produces genuinely static name references without unsafe lifetime extension or
+per-App `Box::leak`; repeated App/bootstrap construction reuses the same object
+and cannot grow it. The registry retains every safe installed family for explicit
+config-chain resolution, while the picker exposes only the shared ordered
+monospace subset. This preserves the existing GTK/Swift behavior for a user who
+manually configures a proportional family without advertising it as a terminal
+picker recommendation. This is immutable renderer metadata, not a global async
+runtime or engine state singleton; it is bounded by the system family count and
+does not grow on palette opens, previews, config reloads, or tab creation.
+The registry snapshots cloned names/flags under the renderer font-system lock
+at startup and releases that lock before constructing palette/model state or
+invoking any UI code. It therefore reuses the exact database already used by
+wgpu/tiny-skia, adds no second system-font scan or direct parser dependency,
+and cannot deadlock paragraph measurement by retaining the write guard.
+Unknown configured families and unavailable primary entries in a configured
+comma chain fall through to the next installed entry and finally Iced's
+generic monospace family without persisting a replacement.
+The shared ordering function rejects empty names and names containing control
+characters, a double quote, or a comma because Roost's current scalar config
+grammar has no escape syntax and uses comma as the fallback-chain delimiter;
+such metadata must never create a second config line or a value that cannot
+round-trip to the same family.
+
+Metric and transaction flow: `TerminalMetrics` will measure a supplied Iced
+`Font` rather than always constructing `Font::MONOSPACE`; the existing size
+entry point delegates to the generic family. Bold/italic variants retain the
+resolved base family. The family chain stays in shared `TerminalTypography`,
+while the resolved static Iced token stays in `TerminalMetrics`. Size changes
+remeasure the currently resolved family. Family preview builds a cloned
+typography candidate, resolves and measures it at the current point size, then
+uses the existing stable-ID, all-tab geometry transaction. Libghostty metrics,
+mode-2048 replies, PTY resize, and tracked-pointer release follow the same
+stage/rollback/commit ordering as font size. A failed tab application or
+measurement restores every previously applied tab and keeps live typography,
+palette-open snapshot, config, and disk bytes unchanged.
+Normal, bold, and italic draw primitives must derive from the resolved named
+base `metrics.font`; measuring one family while drawing generic monospace is a
+correctness failure. The existing explicit wide/CJK policy remains: a wide cell
+may use Iced's generic sans-serif fallback for glyph availability while keeping
+the selected family's measured two-cell allotment. Renderer-level tests inspect
+the generated draw font for normal/bold/italic cells and preserve the focused
+wide/combined screenshot proof.
+
+Palette and persistence semantics: opening a palette records the raw optional
+family override and its resolved installed renderer token separately from the
+theme snapshot. Entering `fonts` preselects the resolved token, including when
+the raw override is unset, its primary is missing but a secondary is installed,
+or its complete chain falls back to generic monospace. Query and arrow selection
+preview exactly one selected family without persistence. Escape, outside
+click, a back action, opening another palette, or a provider replacement
+restores the complete raw at-open chain, including the distinction between an
+unset family and a configured comma-separated fallback. Confirmation uses the
+extended shared `confirm_family` result, which receives both the raw at-open
+override and its resolved token. Confirming that resolved token restores the
+complete raw chain if needed and performs no write; confirming a genuinely
+different row commits its name and writes one `font-family = "<name>"` value
+atomically. Pure tests pin unset/default, missing-primary/installed-secondary,
+and entirely-missing-chain confirmation so a preview cannot silently collapse
+the user's fallback policy.
+The palette closes before surfacing a write error so dismissal cannot undo an
+accepted live selection. Family names come only from system metadata, but config
+serialization still uses the existing shared exact-quote serializer after the
+shared discovery filter has established that the name round-trips safely.
+
+All palette exits use one disposition-aware close operation. `Confirm` clears
+the family snapshot without restoration after the live commit. `Cancel` or
+`Replace` attempts the relevant font preview restoration before clearing or
+popping palette state; if the all-tab restore fails, the original snapshot and
+font frame remain recoverable, the error is surfaced, and an attempted palette
+or provider replacement is aborted. Escape, outside click, back, opening a new
+palette, and IPC palette replacement have injected restore-failure tests. The
+operation never invokes renderer/UI work while holding the renderer font-system
+lock or shared workspace state.
+
+Tests and acceptance: add pure shared tests for curated ordering,
+case-insensitive canonicalization/deduplication, non-monospace filtering, and
+generic fallback; GTK tests must retain its picker order. Add Iced registry,
+chain resolution, supplied-font metric, boot fallback, preview/restore,
+confirmation/no-write, persistence-error, all-tab rollback, draw-font, and
+repeated process-registry acquisition tests. Every accepted discovered name
+must pass an exact persist/parse/resolve round trip. Generalize the harness-owned
+family regression to GTK and Iced so both
+must expose at least two installed rows, preview without writing, dismiss back
+to the launch state, confirm with exact config bytes, restore the original, and
+leave the tracked seed untouched. Capture the same Latin/bold/italic/wide/
+combining fixture before and after a visible family choice for human review;
+permanent tests assert semantics and renderer-derived geometry rather than a
+font-specific full-window golden. Run both macOS renderers, Linux X11/Wayland
+renderers, real input, GTK/AppKit regressions, dependency boundaries, the full
+shed gate, independent diff review, and branch CI. Acceptance requires the
+family skip to disappear, configured/live/new-tab family behavior to work on
+macOS and Linux, no unbounded growth across repeated palette opens, and no UI
+dependency-direction change.
+
+Implementation result (2026-08-01): GTK and Iced now share curated ordering,
+safe-name filtering, fallback-chain resolution, raw-chain confirmation, size,
+and persistence policy. Discovery and measurement remain toolkit adapters.
+Iced snapshots its renderer font database once into an immutable `OnceLock`
+registry, releases the database lock before any UI work, and maps the shared
+canonical result to a process-lifetime Iced font token without unsafe or
+per-open leaks. The generic `Monospace` row is always present exactly once;
+the Linux matrix caught and closed an earlier case where a generic fallback
+was live but an unrelated first installed row was highlighted.
+
+The Iced live transaction now measures and draws the same resolved family for
+normal, bold, italic, and combining cells, retaining only the documented
+generic sans-serif fallback for wide cells. Query, arrow, dismiss, back,
+replacement, confirmation, persistence errors, tracked pointer releases,
+mode-2048 replies, and all-tab rollback use explicit error paths. Async
+provider results are bound to the palette frame that spawned them, so they
+cannot replace a later font preview. `app.window_metrics` gained an optional
+`terminal_font_family` diagnostic containing the renderer-resolved token; old
+adapters and clients remain compatible because the field is optional.
+
+The required GTK/Iced functional test no longer has a family skip. It requires
+two rows, asserts the live renderer token, preview-without-write, dismissal,
+confirmation bytes, hidden-tab geometry when the selected faces measure
+differently, and new-tab inheritance. The schema-3 opt-in visual tool captures
+the same Latin/bold/italic/combining/wide fixture before and after a real
+family choice, validates both files and hashes plus an isolated terminal-region
+change, and links both artifacts in its manifest. Visual inspection passed on
+macOS GTK/Iced and Linux Iced X11/Wayland under wgpu/tiny-skia. The macOS Iced
+functional lanes each passed 51 tests with two named platform/focus skips;
+Linux X11 passed 52 with one named focus skip under each renderer, and Linux
+Wayland passed all 46 under each renderer. Linux GTK passed 159 tests with the
+four Iced-only cases and existing same-chunk OSC limitation skipped. The shed
+Wayland GTK drag gate and Iced X11/Wayland real-input gates passed. Local
+evidence is under `target/visual-parity/8ded829-32bc4d8577/` and
+`target/visual-parity-linux-fonts/`; these ignored artifacts are reproducible,
+not committed goldens.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

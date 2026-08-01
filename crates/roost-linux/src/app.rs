@@ -236,6 +236,9 @@ pub struct App {
     /// dismiss-without-confirm so an in-flight live preview reverts.
     /// `None` while the palette is closed or before the first open.
     font_family_at_open: RefCell<Option<Option<String>>>,
+    /// Installed renderer token resolved from the raw at-open family chain
+    /// when the font frame is built.
+    font_resolved_at_open: RefCell<Option<String>>,
     /// `copy-on-select` from `~/.config/roost/config.conf` (default
     /// `True`). `RefCell` so a future config-reload path can update it
     /// without rebuilding the App; new tabs read the current value
@@ -802,6 +805,7 @@ impl App {
                 cfg.font_size,
             )),
             font_family_at_open: RefCell::new(None),
+            font_resolved_at_open: RefCell::new(None),
             copy_on_select: RefCell::new(cfg.copy_on_select),
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
@@ -3828,8 +3832,14 @@ impl App {
     /// against the live value would still drop the fallback.
     fn commit_font_family(self: &Rc<Self>, name: &str) {
         let opened = self.font_family_at_open.borrow().clone().flatten();
+        let resolved = self
+            .font_resolved_at_open
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "Monospace".to_string());
         let live = self.typography.borrow().family().map(str::to_owned);
-        let confirmation = typography::confirm_family(opened.as_deref(), live.as_deref(), name);
+        let confirmation =
+            typography::confirm_family(opened.as_deref(), &resolved, live.as_deref(), name);
         match confirmation.apply {
             FamilyApply::Keep => {}
             FamilyApply::Set(family) => self.set_active_font_family(family),
@@ -3858,6 +3868,7 @@ impl App {
         *self.theme_name_at_open.borrow_mut() = Some(self.active_theme_name.borrow().clone());
         *self.font_family_at_open.borrow_mut() =
             Some(self.typography.borrow().family().map(str::to_owned));
+        *self.font_resolved_at_open.borrow_mut() = None;
 
         // Reverse map (action → shortcut label) from the canonicalized
         // bindings, so each command row shows its keybind hint. First
@@ -4770,6 +4781,7 @@ impl App {
         *self.palette.borrow_mut() = None;
         *self.theme_name_at_open.borrow_mut() = None;
         *self.font_family_at_open.borrow_mut() = None;
+        *self.font_resolved_at_open.borrow_mut() = None;
         self.focus_active_terminal();
     }
 
@@ -4893,18 +4905,12 @@ impl App {
     fn font_frame(self: &Rc<Self>) -> PaletteFrame {
         let families = self.available_font_families();
         let active = self.typography.borrow().effective_family().to_string();
-        // Match against the primary entry of a comma list (e.g. the
-        // default `"JetBrains Mono, Monospace"` should pre-select
-        // "JetBrains Mono"). Fall back to row 0 if not found.
-        let primary = active
-            .split(',')
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .unwrap_or("");
+        let resolved = typography::resolve_family_name(&active, &families);
         let selection = families
             .iter()
-            .position(|n| n.eq_ignore_ascii_case(primary))
+            .position(|name| name.eq_ignore_ascii_case(&resolved))
             .unwrap_or(0);
+        *self.font_resolved_at_open.borrow_mut() = Some(resolved);
         let items = families
             .into_iter()
             .map(|n| PaletteItem::new(n.clone(), n))
@@ -4966,32 +4972,6 @@ impl App {
         self.set_active_font_family(target);
     }
 
-    /// Curated programming fonts that look great in a terminal, in a
-    /// thoughtful order. The first entry that's actually installed
-    /// becomes the top of the picker; uninstalled entries are skipped.
-    /// Mirrors the Swift `availableFontFamilies` curated list.
-    const CURATED_FONTS: &'static [&'static str] = &[
-        "JetBrains Mono",
-        "JetBrainsMono Nerd Font",
-        "Fira Code",
-        "Fira Mono",
-        "Hack",
-        "Source Code Pro",
-        "Cascadia Code",
-        "Cascadia Mono",
-        "IBM Plex Mono",
-        "Inconsolata",
-        "Iosevka",
-        "DejaVu Sans Mono",
-        "Ubuntu Mono",
-        "Liberation Mono",
-        "Noto Sans Mono",
-        // Mac-only families (no-op on Linux when not installed).
-        "SF Mono",
-        "Menlo",
-        "Monaco",
-    ];
-
     /// Enumerate font families for the picker: curated first
     /// (filtered to installed), then every other monospace family
     /// alphabetically. Uses the active window's Pango context so the
@@ -5008,40 +4988,35 @@ impl App {
             return vec!["Monospace".to_string()];
         };
         let families = font_map.list_families();
-        // Build a name→is_monospace map (case-insensitive lookup).
-        let mut installed: Vec<(String, bool)> = families
+        let installed = families
             .iter()
             .map(|family| (family.name().to_string(), family.is_monospace()))
-            .collect();
-        installed.sort_by_key(|a| a.0.to_lowercase());
+            .collect::<Vec<_>>();
+        typography::ordered_monospace_families(installed)
+    }
 
-        let canonical_name = |name: &str| -> Option<String> {
-            installed
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(n, _)| n.clone())
+    /// Every safe installed Pango family for resolving diagnostic config
+    /// chains. Unlike the picker this intentionally retains proportional
+    /// families: Pango accepts those in an explicit user configuration, so
+    /// reporting against only picker rows could disagree with live rendering.
+    fn installed_font_family_names(self: &Rc<Self>) -> Vec<String> {
+        let context = self.window.pango_context();
+        let Some(font_map) = context.font_map() else {
+            return Vec::new();
         };
-
-        let mut out: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::<String>::new();
-        for entry in Self::CURATED_FONTS {
-            if let Some(n) = canonical_name(entry) {
-                let key = n.to_lowercase();
-                if seen.insert(key) {
-                    out.push(n);
-                }
-            }
-        }
-        for (n, is_mono) in &installed {
-            if !is_mono {
-                continue;
-            }
-            let key = n.to_lowercase();
-            if seen.insert(key) {
-                out.push(n.clone());
-            }
-        }
-        out
+        let mut names = font_map
+            .list_families()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .filter(|name| typography::font_family_name_is_safe(name))
+            .collect::<Vec<_>>();
+        names.sort_by(|left, right| {
+            left.to_lowercase()
+                .cmp(&right.to_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        names
     }
 
     fn active_terminal_view(self: &Rc<Self>) -> Option<Rc<TerminalView>> {
@@ -5598,7 +5573,9 @@ impl App {
     /// sidebar that's the start child of the `gtk4::Paned` we built
     /// with `resize_start_child(false) + shrink_start_child(false)`,
     /// so it equals the paned position when visible.
-    fn ipc_window_metrics(self: &Rc<Self>) -> Result<(f64, f64, f64, bool, Option<f64>), String> {
+    fn ipc_window_metrics(
+        self: &Rc<Self>,
+    ) -> Result<(f64, f64, f64, bool, Option<f64>, Option<String>), String> {
         let w = self.window.width() as f64;
         let h = self.window.height() as f64;
         let collapsed = !self.sidebar_box.is_visible();
@@ -5607,7 +5584,10 @@ impl App {
         } else {
             self.sidebar_box.width() as f64
         };
-        Ok((w, h, sw, collapsed, None))
+        let families = self.installed_font_family_names();
+        let family =
+            typography::resolve_family_name(self.typography.borrow().effective_family(), &families);
+        Ok((w, h, sw, collapsed, None, Some(family)))
     }
 
     /// `app.sidebar_dump` — read every project's *last-rendered* agent

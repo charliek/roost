@@ -25,7 +25,7 @@ from typing import Iterable
 
 import pngtool
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCENARIO = "workspace-shell-v1"
 SCALE = 1
 TERMINAL_BACKGROUND = (0x1E, 0x1E, 0x1E)
@@ -37,7 +37,14 @@ LIFECYCLE_COLORS = {
     "finished": (0x7A, 0x7A, 0x7A),
     "failed": (0xE0, 0x52, 0x52),
 }
-PALETTE_VARIANTS = ("commands", "query", "agents", "notifications", "provider")
+PALETTE_VARIANTS = (
+    "commands",
+    "query",
+    "agents",
+    "notifications",
+    "provider",
+    "fonts",
+)
 
 Image = tuple[int, int, int, bytes]
 
@@ -203,16 +210,34 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def central_region_digest(path: Path) -> str:
-    width, height, bpp, data = pngtool.load(str(path))
-    left, right = width // 4, width * 3 // 4
-    top, bottom = height // 5, height * 4 // 5
+def image_region_digest(
+    image: Image, bounds: tuple[int, int, int, int]
+) -> str:
+    width, height, bpp, data = image
+    left, top, right, bottom = bounds
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(width, right), min(height, bottom)
+    if left >= right or top >= bottom:
+        raise ValueError(f"empty image digest bounds: {bounds} for {width}x{height}")
     digest = hashlib.sha256()
     for y in range(top, bottom):
         start = (y * width + left) * bpp
         end = (y * width + right) * bpp
         digest.update(data[start:end])
     return digest.hexdigest()
+
+
+def region_digest(path: Path, bounds: tuple[int, int, int, int]) -> str:
+    return image_region_digest(pngtool.load(str(path)), bounds)
+
+
+def central_region_digest(path: Path) -> str:
+    image = pngtool.load(str(path))
+    width, height, _bpp, _data = image
+    return image_region_digest(
+        image,
+        (width // 4, height // 5, width * 3 // 4, height * 4 // 5),
+    )
 
 
 def measure_shell(path: Path, sidebar_width: int) -> dict:
@@ -392,6 +417,59 @@ def validate_measurement(document: dict, run_id: str, commit: str) -> None:
             variant = variants.get(name, {})
             if not variant.get("png") or not variant.get("sha256"):
                 raise ValueError(f"measurement is missing {name} palette provenance")
+    font = document.get("font_comparison", {})
+    for field in (
+        "fixture",
+        "baseline_font",
+        "baseline_png",
+        "baseline_sha256",
+        "terminal_text_bounds",
+        "baseline_text_sha256",
+    ):
+        if not font.get(field):
+            raise ValueError(f"measurement is missing font comparison {field}")
+    if not isinstance(font.get("alternate_available"), bool):
+        raise ValueError("measurement is missing font alternate availability")
+    if font["alternate_available"]:
+        for field in (
+            "alternate_font",
+            "alternate_png",
+            "alternate_sha256",
+            "alternate_text_sha256",
+            "alternate_extent",
+        ):
+            if not font.get(field):
+                raise ValueError(f"measurement is missing font comparison {field}")
+        if font["baseline_text_sha256"] == font["alternate_text_sha256"]:
+            raise ValueError("font comparison terminal regions are identical")
+    elif not font.get("reason"):
+        raise ValueError("unavailable font comparison is missing its reason")
+
+
+def validate_artifact_files(document: dict, artifact_dir: Path) -> None:
+    expected = [
+        (document["shell"]["png"], document["shell"]["sha256"]),
+    ]
+    palette = document["palette"]
+    if palette.get("available") is not False:
+        expected.append((palette["png"], palette["sha256"]))
+        expected.extend(
+            (variant["png"], variant["sha256"])
+            for variant in palette["variants"].values()
+        )
+    font = document["font_comparison"]
+    expected.append((font["baseline_png"], font["baseline_sha256"]))
+    if font["alternate_available"]:
+        expected.append((font["alternate_png"], font["alternate_sha256"]))
+    for filename, digest in expected:
+        path = Path(filename)
+        if path.name != filename:
+            raise ValueError(f"artifact name is not one safe component: {filename!r}")
+        artifact = artifact_dir / path
+        if not artifact.is_file():
+            raise ValueError(f"measurement artifact is missing: {filename}")
+        if sha256(artifact) != digest:
+            raise ValueError(f"measurement artifact digest mismatch: {filename}")
 
 
 def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
@@ -405,6 +483,7 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
         shell = document["shell"]
         key = environment_key(metadata)
         palette = document["palette"]
+        font = document["font_comparison"]
         executable = metadata["executable"]
         if palette.get("available") is not False:
             palette_link = " ".join(
@@ -413,9 +492,16 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
             )
         else:
             palette_link = f"unavailable: {palette.get('reason', 'unspecified')}"
+        if font["alternate_available"]:
+            font_link = (
+                f"{font['baseline_font']} [before]({key}/{font['baseline_png']}) → "
+                f"{font['alternate_font']} [after]({key}/{font['alternate_png']})"
+            )
+        else:
+            font_link = f"unavailable: {font['reason']}"
         rows.append(
             "| {target} | {os} | {display} | {renderer} | {size} | {sidebar} | "
-            "{top} | [shell]({shell_link}) | {palette_link} | {source} | "
+            "{top} | [shell]({shell_link}) | {palette_link} | {font_link} | {source} | "
             "`{executable}` | `{digest}` |".format(
                 target=metadata["target"],
                 os=metadata["os"],
@@ -426,6 +512,7 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
                 top=shell["terminal_top"],
                 shell_link=f"{key}/{shell['png']}",
                 palette_link=palette_link,
+                font_link=font_link,
                 source="dirty" if metadata["source_dirty"] else "clean",
                 executable=executable["sha256"],
                 digest=shell["sha256"],
@@ -439,9 +526,9 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
         "Hashes record provenance only; they are not golden-image assertions.\n\n"
         "Agent elapsed times are dynamic and excluded from visual comparison.\n\n"
         "| Target | OS | Display | Renderer | Shell size | Sidebar sample | "
-        "Terminal top | Shell | Palettes | Source | Executable SHA-256 | "
+        "Terminal top | Shell | Palettes | Font comparison | Source | Executable SHA-256 | "
         "Shell SHA-256 |\n"
-        "|---|---|---|---|---:|---|---:|---|---|---|---|---|\n"
+        "|---|---|---|---|---:|---|---:|---|---|---|---|---|---|\n"
     )
     return header + "\n".join(rows) + "\n"
 
@@ -574,6 +661,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             document = json.loads(path.read_text())
             validate_measurement(document, run_id, commit)
+            validate_artifact_files(document, path.parent)
             documents.append(document)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             failures.append(f"{path}: {error}")
