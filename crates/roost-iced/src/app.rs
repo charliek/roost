@@ -480,6 +480,61 @@ struct ScreenshotRequest {
     reply: ScreenshotReply,
 }
 
+#[derive(Default)]
+struct ScreenshotQueue {
+    pending: VecDeque<ScreenshotRequest>,
+    in_flight: Option<ScreenshotRequest>,
+}
+
+impl ScreenshotQueue {
+    fn enqueue(&mut self, scale: u32, reply: ScreenshotReply) {
+        self.pending.push_back(ScreenshotRequest { scale, reply });
+    }
+
+    fn start_next(&mut self, window_id: Option<window::Id>) -> UiTask {
+        if self.in_flight.is_some() {
+            return UiTask::None;
+        }
+        let Some(window_id) = window_id else {
+            return UiTask::None;
+        };
+        let Some(request) = self.pending.pop_front() else {
+            return UiTask::None;
+        };
+        self.in_flight = Some(request);
+        UiTask::Screenshot(window_id)
+    }
+
+    fn complete(&mut self) -> Option<ScreenshotRequest> {
+        self.in_flight.take()
+    }
+}
+
+struct WindowOpenResult {
+    task: UiTask,
+    retained_resize_scheduled: bool,
+}
+
+fn prepare_window_opened(
+    window_id: &mut Option<window::Id>,
+    pending_window_resize: &mut Option<Size>,
+    screenshots: &mut ScreenshotQueue,
+    id: window::Id,
+) -> WindowOpenResult {
+    *window_id = Some(id);
+    let resize = pending_window_resize
+        .take()
+        .map(|size| UiTask::Resize(id, size));
+    let retained_resize_scheduled = resize.is_some();
+    let task = resize
+        .unwrap_or(UiTask::None)
+        .then(screenshots.start_next(*window_id));
+    WindowOpenResult {
+        task,
+        retained_resize_scheduled,
+    }
+}
+
 struct AgentMetricsResult {
     session: u64,
     claimed: Vec<String>,
@@ -913,8 +968,7 @@ pub struct App {
     ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
-    screenshot_queue: VecDeque<ScreenshotRequest>,
-    screenshot_in_flight: Option<ScreenshotRequest>,
+    screenshots: ScreenshotQueue,
     window_size: Size,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
@@ -1006,8 +1060,7 @@ impl App {
             ui_rx,
             window_id: None,
             pending_window_resize: None,
-            screenshot_queue: VecDeque::new(),
-            screenshot_in_flight: None,
+            screenshots: ScreenshotQueue::default(),
             window_size: Size::new(1100.0, 720.0),
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
@@ -1047,15 +1100,23 @@ impl App {
     }
 
     pub fn window_opened(&mut self, id: window::Id) -> UiTask {
-        self.window_id = Some(id);
-        self.pending_window_resize
-            .take()
-            .map_or(UiTask::None, |size| UiTask::Resize(id, size))
+        prepare_window_opened(
+            &mut self.window_id,
+            &mut self.pending_window_resize,
+            &mut self.screenshots,
+            id,
+        )
+        .task
     }
 
     pub fn window_resized(&mut self, id: window::Id, size: Size) -> UiTask {
-        let task = self.window_opened(id);
-        if matches!(task, UiTask::None) {
+        let opened = prepare_window_opened(
+            &mut self.window_id,
+            &mut self.pending_window_resize,
+            &mut self.screenshots,
+            id,
+        );
+        if !opened.retained_resize_scheduled {
             self.resize(size);
         }
         // A native resize event confirms that Iced has rebuilt the widget
@@ -1064,7 +1125,7 @@ impl App {
         if self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
-        task
+        opened.task
     }
 
     pub fn tick(&mut self) -> UiTask {
@@ -1105,7 +1166,7 @@ impl App {
             self.tabs.remove(&tab_id);
         }
         task = task.then(self.take_palette_visibility_task());
-        task = task.then(self.start_next_screenshot());
+        task = task.then(self.screenshots.start_next(self.window_id));
         task
     }
 
@@ -1126,25 +1187,13 @@ impl App {
     }
 
     pub fn screenshot_captured(&mut self, capture: &window::Screenshot) -> UiTask {
-        if let Some(request) = self.screenshot_in_flight.take() {
+        if let Some(request) = self.screenshots.complete() {
             let result = crate::screenshot::encode(capture, request.scale);
             let _ = request.reply.send(result);
         } else {
             tracing::warn!("received an Iced screenshot with no request in flight");
         }
-        self.start_next_screenshot()
-    }
-
-    fn start_next_screenshot(&mut self) -> UiTask {
-        if self.screenshot_in_flight.is_some() {
-            return UiTask::None;
-        }
-        let (Some(window_id), Some(request)) = (self.window_id, self.screenshot_queue.pop_front())
-        else {
-            return UiTask::None;
-        };
-        self.screenshot_in_flight = Some(request);
-        UiTask::Screenshot(window_id)
+        self.screenshots.start_next(self.window_id)
     }
 
     pub fn resize(&mut self, size: Size) {
@@ -2825,8 +2874,7 @@ impl App {
                     let _ = reply.send(Ok(self.workspace.active().1));
                 }
                 UiRequest::Screenshot { scale, reply } => {
-                    self.screenshot_queue
-                        .push_back(ScreenshotRequest { scale, reply });
+                    self.screenshots.enqueue(scale, reply);
                 }
                 UiRequest::PaletteOpen { kind, reply } => {
                     let result = self
@@ -3191,6 +3239,123 @@ mod tests {
         };
         assert!(matches!(*first, UiTask::FocusWidget(_)));
         assert!(matches!(*second, UiTask::Resize(_, _)));
+    }
+
+    #[test]
+    fn screenshot_queue_retains_a_request_until_a_window_exists() {
+        let mut queue = ScreenshotQueue::default();
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        queue.enqueue(1, reply);
+
+        assert!(matches!(queue.start_next(None), UiTask::None));
+        assert_eq!(queue.pending.len(), 1);
+        assert!(queue.in_flight.is_none());
+        assert!(matches!(
+            result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let id = window::Id::unique();
+        assert!(matches!(
+            queue.start_next(Some(id)),
+            UiTask::Screenshot(scheduled) if scheduled == id
+        ));
+        assert!(queue.pending.is_empty());
+        assert!(queue.in_flight.is_some());
+    }
+
+    #[test]
+    fn screenshot_queue_completes_in_fifo_order() {
+        let mut queue = ScreenshotQueue::default();
+        let (first_reply, mut first_result) = tokio::sync::oneshot::channel();
+        let (second_reply, mut second_result) = tokio::sync::oneshot::channel();
+        queue.enqueue(1, first_reply);
+        queue.enqueue(2, second_reply);
+        let id = window::Id::unique();
+
+        assert!(matches!(queue.start_next(Some(id)), UiTask::Screenshot(_)));
+        assert!(matches!(queue.start_next(Some(id)), UiTask::None));
+        let first = queue.complete().expect("first capture must be active");
+        assert_eq!(first.scale, 1);
+        let _ = first.reply.send(Ok((Vec::new(), 1, 1)));
+        assert!(first_result.try_recv().unwrap().is_ok());
+        assert!(matches!(
+            second_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        assert!(matches!(queue.start_next(Some(id)), UiTask::Screenshot(_)));
+        let second = queue.complete().expect("second capture must be active");
+        assert_eq!(second.scale, 2);
+        let _ = second.reply.send(Ok((Vec::new(), 2, 2)));
+        assert!(second_result.try_recv().unwrap().is_ok());
+        assert!(queue.pending.is_empty());
+        assert!(queue.in_flight.is_none());
+    }
+
+    #[test]
+    fn screenshot_queue_drop_closes_pending_and_active_callers() {
+        let (active_reply, mut active_result) = tokio::sync::oneshot::channel();
+        let (pending_reply, mut pending_result) = tokio::sync::oneshot::channel();
+        {
+            let mut queue = ScreenshotQueue::default();
+            queue.enqueue(1, active_reply);
+            queue.enqueue(2, pending_reply);
+            assert!(matches!(
+                queue.start_next(Some(window::Id::unique())),
+                UiTask::Screenshot(_)
+            ));
+        }
+        assert!(matches!(
+            active_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(matches!(
+            pending_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn window_open_tasks_keep_resize_bookkeeping_separate_from_screenshot_work() {
+        let id = window::Id::unique();
+        let retained_size = Size::new(820.0, 520.0);
+        let mut window_id = None;
+        let mut pending_resize = Some(retained_size);
+        let mut screenshots = ScreenshotQueue::default();
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        screenshots.enqueue(1, reply);
+
+        let opened =
+            prepare_window_opened(&mut window_id, &mut pending_resize, &mut screenshots, id);
+        assert!(opened.retained_resize_scheduled);
+        let UiTask::Then(first, second) = opened.task else {
+            panic!("retained resize and screenshot must both be scheduled");
+        };
+        assert!(matches!(
+            *first,
+            UiTask::Resize(scheduled, size) if scheduled == id && size == retained_size
+        ));
+        assert!(matches!(*second, UiTask::Screenshot(scheduled) if scheduled == id));
+
+        // A later open/focus/resize notification cannot duplicate the active
+        // capture and has no retained resize to suppress native geometry.
+        let reopened =
+            prepare_window_opened(&mut window_id, &mut pending_resize, &mut screenshots, id);
+        assert!(!reopened.retained_resize_scheduled);
+        assert!(matches!(reopened.task, UiTask::None));
+
+        let mut screenshot_only = ScreenshotQueue::default();
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        screenshot_only.enqueue(1, reply);
+        let opened = prepare_window_opened(
+            &mut window_id,
+            &mut pending_resize,
+            &mut screenshot_only,
+            id,
+        );
+        assert!(!opened.retained_resize_scheduled);
+        assert!(matches!(opened.task, UiTask::Screenshot(scheduled) if scheduled == id));
     }
 
     #[test]

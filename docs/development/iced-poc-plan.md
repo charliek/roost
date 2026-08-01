@@ -1017,6 +1017,57 @@ under macOS/wgpu and all shed
 renderer/display combinations, then the full local/shed gates, review, push,
 and all four Actions Iced jobs must pass before new feature work.
 
+### CI root-cause follow-up: retain pre-window screenshot requests
+
+Evidence: the Ubuntu/wgpu lane failed `app.screenshot` with
+`UI dropped reply` in consecutive Actions runs `30696537783` and
+`30696820857`, while Ubuntu/tiny-skia, both macOS renderers, and repeated local
+plus shed runs passed. In both failures every other Iced functional assertion,
+including the native clipboard suite, passed. The adapter currently evaluates
+`(self.window_id, self.screenshot_queue.pop_front())` before matching the two
+`Some` values. When the IPC server accepts the first capture just before Iced
+publishes `WindowOpened`, `pop_front()` still removes and drops the request even
+though there is no window ID to schedule. Dropping its oneshot sender produces
+the observed engine error immediately; this is an ownership bug, not a timeout
+or renderer failure.
+
+Scope: encapsulate pending and in-flight captures in a small adapter-owned
+`ScreenshotQueue`. Enqueue retains the IPC reply sender. `start_next` first
+requires a native window ID and no active capture, and only then removes the
+oldest pending request and returns the Iced screenshot task. A private
+window-open preparation step returns both the composed task and an explicit
+`retained_resize_scheduled` flag. `window_opened` exposes the task, while
+`window_resized` uses the flag—not `UiTask::None`—to decide whether the native
+resize event must update terminal geometry. The preparation step orders any
+retained native resize before `start_next` (`Resize.then(Screenshot)`), so a
+pre-window request starts immediately after the requested native size is
+applied; the periodic tick remains a recovery path. Capture completion takes
+exactly the active request, sends its encoded result, and starts the next FIFO
+entry. No IPC DTO, engine behavior, renderer, or screenshot encoding changes.
+
+Invariants: absence of a window never consumes or closes a reply sender; only
+one native capture is active; requests complete in receive order; repeated
+open/focus/resize events cannot schedule the active request twice; completing
+one request cannot answer another; UI work remains on Iced's event loop and no
+engine or terminal lock crosses a native task. App teardown still closes all
+remaining senders so callers fail deterministically instead of hanging. The
+engine and Iced dependency boundaries remain unchanged.
+
+Tests and acceptance: unit tests prove a pre-window request remains pending
+with an open receiver, begins after a window ID appears, and blocks a second
+capture until the first is completed; they also prove FIFO completion and
+sender closure for both pending and in-flight requests on queue drop. Window
+integration tests prove a retained resize is composed before screenshot
+startup, a resize event still requests geometry application when screenshot
+startup is the only returned task, and repeated open/focus/resize preparation
+cannot duplicate an active capture. The existing functional test continues to
+exercise stable 1x/2x capture plus two simultaneous IPC clients without a retry
+or skip. Repeat the full Iced functional lane under macOS wgpu and tiny-skia
+and shed X11/Wayland wgpu/tiny-skia, run `make check` and `make check-iced`,
+preserve GTK and Swift regression results, review the full diff, commit and
+push separately, and require all Actions jobs—including the Ubuntu/wgpu lane
+that reproduced twice—to pass before feature work resumes.
+
 ### Native Iced clipboard bridge commit plan
 
 Scope: replace `roost-iced`'s process-local system/selection clipboard shadows
