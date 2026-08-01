@@ -314,6 +314,15 @@ pub enum UiTask {
     FocusWidget(Id),
     Resize(window::Id, Size),
     Screenshot(window::Id),
+    ClipboardRead {
+        request_id: u64,
+        target: ClipboardOp,
+    },
+    ClipboardWrite {
+        request_id: u64,
+        target: ClipboardOp,
+        text: String,
+    },
     PaletteVisibility {
         scroll_id: Id,
         row_id: Id,
@@ -335,6 +344,136 @@ impl UiTask {
 }
 
 type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
+type ClipboardReply = tokio::sync::oneshot::Sender<Result<Option<String>, String>>;
+
+#[derive(Debug)]
+enum ClipboardEffect {
+    Read {
+        request_id: u64,
+        target: ClipboardOp,
+    },
+    Write {
+        request_id: u64,
+        target: ClipboardOp,
+        text: String,
+    },
+}
+
+impl ClipboardEffect {
+    fn request_id(&self) -> u64 {
+        match self {
+            Self::Read { request_id, .. } | Self::Write { request_id, .. } => *request_id,
+        }
+    }
+
+    fn into_task(self) -> UiTask {
+        match self {
+            Self::Read { request_id, target } => UiTask::ClipboardRead { request_id, target },
+            Self::Write {
+                request_id,
+                target,
+                text,
+            } => UiTask::ClipboardWrite {
+                request_id,
+                target,
+                text,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClipboardQueue {
+    next_request_id: u64,
+    queued: VecDeque<ClipboardEffect>,
+    active_request_id: Option<u64>,
+    pending_reads: HashMap<u64, ClipboardReply>,
+}
+
+impl ClipboardQueue {
+    fn allocate_request_id(&mut self) -> u64 {
+        loop {
+            self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+            let request_id = self.next_request_id;
+            let queued = self
+                .queued
+                .iter()
+                .any(|effect| effect.request_id() == request_id);
+            if self.active_request_id != Some(request_id)
+                && !self.pending_reads.contains_key(&request_id)
+                && !queued
+            {
+                return request_id;
+            }
+        }
+    }
+
+    fn enqueue_read(&mut self, target: ClipboardOp, reply: ClipboardReply) -> u64 {
+        let request_id = self.allocate_request_id();
+        self.pending_reads.insert(request_id, reply);
+        self.queued
+            .push_back(ClipboardEffect::Read { request_id, target });
+        request_id
+    }
+
+    fn enqueue_write(&mut self, target: ClipboardOp, text: String) -> u64 {
+        let request_id = self.allocate_request_id();
+        self.queued.push_back(ClipboardEffect::Write {
+            request_id,
+            target,
+            text,
+        });
+        request_id
+    }
+
+    fn start_next(&mut self) -> UiTask {
+        if self.active_request_id.is_some() {
+            return UiTask::None;
+        }
+        let Some(effect) = self.queued.pop_front() else {
+            return UiTask::None;
+        };
+        self.active_request_id = Some(effect.request_id());
+        effect.into_task()
+    }
+
+    fn complete_read(&mut self, request_id: u64, value: Option<String>) -> bool {
+        if self.active_request_id != Some(request_id) {
+            return false;
+        }
+        self.active_request_id = None;
+        let Some(reply) = self.pending_reads.remove(&request_id) else {
+            return false;
+        };
+        let _ = reply.send(Ok(value));
+        true
+    }
+
+    fn complete_write(&mut self, request_id: u64) -> bool {
+        if self.active_request_id != Some(request_id) {
+            return false;
+        }
+        self.active_request_id = None;
+        true
+    }
+}
+
+fn enqueue_osc_clipboard_write(
+    clipboard: &mut ClipboardQueue,
+    policy: config::ClipboardWrite,
+    target: ClipboardTarget,
+    text: String,
+) -> bool {
+    if policy == config::ClipboardWrite::Deny {
+        return false;
+    }
+    let target = match target {
+        ClipboardTarget::System => ClipboardOp::System,
+        ClipboardTarget::Selection => ClipboardOp::Selection,
+    };
+    clipboard.enqueue_write(target, text);
+    true
+}
 
 struct ScreenshotRequest {
     scale: u32,
@@ -805,8 +944,7 @@ pub struct App {
     provider_frames: HashMap<String, provider::Provider>,
     palette_present_reply:
         Option<tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>>,
-    system_clipboard: Option<String>,
-    selection_clipboard: Option<String>,
+    clipboard: ClipboardQueue,
     // Field order is intentional: terminal sessions and IPC receivers are
     // dropped before the runtime; the lock is held until every runtime task
     // has been cancelled and joined by Runtime::drop.
@@ -898,8 +1036,7 @@ impl App {
             provider_rx,
             provider_frames: HashMap::new(),
             palette_present_reply: None,
-            system_clipboard: None,
-            selection_clipboard: None,
+            clipboard: ClipboardQueue::default(),
             runtime,
             _lock: lock,
         };
@@ -961,7 +1098,7 @@ impl App {
             }
         }
         for (tab_id, actions) in osc_actions {
-            self.apply_osc_actions(tab_id, actions);
+            task = task.then(self.apply_osc_actions(tab_id, actions));
         }
         for tab_id in exited {
             let _ = self.workspace.close_tab(tab_id);
@@ -970,6 +1107,22 @@ impl App {
         task = task.then(self.take_palette_visibility_task());
         task = task.then(self.start_next_screenshot());
         task
+    }
+
+    pub fn clipboard_read_completed(&mut self, request_id: u64, value: Option<String>) -> UiTask {
+        if !self.clipboard.complete_read(request_id, value) {
+            tracing::warn!(request_id, "ignored stale native clipboard read result");
+            return UiTask::None;
+        }
+        self.clipboard.start_next()
+    }
+
+    pub fn clipboard_write_completed(&mut self, request_id: u64) -> UiTask {
+        if !self.clipboard.complete_write(request_id) {
+            tracing::warn!(request_id, "ignored stale native clipboard write result");
+            return UiTask::None;
+        }
+        self.clipboard.start_next()
     }
 
     pub fn screenshot_captured(&mut self, capture: &window::Screenshot) -> UiTask {
@@ -2574,7 +2727,7 @@ impl App {
                         Err(format!("tab {tab_id} has no live terminal"))
                     };
                     if let Some(actions) = actions {
-                        self.apply_osc_actions(tab_id, actions);
+                        task = task.then(self.apply_osc_actions(tab_id, actions));
                     }
                     let _ = reply.send(result);
                 }
@@ -2746,16 +2899,13 @@ impl App {
                     let _ = reply.send(result);
                 }
                 UiRequest::ClipboardDump { target, reply } => {
-                    let value = match target {
-                        ClipboardOp::System => self.system_clipboard.clone(),
-                        ClipboardOp::Selection => self.selection_clipboard.clone(),
-                    };
-                    let _ = reply.send(Ok(value));
+                    self.clipboard.enqueue_read(target, reply);
+                    task = task.then(self.clipboard.start_next());
                 }
-                UiRequest::ClipboardWrite { target, text } => match target {
-                    ClipboardOp::System => self.system_clipboard = Some(text),
-                    ClipboardOp::Selection => self.selection_clipboard = Some(text),
-                },
+                UiRequest::ClipboardWrite { target, text } => {
+                    self.clipboard.enqueue_write(target, text);
+                    task = task.then(self.clipboard.start_next());
+                }
                 UiRequest::TabExpandSelectionAt {
                     tab_id,
                     col,
@@ -2817,7 +2967,7 @@ impl App {
         task
     }
 
-    fn apply_osc_actions(&mut self, tab_id: i64, actions: Vec<OscAction>) {
+    fn apply_osc_actions(&mut self, tab_id: i64, actions: Vec<OscAction>) -> UiTask {
         for action in actions {
             match action {
                 OscAction::Workspace { command, payload } => {
@@ -2828,10 +2978,20 @@ impl App {
                         tab.session.send_input(bytes);
                     }
                 }
-                OscAction::ClipboardWrite { target, text } => match target {
-                    ClipboardTarget::System => self.system_clipboard = Some(text),
-                    ClipboardTarget::Selection => self.selection_clipboard = Some(text),
-                },
+                OscAction::ClipboardWrite { target, text } => {
+                    if !enqueue_osc_clipboard_write(
+                        &mut self.clipboard,
+                        self.config.clipboard_write,
+                        target,
+                        text,
+                    ) {
+                        tracing::info!(
+                            tab_id,
+                            "OSC 52 clipboard write dropped — clipboard-write = deny"
+                        );
+                        continue;
+                    }
+                }
                 OscAction::PointerShape(name) => {
                     if let Some(tab) = self.tabs.get_mut(&tab_id) {
                         tab.pointer_shape = canonical_pointer_shape(&name).into();
@@ -2839,6 +2999,7 @@ impl App {
                 }
             }
         }
+        self.clipboard.start_next()
     }
 }
 
@@ -3030,6 +3191,158 @@ mod tests {
         };
         assert!(matches!(*first, UiTask::FocusWidget(_)));
         assert!(matches!(*second, UiTask::Resize(_, _)));
+    }
+
+    #[test]
+    fn clipboard_queue_serializes_two_writes_before_a_read() {
+        let mut queue = ClipboardQueue::default();
+        let first_id = queue.enqueue_write(ClipboardOp::System, "A".into());
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardWrite {
+                request_id,
+                target: ClipboardOp::System,
+                ref text,
+            } if request_id == first_id && text == "A"
+        ));
+
+        // Model requests arriving on a later event-loop tick while the first
+        // native write is still active. They must queue behind it rather than
+        // starting concurrently.
+        let second_id = queue.enqueue_write(ClipboardOp::System, "B".into());
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        let read_id = queue.enqueue_read(ClipboardOp::System, reply);
+        assert!(matches!(queue.start_next(), UiTask::None));
+        assert!(queue.complete_write(first_id));
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardWrite {
+                request_id,
+                target: ClipboardOp::System,
+                ref text,
+            } if request_id == second_id && text == "B"
+        ));
+        assert!(queue.complete_write(second_id));
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead {
+                request_id,
+                target: ClipboardOp::System,
+            } if request_id == read_id
+        ));
+        assert!(queue.complete_read(read_id, Some("B".into())));
+        assert_eq!(result.try_recv().unwrap().unwrap().as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn clipboard_read_results_are_request_scoped_and_single_consumption() {
+        let mut queue = ClipboardQueue::default();
+        let (first_reply, mut first_result) = tokio::sync::oneshot::channel();
+        let (second_reply, mut second_result) = tokio::sync::oneshot::channel();
+        let first_id = queue.enqueue_read(ClipboardOp::System, first_reply);
+        let second_id = queue.enqueue_read(ClipboardOp::Selection, second_reply);
+
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id, .. } if request_id == first_id
+        ));
+        assert!(!queue.complete_read(second_id, Some("early".into())));
+        assert!(!queue.complete_read(u64::MAX, Some("unknown".into())));
+        assert!(matches!(
+            first_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            second_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        assert!(queue.complete_read(first_id, Some("first".into())));
+        assert_eq!(
+            first_result.try_recv().unwrap().unwrap().as_deref(),
+            Some("first")
+        );
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id, .. } if request_id == second_id
+        ));
+        assert!(!queue.complete_read(first_id, Some("duplicate".into())));
+        assert!(queue.complete_read(second_id, Some("second".into())));
+        assert_eq!(
+            second_result.try_recv().unwrap().unwrap().as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn clipboard_request_ids_skip_live_entries_after_wrap() {
+        let mut queue = ClipboardQueue::default();
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        assert_eq!(queue.enqueue_read(ClipboardOp::System, reply), 1);
+        queue.next_request_id = u64::MAX;
+        assert_eq!(queue.enqueue_write(ClipboardOp::System, "next".into()), 2);
+    }
+
+    #[test]
+    fn clipboard_queue_tolerates_caller_cancellation_and_closes_on_drop() {
+        let mut queue = ClipboardQueue::default();
+        let (cancelled_reply, cancelled_result) = tokio::sync::oneshot::channel();
+        let cancelled_id = queue.enqueue_read(ClipboardOp::System, cancelled_reply);
+        drop(cancelled_result);
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id, .. } if request_id == cancelled_id
+        ));
+        assert!(queue.complete_read(cancelled_id, Some("ignored".into())));
+
+        let (pending_reply, pending_result) = tokio::sync::oneshot::channel();
+        queue.enqueue_read(ClipboardOp::Selection, pending_reply);
+        drop(queue);
+        assert!(pending_result.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn osc_clipboard_policy_maps_targets_and_drops_denied_writes() {
+        let mut allowed_system = ClipboardQueue::default();
+        assert!(enqueue_osc_clipboard_write(
+            &mut allowed_system,
+            config::ClipboardWrite::Allow,
+            ClipboardTarget::System,
+            "system".into(),
+        ));
+        assert!(matches!(
+            allowed_system.start_next(),
+            UiTask::ClipboardWrite {
+                target: ClipboardOp::System,
+                ref text,
+                ..
+            } if text == "system"
+        ));
+
+        let mut allowed = ClipboardQueue::default();
+        assert!(enqueue_osc_clipboard_write(
+            &mut allowed,
+            config::ClipboardWrite::Allow,
+            ClipboardTarget::Selection,
+            "selection".into(),
+        ));
+        assert!(matches!(
+            allowed.start_next(),
+            UiTask::ClipboardWrite {
+                target: ClipboardOp::Selection,
+                ref text,
+                ..
+            } if text == "selection"
+        ));
+
+        let mut denied = ClipboardQueue::default();
+        assert!(!enqueue_osc_clipboard_write(
+            &mut denied,
+            config::ClipboardWrite::Deny,
+            ClipboardTarget::System,
+            "denied".into(),
+        ));
+        assert!(matches!(denied.start_next(), UiTask::None));
     }
 
     #[test]

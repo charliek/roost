@@ -534,10 +534,18 @@ jobs:
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
+          tools/roosttest/test_selection.py
+          tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (Linux Wayland)
         if: runner.os == 'Linux'
+        # weston's headless backend has no input seat. Iced 0.14's
+        # smithay-clipboard correctly refuses wl_data_device ownership without
+        # a focused seat/serial, so native clipboard coverage runs in the X11
+        # lane above. This lane still requires the complete non-clipboard
+        # Wayland renderer suite; the POC plan records the real-seat evidence
+        # and remaining programmatic-write limitation.
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -575,6 +583,8 @@ jobs:
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
+          tools/roosttest/test_selection.py
+          tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
       - name: Collect Iced diagnostics

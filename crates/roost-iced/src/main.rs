@@ -29,6 +29,11 @@ enum Message {
     WindowResized(window::Id, Size),
     WindowFocus(window::Id, bool),
     ScreenshotCaptured(window::Screenshot),
+    ClipboardReadCompleted {
+        request_id: u64,
+        value: Option<String>,
+    },
+    ClipboardWriteCompleted(u64),
     Keyboard(keyboard::Event),
     TerminalPointer(terminal_canvas::TerminalPointer),
     ProjectSelected(i64),
@@ -99,6 +104,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             task
         }
         Message::ScreenshotCaptured(capture) => app.screenshot_captured(&capture).map_task(),
+        Message::ClipboardReadCompleted { request_id, value } => {
+            app.clipboard_read_completed(request_id, value).map_task()
+        }
+        Message::ClipboardWriteCompleted(request_id) => {
+            app.clipboard_write_completed(request_id).map_task()
+        }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
         Message::TerminalPointer(event) => {
             app.pointer(event.action, event.button, event.col, event.row);
@@ -222,6 +233,28 @@ impl UiTask for app::UiTask {
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::Resize(id, size) => window::resize(id, size),
             app::UiTask::Screenshot(id) => window::screenshot(id).map(Message::ScreenshotCaptured),
+            app::UiTask::ClipboardRead { request_id, target } => {
+                let message = move |value| Message::ClipboardReadCompleted { request_id, value };
+                match target {
+                    roost_engine::ipc::ClipboardOp::System => iced::clipboard::read().map(message),
+                    roost_engine::ipc::ClipboardOp::Selection => {
+                        iced::clipboard::read_primary().map(message)
+                    }
+                }
+            }
+            app::UiTask::ClipboardWrite {
+                request_id,
+                target,
+                text,
+            } => {
+                let write = match target {
+                    roost_engine::ipc::ClipboardOp::System => iced::clipboard::write(text),
+                    roost_engine::ipc::ClipboardOp::Selection => {
+                        iced::clipboard::write_primary(text)
+                    }
+                };
+                write.chain(Task::done(Message::ClipboardWriteCompleted(request_id)))
+            }
             app::UiTask::PaletteVisibility {
                 scroll_id,
                 row_id,

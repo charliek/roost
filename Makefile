@@ -67,7 +67,10 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac smoke-mac-launch test-real-input check-iced
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac smoke-mac-launch test-real-input check-iced
+
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py
+ICED_CLIPBOARD_TESTS := tools/roosttest/test_selection.py tools/roosttest/test_osc52.py
 test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
 test-rust:  ## cargo test --workspace
@@ -89,7 +92,13 @@ e2e-gtk:  ## E2E against the GTK UI
 	uv run --group test pytest tools/roosttest --roost-target gtk
 
 e2e-iced:  ## Required functional E2E against Iced
-	uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py --roost-target iced
+	@tests='$(ICED_E2E_TESTS)'; \
+	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
+	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
+	uv run --group test pytest $$tests --roost-target iced
+
+e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not headless Wayland)
+	uv run --group test pytest $(ICED_CLIPBOARD_TESTS) --roost-target iced
 
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
@@ -98,7 +107,10 @@ e2e-gtk-ci:  ## GTK E2E at CI parity (test-mode + fresh harness-owned UI, isolat
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
-	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py --roost-target iced --roost-fresh
+	@tests='$(ICED_E2E_TESTS)'; \
+	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
+	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
+	ROOST_TEST_MODE=1 uv run --group test pytest $$tests --roost-target iced --roost-fresh
 
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh

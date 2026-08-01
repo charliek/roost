@@ -28,7 +28,8 @@ error; none leave an IPC caller waiting on a dropped reply.
 
 The canvas currently covers foreground/background colors, inverse, bold,
 italic, cursor shapes, grapheme cell text, clipping by the widget, and resize.
-Selection geometry, native clipboard synchronization and paste, links, mouse
+Selection geometry and native system/PRIMARY clipboard access for IPC and OSC
+52 are implemented. User-triggered copy/paste, copy-on-select, links, mouse
 protocols, config-selected theme/font application, desktop notification
 presentation, palette behavior, in-process screenshots, and full product
 styling remain the next parity slices; they are not hidden behind target-wide
@@ -43,11 +44,14 @@ make run-iced
 make test-iced
 make check-iced
 make e2e-iced
+make e2e-iced-clipboard
 make e2e-iced-ci
 ```
 
 `make e2e-iced-ci` launches a fresh harness-owned process with an isolated
 temporary `ROOST_STATE_DIR`. It never reads or writes developer session state.
+`make e2e-iced-clipboard` runs the native clipboard and OSC 52 contract on
+macOS or Linux X11. The default Iced E2E targets include it outside Wayland.
 Select a renderer explicitly when diagnosing backend behavior:
 
 ```sh
@@ -56,21 +60,29 @@ ICED_BACKEND=tiny-skia make e2e-iced-ci
 ```
 
 On Linux, Iced is built with both X11 and Wayland support. CI runs the functional
-slice under Xvfb and headless Weston with both renderers. The shed is the local
-Linux authority and keeps ELF, Cargo, and Ghostty artifacts outside the mounted
-macOS output directories:
+slice under Xvfb and headless Weston with both renderers. Native clipboard tests
+run under X11: Iced 0.14's Wayland backend needs a focused seat/input serial,
+which input-less headless Weston does not provide. PRIMARY also depends on the
+compositor advertising its optional protocol. The shed is the local Linux
+authority and keeps ELF, Cargo, and Ghostty artifacts outside the mounted macOS
+output directories:
 
 ```sh
 tools/shed/shed-test.sh --build-only
 ```
 
-For direct harness commands in the shed, select the shed-local ELF explicitly
-instead of the mounted macOS `target/` artifact:
+For direct harness commands in the shed, bind the shed-local debug directory
+over the mounted macOS `target/debug` path in the guest and use its system
+`pytest`:
 
 ```sh
-ROOST_ICED_BIN=$HOME/rt/debug/roost-iced \
-ROOST_ROOSTCTL=$HOME/rt/debug/roostctl \
-  uv run --group test pytest tools/roosttest --roost-target iced --roost-fresh
+shed exec roost-dev -- bash -lc '
+  sudo mount --bind ~/rt/debug ~/roost/target/debug
+  trap "sudo umount ~/roost/target/debug" EXIT
+  cd ~/roost
+  ICED_BACKEND=wgpu ROOST_TEST_MODE=1 \
+    xvfb-run -a pytest tools/roosttest/test_selection.py \
+      tools/roosttest/test_osc52.py --roost-target iced --roost-fresh -q'
 ```
 
 `ROOST_GTK_BIN` provides the equivalent explicit GTK binary override. Relative

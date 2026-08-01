@@ -15,6 +15,7 @@ Run against either UI:
 
     pytest -q tools/roosttest/test_osc52.py --roost-target mac
     pytest -q tools/roosttest/test_osc52.py --roost-target gtk
+    pytest -q tools/roosttest/test_osc52.py --roost-target iced
 """
 
 from __future__ import annotations
@@ -77,12 +78,13 @@ def test_osc52_writes_selection_clipboard(roost, project, target):
     # 52 path even runs. Skip on that profile only; on real Linux
     # CI (e2e-gtk) and on `--roost-target mac` (named NSPasteboard)
     # the test runs and exercises the real PRIMARY path.
-    if target == "gtk" and sys.platform == "darwin":
+    if target in {"gtk", "iced"} and sys.platform == "darwin":
         pytest.skip(
-            "GTK selection clipboard (X11/Wayland PRIMARY) is Linux-only; "
-            "macOS GTK dev build has no PRIMARY. System clipboard covered "
+            f"{target} selection clipboard (X11/Wayland PRIMARY) is Linux-only; "
+            f"macOS {target} dev build has no PRIMARY. System clipboard covered "
             "by test_osc52_writes_system_clipboard. Real GTK on Linux runs "
-            "this in e2e-gtk CI."
+            "this in e2e-gtk CI, and Iced runs it in both renderer lanes on "
+            "X11; the Iced plan records the headless Wayland protocol gap."
         )
     tab = roost.open_tab(project, cwd="/tmp", title="osc52-sel")
     baseline = _seed_baseline(roost, "selection")

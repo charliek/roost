@@ -366,7 +366,7 @@ No missing common behavior is hidden by a target-wide skip.
 | macOS/tiny-skia | yes | targeted | smoke | screenshot |
 | Ubuntu/X11 wgpu or runner fallback | yes | yes | full suite under Xvfb | screenshot + XTEST |
 | Ubuntu/X11 tiny-skia | yes | targeted | full deterministic CI lane | screenshot |
-| Ubuntu/Wayland/wgpu | yes | targeted | full suite under headless Weston | pointer/clipboard where compositor supports it |
+| Ubuntu/Wayland/wgpu | yes | targeted | non-clipboard suite under input-less headless Weston | renderer; native clipboard requires a seat/serial |
 | Ubuntu/Wayland tiny-skia | yes | targeted | startup and terminal smoke | renderer diagnostics |
 
 The shed is the local Linux authority. Its build script keeps Cargo and Ghostty
@@ -379,7 +379,7 @@ guard remains unchanged. The shed is stopped after final validation.
 Make targets:
 
 - `build-iced`, `run-iced`, `test-iced`;
-- `e2e-iced`, `e2e-iced-ci`, `smoke-iced`;
+- `e2e-iced`, `e2e-iced-ci`, `e2e-iced-clipboard`, `smoke-iced`;
 - `check-iced` for format/clippy/engine/Iced/dependency boundaries; and
 - existing targets keep their names and behavior.
 
@@ -1016,6 +1016,84 @@ the row. The complete palette suite is repeated
 under macOS/wgpu and all shed
 renderer/display combinations, then the full local/shed gates, review, push,
 and all four Actions Iced jobs must pass before new feature work.
+
+### Native Iced clipboard bridge commit plan
+
+Scope: replace `roost-iced`'s process-local system/selection clipboard shadows
+with Iced 0.14's native standard and primary clipboard tasks for the existing
+`clipboard.dump`, `clipboard.write`, and OSC 52 UI ports. This commit does not
+yet add user copy/paste keybinds, copy-on-select, middle-click paste, image/URI
+paste, or multi-click selection; those remain a following presentation/input
+slice after the native port itself is proven.
+
+Interfaces and flow: the toolkit-neutral engine continues to emit
+`UiRequest::ClipboardDump` / `ClipboardWrite` and `OscAction::ClipboardWrite`
+with `ClipboardOp` / `ClipboardTarget`; no toolkit type enters the engine. The
+Iced adapter allocates a monotonically increasing request ID for each native
+read or write (skipping every active, queued, or pending ID on wrap), retains
+read IPC oneshots in adapter-owned pending state, maps task results back through
+typed Iced messages, and resolves exactly one pending request. Writes become
+explicit `UiTask` effects. `service_ui_requests` folds reads and writes into an
+adapter-owned FIFO in `ui_rx` receive order. Only one native effect is active;
+its typed completion starts the next operation. This stronger serialization
+guarantees that a fire-and-forget write completes before an immediately
+following dump begins even when the two requests arrive on different ticks.
+Unrelated UI effects still compose through `UiTask::Then` / Iced `Task::chain`.
+`apply_osc_actions` likewise returns the queue's next task, which both the live
+PTY tick and test-only `TabFeedPtyBytes` path append rather than discard. System
+maps to the standard clipboard; selection maps to PRIMARY. Iced's
+macOS backend reports PRIMARY unavailable, so reads return empty there, matching
+the existing macOS GTK adapter rather than the AppKit-only named selection
+pasteboard.
+
+Invariants: all native clipboard access occurs on Iced's event loop; engine and
+PTY locks are never held across a toolkit operation; stale/duplicate read
+results cannot answer another caller. The adapter inserts each reply sender into
+an ID-keyed pending map before scheduling its native read, removes it on the
+first result, logs unknown/duplicate IDs without consuming a different request,
+ignores a failed reply send after caller cancellation, and drops all remaining
+senders with the app. `clipboard-write = deny` filters only OSC 52 before a
+native write is scheduled; the test-only IPC clipboard port continues to bypass
+that preference, matching GTK. Empty/native-unavailable reads return `Ok(None)`
+rather than hanging; the engine remains free of Iced and GTK dependencies.
+
+Tests and acceptance: unit tests cover target mapping, monotonic request IDs,
+wrap/collision avoidance, single-consumption/stale-result handling, ordered
+write-then-read task composition, and OSC write policy. Pending-state tests
+include an out-of-order read result that is rejected while both replies remain
+pending, duplicate and unknown results, caller cancellation, and app-drop
+cleanup. Native functional coverage includes exact,
+no-poll `write(system, A) -> dump == A` and
+`write(A) -> write(B) -> dump == B` sequences. Unit coverage asserts OSC
+allow/deny task presence and unchanged queue state under deny. Existing
+target-neutral `test_selection.py` and `test_osc52.py` are added explicitly to
+an Iced native-clipboard Make target, to the default Iced Make gates outside
+Wayland, and to the Actions X11 and macOS lists. Linux X11 runs system and
+PRIMARY coverage under wgpu and tiny-skia; macOS requires system coverage and
+records the accepted Iced PRIMARY parity gap with one narrow selection-target
+skip. The complete Iced suite, GTK clipboard regressions,
+warnings-denied lint, dependency boundaries, macOS build, and shed wgpu /
+tiny-skia X11 clipboard tests must pass. Review the complete diff,
+commit as one native-adapter slice, push `poc/iced`, and require green Actions
+before beginning user-triggered paste behavior.
+
+Wayland evidence and deferral: Iced 0.14 delegates Wayland clipboard access to
+`smithay-clipboard`, whose regular `wl_data_device` path requires a focused
+seat and a current input serial. The headless Weston CI backend deliberately has
+no input devices, so both native targets are unavailable there; its required
+Iced renderer suite therefore remains non-clipboard, with X11 serving as the
+documented native-clipboard equivalent. A shed experiment under cage plus real
+`/dev/uinput` proved a standard write after a fresh pointer serial, but cage
+accepted only one programmatic selection update per serial and did not expose
+the PRIMARY protocol. Repeated OSC 52 writes therefore are not yet a reliable
+Iced/Wayland capability. Adding a privileged data-control client would be a
+separate platform decision (and is not portable to compositors that omit that
+extension), so it is deferred rather than hidden behind a passing headless
+test. User impact: macOS and X11 native clipboard/OSC work in this slice;
+Wayland native writes depend on the compositor accepting Iced's most recent
+input serial, and PRIMARY depends on compositor protocol support. The next
+clipboard/input slice must resolve or explicitly accept this limitation before
+the POC can claim full Wayland clipboard parity.
 
 ## Objective acceptance criteria
 
