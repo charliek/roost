@@ -108,6 +108,7 @@ nav:
       - Architecture: reference/architecture.md
   - Development:
       - Architecture & principles: development/vision.md
+      - Iced POC proposal: development/iced-poc-plan.md
       - Test automation: development/test-automation.md
       - Setup: development/setup.md
       - Claude integration testing: development/claude-testing.md
