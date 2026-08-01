@@ -460,7 +460,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libclang-dev libxkbcommon-x11-0 libwayland-client0 \
+            fonts-noto-cjk libclang-dev libxkbcommon-x11-0 libwayland-client0 \
             mesa-vulkan-drivers weston xvfb xdotool zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)

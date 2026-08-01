@@ -149,6 +149,13 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
         latest: dict = {}
 
         def painted() -> bool:
+            # A sidebar transition resizes/reflows the live PTY. The shell can
+            # repaint its prompt after the transition and legitimately replace
+            # row 0, so reseed the test-only marker immediately before each
+            # capture attempt instead of treating VT contents as resize-stable.
+            roost.tab_feed_pty_bytes(
+                tab, b"\x1b[H\x1b[48;2;17;201;93m \x1b[0m"
+            )
             png, _width, _height = roost.screenshot(scale=1)
             shot_path.write_bytes(png)
             latest["shot"] = pngtool.load(str(shot_path))
