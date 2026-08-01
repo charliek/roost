@@ -40,6 +40,15 @@ The concrete `Workspace`, `LocalClient`, and runtime APIs remain public during
 the GTK migration. `roost-linux` compatibility modules only re-export shared
 types; they no longer own those state machines.
 
+`Workspace` also owns the last selected live tab for each project. Its
+`preferred_tab` query falls back to display order and repairs preferences when
+tabs or projects close. Adapters therefore do not need a competing
+per-project selection map, and project shortcuts can resolve against a fresh
+authoritative snapshot. Only the globally active project/tab position is
+persisted today; inactive-project preferences are intentionally runtime-only
+and rebuild during restoration, preserving the established `state.json`
+schema and semantics.
+
 Each live Rust terminal owns a `roost_engine::osc::OscRouter`. The caller feeds
 PTY bytes plus an owned renderer-derived RGB/palette snapshot and receives an
 ordered list of workspace, PTY-input, clipboard, and pointer actions. This

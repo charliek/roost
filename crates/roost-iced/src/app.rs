@@ -69,6 +69,35 @@ const PALETTE_AGENT_PROJECT_MAX_COLUMNS: usize = 24;
 // Unicode display columns, rather than scalar counts, keep wide labels honest.
 const PALETTE_AGENT_LEFT_MAX_COLUMNS: usize = 58;
 const PALETTE_AGENT_STATUS_FLOOR_COLUMNS: usize = 18;
+const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct StatusBanner {
+    message: Option<String>,
+    expires_at: Option<Instant>,
+}
+
+impl StatusBanner {
+    fn set_at(&mut self, message: impl Into<String>, now: Instant) {
+        self.message = Some(message.into());
+        self.expires_at = Some(now + STATUS_BANNER_DURATION);
+    }
+
+    fn clear(&mut self) {
+        self.message = None;
+        self.expires_at = None;
+    }
+
+    fn expire_at(&mut self, now: Instant) {
+        if self.expires_at.is_some_and(|deadline| now >= deadline) {
+            self.clear();
+        }
+    }
+
+    fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaletteTextRun {
@@ -176,6 +205,34 @@ fn sidebar_width(collapsed: bool) -> f32 {
     } else {
         SIDEBAR_WIDTH
     }
+}
+
+fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 || current >= len {
+        return None;
+    }
+    Some((current as isize + delta).clamp(0, len as isize - 1) as usize)
+}
+
+fn project_id_at_index(projects: &[Project], index: u8) -> Option<i64> {
+    index
+        .checked_sub(1)
+        .and_then(|index| projects.get(usize::from(index)))
+        .map(|project| project.id)
+}
+
+fn active_project_tab_at_index(projects: &[Project], project_id: i64, index: u8) -> Option<i64> {
+    index.checked_sub(1).and_then(|index| {
+        projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .and_then(|project| project.tabs.get(usize::from(index)))
+            .map(|tab| tab.id)
+    })
+}
+
+fn dispatch_keybind_once_unless_repeat<T>(repeat: bool, dispatch: impl FnOnce() -> T) -> Option<T> {
+    (!repeat).then(dispatch)
 }
 
 fn accel_label(accel: &Accel) -> Option<String> {
@@ -1468,7 +1525,7 @@ pub struct App {
     window_size: Size,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
-    status: Option<String>,
+    status: StatusBanner,
     config: RoostConfig,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
@@ -1566,7 +1623,7 @@ impl App {
             window_size: Size::new(1100.0, 720.0),
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
-            status: None,
+            status: StatusBanner::default(),
             config,
             keybindings,
             active_theme_name,
@@ -1632,6 +1689,7 @@ impl App {
     }
 
     pub fn tick(&mut self) -> UiTask {
+        self.status.expire_at(Instant::now());
         let mut task = self.service_ui_requests();
         self.service_agent_metrics();
         self.service_provider_results();
@@ -1639,6 +1697,7 @@ impl App {
         self.reconcile();
         let mut exited = Vec::new();
         let mut osc_actions = Vec::new();
+        let mut output_error = None;
         for (tab_id, tab) in &mut self.tabs {
             while let Ok(output) = tab.output_rx.try_recv() {
                 match output {
@@ -1652,7 +1711,7 @@ impl App {
                     TabOutput::Error(error) => {
                         // Broadcast lag cannot be reconstructed. Surface it and
                         // keep the workspace alive so IPC/UI state still resyncs.
-                        self.status = Some(format!("tab {tab_id}: {error}"));
+                        output_error = Some(format!("tab {tab_id}: {error}"));
                         tracing::error!(tab_id, %error, "PTY output stream lost bytes");
                     }
                 }
@@ -1660,6 +1719,9 @@ impl App {
             if let Err(error) = tab.refresh_snapshot() {
                 tracing::warn!(tab_id, ?error, "terminal snapshot refresh failed");
             }
+        }
+        if let Some(error) = output_error {
+            self.set_status(error);
         }
         for (tab_id, actions) in osc_actions {
             task = task.then(self.apply_osc_actions(tab_id, actions));
@@ -1691,6 +1753,10 @@ impl App {
             }
         }
         self.clipboard.start_next()
+    }
+
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status.set_at(message, Instant::now());
     }
 
     pub fn clipboard_write_completed(&mut self, request_id: u64) -> UiTask {
@@ -1752,7 +1818,7 @@ impl App {
                     Key::Named(Named::ArrowDown) => self.move_palette_selection(1),
                     Key::Named(Named::Enter) => {
                         if let Err(error) = self.confirm_palette_selection() {
-                            self.status = Some(error);
+                            self.set_status(error);
                         }
                     }
                     _ => {}
@@ -1768,15 +1834,8 @@ impl App {
         if let Some(action) = input::accelerator(&event)
             .and_then(|accelerator| self.keybindings.get(&accelerator).copied())
         {
-            match action {
-                KeybindAction::Copy => return self.copy_active_selection(),
-                KeybindAction::Paste => return self.paste_into_active(ClipboardOp::System),
-                KeybindAction::CommandPalette => return self.open_bound_palette("commands"),
-                KeybindAction::CommandLauncher => return self.open_bound_palette("launcher"),
-                KeybindAction::CustomPalette => return self.open_bound_palette("custom"),
-                KeybindAction::AgentPalette => return self.open_bound_palette("agents"),
-                _ => {}
-            }
+            let repeat = matches!(&event, keyboard::Event::KeyPressed { repeat: true, .. });
+            return self.dispatch_keybind_action(action, repeat);
         }
 
         let KeyboardRoute::Terminal(active_tab) = self.keyboard_route() else {
@@ -1790,12 +1849,98 @@ impl App {
         UiTask::None
     }
 
-    fn open_bound_palette(&mut self, kind: &str) -> UiTask {
-        if let Err(error) = self.open_palette(kind) {
-            self.status = Some(error);
+    fn dispatch_keybind_action(&mut self, action: KeybindAction, repeat: bool) -> UiTask {
+        // Once an accelerator matches, it belongs to Roost and must never be
+        // encoded into the PTY. Suppress repeats for all application actions:
+        // this prevents held destructive shortcuts from cascading while still
+        // consuming every repeated event.
+        let Some(result) = dispatch_keybind_once_unless_repeat(repeat, || {
+            self.status.clear();
+            self.dispatch_keybind_action_once(action)
+        }) else {
             return UiTask::None;
+        };
+        match result {
+            Ok(task) => task,
+            Err(error) => {
+                self.set_status(error);
+                UiTask::None
+            }
         }
-        self.take_palette_focus_task()
+    }
+
+    fn dispatch_keybind_action_once(&mut self, action: KeybindAction) -> Result<UiTask, String> {
+        match action {
+            KeybindAction::NewTab => {
+                self.new_tab_result()?;
+                Ok(UiTask::None)
+            }
+            KeybindAction::CloseTab => {
+                let tab_id = self.workspace.active().1;
+                if tab_id != 0 {
+                    self.close_tab_result(tab_id)?;
+                }
+                Ok(UiTask::None)
+            }
+            KeybindAction::NewProject => Err("New Project is not available in Iced yet".into()),
+            KeybindAction::RenameProject => {
+                Err("Rename Project is not available in Iced yet".into())
+            }
+            KeybindAction::RenameTab => Err("Rename Tab is not available in Iced yet".into()),
+            KeybindAction::CloseProject => Err("Close Project is not available in Iced yet".into()),
+            KeybindAction::JumpToUnread => {
+                let active_project_id = self.workspace.active().0;
+                if let Some(tab_id) =
+                    notification_inbox::next_unread(&self.notification_inbox, active_project_id)
+                {
+                    self.focus_tab_and_clear(tab_id, true)?;
+                }
+                Ok(UiTask::None)
+            }
+            KeybindAction::CycleTabPrev => {
+                self.cycle_tab(-1)?;
+                Ok(UiTask::None)
+            }
+            KeybindAction::CycleTabNext => {
+                self.cycle_tab(1)?;
+                Ok(UiTask::None)
+            }
+            KeybindAction::Copy => Ok(self.copy_active_selection()),
+            KeybindAction::Paste => Ok(self.paste_into_active(ClipboardOp::System)),
+            KeybindAction::ToggleSidebar => {
+                self.toggle_sidebar();
+                Ok(UiTask::None)
+            }
+            KeybindAction::ToggleSidebarAgents => {
+                self.toggle_sidebar_agents();
+                Ok(UiTask::None)
+            }
+            KeybindAction::FontIncrease => {
+                Err("Increase Font Size is not available in Iced yet".into())
+            }
+            KeybindAction::FontDecrease => {
+                Err("Decrease Font Size is not available in Iced yet".into())
+            }
+            KeybindAction::FontReset => Err("Reset Font Size is not available in Iced yet".into()),
+            KeybindAction::CommandPalette => self.open_bound_palette_result("commands"),
+            KeybindAction::CommandLauncher => self.open_bound_palette_result("launcher"),
+            KeybindAction::CustomPalette => self.open_bound_palette_result("custom"),
+            KeybindAction::AgentPalette => self.open_bound_palette_result("agents"),
+            KeybindAction::Unbind => Ok(UiTask::None),
+            KeybindAction::SwitchProject(index) => {
+                self.switch_project_by_index(index)?;
+                Ok(UiTask::None)
+            }
+            KeybindAction::SwitchTab(index) => {
+                self.switch_tab_by_index(index)?;
+                Ok(UiTask::None)
+            }
+        }
+    }
+
+    fn open_bound_palette_result(&mut self, kind: &str) -> Result<UiTask, String> {
+        self.open_palette(kind)?;
+        Ok(self.take_palette_focus_task())
     }
 
     fn copy_active_selection(&mut self) -> UiTask {
@@ -1804,7 +1949,7 @@ impl App {
             Some(tab) => match tab.selected_text() {
                 Ok(text) => text,
                 Err(error) => {
-                    self.status = Some(format!("copy selection from tab {tab_id}: {error}"));
+                    self.set_status(format!("copy selection from tab {tab_id}: {error}"));
                     return UiTask::None;
                 }
             },
@@ -1913,7 +2058,7 @@ impl App {
             Ok(()) => {}
             Err(error) => {
                 tracing::warn!(%error, "URL launcher failed");
-                self.status = Some(error);
+                self.set_status(error);
             }
         }
     }
@@ -2004,10 +2149,6 @@ impl App {
                 }
             }
             sidebar_body = sidebar_body.push(project_group);
-        }
-        if let Some(status) = &self.status {
-            sidebar_body =
-                sidebar_body.push(text(status).size(11).color(Color::from_rgb8(238, 120, 120)));
         }
         let sidebar_header = container(text("PROJECTS").size(11).color(chrome::MUTED_TEXT))
             .height(chrome::BAND_HEIGHT)
@@ -2174,6 +2315,21 @@ impl App {
             main.width(Fill).height(Fill).into()
         } else {
             row![sidebar, main].width(Fill).height(Fill).into()
+        };
+        let content: Element<'_, Message> = if let Some(status) = self.status.message() {
+            let toast = container(text(status).size(12).color(chrome::ERROR_TEXT))
+                .max_width(520)
+                .padding([8, 12])
+                .style(chrome::status_toast);
+            let overlay = container(toast)
+                .width(Fill)
+                .height(Fill)
+                .padding(16)
+                .align_x(Alignment::End)
+                .align_y(Alignment::End);
+            stack![content, overlay].width(Fill).height(Fill).into()
+        } else {
+            content
         };
         let Some(palette) = &self.palette else {
             return content;
@@ -2346,13 +2502,7 @@ impl App {
     }
 
     pub fn select_project(&mut self, project_id: i64) {
-        let tab_id = self
-            .projects
-            .iter()
-            .find(|project| project.id == project_id)
-            .and_then(|project| project.tabs.first())
-            .map(|tab| tab.id);
-        if let Some(tab_id) = tab_id {
+        if let Some(tab_id) = self.workspace.preferred_tab(project_id) {
             let _ = self.focus_tab_and_clear(tab_id, false);
         }
     }
@@ -2367,7 +2517,7 @@ impl App {
 
     pub fn open_notifications(&mut self) -> UiTask {
         if let Err(error) = self.open_palette("notifications") {
-            self.status = Some(error);
+            self.set_status(error);
         }
         self.take_palette_focus_task()
     }
@@ -2390,31 +2540,44 @@ impl App {
         };
         if let Some(path) = config::config_path() {
             if let Err(error) = config::set_key(&path, "show-sidebar-agents", value) {
-                self.status = Some(format!("persist show-sidebar-agents: {error}"));
+                self.set_status(format!("persist show-sidebar-agents: {error}"));
             }
         }
     }
 
     pub fn new_tab(&mut self) {
+        if let Err(error) = self.new_tab_result() {
+            self.set_status(error);
+        }
+    }
+
+    fn new_tab_result(&mut self) -> Result<(), String> {
         let (project_id, _) = self.workspace.active();
         if project_id == 0 {
-            return;
+            return Ok(());
         }
         let cwd = self.launch_cwd(project_id);
-        if let Err(error) = self.runtime.block_on(self.client.open_tab(
-            project_id,
-            &cwd,
-            "",
-            &[],
-            u32::from(DEFAULT_COLS),
-            u32::from(DEFAULT_ROWS),
-        )) {
-            self.status = Some(error.to_string());
-        }
+        self.runtime
+            .block_on(self.client.open_tab(
+                project_id,
+                &cwd,
+                "",
+                &[],
+                u32::from(DEFAULT_COLS),
+                u32::from(DEFAULT_ROWS),
+            ))
+            .map_err(|error| error.to_string())?;
         self.reconcile();
+        Ok(())
     }
 
     pub fn close_tab(&mut self, tab_id: i64) {
+        if let Err(error) = self.close_tab_result(tab_id) {
+            self.set_status(error);
+        }
+    }
+
+    fn close_tab_result(&mut self, tab_id: i64) -> Result<(), String> {
         match close_tab_by_id(&self.runtime, &self.client, tab_id) {
             Ok(CloseTabOutcome::Closed) => {}
             Ok(CloseTabOutcome::AlreadyGone) => {
@@ -2422,10 +2585,11 @@ impl App {
             }
             Err(error) => {
                 tracing::warn!(?error, tab_id, "close_tab failed");
-                self.status = Some(error.to_string());
+                return Err(error.to_string());
             }
         }
         self.reconcile();
+        Ok(())
     }
 
     pub fn palette_query_changed(&mut self, query: &str) {
@@ -2434,13 +2598,13 @@ impl App {
 
     pub fn palette_activate(&mut self, id: &str) {
         if let Err(error) = self.activate_palette(id) {
-            self.status = Some(error);
+            self.set_status(error);
         }
     }
 
     pub fn palette_confirm(&mut self) {
         if let Err(error) = self.confirm_palette_selection() {
-            self.status = Some(error);
+            self.set_status(error);
         }
     }
 
@@ -2757,7 +2921,7 @@ impl App {
             state.move_selection(delta);
         }
         if let Err(error) = self.preview_selected_theme() {
-            self.status = Some(error);
+            self.set_status(error);
         }
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
@@ -3043,15 +3207,15 @@ impl App {
     fn restore_palette_theme(&mut self) {
         if let Some(name) = self.palette_theme_at_open.clone() {
             if let Err(error) = self.apply_theme_name(&name) {
-                self.status = Some(error);
+                self.set_status(error);
             }
         }
     }
 
     fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
         let (project_id, active_tab) = self.workspace.active();
-        let tabs = self
-            .projects
+        let projects = self.workspace.snapshot();
+        let tabs = projects
             .iter()
             .find(|project| project.id == project_id)
             .map(|project| project.tabs.as_slice())
@@ -3063,9 +3227,34 @@ impl App {
             .iter()
             .position(|tab| tab.id == active_tab)
             .unwrap_or(0);
-        let next = (current as isize + delta).rem_euclid(tabs.len() as isize) as usize;
+        let Some(next) = clamped_tab_index(current, tabs.len(), delta) else {
+            return Ok(());
+        };
+        if next == current {
+            return Ok(());
+        }
         self.focus_tab_and_clear(tabs[next].id, false)?;
         Ok(())
+    }
+
+    fn switch_project_by_index(&mut self, index: u8) -> Result<(), String> {
+        let projects = self.workspace.snapshot();
+        let Some(project_id) = project_id_at_index(&projects, index) else {
+            return Ok(());
+        };
+        let Some(tab_id) = self.workspace.preferred_tab(project_id) else {
+            return Ok(());
+        };
+        self.focus_tab_and_clear(tab_id, false)
+    }
+
+    fn switch_tab_by_index(&mut self, index: u8) -> Result<(), String> {
+        let project_id = self.workspace.active().0;
+        let projects = self.workspace.snapshot();
+        let Some(tab_id) = active_project_tab_at_index(&projects, project_id, index) else {
+            return Ok(());
+        };
+        self.focus_tab_and_clear(tab_id, false)
     }
 
     fn focus_tab_and_clear(&mut self, tab_id: i64, reveal_sidebar: bool) -> Result<(), String> {
@@ -4117,6 +4306,84 @@ mod tests {
     fn collapsed_sidebar_has_no_layout_width() {
         assert_eq!(sidebar_width(false), SIDEBAR_WIDTH);
         assert_eq!(sidebar_width(true), 0.0);
+    }
+
+    #[test]
+    fn status_banner_replaces_clears_and_expires_deterministically() {
+        let now = Instant::now();
+        let mut status = StatusBanner::default();
+        status.set_at("first", now);
+        assert_eq!(status.message(), Some("first"));
+        status.set_at("replacement", now + Duration::from_secs(1));
+        assert_eq!(status.message(), Some("replacement"));
+        status.expire_at(now + Duration::from_secs(1) + STATUS_BANNER_DURATION);
+        assert_eq!(status.message(), None);
+
+        status.set_at("clear me", now);
+        status.clear();
+        assert_eq!(status.message(), None);
+    }
+
+    #[test]
+    fn tab_cycle_clamps_at_both_ends_instead_of_wrapping() {
+        assert_eq!(clamped_tab_index(0, 3, -1), Some(0));
+        assert_eq!(clamped_tab_index(0, 3, 1), Some(1));
+        assert_eq!(clamped_tab_index(2, 3, 1), Some(2));
+        assert_eq!(clamped_tab_index(2, 3, -1), Some(1));
+        assert_eq!(clamped_tab_index(0, 0, 1), None);
+        assert_eq!(clamped_tab_index(3, 3, -1), None);
+    }
+
+    #[test]
+    fn repeated_keybinds_are_consumed_without_dispatching_the_action() {
+        let mut calls = 0;
+        let repeated = dispatch_keybind_once_unless_repeat(true, || {
+            calls += 1;
+            KeybindAction::CloseProject
+        });
+        assert_eq!(repeated, None);
+        assert_eq!(calls, 0);
+
+        let pressed = dispatch_keybind_once_unless_repeat(false, || {
+            calls += 1;
+            KeybindAction::CloseProject
+        });
+        assert_eq!(pressed, Some(KeybindAction::CloseProject));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn numeric_switch_helpers_follow_authoritative_snapshot_order() {
+        let workspace = Workspace::new();
+        let first = workspace.create_project("first", "/tmp").unwrap();
+        let first_tab = workspace.open_tab(first.id, "/tmp", "one").unwrap();
+        let second_tab = workspace.open_tab(first.id, "/tmp", "two").unwrap();
+        let second = workspace.create_project("second", "/tmp").unwrap();
+        let second_project_tab = workspace.open_tab(second.id, "/tmp", "three").unwrap();
+
+        let snapshot = workspace.snapshot();
+        assert_eq!(project_id_at_index(&snapshot, 1), Some(first.id));
+        assert_eq!(project_id_at_index(&snapshot, 2), Some(second.id));
+        assert_eq!(project_id_at_index(&snapshot, 0), None);
+        assert_eq!(project_id_at_index(&snapshot, 10), None);
+        assert_eq!(
+            active_project_tab_at_index(&snapshot, first.id, 2),
+            Some(second_tab.id)
+        );
+        assert_eq!(active_project_tab_at_index(&snapshot, first.id, 0), None);
+        assert_eq!(active_project_tab_at_index(&snapshot, first.id, 10), None);
+
+        workspace.reorder_projects(&[second.id, first.id]).unwrap();
+        let reordered = workspace.snapshot();
+        assert_eq!(project_id_at_index(&reordered, 1), Some(second.id));
+        assert_eq!(workspace.preferred_tab(first.id), Some(second_tab.id));
+        assert_eq!(
+            workspace.preferred_tab(second.id),
+            Some(second_project_tab.id)
+        );
+
+        workspace.focus_tab(first_tab.id).unwrap();
+        assert_eq!(workspace.preferred_tab(first.id), Some(first_tab.id));
     }
 
     #[test]

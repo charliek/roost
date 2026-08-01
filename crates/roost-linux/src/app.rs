@@ -5967,13 +5967,18 @@ impl App {
     /// `ActiveChanged` reaction body — syncing there would echo the core's
     /// *previous* selection back over the one the caller asked for.
     fn activate_project_from_ui(self: &Rc<Self>, project_id: i64) {
+        let preferred_tab = self
+            .client
+            .borrow()
+            .as_ref()
+            .and_then(|client| client.workspace.preferred_tab(project_id));
         self.set_active_project(project_id);
         // An empty project (no tab yet) has nothing to focus, so the
         // core's active selection stays put until its first tab opens. In
         // normal use a project always has >=1 tab — closing the last tab
         // cascades the project away — so this only bites a raw IPC
         // `project.create` with no `tab.open`.
-        if let Some(tab_id) = self.active_tab_id(project_id) {
+        if let Some(tab_id) = preferred_tab.or_else(|| self.active_tab_id(project_id)) {
             self.sync_core_active_tab(tab_id);
         }
     }

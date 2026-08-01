@@ -203,6 +203,12 @@ class Roost:
     def rename_project(self, project_id: int, name: str) -> None:
         self.call("project.rename", {"project_id": str(project_id), "name": name})
 
+    def reorder_projects(self, project_ids: list[int]) -> None:
+        self.call(
+            "project.reorder",
+            {"project_ids": [str(project_id) for project_id in project_ids]},
+        )
+
     def reorder_tabs(self, project_id: int, tab_ids: list[int]) -> None:
         self.call("tab.reorder", {"project_id": str(project_id),
                                   "tab_ids": [str(t) for t in tab_ids]})

@@ -30,6 +30,7 @@ pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
 pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
 pub const PALETTE_PLACEHOLDER: Color = Color::from_rgb8(0x9e, 0x9e, 0x9e);
 pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
+pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
 
 pub fn surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE)
@@ -87,6 +88,23 @@ pub fn palette_panel(_: &Theme) -> container::Style {
             color: Color::from_rgba8(0, 0, 0, 0.55),
             offset: Vector::new(0.0, 12.0),
             blur_radius: 34.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn status_toast(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(PALETTE_SURFACE)),
+        border: Border {
+            color: ERROR_TEXT.scale_alpha(0.55),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.45),
+            offset: Vector::new(0.0, 5.0),
+            blur_radius: 18.0,
         },
         ..container::Style::default()
     }
@@ -230,5 +248,13 @@ mod tests {
         let disabled = palette_row(false, false)(&theme, button::Status::Hovered);
         assert_eq!(disabled.background, None);
         assert_eq!(disabled.text_color, PALETTE_PLACEHOLDER.scale_alpha(0.6));
+    }
+
+    #[test]
+    fn status_toast_is_a_neutral_surface_with_an_error_accent() {
+        let style = status_toast(&Theme::Dark);
+        assert_eq!(style.background, Some(Background::Color(PALETTE_SURFACE)));
+        assert_eq!(style.border.color, ERROR_TEXT.scale_alpha(0.55));
+        assert_eq!(style.border.width, 1.0);
     }
 }

@@ -270,6 +270,61 @@ def _capture_contains(launch: Launch, expected: bytes) -> bool:
     return expected in launch.client.tab_capture_pty_input(launch.tab, drain=True)
 
 
+def _drain_tabs(launch: Launch, tab_ids: list[int]) -> None:
+    for tab_id in tab_ids:
+        launch.client.tab_capture_pty_input(tab_id, drain=True)
+
+
+def _assert_no_pty_input(
+    launch: Launch, tab_ids: list[int], description: str, duration: float = 0.5
+) -> None:
+    deadline = time.monotonic() + duration * SCALE
+    captured = bytearray()
+    while time.monotonic() < deadline:
+        for tab_id in tab_ids:
+            captured.extend(launch.client.tab_capture_pty_input(tab_id, drain=True))
+        time.sleep(0.05)
+    if captured:
+        raise AssertionError(f"{description} leaked PTY bytes: {bytes(captured)!r}")
+
+
+def _hold_key(launch: Launch, modifier: str, key: str, seconds: float = 1.2) -> None:
+    subprocess.run(
+        [
+            "xdotool",
+            "windowfocus",
+            "--sync",
+            launch.window,
+            "keydown",
+            "--clearmodifiers",
+            modifier,
+            "keydown",
+            key,
+            "sleep",
+            str(seconds * SCALE),
+            "keyup",
+            key,
+            "keyup",
+            modifier,
+        ],
+        env=launch.xenv,
+        check=True,
+    )
+    time.sleep(0.2)
+
+
+def _screenshot_color_count(launch: Launch, color: tuple[int, int, int], name: str) -> int:
+    png, _width, _height = launch.client.screenshot(scale=1)
+    path = launch.root / f"{name}.png"
+    path.write_bytes(png)
+    width, height, bpp, data = pngtool.load(str(path))
+    return sum(
+        tuple(data[(y * width + x) * bpp : (y * width + x) * bpp + 3]) == color
+        for y in range(height)
+        for x in range(width)
+    )
+
+
 def _tab_is_attached(launch: Launch, tab_id: int) -> bool:
     try:
         return bool(launch.client.dump(tab_id))
@@ -464,6 +519,169 @@ def _palette_pointer_routing(launch: Launch) -> None:
     _assert_stays(
         lambda: len(launch.client.project_tab_ids(project)) == before,
         "outside dismissal does not click through to add-tab",
+    )
+
+
+def _keybind_dispatch(launch: Launch) -> None:
+    """Exercise the shared configured action table through physical XTEST keys."""
+    identity = launch.client.identify()
+    home_project = int(identity["active_project_id"])
+    home_tab = int(identity["active_tab_id"])
+    sibling = launch.client.open_tab(home_project, title="SHORTCUT-SIBLING")
+    _wait_until(lambda: _tab_is_attached(launch, sibling), "shortcut sibling PTY")
+    launch.client.reorder_tabs(home_project, [sibling, home_tab])
+    _wait_until(
+        lambda: launch.client.project_tab_ids(home_project) == [sibling, home_tab],
+        "authoritative reordered tab snapshot",
+    )
+
+    other_project = launch.client.create_project("SHORTCUT-OTHER", "/tmp")
+    other_first = launch.client.open_tab(other_project, "/tmp", "OTHER-FIRST")
+    other_tab = launch.client.open_tab(other_project, "/tmp", "OTHER-PREFERRED")
+    _wait_until(lambda: _tab_is_attached(launch, other_first), "other first PTY")
+    _wait_until(lambda: _tab_is_attached(launch, other_tab), "other preferred PTY")
+    # The reorder response means the engine mutation committed. Dispatch
+    # immediately: adapter-local caches are deliberately not a prerequisite.
+    launch.client.reorder_projects([other_project, home_project])
+
+    launch.client.focus(home_tab)
+    _drain_tabs(launch, [home_tab, sibling, other_first, other_tab])
+    launch.key("ctrl+1")
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == sibling,
+        "Ctrl+1 reordered tab selection",
+    )
+    _assert_no_pty_input(
+        launch, [home_tab, sibling], "supported numeric tab shortcut"
+    )
+
+    launch.key("ctrl+9")
+    _assert_stays(
+        lambda: launch.client.identify()["active_tab_id"] == sibling,
+        "out-of-range tab shortcut no-op",
+    )
+    _assert_no_pty_input(launch, [sibling], "out-of-range tab shortcut")
+
+    launch.key("alt+1")
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == other_tab,
+        "Alt+1 reordered project selection",
+    )
+    _assert_no_pty_input(
+        launch, [sibling, other_tab], "supported numeric project shortcut"
+    )
+    launch.key("alt+9")
+    _assert_stays(
+        lambda: launch.client.identify()["active_tab_id"] == other_tab,
+        "out-of-range project shortcut no-op",
+    )
+    _assert_no_pty_input(launch, [other_tab], "out-of-range project shortcut")
+
+    # Jump-to-unread must clear the engine notification and reveal its target
+    # even when the sidebar was hidden at dispatch time.
+    launch.client.notify(home_tab, "Shortcut unread")
+    launch.client.wait_notification(home_tab, True)
+    if not launch.client.window_metrics()["sidebar_collapsed"]:
+        launch.key("alt+b")
+    _wait_until(
+        lambda: launch.client.window_metrics()["sidebar_collapsed"],
+        "sidebar collapse before jump-to-unread",
+    )
+    _drain_tabs(launch, [other_tab, home_tab])
+    launch.key("alt+shift+u")
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == home_tab,
+        "jump-to-unread focus",
+    )
+    _wait_until(lambda: not launch.client.has_notification(home_tab), "unread clear")
+    _wait_until(
+        lambda: not launch.client.window_metrics()["sidebar_collapsed"],
+        "jump-to-unread sidebar reveal",
+    )
+    _assert_no_pty_input(launch, [other_tab, home_tab], "jump-to-unread shortcut")
+
+    launch.client.focus(sibling)
+    launch.key("alt+shift+bracketleft")
+    _assert_stays(
+        lambda: launch.client.identify()["active_tab_id"] == sibling,
+        "previous-tab clamp at first tab",
+    )
+    launch.key("alt+shift+bracketright")
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == home_tab,
+        "next-tab navigation",
+    )
+    launch.key("alt+shift+bracketright")
+    _assert_stays(
+        lambda: launch.client.identify()["active_tab_id"] == home_tab,
+        "next-tab clamp at last tab",
+    )
+    _assert_no_pty_input(launch, [sibling, home_tab], "tab cycle shortcuts")
+
+    # This real-seat hold supplements the deterministic Rust repeat-path unit
+    # test. When Xvfb emits auto-repeat, New/Close must still execute once.
+    before = len(launch.client.project_tab_ids(home_project))
+    _drain_tabs(launch, [home_tab])
+    _hold_key(launch, "alt", "t")
+    _wait_until(
+        lambda: len(launch.client.project_tab_ids(home_project)) == before + 1,
+        "held New Tab one-shot",
+    )
+    _assert_stays(
+        lambda: len(launch.client.project_tab_ids(home_project)) == before + 1,
+        "held New Tab repeat suppression",
+    )
+    _assert_no_pty_input(launch, [home_tab], "held New Tab shortcut")
+
+    active_before_close = int(launch.client.identify()["active_tab_id"])
+    count_before_close = len(launch.client.project_tab_ids(home_project))
+    _drain_tabs(launch, [active_before_close, home_tab])
+    _hold_key(launch, "alt", "w")
+    _wait_until(
+        lambda: len(launch.client.project_tab_ids(home_project)) == count_before_close - 1,
+        "held Close Tab one-shot",
+    )
+    _assert_stays(
+        lambda: len(launch.client.project_tab_ids(home_project)) == count_before_close - 1,
+        "held Close Tab repeat suppression",
+    )
+
+    # Unsupported actions are still application-owned. Their error remains
+    # visible globally while collapsed, then a successful shortcut clears it.
+    if not launch.client.window_metrics()["sidebar_collapsed"]:
+        launch.key("alt+b")
+    active = int(launch.client.identify()["active_tab_id"])
+    _drain_tabs(launch, [active])
+    launch.key("alt+shift+r")
+    _assert_no_pty_input(launch, [active], "unsupported Rename Project shortcut")
+    _wait_until(
+        lambda: _screenshot_color_count(
+            launch, (0xEE, 0x78, 0x78), "unsupported-shortcut-toast"
+        )
+        >= 4,
+        "global unsupported-action status toast",
+    )
+    launch.key("alt+b")
+    _wait_until(
+        lambda: _screenshot_color_count(
+            launch, (0xEE, 0x78, 0x78), "supported-shortcut-clears-toast"
+        )
+        == 0,
+        "successful shortcut status clear",
+    )
+
+    # Restore the launch fixture for the independent close/overflow checks
+    # that follow. Those scenarios deliberately assume one baseline tab.
+    launch.client.focus(home_tab)
+    for tab_id in launch.client.project_tab_ids(home_project):
+        if tab_id != home_tab:
+            launch.client.close_tab(tab_id)
+    if launch.client.project(other_project) is not None:
+        launch.client.delete_project(other_project)
+    _wait_until(
+        lambda: launch.client.project_tab_ids(home_project) == [home_tab]
+        and launch.client.identify()["active_tab_id"] == home_tab,
+        "shortcut fixture cleanup",
     )
 
 
@@ -962,6 +1180,7 @@ def main() -> int:
         off = Launch(root, display, "off", "explicit")
         launches.append(off)
         _explicit_copy_and_paste(off)
+        _keybind_dispatch(off)
         _direct_tab_close(off)
         _chrome_overflow_navigation(off)
         _palette_pointer_routing(off)
@@ -993,6 +1212,7 @@ def main() -> int:
     print(
         "PASS: configured explicit Copy, plain/bracketed Paste, real-drag "
         "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
+        "exhaustive shortcut dispatch/repeat suppression, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
         "constrained chrome overflow navigation, and palette pointer routing"
     )

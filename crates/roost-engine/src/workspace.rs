@@ -75,6 +75,12 @@ struct TabRow {
 struct Inner {
     projects: BTreeMap<i64, ProjectRow>,
     tabs: BTreeMap<i64, TabRow>,
+    /// Last selected live tab per project. This is runtime navigation state,
+    /// not a second workspace authority: every write happens alongside the
+    /// global active selection under this same lock. Only the globally-active
+    /// project position is persisted today, matching the existing restoration
+    /// contract; other projects rebuild their preference as tabs are restored.
+    active_tabs_by_project: BTreeMap<i64, i64>,
     next_id: i64,
     active_project_id: i64,
     active_tab_id: i64,
@@ -100,6 +106,7 @@ impl Default for Inner {
         Self {
             projects: BTreeMap::new(),
             tabs: BTreeMap::new(),
+            active_tabs_by_project: BTreeMap::new(),
             next_id: 0,
             active_project_id: 0,
             active_tab_id: 0,
@@ -565,6 +572,13 @@ impl Workspace {
         (inner.active_project_id, inner.active_tab_id)
     }
 
+    /// Return the project's last selected live tab, falling back to its first
+    /// tab in display order. UI adapters use this for project switching so the
+    /// selection policy remains authoritative and toolkit-neutral.
+    pub fn preferred_tab(&self, project_id: i64) -> Option<i64> {
+        self.inner.lock().unwrap().preferred_tab(project_id)
+    }
+
     /// Ensure a default project exists; return its id. Used by
     /// `tab.open` when the client passes `project_id = 0`.
     pub fn ensure_default_project(&self, cwd: &str) -> i64 {
@@ -689,18 +703,14 @@ impl Workspace {
             inner.tabs.remove(tid);
         }
         inner.projects.remove(&project_id);
+        inner.active_tabs_by_project.remove(&project_id);
 
         // Adjust active selection if it points at the deleted
         // project or one of its tabs.
         let mut active_changed = false;
         if inner.active_project_id == project_id || tab_ids.contains(&inner.active_tab_id) {
             let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
-            let fallback_tab = inner
-                .tabs
-                .values()
-                .find(|t| t.project_id == fallback_project)
-                .map(|t| t.id)
-                .unwrap_or(0);
+            let fallback_tab = inner.preferred_tab(fallback_project).unwrap_or(0);
             inner.active_project_id = fallback_project;
             inner.active_tab_id = fallback_tab;
             active_changed = true;
@@ -768,6 +778,7 @@ impl Workspace {
         // New tabs steal the active selection.
         inner.active_project_id = project_id;
         inner.active_tab_id = id;
+        inner.active_tabs_by_project.insert(project_id, id);
 
         let tab = self.to_wire_tab(&row, &inner);
         self.commit(
@@ -807,6 +818,14 @@ impl Workspace {
             && !inner.tabs.values().any(|t| t.project_id == project_id);
         if project_emptied {
             inner.projects.remove(&project_id);
+            inner.active_tabs_by_project.remove(&project_id);
+        } else if inner.active_tabs_by_project.get(&project_id) == Some(&tab_id) {
+            let replacement = inner.first_tab(project_id);
+            if let Some(replacement) = replacement {
+                inner.active_tabs_by_project.insert(project_id, replacement);
+            } else {
+                inner.active_tabs_by_project.remove(&project_id);
+            }
         }
 
         // Reassign the active selection if it pointed at the closed
@@ -818,26 +837,23 @@ impl Workspace {
             let next = if project_emptied {
                 // Project gone: fall back to another project's tab.
                 let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
-                let fallback_tab = inner
-                    .tabs
-                    .values()
-                    .find(|t| t.project_id == fallback_project)
-                    .map(|t| t.id)
-                    .unwrap_or(0);
+                let fallback_tab = inner.preferred_tab(fallback_project).unwrap_or(0);
                 (fallback_project, fallback_tab)
             } else {
                 // Project survives: fall back to a sibling tab, else
                 // any tab anywhere.
                 inner
-                    .tabs
-                    .values()
-                    .find(|t| t.project_id == project_id)
+                    .preferred_tab(project_id)
+                    .and_then(|tab_id| inner.tabs.get(&tab_id))
                     .or_else(|| inner.tabs.values().next())
                     .map(|t| (t.project_id, t.id))
                     .unwrap_or((project_id, 0))
             };
             inner.active_project_id = next.0;
             inner.active_tab_id = next.1;
+            if next.1 != 0 {
+                inner.active_tabs_by_project.insert(next.0, next.1);
+            }
             changed = true;
         }
         let active = if changed {
@@ -1214,6 +1230,7 @@ impl Workspace {
         let prev = (inner.active_project_id, inner.active_tab_id);
         inner.active_project_id = row.project_id;
         inner.active_tab_id = row.id;
+        inner.active_tabs_by_project.insert(row.project_id, row.id);
         // Persist the active selection so it survives a relaunch
         // (restored by position). Skip when unchanged — focusing the
         // already-active tab shouldn't churn the file.
@@ -1518,6 +1535,24 @@ impl Inner {
         rows
     }
 
+    fn first_tab(&self, project_id: i64) -> Option<i64> {
+        self.tabs_in_display_order(project_id)
+            .first()
+            .map(|tab| tab.id)
+    }
+
+    fn preferred_tab(&self, project_id: i64) -> Option<i64> {
+        self.active_tabs_by_project
+            .get(&project_id)
+            .copied()
+            .filter(|tab_id| {
+                self.tabs
+                    .get(tab_id)
+                    .is_some_and(|tab| tab.project_id == project_id)
+            })
+            .or_else(|| self.first_tab(project_id))
+    }
+
     /// Snapshot the persistable state plus a fresh commit sequence.
     /// The seq is assigned here — under the `inner` lock the caller
     /// holds — so it strictly reflects commit order; `persist()` uses
@@ -1682,6 +1717,41 @@ mod tests {
         // The remaining tab is now active. It's the one we did not close.
         assert_ne!(atid_after, atid_before);
         assert_eq!(atid_after, t1);
+    }
+
+    #[test]
+    fn preferred_tab_is_authoritative_per_project_and_repairs_after_close() {
+        let ws = Workspace::new();
+        let first_project = ws.create_project("first", "").unwrap().id;
+        let first = ws.open_tab(first_project, "/", "one").unwrap().id;
+        let second = ws.open_tab(first_project, "/", "two").unwrap().id;
+        let other_project = ws.create_project("other", "").unwrap().id;
+        let other = ws.open_tab(other_project, "/", "other").unwrap().id;
+
+        assert_eq!(ws.preferred_tab(first_project), Some(second));
+        ws.focus_tab(first).unwrap();
+        ws.focus_tab(other).unwrap();
+        assert_eq!(ws.preferred_tab(first_project), Some(first));
+
+        ws.close_tab(first).unwrap();
+        assert_eq!(ws.preferred_tab(first_project), Some(second));
+        ws.delete_project(first_project).unwrap();
+        assert_eq!(ws.preferred_tab(first_project), None);
+    }
+
+    #[test]
+    fn closing_active_preferred_tab_uses_one_display_ordered_replacement() {
+        let ws = Workspace::new();
+        let project = ws.create_project("project", "").unwrap().id;
+        let first = ws.open_tab(project, "/", "first").unwrap().id;
+        let middle = ws.open_tab(project, "/", "middle").unwrap().id;
+        let last = ws.open_tab(project, "/", "last").unwrap().id;
+        ws.reorder_tabs(project, &[last, middle, first]).unwrap();
+        ws.focus_tab(middle).unwrap();
+
+        ws.close_tab(middle).unwrap();
+        assert_eq!(ws.active(), (project, last));
+        assert_eq!(ws.preferred_tab(project), Some(last));
     }
 
     #[test]
