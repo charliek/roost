@@ -36,6 +36,7 @@ use roost_vt::{
 };
 
 use crate::input;
+use crate::palette_scroll::Visibility;
 use crate::terminal_canvas::{
     resolve_colors, DrawCell, TerminalCanvas, TerminalSnapshot, CELL_HEIGHT, CELL_WIDTH,
     TERMINAL_PADDING,
@@ -141,6 +142,84 @@ fn take_palette_focus_request(requested: &mut bool, input_id: &Id) -> UiTask {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaletteVisibilityRequest {
+    #[default]
+    None,
+    Measure,
+    Reveal,
+}
+
+impl PaletteVisibilityRequest {
+    fn merge(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Reveal, _) | (_, Self::Reveal) => Self::Reveal,
+            (Self::Measure, _) | (_, Self::Measure) => Self::Measure,
+            _ => Self::None,
+        }
+    }
+}
+
+fn queue_visibility_request(
+    current: PaletteVisibilityRequest,
+    next: PaletteVisibilityRequest,
+    replace: bool,
+) -> PaletteVisibilityRequest {
+    if replace {
+        next
+    } else {
+        current.merge(next)
+    }
+}
+
+fn missing_geometry_retry(retries: u8, reveal: bool) -> Option<(u8, PaletteVisibilityRequest)> {
+    (retries < 2).then(|| {
+        (
+            retries + 1,
+            if reveal {
+                PaletteVisibilityRequest::Reveal
+            } else {
+                PaletteVisibilityRequest::Measure
+            },
+        )
+    })
+}
+
+fn palette_row_id(session: u64, revision: u64, index: usize) -> Id {
+    Id::from(format!("palette-row:{session}:{revision}:{index}"))
+}
+
+fn visibility_result_is_current(
+    current_session: u64,
+    current_revision: u64,
+    result_session: u64,
+    result_revision: u64,
+) -> bool {
+    current_session == result_session && current_revision == result_revision
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaletteLayoutRow {
+    id: String,
+    title: String,
+    subtitle: Option<String>,
+    trailing_text: Option<String>,
+    has_agent_layout: bool,
+}
+
+fn dynamic_refresh_request(
+    layout_changed: bool,
+    rendered_content_changed: bool,
+) -> PaletteVisibilityRequest {
+    if layout_changed {
+        PaletteVisibilityRequest::Reveal
+    } else if rendered_content_changed {
+        PaletteVisibilityRequest::Measure
+    } else {
+        PaletteVisibilityRequest::None
+    }
+}
+
 pub enum UiTask {
     None,
     Then(Box<UiTask>, Box<UiTask>),
@@ -148,6 +227,13 @@ pub enum UiTask {
     FocusWidget(Id),
     Resize(window::Id, Size),
     Screenshot(window::Id),
+    PaletteVisibility {
+        scroll_id: Id,
+        row_id: Id,
+        session: u64,
+        revision: u64,
+        reveal: bool,
+    },
 }
 
 impl UiTask {
@@ -612,7 +698,12 @@ pub struct App {
     palette_session: u64,
     palette_theme_at_open: Option<String>,
     palette_input_id: Id,
+    palette_scroll_id: Id,
     palette_focus_requested: bool,
+    palette_layout_revision: u64,
+    palette_selected_in_view: Option<bool>,
+    palette_visibility_request: PaletteVisibilityRequest,
+    palette_visibility_retries: u8,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     metrics_tx: tokio::sync::mpsc::UnboundedSender<AgentMetricsResult>,
@@ -698,7 +789,12 @@ impl App {
             palette_session: 0,
             palette_theme_at_open: None,
             palette_input_id: Id::unique(),
+            palette_scroll_id: Id::unique(),
             palette_focus_requested: false,
+            palette_layout_revision: 0,
+            palette_selected_in_view: None,
+            palette_visibility_request: PaletteVisibilityRequest::None,
+            palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
             metrics_tx,
@@ -730,6 +826,12 @@ impl App {
         let task = self.window_opened(id);
         if matches!(task, UiTask::None) {
             self.resize(size);
+        }
+        // A native resize event confirms that Iced has rebuilt the widget
+        // viewport. The test IPC path may already have stored the same logical
+        // size, so invalidate even when `resize` sees no numeric change.
+        if self.palette.is_some() {
+            self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
         task
     }
@@ -771,6 +873,7 @@ impl App {
             let _ = self.workspace.close_tab(tab_id);
             self.tabs.remove(&tab_id);
         }
+        task = task.then(self.take_palette_visibility_task());
         task = task.then(self.start_next_screenshot());
         task
     }
@@ -798,6 +901,7 @@ impl App {
     }
 
     pub fn resize(&mut self, size: Size) {
+        let changed = self.window_size != size;
         self.window_size = size;
         let width = (size.width
             - sidebar_width(self.workspace.sidebar_collapsed())
@@ -808,6 +912,9 @@ impl App {
         let rows = ((height / CELL_HEIGHT).floor() as u16).max(2);
         for tab in self.tabs.values_mut() {
             tab.resize(cols, rows);
+        }
+        if changed && self.palette.is_some() {
+            self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
     }
 
@@ -1091,13 +1198,24 @@ impl App {
                 );
             }
             items = items.push(
-                button(label)
-                    .width(Fill)
-                    .padding([8, 10])
-                    .on_press(Message::PaletteActivate(matched.item.id)),
+                container(
+                    button(label)
+                        .width(Fill)
+                        .padding([8, 10])
+                        .on_press(Message::PaletteActivate(matched.item.id)),
+                )
+                .id(palette_row_id(
+                    self.palette_session,
+                    self.palette_layout_revision,
+                    index,
+                )),
             );
         }
-        let panel = container(column![input, scrollable(items).height(420)].spacing(8))
+        let list = scrollable(items)
+            .id(self.palette_scroll_id.clone())
+            .on_scroll(|_| Message::PaletteScrolled)
+            .height(420);
+        let panel = container(column![input, list].spacing(8))
             .width(560)
             .padding(12)
             .style(container::dark);
@@ -1214,6 +1332,7 @@ impl App {
         self.palette = Some(palette::PaletteState::new(frame));
         self.palette_focus_requested = true;
         self.refresh_agent_palette();
+        self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         Ok(())
     }
 
@@ -1246,10 +1365,156 @@ impl App {
         )));
         self.palette_present_reply = Some(reply);
         self.palette_focus_requested = true;
+        self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
     fn take_palette_focus_task(&mut self) -> UiTask {
         take_palette_focus_request(&mut self.palette_focus_requested, &self.palette_input_id)
+    }
+
+    fn invalidate_palette_geometry(&mut self, request: PaletteVisibilityRequest) {
+        self.reset_palette_geometry(request, true);
+    }
+
+    fn reset_palette_geometry(&mut self, request: PaletteVisibilityRequest, merge: bool) {
+        self.palette_layout_revision = self.palette_layout_revision.wrapping_add(1).max(1);
+        self.palette_selected_in_view = None;
+        self.palette_visibility_retries = 0;
+        let has_selection = self.palette.as_ref().is_some_and(|state| {
+            let frame = state.current();
+            state.matches().get(frame.selection).is_some()
+        });
+        self.palette_visibility_request = if !has_selection {
+            PaletteVisibilityRequest::None
+        } else {
+            queue_visibility_request(self.palette_visibility_request, request, !merge)
+        };
+    }
+
+    fn clear_palette_geometry(&mut self) {
+        self.palette_layout_revision = self.palette_layout_revision.wrapping_add(1).max(1);
+        self.palette_selected_in_view = None;
+        self.palette_visibility_request = PaletteVisibilityRequest::None;
+        self.palette_visibility_retries = 0;
+    }
+
+    fn take_palette_visibility_task(&mut self) -> UiTask {
+        if self.window_id.is_none() {
+            return UiTask::None;
+        }
+        let request = self.palette_visibility_request;
+        if request == PaletteVisibilityRequest::None {
+            return UiTask::None;
+        }
+        let Some(state) = &self.palette else {
+            self.clear_palette_geometry();
+            return UiTask::None;
+        };
+        let selection = state.current().selection;
+        if state.matches().get(selection).is_none() {
+            self.palette_visibility_request = PaletteVisibilityRequest::None;
+            return UiTask::None;
+        }
+        self.palette_visibility_request = PaletteVisibilityRequest::None;
+        tracing::debug!(
+            session = self.palette_session,
+            revision = self.palette_layout_revision,
+            selection,
+            reveal = request == PaletteVisibilityRequest::Reveal,
+            "schedule palette visibility operation"
+        );
+        UiTask::PaletteVisibility {
+            scroll_id: self.palette_scroll_id.clone(),
+            row_id: palette_row_id(
+                self.palette_session,
+                self.palette_layout_revision,
+                selection,
+            ),
+            session: self.palette_session,
+            revision: self.palette_layout_revision,
+            reveal: request == PaletteVisibilityRequest::Reveal,
+        }
+    }
+
+    pub fn palette_scrolled(&mut self) {
+        if self.palette.is_some() {
+            // A later manual viewport change supersedes an older reveal that
+            // has not run yet; measuring must not snap the user back.
+            self.reset_palette_geometry(PaletteVisibilityRequest::Measure, false);
+        }
+    }
+
+    pub fn palette_visibility_measured(
+        &mut self,
+        session: u64,
+        revision: u64,
+        reveal: bool,
+        visibility: Visibility,
+    ) {
+        if !visibility_result_is_current(
+            self.palette_session,
+            self.palette_layout_revision,
+            session,
+            revision,
+        ) || self.palette.is_none()
+        {
+            tracing::debug!(
+                session,
+                revision,
+                ?visibility,
+                "discard stale palette visibility"
+            );
+            return;
+        }
+        tracing::debug!(
+            session,
+            revision,
+            ?visibility,
+            "palette visibility measured"
+        );
+        match visibility {
+            Visibility::Visible(visible) => {
+                self.palette_selected_in_view = Some(visible);
+                self.palette_visibility_retries = 0;
+            }
+            Visibility::Missing => {
+                if let Some((retries, retry)) =
+                    missing_geometry_retry(self.palette_visibility_retries, reveal)
+                {
+                    self.palette_visibility_retries = retries;
+                    self.palette_visibility_request = self.palette_visibility_request.merge(retry);
+                } else {
+                    tracing::debug!(
+                        session,
+                        revision,
+                        "palette geometry unavailable after retry"
+                    );
+                }
+            }
+        }
+    }
+
+    fn palette_render_signature(&self) -> Option<(String, usize, Vec<palette::PaletteMatch>)> {
+        let state = self.palette.as_ref()?;
+        let frame = state.current();
+        Some((frame.id.clone(), frame.selection, state.matches()))
+    }
+
+    fn palette_layout_signature(&self) -> Option<(String, usize, Vec<PaletteLayoutRow>)> {
+        let state = self.palette.as_ref()?;
+        let frame = state.current();
+        let rows = state
+            .matches()
+            .into_iter()
+            .map(|matched| PaletteLayoutRow {
+                id: matched.item.id,
+                title: matched.item.title,
+                subtitle: matched.item.subtitle,
+                trailing_text: matched.item.trailing_text,
+                has_agent_layout: matched.item.agent.is_some(),
+            })
+            .collect();
+        Some((frame.id.clone(), frame.selection, rows))
     }
 
     fn palette_state_result(&self) -> PaletteStateResult {
@@ -1272,9 +1537,9 @@ impl App {
                     agent: matched.item.agent,
                 })
                 .collect(),
-            // Iced's scrollable does not expose row geometry. `None` is
-            // the contract's explicit honest value for that adapter.
-            selected_in_view: None,
+            // Geometry is populated asynchronously after Iced lays out the
+            // current revision; `None` honestly means pending/unavailable.
+            selected_in_view: self.palette_selected_in_view,
         }
     }
 
@@ -1284,6 +1549,7 @@ impl App {
             .as_mut()
             .ok_or_else(|| "no palette open".to_string())?;
         state.set_query(query);
+        self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         self.preview_selected_theme()?;
         Ok(self.palette_state_result())
     }
@@ -1295,6 +1561,7 @@ impl App {
         if let Err(error) = self.preview_selected_theme() {
             self.status = Some(error);
         }
+        self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
     fn confirm_palette_selection(&mut self) -> Result<PaletteStateResult, String> {
@@ -1322,6 +1589,7 @@ impl App {
             let item = matches[index].item.clone();
             (state.current().id.clone(), item)
         };
+        self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
 
         if !item.actionable {
             return Ok(self.palette_state_result());
@@ -1504,6 +1772,11 @@ impl App {
                 ))
             }
         }
+        if self.palette.is_some() {
+            self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
+        } else {
+            self.clear_palette_geometry();
+        }
         Ok(self.palette_state_result())
     }
 
@@ -1551,12 +1824,14 @@ impl App {
         if was_theme {
             self.restore_palette_theme();
         }
+        self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
     fn dismiss_palette(&mut self) {
         self.restore_palette_theme();
         self.palette = None;
         self.palette_theme_at_open = None;
+        self.clear_palette_geometry();
         self.provider_request = self.provider_request.wrapping_add(1);
         self.provider_frames.clear();
         if let Some(reply) = self.palette_present_reply.take() {
@@ -1802,9 +2077,18 @@ impl App {
         if !has_notifications {
             return;
         }
+        let before_layout = self.palette_layout_signature();
+        let before_render = self.palette_render_signature();
         let items = notification_inbox::frame(&self.notification_inbox).items;
         if let Some(state) = &mut self.palette {
             state.update_items("notifications", items);
+        }
+        let request = dynamic_refresh_request(
+            before_layout != self.palette_layout_signature(),
+            before_render != self.palette_render_signature(),
+        );
+        if request != PaletteVisibilityRequest::None {
+            self.invalidate_palette_geometry(request);
         }
     }
 
@@ -1861,6 +2145,8 @@ impl App {
         if !has_agents {
             return;
         }
+        let before_layout = self.palette_layout_signature();
+        let before_render = self.palette_render_signature();
         // Do not rebuild from `self.projects`: an IPC workspace mutation and
         // `palette.open` can be serviced in the same event-loop turn, before
         // the adapter's next general reconcile. The engine snapshot is the
@@ -1871,6 +2157,13 @@ impl App {
         self.apply_metrics_cache(&cwds, &mut items);
         if let Some(state) = &mut self.palette {
             state.update_items(agent_palette::FRAME_ID, items);
+        }
+        let request = dynamic_refresh_request(
+            before_layout != self.palette_layout_signature(),
+            before_render != self.palette_render_signature(),
+        );
+        if request != PaletteVisibilityRequest::None {
+            self.invalidate_palette_geometry(request);
         }
         self.spawn_agent_metrics(&cwds);
     }
@@ -2044,6 +2337,8 @@ impl App {
             {
                 continue;
             }
+            let before_layout = self.palette_layout_signature();
+            let before_render = self.palette_render_signature();
             match result.outcome {
                 Ok(output)
                     if result.phase == provider::Phase::Activate && output.items.is_empty() =>
@@ -2081,6 +2376,13 @@ impl App {
                         ));
                     }
                 }
+            }
+            let request = dynamic_refresh_request(
+                before_layout != self.palette_layout_signature(),
+                before_render != self.palette_render_signature(),
+            );
+            if self.palette.is_some() && request != PaletteVisibilityRequest::None {
+                self.invalidate_palette_geometry(request);
             }
         }
     }
@@ -2573,6 +2875,64 @@ mod tests {
         };
         assert!(matches!(*first, UiTask::FocusWidget(_)));
         assert!(matches!(*second, UiTask::Resize(_, _)));
+    }
+
+    #[test]
+    fn palette_visibility_requests_keep_reveal_precedence() {
+        assert_eq!(
+            PaletteVisibilityRequest::Measure.merge(PaletteVisibilityRequest::Reveal),
+            PaletteVisibilityRequest::Reveal
+        );
+        assert_eq!(
+            PaletteVisibilityRequest::Reveal.merge(PaletteVisibilityRequest::Measure),
+            PaletteVisibilityRequest::Reveal
+        );
+        assert_eq!(
+            queue_visibility_request(
+                PaletteVisibilityRequest::Reveal,
+                PaletteVisibilityRequest::Measure,
+                true,
+            ),
+            PaletteVisibilityRequest::Measure,
+            "a later manual scroll replaces an unconsumed reveal"
+        );
+    }
+
+    #[test]
+    fn dynamic_content_only_changes_measure_without_revealing() {
+        assert_eq!(
+            dynamic_refresh_request(false, true),
+            PaletteVisibilityRequest::Measure
+        );
+        assert_eq!(
+            dynamic_refresh_request(true, true),
+            PaletteVisibilityRequest::Reveal
+        );
+        assert_eq!(
+            dynamic_refresh_request(false, false),
+            PaletteVisibilityRequest::None
+        );
+    }
+
+    #[test]
+    fn missing_palette_geometry_retries_twice_then_stops() {
+        assert_eq!(
+            missing_geometry_retry(0, true),
+            Some((1, PaletteVisibilityRequest::Reveal))
+        );
+        assert_eq!(
+            missing_geometry_retry(1, false),
+            Some((2, PaletteVisibilityRequest::Measure))
+        );
+        assert_eq!(missing_geometry_retry(2, true), None);
+    }
+
+    #[test]
+    fn palette_visibility_results_require_the_same_session_and_revision() {
+        assert!(visibility_result_is_current(4, 9, 4, 9));
+        assert!(!visibility_result_is_current(4, 9, 3, 9));
+        assert!(!visibility_result_is_current(4, 9, 4, 8));
+        assert_ne!(palette_row_id(4, 9, 0), palette_row_id(4, 10, 0));
     }
 
     #[test]

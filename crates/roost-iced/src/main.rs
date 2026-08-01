@@ -1,5 +1,6 @@
 mod app;
 mod input;
+mod palette_scroll;
 mod screenshot;
 mod terminal_canvas;
 
@@ -39,6 +40,13 @@ enum Message {
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
+    PaletteScrolled,
+    PaletteVisibilityMeasured {
+        session: u64,
+        revision: u64,
+        reveal: bool,
+        visibility: palette_scroll::Visibility,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,6 +113,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::PaletteConfirm => {
             app.palette_confirm();
+            Task::none()
+        }
+        Message::PaletteScrolled => {
+            app.palette_scrolled();
+            Task::none()
+        }
+        Message::PaletteVisibilityMeasured {
+            session,
+            revision,
+            reveal,
+            visibility,
+        } => {
+            app.palette_visibility_measured(session, revision, reveal, visibility);
             Task::none()
         }
         message @ (Message::ProjectSelected(_)
@@ -193,6 +214,31 @@ impl UiTask for app::UiTask {
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::Resize(id, size) => window::resize(id, size),
             app::UiTask::Screenshot(id) => window::screenshot(id).map(Message::ScreenshotCaptured),
+            app::UiTask::PaletteVisibility {
+                scroll_id,
+                row_id,
+                session,
+                revision,
+                reveal,
+            } => {
+                let message = move |visibility| Message::PaletteVisibilityMeasured {
+                    session,
+                    revision,
+                    reveal,
+                    visibility,
+                };
+                if reveal {
+                    iced::advanced::widget::operate(palette_scroll::ensure_visible(
+                        scroll_id, row_id,
+                    ))
+                    .map(message)
+                } else {
+                    iced::advanced::widget::operate(palette_scroll::measure_visible(
+                        scroll_id, row_id,
+                    ))
+                    .map(message)
+                }
+            }
         }
     }
 }

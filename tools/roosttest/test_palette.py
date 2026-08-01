@@ -146,10 +146,10 @@ def test_theme_frame_keeps_selection_in_view(target, palette):
     nothing scrolled the list to the selection. The bundled theme set
     overflows the palette viewport and a fresh instance's default active
     theme (`roost-dark`) sorts last, so the pre-selected row starts
-    off-screen — exercising the scroll. `selected_in_view` is reported only
-    by the GTK UI (the Mac UI scrolls correctly and omits the field)."""
-    if target != "gtk":
-        pytest.skip("selected_in_view geometry is reported by the GTK UI only")
+    off-screen — exercising the scroll. GTK and Iced report measured geometry;
+    the Mac UI scrolls correctly but does not expose the field."""
+    if target == "mac":
+        pytest.skip("selected_in_view geometry is not exposed by the Mac UI")
     palette.palette_open()
     st = palette.palette_activate("select_theme")
     assert st["frame"] == "themes"
@@ -161,4 +161,14 @@ def test_theme_frame_keeps_selection_in_view(target, palette):
         lambda: palette.palette_state().get("selected_in_view") is True,
         10.0,
         "theme frame scrolls the pre-selected row into view",
+    )
+
+    # A viewport change invalidates the old geometry. The selected row must be
+    # remeasured and, if the smaller viewport clips it, minimally revealed
+    # again instead of retaining a stale `true` result.
+    palette.window_resize(800, 360)
+    palette._wait(
+        lambda: palette.palette_state().get("selected_in_view") is True,
+        10.0,
+        "theme selection remains visible after window resize",
     )

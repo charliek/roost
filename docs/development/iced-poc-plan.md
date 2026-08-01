@@ -883,6 +883,63 @@ accepting an always-true implementation; the file joins the required Iced
 Make/Actions gate; full Iced, GTK, Swift, dependency-boundary, and local/shed
 gates remain green.
 
+### Active mini-plan: Iced palette selection visibility
+
+Scope: remove the remaining Iced-only functional skip by keeping the selected
+palette row fully visible with Iced widget-tree operations and reporting the
+same `selected_in_view` contract GTK exposes. This is an Iced presentation
+adapter concern; palette frames, filtering, ranking, and selection remain in
+`roost-ui-model`.
+
+Invariants and interfaces:
+
+- each palette layout revision has stable adapter-local scrollable and selected
+  row widget IDs. Opening a frame, changing the query, moving/activating the
+  selection, resizing the window, or materially changing the visible dynamic
+  frame invalidates the previous geometry. Background-frame refreshes wait
+  until that frame becomes current, and unchanged per-tick refreshes do not
+  advance the revision;
+- a renderer-neutral widget operation first locates the real scroll viewport
+  translation and selected-row bounds. Because Iced visits the scrollable
+  before its child containers, `Outcome::Chain` then runs a second operation
+  to mutate scroll state and a third traversal to read the new translation
+  before publishing. It scrolls by only the amount needed to reveal a clipped
+  edge. The IPC field stays `None` while geometry is unavailable or stale and
+  is `false` only when a freshly measured row is genuinely clipped;
+- stale measurement results carry a palette session and layout revision and
+  cannot overwrite a newer frame/query/selection. Dismissal clears geometry;
+- one adapter helper owns invalidation, revision/ID advancement, measurement
+  clearing, and task scheduling for open/present, query, keyboard movement,
+  mouse/IPC activation, frame push/pop, async provider success/error, visible
+  agent/notification replacement, and resize. A separate measure-only request
+  follows `Scrollable::on_scroll`, so manual browsing updates the observable
+  without snapping the selection back into view;
+- a missing window or widget ID leaves the matching revision pending for the
+  next settled tick/window-open event. An empty result set has no selected-row
+  ID and remains `None` without retrying indefinitely;
+- visibility tasks compose with focus, activation, resize, and screenshot
+  tasks instead of replacing them, preserving UI-request arrival order; and
+- no Iced widget ID, bounds, callback, or renderer type enters `roost-engine`,
+  `roost-ipc`, or `roost-ui-model`.
+
+Acceptance: unit tests pin top and bottom minimal reveal, already-visible
+no-op, fractional tolerance, zero-height rejection, bounded missing-geometry
+retry, stale session/revision rejection, newer-manual-scroll precedence, and
+structural-vs-content-only dynamic-refresh scheduling. The existing
+theme-frame functional test runs on GTK and Iced without an Iced skip, proves
+the chained operation reaches a fresh visible measurement, shrinks the native
+window, and proves resize invalidation restores `selected_in_view == true`;
+full Iced
+has only the shared OSC #145 and local Bash 3.2 skips; `test_palette.py` joins
+the required Iced Make/Actions suite; macOS plus shed
+wgpu/tiny-skia X11/Wayland gates pass; complete Rust, GTK, Swift, harness,
+dependency-boundary, and CI gates remain green.
+
+Commit boundary: `cc6daac` (logical focus) was pushed and Actions run
+`30693454734` completed green before this slice began. Visibility adapter code,
+tests, skip removal, Make/Actions changes, and this reviewed plan land together
+as the next independently green commit.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

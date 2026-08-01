@@ -24,6 +24,7 @@ roost-vt = { path = "../roost-vt", features = ["ffi"] }
 # Released and exact-pinned for a reproducible long-lived POC. Both renderers
 # are compiled: wgpu is primary, tiny-skia is the software/headless fallback.
 iced = { version = "=0.14.0", default-features = false, features = [
+    "advanced",
     "canvas",
     "crisp",
     "tiny-skia",

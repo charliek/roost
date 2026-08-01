@@ -533,6 +533,7 @@ jobs:
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_focus.py
+          tools/roosttest/test_palette.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (Linux Wayland)
@@ -553,6 +554,7 @@ jobs:
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_focus.py
+          tools/roosttest/test_palette.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (macOS)
@@ -572,6 +574,7 @@ jobs:
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
           tools/roosttest/test_focus.py
+          tools/roosttest/test_palette.py
           --roost-target iced --roost-fresh -v
 
       - name: Collect Iced diagnostics
