@@ -1,0 +1,406 @@
+{
+  "group": "config_values",
+  "cases": [
+    {
+      "name": "plain-scalar-values",
+      "content": "theme = Dracula\nfont-family = JetBrains Mono\nfont-size = 14\ncopy-on-select = clipboard\nclipboard-write = deny\nshow-sidebar-agents = false\nword-break-chars = _-\n",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": "JetBrains Mono",
+        "font_size": 14,
+        "copy_on_select": "clipboard",
+        "clipboard_write": "deny",
+        "show_sidebar_agents": false,
+        "word_break_chars": "_-",
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "double-quoted-theme",
+      "content": "theme = \"Dracula\"\n",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "single-quoted-theme",
+      "content": "theme = 'Dracula'\n",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "quoted-bool-and-enum-values",
+      "content": "show-sidebar-agents = 'false'\ncopy-on-select = \"off\"\nclipboard-write = 'deny'\nfont-size = \"14\"\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": 14,
+        "copy_on_select": "off",
+        "clipboard_write": "deny",
+        "show_sidebar_agents": false,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "single-unmatched-leading-quote-kept",
+      "content": "theme = \"dark\n",
+      "expect": {
+        "theme": "\"dark",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "mismatched-quote-pair-kept-verbatim",
+      "content": "theme = \"dark'\n",
+      "expect": {
+        "theme": "\"dark'",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "nested-quotes-strip-one-pair-only",
+      "content": "theme = \"\"Dracula\"\"\n",
+      "expect": {
+        "theme": "\"Dracula\"",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "empty-quoted-value-is-empty-string",
+      "content": "theme = ''\n",
+      "expect": {
+        "theme": "",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "quoted-inner-padding-not-retrimmed",
+      "content": "theme = \" Dracula \"\n",
+      "expect": {
+        "theme": " Dracula ",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "crlf-whole-file",
+      "content": "theme = Dracula\r\nfont-size = 14\r\nshow-sidebar-agents = false\r\n",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": null,
+        "font_size": 14,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": false,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "crlf-with-quoted-values",
+      "content": "theme = \"Dracula\"\r\nfont-family = 'JetBrains Mono'\r\n",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": "JetBrains Mono",
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "unterminated-final-crlf-line",
+      "content": "font-size = 14\r\ntheme = Dracula\r",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": null,
+        "font_size": 14,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "double-quoted-font-family-with-spaces",
+      "content": "font-family = \"JetBrains Mono\"\n",
+      "expect": {
+        "theme": null,
+        "font_family": "JetBrains Mono",
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "single-quoted-font-family-with-spaces",
+      "content": "font-family = 'Fira Code'\n",
+      "expect": {
+        "theme": null,
+        "font_family": "Fira Code",
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "word-break-chars-bare-empty",
+      "content": "word-break-chars =\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": "",
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "word-break-chars-quoted-empty",
+      "content": "word-break-chars = \"\"\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": "",
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "word-break-chars-quoted-leading-space",
+      "content": "word-break-chars = \" -\"\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": " -",
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "quoted-trigger-keybind-kept-verbatim",
+      "content": "keybind = \"ctrl+t\" = new_tab\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [{ "trigger": "\"ctrl+t\"", "action": "new_tab" }],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "keybind-action-containing-equals",
+      "content": "keybind = ctrl+t = new_tab\nkeybind = ctrl+p = goto=next\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [
+          { "trigger": "ctrl+t", "action": "new_tab" },
+          { "trigger": "ctrl+p", "action": "goto=next" }
+        ],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "duplicate-keys-last-wins",
+      "content": "theme = first\ntheme = second\nfont-size = 12\nfont-size = 15\n",
+      "expect": {
+        "theme": "second",
+        "font_family": null,
+        "font_size": 15,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "command-full-field-coverage",
+      "content": "command = label=\"Build All\" run=\"make all\" title=\"Building\" hold=true env=\"FOO=bar BAZ=qux\"\ncommand = label=ls run=ls\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [
+          {
+            "label": "Build All",
+            "run": "make all",
+            "title": "Building",
+            "hold": true,
+            "env": [["FOO", "bar"], ["BAZ", "qux"]]
+          },
+          {
+            "label": "ls",
+            "run": "ls",
+            "title": "ls",
+            "hold": false,
+            "env": []
+          }
+        ],
+        "providers": []
+      }
+    },
+    {
+      "name": "provider-full-field-coverage",
+      "content": "provider = label=\"Open shed\" run=\"shed.sh --list\" title=\"Sheds\" timeout=8 limit=20\nprovider = label=Worktrees run=wt.sh\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": [
+          {
+            "label": "Open shed",
+            "run": "shed.sh --list",
+            "title": "Sheds",
+            "timeout_secs": 8,
+            "limit": 20
+          },
+          {
+            "label": "Worktrees",
+            "run": "wt.sh",
+            "title": "Worktrees",
+            "timeout_secs": 5,
+            "limit": 100
+          }
+        ]
+      }
+    },
+    {
+      "name": "comments-blanks-and-unknown-keys-dropped",
+      "content": "# a comment\n\nfuture-key = zap\nnot a key value line\ntheme = Dracula\n",
+      "expect": {
+        "theme": "Dracula",
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    }
+  ]
+}

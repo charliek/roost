@@ -15,6 +15,8 @@ mod app;
 mod cell_metrics;
 mod clipboard;
 mod config;
+#[cfg(test)]
+mod config_fixture_tests;
 mod custom_command;
 mod events;
 mod focus;
