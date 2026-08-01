@@ -284,7 +284,12 @@
         "clipboard_write": "allow",
         "show_sidebar_agents": true,
         "word_break_chars": null,
-        "keybinds": [{ "trigger": "\"ctrl+t\"", "action": "new_tab" }],
+        "keybinds": [
+          {
+            "trigger": "\"ctrl+t\"",
+            "action": "new_tab"
+          }
+        ],
         "commands": [],
         "providers": []
       }
@@ -301,8 +306,14 @@
         "show_sidebar_agents": true,
         "word_break_chars": null,
         "keybinds": [
-          { "trigger": "ctrl+t", "action": "new_tab" },
-          { "trigger": "ctrl+p", "action": "goto=next" }
+          {
+            "trigger": "ctrl+t",
+            "action": "new_tab"
+          },
+          {
+            "trigger": "ctrl+p",
+            "action": "goto=next"
+          }
         ],
         "commands": [],
         "providers": []
@@ -342,7 +353,16 @@
             "run": "make all",
             "title": "Building",
             "hold": true,
-            "env": [["FOO", "bar"], ["BAZ", "qux"]]
+            "env": [
+              [
+                "FOO",
+                "bar"
+              ],
+              [
+                "BAZ",
+                "qux"
+              ]
+            ]
           },
           {
             "label": "ls",
@@ -398,6 +418,27 @@
         "show_sidebar_agents": true,
         "word_break_chars": null,
         "keybinds": [],
+        "commands": [],
+        "providers": []
+      }
+    },
+    {
+      "name": "keybind-empty-trigger-or-action-dropped",
+      "content": "keybind = = new_tab\nkeybind = ctrl+t =\nkeybind = ctrl+n = new_tab\n",
+      "expect": {
+        "theme": null,
+        "font_family": null,
+        "font_size": null,
+        "copy_on_select": "true",
+        "clipboard_write": "allow",
+        "show_sidebar_agents": true,
+        "word_break_chars": null,
+        "keybinds": [
+          {
+            "trigger": "ctrl+n",
+            "action": "new_tab"
+          }
+        ],
         "commands": [],
         "providers": []
       }

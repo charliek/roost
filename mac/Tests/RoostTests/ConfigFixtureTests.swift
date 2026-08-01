@@ -205,7 +205,7 @@ func everyConfigFixtureGroupIsRepresentedAndNonTrivial() throws {
     // pruning is allowed but silently gutting a group is not. Kept in
     // step with the Rust loader's table.
     let want: [String: Int] = [
-        "config_values": 13
+        "config_values": 22
     ]
 
     var found: [String: Int] = [:]

@@ -150,7 +150,7 @@ fn check<T: PartialEq + Debug>(
 fn every_group_is_represented_and_non_trivial() {
     // Floors, not targets: set just under the current counts so genuine
     // pruning is allowed but silently gutting a group is not.
-    let want: BTreeMap<&str, usize> = [("config_values", 13)].into_iter().collect();
+    let want: BTreeMap<&str, usize> = [("config_values", 22)].into_iter().collect();
 
     let mut found: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, file) in load() {

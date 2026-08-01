@@ -219,10 +219,14 @@ impl RoostConfig {
                 "keybind" => {
                     // Ghostty form: `keybind = <trigger> = <action>`.
                     // The first `=` was the outer split; the value
-                    // now looks like `<trigger> = <action>`.
+                    // now looks like `<trigger> = <action>`. An empty
+                    // trigger or action is malformed — dropped, like
+                    // every other malformed line (mirrors Config.swift).
                     if let Some((trigger, action)) = raw_value.split_once('=') {
-                        cfg.keybinds
-                            .push((trigger.trim().to_string(), action.trim().to_string()));
+                        let (trigger, action) = (trigger.trim(), action.trim());
+                        if !trigger.is_empty() && !action.is_empty() {
+                            cfg.keybinds.push((trigger.to_string(), action.to_string()));
+                        }
                     }
                 }
                 "copy-on-select" => {
