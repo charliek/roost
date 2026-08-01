@@ -1,10 +1,11 @@
 //! ~/.config/roost/config.conf parser.
 //!
-//! Mirrors `mac/Sources/Roost/Config.swift` 1:1 in surface area:
-//! same recognized keys (`theme`, `font-family`, `font-size`,
-//! `keybind = <trigger> = <action>`), same lenient-line parsing
-//! (blank lines and `#`-comments dropped), same forward-compat
-//! (unknown keys silently ignored).
+//! Mirrors `mac/Sources/Roost/Config.swift`'s parse shape and value
+//! normalization: same lenient-line parsing (blank lines and
+//! `#`-comments dropped), same forward-compat (unknown keys silently
+//! ignored), same raw-vs-unquoted split per key. The recognized-key
+//! sets are not identical — `link-modifier` is Linux-only,
+//! `tab-min-width` / `tab-max-width` are Mac-only.
 
 use std::fs;
 use std::io;
@@ -148,22 +149,24 @@ impl CopyOnSelect {
 /// Mirrors `ClipboardWrite::parse` / `CopyOnSelect::parse`'s
 /// `Option`-returning shape so every boolean key in the parse loop
 /// below shares one `if let Some(v) = ... else { warn }` pattern.
-/// Quotes and `\r` are stripped here rather than relying on the parse
-/// loop: the loop strips surrounding quotes only for `font-family`, and
-/// the Swift mirror's line trim excludes `\r`, so a `theme = "dark"` or
-/// a CRLF file already parses differently on the two platforms. Doing it
-/// locally keeps at least this key identical across the pair.
 fn parse_bool_like(s: &str) -> Option<bool> {
-    match s
-        .trim()
-        .trim_matches(['"', '\'', '\r'])
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match s.trim().to_ascii_lowercase().as_str() {
         "true" | "yes" => Some(true),
         "false" | "no" => Some(false),
         _ => None,
+    }
+}
+
+/// Strip one matched quote pair. Mirrors `unquote` in
+/// `mac/Sources/Roost/Config.swift`: no recursion (`""x""` → `"x"`), and
+/// no re-trim afterward, so `word-break-chars = " -"` keeps its leading
+/// space.
+fn unquote(s: &str) -> &str {
+    let t = s.trim();
+    let mut chars = t.chars();
+    match (chars.next(), chars.next_back()) {
+        (Some(q @ ('"' | '\'')), Some(last)) if last == q => chars.as_str(),
+        _ => t,
     }
 }
 
@@ -198,10 +201,14 @@ impl RoostConfig {
                 continue;
             };
             let key = key.trim();
-            let value = value.trim();
+            // `raw_value` keeps quotes intact for the quote-aware
+            // `command` / `provider` tokenizers and for `keybind`, whose
+            // trigger is taken verbatim; every scalar key uses `value`.
+            let raw_value = value.trim();
+            let value = unquote(raw_value);
             match key {
                 "theme" => cfg.theme_name = Some(value.to_string()),
-                "font-family" => cfg.font_family = Some(value.trim_matches('"').to_string()),
+                "font-family" => cfg.font_family = Some(value.to_string()),
                 "font-size" => {
                     if let Ok(n) = value.parse::<f64>() {
                         if n > 0.0 {
@@ -213,7 +220,7 @@ impl RoostConfig {
                     // Ghostty form: `keybind = <trigger> = <action>`.
                     // The first `=` was the outer split; the value
                     // now looks like `<trigger> = <action>`.
-                    if let Some((trigger, action)) = value.split_once('=') {
+                    if let Some((trigger, action)) = raw_value.split_once('=') {
                         cfg.keybinds
                             .push((trigger.trim().to_string(), action.trim().to_string()));
                     }
@@ -270,7 +277,7 @@ impl RoostConfig {
                     // The value (everything after the first `=`) is a
                     // record of quote-aware `key="value"` tokens; a line
                     // missing label/run is skipped, not fatal.
-                    if let Some(c) = custom_command::parse_command_line(value) {
+                    if let Some(c) = custom_command::parse_command_line(raw_value) {
                         cfg.commands.push(c);
                     } else {
                         tracing::warn!(
@@ -283,7 +290,7 @@ impl RoostConfig {
                     // Dynamic provider: `provider = label="…" run="…" …`.
                     // Same grammar as `command =`; a line missing
                     // label/run is skipped, not fatal.
-                    if let Some(p) = provider::parse_provider_line(value) {
+                    if let Some(p) = provider::parse_provider_line(raw_value) {
                         cfg.providers.push(p);
                     } else {
                         tracing::warn!(
@@ -726,8 +733,7 @@ mod tests {
         assert!(!RoostConfig::parse("show-sidebar-agents = no").show_sidebar_agents);
     }
 
-    // Quoted and CRLF forms must agree with the Swift mirror, whose
-    // shared parse loop strips quotes globally and leaves `\r` behind.
+    // Quoted and CRLF forms must agree with the Swift mirror.
     #[test]
     fn show_sidebar_agents_accepts_quoted_and_crlf_values() {
         assert!(!RoostConfig::parse("show-sidebar-agents = \"false\"").show_sidebar_agents);
@@ -740,6 +746,137 @@ mod tests {
     fn show_sidebar_agents_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("show-sidebar-agents = pancakes");
         assert!(cfg.show_sidebar_agents);
+    }
+
+    // ----- unquote semantic (mirrors Config.swift's `unquote`) -------
+
+    #[test]
+    fn theme_accepts_both_quote_kinds() {
+        assert_eq!(
+            RoostConfig::parse("theme = \"Dracula\"")
+                .theme_name
+                .as_deref(),
+            Some("Dracula")
+        );
+        assert_eq!(
+            RoostConfig::parse("theme = 'Dracula'")
+                .theme_name
+                .as_deref(),
+            Some("Dracula")
+        );
+    }
+
+    #[test]
+    fn unquote_strips_exactly_one_pair() {
+        // No recursion: the inner pair survives.
+        assert_eq!(
+            RoostConfig::parse("theme = \"\"x\"\"")
+                .theme_name
+                .as_deref(),
+            Some("\"x\"")
+        );
+    }
+
+    #[test]
+    fn unquote_keeps_mismatched_pair_verbatim() {
+        // Deliberately narrower than Swift's old set-trim: a mismatched
+        // pair is not a quoted value, so both platforms now fail the
+        // theme lookup identically.
+        assert_eq!(
+            RoostConfig::parse("theme = \"dark'").theme_name.as_deref(),
+            Some("\"dark'")
+        );
+        assert_eq!(
+            RoostConfig::parse("theme = \"dark").theme_name.as_deref(),
+            Some("\"dark")
+        );
+    }
+
+    #[test]
+    fn unquote_matches_scalar_level_quotes() {
+        // A combining mark right after the opening quote must not stop
+        // the strip: both platforms compare unicode scalars, so the
+        // quote is matched even when a grapheme-cluster view would
+        // fuse it with the following mark.
+        assert_eq!(
+            RoostConfig::parse("theme = \"\u{0301}x\"")
+                .theme_name
+                .as_deref(),
+            Some("\u{0301}x")
+        );
+    }
+
+    #[test]
+    fn bool_value_with_interior_cr_before_closing_quote_parses() {
+        // `"false\r"` unquotes to `false\r`; the bool parser's trim
+        // must strip that CR on both platforms.
+        assert!(!RoostConfig::parse("show-sidebar-agents = \"false\r\"").show_sidebar_agents);
+    }
+
+    #[test]
+    fn unquote_does_not_retrim_interior_padding() {
+        assert_eq!(
+            RoostConfig::parse("theme = \" Dracula \"")
+                .theme_name
+                .as_deref(),
+            Some(" Dracula ")
+        );
+    }
+
+    #[test]
+    fn font_family_accepts_single_quotes() {
+        assert_eq!(
+            RoostConfig::parse("font-family = 'JetBrains Mono'")
+                .font_family
+                .as_deref(),
+            Some("JetBrains Mono")
+        );
+    }
+
+    #[test]
+    fn font_size_accepts_quoted_value() {
+        assert_eq!(
+            RoostConfig::parse("font-size = \"14\"").font_size,
+            Some(14.0)
+        );
+    }
+
+    #[test]
+    fn keybind_uses_the_raw_value() {
+        // Pinned to the raw value on both platforms: a quoted trigger
+        // stays verbatim rather than becoming a different binding.
+        let cfg = RoostConfig::parse("keybind = \"ctrl+t\" = new_tab");
+        assert_eq!(
+            cfg.keybinds,
+            vec![("\"ctrl+t\"".to_string(), "new_tab".to_string())]
+        );
+    }
+
+    #[test]
+    fn crlf_file_parses_every_key() {
+        let cfg = RoostConfig::parse("theme = Dracula\r\nfont-size = 14\r\n");
+        assert_eq!(cfg.theme_name.as_deref(), Some("Dracula"));
+        assert_eq!(cfg.font_size, Some(14.0));
+    }
+
+    #[test]
+    fn link_modifier_accepts_quoted_value() {
+        assert_eq!(
+            RoostConfig::parse("link-modifier = \"ctrl\"\n").link_modifier,
+            Some(AccelMods::CTRL)
+        );
+    }
+
+    #[test]
+    fn unterminated_final_crlf_line_parses() {
+        // `.lines()` leaves the bare `\r` on an unterminated final line;
+        // the value trim has to finish the job.
+        assert_eq!(
+            RoostConfig::parse("font-size = 14\r\ntheme = Dracula\r")
+                .theme_name
+                .as_deref(),
+            Some("Dracula")
+        );
     }
 
     #[test]
@@ -759,6 +896,14 @@ mod tests {
         // Explicit empty value → "Unicode letters/digits only".
         let cfg = RoostConfig::parse("word-break-chars = ");
         assert_eq!(cfg.word_break_chars, "");
+    }
+
+    #[test]
+    fn word_break_chars_quoted_value_keeps_interior_space() {
+        // Quoting is how a user expresses a leading space; unquoting
+        // must not re-trim it away.
+        let cfg = RoostConfig::parse("word-break-chars = \" -\"");
+        assert_eq!(cfg.word_break_chars, " -");
     }
 
     #[test]

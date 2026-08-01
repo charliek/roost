@@ -30,6 +30,13 @@ struct ConfigWordBreakCharsTests {
         #expect(cfg.wordBreakChars == "")
     }
 
+    @Test func quotedValueKeepsInteriorSpace() {
+        // Quoting is how a user expresses a leading space; unquoting
+        // must not re-trim it away.
+        let cfg = parse("word-break-chars = \" -\"")
+        #expect(cfg.wordBreakChars == " -")
+    }
+
     @Test func mixedWithOtherKeys() {
         // Pin parse-order independence: word-break-chars sits next to
         // copy-on-select in the file without affecting either.
