@@ -805,6 +805,47 @@ added to the required Iced Make/Actions gate; full Iced has no functional
 failure other than the explicitly separate screenshot pixel port; Swift and
 dependency-boundary gates remain green.
 
+### Active mini-plan: renderer-neutral Iced screenshots and visual gate
+
+Scope: implement Iced's `app.screenshot` UI port through the released Iced
+0.14 `window::screenshot` task, normalize its renderer-owned RGBA capture to
+Roost's requested logical 1x/2x contract, encode PNG in the Iced adapter, and
+extend the existing screenshot harness and targeted sidebar pixel assertion to
+the third UI. No screenshot, PNG, window, or renderer type enters the engine.
+
+Invariants and interfaces:
+
+- both compiled backends use Iced's public screenshot task; the adapter does
+  not reach into `iced_wgpu`, `iced_tiny_skia`, a native window handle, or an
+  operating-system capture API;
+- the captured physical dimensions and Iced scale factor are normalized to
+  `logical renderer surface * requested scale`, so scale 1 and 2 have identical
+  wire semantics on Retina macOS, X11, and Wayland (where the renderer surface
+  can differ from decorated window metrics). Resampling and PNG encoding
+  validate scale factors, dimensions, byte lengths, and allocation arithmetic
+  and return explicit errors instead of panicking;
+- the app owns a FIFO of screenshot requests and at most one renderer capture
+  in flight. Every request sender is consumed exactly once; an early request
+  waits for the first window id, and another UI task can delay but never discard
+  a queued capture;
+- the existing shared IPC dispatcher continues to validate requested scale and
+  the 16 MiB framed-response limit. The Iced adapter returns owned PNG bytes and
+  dimensions only after renderer access has completed on Iced's event loop;
+- `tools/screenshot` accepts `iced` with its isolated profile, binary, socket,
+  log, launch, and shutdown paths. The scenario remains target-neutral and
+  creates only its throwaway workspace rows; and
+- visual automation asserts owned lifecycle colors and common left-edge
+  geometry rather than whole-window pixel identity. Failure artifacts include
+  the last capture and Iced logs; human comparison artifacts use the same
+  seeded GTK and Iced scenario.
+
+Acceptance: unit tests cover 1x/2x normalization at native 1x/2x, malformed
+RGBA metadata, and PNG dimensions; `test_sidebar_pixels.py` passes for Iced on
+macOS and in the shed with wgpu/tiny-skia under X11/Wayland; it joins the
+required Iced Make/Actions suite; `make smoke-iced` produces the five labeled
+scenario PNGs and manifest; full Iced has no remaining functional failure;
+GTK, Swift, dependency-boundary, and complete local/shed gates remain green.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.
@@ -837,6 +878,7 @@ dependency-boundary gates remain green.
 | Workspace lock emits callbacks or persistence reorders writes | non-blocking event enqueue under lock; callbacks/UI/persistence after unlock; revision tests | retain current sender/sequence design |
 | Slow UI diverges | revisioned events plus mandatory full snapshot resync | fall back to resync on every ambiguous transition |
 | Iced canvas text misaligns graphemes | fixture screenshots and measured cells in both backends | custom primitive widget behind same adapter |
+| Iced 2x capture on a native 1x display has no public arbitrary-scale render target | normalize the public renderer capture to the required dimensions; pixel/geometry gates run at 1x and smoke artifacts validate 2x | accept nearest-neighbor 2x enlargement for this POC, while Retina captures retain native 2x detail |
 | GPU unavailable in CI or older Linux | tiny-skia deterministic lane and wgpu smoke | make software backend CI default, keep runtime selection |
 | X11/Wayland behavior differs | explicit lanes and shed runs, no implicit backend | document a narrowly scoped renderer limitation only with evidence |
 | Target generalization regresses existing CLI | table-driven three-target tests and precedence fixtures | keep explicit `--socket` escape hatch while fixing selector |

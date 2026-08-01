@@ -522,6 +522,7 @@ jobs:
           RUST_LOG: warn
           ROOST_TEST_MODE: "1"
           ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-artifacts
           ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-logs
         run: >
           xvfb-run -a --server-args="-screen 0 1920x1080x24"
@@ -530,6 +531,7 @@ jobs:
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
           tools/roosttest/test_provider.py
+          tools/roosttest/test_sidebar_pixels.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (Linux Wayland)
@@ -539,6 +541,7 @@ jobs:
           RUST_LOG: warn
           ROOST_TEST_MODE: "1"
           ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-artifacts
           ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-logs
         run: >
           tools/wayland/weston-run.sh
@@ -547,6 +550,7 @@ jobs:
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
           tools/roosttest/test_provider.py
+          tools/roosttest/test_sidebar_pixels.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (macOS)
@@ -556,6 +560,7 @@ jobs:
           RUST_LOG: warn
           ROOST_TEST_MODE: "1"
           ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-artifacts
           ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-logs
         run: >
           uv run --group test pytest
@@ -563,6 +568,7 @@ jobs:
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
           tools/roosttest/test_provider.py
+          tools/roosttest/test_sidebar_pixels.py
           --roost-target iced --roost-fresh -v
 
       - name: Collect Iced diagnostics
@@ -572,6 +578,10 @@ jobs:
           mkdir -p diagnostics
           find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-logs/*.log' \
             -exec cp '{}' diagnostics/ \; 2>/dev/null || true
+          while IFS= read -r screenshot; do
+            suite="$(basename "$(dirname "${screenshot}")")"
+            cp "${screenshot}" "diagnostics/${suite}-$(basename "${screenshot}")"
+          done < <(find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-artifacts/*.png' 2>/dev/null)
           if [ "${RUNNER_OS}" = "macOS" ]; then
             cp "$HOME"/Library/Logs/DiagnosticReports/roost-iced*.ips diagnostics/ 2>/dev/null || true
           fi

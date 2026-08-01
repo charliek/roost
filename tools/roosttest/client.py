@@ -42,11 +42,12 @@ class Timeout(RoostError):
 
 
 class Roost:
-    def __init__(self, socket_path: str):
+    def __init__(self, socket_path: str, timeout: float | None = None):
         self.path = str(socket_path)
         self._next_id = 0
         self._buf = b""
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(timeout)
         self._sock.connect(self.path)
 
     # -- lifecycle --------------------------------------------------------

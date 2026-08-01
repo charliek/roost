@@ -1,5 +1,5 @@
-"""Sidebar agent-row pixel guards — plan 007, both targets
-(`--roost-target mac|gtk`). The only two things about the rendered rows
+"""Sidebar agent-row pixel guards — plan 007, all three targets
+(`--roost-target mac|gtk|iced`). The only two things about the rendered rows
 that `app.sidebar_dump` cannot see: the lifecycle DOT COLOUR and the
 column the dots line up in.
 
@@ -81,12 +81,12 @@ LIFECYCLE_COLORS: dict[str, tuple[int, int, int]] = {
 # invariant — every dot on one edge — is asserted exactly below; this
 # band only catches gross indentation, which is the regression it exists
 # for (the dot was 10px past the project name and still is caught).
-DOT_LEFT_X = {"gtk": 27, "mac": 25}
-DOT_LEFT_TOLERANCE = {"gtk": 6, "mac": 3}
+DOT_LEFT_X = {"gtk": 27, "iced": 21, "mac": 25}
+DOT_LEFT_TOLERANCE = {"gtk": 6, "iced": 2, "mac": 3}
 
-# Both UIs draw an 8x8 dot with a 4px corner radius; the fully-saturated
-# core measures 6x6, with the corners antialiased into the background.
-# 5 accepts the core while rejecting the 3px project stripe.
+# All three UIs draw an 8x8 rounded dot (AppKit/GTK use a 4px radius; Iced
+# uses 3px to retain a solid renderer-neutral edge). The saturated core is
+# at least 5x5, while the project lifecycle stripe is only 3px wide.
 MIN_DOT_SIDE = 5
 # Colour match tolerance for *finding* a dot. 0 and 2 select identical
 # pixels on both targets today; 2 leaves room for compositing rounding
@@ -157,7 +157,7 @@ def _capture(roost, path: Path):
     try:
         png, _w, _h = roost.screenshot()
     except RoostError as e:
-        if e.code == "internal":
+        if e.code == "internal" and "empty snapshot" in e.message:
             return None
         raise
     path.write_bytes(png)
@@ -200,7 +200,13 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
     # for why a refused resize must never fail a test).
     roost.window_resize(WINDOW_W, WINDOW_H)
 
-    shot_path = tmp_path / "sidebar.png"
+    artifact_dir = os.environ.get("ROOST_E2E_ARTIFACT_DIR")
+    shot_path = (
+        Path(artifact_dir) / "sidebar.png"
+        if artifact_dir
+        else tmp_path / "sidebar.png"
+    )
+    shot_path.parent.mkdir(parents=True, exist_ok=True)
     state: dict = {"shot": None, "blobs": {}}
 
     def _all_four_painted() -> bool:

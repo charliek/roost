@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{button, canvas, column, container, row, scrollable, stack, text, text_input};
-use iced::{window, Color, Element, Fill, Size, Task};
+use iced::{window, Alignment, Color, Element, Fill, Size, Task};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
@@ -46,8 +46,6 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 const TAB_BAR_HEIGHT: f32 = 44.0;
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
-const UNSUPPORTED: &str = "not implemented by the Iced walking skeleton";
-
 fn sidebar_width(collapsed: bool) -> f32 {
     if collapsed {
         0.0
@@ -116,9 +114,28 @@ fn font_palette_frame() -> palette::PaletteFrame {
 
 pub enum UiTask {
     None,
+    Then(Box<UiTask>, Box<UiTask>),
     Focus(window::Id),
     FocusWidget(Id),
     Resize(window::Id, Size),
+    Screenshot(window::Id),
+}
+
+impl UiTask {
+    fn then(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::None, next) => next,
+            (task, Self::None) => task,
+            (task, next) => Self::Then(Box::new(task), Box::new(next)),
+        }
+    }
+}
+
+type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
+
+struct ScreenshotRequest {
+    scale: u32,
+    reply: ScreenshotReply,
 }
 
 struct AgentMetricsResult {
@@ -554,6 +571,8 @@ pub struct App {
     ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
+    screenshot_queue: VecDeque<ScreenshotRequest>,
+    screenshot_in_flight: Option<ScreenshotRequest>,
     window_size: Size,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
@@ -638,6 +657,8 @@ impl App {
             ui_rx,
             window_id: None,
             pending_window_resize: None,
+            screenshot_queue: VecDeque::new(),
+            screenshot_in_flight: None,
             window_size: Size::new(1100.0, 720.0),
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
@@ -685,7 +706,7 @@ impl App {
     }
 
     pub fn tick(&mut self) -> UiTask {
-        let task = self.service_ui_requests();
+        let mut task = self.service_ui_requests();
         self.service_agent_metrics();
         self.service_provider_results();
         self.service_workspace_events();
@@ -721,7 +742,30 @@ impl App {
             let _ = self.workspace.close_tab(tab_id);
             self.tabs.remove(&tab_id);
         }
+        task = task.then(self.start_next_screenshot());
         task
+    }
+
+    pub fn screenshot_captured(&mut self, capture: &window::Screenshot) -> UiTask {
+        if let Some(request) = self.screenshot_in_flight.take() {
+            let result = crate::screenshot::encode(capture, request.scale);
+            let _ = request.reply.send(result);
+        } else {
+            tracing::warn!("received an Iced screenshot with no request in flight");
+        }
+        self.start_next_screenshot()
+    }
+
+    fn start_next_screenshot(&mut self) -> UiTask {
+        if self.screenshot_in_flight.is_some() {
+            return UiTask::None;
+        }
+        let (Some(window_id), Some(request)) = (self.window_id, self.screenshot_queue.pop_front())
+        else {
+            return UiTask::None;
+        };
+        self.screenshot_in_flight = Some(request);
+        UiTask::Screenshot(window_id)
     }
 
     pub fn resize(&mut self, size: Size) {
@@ -865,15 +909,23 @@ impl App {
                         agent.name.clone()
                     };
                     let detail = format!("{}  ·  {}", agent.status_text, agent.time_text);
+                    let dot_color = agent_color(agent.lifecycle);
+                    let dot =
+                        container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
+                            iced::widget::container::Style::default()
+                                .background(dot_color)
+                                .border(iced::border::rounded(3))
+                        });
                     let row = row![
-                        text("●").size(12).color(agent_color(agent.lifecycle)),
+                        dot,
                         column![
                             text(name).size(12),
                             text(detail).size(10).color(Color::from_rgb8(160, 164, 176))
                         ]
                         .spacing(1)
                     ]
-                    .spacing(7);
+                    .spacing(7)
+                    .align_y(Alignment::Center);
                     project_group = project_group.push(
                         button(row)
                             .width(Fill)
@@ -2124,8 +2176,9 @@ impl App {
                 UiRequest::AppSelectedTabId { reply } => {
                     let _ = reply.send(Ok(self.workspace.active().1));
                 }
-                UiRequest::Screenshot { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::Screenshot { scale, reply } => {
+                    self.screenshot_queue
+                        .push_back(ScreenshotRequest { scale, reply });
                 }
                 UiRequest::PaletteOpen { kind, reply } => {
                     let result = self

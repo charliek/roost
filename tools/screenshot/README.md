@@ -1,6 +1,6 @@
 # Roost screenshot harness (`tools/screenshot/`)
 
-The **visual** layer: screenshot-driven smoke testing for both Roost UIs,
+The **visual** layer: screenshot-driven smoke testing for all three Roost UIs,
 driven entirely through `roostctl`, plus `pngtool.py` to inspect the
 captures with no image libraries. Use it to verify what IPC can't *see* —
 pill-dot/badge colors, theme rendering, which tab is on screen, reflow —
@@ -16,33 +16,34 @@ Two halves:
 
 See [`../README.md`](../README.md) for how this fits the three test layers.
 
-## Why one harness for two UIs
+## Why one harness for three UIs
 
-The Swift (Mac) and gtk4-rs (Linux) UIs embed the **same** workspace +
-IPC server and speak the **same** newline-delimited JSON wire format, so
+The Swift (Mac), gtk4-rs, and Iced UIs speak the **same** workspace and
+newline-delimited JSON IPC contract, so
 the test driver is a single `roostctl` parameterized by
-`--target {mac,gtk}`. Only two things differ per UI, and `lib.sh`
-isolates both:
+`--target {mac,gtk,iced}`. Only two things differ per UI, and `lib.sh`
+isolates them:
 
-| Concern | Mac | GTK |
-|---|---|---|
-| Launch  | `open mac/build/Roost.app` (bundles if missing) | run `target/debug/roost` (Roost-gtk profile) |
-| Quit    | `osascript … to quit` | `SIGTERM` the pid from `identify` |
-| Socket  | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` (macOS dev) / `$XDG_RUNTIME_DIR/roost/roost.sock` (Linux) |
+| Concern | Mac | GTK | Iced |
+|---|---|---|---|
+| Launch | `open mac/build/Roost.app` | `target/debug/roost` | `target/debug/roost-iced` |
+| Quit | AppleScript | `SIGTERM` identified pid | `SIGTERM` identified pid |
+| Socket on macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` | `~/Library/Caches/Roost-iced/roost.sock` |
+| Socket on Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock` |
 
-The GTK binary runs on macOS too (cross-platform dev), so on a Mac you
-can drive both UIs side by side — they use distinct profiles and never
-clobber each other.
+Both Rust binaries run on macOS, so all three UIs can be driven side by
+side there; their profiles keep sockets, locks, logs, and state distinct.
 
 ## Quick start
 
 ```bash
 # Launch a UI (idempotent — no-op if already running)
-tools/screenshot/launch.sh mac        # or: gtk
+tools/screenshot/launch.sh mac        # or: gtk / iced
 
 # Run the full smoke scenario; writes PNGs + manifest.md to an outdir
 tools/screenshot/smoke.sh mac /tmp/ut-mac
 tools/screenshot/smoke.sh gtk /tmp/ut-gtk
+tools/screenshot/smoke.sh iced /tmp/ut-iced
 
 # Quit cleanly (exercises fsync-on-exit; next launch restores the layout)
 tools/screenshot/quit.sh mac
@@ -83,7 +84,7 @@ caught — `03-focus-clears.png` calls it out explicitly.
 
 ## Building blocks (`lib.sh`)
 
-Source `lib.sh` and call `ut_init <mac|gtk>` to write your own scenario:
+Source `lib.sh` and call `ut_init <mac|gtk|iced>` to write your own scenario:
 
 - `rc …` — run `roostctl --target <target> …`
 - `ut_launch` / `ut_quit` / `ut_alive` / `ut_wait_alive`

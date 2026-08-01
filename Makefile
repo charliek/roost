@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch test-real-input check-iced
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac smoke-mac-launch test-real-input check-iced
 test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
 test-rust:  ## cargo test --workspace
@@ -89,7 +89,7 @@ e2e-gtk:  ## E2E against the GTK UI
 	uv run --group test pytest tools/roosttest --roost-target gtk
 
 e2e-iced:  ## Required functional E2E against Iced
-	uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py --roost-target iced
+	uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py --roost-target iced
 
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
@@ -98,13 +98,16 @@ e2e-gtk-ci:  ## GTK E2E at CI parity (test-mode + fresh harness-owned UI, isolat
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh
 
 e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
-	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py --roost-target iced --roost-fresh
+	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py --roost-target iced --roost-fresh
 
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 	tools/screenshot/smoke.sh gtk
+
+smoke-iced:  ## Screenshot-driven UI smoke against a running Iced UI
+	tools/screenshot/smoke.sh iced
 
 smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
 	tools/screenshot/smoke.sh mac

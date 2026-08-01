@@ -1,5 +1,6 @@
 mod app;
 mod input;
+mod screenshot;
 mod terminal_canvas;
 
 use std::fs::OpenOptions;
@@ -26,6 +27,7 @@ enum Message {
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
     WindowFocus(window::Id, bool),
+    ScreenshotCaptured(window::Screenshot),
     Keyboard(keyboard::Event),
     TerminalPointer(terminal_canvas::TerminalPointer),
     ProjectSelected(i64),
@@ -87,6 +89,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.set_window_focus(focused);
             task
         }
+        Message::ScreenshotCaptured(capture) => app.screenshot_captured(&capture).map_task(),
         Message::Keyboard(event) => app.keyboard(event).map_task(),
         Message::TerminalPointer(event) => {
             app.pointer(event.action, event.button, event.col, event.row);
@@ -185,9 +188,11 @@ impl UiTask for app::UiTask {
     fn map_task(self) -> Task<Message> {
         match self {
             app::UiTask::None => Task::none(),
+            app::UiTask::Then(first, second) => first.map_task().chain(second.map_task()),
             app::UiTask::Focus(id) => window::gain_focus(id),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::Resize(id, size) => window::resize(id, size),
+            app::UiTask::Screenshot(id) => window::screenshot(id).map(Message::ScreenshotCaptured),
         }
     }
 }
