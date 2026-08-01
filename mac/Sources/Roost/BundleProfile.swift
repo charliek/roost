@@ -1,9 +1,8 @@
 // BundleProfile.swift — daemon-removal refactor M1.
 //
-// Swift companion to `roost_common::BundleProfile` (Rust). Two
-// variants — `mac` (Swift `Roost.app`) and `gtk` (gtk4-rs
-// `roost-linux`, used in dev mode on macOS side-by-side with the
-// Swift app). Path resolution mirrors the Rust side byte-for-byte so
+// Swift companion to `roost_ipc::paths::BundleProfile` (Rust). Three
+// variants — `mac` (Swift `Roost.app`), `gtk` (gtk4-rs
+// `roost-linux`), and the Iced POC. Path resolution mirrors the Rust side so
 // `roostctl` written in Rust and the Swift UI agree on where the
 // Unix socket lives.
 //
@@ -13,18 +12,19 @@
 
 import Foundation
 
-/// Two UI variants Roost ships. On macOS they coexist on the same
+/// UI variants Roost ships or evaluates. On macOS they coexist on the same
 /// machine with distinct paths so a Swift `Roost.app` and a
 /// `cargo run -p roost-linux` dev session don't fight over the same
 /// socket / state directory.
 enum BundleProfileKind: String, Sendable {
     case mac
     case gtk
+    case iced
 }
 
 struct BundleProfile: Sendable {
     let kind: BundleProfileKind
-    /// `"Roost"` or `"Roost-gtk"`. Used as the directory component
+    /// `"Roost"`, `"Roost-gtk"`, or `"Roost-iced"`. Used as the directory component
     /// under `~/Library/{Caches,Application Support,Logs}/`.
     let appLabel: String
     /// `CFBundleIdentifier` (Mac) / GApplication application id (GTK).
@@ -63,6 +63,7 @@ struct BundleProfile: Sendable {
             switch kind {
             case .mac: return ("Roost", "ai.stridelabs.Roost")
             case .gtk: return ("Roost-gtk", "ai.stridelabs.Roost.gtk")
+            case .iced: return ("Roost-iced", "ai.stridelabs.Roost.iced")
             }
         }()
 
@@ -128,7 +129,14 @@ struct BundleProfile: Sendable {
         resolve(kind: .gtk, environment: env)
     }
 
-    /// Pick a profile, letting `ROOST_BUNDLE_PROFILE=mac|gtk` override
+    /// Iced POC profile — isolated from both production UIs.
+    static func iced(environment env: [String: String] = ProcessInfo.processInfo.environment)
+        -> BundleProfile
+    {
+        resolve(kind: .iced, environment: env)
+    }
+
+    /// Pick a profile, letting `ROOST_BUNDLE_PROFILE=mac|gtk|iced` override
     /// the caller's preferred default. Unknown values silently fall
     /// through to the default — same policy as Rust.
     static func currentForBinary(
@@ -139,6 +147,7 @@ struct BundleProfile: Sendable {
             switch env["ROOST_BUNDLE_PROFILE"]?.trimmingCharacters(in: .whitespaces) {
             case "mac": return .mac
             case "gtk": return .gtk
+            case "iced": return .iced
             default: return fallback
             }
         }()

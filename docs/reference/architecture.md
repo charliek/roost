@@ -105,7 +105,7 @@ The Mac PTY read path uses a dedicated pattern: the `DispatchSourceRead` closure
 - `libghostty-vt` lives inside each UI for VT parsing + rendering.
 - OSC scanning lives in the UI (`OscScanner.swift` on macOS, `roost-osc` crate on Linux) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
 - Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) split across two channels — embedder-synthesized OSC color replies vs. libghostty-answered device replies. See [Terminal query replies](terminal-queries.md) for which is which and why.
-- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket (`~/Library/Caches/Roost/roost.sock` for Mac, `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux). `roostctl --target {mac,gtk}` routes to the right one; `roostctl` with no `--target` auto-detects via a parallel `connect()` probe of both candidate sockets.
+- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket. The Iced POC adds isolated `Roost-iced`/`roost-iced` paths alongside the existing Mac and GTK paths. `roostctl --target {mac,gtk,iced}` routes explicitly; with no selector it probes every distinct candidate concurrently and requires a choice if multiple UIs answer.
 - Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on a pidfile next to the socket. Second launches read the holder PID and exit 0. `ROOST_ALLOW_MULTI=1` bypasses for dev/test workflows.
 
 See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

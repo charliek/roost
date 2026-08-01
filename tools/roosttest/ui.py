@@ -1,8 +1,8 @@
 """Launch / quit a Roost UI for tests, and resolve its socket path.
 
-Both UIs speak the same IPC, so the test driver is one client
-parameterized by target; only launch/quit/socket differ per UI (Swift
-`Roost.app` vs the `roost` GTK binary). Mirrors `tools/screenshot/lib.sh`.
+All UIs speak the same IPC, so the test driver is one client
+parameterized by target. Per-target launch and isolation details live in
+the explicit capability table below instead of two-target conditionals.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from client import Roost, RoostError, scaled_timeout
@@ -26,16 +27,18 @@ from client import Roost, RoostError, scaled_timeout
 # its own state. None when reusing or before a session starts.
 _SESSION_STATE_DIR: Path | None = None
 
-# A harness-launched GTK UI's process handle + the file capturing its
+# Harness-launched Rust UI process handles + files capturing their
 # stdout+stderr (the UI tees its log to stdout). Retained so `wait_alive`
 # can tell a UI that crashed on boot (process already exited) from one
 # that's merely slow, and surface the captured log instead of an opaque
-# "did not boot". `None` until a GTK launch; the Mac path launches via
+# "did not boot". `None` until launch; the Mac path launches via
 # `open` (no direct child) and leaves these unset.
 _GTK_PROC: "subprocess.Popen[bytes] | None" = None
 _GTK_LOG: Path | None = None
+_ICED_PROC: "subprocess.Popen[bytes] | None" = None
+_ICED_LOG: Path | None = None
 
-# Env vars to strip from a harness-launched GTK UI's inherited environment.
+# Env vars to strip from a harness-launched Rust UI's inherited environment.
 # These are either per-tab values Roost injects itself (a stale inherited
 # value would leak into every tab — `pty.rs` keeps a pre-set
 # ROOST_SHELL_FEATURES instead of injecting the default) or selectors the
@@ -53,7 +56,49 @@ _UI_ENV_SANITIZE = (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TARGETS = ("mac", "gtk")
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """Launch and isolation capabilities for one UI implementation."""
+
+    name: str
+    profile: str
+    mac_label: str
+    linux_namespace: str
+    rust_package: str | None = None
+    binary_name: str | None = None
+    scans_gtk_criticals: bool = False
+    isolates_user_defaults: bool = False
+
+
+TARGET_SPECS = {
+    "mac": TargetSpec(
+        name="mac",
+        profile="mac",
+        mac_label="Roost",
+        linux_namespace="roost",
+        isolates_user_defaults=True,
+    ),
+    "gtk": TargetSpec(
+        name="gtk",
+        profile="gtk",
+        mac_label="Roost-gtk",
+        linux_namespace="roost",
+        rust_package="roost-linux",
+        binary_name="roost",
+        scans_gtk_criticals=True,
+    ),
+    "iced": TargetSpec(
+        name="iced",
+        profile="iced",
+        mac_label="Roost-iced",
+        linux_namespace="roost-iced",
+        rust_package="roost-iced",
+        binary_name="roost-iced",
+    ),
+}
+TARGETS = tuple(TARGET_SPECS)
 
 # Seed config the harness points the UI at via ROOST_CONFIG, so the
 # command-launcher tests have a deterministic command list (see
@@ -78,15 +123,19 @@ MAC_TEST_DEFAULTS_SUITE = "ai.stridelabs.Roost.e2e"
 
 
 def socket_path(target: str) -> Path:
+    try:
+        spec = TARGET_SPECS[target]
+    except KeyError as error:
+        raise ValueError(
+            f"unknown target {target!r} (want {'|'.join(TARGETS)})"
+        ) from error
     home = Path.home()
-    if target == "mac":
-        return home / "Library/Caches/Roost/roost.sock"
-    if target == "gtk":
-        if platform.system() == "Darwin":
-            return home / "Library/Caches/Roost-gtk/roost.sock"
-        xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/roost-{os.getuid()}"
-        return Path(xdg) / "roost/roost.sock"
-    raise ValueError(f"unknown target {target!r} (want mac|gtk)")
+    if platform.system() == "Darwin":
+        return home / f"Library/Caches/{spec.mac_label}/roost.sock"
+    xdg = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+    if xdg.is_absolute():
+        return xdg / spec.linux_namespace / "roost.sock"
+    return Path(f"/tmp/{spec.linux_namespace}-{os.getuid()}") / "roost.sock"
 
 
 def is_alive(target: str) -> bool:
@@ -101,28 +150,32 @@ def is_alive(target: str) -> bool:
         return False
 
 
-def _gtk_log_path() -> Path:
-    """Where a harness-launched GTK UI's stdout+stderr are captured. Honors
+def _rust_log_path(target: str) -> Path:
+    """Where a harness-launched Rust UI's stdout+stderr are captured. Honors
     `ROOST_E2E_LOG_DIR` (CI points it at a dir it collects + uploads as a
     build artifact); falls back to the system temp dir for local runs."""
     base = Path(os.environ.get("ROOST_E2E_LOG_DIR") or tempfile.gettempdir())
     base.mkdir(parents=True, exist_ok=True)
-    return base / "roost-gtk-ui.log"
+    return base / f"roost-{target}-ui.log"
 
 
 def _boot_failure_detail(target: str) -> str:
-    """Diagnostic suffix for a GTK boot timeout: whether the launched UI
+    """Diagnostic suffix for a Rust UI boot timeout: whether the launched UI
     already exited (so it crashed, not just slow) and the tail of its
     captured log. Empty for Mac (launched via `open`, no captured child)."""
-    if target != "gtk" or _GTK_PROC is None:
+    proc, log = {
+        "gtk": (_GTK_PROC, _GTK_LOG),
+        "iced": (_ICED_PROC, _ICED_LOG),
+    }.get(target, (None, None))
+    if proc is None:
         return ""
     parts = []
-    rc = _GTK_PROC.poll()
+    rc = proc.poll()
     if rc is not None:
         parts.append(f" — UI process exited (code {rc}) before becoming ready")
-    if _GTK_LOG is not None and _GTK_LOG.exists():
+    if log is not None and log.exists():
         try:
-            tail = _GTK_LOG.read_text(errors="replace").splitlines()[-40:]
+            tail = log.read_text(errors="replace").splitlines()[-40:]
         except OSError:
             tail = []
         if tail:
@@ -248,10 +301,12 @@ def start_session(target: str, *, fresh: bool) -> bool:
 def end_session(target: str) -> None:
     """Quit a harness-owned UI and remove its throwaway state (state dir +,
     on Mac, the isolated UserDefaults suite)."""
-    global _SESSION_STATE_DIR, _GTK_PROC, _GTK_LOG
+    global _SESSION_STATE_DIR, _GTK_PROC, _GTK_LOG, _ICED_PROC, _ICED_LOG
     quit(target)
     _GTK_PROC = None
     _GTK_LOG = None
+    _ICED_PROC = None
+    _ICED_LOG = None
     if _SESSION_STATE_DIR is not None:
         shutil.rmtree(_SESSION_STATE_DIR, ignore_errors=True)
         _SESSION_STATE_DIR = None
@@ -279,11 +334,15 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         if not app.is_dir():
             subprocess.run(["./scripts/bundle.sh", "debug"], cwd=REPO_ROOT / "mac", check=True)
         _launch_mac(app, state_dir=state_dir)
-    elif target == "gtk":
-        binary = REPO_ROOT / "target/debug/roost"
+    elif target in ("gtk", "iced"):
+        spec = TARGET_SPECS[target]
+        assert spec.binary_name is not None and spec.rust_package is not None
+        binary = REPO_ROOT / "target/debug" / spec.binary_name
         if not binary.is_file():
-            subprocess.run(["cargo", "build", "-p", "roost-linux"], cwd=REPO_ROOT, check=True)
-        # GTK inherits the full parent env, so sanitize vars that would
+            subprocess.run(
+                ["cargo", "build", "-p", spec.rust_package], cwd=REPO_ROOT, check=True
+            )
+        # Rust UIs inherit the full parent env, so sanitize vars that would
         # send the UI somewhere other than what the harness drives. Drop
         # the per-tab vars Roost injects itself (else a value leaked from
         # the shell that launched pytest — e.g. ROOST_SHELL_FEATURES=
@@ -293,6 +352,7 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "warn")}
         for leaked in _UI_ENV_SANITIZE:
             env.pop(leaked, None)
+        env["ROOST_BUNDLE_PROFILE"] = spec.profile
         env["ROOST_CONFIG"] = str(_session_config_path() if state_dir is not None else SEED_CONFIG)
         if state_dir is not None:
             env["ROOST_STATE_DIR"] = str(state_dir)
@@ -300,17 +360,21 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         # panic that predates the file logger only shows on stderr) so a boot
         # failure isn't blind — `wait_alive` reads this on timeout and CI
         # uploads it. Detached: outlive this call; quit() SIGTERMs it by pid.
-        global _GTK_PROC, _GTK_LOG
-        _GTK_LOG = _gtk_log_path()
-        log_fh = open(_GTK_LOG, "wb")
+        global _GTK_PROC, _GTK_LOG, _ICED_PROC, _ICED_LOG
+        log_path = _rust_log_path(target)
+        log_fh = open(log_path, "wb")
         try:
-            _GTK_PROC = subprocess.Popen(
+            proc = subprocess.Popen(
                 [str(binary)], cwd=REPO_ROOT, env=env,
                 stdout=log_fh, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         finally:
             log_fh.close()  # the child holds its own dup of the fd
+        if target == "gtk":
+            _GTK_PROC, _GTK_LOG = proc, log_path
+        else:
+            _ICED_PROC, _ICED_LOG = proc, log_path
         wait_alive(target)
     else:
         raise ValueError(f"unknown target {target!r}")

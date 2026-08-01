@@ -60,8 +60,8 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac e2e-gtk-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch test-real-input
-test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
+.PHONY: test test-rust test-mac test-harness e2e e2e-gtk e2e-mac e2e-gtk-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch test-real-input
+test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
 test-rust:  ## cargo test --workspace
 	cargo test --workspace
@@ -69,7 +69,10 @@ test-rust:  ## cargo test --workspace
 test-mac:  ## swift test (Mac)
 	cd $(MAC_DIR) && swift test
 
-e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk, default gtk; launches the UI)
+test-harness:  ## Fast unit tests for target/path/capability harness wiring
+	python3 -m unittest discover -s tools/roosttest_unit -v
+
+e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk|iced, default gtk; launches the UI)
 	uv run --group test pytest tools/roosttest
 
 e2e-gtk:  ## E2E against the GTK UI

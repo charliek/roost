@@ -1,4 +1,4 @@
-"""Thin JSON-IPC client for a running Roost UI (Mac or GTK).
+"""Thin JSON-IPC client for a running Roost UI (Mac, GTK, or Iced).
 
 Speaks the newline-delimited JSON protocol directly over the Unix socket
 — the same contract `roostctl` uses (see docs/reference/ipc.md). Tests

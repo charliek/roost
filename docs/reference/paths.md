@@ -2,7 +2,7 @@
 
 Roost resolves all of its filesystem state once at startup. Other components read the paths from this resolution; nothing should derive its own.
 
-Each UI owns its own `BundleProfile` — two variants, `Mac` (Swift `Roost.app`, `CFBundleIdentifier ai.stridelabs.Roost`) and `Gtk` (gtk4-rs `roost-linux`, app id `ai.stridelabs.Roost.gtk`). There is no shared daemon; the profile a UI resolves determines the socket `roostctl` dials. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. The two implementations are tested in lockstep.
+Each UI owns its own `BundleProfile` — `Mac` (Swift `Roost.app`, `CFBundleIdentifier ai.stridelabs.Roost`), `Gtk` (gtk4-rs `roost-linux`, app id `ai.stridelabs.Roost.gtk`), or `Iced` (the Rust/Iced POC, app id `ai.stridelabs.Roost.iced`). There is no shared daemon; the profile a UI resolves determines the socket `roostctl` dials. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. The two implementations are tested in lockstep.
 
 The profile defaults to:
 
@@ -10,11 +10,12 @@ The profile defaults to:
 |--------------|------------------|----------|
 | Swift `Roost.app` | `Mac` | n/a (the app picks `Mac` directly) |
 | `roost-linux`     | `Gtk` | `ROOST_BUNDLE_PROFILE=mac` to dial a `Mac`-profile UI |
-| `roostctl` (binary from the `roost-cli` crate) | `Mac` | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,gtk}` |
+| `roost-iced`      | `Iced` | reserved for test/profile overrides |
+| `roostctl` (binary from the `roost-cli` crate) | auto-detect | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,gtk,iced}` |
 
 ## File locations
 
-The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost` or `Roost-gtk`.
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-gtk`, or `Roost-iced`.
 
 Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` lives) — the socket, single-instance lock, and log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
 
@@ -41,9 +42,23 @@ Same shape as the `Mac` profile with `Roost-gtk` in place of `Roost`:
 | `~/Library/Caches/Roost-gtk/roost.lock` | GTK-app single-instance lock |
 | `~/Library/Logs/Roost-gtk/roost.log` | GTK-app log (also teed to stdout); distinct from the Swift app's `~/Library/Logs/Roost/roost.log` |
 
+### macOS — `Iced` profile (`cargo run -p roost-iced`)
+
+The Iced POC uses the same shape with `Roost-iced`, so all three UIs can run
+at once:
+
+| Path | Purpose |
+|---|---|
+| `~/Library/Application Support/Roost-iced/state.json` | Iced workspace state |
+| `~/Library/Caches/Roost-iced/roost.sock` | Iced Unix socket |
+| `~/Library/Caches/Roost-iced/roost.lock` | Iced single-instance lock |
+| `~/Library/Logs/Roost-iced/roost.log` | Iced log (also teed to stdout) |
+
 ### Linux
 
-Linux follows XDG conventions for everything. There is only one UI variant on Linux — both `Mac` and `Gtk` profile kinds resolve to the same XDG paths.
+Linux follows XDG conventions for everything. The legacy `Mac` and `Gtk`
+profile kinds resolve to the production `roost` namespace. The Iced POC stays
+in a separate `roost-iced` namespace so it can run beside GTK.
 
 | Path | Purpose |
 |---|---|
@@ -51,6 +66,9 @@ Linux follows XDG conventions for everything. There is only one UI variant on Li
 | `$XDG_DATA_HOME/roost/state.json` | UI-owned workspace state; defaults to `~/.local/share/roost/` |
 | `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |
 | `$XDG_STATE_HOME/roost/roost.log` | app log (also teed to stdout); falls back to `~/.local/state/roost/` |
+
+For Iced, replace each `roost` path component with `roost-iced`; its socket
+fallback is `/tmp/roost-iced-<uid>/roost.sock`.
 
 The directories are created at first launch with mode `0700`.
 
@@ -189,7 +207,9 @@ opt-out (`no-ssh-env`).
 | `ROOST_SOCKET` | Override the socket the CLI dials |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
 
-`roostctl` also honours `ROOST_BUNDLE_PROFILE=mac|gtk` to pick which UI's socket it dials by default (useful when a Mac `Roost.app` and a GTK dev UI both run on macOS).
+`roostctl` also honours `ROOST_BUNDLE_PROFILE=mac|gtk|iced`. With no explicit
+selector it probes every distinct socket, chooses the only live UI, or names
+the live candidates when selection is ambiguous.
 
 ## Resetting state
 
@@ -202,8 +222,14 @@ rm "$HOME/Library/Application Support/Roost/state.json"
 # macOS — Gtk dev profile (cargo run -p roost-linux on Mac)
 rm "$HOME/Library/Application Support/Roost-gtk/state.json"
 
+# macOS — Iced POC
+rm "$HOME/Library/Application Support/Roost-iced/state.json"
+
 # Linux (uses XDG_DATA_HOME with the spec-default fallback)
 rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost/state.json"
+
+# Linux — Iced POC
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/roost-iced/state.json"
 ```
 
 `state.json` is the UI-owned persistent store. Relaunch the UI — it will recreate default state on first run.

@@ -1,6 +1,6 @@
 # roosttest — pytest E2E harness
 
-Functional end-to-end tests that drive a **real** Roost UI (Mac or GTK)
+Functional end-to-end tests that drive a **real** Roost UI (Mac, GTK, or Iced)
 over the JSON IPC socket and assert on the op set — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
 Most tests read back via `tab.dump` / `tab.list` / `identify`; the
@@ -19,6 +19,7 @@ make e2e-gtk-ci     # CI parity: ROOST_TEST_MODE=1 + --roost-fresh (owns a fresh
 make e2e-mac-ci     # CI parity (DESTRUCTIVE: force-quits any running Roost.app)
 # or directly:
 uv run --group test pytest tools/roosttest --roost-target mac -v
+uv run --group test pytest tools/roosttest --roost-target iced -v
 ```
 
 The session fixture launches the UI if it isn't already running (and

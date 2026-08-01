@@ -56,6 +56,7 @@ jobs:
               - 'tests/**'
             tests:
               - 'tools/roosttest/**'
+              - 'tools/roosttest_unit/**'
               - 'tools/input/linux/**'
               - 'tools/wayland/**'
               - 'pyproject.toml'
@@ -93,6 +94,17 @@ jobs:
         # installed — handled by the dedicated `gtk-build` job instead of
         # bloating this lint runner with the GTK toolchain.
         run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
+
+  harness-unit:
+    needs: changes
+    if: needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Functional harness target contract
+        run: python3 -m unittest discover -s tools/roosttest_unit -v
 
   themes-parity:
     needs: changes
@@ -874,13 +886,13 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, themes-parity, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
+    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then

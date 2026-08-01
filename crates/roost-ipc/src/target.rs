@@ -1,17 +1,17 @@
 //! CLI-side target selection for `roostctl`.
 //!
-//! `roostctl` can dial either the Mac Swift UI or the GTK UI. With
-//! both running on the same Mac, the CLI needs to be told which to
+//! `roostctl` can dial the Mac, GTK, or Iced UI. With multiple UIs
+//! running, the CLI needs to be told which to
 //! talk to. Resolution order (highest precedence first):
 //!
 //! 1. `--socket <path>` (explicit path).
 //! 2. `ROOST_SOCKET` env var.
-//! 3. `--target {mac,gtk}` shortcut (resolves to that profile's
+//! 3. `--target {mac,gtk,iced}` shortcut (resolves to that profile's
 //!    canonical socket path).
 //! 4. `ROOST_BUNDLE_PROFILE` env var (same effect as `--target`).
-//! 5. Auto-detect: probe both known socket paths. If exactly one is
-//!    listening, use it. If both are listening, return
-//!    [`TargetError::Ambiguous`]. If neither, return
+//! 5. Auto-detect: probe every distinct known socket path. If exactly
+//!    one is listening, use it. If multiple are listening, return
+//!    [`TargetError::Ambiguous`]. If none, return
 //!    [`TargetError::NoLiveTarget`].
 //!
 //! The auto-detect probe must be cheap and fast — it's on the hot
@@ -32,23 +32,39 @@ use crate::paths::{BundleProfile, BundleProfileKind};
 pub struct TargetSelector {
     /// `--socket <path>` value. Highest precedence.
     pub socket_override: Option<PathBuf>,
-    /// `--target {mac,gtk}` value.
+    /// `--target {mac,gtk,iced}` value.
     pub kind_override: Option<BundleProfileKind>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum TargetError {
     #[error(
-        "two Roost UIs are running (mac + gtk); pass --target mac|gtk or set \
+        "multiple Roost UIs are running ({live}); pass --target mac|gtk|iced or set \
          ROOST_BUNDLE_PROFILE"
     )]
-    Ambiguous,
+    Ambiguous { live: LiveProfiles },
     #[error("no Roost UI is running (tried {tried:?})")]
     NoLiveTarget { tried: Vec<PathBuf> },
     #[error("path resolution failed: {0}")]
     Path(#[from] anyhow::Error),
-    #[error("unknown ROOST_BUNDLE_PROFILE value {0:?} (expected `mac` or `gtk`)")]
+    #[error("unknown ROOST_BUNDLE_PROFILE value {0:?} (expected `mac`, `gtk`, or `iced`)")]
     UnknownProfile(String),
+}
+
+/// Deterministically ordered live profiles included in ambiguity errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProfiles(pub Vec<BundleProfileKind>);
+
+impl std::fmt::Display for LiveProfiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, kind) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(" + ")?;
+            }
+            f.write_str(kind.as_str())?;
+        }
+        Ok(())
+    }
 }
 
 /// Resolved target — a socket path plus the profile kind that
@@ -204,6 +220,7 @@ fn classify(
     match profile_env.map(str::trim) {
         Some("mac") => Step::Profile(BundleProfileKind::Mac, TargetOrigin::ProfileEnv),
         Some("gtk") => Step::Profile(BundleProfileKind::Gtk, TargetOrigin::ProfileEnv),
+        Some("iced") => Step::Profile(BundleProfileKind::Iced, TargetOrigin::ProfileEnv),
         // Empty string is the launchd-inherited empty-env case; fall
         // through to auto-detect so a sandboxed process with no profile
         // set can still discover one.
@@ -222,25 +239,31 @@ fn for_kind(kind: BundleProfileKind) -> Result<ResolvedTarget, TargetError> {
 /// The socket paths auto-detect probes, each labelled with the profile
 /// it belongs to, in precedence order.
 ///
-/// Off macOS both profiles resolve to the same XDG path — there is only
-/// one UI and `paths.rs` ignores `app_label` there — so the pair
-/// collapses to the lone gtk target. Keyed off the resolved paths being
-/// equal rather than `cfg!(target_os)` so it stays correct if the path
-/// policy ever changes.
+/// Profiles that resolve to the same path collapse to the later entry.
+/// Today that means Mac + GTK become the lone GTK production target on
+/// Linux, while Iced remains independently addressable.
 ///
 /// This is the *only* encoding of that set: [`resolve_auto_detect`]
 /// consumes it and [`TargetDiagnosis`] reports it, so a diagnostic can
 /// never disagree with the resolver about what would have been tried.
 fn auto_detect_candidates() -> Result<Vec<(BundleProfileKind, PathBuf)>, TargetError> {
-    let mac = BundleProfile::mac()?;
-    let gtk = BundleProfile::gtk()?;
-    if mac.socket_path == gtk.socket_path {
-        return Ok(vec![(BundleProfileKind::Gtk, gtk.socket_path)]);
+    let profiles = [
+        BundleProfile::mac()?,
+        BundleProfile::gtk()?,
+        BundleProfile::iced()?,
+    ];
+    let mut candidates: Vec<(BundleProfileKind, PathBuf)> = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        if let Some(existing) = candidates
+            .iter_mut()
+            .find(|(_, path)| *path == profile.socket_path)
+        {
+            existing.0 = profile.kind;
+        } else {
+            candidates.push((profile.kind, profile.socket_path));
+        }
     }
-    Ok(vec![
-        (BundleProfileKind::Mac, mac.socket_path),
-        (BundleProfileKind::Gtk, gtk.socket_path),
-    ])
+    Ok(candidates)
 }
 
 /// Auto-detect step (resolution order #5): probe the known profile
@@ -251,55 +274,61 @@ fn auto_detect_candidates() -> Result<Vec<(BundleProfileKind, PathBuf)>, TargetE
 async fn resolve_auto_detect(probe_alive: bool) -> Result<ResolvedTarget, TargetError> {
     let candidates = auto_detect_candidates()?;
 
-    // One candidate is the collapsed off-macOS case, not a partial list
-    // — probing the single shared path twice would report a phantom
-    // "mac + gtk both running" ambiguity.
-    let [(mac_kind, mac_path), (gtk_kind, gtk_path)] = candidates.as_slice() else {
-        // `auto_detect_candidates` never returns empty, but this sits
-        // under `doctor::collect`, which promises totality — an index
-        // panic there would take out the diagnostic instead of being one.
-        let Some((kind, path)) = candidates.first() else {
-            return Err(TargetError::NoLiveTarget { tried: Vec::new() });
-        };
-        if !probe_alive || probe_socket(path).await {
-            return Ok(ResolvedTarget {
-                socket_path: path.clone(),
-                kind: Some(*kind),
-            });
-        }
-        return Err(TargetError::NoLiveTarget {
-            tried: vec![path.clone()],
-        });
-    };
-
     if !probe_alive {
-        // Without a probe, prefer the Mac socket. Callers in
+        // Without a probe, prefer the first canonical socket (Mac on
+        // macOS, GTK on Linux). Callers in
         // probe_alive=false mode (Claude hooks) tolerate
         // "no live target" silently — they just no-op when the
         // dial fails downstream.
-        return Ok(ResolvedTarget {
-            socket_path: mac_path.clone(),
-            kind: Some(*mac_kind),
-        });
+        return candidates
+            .first()
+            .map(|(kind, path)| ResolvedTarget {
+                socket_path: path.clone(),
+                kind: Some(*kind),
+            })
+            .ok_or(TargetError::NoLiveTarget { tried: Vec::new() });
     }
 
-    // Probe both candidates in parallel so the cold-path cost
-    // is one 50ms timeout, not two. `tokio::join!` polls both
-    // futures concurrently on the current task — no extra
-    // executor work.
-    let (mac_alive, gtk_alive) = tokio::join!(probe_socket(mac_path), probe_socket(gtk_path));
-    match (mac_alive, gtk_alive) {
-        (true, false) => Ok(ResolvedTarget {
-            socket_path: mac_path.clone(),
-            kind: Some(*mac_kind),
+    // There are at most three known profiles. Spell out the bounded
+    // fan-out so probes remain concurrent without adding an executor or
+    // a futures utility dependency to the IPC contract crate.
+    let alive = match candidates.as_slice() {
+        [] => Vec::new(),
+        [(_, one)] => vec![probe_socket(one).await],
+        [(_, one), (_, two)] => {
+            let (one, two) = tokio::join!(probe_socket(one), probe_socket(two));
+            vec![one, two]
+        }
+        [(_, one), (_, two), (_, three)] => {
+            let (one, two, three) =
+                tokio::join!(probe_socket(one), probe_socket(two), probe_socket(three));
+            vec![one, two, three]
+        }
+        _ => unreachable!("Roost has only three known profiles"),
+    };
+    choose_live_candidate(&candidates, &alive)
+}
+
+fn choose_live_candidate(
+    candidates: &[(BundleProfileKind, PathBuf)],
+    alive: &[bool],
+) -> Result<ResolvedTarget, TargetError> {
+    debug_assert_eq!(candidates.len(), alive.len());
+    let live: Vec<_> = candidates
+        .iter()
+        .zip(alive)
+        .filter_map(|((kind, path), alive)| alive.then_some((*kind, path)))
+        .collect();
+    match live.as_slice() {
+        [(kind, path)] => Ok(ResolvedTarget {
+            socket_path: (*path).clone(),
+            kind: Some(*kind),
         }),
-        (false, true) => Ok(ResolvedTarget {
-            socket_path: gtk_path.clone(),
-            kind: Some(*gtk_kind),
+        [] => Err(TargetError::NoLiveTarget {
+            tried: candidates.iter().map(|(_, path)| path.clone()).collect(),
         }),
-        (true, true) => Err(TargetError::Ambiguous),
-        (false, false) => Err(TargetError::NoLiveTarget {
-            tried: vec![mac_path.clone(), gtk_path.clone()],
+        _ => Err(TargetError::Ambiguous {
+            live: LiveProfiles(live.iter().map(|(kind, _)| *kind).collect()),
         }),
     }
 }
@@ -393,6 +422,10 @@ mod tests {
             classify(None, None, None, Some(" gtk ")),
             Step::Profile(BundleProfileKind::Gtk, TargetOrigin::ProfileEnv)
         );
+        assert_eq!(
+            classify(None, None, None, Some("iced")),
+            Step::Profile(BundleProfileKind::Iced, TargetOrigin::ProfileEnv)
+        );
         // An unrecognized profile is an error, not a fall-through — the
         // user named a target and got it wrong.
         assert_eq!(
@@ -431,20 +464,31 @@ mod tests {
         );
     }
 
-    // On non-macOS the two profiles intentionally share one socket path
-    // (one UI, `app_label` ignored). The auto-detect picker must treat
-    // that as a single gtk target — never as a mac+gtk ambiguity. Calls
+    // On non-macOS the production profiles intentionally share one socket
+    // path while Iced has its own. The auto-detect picker must treat Mac +
+    // GTK as a single GTK candidate — never as a phantom ambiguity. Calls
     // `resolve_auto_detect` directly so the assertion is independent of
     // ambient `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`, which the public
     // `resolve` consults ahead of auto-detect.
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
-    async fn linux_collapses_identical_profile_paths_to_gtk() {
+    async fn linux_collapses_production_paths_but_keeps_iced_candidate() {
         let mac = BundleProfile::mac().expect("mac profile");
         let gtk = BundleProfile::gtk().expect("gtk profile");
+        let iced = BundleProfile::iced().expect("iced profile");
         assert_eq!(
             mac.socket_path, gtk.socket_path,
             "precondition: Linux profiles share one socket path"
+        );
+        assert_ne!(gtk.socket_path, iced.socket_path);
+
+        let candidates = auto_detect_candidates().expect("candidates");
+        assert_eq!(
+            candidates,
+            vec![
+                (BundleProfileKind::Gtk, gtk.socket_path.clone()),
+                (BundleProfileKind::Iced, iced.socket_path),
+            ]
         );
 
         // probe_alive=false skips the dial, so the result is independent
@@ -454,5 +498,46 @@ mod tests {
             .expect("resolve must not be ambiguous when paths collapse");
         assert_eq!(res.kind, Some(BundleProfileKind::Gtk));
         assert_eq!(res.socket_path, gtk.socket_path);
+    }
+
+    #[test]
+    fn chooser_names_every_live_candidate_in_stable_order() {
+        let candidates = vec![
+            (BundleProfileKind::Mac, PathBuf::from("/tmp/mac.sock")),
+            (BundleProfileKind::Gtk, PathBuf::from("/tmp/gtk.sock")),
+            (BundleProfileKind::Iced, PathBuf::from("/tmp/iced.sock")),
+        ];
+        let error = choose_live_candidate(&candidates, &[true, false, true])
+            .expect_err("two live profiles must be ambiguous");
+        match error {
+            TargetError::Ambiguous { live } => {
+                assert_eq!(
+                    live,
+                    LiveProfiles(vec![BundleProfileKind::Mac, BundleProfileKind::Iced])
+                );
+                assert_eq!(live.to_string(), "mac + iced");
+            }
+            other => panic!("expected ambiguity, got {other}"),
+        }
+    }
+
+    #[test]
+    fn chooser_reports_all_tried_paths_when_none_is_live() {
+        let candidates = vec![
+            (BundleProfileKind::Gtk, PathBuf::from("/tmp/gtk.sock")),
+            (BundleProfileKind::Iced, PathBuf::from("/tmp/iced.sock")),
+        ];
+        let error = choose_live_candidate(&candidates, &[false, false])
+            .expect_err("no live profiles must fail");
+        match error {
+            TargetError::NoLiveTarget { tried } => assert_eq!(
+                tried,
+                vec![
+                    PathBuf::from("/tmp/gtk.sock"),
+                    PathBuf::from("/tmp/iced.sock")
+                ]
+            ),
+            other => panic!("expected no-live-target, got {other}"),
+        }
     }
 }
