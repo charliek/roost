@@ -1,8 +1,17 @@
-use iced::widget::canvas;
-use iced::{mouse, Color, Font, Point, Rectangle, Renderer, Size, Theme};
+//! Renderer-neutral Iced terminal widget.
+
+use iced::advanced::text::Renderer as _;
+use iced::advanced::widget::{self, Widget};
+use iced::advanced::{layout, renderer, text, Clipboard, Layout, Renderer as _, Shell};
+#[cfg(test)]
+use iced::event;
+use iced::{
+    mouse, Border, Color, Element, Event, Font, Length, Point, Rectangle, Renderer, Size, Theme,
+};
 use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 pub const CELL_WIDTH: f32 = 8.4;
 pub const CELL_HEIGHT: f32 = 18.0;
@@ -68,7 +77,7 @@ impl TerminalSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct TerminalCanvas {
+pub struct TerminalWidget {
     pub tab_id: i64,
     pub snapshot: TerminalSnapshot,
 }
@@ -91,12 +100,13 @@ pub(crate) struct TerminalPointerEvent {
 }
 
 #[derive(Default)]
-pub(crate) struct TerminalCanvasState {
+pub(crate) struct TerminalWidgetState {
     tab_id: Option<i64>,
     pressed: Option<PointerButton>,
     last_cell: Option<(u32, u32)>,
     was_inside: bool,
     clicks: ClickTracker,
+    last_mouse_interaction: Option<mouse::Interaction>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,16 +146,49 @@ impl ClickTracker {
     }
 }
 
-impl canvas::Program<crate::Message> for TerminalCanvas {
-    type State = TerminalCanvasState;
+#[derive(Debug)]
+struct PointerOutcome {
+    message: Option<crate::Message>,
+    captured: bool,
+}
 
-    fn update(
+impl PointerOutcome {
+    fn publish(message: crate::Message) -> Self {
+        Self {
+            message: Some(message),
+            captured: true,
+        }
+    }
+
+    fn capture() -> Self {
+        Self {
+            message: None,
+            captured: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> (Option<crate::Message>, (), event::Status) {
+        (
+            self.message,
+            (),
+            if self.captured {
+                event::Status::Captured
+            } else {
+                event::Status::Ignored
+            },
+        )
+    }
+}
+
+impl TerminalWidget {
+    fn update_pointer(
         &self,
-        state: &mut Self::State,
-        event: &canvas::Event,
+        state: &mut TerminalWidgetState,
+        event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
-    ) -> Option<canvas::Action<crate::Message>> {
+    ) -> Option<PointerOutcome> {
         if state.tab_id != Some(self.tab_id) {
             state.tab_id = Some(self.tab_id);
             state.pressed = None;
@@ -153,21 +196,18 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
             state.was_inside = false;
             state.clicks.reset();
         }
-        if matches!(event, canvas::Event::Mouse(mouse::Event::CursorLeft)) {
+        if matches!(event, Event::Mouse(mouse::Event::CursorLeft)) {
             if state.was_inside || state.last_cell.is_some() {
                 state.was_inside = false;
                 if state.pressed.is_none() {
                     state.last_cell = None;
                 }
                 state.clicks.reset();
-                return Some(
-                    canvas::Action::publish(crate::Message::TerminalPointer(
-                        TerminalPointer::Leave {
-                            tab_id: self.tab_id,
-                        },
-                    ))
-                    .and_capture(),
-                );
+                return Some(PointerOutcome::publish(crate::Message::TerminalPointer(
+                    TerminalPointer::Leave {
+                        tab_id: self.tab_id,
+                    },
+                )));
             }
             return None;
         }
@@ -176,25 +216,22 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
         // tracking without the original button's release. Consume the
         // secondary button pair locally and keep motion attributed to the
         // initiating button.
-        if state.pressed.is_some()
-            && matches!(event, canvas::Event::Mouse(mouse::Event::ButtonPressed(_)))
+        if state.pressed.is_some() && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
         {
             state.clicks.reset();
-            return Some(canvas::Action::capture());
+            return Some(PointerOutcome::capture());
         }
-        if let canvas::Event::Mouse(mouse::Event::ButtonReleased(native_button)) = event {
+        if let Event::Mouse(mouse::Event::ButtonReleased(native_button)) = event {
             if let Some(owner) = state.pressed {
                 if mouse_button(*native_button) != Some(owner) {
-                    return Some(canvas::Action::capture());
+                    return Some(PointerOutcome::capture());
                 }
             }
         }
         let captured_gesture = state.pressed.is_some()
             && matches!(
                 event,
-                canvas::Event::Mouse(
-                    mouse::Event::ButtonReleased(_) | mouse::Event::CursorMoved { .. }
-                )
+                Event::Mouse(mouse::Event::ButtonReleased(_) | mouse::Event::CursorMoved { .. })
             );
         let point = cursor.position_from(Point::new(bounds.x, bounds.y));
         let cell = point.and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows));
@@ -204,16 +241,13 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                 state.was_inside = false;
                 state.last_cell = None;
                 state.clicks.reset();
-                return Some(
-                    canvas::Action::publish(crate::Message::TerminalPointer(
-                        TerminalPointer::Leave {
-                            tab_id: self.tab_id,
-                        },
-                    ))
-                    .and_capture(),
-                );
+                return Some(PointerOutcome::publish(crate::Message::TerminalPointer(
+                    TerminalPointer::Leave {
+                        tab_id: self.tab_id,
+                    },
+                )));
             }
-            if matches!(event, canvas::Event::Mouse(mouse::Event::ButtonPressed(_))) {
+            if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
                 state.clicks.reset();
             }
             return None;
@@ -232,7 +266,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
         state.was_inside = inside;
         state.last_cell = inside.then_some(cell).or(state.last_cell);
         let pointer = match event {
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let Some(button) = mouse_button(*button) else {
                     state.clicks.reset();
                     return None;
@@ -256,7 +290,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                     inside,
                 })
             }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(button)) => {
+            Event::Mouse(mouse::Event::ButtonReleased(button)) => {
                 let button = mouse_button(*button)?;
                 if state.pressed == Some(button) {
                     state.pressed = None;
@@ -274,7 +308,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                     inside,
                 })
             }
-            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 TerminalPointer::Event(TerminalPointerEvent {
                     tab_id: self.tab_id,
                     action: PointerAction::Motion,
@@ -285,7 +319,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                     inside,
                 })
             }
-            canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 state.clicks.reset();
                 let vertical = match delta {
                     mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {
@@ -311,12 +345,13 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
             }
             _ => return None,
         };
-        Some(canvas::Action::publish(crate::Message::TerminalPointer(pointer)).and_capture())
+        Some(PointerOutcome::publish(crate::Message::TerminalPointer(
+            pointer,
+        )))
     }
 
-    fn mouse_interaction(
+    fn pointer_interaction_at(
         &self,
-        _state: &Self::State,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
@@ -331,120 +366,252 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
         }
         pointer_interaction(self.snapshot.pointer_shape.as_str())
     }
+}
+
+impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
+    fn tag(&self) -> widget::tree::Tag {
+        widget::tree::Tag::of::<TerminalWidgetState>()
+    }
+
+    fn state(&self) -> widget::tree::State {
+        widget::tree::State::new(TerminalWidgetState::default())
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut widget::Tree,
+        _renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut widget::Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        _clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, crate::Message>,
+        viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<TerminalWidgetState>();
+        if let Some(outcome) = self.update_pointer(state, event, layout.bounds(), cursor) {
+            if let Some(message) = outcome.message {
+                shell.publish(message);
+            }
+            if outcome.captured {
+                shell.capture_event();
+            }
+        }
+
+        let interaction = self.pointer_interaction_at(layout.bounds(), cursor);
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) {
+            state.last_mouse_interaction = Some(interaction);
+        } else if state
+            .last_mouse_interaction
+            .is_some_and(|previous| previous != interaction)
+        {
+            shell.request_redraw();
+        }
+
+        let _ = (renderer, viewport);
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &widget::Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.pointer_interaction_at(layout.bounds(), cursor)
+    }
 
     fn draw(
         &self,
-        _state: &Self::State,
-        renderer: &Renderer,
+        _tree: &widget::Tree,
+        renderer: &mut Renderer,
         _theme: &Theme,
-        bounds: Rectangle,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
         _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        frame.fill_rectangle(
-            Point::ORIGIN,
-            bounds.size(),
-            color(self.snapshot.background),
-        );
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
 
-        for cell in &self.snapshot.cells {
-            let position = cell_position(cell.col, cell.row);
-            if cell.explicit_background {
-                frame.fill_rectangle(
-                    position,
-                    Size::new(CELL_WIDTH.ceil(), CELL_HEIGHT.ceil()),
-                    color(cell.background),
+        renderer.with_layer(clip, |renderer| {
+            fill_quad(renderer, bounds, color(self.snapshot.background));
+
+            for cell in &self.snapshot.cells {
+                let position = cell_position(bounds.position(), cell.col, cell.row);
+                if cell.explicit_background {
+                    fill_quad(
+                        renderer,
+                        // Preserve the Canvas path's one-pixel overdraw. The
+                        // logical grid is fractional (8.4 pt), and adjacent
+                        // antialiased quads can otherwise expose hairlines of
+                        // the default background under tiny-skia.
+                        Rectangle::new(position, Size::new(CELL_WIDTH.ceil(), CELL_HEIGHT.ceil())),
+                        color(cell.background),
+                    );
+                }
+                if !cell.text.is_empty() && cell.text != " " {
+                    let font = Font {
+                        family: if UnicodeWidthStr::width(cell.text.as_str()) > 1 {
+                            // Cosmic Text's generic monospace family does not
+                            // discover every platform fallback (notably CJK on
+                            // macOS). Each render cell already owns its fixed
+                            // terminal advance, so wide clusters can use the
+                            // system fallback chain across their allotted cells
+                            // without changing the grid. Single-cell Unicode
+                            // (including combining clusters, Greek, and box
+                            // drawing) retains the monospace family.
+                            iced::font::Family::SansSerif
+                        } else {
+                            iced::font::Family::Monospace
+                        },
+                        weight: if cell.bold {
+                            iced::font::Weight::Bold
+                        } else {
+                            iced::font::Weight::Normal
+                        },
+                        style: if cell.italic {
+                            iced::font::Style::Italic
+                        } else {
+                            iced::font::Style::Normal
+                        },
+                        ..Font::DEFAULT
+                    };
+                    renderer.fill_text(
+                        text::Text {
+                            content: cell.text.clone(),
+                            bounds: Size::new(f32::INFINITY, CELL_HEIGHT),
+                            size: iced::Pixels(13.5),
+                            line_height: text::LineHeight::Relative(1.2),
+                            font,
+                            align_x: text::Alignment::Default,
+                            align_y: iced::alignment::Vertical::Top,
+                            shaping: text::Shaping::Auto,
+                            wrapping: text::Wrapping::None,
+                        },
+                        Point::new(position.x, position.y + 1.0),
+                        color(cell.foreground),
+                        clip,
+                    );
+                }
+            }
+
+            for span in &self.snapshot.selection_spans {
+                fill_quad(
+                    renderer,
+                    Rectangle::new(
+                        cell_position(bounds.position(), span.col0, u32::from(span.row)),
+                        Size::new(
+                            f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
+                            CELL_HEIGHT,
+                        ),
+                    ),
+                    Color {
+                        a: 0.35,
+                        ..color(self.snapshot.selection_background)
+                    },
                 );
             }
-            if !cell.text.is_empty() && cell.text != " " {
-                let font = Font {
-                    weight: if cell.bold {
-                        iced::font::Weight::Bold
-                    } else {
-                        iced::font::Weight::Normal
-                    },
-                    style: if cell.italic {
-                        iced::font::Style::Italic
-                    } else {
-                        iced::font::Style::Normal
-                    },
-                    ..Font::MONOSPACE
-                };
-                frame.fill_text(canvas::Text {
-                    content: cell.text.clone(),
-                    position: Point::new(position.x, position.y + 1.0),
-                    color: color(cell.foreground),
-                    size: iced::Pixels(13.5),
-                    font,
-                    ..canvas::Text::default()
-                });
+
+            if let Some(span) = self.snapshot.link_hover {
+                let point = cell_position(bounds.position(), span.col0, u32::from(span.row));
+                fill_quad(
+                    renderer,
+                    Rectangle::new(
+                        Point::new(point.x, point.y + CELL_HEIGHT - 1.0),
+                        Size::new(
+                            f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
+                            1.0,
+                        ),
+                    ),
+                    color(self.snapshot.foreground),
+                );
             }
-        }
 
-        for span in &self.snapshot.selection_spans {
-            frame.fill_rectangle(
-                cell_position(span.col0, u32::from(span.row)),
-                Size::new(
-                    f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
-                    CELL_HEIGHT,
-                ),
-                Color {
-                    a: 0.35,
-                    ..color(self.snapshot.selection_background)
-                },
-            );
-        }
-
-        if let Some(span) = self.snapshot.link_hover {
-            let point = cell_position(span.col0, u32::from(span.row));
-            frame.fill_rectangle(
-                Point::new(point.x, point.y + CELL_HEIGHT - 1.0),
-                Size::new(
-                    f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
-                    1.0,
-                ),
-                color(self.snapshot.foreground),
-            );
-        }
-
-        if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
-            let point = cell_position(cursor.col as u16, cursor.row);
-            let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
-            match cursor.visual_style {
-                CursorVisualStyle::Block => frame.fill_rectangle(
-                    point,
-                    Size::new(CELL_WIDTH, CELL_HEIGHT),
-                    Color {
-                        a: 0.55,
-                        ..cursor_color
-                    },
-                ),
-                CursorVisualStyle::BlockHollow => frame.stroke_rectangle(
-                    point,
-                    Size::new(CELL_WIDTH, CELL_HEIGHT),
-                    canvas::Stroke::default()
-                        .with_color(cursor_color)
-                        .with_width(1.0),
-                ),
-                CursorVisualStyle::Bar => {
-                    frame.fill_rectangle(point, Size::new(1.5, CELL_HEIGHT), cursor_color)
+            if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
+                let point = cell_position(bounds.position(), cursor.col as u16, cursor.row);
+                let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
+                match cursor.visual_style {
+                    CursorVisualStyle::Block => fill_quad(
+                        renderer,
+                        Rectangle::new(point, Size::new(CELL_WIDTH, CELL_HEIGHT)),
+                        Color {
+                            a: 0.55,
+                            ..cursor_color
+                        },
+                    ),
+                    CursorVisualStyle::BlockHollow => renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle::new(point, Size::new(CELL_WIDTH, CELL_HEIGHT)),
+                            border: Border {
+                                color: cursor_color,
+                                width: 1.0,
+                                ..Border::default()
+                            },
+                            snap: false,
+                            ..renderer::Quad::default()
+                        },
+                        Color::TRANSPARENT,
+                    ),
+                    CursorVisualStyle::Bar => fill_quad(
+                        renderer,
+                        Rectangle::new(point, Size::new(1.5, CELL_HEIGHT)),
+                        cursor_color,
+                    ),
+                    CursorVisualStyle::Underline => fill_quad(
+                        renderer,
+                        Rectangle::new(
+                            Point::new(point.x, point.y + CELL_HEIGHT - 2.0),
+                            Size::new(CELL_WIDTH, 2.0),
+                        ),
+                        cursor_color,
+                    ),
                 }
-                CursorVisualStyle::Underline => frame.fill_rectangle(
-                    Point::new(point.x, point.y + CELL_HEIGHT - 2.0),
-                    Size::new(CELL_WIDTH, 2.0),
-                    cursor_color,
-                ),
             }
-        }
-
-        vec![frame.into_geometry()]
+        });
     }
 }
 
-fn cell_position(col: u16, row: u32) -> Point {
+impl From<TerminalWidget> for Element<'_, crate::Message> {
+    fn from(widget: TerminalWidget) -> Self {
+        Self::new(widget)
+    }
+}
+
+fn fill_quad(renderer: &mut Renderer, bounds: Rectangle, background: Color) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            snap: false,
+            ..renderer::Quad::default()
+        },
+        background,
+    );
+}
+
+fn cell_position(origin: Point, col: u16, row: u32) -> Point {
     Point::new(
-        TERMINAL_PADDING + f32::from(col) * CELL_WIDTH,
-        TERMINAL_PADDING + row as f32 * CELL_HEIGHT,
+        origin.x + TERMINAL_PADDING + f32::from(col) * CELL_WIDTH,
+        origin.y + TERMINAL_PADDING + row as f32 * CELL_HEIGHT,
     )
 }
 
@@ -529,7 +696,15 @@ mod tests {
     }
 
     #[test]
-    fn canvas_coordinates_map_to_terminal_cells() {
+    fn widget_coordinates_map_to_terminal_cells_from_a_nonzero_origin() {
+        let origin = Point::new(220.0, 44.0);
+        assert_eq!(
+            cell_position(origin, 5, 3),
+            Point::new(
+                origin.x + TERMINAL_PADDING + 5.0 * CELL_WIDTH,
+                origin.y + TERMINAL_PADDING + 3.0 * CELL_HEIGHT,
+            )
+        );
         assert_eq!(
             cell_at(
                 Point::new(
@@ -549,28 +724,68 @@ mod tests {
     }
 
     #[test]
+    fn non_pointer_events_are_ignored_and_a_new_tab_resets_gesture_state() {
+        let widget = TerminalWidget {
+            tab_id: 22,
+            snapshot: TerminalSnapshot::blank(80, 24),
+        };
+        let mut state = TerminalWidgetState {
+            tab_id: Some(21),
+            pressed: Some(PointerButton::Left),
+            last_cell: Some((7, 4)),
+            was_inside: true,
+            clicks: ClickTracker {
+                sequence: Some(ClickSequence {
+                    tab_id: 21,
+                    cell: (7, 4),
+                    at: Instant::now(),
+                    count: 2,
+                }),
+            },
+            last_mouse_interaction: Some(mouse::Interaction::Pointer),
+        };
+        let bounds = Rectangle::new(Point::new(220.0, 44.0), Size::new(800.0, 600.0));
+
+        let outcome = widget.update_pointer(
+            &mut state,
+            &Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            bounds,
+            mouse::Cursor::Unavailable,
+        );
+
+        assert!(outcome.is_none(), "keyboard input must remain uncaptured");
+        assert_eq!(state.tab_id, Some(22));
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.last_cell, None);
+        assert!(!state.was_inside);
+        assert!(state.clicks.sequence.is_none());
+    }
+
+    #[test]
     fn native_press_state_is_carried_into_drag_motion() {
-        let program = TerminalCanvas {
+        let program = TerminalWidget {
             tab_id: 42,
             snapshot: TerminalSnapshot::blank(80, 24),
         };
-        let mut state = TerminalCanvasState::default();
+        let mut state = TerminalWidgetState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let cursor = mouse::Cursor::Available(Point::new(
             TERMINAL_PADDING + 5.5 * CELL_WIDTH,
             TERMINAL_PADDING + 3.5 * CELL_HEIGHT,
         ));
-        let press = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            bounds,
-            cursor,
-        )
-        .expect("press action")
-        .into_inner()
-        .0
-        .expect("press message");
+        let press = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                bounds,
+                cursor,
+            )
+            .expect("press action")
+            .into_inner()
+            .0
+            .expect("press message");
         let crate::Message::TerminalPointer(TerminalPointer::Event(TerminalPointerEvent {
             tab_id,
             action,
@@ -588,19 +803,19 @@ mod tests {
         assert_eq!(button, Some(PointerButton::Left));
         assert_eq!((col, row, click_count, inside), (5, 3, 1, true));
 
-        let motion = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: Point::new(1.0, 1.0),
-            }),
-            bounds,
-            cursor,
-        )
-        .expect("motion action")
-        .into_inner()
-        .0
-        .expect("motion message");
+        let motion = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(1.0, 1.0),
+                }),
+                bounds,
+                cursor,
+            )
+            .expect("motion action")
+            .into_inner()
+            .0
+            .expect("motion message");
         let crate::Message::TerminalPointer(TerminalPointer::Event(TerminalPointerEvent {
             action,
             button,
@@ -615,19 +830,19 @@ mod tests {
         assert!(inside);
 
         let outside = mouse::Cursor::Available(Point::new(-20.0, 900.0));
-        let outside_motion = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: Point::new(-20.0, 900.0),
-            }),
-            bounds,
-            outside,
-        )
-        .expect("outside motion action")
-        .into_inner()
-        .0
-        .expect("outside motion message");
+        let outside_motion = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(-20.0, 900.0),
+                }),
+                bounds,
+                outside,
+            )
+            .expect("outside motion action")
+            .into_inner()
+            .0
+            .expect("outside motion message");
         assert!(matches!(
             outside_motion,
             crate::Message::TerminalPointer(TerminalPointer::Event(TerminalPointerEvent {
@@ -638,17 +853,17 @@ mod tests {
                 ..
             }))
         ));
-        let release = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            bounds,
-            outside,
-        )
-        .expect("release action")
-        .into_inner()
-        .0
-        .expect("release message");
+        let release = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                bounds,
+                outside,
+            )
+            .expect("release action")
+            .into_inner()
+            .0
+            .expect("release message");
         let crate::Message::TerminalPointer(TerminalPointer::Event(TerminalPointerEvent {
             action,
             col,
@@ -666,64 +881,65 @@ mod tests {
 
     #[test]
     fn chorded_button_cannot_steal_the_captured_gesture() {
-        let program = TerminalCanvas {
+        let program = TerminalWidget {
             tab_id: 42,
             snapshot: TerminalSnapshot::blank(80, 24),
         };
-        let mut state = TerminalCanvasState::default();
+        let mut state = TerminalWidgetState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let cursor = mouse::Cursor::Available(Point::new(
             TERMINAL_PADDING + 5.5 * CELL_WIDTH,
             TERMINAL_PADDING + 3.5 * CELL_HEIGHT,
         ));
-        let left_press = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            bounds,
-            cursor,
-        )
-        .expect("left press action")
-        .into_inner();
+        let left_press = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                bounds,
+                cursor,
+            )
+            .expect("left press action")
+            .into_inner();
         assert!(left_press.0.is_some());
         assert_eq!(state.pressed, Some(PointerButton::Left));
 
-        let right_press = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
-            bounds,
-            cursor,
-        )
-        .expect("chorded press is captured")
-        .into_inner();
+        let right_press = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                bounds,
+                cursor,
+            )
+            .expect("chorded press is captured")
+            .into_inner();
         assert!(right_press.0.is_none());
+        assert_eq!(right_press.2, event::Status::Captured);
         assert_eq!(state.pressed, Some(PointerButton::Left));
 
-        let right_release = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
-            bounds,
-            cursor,
-        )
-        .expect("chorded release is captured")
-        .into_inner();
+        let right_release = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                bounds,
+                cursor,
+            )
+            .expect("chorded release is captured")
+            .into_inner();
         assert!(right_release.0.is_none());
         assert_eq!(state.pressed, Some(PointerButton::Left));
 
-        let motion = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: cursor.position().expect("available cursor"),
-            }),
-            bounds,
-            cursor,
-        )
-        .expect("captured motion")
-        .into_inner()
-        .0;
+        let motion = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: cursor.position().expect("available cursor"),
+                }),
+                bounds,
+                cursor,
+            )
+            .expect("captured motion")
+            .into_inner()
+            .0;
         assert!(matches!(
             motion,
             Some(crate::Message::TerminalPointer(TerminalPointer::Event(
@@ -735,16 +951,16 @@ mod tests {
             )))
         ));
 
-        let left_release = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            bounds,
-            cursor,
-        )
-        .expect("owner release")
-        .into_inner()
-        .0;
+        let left_release = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                bounds,
+                cursor,
+            )
+            .expect("owner release")
+            .into_inner()
+            .0;
         assert!(matches!(
             left_release,
             Some(crate::Message::TerminalPointer(TerminalPointer::Event(
@@ -802,74 +1018,74 @@ mod tests {
 
     #[test]
     fn passive_move_out_publishes_one_leave() {
-        let program = TerminalCanvas {
+        let program = TerminalWidget {
             tab_id: 9,
             snapshot: TerminalSnapshot::blank(80, 24),
         };
-        let mut state = TerminalCanvasState {
+        let mut state = TerminalWidgetState {
             tab_id: Some(9),
             was_inside: true,
             last_cell: Some((3, 2)),
-            ..TerminalCanvasState::default()
+            ..TerminalWidgetState::default()
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let outside = mouse::Cursor::Available(Point::new(-10.0, 40.0));
-        let action = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: Point::new(-10.0, 40.0),
-            }),
-            bounds,
-            outside,
-        )
-        .expect("leave action")
-        .into_inner()
-        .0;
+        let action = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(-10.0, 40.0),
+                }),
+                bounds,
+                outside,
+            )
+            .expect("leave action")
+            .into_inner()
+            .0;
         assert!(matches!(
             action,
             Some(crate::Message::TerminalPointer(TerminalPointer::Leave {
                 tab_id: 9
             }))
         ));
-        assert!(<TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut state,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: Point::new(-20.0, 50.0),
-            }),
-            bounds,
-            outside,
-        )
-        .is_none());
+        assert!(program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(-20.0, 50.0),
+                }),
+                bounds,
+                outside,
+            )
+            .is_none());
     }
 
     #[test]
-    fn canvas_padding_is_leave_for_hover_and_clamped_for_capture() {
-        let program = TerminalCanvas {
+    fn widget_padding_is_leave_for_hover_and_clamped_for_capture() {
+        let program = TerminalWidget {
             tab_id: 10,
             snapshot: TerminalSnapshot::blank(80, 24),
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let padding = mouse::Cursor::Available(Point::new(790.0, 590.0));
-        let mut passive = TerminalCanvasState {
+        let mut passive = TerminalWidgetState {
             tab_id: Some(10),
             was_inside: true,
             last_cell: Some((5, 3)),
-            ..TerminalCanvasState::default()
+            ..TerminalWidgetState::default()
         };
-        let leave = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut passive,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: Point::new(790.0, 590.0),
-            }),
-            bounds,
-            padding,
-        )
-        .expect("padding leave")
-        .into_inner()
-        .0;
+        let leave = program
+            .update_pointer(
+                &mut passive,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(790.0, 590.0),
+                }),
+                bounds,
+                padding,
+            )
+            .expect("padding leave")
+            .into_inner()
+            .0;
         assert!(matches!(
             leave,
             Some(crate::Message::TerminalPointer(TerminalPointer::Leave {
@@ -878,25 +1094,25 @@ mod tests {
         ));
         assert_eq!(passive.last_cell, None);
 
-        let mut captured = TerminalCanvasState {
+        let mut captured = TerminalWidgetState {
             tab_id: Some(10),
             pressed: Some(PointerButton::Left),
             was_inside: true,
             last_cell: Some((5, 3)),
-            ..TerminalCanvasState::default()
+            ..TerminalWidgetState::default()
         };
-        let motion = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
-            &mut captured,
-            &canvas::Event::Mouse(mouse::Event::CursorMoved {
-                position: Point::new(790.0, 590.0),
-            }),
-            bounds,
-            padding,
-        )
-        .expect("captured padding motion")
-        .into_inner()
-        .0;
+        let motion = program
+            .update_pointer(
+                &mut captured,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(790.0, 590.0),
+                }),
+                bounds,
+                padding,
+            )
+            .expect("captured padding motion")
+            .into_inner()
+            .0;
         assert!(matches!(
             motion,
             Some(crate::Message::TerminalPointer(TerminalPointer::Event(
@@ -913,12 +1129,12 @@ mod tests {
 
     #[test]
     fn wheel_resets_the_native_click_sequence() {
-        let program = TerminalCanvas {
+        let program = TerminalWidget {
             tab_id: 11,
             snapshot: TerminalSnapshot::blank(80, 24),
         };
         let start = Instant::now();
-        let mut state = TerminalCanvasState {
+        let mut state = TerminalWidgetState {
             tab_id: Some(11),
             clicks: ClickTracker {
                 sequence: Some(ClickSequence {
@@ -928,17 +1144,16 @@ mod tests {
                     count: 1,
                 }),
             },
-            ..TerminalCanvasState::default()
+            ..TerminalWidgetState::default()
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let cursor = mouse::Cursor::Available(Point::new(
             TERMINAL_PADDING + 4.5 * CELL_WIDTH,
             TERMINAL_PADDING + 2.5 * CELL_HEIGHT,
         ));
-        let _ = <TerminalCanvas as canvas::Program<crate::Message>>::update(
-            &program,
+        let _ = program.update_pointer(
             &mut state,
-            &canvas::Event::Mouse(mouse::Event::WheelScrolled {
+            &Event::Mouse(mouse::Event::WheelScrolled {
                 delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
             }),
             bounds,
@@ -948,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn link_interaction_is_confined_to_canvas_bounds() {
+    fn link_interaction_is_confined_to_widget_bounds() {
         let mut snapshot = TerminalSnapshot::blank(80, 24);
         snapshot.link_hover = Some(SelectionSpan {
             row: 0,
@@ -956,37 +1171,26 @@ mod tests {
             col1: 4,
         });
         snapshot.pointer_shape = "pointer".into();
-        let program = TerminalCanvas {
+        let program = TerminalWidget {
             tab_id: 1,
             snapshot,
         };
-        let state = TerminalCanvasState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         assert_eq!(
-            <TerminalCanvas as canvas::Program<crate::Message>>::mouse_interaction(
-                &program,
-                &state,
-                bounds,
-                mouse::Cursor::Available(Point::new(20.0, 20.0)),
-            ),
+            program
+                .pointer_interaction_at(bounds, mouse::Cursor::Available(Point::new(20.0, 20.0)),),
             mouse::Interaction::Pointer
         );
         assert_eq!(
-            <TerminalCanvas as canvas::Program<crate::Message>>::mouse_interaction(
-                &program,
-                &state,
+            program.pointer_interaction_at(
                 bounds,
                 mouse::Cursor::Available(Point::new(790.0, 590.0)),
             ),
             mouse::Interaction::default()
         );
         assert_eq!(
-            <TerminalCanvas as canvas::Program<crate::Message>>::mouse_interaction(
-                &program,
-                &state,
-                bounds,
-                mouse::Cursor::Available(Point::new(900.0, 20.0)),
-            ),
+            program
+                .pointer_interaction_at(bounds, mouse::Cursor::Available(Point::new(900.0, 20.0)),),
             mouse::Interaction::default()
         );
         assert_eq!(

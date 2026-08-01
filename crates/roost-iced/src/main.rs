@@ -2,7 +2,7 @@ mod app;
 mod input;
 mod palette_scroll;
 mod screenshot;
-mod terminal_canvas;
+mod terminal_widget;
 mod url_launcher;
 
 use std::fs::OpenOptions;
@@ -37,7 +37,7 @@ enum Message {
     ClipboardWriteCompleted(u64),
     UrlOpenCompleted(Result<(), String>),
     Keyboard(keyboard::Event),
-    TerminalPointer(terminal_canvas::TerminalPointer),
+    TerminalPointer(terminal_widget::TerminalPointer),
     ProjectSelected(i64),
     AgentSelected(i64),
     TabSelected(i64),
@@ -118,8 +118,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::TerminalPointer(event) => match event {
-            terminal_canvas::TerminalPointer::Event(event) => app.pointer(event).map_task(),
-            terminal_canvas::TerminalPointer::Leave { tab_id } => {
+            terminal_widget::TerminalPointer::Event(event) => app.pointer(event).map_task(),
+            terminal_widget::TerminalPointer::Leave { tab_id } => {
                 app.pointer_leave(tab_id);
                 Task::none()
             }

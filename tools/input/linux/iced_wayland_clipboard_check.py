@@ -160,6 +160,22 @@ def _capture_contains(client, tab: int, expected: bytes) -> bool:
     return expected in client.tab_capture_pty_input(tab, drain=True)
 
 
+def _wait_for_selection(client, tab: int, expected: str, description: str) -> None:
+    observed: dict[str, object] = {}
+
+    def matches() -> bool:
+        nonlocal observed
+        observed = client.selection_dump(tab)
+        return observed.get("text") == expected
+
+    try:
+        _wait_until(matches, description)
+    except AssertionError as error:
+        raise AssertionError(
+            f"{error}; expected {expected!r}, last selection {observed!r}"
+        ) from error
+
+
 def main() -> int:
     if not ICED_BIN.is_file():
         _skip(f"Iced binary not found: {ICED_BIN}")
@@ -220,11 +236,21 @@ def main() -> int:
         tab = int(client.identify()["active_tab_id"])
         _wait_until(lambda: bool(client.dump(tab)), "live Iced terminal")
         metrics = client.window_metrics()
-        width = int(metrics.get("window_width") or 0)
-        height = int(metrics.get("window_height") or 0)
+        logical_width = int(metrics.get("window_width") or 0)
+        logical_height = int(metrics.get("window_height") or 0)
         sidebar = int(metrics.get("sidebar_width") or 220)
-        if not width or not height:
+        if not logical_width or not logical_height:
             _skip(f"window_metrics returned invalid size: {metrics!r}")
+        # The virtual absolute device is normalized against the compositor
+        # output, not the client's logical/decorated window extent. Cage's
+        # headless output can be wider than `window_metrics` (for example,
+        # 2048 output pixels for a 1920-wide client); using the client extent
+        # shifts every injected point proportionally. A scale-1 product
+        # capture reports the renderer/output extent we must advertise to
+        # uinput while the target coordinates remain logical layout points.
+        _png, width, height = client.screenshot(scale=1)
+        if not width or not height:
+            _skip(f"screenshot returned invalid output size: {(width, height)!r}")
 
         explicit = f"wayland-copy-{uuid.uuid4().hex[:8]}"
         _set_row(client, tab, explicit)
@@ -245,9 +271,8 @@ def main() -> int:
         x1 = sidebar + 12 + int((len(dragged) - 0.5) * 8.4)
         y = 44 + 12 + 9
         _inject_drag(width, height, x0, y, x1)
-        _wait_until(
-            lambda: client.selection_dump(tab).get("text") == dragged,
-            "real-seat Wayland drag selection",
+        _wait_for_selection(
+            client, tab, dragged, "real-seat Wayland drag selection"
         )
         _inject_key("ALT", "V")
         _wait_until(

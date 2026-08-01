@@ -263,34 +263,50 @@ backends. Sources consulted:
 - <https://docs.rs/iced/0.14.0/iced/window/fn.screenshot.html>
 - <https://docs.rs/crate/iced/0.14.0/features>
 
-The POC enables `canvas`, `wgpu`, `tiny-skia`, `x11`, and `wayland`. Production
-default is Iced's `Best`: wgpu on Metal/Vulkan when available, with tiny-skia as
-the software fallback. CI runs an explicit software lane via
+The POC enables `wgpu`, `tiny-skia`, `x11`, and `wayland`. Production default is
+Iced's `Best`: wgpu on Metal/Vulkan when available, with tiny-skia as the
+software fallback. CI runs an explicit software lane via
 `ICED_BACKEND=tiny-skia` to remove GPU-driver nondeterminism, plus at least one
 wgpu smoke where the runner supports it.
 
-The terminal is an Iced `Canvas` program, not thousands of text widgets. On
-each redraw it snapshots the active `roost-vt::RenderState`, resolves theme and
-cell colors, clips to the terminal bounds, fills backgrounds, draws glyph
-clusters at measured cell origins, applies supported bold/italic/underline
-styles, draws selection, then draws the cursor. The terminal handle and render
-walk stay on Iced's update/draw thread. PTY readers emit owned byte messages;
-the UI applies `vt_write` and schedules redraw.
+The walking skeleton initially used an Iced `Canvas` program. Cross-renderer
+product and external-compositor captures exposed the released tiny-skia canvas
+translation defect tracked by [iced#3243](https://github.com/iced-rs/iced/issues/3243):
+a canvas below Roost's 220 pt sidebar and 44 pt tab band was rendered at
+`(440, 88)` instead of `(220, 44)`. The official fix
+([iced commit `76b32d4`](https://github.com/iced-rs/iced/commit/76b32d4906c0023ade37192a16570f9eb100e2b6))
+landed after 0.14.0, which is still the latest released Iced version. The POC
+therefore exercised its documented rollback instead of adopting an unpinned
+Git dependency or vendoring a renderer patch.
+
+The terminal is now one renderer-neutral custom Iced widget that emits core
+text and quad primitives directly, not thousands of text widgets. It draws in
+absolute `layout.bounds()` coordinates, clips every primitive to the widget
+and viewport intersection, and deliberately disables pixel snapping for the
+fractional 8.4 pt cell grid. On each redraw it snapshots the active
+`roost-vt::RenderState`, resolves theme and cell colors, fills backgrounds,
+draws unwrapped shaped glyph clusters at measured cell origins, applies
+supported bold/italic styles, draws selection and link affordances, then draws
+the cursor. Its persistent widget state owns pointer capture, hover cells, and
+multi-click sequencing; unrelated keyboard/window events remain ignored so
+the application keyboard subscription still reaches the PTY. The terminal
+handle and render walk stay on Iced's update/draw thread. PTY readers emit
+owned byte messages; the UI applies `vt_write` and schedules redraw.
 
 The walking skeleton must prove:
 
-- canvas glyph metrics are stable for ASCII, wide, and combined characters;
+- widget glyph metrics are stable for ASCII, wide, and combined characters;
 - foreground/background/inverse/style resolution matches GTK;
 - cursor shapes and clipping work in both backends;
 - resize quantizes pixels to rows/columns and resizes both VT and PTY;
 - window screenshots return RGBA bytes that can be encoded as PNG for IPC; and
-- keyboard subscriptions and canvas pointer events cover terminal input,
+- keyboard subscriptions and widget pointer events cover terminal input,
   shortcuts, selection, wheel/scrollback, hyperlinks, and mouse reporting.
 
-If canvas text cannot maintain cell alignment for required grapheme cases, the
-rollback is a small custom Iced widget that emits backend text/quad primitives;
-the engine and third-target work remain valid. A renderer failure does not
-justify depending on GTK or copying its workspace core.
+The custom widget is the exercised renderer rollback. A renderer failure does
+not justify depending on GTK or copying its workspace core. A future released
+Iced version may permit reconsidering Canvas, but only after the same product
+capture and focused origin/clipping tests pass under both backends.
 
 ## Third target, profiles, and paths
 
@@ -1425,10 +1441,25 @@ ownership, exited-child PID reuse, changed live ownership, a held replacement
 lock, and a replacement server. The final independent review found one
 additional chorded-button capture bug and one stale URL-offset comment.
 Secondary presses/releases are now consumed without replacing the initiating
-drag/tracking owner, with a focused Canvas regression, and the URL contract now
+drag/tracking owner, with a focused terminal-pointer regression, and the URL contract now
 names Unicode-scalar offsets plus cell-aware projection. The hardened cleanup
 itself had no further actionable ownership finding after its documented local
 audit, unit coverage, and live functional cleanup proofs.
+
+### Renderer-correctness slice result (2026-08-01)
+
+The released-Canvas rollback is exercised and validated. The focused terminal
+widget suite passes on macOS with wgpu and tiny-skia and in the Linux shed with
+both renderers under X11 and headless Wayland. It checks a distinctive explicit
+cell background at the non-zero `(220, 44)` origin, the `(0, 44)` collapsed
+origin, the base background at the widget origin and far edges, and
+shape-independent ASCII signal, CJK fallback across the second logical cell,
+and a combining-mark ascent relative to the adjacent plain glyph. A separate Xvfb root
+capture of the live tiny-skia window agrees with the in-product capture: the
+terminal begins at the sidebar edge instead of the historical doubled origin.
+Existing PTY, resize, device-reply, screenshot scaling, and queued-client tests
+pass in the same lanes. This is a focused correctness gate in the existing
+renderer matrix, not a long-running visual-parity CI suite.
 
 ### Next phase: measured UI polish and parity convergence
 
@@ -1488,7 +1519,7 @@ accepted as toolkit-native.
 | Mechanical extraction changes GTK behavior | move code/tests first, preserve concrete API, types, and event order before layering the new facade; run full GTK suite | revert the extraction commit before Iced consumes it |
 | Workspace lock emits callbacks or persistence reorders writes | non-blocking event enqueue under lock; callbacks/UI/persistence after unlock; revision tests | retain current sender/sequence design |
 | Slow UI diverges | revisioned events plus mandatory full snapshot resync | fall back to resync on every ambiguous transition |
-| Iced canvas text misaligns graphemes | fixture screenshots and measured cells in both backends | custom primitive widget behind same adapter |
+| Iced terminal text misaligns graphemes | fixture screenshots and measured cells in both backends | retain the custom primitive widget and adjust its renderer-neutral shaping/metrics |
 | Iced 2x capture on a native 1x display has no public arbitrary-scale render target | normalize the public renderer capture to the required dimensions; pixel/geometry gates run at 1x and smoke artifacts validate 2x | accept nearest-neighbor 2x enlargement for this POC, while Retina captures retain native 2x detail |
 | GPU unavailable in CI or older Linux | tiny-skia deterministic lane and wgpu smoke | make software backend CI default, keep runtime selection |
 | X11/Wayland behavior differs | explicit lanes and shed runs, no implicit backend | document a narrowly scoped renderer limitation only with evidence |

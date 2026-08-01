@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
-use iced::widget::{button, canvas, column, container, row, scrollable, stack, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, stack, text, text_input};
 use iced::{window, Alignment, Color, Element, Fill, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
@@ -40,8 +40,8 @@ use roost_vt::{
 
 use crate::input;
 use crate::palette_scroll::Visibility;
-use crate::terminal_canvas::{
-    resolve_colors, DrawCell, TerminalCanvas, TerminalPointerEvent, TerminalSnapshot, CELL_HEIGHT,
+use crate::terminal_widget::{
+    resolve_colors, DrawCell, TerminalPointerEvent, TerminalSnapshot, TerminalWidget, CELL_HEIGHT,
     CELL_WIDTH, TERMINAL_PADDING,
 };
 use crate::Message;
@@ -1829,12 +1829,10 @@ impl App {
             .style(container::dark);
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
-            Some(tab) => canvas(TerminalCanvas {
+            Some(tab) => TerminalWidget {
                 tab_id: active_tab,
                 snapshot: tab.snapshot.clone(),
-            })
-            .width(Fill)
-            .height(Fill)
+            }
             .into(),
             None => container(text("Starting terminal…"))
                 .center(Fill)

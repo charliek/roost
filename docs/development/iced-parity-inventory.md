@@ -60,11 +60,15 @@ native window chrome. Full-window pixel equality remains inappropriate.
 
 The resulting `make visual-parity` fixture was then captured locally for all
 three macOS targets and in the Linux shed for GTK plus Iced under X11/Wayland
-with both wgpu and tiny-skia. Visual review found a renderer correctness defect:
-tiny-skia starts its terminal body at x=440/y=88 while wgpu starts at the
-expected sidebar edge x=220/y=44. The defect reproduces on both Linux display
-backends and
-therefore precedes cosmetic chrome work. Captures are under the ignored
+with both wgpu and tiny-skia. Visual review found a renderer correctness defect
+in the original Canvas implementation: tiny-skia started its terminal body at
+x=440/y=88 while wgpu started at the expected sidebar edge x=220/y=44. The
+defect reproduced in both product and external-compositor captures on both
+Linux display backends. Iced 0.14.0 is the latest release, while its official
+fix landed after that release; the terminal therefore moved to a
+renderer-neutral custom widget using core quads and text. Focused product
+captures now guard the non-zero origin, full extent, collapsed-sidebar origin,
+and glyph signal independently of visual parity. Captures are under the ignored
 `target/visual-parity-shed/` tree; their manifests identify display backend and
 renderer so results cannot be confused or overwritten.
 
@@ -116,7 +120,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Mostly inherited stock theme states | P1 | Renderer-neutral state-style unit tests plus real pointer/keyboard capture |
 | File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using UI-owned native adapters | No Iced drop or image-paste adapter | P1 | Text/file/image payload tests, shell escaping parity, platform launch smoke |
 | Native chrome | Platform-appropriate window controls and title/subtitle behavior | Native winit decorations; renderer screenshot cannot compare them directly | P2 | Platform launch artifacts and manual checklist, separate from content pixels |
-| Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | wgpu begins at x=220/y=44; tiny-skia incorrectly offsets the surface to x=440/y=88 on X11 and Wayland | P0 | Product-generated wgpu/tiny-skia captures on both display backends plus focused terminal viewport geometry regression |
+| Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | Closed for the current shell: renderer-neutral widget begins at x=220/y=44 with the sidebar and x=0/y=44 collapsed under wgpu/tiny-skia on macOS, X11, and Wayland | closed | Focused product screenshot regression runs in the existing renderer matrix; repeatable parity captures remain available for human review |
 
 ## Functional interaction gap register
 
