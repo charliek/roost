@@ -88,6 +88,16 @@ class TargetContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a Rust UI"):
             ui.rust_binary_path("mac")
 
+    def test_owned_session_config_is_available_only_inside_harness_state(self) -> None:
+        with patch("ui._SESSION_STATE_DIR", None):
+            self.assertIsNone(ui.owned_session_config_path())
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root)
+            with patch("ui._SESSION_STATE_DIR", state):
+                path = ui.owned_session_config_path()
+            self.assertEqual(path, (state / "launcher.conf").resolve())
+            self.assertNotEqual(path, ui.SEED_CONFIG.resolve())
+
     @patch.dict(os.environ, {"XDG_RUNTIME_DIR": "relative/runtime"}, clear=False)
     @patch("ui.os.getuid", return_value=1234)
     @patch("ui.platform.system", return_value="Linux")

@@ -15,7 +15,9 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import ui
 from client import RoostError
+from util import BARE_SHELL_ARGV, wait_tab_attached
 
 # The shared `palette` fixture (drive from closed, leave closed) lives in
 # conftest.py so the notification + launcher suites reuse it.
@@ -172,3 +174,113 @@ def test_theme_frame_keeps_selection_in_view(target, palette):
         10.0,
         "theme selection remains visible after window resize",
     )
+
+
+def _default_background(roost, tab_id: int) -> str:
+    cells = roost.tab_dump_resolved(tab_id)["cells"]
+    assert cells, f"tab {tab_id} has no resolved cells"
+    return cells[0]["bg"]
+
+
+def _theme_lines(path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.partition("=")[0].strip() == "theme"
+    ]
+
+
+def test_theme_preview_reverts_and_confirm_persists_for_all_tabs(
+    roost, project, palette
+):
+    """Theme preview is live-only; confirmation is live + persistent.
+
+    Refuse to perform even the first mutating UI action when this session does
+    not belong to the harness. That keeps a reused developer instance and its
+    real config completely out of this write-back test.
+    """
+    config_path = ui.owned_session_config_path()
+    if config_path is None:
+        pytest.skip("theme persistence requires a harness-owned config copy")
+    assert config_path.parent == ui._SESSION_STATE_DIR.resolve()
+    assert config_path != ui.SEED_CONFIG.resolve()
+
+    seed_before = ui.SEED_CONFIG.read_bytes()
+    config_before = config_path.read_bytes()
+    first = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    second = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    wait_tab_attached(roost, first)
+    wait_tab_attached(roost, second)
+    original_backgrounds = {
+        first: _default_background(roost, first),
+        second: _default_background(roost, second),
+    }
+
+    palette.palette_open()
+    themes = palette.palette_activate("select_theme")
+    original = themes["items"][themes["selection"]]
+    preferred = "Oxocarbon" if original["id"] != "Oxocarbon" else "roost-dark"
+    target = next(item for item in themes["items"] if item["id"] == preferred)
+    third = None
+    try:
+        preview = palette.palette_query(target["title"])
+        assert preview["items"][preview["selection"]]["id"] == target["id"]
+        roost._wait(
+            lambda: all(
+                _default_background(roost, tab_id) != original_backgrounds[tab_id]
+                for tab_id in (first, second)
+            ),
+            5.0,
+            "theme preview reaches both existing tabs",
+        )
+        preview_background = _default_background(roost, first)
+        assert _default_background(roost, second) == preview_background
+        assert config_path.read_bytes() == config_before
+
+        dismissed = palette.palette_dismiss()
+        assert dismissed["open"] is False
+        roost._wait(
+            lambda: all(
+                _default_background(roost, tab_id) == original_backgrounds[tab_id]
+                for tab_id in (first, second)
+            ),
+            5.0,
+            "dismissed theme preview reverts both existing tabs",
+        )
+        assert config_path.read_bytes() == config_before
+
+        palette.palette_open()
+        palette.palette_activate("select_theme")
+        confirmed = palette.palette_activate(target["id"])
+        assert confirmed["open"] is False
+        roost._wait(
+            lambda: all(
+                _default_background(roost, tab_id) == preview_background
+                for tab_id in (first, second)
+            ),
+            5.0,
+            "confirmed theme reaches both existing tabs",
+        )
+        assert _theme_lines(config_path) == [f"theme = {target['id']}"]
+        assert ui.SEED_CONFIG.read_bytes() == seed_before
+
+        third = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        wait_tab_attached(roost, third)
+        assert _default_background(roost, third) == preview_background
+    finally:
+        palette.palette_dismiss()
+        palette.palette_open()
+        palette.palette_activate("select_theme")
+        restored = palette.palette_activate(original["id"])
+        assert restored["open"] is False
+        expected_tabs = [first, second] + ([third] if third is not None else [])
+        roost._wait(
+            lambda: all(
+                _default_background(roost, tab_id) == original_backgrounds[first]
+                for tab_id in expected_tabs
+            ),
+            5.0,
+            "theme cleanup restores every fixture tab",
+        )
+        assert _theme_lines(config_path) == [f"theme = {original['id']}"]
+        assert ui.SEED_CONFIG.read_bytes() == seed_before

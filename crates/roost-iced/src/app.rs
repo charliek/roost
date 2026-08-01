@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -367,6 +369,86 @@ fn theme_palette_frame(active_theme_name: &str) -> palette::PaletteFrame {
         .map(|name| palette::PaletteItem::new(name.clone(), name))
         .collect();
     palette::PaletteFrame::new("themes", "Select a theme…", items).with_selection(selection)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ApplyRollbackFailure<E> {
+    apply: E,
+    rollback: Option<E>,
+}
+
+fn apply_with_rollback<T, E>(
+    previous: &T,
+    next: &T,
+    mut apply: impl FnMut(&T) -> std::result::Result<(), E>,
+) -> std::result::Result<(), ApplyRollbackFailure<E>> {
+    if let Err(error) = apply(next) {
+        return Err(ApplyRollbackFailure {
+            apply: error,
+            rollback: apply(previous).err(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ThemeBatchFailure {
+    tab_id: i64,
+    apply: String,
+    rollback: Vec<(i64, String)>,
+}
+
+fn apply_theme_batch(
+    targets: &[(i64, Theme)],
+    next: &Theme,
+    mut apply: impl FnMut(i64, &Theme) -> std::result::Result<(), String>,
+) -> std::result::Result<(), ThemeBatchFailure> {
+    for (applied, (tab_id, _)) in targets.iter().enumerate() {
+        if let Err(error) = apply(*tab_id, next) {
+            let rollback = targets[..applied]
+                .iter()
+                .rev()
+                .filter_map(|(rollback_id, previous)| {
+                    apply(*rollback_id, previous)
+                        .err()
+                        .map(|error| (*rollback_id, error))
+                })
+                .collect();
+            return Err(ThemeBatchFailure {
+                tab_id: *tab_id,
+                apply: error,
+                rollback,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn persist_theme_selection_with(
+    config: &mut RoostConfig,
+    path: Option<&Path>,
+    name: &str,
+    write: impl FnOnce(&Path, &str, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    config.theme_name = Some(name.to_string());
+    let Some(path) = path else {
+        return Ok(());
+    };
+    write(path, "theme", name)
+}
+
+fn finish_theme_confirmation(
+    palette: &mut Option<palette::PaletteState>,
+    theme_at_open: &mut Option<String>,
+    status: &mut StatusBanner,
+    persistence_error: Option<String>,
+    now: Instant,
+) {
+    *palette = None;
+    *theme_at_open = None;
+    if let Some(error) = persistence_error {
+        status.set_at(error, now);
+    }
 }
 
 fn font_palette_frame() -> palette::PaletteFrame {
@@ -1428,11 +1510,20 @@ impl TerminalTab {
         }
     }
 
-    fn set_theme(&mut self, theme: Theme) -> Result<()> {
-        self.terminal.set_color_foreground(theme.foreground)?;
-        self.terminal.set_color_background(theme.background)?;
-        self.terminal.set_color_cursor(theme.cursor)?;
-        self.terminal.set_color_palette(&theme.palette)?;
+    fn set_theme(&mut self, theme: &Theme) -> Result<()> {
+        let previous = self.theme.clone();
+        if let Err(failure) = apply_with_rollback(&previous, theme, |candidate| {
+            self.apply_theme_candidate(candidate)
+        }) {
+            return Err(match failure.rollback {
+                Some(rollback) => anyhow::anyhow!(
+                    "theme apply failed: {}; rollback failed: {}",
+                    failure.apply,
+                    rollback
+                ),
+                None => anyhow::anyhow!("theme apply failed: {}", failure.apply),
+            });
+        }
         if self.terminal.mode_get(2031) {
             self.session.send_input(if theme.background.is_light() {
                 b"\x1b[?997;2n".to_vec()
@@ -1440,7 +1531,15 @@ impl TerminalTab {
                 b"\x1b[?997;1n".to_vec()
             });
         }
-        self.theme = theme;
+        Ok(())
+    }
+
+    fn apply_theme_candidate(&mut self, theme: &Theme) -> Result<()> {
+        self.theme = theme.clone();
+        self.terminal.set_color_foreground(theme.foreground)?;
+        self.terminal.set_color_background(theme.background)?;
+        self.terminal.set_color_cursor(theme.cursor)?;
+        self.terminal.set_color_palette(&theme.palette)?;
         self.refresh_snapshot()
     }
 
@@ -3156,9 +3255,14 @@ impl App {
                 self.reconcile();
             }
             "themes" => {
-                self.apply_theme_name(&item.id)?;
-                self.palette = None;
-                self.palette_theme_at_open = None;
+                let persistence_error = self.commit_theme_name(&item.id)?;
+                finish_theme_confirmation(
+                    &mut self.palette,
+                    &mut self.palette_theme_at_open,
+                    &mut self.status,
+                    persistence_error,
+                    Instant::now(),
+                );
             }
             "fonts" => {
                 self.palette = None;
@@ -3237,12 +3341,37 @@ impl App {
             return Ok(());
         }
         let theme = Theme::load_bundled(name);
-        for (tab_id, tab) in &mut self.tabs {
-            tab.set_theme(theme.clone())
-                .map_err(|error| format!("apply theme to tab {tab_id}: {error}"))?;
+        let mut targets = self
+            .tabs
+            .iter()
+            .map(|(tab_id, tab)| (*tab_id, tab.theme.clone()))
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|(tab_id, _)| *tab_id);
+        if let Err(failure) = apply_theme_batch(&targets, &theme, |tab_id, candidate| {
+            self.tabs
+                .get_mut(&tab_id)
+                .ok_or_else(|| format!("tab {tab_id} disappeared during theme application"))?
+                .set_theme(candidate)
+                .map_err(|error| error.to_string())
+        }) {
+            let mut message = format!("apply theme to tab {}: {}", failure.tab_id, failure.apply);
+            for (tab_id, error) in failure.rollback {
+                message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+            }
+            return Err(message);
         }
         self.active_theme_name = name.to_string();
         Ok(())
+    }
+
+    fn commit_theme_name(&mut self, name: &str) -> Result<Option<String>, String> {
+        self.apply_theme_name(name)?;
+        let path = config::config_path();
+        Ok(
+            persist_theme_selection_with(&mut self.config, path.as_deref(), name, config::set_key)
+                .err()
+                .map(|error| format!("persist theme: {error}")),
+        )
     }
 
     fn palette_back_or_dismiss(&mut self) {
@@ -5890,6 +6019,117 @@ mod tests {
         assert_eq!(frame.id, "themes");
         assert!(frame.items.len() > 1);
         assert_eq!(frame.items[frame.selection].id, "roost-dark");
+    }
+
+    #[test]
+    fn failed_apply_attempts_the_previous_value() {
+        let mut applied = Vec::new();
+        let failure = apply_with_rollback(&"previous", &"next", |value| {
+            applied.push(*value);
+            if *value == "next" {
+                Err("injected apply failure")
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("next value must fail");
+        assert_eq!(applied, ["next", "previous"]);
+        assert_eq!(
+            failure,
+            ApplyRollbackFailure {
+                apply: "injected apply failure",
+                rollback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_theme_batch_rolls_back_already_applied_tabs() {
+        let first = Theme::load_bundled("roost-dark");
+        let second = Theme::load_bundled("Oxocarbon");
+        let next = Theme::load_bundled("Atom");
+        let targets = vec![(7, first.clone()), (11, second)];
+        let mut applied = Vec::new();
+        let failure = apply_theme_batch(&targets, &next, |tab_id, theme| {
+            applied.push((tab_id, theme.background));
+            if tab_id == 11 && theme.background == next.background {
+                Err("injected tab failure".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("second tab must fail");
+        assert_eq!(failure.tab_id, 11);
+        assert_eq!(failure.apply, "injected tab failure");
+        assert!(failure.rollback.is_empty());
+        assert_eq!(
+            applied,
+            [
+                (7, next.background),
+                (11, next.background),
+                (7, first.background),
+            ]
+        );
+    }
+
+    #[test]
+    fn theme_persistence_handles_absence_success_and_failure() {
+        let mut absent = RoostConfig::default();
+        persist_theme_selection_with(&mut absent, None, "Oxocarbon", |_, _, _| {
+            panic!("absent path must not invoke the writer")
+        })
+        .expect("absent path is a silent success");
+        assert_eq!(absent.theme_name.as_deref(), Some("Oxocarbon"));
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.conf");
+        std::fs::write(&path, "# keep me\nfont-size = 14\n").expect("seed config");
+        let mut successful = RoostConfig::default();
+        persist_theme_selection_with(&mut successful, Some(&path), "Oxocarbon", config::set_key)
+            .expect("persist theme");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read persisted config"),
+            "# keep me\nfont-size = 14\ntheme = Oxocarbon\n"
+        );
+        assert_eq!(
+            RoostConfig::load_from(&path).theme_name.as_deref(),
+            Some("Oxocarbon"),
+            "the next bootstrap observes the committed theme"
+        );
+
+        let before = std::fs::read(&path).expect("read before failure");
+        let mut failed = RoostConfig::default();
+        let error = persist_theme_selection_with(&mut failed, Some(&path), "Atom", |_, _, _| {
+            Err(io::Error::other("injected writer failure"))
+        })
+        .expect_err("writer failure must be returned to the UI boundary");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(failed.theme_name.as_deref(), Some("Atom"));
+        assert_eq!(std::fs::read(&path).expect("read after failure"), before);
+    }
+
+    #[test]
+    fn theme_persistence_error_closes_before_status_and_cannot_revert() {
+        let mut palette = Some(palette::PaletteState::new(theme_palette_frame(
+            "roost-dark",
+        )));
+        let mut theme_at_open = Some("roost-dark".to_string());
+        let mut status = StatusBanner::default();
+        let now = Instant::now();
+        finish_theme_confirmation(
+            &mut palette,
+            &mut theme_at_open,
+            &mut status,
+            Some("persist theme: injected writer failure".to_string()),
+            now,
+        );
+        assert!(palette.is_none());
+        assert!(theme_at_open.is_none(), "dismiss cannot revert the commit");
+        assert_eq!(
+            status.message(),
+            Some("persist theme: injected writer failure")
+        );
+        assert_eq!(status.expires_at, Some(now + STATUS_BANNER_DURATION));
     }
 
     #[test]

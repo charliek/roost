@@ -297,6 +297,28 @@ def _session_config_path() -> Path:
     return _SESSION_STATE_DIR / "launcher.conf"
 
 
+def owned_session_config_path() -> Path | None:
+    """Return the config only when this harness owns the launched UI.
+
+    Config-mutating functional tests must call this before performing any UI
+    action. A reused developer instance has no session state dir and therefore
+    returns ``None``; tests must skip rather than touching or "restoring" the
+    developer's config. Resolve and contain the path defensively so a future
+    launch refactor cannot silently redirect writes to the tracked seed.
+    """
+    if _SESSION_STATE_DIR is None:
+        return None
+    root = _SESSION_STATE_DIR.resolve()
+    path = _session_config_path().resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise AssertionError(f"session config {path} escapes owned root {root}") from error
+    if path == SEED_CONFIG.resolve():
+        raise AssertionError("owned session config must differ from the tracked seed")
+    return path
+
+
 def start_session(target: str, *, fresh: bool) -> bool:
     """Ensure a UI is running for the test session. Returns True if the
     harness started (and therefore owns) it — the caller quits it at

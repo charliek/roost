@@ -1700,6 +1700,69 @@ Swift tests, and 32 harness-unit tests. The complete shed gate rebuilt isolated
 artifacts and passed GTK Wayland drag/reorder, Iced X11 real input, and Iced
 real-seat Wayland clipboard/input coverage.
 
+### Persisted Iced theme selection commit plan
+
+Scope: close the configuration gap in Iced's otherwise-live theme picker. GTK
+and AppKit distinguish highlight preview from Enter/activation commit, but Iced
+currently calls the live-only `apply_theme_name` on both paths and therefore
+loses the confirmed choice on restart. Add an Iced commit boundary that applies
+the selected bundled theme to every terminal, updates the in-memory config, and
+uses the shared toolkit-neutral `roost_ui_model::config::set_key` atomic editor
+to write `theme = <name>` at the resolved `ROOST_CONFIG`/default path.
+
+Invariants: highlight preview and dismissal/backtracking never write config;
+dismissal restores the theme captured when the palette opened; confirmation
+closes the palette, affects all existing and subsequently attached tabs, and
+persists only the confirmed name; a write failure leaves the safe live choice
+active, surfaces a status message, and does not crash or wedge the palette;
+the in-memory config follows that live choice even if disk persistence fails;
+an absent resolvable config path is a silent success matching GTK; an
+application failure updates neither config nor disk and rolls already-mutated
+tabs back best-effort before reporting any combined error; the tracked seed
+config and developer config are never test targets; GTK, AppKit, engine state,
+theme parsing, and IPC DTOs remain unchanged.
+
+Interfaces and tests: keep preview/application private to the Iced adapter and
+reuse the existing shared config API rather than creating a toolkit callback or
+duplicating config editing. Add a harness accessor that returns a config path
+only for a session the harness actually owns and proves the resolved path is
+inside its temporary state directory and distinct from the tracked seed. The
+functional test skips before any mutation when that proof is unavailable; it
+never writes or attempts to restore a developer config.
+
+Extend the target-neutral palette functional suite to create two tabs under
+that owned session: select a different bundled theme, prove preview updates both
+resolved render snapshots while leaving config bytes unchanged, dismiss and
+prove both revert, confirm and prove both update plus exact shared-editor
+write-back and palette closure, then open a third tab and prove it inherits the
+same resolved colors. Restore the original live theme through the UI, leaving
+the temporary config consistent rather than rewriting its bytes behind a live
+process. Unit-test a writer-injected persistence helper for absent paths,
+successful atomic write/load round-trip, and deterministic write failure; the
+failure case must update in-memory config while leaving disk bytes unchanged.
+Clear palette/captured-theme state before surfacing that handled error. Add a
+small injected apply/rollback test seam proving a failed terminal application
+attempts the previous theme and prevents config/disk commit. The shared config
+editor's exact transformed bytes must preserve unrelated lines and comments.
+Its load round-trip is the stable restart proof; no flaky GUI relaunch is added.
+
+Run focused Iced unit/lint tests, the functional palette suite on GTK/Iced/macOS,
+both Iced renderers, `make check`, dependency boundaries, and the complete shed
+gate; review the complete diff before the focused commit, push, and require all
+branch jobs green. The subsequent typography/polish phase remains explicit:
+measured font metrics and configured families/sizes, followed by refreshed
+GTK/Swift/Iced reference captures, geometry/color review, and the tracked
+capability-gap matrix—not this persistence commit—decide visual acceptance.
+
+Validation result: 89 Iced unit tests and 33 harness-unit tests passed. The
+target-neutral palette suite passed on GTK, AppKit, Iced wgpu, and Iced
+tiny-skia; both complete macOS Iced renderer suites passed 49 tests with the two
+existing documented capability skips. `make check && make check-iced` passed,
+including warnings-denied Rust lint, dependency boundaries, and 688 Swift tests.
+The complete shed gate rebuilt isolated artifacts and passed GTK cage/uinput
+Wayland drag/reorder, the Iced X11 real-input clipboard/input guard, and the Iced
+real-seat Wayland clipboard/input guard.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.
