@@ -107,7 +107,7 @@ jobs:
       # the copies against drift — adding a theme to one UI only is a
       # classic miss.
       - name: Bundled themes byte-identical across UIs
-        run: diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
+        run: diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes
 
   rust-build:
     needs: changes
