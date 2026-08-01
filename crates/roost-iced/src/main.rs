@@ -44,6 +44,7 @@ enum Message {
     PaletteVisibilityMeasured {
         session: u64,
         revision: u64,
+        measurement_generation: u64,
         reveal: bool,
         visibility: palette_scroll::Visibility,
     },
@@ -122,10 +123,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::PaletteVisibilityMeasured {
             session,
             revision,
+            measurement_generation,
             reveal,
             visibility,
         } => {
-            app.palette_visibility_measured(session, revision, reveal, visibility);
+            app.palette_visibility_measured(
+                session,
+                revision,
+                measurement_generation,
+                reveal,
+                visibility,
+            );
             Task::none()
         }
         message @ (Message::ProjectSelected(_)
@@ -219,11 +227,13 @@ impl UiTask for app::UiTask {
                 row_id,
                 session,
                 revision,
+                measurement_generation,
                 reveal,
             } => {
                 let message = move |visibility| Message::PaletteVisibilityMeasured {
                     session,
                     revision,
+                    measurement_generation,
                     reveal,
                     visibility,
                 };

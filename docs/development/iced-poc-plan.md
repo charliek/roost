@@ -974,6 +974,49 @@ complete local gate, and GTK theme regression stay green; the fix is committed
 and pushed separately, and Actions is green in all four Iced matrix jobs before
 the next feature slice begins.
 
+### CI root-cause follow-up: scroll notifications preserve layout identity
+
+Evidence: the expanded missing-geometry budget made the palette test pass in
+Actions' Ubuntu/wgpu job but the same run still timed out on macOS/wgpu and
+Ubuntu/tiny-skia. Local debug traces show a programmatic reveal immediately
+emitting `PaletteScrolled` and advancing revisions (for example revision 62 to
+63), while Iced 0.14's `notify_viewport` publishes `on_scroll` when bounds,
+content bounds, or offsets change. The callback therefore does not identify a
+manual gesture. Treating every notification as structural invalidation can
+continually replace row IDs and stale an otherwise successful measurement.
+
+Scope: preserve the palette layout revision and stable row IDs for scroll
+offset notifications while advancing a separate measurement generation. The
+callback clears the last measurement, resets only the missing-geometry retry
+counter for later measure-only scrolls, and queues a measure once the current
+structural reveal has succeeded. Layout-driven notifications before that
+success preserve the required reveal intent, so delayed geometry cannot
+finalize a clipped row.
+Content-only refreshes also preserve that intent, and both missing geometry and
+persistently clipped reveal results use bounded retry handling. A separate
+scheduling budget counts every reveal attempt even when a programmatic scroll
+generation-fences its result, preventing an alternating-offset task storm.
+Structural frame/query/selection/resize changes continue through the existing
+revision-advancing invalidation path. An already-issued reveal keeps valid row
+IDs but its pre-scroll result is rejected by the measurement generation; the
+queued request remains Reveal until that structural intent succeeds, then later
+scrolls queue Measure.
+
+Invariants: programmatic reveal cannot create a revision loop; scrolling
+invalidates the observable result, preserves an incomplete structural reveal,
+and becomes measure-only after a successful reveal; stale
+frame/query/selection results remain fenced by session/revision and stale
+viewport results by measurement generation; no renderer branch or test
+relaxation is introduced. Unit tests prove scroll measurement clears
+visibility, clears retries after structural reveal intent is satisfied,
+replaces reveal without touching revision-owned IDs, and
+rejects older Visible/Missing results. They also prove a structural reveal
+survives an intervening layout notification until stable geometry can reveal
+the row. The complete palette suite is repeated
+under macOS/wgpu and all shed
+renderer/display combinations, then the full local/shed gates, review, push,
+and all four Actions Iced jobs must pass before new feature work.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

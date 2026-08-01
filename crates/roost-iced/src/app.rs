@@ -178,7 +178,41 @@ fn queue_visibility_request(
     }
 }
 
-fn missing_geometry_retry(retries: u8, reveal: bool) -> Option<(u8, PaletteVisibilityRequest)> {
+fn queue_scroll_measurement(
+    selected_in_view: &mut Option<bool>,
+    retries: &mut u8,
+    request: &mut PaletteVisibilityRequest,
+    measurement_generation: &mut u64,
+    reveal_required: bool,
+) {
+    *selected_in_view = None;
+    *measurement_generation = measurement_generation.wrapping_add(1).max(1);
+    // Scroll offset changes do not change widget identity or row layout. Keep
+    // the current revision/IDs and preserve a structural reveal until it has
+    // succeeded; later viewport changes need only a fresh measurement.
+    *request = if reveal_required {
+        PaletteVisibilityRequest::Reveal
+    } else {
+        *retries = 0;
+        PaletteVisibilityRequest::Measure
+    };
+}
+
+fn schedule_reveal_attempt(
+    attempts: &mut u8,
+    _selected_in_view: &mut Option<bool>,
+    reveal_required: &mut bool,
+) -> bool {
+    if *attempts >= PALETTE_GEOMETRY_RETRY_LIMIT {
+        *reveal_required = false;
+        false
+    } else {
+        *attempts += 1;
+        true
+    }
+}
+
+fn visibility_retry(retries: u8, reveal: bool) -> Option<(u8, PaletteVisibilityRequest)> {
     (retries < PALETTE_GEOMETRY_RETRY_LIMIT).then(|| {
         (
             retries + 1,
@@ -191,6 +225,49 @@ fn missing_geometry_retry(retries: u8, reveal: bool) -> Option<(u8, PaletteVisib
     })
 }
 
+fn queue_layout_visibility_request(
+    current: PaletteVisibilityRequest,
+    next: PaletteVisibilityRequest,
+    replace: bool,
+    reveal_required: bool,
+) -> PaletteVisibilityRequest {
+    if reveal_required {
+        PaletteVisibilityRequest::Reveal
+    } else {
+        queue_visibility_request(current, next, replace)
+    }
+}
+
+fn apply_visible_result(
+    selected_in_view: &mut Option<bool>,
+    retries: &mut u8,
+    request: &mut PaletteVisibilityRequest,
+    reveal_required: &mut bool,
+    reveal: bool,
+    visible: bool,
+) -> bool {
+    *selected_in_view = Some(visible);
+    if !reveal || visible {
+        *retries = 0;
+        if reveal && visible {
+            *reveal_required = false;
+        }
+        return false;
+    }
+    if !*reveal_required {
+        *retries = 0;
+        return false;
+    }
+    if let Some((next_retries, retry)) = visibility_retry(*retries, true) {
+        *retries = next_retries;
+        *request = request.merge(retry);
+        false
+    } else {
+        *reveal_required = false;
+        true
+    }
+}
+
 fn palette_row_id(session: u64, revision: u64, index: usize) -> Id {
     Id::from(format!("palette-row:{session}:{revision}:{index}"))
 }
@@ -198,10 +275,14 @@ fn palette_row_id(session: u64, revision: u64, index: usize) -> Id {
 fn visibility_result_is_current(
     current_session: u64,
     current_revision: u64,
+    current_measurement_generation: u64,
     result_session: u64,
     result_revision: u64,
+    result_measurement_generation: u64,
 ) -> bool {
-    current_session == result_session && current_revision == result_revision
+    current_session == result_session
+        && current_revision == result_revision
+        && current_measurement_generation == result_measurement_generation
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +319,7 @@ pub enum UiTask {
         row_id: Id,
         session: u64,
         revision: u64,
+        measurement_generation: u64,
         reveal: bool,
     },
 }
@@ -707,6 +789,9 @@ pub struct App {
     palette_scroll_id: Id,
     palette_focus_requested: bool,
     palette_layout_revision: u64,
+    palette_measurement_generation: u64,
+    palette_reveal_required: bool,
+    palette_reveal_attempts: u8,
     palette_selected_in_view: Option<bool>,
     palette_visibility_request: PaletteVisibilityRequest,
     palette_visibility_retries: u8,
@@ -798,6 +883,9 @@ impl App {
             palette_scroll_id: Id::unique(),
             palette_focus_requested: false,
             palette_layout_revision: 0,
+            palette_measurement_generation: 0,
+            palette_reveal_required: false,
+            palette_reveal_attempts: 0,
             palette_selected_in_view: None,
             palette_visibility_request: PaletteVisibilityRequest::None,
             palette_visibility_retries: 0,
@@ -1390,10 +1478,22 @@ impl App {
             let frame = state.current();
             state.matches().get(frame.selection).is_some()
         });
+        if has_selection && request == PaletteVisibilityRequest::Reveal {
+            self.palette_reveal_required = true;
+            self.palette_reveal_attempts = 0;
+        } else if !has_selection {
+            self.palette_reveal_required = false;
+            self.palette_reveal_attempts = 0;
+        }
         self.palette_visibility_request = if !has_selection {
             PaletteVisibilityRequest::None
         } else {
-            queue_visibility_request(self.palette_visibility_request, request, !merge)
+            queue_layout_visibility_request(
+                self.palette_visibility_request,
+                request,
+                !merge,
+                self.palette_reveal_required,
+            )
         };
     }
 
@@ -1402,6 +1502,8 @@ impl App {
         self.palette_selected_in_view = None;
         self.palette_visibility_request = PaletteVisibilityRequest::None;
         self.palette_visibility_retries = 0;
+        self.palette_reveal_required = false;
+        self.palette_reveal_attempts = 0;
     }
 
     fn take_palette_visibility_task(&mut self) -> UiTask {
@@ -1422,9 +1524,26 @@ impl App {
             return UiTask::None;
         }
         self.palette_visibility_request = PaletteVisibilityRequest::None;
+        if request == PaletteVisibilityRequest::Reveal
+            && self.palette_reveal_required
+            && !schedule_reveal_attempt(
+                &mut self.palette_reveal_attempts,
+                &mut self.palette_selected_in_view,
+                &mut self.palette_reveal_required,
+            )
+        {
+            tracing::warn!(
+                session = self.palette_session,
+                revision = self.palette_layout_revision,
+                attempts = self.palette_reveal_attempts,
+                "palette reveal exhausted its bounded scheduling budget"
+            );
+            return UiTask::None;
+        }
         tracing::debug!(
             session = self.palette_session,
             revision = self.palette_layout_revision,
+            measurement_generation = self.palette_measurement_generation,
             selection,
             reveal = request == PaletteVisibilityRequest::Reveal,
             "schedule palette visibility operation"
@@ -1438,15 +1557,23 @@ impl App {
             ),
             session: self.palette_session,
             revision: self.palette_layout_revision,
+            measurement_generation: self.palette_measurement_generation,
             reveal: request == PaletteVisibilityRequest::Reveal,
         }
     }
 
     pub fn palette_scrolled(&mut self) {
         if self.palette.is_some() {
-            // A later manual viewport change supersedes an older reveal that
-            // has not run yet; measuring must not snap the user back.
-            self.reset_palette_geometry(PaletteVisibilityRequest::Measure, false);
+            // Iced emits `on_scroll` for programmatic and layout-driven
+            // viewport changes too. Those events must not advance row-ID
+            // revisions or they can perpetually stale the reveal result.
+            queue_scroll_measurement(
+                &mut self.palette_selected_in_view,
+                &mut self.palette_visibility_retries,
+                &mut self.palette_visibility_request,
+                &mut self.palette_measurement_generation,
+                self.palette_reveal_required,
+            );
         }
     }
 
@@ -1454,19 +1581,23 @@ impl App {
         &mut self,
         session: u64,
         revision: u64,
+        measurement_generation: u64,
         reveal: bool,
         visibility: Visibility,
     ) {
         if !visibility_result_is_current(
             self.palette_session,
             self.palette_layout_revision,
+            self.palette_measurement_generation,
             session,
             revision,
+            measurement_generation,
         ) || self.palette.is_none()
         {
             tracing::debug!(
                 session,
                 revision,
+                measurement_generation,
                 ?visibility,
                 "discard stale palette visibility"
             );
@@ -1475,17 +1606,34 @@ impl App {
         tracing::debug!(
             session,
             revision,
+            measurement_generation,
             ?visibility,
             "palette visibility measured"
         );
         match visibility {
             Visibility::Visible(visible) => {
-                self.palette_selected_in_view = Some(visible);
-                self.palette_visibility_retries = 0;
+                if apply_visible_result(
+                    &mut self.palette_selected_in_view,
+                    &mut self.palette_visibility_retries,
+                    &mut self.palette_visibility_request,
+                    &mut self.palette_reveal_required,
+                    reveal,
+                    visible,
+                ) {
+                    tracing::warn!(
+                        session,
+                        revision,
+                        retries = self.palette_visibility_retries,
+                        "palette row remained clipped after bounded reveal retries"
+                    );
+                }
+                if reveal && visible {
+                    self.palette_reveal_attempts = 0;
+                }
             }
             Visibility::Missing => {
                 if let Some((retries, retry)) =
-                    missing_geometry_retry(self.palette_visibility_retries, reveal)
+                    visibility_retry(self.palette_visibility_retries, reveal)
                 {
                     self.palette_visibility_retries = retries;
                     self.palette_visibility_request = self.palette_visibility_request.merge(retry);
@@ -2901,7 +3049,36 @@ mod tests {
                 true,
             ),
             PaletteVisibilityRequest::Measure,
-            "a later manual scroll replaces an unconsumed reveal"
+            "a later scroll replaces a reveal after structural reveal intent is satisfied"
+        );
+
+        let mut selected_in_view = Some(true);
+        let mut retries = 7;
+        let mut request = PaletteVisibilityRequest::Reveal;
+        let mut measurement_generation = 12;
+        queue_scroll_measurement(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut measurement_generation,
+            false,
+        );
+        assert_eq!(selected_in_view, None);
+        assert_eq!(retries, 0);
+        assert_eq!(request, PaletteVisibilityRequest::Measure);
+        assert_eq!(measurement_generation, 13);
+
+        queue_scroll_measurement(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut measurement_generation,
+            true,
+        );
+        assert_eq!(
+            request,
+            PaletteVisibilityRequest::Reveal,
+            "layout scrolls cannot downgrade a reveal that has not succeeded"
         );
     }
 
@@ -2922,30 +3099,210 @@ mod tests {
     }
 
     #[test]
-    fn missing_palette_geometry_retries_to_the_named_limit() {
+    fn palette_visibility_retries_to_the_named_limit() {
         assert_eq!(
-            missing_geometry_retry(0, true),
+            visibility_retry(0, true),
             Some((1, PaletteVisibilityRequest::Reveal))
         );
         assert_eq!(
-            missing_geometry_retry(PALETTE_GEOMETRY_RETRY_LIMIT - 1, false),
+            visibility_retry(PALETTE_GEOMETRY_RETRY_LIMIT - 1, false),
             Some((
                 PALETTE_GEOMETRY_RETRY_LIMIT,
                 PaletteVisibilityRequest::Measure
             ))
         );
+        assert_eq!(visibility_retry(PALETTE_GEOMETRY_RETRY_LIMIT, true), None);
+    }
+
+    #[test]
+    fn palette_visibility_results_require_the_same_identity_and_viewport() {
+        assert!(visibility_result_is_current(4, 9, 2, 4, 9, 2));
+        assert!(!visibility_result_is_current(4, 9, 2, 3, 9, 2));
+        assert!(!visibility_result_is_current(4, 9, 2, 4, 8, 2));
+        assert!(!visibility_result_is_current(4, 9, 2, 4, 9, 1));
+        assert_ne!(palette_row_id(4, 9, 0), palette_row_id(4, 10, 0));
+    }
+
+    #[test]
+    fn scroll_fences_in_flight_visible_and_missing_results() {
+        let session = 4;
+        let revision = 9;
+        let issued_generation = 12;
+        let mut current_generation = issued_generation;
+        let mut selected_in_view = Some(true);
+        let mut retries = 7;
+        let mut request = PaletteVisibilityRequest::Reveal;
+
+        queue_scroll_measurement(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut current_generation,
+            false,
+        );
+
+        assert!(
+            !visibility_result_is_current(
+                session,
+                revision,
+                current_generation,
+                session,
+                revision,
+                issued_generation,
+            ),
+            "a visible result measured before the scroll must be rejected"
+        );
+        assert_eq!(selected_in_view, None);
+
+        if visibility_result_is_current(
+            session,
+            revision,
+            current_generation,
+            session,
+            revision,
+            issued_generation,
+        ) {
+            if let Some((next_retries, retry)) = visibility_retry(retries, true) {
+                retries = next_retries;
+                request = request.merge(retry);
+            }
+        }
+        assert_eq!(retries, 0);
         assert_eq!(
-            missing_geometry_retry(PALETTE_GEOMETRY_RETRY_LIMIT, true),
-            None
+            request,
+            PaletteVisibilityRequest::Measure,
+            "an older missing reveal must not supersede the post-scroll measurement"
         );
     }
 
     #[test]
-    fn palette_visibility_results_require_the_same_session_and_revision() {
-        assert!(visibility_result_is_current(4, 9, 4, 9));
-        assert!(!visibility_result_is_current(4, 9, 3, 9));
-        assert!(!visibility_result_is_current(4, 9, 4, 8));
-        assert_ne!(palette_row_id(4, 9, 0), palette_row_id(4, 10, 0));
+    fn structural_reveal_survives_layout_scroll_until_geometry_is_visible() {
+        let session = 4;
+        let revision = 9;
+        let issued_generation = 12;
+        let mut current_generation = issued_generation;
+        let mut selected_in_view = None;
+        let mut retries = 0;
+        let mut request = PaletteVisibilityRequest::None;
+
+        queue_scroll_measurement(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut current_generation,
+            true,
+        );
+        assert!(!visibility_result_is_current(
+            session,
+            revision,
+            current_generation,
+            session,
+            revision,
+            issued_generation,
+        ));
+        assert_eq!(
+            request,
+            PaletteVisibilityRequest::Reveal,
+            "a structural reveal must remain pending after layout fences its old result"
+        );
+
+        // Once stable geometry is available, the pending request is still a
+        // reveal rather than a measure that could finalize `Visible(false)`.
+        let next = std::mem::take(&mut request);
+        assert_eq!(next, PaletteVisibilityRequest::Reveal);
+    }
+
+    #[test]
+    fn required_reveal_survives_content_only_measure_invalidation() {
+        assert_eq!(
+            queue_layout_visibility_request(
+                PaletteVisibilityRequest::None,
+                PaletteVisibilityRequest::Measure,
+                false,
+                true,
+            ),
+            PaletteVisibilityRequest::Reveal,
+            "content refresh cannot downgrade an in-flight structural reveal"
+        );
+    }
+
+    #[test]
+    fn clipped_reveal_retries_are_bounded() {
+        let mut selected_in_view = None;
+        let mut retries = PALETTE_GEOMETRY_RETRY_LIMIT;
+        let mut request = PaletteVisibilityRequest::None;
+        let mut reveal_required = true;
+        assert!(apply_visible_result(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut reveal_required,
+            true,
+            false,
+        ));
+        assert_eq!(selected_in_view, Some(false));
+        assert_eq!(request, PaletteVisibilityRequest::None);
+        assert!(!reveal_required);
+    }
+
+    #[test]
+    fn scroll_fenced_reveals_cannot_bypass_the_scheduling_budget() {
+        let mut attempts = 0;
+        let mut selected_in_view = None;
+        let mut retries = 4;
+        let mut request = PaletteVisibilityRequest::Reveal;
+        let mut generation = 1;
+        let mut reveal_required = true;
+
+        for _ in 0..PALETTE_GEOMETRY_RETRY_LIMIT {
+            assert!(schedule_reveal_attempt(
+                &mut attempts,
+                &mut selected_in_view,
+                &mut reveal_required,
+            ));
+            let issued_generation = generation;
+            queue_scroll_measurement(
+                &mut selected_in_view,
+                &mut retries,
+                &mut request,
+                &mut generation,
+                true,
+            );
+            assert!(!visibility_result_is_current(
+                1,
+                1,
+                generation,
+                1,
+                1,
+                issued_generation,
+            ));
+            assert_eq!(request, PaletteVisibilityRequest::Reveal);
+            assert_eq!(retries, 4, "scrolls preserve the in-flight retry state");
+        }
+        assert!(!schedule_reveal_attempt(
+            &mut attempts,
+            &mut selected_in_view,
+            &mut reveal_required,
+        ));
+        assert_eq!(
+            selected_in_view, None,
+            "missing or stale geometry cannot fabricate a clipped result"
+        );
+        assert!(!reveal_required);
+
+        let mut measured_clipped = Some(false);
+        let mut reveal_required = true;
+        assert!(!schedule_reveal_attempt(
+            &mut attempts,
+            &mut measured_clipped,
+            &mut reveal_required,
+        ));
+        assert_eq!(
+            measured_clipped,
+            Some(false),
+            "scheduling exhaustion preserves a current clipped measurement"
+        );
+        assert!(!reveal_required);
     }
 
     #[test]
