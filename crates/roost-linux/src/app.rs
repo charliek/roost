@@ -2766,106 +2766,50 @@ impl App {
             let app_for_exit = app_for_attach.clone();
             let session_for_replies = session.clone();
             glib::spawn_future_local(async move {
-                let mut scanner = roost_osc::OscScanner::new();
+                let mut osc_router = roost_engine::osc::OscRouter::new();
                 while let Some(msg) = output_rx.recv().await {
                     match msg {
                         TabOutput::Bytes(data) => {
-                            let events = scanner.feed(&data);
-                            for event in events {
-                                // Synthesise OSC 10/11/12 query
-                                // replies — libghostty-vt drops the
-                                // .query arm, so without us answering
-                                // codex (and reportedly claude-code)
-                                // skip their prompt-row bg SGR. The
-                                // reply rides the same per-tab serial
-                                // PTY-input channel as keystrokes
-                                // (`TabSession::send_input`), so it's
-                                // FIFO-ordered with other writes
-                                // *once enqueued* — not with PTY
-                                // output that hasn't been drained yet.
-                                // Reads libghostty's *currently
-                                // effective* colors so a prior
-                                // `OSC 10/11/12;rgb:…` set is
-                                // reflected in the next query reply
-                                // (vim colorscheme plugins etc.).
-                                if let roost_osc::OscEvent::ColorQuery(n) = event {
-                                    let color = match terminal_for_drain.live_colors() {
-                                        Ok(c) => match n {
-                                            10 => Some(c.foreground),
-                                            11 => Some(c.background),
-                                            // Cursor may be unset; fall
-                                            // back to the theme.
-                                            12 => c.cursor.or_else(|| {
-                                                Some(app_for_osc.theme.borrow().cursor)
-                                            }),
-                                            _ => None,
-                                        },
-                                        // Libghostty isn't reporting a
-                                        // default color yet (theme push
-                                        // hasn't landed, or FFI hiccup);
-                                        // the theme is what we last
-                                        // asked the terminal to render
-                                        // with, so it's the right
-                                        // fallback.
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                ?err,
-                                                "live_colors failed; falling back to theme"
-                                            );
-                                            let theme = app_for_osc.theme.borrow();
-                                            match n {
-                                                10 => Some(theme.foreground),
-                                                11 => Some(theme.background),
-                                                12 => Some(theme.cursor),
-                                                _ => None,
-                                            }
-                                        }
-                                    };
-                                    if let Some(color) = color {
-                                        if let Some(reply) = roost_osc::format_color_query_response(
-                                            n,
-                                            (color.r, color.g, color.b),
-                                        ) {
-                                            session_for_replies.send_input(reply);
-                                        }
-                                    }
-                                    continue;
-                                }
-                                // OSC 4 palette query — answer each index
-                                // from libghostty's live palette (a prior
-                                // `OSC 4;Ps;rgb:…` set wins), falling back to
-                                // the theme palette on FFI error. Same per-tab
-                                // serial reply channel as the OSC 10/11/12 path
-                                // above. opentui (opencode in local mode + other
-                                // TUIs) gates its color detection on a reply to
-                                // `OSC 4;0;?`.
-                                if let roost_osc::OscEvent::PaletteQuery(ref indices) = event {
-                                    let palette = match terminal_for_drain.live_palette() {
-                                        Ok(p) => p,
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                ?err,
-                                                "live_palette failed; falling back to theme palette"
-                                            );
-                                            app_for_osc.theme.borrow().palette
-                                        }
-                                    };
-                                    let mut reply = Vec::new();
-                                    for &idx in indices {
-                                        let color = palette[idx as usize];
-                                        reply.extend_from_slice(
-                                            &roost_osc::format_palette_query_response(
-                                                idx,
-                                                (color.r, color.g, color.b),
-                                            ),
+                            // Read renderer-owned live colors before applying
+                            // this chunk. The shared router stays renderer-free
+                            // and returns ordered, explicit actions.
+                            let theme = app_for_osc.theme.borrow().clone();
+                            let (foreground, background, cursor) =
+                                match terminal_for_drain.live_colors() {
+                                    Ok(colors) => (
+                                        colors.foreground,
+                                        colors.background,
+                                        colors.cursor.unwrap_or(theme.cursor),
+                                    ),
+                                    Err(err) => {
+                                        tracing::debug!(
+                                            ?err,
+                                            "live_colors failed; falling back to theme"
                                         );
+                                        (theme.foreground, theme.background, theme.cursor)
                                     }
-                                    if !reply.is_empty() {
+                                };
+                            let palette = terminal_for_drain.live_palette().unwrap_or_else(|err| {
+                                tracing::debug!(
+                                    ?err,
+                                    "live_palette failed; falling back to theme palette"
+                                );
+                                theme.palette
+                            });
+                            let rgb = |color: roost_vt::ColorRgb| (color.r, color.g, color.b);
+                            let colors = roost_engine::osc::OscColorSnapshot::new(
+                                rgb(foreground),
+                                rgb(background),
+                                rgb(cursor),
+                                palette.map(rgb),
+                            );
+                            for action in osc_router.feed(&data, &colors) {
+                                match action {
+                                    roost_engine::osc::OscAction::PtyInput(reply) => {
                                         session_for_replies.send_input(reply);
                                     }
-                                    continue;
+                                    action => app_for_osc.report_osc_action(tab_id, action),
                                 }
-                                app_for_osc.report_osc_event(tab_id, event);
                             }
                             terminal_for_drain.vt_write(&data);
                         }
@@ -6000,14 +5944,14 @@ impl App {
     /// UI's `RoostApp.reportOsc` path; the daemon decides whether
     /// to emit `TabTitleChanged` / `TabCwdChanged` /
     /// `NotificationEvent` / etc.
-    fn report_osc_event(self: &Rc<Self>, tab_id: i64, event: roost_osc::OscEvent) {
-        use roost_osc::OscEvent as E;
+    fn report_osc_action(self: &Rc<Self>, tab_id: i64, action: roost_engine::osc::OscAction) {
+        use roost_engine::osc::OscAction as A;
         // OSC 52 short-circuits before the daemon dispatch: it's not
         // workspace state, just an action. Honoring it on the UI side
         // is correct because only the UI has the OS clipboard handle.
         // `clipboard-write = deny` drops silently + logs at info,
         // matching Ghostty's behavior (Surface.zig:2164-2166).
-        if let E::Clipboard { target, text } = event {
+        if let A::ClipboardWrite { target, text } = action {
             if *self.clipboard_write_policy.borrow() == config::ClipboardWrite::Deny {
                 tracing::info!(
                     tab_id,
@@ -6028,40 +5972,16 @@ impl App {
         // `set_cursor_from_name` on pointer-in-view, and resets on
         // alt-screen exit. Mirrors the Mac UI's
         // `applyCurrentCursorShapeIfNeeded` path.
-        if let E::MouseShape(name) = event {
+        if let A::PointerShape(name) = action {
             if let Some(view) = self.terminal_view_for(tab_id) {
                 view.apply_mouse_shape(&name);
             }
             return;
         }
-        let (command, payload): (u32, String) = match event {
-            E::Title(t) => (0, t),
-            // OSC 7 wire format is `file://<host>/<path>`. The
-            // scanner already stripped `file://[host]` so `p`
-            // starts with `/`. Wrap back as `file://<empty-host>/<p>`
-            // = `file:///path` so the daemon's parse_cwd_from_osc7
-            // doesn't mistake the first path segment for a host
-            // (caught during Phase 7 smoke testing — sending
-            // `file:/<path>` produced cwd `/<second-component>`).
-            E::Pwd(p) => (7, format!("file://{}", p)),
-            E::Notification { title, body } => {
-                if body.is_empty() {
-                    (9, title)
-                } else {
-                    (777, format!("notify;{title};{body}"))
-                }
-            }
-            E::ColorQuery(n) => (n as u32, "?".to_string()),
-            // OSC 133 prompt/command mark — pass the body through to
-            // apply_osc, which maps it to tab state (P4b).
-            E::CommandMark(body) => (133, body),
-            // Handled by the short-circuits above; unreachable here.
-            E::Clipboard { .. } => unreachable!(),
-            // Handled above via `apply_mouse_shape` on the tab's view.
-            E::MouseShape(_) => unreachable!(),
-            // Handled by the drain's OSC 4 reply short-circuit; never
-            // routed to the daemon.
-            E::PaletteQuery(_) => unreachable!(),
+        let (command, payload): (u32, String) = match action {
+            A::Workspace { command, payload } => (command, payload),
+            A::PtyInput(_) => unreachable!("PTY replies are handled by the drain"),
+            A::ClipboardWrite { .. } | A::PointerShape(_) => unreachable!(),
         };
         let Some(client) = self.client.borrow().clone() else {
             return;

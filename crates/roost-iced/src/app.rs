@@ -5,13 +5,17 @@ use anyhow::{Context, Result};
 use iced::keyboard;
 use iced::widget::{button, canvas, column, container, row, text};
 use iced::{window, Color, Element, Fill, Size, Task};
-use roost_engine::ipc::{DumpData, IpcHandler, ResolvedCellData, ResolvedCellsData, UiRequest};
+use roost_engine::ipc::{
+    ClipboardOp, DumpData, IpcHandler, ResolvedCellData, ResolvedCellsData, UiRequest,
+};
+use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
 use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace};
 use roost_ipc::messages::Project;
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
+use roost_ui_model::theme::Theme;
 use roost_vt::{KeyEncoder, RenderState, Terminal, TerminalOptions};
 
 use crate::input;
@@ -41,6 +45,9 @@ struct TerminalTab {
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TabOutput>,
     reply_buffer: Arc<Mutex<Vec<u8>>>,
     input_capture: Option<InputCapture>,
+    osc_router: OscRouter,
+    pointer_shape: String,
+    theme: Theme,
     snapshot: TerminalSnapshot,
     cols: u16,
     rows: u16,
@@ -53,6 +60,11 @@ impl TerminalTab {
             rows: DEFAULT_ROWS,
             max_scrollback: 2_000,
         })?;
+        let theme = Theme::default();
+        terminal.set_color_foreground(theme.foreground)?;
+        terminal.set_color_background(theme.background)?;
+        terminal.set_color_cursor(theme.cursor)?;
+        terminal.set_color_palette(&theme.palette)?;
         let reply_buffer = Arc::new(Mutex::new(Vec::new()));
         terminal
             .set_write_pty_buffer(Arc::clone(&reply_buffer))
@@ -70,15 +82,45 @@ impl TerminalTab {
             output_rx,
             reply_buffer,
             input_capture,
+            osc_router: OscRouter::new(),
+            pointer_shape: "default".into(),
+            theme,
             snapshot: TerminalSnapshot::blank(DEFAULT_COLS, DEFAULT_ROWS),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
         })
     }
 
-    fn write_vt(&mut self, bytes: &[u8]) {
+    fn write_vt(&mut self, bytes: &[u8]) -> Vec<OscAction> {
+        let colors = self.osc_colors();
+        let actions = self.osc_router.feed(bytes, &colors);
         self.terminal.vt_write(bytes);
         self.drain_terminal_replies();
+        actions
+    }
+
+    fn osc_colors(&self) -> OscColorSnapshot {
+        let fallback_foreground = self.theme.foreground;
+        let fallback_background = self.theme.background;
+        let (foreground, background, cursor) = self
+            .terminal
+            .live_colors()
+            .map(|colors| {
+                (
+                    colors.foreground,
+                    colors.background,
+                    colors.cursor.unwrap_or(self.theme.cursor),
+                )
+            })
+            .unwrap_or((fallback_foreground, fallback_background, self.theme.cursor));
+        let palette = self.terminal.live_palette().unwrap_or(self.theme.palette);
+        let rgb = |color: roost_vt::ColorRgb| (color.r, color.g, color.b);
+        OscColorSnapshot::new(
+            rgb(foreground),
+            rgb(background),
+            rgb(cursor),
+            palette.map(rgb),
+        )
     }
 
     fn drain_terminal_replies(&self) {
@@ -218,6 +260,8 @@ pub struct App {
     window_size: Size,
     test_mode: bool,
     status: Option<String>,
+    system_clipboard: Option<String>,
+    selection_clipboard: Option<String>,
     // Field order is intentional: terminal sessions and IPC receivers are
     // dropped before the runtime; the lock is held until every runtime task
     // has been cancelled and joined by Runtime::drop.
@@ -270,6 +314,8 @@ impl App {
             window_size: Size::new(1100.0, 720.0),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: None,
+            system_clipboard: None,
+            selection_clipboard: None,
             runtime,
             _lock: lock,
         };
@@ -287,10 +333,13 @@ impl App {
         let task = self.service_ui_requests();
         self.reconcile();
         let mut exited = Vec::new();
+        let mut osc_actions = Vec::new();
         for (tab_id, tab) in &mut self.tabs {
             while let Ok(output) = tab.output_rx.try_recv() {
                 match output {
-                    TabOutput::Bytes(bytes) => tab.write_vt(&bytes),
+                    TabOutput::Bytes(bytes) => {
+                        osc_actions.push((*tab_id, tab.write_vt(&bytes)));
+                    }
                     TabOutput::Exit { status, reason } => {
                         tracing::info!(tab_id, status, %reason, "PTY exited");
                         exited.push(*tab_id);
@@ -306,6 +355,9 @@ impl App {
             if let Err(error) = tab.refresh_snapshot() {
                 tracing::warn!(tab_id, ?error, "terminal snapshot refresh failed");
             }
+        }
+        for (tab_id, actions) in osc_actions {
+            self.apply_osc_actions(tab_id, actions);
         }
         for tab_id in exited {
             let _ = self.workspace.close_tab(tab_id);
@@ -494,14 +546,18 @@ impl App {
                     data,
                     reply,
                 } => {
+                    let mut actions = None;
                     let result = if !self.test_mode {
                         Err("ROOST_TEST_MODE=1 is required".into())
                     } else if let Some(tab) = self.tabs.get_mut(&tab_id) {
-                        tab.write_vt(&data);
-                        Ok(())
+                        actions = Some(tab.write_vt(&data));
+                        tab.refresh_snapshot().map_err(|error| error.to_string())
                     } else {
                         Err(format!("tab {tab_id} has no live terminal"))
                     };
+                    if let Some(actions) = actions {
+                        self.apply_osc_actions(tab_id, actions);
+                    }
                     let _ = reply.send(result);
                 }
                 UiRequest::TabCapturePtyInput {
@@ -578,7 +634,11 @@ impl App {
                     let _ = reply.send(result);
                 }
                 UiRequest::AppCursorShape { reply } => {
-                    let _ = reply.send(Ok("default".into()));
+                    let shape = self
+                        .tabs
+                        .get(&self.workspace.active().1)
+                        .map_or("default", |tab| tab.pointer_shape.as_str());
+                    let _ = reply.send(Ok(shape.into()));
                 }
                 UiRequest::AppActiveTerminalFocused { reply } => {
                     let _ = reply.send(Ok(true));
@@ -605,12 +665,17 @@ impl App {
                 UiRequest::SelectionDump { reply, .. } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));
                 }
-                UiRequest::ClipboardDump { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::ClipboardDump { target, reply } => {
+                    let value = match target {
+                        ClipboardOp::System => self.system_clipboard.clone(),
+                        ClipboardOp::Selection => self.selection_clipboard.clone(),
+                    };
+                    let _ = reply.send(Ok(value));
                 }
-                UiRequest::ClipboardWrite { .. } => {
-                    tracing::warn!("{UNSUPPORTED}: clipboard.write")
-                }
+                UiRequest::ClipboardWrite { target, text } => match target {
+                    ClipboardOp::System => self.system_clipboard = Some(text),
+                    ClipboardOp::Selection => self.selection_clipboard = Some(text),
+                },
                 UiRequest::TabExpandSelectionAt { reply, .. } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));
                 }
@@ -623,6 +688,39 @@ impl App {
             }
         }
         task
+    }
+
+    fn apply_osc_actions(&mut self, tab_id: i64, actions: Vec<OscAction>) {
+        for action in actions {
+            match action {
+                OscAction::Workspace { command, payload } => {
+                    self.client.apply_osc(tab_id, command, &payload);
+                }
+                OscAction::PtyInput(bytes) => {
+                    if let Some(tab) = self.tabs.get(&tab_id) {
+                        tab.session.send_input(bytes);
+                    }
+                }
+                OscAction::ClipboardWrite { target, text } => match target {
+                    ClipboardTarget::System => self.system_clipboard = Some(text),
+                    ClipboardTarget::Selection => self.selection_clipboard = Some(text),
+                },
+                OscAction::PointerShape(name) => {
+                    if let Some(tab) = self.tabs.get_mut(&tab_id) {
+                        tab.pointer_shape = canonical_pointer_shape(&name).into();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn canonical_pointer_shape(name: &str) -> &str {
+    match name {
+        "default" | "pointer" | "text" | "crosshair" | "grab" | "grabbing" | "not-allowed"
+        | "col-resize" | "row-resize" | "n-resize" | "s-resize" | "e-resize" | "w-resize"
+        | "ne-resize" | "nw-resize" | "se-resize" | "sw-resize" => name,
+        _ => "default",
     }
 }
 

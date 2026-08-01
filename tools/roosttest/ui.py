@@ -138,6 +138,30 @@ def socket_path(target: str) -> Path:
     return Path(f"/tmp/{spec.linux_namespace}-{os.getuid()}") / "roost.sock"
 
 
+def rust_binary_path(target: str) -> tuple[Path, bool]:
+    """Resolve a Rust UI binary and whether the path was explicit.
+
+    The per-target override is essential when the repository is mounted into
+    a Linux shed: the mounted ``target/`` contains Mach-O artifacts, while the
+    guest build lives in a shed-local Cargo target directory.
+    """
+    try:
+        spec = TARGET_SPECS[target]
+    except KeyError as error:
+        raise ValueError(
+            f"unknown target {target!r} (want {'|'.join(TARGETS)})"
+        ) from error
+    if spec.binary_name is None:
+        raise ValueError(f"target {target!r} is not a Rust UI")
+    env_name = f"ROOST_{target.upper()}_BIN"
+    if override := os.environ.get(env_name):
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        return path, True
+    return REPO_ROOT / "target/debug" / spec.binary_name, False
+
+
 def is_alive(target: str) -> bool:
     try:
         c = Roost(socket_path(target))
@@ -337,8 +361,12 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
     elif target in ("gtk", "iced"):
         spec = TARGET_SPECS[target]
         assert spec.binary_name is not None and spec.rust_package is not None
-        binary = REPO_ROOT / "target/debug" / spec.binary_name
+        binary, explicit_binary = rust_binary_path(target)
         if not binary.is_file():
+            if explicit_binary:
+                raise FileNotFoundError(
+                    f"explicit {target} binary does not exist: {binary}"
+                )
             subprocess.run(
                 ["cargo", "build", "-p", spec.rust_package], cwd=REPO_ROOT, check=True
             )

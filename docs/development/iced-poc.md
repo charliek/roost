@@ -13,6 +13,11 @@ and cursor with an Iced canvas, encodes native keyboard events with
 `roost_vt::KeyEncoder`, and resizes the VT grid and PTY together. The common IPC
 server supports identify, project/tab operations, PTY write/resize, tab list,
 terminal dump, activation, resolved-cell dump, and the test-mode PTY byte ports.
+GTK and Iced now feed the same per-terminal engine OSC router. Iced applies
+title, cwd, shell-state, notification, OSC 52 clipboard state, and OSC 22
+pointer actions, and answers OSC 4/10/11/12 queries from libghostty-vt's live
+colors. An owned color snapshot keeps the router renderer-neutral and suitable
+for a future Swift adapter.
 
 Workspace UI state reconciles from a full snapshot every tick, so a slow UI
 consumer recovers without replaying stale deltas. PTY broadcast lag is different:
@@ -23,10 +28,12 @@ error; none leave an IPC caller waiting on a dropped reply.
 
 The canvas currently covers foreground/background colors, inverse, bold,
 italic, cursor shapes, grapheme cell text, clipping by the widget, and resize.
-Selection, clipboard, links, mouse protocols, theme/config application,
-notifications, palette behavior, in-process screenshots, and full product
+Selection geometry, native clipboard synchronization and paste, links, mouse
+protocols, config-selected theme/font application, desktop notification
+presentation, palette behavior, in-process screenshots, and full product
 styling remain the next parity slices; they are not hidden behind target-wide
-test skips.
+test skips. The default terminal theme is already pushed into libghostty-vt so
+rendering and OSC color queries share one live source of truth.
 
 ## Build, run, and test
 
@@ -56,6 +63,19 @@ macOS output directories:
 ```sh
 tools/shed/shed-test.sh --build-only
 ```
+
+For direct harness commands in the shed, select the shed-local ELF explicitly
+instead of the mounted macOS `target/` artifact:
+
+```sh
+ROOST_ICED_BIN=$HOME/rt/debug/roost-iced \
+ROOST_ROOSTCTL=$HOME/rt/debug/roostctl \
+  uv run --group test pytest tools/roosttest --roost-target iced --roost-fresh
+```
+
+`ROOST_GTK_BIN` provides the equivalent explicit GTK binary override. Relative
+overrides resolve from the repository root; a missing explicit path is a hard
+launch error and never falls back to rebuilding into the shared mount.
 
 ## Target and coexistence
 

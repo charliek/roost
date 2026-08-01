@@ -9,9 +9,9 @@ layouts across an ABI.
 
 The engine owns workspace transitions and ordered events, agent-state
 derivation, persistence/restoration, PTY supervision, terminal session
-lifecycle, OSC application, profile-scoped instance locking, full-state
-reconciliation, and target-neutral IPC dispatch. It reuses the focused
-`roost-ipc` and `roost-osc` contracts.
+lifecycle, streaming OSC routing/application, profile-scoped instance locking,
+full-state reconciliation, and target-neutral IPC dispatch. It reuses the
+focused `roost-ipc` and `roost-osc` contracts.
 
 `roost-ui-model` owns toolkit-neutral configuration, terminal theme/color
 resolution, keybinds, command palettes, providers, custom commands, agent and
@@ -39,6 +39,13 @@ under that lock, and persistence I/O happens after it is released.
 The concrete `Workspace`, `LocalClient`, and runtime APIs remain public during
 the GTK migration. `roost-linux` compatibility modules only re-export shared
 types; they no longer own those state machines.
+
+Each live Rust terminal owns a `roost_engine::osc::OscRouter`. The caller feeds
+PTY bytes plus an owned renderer-derived RGB/palette snapshot and receives an
+ordered list of workspace, PTY-input, clipboard, and pointer actions. This
+keeps split-sequence scan state and reply ordering shared while the adapters
+retain libghostty-vt access and execute native clipboard/pointer ports. No UI
+callback or renderer type crosses the router boundary.
 
 ## Dependency checks
 

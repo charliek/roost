@@ -494,6 +494,36 @@ Before every commit:
    `poc/iced`, and wait for GitHub Actions; and
 9. fix failures with additive commits—never rewrite published history.
 
+### Active mini-plan: shared OSC routing and Iced shell-state parity
+
+Scope: introduce a toolkit-neutral, per-terminal OSC router in `roost-engine`,
+migrate the GTK drain to it, and use it from Iced for PTY output and test-fed
+bytes. The router owns streaming scan state, ordered workspace actions, color
+and palette query replies, and explicit clipboard/pointer UI effects. It does
+not touch a toolkit, terminal renderer, clipboard, or workspace lock.
+
+Invariants and interfaces:
+
+- one router is owned per live terminal, so split OSC sequences cannot cross
+  tabs and action order matches byte order;
+- callers provide an owned live-color snapshot and receive an ordered
+  `Vec<OscAction>`; no UI callback crosses the engine boundary;
+- workspace actions continue through `LocalClient::apply_osc`, while clipboard
+  and pointer actions remain narrow UI ports and PTY replies use the tab's
+  serial input channel;
+- GTK behavior and its OS clipboard/cursor adapters remain unchanged; and
+- Iced refreshes render snapshots after injected bytes so a subsequent IPC
+  resolved-cell dump cannot observe a stale frame.
+
+Acceptance: engine router unit tests cover split input, event/action ordering,
+workspace mapping, and color/palette replies; Iced passes
+`test_osc_pipeline.py`, shell/agent OSC state tests, OSC 52's deterministic
+test port, and OSC 22 cursor assertions; GTK's focused OSC suites and full
+regression gate remain green; dependency-boundary checks remain unchanged.
+Mouse encoding, selection geometry, the visible palette, native clipboard
+readback, and desktop notification presentation are explicitly outside this
+commit and retain their focused failing tests for the next slices.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

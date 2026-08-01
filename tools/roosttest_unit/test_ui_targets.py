@@ -45,6 +45,25 @@ class TargetContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"want mac\|gtk\|iced"):
             ui.socket_path("other")
 
+    @patch.dict(os.environ, {"ROOST_ICED_BIN": "/home/shed/rt/debug/roost-iced"})
+    def test_iced_binary_override_is_explicit_and_absolute(self) -> None:
+        self.assertEqual(
+            ui.rust_binary_path("iced"),
+            (Path("/home/shed/rt/debug/roost-iced"), True),
+        )
+
+    @patch.dict(os.environ, {"ROOST_GTK_BIN": "out/linux/roost"})
+    @patch("ui.REPO_ROOT", Path("/work/roost"))
+    def test_relative_gtk_binary_override_is_repository_relative(self) -> None:
+        self.assertEqual(
+            ui.rust_binary_path("gtk"),
+            (Path("/work/roost/out/linux/roost"), True),
+        )
+
+    def test_mac_has_no_rust_binary(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not a Rust UI"):
+            ui.rust_binary_path("mac")
+
     @patch.dict(os.environ, {"XDG_RUNTIME_DIR": "relative/runtime"}, clear=False)
     @patch("ui.os.getuid", return_value=1234)
     @patch("ui.platform.system", return_value="Linux")

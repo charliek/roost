@@ -25,6 +25,9 @@ uv run --group test pytest tools/roosttest --roost-target iced -v
 The session fixture launches the UI if it isn't already running (and
 quits only what it launched), so a bare `make e2e` is self-contained.
 Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
+`ROOST_GTK_BIN` and `ROOST_ICED_BIN` select explicit Rust UI executables;
+`ROOST_ROOSTCTL` selects the CLI. The shed uses these to run shed-local ELF
+artifacts while the mounted repository's `target/` contains macOS output.
 
 Use the **`*-ci`** targets to reproduce CI locally: they unlock the
 test-mode-gated ops (`ROOST_TEST_MODE=1`) and force a fresh harness-owned

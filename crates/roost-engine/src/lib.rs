@@ -11,6 +11,7 @@ pub mod application;
 pub mod events;
 pub mod facade;
 pub mod ipc;
+pub mod osc;
 pub mod persistence;
 pub mod pointer;
 pub mod pty;
