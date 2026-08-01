@@ -37,7 +37,6 @@ use roost_linux::reconcile;
 
 use crate::agent_palette;
 use crate::agent_palette::SidebarAgentRow;
-use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::clipboard;
 use crate::config;
 use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
@@ -58,6 +57,7 @@ use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
 use roost_engine::git_metrics;
+use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 
 /// One per project: sidebar row + tab strip + tab content stack.
 struct ProjectUi {
@@ -229,26 +229,13 @@ pub struct App {
     /// Count badge overlaid on the HeaderBar notifications bell. Hidden
     /// at zero; `refresh_notif_badge` keeps it in sync with the inbox.
     notif_badge: gtk4::Label,
-    /// Optional font-family override from config. `RefCell` because
-    /// the command palette swaps it live (Select Font…); new tabs
-    /// read the current value at spawn so confirm + revert propagate
-    /// forward, matching the theme story.
-    font_family: RefCell<Option<String>>,
+    /// Toolkit-neutral live family/size state. GTK retains Pango measurement
+    /// and palette presentation; shared transitions live in roost-ui-model.
+    typography: RefCell<TerminalTypography>,
     /// Font family captured when the palette opened, restored on
     /// dismiss-without-confirm so an in-flight live preview reverts.
     /// `None` while the palette is closed or before the first open.
     font_family_at_open: RefCell<Option<Option<String>>>,
-    /// Optional font-size override from config (points). Snapshot
-    /// of the value read at boot; the live size (with FontIncrease /
-    /// FontDecrease / FontReset adjustments) lives in
-    /// `current_font_size_pt`.
-    font_size_pt: Option<f64>,
-    /// Live font size for the active session. Starts at
-    /// `font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT)` and shifts by
-    /// ±1 on each FontIncrease / FontDecrease; FontReset snaps back
-    /// to that baseline. Applied to every TerminalView via
-    /// `apply_font_size_to_all`.
-    current_font_size_pt: RefCell<f64>,
     /// `copy-on-select` from `~/.config/roost/config.conf` (default
     /// `True`). `RefCell` so a future config-reload path can update it
     /// without rebuilding the App; new tabs read the current value
@@ -810,10 +797,11 @@ impl App {
             metrics_cache: RefCell::new(git_metrics::MetricsCache::default()),
             notification_inbox: RefCell::new(NotificationInbox::new()),
             notif_badge: notif_badge.clone(),
-            font_family: RefCell::new(cfg.font_family.clone()),
+            typography: RefCell::new(TerminalTypography::new(
+                cfg.font_family.clone(),
+                cfg.font_size,
+            )),
             font_family_at_open: RefCell::new(None),
-            font_size_pt: cfg.font_size,
-            current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
             copy_on_select: RefCell::new(cfg.copy_on_select),
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
@@ -2530,10 +2518,17 @@ impl App {
         // tab opened after the user has zoomed in matches the
         // existing tabs, rather than snapping back to the config
         // baseline.
+        let (font_family, font_size_pt) = {
+            let typography = self.typography.borrow();
+            (
+                typography.family().map(str::to_owned),
+                typography.current_size_pt(),
+            )
+        };
         let terminal = Rc::new(TerminalView::with_theme_font_and_copy(
             self.theme.borrow().clone(),
-            self.font_family.borrow().as_deref(),
-            Some(*self.current_font_size_pt.borrow()),
+            font_family.as_deref(),
+            Some(font_size_pt),
             *self.copy_on_select.borrow(),
             self.word_break_chars.borrow().clone(),
             self.link_modifier,
@@ -3630,18 +3625,10 @@ impl App {
             KeybindAction::FontIncrease => self.adjust_font_size(1.0),
             KeybindAction::FontDecrease => self.adjust_font_size(-1.0),
             KeybindAction::FontReset => {
-                let baseline = self.font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT);
-                let current = *self.current_font_size_pt.borrow();
-                // No-op when the live size already matches the baseline.
-                // Skipping the apply call also skips its config write —
-                // otherwise a stray Cmd+0 on an unconfigured user would
-                // materialize `font-size = <default>` into a config that
-                // never had a font-size line.
-                if (current - baseline).abs() < 0.01 {
-                    return;
+                let reset = self.typography.borrow_mut().reset_size();
+                if let Some(size_pt) = reset {
+                    self.apply_font_size_to_all(size_pt);
                 }
-                *self.current_font_size_pt.borrow_mut() = baseline;
-                self.apply_font_size_to_all(baseline);
             }
             KeybindAction::SwitchProject(n) => self.switch_project_by_index(n as usize),
             KeybindAction::SwitchTab(n) => self.switch_tab_by_index(n as usize),
@@ -3728,25 +3715,19 @@ impl App {
     /// daemon doesn't know or care about font size — it's purely
     /// a UI concern — so no RPC fires.
     fn adjust_font_size(self: &Rc<Self>, delta: f64) {
-        let new = {
-            let mut size = self.current_font_size_pt.borrow_mut();
-            let new = (*size + delta).clamp(6.0, 72.0);
-            if (new - *size).abs() < 0.01 {
-                return;
-            }
-            *size = new;
-            new
-        };
-        self.apply_font_size_to_all(new);
+        let adjusted = self.typography.borrow_mut().adjust_size(delta);
+        if let Some(size_pt) = adjusted {
+            self.apply_font_size_to_all(size_pt);
+        }
     }
 
     /// Push `size_pt` to every TerminalView in every project. Reuses
     /// each view's existing `apply_font` path so cell metrics get
     /// remeasured + a redraw is queued automatically.
     fn apply_font_size_to_all(self: &Rc<Self>, size_pt: f64) {
+        let family = self.typography.borrow().family().map(str::to_owned);
         {
             let projects = self.projects.borrow();
-            let family = self.font_family.borrow();
             for ui in projects.values() {
                 let tabs = ui.tabs.borrow();
                 for tab_ui in tabs.values() {
@@ -3814,17 +3795,16 @@ impl App {
     /// family slot to support size-only updates, so we must pass an
     /// explicit family string to revert visually.
     fn set_active_font_family(self: &Rc<Self>, family: Option<String>) {
-        // Clone the to-be-applied family BEFORE moving into the
-        // RefCell so the per-tab loop below can read it without
-        // holding a live borrow across arbitrary view code (any
-        // future apply_font side-effect that re-enters would
-        // otherwise trip a BorrowError).
-        let applied: String = family
-            .as_deref()
-            .unwrap_or(crate::cell_metrics::DEFAULT_FONT_FAMILY)
-            .to_string();
-        *self.font_family.borrow_mut() = family;
-        let size = *self.current_font_size_pt.borrow();
+        // Resolve owned values and drop the model borrow before invoking any
+        // TerminalView code; renderer callbacks must never run under it.
+        let (applied, size) = {
+            let mut typography = self.typography.borrow_mut();
+            typography.set_family(family);
+            (
+                typography.effective_family().to_string(),
+                typography.current_size_pt(),
+            )
+        };
         let projects = self.projects.borrow();
         for ui in projects.values() {
             let tabs = ui.tabs.borrow();
@@ -3848,27 +3828,19 @@ impl App {
     /// against the live value would still drop the fallback.
     fn commit_font_family(self: &Rc<Self>, name: &str) {
         let opened = self.font_family_at_open.borrow().clone().flatten();
-        let opened_primary = opened
-            .as_deref()
-            .and_then(|s| s.split(',').map(str::trim).find(|t| !t.is_empty()));
-        if opened_primary
-            .map(|p| p.eq_ignore_ascii_case(name))
-            .unwrap_or(false)
-        {
-            // No-op confirm: restore the opened chain to live state
-            // (an interim preview may have replaced it with the bare
-            // primary) and DON'T rewrite the file — it already has
-            // the chain the user opened with.
-            if *self.font_family.borrow() != opened {
-                self.set_active_font_family(opened);
-            }
-            return;
+        let live = self.typography.borrow().family().map(str::to_owned);
+        let confirmation = typography::confirm_family(opened.as_deref(), live.as_deref(), name);
+        match confirmation.apply {
+            FamilyApply::Keep => {}
+            FamilyApply::Set(family) => self.set_active_font_family(family),
         }
-        self.set_active_font_family(Some(name.to_string()));
-        if let Err(e) = write_back_font_family(name) {
+        let Some(persist) = confirmation.persist else {
+            return;
+        };
+        if let Err(e) = write_back_font_family(&persist) {
             tracing::warn!(
                 error = %e,
-                family = name,
+                family = persist,
                 "failed to persist font-family to config.conf"
             );
         }
@@ -3884,7 +3856,8 @@ impl App {
             return;
         }
         *self.theme_name_at_open.borrow_mut() = Some(self.active_theme_name.borrow().clone());
-        *self.font_family_at_open.borrow_mut() = Some(self.font_family.borrow().clone());
+        *self.font_family_at_open.borrow_mut() =
+            Some(self.typography.borrow().family().map(str::to_owned));
 
         // Reverse map (action → shortcut label) from the canonicalized
         // bindings, so each command row shows its keybind hint. First
@@ -4919,11 +4892,7 @@ impl App {
     /// live family.
     fn font_frame(self: &Rc<Self>) -> PaletteFrame {
         let families = self.available_font_families();
-        let active = self
-            .font_family
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| crate::cell_metrics::DEFAULT_FONT_FAMILY.to_string());
+        let active = self.typography.borrow().effective_family().to_string();
         // Match against the primary entry of a comma list (e.g. the
         // default `"JetBrains Mono, Monospace"` should pre-select
         // "JetBrains Mono"). Fall back to row 0 if not found.
@@ -4971,9 +4940,9 @@ impl App {
     /// already active).
     fn preview_font_family(self: &Rc<Self>, name: &str) {
         let already = self
-            .font_family
+            .typography
             .borrow()
-            .as_deref()
+            .family()
             .map(|s| s == name)
             .unwrap_or(false);
         if already {
@@ -4990,7 +4959,7 @@ impl App {
         let Some(target) = self.font_family_at_open.borrow().clone() else {
             return;
         };
-        let current = self.font_family.borrow().clone();
+        let current = self.typography.borrow().family().map(str::to_owned);
         if current == target {
             return;
         }
@@ -6606,7 +6575,7 @@ fn write_back_font_family(name: &str) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
         return Ok(());
     };
-    let quoted = format!("\"{}\"", name);
+    let quoted = typography::quote_font_family(name);
     config::set_key(&path, "font-family", &quoted)
 }
 
@@ -6617,7 +6586,7 @@ fn write_back_font_size(size_pt: f64) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
         return Ok(());
     };
-    let formatted = format_font_size(size_pt);
+    let formatted = typography::format_font_size(size_pt);
     config::set_key(&path, "font-size", &formatted)
 }
 
@@ -6635,21 +6604,6 @@ fn write_back_show_sidebar_agents(value: bool) -> std::io::Result<()> {
         "show-sidebar-agents",
         if value { "true" } else { "false" },
     )
-}
-
-/// Format a font size in points for the config file. Whole numbers
-/// render as integers; non-whole values keep up to two decimal places
-/// so a `font-size = 14.5` round-trip cleanly. Split out for testing
-/// (no I/O).
-fn format_font_size(size_pt: f64) -> String {
-    if (size_pt.round() - size_pt).abs() < 0.001 {
-        format!("{}", size_pt.round() as i64)
-    } else {
-        // Two decimals is plenty for point sizes; trim trailing zeros.
-        let s = format!("{:.2}", size_pt);
-        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-        trimmed.to_string()
-    }
 }
 
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
@@ -6718,9 +6672,9 @@ fn agent_rows_visible(toggle_on: bool, dragging: bool) -> bool {
 mod tests {
     use super::{
         activation_target, agent_rows_visible, compute_insert_idx, drain_server_driven_marker,
-        format_font_size, is_already_attached_or_pending, pick_next_active_project,
-        resolve_launch_cwd, restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home,
-        ActivationTarget, RestoreTab,
+        is_already_attached_or_pending, pick_next_active_project, resolve_launch_cwd,
+        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, ActivationTarget,
+        RestoreTab,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
@@ -6993,22 +6947,5 @@ mod tests {
         assert_eq!(resolve_launch_cwd(None, "/t"), "/t");
         // Both empty stays empty (open_tab then resolves project → $HOME).
         assert_eq!(resolve_launch_cwd(None, ""), "");
-    }
-
-    #[test]
-    fn format_font_size_whole_renders_as_integer() {
-        assert_eq!(format_font_size(14.0), "14");
-        assert_eq!(format_font_size(8.0), "8");
-        // Floating-point fuzz like 14.0000000001 still rounds.
-        assert_eq!(format_font_size(14.0 + f64::EPSILON), "14");
-    }
-
-    #[test]
-    fn format_font_size_keeps_decimals_when_needed() {
-        assert_eq!(format_font_size(14.5), "14.5");
-        // Trailing zeros are trimmed (no "14.50").
-        assert_eq!(format_font_size(14.50), "14.5");
-        // Two-decimal precision is preserved.
-        assert_eq!(format_font_size(13.25), "13.25");
     }
 }

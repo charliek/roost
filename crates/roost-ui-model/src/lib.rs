@@ -12,4 +12,5 @@ pub mod provider;
 pub mod rollup;
 pub mod shell_escape;
 pub mod theme;
+pub mod typography;
 pub mod word_selection;

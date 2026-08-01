@@ -1763,6 +1763,92 @@ The complete shed gate rebuilt isolated artifacts and passed GTK cage/uinput
 Wayland drag/reorder, the Iced X11 real-input clipboard/input guard, and the Iced
 real-seat Wayland clipboard/input guard.
 
+### Shared Rust terminal-typography policy commit plan
+
+Scope: move the non-rendering terminal font state and transition policy out of
+the GTK application and into `roost-ui-model`. Add a toolkit-neutral
+`typography` module and migrate GTK from its separate `font_family`, launch
+`font_size_pt`, and live `current_font_size_pt` fields to one owned
+`TerminalTypography`. This independently useful extraction preserves GTK's
+rendering, launch contract, config bytes, Pango measurement, installed-font
+discovery, and palette presentation. Iced remains unchanged in this commit and
+will consume the same model in the following measured-renderer slice.
+
+Interfaces: `TerminalTypography` owns the optional configured/live family, the
+launch baseline size, and the current size. Its synchronous API exposes the raw
+configured family, effective fallback family, baseline/current size,
+`set_family(Option<String>)`, size adjustment, and reset as explicit changed or
+no-op transitions. The module owns the current **Rust UI** policy values:
+`JetBrains Mono, Monospace`, 13pt, adjustment clamp 6..72pt, the existing 0.01
+transition no-op tolerance, the existing 0.001 whole-number formatting
+tolerance, two-decimal trimming, and quoted family serialization. These are not
+declared universal product/AppKit policy: AppKit currently has different size
+defaults and bounds.
+
+Construction preserves every finite positive configured size—including
+fractional values and launch baselines outside 6..72—as the unmodified baseline
+and current size. Only an adjustment clamps to 6..72; reset returns to the
+unmodified launch baseline. A non-finite or non-positive value is normalized to
+the Rust default at model consumption; zero and non-finite adjustments are
+no-ops. The shared config parser and fixtures remain unchanged so this slice
+does not silently diverge from Swift's accepted parsing contract.
+
+Family preview snapshots remain UI-owned. A pure model confirmation transition
+accepts the at-open raw family, current live family, and selected family and
+returns an explicit keep/set apply intent plus an optional exact persist value.
+When the selected family case-insensitively matches the at-open chain's primary,
+the transition restores the complete original chain after any interim preview
+and writes nothing. A different selection applies and persists the selected
+family. `set_family(None)` restores the genuinely unconfigured/default state
+without materializing a config override. GTK clones family and size values and
+drops model borrows before every `TerminalView` construction/application, so UI
+code is never invoked while internal state is borrowed.
+
+Adapter and persistence behavior: GTK continues to use
+`roost_ui_model::config::set_key` at its commit boundary. The launch baseline
+does not change when a zoom adjustment is persisted, matching current reset
+semantics. A no-op adjustment/reset performs no apply or write. Font preview,
+dismissal, confirmation, configured fallback-chain preservation, new-tab
+inheritance, and write-error behavior remain unchanged. Pango cell measurement,
+the installed-family picker, and missing-family diagnostics stay in GTK;
+`cell_metrics` consumes the shared Rust defaults rather than redefining them.
+
+Tests: exhaustively unit-test default/configured construction, fractional and
+out-of-range finite baselines, non-finite normalization/deltas, clamp boundaries,
+0.01 transition no-ops, reset, family fallback/set/restore, case-insensitive
+primary matching, explicit confirmation intents, and exact size/family config
+serialization. Add a harness-owned GTK adapter regression with fixed geometry
+and two attached PTY tabs: a font-size command must reflow both grids, write the
+exact temporary config, and be inherited by a third tab; reset must restore the
+launch baseline and a second reset must leave config bytes unchanged. Exercise
+an available font's preview/dismiss/confirm path and config-byte boundaries.
+The functional test refuses all mutation unless `owned_session_config_path()`
+proves ownership and it keeps the tracked seed unchanged. The fallback-chain
+no-write case is covered in the pure model tests because the session config is
+copied before the test body and cannot safely manufacture an at-launch chain.
+
+Acceptance and validation: `roost-ui-model` remains free of GTK, Iced, renderer,
+runtime, callback, IO, and global-state dependencies; GTK has one authoritative
+typography model and unchanged observable behavior; Iced/AppKit are unchanged;
+no dependency direction changes. Run formatting, warnings-denied lint,
+`cargo test -p roost-ui-model`, GTK unit/functional tests, target-neutral GTK,
+AppKit, and both-renderer Iced regressions, `make check && make check-iced`, and
+the complete shed gate. Review the complete diff, commit the focused slice,
+push, and require branch CI green. The commit has no data migration and can be
+reverted independently.
+
+Validation result: 252 shared UI-model tests, 149 GTK library/application tests,
+89 Iced tests, 688 Swift tests, and 33 harness-unit tests passed with formatting,
+warnings-denied lint, theme parity, and dependency boundaries. The complete
+fresh macOS functional suites passed GTK 154 tests, AppKit 145 tests, and Iced
+49 tests on each of wgpu and tiny-skia; remaining skips are the existing named
+platform/capability cases plus the intentionally GTK-scoped typography guard.
+The two new GTK typography tests also passed twice consecutively in isolation.
+The complete shed gate rebuilt isolated GTK/Iced/roostctl artifacts and passed
+GTK real-seat Wayland project/tab drag, Iced X11 real-input, and Iced real-seat
+Wayland clipboard/input coverage. AppKit and Iced clipboard suites were run
+sequentially because the macOS system clipboard is a shared external resource.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.
