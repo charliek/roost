@@ -59,7 +59,7 @@ pub fn encode_press(
     })
 }
 
-fn ghostty_modifiers(value: keyboard::Modifiers) -> u16 {
+pub(crate) fn ghostty_modifiers(value: keyboard::Modifiers) -> u16 {
     let mut result = 0;
     if value.shift() {
         result |= mods::SHIFT;
@@ -187,6 +187,18 @@ mod tests {
         assert_eq!(
             character_key("λ"),
             Some(ghostty::GhosttyKey_GHOSTTY_KEY_UNIDENTIFIED)
+        );
+    }
+
+    #[test]
+    fn maps_native_pointer_modifiers_to_ghostty_bits() {
+        let all = keyboard::Modifiers::SHIFT
+            | keyboard::Modifiers::CTRL
+            | keyboard::Modifiers::ALT
+            | keyboard::Modifiers::LOGO;
+        assert_eq!(
+            ghostty_modifiers(all),
+            mods::SHIFT | mods::CTRL | mods::ALT | mods::SUPER
         );
     }
 }

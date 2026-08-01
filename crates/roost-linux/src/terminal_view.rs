@@ -2358,10 +2358,7 @@ impl TerminalViewState {
     /// when mode 1004 is off, so the caller can no-op without an
     /// extra check).
     fn encode_focus_bytes_if_active(&self, focused: bool) -> Vec<u8> {
-        if !self.terminal.mode_get(1004) {
-            return Vec::new();
-        }
-        roost_linux::mouse_routing::encode_focus_bytes(focused)
+        self.terminal.encode_focus(focused)
     }
 
     /// Resolve the URL (if any) covering `(col, row)`. OSC 8 wins

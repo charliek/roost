@@ -25,7 +25,9 @@ enum Message {
     Tick,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
+    WindowFocus(window::Id, bool),
     Keyboard(keyboard::Event),
+    TerminalPointer(terminal_canvas::TerminalPointer),
     ProjectSelected(i64),
     TabSelected(i64),
     NewTab,
@@ -81,8 +83,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.resize(size);
             Task::none()
         }
+        Message::WindowFocus(id, focused) => {
+            app.set_window_id(id);
+            app.set_window_focus(focused);
+            Task::none()
+        }
         Message::Keyboard(event) => {
             app.keyboard(event);
+            Task::none()
+        }
+        Message::TerminalPointer(event) => {
+            app.pointer(event.action, event.button, event.col, event.row);
             Task::none()
         }
         message @ (Message::ProjectSelected(_) | Message::TabSelected(_) | Message::NewTab) => {
@@ -96,6 +107,11 @@ fn subscription(_app: &App) -> Subscription<Message> {
         time::every(Duration::from_millis(16)).map(|_| Message::Tick),
         window::open_events().map(Message::WindowOpened),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
+        window::events().filter_map(|(id, event)| match event {
+            window::Event::Focused => Some(Message::WindowFocus(id, true)),
+            window::Event::Unfocused => Some(Message::WindowFocus(id, false)),
+            _ => None,
+        }),
         keyboard::listen().map(Message::Keyboard),
     ])
 }

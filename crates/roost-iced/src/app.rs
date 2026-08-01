@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use iced::keyboard;
@@ -9,6 +10,7 @@ use roost_engine::ipc::{
     ClipboardOp, DumpData, IpcHandler, ResolvedCellData, ResolvedCellsData, UiRequest,
 };
 use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
+use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
 use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace};
@@ -16,7 +18,10 @@ use roost_ipc::messages::Project;
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
-use roost_vt::{KeyEncoder, RenderState, Terminal, TerminalOptions};
+use roost_vt::{
+    mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
+    TerminalOptions,
+};
 
 use crate::input;
 use crate::terminal_canvas::{
@@ -41,6 +46,9 @@ struct TerminalTab {
     terminal: Terminal,
     render_state: RenderState,
     encoder: KeyEncoder,
+    mouse_encoder: MouseEncoder,
+    motion_emitter: MotionEmitter,
+    input_started_at: Instant,
     session: TabSession,
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TabOutput>,
     reply_buffer: Arc<Mutex<Vec<u8>>>,
@@ -71,6 +79,7 @@ impl TerminalTab {
             .context("install libghostty PTY reply buffer")?;
         let render_state = RenderState::new()?;
         let encoder = KeyEncoder::new()?;
+        let mouse_encoder = MouseEncoder::new()?;
         let input_capture = test_mode.then(|| Arc::new(Mutex::new(Vec::new())));
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         let session = TabSession::attach(supervisor, tab_id, output_tx, input_capture.clone())?;
@@ -78,6 +87,9 @@ impl TerminalTab {
             terminal,
             render_state,
             encoder,
+            mouse_encoder,
+            motion_emitter: MotionEmitter::new(),
+            input_started_at: Instant::now(),
             session,
             output_rx,
             reply_buffer,
@@ -148,6 +160,65 @@ impl TerminalTab {
         }
         self.drain_terminal_replies();
         self.session.send_resize(cols, rows);
+    }
+
+    fn dispatch_pointer(
+        &mut self,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+        mods: u16,
+    ) -> Result<()> {
+        let col = col.min(u32::from(self.cols.saturating_sub(1)));
+        let row = row.min(u32::from(self.rows.saturating_sub(1)));
+        let motion_without_button = action == PointerAction::Motion && button.is_none();
+        let now = self.input_started_at.elapsed().as_secs_f64();
+        if motion_without_button && !self.motion_emitter.would_emit(col, row, now) {
+            return Ok(());
+        }
+
+        let cell_width = CELL_WIDTH.round().max(1.0) as u32;
+        let cell_height = CELL_HEIGHT.round().max(1.0) as u32;
+        self.mouse_encoder.sync_from_terminal(&self.terminal);
+        self.mouse_encoder.set_size(
+            u32::from(self.cols) * cell_width,
+            u32::from(self.rows) * cell_height,
+            cell_width,
+            cell_height,
+        );
+        let mut event = MouseEvent::new().context("allocate terminal mouse event")?;
+        event
+            .set_action(pointer_action(action))
+            .set_mods(mods)
+            .set_position(
+                (col * cell_width) as f32 + cell_width as f32 / 2.0,
+                (row * cell_height) as f32 + cell_height as f32 / 2.0,
+            );
+        if let Some(button) = button {
+            event.set_button(pointer_button(button));
+        } else {
+            event.clear_button();
+        }
+        let bytes = self
+            .mouse_encoder
+            .encode(&event)
+            .context("encode terminal mouse event")?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if motion_without_button {
+            self.motion_emitter.commit(col, row, now);
+        }
+        self.session.send_input(bytes);
+        Ok(())
+    }
+
+    fn set_window_focus(&self, focused: bool) {
+        let bytes = self.terminal.encode_focus(focused);
+        if !bytes.is_empty() {
+            self.session.send_input(bytes);
+        }
     }
 
     fn refresh_snapshot(&mut self) -> Result<()> {
@@ -258,6 +329,7 @@ pub struct App {
     ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
     window_size: Size,
+    modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: Option<String>,
     system_clipboard: Option<String>,
@@ -312,6 +384,7 @@ impl App {
             ui_rx,
             window_id: None,
             window_size: Size::new(1100.0, 720.0),
+            modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: None,
             system_clipboard: None,
@@ -378,12 +451,44 @@ impl App {
     }
 
     pub fn keyboard(&mut self, event: keyboard::Event) {
+        if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+            self.modifiers = *modifiers;
+        }
         let (_, active_tab) = self.workspace.active();
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
             return;
         };
         let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
         tab.session.send_input(bytes);
+    }
+
+    pub fn pointer(
+        &mut self,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+    ) {
+        let (_, active_tab) = self.workspace.active();
+        let Some(tab) = self.tabs.get_mut(&active_tab) else {
+            return;
+        };
+        if let Err(error) = tab.dispatch_pointer(
+            action,
+            button,
+            col,
+            row,
+            input::ghostty_modifiers(self.modifiers),
+        ) {
+            tracing::warn!(?error, active_tab, "terminal pointer dispatch failed");
+        }
+    }
+
+    pub fn set_window_focus(&mut self, focused: bool) {
+        self.workspace.set_window_focused(focused);
+        if let Some(tab) = self.tabs.get(&self.workspace.active().1) {
+            tab.set_window_focus(focused);
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -437,7 +542,9 @@ impl App {
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
             Some(tab) => canvas(TerminalCanvas {
+                tab_id: active_tab,
                 snapshot: tab.snapshot.clone(),
+                mouse_tracking: tab.terminal.mouse_tracking(),
             })
             .width(Fill)
             .height(Fill)
@@ -626,7 +733,7 @@ impl App {
                 }
                 UiRequest::AppSetWindowFocus { focused, reply } => {
                     let result = if self.test_mode {
-                        self.workspace.set_window_focused(focused);
+                        self.set_window_focus(focused);
                         Ok(())
                     } else {
                         Err("ROOST_TEST_MODE=1 is required".into())
@@ -682,8 +789,29 @@ impl App {
                 UiRequest::SidebarDump { reply } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));
                 }
-                UiRequest::TabDispatchMouseEvent { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::TabDispatchMouseEvent {
+                    tab_id,
+                    kind,
+                    button,
+                    cell_x,
+                    cell_y,
+                    mods,
+                    reply,
+                } => {
+                    let result = if !self.test_mode {
+                        Err("ROOST_TEST_MODE=1 is required".into())
+                    } else {
+                        u16::try_from(mods)
+                            .map_err(|_| format!("modifier mask {mods} exceeds u16"))
+                            .and_then(|mods| {
+                                self.tabs
+                                    .get_mut(&tab_id)
+                                    .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?
+                                    .dispatch_pointer(kind, button, cell_x, cell_y, mods)
+                                    .map_err(|error| error.to_string())
+                            })
+                    };
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -721,6 +849,24 @@ fn canonical_pointer_shape(name: &str) -> &str {
         | "col-resize" | "row-resize" | "n-resize" | "s-resize" | "e-resize" | "w-resize"
         | "ne-resize" | "nw-resize" | "se-resize" | "sw-resize" => name,
         _ => "default",
+    }
+}
+
+fn pointer_action(action: PointerAction) -> roost_vt::MouseAction {
+    match action {
+        PointerAction::Press => mouse_action::PRESS,
+        PointerAction::Release => mouse_action::RELEASE,
+        PointerAction::Motion => mouse_action::MOTION,
+    }
+}
+
+fn pointer_button(button: PointerButton) -> roost_vt::MouseButton {
+    match button {
+        PointerButton::Left => mouse_button::LEFT,
+        PointerButton::Right => mouse_button::RIGHT,
+        PointerButton::Middle => mouse_button::MIDDLE,
+        PointerButton::Four => mouse_button::FOUR,
+        PointerButton::Five => mouse_button::FIVE,
     }
 }
 

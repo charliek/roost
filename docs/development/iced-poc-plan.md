@@ -524,6 +524,43 @@ Mouse encoding, selection geometry, the visible palette, native clipboard
 readback, and desktop notification presentation are explicitly outside this
 commit and retain their focused failing tests for the next slices.
 
+### Active mini-plan: Iced mouse reporting and terminal focus
+
+Scope: add a per-terminal Iced mouse encoder backed by the existing
+`roost-vt`/libghostty protocol implementation, route both Canvas pointer events
+and the synthetic IPC port through one cell-coordinate method, and emit
+mode-1004 focus reports for both native Iced window events and the synthetic
+focus port. Extract the 60 Hz/per-cell motion throttle from the GTK-named module
+into `roost-engine::pointer`, with GTK consuming the new owner through a
+compatibility re-export so there is only one Rust throttle state machine.
+
+Invariants and interfaces:
+
+- each live Iced terminal owns its `MouseEncoder` and `MotionEmitter`; encoder
+  format/mode state is synchronized from that tab's `Terminal` immediately
+  before every attempted report;
+- the adapter accepts toolkit-neutral `PointerAction`/`PointerButton`, cell
+  coordinates, and modifier bits, then maps to libghostty surface coordinates;
+  no Iced or GTK type enters the engine or `roost-vt`;
+- button motion is never throttled; only mode-1003 motion without a button uses
+  the shared 60 Hz/per-cell gate, and the gate commits only after libghostty
+  emits non-empty bytes;
+- native Canvas events and `tab.dispatch_mouse_event` call the same Iced method,
+  while native window focus and `app.set_window_focus` call the same focus
+  method; mode-disabled events remain silent; and
+- pointer bytes go through `TabSession::send_input`, preserving capture order
+  and avoiding UI callbacks or workspace locks.
+
+Acceptance: shared throttle unit tests remain deterministic; all ten
+`test_mouse_tracking.py` cases pass against Iced (including the already-green
+OSC 22 cases); a focused native-event unit test covers cell mapping/button
+state; GTK's mouse-routing unit/E2E suite and full regression suite remain
+green; macOS plus shed X11/Wayland renderer lanes pass; dependency boundaries
+remain unchanged. Selection anchoring, copy/paste, URL hit-testing, local
+scrollback, and platform cursor presentation are separate later slices—the
+Canvas forwards mouse-tracking protocol now but deliberately does not pretend
+those local interactions are complete.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

@@ -430,6 +430,36 @@ impl Terminal {
         out
     }
 
+    /// Encode the canonical xterm focus report when DEC mode 1004 is active.
+    /// Returns no bytes when the mode is disabled or libghostty rejects the
+    /// request, allowing UI adapters to forward the result directly.
+    pub fn encode_focus(&self, focused: bool) -> Vec<u8> {
+        if !self.mode_get(1004) {
+            return Vec::new();
+        }
+        let event = if focused {
+            sys::GhosttyFocusEvent_GHOSTTY_FOCUS_GAINED
+        } else {
+            sys::GhosttyFocusEvent_GHOSTTY_FOCUS_LOST
+        };
+        let mut buffer = [0_u8; 8];
+        let mut written = 0_usize;
+        // SAFETY: both output pointers refer to live stack values and the
+        // supplied capacity is exactly the backing buffer's size.
+        let rc = unsafe {
+            sys::ghostty_focus_encode(
+                event,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut written,
+            )
+        };
+        if Error::from_result(rc).is_err() || written == 0 || written > buffer.len() {
+            return Vec::new();
+        }
+        buffer[..written].to_vec()
+    }
+
     /// True if the active screen is the alternate buffer (vim, less,
     /// htop, etc.). The Linux/Mac UIs use this to decide between local
     /// scrollback and arrow-key translation for the wheel.
