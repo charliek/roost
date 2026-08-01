@@ -1627,6 +1627,46 @@ exposed uinput move/press coalescing; explicit scheduling fences made the
 physical gesture deterministic in two focused reruns and the complete shed
 gate without weakening its selection assertion.
 
+### Deterministic X11 rollup-stripe commit plan
+
+Scope: fix the repeated Ubuntu/wgpu real-input failure without changing product
+behavior or weakening its hit-target assertion. The existing check discovers
+the edge project row from the wide active-project fill, focuses a different
+project, and then clicks the previously recorded Y coordinate. A renderer that
+settles the sidebar scroll/layout between those operations can move the now
+inactive row. The harness will instead give the edge tab a unique agent
+lifecycle, wait for the resulting narrow project-rollup stripe after IPC has
+confirmed the home project is active, and click the measured stripe itself.
+The locator must find exactly one plausible connected component in the leading
+stripe column/sidebar body and observe identical bounds in two consecutive
+captures; zero, multiple, malformed, or still-moving candidates are failures.
+
+Invariants: the injected click remains inside the real leading rollup stripe,
+not the project label; the target is found from a product
+screenshot rather than a hard-coded row; project selection must still change
+through physical XTEST input; no retry may substitute IPC focus for the click;
+and all fixture projects/tabs remain cleaned up. Interfaces are limited to the
+existing target-neutral `tab.agent_report` test operation and the X11 screenshot
+locator—no application, engine, GTK, or IPC contract changes. On success the
+fixture restores home focus, clears the edge lifecycle by deleting its project,
+and waits for the baseline workspace before later real-input scenarios.
+
+Tests and acceptance: review the plan before editing; add mandatory pure
+image-locator tests for one valid component, same-color non-stripe distractors,
+zero/multiple plausible components, and malformed geometry; run Python
+syntax/unit checks; run the complete Iced
+X11 real-input script under wgpu and tiny-skia in the shed; retain the existing
+Wayland and GTK real-input gates; run the repository commit gate; review the
+complete diff; push the focused test commit; and require the previously failing
+Ubuntu/wgpu Actions lane plus the full branch workflow to finish green.
+
+Validation result: the hardened locator passed its pure valid, distractor,
+zero, multiple, and malformed-component tests. The full X11 real-input script
+passed under shed wgpu while reproducing CI's harmless startup
+`X_SetInputFocus BadMatch`, then passed under tiny-skia. `make check` remained
+green, and the complete shed gate passed GTK Wayland drag/reorder, Iced X11,
+and Iced Wayland real-input coverage.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

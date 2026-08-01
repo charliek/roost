@@ -152,6 +152,53 @@ def color_components(
     ]
 
 
+def unique_rollup_stripe_bounds(
+    image: Image,
+    color: tuple[int, int, int],
+    sidebar_width: int,
+    body_top: int,
+    body_bottom: int,
+) -> tuple[int, int, int, int] | None:
+    """Find one plausible project-rollup stripe in the sidebar body.
+
+    Roost's rollup stripe is a narrow, row-height component at the leading
+    edge. Same-color terminal glyphs, tab dots, and agent dots are deliberately
+    outside this search region or fail the stripe geometry. Multiple plausible
+    components are ambiguous and therefore a hard harness error.
+    """
+    width, height, _bpp, _data = image
+    right = max(0, min(sidebar_width, width, 8))
+    top = max(0, min(body_top, height))
+    bottom = max(top, min(body_bottom, height))
+    points = {
+        (x, y)
+        for y in range(top, bottom)
+        for x in range(right)
+        if pixel(image, x, y) == color
+    }
+    plausible = []
+    for component in _components(points):
+        component_width = component["right"] - component["left"] + 1
+        component_height = component["bottom"] - component["top"] + 1
+        if (
+            2 <= component_width <= 5
+            and 18 <= component_height <= 40
+            and component["left"] <= 1
+        ):
+            plausible.append(component)
+    if len(plausible) > 1:
+        raise ValueError(f"multiple plausible rollup stripes: {plausible!r}")
+    if not plausible:
+        return None
+    component = plausible[0]
+    return (
+        component["left"],
+        component["top"],
+        component["right"],
+        component["bottom"],
+    )
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

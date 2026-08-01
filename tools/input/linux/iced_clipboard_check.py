@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
+import parity  # noqa: E402
 from client import RoostError  # noqa: E402
 
 ICED_BIN = Path(
@@ -404,34 +405,34 @@ def _active_pill_close_point(
     raise AssertionError(f"active tab pill never settled; last bounds: {previous!r}")
 
 
-def _active_project_leading_point(
-    launch: Launch, excluded_y: int | None = None
-) -> tuple[int, int]:
-    """Locate the active project row, then target its one-pixel leading edge."""
-    path = launch.root / "chrome-project-leading-edge.png"
-    active = (0x13, 0x50, 0x9D)
+def _stable_rollup_stripe_point(launch: Launch) -> tuple[int, int]:
+    """Locate one stable waiting-agent project stripe after focus settles."""
+    path = launch.root / "chrome-project-rollup-stripe.png"
+    previous: tuple[int, int, int, int] | None = None
     for _attempt in range(50):
         png, _width, _height = launch.client.screenshot(scale=1)
         path.write_bytes(png)
-        width, height, bpp, data = pngtool.load(str(path))
-        sidebar = round(float(launch.client.window_metrics()["sidebar_width"]))
-        points: list[tuple[int, int]] = []
-        for y in range(height):
-            for x in range(min(sidebar, width)):
-                offset = (y * width + x) * bpp
-                if tuple(data[offset : offset + 3]) == active:
-                    points.append((x, y))
-        if points:
-            xs, ys = zip(*points)
-            bounds = min(xs), min(ys), max(xs), max(ys)
-            if bounds[2] - bounds[0] >= 150 and bounds[3] - bounds[1] >= 20:
-                center_y = (bounds[1] + bounds[3]) // 2
-                if center_y != excluded_y:
-                    # This is inside the stripe/gap region (x<14) that used
-                    # to be outside the project row's hit target.
-                    return 12, center_y
+        image = pngtool.load(str(path))
+        _width, height, _bpp, _data = image
+        metrics = launch.client.window_metrics()
+        sidebar = round(float(metrics["sidebar_width"]))
+        band = round(launch.client.terminal_top(metrics))
+        bounds = parity.unique_rollup_stripe_bounds(
+            image,
+            parity.LIFECYCLE_COLORS["waiting"],
+            sidebar,
+            band,
+            height - band,
+        )
+        if bounds is not None and bounds == previous:
+            left, top, right, bottom = bounds
+            return (left + right) // 2, (top + bottom) // 2
+        previous = bounds
         time.sleep(0.1)
-    raise AssertionError(f"active project selection never settled: {path}")
+    raise AssertionError(
+        f"one stable waiting-agent rollup stripe never settled; last bounds "
+        f"{previous!r}, capture {path}"
+    )
 
 
 def _click_window_control(launch: Launch, x: int, y: int) -> None:
@@ -743,19 +744,36 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
         "edge project to become the rendered active row",
     )
     _wait_until(lambda: _tab_is_attached(launch, edge_tab), "edge project PTY attachment")
-    x, y = _active_project_leading_point(launch)
+    report = launch.client.agent_report(
+        edge_tab,
+        "claude",
+        "claim",
+        session_id="x11-rollup-stripe",
+        lifecycle="waiting",
+    )
+    assert report.get("accepted"), report
+    _wait_until(
+        lambda: launch.client.agent_lifecycle(edge_tab) == "waiting",
+        "edge project waiting-agent rollup",
+    )
     launch.client.focus(home_tab)
     _wait_until(
         lambda: launch.client.identify()["active_project_id"] == home_project,
         "home project before leading-edge project click",
     )
-    _active_project_leading_point(launch, excluded_y=y)
+    x, y = _stable_rollup_stripe_point(launch)
     _click_window_control(launch, x, y)
     _wait_until(
         lambda: launch.client.identify()["active_project_id"] == edge_project,
         "project selection through the rollup stripe hit target",
     )
     launch.client.focus(home_tab)
+    launch.client.delete_project(edge_project)
+    _wait_until(
+        lambda: launch.client.project(edge_project) is None
+        and launch.client.identify()["active_tab_id"] == home_tab,
+        "rollup stripe fixture cleanup",
+    )
 
     overflow_tabs = [
         launch.client.open_tab(home_project, title=f"LONG-TAB-{index:02d}-OVERFLOW")

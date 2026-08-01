@@ -17,6 +17,57 @@ def image(width: int, height: int, fills: list[tuple[int, int, int]]) -> parity.
 
 
 class PixelMeasurementTests(unittest.TestCase):
+    def test_rollup_stripe_locator_requires_one_plausible_leading_component(self):
+        black = (0, 0, 0)
+        orange = parity.LIFECYCLE_COLORS["waiting"]
+        fills = [black] * (40 * 70)
+        for y in range(12, 38):
+            for x in range(4):
+                fills[y * 40 + x] = orange
+        # Same-color distractors: a small leading dot and a full-height block
+        # away from the leading stripe column must not affect the result.
+        for y in range(3, 7):
+            for x in range(4):
+                fills[y * 40 + x] = orange
+        for y in range(10, 45):
+            for x in range(12, 18):
+                fills[y * 40 + x] = orange
+
+        self.assertEqual(
+            parity.unique_rollup_stripe_bounds(
+                image(40, 70, fills), orange, sidebar_width=30, body_top=0, body_bottom=60
+            ),
+            (0, 12, 3, 37),
+        )
+
+    def test_rollup_stripe_locator_rejects_zero_multiple_and_malformed(self):
+        black = (0, 0, 0)
+        blue = parity.LIFECYCLE_COLORS["working"]
+        empty = image(20, 70, [black] * (20 * 70))
+        self.assertIsNone(
+            parity.unique_rollup_stripe_bounds(empty, blue, 20, 0, 70)
+        )
+
+        malformed_fills = [black] * (20 * 70)
+        for y in range(10, 20):
+            for x in range(4):
+                malformed_fills[y * 20 + x] = blue
+        self.assertIsNone(
+            parity.unique_rollup_stripe_bounds(
+                image(20, 70, malformed_fills), blue, 20, 0, 70
+            )
+        )
+
+        multiple_fills = [black] * (20 * 70)
+        for top in (5, 40):
+            for y in range(top, top + 22):
+                for x in range(4):
+                    multiple_fills[y * 20 + x] = blue
+        with self.assertRaisesRegex(ValueError, "multiple plausible rollup stripes"):
+            parity.unique_rollup_stripe_bounds(
+                image(20, 70, multiple_fills), blue, 20, 0, 70
+            )
+
     def test_counts_runs_and_components_are_geometry_not_text_based(self):
         black = (0, 0, 0)
         blue = parity.LIFECYCLE_COLORS["working"]
