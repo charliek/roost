@@ -188,6 +188,7 @@ class Launch:
             )
             self.tab = int(self.client.identify()["active_tab_id"])
             _wait_until(lambda: bool(self.client.dump(self.tab)), "live Iced terminal")
+            self.cell_width, self.cell_height = _measure_terminal_cell(self)
         except Exception:
             self.close()
             raise
@@ -229,6 +230,46 @@ class Launch:
                 except ProcessLookupError:
                     pass
             self.log_handle.close()
+
+
+def _measure_terminal_cell(launch: Launch) -> tuple[int, int]:
+    """Measure the live renderer grid through one explicit-background cell."""
+    marker = (17, 201, 93)
+    path = launch.root / "terminal-cell-metrics.png"
+    measured: list[tuple[int, int]] = []
+
+    def capture() -> bool:
+        launch.client.tab_feed_pty_bytes(
+            launch.tab, b"\x1b[2J\x1b[H\x1b[48;2;17;201;93m \x1b[0m"
+        )
+        png, _width, _height = launch.client.screenshot(scale=1)
+        path.write_bytes(png)
+        image = pngtool.load(str(path))
+        width, height, bpp, pixels = image
+        metrics = launch.client.window_metrics()
+        x0 = round(float(metrics["sidebar_width"])) + 12
+        y0 = round(launch.client.terminal_top(metrics)) + 12
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            offset = (y * width + x) * bpp
+            return tuple(pixels[offset : offset + 3])
+
+        if not (0 <= x0 < width and 0 <= y0 < height) or pixel(x0, y0) != marker:
+            return False
+        cell_width = 0
+        while x0 + cell_width < width and pixel(x0 + cell_width, y0) == marker:
+            cell_width += 1
+        cell_height = 0
+        while y0 + cell_height < height and pixel(x0, y0 + cell_height) == marker:
+            cell_height += 1
+        if cell_width <= 0 or cell_height <= 0:
+            return False
+        measured.append((cell_width, cell_height))
+        return True
+
+    _wait_until(capture, "live Iced terminal cell metrics")
+    launch.client.tab_feed_pty_bytes(launch.tab, b"\x1b[0m\x1b[2J\x1b[H")
+    return measured[-1]
 
 
 def _set_row(launch: Launch, text: str) -> None:
@@ -705,6 +746,16 @@ def _direct_tab_close(launch: Launch) -> None:
     _wait_until(lambda: launch.client.tab(doomed) is None, "exact clicked tab removal")
     assert launch.client.identify()["active_tab_id"] == sibling
 
+    # Earlier paste and scrollback checks deliberately leave bytes in the
+    # shell's editable line. Cancel that line and observe a survivor repaint
+    # before issuing the marker; otherwise the command is appended to fixture
+    # residue and its visibility depends on the renderer's live column count.
+    before_interrupt = launch.client.dump(sibling).get("rows_text", [])
+    launch.client.send(sibling, b"\x03")
+    _wait_until(
+        lambda: launch.client.dump(sibling).get("rows_text", []) != before_interrupt,
+        "fallback sibling PTY to repaint after line cancellation",
+    )
     marker = f"close-survivor-{uuid.uuid4().hex[:8]}"
     launch.client.send(sibling, f"printf '%s\\n' '{marker}'\n")
     _wait_until(
@@ -988,7 +1039,7 @@ def _terminal_scrollback_routing(launch: Launch) -> None:
         "terminal history fixture at live bottom",
     )
     terminal_x = 220 + 12 + 4
-    terminal_y = round(launch.client.terminal_top()) + 12 + 9
+    terminal_y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
 
     def wheel(button: int) -> None:
         launch.terminal_pointer(
@@ -1054,9 +1105,9 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
     # Window-relative client coordinates: sidebar + terminal padding and the
     # live application-owned terminal origin. End on the last marker cell because
     # TerminalSelection's committed range is inclusive at pointer release.
-    x0 = 220 + 12 + 4
-    x1 = 220 + 12 + int((len(marker) - 0.5) * 8.4)
-    y = round(launch.client.terminal_top()) + 12 + 9
+    x0 = 220 + 12 + launch.cell_width // 2
+    x1 = 220 + 12 + int((len(marker) - 0.5) * launch.cell_width)
+    y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
     # Keep the press, motion, and release as separate XTEST submissions. The
     # tiny-skia event loop can process a single batched xdotool sequence only
     # after its release, coalescing away the drag motion. IPC observation while
@@ -1166,8 +1217,8 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
 def _multi_click_and_link_hover(launch: Launch) -> None:
     row = "alpha/beta tail"
     _set_row(launch, row)
-    x = 220 + 12 + int(2.5 * 8.4)
-    y = round(launch.client.terminal_top()) + 12 + 9
+    x = 220 + 12 + int(2.5 * launch.cell_width)
+    y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
     launch.terminal_pointer(
         [
             "mousemove",
@@ -1220,7 +1271,7 @@ def _multi_click_and_link_hover(launch: Launch) -> None:
         lambda: launch.client.app_cursor_shape() == "crosshair",
         "OSC 22 baseline cursor",
     )
-    url_x = 220 + 12 + int(8.5 * 8.4)
+    url_x = 220 + 12 + int(8.5 * launch.cell_width)
     launch.terminal_pointer(
         [
             "keydown",

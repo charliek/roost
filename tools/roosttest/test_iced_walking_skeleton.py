@@ -142,6 +142,15 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
             max(y for _x, y in points),
         )
 
+    def color_run(shot, x: int, y: int, dx: int, dy: int, color) -> int:
+        width, height, _bpp, _pixels = shot
+        length = 0
+        while 0 <= x < width and 0 <= y < height and pixel(shot, x, y) == color:
+            length += 1
+            x += dx
+            y += dy
+        return length
+
     def assert_geometry(collapsed: bool) -> None:
         expected_sidebar = 0 if collapsed else int(roost.window_metrics()["sidebar_width"])
         terminal_top = round(roost.terminal_top())
@@ -176,25 +185,47 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
         assert pixel(shot, width - 2, height - 2) == default_rgb
 
         if not collapsed:
-            glyph_y0 = terminal_top + TERMINAL_PADDING + 18
             glyph_x0 = expected_sidebar + TERMINAL_PADDING
+            marker_y0 = terminal_top + TERMINAL_PADDING
+            cell_width = color_run(shot, glyph_x0, marker_y0, 1, 0, ORIGIN_MARKER)
+            cell_height = color_run(shot, glyph_x0, marker_y0, 0, 1, ORIGIN_MARKER)
+            assert cell_width > 0 and cell_height > 0
+            glyph_y0 = marker_y0 + cell_height
             # Keep this semantic rather than a glyph-shape golden: ASCII must
             # draw; the CJK glyph must reach its second logical cell (a
             # one-cell tofu box cannot pass); and e+combining-acute must rise
             # above the adjacent plain e. Exact outlines and antialiasing stay
-            # renderer/platform-owned. The sidebar collapse resizes/reflows
-            # the PTY, so glyphs are checked before that transition.
+            # renderer/platform-owned. Derive windows from the rendered
+            # marker cell instead of copying renderer metrics. The sidebar
+            # collapse resizes/reflows the PTY, so glyphs are checked before
+            # that transition.
             assert foreground_bounds(
-                shot, glyph_x0, glyph_x0 + 8, glyph_y0, glyph_y0 + 18
+                shot,
+                glyph_x0,
+                glyph_x0 + cell_width,
+                glyph_y0,
+                glyph_y0 + cell_height,
             )
             assert foreground_bounds(
-                shot, glyph_x0 + 17, glyph_x0 + 25, glyph_y0, glyph_y0 + 18
+                shot,
+                glyph_x0 + 2 * cell_width,
+                glyph_x0 + 3 * cell_width,
+                glyph_y0,
+                glyph_y0 + cell_height,
             )
             combined = foreground_bounds(
-                shot, glyph_x0 + 25, glyph_x0 + 34, glyph_y0, glyph_y0 + 18
+                shot,
+                glyph_x0 + 3 * cell_width,
+                glyph_x0 + 4 * cell_width,
+                glyph_y0,
+                glyph_y0 + cell_height,
             )
             plain = foreground_bounds(
-                shot, glyph_x0 + 34, glyph_x0 + 42, glyph_y0, glyph_y0 + 18
+                shot,
+                glyph_x0 + 4 * cell_width,
+                glyph_x0 + 5 * cell_width,
+                glyph_y0,
+                glyph_y0 + cell_height,
             )
             assert combined and plain
             assert combined[1] < plain[1]

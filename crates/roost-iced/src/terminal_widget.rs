@@ -1,22 +1,93 @@
 //! Renderer-neutral Iced terminal widget.
 
-use iced::advanced::text::Renderer as _;
+use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{layout, renderer, text, Clipboard, Layout, Renderer as _, Shell};
 #[cfg(test)]
 use iced::event;
 use iced::{
-    mouse, Border, Color, Element, Event, Font, Length, Point, Rectangle, Renderer, Size, Theme,
+    alignment, mouse, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle,
+    Renderer, Size, Theme,
 };
 use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
-pub const CELL_WIDTH: f32 = 8.4;
-pub const CELL_HEIGHT: f32 = 18.0;
 pub const TERMINAL_PADDING: f32 = 12.0;
+const POINT_TO_LOGICAL_PIXEL: f64 = 96.0 / 72.0;
+const TERMINAL_LINE_HEIGHT: f32 = 1.2;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One renderer-resolved terminal cell grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalMetrics {
+    pub font: Font,
+    pub font_pixels: f32,
+    pub cell_width: f32,
+    pub cell_height: f32,
+}
+
+impl TerminalMetrics {
+    /// Resolve the generic monospace grid from a Rust UI point size.
+    pub fn measure(size_pt: f64) -> Result<Self, String> {
+        let pixels = size_pt * POINT_TO_LOGICAL_PIXEL;
+        if !pixels.is_finite() || pixels <= 0.0 || pixels > f64::from(f32::MAX) {
+            return Err(format!(
+                "font size {size_pt}pt cannot be represented as Iced logical pixels"
+            ));
+        }
+        let font_pixels = pixels as f32;
+        if !font_pixels.is_finite() || font_pixels <= 0.0 {
+            return Err(format!(
+                "font size {size_pt}pt narrowed to invalid Iced logical pixels"
+            ));
+        }
+
+        let font = Font::MONOSPACE;
+        type Paragraph = <Renderer as text::Renderer>::Paragraph;
+        let paragraph = Paragraph::with_text(text::Text {
+            content: "M",
+            bounds: Size::INFINITE,
+            size: Pixels(font_pixels),
+            line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
+            font,
+            align_x: text::Alignment::Default,
+            align_y: alignment::Vertical::Top,
+            shaping: text::Shaping::Auto,
+            wrapping: text::Wrapping::None,
+        });
+        let measured = paragraph.min_bounds();
+        let cell_width = measured.width.floor();
+        let cell_height = measured.height.floor();
+        if !cell_width.is_finite()
+            || !cell_height.is_finite()
+            || cell_width < 1.0
+            || cell_height < 1.0
+        {
+            return Err(format!(
+                "font size {size_pt}pt measured an invalid Iced cell {}x{}",
+                measured.width, measured.height
+            ));
+        }
+        Ok(Self {
+            font,
+            font_pixels,
+            cell_width,
+            cell_height,
+        })
+    }
+
+    #[cfg(test)]
+    fn fixed(cell_width: f32, cell_height: f32) -> Self {
+        Self {
+            font: Font::MONOSPACE,
+            font_pixels: 13.5,
+            cell_width,
+            cell_height,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DrawCell {
@@ -80,6 +151,8 @@ impl TerminalSnapshot {
 pub struct TerminalWidget {
     pub tab_id: i64,
     pub snapshot: TerminalSnapshot,
+    pub metrics: TerminalMetrics,
+    pub metric_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,20 +182,21 @@ pub(crate) struct TerminalWheelEvent {
     pub row: u32,
 }
 
-fn wheel_history_rows(delta: mouse::ScrollDelta) -> f64 {
+fn wheel_history_rows(delta: mouse::ScrollDelta, cell_height: f32) -> f64 {
     match delta {
         // Match the existing Swift policy: one discrete notch moves three
         // terminal rows. Iced already gives the conventional positive-up sign.
         mouse::ScrollDelta::Lines { y, .. } => f64::from(y) * 3.0,
         // Smooth native deltas are physical/logical pixels. Convert them into
         // rows here; TerminalScroll owns cross-event fractional accumulation.
-        mouse::ScrollDelta::Pixels { y, .. } => f64::from(y) / f64::from(CELL_HEIGHT),
+        mouse::ScrollDelta::Pixels { y, .. } => f64::from(y) / f64::from(cell_height),
     }
 }
 
 #[derive(Default)]
 pub(crate) struct TerminalWidgetState {
     tab_id: Option<i64>,
+    metric_generation: u64,
     pressed: Option<PointerButton>,
     last_cell: Option<(u32, u32)>,
     was_inside: bool,
@@ -210,8 +284,9 @@ impl TerminalWidget {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<PointerOutcome> {
-        if state.tab_id != Some(self.tab_id) {
+        if state.tab_id != Some(self.tab_id) || state.metric_generation != self.metric_generation {
             state.tab_id = Some(self.tab_id);
+            state.metric_generation = self.metric_generation;
             state.pressed = None;
             state.last_cell = None;
             state.was_inside = false;
@@ -255,7 +330,8 @@ impl TerminalWidget {
                 Event::Mouse(mouse::Event::ButtonReleased(_) | mouse::Event::CursorMoved { .. })
             );
         let point = cursor.position_from(Point::new(bounds.x, bounds.y));
-        let cell = point.and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows));
+        let cell = point
+            .and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows, self.metrics));
         let inside = cursor.is_over(bounds) && cell.is_some();
         if !inside && !captured_gesture {
             if state.was_inside {
@@ -276,7 +352,7 @@ impl TerminalWidget {
         let cell = cell
             .or_else(|| {
                 point.and_then(|point| {
-                    cell_at_clamped(point, self.snapshot.cols, self.snapshot.rows)
+                    cell_at_clamped(point, self.snapshot.cols, self.snapshot.rows, self.metrics)
                 })
             })
             .or(state.last_cell)?;
@@ -342,7 +418,7 @@ impl TerminalWidget {
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 state.clicks.reset();
-                let history_rows = wheel_history_rows(*delta);
+                let history_rows = wheel_history_rows(*delta, self.metrics.cell_height);
                 if history_rows == 0.0 {
                     return None;
                 }
@@ -370,7 +446,7 @@ impl TerminalWidget {
         }
         let cell = cursor
             .position_from(Point::new(bounds.x, bounds.y))
-            .and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows));
+            .and_then(|point| cell_at(point, self.snapshot.cols, self.snapshot.rows, self.metrics));
         if cell.is_none() {
             return mouse::Interaction::default();
         }
@@ -465,17 +541,20 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
 
         renderer.with_layer(clip, |renderer| {
             fill_quad(renderer, bounds, color(self.snapshot.background));
+            let metrics = self.metrics;
 
             for cell in &self.snapshot.cells {
-                let position = cell_position(bounds.position(), cell.col, cell.row);
+                let position = cell_position(bounds.position(), cell.col, cell.row, metrics);
                 if cell.explicit_background {
                     fill_quad(
                         renderer,
-                        // Preserve the Canvas path's one-pixel overdraw. The
-                        // logical grid is fractional (8.4 pt), and adjacent
+                        // Preserve the Canvas path's overdraw policy. Adjacent
                         // antialiased quads can otherwise expose hairlines of
                         // the default background under tiny-skia.
-                        Rectangle::new(position, Size::new(CELL_WIDTH.ceil(), CELL_HEIGHT.ceil())),
+                        Rectangle::new(
+                            position,
+                            Size::new(metrics.cell_width, metrics.cell_height),
+                        ),
                         color(cell.background),
                     );
                 }
@@ -504,14 +583,14 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                         } else {
                             iced::font::Style::Normal
                         },
-                        ..Font::DEFAULT
+                        ..metrics.font
                     };
                     renderer.fill_text(
                         text::Text {
                             content: cell.text.clone(),
-                            bounds: Size::new(f32::INFINITY, CELL_HEIGHT),
-                            size: iced::Pixels(13.5),
-                            line_height: text::LineHeight::Relative(1.2),
+                            bounds: Size::new(f32::INFINITY, metrics.cell_height),
+                            size: Pixels(metrics.font_pixels),
+                            line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
                             font,
                             align_x: text::Alignment::Default,
                             align_y: iced::alignment::Vertical::Top,
@@ -529,10 +608,10 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 fill_quad(
                     renderer,
                     Rectangle::new(
-                        cell_position(bounds.position(), span.col0, u32::from(span.row)),
+                        cell_position(bounds.position(), span.col0, u32::from(span.row), metrics),
                         Size::new(
-                            f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
-                            CELL_HEIGHT,
+                            f32::from(span.col1.saturating_sub(span.col0)) * metrics.cell_width,
+                            metrics.cell_height,
                         ),
                     ),
                     Color {
@@ -543,13 +622,14 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             }
 
             if let Some(span) = self.snapshot.link_hover {
-                let point = cell_position(bounds.position(), span.col0, u32::from(span.row));
+                let point =
+                    cell_position(bounds.position(), span.col0, u32::from(span.row), metrics);
                 fill_quad(
                     renderer,
                     Rectangle::new(
-                        Point::new(point.x, point.y + CELL_HEIGHT - 1.0),
+                        Point::new(point.x, point.y + metrics.cell_height - 1.0),
                         Size::new(
-                            f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
+                            f32::from(span.col1.saturating_sub(span.col0)) * metrics.cell_width,
                             1.0,
                         ),
                     ),
@@ -558,12 +638,13 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             }
 
             if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
-                let point = cell_position(bounds.position(), cursor.col as u16, cursor.row);
+                let point =
+                    cell_position(bounds.position(), cursor.col as u16, cursor.row, metrics);
                 let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
                 match cursor.visual_style {
                     CursorVisualStyle::Block => fill_quad(
                         renderer,
-                        Rectangle::new(point, Size::new(CELL_WIDTH, CELL_HEIGHT)),
+                        Rectangle::new(point, Size::new(metrics.cell_width, metrics.cell_height)),
                         Color {
                             a: 0.55,
                             ..cursor_color
@@ -571,7 +652,10 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                     ),
                     CursorVisualStyle::BlockHollow => renderer.fill_quad(
                         renderer::Quad {
-                            bounds: Rectangle::new(point, Size::new(CELL_WIDTH, CELL_HEIGHT)),
+                            bounds: Rectangle::new(
+                                point,
+                                Size::new(metrics.cell_width, metrics.cell_height),
+                            ),
                             border: Border {
                                 color: cursor_color,
                                 width: 1.0,
@@ -584,14 +668,14 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                     ),
                     CursorVisualStyle::Bar => fill_quad(
                         renderer,
-                        Rectangle::new(point, Size::new(1.5, CELL_HEIGHT)),
+                        Rectangle::new(point, Size::new(1.5, metrics.cell_height)),
                         cursor_color,
                     ),
                     CursorVisualStyle::Underline => fill_quad(
                         renderer,
                         Rectangle::new(
-                            Point::new(point.x, point.y + CELL_HEIGHT - 2.0),
-                            Size::new(CELL_WIDTH, 2.0),
+                            Point::new(point.x, point.y + metrics.cell_height - 2.0),
+                            Size::new(metrics.cell_width, 2.0),
                         ),
                         cursor_color,
                     ),
@@ -618,30 +702,35 @@ fn fill_quad(renderer: &mut Renderer, bounds: Rectangle, background: Color) {
     );
 }
 
-fn cell_position(origin: Point, col: u16, row: u32) -> Point {
+fn cell_position(origin: Point, col: u16, row: u32, metrics: TerminalMetrics) -> Point {
     Point::new(
-        origin.x + TERMINAL_PADDING + f32::from(col) * CELL_WIDTH,
-        origin.y + TERMINAL_PADDING + row as f32 * CELL_HEIGHT,
+        origin.x + TERMINAL_PADDING + f32::from(col) * metrics.cell_width,
+        origin.y + TERMINAL_PADDING + row as f32 * metrics.cell_height,
     )
 }
 
-fn cell_at(point: Point, cols: u16, rows: u16) -> Option<(u32, u32)> {
+fn cell_at(point: Point, cols: u16, rows: u16, metrics: TerminalMetrics) -> Option<(u32, u32)> {
     if point.x < TERMINAL_PADDING || point.y < TERMINAL_PADDING {
         return None;
     }
-    let col = ((point.x - TERMINAL_PADDING) / CELL_WIDTH).floor() as u32;
-    let row = ((point.y - TERMINAL_PADDING) / CELL_HEIGHT).floor() as u32;
+    let col = ((point.x - TERMINAL_PADDING) / metrics.cell_width).floor() as u32;
+    let row = ((point.y - TERMINAL_PADDING) / metrics.cell_height).floor() as u32;
     (col < u32::from(cols) && row < u32::from(rows)).then_some((col, row))
 }
 
-fn cell_at_clamped(point: Point, cols: u16, rows: u16) -> Option<(u32, u32)> {
+fn cell_at_clamped(
+    point: Point,
+    cols: u16,
+    rows: u16,
+    metrics: TerminalMetrics,
+) -> Option<(u32, u32)> {
     if cols == 0 || rows == 0 {
         return None;
     }
-    let col = ((point.x - TERMINAL_PADDING) / CELL_WIDTH)
+    let col = ((point.x - TERMINAL_PADDING) / metrics.cell_width)
         .floor()
         .clamp(0.0, f32::from(cols.saturating_sub(1))) as u32;
-    let row = ((point.y - TERMINAL_PADDING) / CELL_HEIGHT)
+    let row = ((point.y - TERMINAL_PADDING) / metrics.cell_height)
         .floor()
         .clamp(0.0, f32::from(rows.saturating_sub(1))) as u32;
     Some((col, row))
@@ -698,6 +787,42 @@ pub fn resolve_colors(
 mod tests {
     use super::*;
 
+    const CELL_WIDTH: f32 = 8.4;
+    const CELL_HEIGHT: f32 = 18.0;
+
+    fn metrics() -> TerminalMetrics {
+        TerminalMetrics::fixed(CELL_WIDTH, CELL_HEIGHT)
+    }
+
+    fn widget(tab_id: i64, snapshot: TerminalSnapshot) -> TerminalWidget {
+        TerminalWidget {
+            tab_id,
+            snapshot,
+            metrics: metrics(),
+            metric_generation: 1,
+        }
+    }
+
+    #[test]
+    fn measured_metrics_are_positive_and_scale_with_point_size() {
+        let default = TerminalMetrics::measure(13.0).expect("default metrics");
+        let larger = TerminalMetrics::measure(18.0).expect("larger metrics");
+        assert!(default.cell_width >= 1.0);
+        assert!(default.cell_height >= 1.0);
+        assert_eq!(default.cell_width.fract(), 0.0);
+        assert_eq!(default.cell_height.fract(), 0.0);
+        assert!(larger.font_pixels > default.font_pixels);
+        assert!(larger.cell_width >= default.cell_width);
+        assert!(larger.cell_height > default.cell_height);
+    }
+
+    #[test]
+    fn invalid_or_unrenderable_point_sizes_are_rejected() {
+        for size in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(TerminalMetrics::measure(size).is_err(), "accepted {size}");
+        }
+    }
+
     #[test]
     fn inverse_swaps_resolved_defaults() {
         let fg = ColorRgb { r: 1, g: 2, b: 3 };
@@ -709,7 +834,7 @@ mod tests {
     fn widget_coordinates_map_to_terminal_cells_from_a_nonzero_origin() {
         let origin = Point::new(220.0, 44.0);
         assert_eq!(
-            cell_position(origin, 5, 3),
+            cell_position(origin, 5, 3, metrics()),
             Point::new(
                 origin.x + TERMINAL_PADDING + 5.0 * CELL_WIDTH,
                 origin.y + TERMINAL_PADDING + 3.0 * CELL_HEIGHT,
@@ -723,24 +848,23 @@ mod tests {
                 ),
                 80,
                 24,
+                metrics(),
             ),
             Some((5, 3))
         );
-        assert_eq!(cell_at(Point::new(1.0, 1.0), 80, 24), None);
+        assert_eq!(cell_at(Point::new(1.0, 1.0), 80, 24, metrics()), None);
         assert_eq!(
-            cell_at_clamped(Point::new(-50.0, 9_000.0), 80, 24),
+            cell_at_clamped(Point::new(-50.0, 9_000.0), 80, 24, metrics()),
             Some((0, 23))
         );
     }
 
     #[test]
     fn non_pointer_events_are_ignored_and_a_new_tab_resets_gesture_state() {
-        let widget = TerminalWidget {
-            tab_id: 22,
-            snapshot: TerminalSnapshot::blank(80, 24),
-        };
+        let widget = widget(22, TerminalSnapshot::blank(80, 24));
         let mut state = TerminalWidgetState {
             tab_id: Some(21),
+            metric_generation: 1,
             pressed: Some(PointerButton::Left),
             last_cell: Some((7, 4)),
             was_inside: true,
@@ -774,11 +898,38 @@ mod tests {
     }
 
     #[test]
-    fn native_press_state_is_carried_into_drag_motion() {
-        let program = TerminalWidget {
-            tab_id: 42,
-            snapshot: TerminalSnapshot::blank(80, 24),
+    fn metric_generation_change_resets_a_captured_pointer_gesture() {
+        let mut widget = widget(22, TerminalSnapshot::blank(80, 24));
+        widget.metric_generation = 8;
+        let mut state = TerminalWidgetState {
+            tab_id: Some(22),
+            metric_generation: 7,
+            pressed: Some(PointerButton::Left),
+            last_cell: Some((7, 4)),
+            was_inside: true,
+            ..TerminalWidgetState::default()
         };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+
+        assert!(widget
+            .update_pointer(
+                &mut state,
+                &Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                    iced::keyboard::Modifiers::SHIFT,
+                )),
+                bounds,
+                mouse::Cursor::Unavailable,
+            )
+            .is_none());
+        assert_eq!(state.metric_generation, 8);
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.last_cell, None);
+        assert!(!state.was_inside);
+    }
+
+    #[test]
+    fn native_press_state_is_carried_into_drag_motion() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
         let mut state = TerminalWidgetState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let cursor = mouse::Cursor::Available(Point::new(
@@ -891,10 +1042,7 @@ mod tests {
 
     #[test]
     fn chorded_button_cannot_steal_the_captured_gesture() {
-        let program = TerminalWidget {
-            tab_id: 42,
-            snapshot: TerminalSnapshot::blank(80, 24),
-        };
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
         let mut state = TerminalWidgetState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let cursor = mouse::Cursor::Available(Point::new(
@@ -1028,12 +1176,10 @@ mod tests {
 
     #[test]
     fn passive_move_out_publishes_one_leave() {
-        let program = TerminalWidget {
-            tab_id: 9,
-            snapshot: TerminalSnapshot::blank(80, 24),
-        };
+        let program = widget(9, TerminalSnapshot::blank(80, 24));
         let mut state = TerminalWidgetState {
             tab_id: Some(9),
+            metric_generation: 1,
             was_inside: true,
             last_cell: Some((3, 2)),
             ..TerminalWidgetState::default()
@@ -1072,14 +1218,12 @@ mod tests {
 
     #[test]
     fn widget_padding_is_leave_for_hover_and_clamped_for_capture() {
-        let program = TerminalWidget {
-            tab_id: 10,
-            snapshot: TerminalSnapshot::blank(80, 24),
-        };
+        let program = widget(10, TerminalSnapshot::blank(80, 24));
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let padding = mouse::Cursor::Available(Point::new(790.0, 590.0));
         let mut passive = TerminalWidgetState {
             tab_id: Some(10),
+            metric_generation: 1,
             was_inside: true,
             last_cell: Some((5, 3)),
             ..TerminalWidgetState::default()
@@ -1106,6 +1250,7 @@ mod tests {
 
         let mut captured = TerminalWidgetState {
             tab_id: Some(10),
+            metric_generation: 1,
             pressed: Some(PointerButton::Left),
             was_inside: true,
             last_cell: Some((5, 3)),
@@ -1139,13 +1284,11 @@ mod tests {
 
     #[test]
     fn wheel_resets_the_native_click_sequence() {
-        let program = TerminalWidget {
-            tab_id: 11,
-            snapshot: TerminalSnapshot::blank(80, 24),
-        };
+        let program = widget(11, TerminalSnapshot::blank(80, 24));
         let start = Instant::now();
         let mut state = TerminalWidgetState {
             tab_id: Some(11),
+            metric_generation: 1,
             clicks: ClickTracker {
                 sequence: Some(ClickSequence {
                     tab_id: 11,
@@ -1175,18 +1318,21 @@ mod tests {
     #[test]
     fn wheel_units_normalize_to_positive_history_rows() {
         assert_eq!(
-            wheel_history_rows(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }),
+            wheel_history_rows(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }, CELL_HEIGHT,),
             3.0
         );
         assert_eq!(
-            wheel_history_rows(mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 }),
+            wheel_history_rows(mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 }, CELL_HEIGHT,),
             -6.0
         );
         assert_eq!(
-            wheel_history_rows(mouse::ScrollDelta::Pixels {
-                x: 0.0,
-                y: CELL_HEIGHT / 2.0,
-            }),
+            wheel_history_rows(
+                mouse::ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: CELL_HEIGHT / 2.0,
+                },
+                CELL_HEIGHT
+            ),
             0.5
         );
     }
@@ -1200,10 +1346,7 @@ mod tests {
             col1: 4,
         });
         snapshot.pointer_shape = "pointer".into();
-        let program = TerminalWidget {
-            tab_id: 1,
-            snapshot,
-        };
+        let program = widget(1, snapshot);
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         assert_eq!(
             program

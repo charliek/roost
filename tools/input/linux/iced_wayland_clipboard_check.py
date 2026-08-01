@@ -32,6 +32,9 @@ from typing import Callable, NoReturn
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 sys.path.insert(0, str(REPO / "tools" / "roosttest"))
+sys.path.insert(0, str(REPO / "tools" / "screenshot"))
+
+import pngtool  # noqa: E402
 
 ICED_BIN = Path(
     os.environ.get("ROOST_ICED_BIN") or REPO / "target" / "debug" / "roost-iced"
@@ -166,6 +169,45 @@ def _capture_contains(client, tab: int, expected: bytes) -> bool:
     return expected in client.tab_capture_pty_input(tab, drain=True)
 
 
+def _measure_terminal_cell(client, tab: int, root: Path) -> tuple[int, int]:
+    """Measure the live renderer grid through one explicit-background cell."""
+    marker = (17, 201, 93)
+    path = root / "terminal-cell-metrics.png"
+    measured: list[tuple[int, int]] = []
+
+    def capture() -> bool:
+        client.tab_feed_pty_bytes(
+            tab, b"\x1b[2J\x1b[H\x1b[48;2;17;201;93m \x1b[0m"
+        )
+        png, _width, _height = client.screenshot(scale=1)
+        path.write_bytes(png)
+        width, height, bpp, pixels = pngtool.load(str(path))
+        metrics = client.window_metrics()
+        x0 = round(float(metrics["sidebar_width"])) + 12
+        y0 = round(client.terminal_top(metrics)) + 12
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            offset = (y * width + x) * bpp
+            return tuple(pixels[offset : offset + 3])
+
+        if not (0 <= x0 < width and 0 <= y0 < height) or pixel(x0, y0) != marker:
+            return False
+        cell_width = 0
+        while x0 + cell_width < width and pixel(x0 + cell_width, y0) == marker:
+            cell_width += 1
+        cell_height = 0
+        while y0 + cell_height < height and pixel(x0, y0 + cell_height) == marker:
+            cell_height += 1
+        if cell_width <= 0 or cell_height <= 0:
+            return False
+        measured.append((cell_width, cell_height))
+        return True
+
+    _wait_until(capture, "live Iced terminal cell metrics")
+    client.tab_feed_pty_bytes(tab, b"\x1b[0m\x1b[2J\x1b[H")
+    return measured[-1]
+
+
 def _wait_for_selection(client, tab: int, expected: str, description: str) -> None:
     observed: dict[str, object] = {}
 
@@ -266,6 +308,8 @@ def main() -> int:
                 "terminal_top": client.terminal_top(metrics),
             },
         )
+        cell_width, cell_height = _measure_terminal_cell(client, tab, root)
+        print("Wayland terminal cell:", (cell_width, cell_height))
 
         explicit = f"wayland-copy-{uuid.uuid4().hex[:8]}"
         _set_row(client, tab, explicit)
@@ -282,9 +326,9 @@ def main() -> int:
         _set_row(client, tab, dragged)
         client.selection_clear(tab)
         client.tab_capture_pty_input(tab, drain=True)
-        x0 = sidebar + 12 + 4
-        x1 = sidebar + 12 + int((len(dragged) - 0.5) * 8.4)
-        y = round(client.terminal_top(metrics)) + 12 + 9
+        x0 = sidebar + 12 + cell_width // 2
+        x1 = sidebar + 12 + int((len(dragged) - 0.5) * cell_width)
+        y = round(client.terminal_top(metrics)) + 12 + cell_height // 2
         _inject_drag(width, height, x0, y, x1)
         _wait_for_selection(
             client, tab, dragged, "real-seat Wayland drag selection"
@@ -297,7 +341,7 @@ def main() -> int:
 
         multi = "alpha/beta tail"
         _set_row(client, tab, multi)
-        click_x = sidebar + 12 + int(2.5 * 8.4)
+        click_x = sidebar + 12 + int(2.5 * cell_width)
         _inject_clicks(width, height, click_x, y, 2)
         _wait_until(
             lambda: client.selection_dump(tab).get("text") == "alpha/beta",
@@ -317,7 +361,7 @@ def main() -> int:
             lambda: client.app_cursor_shape() == "crosshair",
             "real-seat Wayland OSC cursor baseline",
         )
-        hover_x = sidebar + 12 + int(8.5 * 8.4)
+        hover_x = sidebar + 12 + int(8.5 * cell_width)
         _inject_link_hover(client, width, height, hover_x, y)
         _wait_until(
             lambda: client.app_cursor_shape() == "crosshair",

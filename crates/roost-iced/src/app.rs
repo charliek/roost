@@ -33,6 +33,7 @@ use roost_ipc::messages::{
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
+use roost_ui_model::typography::{self, TerminalTypography};
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
@@ -51,8 +52,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette_scroll::Visibility;
 use crate::terminal_widget::{
-    resolve_colors, DrawCell, TerminalPointerEvent, TerminalSnapshot, TerminalWheelEvent,
-    TerminalWidget, CELL_HEIGHT, CELL_WIDTH, TERMINAL_PADDING,
+    resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
+    TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
 };
 use crate::Message;
 use crate::{chrome, input};
@@ -435,6 +436,19 @@ fn persist_theme_selection_with(
         return Ok(());
     };
     write(path, "theme", name)
+}
+
+fn persist_font_size_with(
+    config: &mut RoostConfig,
+    path: Option<&Path>,
+    size_pt: f64,
+    write: impl FnOnce(&Path, &str, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    config.font_size = Some(size_pt);
+    let Some(path) = path else {
+        return Ok(());
+    };
+    write(path, "font-size", &typography::format_font_size(size_pt))
 }
 
 fn finish_theme_confirmation(
@@ -996,6 +1010,125 @@ fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
     bytes
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalGeometry {
+    cols: u16,
+    rows: u16,
+    metrics: TerminalMetrics,
+    metric_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GeometryChange {
+    previous: Option<TerminalGeometry>,
+    current: TerminalGeometry,
+    grid_changed: bool,
+    metrics_changed: bool,
+    deferred_replies: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GeometryBatchOperation {
+    Apply {
+        tab_id: i64,
+        cols: u16,
+        rows: u16,
+        metrics: TerminalMetrics,
+        metric_generation: u64,
+    },
+    Rollback {
+        tab_id: i64,
+        previous: TerminalGeometry,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GeometryBatchFailure {
+    tab_id: i64,
+    apply: String,
+    rollback: Vec<(i64, String)>,
+}
+
+fn apply_geometry_batch(
+    tab_ids: &[i64],
+    cols: u16,
+    rows: u16,
+    metrics: TerminalMetrics,
+    metric_generation: u64,
+    mut transition: impl FnMut(
+        GeometryBatchOperation,
+    ) -> std::result::Result<Option<GeometryChange>, String>,
+) -> std::result::Result<Vec<(i64, GeometryChange)>, GeometryBatchFailure> {
+    let mut applied = Vec::with_capacity(tab_ids.len());
+    for tab_id in tab_ids {
+        let operation = GeometryBatchOperation::Apply {
+            tab_id: *tab_id,
+            cols,
+            rows,
+            metrics,
+            metric_generation,
+        };
+        match transition(operation) {
+            Ok(Some(change)) => applied.push((*tab_id, change)),
+            Ok(None) => {}
+            Err(error) => {
+                let rollback = applied
+                    .iter()
+                    .rev()
+                    .filter_map(|(rollback_id, change): &(i64, GeometryChange)| {
+                        let previous = change.previous?;
+                        transition(GeometryBatchOperation::Rollback {
+                            tab_id: *rollback_id,
+                            previous,
+                        })
+                        .err()
+                        .map(|error| (*rollback_id, error))
+                    })
+                    .collect();
+                return Err(GeometryBatchFailure {
+                    tab_id: *tab_id,
+                    apply: error,
+                    rollback,
+                });
+            }
+        }
+    }
+    Ok(applied)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FontSizeTransition {
+    Adjust(f64),
+    Reset,
+}
+
+fn font_size_candidate(
+    current: &TerminalTypography,
+    transition: FontSizeTransition,
+) -> Result<Option<(TerminalTypography, TerminalMetrics)>, String> {
+    let mut candidate = current.clone();
+    let changed = match transition {
+        FontSizeTransition::Adjust(delta) => candidate.adjust_size(delta).is_some(),
+        FontSizeTransition::Reset => candidate.reset_size().is_some(),
+    };
+    if !changed {
+        return Ok(None);
+    }
+    let metrics = TerminalMetrics::measure(candidate.current_size_pt())?;
+    Ok(Some((candidate, metrics)))
+}
+
+fn terminal_grid(size: Size, sidebar_collapsed: bool, metrics: TerminalMetrics) -> (u16, u16) {
+    let width = (size.width - sidebar_width(sidebar_collapsed) - 2.0 * TERMINAL_PADDING)
+        .max(metrics.cell_width * 2.0);
+    let height =
+        (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(metrics.cell_height * 2.0);
+    (
+        ((width / metrics.cell_width).floor() as u16).max(2),
+        ((height / metrics.cell_height).floor() as u16).max(2),
+    )
+}
+
 struct TerminalTab {
     terminal: Terminal,
     render_state: RenderState,
@@ -1021,6 +1154,8 @@ struct TerminalTab {
     snapshot: TerminalSnapshot,
     cols: u16,
     rows: u16,
+    applied_metrics: Option<TerminalMetrics>,
+    metric_generation: u64,
 }
 
 impl TerminalTab {
@@ -1075,6 +1210,8 @@ impl TerminalTab {
             snapshot: TerminalSnapshot::blank(DEFAULT_COLS, DEFAULT_ROWS),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
+            applied_metrics: None,
+            metric_generation: 0,
         })
     }
 
@@ -1111,32 +1248,122 @@ impl TerminalTab {
     }
 
     fn drain_terminal_replies(&self) {
-        let bytes = self
-            .reply_buffer
-            .lock()
-            .map(|mut buffer| std::mem::take(&mut *buffer))
-            .unwrap_or_default();
-        self.session.send_input(bytes);
+        self.session.send_input(self.take_terminal_replies());
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) {
-        if self.cols == cols && self.rows == rows {
-            return;
+    fn take_terminal_replies(&self) -> Vec<u8> {
+        self.reply_buffer
+            .lock()
+            .map(|mut buffer| std::mem::take(&mut *buffer))
+            .unwrap_or_default()
+    }
+
+    fn apply_geometry(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        metrics: TerminalMetrics,
+        metric_generation: u64,
+    ) -> Result<Option<GeometryChange>> {
+        let grid_changed = self.cols != cols || self.rows != rows;
+        let metrics_changed = self.applied_metrics != Some(metrics);
+        if !grid_changed && !metrics_changed {
+            return Ok(None);
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.last_pointer_cell = None;
-        self.hover_url = None;
-        if let Err(error) = self.terminal.resize(
+        let previous = self.applied_metrics.map(|metrics| TerminalGeometry {
+            cols: self.cols,
+            rows: self.rows,
+            metrics,
+            metric_generation: self.metric_generation,
+        });
+        let resize = self.terminal.resize(
             cols,
             rows,
-            CELL_WIDTH.round() as u32,
-            CELL_HEIGHT.round() as u32,
-        ) {
-            tracing::warn!(?error, cols, rows, "libghostty terminal resize failed");
+            metrics.cell_width.round().max(1.0) as u32,
+            metrics.cell_height.round().max(1.0) as u32,
+        );
+        let deferred_replies = self.take_terminal_replies();
+        resize?;
+        self.cols = cols;
+        self.rows = rows;
+        self.applied_metrics = Some(metrics);
+        self.metric_generation = metric_generation;
+        self.hover_url = None;
+        self.last_pointer_cell = self.last_pointer_cell.map(|(col, row)| {
+            (
+                col.min(cols.saturating_sub(1)),
+                row.min(rows.saturating_sub(1)),
+            )
+        });
+        Ok(Some(GeometryChange {
+            previous,
+            current: TerminalGeometry {
+                cols,
+                rows,
+                metrics,
+                metric_generation,
+            },
+            grid_changed,
+            metrics_changed,
+            deferred_replies,
+        }))
+    }
+
+    fn rollback_geometry(&mut self, previous: TerminalGeometry) -> Result<()> {
+        let resize = self.terminal.resize(
+            previous.cols,
+            previous.rows,
+            previous.metrics.cell_width.round().max(1.0) as u32,
+            previous.metrics.cell_height.round().max(1.0) as u32,
+        );
+        // The candidate report was staged in `GeometryChange`; the rollback
+        // report describes an internal transition the PTY never observed.
+        // Neither may escape a failed all-tab transaction.
+        let _ = self.take_terminal_replies();
+        resize?;
+        self.cols = previous.cols;
+        self.rows = previous.rows;
+        self.applied_metrics = Some(previous.metrics);
+        self.metric_generation = previous.metric_generation;
+        self.hover_url = None;
+        self.last_pointer_cell = self.last_pointer_cell.map(|(col, row)| {
+            (
+                col.min(previous.cols.saturating_sub(1)),
+                row.min(previous.rows.saturating_sub(1)),
+            )
+        });
+        Ok(())
+    }
+
+    fn commit_geometry(&self, change: GeometryChange) {
+        self.session.send_input(change.deferred_replies);
+        if change.grid_changed {
+            self.session
+                .send_resize(change.current.cols, change.current.rows);
         }
-        self.drain_terminal_replies();
-        self.session.send_resize(cols, rows);
+    }
+
+    fn prepare_pointer_cancel(&mut self) -> Result<Vec<u8>> {
+        if let Some(button) = self.tracking_pointer {
+            let (col, row) = self.last_pointer_cell.unwrap_or_default();
+            self.encode_pointer(
+                PointerAction::Release,
+                Some(button),
+                u32::from(col),
+                u32::from(row),
+                0,
+            )
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn commit_pointer_cancel(&mut self, release: Vec<u8>) {
+        self.session.send_input(release);
+        self.tracking_pointer = None;
+        self.local_pointer_gesture = None;
+        self.last_pointer_cell = None;
+        self.hover_url = None;
     }
 
     fn dispatch_pointer(
@@ -1155,8 +1382,30 @@ impl TerminalTab {
             return Ok(());
         }
 
-        let cell_width = CELL_WIDTH.round().max(1.0) as u32;
-        let cell_height = CELL_HEIGHT.round().max(1.0) as u32;
+        let bytes = self.encode_pointer(action, button, col, row, mods)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if motion_without_button {
+            self.motion_emitter.commit(col, row, now);
+        }
+        self.session.send_input(bytes);
+        Ok(())
+    }
+
+    fn encode_pointer(
+        &mut self,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+        mods: u16,
+    ) -> Result<Vec<u8>> {
+        let Some(metrics) = self.applied_metrics else {
+            return Ok(Vec::new());
+        };
+        let cell_width = metrics.cell_width.round().max(1.0) as u32;
+        let cell_height = metrics.cell_height.round().max(1.0) as u32;
         self.mouse_encoder.sync_from_terminal(&self.terminal);
         self.mouse_encoder.set_size(
             u32::from(self.cols) * cell_width,
@@ -1177,18 +1426,9 @@ impl TerminalTab {
         } else {
             event.clear_button();
         }
-        let bytes = self
-            .mouse_encoder
+        self.mouse_encoder
             .encode(&event)
-            .context("encode terminal mouse event")?;
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        if motion_without_button {
-            self.motion_emitter.commit(col, row, now);
-        }
-        self.session.send_input(bytes);
-        Ok(())
+            .context("encode terminal mouse event")
     }
 
     fn handle_wheel(&mut self, history_rows: f64, col: u32, row: u32, mods: u16) -> Result<()> {
@@ -1674,6 +1914,9 @@ pub struct App {
     test_mode: bool,
     status: StatusBanner,
     config: RoostConfig,
+    typography: TerminalTypography,
+    terminal_metrics: TerminalMetrics,
+    metric_generation: u64,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
@@ -1710,6 +1953,23 @@ pub struct App {
 impl App {
     pub fn bootstrap(profile: &BundleProfile, lock: InstanceLock) -> Result<Self> {
         let config = RoostConfig::load_default();
+        let configured_typography = TerminalTypography::new(None, config.font_size);
+        let (typography, terminal_metrics) =
+            match TerminalMetrics::measure(configured_typography.current_size_pt()) {
+                Ok(metrics) => (configured_typography, metrics),
+                Err(error) => {
+                    tracing::warn!(
+                        configured_size = configured_typography.current_size_pt(),
+                        %error,
+                        "configured font size cannot be rendered by Iced; using Rust UI default"
+                    );
+                    let fallback = TerminalTypography::new(None, None);
+                    let metrics = TerminalMetrics::measure(fallback.current_size_pt())
+                        .map_err(anyhow::Error::msg)
+                        .context("measure default Iced terminal font")?;
+                    (fallback, metrics)
+                }
+            };
         let keybindings = keybind::canonicalize_bindings(
             keybind::default_bindings(),
             config.keybinds.clone(),
@@ -1772,6 +2032,9 @@ impl App {
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: StatusBanner::default(),
             config,
+            typography,
+            terminal_metrics,
+            metric_generation: 1,
             keybindings,
             active_theme_name,
             palette: None,
@@ -1927,16 +2190,19 @@ impl App {
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
         self.window_size = size;
-        let width = (size.width
-            - sidebar_width(self.workspace.sidebar_collapsed())
-            - 2.0 * TERMINAL_PADDING)
-            .max(CELL_WIDTH * 2.0);
-        let height =
-            (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
-        let cols = ((width / CELL_WIDTH).floor() as u16).max(2);
-        let rows = ((height / CELL_HEIGHT).floor() as u16).max(2);
-        for tab in self.tabs.values_mut() {
-            tab.resize(cols, rows);
+        let (cols, rows) = terminal_grid(
+            size,
+            self.workspace.sidebar_collapsed(),
+            self.terminal_metrics,
+        );
+        for (tab_id, tab) in &mut self.tabs {
+            match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
+                Ok(Some(change)) => tab.commit_geometry(change),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(?error, tab_id, cols, rows, "terminal resize failed")
+                }
+            }
         }
         if changed && self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
@@ -2068,12 +2334,17 @@ impl App {
                 Ok(UiTask::None)
             }
             KeybindAction::FontIncrease => {
-                Err("Increase Font Size is not available in Iced yet".into())
+                self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
+                Ok(UiTask::None)
             }
             KeybindAction::FontDecrease => {
-                Err("Decrease Font Size is not available in Iced yet".into())
+                self.apply_font_size_transition(FontSizeTransition::Adjust(-1.0))?;
+                Ok(UiTask::None)
             }
-            KeybindAction::FontReset => Err("Reset Font Size is not available in Iced yet".into()),
+            KeybindAction::FontReset => {
+                self.apply_font_size_transition(FontSizeTransition::Reset)?;
+                Ok(UiTask::None)
+            }
             KeybindAction::CommandPalette => self.open_bound_palette_result("commands"),
             KeybindAction::CommandLauncher => self.open_bound_palette_result("launcher"),
             KeybindAction::CustomPalette => self.open_bound_palette_result("custom"),
@@ -2093,6 +2364,120 @@ impl App {
     fn open_bound_palette_result(&mut self, kind: &str) -> Result<UiTask, String> {
         self.open_palette(kind)?;
         Ok(self.take_palette_focus_task())
+    }
+
+    fn apply_font_size_transition(&mut self, transition: FontSizeTransition) -> Result<(), String> {
+        let Some((candidate, metrics)) = font_size_candidate(&self.typography, transition)? else {
+            return Ok(());
+        };
+        let metric_generation = self.metric_generation.wrapping_add(1).max(1);
+        let (cols, rows) = terminal_grid(
+            self.window_size,
+            self.workspace.sidebar_collapsed(),
+            metrics,
+        );
+        let mut tab_ids = self.tabs.keys().copied().collect::<Vec<_>>();
+        tab_ids.sort_unstable();
+        let applied = apply_geometry_batch(
+            &tab_ids,
+            cols,
+            rows,
+            metrics,
+            metric_generation,
+            |operation| match operation {
+                GeometryBatchOperation::Apply {
+                    tab_id,
+                    cols,
+                    rows,
+                    metrics,
+                    metric_generation,
+                } => self
+                    .tabs
+                    .get_mut(&tab_id)
+                    .ok_or_else(|| {
+                        format!("tab {tab_id} disappeared during font-size application")
+                    })?
+                    .apply_geometry(cols, rows, metrics, metric_generation)
+                    .map_err(|error| error.to_string()),
+                GeometryBatchOperation::Rollback { tab_id, previous } => self
+                    .tabs
+                    .get_mut(&tab_id)
+                    .ok_or_else(|| format!("tab {tab_id} disappeared during font-size rollback"))?
+                    .rollback_geometry(previous)
+                    .map(|()| None)
+                    .map_err(|error| error.to_string()),
+            },
+        )
+        .map_err(|failure| {
+            let mut message = format!(
+                "apply font size to tab {}: {}",
+                failure.tab_id, failure.apply
+            );
+            for (tab_id, error) in failure.rollback {
+                message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+            }
+            message
+        })?;
+
+        let mut pointer_releases = Vec::new();
+        for (tab_id, change) in &applied {
+            if !change.metrics_changed {
+                continue;
+            }
+            let release = match self.tabs.get_mut(tab_id) {
+                Some(tab) => tab.prepare_pointer_cancel(),
+                None => Err(anyhow::anyhow!(
+                    "tab {tab_id} disappeared while staging pointer release"
+                )),
+            };
+            match release {
+                Ok(release) => pointer_releases.push((*tab_id, release)),
+                Err(error) => {
+                    let mut message = format!(
+                        "stage pointer release for tab {tab_id} before font-size commit: {error}"
+                    );
+                    for (rollback_id, applied_change) in applied.iter().rev() {
+                        let Some(previous) = applied_change.previous else {
+                            continue;
+                        };
+                        if let Err(rollback_error) = self
+                            .tabs
+                            .get_mut(rollback_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "tab {rollback_id} disappeared during font-size rollback"
+                                )
+                            })
+                            .and_then(|tab| tab.rollback_geometry(previous))
+                        {
+                            message.push_str(&format!(
+                                "; rollback tab {rollback_id}: {rollback_error}"
+                            ));
+                        }
+                    }
+                    return Err(message);
+                }
+            }
+        }
+
+        self.typography = candidate;
+        self.terminal_metrics = metrics;
+        self.metric_generation = metric_generation;
+        for (tab_id, release) in pointer_releases {
+            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+                tab.commit_pointer_cancel(release);
+            }
+        }
+        for (tab_id, change) in applied {
+            if let Some(tab) = self.tabs.get(&tab_id) {
+                tab.commit_geometry(change);
+            }
+        }
+
+        let size_pt = self.typography.current_size_pt();
+        let path = config::config_path();
+        persist_font_size_with(&mut self.config, path.as_deref(), size_pt, config::set_key)
+            .map_err(|error| format!("persist font size: {error}"))
     }
 
     fn copy_active_selection(&mut self) -> UiTask {
@@ -2476,12 +2861,14 @@ impl App {
             .style(chrome::dark_surface);
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
-            Some(tab) => TerminalWidget {
+            Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
                 tab_id: active_tab,
                 snapshot: tab.snapshot.clone(),
+                metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
+                metric_generation: tab.metric_generation,
             }
             .into(),
-            None => container(text("Starting terminal…"))
+            _ => container(text("Starting terminal…"))
                 .center(Fill)
                 .width(Fill)
                 .height(Fill)
@@ -3208,6 +3595,21 @@ impl App {
                     self.palette_theme_at_open = None;
                     self.toggle_sidebar_agents();
                 }
+                "font_increase" => {
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
+                }
+                "font_decrease" => {
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.apply_font_size_transition(FontSizeTransition::Adjust(-1.0))?;
+                }
+                "font_reset" => {
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.apply_font_size_transition(FontSizeTransition::Reset)?;
+                }
                 "jump_to_unread" => {
                     let active_project_id = self.workspace.active().0;
                     let target = notification_inbox::next_unread(
@@ -3534,18 +3936,30 @@ impl App {
             };
             match attached {
                 Ok(mut tab) => {
-                    let size = self.window_size;
-                    let width = (size.width
-                        - sidebar_width(self.workspace.sidebar_collapsed())
-                        - 2.0 * TERMINAL_PADDING)
-                        .max(CELL_WIDTH * 2.0);
-                    let height = (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING)
-                        .max(CELL_HEIGHT * 2.0);
-                    tab.resize(
-                        ((width / CELL_WIDTH).floor() as u16).max(2),
-                        ((height / CELL_HEIGHT).floor() as u16).max(2),
+                    let (cols, rows) = terminal_grid(
+                        self.window_size,
+                        self.workspace.sidebar_collapsed(),
+                        self.terminal_metrics,
                     );
-                    self.tabs.insert(tab_id, tab);
+                    match tab.apply_geometry(
+                        cols,
+                        rows,
+                        self.terminal_metrics,
+                        self.metric_generation,
+                    ) {
+                        Ok(Some(change)) => {
+                            tab.commit_geometry(change);
+                            self.tabs.insert(tab_id, tab);
+                        }
+                        Ok(None) => {
+                            tracing::warn!(tab_id, "new terminal did not install renderer metrics")
+                        }
+                        Err(error) => tracing::warn!(
+                            tab_id,
+                            ?error,
+                            "new terminal renderer geometry installation failed"
+                        ),
+                    }
                 }
                 Err(error) => tracing::debug!(tab_id, ?error, "PTY not ready for UI attach"),
             }
@@ -4466,7 +4880,7 @@ mod tests {
                 std::path::Path::new("/tmp/roost-iced-pointer-test.sock"),
             )
             .expect("spawn pointer-test PTY");
-        let tab = TerminalTab::attach(
+        let mut tab = TerminalTab::attach(
             Arc::clone(&supervisor),
             tab_id,
             true,
@@ -4474,6 +4888,10 @@ mod tests {
             roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
         )
         .expect("attach pointer-test terminal");
+        let metrics = TerminalMetrics::measure(13.0).expect("pointer-test terminal metrics");
+        tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, 1)
+            .expect("install pointer-test terminal metrics")
+            .expect("new pointer-test terminal changes geometry");
         (tab, supervisor)
     }
 
@@ -4502,11 +4920,8 @@ mod tests {
     #[test]
     fn terminal_geometry_never_produces_zero_grid() {
         let size = Size::new(1.0, 1.0);
-        let width = (size.width - SIDEBAR_WIDTH - 2.0 * TERMINAL_PADDING).max(CELL_WIDTH * 2.0);
-        let height =
-            (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
-        assert_eq!(((width / CELL_WIDTH).floor() as u16).max(2), 2);
-        assert_eq!(((height / CELL_HEIGHT).floor() as u16).max(2), 2);
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        assert_eq!(terminal_grid(size, false, metrics), (2, 2));
     }
 
     #[test]
@@ -5185,6 +5600,179 @@ mod tests {
         let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
         assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
         supervisor.close(91);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn geometry_transaction_defers_in_band_reports_until_commit() {
+        let (mut tab, supervisor) = attached_test_terminal(92);
+        tab.write_vt(b"\x1b[?2048h");
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+
+        let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
+        let change = tab
+            .apply_geometry(92, 29, larger, 2)
+            .expect("stage candidate geometry")
+            .expect("candidate changes geometry");
+        assert!(
+            tab.input_capture
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "libghostty size reports must remain internal until batch commit"
+        );
+        tab.commit_geometry(change);
+        assert!(
+            !tab.input_capture
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "successful commit delivers the staged in-band report"
+        );
+
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        let smaller = TerminalMetrics::measure(13.0).expect("smaller metrics");
+        let change = tab
+            .apply_geometry(100, 32, smaller, 3)
+            .expect("stage rollback candidate")
+            .expect("rollback candidate changes geometry");
+        tab.rollback_geometry(change.previous.expect("installed prior geometry"))
+            .expect("rollback candidate geometry");
+        assert!(
+            tab.input_capture
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "candidate and rollback reports must not escape a failed transaction"
+        );
+        supervisor.close(92);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metric_change_stages_mouse_release_while_resize_and_rollback_preserve_tracking() {
+        let (mut tab, supervisor) = attached_test_terminal(93);
+        tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
+        let original = tab.applied_metrics.expect("installed metrics");
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 2),
+            1,
+            true,
+            false,
+        );
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+
+        let grid_change = tab
+            .apply_geometry(99, 31, original, 1)
+            .expect("resize grid")
+            .expect("grid changed");
+        assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
+        tab.commit_geometry(grid_change);
+        native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (2, 2),
+            0,
+            true,
+            false,
+        );
+        assert_eq!(tab.tracking_pointer, None);
+        assert_eq!(
+            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            Some(&b'm'),
+            "the native release reaches the tracked application after grid-only resize"
+        );
+
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (3, 3),
+            1,
+            true,
+            false,
+        );
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        let larger = TerminalMetrics::measure(14.0).expect("larger metrics");
+        let metric_change = tab
+            .apply_geometry(92, 28, larger, 2)
+            .expect("apply metric change")
+            .expect("metrics changed");
+        assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
+        assert!(tab
+            .input_capture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty());
+        let release = tab.prepare_pointer_cancel().expect("stage tracked release");
+        assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
+        assert!(tab
+            .input_capture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty());
+        tab.commit_pointer_cancel(release);
+        assert_eq!(tab.tracking_pointer, None);
+        assert_eq!(
+            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            Some(&b'm'),
+            "committed metric replacement sends its staged release"
+        );
+        tab.commit_geometry(metric_change);
+
+        native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (4, 4),
+            1,
+            true,
+            false,
+        );
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+        let rollback = tab
+            .apply_geometry(99, 31, original, 3)
+            .expect("stage failed metric candidate")
+            .expect("rollback candidate changes metrics");
+        tab.rollback_geometry(rollback.previous.expect("prior geometry"))
+            .expect("roll back failed metric candidate");
+        assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
+        assert!(
+            tab.input_capture
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "failed metric transition must not release or clear mouse ownership"
+        );
+        native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (4, 4),
+            0,
+            true,
+            false,
+        );
+        assert_eq!(tab.tracking_pointer, None);
+        assert_eq!(
+            tab.input_capture.as_ref().unwrap().lock().unwrap().last(),
+            Some(&b'm')
+        );
+        supervisor.close(93);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6070,6 +6658,134 @@ mod tests {
                 (7, first.background),
             ]
         );
+    }
+
+    #[test]
+    fn failed_font_geometry_batch_rolls_back_in_reverse_and_does_not_persist() {
+        let original_metrics = TerminalMetrics::measure(13.0).expect("original metrics");
+        let next_metrics = TerminalMetrics::measure(14.0).expect("next metrics");
+        let original = TerminalGeometry {
+            cols: 100,
+            rows: 32,
+            metrics: original_metrics,
+            metric_generation: 4,
+        };
+        let mut states = HashMap::from([(7_i64, original), (11_i64, original)]);
+        let mut operations = Vec::new();
+        let mut persisted = false;
+
+        let result =
+            apply_geometry_batch(
+                &[7, 11],
+                92,
+                29,
+                next_metrics,
+                5,
+                |operation| match operation {
+                    GeometryBatchOperation::Apply {
+                        tab_id,
+                        cols,
+                        rows,
+                        metrics,
+                        metric_generation,
+                    } => {
+                        operations.push(format!("apply:{tab_id}"));
+                        if tab_id == 11 {
+                            return Err("injected tab failure".to_string());
+                        }
+                        let previous = states.insert(
+                            tab_id,
+                            TerminalGeometry {
+                                cols,
+                                rows,
+                                metrics,
+                                metric_generation,
+                            },
+                        );
+                        Ok(Some(GeometryChange {
+                            previous,
+                            current: states[&tab_id],
+                            grid_changed: true,
+                            metrics_changed: true,
+                            deferred_replies: Vec::new(),
+                        }))
+                    }
+                    GeometryBatchOperation::Rollback { tab_id, previous } => {
+                        operations.push(format!("rollback:{tab_id}"));
+                        states.insert(tab_id, previous);
+                        Ok(None)
+                    }
+                },
+            );
+        if result.is_ok() {
+            persisted = true;
+        }
+
+        assert_eq!(
+            result.expect_err("second tab must fail"),
+            GeometryBatchFailure {
+                tab_id: 11,
+                apply: "injected tab failure".to_string(),
+                rollback: Vec::new(),
+            }
+        );
+        assert_eq!(operations, ["apply:7", "apply:11", "rollback:7"]);
+        assert_eq!(states[&7], original);
+        assert_eq!(states[&11], original);
+        assert!(
+            !persisted,
+            "failed live application cannot reach persistence"
+        );
+    }
+
+    #[test]
+    fn font_size_candidate_is_atomic_when_reset_cannot_be_measured() {
+        let mut current = TerminalTypography::new(None, Some(f64::MAX));
+        assert_eq!(current.adjust_size(-1.0), Some(72.0));
+        let before = current.clone();
+        assert!(font_size_candidate(&current, FontSizeTransition::Reset).is_err());
+        assert_eq!(
+            current, before,
+            "candidate measurement cannot mutate live state"
+        );
+
+        let candidate = font_size_candidate(&current, FontSizeTransition::Adjust(-1.0))
+            .expect("measurable candidate")
+            .expect("changed candidate");
+        assert_eq!(candidate.0.current_size_pt(), 71.0);
+        assert_eq!(current, before);
+    }
+
+    #[test]
+    fn font_size_persistence_handles_absence_success_and_failure() {
+        let mut absent = RoostConfig::default();
+        persist_font_size_with(&mut absent, None, 14.0, |_, _, _| {
+            panic!("absent path must not invoke the writer")
+        })
+        .expect("absent path is a silent success");
+        assert_eq!(absent.font_size, Some(14.0));
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.conf");
+        std::fs::write(&path, "# keep me\ntheme = roost-dark\n").expect("seed config");
+        let mut successful = RoostConfig::default();
+        persist_font_size_with(&mut successful, Some(&path), 14.5, config::set_key)
+            .expect("persist font size");
+        assert_eq!(successful.font_size, Some(14.5));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read persisted config"),
+            "# keep me\ntheme = roost-dark\nfont-size = 14.5\n"
+        );
+
+        let before = std::fs::read(&path).expect("read before failure");
+        let mut failed = RoostConfig::default();
+        let error = persist_font_size_with(&mut failed, Some(&path), 15.0, |_, _, _| {
+            Err(io::Error::other("injected writer failure"))
+        })
+        .expect_err("writer failure must be returned to the UI boundary");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(failed.font_size, Some(15.0));
+        assert_eq!(std::fs::read(&path).expect("read after failure"), before);
     }
 
     #[test]

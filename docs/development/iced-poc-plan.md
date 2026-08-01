@@ -1848,6 +1848,159 @@ The complete shed gate rebuilt isolated GTK/Iced/roostctl artifacts and passed
 GTK real-seat Wayland project/tab drag, Iced X11 real-input, and Iced real-seat
 Wayland clipboard/input coverage. AppKit and Iced clipboard suites were run
 sequentially because the macOS system clipboard is a shared external resource.
+GitHub Actions run `30720544507` passed at pushed commit `2ea3632` across every
+Swift, GTK, engine, and Iced OS/renderer lane.
+
+### Iced measured font-size and reflow commit plan
+
+Scope: replace Iced's hard-coded 8.4-by-18 logical-cell grid and 13.5-pixel
+terminal text with a renderer-measured adapter driven by the shared
+`TerminalTypography` state. Implement the existing Font Increase, Font
+Decrease, and Font Reset action IDs in Iced, reflow every live terminal and any
+later-created tab, and persist the exact shared `font-size` config bytes. This
+commit covers size and cell metrics only. Installed-family discovery and the
+font-picker preview/confirmation path remain the next typography adapter slice;
+the existing one-row Iced family placeholder must continue to be named as a
+gap rather than represented as complete support.
+
+Ownership and interfaces: `roost-ui-model::TerminalTypography` remains the
+toolkit-neutral authority for launch baseline, live size, clamp/reset, no-op,
+and serialization policy. Iced owns a small immutable/copyable
+`TerminalMetrics` renderer value containing its base generic-monospace `Font`,
+logical font pixels, cell width, and cell height. It converts the shared Rust
+point size at 96/72 logical pixels per point, matching GTK's current
+absolute-size conversion; platform device scaling remains the
+renderer/compositor's concern.
+The adapter measures `M` through Iced 0.14's released associated paragraph
+type, `<iced::Renderer as iced::advanced::text::Renderer>::Paragraph`, without
+adding an `iced_graphics` dependency. Measurement uses `Size::INFINITE`,
+`Wrapping::None`, `Shaping::Auto`, default horizontal/top vertical alignment,
+and the same `LineHeight::Relative(1.2)` as drawing. Width and height are
+floored, then required to remain finite and at least one whole logical pixel,
+matching GTK's floor quantization. Glyph origins, cell backgrounds, pointer
+hit-testing, and libghostty's pixel-cell dimensions therefore share one grid
+under wgpu and tiny-skia. Normal cells derive bold/italic variants from the
+stored generic-monospace base; the existing deliberate `SansSerif` fallback for
+wide cells remains renderer-specific and keeps the same size and cell allotment.
+
+Metric construction is fallible. Point-to-pixel conversion checks the `f64`
+value before and after narrowing to `f32`, and rejects non-finite/non-positive
+pixels or paragraph bounds rather than passing infinity or zero into the
+renderer. On boot, a valid-for-the-shared-model but unrenderable tiny/extreme
+configured size logs a diagnostic and starts Iced from the shared default. A
+live adjustment/reset is first applied to a cloned typography candidate;
+metrics are measured from the candidate, and only then are both candidate and
+metrics committed. Failure retains the previous model/metrics, performs no
+write, and surfaces a bounded status message. Boot fallback replaces both the
+Iced typography baseline/current value and metrics with the shared default;
+`RoostConfig.font_size` and the user's disk bytes retain the original extreme
+value so the adapter does not silently rewrite configuration.
+
+Every `TerminalTab` stores the metrics used by its terminal, encoder, and
+snapshot widget. Terminal drawing, cursor/selection/link rectangles, pointer
+cell mapping, smooth-wheel pixel-to-row conversion, mouse encoder dimensions,
+window-to-grid sizing, libghostty resize calls, and newly attached tabs all use
+that same value; no former cell constant may remain in a live geometry path.
+Changing metrics forces libghostty's cell-pixel resize even in the unlikely
+case that rows and columns remain unchanged, while `TabSession::send_resize`
+and its PTY `SIGWINCH` path run only when rows or columns actually change.
+Newly attached tabs begin with no applied metric marker, so their first layout
+always installs cell-pixel dimensions even when it happens to equal the
+100-by-32 libghostty default. Grid-only changes preserve a captured pointer so
+the native release still reaches an application using terminal mouse reporting.
+A committed metric change stages and then sends that release before clearing
+hover, pointer, and captured-gesture state; a failed/rolled-back metric change
+preserves ownership on both sides. The custom widget tracks a monotonically
+advancing metric generation and discards any press/click sequence begun under
+the successfully replaced physical geometry. The application updates its model and metrics
+synchronously on the Iced event loop and computes every target geometry before
+committing global state. Tabs are applied in stable ID order through a fallible
+libghostty resize that updates stored grid/metrics only after acceptance and
+does not yet signal the PTY. Libghostty in-band size reports and any terminal
+mouse release are staged as owned bytes rather than sent during this phase. A
+rejection rolls already-applied tabs back in
+reverse order, leaves global typography/config untouched, performs no
+persistence, discards candidate and rollback size reports, and reports both the
+primary and any rollback error. Only after
+every tab accepts does Iced commit the global candidate and send PTY resize for
+tabs whose row/column grid changed. No renderer/UI call occurs while shared
+model state is borrowed, and no typography state enters `roost-engine`.
+
+Command and persistence behavior: a repeated/saturated size command is consumed
+as a Roost shortcut but performs no terminal resize and no config write. A real
+increase/decrease applies the new metrics to all tabs and writes
+`font-size = <shared serialization>` through the existing atomic config editor.
+Reset returns to the unmodified launch baseline, including a valid fractional
+or out-of-range baseline, and a second reset writes nothing. An absent config
+path is silent success and does not invoke the writer. Once metrics apply,
+`RoostConfig.font_size` mirrors the live value even if the disk writer later
+fails, matching Iced's existing theme behavior, while `TerminalTypography`
+retains its immutable launch baseline. A disk persistence failure therefore
+leaves the useful already-accepted live change in place, performs no rollback,
+and surfaces a bounded Iced status error instead of swallowing it. The
+boot-time configured family remains in `RoostConfig` but is not claimed as
+rendered until the next family-adapter slice.
+
+Tests: add pure metric tests for positive/integral measurements, increasing
+size, point-to-pixel conversion, and consistent text/grid parameters. Convert
+terminal-widget coordinate, cursor, selection, link, wheel, and pointer tests
+to inject explicit metrics so they prove the dynamic contract instead of
+copying new constants. Add app tests for action routing, all-tab/new-tab metric
+inheritance, first-install and metric-only cell-pixel resize without spurious
+PTY resize, persistence absence/success/failure ordering, saturated no-write,
+and reset semantics. Include tiny/overflowing configured sizes and a reset to
+an unrenderable baseline, proving fallback or retention before model mutation,
+plus an injected mid-batch resize failure that rolls back and never persists.
+Generalize the harness-owned GTK typography size test to `gtk|iced` while
+keeping family preview GTK-only until Iced actually implements it: fixed
+geometry, two live PTY tabs, increase/reflow/exact config,
+third-tab inheritance, reset, and unchanged inode/bytes on a second reset.
+Ownership guards must run before project or palette mutation.
+
+Visual and platform validation: capture the same seeded GTK and Iced terminal
+at fixed geometry after default launch and after one increase, then inspect
+padding, density, baseline, Latin/bold/italic, wide CJK, and combining marks.
+The repeatable capture is review evidence, not a permanent full-window pixel
+golden. Run focused macOS wgpu/tiny-skia functional and screenshot checks,
+Linux shed X11 and Wayland checks under both renderers, and the existing real
+input routes because dynamic metrics affect hit-testing, wheel normalization,
+and mouse-report coordinates. Run the complete Rust/Swift/GTK gates,
+dependency-boundary checks, and full shed gate before commit; review the diff,
+push one conventional commit, and require its branch Actions green.
+
+Acceptance: the default Iced terminal is visibly measured rather than
+constant-sized; all font-size commands work through keyboard and palette IDs;
+configured/live/reset sizes reflow every current and future PTY tab and persist
+with GTK-compatible bytes; mouse, selection, link, wheel, cursor, screenshots,
+and PTY resize remain correct under both renderers on macOS, X11, and Wayland;
+GTK/AppKit regressions stay green; the engine/UI dependency direction is
+unchanged; and arbitrary font-family support remains one explicit, narrowly
+scoped follow-up rather than an unsafe or leaking shortcut.
+
+Validation result: the implementation passed formatting and warnings-denied
+workspace/Iced lint, 97 Iced unit tests, the complete shared Rust workspace,
+688 Swift tests, and 33 harness-unit tests. The complete macOS Iced functional
+suite passed 50 tests under both wgpu and tiny-skia; its three skips remain
+named platform/capability cases, including the intentionally deferred Iced
+font-family picker. The complete GTK (154 passed) and AppKit (145 passed)
+functional suites also passed during this slice. Linux focused typography and
+walking-skeleton tests passed on X11 and Wayland with both renderers. The final
+shed gate rebuilt isolated GTK, Iced, and roostctl artifacts, then passed GTK
+real-seat Wayland project/tab drag, the complete Iced X11 real-input suite, and
+Iced real-seat Wayland clipboard/drag/multi-click/link-hover coverage. Both
+Linux real-input probes now measure the live renderer cell through a product
+screenshot instead of copying a font-size-dependent constant (10 by 20 logical
+pixels in the final Wayland run).
+
+The inspected default-size evidence is
+`target/visual-parity/2ea3632-8f3710ae1a/iced-darwin-native-default-1/shell.png`
+on macOS and
+`target/visual-parity/typography-linux-x11-wgpu/iced-linux-x11-wgpu-1/shell.png`
+on Linux X11/wgpu. Both show terminal density and padding aligned with the GTK
+reference while retaining normal toolkit glyph differences. Cargo dependency
+inspection found no GTK/libadwaita/Pango/Cairo/`roost-linux` edge from Iced and
+no GTK/Iced edge from the engine; inverse trees show both `roost-linux` and
+`roost-iced` depending independently on `roost-engine`.
 
 ## Objective acceptance criteria
 
