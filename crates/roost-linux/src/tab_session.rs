@@ -69,9 +69,10 @@ pub struct TabSession {
 
 impl TabSession {
     /// Attach to a tab the supervisor already spawned. `output_rx`
-    /// is the broadcast receiver that `LocalClient::open_tab`
-    /// returned from `PtySupervisor::spawn` (subscribed BEFORE the
-    /// reader task started — no early-byte loss).
+    /// should be a receiver subscribed before the supervisor's reader
+    /// task started producing (`PtySupervisor::spawn`'s return, or
+    /// the stashed twin via `take_initial_receiver`) — no early-byte
+    /// loss.
     pub fn attach_with_receiver(
         supervisor: Arc<PtySupervisor>,
         tab_id: i64,
@@ -133,9 +134,12 @@ impl TabSession {
         }
     }
 
-    /// Subscribe lazily by tab_id (used when reattaching to an
-    /// existing session). Errors if the supervisor has no live PTY
-    /// for that id. Production callers pass `None` for
+    /// Attach by tab_id. The first attach consumes the receiver the
+    /// supervisor subscribed before its reader task started, so
+    /// output emitted before the UI attached (a fast launcher
+    /// command's first bytes) is preserved; a reattach falls back to
+    /// a fresh lazy subscription. Errors if the supervisor has no
+    /// live PTY for that id. Production callers pass `None` for
     /// `input_capture`; `App` passes `Some` only when
     /// `ROOST_TEST_MODE=1`.
     pub fn attach(
@@ -145,7 +149,8 @@ impl TabSession {
         input_capture: Option<InputCapture>,
     ) -> Result<Self> {
         let rx = supervisor
-            .subscribe_output(tab_id)
+            .take_initial_receiver(tab_id)
+            .or_else(|| supervisor.subscribe_output(tab_id))
             .ok_or_else(|| anyhow::anyhow!("no live PTY for tab {tab_id}"))?;
         Ok(Self::attach_with_receiver(
             supervisor,
@@ -275,5 +280,70 @@ mod tests {
         assert_eq!(got, b"hello world".to_vec());
 
         supervisor.close(7);
+    }
+
+    /// #267: output a fast command emits before the UI attaches must
+    /// reach the terminal. The UI's attach can trail the spawn by a
+    /// main-loop hop (or a whole TabOpened event round-trip for IPC
+    /// opens); `TabSession::attach` consumes the receiver the
+    /// supervisor subscribed before its reader task started, so those
+    /// bytes are waiting in its buffer instead of lost to a late
+    /// `subscribe_output`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_after_output_preserves_early_bytes() {
+        let supervisor = Arc::new(PtySupervisor::new());
+        let socket = std::path::PathBuf::from("/tmp/roost-tabsession-early.sock");
+        // `exec cat` keeps the PTY alive so Exit can't race the drain.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf EARLY_MARKER; exec /bin/cat".to_string(),
+        ];
+        let _rx_dropped = supervisor
+            .spawn(21, "/tmp", &argv, 80, 24, &socket)
+            .expect("spawn");
+        // Give the command time to run and its output time to reach
+        // the broadcast channel — the window the old lazy subscribe
+        // lost bytes in.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _session = TabSession::attach(supervisor.clone(), 21, out_tx, None).expect("attach");
+
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !seen.windows(12).any(|w| w == b"EARLY_MARKER") {
+            match out_rx.try_recv() {
+                Ok(TabOutput::Bytes(b)) => seen.extend_from_slice(&b),
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("output channel closed early: {e:?}"),
+            }
+        }
+        supervisor.close(21);
+        assert!(
+            seen.windows(12).any(|w| w == b"EARLY_MARKER"),
+            "pre-attach output was lost; got: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    /// The stashed receiver is handed out exactly once; a second
+    /// attach (reattach) falls back to a fresh lazy subscription and
+    /// still succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_attach_falls_back_to_lazy_subscribe() {
+        let supervisor = Arc::new(PtySupervisor::new());
+        let socket = std::path::PathBuf::from("/tmp/roost-tabsession-reattach.sock");
+        let _rx = supervisor
+            .spawn(22, "/tmp", &["/bin/cat".into()], 80, 24, &socket)
+            .expect("spawn");
+        assert!(supervisor.take_initial_receiver(22).is_some());
+        assert!(supervisor.take_initial_receiver(22).is_none());
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _session = TabSession::attach(supervisor.clone(), 22, out_tx, None).expect("reattach");
+        supervisor.close(22);
     }
 }

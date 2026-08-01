@@ -97,6 +97,13 @@ struct Session {
     /// child is reaped). `close()`'s SIGKILL watchdog reads this to
     /// skip force-killing an already-dead child.
     reaped: Arc<AtomicBool>,
+    /// A receiver subscribed before the reader task started, held for
+    /// the UI's first attach. The attach can be arbitrarily late (a
+    /// main-loop hop for in-process opens, a TabOpened event for IPC
+    /// opens); a fast command's first bytes land in this receiver's
+    /// buffer instead of vanishing before a late `subscribe_output`.
+    /// `take_initial_receiver` hands it out exactly once.
+    initial_rx: Option<broadcast::Receiver<PtyOutputEvent>>,
 }
 
 impl Default for PtySupervisor {
@@ -130,6 +137,22 @@ impl PtySupervisor {
             .unwrap()
             .get(&tab_id)
             .map(|s| s.output_tx.subscribe())
+    }
+
+    /// The receiver `spawn` subscribed before the reader task started,
+    /// handed out exactly once — the UI's first attach consumes it so
+    /// output emitted before the attach is preserved. `None` if the
+    /// tab has no live PTY or the receiver was already taken (a
+    /// reattach falls back to [`Self::subscribe_output`]).
+    pub fn take_initial_receiver(
+        &self,
+        tab_id: i64,
+    ) -> Option<broadcast::Receiver<PtyOutputEvent>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get_mut(&tab_id)
+            .and_then(|s| s.initial_rx.take())
     }
 
     /// Best-effort native read of the tab's shell cwd — the new-tab
@@ -261,6 +284,9 @@ impl PtySupervisor {
         // to the caller guarantees no Bytes/Exit event between
         // spawn and caller-subscribe can be lost.
         let early_rx = output_tx.subscribe();
+        // Second pre-reader subscription, stashed in the Session for
+        // the UI's first attach (see `Session::initial_rx`).
+        let initial_rx = output_tx.subscribe();
         // One command channel for input + resize so they apply to the
         // PTY in submission order (#80).
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(PTY_INPUT_CHANNEL_CAPACITY);
@@ -340,6 +366,7 @@ impl PtySupervisor {
             killer: Mutex::new(killer),
             pid,
             reaped,
+            initial_rx: Some(initial_rx),
         };
         // Promote the slot from pending → sessions atomically.
         // If `close(tab_id)` ran while we were building the PTY it
