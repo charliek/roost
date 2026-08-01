@@ -20,7 +20,6 @@ mod config_fixture_tests;
 mod custom_command;
 mod events;
 mod focus;
-mod git_metrics;
 mod key_encoder;
 mod keybind;
 mod notification_inbox;

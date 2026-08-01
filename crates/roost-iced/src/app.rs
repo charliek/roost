@@ -7,6 +7,7 @@ use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{button, canvas, column, container, row, scrollable, stack, text, text_input};
 use iced::{window, Color, Element, Fill, Size, Task};
+use roost_engine::git_metrics;
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
     SelectionData, UiRequest,
@@ -20,7 +21,7 @@ use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
-use roost_ui_model::{config::RoostConfig, custom_command, palette};
+use roost_ui_model::{agent_palette, config::RoostConfig, custom_command, palette};
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
     TerminalOptions, TerminalSelection,
@@ -40,11 +41,16 @@ const DEFAULT_ROWS: u16 = 32;
 const UNSUPPORTED: &str = "not implemented by the Iced walking skeleton";
 
 fn command_palette_frame() -> palette::PaletteFrame {
-    palette::PaletteFrame::new(
-        "commands",
-        "Execute a command…",
-        palette::command_items(|_| None),
-    )
+    let mut items = palette::command_items(|_| None);
+    let index = items
+        .iter()
+        .position(|item| item.id == palette::PaletteCommands::SELECT_FONT_ID)
+        .map_or(items.len(), |index| index + 1);
+    items.insert(
+        index,
+        palette::PaletteItem::new(palette::PaletteCommands::VIEW_AGENTS_ID, "Go to Agent…"),
+    );
+    palette::PaletteFrame::new("commands", "Execute a command…", items)
 }
 
 fn launcher_palette_frame(config: &RoostConfig) -> palette::PaletteFrame {
@@ -81,6 +87,12 @@ pub enum UiTask {
     Focus(window::Id),
     FocusWidget(Id),
     Resize(window::Id, Size),
+}
+
+struct AgentMetricsResult {
+    session: u64,
+    claimed: Vec<String>,
+    outcomes: Result<Vec<git_metrics::ProbeOutcome>, String>,
 }
 
 struct TerminalTab {
@@ -506,9 +518,14 @@ pub struct App {
     config: RoostConfig,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
+    palette_session: u64,
     palette_theme_at_open: Option<String>,
     palette_input_id: Id,
     palette_focus_requested: bool,
+    git_probe: Arc<git_metrics::GitProbe>,
+    metrics_cache: git_metrics::MetricsCache,
+    metrics_tx: tokio::sync::mpsc::UnboundedSender<AgentMetricsResult>,
+    metrics_rx: tokio::sync::mpsc::UnboundedReceiver<AgentMetricsResult>,
     system_clipboard: Option<String>,
     selection_clipboard: Option<String>,
     // Field order is intentional: terminal sessions and IPC receivers are
@@ -540,6 +557,7 @@ impl App {
         hydrate_workspace(&runtime, &client)?;
 
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -573,9 +591,14 @@ impl App {
             config,
             active_theme_name,
             palette: None,
+            palette_session: 0,
             palette_theme_at_open: None,
             palette_input_id: Id::unique(),
             palette_focus_requested: false,
+            git_probe: Arc::new(git_metrics::GitProbe::new()),
+            metrics_cache: git_metrics::MetricsCache::default(),
+            metrics_tx,
+            metrics_rx,
             system_clipboard: None,
             selection_clipboard: None,
             runtime,
@@ -604,6 +627,7 @@ impl App {
 
     pub fn tick(&mut self) -> UiTask {
         let task = self.service_ui_requests();
+        self.service_agent_metrics();
         self.reconcile();
         let mut exited = Vec::new();
         let mut osc_actions = Vec::new();
@@ -824,6 +848,17 @@ impl App {
             let selected = index == frame.selection;
             let marker = if selected { "› " } else { "  " };
             let mut label = column![text(format!("{marker}{}", matched.item.title)).size(14)];
+            if let Some(agent) = matched.item.agent {
+                let metrics = agent.metrics_text.as_deref().unwrap_or("…");
+                label = label.push(
+                    text(format!(
+                        "{}  ·  {}  ·  {}",
+                        agent.status_text, agent.time_text, metrics
+                    ))
+                    .size(11)
+                    .color(agent_color(agent.effective_lifecycle)),
+                );
+            }
             if let Some(subtitle) = matched.item.subtitle {
                 label = label.push(
                     text(subtitle)
@@ -905,15 +940,20 @@ impl App {
         let frame = match kind {
             "" | "commands" => command_palette_frame(),
             "launcher" => launcher_palette_frame(&self.config),
-            "custom" | "agents" => {
+            "agents" => {
+                agent_palette::agent_frame(&self.workspace.snapshot(), agent_palette::now_unix())
+            }
+            "custom" => {
                 return Err(format!("palette kind {kind:?} is not implemented by Iced"));
             }
             _ => return Err(format!("unknown palette kind {kind:?}")),
         };
         self.dismiss_palette();
+        self.palette_session = self.palette_session.wrapping_add(1).max(1);
         self.palette_theme_at_open = Some(self.active_theme_name.clone());
         self.palette = Some(palette::PaletteState::new(frame));
         self.palette_focus_requested = true;
+        self.refresh_agent_palette();
         Ok(())
     }
 
@@ -993,11 +1033,12 @@ impl App {
                 .ok_or_else(|| format!("no palette row with id {id:?}"))?;
             state.set_selection(index);
             let item = matches[index].item.clone();
-            if !item.actionable {
-                return Err(format!("palette row {id:?} is not actionable"));
-            }
             (state.current().id.clone(), item)
         };
+
+        if !item.actionable {
+            return Ok(self.palette_state_result());
+        }
 
         match frame_id.as_str() {
             "commands" => match item.id.as_str() {
@@ -1010,6 +1051,15 @@ impl App {
                     if let Some(state) = &mut self.palette {
                         state.push(font_palette_frame());
                     }
+                }
+                palette::PaletteCommands::VIEW_AGENTS_ID => {
+                    if let Some(state) = &mut self.palette {
+                        state.push(agent_palette::agent_frame(
+                            &self.workspace.snapshot(),
+                            agent_palette::now_unix(),
+                        ));
+                    }
+                    self.refresh_agent_palette();
                 }
                 "new_tab" => {
                     self.palette = None;
@@ -1070,6 +1120,15 @@ impl App {
                 self.palette_theme_at_open = None;
             }
             "fonts" => {
+                self.palette = None;
+                self.palette_theme_at_open = None;
+            }
+            agent_palette::FRAME_ID => {
+                let tab_id = agent_palette::agent_tab_id(&item.id)
+                    .ok_or_else(|| format!("agent row {:?} cannot be activated", item.id))?;
+                self.workspace
+                    .focus_tab(tab_id)
+                    .map_err(|error| error.to_string())?;
                 self.palette = None;
                 self.palette_theme_at_open = None;
             }
@@ -1183,6 +1242,7 @@ impl App {
         // Full authoritative snapshot on every UI tick is the recovery path
         // for a slow consumer: deltas are an optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.refresh_agent_palette();
         let live_ids: HashSet<i64> = self
             .projects
             .iter()
@@ -1216,6 +1276,108 @@ impl App {
                     self.tabs.insert(tab_id, tab);
                 }
                 Err(error) => tracing::debug!(tab_id, ?error, "PTY not ready for UI attach"),
+            }
+        }
+    }
+
+    fn refresh_agent_palette(&mut self) {
+        let has_agents = self.palette.as_ref().is_some_and(|state| {
+            state
+                .frames()
+                .iter()
+                .any(|frame| frame.id == agent_palette::FRAME_ID)
+        });
+        if !has_agents {
+            return;
+        }
+        // Do not rebuild from `self.projects`: an IPC workspace mutation and
+        // `palette.open` can be serviced in the same event-loop turn, before
+        // the adapter's next general reconcile. The engine snapshot is the
+        // authoritative resync source for this live frame.
+        let projects = self.workspace.snapshot();
+        let cwds = agent_palette::agent_tab_cwds(&projects);
+        let mut items = agent_palette::agent_items(&projects, agent_palette::now_unix());
+        self.apply_metrics_cache(&cwds, &mut items);
+        if let Some(state) = &mut self.palette {
+            state.update_items(agent_palette::FRAME_ID, items);
+        }
+        self.spawn_agent_metrics(&cwds);
+    }
+
+    fn apply_metrics_cache(&self, cwds: &HashMap<i64, String>, items: &mut [palette::PaletteItem]) {
+        for item in items {
+            let Some(tab_id) = agent_palette::agent_tab_id(&item.id) else {
+                continue;
+            };
+            let (Some(agent), Some(cwd)) = (item.agent.as_mut(), cwds.get(&tab_id)) else {
+                continue;
+            };
+            agent.metrics_text = self
+                .metrics_cache
+                .text_for_session(self.palette_session, cwd)
+                .map(str::to_string);
+        }
+    }
+
+    fn spawn_agent_metrics(&mut self, cwds: &HashMap<i64, String>) {
+        self.metrics_cache.begin_session(self.palette_session);
+        let claimed = self.metrics_cache.claim_unprobed(cwds.values().cloned());
+        if claimed.is_empty() {
+            return;
+        }
+        let known = self.metrics_cache.known_roots();
+        let probe = Arc::clone(&self.git_probe);
+        let tx = self.metrics_tx.clone();
+        let session = self.palette_session;
+        let failed_claims = claimed.clone();
+        let task = self
+            .runtime
+            .spawn(git_metrics::probe_batch(probe, claimed, known));
+        self.runtime.spawn(async move {
+            let outcomes = task.await.map_err(|error| error.to_string());
+            let _ = tx.send(AgentMetricsResult {
+                session,
+                claimed: failed_claims,
+                outcomes,
+            });
+        });
+    }
+
+    fn service_agent_metrics(&mut self) {
+        while let Ok(result) = self.metrics_rx.try_recv() {
+            if self.palette.is_none()
+                || result.session != self.palette_session
+                || self.metrics_cache.session() != result.session
+            {
+                continue;
+            }
+            match result.outcomes {
+                Ok(outcomes) => {
+                    for outcome in outcomes {
+                        let Some(root) = outcome.root.clone() else {
+                            if let git_metrics::ProbeValue::Measured(Err(error)) = &outcome.value {
+                                tracing::debug!(cwd = %outcome.cwd, reason = %error, "no git metrics");
+                            }
+                            self.metrics_cache.store_unresolved(&outcome.cwd);
+                            continue;
+                        };
+                        let text = match outcome.value {
+                            git_metrics::ProbeValue::Reused(text) => text,
+                            git_metrics::ProbeValue::Measured(Ok(metrics)) => metrics.text(),
+                            git_metrics::ProbeValue::Measured(Err(error)) => {
+                                tracing::debug!(cwd = %outcome.cwd, reason = %error, "no git metrics");
+                                git_metrics::UNKNOWN.to_string()
+                            }
+                        };
+                        self.metrics_cache.store_root(&outcome.cwd, &root, text);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "git metrics task failed");
+                    for cwd in result.claimed {
+                        self.metrics_cache.store_unresolved(&cwd);
+                    }
+                }
             }
         }
     }
@@ -1520,6 +1682,17 @@ fn canonical_pointer_shape(name: &str) -> &str {
     }
 }
 
+fn agent_color(lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
+    use roost_ipc::agent::AgentLifecycle;
+    match lifecycle {
+        AgentLifecycle::Working => Color::from_rgb8(86, 182, 194),
+        AgentLifecycle::Waiting => Color::from_rgb8(238, 193, 95),
+        AgentLifecycle::Finished => Color::from_rgb8(126, 200, 126),
+        AgentLifecycle::Failed => Color::from_rgb8(238, 120, 120),
+        AgentLifecycle::Inactive => Color::from_rgb8(160, 164, 176),
+    }
+}
+
 fn pointer_action(action: PointerAction) -> roost_vt::MouseAction {
     match action {
         PointerAction::Press => mouse_action::PRESS,
@@ -1643,10 +1816,20 @@ mod tests {
     #[test]
     fn command_palette_uses_shared_ids_and_ranking() {
         let mut state = palette::PaletteState::new(command_palette_frame());
-        assert!(state
+        let ids: Vec<String> = state
             .matches()
+            .into_iter()
+            .map(|matched| matched.item.id)
+            .collect();
+        assert!(ids.iter().any(|id| id == "new_tab"));
+        let font = ids
             .iter()
-            .any(|matched| matched.item.id == "new_tab"));
+            .position(|id| id == palette::PaletteCommands::SELECT_FONT_ID)
+            .expect("font drill-in");
+        assert_eq!(
+            ids.get(font + 1).map(String::as_str),
+            Some(palette::PaletteCommands::VIEW_AGENTS_ID)
+        );
         state.set_query("theme");
         assert_eq!(
             state.selected_item().map(|item| item.id),

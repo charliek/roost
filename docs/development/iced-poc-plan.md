@@ -645,6 +645,48 @@ resize for delivery when the window id arrives; startup readiness must not
 depend on renderer event timing. The walking-skeleton resize/device-reply test
 is the regression gate on both Linux renderer lanes and macOS.
 
+### Active mini-plan: shared agent switcher and git metrics
+
+Scope: make the Iced palette consume the existing toolkit-neutral agent-row
+projection and move the asynchronous git-metrics service out of the GTK package
+into `roost-engine`. GTK keeps its current presentation and main-context hop;
+Iced adds a visible agent row, direct `palette.open kind="agents"`, the command
+palette drill-in, live authoritative refresh, and tab activation through the
+workspace operation path.
+
+Invariants and interfaces:
+
+- `roost-ui-model::agent_palette` remains the only owner of population,
+  lifecycle derivation, row text, ordering, elapsed time, and row-id parsing;
+- `roost-engine::git_metrics` owns process execution, timeouts, concurrency,
+  parsing, deduplication, and session cache data without GTK, Iced, renderer, or
+  callback dependencies; GTK imports it from the engine rather than retaining a
+  compatibility copy;
+- each open Iced palette receives a monotonically increasing session id; git
+  work returns through an owned channel, and results are ingested only when the
+  current session matches, so dismiss/reopen cannot flash or apply stale values;
+- every Iced tick resyncs the open agents frame from `Workspace::snapshot`,
+  preserving query and selected row by id through `PaletteState::update_items`;
+  a slow UI therefore recovers without relying on a complete delta stream;
+- non-repository, missing-cwd, timeout, and task failures become the explicit
+  em-dash value after logging; a pending row stays `None`, never a false zero;
+- activating `agent:<tab-id>` focuses through `Workspace::focus_tab` and closes
+  the palette; the empty sentinel is a successful no-op that remains open, and
+  a row whose tab vanished returns the existing not-found contract without a
+  crash; and
+- Iced renders the serialized agent payload (project, name, lifecycle/status,
+  elapsed time, and metrics) without creating a second agent state machine.
+
+Acceptance: all agent-palette model and extracted git-metrics unit tests pass;
+GTK compiles against `roost-engine::git_metrics` and its full regression suite
+stays green; every target-neutral case in `test_agent_palette.py` passes against
+Iced, including live lifecycle/project refresh, effective lifecycle, activation,
+command drill-in, real hook routing, same-root metrics reuse, and non-repo error
+resolution; macOS plus shed X11/Wayland focused gates pass; dependency trees
+remain toolkit-clean. Sidebar agent rows, native notification presentation,
+notification/provider palettes, and sidebar collapse/reveal behavior are
+separate slices and do not gain shadow state here.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

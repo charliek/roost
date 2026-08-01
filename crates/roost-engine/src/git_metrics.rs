@@ -1,15 +1,14 @@
-//! Git metrics for the agents palette (plan 005 §3.7).
+//! Toolkit-neutral git metrics for agent projections (plan 005 §3.7).
 //!
 //! Each agent row shows what its repo looks like right now — `"Nf +A -D"`
 //! (files touched, lines added, lines deleted) — probed asynchronously so
 //! the palette never blocks on `git`. Everything here is seam-shaped: a
 //! [`CommandRunner`] is injected, so the pipeline (dedupe → resolve root →
-//! diff + untracked → parse) is unit-tested without a repo on disk, and a
-//! future `roost-core` lift is mechanical.
+//! diff + untracked → parse) is unit-tested without a repo on disk, and
+//! both Rust UI adapters consume the same subprocess and cache semantics.
 //!
 //! Threading: the whole batch runs on the app's tokio runtime (never the
-//! GTK main thread); `app.rs` hops the result back to the main context the
-//! same way the provider subprocess path does.
+//! UI thread); each adapter owns the explicit hop back to its event loop.
 //!
 //! Every failure path — no cwd, not a repo, unborn HEAD, missing `git`,
 //! timeout, unparseable output — surfaces as `Err`, and the *caller* maps

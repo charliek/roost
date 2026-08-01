@@ -10,6 +10,7 @@
 pub mod application;
 pub mod events;
 pub mod facade;
+pub mod git_metrics;
 pub mod ipc;
 pub mod osc;
 pub mod persistence;

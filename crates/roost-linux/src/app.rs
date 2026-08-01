@@ -44,7 +44,6 @@ use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::focus::safe_grab_focus;
-use crate::git_metrics;
 use crate::keybind::{
     canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
 };
@@ -60,6 +59,7 @@ use crate::rollup::{project_rollup, rollup_css_class, ROLLUP_CLASSES};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
+use roost_engine::git_metrics;
 
 /// One per project: sidebar row + tab strip + tab content stack.
 struct ProjectUi {
