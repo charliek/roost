@@ -214,12 +214,40 @@ class Launch:
 
 
 def _set_row(launch: Launch, text: str) -> None:
-    launch.client.tab_feed_pty_bytes(
-        launch.tab, b"\x1b[2J\x1b[H" + text.encode("utf-8")
-    )
-    _wait_until(
-        lambda: launch.client.dump(launch.tab)["rows_text"][0].startswith(text),
-        f"terminal row {text!r}",
+    payload = b"\x1b[2J\x1b[H" + text.encode("utf-8")
+    timeout = 10.0 * SCALE
+    deadline = time.monotonic() + timeout
+    retry_interval = timeout / 4
+    next_feed = 0.0
+    attempts = 0
+    last_dump: dict | None = None
+    last_error: Exception | None = None
+
+    # Paste and middle-click checks still send their bytes to the real PTY, so
+    # delayed shell echo can overwrite row zero after this test fixture lands.
+    # Reapply the complete clear/home/text fixture at a few spaced intervals;
+    # every retry is idempotent and all attempts share the original deadline.
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if attempts < 4 and now >= next_feed:
+            # Transport/protocol errors are real failures and intentionally
+            # propagate instead of being mistaken for renderer scheduling.
+            launch.client.tab_feed_pty_bytes(launch.tab, payload)
+            attempts += 1
+            next_feed = now + retry_interval
+        try:
+            last_dump = launch.client.dump(launch.tab)
+            rows = last_dump.get("rows_text", [])
+            if rows and rows[0].startswith(text):
+                return
+        except (ConnectionError, FileNotFoundError, OSError) as error:
+            last_error = error
+        time.sleep(0.1)
+
+    suffix = f"; last error: {last_error}" if last_error else ""
+    raise AssertionError(
+        f"timed out waiting for terminal row {text!r} after {attempts} feeds; "
+        f"last dump: {last_dump!r}{suffix}"
     )
 
 
