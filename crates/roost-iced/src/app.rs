@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use iced::keyboard;
-use iced::widget::{button, canvas, column, container, row, text};
+use iced::keyboard::{self, key::Named, Key};
+use iced::widget::Id;
+use iced::widget::{button, canvas, column, container, row, scrollable, stack, text, text_input};
 use iced::{window, Color, Element, Fill, Size, Task};
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
@@ -15,10 +16,11 @@ use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
 use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace};
-use roost_ipc::messages::Project;
+use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
+use roost_ui_model::{config::RoostConfig, custom_command, palette};
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
     TerminalOptions, TerminalSelection,
@@ -37,9 +39,47 @@ const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
 const UNSUPPORTED: &str = "not implemented by the Iced walking skeleton";
 
+fn command_palette_frame() -> palette::PaletteFrame {
+    palette::PaletteFrame::new(
+        "commands",
+        "Execute a command…",
+        palette::command_items(|_| None),
+    )
+}
+
+fn launcher_palette_frame(config: &RoostConfig) -> palette::PaletteFrame {
+    palette::PaletteFrame::new(
+        "launcher",
+        "Run a command…",
+        custom_command::launcher_items(&config.commands),
+    )
+}
+
+fn theme_palette_frame(active_theme_name: &str) -> palette::PaletteFrame {
+    let names = Theme::bundled_names();
+    let selection = names
+        .iter()
+        .position(|name| name == active_theme_name)
+        .unwrap_or(0);
+    let items = names
+        .into_iter()
+        .map(|name| palette::PaletteItem::new(name.clone(), name))
+        .collect();
+    palette::PaletteFrame::new("themes", "Select a theme…", items).with_selection(selection)
+}
+
+fn font_palette_frame() -> palette::PaletteFrame {
+    palette::PaletteFrame::new(
+        "fonts",
+        "Select a font…",
+        vec![palette::PaletteItem::new("font:monospace", "Monospace")],
+    )
+}
+
 pub enum UiTask {
     None,
     Focus(window::Id),
+    FocusWidget(Id),
     Resize(window::Id, Size),
 }
 
@@ -66,13 +106,17 @@ struct TerminalTab {
 }
 
 impl TerminalTab {
-    fn attach(supervisor: Arc<PtySupervisor>, tab_id: i64, test_mode: bool) -> Result<Self> {
+    fn attach(
+        supervisor: Arc<PtySupervisor>,
+        tab_id: i64,
+        test_mode: bool,
+        theme: Theme,
+    ) -> Result<Self> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             max_scrollback: 2_000,
         })?;
-        let theme = Theme::default();
         terminal.set_color_foreground(theme.foreground)?;
         terminal.set_color_background(theme.background)?;
         terminal.set_color_cursor(theme.cursor)?;
@@ -327,6 +371,22 @@ impl TerminalTab {
         }
     }
 
+    fn set_theme(&mut self, theme: Theme) -> Result<()> {
+        self.terminal.set_color_foreground(theme.foreground)?;
+        self.terminal.set_color_background(theme.background)?;
+        self.terminal.set_color_cursor(theme.cursor)?;
+        self.terminal.set_color_palette(&theme.palette)?;
+        if self.terminal.mode_get(2031) {
+            self.session.send_input(if theme.background.is_light() {
+                b"\x1b[?997;2n".to_vec()
+            } else {
+                b"\x1b[?997;1n".to_vec()
+            });
+        }
+        self.theme = theme;
+        self.refresh_snapshot()
+    }
+
     fn refresh_snapshot(&mut self) -> Result<()> {
         self.render_state.update(&self.terminal)?;
         let colors = self.render_state.colors()?;
@@ -442,6 +502,12 @@ pub struct App {
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: Option<String>,
+    config: RoostConfig,
+    active_theme_name: String,
+    palette: Option<palette::PaletteState>,
+    palette_theme_at_open: Option<String>,
+    palette_input_id: Id,
+    palette_focus_requested: bool,
     system_clipboard: Option<String>,
     selection_clipboard: Option<String>,
     // Field order is intentional: terminal sessions and IPC receivers are
@@ -453,6 +519,11 @@ pub struct App {
 
 impl App {
     pub fn bootstrap(profile: &BundleProfile, lock: InstanceLock) -> Result<Self> {
+        let config = RoostConfig::load_default();
+        let active_theme_name = config
+            .theme_name
+            .clone()
+            .unwrap_or_else(|| "roost-dark".into());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -497,6 +568,12 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: None,
+            config,
+            active_theme_name,
+            palette: None,
+            palette_theme_at_open: None,
+            palette_input_id: Id::unique(),
+            palette_focus_requested: false,
             system_clipboard: None,
             selection_clipboard: None,
             runtime,
@@ -560,16 +637,62 @@ impl App {
         }
     }
 
-    pub fn keyboard(&mut self, event: keyboard::Event) {
+    pub fn keyboard(&mut self, event: keyboard::Event) -> UiTask {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.modifiers = *modifiers;
         }
+        if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
+            let palette_modifier = if cfg!(target_os = "macos") {
+                modifiers.logo()
+            } else {
+                modifiers.alt()
+            };
+            let character = match key.as_ref() {
+                Key::Character(value) => Some(value),
+                _ => None,
+            };
+            if self.palette.is_none()
+                && palette_modifier
+                && modifiers.shift()
+                && character.is_some_and(|value| value.eq_ignore_ascii_case("p"))
+            {
+                let _ = self.open_palette("commands");
+                return self.take_palette_focus_task();
+            }
+            if self.palette.is_none()
+                && palette_modifier
+                && modifiers.shift()
+                && character.is_some_and(|value| value.eq_ignore_ascii_case("t"))
+            {
+                let _ = self.open_palette("launcher");
+                return self.take_palette_focus_task();
+            }
+            if self.palette.is_some() {
+                match key.as_ref() {
+                    Key::Named(Named::Escape) => self.palette_back_or_dismiss(),
+                    Key::Named(Named::ArrowUp) => self.move_palette_selection(-1),
+                    Key::Named(Named::ArrowDown) => self.move_palette_selection(1),
+                    Key::Named(Named::Enter) => {
+                        if let Err(error) = self.confirm_palette_selection() {
+                            self.status = Some(error);
+                        }
+                    }
+                    _ => {}
+                }
+                // The text input widget consumes printable events. Never let
+                // a palette keystroke leak through to the active PTY.
+                return UiTask::None;
+            }
+        } else if self.palette.is_some() {
+            return UiTask::None;
+        }
         let (_, active_tab) = self.workspace.active();
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
-            return;
+            return UiTask::None;
         };
         let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
         tab.session.send_input(bytes);
+        UiTask::None
     }
 
     pub fn pointer(
@@ -667,10 +790,51 @@ impl App {
                 .height(Fill)
                 .into(),
         };
-        row![sidebar, column![tab_bar, terminal].width(Fill).height(Fill)]
+        let content: Element<'_, Message> =
+            row![sidebar, column![tab_bar, terminal].width(Fill).height(Fill)]
+                .width(Fill)
+                .height(Fill)
+                .into();
+        let Some(palette) = &self.palette else {
+            return content;
+        };
+
+        let frame = palette.current();
+        let input = text_input(&frame.placeholder, &frame.query)
+            .id(self.palette_input_id.clone())
+            .on_input(Message::PaletteQueryChanged)
+            .on_submit(Message::PaletteConfirm)
+            .padding(12)
+            .size(16);
+        let mut items = column![].spacing(4);
+        for (index, matched) in palette.matches().into_iter().enumerate() {
+            let selected = index == frame.selection;
+            let marker = if selected { "› " } else { "  " };
+            let mut label = column![text(format!("{marker}{}", matched.item.title)).size(14)];
+            if let Some(subtitle) = matched.item.subtitle {
+                label = label.push(
+                    text(subtitle)
+                        .size(11)
+                        .color(Color::from_rgb8(160, 164, 176)),
+                );
+            }
+            items = items.push(
+                button(label)
+                    .width(Fill)
+                    .padding([8, 10])
+                    .on_press(Message::PaletteActivate(matched.item.id)),
+            );
+        }
+        let panel = container(column![input, scrollable(items).height(420)].spacing(8))
+            .width(560)
+            .padding(12)
+            .style(container::dark);
+        let overlay = container(panel)
             .width(Fill)
             .height(Fill)
-            .into()
+            .padding([60, 40])
+            .center_x(Fill);
+        stack![content, overlay].width(Fill).height(Fill).into()
     }
 
     pub fn select_project(&mut self, project_id: i64) {
@@ -694,9 +858,10 @@ impl App {
         if project_id == 0 {
             return;
         }
+        let cwd = self.launch_cwd(project_id);
         if let Err(error) = self.runtime.block_on(self.client.open_tab(
             project_id,
-            "",
+            &cwd,
             "",
             &[],
             u32::from(DEFAULT_COLS),
@@ -705,6 +870,300 @@ impl App {
             self.status = Some(error.to_string());
         }
         self.reconcile();
+    }
+
+    pub fn palette_query_changed(&mut self, query: &str) {
+        let _ = self.query_palette(query);
+    }
+
+    pub fn palette_activate(&mut self, id: &str) {
+        if let Err(error) = self.activate_palette(id) {
+            self.status = Some(error);
+        }
+    }
+
+    pub fn palette_confirm(&mut self) {
+        if let Err(error) = self.confirm_palette_selection() {
+            self.status = Some(error);
+        }
+    }
+
+    fn open_palette(&mut self, kind: &str) -> Result<(), String> {
+        let frame = match kind {
+            "" | "commands" => command_palette_frame(),
+            "launcher" => launcher_palette_frame(&self.config),
+            "custom" | "agents" => {
+                return Err(format!("palette kind {kind:?} is not implemented by Iced"));
+            }
+            _ => return Err(format!("unknown palette kind {kind:?}")),
+        };
+        self.dismiss_palette();
+        self.palette_theme_at_open = Some(self.active_theme_name.clone());
+        self.palette = Some(palette::PaletteState::new(frame));
+        self.palette_focus_requested = true;
+        Ok(())
+    }
+
+    fn take_palette_focus_task(&mut self) -> UiTask {
+        if std::mem::take(&mut self.palette_focus_requested) {
+            UiTask::FocusWidget(self.palette_input_id.clone())
+        } else {
+            UiTask::None
+        }
+    }
+
+    fn palette_state_result(&self) -> PaletteStateResult {
+        let Some(state) = &self.palette else {
+            return PaletteStateResult::default();
+        };
+        let frame = state.current();
+        PaletteStateResult {
+            open: true,
+            frame: Some(frame.id.clone()),
+            query: frame.query.clone(),
+            selection: u32::try_from(frame.selection).unwrap_or(u32::MAX),
+            items: state
+                .matches()
+                .into_iter()
+                .map(|matched| PaletteItemView {
+                    id: matched.item.id,
+                    title: matched.item.title,
+                    subtitle: matched.item.subtitle,
+                    agent: matched.item.agent,
+                })
+                .collect(),
+            // Iced's scrollable does not expose row geometry. `None` is
+            // the contract's explicit honest value for that adapter.
+            selected_in_view: None,
+        }
+    }
+
+    fn query_palette(&mut self, query: &str) -> Result<PaletteStateResult, String> {
+        let state = self
+            .palette
+            .as_mut()
+            .ok_or_else(|| "no palette open".to_string())?;
+        state.set_query(query);
+        self.preview_selected_theme()?;
+        Ok(self.palette_state_result())
+    }
+
+    fn move_palette_selection(&mut self, delta: isize) {
+        if let Some(state) = &mut self.palette {
+            state.move_selection(delta);
+        }
+        if let Err(error) = self.preview_selected_theme() {
+            self.status = Some(error);
+        }
+    }
+
+    fn confirm_palette_selection(&mut self) -> Result<PaletteStateResult, String> {
+        let id = self
+            .palette
+            .as_ref()
+            .and_then(palette::PaletteState::selected_item)
+            .ok_or_else(|| "no actionable palette row selected".to_string())?
+            .id;
+        self.activate_palette(&id)
+    }
+
+    fn activate_palette(&mut self, id: &str) -> Result<PaletteStateResult, String> {
+        let (frame_id, item) = {
+            let state = self
+                .palette
+                .as_mut()
+                .ok_or_else(|| "no palette open".to_string())?;
+            let matches = state.matches();
+            let index = matches
+                .iter()
+                .position(|matched| matched.item.id == id)
+                .ok_or_else(|| format!("no palette row with id {id:?}"))?;
+            state.set_selection(index);
+            let item = matches[index].item.clone();
+            if !item.actionable {
+                return Err(format!("palette row {id:?} is not actionable"));
+            }
+            (state.current().id.clone(), item)
+        };
+
+        match frame_id.as_str() {
+            "commands" => match item.id.as_str() {
+                palette::PaletteCommands::SELECT_THEME_ID => {
+                    if let Some(state) = &mut self.palette {
+                        state.push(theme_palette_frame(&self.active_theme_name));
+                    }
+                }
+                palette::PaletteCommands::SELECT_FONT_ID => {
+                    if let Some(state) = &mut self.palette {
+                        state.push(font_palette_frame());
+                    }
+                }
+                "new_tab" => {
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.new_tab();
+                }
+                "close_tab" => {
+                    let tab_id = self.workspace.active().1;
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.runtime
+                        .block_on(self.client.close_tab(tab_id))
+                        .map_err(|error| error.to_string())?;
+                    self.reconcile();
+                }
+                "cycle_tab_next" => {
+                    self.cycle_tab(1)?;
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                }
+                "cycle_tab_prev" => {
+                    self.cycle_tab(-1)?;
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                }
+                command => {
+                    return Err(format!(
+                        "palette command {command:?} is not implemented by Iced"
+                    ));
+                }
+            },
+            "launcher" => {
+                let index = custom_command::launch_index(&item.id)
+                    .filter(|index| *index < self.config.commands.len())
+                    .ok_or_else(|| format!("launcher row {:?} cannot be run", item.id))?;
+                let command = self.config.commands[index].clone();
+                let (project_id, _) = self.workspace.active();
+                let cwd = self.launch_cwd(project_id);
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                let argv = custom_command::launch_argv(&shell, &command);
+                self.palette = None;
+                self.palette_theme_at_open = None;
+                self.runtime
+                    .block_on(self.client.open_tab(
+                        project_id,
+                        &cwd,
+                        &command.title,
+                        &argv,
+                        u32::from(DEFAULT_COLS),
+                        u32::from(DEFAULT_ROWS),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                self.reconcile();
+            }
+            "themes" => {
+                self.apply_theme_name(&item.id)?;
+                self.palette = None;
+                self.palette_theme_at_open = None;
+            }
+            "fonts" => {
+                self.palette = None;
+                self.palette_theme_at_open = None;
+            }
+            frame => {
+                return Err(format!(
+                    "palette frame {frame:?} is not implemented by Iced"
+                ))
+            }
+        }
+        Ok(self.palette_state_result())
+    }
+
+    fn preview_selected_theme(&mut self) -> Result<(), String> {
+        let selected = self.palette.as_ref().and_then(|state| {
+            (state.current().id == "themes")
+                .then(|| state.selected_item().map(|item| item.id))
+                .flatten()
+        });
+        if let Some(name) = selected {
+            self.apply_theme_name(&name)?;
+        }
+        Ok(())
+    }
+
+    fn apply_theme_name(&mut self, name: &str) -> Result<(), String> {
+        if self.active_theme_name == name {
+            return Ok(());
+        }
+        let theme = Theme::load_bundled(name);
+        for (tab_id, tab) in &mut self.tabs {
+            tab.set_theme(theme.clone())
+                .map_err(|error| format!("apply theme to tab {tab_id}: {error}"))?;
+        }
+        self.active_theme_name = name.to_string();
+        Ok(())
+    }
+
+    fn palette_back_or_dismiss(&mut self) {
+        let is_root = self
+            .palette
+            .as_ref()
+            .is_none_or(palette::PaletteState::is_root);
+        if is_root {
+            self.dismiss_palette();
+            return;
+        }
+        let was_theme = self
+            .palette
+            .as_ref()
+            .is_some_and(|state| state.current().id == "themes");
+        if let Some(state) = &mut self.palette {
+            let _ = state.pop();
+        }
+        if was_theme {
+            self.restore_palette_theme();
+        }
+    }
+
+    fn dismiss_palette(&mut self) {
+        self.restore_palette_theme();
+        self.palette = None;
+        self.palette_theme_at_open = None;
+    }
+
+    fn restore_palette_theme(&mut self) {
+        if let Some(name) = self.palette_theme_at_open.clone() {
+            if let Err(error) = self.apply_theme_name(&name) {
+                self.status = Some(error);
+            }
+        }
+    }
+
+    fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
+        let (project_id, active_tab) = self.workspace.active();
+        let tabs = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.tabs.as_slice())
+            .unwrap_or_default();
+        if tabs.is_empty() {
+            return Ok(());
+        }
+        let current = tabs
+            .iter()
+            .position(|tab| tab.id == active_tab)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(tabs.len() as isize) as usize;
+        self.workspace
+            .focus_tab(tabs[next].id)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn launch_cwd(&self, project_id: i64) -> String {
+        let active_tab = self.workspace.active().1;
+        if let Some(native) = self.supervisor.foreground_cwd(active_tab) {
+            if !native.is_empty() {
+                return native;
+            }
+        }
+        self.projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .and_then(|project| project.tabs.iter().find(|tab| tab.id == active_tab))
+            .map(|tab| tab.cwd.clone())
+            .unwrap_or_default()
     }
 
     fn reconcile(&mut self) {
@@ -723,7 +1182,12 @@ impl App {
             }
             let attached = {
                 let _guard = self.runtime.enter();
-                TerminalTab::attach(Arc::clone(&self.supervisor), tab_id, self.test_mode)
+                TerminalTab::attach(
+                    Arc::clone(&self.supervisor),
+                    tab_id,
+                    self.test_mode,
+                    Theme::load_bundled(&self.active_theme_name),
+                )
             };
             match attached {
                 Ok(mut tab) => {
@@ -868,12 +1332,27 @@ impl App {
                 UiRequest::Screenshot { reply, .. } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));
                 }
-                UiRequest::PaletteOpen { reply, .. }
-                | UiRequest::PaletteState { reply }
-                | UiRequest::PaletteQuery { reply, .. }
-                | UiRequest::PaletteActivate { reply, .. }
-                | UiRequest::PaletteDismiss { reply } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::PaletteOpen { kind, reply } => {
+                    let result = self
+                        .open_palette(&kind)
+                        .map(|()| self.palette_state_result());
+                    if result.is_ok() {
+                        task = self.take_palette_focus_task();
+                    }
+                    let _ = reply.send(result);
+                }
+                UiRequest::PaletteState { reply } => {
+                    let _ = reply.send(Ok(self.palette_state_result()));
+                }
+                UiRequest::PaletteQuery { query, reply } => {
+                    let _ = reply.send(self.query_palette(&query));
+                }
+                UiRequest::PaletteActivate { id, reply } => {
+                    let _ = reply.send(self.activate_palette(&id));
+                }
+                UiRequest::PaletteDismiss { reply } => {
+                    self.dismiss_palette();
+                    let _ = reply.send(Ok(self.palette_state_result()));
                 }
                 UiRequest::PalettePresent { reply, .. } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));
@@ -1141,5 +1620,37 @@ mod tests {
         let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
         assert_eq!(((width / CELL_WIDTH).floor() as u16).max(2), 2);
         assert_eq!(((height / CELL_HEIGHT).floor() as u16).max(2), 2);
+    }
+
+    #[test]
+    fn command_palette_uses_shared_ids_and_ranking() {
+        let mut state = palette::PaletteState::new(command_palette_frame());
+        assert!(state
+            .matches()
+            .iter()
+            .any(|matched| matched.item.id == "new_tab"));
+        state.set_query("theme");
+        assert_eq!(
+            state.selected_item().map(|item| item.id),
+            Some(palette::PaletteCommands::SELECT_THEME_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn theme_frame_selects_the_active_theme() {
+        let frame = theme_palette_frame("roost-dark");
+        assert_eq!(frame.id, "themes");
+        assert!(frame.items.len() > 1);
+        assert_eq!(frame.items[frame.selection].id, "roost-dark");
+    }
+
+    #[test]
+    fn launcher_frame_resolves_configured_command_ids() {
+        let config =
+            RoostConfig::parse(r#"command = label="Echo Marker" run="printf marker" hold=true"#);
+        let state = palette::PaletteState::new(launcher_palette_frame(&config));
+        let item = state.selected_item().expect("configured launcher row");
+        assert_eq!(item.id, "launch:0");
+        assert_eq!(custom_command::launch_index(&item.id), Some(0));
     }
 }

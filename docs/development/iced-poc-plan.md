@@ -599,6 +599,45 @@ middle-click paste, URL hit-testing, and double-click timing in the Iced Canvas
 are the next clipboard/input slice. Existing deterministic clipboard shadows
 remain explicit test ports in this commit and are not described as OS-native.
 
+### Active mini-plan: Iced command palette and launcher adapter
+
+Scope: add one tab-independent Iced palette session backed by
+`roost-ui-model::palette::PaletteState`. The visible overlay, native keyboard
+and pointer actions, `palette.open/state/query/activate/dismiss`, bundled-theme
+and font drill-ins, and configured command launcher all read and mutate that
+same session. Launcher confirmation uses `LocalClient::open_tab`, preserving
+the engine-owned workspace/PTY operation path.
+
+Invariants and interfaces:
+
+- Iced owns only presentation/session adaptation; fuzzy matching, query and
+  selection transitions, frames, command ids, launcher items, and shell argv
+  construction remain toolkit-neutral `roost-ui-model` APIs;
+- palette input has priority over terminal input while open, dismiss/confirm
+  resolves exactly once, and IPC plus native buttons call the same methods;
+- command activation dispatches through existing App/workspace operations;
+  unsupported rename dialogs do not gain shadow state or false-success paths;
+- theme preview applies to every live `TerminalTab`, refreshes libghostty
+  colors, emits DEC 2031 reports through `TabSession`, and dismissal restores
+  the theme that was active when the palette opened;
+- launcher commands come from the same `ROOST_CONFIG` parser as GTK, inherit
+  the active workspace cwd, and launch through the engine supervisor;
+- the engine's native cwd fallback uses `/proc` on Linux and libproc on
+  macOS, matching the existing Swift behavior without moving process
+  inspection into either UI adapter; and
+- no palette callback, Iced widget, or renderer object enters `roost-engine`,
+  `roost-ui-model`, or a workspace lock.
+
+Acceptance: Iced unit tests cover closed/open snapshots, query ranking,
+theme drill-in/preview restoration, and launcher id resolution; the common
+`test_palette.py`, `test_launcher.py`, and mode-2031 theme-switch assertion
+pass against Iced; native overlay actions exercise the same session methods;
+GTK/Swift regressions stay green; macOS and shed X11/Wayland renderer lanes
+pass; dependency boundaries remain unchanged. Agent palettes and git metrics,
+notification inbox commands, provider-driven `palette.present`, rename
+dialogs, and persistence of an explicitly confirmed theme/font are named
+follow-up slices rather than parallel state hidden in this commit.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

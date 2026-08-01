@@ -618,9 +618,8 @@ fn bash_bootstrap_env(
 }
 
 /// Current working directory of `pid`. Linux reads `/proc/<pid>/cwd`;
-/// other platforms (the macOS GTK dev build) have no `/proc` and
-/// return `None` — the shipping GTK target is Linux. Backs the new-tab
-/// cwd fallback when no OSC 7 cwd is tracked.
+/// macOS asks libproc for `PROC_PIDVNODEPATHINFO`. Backs the new-tab cwd
+/// fallback when no OSC 7 cwd is tracked for either Rust UI.
 #[cfg(target_os = "linux")]
 fn cwd_of_pid(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
@@ -628,7 +627,46 @@ fn cwd_of_pid(pid: u32) -> Option<String> {
         .and_then(|p| p.to_str().map(str::to_owned))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn cwd_of_pid(pid: u32) -> Option<String> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = i32::try_from(size_of::<libc::proc_vnodepathinfo>()).ok()?;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes for the
+    // structure requested by PROC_PIDVNODEPATHINFO. We read it only when
+    // libproc reports that it initialized the complete structure. The SDK
+    // defines `vip_path` as a NUL-terminated MAXPATHLEN char array.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).ok()?,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: the full structure was initialized above and `vip_path` is a
+    // fixed C string buffer supplied by libproc.
+    let path = unsafe {
+        CStr::from_ptr(
+            info.assume_init_ref()
+                .pvi_cdir
+                .vip_path
+                .as_ptr()
+                .cast::<libc::c_char>(),
+        )
+        .to_str()
+        .ok()?
+    };
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cwd_of_pid(_pid: u32) -> Option<String> {
     None
 }
@@ -941,10 +979,10 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "ROOST_BASH_UNEXPORT_HISTFILE"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn cwd_of_pid_reads_proc_self() {
-        let got = cwd_of_pid(std::process::id()).expect("own cwd via /proc");
+    fn cwd_of_pid_reads_current_process() {
+        let got = cwd_of_pid(std::process::id()).expect("own cwd via platform process API");
         assert_eq!(
             std::path::Path::new(&got).canonicalize().unwrap(),
             std::env::current_dir().unwrap().canonicalize().unwrap()

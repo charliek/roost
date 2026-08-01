@@ -31,6 +31,9 @@ enum Message {
     ProjectSelected(i64),
     TabSelected(i64),
     NewTab,
+    PaletteQueryChanged(String),
+    PaletteActivate(String),
+    PaletteConfirm,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -88,12 +91,21 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.set_window_focus(focused);
             Task::none()
         }
-        Message::Keyboard(event) => {
-            app.keyboard(event);
-            Task::none()
-        }
+        Message::Keyboard(event) => app.keyboard(event).map_task(),
         Message::TerminalPointer(event) => {
             app.pointer(event.action, event.button, event.col, event.row);
+            Task::none()
+        }
+        Message::PaletteQueryChanged(query) => {
+            app.palette_query_changed(&query);
+            Task::none()
+        }
+        Message::PaletteActivate(id) => {
+            app.palette_activate(&id);
+            Task::none()
+        }
+        Message::PaletteConfirm => {
+            app.palette_confirm();
             Task::none()
         }
         message @ (Message::ProjectSelected(_) | Message::TabSelected(_) | Message::NewTab) => {
@@ -175,6 +187,7 @@ impl UiTask for app::UiTask {
         match self {
             app::UiTask::None => Task::none(),
             app::UiTask::Focus(id) => window::gain_focus(id),
+            app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::Resize(id, size) => window::resize(id, size),
         }
     }
