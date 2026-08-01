@@ -25,16 +25,19 @@ from typing import Iterable
 
 import pngtool
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCENARIO = "workspace-shell-v1"
 SCALE = 1
 TERMINAL_BACKGROUND = (0x1E, 0x1E, 0x1E)
+PALETTE_SELECTION = (0x48, 0x48, 0x4E)
+PALETTE_PRIMARY_TEXT = {(0xF2, 0xF2, 0xF2), (0xFF, 0xFF, 0xFF)}
 LIFECYCLE_COLORS = {
     "working": (0x5F, 0xA3, 0xF0),
     "waiting": (0xF0, 0xA0, 0x40),
     "finished": (0x7A, 0x7A, 0x7A),
     "failed": (0xE0, 0x52, 0x52),
 }
+PALETTE_VARIANTS = ("commands", "query", "agents", "notifications", "provider")
 
 Image = tuple[int, int, int, bytes]
 
@@ -196,6 +199,60 @@ def measure_shell(path: Path, sidebar_width: int) -> dict:
     }
 
 
+def measure_agent_palette(path: Path, sidebar_width: int) -> dict:
+    """Measure the selected failed row's semantic column geometry.
+
+    This deliberately checks relationships rather than whole-image equality:
+    the status must trail the name, while muted metrics/time remain visible to
+    its right. GTK and Iced use the same selection/lifecycle colors but retain
+    their normal font rasterization differences.
+    """
+    image = pngtool.load(str(path))
+    width, height, _bpp, _data = image
+    selected = color_components(
+        image,
+        PALETTE_SELECTION,
+        (sidebar_width, 0, width, height),
+        minimum_side=12,
+    )
+    if not selected:
+        raise ValueError("agent palette has no selected-row background")
+    bounds = max(selected, key=lambda item: item["pixels"])
+    left, top = bounds["left"], bounds["top"]
+    right, bottom = bounds["right"], bounds["bottom"]
+    primary_x = [
+        x
+        for y in range(top, bottom + 1)
+        for x in range(left + 24, right + 1)
+        if pixel(image, x, y) in PALETTE_PRIMARY_TEXT
+    ]
+    status_x = [
+        x
+        for y in range(top, bottom + 1)
+        for x in range(left + 32, right + 1)
+        if pixel(image, x, y) == LIFECYCLE_COLORS["failed"]
+    ]
+    if not primary_x or not status_x:
+        raise ValueError("agent palette selected row is missing name or failed status text")
+    name_right = max(primary_x)
+    status_left, status_right = min(status_x), max(status_x)
+    trailing_ink_pixels = sum(
+        pixel(image, x, y) != PALETTE_SELECTION
+        for y in range(top + 6, bottom - 5)
+        for x in range(max(status_right + 2, right - 80), right - 3)
+    )
+    return {
+        "selected_bounds": bounds,
+        "name_right": name_right,
+        "status_left": status_left,
+        "status_right": status_right,
+        "status_ink_span": status_right - status_left + 1,
+        "name_status_gap": status_left - name_right - 1,
+        # The rightmost 80px are reserved for the compact metrics/time column.
+        # Count rasterized ink rather than one exact foreground because GTK
+        # alpha-blends its text color into the selected-row background.
+        "trailing_ink_pixels": trailing_ink_pixels,
+    }
 def environment_metadata(target: str, run_id: str, commit: str) -> dict[str, object]:
     system = platform.system().lower()
     backend_override = None
@@ -282,6 +339,12 @@ def validate_measurement(document: dict, run_id: str, commit: str) -> None:
     palette = document.get("palette", {})
     if palette.get("available") is not False and not palette.get("sha256"):
         raise ValueError("measurement is missing palette provenance")
+    if palette.get("available") is not False:
+        variants = palette.get("variants", {})
+        for name in PALETTE_VARIANTS:
+            variant = variants.get(name, {})
+            if not variant.get("png") or not variant.get("sha256"):
+                raise ValueError(f"measurement is missing {name} palette provenance")
 
 
 def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
@@ -296,11 +359,13 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
         key = environment_key(metadata)
         palette = document["palette"]
         executable = metadata["executable"]
-        palette_link = (
-            f"[palette]({key}/{palette['png']})"
-            if palette.get("available") is not False
-            else f"unavailable: {palette.get('reason', 'unspecified')}"
-        )
+        if palette.get("available") is not False:
+            palette_link = " ".join(
+                f"[{name}]({key}/{palette['variants'][name]['png']})"
+                for name in PALETTE_VARIANTS
+            )
+        else:
+            palette_link = f"unavailable: {palette.get('reason', 'unspecified')}"
         rows.append(
             "| {target} | {os} | {display} | {renderer} | {size} | {sidebar} | "
             "{top} | [shell]({shell_link}) | {palette_link} | {source} | "
@@ -327,7 +392,7 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
         "Hashes record provenance only; they are not golden-image assertions.\n\n"
         "Agent elapsed times are dynamic and excluded from visual comparison.\n\n"
         "| Target | OS | Display | Renderer | Shell size | Sidebar sample | "
-        "Terminal top | Shell | Palette | Source | Executable SHA-256 | "
+        "Terminal top | Shell | Palettes | Source | Executable SHA-256 | "
         "Shell SHA-256 |\n"
         "|---|---|---|---|---:|---|---:|---|---|---|---|---|\n"
     )

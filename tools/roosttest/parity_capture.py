@@ -85,7 +85,7 @@ def _semantic_fixture_ready(observation: dict, project_id: int, tabs: dict[str, 
 def _capture_settled(
     roost,
     path: Path,
-    central_region_different_from: str | None = None,
+    central_region_different_from: str | set[str] | None = None,
 ) -> tuple[int, int]:
     previous: tuple[int, int] | None = None
     settled: tuple[int, int] | None = None
@@ -100,7 +100,12 @@ def _capture_settled(
             raise
         path.write_bytes(png)
         central_digest = parity.central_region_digest(path)
-        if central_digest == central_region_different_from:
+        excluded_digests = (
+            central_region_different_from
+            if isinstance(central_region_different_from, set)
+            else {central_region_different_from}
+        )
+        if central_digest in excluded_digests:
             previous = None
             return False
         current = (width, height)
@@ -115,11 +120,27 @@ def _capture_settled(
     return settled
 
 
+def _capture_palette_variant(
+    roost,
+    output: Path,
+    filename: str,
+    excluded_digests: set[str],
+) -> tuple[Path, tuple[int, int], str]:
+    path = output / filename
+    extent = _capture_settled(
+        roost,
+        path,
+        central_region_different_from=excluded_digests,
+    )
+    return path, extent, parity.central_region_digest(path)
+
+
 def _write_measurements(
     output: Path,
     metadata: dict,
     shell_path: Path,
     palette_path: Path | None,
+    palette_variants: dict[str, Path],
     metrics: dict,
     fixture: dict,
 ) -> dict:
@@ -142,6 +163,27 @@ def _write_measurements(
             "width": palette_image[0],
             "height": palette_image[1],
         }
+    palette_measurement["variants"] = {
+        name: {
+            "png": path.name,
+            "sha256": parity.sha256(path),
+            "width": parity.pngtool.load(str(path))[0],
+            "height": parity.pngtool.load(str(path))[1],
+        }
+        for name, path in sorted(palette_variants.items())
+    }
+    if agent_path := palette_variants.get("agents"):
+        agent_geometry = parity.measure_agent_palette(agent_path, sidebar_width)
+        gap = agent_geometry["name_status_gap"]
+        if not 0 <= gap <= 20:
+            raise AssertionError(
+                f"agent status must trail its name (measured gap: {gap}px)"
+            )
+        if agent_geometry["status_ink_span"] < 140:
+            raise AssertionError("long agent status was truncated despite available row width")
+        if agent_geometry["trailing_ink_pixels"] == 0:
+            raise AssertionError("agent metrics/time are not visible after a long status")
+        palette_measurement["agent_geometry"] = agent_geometry
     document = {
         "metadata": metadata,
         "fixture": fixture,
@@ -261,15 +303,93 @@ def test_capture_visual_parity_fixture(roost, target):
         )
 
     roost._wait(command_palette_ready, 10.0, "root command palette semantic state")
+    command_state = state
     palette_path: Path | None = None
     palette_extent: tuple[int, int] | None = None
+    palette_variants: dict[str, Path] = {}
+    palette_variant_extents: dict[str, tuple[int, int]] = {}
+    previous_palette_digest = parity.central_region_digest(shell_path)
     if target != "mac":
-        palette_path = output / "palette.png"
-        palette_extent = _capture_settled(
+        palette_path, palette_extent, previous_palette_digest = _capture_palette_variant(
             roost,
-            palette_path,
-            central_region_different_from=parity.central_region_digest(shell_path),
+            output,
+            "palette.png",
+            {previous_palette_digest},
         )
+        palette_variants["commands"] = palette_path
+        palette_variant_extents["commands"] = palette_extent
+
+    state = roost.palette_query("project")
+    assert state["frame"] == "commands" and state["query"] == "project"
+    if target != "mac":
+        path, extent, previous_palette_digest = _capture_palette_variant(
+            roost, output, "palette-query.png", {previous_palette_digest}
+        )
+        palette_variants["query"] = path
+        palette_variant_extents["query"] = extent
+
+    roost.palette_dismiss()
+    _seed(
+        roost,
+        tabs["Working"],
+        lifecycle="working",
+        name="Working through an intentionally long agent name",
+        source="parity-long-agent",
+        session="parity-2-working",
+    )
+    _seed(
+        roost,
+        tabs["Failed"],
+        lifecycle="failed",
+        name="Failed",
+        detail="an intentionally long failure detail for layout pressure",
+        source="parity-long-failure",
+        session="parity-1-failed-detail",
+    )
+    state = roost.palette_open("agents")
+    assert state["frame"] == "agents" and len(state["items"]) == len(TAB_LIFECYCLES)
+    if target != "mac":
+        path, extent, previous_palette_digest = _capture_palette_variant(
+            roost, output, "palette-agents.png", {previous_palette_digest}
+        )
+        palette_variants["agents"] = path
+        palette_variant_extents["agents"] = extent
+
+    roost.palette_dismiss()
+    roost.palette_open("commands")
+    state = roost.palette_activate("view_notifications")
+    assert state["frame"] == "notifications"
+    assert any(item["id"].startswith("notif:") for item in state["items"])
+    if target != "mac":
+        path, extent, previous_palette_digest = _capture_palette_variant(
+            roost, output, "palette-notifications.png", {previous_palette_digest}
+        )
+        palette_variants["notifications"] = path
+        palette_variant_extents["notifications"] = extent
+
+    roost.palette_dismiss()
+    state = roost.palette_open("custom")
+    provider = next(
+        (item for item in state["items"] if item["title"] == "Fixture Provider"),
+        None,
+    )
+    assert provider is not None, state["items"]
+    roost.palette_activate(provider["id"])
+    roost._wait(
+        lambda: any(
+            item["title"] == "Disabled row"
+            for item in roost.palette_state().get("items", [])
+        ),
+        8.0,
+        "provider palette with a disabled row",
+    )
+    state = roost.palette_state()
+    if target != "mac":
+        path, extent, previous_palette_digest = _capture_palette_variant(
+            roost, output, "palette-provider.png", {previous_palette_digest}
+        )
+        palette_variants["provider"] = path
+        palette_variant_extents["provider"] = extent
 
     fixture = {
         "project": PROJECT_NAME,
@@ -283,9 +403,10 @@ def test_capture_visual_parity_fixture(roost, target):
             for title, lifecycle in TAB_LIFECYCLES
         ],
         "palette": {
-            "frame": state["frame"],
-            "query": state["query"],
-            "selection": state["selection"],
+            "frame": command_state["frame"],
+            "query": command_state["query"],
+            "selection": command_state["selection"],
+            "variants": ["commands", "query", "agents", "notifications", "provider"],
         },
     }
     document = _write_measurements(
@@ -293,6 +414,7 @@ def test_capture_visual_parity_fixture(roost, target):
         metadata,
         shell_path,
         palette_path,
+        palette_variants,
         metrics,
         fixture,
     )
@@ -307,6 +429,11 @@ def test_capture_visual_parity_fixture(roost, target):
             document["palette"]["width"],
             document["palette"]["height"],
         ) == palette_extent
+        for name, extent in palette_variant_extents.items():
+            assert (
+                document["palette"]["variants"][name]["width"],
+                document["palette"]["variants"][name]["height"],
+            ) == extent
     else:
         assert document["palette"]["available"] is False
     assert tuple(shell["terminal_sample"]) == parity.TERMINAL_BACKGROUND

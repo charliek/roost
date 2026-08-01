@@ -100,7 +100,23 @@ pub struct PaletteMatch {
 /// `Palette.swift`.
 pub fn fuzzy_match(query: &str, candidate: &str) -> Option<(i64, Vec<Range<usize>>)> {
     let q: Vec<char> = query.to_lowercase().chars().collect();
-    let c: Vec<char> = candidate.to_lowercase().chars().collect();
+    // Lowercasing can expand one displayed scalar into several folded scalars
+    // (`İ` -> `i` + combining dot). Keep the displayed scalar index beside
+    // every folded scalar so highlight ranges always address `candidate`, not
+    // the implementation's case-folded scratch string.
+    let folded = candidate
+        .chars()
+        .enumerate()
+        .flat_map(|(source_index, character)| {
+            character
+                .to_lowercase()
+                .map(move |folded_character| (folded_character, source_index))
+        })
+        .collect::<Vec<_>>();
+    let c = folded
+        .iter()
+        .map(|(character, _)| *character)
+        .collect::<Vec<_>>();
     if q.is_empty() {
         return Some((0, Vec::new()));
     }
@@ -148,7 +164,12 @@ pub fn fuzzy_match(query: &str, candidate: &str) -> Option<(i64, Vec<Range<usize
     // Shorter candidates with the same hits read as tighter matches.
     score -= (c.len() / 10) as i64;
 
-    Some((score, contiguous_ranges(&matched)))
+    let mut source_matches = matched
+        .iter()
+        .map(|index| folded[*index].1)
+        .collect::<Vec<_>>();
+    source_matches.dedup();
+    Some((score, contiguous_ranges(&source_matches)))
 }
 
 fn is_boundary(ch: char) -> bool {
@@ -512,6 +533,17 @@ mod tests {
     fn case_insensitive() {
         assert!(fuzzy_match("NEW", "new tab").is_some());
         assert!(fuzzy_match("new", "NEW TAB").is_some());
+    }
+
+    #[test]
+    fn case_fold_expansion_keeps_ranges_in_displayed_scalar_offsets() {
+        let (_, ranges) = fuzzy_match("x", "İx").expect("folded suffix matches");
+        assert_eq!(ranges, vec![1..2]);
+
+        // Two folded query scalars can map back to the same displayed scalar;
+        // the UI still highlights that displayed character exactly once.
+        let (_, ranges) = fuzzy_match("i̇", "İ").expect("expanded scalar matches");
+        assert_eq!(ranges, vec![0..1]);
     }
 
     // ----- state machine --------------------------------------------

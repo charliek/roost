@@ -73,6 +73,16 @@ def _wait_until(
     raise AssertionError(f"timed out waiting for {description}{suffix}")
 
 
+def _assert_stays(
+    predicate: Callable[[], bool], description: str, duration: float = 0.75
+) -> None:
+    deadline = time.monotonic() + duration * SCALE
+    while time.monotonic() < deadline:
+        if not predicate():
+            raise AssertionError(f"state changed while verifying {description}")
+        time.sleep(0.05)
+
+
 def _connect(socket_path: Path):
     from client import Roost
 
@@ -374,6 +384,87 @@ def _click_window_control(launch: Launch, x: int, y: int) -> None:
     )
     launch.terminal_pointer(["mousedown", "1"])
     launch.terminal_pointer(["mouseup", "1"])
+
+
+def _palette_color_bounds(
+    launch: Launch, color: tuple[int, int, int], minimum_pixels: int
+) -> tuple[int, int, int, int]:
+    """Return stable exact-color bounds from the in-product renderer capture."""
+    path = launch.root / f"palette-{color[0]:02x}{color[1]:02x}{color[2]:02x}.png"
+    previous: tuple[int, int, int, int] | None = None
+    for _attempt in range(12):
+        png, _width, _height = launch.client.screenshot(scale=1)
+        path.write_bytes(png)
+        width, height, bpp, data = pngtool.load(str(path))
+        points: list[tuple[int, int]] = []
+        for y in range(height):
+            for x in range(width):
+                offset = (y * width + x) * bpp
+                if tuple(data[offset : offset + 3]) == color:
+                    points.append((x, y))
+        if len(points) >= minimum_pixels:
+            xs, ys = zip(*points)
+            bounds = min(xs), min(ys), max(xs), max(ys)
+            if bounds == previous:
+                return bounds
+            previous = bounds
+        else:
+            previous = None
+        time.sleep(0.1)
+    raise AssertionError(
+        f"palette color {color!r} never settled with {minimum_pixels} pixels; "
+        f"last bounds: {previous!r}; capture: {path}"
+    )
+
+
+def _palette_pointer_routing(launch: Launch) -> None:
+    """Prove the transparent catcher and semantic rows own their click regions."""
+    launch.client.window_resize(640, 360)
+    width, _height = _wait_product_extent(launch, 640, 360)
+    project = int(launch.client.identify()["active_project_id"])
+
+    state = launch.client.palette_open("commands")
+    assert state["frame"] == "commands"
+    panel = _palette_color_bounds(launch, (0x2D, 0x2D, 0x33), 5_000)
+    assert panel[0] >= 15 and panel[2] <= width - 15, panel
+    assert panel[1] >= 59, panel
+
+    # Blank padding belongs to the card. It must neither dismiss the palette
+    # nor leak into the terminal beneath it.
+    _click_window_control(launch, panel[2] - 4, panel[3] - 4)
+    _assert_stays(
+        lambda: launch.client.palette_state().get("frame") == "commands",
+        "blank card click remains inside the palette",
+    )
+
+    state = launch.client.palette_query("theme")
+    assert state["selection"] == 0
+    selected = _palette_color_bounds(launch, (0x48, 0x48, 0x4E), 1_000)
+    _click_window_control(
+        launch,
+        (selected[0] + selected[2]) // 2,
+        (selected[1] + selected[3]) // 2,
+    )
+    _wait_until(
+        lambda: launch.client.palette_state().get("frame") == "themes",
+        "exact selected palette row activation",
+    )
+    launch.client.palette_dismiss()
+
+    # The fixed add-tab control is deliberately outside the card. The first
+    # click dismisses exactly once and cannot also activate that control.
+    before = len(launch.client.project_tab_ids(project))
+    launch.client.palette_open("commands")
+    terminal_top = round(launch.client.terminal_top())
+    _click_window_control(launch, width - 49, terminal_top // 2)
+    _wait_until(
+        lambda: launch.client.palette_state().get("open") is False,
+        "outside click palette dismissal",
+    )
+    _assert_stays(
+        lambda: len(launch.client.project_tab_ids(project)) == before,
+        "outside dismissal does not click through to add-tab",
+    )
 
 
 def _direct_tab_close(launch: Launch) -> None:
@@ -873,6 +964,7 @@ def main() -> int:
         _explicit_copy_and_paste(off)
         _direct_tab_close(off)
         _chrome_overflow_navigation(off)
+        _palette_pointer_routing(off)
         off.close()
         launches.pop()
 
@@ -902,7 +994,7 @@ def main() -> int:
         "PASS: configured explicit Copy, plain/bracketed Paste, real-drag "
         "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
-        "and constrained chrome overflow navigation"
+        "constrained chrome overflow navigation, and palette pointer routing"
     )
     return 0
 

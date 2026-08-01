@@ -133,6 +133,10 @@ class ManifestTests(unittest.TestCase):
                 "available": True,
                 "png": "palette.png",
                 "sha256": "b" * 64,
+                "variants": {
+                    name: {"png": f"palette-{name}.png", "sha256": name * 8}
+                    for name in parity.PALETTE_VARIANTS
+                },
             },
         }
 
@@ -142,7 +146,12 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("Commit: `abc123`", rendered)
         self.assertIn("iced | linux | x11 | wgpu", rendered)
         self.assertIn("[shell](iced-linux-x11-wgpu-1/shell.png)", rendered)
-        self.assertIn("[palette](iced-linux-x11-wgpu-1/palette.png)", rendered)
+        self.assertIn(
+            "[query](iced-linux-x11-wgpu-1/palette-query.png)", rendered
+        )
+        self.assertIn(
+            "[provider](iced-linux-x11-wgpu-1/palette-provider.png)", rendered
+        )
         self.assertIn("dirty", rendered)
         self.assertIn("`" + "c" * 64 + "`", rendered)
         self.assertIn("not golden-image assertions", rendered)
@@ -160,6 +169,12 @@ class ManifestTests(unittest.TestCase):
             "reason": "product capture API excludes child panel",
         }
         parity.validate_measurement(document, "run-7", "abc123")
+
+    def test_available_palette_requires_every_named_variant(self):
+        document = self.document()
+        del document["palette"]["variants"]["provider"]
+        with self.assertRaisesRegex(ValueError, "provider palette provenance"):
+            parity.validate_measurement(document, "run-7", "abc123")
 
 
 class RunnerTests(unittest.TestCase):

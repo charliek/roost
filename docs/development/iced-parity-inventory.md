@@ -141,7 +141,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Terminal scrollback | Wheel/page navigation scrolls retained history locally when mouse reporting is off; alternate-screen behavior follows terminal modes | 2,000 rows are retained but Iced has no local viewport-scroll path; non-reporting wheel events are dropped | P0 | Long-output wheel/page fixture, snap to bottom on non-modifier input, output preservation behavior compared with both references, alternate-screen and mouse-reporting tests |
 | Terminal typography | Configured family/size, baseline and cell metrics stable across styles and graphemes | PTY and glyph rendering work; font selection is currently a one-row placeholder and baseline parity is unmeasured | P0 | Latin/wide/combined/style fixture under wgpu and tiny-skia; font selection E2E |
 | Terminal cursor/selection/link | Shared colors and modes with reference-like cursor, selection, and link feedback | Functional coverage exists; geometry/color comparison remains incomplete | P1 | Focused cursor/selection/link screenshots plus existing real-input gates |
-| Palette placement | Centered, elevated compact panel with dimmed background, styled rows, keyboard focus, and scrolling | Functional centered panel, but stock input/buttons and no scrim/elevation parity | P0 | Named command/agent/notification captures; focus/scroll/click E2E |
+| Palette placement | Centered, elevated compact panel over an undimmed terminal, styled semantic rows, keyboard focus, and scrolling | Closed for the visual-feasibility slice: exact reference neutrals, border/shadow, content-sized 660 pt card capped at 500 pt, compact command/agent/notification/provider rows, shortcut hints, fuzzy-match accents, disabled state, and a narrow neutral scrollbar | closed | Five named GTK/Iced captures; focus/scroll tests plus real row/card/outside pointer routing |
 | Empty/loading/error states | Deliberate shell placeholders without changing hierarchy | Plain `Starting terminal…`; status errors are appended to the sidebar | P1 | Seeded empty/loading/error snapshots and recovery tests |
 | Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Mostly inherited stock theme states | P1 | Renderer-neutral state-style unit tests plus real pointer/keyboard capture |
 | File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using UI-owned native adapters | No Iced drop or image-paste adapter | P1 | Text/file/image payload tests, shell escaping parity, platform launch smoke |
@@ -195,10 +195,11 @@ renderers, and is pushed only after the complete applicable gate is green.
    tab close control; reduce band and row density. Preserve all engine APIs and
    compare the resulting named captures against GTK and Swift.
 4. **Palette convergence and visual go/no-go:** replace the remaining stock
-   input/button treatment with a scrim, elevated panel, compact semantic rows,
-   and reference-like focus/selection states across command, agent, provider,
-   and notification frames. Refresh the three-target capture and explicitly
-   decide whether Iced still has a credible path to reference-level polish.
+   input/button treatment with a transparent click catcher, elevated panel,
+   compact semantic rows, and reference-like focus/selection states across
+   command, agent, provider, and notification frames. Refresh the three-target
+   capture and explicitly decide whether Iced still has a credible path to
+   reference-level polish.
 5. **Scrollable navigation and shortcut safety:** make terminal scrollback
    reachable, then dispatch every configured workspace shortcut before terminal
    encoding so missing UI commands cannot leak bytes. Sidebar and tab chrome
@@ -219,6 +220,34 @@ renderers, and is pushed only after the complete applicable gate is green.
    then both-renderer artifacts.
 11. **Final gap closure:** repeat the inventory against the named fixture;
    accept only explicitly documented native-toolkit differences.
+
+## Palette-feasibility slice result (2026-08-01)
+
+The palette visual go/no-go passes. The original purple rows were Iced's stock
+primary-button theme, not a renderer or widget limitation. The Iced adapter now
+renders the same `#2d2d33` surface and `#48484e` selection as GTK, with a
+transparent input, reference border and shadow, compact neutral hover/disabled
+states, fuzzy-match highlighting, platform shortcut labels, distinct agent-row
+composition, and content-sized cards that clamp and scroll in short windows.
+The underlying terminal stays undimmed, matching both current references.
+
+The reusable comparison fixture now captures command, queried command, agent,
+notification, and provider/disabled frames. Human comparison of those named
+GTK and Iced artifacts is the parity gate; the functional suite continues to
+own command semantics, focus, selection reveal, providers, and notifications.
+The Linux real-input lane additionally proves a click inside blank card space
+does not dismiss, an exact row click activates once, and an outside click
+dismisses without activating the tab control underneath.
+
+This result establishes a credible path to reference-level Iced styling on
+macOS, X11, and Wayland with both released renderers. The project owner accepted
+the styling-feasibility result and authorized continued parity work; no further
+approval pause is required. Direct manipulation is the next implementation and
+cost-validation milestone: project or tab editing must still demonstrate that
+focus, text editing, drag feedback, accessibility, and maintenance cost can be
+competitive with GTK. The footer, project/tab manipulation, sidebar resizing,
+terminal scrollback/font handling, and several native adapters remain material
+P0/P1 work elsewhere in this register.
 
 ## First slice contract
 

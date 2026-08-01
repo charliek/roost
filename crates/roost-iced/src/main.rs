@@ -49,6 +49,8 @@ enum Message {
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
+    PaletteDismiss,
+    PaletteCardPressed,
     PaletteScrolled,
     PaletteVisibilityMeasured {
         session: u64,
@@ -138,6 +140,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.palette_confirm();
             Task::none()
         }
+        Message::PaletteDismiss => {
+            app.palette_pointer_dismiss();
+            Task::none()
+        }
+        Message::PaletteCardPressed => Task::none(),
         Message::PaletteScrolled => {
             app.palette_scrolled();
             Task::none()

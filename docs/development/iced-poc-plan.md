@@ -1520,6 +1520,33 @@ Programmatic selection does not yet auto-reveal an offscreen tab pill; manual
 horizontal reachability is proven and auto-reveal stays in the tab-manipulation
 slice.
 
+### Palette-feasibility slice result (2026-08-01)
+
+The second visual checkpoint also passes. Iced's stock purple controls have
+been removed from the command surface: the adapter owns the reference neutral
+surface, selection, hover, disabled, input, border, shadow, and scrollbar
+styles. Cards are 660 points wide at the reference fixture, size down to their
+content, cap at 500 points, and clamp inside a 640-by-360 window. Command rows
+show effective platform shortcut hints; fuzzy matches use the shared model's
+Unicode-scalar ranges; agent, notification, generic, and provider/disabled rows
+retain distinct semantics instead of being flattened into one button label.
+
+The comparison tool now emits five named palette captures for GTK and Iced
+(command, query, agents, notifications, provider) under the same hermetic
+workspace. These are local/review artifacts rather than a permanent visual
+parity CI job. Focus, scrolling, activation, providers, and notifications stay
+covered by correctness tests, and Linux real-input coverage checks the
+transparent catcher's inside/outside routing so dismissal cannot click through
+to application controls.
+
+The evidence supports continuing Iced as a replacement candidate; it does not
+claim that Iced is ready to replace GTK or will necessarily be cheaper to
+maintain. The project owner accepted the styling-feasibility result and asked
+the work to continue without another approval pause. A polished
+direct-manipulation path is the next parity and cost-validation milestone,
+where text editing, drag/drop feedback, accessibility, and event-routing
+complexity can expose costs that static styling cannot.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

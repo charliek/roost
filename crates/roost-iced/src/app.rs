@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use iced::widget::Id;
 use iced::widget::{
     button, column, container, mouse_area, row, scrollable, stack, text, text_input,
 };
-use iced::{window, Alignment, Color, Element, Fill, Size};
+use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
@@ -34,7 +35,7 @@ use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
     custom_command,
-    keybind::{self, Accel, KeybindAction},
+    keybind::{self, Accel, AccelMods, KeybindAction},
     notification_inbox, palette, provider,
     rollup::project_rollup,
 };
@@ -43,6 +44,7 @@ use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
     TerminalOptions, TerminalSelection,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette_scroll::Visibility;
 use crate::terminal_widget::{
@@ -60,6 +62,88 @@ const DEFAULT_ROWS: u16 = 32;
 // later application ticks for roughly two seconds at the 60 Hz subscription,
 // while keeping the work bounded and revision-scoped.
 const PALETTE_GEOMETRY_RETRY_LIMIT: u8 = 120;
+const PALETTE_AGENT_PROJECT_MAX_COLUMNS: usize = 24;
+// Name and status share the width left after project and the reserved
+// metrics/time column. Preserve both when they fit. Under genuine pressure,
+// retain a useful status tail and let the usually-longer name ellipsize first.
+// Unicode display columns, rather than scalar counts, keep wide labels honest.
+const PALETTE_AGENT_LEFT_MAX_COLUMNS: usize = 58;
+const PALETTE_AGENT_STATUS_FLOOR_COLUMNS: usize = 18;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaletteTextRun {
+    text: String,
+    matched: bool,
+}
+
+fn palette_title_runs(title: &str, ranges: &[Range<usize>]) -> Vec<PaletteTextRun> {
+    let characters = title.chars().collect::<Vec<_>>();
+    let mut cursor = 0;
+    let mut runs = Vec::new();
+    for range in ranges {
+        let start = range.start.max(cursor).min(characters.len());
+        let end = range.end.max(start).min(characters.len());
+        if cursor < start {
+            runs.push(PaletteTextRun {
+                text: characters[cursor..start].iter().collect(),
+                matched: false,
+            });
+        }
+        if start < end {
+            runs.push(PaletteTextRun {
+                text: characters[start..end].iter().collect(),
+                matched: true,
+            });
+        }
+        cursor = end;
+    }
+    if cursor < characters.len() || runs.is_empty() {
+        runs.push(PaletteTextRun {
+            text: characters[cursor..].iter().collect(),
+            matched: false,
+        });
+    }
+    runs
+}
+
+fn ellipsize_palette_text(value: &str, max_columns: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_columns {
+        return value.to_string();
+    }
+    if max_columns == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width + 1 > max_columns {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
+}
+
+fn palette_agent_left_text(name: &str, status: &str) -> (String, String) {
+    let name_width = UnicodeWidthStr::width(name);
+    let status_width = UnicodeWidthStr::width(status);
+    if name_width + status_width <= PALETTE_AGENT_LEFT_MAX_COLUMNS {
+        return (name.to_string(), status.to_string());
+    }
+
+    let status_floor = status_width
+        .min(PALETTE_AGENT_STATUS_FLOOR_COLUMNS)
+        .min(PALETTE_AGENT_LEFT_MAX_COLUMNS);
+    let name_budget = name_width.min(PALETTE_AGENT_LEFT_MAX_COLUMNS - status_floor);
+    let status_budget = status_width.min(PALETTE_AGENT_LEFT_MAX_COLUMNS - name_budget);
+    (
+        ellipsize_palette_text(name, name_budget),
+        ellipsize_palette_text(status, status_budget),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseTabOutcome {
@@ -94,23 +178,106 @@ fn sidebar_width(collapsed: bool) -> f32 {
     }
 }
 
-fn command_palette_frame(notification_count: usize, has_providers: bool) -> palette::PaletteFrame {
-    let mut items = palette::command_items(|_| None);
+fn accel_label(accel: &Accel) -> Option<String> {
+    if accel.key.is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    let mut label = String::new();
+    #[cfg(not(target_os = "macos"))]
+    let mut parts = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        if accel.modifiers.contains(AccelMods::CTRL) {
+            label.push('⌃');
+        }
+        if accel.modifiers.contains(AccelMods::ALT) {
+            label.push('⌥');
+        }
+        if accel.modifiers.contains(AccelMods::SHIFT) {
+            label.push('⇧');
+        }
+        if accel.modifiers.contains(AccelMods::SUPER) {
+            label.push('⌘');
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if accel.modifiers.contains(AccelMods::CTRL) {
+            parts.push("Ctrl".to_string());
+        }
+        if accel.modifiers.contains(AccelMods::ALT) {
+            parts.push("Alt".to_string());
+        }
+        if accel.modifiers.contains(AccelMods::SHIFT) {
+            parts.push("Shift".to_string());
+        }
+        if accel.modifiers.contains(AccelMods::SUPER) {
+            parts.push("Super".to_string());
+        }
+    }
+
+    let key = match accel.key.as_str() {
+        "bracketleft" => "[".to_string(),
+        "bracketright" => "]".to_string(),
+        "braceleft" => "{".to_string(),
+        "braceright" => "}".to_string(),
+        "equal" => "=".to_string(),
+        "minus" => "-".to_string(),
+        key if key.chars().count() == 1 => key.to_uppercase(),
+        key => key.to_string(),
+    };
+    #[cfg(target_os = "macos")]
+    {
+        label.push_str(&key);
+        Some(label)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parts.push(key);
+        Some(parts.join("+"))
+    }
+}
+
+fn command_palette_frame(
+    notification_count: usize,
+    providers: &[provider::Provider],
+    keybindings: &HashMap<Accel, KeybindAction>,
+) -> palette::PaletteFrame {
+    let mut bindings = keybindings.iter().collect::<Vec<_>>();
+    bindings.sort_by(|(left, _), (right, _)| {
+        (left.modifiers.bits(), &left.key).cmp(&(right.modifiers.bits(), &right.key))
+    });
+    let mut reverse = HashMap::new();
+    for (accel, action) in bindings {
+        reverse.entry(*action).or_insert(accel);
+    }
+    let mut items =
+        palette::command_items(|action| reverse.get(&action).and_then(|accel| accel_label(accel)));
     let index = items
         .iter()
         .position(|item| item.id == palette::PaletteCommands::SELECT_FONT_ID)
         .map_or(items.len(), |index| index + 1);
-    let mut dynamic = vec![palette::PaletteItem::new(
-        palette::PaletteCommands::VIEW_AGENTS_ID,
-        "Go to Agent…",
-    )];
+    let mut dynamic =
+        vec![
+            palette::PaletteItem::new(palette::PaletteCommands::VIEW_AGENTS_ID, "Go to Agent…")
+                .with_trailing(
+                    reverse
+                        .get(&KeybindAction::AgentPalette)
+                        .and_then(|accel| accel_label(accel)),
+                ),
+        ];
     dynamic.extend(notification_inbox::command_items(notification_count));
     items.splice(index..index, dynamic);
-    if has_providers {
-        items.push(palette::PaletteItem::new(
-            "custom_commands",
-            "Custom Commands…",
-        ));
+    if !providers.is_empty() {
+        items.push(
+            palette::PaletteItem::new("custom_commands", "Custom Commands…").with_trailing(
+                reverse
+                    .get(&KeybindAction::CustomPalette)
+                    .and_then(|accel| accel_label(accel)),
+            ),
+        );
     }
     palette::PaletteFrame::new("commands", "Execute a command…", items)
 }
@@ -2017,66 +2184,165 @@ impl App {
             .id(self.palette_input_id.clone())
             .on_input(Message::PaletteQueryChanged)
             .on_submit(Message::PaletteConfirm)
-            .padding(12)
-            .size(16);
-        let mut items = column![].spacing(4);
+            .padding([4, 8])
+            .size(17)
+            .style(chrome::palette_input);
+        let mut items = column![].spacing(0);
         for (index, matched) in palette.matches().into_iter().enumerate() {
             let selected = index == frame.selection;
-            let marker = if selected { "› " } else { "  " };
-            let mut label = column![text(format!("{marker}{}", matched.item.title)).size(14)];
-            if let Some(agent) = matched.item.agent {
-                let metrics = agent.metrics_text.as_deref().unwrap_or("…");
-                label = label.push(
-                    text(format!(
-                        "{}  ·  {}  ·  {}",
-                        agent.status_text, agent.time_text, metrics
-                    ))
-                    .size(11)
-                    .color(agent_color(agent.effective_lifecycle)),
-                );
-            }
-            if let Some(subtitle) = matched.item.subtitle {
-                label = label.push(
-                    text(subtitle)
-                        .size(11)
-                        .color(Color::from_rgb8(160, 164, 176)),
-                );
-            }
-            if let Some(trailing) = matched.item.trailing_text {
-                label = label.push(
-                    text(trailing)
-                        .size(10)
-                        .color(Color::from_rgb8(132, 136, 148)),
-                );
-            }
-            items = items.push(
-                container(
-                    button(label)
-                        .width(Fill)
-                        .padding([8, 10])
-                        .on_press(Message::PaletteActivate(matched.item.id)),
-                )
-                .id(palette_row_id(
-                    self.palette_session,
-                    self.palette_layout_revision,
-                    index,
-                )),
-            );
+            let item = matched.item;
+            let actionable = item.actionable;
+            let primary_color = if actionable {
+                chrome::TEXT
+            } else {
+                chrome::PALETTE_PLACEHOLDER.scale_alpha(0.6)
+            };
+            let label: Element<'_, Message> = if let Some(agent) = item.agent {
+                let lifecycle_color = if actionable {
+                    agent_color(agent.effective_lifecycle)
+                } else {
+                    chrome::PALETTE_PLACEHOLDER.scale_alpha(0.6)
+                };
+                let dot =
+                    container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
+                        iced::widget::container::Style::default()
+                            .background(lifecycle_color)
+                            .border(iced::border::rounded(4))
+                    });
+                let metrics = agent.metrics_text.unwrap_or_default();
+                let project =
+                    ellipsize_palette_text(&agent.project, PALETTE_AGENT_PROJECT_MAX_COLUMNS);
+                let (name, status) = palette_agent_left_text(&agent.name, &agent.status_text);
+                row![
+                    dot,
+                    container(
+                        text(project)
+                            .size(14)
+                            .font(Font {
+                                weight: font::Weight::Bold,
+                                ..Font::default()
+                            })
+                            .color(primary_color)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                    )
+                    .max_width(140),
+                    container(
+                        text(name)
+                            .size(14)
+                            .color(primary_color)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                    ),
+                    text(status)
+                        .size(13)
+                        .color(lifecycle_color)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    iced::widget::Space::new().width(Fill),
+                    text(metrics)
+                        .size(12)
+                        .font(Font::MONOSPACE)
+                        .color(chrome::MUTED_TEXT),
+                    text(agent.time_text)
+                        .size(12)
+                        .font(Font::MONOSPACE)
+                        .color(chrome::MUTED_TEXT)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into()
+            } else {
+                let spans = palette_title_runs(&item.title, &matched.ranges)
+                    .into_iter()
+                    .map(|run| {
+                        let mut span = iced::widget::span::<(), Font>(run.text).color(
+                            if run.matched && actionable {
+                                chrome::PALETTE_MATCH
+                            } else {
+                                primary_color
+                            },
+                        );
+                        if run.matched && actionable {
+                            span = span.font(Font {
+                                weight: font::Weight::Semibold,
+                                ..Font::default()
+                            });
+                        }
+                        span
+                    })
+                    .collect::<Vec<_>>();
+                let title = iced::widget::rich_text(spans)
+                    .size(14)
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None);
+                let mut leading = column![title];
+                if let Some(subtitle) = item.subtitle {
+                    leading = leading.push(
+                        text(subtitle)
+                            .size(12)
+                            .color(chrome::PALETTE_PLACEHOLDER)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    );
+                }
+                let mut generic = row![leading.width(Fill)].align_y(Alignment::Center);
+                if let Some(trailing) = item.trailing_text {
+                    generic = generic.push(
+                        text(trailing)
+                            .size(12)
+                            .color(chrome::PALETTE_PLACEHOLDER)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    );
+                }
+                generic.into()
+            };
+            let row = button(label)
+                .width(Fill)
+                .padding([6, 10])
+                .style(chrome::palette_row(selected, actionable));
+            let row = if actionable {
+                row.on_press(Message::PaletteActivate(item.id))
+            } else {
+                row
+            };
+            items = items.push(container(row).id(palette_row_id(
+                self.palette_session,
+                self.palette_layout_revision,
+                index,
+            )));
         }
         let list = scrollable(items)
             .id(self.palette_scroll_id.clone())
             .on_scroll(|_| Message::PaletteScrolled)
-            .height(420);
-        let panel = container(column![input, list].spacing(8))
-            .width(560)
-            .padding(12)
-            .style(container::dark);
-        let overlay = container(panel)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(2)
+                    .scroller_width(4)
+                    .margin(2),
+            ))
+            .style(chrome::palette_scrollable)
+            .height(Shrink);
+        let divider = container(
+            container(iced::widget::Space::new().height(1))
+                .width(Fill)
+                .style(chrome::palette_divider),
+        )
+        .padding([8, 2]);
+        let panel = container(column![input, divider, list].spacing(0))
+            .width(Fill)
+            .max_width(chrome::PALETTE_WIDTH)
+            .height(Shrink)
+            .max_height(chrome::PALETTE_MAX_HEIGHT)
+            .padding(10)
+            .style(chrome::palette_panel);
+        let overlay = container(mouse_area(panel).on_press(Message::PaletteCardPressed))
             .width(Fill)
             .height(Fill)
-            .padding([60, 40])
+            .padding([60, 16])
             .center_x(Fill);
-        stack![content, overlay].width(Fill).height(Fill).into()
+        let catcher = mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
+            .on_press(Message::PaletteDismiss);
+        stack![content, catcher, overlay]
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     pub fn select_project(&mut self, project_id: i64) {
@@ -2178,11 +2444,16 @@ impl App {
         }
     }
 
+    pub fn palette_pointer_dismiss(&mut self) {
+        self.dismiss_palette();
+    }
+
     fn open_palette(&mut self, kind: &str) -> Result<(), String> {
         let frame = match kind {
             "" | "commands" => command_palette_frame(
                 self.notification_inbox.count(),
-                !self.config.providers.is_empty(),
+                &self.config.providers,
+                &self.keybindings,
             ),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => {
@@ -3923,6 +4194,100 @@ mod tests {
     }
 
     #[test]
+    fn palette_title_runs_preserve_unicode_scalar_offsets_and_text() {
+        let title = "Open 東京 terminal";
+        let runs = palette_title_runs(title, &[5..7, 8..12]);
+        assert_eq!(
+            runs,
+            vec![
+                PaletteTextRun {
+                    text: "Open ".into(),
+                    matched: false,
+                },
+                PaletteTextRun {
+                    text: "東京".into(),
+                    matched: true,
+                },
+                PaletteTextRun {
+                    text: " ".into(),
+                    matched: false,
+                },
+                PaletteTextRun {
+                    text: "term".into(),
+                    matched: true,
+                },
+                PaletteTextRun {
+                    text: "inal".into(),
+                    matched: false,
+                },
+            ]
+        );
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            title
+        );
+    }
+
+    #[test]
+    fn palette_title_runs_clamp_overlapping_and_out_of_bounds_ranges() {
+        assert_eq!(
+            palette_title_runs("abc", &[1..3, 2..usize::MAX]),
+            vec![
+                PaletteTextRun {
+                    text: "a".into(),
+                    matched: false,
+                },
+                PaletteTextRun {
+                    text: "bc".into(),
+                    matched: true,
+                },
+            ]
+        );
+        assert_eq!(
+            palette_title_runs("", &[]),
+            vec![PaletteTextRun {
+                text: String::new(),
+                matched: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn palette_agent_text_ellipsizes_on_unicode_scalar_boundaries() {
+        assert_eq!(ellipsize_palette_text("short", 8), "short");
+        assert_eq!(ellipsize_palette_text("abcdef", 4), "abc…");
+        assert_eq!(ellipsize_palette_text("東京都市", 5), "東京…");
+        assert_eq!(ellipsize_palette_text("anything", 0), "");
+        assert!(UnicodeWidthStr::width(ellipsize_palette_text("東京都市", 5).as_str()) <= 5);
+    }
+
+    #[test]
+    fn palette_agent_name_and_status_share_only_the_width_they_need() {
+        let working = "Working through an intentionally long agent name";
+        assert_eq!(
+            palette_agent_left_text(working, "Working"),
+            (working.to_string(), "Working".to_string())
+        );
+
+        let failed = "Failed · an intentionally long failure detail fo…";
+        assert_eq!(
+            palette_agent_left_text("Failed", failed),
+            ("Failed".to_string(), failed.to_string())
+        );
+
+        let (name, status) = palette_agent_left_text(
+            &"界".repeat(40),
+            "Failed · an intentionally long failure detail",
+        );
+        assert!(name.ends_with('…'));
+        assert!(status.ends_with('…'));
+        assert!(
+            UnicodeWidthStr::width(name.as_str()) + UnicodeWidthStr::width(status.as_str())
+                <= PALETTE_AGENT_LEFT_MAX_COLUMNS
+        );
+    }
+
+    #[test]
     fn ui_tasks_compose_without_overwriting_an_earlier_focus_request() {
         let task = UiTask::FocusWidget(Id::unique()).then(UiTask::Resize(
             window::Id::unique(),
@@ -5077,7 +5442,10 @@ mod tests {
 
     #[test]
     fn command_palette_uses_shared_ids_and_ranking() {
-        let mut state = palette::PaletteState::new(command_palette_frame(2, true));
+        let config = RoostConfig::parse(r#"provider = label="Fixture" run="fixture.sh""#);
+        let bindings = keybind::default_bindings().into_iter().collect();
+        let mut state =
+            palette::PaletteState::new(command_palette_frame(2, &config.providers, &bindings));
         let ids: Vec<String> = state
             .matches()
             .into_iter()
@@ -5097,6 +5465,13 @@ mod tests {
             Some(palette::PaletteCommands::VIEW_NOTIFICATIONS_ID)
         );
         assert!(ids.iter().any(|id| id == "custom_commands"));
+        assert!(state
+            .current()
+            .items
+            .iter()
+            .find(|item| item.id == "new_tab")
+            .and_then(|item| item.trailing_text.as_deref())
+            .is_some());
         state.set_query("theme");
         assert_eq!(
             state.selected_item().map(|item| item.id),

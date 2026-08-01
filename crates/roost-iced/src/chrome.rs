@@ -1,5 +1,5 @@
-use iced::widget::{button, container};
-use iced::{Background, Border, Color, Shadow, Theme};
+use iced::widget::{button, container, scrollable, text_input};
+use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
 /// on the same seam. Native window decorations remain outside this geometry.
@@ -13,6 +13,8 @@ pub const PROJECT_RIGHT_INSET: f32 = 8.0;
 pub const AGENT_DOT_INSET: f32 = 25.0;
 pub const TAB_STATUS_SIZE: f32 = 7.0;
 pub const NOTIFICATION_DOT_SIZE: f32 = 8.0;
+pub const PALETTE_WIDTH: f32 = 660.0;
+pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
 
 pub const SURFACE: Color = Color::from_rgb8(0x28, 0x28, 0x28);
 pub const SURFACE_DARK: Color = Color::from_rgb8(0x21, 0x21, 0x21);
@@ -23,6 +25,11 @@ pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
 pub const NOTIFICATION: Color = Color::from_rgb8(0x4e, 0x9a, 0xf1);
+pub const PALETTE_SURFACE: Color = Color::from_rgb8(0x2d, 0x2d, 0x33);
+pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
+pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
+pub const PALETTE_PLACEHOLDER: Color = Color::from_rgb8(0x9e, 0x9e, 0x9e);
+pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
 
 pub fn surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE)
@@ -66,6 +73,82 @@ pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
     chrome_button(None, status, 4.0)
+}
+
+pub fn palette_panel(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(PALETTE_SURFACE)),
+        border: Border {
+            color: Color::from_rgba8(0xff, 0xff, 0xff, 0.12),
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.55),
+            offset: Vector::new(0.0, 12.0),
+            blur_radius: 34.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn palette_divider(_: &Theme) -> container::Style {
+    container::Style::default().background(Color::from_rgba8(0xff, 0xff, 0xff, 0.10))
+}
+
+pub fn palette_input(_: &Theme, _: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        icon: PALETTE_PLACEHOLDER,
+        placeholder: PALETTE_PLACEHOLDER,
+        value: TEXT,
+        selection: ACTIVE_BLUE,
+    }
+}
+
+pub fn palette_scrollable(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let mut style = scrollable::default(theme, status);
+    let rail = scrollable::Rail {
+        background: None,
+        border: Border::default(),
+        scroller: scrollable::Scroller {
+            background: Background::Color(PALETTE_PLACEHOLDER.scale_alpha(0.35)),
+            border: Border::default().rounded(2),
+        },
+    };
+    style.vertical_rail = rail;
+    style.horizontal_rail = rail;
+    style
+}
+
+pub fn palette_row(
+    selected: bool,
+    actionable: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let background = if selected {
+            Some(PALETTE_SELECTION)
+        } else {
+            match status {
+                button::Status::Hovered | button::Status::Pressed if actionable => {
+                    Some(PALETTE_HOVER)
+                }
+                _ => None,
+            }
+        };
+        button::Style {
+            background: background.map(Background::Color),
+            text_color: if actionable {
+                TEXT
+            } else {
+                PALETTE_PLACEHOLDER.scale_alpha(0.6)
+            },
+            border: Border::default().rounded(6),
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
 }
 
 fn chrome_button(selected: Option<Color>, status: button::Status, radius: f32) -> button::Style {
@@ -121,5 +204,31 @@ mod tests {
         assert!((project_text - AGENT_DOT_INSET).abs() <= 1.0);
         assert_eq!(TAB_STATUS_SIZE, 7.0);
         assert_eq!(NOTIFICATION_DOT_SIZE, 8.0);
+    }
+
+    #[test]
+    fn palette_styles_use_reference_neutrals_without_stock_primary_fill() {
+        let theme = Theme::Dark;
+        assert_eq!(
+            palette_panel(&theme).background,
+            Some(Background::Color(PALETTE_SURFACE))
+        );
+        assert_eq!(
+            palette_row(true, true)(&theme, button::Status::Active).background,
+            Some(Background::Color(PALETTE_SELECTION))
+        );
+        assert_eq!(
+            palette_row(false, true)(&theme, button::Status::Active).background,
+            None
+        );
+        assert_eq!(
+            palette_input(&theme, text_input::Status::Focused { is_hovered: false })
+                .border
+                .width,
+            0.0
+        );
+        let disabled = palette_row(false, false)(&theme, button::Status::Hovered);
+        assert_eq!(disabled.background, None);
+        assert_eq!(disabled.text_color, PALETTE_PLACEHOLDER.scale_alpha(0.6));
     }
 }

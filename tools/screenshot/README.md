@@ -63,10 +63,14 @@ instance of each requested target before launching a throwaway state/config.
 Save work in live Roost sessions before running it. The disposable fixture never
 reads or writes developer state, but closing the existing UI is destructive.
 Each target receives exactly one `Parity Project` with four fixed lifecycle tabs,
-one inactive notification, a visible 220pt sidebar, and the root command
-palette. It writes `shell.png`, a palette capture where the product API supports
-it, and `measurements.json`, then aggregates current-run documents into
-`manifest.md`.
+one inactive notification, a visible 220pt sidebar, and five deterministic
+palette states where the product API supports them. It writes `shell.png`,
+`palette.png` (root commands), `palette-query.png` (filtered commands),
+`palette-agents.png`, `palette-notifications.png`, `palette-provider.png`
+(including a disabled provider), and schema-versioned `measurements.json`, then
+aggregates current-run documents into `manifest.md`. Schema 2 requires and links
+all five palette variants; readers must reject incompatible schemas rather than
+silently interpreting older documents.
 Artifacts are keyed by target, OS, display backend, renderer, scale, commit,
 and run ID so X11/Wayland or wgpu/tiny-skia output cannot overwrite each other.
 PNG hashes are provenance, not golden assertions. The captures and their basic
@@ -84,10 +88,10 @@ build with `tools/shed/shed-test.sh --build-only`, point `ROOST_GTK_BIN` or
 the shared mount.
 
 AppKit's product screenshot renders the main window content view but not its
-child `NSPanel`, so the Mac document records the palette capture as unavailable
-and does not write a misleading `palette.png`. Shell captures compare all three
-targets; palette captures compare GTK and Iced. A future AppKit compositor for
-child panels can remove that declared capability gap.
+child `NSPanel`, so the Mac document records palette capture as unavailable and
+does not write misleading palette images. Shell captures compare all three
+targets; the five palette variants compare GTK and Iced. A future AppKit
+compositor for child panels can remove that declared capability gap.
 
 ## How verification works
 
