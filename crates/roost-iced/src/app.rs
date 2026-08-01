@@ -498,6 +498,7 @@ pub struct App {
     projects: Vec<Project>,
     ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
+    pending_window_resize: Option<Size>,
     window_size: Size,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
@@ -564,6 +565,7 @@ impl App {
             projects: Vec::new(),
             ui_rx,
             window_id: None,
+            pending_window_resize: None,
             window_size: Size::new(1100.0, 720.0),
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
@@ -585,8 +587,19 @@ impl App {
         Ok(app)
     }
 
-    pub fn set_window_id(&mut self, id: window::Id) {
+    pub fn window_opened(&mut self, id: window::Id) -> UiTask {
         self.window_id = Some(id);
+        self.pending_window_resize
+            .take()
+            .map_or(UiTask::None, |size| UiTask::Resize(id, size))
+    }
+
+    pub fn window_resized(&mut self, id: window::Id, size: Size) -> UiTask {
+        let task = self.window_opened(id);
+        if matches!(task, UiTask::None) {
+            self.resize(size);
+        }
+        task
     }
 
     pub fn tick(&mut self) -> UiTask {
@@ -1292,7 +1305,7 @@ impl App {
                 } => {
                     let result = if !self.test_mode {
                         Err("ROOST_TEST_MODE=1 is required".into())
-                    } else if let Some(id) = self.window_id {
+                    } else {
                         let size = Size::new(width as f32, height as f32);
                         // Some Wayland compositors retain authority over the
                         // toplevel size and may ignore a client request. Apply
@@ -1300,10 +1313,15 @@ impl App {
                         // deterministic test port; a compositor Resized event
                         // remains authoritative if it sends one afterward.
                         self.resize(size);
-                        task = UiTask::Resize(id, size);
+                        if let Some(id) = self.window_id {
+                            task = UiTask::Resize(id, size);
+                        } else {
+                            // IPC can become reachable just before Iced emits
+                            // WindowOpened. Preserve the native resize until an
+                            // ID exists instead of rejecting a ready server.
+                            self.pending_window_resize = Some(size);
+                        }
                         Ok(())
-                    } else {
-                        Err("Iced window is not open yet".into())
                     };
                     let _ = reply.send(result);
                 }

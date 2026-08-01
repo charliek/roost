@@ -638,6 +638,13 @@ notification inbox commands, provider-driven `palette.present`, rename
 dialogs, and persistence of an explicitly confirmed theme/font are named
 follow-up slices rather than parallel state hidden in this commit.
 
+Hosted-CI review follow-up: the IPC socket can answer during the short interval
+before Iced publishes its first `WindowOpened` event. An early `window.resize`
+must update logical terminal geometry immediately and retain one pending native
+resize for delivery when the window id arrives; startup readiness must not
+depend on renderer event timing. The walking-skeleton resize/device-reply test
+is the regression gate on both Linux renderer lanes and macOS.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

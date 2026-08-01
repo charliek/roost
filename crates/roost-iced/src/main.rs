@@ -77,19 +77,12 @@ fn main() -> anyhow::Result<()> {
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::Tick => app.tick().map_task(),
-        Message::WindowOpened(id) => {
-            app.set_window_id(id);
-            Task::none()
-        }
-        Message::WindowResized(id, size) => {
-            app.set_window_id(id);
-            app.resize(size);
-            Task::none()
-        }
+        Message::WindowOpened(id) => app.window_opened(id).map_task(),
+        Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
         Message::WindowFocus(id, focused) => {
-            app.set_window_id(id);
+            let task = app.window_opened(id).map_task();
             app.set_window_focus(focused);
-            Task::none()
+            task
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
         Message::TerminalPointer(event) => {
