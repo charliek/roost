@@ -88,8 +88,8 @@ e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk|iced, default gtk; launches the 
 e2e-gtk:  ## E2E against the GTK UI
 	uv run --group test pytest tools/roosttest --roost-target gtk
 
-e2e-iced:  ## Walking-skeleton E2E against Iced
-	uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py --roost-target iced
+e2e-iced:  ## Required functional E2E against Iced
+	uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py --roost-target iced
 
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
@@ -97,8 +97,8 @@ e2e-mac:  ## E2E against the Mac app
 e2e-gtk-ci:  ## GTK E2E at CI parity (test-mode + fresh harness-owned UI, isolated state)
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh
 
-e2e-iced-ci:  ## Iced walking-skeleton E2E at CI parity (fresh + isolated state)
-	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py --roost-target iced --roost-fresh
+e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
+	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py --roost-target iced --roost-fresh
 
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh

@@ -726,6 +726,48 @@ following screenshot/visual slice because `app.screenshot` is still an honest
 unsupported Iced UI port in this commit. Notifications and provider palettes
 also remain separate coherent slices.
 
+### Active mini-plan: shared notification inbox and Iced triage
+
+Scope: make GTK and Iced consume one toolkit-neutral notification palette
+projection, then connect Iced to the engine's ordered notification events and
+authoritative snapshot. Iced gains the inbox drill-in, unread jump, clear-all,
+per-tab attention marker, and a native inbox button. Desktop banner delivery
+remains a separate native UI port rather than entering the engine or shared
+model.
+
+Invariants and interfaces:
+
+- `Workspace` remains the sole owner of focus suppression and the
+  `has_notification` bit; the Iced adapter never re-derives policy from window
+  or tab state after the event;
+- `roost-ui-model::notification_inbox` owns deduplication, cap, ordering, row
+  ids, frame construction, command rows, and active-project-first unread
+  selection; GTK migrates its matching helpers onto those APIs in the same
+  commit;
+- Iced subscribes before hydration and drains `WorkspaceEvent` without calling
+  UI code from a runtime worker. `NotificationFired` supplies the ephemeral
+  body while `TabNotification(false)` and close/delete edges remove rows;
+- each Iced tick reconciles membership to a full workspace snapshot. A lagged
+  consumer drops stale rows and deterministically reconstructs missing pending
+  rows without bodies, because notification content is intentionally not
+  persisted;
+- tab, agent, notification, and unread navigation all focus through the
+  workspace, clear the authoritative bit, and reveal the sidebar only after a
+  successful focus; and
+- clearing iterates the inbox and sends one workspace clear per row. Row
+  removal follows the resulting false-edge rather than a competing local
+  mutation.
+
+Acceptance: the shared-model tests cover dynamic command count, empty and
+populated frames, row parsing, newest/active-project unread selection, and cap;
+all five `test_notifications.py` cases pass against Iced; existing palette,
+agent, sidebar, GTK, and Swift regressions stay green; macOS plus shed
+X11/wgpu and Wayland/tiny-skia focused gates pass; dependency boundaries remain
+toolkit-clean. Native OS notification banners are deferred because they require
+a platform-specific Iced notification port and are not needed to validate the
+shared state/event architecture; the visible inbox, markers, and triage actions
+remain fully usable.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

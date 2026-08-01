@@ -16,7 +16,7 @@ use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter}
 use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
-use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace};
+use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceEvent};
 use roost_ipc::messages::{
     PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
     SidebarDumpResult,
@@ -27,7 +27,7 @@ use roost_ui_model::theme::Theme;
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
-    custom_command, palette,
+    custom_command, notification_inbox, palette,
 };
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
@@ -55,16 +55,18 @@ fn sidebar_width(collapsed: bool) -> f32 {
     }
 }
 
-fn command_palette_frame() -> palette::PaletteFrame {
+fn command_palette_frame(notification_count: usize) -> palette::PaletteFrame {
     let mut items = palette::command_items(|_| None);
     let index = items
         .iter()
         .position(|item| item.id == palette::PaletteCommands::SELECT_FONT_ID)
         .map_or(items.len(), |index| index + 1);
-    items.insert(
-        index,
-        palette::PaletteItem::new(palette::PaletteCommands::VIEW_AGENTS_ID, "Go to Agent…"),
-    );
+    let mut dynamic = vec![palette::PaletteItem::new(
+        palette::PaletteCommands::VIEW_AGENTS_ID,
+        "Go to Agent…",
+    )];
+    dynamic.extend(notification_inbox::command_items(notification_count));
+    items.splice(index..index, dynamic);
     palette::PaletteFrame::new("commands", "Execute a command…", items)
 }
 
@@ -524,6 +526,8 @@ pub struct App {
     tabs: HashMap<i64, TerminalTab>,
     projects: Vec<Project>,
     sidebar_agents: HashMap<i64, Vec<SidebarDumpAgentRow>>,
+    notification_inbox: notification_inbox::NotificationInbox,
+    workspace_events: tokio::sync::broadcast::Receiver<WorkspaceEvent>,
     ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
@@ -563,6 +567,7 @@ impl App {
             .build()
             .context("build Iced engine runtime")?;
         let workspace = Arc::new(Workspace::open(profile.state_json_path()));
+        let workspace_events = workspace.subscribe();
         let supervisor = Arc::new(PtySupervisor::new());
         let client = LocalClient::new(
             Arc::clone(&workspace),
@@ -598,6 +603,8 @@ impl App {
             tabs: HashMap::new(),
             projects: Vec::new(),
             sidebar_agents: HashMap::new(),
+            notification_inbox: notification_inbox::NotificationInbox::new(),
+            workspace_events,
             ui_rx,
             window_id: None,
             pending_window_resize: None,
@@ -645,6 +652,7 @@ impl App {
     pub fn tick(&mut self) -> UiTask {
         let task = self.service_ui_requests();
         self.service_agent_metrics();
+        self.service_workspace_events();
         self.reconcile();
         let mut exited = Vec::new();
         let mut osc_actions = Vec::new();
@@ -856,12 +864,22 @@ impl App {
             };
             let label = if tab.id == active_tab {
                 format!("● {title}")
+            } else if tab.has_notification {
+                format!("• {title}")
             } else {
                 title.to_string()
             };
             tabs = tabs.push(button(text(label).size(13)).on_press(Message::TabSelected(tab.id)));
         }
         tabs = tabs.push(button(text("+")).on_press(Message::NewTab));
+        let notification_count = self.notification_inbox.count();
+        let notification_label = if notification_count == 0 {
+            "Notifications".to_string()
+        } else {
+            format!("Notifications ({notification_count})")
+        };
+        tabs = tabs
+            .push(button(text(notification_label).size(11)).on_press(Message::OpenNotifications));
         let tab_bar = container(tabs)
             .height(TAB_BAR_HEIGHT)
             .width(Fill)
@@ -921,6 +939,13 @@ impl App {
                         .color(Color::from_rgb8(160, 164, 176)),
                 );
             }
+            if let Some(trailing) = matched.item.trailing_text {
+                label = label.push(
+                    text(trailing)
+                        .size(10)
+                        .color(Color::from_rgb8(132, 136, 148)),
+                );
+            }
             items = items.push(
                 button(label)
                     .width(Fill)
@@ -941,24 +966,28 @@ impl App {
     }
 
     pub fn select_project(&mut self, project_id: i64) {
-        if let Some(tab_id) = self
+        let tab_id = self
             .projects
             .iter()
             .find(|project| project.id == project_id)
             .and_then(|project| project.tabs.first())
-            .map(|tab| tab.id)
-        {
-            let _ = self.workspace.focus_tab(tab_id);
+            .map(|tab| tab.id);
+        if let Some(tab_id) = tab_id {
+            let _ = self.focus_tab_and_clear(tab_id, false);
         }
     }
 
     pub fn select_tab(&mut self, tab_id: i64) {
-        let _ = self.workspace.focus_tab(tab_id);
+        let _ = self.focus_tab_and_clear(tab_id, false);
     }
 
     pub fn select_agent(&mut self, tab_id: i64) {
-        if self.workspace.focus_tab(tab_id).is_ok() {
-            self.set_sidebar_collapsed(false);
+        let _ = self.focus_tab_and_clear(tab_id, true);
+    }
+
+    pub fn open_notifications(&mut self) {
+        if let Err(error) = self.open_palette("notifications") {
+            self.status = Some(error);
         }
     }
 
@@ -1022,11 +1051,12 @@ impl App {
 
     fn open_palette(&mut self, kind: &str) -> Result<(), String> {
         let frame = match kind {
-            "" | "commands" => command_palette_frame(),
+            "" | "commands" => command_palette_frame(self.notification_inbox.count()),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => {
                 agent_palette::agent_frame(&self.workspace.snapshot(), agent_palette::now_unix())
             }
+            "notifications" => notification_inbox::frame(&self.notification_inbox),
             "custom" => {
                 return Err(format!("palette kind {kind:?} is not implemented by Iced"));
             }
@@ -1145,6 +1175,25 @@ impl App {
                     }
                     self.refresh_agent_palette();
                 }
+                palette::PaletteCommands::VIEW_NOTIFICATIONS_ID => {
+                    if let Some(state) = &mut self.palette {
+                        state.push(notification_inbox::frame(&self.notification_inbox));
+                    }
+                }
+                palette::PaletteCommands::CLEAR_NOTIFICATIONS_ID => {
+                    let tab_ids = self.notification_inbox.tab_ids();
+                    let mut first_error = None;
+                    for tab_id in tab_ids {
+                        if let Err(error) = self.workspace.set_tab_has_notification(tab_id, false) {
+                            first_error.get_or_insert_with(|| error.to_string());
+                        }
+                    }
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                }
                 "new_tab" => {
                     self.palette = None;
                     self.palette_theme_at_open = None;
@@ -1178,6 +1227,18 @@ impl App {
                     self.palette = None;
                     self.palette_theme_at_open = None;
                     self.toggle_sidebar_agents();
+                }
+                "jump_to_unread" => {
+                    let active_project_id = self.workspace.active().0;
+                    let target = notification_inbox::next_unread(
+                        &self.notification_inbox,
+                        active_project_id,
+                    );
+                    if let Some(tab_id) = target {
+                        self.focus_tab_and_clear(tab_id, true)?;
+                    }
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
                 }
                 command => {
                     return Err(format!(
@@ -1220,10 +1281,14 @@ impl App {
             agent_palette::FRAME_ID => {
                 let tab_id = agent_palette::agent_tab_id(&item.id)
                     .ok_or_else(|| format!("agent row {:?} cannot be activated", item.id))?;
-                self.workspace
-                    .focus_tab(tab_id)
-                    .map_err(|error| error.to_string())?;
-                self.set_sidebar_collapsed(false);
+                self.focus_tab_and_clear(tab_id, true)?;
+                self.palette = None;
+                self.palette_theme_at_open = None;
+            }
+            "notifications" => {
+                let tab_id = notification_inbox::tab_id(&item.id)
+                    .ok_or_else(|| format!("notification row {:?} cannot be activated", item.id))?;
+                self.focus_tab_and_clear(tab_id, true)?;
                 self.palette = None;
                 self.palette_theme_at_open = None;
             }
@@ -1312,9 +1377,20 @@ impl App {
             .position(|tab| tab.id == active_tab)
             .unwrap_or(0);
         let next = (current as isize + delta).rem_euclid(tabs.len() as isize) as usize;
+        self.focus_tab_and_clear(tabs[next].id, false)?;
+        Ok(())
+    }
+
+    fn focus_tab_and_clear(&mut self, tab_id: i64, reveal_sidebar: bool) -> Result<(), String> {
         self.workspace
-            .focus_tab(tabs[next].id)
+            .focus_tab(tab_id)
             .map_err(|error| error.to_string())?;
+        self.workspace
+            .set_tab_has_notification(tab_id, false)
+            .map_err(|error| error.to_string())?;
+        if reveal_sidebar {
+            self.set_sidebar_collapsed(false);
+        }
         Ok(())
     }
 
@@ -1337,6 +1413,8 @@ impl App {
         // Full authoritative snapshot on every UI tick is the recovery path
         // for a slow consumer: deltas are an optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.reconcile_notification_inbox();
+        self.refresh_notification_palette();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         let live_ids: HashSet<i64> = self
@@ -1375,6 +1453,144 @@ impl App {
                 }
                 Err(error) => tracing::debug!(tab_id, ?error, "PTY not ready for UI attach"),
             }
+        }
+    }
+
+    fn service_workspace_events(&mut self) {
+        loop {
+            match self.workspace_events.try_recv() {
+                Ok(WorkspaceEvent::NotificationFired {
+                    tab_id,
+                    title: _,
+                    body,
+                }) => {
+                    if let Some((project_id, title)) = self.notification_title(tab_id) {
+                        self.notification_inbox.upsert(
+                            notification_inbox::NotificationRecord::new(
+                                tab_id, project_id, title, body,
+                            ),
+                        );
+                    }
+                }
+                Ok(WorkspaceEvent::TabNotification {
+                    tab_id,
+                    has_pending: false,
+                })
+                | Ok(WorkspaceEvent::TabClosed { tab_id }) => {
+                    self.notification_inbox.remove(tab_id);
+                }
+                Ok(WorkspaceEvent::ProjectDeleted { project_id }) => {
+                    let stale: Vec<i64> = self
+                        .notification_inbox
+                        .snapshot()
+                        .iter()
+                        .filter(|record| record.project_id == project_id)
+                        .map(|record| record.tab_id)
+                        .collect();
+                    for tab_id in stale {
+                        self.notification_inbox.remove(tab_id);
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(dropped)) => {
+                    tracing::warn!(dropped, "Iced workspace event consumer lagged; resyncing");
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+    }
+
+    fn notification_title(&self, tab_id: i64) -> Option<(i64, String)> {
+        self.workspace.snapshot().into_iter().find_map(|project| {
+            project.tabs.into_iter().find_map(|tab| {
+                (tab.id == tab_id).then(|| {
+                    let tab_title = if !tab.title.is_empty() {
+                        tab.title
+                    } else if !tab.cwd.is_empty() {
+                        tab.cwd
+                    } else {
+                        "Tab".to_string()
+                    };
+                    (
+                        project.id,
+                        notification_inbox::compose_title(&project.name, &tab_title),
+                    )
+                })
+            })
+        })
+    }
+
+    fn reconcile_notification_inbox(&mut self) {
+        let pending_rows: Vec<(i64, i64, String)> = self
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.has_notification)
+                    .map(move |tab| {
+                        let tab_title = if !tab.title.is_empty() {
+                            tab.title.clone()
+                        } else if !tab.cwd.is_empty() {
+                            tab.cwd.clone()
+                        } else {
+                            "Tab".to_string()
+                        };
+                        (
+                            tab.id,
+                            project.id,
+                            notification_inbox::compose_title(&project.name, &tab_title),
+                        )
+                    })
+            })
+            .collect();
+        let pending_ids: HashSet<i64> = pending_rows.iter().map(|row| row.0).collect();
+        let stale: Vec<i64> = self
+            .notification_inbox
+            .tab_ids()
+            .into_iter()
+            .filter(|tab_id| !pending_ids.contains(tab_id))
+            .collect();
+        for tab_id in stale {
+            self.notification_inbox.remove(tab_id);
+        }
+
+        let existing: HashSet<i64> = self.notification_inbox.tab_ids().into_iter().collect();
+        let slots = notification_inbox::CAP.saturating_sub(self.notification_inbox.count());
+        let mut additions = Vec::with_capacity(slots);
+        for row in pending_rows
+            .into_iter()
+            .filter(|row| !existing.contains(&row.0))
+            .take(slots)
+        {
+            additions.push(row);
+        }
+        // Insert in reverse snapshot order so the first deterministic
+        // project/tab fallback remains at the front after repeated prepends.
+        while let Some((tab_id, project_id, title)) = additions.pop() {
+            self.notification_inbox
+                .upsert(notification_inbox::NotificationRecord::new(
+                    tab_id, project_id, title, "",
+                ));
+        }
+    }
+
+    fn refresh_notification_palette(&mut self) {
+        let has_notifications = self.palette.as_ref().is_some_and(|state| {
+            state
+                .frames()
+                .iter()
+                .any(|frame| frame.id == "notifications")
+        });
+        if !has_notifications {
+            return;
+        }
+        let items = notification_inbox::frame(&self.notification_inbox).items;
+        if let Some(state) = &mut self.palette {
+            state.update_items("notifications", items);
         }
     }
 
@@ -1938,6 +2154,7 @@ impl Message {
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::NewTab => app.new_tab(),
             Self::ToggleSidebar => app.toggle_sidebar(),
+            Self::OpenNotifications => app.open_notifications(),
             _ => {}
         }
         Task::none()
@@ -1986,7 +2203,7 @@ mod tests {
 
     #[test]
     fn command_palette_uses_shared_ids_and_ranking() {
-        let mut state = palette::PaletteState::new(command_palette_frame());
+        let mut state = palette::PaletteState::new(command_palette_frame(2));
         let ids: Vec<String> = state
             .matches()
             .into_iter()
@@ -2000,6 +2217,10 @@ mod tests {
         assert_eq!(
             ids.get(font + 1).map(String::as_str),
             Some(palette::PaletteCommands::VIEW_AGENTS_ID)
+        );
+        assert_eq!(
+            ids.get(font + 2).map(String::as_str),
+            Some(palette::PaletteCommands::VIEW_NOTIFICATIONS_ID)
         );
         state.set_query("theme");
         assert_eq!(

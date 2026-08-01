@@ -33,6 +33,7 @@ enum Message {
     TabSelected(i64),
     NewTab,
     ToggleSidebar,
+    OpenNotifications,
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
@@ -107,7 +108,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::AgentSelected(_)
         | Message::TabSelected(_)
         | Message::NewTab
-        | Message::ToggleSidebar) => message.apply(app),
+        | Message::ToggleSidebar
+        | Message::OpenNotifications) => message.apply(app),
     }
 }
 

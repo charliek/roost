@@ -47,9 +47,7 @@ use crate::focus::safe_grab_focus;
 use crate::keybind::{
     canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
 };
-use crate::notification_inbox::{
-    compose_title, relative_time, NotificationInbox, NotificationRecord,
-};
+use crate::notification_inbox::{self, compose_title, NotificationInbox, NotificationRecord};
 use crate::palette::{command_items, PaletteCommands, PaletteFrame, PaletteItem};
 use crate::palette_ui::{
     PaletteBehavior, PaletteOutcome, PaletteOverlay, PaletteSnapshot, TOP_GAP,
@@ -4693,53 +4691,21 @@ impl App {
     /// `PaletteCommands::SPECS`) so "View Notifications" can show the
     /// live pending count.
     fn notification_command_items(self: &Rc<Self>) -> Vec<PaletteItem> {
-        let count = self.notification_inbox.borrow().count();
-        let view_title = if count > 0 {
-            format!("View Notifications ({count})")
-        } else {
-            "View Notifications".to_string()
-        };
-        vec![
-            PaletteItem::new(PaletteCommands::VIEW_NOTIFICATIONS_ID, view_title),
-            PaletteItem::new(
-                PaletteCommands::CLEAR_NOTIFICATIONS_ID,
-                "Clear All Notifications",
-            ),
-        ]
+        notification_inbox::command_items(self.notification_inbox.borrow().count())
     }
 
     /// Build the notifications sub-frame from the live inbox snapshot.
     /// Each row encodes its tab id as `notif:<id>` (parsed on confirm to
     /// jump). An empty inbox shows a single non-actionable row.
     fn notifications_frame(self: &Rc<Self>) -> PaletteFrame {
-        let inbox = self.notification_inbox.borrow();
-        let items: Vec<PaletteItem> = if inbox.is_empty() {
-            vec![PaletteItem::new("notif:none", "No notifications")]
-        } else {
-            inbox
-                .snapshot()
-                .iter()
-                .map(|r| {
-                    let trailing = relative_time(r.at.elapsed().as_secs());
-                    let subtitle = if r.body.is_empty() {
-                        None
-                    } else {
-                        Some(r.body.clone())
-                    };
-                    PaletteItem::new(format!("notif:{}", r.tab_id), r.title.clone())
-                        .with_subtitle(subtitle)
-                        .with_trailing(Some(trailing))
-                })
-                .collect()
-        };
-        PaletteFrame::new("notifications", "Jump to a notification…", items)
+        notification_inbox::frame(&self.notification_inbox.borrow())
     }
 
     /// Confirm on a notification row → focus that project + tab (which
     /// clears the tab's notification → drops the row). The "No
     /// notifications" sentinel is a no-op.
     fn notifications_behavior(self: &Rc<Self>) -> PaletteBehavior {
-        self.jump_to_tab_behavior(notif_tab_id)
+        self.jump_to_tab_behavior(notification_inbox::tab_id)
     }
 
     /// "Clear All Notifications": clear each pending tab's notification
@@ -6089,15 +6055,7 @@ impl App {
     /// `focus_tab_by_id`), so repeating the action walks the inbox.
     fn jump_to_unread(self: &Rc<Self>) {
         let active_pid = *self.active_project_id.borrow();
-        let target = {
-            let inbox = self.notification_inbox.borrow();
-            let pending = inbox.snapshot();
-            pending
-                .iter()
-                .find(|r| r.project_id == active_pid)
-                .or_else(|| pending.first())
-                .map(|r| r.tab_id)
-        };
+        let target = notification_inbox::next_unread(&self.notification_inbox.borrow(), active_pid);
         if let Some(tab_id) = target {
             self.reveal_and_focus_tab(tab_id);
         }
@@ -6480,13 +6438,6 @@ fn activation_target(
     }
 }
 
-/// Parse a notification row's item id (`notif:<tab_id>`) into the tab
-/// id. Returns `None` for the `notif:none` sentinel and any malformed
-/// id, so the confirm handler treats those as no-ops.
-fn notif_tab_id(item_id: &str) -> Option<i64> {
-    item_id.strip_prefix("notif:").and_then(|s| s.parse().ok())
-}
-
 /// Tilde-abbreviated cwd of `ui`'s currently selected tab (or the
 /// first tab if no selection exists yet). Empty string when the
 /// project has no attached tabs — caller uses that as the "subtitle
@@ -6810,7 +6761,7 @@ fn agent_rows_visible(toggle_on: bool, dragging: bool) -> bool {
 mod tests {
     use super::{
         activation_target, agent_rows_visible, compute_insert_idx, drain_server_driven_marker,
-        format_font_size, is_already_attached_or_pending, notif_tab_id, pick_next_active_project,
+        format_font_size, is_already_attached_or_pending, pick_next_active_project,
         resolve_launch_cwd, restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home,
         ActivationTarget, RestoreTab,
     };
@@ -6894,19 +6845,6 @@ mod tests {
     fn reveal_scroll_clamps_when_content_shorter_than_page() {
         // content (upper 60) narrower than the viewport (100) → never overscroll.
         assert_eq!(reveal_scroll_value(0.0, 0.0, 60.0, 100.0, 10.0, 50.0), 0.0);
-    }
-
-    /// The notification-row id parser: `notif:<tab>` → the tab id; the
-    /// `notif:none` empty sentinel + malformed ids → `None` (so confirm
-    /// treats them as no-ops rather than jumping to a bogus tab).
-    #[test]
-    fn notif_tab_id_parses_only_well_formed_ids() {
-        assert_eq!(notif_tab_id("notif:42"), Some(42));
-        assert_eq!(notif_tab_id("notif:-3"), Some(-3));
-        assert_eq!(notif_tab_id("notif:none"), None);
-        assert_eq!(notif_tab_id("notif:"), None);
-        assert_eq!(notif_tab_id("new_tab"), None);
-        assert_eq!(notif_tab_id("notif:1.5"), None);
     }
 
     /// `restore_open_specs` encodes the seed-one-when-empty rule: a
