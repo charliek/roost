@@ -1667,6 +1667,39 @@ passed under shed wgpu while reproducing CI's harmless startup
 green, and the complete shed gate passed GTK Wayland drag/reorder, Iced X11,
 and Iced Wayland real-input coverage.
 
+### Marker-free X11 rollup fixture commit plan
+
+Scope: remove the remaining renderer-dependent timing race from the synthetic
+agent fixture without changing product behavior or the stripe locator. The
+published locator commit proved the physical-click path under shed wgpu and
+tiny-skia and made Ubuntu/wgpu green, but Ubuntu/tiny-skia captured the edge
+project after its interactive shell emitted a delayed prompt integration mark.
+That mark correctly releases stale agent ownership, so the project row remained
+while its waiting stripe disappeared. Launch the fixture tab with a plain
+`/bin/cat` PTY instead: it remains a real supervised PTY but cannot emit shell
+integration marks that compete with the explicit `tab.agent_report` claim.
+
+Invariants: the waiting lifecycle must still come from the authoritative shared
+engine via `tab.agent_report`; the rendered stripe must still be located from
+two consecutive product screenshots; project selection must still occur only
+through the measured physical XTEST click; no retry or IPC selection may mask a
+missing stripe; the fixture must remain isolated and deleted before later input
+scenarios; and GTK, Iced product code, IPC contracts, and renderer settings stay
+unchanged.
+
+Tests and acceptance: review this follow-up plan; rerun the complete Iced X11
+real-input script in the shed under tiny-skia and wgpu; rerun Python syntax/unit
+checks, the repository commit gate, and the complete shed gate; review the full
+diff; push a focused test-fixture commit; and require both Ubuntu renderer lanes
+plus every existing branch job to finish green.
+
+Validation result: the marker-free fixture passed the complete X11 real-input
+script under shed tiny-skia and wgpu, including the physical rollup-stripe
+selection. `make check` passed warnings-denied Rust lint, workspace tests, 688
+Swift tests, and 32 harness-unit tests. The complete shed gate rebuilt isolated
+artifacts and passed GTK Wayland drag/reorder, Iced X11 real input, and Iced
+real-seat Wayland clipboard/input coverage.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

@@ -738,7 +738,12 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
     home_tab = int(identity["active_tab_id"])
 
     edge_project = launch.client.create_project("LEADING-EDGE", "/tmp")
-    edge_tab = launch.client.open_tab(edge_project, "/tmp", "leading-edge")
+    edge_tab = launch.client.open_tab(
+        edge_project,
+        "/tmp",
+        "leading-edge",
+        argv=["/bin/cat"],
+    )
     _wait_until(
         lambda: launch.client.identify()["active_project_id"] == edge_project,
         "edge project to become the rendered active row",
