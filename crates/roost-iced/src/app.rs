@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
@@ -14,12 +14,13 @@ use roost_engine::ipc::{
 };
 use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
 use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
+use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
 use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceEvent};
 use roost_ipc::messages::{
-    PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
-    SidebarDumpResult,
+    PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
+    SidebarDumpProject, SidebarDumpResult,
 };
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
@@ -27,7 +28,7 @@ use roost_ui_model::theme::Theme;
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
-    custom_command, notification_inbox, palette,
+    custom_command, notification_inbox, palette, provider,
 };
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
@@ -55,7 +56,7 @@ fn sidebar_width(collapsed: bool) -> f32 {
     }
 }
 
-fn command_palette_frame(notification_count: usize) -> palette::PaletteFrame {
+fn command_palette_frame(notification_count: usize, has_providers: bool) -> palette::PaletteFrame {
     let mut items = palette::command_items(|_| None);
     let index = items
         .iter()
@@ -67,7 +68,21 @@ fn command_palette_frame(notification_count: usize) -> palette::PaletteFrame {
     )];
     dynamic.extend(notification_inbox::command_items(notification_count));
     items.splice(index..index, dynamic);
+    if has_providers {
+        items.push(palette::PaletteItem::new(
+            "custom_commands",
+            "Custom Commands…",
+        ));
+    }
     palette::PaletteFrame::new("commands", "Execute a command…", items)
+}
+
+fn provider_palette_frame(providers: &[provider::Provider]) -> palette::PaletteFrame {
+    palette::PaletteFrame::new(
+        "custom",
+        "Custom commands…",
+        provider::provider_items(providers),
+    )
 }
 
 fn launcher_palette_frame(config: &RoostConfig) -> palette::PaletteFrame {
@@ -110,6 +125,14 @@ struct AgentMetricsResult {
     session: u64,
     claimed: Vec<String>,
     outcomes: Result<Vec<git_metrics::ProbeOutcome>, String>,
+}
+
+struct ProviderRunResult {
+    palette_session: u64,
+    request: u64,
+    provider: provider::Provider,
+    phase: provider::Phase,
+    outcome: Result<provider::ProviderOutput, String>,
 }
 
 struct TerminalTab {
@@ -546,6 +569,12 @@ pub struct App {
     metrics_cache: git_metrics::MetricsCache,
     metrics_tx: tokio::sync::mpsc::UnboundedSender<AgentMetricsResult>,
     metrics_rx: tokio::sync::mpsc::UnboundedReceiver<AgentMetricsResult>,
+    provider_request: u64,
+    provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderRunResult>,
+    provider_rx: tokio::sync::mpsc::UnboundedReceiver<ProviderRunResult>,
+    provider_frames: HashMap<String, provider::Provider>,
+    palette_present_reply:
+        Option<tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>>,
     system_clipboard: Option<String>,
     selection_clipboard: Option<String>,
     // Field order is intentional: terminal sessions and IPC receivers are
@@ -579,6 +608,7 @@ impl App {
 
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
         let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -623,6 +653,11 @@ impl App {
             metrics_cache: git_metrics::MetricsCache::default(),
             metrics_tx,
             metrics_rx,
+            provider_request: 0,
+            provider_tx,
+            provider_rx,
+            provider_frames: HashMap::new(),
+            palette_present_reply: None,
             system_clipboard: None,
             selection_clipboard: None,
             runtime,
@@ -652,6 +687,7 @@ impl App {
     pub fn tick(&mut self) -> UiTask {
         let task = self.service_ui_requests();
         self.service_agent_metrics();
+        self.service_provider_results();
         self.service_workspace_events();
         self.reconcile();
         let mut exited = Vec::new();
@@ -730,6 +766,22 @@ impl App {
                 && character.is_some_and(|value| value.eq_ignore_ascii_case("t"))
             {
                 let _ = self.open_palette("launcher");
+                return self.take_palette_focus_task();
+            }
+            if self.palette.is_none()
+                && palette_modifier
+                && modifiers.shift()
+                && character.is_some_and(|value| value.eq_ignore_ascii_case("e"))
+            {
+                let _ = self.open_palette("custom");
+                return self.take_palette_focus_task();
+            }
+            if self.palette.is_none()
+                && palette_modifier
+                && modifiers.shift()
+                && character.is_some_and(|value| value.eq_ignore_ascii_case("o"))
+            {
+                let _ = self.open_palette("agents");
                 return self.take_palette_focus_task();
             }
             if self.palette.is_some() {
@@ -1051,15 +1103,16 @@ impl App {
 
     fn open_palette(&mut self, kind: &str) -> Result<(), String> {
         let frame = match kind {
-            "" | "commands" => command_palette_frame(self.notification_inbox.count()),
+            "" | "commands" => command_palette_frame(
+                self.notification_inbox.count(),
+                !self.config.providers.is_empty(),
+            ),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => {
                 agent_palette::agent_frame(&self.workspace.snapshot(), agent_palette::now_unix())
             }
             "notifications" => notification_inbox::frame(&self.notification_inbox),
-            "custom" => {
-                return Err(format!("palette kind {kind:?} is not implemented by Iced"));
-            }
+            "custom" => provider_palette_frame(&self.config.providers),
             _ => return Err(format!("unknown palette kind {kind:?}")),
         };
         self.dismiss_palette();
@@ -1069,6 +1122,37 @@ impl App {
         self.palette_focus_requested = true;
         self.refresh_agent_palette();
         Ok(())
+    }
+
+    fn present_palette(
+        &mut self,
+        title: String,
+        placeholder: String,
+        items: Vec<(String, String, Option<String>)>,
+        reply: tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>,
+    ) {
+        self.dismiss_palette();
+        self.palette_session = self.palette_session.wrapping_add(1).max(1);
+        let placeholder = if !placeholder.is_empty() {
+            placeholder
+        } else if !title.is_empty() {
+            title
+        } else {
+            "Select…".to_string()
+        };
+        let items = items
+            .into_iter()
+            .map(|(id, title, subtitle)| {
+                palette::PaletteItem::new(id, title).with_subtitle(subtitle)
+            })
+            .collect();
+        self.palette = Some(palette::PaletteState::new(palette::PaletteFrame::new(
+            "present",
+            placeholder,
+            items,
+        )));
+        self.palette_present_reply = Some(reply);
+        self.palette_focus_requested = true;
     }
 
     fn take_palette_focus_task(&mut self) -> UiTask {
@@ -1240,6 +1324,11 @@ impl App {
                     self.palette = None;
                     self.palette_theme_at_open = None;
                 }
+                "custom_commands" => {
+                    if let Some(state) = &mut self.palette {
+                        state.push(provider_palette_frame(&self.config.providers));
+                    }
+                }
                 command => {
                     return Err(format!(
                         "palette command {command:?} is not implemented by Iced"
@@ -1291,6 +1380,34 @@ impl App {
                 self.focus_tab_and_clear(tab_id, true)?;
                 self.palette = None;
                 self.palette_theme_at_open = None;
+            }
+            "custom" => {
+                let index = provider::provider_index(&item.id)
+                    .filter(|index| *index < self.config.providers.len())
+                    .ok_or_else(|| format!("provider row {:?} cannot be activated", item.id))?;
+                self.spawn_provider(
+                    self.config.providers[index].clone(),
+                    provider::Phase::List,
+                    None,
+                );
+            }
+            "present" => {
+                if let Some(reply) = self.palette_present_reply.take() {
+                    let _ = reply.send(Ok(PalettePresentResult {
+                        selected_id: Some(item.id),
+                        dismissed: false,
+                    }));
+                }
+                self.palette = None;
+                self.palette_theme_at_open = None;
+            }
+            frame if frame.starts_with("provider:items:") => {
+                let provider = self
+                    .provider_frames
+                    .get(frame)
+                    .cloned()
+                    .ok_or_else(|| format!("provider frame {frame:?} is stale"))?;
+                self.spawn_provider(provider, provider::Phase::Activate, Some(item.id));
             }
             frame => {
                 return Err(format!(
@@ -1351,6 +1468,14 @@ impl App {
         self.restore_palette_theme();
         self.palette = None;
         self.palette_theme_at_open = None;
+        self.provider_request = self.provider_request.wrapping_add(1);
+        self.provider_frames.clear();
+        if let Some(reply) = self.palette_present_reply.take() {
+            let _ = reply.send(Ok(PalettePresentResult {
+                selected_id: None,
+                dismissed: true,
+            }));
+        }
     }
 
     fn restore_palette_theme(&mut self) {
@@ -1739,6 +1864,138 @@ impl App {
         }
     }
 
+    fn spawn_provider(
+        &mut self,
+        provider: provider::Provider,
+        phase: provider::Phase,
+        selected_id: Option<String>,
+    ) {
+        self.provider_request = self.provider_request.wrapping_add(1).max(1);
+        let request = self.provider_request;
+        let palette_session = self.palette_session;
+        let context = self.provider_context(selected_id);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let argv =
+            provider::invocation_argv(&shell, &provider.run, provider.shell_interpret, phase);
+        let env = provider::invocation_env(phase, &context);
+        let has_roostctl = env.iter().any(|(key, _)| key == "ROOST_ROOSTCTL");
+        let process_request = ProcessRequest {
+            argv,
+            env,
+            env_remove: (!has_roostctl)
+                .then(|| "ROOST_ROOSTCTL".to_string())
+                .into_iter()
+                .collect(),
+            stdin: provider::invocation_stdin(phase, &context).into_bytes(),
+            cwd: (!context.active_cwd.is_empty()).then(|| context.active_cwd.into()),
+            timeout: Duration::from_secs(provider.timeout_secs),
+        };
+        let tx = self.provider_tx.clone();
+        let result_provider = provider;
+        let task = self.runtime.spawn(async move {
+            let stdout = process::run(process_request)
+                .await
+                .map_err(|error| error.to_string())?
+                .stdout;
+            match phase {
+                provider::Phase::List => provider::parse_provider_output(&stdout),
+                provider::Phase::Activate => provider::parse_activate_output(&stdout),
+            }
+        });
+        self.runtime.spawn(async move {
+            let outcome = task
+                .await
+                .map_err(|error| format!("provider task failed: {error}"))
+                .and_then(|outcome| outcome);
+            let _ = tx.send(ProviderRunResult {
+                palette_session,
+                request,
+                provider: result_provider,
+                phase,
+                outcome,
+            });
+        });
+    }
+
+    fn provider_context(&self, selected_id: Option<String>) -> provider::ProviderContext {
+        let (project_id, tab_id) = self.workspace.active();
+        let active_title = self
+            .workspace
+            .snapshot()
+            .into_iter()
+            .flat_map(|project| project.tabs)
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.title)
+            .unwrap_or_default();
+        provider::ProviderContext {
+            socket: self.client.socket_path.to_string_lossy().into_owned(),
+            query: self
+                .palette
+                .as_ref()
+                .map(|state| state.current().query.clone())
+                .unwrap_or_default(),
+            selected_id,
+            active_tab_id: (tab_id != 0).then_some(tab_id),
+            active_project_id: (project_id != 0).then_some(project_id),
+            active_cwd: if project_id != 0 {
+                self.launch_cwd(project_id)
+            } else {
+                String::new()
+            },
+            active_title,
+            roostctl: process::sibling_executable("roostctl"),
+        }
+    }
+
+    fn service_provider_results(&mut self) {
+        while let Ok(result) = self.provider_rx.try_recv() {
+            if self.palette.is_none()
+                || result.palette_session != self.palette_session
+                || result.request != self.provider_request
+            {
+                continue;
+            }
+            match result.outcome {
+                Ok(output)
+                    if result.phase == provider::Phase::Activate && output.items.is_empty() =>
+                {
+                    self.dismiss_palette();
+                }
+                Ok(output) => {
+                    let placeholder = if output.placeholder.is_empty() {
+                        format!("{}…", result.provider.title)
+                    } else {
+                        output.placeholder.clone()
+                    };
+                    let items = provider::output_palette_items(&output, result.provider.limit);
+                    let frame_id = format!("provider:items:{}", result.request);
+                    self.provider_frames
+                        .insert(frame_id.clone(), result.provider);
+                    if let Some(state) = &mut self.palette {
+                        state.push(palette::PaletteFrame::new(frame_id, placeholder, items));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "provider run failed");
+                    let frame_id = format!("provider:items:{}", result.request);
+                    let items =
+                        vec![
+                            palette::PaletteItem::new("provider:_error", "Provider failed")
+                                .with_subtitle(Some(error))
+                                .with_actionable(false),
+                        ];
+                    if let Some(state) = &mut self.palette {
+                        state.push(palette::PaletteFrame::new(
+                            frame_id,
+                            "Provider error",
+                            items,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn service_ui_requests(&mut self) -> UiTask {
         let mut task = UiTask::None;
         while let Ok(request) = self.ui_rx.try_recv() {
@@ -1892,8 +2149,14 @@ impl App {
                     self.dismiss_palette();
                     let _ = reply.send(Ok(self.palette_state_result()));
                 }
-                UiRequest::PalettePresent { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::PalettePresent {
+                    title,
+                    placeholder,
+                    items,
+                    reply,
+                } => {
+                    self.present_palette(title, placeholder, items, reply);
+                    task = self.take_palette_focus_task();
                 }
                 UiRequest::SelectionSet {
                     tab_id,
@@ -2203,7 +2466,7 @@ mod tests {
 
     #[test]
     fn command_palette_uses_shared_ids_and_ranking() {
-        let mut state = palette::PaletteState::new(command_palette_frame(2));
+        let mut state = palette::PaletteState::new(command_palette_frame(2, true));
         let ids: Vec<String> = state
             .matches()
             .into_iter()
@@ -2222,6 +2485,7 @@ mod tests {
             ids.get(font + 2).map(String::as_str),
             Some(palette::PaletteCommands::VIEW_NOTIFICATIONS_ID)
         );
+        assert!(ids.iter().any(|id| id == "custom_commands"));
         state.set_query("theme");
         assert_eq!(
             state.selected_item().map(|item| item.id),
@@ -2245,5 +2509,14 @@ mod tests {
         let item = state.selected_item().expect("configured launcher row");
         assert_eq!(item.id, "launch:0");
         assert_eq!(custom_command::launch_index(&item.id), Some(0));
+    }
+
+    #[test]
+    fn provider_frame_uses_shared_provider_ids() {
+        let config = RoostConfig::parse(r#"provider = label="Fixture" run="fixture.sh""#);
+        let state = palette::PaletteState::new(provider_palette_frame(&config.providers));
+        let item = state.selected_item().expect("provider row");
+        assert_eq!(item.id, "provider:0");
+        assert_eq!(provider::provider_index(&item.id), Some(0));
     }
 }

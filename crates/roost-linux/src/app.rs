@@ -4534,24 +4534,10 @@ impl App {
             .as_ref()
             .map(|o| o.driver().snapshot().query)
             .unwrap_or_default();
-        // Roost's own roostctl, resolved as a sibling of the running
-        // binary (`/usr/bin/roost` → `/usr/bin/roostctl` from the .deb;
-        // `target/debug/roost` → `…/roostctl` in dev). Canonicalize first
-        // so a symlinked launch resolves to the real install dir, and
-        // require the executable bit (mirrors provider discovery in
-        // config.rs, and matches the Mac `isExecutableFile` check). Lets a
-        // provider shell out without roostctl on PATH.
-        let roostctl = std::env::current_exe()
-            .ok()
-            .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
-            .and_then(|exe| exe.parent().map(|d| d.join("roostctl")))
-            .filter(|p| {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(p)
-                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false)
-            })
-            .map(|p| p.to_string_lossy().into_owned());
+        // Roost's own roostctl, resolved as an executable sibling of the
+        // canonical running binary. The shared runtime helper keeps GTK and
+        // Iced provider environments byte-for-byte aligned.
+        let roostctl = roost_engine::process::sibling_executable("roostctl");
         provider::ProviderContext {
             socket,
             query,
@@ -4598,61 +4584,27 @@ impl App {
         ctx: provider::ProviderContext,
         timeout_secs: u64,
     ) -> Result<provider::ProviderOutput, String> {
-        use std::process::Stdio;
         use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
 
         let argv = provider::invocation_argv(&shell, &run, shell_interpret, phase);
         let env = provider::invocation_env(phase, &ctx);
         let stdin_json = provider::invocation_stdin(phase, &ctx);
-
         let has_roostctl = env.iter().any(|(k, _)| k == "ROOST_ROOSTCTL");
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        // If Roost couldn't resolve its own roostctl, strip any inherited
-        // ROOST_ROOSTCTL so the script's `${ROOST_ROOSTCTL:-roostctl}` PATH
-        // fallback actually fires (don't leak a stale parent value).
-        if !has_roostctl {
-            cmd.env_remove("ROOST_ROOSTCTL");
-        }
-        // Only set the cwd if it still exists — the active tab's dir may
-        // have been removed; don't let that fail the whole spawn (inherit
-        // Roost's cwd instead).
-        if !ctx.active_cwd.is_empty() && std::path::Path::new(&ctx.active_cwd).is_dir() {
-            cmd.current_dir(&ctx.active_cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(|e| format!("spawn provider: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(stdin_json.as_bytes()).await;
-            // stdin drops here → EOF for the child.
-        }
-        let output =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-            {
-                Err(_) => return Err(format!("provider timed out after {timeout_secs}s")),
-                Ok(Err(e)) => return Err(format!("provider io error: {e}")),
-                Ok(Ok(o)) => o,
-            };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail = stderr.lines().last().unwrap_or("").trim().to_string();
-            let code = output.status.code().unwrap_or(-1);
-            return Err(if tail.is_empty() {
-                format!("provider exited with status {code}")
-            } else {
-                format!("provider exited {code}: {tail}")
-            });
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let request = roost_engine::process::ProcessRequest {
+            argv,
+            env,
+            env_remove: (!has_roostctl)
+                .then(|| "ROOST_ROOSTCTL".to_string())
+                .into_iter()
+                .collect(),
+            stdin: stdin_json.into_bytes(),
+            cwd: (!ctx.active_cwd.is_empty()).then(|| ctx.active_cwd.into()),
+            timeout: Duration::from_secs(timeout_secs),
+        };
+        let stdout = roost_engine::process::run(request)
+            .await
+            .map_err(|error| error.to_string())?
+            .stdout;
         // Activate is a side-effect phase: ignore non-JSON stdout (e.g. the
         // tab id `roostctl tab open` prints) so it doesn't fail parsing.
         match phase {

@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod osc;
 pub mod persistence;
 pub mod pointer;
+pub mod process;
 pub mod pty;
 pub mod reconcile;
 pub mod session;

@@ -768,6 +768,43 @@ a platform-specific Iced notification port and are not needed to validate the
 shared state/event architecture; the visible inbox, markers, and triage actions
 remain fully usable.
 
+### Active mini-plan: shared provider runtime and deferred palettes
+
+Scope: extract provider subprocess execution from GTK into a generic bounded
+process service in `roost-engine`, migrate GTK to it, and implement Iced's
+provider list/activate drill-ins plus the blocking `palette.present` IPC port.
+Provider parsing, invocation DTO construction, output parsing, and palette-row
+projection remain in `roost-ui-model`.
+
+Invariants and interfaces:
+
+- `roost-engine::process` accepts owned argv/env/stdin/cwd/timeout data and
+  returns owned stdout or a typed error; it has no provider, palette, GTK, or
+  Iced dependency and always uses kill-on-drop for timeout/cancellation;
+- GTK and Iced build the same provider invocation through
+  `roost-ui-model::provider`, call the shared process service off their UI
+  loops, and parse the phase-specific output through the same model functions;
+- every Iced provider request carries the current palette session and a
+  monotonically increasing request generation. Dismiss/reopen, a newer run,
+  or shutdown makes late results inert;
+- provider frames preserve the model's actionable flag, row limit, error row,
+  placeholder, environment, stdin JSON, active-tab context, sibling
+  `roostctl`, and list-versus-activate semantics;
+- `palette.present` stores one owned reply sender in the Iced adapter. Pick,
+  dismiss, or replacement takes it exactly once, and no workspace/UI lock is
+  held while replying; and
+- the custom and agent default shortcuts open their existing frames without
+  leaking the keystroke into the PTY. Unsupported rename or screenshot ports
+  are unaffected.
+
+Acceptance: engine process tests cover stdout/stdin/env/cwd, nonzero exit,
+timeout, empty argv, and sibling executable resolution; GTK's provider and full
+functional suites remain green; all four `test_provider.py` cases pass against
+Iced on macOS, shed X11/wgpu, and shed Wayland/tiny-skia; the provider suite is
+added to the required Iced Make/Actions gate; full Iced has no functional
+failure other than the explicitly separate screenshot pixel port; Swift and
+dependency-boundary gates remain green.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.
