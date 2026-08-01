@@ -14,6 +14,7 @@
 #   * roost-ui-model — toolkit-neutral config, theme, palette, keybind,
 #                      provider, agent projection, and selection models.
 #   * roost-linux — gtk4-rs + libadwaita Linux UI adapter.
+#   * roost-iced — Iced POC UI adapter, isolated from GTK dependencies.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
 #
 # `roost-linux` is in `default-members`: the workspace builds the whole
@@ -38,6 +39,7 @@ members = [
     "crates/roost-ui-model",
     "crates/roost-cli",
     "crates/roost-linux",
+    "crates/roost-iced",
 ]
 
 [workspace.package]

@@ -16,7 +16,7 @@
 #
 # Usage:
 #   tools/shed/shed-test.sh                 # ensure box, build, run the drag guard
-#   tools/shed/shed-test.sh --build-only    # just build roost-linux in the shed
+#   tools/shed/shed-test.sh --build-only    # build GTK + Iced + roostctl in the shed
 #   tools/shed/shed-test.sh --shell         # ensure box + drop into a shell
 #   tools/shed/shed-test.sh --snapshot-base # cache the provisioned box as roost-base
 #   tools/shed/shed-test.sh --reprovision   # delete box + snapshot, rebuild from scratch
@@ -54,7 +54,7 @@ ensure_box() {
 }
 
 build() {
-  log "building roost-linux + roostctl in the shed (all artifacts shed-local; Mac target/ + ghostty untouched)"
+  log "building GTK + Iced + roostctl in the shed (all artifacts shed-local; Mac target/ + ghostty untouched)"
   in_shed "chmod +x ~/roost/tools/shed/build-in-shed.sh; ~/roost/tools/shed/build-in-shed.sh"
 }
 

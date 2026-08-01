@@ -46,11 +46,16 @@ types; they no longer own those state machines.
 cargo tree -p roost-engine -e normal
 cargo tree -p roost-ui-model -e normal
 cargo tree -p roost-linux -i roost-engine
+cargo tree -p roost-iced -i roost-engine
 ```
 
 Neither shared crate may gain GTK, libadwaita, Iced, AppKit, Cairo, Pango, or a
 renderer dependency. `roost-ui-model` uses the renderer-independent
 `roost_vt::ColorRgb`; enabling libghostty-vt FFI remains a UI-adapter choice.
+
+GTK and Iced both depend on `roost-engine`; neither shared crate depends back
+on either adapter, and `roost-iced` has no dependency on `roost-linux` or GTK's
+native stack.
 
 The proposed Swift ABI, ownership and threading rules, migration slices, and
 the reviewed decision to defer unsafe FFI during the walking skeleton are in

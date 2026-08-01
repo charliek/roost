@@ -2,6 +2,13 @@
 
 Status: POC proposal, not an accepted replacement architecture
 
+Implementation note: the shared-engine extraction, isolated third-target
+contract, and Iced walking skeleton are implemented on `poc/iced`. The walking
+skeleton has been exercised on macOS and in the Linux shed under X11 and
+Wayland with both wgpu and tiny-skia. Product-parity work remains governed by
+the acceptance matrices below; this note does not promote the POC to accepted
+replacement architecture.
+
 Branch: `poc/iced`
 
 Reviewed against: repository at `3ffa7fa`, Iced `0.14.0`

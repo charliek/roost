@@ -1,0 +1,43 @@
+[package]
+name        = "roost-iced"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Roost Iced proof-of-concept UI adapter over roost-engine"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "roost-iced"
+path = "src/main.rs"
+
+[dependencies]
+roost-engine = { path = "../roost-engine" }
+roost-ipc = { path = "../roost-ipc" }
+roost-ui-model = { path = "../roost-ui-model" }
+roost-vt = { path = "../roost-vt", features = ["ffi"] }
+
+# Released and exact-pinned for a reproducible long-lived POC. Both renderers
+# are compiled: wgpu is primary, tiny-skia is the software/headless fallback.
+iced = { version = "=0.14.0", default-features = false, features = [
+    "canvas",
+    "crisp",
+    "tiny-skia",
+    "tokio",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+
+anyhow = { workspace = true }
+serde_json = "1"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
