@@ -687,6 +687,45 @@ remain toolkit-clean. Sidebar agent rows, native notification presentation,
 notification/provider palettes, and sidebar collapse/reveal behavior are
 separate slices and do not gain shadow state here.
 
+### Active mini-plan: Iced sidebar state and agent rows
+
+Scope: make the Iced sidebar a live projection of the authoritative workspace,
+including per-project agent rows, active-row styling, collapse/reveal, the
+`show-sidebar-agents` toggle, and `app.sidebar_dump`. The existing engine
+`sidebar_collapsed` field remains the persisted owner; the existing shared
+config parser/writer remains the owner of the agent-row visibility preference.
+
+Invariants and interfaces:
+
+- project and tab membership, ordering, focus, lifecycle, and row text come
+  from `Workspace::snapshot` plus `roost-ui-model::agent_palette::sidebar_agents`;
+  Iced owns only widget composition and a last-rendered projection cache;
+- `app.sidebar_dump` combines fresh snapshot membership with the same
+  last-rendered rows the Iced view consumes, includes every project (including
+  one created before its first UI reconcile), and marks at most the one
+  engine-active tab;
+- `toggle_sidebar` calls `Workspace::set_sidebar_collapsed`, so persistence and
+  restoration stay engine-owned; collapsing changes terminal geometry and
+  `window.metrics` immediately without a second boolean cache;
+- `toggle_sidebar_agents` mutates the loaded `RoostConfig` value and writes it
+  through `roost-ui-model::config::set_key`; a failed write is visible in the
+  status area and leaves the deliberate live-session value intact;
+- project, tab, and agent buttons dispatch the existing workspace focus
+  operations; a successful cross-project agent jump reveals the sidebar, while
+  a vanished tab cannot alter collapse state; and
+- lifecycle colors use the shipped GTK/AppKit constants; no agent ranking,
+  state derivation, persistence, or event callback is duplicated in Iced.
+
+Acceptance: all `test_sidebar_agents.py` and
+`test_sidebar_collapse_persistence.py` cases pass against Iced; focused agent
+palette tests remain green; unit tests pin collapsed width and lifecycle color
+constants; GTK and Mac functional regressions stay green; macOS and shed
+X11/Wayland sidebar/agent gates pass; dependency boundaries remain unchanged.
+Pixel capture and geometry/color assertions remain explicitly assigned to the
+following screenshot/visual slice because `app.screenshot` is still an honest
+unsupported Iced UI port in this commit. Notifications and provider palettes
+also remain separate coherent slices.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

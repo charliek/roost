@@ -29,8 +29,10 @@ enum Message {
     Keyboard(keyboard::Event),
     TerminalPointer(terminal_canvas::TerminalPointer),
     ProjectSelected(i64),
+    AgentSelected(i64),
     TabSelected(i64),
     NewTab,
+    ToggleSidebar,
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
@@ -101,9 +103,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.palette_confirm();
             Task::none()
         }
-        message @ (Message::ProjectSelected(_) | Message::TabSelected(_) | Message::NewTab) => {
-            message.apply(app)
-        }
+        message @ (Message::ProjectSelected(_)
+        | Message::AgentSelected(_)
+        | Message::TabSelected(_)
+        | Message::NewTab
+        | Message::ToggleSidebar) => message.apply(app),
     }
 }
 

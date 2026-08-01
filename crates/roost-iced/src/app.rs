@@ -17,11 +17,18 @@ use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
 use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace};
-use roost_ipc::messages::{PaletteItemView, PaletteStateResult, Project};
+use roost_ipc::messages::{
+    PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
+    SidebarDumpResult,
+};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
-use roost_ui_model::{agent_palette, config::RoostConfig, custom_command, palette};
+use roost_ui_model::{
+    agent_palette,
+    config::{self, RoostConfig},
+    custom_command, palette,
+};
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
     TerminalOptions, TerminalSelection,
@@ -39,6 +46,14 @@ const TAB_BAR_HEIGHT: f32 = 44.0;
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
 const UNSUPPORTED: &str = "not implemented by the Iced walking skeleton";
+
+fn sidebar_width(collapsed: bool) -> f32 {
+    if collapsed {
+        0.0
+    } else {
+        SIDEBAR_WIDTH
+    }
+}
 
 fn command_palette_frame() -> palette::PaletteFrame {
     let mut items = palette::command_items(|_| None);
@@ -508,6 +523,7 @@ pub struct App {
     client: LocalClient,
     tabs: HashMap<i64, TerminalTab>,
     projects: Vec<Project>,
+    sidebar_agents: HashMap<i64, Vec<SidebarDumpAgentRow>>,
     ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
@@ -581,6 +597,7 @@ impl App {
             client,
             tabs: HashMap::new(),
             projects: Vec::new(),
+            sidebar_agents: HashMap::new(),
             ui_rx,
             window_id: None,
             pending_window_resize: None,
@@ -665,7 +682,10 @@ impl App {
 
     pub fn resize(&mut self, size: Size) {
         self.window_size = size;
-        let width = (size.width - SIDEBAR_WIDTH - 2.0 * TERMINAL_PADDING).max(CELL_WIDTH * 2.0);
+        let width = (size.width
+            - sidebar_width(self.workspace.sidebar_collapsed())
+            - 2.0 * TERMINAL_PADDING)
+            .max(CELL_WIDTH * 2.0);
         let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
         let cols = ((width / CELL_WIDTH).floor() as u16).max(2);
         let rows = ((height / CELL_HEIGHT).floor() as u16).max(2);
@@ -773,15 +793,45 @@ impl App {
             } else {
                 format!("   {}", project.name)
             };
-            sidebar = sidebar.push(
-                button(text(label).size(14))
-                    .width(Fill)
-                    .on_press(Message::ProjectSelected(project.id)),
-            );
+            let mut project_group = column![button(text(label).size(14))
+                .width(Fill)
+                .on_press(Message::ProjectSelected(project.id))]
+            .spacing(2);
+            if self.config.show_sidebar_agents {
+                for agent in self.sidebar_agents.get(&project.id).into_iter().flatten() {
+                    let name = if agent.is_active {
+                        format!("{}  ←", agent.name)
+                    } else {
+                        agent.name.clone()
+                    };
+                    let detail = format!("{}  ·  {}", agent.status_text, agent.time_text);
+                    let row = row![
+                        text("●").size(12).color(agent_color(agent.lifecycle)),
+                        column![
+                            text(name).size(12),
+                            text(detail).size(10).color(Color::from_rgb8(160, 164, 176))
+                        ]
+                        .spacing(1)
+                    ]
+                    .spacing(7);
+                    project_group = project_group.push(
+                        button(row)
+                            .width(Fill)
+                            .padding([5, 8])
+                            .on_press(Message::AgentSelected(agent.tab_id)),
+                    );
+                }
+            }
+            sidebar = sidebar.push(project_group);
         }
         if let Some(status) = &self.status {
             sidebar = sidebar.push(text(status).size(11).color(Color::from_rgb8(238, 120, 120)));
         }
+        sidebar = sidebar.push(
+            button(text("Hide Sidebar").size(11))
+                .width(Fill)
+                .on_press(Message::ToggleSidebar),
+        );
         let sidebar = container(sidebar)
             .width(SIDEBAR_WIDTH)
             .height(Fill)
@@ -793,7 +843,11 @@ impl App {
             .find(|project| project.id == active_project)
             .map(|project| project.tabs.as_slice())
             .unwrap_or(&[]);
+        let collapsed = self.workspace.sidebar_collapsed();
         let mut tabs = row![].spacing(6).padding([7, 10]);
+        if collapsed {
+            tabs = tabs.push(button(text("☰")).on_press(Message::ToggleSidebar));
+        }
         for tab in active_project_tabs {
             let title = if tab.title.is_empty() {
                 "shell"
@@ -827,11 +881,12 @@ impl App {
                 .height(Fill)
                 .into(),
         };
-        let content: Element<'_, Message> =
-            row![sidebar, column![tab_bar, terminal].width(Fill).height(Fill)]
-                .width(Fill)
-                .height(Fill)
-                .into();
+        let main = column![tab_bar, terminal].width(Fill).height(Fill);
+        let content: Element<'_, Message> = if collapsed {
+            main.width(Fill).height(Fill).into()
+        } else {
+            row![sidebar, main].width(Fill).height(Fill).into()
+        };
         let Some(palette) = &self.palette else {
             return content;
         };
@@ -899,6 +954,35 @@ impl App {
 
     pub fn select_tab(&mut self, tab_id: i64) {
         let _ = self.workspace.focus_tab(tab_id);
+    }
+
+    pub fn select_agent(&mut self, tab_id: i64) {
+        if self.workspace.focus_tab(tab_id).is_ok() {
+            self.set_sidebar_collapsed(false);
+        }
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.set_sidebar_collapsed(!self.workspace.sidebar_collapsed());
+    }
+
+    fn set_sidebar_collapsed(&mut self, collapsed: bool) {
+        self.workspace.set_sidebar_collapsed(collapsed);
+        self.resize(self.window_size);
+    }
+
+    fn toggle_sidebar_agents(&mut self) {
+        self.config.show_sidebar_agents = !self.config.show_sidebar_agents;
+        let value = if self.config.show_sidebar_agents {
+            "true"
+        } else {
+            "false"
+        };
+        if let Some(path) = config::config_path() {
+            if let Err(error) = config::set_key(&path, "show-sidebar-agents", value) {
+                self.status = Some(format!("persist show-sidebar-agents: {error}"));
+            }
+        }
     }
 
     pub fn new_tab(&mut self) {
@@ -1085,6 +1169,16 @@ impl App {
                     self.palette = None;
                     self.palette_theme_at_open = None;
                 }
+                "toggle_sidebar" => {
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.toggle_sidebar();
+                }
+                "toggle_sidebar_agents" => {
+                    self.palette = None;
+                    self.palette_theme_at_open = None;
+                    self.toggle_sidebar_agents();
+                }
                 command => {
                     return Err(format!(
                         "palette command {command:?} is not implemented by Iced"
@@ -1129,6 +1223,7 @@ impl App {
                 self.workspace
                     .focus_tab(tab_id)
                     .map_err(|error| error.to_string())?;
+                self.set_sidebar_collapsed(false);
                 self.palette = None;
                 self.palette_theme_at_open = None;
             }
@@ -1242,6 +1337,7 @@ impl App {
         // Full authoritative snapshot on every UI tick is the recovery path
         // for a slow consumer: deltas are an optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         let live_ids: HashSet<i64> = self
             .projects
@@ -1265,8 +1361,10 @@ impl App {
             match attached {
                 Ok(mut tab) => {
                     let size = self.window_size;
-                    let width =
-                        (size.width - SIDEBAR_WIDTH - 2.0 * TERMINAL_PADDING).max(CELL_WIDTH * 2.0);
+                    let width = (size.width
+                        - sidebar_width(self.workspace.sidebar_collapsed())
+                        - 2.0 * TERMINAL_PADDING)
+                        .max(CELL_WIDTH * 2.0);
                     let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING)
                         .max(CELL_HEIGHT * 2.0);
                     tab.resize(
@@ -1277,6 +1375,49 @@ impl App {
                 }
                 Err(error) => tracing::debug!(tab_id, ?error, "PTY not ready for UI attach"),
             }
+        }
+    }
+
+    fn refresh_sidebar_agents(&mut self) {
+        let active_tab = self.workspace.active().1;
+        let now = agent_palette::now_unix();
+        self.sidebar_agents = self
+            .projects
+            .iter()
+            .map(|project| {
+                let rows = agent_palette::sidebar_agents(project, now)
+                    .into_iter()
+                    .map(|row| SidebarDumpAgentRow {
+                        tab_id: row.tab_id,
+                        name: row.name,
+                        lifecycle: row.lifecycle,
+                        status_text: row.status_text,
+                        time_text: row.time_text,
+                        is_active: row.tab_id == active_tab,
+                    })
+                    .collect();
+                (project.id, rows)
+            })
+            .collect();
+    }
+
+    fn sidebar_dump(&self) -> SidebarDumpResult {
+        let projects = self
+            .workspace
+            .snapshot()
+            .into_iter()
+            .map(|project| SidebarDumpProject {
+                project_id: project.id,
+                agents: self
+                    .sidebar_agents
+                    .get(&project.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        SidebarDumpResult {
+            agents_visible: self.config.show_sidebar_agents,
+            projects,
         }
     }
 
@@ -1453,11 +1594,12 @@ impl App {
                     let _ = reply.send(result);
                 }
                 UiRequest::WindowMetrics { reply } => {
+                    let collapsed = self.workspace.sidebar_collapsed();
                     let _ = reply.send(Ok((
                         f64::from(self.window_size.width),
                         f64::from(self.window_size.height),
-                        f64::from(SIDEBAR_WIDTH),
-                        false,
+                        f64::from(sidebar_width(collapsed)),
+                        collapsed,
                     )));
                 }
                 UiRequest::WindowResize {
@@ -1617,7 +1759,7 @@ impl App {
                     let _ = reply.send(result);
                 }
                 UiRequest::SidebarDump { reply } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                    let _ = reply.send(Ok(self.sidebar_dump()));
                 }
                 UiRequest::TabDispatchMouseEvent {
                     tab_id,
@@ -1685,11 +1827,11 @@ fn canonical_pointer_shape(name: &str) -> &str {
 fn agent_color(lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
     use roost_ipc::agent::AgentLifecycle;
     match lifecycle {
-        AgentLifecycle::Working => Color::from_rgb8(86, 182, 194),
-        AgentLifecycle::Waiting => Color::from_rgb8(238, 193, 95),
-        AgentLifecycle::Finished => Color::from_rgb8(126, 200, 126),
-        AgentLifecycle::Failed => Color::from_rgb8(238, 120, 120),
-        AgentLifecycle::Inactive => Color::from_rgb8(160, 164, 176),
+        AgentLifecycle::Working => Color::from_rgb8(0x5f, 0xa3, 0xf0),
+        AgentLifecycle::Waiting => Color::from_rgb8(0xf0, 0xa0, 0x40),
+        AgentLifecycle::Finished => Color::from_rgb8(0x7a, 0x7a, 0x7a),
+        AgentLifecycle::Failed => Color::from_rgb8(0xe0, 0x52, 0x52),
+        AgentLifecycle::Inactive => Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
     }
 }
 
@@ -1792,8 +1934,10 @@ impl Message {
     pub(crate) fn apply(self, app: &mut App) -> Task<Message> {
         match self {
             Self::ProjectSelected(project_id) => app.select_project(project_id),
+            Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::NewTab => app.new_tab(),
+            Self::ToggleSidebar => app.toggle_sidebar(),
             _ => {}
         }
         Task::none()
@@ -1811,6 +1955,33 @@ mod tests {
         let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
         assert_eq!(((width / CELL_WIDTH).floor() as u16).max(2), 2);
         assert_eq!(((height / CELL_HEIGHT).floor() as u16).max(2), 2);
+    }
+
+    #[test]
+    fn collapsed_sidebar_has_no_layout_width() {
+        assert_eq!(sidebar_width(false), SIDEBAR_WIDTH);
+        assert_eq!(sidebar_width(true), 0.0);
+    }
+
+    #[test]
+    fn agent_colors_match_the_shipped_gtk_and_appkit_palette() {
+        use roost_ipc::agent::AgentLifecycle;
+        assert_eq!(
+            agent_color(AgentLifecycle::Working),
+            Color::from_rgb8(0x5f, 0xa3, 0xf0)
+        );
+        assert_eq!(
+            agent_color(AgentLifecycle::Waiting),
+            Color::from_rgb8(0xf0, 0xa0, 0x40)
+        );
+        assert_eq!(
+            agent_color(AgentLifecycle::Finished),
+            Color::from_rgb8(0x7a, 0x7a, 0x7a)
+        );
+        assert_eq!(
+            agent_color(AgentLifecycle::Failed),
+            Color::from_rgb8(0xe0, 0x52, 0x52)
+        );
     }
 
     #[test]
