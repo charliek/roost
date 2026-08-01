@@ -44,7 +44,7 @@ enum CopyOnSelect: Sendable {
     /// spellings; any other value returns `nil` so the caller can
     /// fall back to the default and log.
     static func parse(_ s: String) -> CopyOnSelect? {
-        switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+        switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "off", "false", "no": return .off
         case "true", "yes": return .on
         case "clipboard", "both": return .clipboard
@@ -67,7 +67,7 @@ enum ClipboardWrite: Sendable {
     /// `deny | false | no` → `.deny`; any other value returns `nil`
     /// so the caller can fall back to the default and log.
     static func parse(_ s: String) -> ClipboardWrite? {
-        switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+        switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "allow", "true", "yes": return .allow
         case "deny", "false", "no": return .deny
         default: return nil
@@ -79,19 +79,29 @@ enum ClipboardWrite: Sendable {
 /// Mirrors `ClipboardWrite.parse` / `CopyOnSelect.parse`'s
 /// optional-returning shape so every boolean key in `parse(_:)` below
 /// shares one pattern.
-/// `\r` and quotes are stripped here rather than relying on `parse(_:)`:
-/// its line trim uses `.whitespaces`, which excludes `\r`, and the Rust
-/// mirror's loop strips quotes only for `font-family`. Doing it locally
-/// keeps at least this key identical across the pair.
 func parseBoolLike(_ s: String) -> Bool? {
-    switch s
-        .trimmingCharacters(in: CharacterSet(charactersIn: "\"' \t\r\n"))
-        .lowercased()
-    {
+    switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "true", "yes": return true
     case "false", "no": return false
     default: return nil
     }
+}
+
+/// Strip one matched quote pair. Mirrors `unquote` in
+/// `crates/roost-linux/src/config.rs`: no recursion (`""x""` → `"x"`),
+/// and no re-trim afterward, so `word-break-chars = " -"` keeps its
+/// leading space. Operates on unicode scalars, not `Character`s — a
+/// combining mark after the opening quote must not fuse with it into
+/// one grapheme (Rust compares scalars; the mirror must too).
+func unquote(_ s: String) -> String {
+    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    let scalars = t.unicodeScalars
+    // `dropFirst().last` is the len ≥ 2 check, mirroring Rust's
+    // `chars.next_back()` on the already-advanced iterator.
+    guard let first = scalars.first, let last = scalars.dropFirst().last,
+        first == last, first == "\"" || first == "'"
+    else { return t }
+    return String(String.UnicodeScalarView(scalars.dropFirst().dropLast()))
 }
 
 struct RoostConfig: Sendable {
@@ -272,7 +282,7 @@ struct RoostConfig: Sendable {
         let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
         if trimmed.isEmpty || trimmed.hasPrefix("#") { return false }
         guard let eq = trimmed.firstIndex(of: "=") else { return false }
-        let keyPart = trimmed[..<eq].trimmingCharacters(in: .whitespaces)
+        let keyPart = trimmed[..<eq].trimmingCharacters(in: .whitespacesAndNewlines)
         return keyPart == target
     }
 }
@@ -281,23 +291,22 @@ struct RoostConfig: Sendable {
 /// parse error is dropped and the affected key stays at its default.
 func parse(_ text: String) -> RoostConfig {
     var cfg = RoostConfig.empty
-    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
-        let line = raw.trimmingCharacters(in: .whitespaces)
+    // `components(separatedBy:)`, not `split(separator: "\n")`: Swift
+    // treats `\r\n` as a single Character, so `split` never sees the
+    // `\n` inside it and a CRLF file collapses to one giant line. The
+    // line trim then has to be `.whitespacesAndNewlines`, since
+    // `.whitespaces` leaves the `\r` behind.
+    for raw in text.components(separatedBy: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if line.isEmpty || line.hasPrefix("#") { continue }
         guard let eqIdx = line.firstIndex(of: "=") else { continue }
-        let key = line[..<eqIdx].trimmingCharacters(in: .whitespaces)
-        // Value with whitespace trimmed but quotes intact — the
-        // `command` parser does its own quote-aware tokenizing, and
-        // the unconditional quote-strip below would lop the closing
-        // quote off a value like `run="…"`.
+        let key = line[..<eqIdx].trimmingCharacters(in: .whitespacesAndNewlines)
+        // `rawValue` keeps quotes intact for the quote-aware
+        // `command` / `provider` tokenizers and for `keybind`, whose
+        // trigger is taken verbatim; every scalar key uses `value`.
         let rawValue = line[line.index(after: eqIdx)...]
-            .trimmingCharacters(in: .whitespaces)
-        let value =
-            rawValue
-            // Strip surrounding quotes so a user can write either
-            // `font-family = "JetBrains Mono"` or
-            // `font-family = JetBrains Mono` and both work.
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = unquote(rawValue)
         switch key {
         case "theme":
             cfg.themeName = value
@@ -352,14 +361,13 @@ func parse(_ text: String) -> RoostConfig {
             // from action. Lenient: drop malformed lines silently
             // (tolerates editor saves mid-edit).
             //
-            // Note: `value` was unconditionally quote-stripped
-            // above for `theme` / `font-family`; that's safe for
-            // keybinds too since Ghostty triggers don't include
-            // matching quote characters at the ends.
-            if let inner = value.firstIndex(of: "=") {
-                let t = value[..<inner].trimmingCharacters(in: .whitespaces)
-                let a = value[value.index(after: inner)...]
-                    .trimmingCharacters(in: .whitespaces)
+            // Parsed from the RAW value (quotes intact), matching the
+            // Rust mirror: a quoted trigger is preserved verbatim rather
+            // than silently unquoted into a different binding.
+            if let inner = rawValue.firstIndex(of: "=") {
+                let t = rawValue[..<inner].trimmingCharacters(in: .whitespacesAndNewlines)
+                let a = rawValue[rawValue.index(after: inner)...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !t.isEmpty && !a.isEmpty {
                     cfg.keybinds.append(Keybind(trigger: t, action: a))
                 }

@@ -65,13 +65,21 @@ def _skip_on_ci():
 
 
 def _toggle_to_collapsed(roost: Roost) -> None:
-    """Drive the palette to collapse the sidebar. No-op if already collapsed."""
+    """Drive the palette to collapse the sidebar, then wait for the
+    collapse to land — the toggle is applied on the GTK idle, so the
+    callers' immediate `window_metrics` reads race it otherwise (the
+    inverse of `_toggle_to_visible`'s settle wait)."""
     metrics = roost.window_metrics()
     if metrics["sidebar_collapsed"]:
         return
     roost.palette_open()
     roost.palette_query("toggle sidebar")
     roost.palette_activate("toggle_sidebar")
+    Roost._wait(
+        lambda: roost.window_metrics()["sidebar_collapsed"],
+        timeout=2.0,
+        what="sidebar to collapse",
+    )
 
 
 def _sidebar_visible_and_allocated(roost: Roost) -> bool:

@@ -21,8 +21,7 @@ struct ConfigShowSidebarAgentsTests {
         #expect(parse("show-sidebar-agents = no").showSidebarAgents == false)
     }
 
-    // Quoted and CRLF forms must agree with the Rust mirror, whose
-    // shared parse loop strips quotes only for `font-family`.
+    // Quoted and CRLF forms must agree with the Rust mirror.
     @Test func parsesQuotedAndCRLFValues() {
         #expect(parse("show-sidebar-agents = \"false\"").showSidebarAgents == false)
         #expect(parse("show-sidebar-agents = 'false'").showSidebarAgents == false)

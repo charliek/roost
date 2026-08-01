@@ -12,7 +12,7 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq \
   libgtk-4-dev libadwaita-1-dev pkg-config libclang-dev clang \
   weston cage seatd \
-  xvfb xdotool \
+  xvfb xdotool dbus-x11 \
   python3-pytest wl-clipboard zsh
 log "apt done"
 

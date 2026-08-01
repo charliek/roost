@@ -19,36 +19,14 @@ import time
 
 import pytest
 
-from client import RoostError, scaled_timeout
+from client import scaled_timeout
+from util import wait_tab_attached
 
 
 # Skip the whole file when the gating env var is absent. The handlers
 # return `not-enabled` in that case, which would make every assertion
 # fail in a useless way; a clear top-of-file skip explains why.
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
-
-
-def _wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
-    """Block until the UI has attached its TerminalView to `tab_id`.
-
-    `tab.open` returns as soon as the workspace creates the tab; the
-    UI's TabSession + TerminalView attach asynchronously on the main
-    loop. The test-mode ops that need the live `TerminalView`
-    (`tab.feed_pty_bytes`, `tab.dump_resolved`) return `not-found`
-    during the gap. `tab.dump` is the same shape and the same
-    attachment dependency, so polling it is the canonical wait.
-    """
-    deadline = time.monotonic() + scaled_timeout(timeout)
-    while True:
-        try:
-            roost.dump_text(tab_id)
-            return
-        except RoostError as e:
-            if e.code != "not-found":
-                raise
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"tab {tab_id} never attached a TerminalView")
-        time.sleep(0.05)
 
 
 @pytest.mark.skipif(
@@ -73,7 +51,7 @@ class TestTestOps:
         marker far down keeps the assertion stable across runners.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         marker = "roost-feed-smoke-1234"
         roost.tab_feed_pty_bytes(
             tab,
@@ -88,7 +66,7 @@ class TestTestOps:
         reply must show up in `tab.capture_pty_input`. This is the
         bare minimum proof the input-capture tap is wired."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         # OSC 11 query (background). The reply rides the input
         # channel as `\e]11;rgb:RRRR/GGGG/BBBB\x07`. We don't
         # care which color — only that *something* came back.
@@ -116,7 +94,7 @@ class TestTestOps:
         is a list with a sane size (cols*rows), every cell carries
         the expected fields including `#RRGGBB` color strings."""
         tab = roost.open_tab(project, cwd="/tmp")
-        _wait_tab_attached(roost, tab)
+        wait_tab_attached(roost, tab)
         # Use the existing tab.list to find the open dims — the
         # IPC handler decides defaults (mac/gtk may differ on the
         # very first tab). What we assert is internal consistency

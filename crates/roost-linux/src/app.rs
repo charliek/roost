@@ -2428,7 +2428,7 @@ impl App {
         let cwd = cwd.to_string();
         let title = title.to_string();
         let argv = argv.to_vec();
-        let (tab, _rx) = rt
+        let tab = rt
             .spawn(async move {
                 client
                     .open_tab(project_id, &cwd, &title, &argv, 80, 24)
@@ -2440,12 +2440,12 @@ impl App {
         // Optimistic attach: the workspace's TabOpened event also
         // arrives via the events subscription; the
         // `ProjectUi.pending_attaches` synchronous insert below
-        // closes that race. We drop the broadcast receiver returned
-        // by `client.open_tab` here because `attach_existing_tab`
-        // re-subscribes via `PtySupervisor::subscribe_output` — the
-        // window between spawn returning and subscribe_output
-        // running is single-digit microseconds in-process, well
-        // inside the broadcast channel's per-subscriber buffer.
+        // closes that race. Early PTY output is safe however long
+        // this attach takes: `TabSession::attach` consumes the
+        // pre-reader receiver the supervisor stashed at spawn
+        // (`take_initial_receiver`), so a fast command's first bytes
+        // are waiting in its buffer rather than lost to a late
+        // subscribe.
         self.attach_existing_tab(tab);
         Ok(tab_id)
     }
@@ -2571,9 +2571,40 @@ impl App {
         // attach is synchronous (no gRPC dial), but we still hop
         // through `rt.spawn` so the drain task it kicks off lands
         // on the tokio runtime rather than the glib main loop.
+        //
+        // Retry on "no live PTY": `Workspace::open_tab` fires
+        // TabOpened *before* the caller's `PtySupervisor::spawn`
+        // promotes the session, so an event-driven attach (IPC
+        // `tab.open`) can land in that gap — under CI load the gap is
+        // wide enough to lose the race, and a failed attach tears the
+        // page down with no retry ("tab N never attached a
+        // TerminalView", #267). The supervisor's stashed pre-reader
+        // receiver makes a late attach lossless, so waiting out the
+        // gap is safe. Bail early once the workspace no longer knows
+        // the tab (spawn failed and rolled back, or the tab closed).
         let supervisor = client_for_session.supervisor.clone();
-        let session_handle = rt
-            .spawn(async move { TabSession::attach(supervisor, tab_id, output_tx, input_capture) });
+        let workspace_for_attach = client_for_session.workspace.clone();
+        let session_handle = rt.spawn(async move {
+            let mut last_err = None;
+            for attempt in 0..40 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    if workspace_for_attach.tab(tab_id).is_err() {
+                        break;
+                    }
+                }
+                match TabSession::attach(
+                    supervisor.clone(),
+                    tab_id,
+                    output_tx.clone(),
+                    input_capture.clone(),
+                ) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("attach retry loop never ran")))
+        });
 
         // `append` makes the first page of an empty AdwTabView its
         // selection, firing `selected-page` before the page is named — guard

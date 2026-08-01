@@ -15,9 +15,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use roost_ipc::messages::{Project, Tab};
-use tokio::sync::broadcast;
 
-use crate::daemon::{AttentionSource, PtyOutputEvent, PtySupervisor, Workspace};
+use crate::daemon::{AttentionSource, PtySupervisor, Workspace};
 
 /// In-process workspace + PTY supervisor handle.
 #[derive(Clone)]
@@ -71,10 +70,6 @@ impl LocalClient {
         Ok(self.workspace.reorder_tabs(project_id, &tab_ids)?)
     }
 
-    /// Open a tab and spawn the shell. Returns the tab snapshot
-    /// plus a `broadcast::Receiver` subscribed BEFORE the supervisor's
-    /// reader task started producing — `TabSession::attach_with_receiver`
-    /// consumes it, no early-byte loss.
     pub async fn resize_tab(&self, tab_id: i64, cols: u32, rows: u32) -> Result<()> {
         // Same validation as `open_tab` — caller-supplied dims via
         // `roostctl tab resize` or via UI live-resize.
@@ -94,7 +89,7 @@ impl LocalClient {
         argv: &[String],
         cols: u32,
         rows: u32,
-    ) -> Result<(Tab, broadcast::Receiver<PtyOutputEvent>)> {
+    ) -> Result<Tab> {
         // Resolve cwd: caller-supplied → project's cwd → $HOME →
         // "/". Matches the Mac side's `LocalClient.openTab`
         // fallback. Both the UI's open-new-tab path and the
@@ -124,7 +119,11 @@ impl LocalClient {
             .supervisor
             .spawn(tab.id, &resolved_cwd, argv, cols, rows, &self.socket_path)
         {
-            Ok(rx) => Ok((tab, rx)),
+            // The pre-subscribed receiver spawn returns is dropped;
+            // the supervisor's stashed twin (`take_initial_receiver`)
+            // is what the UI's attach consumes, so early output
+            // survives however late that attach runs.
+            Ok(_rx) => Ok(tab),
             Err(err) => {
                 let _ = self.workspace.close_tab(tab.id);
                 Err(anyhow::anyhow!("pty spawn failed: {err:?}"))

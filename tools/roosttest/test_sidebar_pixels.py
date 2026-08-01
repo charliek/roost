@@ -43,6 +43,7 @@ from client import RoostError, Timeout
 from test_agent_palette import _seed
 from test_sidebar_agents import _agent_row, _set_agents_visible
 from test_sidebar_collapse_persistence import _toggle_to_visible
+from util import BARE_SHELL_ARGV
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
@@ -166,25 +167,17 @@ def _capture(roost, path: Path):
 def _seed_one_per_lifecycle(roost, project) -> dict[str, int]:
     tabs = {}
     for lifecycle in LIFECYCLE_COLORS:
-        tab = roost.open_tab(project, cwd="/tmp")
+        tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
         _seed(roost, tab, lifecycle=lifecycle, name=f"px-{lifecycle}")
         tabs[lifecycle] = tab
-    # A shell prompt mark landing after the claim resets the lifecycle to
-    # `inactive` (the plan-002 dead-agent failsafe), and a fresh tab's shell
-    # can still be starting when the claim goes in. Ownership survives that
-    # reset but the lifecycle does not, so waiting for the row to appear is
-    # not enough — re-report until the lifecycle itself sticks.
-    def _settled(tab: int, lifecycle: str) -> bool:
-        if roost.agent_lifecycle(tab) == lifecycle:
-            return _agent_row(roost.sidebar_dump(), project, tab) is not None
-        _seed(roost, tab, lifecycle=lifecycle)
-        return False
-
+    # `_seed` guarantees the lifecycle stuck (bare shell, no late marks,
+    # plus its own tripwire), so all that is left is waiting for the row
+    # to reach the sidebar's rendered cache.
     for lifecycle, tab in tabs.items():
         roost._wait(
-            lambda t=tab, lc=lifecycle: _settled(t, lc),
+            lambda t=tab: _agent_row(roost.sidebar_dump(), project, t) is not None,
             10.0,
-            f"{lifecycle} agent on tab {tab} to settle into its lifecycle",
+            f"{lifecycle} agent row for tab {tab} reaches the sidebar dump",
         )
     return tabs
 

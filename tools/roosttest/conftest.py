@@ -9,6 +9,7 @@ needed, and quitting only what it launched). Each test gets a fresh
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 
 import pytest
@@ -21,6 +22,21 @@ from client import Roost
 # is critical-clean. Add entries as a tight substring + a `# reason`, mirroring
 # the clippy.toml guards, only after confirming the line is environmental.
 _GTK_CRITICAL_ALLOWLIST: list[str] = []
+
+# macOS-dev only: Homebrew GTK has no session D-Bus, so GIO's bus wiring
+# fires exactly these three criticals at teardown. Scoped by platform, not
+# by probing DBUS_SESSION_BUS_ADDRESS — CI's ubuntu runners under xvfb-run
+# don't reliably export it either, and this gate must stay strict there.
+# Every OTHER critical remains fatal on macOS dev too (deliberately not a
+# wholesale skip-on-darwin).
+# Full `func: assertion` text, not bare function names — a different
+# (real) critical raised from the same GIO function must still fail.
+_DARWIN_DEV_ALLOWLIST: list[str] = [
+    # no session D-Bus (Homebrew GTK, macOS dev):
+    "g_bus_watch_name_on_connection: assertion 'G_IS_DBUS_CONNECTION (connection)' failed",
+    "g_dbus_connection_signal_subscribe: assertion 'G_IS_DBUS_CONNECTION (connection)' failed",
+    "g_dbus_connection_call_internal: assertion 'G_IS_DBUS_CONNECTION (connection)' failed",
+]
 
 
 def pytest_addoption(parser):
@@ -78,11 +94,14 @@ def _ui_session(target, fresh):
     # teardown order. Surfaces as an ERROR-at-teardown (still a non-zero exit).
     # (`G_DEBUG=fatal-criticals` as a separate diagnostic lane is a follow-up.)
     if gtk_log is not None and gtk_log.exists():
+        allowlist = _GTK_CRITICAL_ALLOWLIST + (
+            _DARWIN_DEV_ALLOWLIST if sys.platform == "darwin" else []
+        )
         bad = [
             line
             for line in gtk_log.read_text(errors="replace").splitlines()
             if "-CRITICAL **:" in line
-            and not any(allow in line for allow in _GTK_CRITICAL_ALLOWLIST)
+            and not any(allow in line for allow in allowlist)
         ]
         assert not bad, (
             f"{len(bad)} non-allowlisted GLib *-CRITICAL line(s) in the GTK UI "

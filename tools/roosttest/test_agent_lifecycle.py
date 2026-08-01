@@ -39,7 +39,8 @@ import subprocess
 import pytest
 
 import ui
-from util import roostctl_path, wait_tab_attached
+from client import scaled_timeout
+from util import BARE_SHELL_ARGV, roostctl_path, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -83,7 +84,10 @@ def claude_hook(
         input=stdin,
         capture_output=True,
         env=env,
-        timeout=30,
+        # Scaled like every in-band wait: the hook subprocess crosses a
+        # process spawn + an IPC round-trip under the same CI load
+        # profile the suite budgets for.
+        timeout=scaled_timeout(30),
     )
     assert proc.returncode == 0, (
         f"roostctl claude-hook {event} exited {proc.returncode}: "
@@ -97,10 +101,14 @@ def claude_hook(
 def agent_tab(roost, project) -> int:
     """A bare-shell agent tab that is NOT the active tab (see module
     docstring), attached and ready to be fed PTY bytes."""
-    tab = roost.open_tab(project, cwd="/tmp",
-                         argv=["/bin/bash", "--norc", "--noprofile"])
-    roost.open_tab(project, cwd="/tmp")  # steals active, so the agent tab is background
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    # Attach-wait BEFORE the decoy: two concurrent spawns + two view
+    # attachments otherwise race the attach budget. Order is the only
+    # thing that changes — the decoy still opens (and steals active)
+    # before this returns, so the invariant every caller relies on
+    # holds: the agent tab is a BACKGROUND tab by the time hooks fire.
     wait_tab_attached(roost, tab)
+    roost.open_tab(project, cwd="/tmp")  # steals active, so the agent tab is background
     return tab
 
 

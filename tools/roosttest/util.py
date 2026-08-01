@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,16 @@ import pytest
 from client import RoostError, Timeout, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# A shell with NO startup files, therefore no Roost shell integration,
+# therefore no OSC 133 marks the test didn't feed itself. Any tab whose
+# agent lifecycle a test seeds MUST be opened with this argv: a real
+# integrated shell can emit an A/B/D mark at any point after the claim
+# (a WINCH-driven prompt redraw at view attach, say), and the plan-002
+# dead-agent failsafe resets the seeded lifecycle to `inactive` when it
+# lands. `test_agent_lifecycle.agent_tab` has always used this argv for
+# exactly that reason; `test_agent_palette._seed` requires it.
+BARE_SHELL_ARGV = ["/bin/bash", "--norc", "--noprofile"]
 
 
 def roostctl_path() -> str:
@@ -101,6 +112,11 @@ def cwd_reaches(roost, tab_id: int, want: str, timeout: float = 3.0) -> bool:
     return False
 
 
+# Attach is the lowest IPC-observable readiness rung above "id exists in
+# tab.list"; `test_agent_lifecycle`'s single-shot `tab()["state"]` reads
+# ride on it and are sound only while `state` and `agent_lifecycle`
+# derive from ONE server-side write. If those ever split, those reads
+# need condition waits of their own.
 def wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
     """Wait until the UI's TerminalView for `tab_id` is live.
 
@@ -108,8 +124,15 @@ def wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
     UI's TerminalView attaches asynchronously on the main loop. Poll
     `tab.dump` (same shape, same attachment dependency) until it
     stops returning `not-found`. Raises `TimeoutError` on overrun.
+
+    The 5.0s default is pinned: attach is a main-loop round-trip, so a
+    longer budget would mask the very regressions this anchor exists to
+    catch. On overrun the message carries the last IPC error plus a
+    `tab.list` snapshot (is the id even present?) — both gathered
+    best-effort, so a failing diagnostic can't mask the timeout.
     """
     deadline = time.monotonic() + scaled_timeout(timeout)
+    last_error: RoostError | None = None
     while True:
         try:
             roost.dump_text(tab_id)
@@ -117,9 +140,34 @@ def wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
         except RoostError as e:
             if e.code != "not-found":
                 raise
+            last_error = e
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"tab {tab_id} never attached a TerminalView")
+            raise TimeoutError(
+                f"tab {tab_id} never attached a TerminalView; "
+                f"last IPC error={last_error}; {_tab_list_snapshot(roost, tab_id)}"
+            )
         time.sleep(0.05)
+
+
+def _tab_list_snapshot(roost, tab_id: int, budget: float = 2.0) -> str:
+    """Best-effort `tab.list` summary for timeout diagnostics. Runs the
+    IPC call on a daemon thread with a hard join budget: the client's
+    socket recv has no timeout, so a wedged UI — the very condition a
+    timeout usually means — would otherwise hang this diagnostic forever
+    and the real `TimeoutError` would never surface."""
+    result: list[str] = []
+
+    def grab() -> None:
+        try:
+            ids = sorted(int(t["id"]) for t in roost.tabs())
+            result.append(f"tab.list ids={ids}, present={tab_id in ids}")
+        except Exception as diag:
+            result.append(f"tab.list unavailable ({diag!r})")
+
+    t = threading.Thread(target=grab, daemon=True)
+    t.start()
+    t.join(scaled_timeout(budget))
+    return result[0] if result else "tab.list unavailable (snapshot timed out)"
 
 
 def spawned_tab_id(roost, before: set[int], what: str, timeout: float = 5.0) -> int:
@@ -141,7 +189,14 @@ def wait_spawned_output(roost, tab_id: int, needle: str, timeout: float = 12.0) 
     under-provisioned timeout here reads as a launcher bug when it is
     really just shell startup — that ambiguity is why the dump below
     exists.
+
+    Anchored on `wait_tab_attached` first (its own scaled budget): the
+    marker clock must not start before the TerminalView is live, or the
+    pre-attach window is silently consumed as failed `tab.dump` polls
+    and the marker budget measures attach latency instead of "shell runs
+    the command and output round-trips."
     """
+    wait_tab_attached(roost, tab_id)
     try:
         roost.wait_text(tab_id, needle, timeout=timeout)
     except Timeout as exc:

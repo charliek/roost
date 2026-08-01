@@ -12,11 +12,12 @@ other agent-owned tabs already open. The one exception is the empty-state
 test, which needs a fresh harness-owned instance to guarantee zero rows
 and is skipped otherwise (`util.is_fresh`).
 
-Every seeded lifecycle is reported only after the tab's shell reaches its
-first prompt (`wait_shell_state(..., "at_prompt")`): a late startup A/B/D
-OSC 133 mark drops the raw agent lifecycle back to `inactive` while
-keeping ownership as a label (the plan-002 dead-agent failsafe), which
-would silently reset a lifecycle seeded too early.
+Every tab whose lifecycle a test seeds is opened as a bare
+`util.BARE_SHELL_ARGV` shell: an A/B/D OSC 133 mark drops the raw agent
+lifecycle back to `inactive` while keeping ownership as a label (the
+plan-002 dead-agent failsafe), and an integrated shell can emit one at
+any point after the claim. With no integration the marks are only the
+ones `_seed` feeds itself, before the claim.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import pytest
 
 from client import RoostError, Timeout
 from test_agent_lifecycle import agent_tab, claude_hook
-from util import is_fresh, wait_tab_attached
+from util import BARE_SHELL_ARGV, is_fresh, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -65,24 +66,24 @@ def _seed(
     """Claim ownership of a settled tab with the given lifecycle. Waits
     for the shell to reach its first prompt before reporting (module
     docstring). Returns the (source, session) pair's source, so callers
-    that need to report again (live refresh, ordering ties) reuse it."""
+    that need to report again (live refresh, ordering ties) reuse it.
+
+    **The tab MUST have been opened with `util.BARE_SHELL_ARGV`.** An
+    integrated shell can emit an OSC 133 A/B/D mark at any point after
+    the claim, and the plan-002 dead-agent failsafe resets the seeded
+    lifecycle to `inactive` when one lands — no wait here can close that
+    window. The tripwire at the end of this function catches a caller
+    that forgot."""
     if name is not None:
         roost.set_title(tab_id, name)
     wait_tab_attached(roost, tab_id)
-    # The shell's own first prompt should land BEFORE we claim: Roost
-    # auto-bootstraps roost.bash/roost.zsh, whose PROMPT_COMMAND emits
-    # OSC 133;D, and an A/B/D mark resets a seeded lifecycle to
-    # `inactive` (the plan-002 dead-agent failsafe). The marks precede
-    # the PS1 bytes in the same write, so a non-empty screen (or a
-    # shell_state already moved off `unknown`) means they are drained.
-    # Without this, a seeded lifecycle survives only until the real
-    # prompt paints — a ~100ms window that made the live-refresh test
-    # flake under load (plan 006 §Verified).
-    #
-    # Best-effort, not a hard gate: a shell that never paints (CI spawn
-    # anomalies) emits no late mark either, so the race this settles
-    # cannot occur there — proceed on the fed mark below rather than
-    # failing a test that never needed the real shell.
+    # Drain ordering only: let whatever the shell writes at startup land
+    # BEFORE the synthetic `133;A` below, so the fed mark is the last
+    # word on the shell axis rather than racing bytes still in flight
+    # (the ordering the live-refresh test needed — plan 006 §Verified).
+    # A bare shell emits no marks of its own, so this is not protecting
+    # against a reset any more; it is best-effort and a shell that never
+    # paints simply proceeds.
     try:
         roost._wait(
             lambda: roost.dump_text(tab_id).strip() != ""
@@ -93,11 +94,10 @@ def _seed(
     except Timeout:
         pass
     if TEST_MODE:
-        # CI shells have no OSC 133 integration (Apple bash 3.2 is
-        # skipped by the autobootstrap), so waiting for a real prompt
-        # mark hangs there. Feed the A mark ourselves — same settled
-        # end-state, deterministic, and it still exercises the
-        # late-mark-can't-reset property the passive wait was for.
+        # A bare shell emits no OSC 133 marks of its own, so `at_prompt`
+        # has to come from us. Feed the A mark ourselves — same settled
+        # end-state as a real prompt, deterministic, and it still
+        # exercises the late-mark-can't-reset property.
         roost.tab_feed_pty_bytes(tab_id, b"\x1b]133;A\x07")
     roost.wait_shell_state(tab_id, "at_prompt", timeout=15.0)
     src = source or _agent_source("seed")
@@ -109,6 +109,18 @@ def _seed(
         lifecycle=lifecycle,
         detail=detail,
         metadata=metadata,
+    )
+    # Tripwire, single read, no retry: `tab.agent_lifecycle` is the RAW
+    # axis, so it must read back exactly what was just claimed. Anything
+    # else means a real shell OSC 133 mark landed after the claim and the
+    # dead-agent failsafe reset it — i.e. this tab was NOT opened with
+    # `util.BARE_SHELL_ARGV`. Retrying would only re-open the same window.
+    got = roost.agent_lifecycle(tab_id)
+    assert got == lifecycle, (
+        f"tab {tab_id}: seeded lifecycle {lifecycle!r} read back as {got!r}. "
+        "A late shell OSC 133 A/B/D mark reset it (the plan-002 dead-agent "
+        "failsafe) — open seeded tabs with util.BARE_SHELL_ARGV so the shell "
+        "has no integration and emits no marks of its own."
     )
     return src
 
@@ -203,10 +215,10 @@ def test_seed_four_lifecycles_ranked_with_exact_status_and_title(roost, project)
     well-formed `time_text`."""
     p2 = roost.create_project(name=f"pytest-agents2-{uuid.uuid4().hex[:6]}", cwd="/tmp")
     try:
-        t_waiting = roost.open_tab(project, cwd="/tmp")
-        t_working = roost.open_tab(project, cwd="/tmp")
-        t_failed = roost.open_tab(p2, cwd="/tmp")
-        t_finished = roost.open_tab(p2, cwd="/tmp")
+        t_waiting = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        t_working = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        t_failed = roost.open_tab(p2, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        t_finished = roost.open_tab(p2, cwd="/tmp", argv=BARE_SHELL_ARGV)
 
         _seed(roost, t_waiting, lifecycle="waiting", name="waiting-agent")
         _seed(roost, t_working, lifecycle="working", name="working-agent")
@@ -250,7 +262,7 @@ def test_seed_four_lifecycles_ranked_with_exact_status_and_title(roost, project)
 
 
 def test_working_with_background_tasks_detail(roost, project):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="working", detail="background_tasks:2")
     row = roost.palette_row("agents", f"agent:{tab}")
     assert row is not None
@@ -258,7 +270,7 @@ def test_working_with_background_tasks_detail(roost, project):
 
 
 def test_session_title_metadata_preferred_over_tab_title(roost, project):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(
         roost,
         tab,
@@ -285,7 +297,7 @@ def test_manual_claimed_tab_is_excluded(roost, project):
 
 def test_filter_narrows_by_project_or_name_and_no_match_is_empty(roost, project, palette):
     tag = uuid.uuid4().hex[:8]
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="working", name=f"zzz-{tag}")
     row_id = f"agent:{tab}"
 
@@ -432,7 +444,7 @@ def test_idle_prompt_and_permission_prompt_diverge_in_palette(roost, project, ta
 
 
 def test_live_refresh_flips_lifecycle_and_project_rename(roost, project, palette):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     session = uuid.uuid4().hex
     source = _seed(roost, tab, lifecycle="waiting", session=session)
     row_id = f"agent:{tab}"
@@ -474,7 +486,7 @@ def test_live_refresh_flips_lifecycle_and_project_rename(roost, project, palette
 
 
 def test_activate_agent_row_focuses_tab_and_closes_palette(roost, project, target, palette):
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     roost.open_tab(project, cwd="/tmp")  # steals active
     _seed(roost, tab, lifecycle="waiting")
     row_id = f"agent:{tab}"
@@ -508,7 +520,7 @@ def test_activate_row_for_a_closed_tab_does_not_crash(roost, project, palette):
     are the harness-visible "no crash" outcomes plan 005 §3.10 asks for.
     A real crash would surface as a transport-level RoostError
     (`disconnected`), which this does NOT catch."""
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="working")
     row_id = f"agent:{tab}"
 
@@ -526,7 +538,7 @@ def test_dismiss_closes_and_reopen_rebuilds(roost, project, palette):
     """Hotkey chords (Esc included) aren't injectable via roosttest
     (plan 005 §3.10's unit+manual note); `palette.dismiss` drives the
     same close path Esc triggers, and a reopen rebuilds fresh."""
-    tab = roost.open_tab(project, cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     _seed(roost, tab, lifecycle="working")
     row_id = f"agent:{tab}"
 
@@ -565,7 +577,7 @@ def test_command_palette_view_agents_directly_after_select_font(palette):
 def test_git_metrics_wired_end_to_end(roost, project, tmp_path, palette):
     repo, expected = _make_git_repo(tmp_path)
 
-    tab1 = roost.open_tab(project, cwd=str(repo))
+    tab1 = roost.open_tab(project, cwd=str(repo), argv=BARE_SHELL_ARGV)
     _seed(roost, tab1, lifecycle="working")
     row_id1 = f"agent:{tab1}"
 
@@ -587,7 +599,7 @@ def test_git_metrics_wired_end_to_end(roost, project, tmp_path, palette):
     # A second tab on the identical repo must resolve to the identical
     # string (the dedupe-by-root cache reuse), while the palette stays
     # open the whole time (live refresh picks up the new row + its cwd).
-    tab2 = roost.open_tab(project, cwd=str(repo))
+    tab2 = roost.open_tab(project, cwd=str(repo), argv=BARE_SHELL_ARGV)
     _seed(roost, tab2, lifecycle="working")
     row_id2 = f"agent:{tab2}"
     roost._wait(
@@ -597,7 +609,7 @@ def test_git_metrics_wired_end_to_end(roost, project, tmp_path, palette):
     # A non-repo cwd resolves to the em-dash sentinel.
     non_repo = tmp_path / "not-a-repo"
     non_repo.mkdir()
-    tab3 = roost.open_tab(project, cwd=str(non_repo))
+    tab3 = roost.open_tab(project, cwd=str(non_repo), argv=BARE_SHELL_ARGV)
     _seed(roost, tab3, lifecycle="working")
     row_id3 = f"agent:{tab3}"
     roost._wait(

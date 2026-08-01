@@ -21,6 +21,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       mac: ${{ steps.filter.outputs.mac }}
       linux: ${{ steps.filter.outputs.linux }}
+      fixtures: ${{ steps.filter.outputs.fixtures }}
       tests: ${{ steps.filter.outputs.tests }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -47,6 +48,12 @@ jobs:
             linux:
               - *rustcore
               - 'linux/**'
+            # repo-root shared fixture corpora (parity gates for both UIs),
+            # consumed only by the unit-test jobs (rust-build, gtk-build,
+            # swift-mac) — distinct from the `tests` output below, which
+            # means tools/roosttest/**
+            fixtures:
+              - 'tests/**'
             tests:
               - 'tools/roosttest/**'
               - 'tools/input/linux/**'
@@ -104,7 +111,7 @@ jobs:
 
   rust-build:
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -172,7 +179,7 @@ jobs:
 
   swift-mac:
     needs: changes
-    if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -343,7 +350,7 @@ jobs:
 
   gtk-build:
     needs: changes
-    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

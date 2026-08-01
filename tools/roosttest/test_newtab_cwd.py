@@ -17,7 +17,14 @@ the *live* cwd, not the project cwd.
 
 from __future__ import annotations
 
-from util import cwd_reaches, precondition, spawned_tab_id, wait_spawned_output
+from util import (
+    cwd_reaches,
+    precondition,
+    spawned_tab_id,
+    wait_shell_ready,
+    wait_spawned_output,
+    wait_tab_attached,
+)
 
 # Live cwd distinct from the project fixture's /tmp, and real on both
 # Linux and macOS (note: /tmp is a symlink on macOS, /usr is not — we
@@ -59,10 +66,14 @@ def test_new_tab_inherits_active_cwd(roost, project, palette):
     assert state["open"] is False  # activating new_tab confirms + closes
 
     new_id = spawned_tab_id(roost, before, "new_tab spawned a tab")
+    # The send needs a live, interactable shell: anchor on attach, then
+    # on the shell actually executing a command, before driving it.
+    wait_tab_attached(roost, new_id)
+    wait_shell_ready(roost, new_id)
     # Ask the new shell where it is — proves the *spawn* cwd directly,
     # independent of the new tab's own OSC 7 timing.
     roost.run(new_id, "echo NEWTAB_PWD=$(pwd)")
-    wait_spawned_output(roost, new_id, f"NEWTAB_PWD={LIVE_CWD}")
+    roost.wait_text(new_id, f"NEWTAB_PWD={LIVE_CWD}", timeout=8)
 
 
 def test_launcher_runs_in_active_cwd(roost, project, palette):
