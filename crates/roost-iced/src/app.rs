@@ -41,15 +41,16 @@ use roost_ui_model::{
 };
 use roost_url::HoverUrl;
 use roost_vt::{
-    mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
-    TerminalOptions, TerminalSelection,
+    key_action, mouse_action, mouse_button, KeyEncoder, KeyEvent, MouseEncoder, MouseEvent,
+    RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions, TerminalScroll,
+    TerminalSelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette_scroll::Visibility;
 use crate::terminal_widget::{
-    resolve_colors, DrawCell, TerminalPointerEvent, TerminalSnapshot, TerminalWidget, CELL_HEIGHT,
-    CELL_WIDTH, TERMINAL_PADDING,
+    resolve_colors, DrawCell, TerminalPointerEvent, TerminalSnapshot, TerminalWheelEvent,
+    TerminalWidget, CELL_HEIGHT, CELL_WIDTH, TERMINAL_PADDING,
 };
 use crate::Message;
 use crate::{chrome, input};
@@ -918,6 +919,7 @@ struct TerminalTab {
     render_state: RenderState,
     encoder: KeyEncoder,
     mouse_encoder: MouseEncoder,
+    scroll: TerminalScroll,
     motion_emitter: MotionEmitter,
     tracking_pointer: Option<PointerButton>,
     local_pointer_gesture: Option<LocalPointerGesture>,
@@ -971,6 +973,7 @@ impl TerminalTab {
             render_state,
             encoder,
             mouse_encoder,
+            scroll: TerminalScroll::new(),
             motion_emitter: MotionEmitter::new(),
             tracking_pointer: None,
             local_pointer_gesture: None,
@@ -1104,6 +1107,51 @@ impl TerminalTab {
         }
         self.session.send_input(bytes);
         Ok(())
+    }
+
+    fn handle_wheel(&mut self, history_rows: f64, col: u32, row: u32, mods: u16) -> Result<()> {
+        let route = self.scroll.route(&mut self.terminal, history_rows);
+        match route {
+            Some(ScrollRoute::MouseReport { direction, rows }) => {
+                let button = match direction {
+                    ScrollDirection::History => PointerButton::Four,
+                    ScrollDirection::Bottom => PointerButton::Five,
+                };
+                for _ in 0..rows {
+                    self.dispatch_pointer(PointerAction::Press, Some(button), col, row, mods)?;
+                }
+            }
+            Some(ScrollRoute::AlternateScreenKey { direction, rows }) => {
+                let key = match direction {
+                    ScrollDirection::History => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP,
+                    ScrollDirection::Bottom => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN,
+                };
+                let mut event = KeyEvent::new().context("allocate terminal wheel key event")?;
+                event.set_action(key_action::PRESS);
+                event.set_key(key);
+                event.set_mods(0);
+                self.encoder.sync_from_terminal(&self.terminal);
+                let mut bytes = Vec::new();
+                for _ in 0..rows {
+                    bytes.extend(
+                        self.encoder
+                            .encode(&event)
+                            .context("encode alternate-screen wheel key")?,
+                    );
+                }
+                self.session.send_input(bytes);
+            }
+            Some(ScrollRoute::LocalViewport { .. }) | None => {}
+        }
+        Ok(())
+    }
+
+    fn snap_to_bottom_for_input(&mut self) -> Result<bool> {
+        let snapped = self.scroll.snap_to_bottom(&mut self.terminal);
+        if snapped {
+            self.refresh_snapshot()?;
+        }
+        Ok(snapped)
     }
 
     /// Route a native pointer gesture with terminal mouse reporting taking
@@ -1844,6 +1892,11 @@ impl App {
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
             return UiTask::None;
         };
+        if input::should_snap_for_terminal_input(&event) {
+            if let Err(error) = tab.snap_to_bottom_for_input() {
+                tracing::warn!(?error, active_tab, "terminal snap-to-bottom failed");
+            }
+        }
         let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
         tab.session.send_input(bytes);
         UiTask::None
@@ -2037,6 +2090,31 @@ impl App {
             Some(url) => UiTask::OpenUrl { url }.then(clipboard),
             None => clipboard,
         }
+    }
+
+    pub fn wheel(&mut self, event: TerminalWheelEvent) -> UiTask {
+        let TerminalWheelEvent {
+            tab_id,
+            history_rows,
+            col,
+            row,
+        } = event;
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+            tracing::debug!(tab_id, "ignored terminal wheel event for a closed tab");
+            return UiTask::None;
+        };
+        if let Err(error) = tab
+            .handle_wheel(
+                history_rows,
+                col,
+                row,
+                input::ghostty_modifiers(self.modifiers),
+            )
+            .and_then(|()| tab.refresh_snapshot())
+        {
+            tracing::warn!(?error, tab_id, "terminal wheel dispatch failed");
+        }
+        UiTask::None
     }
 
     pub fn pointer_leave(&mut self, tab_id: i64) {
@@ -4978,6 +5056,66 @@ mod tests {
         let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
         assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
         supervisor.close(91);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wheel_routes_history_tracking_and_alternate_screen_through_shared_policy() {
+        let (mut local, local_supervisor) = attached_test_terminal(191);
+        for index in 0..48 {
+            local.write_vt(format!("history-{index:02}\r\n").as_bytes());
+        }
+        local
+            .handle_wheel(2.0, 3, 1, 0)
+            .expect("local history wheel");
+        assert!(local.scroll.is_scrolled_back());
+        assert!(local
+            .snap_to_bottom_for_input()
+            .expect("snap local history"));
+        assert!(!local.scroll.is_scrolled_back());
+        local_supervisor.close(191);
+
+        let (mut tracked, tracked_supervisor) = attached_test_terminal(192);
+        tracked.write_vt(b"\x1b[?1000h\x1b[?1006h");
+        tracked
+            .input_capture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clear();
+        tracked.handle_wheel(2.0, 3, 1, 0).expect("tracked wheel");
+        let captured = tracked
+            .input_capture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(captured.iter().filter(|byte| **byte == b'M').count(), 2);
+        assert!(captured.windows(5).any(|bytes| bytes == b"\x1b[<64"));
+        tracked_supervisor.close(192);
+
+        let (mut alternate, alternate_supervisor) = attached_test_terminal(193);
+        alternate.write_vt(b"\x1b[?1049h");
+        alternate
+            .input_capture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clear();
+        alternate
+            .handle_wheel(2.0, 3, 1, 0)
+            .expect("alternate-screen wheel");
+        let captured = alternate
+            .input_capture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(captured, b"\x1b[A\x1b[A");
+        alternate_supervisor.close(193);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

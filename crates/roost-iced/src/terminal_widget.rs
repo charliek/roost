@@ -85,6 +85,7 @@ pub struct TerminalWidget {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TerminalPointer {
     Event(TerminalPointerEvent),
+    Wheel(TerminalWheelEvent),
     Leave { tab_id: i64 },
 }
 
@@ -97,6 +98,26 @@ pub(crate) struct TerminalPointerEvent {
     pub row: u32,
     pub click_count: u8,
     pub inside: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TerminalWheelEvent {
+    pub tab_id: i64,
+    /// Positive moves toward older history; negative toward the live bottom.
+    pub history_rows: f64,
+    pub col: u32,
+    pub row: u32,
+}
+
+fn wheel_history_rows(delta: mouse::ScrollDelta) -> f64 {
+    match delta {
+        // Match the existing Swift policy: one discrete notch moves three
+        // terminal rows. Iced already gives the conventional positive-up sign.
+        mouse::ScrollDelta::Lines { y, .. } => f64::from(y) * 3.0,
+        // Smooth native deltas are physical/logical pixels. Convert them into
+        // rows here; TerminalScroll owns cross-event fractional accumulation.
+        mouse::ScrollDelta::Pixels { y, .. } => f64::from(y) / f64::from(CELL_HEIGHT),
+    }
 }
 
 #[derive(Default)]
@@ -321,26 +342,15 @@ impl TerminalWidget {
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 state.clicks.reset();
-                let vertical = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {
-                        *y
-                    }
-                };
-                if vertical == 0.0 {
+                let history_rows = wheel_history_rows(*delta);
+                if history_rows == 0.0 {
                     return None;
                 }
-                TerminalPointer::Event(TerminalPointerEvent {
+                TerminalPointer::Wheel(TerminalWheelEvent {
                     tab_id: self.tab_id,
-                    action: PointerAction::Press,
-                    button: Some(if vertical > 0.0 {
-                        PointerButton::Four
-                    } else {
-                        PointerButton::Five
-                    }),
+                    history_rows,
                     col,
                     row,
-                    click_count: 1,
-                    inside,
                 })
             }
             _ => return None,
@@ -1160,6 +1170,25 @@ mod tests {
             cursor,
         );
         assert!(state.clicks.sequence.is_none());
+    }
+
+    #[test]
+    fn wheel_units_normalize_to_positive_history_rows() {
+        assert_eq!(
+            wheel_history_rows(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }),
+            3.0
+        );
+        assert_eq!(
+            wheel_history_rows(mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 }),
+            -6.0
+        );
+        assert_eq!(
+            wheel_history_rows(mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: CELL_HEIGHT / 2.0,
+            }),
+            0.5
+        );
     }
 
     #[test]

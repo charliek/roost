@@ -53,6 +53,24 @@ pub enum ScrollViewport {
     Delta(isize),
 }
 
+/// Authoritative scrollable-area state reported by libghostty-vt.
+///
+/// `offset + len >= total` means the viewport is at the live bottom.  Keep
+/// this wrapper layout-independent so callers never depend on bindgen's C
+/// struct representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Scrollbar {
+    pub fn is_at_bottom(self) -> bool {
+        self.offset.saturating_add(self.len) >= self.total
+    }
+}
+
 /// Result of `Terminal::active_screen()`. The Mac UI's scroll handler
 /// uses this to decide between local scrollback and alt-screen arrow
 /// translation.
@@ -416,6 +434,32 @@ impl Terminal {
         };
         // SAFETY: handle non-null; viewport struct is stack-owned.
         unsafe { sys::ghostty_terminal_scroll_viewport(self.handle, viewport) };
+    }
+
+    /// Return the terminal's current viewport position within its scrollable
+    /// rows. This is the authoritative way to distinguish a partial scroll
+    /// toward the bottom from actually reaching the live region.
+    pub fn scrollbar(&self) -> Result<Scrollbar> {
+        let mut out = sys::GhosttyTerminalScrollbar {
+            total: 0,
+            offset: 0,
+            len: 0,
+        };
+        // SAFETY: handle is non-null and `out` is a correctly typed local for
+        // GHOSTTY_TERMINAL_DATA_SCROLLBAR.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                (&mut out) as *mut sys::GhosttyTerminalScrollbar as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(Scrollbar {
+            total: out.total,
+            offset: out.offset,
+            len: out.len,
+        })
     }
 
     /// Read a DEC mode bit (e.g. mode 2004 for bracketed paste).

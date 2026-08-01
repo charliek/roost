@@ -90,7 +90,13 @@ def _inject_key(*names: str) -> None:
 
 
 def _inject_drag(width: int, height: int, x0: int, y: int, x1: int) -> None:
-    operations = [f"move {x0} {y}", "down LEFT"]
+    # Keep the virtual device alive for the complete gesture, but leave a
+    # scheduling fence after positioning and pressing. Without these pauses,
+    # the Wayland event loop can observe the button press with a later,
+    # coalesced cursor position and start the selection several cells into the
+    # fixture. X11 uses separate XTEST submissions plus an IPC fence for the
+    # same reason; a single uinput device cannot be split across processes.
+    operations = [f"move {x0} {y}", "sleep 300", "down LEFT", "sleep 300"]
     for step in range(1, 9):
         x = int(x0 + (x1 - x0) * step / 8)
         operations.append(f"move {x} {y}")
@@ -251,6 +257,15 @@ def main() -> int:
         _png, width, height = client.screenshot(scale=1)
         if not width or not height:
             _skip(f"screenshot returned invalid output size: {(width, height)!r}")
+        print(
+            "Wayland geometry:",
+            {
+                "window": (logical_width, logical_height),
+                "capture": (width, height),
+                "sidebar": sidebar,
+                "terminal_top": client.terminal_top(metrics),
+            },
+        )
 
         explicit = f"wayland-copy-{uuid.uuid4().hex[:8]}"
         _set_row(client, tab, explicit)

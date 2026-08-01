@@ -51,6 +51,31 @@ pub(crate) fn accelerator_modifiers(value: keyboard::Modifiers) -> AccelMods {
     result
 }
 
+/// Whether this event is a real terminal key press that should snap local
+/// scrollback first. Releases, modifier-state events, and modifier-only presses
+/// must not disturb scrollback or selection before a later copy chord.
+pub(crate) fn should_snap_for_terminal_input(event: &keyboard::Event) -> bool {
+    let keyboard::Event::KeyPressed { key, .. } = event else {
+        return false;
+    };
+    !matches!(
+        key,
+        Key::Named(
+            Named::Alt
+                | Named::AltGraph
+                | Named::Control
+                | Named::Fn
+                | Named::FnLock
+                | Named::Shift
+                | Named::Symbol
+                | Named::SymbolLock
+                | Named::Meta
+                | Named::Hyper
+                | Named::Super
+        )
+    )
+}
+
 fn accelerator_key(key: &Key<&str>) -> Option<String> {
     let name = match key {
         Key::Character(value) => return Some(canonical_character(value)),
@@ -318,6 +343,35 @@ mod tests {
             ghostty_modifiers(all),
             mods::SHIFT | mods::CTRL | mods::ALT | mods::SUPER
         );
+    }
+
+    #[test]
+    fn only_non_modifier_key_presses_snap_terminal_scrollback() {
+        let character = key_press(
+            Key::Character("x".into()),
+            Physical::Code(Code::KeyX),
+            keyboard::Modifiers::empty(),
+        );
+        assert!(should_snap_for_terminal_input(&character));
+
+        let modifier = key_press(
+            Key::Named(Named::Shift),
+            Physical::Code(Code::ShiftLeft),
+            keyboard::Modifiers::SHIFT,
+        );
+        assert!(!should_snap_for_terminal_input(&modifier));
+        assert!(!should_snap_for_terminal_input(
+            &keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)
+        ));
+        assert!(!should_snap_for_terminal_input(
+            &keyboard::Event::KeyReleased {
+                key: Key::Character("x".into()),
+                modified_key: Key::Character("x".into()),
+                physical_key: Physical::Code(Code::KeyX),
+                location: Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            }
+        ));
     }
 
     #[test]

@@ -18,6 +18,16 @@ resolution, keybinds, command palettes, providers, custom commands, agent and
 notification projections, project rollups, shell escaping, and word
 selection.
 
+`roost-vt::TerminalScroll` owns the synchronous terminal-wheel policy shared
+by GTK and Iced. Every live terminal has an independent accumulator and
+snap-to-bottom state. Adapters normalize native units into signed rows and
+retain pointer geometry, modifiers, encoders, and PTY writes; the shared model
+selects mouse-report, alternate-screen key, or local viewport behavior with
+mouse tracking taking precedence. Local movement reconciles against
+libghostty's authoritative scrollbar rather than guessing whether a downward
+request reached the live bottom. The outcome enum is also a realistic future
+Swift adoption seam without exposing Rust layouts through an ABI.
+
 UI adapters retain native widgets and layout, terminal drawing and
 libghostty-vt event-loop access, platform input translation, clipboard and
 notifications, URL launching, screenshot capture, and event-loop marshalling.

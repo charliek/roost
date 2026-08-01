@@ -36,10 +36,11 @@ Everything is stdlib Python 3 + bash. No build step.
 |------|--------------|
 | `inject_key.py` | Press a key chord (`CTRL SHIFT C`) or type a string (`--type "ls\n"`). Follows keyboard focus. |
 | `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, optional `keydown/keyup CTRL\|ALT\|SUPER`, drags. Needs single monitor. |
+| `inject_wheel.py` | Relative uinput mouse-wheel diagnostic with legacy + high-resolution detents. Position/focus the seat first; cage's headless backend currently observes it in libinput but does not forward it to the client. |
 | `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
 | `real_input_check.py` | Self-contained real-input regression: focus + core-sync (click-to-focus, project switch, Alt+digit, Ctrl+PageDown, cycle_tab, pill click, context menu) **and** drag reorder (tab pills + project rows). Spins up its own Xvfb + throwaway Roost and drives **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
-| `iced_clipboard_check.py` | Self-contained Iced/X11 text and click gate: Copy/Paste, drag copy-on-select, middle-click PRIMARY, double/triple-click selection, and modifier-link hover under Xvfb + xdotool. |
+| `iced_clipboard_check.py` | Self-contained Iced/X11 text/click/wheel gate: Copy/Paste, drag copy-on-select, middle-click PRIMARY, local/tracked/alternate terminal wheel routing, key snap, double/triple-click selection, and modifier-link hover under Xvfb + xdotool. |
 | `iced_wayland_clipboard_check.py` | Shed/real-kernel Iced Wayland proof under cage + uinput: system Copy/Paste, drag copy-on-select, double/triple-click selection, and combined modifier-link hover. PRIMARY is a named compositor limitation. |
 
 PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
@@ -92,6 +93,14 @@ the ordinary system clipboard paths plus native multi-click and link-hover
 input to pass using fresh keyboard/pointer serials. Cage does not advertise the PRIMARY selection protocol, so the
 Linux-terminal middle-click convention remains explicitly X11-gated instead
 of being hidden by a headless Wayland skip.
+
+The X11 gate also owns physical wheel coverage under both Iced renderers.
+`inject_wheel.py` produces a valid libinput wheel event in the shed, but cage's
+headless/libinput backend does not forward a hot-plugged wheel axis to its
+client even though it forwards that harness's pointer motion and buttons. The
+Wayland gate therefore stays strict for supported real-seat inputs instead of
+adding a product skip; shared route tests and the existing Wayland renderer
+lane supplement the two-renderer X11 proof.
 
 ```sh
 make test-iced-real-input       # Linux X11, self-contained Xvfb

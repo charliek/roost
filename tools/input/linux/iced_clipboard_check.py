@@ -13,6 +13,8 @@ copy-on-select from making the explicit-Copy assertion pass accidentally:
   PRIMARY;
 * native double/triple clicks expand a word/line, and Alt-hover composes the
   link pointer over an OSC 22 cursor without launching a browser.
+* physical wheel input reaches local history, snaps on the next terminal key,
+  emits terminal mouse reports, and becomes arrows on an untracked alt screen.
 
 Set ROOST_REQUIRE_REAL_INPUT=1 in CI/shed so a missing dependency is a failure.
 ROOST_ICED_BIN and ROOSTCTL may point at shed-local Linux artifacts.
@@ -951,6 +953,74 @@ def _explicit_copy_and_paste(launch: Launch) -> None:
     _wait_until(lambda: _capture_contains(launch, expected), "bracketed Paste PTY bytes")
 
 
+def _terminal_scrollback_routing(launch: Launch) -> None:
+    """Drive all three shared terminal-wheel routes through native XTEST."""
+    rows = "".join(f"wheel-history-{index:02}\r\n" for index in range(72))
+    launch.client.tab_feed_pty_bytes(
+        launch.tab, b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[2J\x1b[H" + rows.encode()
+    )
+    _wait_until(
+        lambda: "wheel-history-71"
+        in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
+        "terminal history fixture at live bottom",
+    )
+    terminal_x = 220 + 12 + 4
+    terminal_y = round(launch.client.terminal_top()) + 12 + 9
+
+    def wheel(button: int) -> None:
+        launch.terminal_pointer(
+            [
+                "mousemove",
+                "--window",
+                launch.window,
+                str(terminal_x),
+                str(terminal_y),
+                "click",
+                str(button),
+            ]
+        )
+
+    wheel(4)
+    _wait_until(
+        lambda: "wheel-history-71"
+        not in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
+        "physical wheel reveals local terminal history",
+    )
+    launch.client.tab_capture_pty_input(launch.tab, drain=True)
+    launch.key("x")
+    _wait_until(
+        lambda: "wheel-history-71"
+        in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
+        "terminal key snaps scrolled viewport to live bottom",
+    )
+    _wait_until(lambda: _capture_contains(launch, b"x"), "post-scroll terminal key bytes")
+
+    launch.client.tab_feed_pty_bytes(launch.tab, b"\x1b[?1000h\x1b[?1006h")
+    launch.client.tab_capture_pty_input(launch.tab, drain=True)
+    wheel(4)
+    _wait_until(
+        lambda: _capture_contains(launch, b"\x1b[<64;"),
+        "physical wheel-up terminal mouse report",
+    )
+    wheel(5)
+    _wait_until(
+        lambda: _capture_contains(launch, b"\x1b[<65;"),
+        "physical wheel-down terminal mouse report",
+    )
+
+    launch.client.tab_feed_pty_bytes(
+        launch.tab, b"\x1b[?1000l\x1b[?1006l\x1b[?1049h"
+    )
+    launch.client.tab_capture_pty_input(launch.tab, drain=True)
+    wheel(4)
+    _wait_until(lambda: _capture_contains(launch, b"\x1b[A"), "alt-screen wheel-up key")
+    wheel(5)
+    _wait_until(lambda: _capture_contains(launch, b"\x1b[B"), "alt-screen wheel-down key")
+    launch.client.tab_feed_pty_bytes(
+        launch.tab, b"\x1b[?1049l\x1b[?1000l\x1b[?1006l\x1b[2J\x1b[H"
+    )
+
+
 def _drag_copy_and_middle_paste(launch: Launch) -> None:
     marker = f"drag-{uuid.uuid4().hex[:8]}"
     _set_row(launch, marker)
@@ -1180,6 +1250,7 @@ def main() -> int:
         off = Launch(root, display, "off", "explicit")
         launches.append(off)
         _explicit_copy_and_paste(off)
+        _terminal_scrollback_routing(off)
         _keybind_dispatch(off)
         _direct_tab_close(off)
         _chrome_overflow_navigation(off)
@@ -1212,6 +1283,7 @@ def main() -> int:
     print(
         "PASS: configured explicit Copy, plain/bracketed Paste, real-drag "
         "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
+        "local/tracked/alternate terminal wheel routing and key snap, "
         "exhaustive shortcut dispatch/repeat suppression, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
         "constrained chrome overflow navigation, and palette pointer routing"

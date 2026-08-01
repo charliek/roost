@@ -1547,6 +1547,86 @@ direct-manipulation path is the next parity and cost-validation milestone,
 where text editing, drag/drop feedback, accessibility, and event-routing
 complexity can expose costs that static styling cannot.
 
+### Shared terminal-scroll routing commit plan
+
+Scope: close Iced's P0 local-scrollback gap while removing the Rust UIs'
+opportunity to diverge on terminal wheel policy. `roost-vt` will own a small
+synchronous scroll state machine that accepts normalized row intent and returns
+an explicit mouse-report, alternate-screen key, or local-viewport outcome.
+It also owns fractional accumulation and the “typing snaps a scrolled viewport
+to bottom” state. GTK will migrate from its adapter-local policy and Iced will
+route native wheel events through the same API. Font metrics, PageUp/PageDown
+application commands, UI scrollbars, and drag/drop remain separate slices.
+
+The normalized value is `history_rows`: positive means toward older history,
+negative means toward the live bottom. Conversion and routing are explicit:
+
+| Source/outcome | Conversion or mapping |
+|---|---|
+| GTK vertical `dy` | `history_rows = -dy`; GTK reports negative for wheel-up and does not distinguish discrete from smooth units |
+| Iced `Lines { y }` | `history_rows = y * 3`; one discrete notch matches the existing Swift three-row policy |
+| Iced `Pixels { y }` | `history_rows = y / cell_height`; fractional rows accumulate |
+| Mouse tracking | positive = button 4, negative = button 5, one report per whole row |
+| Untracked alternate screen | positive = Up, negative = Down, one encoded key per whole row |
+| Untracked primary screen | `ScrollViewport::Delta(-history_rows)`; libghostty's negative delta moves toward older history |
+
+Invariants: mouse tracking wins over alternate-screen translation; an
+untracked alternate screen receives one encoded arrow press per whole row;
+an untracked primary screen moves libghostty's viewport with negative deltas
+toward older history; modifier-only and Roost-owned shortcuts do not snap the
+viewport; the next terminal keystroke does. UI adapters retain native event
+units, pointer geometry, modifier conversion, encoders, and PTY writes. No
+toolkit, renderer, callback, or session object enters `roost-vt`, and the Swift
+implementation can adopt the same explicit outcome model later without an ABI
+or struct-layout dependency.
+
+Every live terminal/tab owns an independent scroll-state instance. Direction
+changes discard stale fractional momentum. After a local viewport move, the
+state reads libghostty's authoritative scrollbar (`offset + len >= total`
+means bottom) instead of guessing from the request size; a partial move toward
+bottom therefore remains scrolled. Explicit bottom snap clears accumulation
+and state. Output, mouse-report, alternate-screen, modifier-only, and
+Roost-owned shortcut paths do not clear another tab's state.
+
+Tests and acceptance: pure route/accumulator/direction-change tests and
+libghostty viewport/snap tests pin the shared API; GTK unit and functional
+regressions stay green after migration; Iced widget/app tests cover line and
+pixel wheel normalization, local history, alternate-screen arrows,
+mouse-report precedence, and terminal-key snap. The Linux X11 real-input gate
+uses physical wheel events under wgpu and tiny-skia to prove visible history,
+tracking bytes, alternate-screen bytes, and return-to-bottom behavior. Existing
+Wayland real-seat uinput coverage attempts the same axis path; the concrete
+cage limitation and equivalent proof are recorded below rather than skipped.
+Cross-tab isolation and partial-scroll-down-then-key behavior are explicit
+regressions. macOS Iced E2E, Swift/GTK suites, dependency boundaries, and the
+complete per-commit gate must remain green before the focused commit is pushed
+and Actions verified.
+
+Wayland validation evidence: the shed's standalone relative uinput mouse is
+recognized by libinput 1.25 as a pointer and produces a valid
+`POINTER_SCROLL_WHEEL` event with legacy and high-resolution detents. Cage's
+headless + libinput backend did not forward that hot-plugged axis event to its
+Wayland client in four variants (absolute-device axis, separate relative
+device, explicit pointer property, and relative-device focus motion), although
+the same seat continues to forward motion, buttons, drags, and multi-clicks.
+The committed Wayland gate therefore remains strict for the input types cage
+can deliver and does not add a skip. The renderer-specific equivalent for
+wheel is the complete physical X11 route under both wgpu and tiny-skia, plus
+backend-neutral Iced event-normalization tests, shared libghostty route tests,
+and the existing Wayland renderer/pointer suite. `inject_wheel.py` remains as a
+small reusable diagnostic for a future real-compositor/physical-seat gate.
+
+Validation result: `make check` passed the warnings-denied Rust lint, complete
+Rust workspace, GTK tests, 688 Swift tests, and harness unit tests. macOS Iced
+E2E passed under both wgpu and tiny-skia (49 passed, one documented Linux-only
+PRIMARY-selection skip per renderer). The final shed gate passed GTK's physical
+Wayland drag/reorder guard, Iced's X11 real-input guard including all three
+wheel routes and key snap, and Iced's physical Wayland clipboard, drag,
+multi-click, and link-hover guard. During the audit, the Wayland drag fixture
+exposed uinput move/press coalescing; explicit scheduling fences made the
+physical gesture deterministic in two focused reruns and the complete shed
+gate without weakening its selection assertion.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

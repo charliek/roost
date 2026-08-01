@@ -39,10 +39,17 @@ use pangocairo::functions as pango_cairo;
 use roost_url::HoverUrl;
 use roost_vt::{
     ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, MouseEncoder,
-    MouseEvent, RenderState, ScrollViewport, Terminal, TerminalOptions,
+    MouseEvent, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
+    TerminalScroll,
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
+
+fn gtk_history_rows(dy: f64) -> f64 {
+    // GtkEventControllerScroll uses positive Y for down. The shared terminal
+    // policy uses positive for older history (up).
+    -dy
+}
 use crate::clipboard;
 use crate::config::CopyOnSelect;
 use crate::focus::safe_grab_focus;
@@ -252,8 +259,7 @@ impl TerminalView {
             // first focus-in event the user generates after the
             // widget is realized.
             has_focus: false,
-            scrolled_back: false,
-            scroll_accum: 0.0,
+            scroll: TerminalScroll::new(),
             selection: roost_vt::TerminalSelection::new(),
             copy_on_select: CopyOnSelect::default(),
             input_callback: None,
@@ -1465,12 +1471,10 @@ impl TerminalView {
                 // and clears any active selection — even when the key
                 // encodes to nothing (dead keys / IME composition /
                 // unmapped), since typing always overrides a selection.
-                let snapped = s.scrolled_back;
-                if s.scrolled_back {
-                    s.terminal.scroll_viewport(ScrollViewport::Bottom);
-                    s.scrolled_back = false;
-                    s.scroll_accum = 0.0;
-                }
+                let snapped = {
+                    let s_mut: &mut TerminalViewState = &mut s;
+                    s_mut.scroll.snap_to_bottom(&mut s_mut.terminal)
+                };
                 let had_selection = s.selection.clear();
                 // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
                 // (the safe wrapper landed in commit 1). The encoder
@@ -1526,16 +1530,9 @@ struct TerminalViewState {
     cell_metrics: CellMetrics,
     cursor_blink_on: bool,
     has_focus: bool,
-    /// True while the viewport has been scrolled back into history.
-    /// Cleared the moment we scroll back to bottom (either via a
-    /// keystroke snap or by the wheel reaching the active region).
-    /// Consulted before encoding a key to decide whether to snap.
-    scrolled_back: bool,
-    /// Smooth-scroll accumulator. Trackpad / Magic Mouse deltas are
-    /// fractional rows; we accumulate until we have a whole row,
-    /// then dispatch. Discrete wheels usually report 1.0+ per notch
-    /// so the accumulator passes through.
-    scroll_accum: f64,
+    /// Shared, per-terminal wheel accumulator, mode router, and
+    /// snap-to-bottom state. Native GTK units stay in this adapter.
+    scroll: TerminalScroll,
     /// Current drag selection, in (col, screen_y) coordinates.
     /// `None` outside an active drag.
     selection: roost_vt::TerminalSelection,
@@ -1959,8 +1956,9 @@ impl TerminalViewState {
         }
     }
 
-    /// Handle a single scroll-wheel `dy`. Negative = up (older
-    /// history). 3 modes:
+    /// Handle a single GTK scroll-wheel `dy`. GTK reports negative for
+    /// wheel-up, so this adapter negates it into `TerminalScroll`'s positive-
+    /// toward-history convention. Three modes:
     ///   * Mouse-tracking (DECSET 1000/1002/1003) — encode button-4/5
     ///     reports via `encode_wheel_buttons`, checked first so a
     ///     tracking alt-screen app (htop) gets the report.
@@ -1974,82 +1972,49 @@ impl TerminalViewState {
     /// dispatches them through `input_callback` after dropping the
     /// borrow, per the callback invariant on `TerminalViewState`.
     fn handle_scroll(&mut self, dy: f64, mods: roost_vt::Mods) -> Vec<u8> {
-        // Smooth-scroll accumulator. Trackpad deltas are typically
-        // fractional rows; discrete wheels are integers.
-        self.scroll_accum += dy;
-        // 3 rows per discrete notch matches the Mac UI; for smooth
-        // scroll we step one row at a time so the animation isn't
-        // jumpy.
-        let rows_to_scroll = if self.scroll_accum.abs() >= 1.0 {
-            let rows = self.scroll_accum.trunc() as isize;
-            self.scroll_accum -= rows as f64;
-            rows
-        } else {
-            return Vec::new();
-        };
-
-        // Mouse tracking: the app opted into mouse events, so forward the
-        // wheel as button-4 (up) / button-5 (down) reports at the
-        // pointer's cell. Checked *before* alt-screen — a mouse-tracking
-        // alt-screen app (htop) wants the report, not arrow keys. The
-        // encoder honors the negotiated format (X10 / SGR / pixels).
-        if self.terminal.mouse_tracking() {
-            return self.encode_wheel_buttons(rows_to_scroll, mods);
-        }
-
-        if self.terminal.active_screen() == ActiveScreen::Alternate {
-            // Translate to arrow keys for alt-screen apps.
-            let key = if rows_to_scroll < 0 {
-                roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP
-            } else {
-                roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN
-            };
-            let mut event = match roost_vt::KeyEvent::new() {
-                Ok(ev) => ev,
-                Err(_) => return Vec::new(),
-            };
-            event.set_action(roost_vt::key_action::PRESS);
-            event.set_key(key);
-            event.set_mods(0);
-            self.encoder.sync_from_terminal(&self.terminal);
-            let mut out = Vec::new();
-            for _ in 0..rows_to_scroll.unsigned_abs() {
-                if let Ok(bytes) = self.encoder.encode(&event) {
-                    out.extend_from_slice(&bytes);
-                }
+        let route = self.scroll.route(&mut self.terminal, gtk_history_rows(dy));
+        match route {
+            Some(ScrollRoute::MouseReport { direction, rows }) => {
+                self.encode_wheel_buttons(direction, rows, mods)
             }
-            return out;
+            Some(ScrollRoute::AlternateScreenKey { direction, rows }) => {
+                let key = match direction {
+                    ScrollDirection::History => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP,
+                    ScrollDirection::Bottom => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN,
+                };
+                let mut event = match roost_vt::KeyEvent::new() {
+                    Ok(event) => event,
+                    Err(_) => return Vec::new(),
+                };
+                event.set_action(roost_vt::key_action::PRESS);
+                event.set_key(key);
+                event.set_mods(0);
+                self.encoder.sync_from_terminal(&self.terminal);
+                let mut out = Vec::new();
+                for _ in 0..rows {
+                    if let Ok(bytes) = self.encoder.encode(&event) {
+                        out.extend_from_slice(&bytes);
+                    }
+                }
+                out
+            }
+            Some(ScrollRoute::LocalViewport { .. }) | None => Vec::new(),
         }
-
-        // Primary screen: local scrollback. Negative dy = scroll up
-        // (older history). libghostty's Delta semantics use negative
-        // for up.
-        self.terminal
-            .scroll_viewport(ScrollViewport::Delta(-rows_to_scroll));
-        // Track whether we're scrolled back. A positive scroll-down
-        // that lands us at the active region clears the flag.
-        if rows_to_scroll < 0 {
-            self.scrolled_back = true;
-        } else if rows_to_scroll > 0 && self.scrolled_back {
-            // Heuristic: if we scrolled down by the request, assume
-            // we're back at bottom. A more precise check would call
-            // a render-state getter for the viewport offset; deferred
-            // since the keystroke snap is the primary "back-to-bottom"
-            // path.
-            self.scrolled_back = false;
-        }
-        Vec::new()
     }
 
     /// Encode one wheel button-press per scrolled row at the pointer's
-    /// current cell. `rows < 0` is wheel-up (button 4); `rows > 0` is
-    /// wheel-down (button 5). Returns the concatenated reports (empty if
+    /// current cell. History is button 4 and Bottom is button 5. Returns the
+    /// concatenated reports (empty if
     /// the encoder declines, e.g. the negotiated format reports nothing).
-    fn encode_wheel_buttons(&mut self, rows: isize, mods: roost_vt::Mods) -> Vec<u8> {
-        let button = if rows < 0 {
-            roost_vt::mouse_button::FOUR // wheel up
-        } else {
-            roost_vt::mouse_button::FIVE // wheel down
+    fn encode_wheel_buttons(
+        &mut self,
+        direction: ScrollDirection,
+        rows: usize,
+        mods: roost_vt::Mods,
+    ) -> Vec<u8> {
+        let button = match direction {
+            ScrollDirection::History => roost_vt::mouse_button::FOUR,
+            ScrollDirection::Bottom => roost_vt::mouse_button::FIVE,
         };
         let cw = self.cell_metrics.cell_width.max(1.0);
         let ch = self.cell_metrics.cell_height.max(1.0);
@@ -2075,7 +2040,7 @@ impl TerminalViewState {
         event.set_position(x, y);
 
         let mut out = Vec::new();
-        for _ in 0..rows.unsigned_abs() {
+        for _ in 0..rows {
             if let Ok(bytes) = self.mouse_encoder.encode(&event) {
                 out.extend_from_slice(&bytes);
             }
@@ -2857,6 +2822,12 @@ mod tests {
     //! the canvas bg). All cases below exercise `resolve_cell_colors`.
     use super::*;
     use roost_vt::{Cell, ColorRgb, Style};
+
+    #[test]
+    fn gtk_scroll_sign_normalizes_up_to_positive_history() {
+        assert_eq!(gtk_history_rows(-1.0), 1.0);
+        assert_eq!(gtk_history_rows(1.0), -1.0);
+    }
 
     #[test]
     fn link_modifier_mask_super_accepts_meta_and_super() {
