@@ -1,0 +1,23 @@
+[package]
+name = "roost-ui-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Toolkit-neutral Roost configuration and presentation models"
+
+[dependencies]
+roost-ipc = { path = "../roost-ipc" }
+roost-vt = { path = "../roost-vt" }
+bitflags = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

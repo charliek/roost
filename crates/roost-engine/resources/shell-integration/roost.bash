@@ -1,4 +1,4 @@
-# Roost shell integration (bash).
+# Roost engine shell integration (bash).
 #
 # Makes the header subtitle, the tab label, and new-tab cwd inheritance
 # follow `cd` via OSC 7, and sets a sane default prompt. Safe everywhere:

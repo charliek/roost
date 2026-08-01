@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use roost_linux::daemon::{PtyOutputEvent, PtySupervisor, SupervisorEvent};
+use roost_engine::{PtyOutputEvent, PtySupervisor, SupervisorEvent};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::sleep;
@@ -167,10 +167,10 @@ async fn duplicate_spawn_for_same_tab_id_is_rejected() {
     // assert the underlying PtyError variant rather than scraping
     // the Display string.
     let pty_err = err
-        .downcast_ref::<roost_linux::daemon::PtyError>()
+        .downcast_ref::<roost_engine::PtyError>()
         .expect("expected PtyError in anyhow chain");
     assert!(
-        matches!(pty_err, roost_linux::daemon::PtyError::DuplicateTab(42)),
+        matches!(pty_err, roost_engine::PtyError::DuplicateTab(42)),
         "expected DuplicateTab(42), got {pty_err:?}"
     );
 
@@ -230,7 +230,7 @@ async fn write_after_exit_returns_not_found() {
     let probe_deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         match sup.write(7, b"x".to_vec()).await {
-            Err(roost_linux::daemon::PtyError::NotFound(7)) => break,
+            Err(roost_engine::PtyError::NotFound(7)) => break,
             other => {
                 assert!(
                     std::time::Instant::now() < probe_deadline,

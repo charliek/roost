@@ -195,7 +195,7 @@ struct WorkspaceStateTests {
     }
 
     /// Ported from the Rust twin `position_is_max_plus_one_after_delete`
-    /// (`crates/roost-linux/src/daemon/state.rs`). Swift allocated from
+    /// (`crates/roost-engine/src/workspace.rs`). Swift allocated from
     /// `count` until #262, which collides after a mid-list delete
     /// because positions are sparse, not dense (#80).
     @Test func positionIsMaxPlusOneAfterDelete() async throws {
@@ -296,7 +296,7 @@ private func label(for event: Workspace.Event) -> String {
 }
 
 // Agent state model (plan 002). Mirrors the Rust workspace suite in
-// `crates/roost-linux/src/daemon/state.rs` case for case, so the two
+// `crates/roost-engine/src/workspace.rs` case for case, so the two
 // implementations of the same op set can't drift.
 @MainActor
 @Suite("Workspace agent state model")

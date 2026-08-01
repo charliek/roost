@@ -3,7 +3,7 @@
 //! survive as restore *descriptors* (the layout the UI re-opens as
 //! fresh shells), not as live tabs in the workspace.
 
-use roost_linux::daemon::Workspace;
+use roost_engine::Workspace;
 use tempfile::tempdir;
 
 #[test]

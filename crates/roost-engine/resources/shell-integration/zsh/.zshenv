@@ -1,4 +1,4 @@
-# Roost zsh auto-bootstrap.
+# Roost engine zsh auto-bootstrap.
 #
 # Sourced automatically by zsh because Roost sets ZDOTDIR to this
 # directory. It restores the user's real ZDOTDIR FIRST (so all their

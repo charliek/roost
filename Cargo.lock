@@ -1069,6 +1069,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "roost-engine"
+version = "0.0.17"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "libc",
+ "portable-pty",
+ "roost-ipc",
+ "roost-osc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "roost-ipc"
 version = "0.0.17"
 dependencies = [
@@ -1087,18 +1105,16 @@ name = "roost-linux"
 version = "0.0.17"
 dependencies = [
  "anyhow",
- "bitflags 2.11.1",
- "fs2",
  "futures",
  "gdk-pixbuf",
  "glib",
  "gtk4",
  "libadwaita",
- "libc",
  "pangocairo",
- "portable-pty",
+ "roost-engine",
  "roost-ipc",
  "roost-osc",
+ "roost-ui-model",
  "roost-url",
  "roost-vt",
  "serde",
@@ -1116,6 +1132,19 @@ name = "roost-osc"
 version = "0.0.17"
 dependencies = [
  "base64",
+]
+
+[[package]]
+name = "roost-ui-model"
+version = "0.0.17"
+dependencies = [
+ "bitflags 2.11.1",
+ "roost-ipc",
+ "roost-vt",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

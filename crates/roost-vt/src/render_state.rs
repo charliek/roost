@@ -14,51 +14,7 @@
 use std::ptr;
 
 use crate::sys;
-use crate::{Error, Result, Terminal};
-
-/// sRGB triple, layout-compatible with libghostty's `GhosttyColorRgb`.
-/// Repr-C so palette arrays can be passed through `set_color_palette`
-/// without copying.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ColorRgb {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
-
-impl ColorRgb {
-    pub const fn new(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
-    }
-
-    /// Convert to f64 triple normalized to [0.0, 1.0] for Cairo /
-    /// Pango color sinks.
-    pub fn to_f64(self) -> (f64, f64, f64) {
-        (
-            self.r as f64 / 255.0,
-            self.g as f64 / 255.0,
-            self.b as f64 / 255.0,
-        )
-    }
-
-    /// Rec. 709 luminance over the sRGB channels normalized to [0,1].
-    /// Not gamma-linearized — a plain weighted sum is enough to sort a
-    /// theme background into "light" vs "dark". This is the ONE formula
-    /// behind the DEC 2031 color-scheme classification; the Mac side
-    /// mirrors it in `Theme.isLight` (`mac/Sources/Roost/Theme.swift`).
-    pub fn relative_luminance(self) -> f64 {
-        let (r, g, b) = self.to_f64();
-        0.2126 * r + 0.7152 * g + 0.0722 * b
-    }
-
-    /// True when the color reads as a light scheme (luminance > 0.5).
-    /// Used to pick the DEC 2031 report parameter (`997;2n` light /
-    /// `997;1n` dark) from a theme's background.
-    pub fn is_light(self) -> bool {
-        self.relative_luminance() > 0.5
-    }
-}
+use crate::{ColorRgb, Error, Result, Terminal};
 
 impl From<sys::GhosttyColorRgb> for ColorRgb {
     fn from(c: sys::GhosttyColorRgb) -> Self {

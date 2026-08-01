@@ -1,4 +1,4 @@
-//! `state.json` reader + atomic writer.
+//! Toolkit-neutral `state.json` reader + atomic writer.
 //!
 //! M3 of the daemon-removal refactor. Replaces the legacy
 //! SQLite-backed `Store` with a single JSON file per profile.

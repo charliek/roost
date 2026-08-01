@@ -1,4 +1,4 @@
-# Roost shell integration (zsh).
+# Roost engine shell integration (zsh).
 #
 # Sourced inside a Roost tab to make the header subtitle, the tab label,
 # and new-tab cwd inheritance follow `cd` via OSC 7, and to set a sane

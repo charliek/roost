@@ -1,4 +1,4 @@
-//! PTY supervision: spawn a shell, surface the master fd as async
+//! Toolkit-neutral PTY supervision: spawn a shell, surface the master fd as async
 //! streams of bytes, bridge writes/resizes back.
 //!
 //! Copied + adapted from `crates/roost-core/src/pty.rs` at M3 of

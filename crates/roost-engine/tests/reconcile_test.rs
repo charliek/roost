@@ -1,8 +1,8 @@
 //! Unit tests for the pure resync reconcile planner
-//! (`roost_linux::reconcile`). No GTK / glib main loop required.
+//! (`roost_engine::reconcile`). No UI event loop required.
 
+use roost_engine::reconcile::{plan, CurrentView};
 use roost_ipc::messages::{Project, Tab, TabState};
-use roost_linux::reconcile::{plan, CurrentView};
 
 fn tab(id: i64, project_id: i64, position: i32, is_active: bool) -> Tab {
     Tab {

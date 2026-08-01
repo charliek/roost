@@ -1,6 +1,8 @@
 # Architecture
 
-Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed the workspace + PTY supervisor in-process. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+Roost ships two production native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed their runtime in-process. The GTK runtime's authoritative state is provided by the toolkit-neutral `roost-engine` crate. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+
+The `poc/iced` branch proposes extending the shared Rust engine to Iced and, incrementally, Swift. This is a POC architecture proposal, not approval to migrate the production AppKit implementation; see [the reviewed Iced POC plan](../development/iced-poc-plan.md).
 
 For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md).
 
@@ -11,7 +13,7 @@ For the durable design rationale (why two languages, why in-process, why local U
 | Window + chrome | Swift + AppKit | Rust + gtk4-rs + libadwaita |
 | Renderer | Core Graphics over libghostty-vt cell grid | Cairo + Pango over libghostty-vt cell grid |
 | Terminal engine | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) |
-| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-linux/src/daemon/state.rs` |
+| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-engine/src/workspace.rs` |
 | PTY supervisor | `mac/Sources/Roost/PtySupervisor.swift` (forkpty + DispatchSourceRead) | `crates/roost-linux/src/daemon/pty.rs` (`portable-pty` + tokio tasks) |
 | Persistence | `state.json` via tmp + fsync + `replaceItemAt` | `state.json` via tmp + fsync + rename + parent-dir fsync |
 | IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |

@@ -109,6 +109,7 @@ nav:
   - Development:
       - Architecture & principles: development/vision.md
       - Iced POC proposal: development/iced-poc-plan.md
+      - Shared Rust engine: development/shared-rust-engine.md
       - Test automation: development/test-automation.md
       - Setup: development/setup.md
       - Claude integration testing: development/claude-testing.md

@@ -114,7 +114,7 @@ clippy:  ## Lint Rust at CI parity (warnings are errors)
 	cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types -D clippy::disallowed_methods
 
 themes-check:  ## Assert the Rust + Mac bundled-theme copies are byte-identical
-	diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
+	diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes
 
 check: fmt-check clippy themes-check test  ## Pre-push gate: fmt-check + clippy + themes-check + tests
 

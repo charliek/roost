@@ -95,7 +95,7 @@ let package = Package(
                 // in the same commit.
             ],
             // Bundled theme files. The source-of-truth copy lives in the
-            // Rust crate at `crates/roost-linux/src/resources/themes/`;
+            // Rust crate at `crates/roost-ui-model/src/resources/themes/`;
             // this is a byte-identical copy (kept in sync by
             // `make themes-check`) because SwiftPM `.copy` can't reach
             // outside the package. SwiftPM exposes them via

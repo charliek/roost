@@ -1,0 +1,30 @@
+[package]
+name = "roost-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Toolkit-neutral Roost workspace, PTY runtime, persistence, events, and IPC dispatch"
+
+[dependencies]
+roost-ipc = { path = "../roost-ipc" }
+roost-osc = { path = "../roost-osc" }
+
+portable-pty = { workspace = true }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fs2 = "0.4"
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -6,14 +6,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use roost_engine::ipc::IpcHandler;
+use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::messages::{
     ops, IdentifyParams, IdentifyResult, ProjectCreateParams, ProjectCreateResult, TabListResult,
     TabOpenParams, TabOpenResult,
 };
 use roost_ipc::IpcClient;
 use roost_ipc::IpcServer;
-use roost_linux::daemon::{PtySupervisor, Workspace};
-use roost_linux::ipc::IpcHandler;
 use tempfile::tempdir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

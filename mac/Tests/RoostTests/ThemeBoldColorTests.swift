@@ -1,5 +1,5 @@
 // Swift companion to the Rust theme parser tests in
-// `crates/roost-linux/src/theme.rs::tests`. Both UIs MUST agree on
+// `crates/roost-ui-model/src/theme.rs::tests`. Both UIs MUST agree on
 // whether a theme opts into the Ghostty `bold-color` accent — same
 // theme file, same parsed result — so the resolver's bold-default-fg
 // branch fires symmetrically on Mac and Linux.

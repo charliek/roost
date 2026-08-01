@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use roost_linux::daemon::{Workspace, WorkspaceEvent};
+use roost_engine::{Workspace, WorkspaceEvent};
 use tokio::sync::broadcast::error::TryRecvError;
 
-/// `EVENT_CHANNEL_CAPACITY` in `daemon/state.rs`. Sending more than
+/// `EVENT_CHANNEL_CAPACITY` in `workspace.rs`. Sending more than
 /// this without draining forces the subscriber to lag.
 const CHANNEL_CAPACITY: usize = 256;
 

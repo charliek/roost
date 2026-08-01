@@ -13,25 +13,10 @@
 //! needs to decide whether to call the encoder at all, vs routing
 //! the event to selection / paste / URL hover.
 
-/// One of the three mouse actions libghostty-vt's encoder accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseRoutingAction {
-    Press,
-    Release,
-    Motion,
-}
-
-/// One of the five buttons the encoder reports on. Wheel up =
-/// `Four`, wheel down = `Five`. `None` is used at call sites that
-/// mean "no button" (motion-no-button under mode 1003).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseRoutingButton {
-    Left,
-    Right,
-    Middle,
-    Four,
-    Five,
-}
+/// Engine-owned pointer DTOs retain the GTK adapter's established aliases.
+pub use roost_engine::pointer::{
+    PointerAction as MouseRoutingAction, PointerButton as MouseRoutingButton,
+};
 
 /// What the call site should do with this mouse event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

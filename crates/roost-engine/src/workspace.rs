@@ -31,10 +31,11 @@ use roost_ipc::agent::{
     SOURCE_LEGACY, SOURCE_MANUAL,
 };
 use roost_ipc::messages::{Project, Tab, TabState};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::daemon::store_json::{persist_state, read_state, ProjectSnapshot, SnapshotFile};
+use crate::persistence::{persist_state, read_state, ProjectSnapshot, SnapshotFile};
 
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
@@ -90,6 +91,8 @@ struct Inner {
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
     persist_seq: u64,
+    /// Monotonic in-process revision for every committed transition.
+    revision: u64,
 }
 
 impl Default for Inner {
@@ -108,6 +111,7 @@ impl Default for Inner {
             // real window would.
             window_focused: true,
             persist_seq: 0,
+            revision: 0,
         }
     }
 }
@@ -145,51 +149,64 @@ pub struct RestoreTab {
 
 /// Workspace event channel. Server-push subscribers in `ipc.rs`
 /// convert these to wire-format `EventEnvelope`s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WorkspaceEvent {
     TabOpened(Tab),
     TabClosed {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
     },
     TabStateChanged {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         state: TabState,
     },
     TabTitleChanged {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         title: String,
     },
     TabCwdChanged {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         cwd: String,
     },
     TabNotification {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         has_pending: bool,
     },
     ProjectCreated(Project),
     ProjectRenamed {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         project_id: i64,
         name: String,
     },
     ProjectDeleted {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         project_id: i64,
     },
     ActiveChanged {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         project_id: i64,
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
     },
     HookActiveChanged {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         active: bool,
     },
     /// The full agent record after an accepted report or shell mark;
     /// see [`roost_ipc::messages::AgentReportChangedEvent`].
     AgentChanged {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         agent: AgentTabState,
     },
     NotificationFired {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         title: String,
         body: String,
@@ -199,12 +216,15 @@ pub enum WorkspaceEvent {
     /// unlisted siblings in their prior position order. Mirrors
     /// the Mac side's `Workspace.Event.tabsReordered`.
     TabsReordered {
+        #[serde(with = "roost_ipc::messages::string_int64")]
         project_id: i64,
+        #[serde(with = "roost_ipc::messages::vec_string_int64")]
         tab_ids: Vec<i64>,
     },
     /// Fired after `reorder_projects`. `project_ids` is the
     /// post-reorder sidebar order.
     ProjectsReordered {
+        #[serde(with = "roost_ipc::messages::vec_string_int64")]
         project_ids: Vec<i64>,
     },
     /// Full-state recovery snapshot. Minted by the event bridge
@@ -214,6 +234,14 @@ pub enum WorkspaceEvent {
     /// carries its live tabs; the active tab is the one with
     /// `is_active == true`.
     Resync(Vec<Project>),
+}
+
+/// An ordered workspace event tagged under the authoritative state lock.
+/// Events produced by one command share a revision and retain vector order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedWorkspaceEvent {
+    pub revision: u64,
+    pub event: WorkspaceEvent,
 }
 
 pub struct Workspace {
@@ -228,6 +256,7 @@ pub struct Workspace {
     /// std `Mutex` across it cannot deadlock. Durability
     /// (`persist`) deliberately runs *after* the lock drops.
     events: broadcast::Sender<WorkspaceEvent>,
+    versioned_events: broadcast::Sender<VersionedWorkspaceEvent>,
     /// Where to write the `state.json` file. `None` means the
     /// in-memory variant (used by tests).
     state_path: Option<PathBuf>,
@@ -333,9 +362,11 @@ impl Workspace {
     /// Construct an empty in-memory workspace. Used by tests.
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (versioned_tx, _versioned_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             inner: Mutex::new(Inner::default()),
             events: tx,
+            versioned_events: versioned_tx,
             state_path: None,
             persist_guard: Mutex::new(0),
             restore_layout: Mutex::new(None),
@@ -362,6 +393,7 @@ impl Workspace {
         // colliding project positions, and those survive the load.
         normalize_project_positions(&mut snapshot.projects);
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (versioned_tx, _versioned_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut inner = Inner {
             next_id: snapshot.next_id.max(1),
             sidebar_collapsed: snapshot.sidebar_collapsed,
@@ -417,6 +449,7 @@ impl Workspace {
         Self {
             inner: Mutex::new(inner),
             events: tx,
+            versioned_events: versioned_tx,
             state_path: Some(state_path),
             persist_guard: Mutex::new(0),
             restore_layout: Mutex::new(Some(restore)),
@@ -468,9 +501,35 @@ impl Workspace {
         self.events.subscribe()
     }
 
+    /// Subscribe to events carrying their authoritative commit revision.
+    pub fn subscribe_versioned(&self) -> broadcast::Receiver<VersionedWorkspaceEvent> {
+        self.versioned_events.subscribe()
+    }
+
     /// Snapshot of the workspace as it appears on the wire.
     pub fn snapshot(&self) -> Vec<Project> {
         let inner = self.inner.lock().unwrap();
+        self.snapshot_locked(&inner)
+    }
+
+    /// Full ordered snapshot and revision captured under one lock.
+    pub fn snapshot_with_revision(&self) -> (u64, Vec<Project>) {
+        let inner = self.inner.lock().unwrap();
+        (inner.revision, self.snapshot_locked(&inner))
+    }
+
+    pub(crate) fn snapshot_parts(&self) -> (u64, Vec<Project>, i64, i64, bool) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.revision,
+            self.snapshot_locked(&inner),
+            inner.active_project_id,
+            inner.active_tab_id,
+            inner.sidebar_collapsed,
+        )
+    }
+
+    fn snapshot_locked(&self, inner: &Inner) -> Vec<Project> {
         let mut out: Vec<Project> = inner
             .projects
             .values()
@@ -484,7 +543,7 @@ impl Workspace {
                     .tabs
                     .values()
                     .filter(|t| t.project_id == p.id)
-                    .map(|t| self.to_wire_tab(t, &inner))
+                    .map(|t| self.to_wire_tab(t, inner))
                     .collect(),
             })
             .collect();
@@ -1302,7 +1361,7 @@ impl Workspace {
     /// writers and drops any snapshot older than the newest already
     /// on disk, so a slow earlier commit can never clobber a newer
     /// one (#80).
-    fn persist(&self, seq: u64, snapshot: SnapshotFile, sync: bool) {
+    fn persist(&self, seq: u64, snapshot: &SnapshotFile, sync: bool) {
         // Frozen by `flush()` on clean exit: ignore any later write so
         // a teardown cascade can't overwrite the flushed layout.
         if self.shutting_down.load(Ordering::Relaxed) {
@@ -1315,7 +1374,7 @@ impl Workspace {
         if seq <= *last {
             return; // a newer commit already persisted; this write is stale
         }
-        if let Err(err) = persist_state(&path, &snapshot, sync) {
+        if let Err(err) = persist_state(&path, snapshot, sync) {
             warn!(?err, "failed to persist state.json");
         }
         // Advance past this seq even on write failure: an older
@@ -1338,7 +1397,7 @@ impl Workspace {
             let mut inner = self.inner.lock().unwrap();
             inner.snapshot_for_persist()
         };
-        self.persist(seq, snapshot, true);
+        self.persist(seq, &snapshot, true);
         self.shutting_down.store(true, Ordering::Relaxed);
     }
 
@@ -1357,16 +1416,22 @@ impl Workspace {
         events: Vec<WorkspaceEvent>,
         persist: Persist,
     ) {
+        inner.revision = inner.revision.saturating_add(1);
+        let revision = inner.revision;
         let to_write = match persist {
             Persist::Skip => None,
             Persist::Write => Some(inner.snapshot_for_persist()),
         };
         for ev in events {
-            let _ = self.events.send(ev);
+            let _ = self.events.send(ev.clone());
+            let _ = self.versioned_events.send(VersionedWorkspaceEvent {
+                revision,
+                event: ev,
+            });
         }
         drop(inner);
         if let Some((snapshot, seq)) = to_write {
-            self.persist(seq, snapshot, false);
+            self.persist(seq, &snapshot, false);
         }
     }
 }
@@ -1385,6 +1450,7 @@ pub enum AttentionSource {
 /// changes (projects/tabs/order/active selection); `Skip` for state
 /// that isn't in the persisted snapshot (the agent axes, notification
 /// flags) — those emit an event but never touch disk.
+#[derive(Clone, Copy)]
 enum Persist {
     Skip,
     Write,
@@ -1459,7 +1525,7 @@ impl Inner {
     /// carries its tab layout (title + cwd + position) so a relaunch
     /// can re-open the tabs in their saved directories.
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
-        use crate::daemon::store_json::{ProjectSnapshot, TabSnapshot};
+        use crate::persistence::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
         // Active tab restored by its DENSE index within the active
         // project's display-ordered tabs — not the raw `position`
@@ -2382,7 +2448,7 @@ mod tests {
         // the newest snapshot stays on disk (#80).
         ws.persist(
             2,
-            SnapshotFile {
+            &SnapshotFile {
                 next_id: 99,
                 ..Default::default()
             },
@@ -2390,7 +2456,7 @@ mod tests {
         );
         ws.persist(
             1,
-            SnapshotFile {
+            &SnapshotFile {
                 next_id: 5,
                 ..Default::default()
             },
@@ -2405,7 +2471,7 @@ mod tests {
         // A genuinely newer commit (seq 3) still applies.
         ws.persist(
             3,
-            SnapshotFile {
+            &SnapshotFile {
                 next_id: 200,
                 ..Default::default()
             },

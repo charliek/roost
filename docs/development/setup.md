@@ -63,7 +63,9 @@ Rust tests live next to the code they exercise. Major coverage:
 | `roost-ipc` | Frame reader/writer, JSON wire vectors, target selection (probe alive + env precedence) |
 | `roost-osc` | OSC 9 / 777 streaming parser, ST terminator, hook suppression |
 | `roost-vt` | FFI smoke tests against the vendored `libghostty-vt` archive (gated on `--features ffi`) |
-| `roost-linux` | Workspace state machine, PTY supervisor, IPC dispatch, single-instance flock |
+| `roost-engine` | Workspace, PTY supervision, persistence, events, IPC dispatch, instance lock |
+| `roost-ui-model` | Config, theme, keybind, palette, provider, and agent projection models |
+| `roost-linux` | GTK presentation, native ports, input, and terminal rendering adapter |
 | `roost-cli` | Escape decoder, shell quoter, target arg mapping |
 
 Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state machine, PTY supervisor lifecycle, IPC server framing, single-instance flock, renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).
