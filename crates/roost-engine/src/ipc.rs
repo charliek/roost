@@ -291,7 +291,7 @@ pub enum UiRequest {
         reply: UnitReply,
     },
     /// `app.set_window_focus` — drive the focus-tracking emit path
-    /// without actually taking GTK focus. Targets the active tab.
+    /// without actually changing native window focus. Targets the active tab.
     /// Gated on `ROOST_TEST_MODE=1`.
     AppSetWindowFocus { focused: bool, reply: UnitReply },
     /// `app.cursor_shape` — return the active tab's currently
@@ -300,7 +300,7 @@ pub enum UiRequest {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// `app.active_terminal_focused` — return whether the active tab's
-    /// terminal holds GTK logical keyboard focus. Ungated (read-only).
+    /// terminal owns the UI's logical keyboard route. Ungated (read-only).
     AppActiveTerminalFocused {
         reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
     },

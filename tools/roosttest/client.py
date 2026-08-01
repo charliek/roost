@@ -477,11 +477,10 @@ class Roost:
         return res.get("shape", "")
 
     def app_active_terminal_focused(self) -> bool:
-        """Return whether the active tab's terminal holds GTK *logical*
-        keyboard focus (`window.focus_widget() == terminal`). Reads
-        logical focus, so it is observable under the WM-less Xvfb e2e
-        runner. Ungated (read-only); False when there is no active
-        terminal."""
+        """Return whether the active tab's terminal owns the UI's *logical*
+        keyboard route. Toolkit adapters expose this independently of
+        compositor/toplevel focus. Ungated (read-only); False when there is
+        no live active terminal or another in-app surface owns keyboard input."""
         res = self.call("app.active_terminal_focused", {})
         # Direct key access (not .get with a default): a missing field is
         # a protocol violation that should surface, not silently read as

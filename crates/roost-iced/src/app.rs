@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{button, canvas, column, container, row, scrollable, stack, text, text_input};
-use iced::{window, Alignment, Color, Element, Fill, Size, Task};
+use iced::{window, Alignment, Color, Element, Fill, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
@@ -110,6 +110,35 @@ fn font_palette_frame() -> palette::PaletteFrame {
         "Select a font…",
         vec![palette::PaletteItem::new("font:monospace", "Monospace")],
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardRoute {
+    None,
+    Palette,
+    Terminal(i64),
+}
+
+fn resolve_keyboard_route(
+    palette_open: bool,
+    active_tab: i64,
+    active_terminal_live: bool,
+) -> KeyboardRoute {
+    if palette_open {
+        KeyboardRoute::Palette
+    } else if active_terminal_live {
+        KeyboardRoute::Terminal(active_tab)
+    } else {
+        KeyboardRoute::None
+    }
+}
+
+fn take_palette_focus_request(requested: &mut bool, input_id: &Id) -> UiTask {
+    if std::mem::take(requested) {
+        UiTask::FocusWidget(input_id.clone())
+    } else {
+        UiTask::None
+    }
 }
 
 pub enum UiTask {
@@ -828,7 +857,7 @@ impl App {
                 let _ = self.open_palette("agents");
                 return self.take_palette_focus_task();
             }
-            if self.palette.is_some() {
+            if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
                 match key.as_ref() {
                     Key::Named(Named::Escape) => self.palette_back_or_dismiss(),
                     Key::Named(Named::ArrowUp) => self.move_palette_selection(-1),
@@ -844,16 +873,27 @@ impl App {
                 // a palette keystroke leak through to the active PTY.
                 return UiTask::None;
             }
-        } else if self.palette.is_some() {
+        } else if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
             return UiTask::None;
         }
-        let (_, active_tab) = self.workspace.active();
+        let KeyboardRoute::Terminal(active_tab) = self.keyboard_route() else {
+            return UiTask::None;
+        };
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
             return UiTask::None;
         };
         let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
         tab.session.send_input(bytes);
         UiTask::None
+    }
+
+    fn keyboard_route(&self) -> KeyboardRoute {
+        let active_tab = self.workspace.active().1;
+        resolve_keyboard_route(
+            self.palette.is_some(),
+            active_tab,
+            self.tabs.contains_key(&active_tab),
+        )
     }
 
     pub fn pointer(
@@ -1089,10 +1129,11 @@ impl App {
         let _ = self.focus_tab_and_clear(tab_id, true);
     }
 
-    pub fn open_notifications(&mut self) {
+    pub fn open_notifications(&mut self) -> UiTask {
         if let Err(error) = self.open_palette("notifications") {
             self.status = Some(error);
         }
+        self.take_palette_focus_task()
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -1208,11 +1249,7 @@ impl App {
     }
 
     fn take_palette_focus_task(&mut self) -> UiTask {
-        if std::mem::take(&mut self.palette_focus_requested) {
-            UiTask::FocusWidget(self.palette_input_id.clone())
-        } else {
-            UiTask::None
-        }
+        take_palette_focus_request(&mut self.palette_focus_requested, &self.palette_input_id)
     }
 
     fn palette_state_result(&self) -> PaletteStateResult {
@@ -2054,7 +2091,7 @@ impl App {
             match request {
                 UiRequest::Activate => {
                     if let Some(id) = self.window_id {
-                        task = UiTask::Focus(id);
+                        task = task.then(UiTask::Focus(id));
                     }
                 }
                 UiRequest::Dump { tab_id, reply } => {
@@ -2143,7 +2180,7 @@ impl App {
                         // remains authoritative if it sends one afterward.
                         self.resize(size);
                         if let Some(id) = self.window_id {
-                            task = UiTask::Resize(id, size);
+                            task = task.then(UiTask::Resize(id, size));
                         } else {
                             // IPC can become reachable just before Iced emits
                             // WindowOpened. Preserve the native resize until an
@@ -2171,7 +2208,8 @@ impl App {
                     let _ = reply.send(Ok(shape.into()));
                 }
                 UiRequest::AppActiveTerminalFocused { reply } => {
-                    let _ = reply.send(Ok(true));
+                    let focused = matches!(self.keyboard_route(), KeyboardRoute::Terminal(_));
+                    let _ = reply.send(Ok(focused));
                 }
                 UiRequest::AppSelectedTabId { reply } => {
                     let _ = reply.send(Ok(self.workspace.active().1));
@@ -2185,7 +2223,7 @@ impl App {
                         .open_palette(&kind)
                         .map(|()| self.palette_state_result());
                     if result.is_ok() {
-                        task = self.take_palette_focus_task();
+                        task = task.then(self.take_palette_focus_task());
                     }
                     let _ = reply.send(result);
                 }
@@ -2209,7 +2247,7 @@ impl App {
                     reply,
                 } => {
                     self.present_palette(title, placeholder, items, reply);
-                    task = self.take_palette_focus_task();
+                    task = task.then(self.take_palette_focus_task());
                 }
                 UiRequest::SelectionSet {
                     tab_id,
@@ -2463,17 +2501,17 @@ fn hydrate_workspace(runtime: &tokio::runtime::Runtime, client: &LocalClient) ->
 }
 
 impl Message {
-    pub(crate) fn apply(self, app: &mut App) -> Task<Message> {
+    pub(crate) fn apply(self, app: &mut App) -> UiTask {
         match self {
             Self::ProjectSelected(project_id) => app.select_project(project_id),
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::NewTab => app.new_tab(),
             Self::ToggleSidebar => app.toggle_sidebar(),
-            Self::OpenNotifications => app.open_notifications(),
+            Self::OpenNotifications => return app.open_notifications(),
             _ => {}
         }
-        Task::none()
+        UiTask::None
     }
 }
 
@@ -2494,6 +2532,47 @@ mod tests {
     fn collapsed_sidebar_has_no_layout_width() {
         assert_eq!(sidebar_width(false), SIDEBAR_WIDTH);
         assert_eq!(sidebar_width(true), 0.0);
+    }
+
+    #[test]
+    fn keyboard_route_requires_a_live_terminal_and_gives_palette_precedence() {
+        assert_eq!(resolve_keyboard_route(false, 7, false), KeyboardRoute::None);
+        assert_eq!(
+            resolve_keyboard_route(false, 7, true),
+            KeyboardRoute::Terminal(7)
+        );
+        assert_eq!(
+            resolve_keyboard_route(true, 7, true),
+            KeyboardRoute::Palette
+        );
+    }
+
+    #[test]
+    fn palette_focus_request_is_emitted_once_for_direct_open_actions() {
+        let input_id = Id::unique();
+        let mut requested = true;
+        assert!(matches!(
+            take_palette_focus_request(&mut requested, &input_id),
+            UiTask::FocusWidget(_)
+        ));
+        assert!(!requested);
+        assert!(matches!(
+            take_palette_focus_request(&mut requested, &input_id),
+            UiTask::None
+        ));
+    }
+
+    #[test]
+    fn ui_tasks_compose_without_overwriting_an_earlier_focus_request() {
+        let task = UiTask::FocusWidget(Id::unique()).then(UiTask::Resize(
+            window::Id::unique(),
+            Size::new(800.0, 600.0),
+        ));
+        let UiTask::Then(first, second) = task else {
+            panic!("both UI tasks must be retained");
+        };
+        assert!(matches!(*first, UiTask::FocusWidget(_)));
+        assert!(matches!(*second, UiTask::Resize(_, _)));
     }
 
     #[test]

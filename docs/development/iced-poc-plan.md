@@ -846,6 +846,43 @@ required Iced Make/Actions suite; `make smoke-iced` produces the five labeled
 scenario PNGs and manifest; full Iced has no remaining functional failure;
 GTK, Swift, dependency-boundary, and complete local/shed gates remain green.
 
+### Active mini-plan: Iced logical keyboard-focus ownership
+
+Scope: implement `app.active_terminal_focused` for Iced as the adapter's
+truthful logical keyboard-route owner, broaden the existing focus contract
+from GTK to both Rust UIs, and make those tests part of every required Iced
+functional lane. This does not introduce widget focus or presentation state
+into `roost-engine`.
+
+Invariants and interfaces:
+
+- Iced's terminal owns keyboard routing only when the command palette is
+  closed and the workspace's active tab has a live terminal adapter. A palette
+  takes ownership before its input focus task is issued and keeps ownership
+  across background project/tab navigation until explicit dismissal or a
+  committed activation that intentionally closes it;
+- the IPC port returns that adapter state instead of a constant, so both true
+  and false transitions are observable without relying on compositor focus.
+  One adapter-owned keyboard-route decision is shared by PTY key dispatch and
+  the IPC getter so the observable cannot drift into shadow state;
+- native toplevel focus and mode-1004 terminal focus reports remain separate:
+  `app.set_window_focus` continues to own the latter test seam, and an
+  unfocused window does not change which in-app route would receive a key;
+- navigation, close-survivor, and core/displayed-tab behavior continue to use
+  authoritative workspace operations. Focus ownership never creates a second
+  tab-selection state machine; and
+- GTK-specific critical-log assertions stay GTK-only even though the common
+  logical focus behavior runs on GTK and Iced.
+
+Acceptance: unit tests prove `None` with no live active adapter, `Terminal`
+after attachment, and `Palette` precedence; all eight existing focus tests plus
+a test-mode window-focus separation test pass on Iced macOS and in the shed
+with wgpu/tiny-skia under X11/Wayland. The functional gate still proves the
+false palette state and palette ownership during navigation rather than
+accepting an always-true implementation; the file joins the required Iced
+Make/Actions gate; full Iced, GTK, Swift, dependency-boundary, and local/shed
+gates remain green.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

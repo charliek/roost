@@ -6,31 +6,29 @@ terminal without an extra click (the Swift `makeFirstResponder` policy).
 
 Companion to `test_mouse_tracking.py`, which owns the mode-1004 focus-
 *event* + cursor-shape surface; this module owns the *who-holds-focus*
-surface via the `app.active_terminal_focused` op. That op reads GTK
-logical focus (`window.focus_widget() == terminal`), which `grab_focus()`
-sets regardless of whether the toplevel has the compositor's input focus —
-so it is observable under the WM-less Xvfb e2e runner, unlike the global
-`:has-focus` property.
+surface via the `app.active_terminal_focused` op. GTK reads its logical
+focus widget, while Iced reports the adapter route that actually dispatches
+keyboard events. Both are independent of compositor/toplevel focus.
 """
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
 
 from client import Roost, RoostError, scaled_timeout
-from util import wait_tab_attached
+from util import drain, drain_until_match, wait_tab_attached
 
 
 @pytest.fixture(autouse=True)
-def _gtk_only(target):
-    """These tests read the `app.active_terminal_focused` op, which only
-    the GTK UI implements. The Mac UI already has the focus behavior
-    (it's the reference); exposing the op + running these on Mac for
-    full parity is a follow-up."""
-    if target != "gtk":
-        pytest.skip("app.active_terminal_focused is implemented by the GTK UI only")
+def _logical_focus_port_only(target):
+    """GTK and Iced expose the common logical focus port. The Mac UI already
+    has the reference behavior; exposing this test-only read port there remains
+    a follow-up."""
+    if target not in ("gtk", "iced"):
+        pytest.skip("app.active_terminal_focused is implemented by GTK and Iced only")
 
 
 def _wait_terminal_focused(roost, what: str, timeout: float = 2.0) -> None:
@@ -78,6 +76,29 @@ def test_palette_steals_then_restores_terminal_focus(palette, project):
     _wait_terminal_focused(roost, what="terminal refocused after palette dismiss")
 
 
+@pytest.mark.skipif(
+    os.environ.get("ROOST_TEST_MODE") != "1",
+    reason="window focus injection requires ROOST_TEST_MODE=1",
+)
+def test_window_focus_reports_do_not_change_logical_keyboard_owner(roost, project):
+    """Mode-1004 toplevel reports and in-app keyboard ownership are separate.
+    Losing native focus emits focus-out to the PTY but the terminal remains the
+    route that will receive keys when the window is active again."""
+    tab = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, tab)
+    _wait_terminal_focused(roost, what="terminal focused before native focus reports")
+
+    roost.tab_feed_pty_bytes(tab, b"\x1b[?1004h")
+    drain(roost, tab)
+    roost.app_set_window_focus(focus=False)
+    assert roost.app_active_terminal_focused() is True
+    assert b"\x1b[O" in drain_until_match(roost, tab, rb"\x1b\[O")
+
+    roost.app_set_window_focus(focus=True)
+    assert roost.app_active_terminal_focused() is True
+    assert b"\x1b[I" in drain_until_match(roost, tab, rb"\x1b\[I")
+
+
 def _focus_critical_lines(since: int) -> list[str]:
     """New `GTK_IS_WIDGET` focus-family criticals appended to the captured UI
     log past byte offset `since`. The #234 focus-on-dead-widget crash (and its
@@ -100,7 +121,9 @@ def _gtk_log_len() -> int:
     return len(log.read_bytes()) if (log is not None and log.exists()) else 0
 
 
-def test_navigation_with_notifications_palette_open_keeps_focus_ownership(palette, project):
+def test_navigation_with_notifications_palette_open_keeps_focus_ownership(
+    palette, project, target
+):
     """#234 regression: with the notifications palette open, navigating (a
     project switch here) must NOT steal focus back to a terminal — the palette
     owns focus until it is dismissed — and must emit no `GTK_IS_WIDGET`
@@ -127,7 +150,7 @@ def test_navigation_with_notifications_palette_open_keeps_focus_ownership(palett
         _wait_terminal_focused(roost, what="terminal focused on the first project")
         roost.notify(b, "Build finished", "#234")
 
-        log_at = _gtk_log_len()
+        log_at = _gtk_log_len() if target == "gtk" else 0
 
         # Open the notifications palette (the bell surface); confirm it took focus.
         roost.palette_open(kind="commands")
@@ -169,8 +192,9 @@ def test_navigation_with_notifications_palette_open_keeps_focus_ownership(palett
         roost.palette_dismiss()
         _wait_terminal_focused(roost, what="terminal refocused after the palette is dismissed")
 
-        crit = _focus_critical_lines(log_at)
-        assert not crit, "#234 focus-on-dead-widget critical(s):\n" + "\n".join(crit[:10])
+        if target == "gtk":
+            crit = _focus_critical_lines(log_at)
+            assert not crit, "#234 focus-on-dead-widget critical(s):\n" + "\n".join(crit[:10])
     finally:
         roost.delete_project(other)  # deterministic cleanup even if an assert fails
 

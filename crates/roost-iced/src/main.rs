@@ -112,7 +112,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::TabSelected(_)
         | Message::NewTab
         | Message::ToggleSidebar
-        | Message::OpenNotifications) => message.apply(app),
+        | Message::OpenNotifications) => message.apply(app).map_task(),
     }
 }
 
