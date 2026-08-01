@@ -5629,7 +5629,7 @@ impl App {
     /// sidebar that's the start child of the `gtk4::Paned` we built
     /// with `resize_start_child(false) + shrink_start_child(false)`,
     /// so it equals the paned position when visible.
-    fn ipc_window_metrics(self: &Rc<Self>) -> Result<(f64, f64, f64, bool), String> {
+    fn ipc_window_metrics(self: &Rc<Self>) -> Result<(f64, f64, f64, bool, Option<f64>), String> {
         let w = self.window.width() as f64;
         let h = self.window.height() as f64;
         let collapsed = !self.sidebar_box.is_visible();
@@ -5638,7 +5638,7 @@ impl App {
         } else {
             self.sidebar_box.width() as f64
         };
-        Ok((w, h, sw, collapsed))
+        Ok((w, h, sw, collapsed, None))
     }
 
     /// `app.sidebar_dump` — read every project's *last-rendered* agent

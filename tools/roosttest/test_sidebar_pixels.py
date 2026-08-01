@@ -65,6 +65,7 @@ LIFECYCLE_COLORS: dict[str, tuple[int, int, int]] = {
     "finished": (0x7A, 0x7A, 0x7A),
     "failed": (0xE0, 0x52, 0x52),
 }
+ICED_ACTIVE_PROJECT = (0x13, 0x50, 0x9D)
 
 # Left edge (x, in the screenshot's pixels — `app.screenshot` at scale 1
 # renders one pixel per logical point on both UIs) shared by every agent
@@ -81,7 +82,7 @@ LIFECYCLE_COLORS: dict[str, tuple[int, int, int]] = {
 # invariant — every dot on one edge — is asserted exactly below; this
 # band only catches gross indentation, which is the regression it exists
 # for (the dot was 10px past the project name and still is caught).
-DOT_LEFT_X = {"gtk": 27, "iced": 21, "mac": 25}
+DOT_LEFT_X = {"gtk": 27, "iced": 25, "mac": 25}
 DOT_LEFT_TOLERANCE = {"gtk": 6, "iced": 2, "mac": 3}
 
 # All three UIs draw an 8x8 rounded dot (AppKit/GTK use a 4px radius; Iced
@@ -146,6 +147,31 @@ def _pixel(shot, x: int, y: int) -> tuple[int, int, int]:
     width, _height, bpp, px = shot
     o = (y * width + x) * bpp
     return (px[o], px[o + 1], px[o + 2])
+
+
+def _longest_vertical_run(shot, x: int, color: tuple[int, int, int]) -> int:
+    """Longest exact-color run at x; used for toolkit-owned stripe geometry."""
+    _width, height, _bpp, _px = shot
+    longest = current = 0
+    for y in range(height):
+        if _pixel(shot, x, y) == color:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _color_components(shot, max_x: int, color: tuple[int, int, int]):
+    width, height, bpp, px = shot
+    points = set()
+    for y in range(height):
+        base = y * width * bpp
+        for x in range(min(width, max_x)):
+            offset = base + x * bpp
+            if tuple(px[offset : offset + 3]) == color:
+                points.add((x, y))
+    return _components(points)
 
 
 def _capture(roost, path: Path):
@@ -266,3 +292,31 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
         f"agent dots start at x={observed[0]} on {target}, expected "
         f"{expected_x}±{tolerance} (screenshot: {shot_path})"
     )
+
+    if target == "iced":
+        # The active project's failed rollup is a 3x28 strip at the true
+        # sidebar edge. Rounded ends may shorten the exact-color centreline,
+        # so pin the edge and require the bulk of the reference-height run.
+        stripe_run = _longest_vertical_run(shot, 0, LIFECYCLE_COLORS["failed"])
+        assert stripe_run >= 24, (
+            f"Iced project rollup must occupy the true sidebar edge at x=0 "
+            f"for approximately 28px; longest failed-color run was {stripe_run}px "
+            f"(screenshot: {shot_path})"
+        )
+        sidebar_w = round(float(roost.window_metrics()["sidebar_width"]))
+        selections = [
+            bounds
+            for bounds in _color_components(shot, sidebar_w, ICED_ACTIVE_PROJECT)
+            if bounds[2] - bounds[0] >= 150 and bounds[3] - bounds[1] >= 20
+        ]
+        assert len(selections) == 1, (
+            f"expected one Iced active-project selection pill, got {selections} "
+            f"(screenshot: {shot_path})"
+        )
+        left, _top, right, _bottom = selections[0]
+        right_inset = sidebar_w - 1 - right
+        assert abs(left - 14) <= 1 and abs(right_inset - 8) <= 1, (
+            f"Iced project selection must be independently inset from the rollup "
+            f"and divider; got left={left}, right inset={right_inset} "
+            f"(screenshot: {shot_path})"
+        )

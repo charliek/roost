@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import socket
 import time
@@ -249,9 +250,28 @@ class Roost:
         return base64.b64decode(r["png"]), r["width"], r["height"]
 
     def window_metrics(self) -> dict:
-        """{window_width, window_height, sidebar_width, sidebar_collapsed}
-        in logical points. Backs the sidebar-holds-width regression."""
+        """Window/sidebar logical points plus optional ``terminal_top``.
+
+        Iced reports the exact application-owned terminal origin so pointer and
+        screenshot tests follow live product geometry instead of a copied band
+        constant. Native adapters may omit it.
+        """
         return self.call("app.window_metrics", {})
+
+    def terminal_top(self, metrics: dict | None = None) -> float:
+        """Return a trustworthy application-owned terminal Y origin.
+
+        Iced geometry-sensitive tests deliberately fail when the adapter omits
+        or corrupts this value; silently falling back to a copied chrome height
+        would let the product and test drift together unnoticed.
+        """
+        value = (metrics or self.window_metrics()).get("terminal_top")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise AssertionError(f"window_metrics has no terminal_top: {value!r}")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise AssertionError(f"window_metrics terminal_top is invalid: {value!r}")
+        return value
 
     def window_resize(self, width: float, height: float) -> None:
         """Test-mode only — set the window's logical size."""

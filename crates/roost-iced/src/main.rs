@@ -1,4 +1,5 @@
 mod app;
+mod chrome;
 mod input;
 mod palette_scroll;
 mod screenshot;
@@ -41,6 +42,7 @@ enum Message {
     ProjectSelected(i64),
     AgentSelected(i64),
     TabSelected(i64),
+    CloseTab(i64),
     NewTab,
     ToggleSidebar,
     OpenNotifications,
@@ -159,6 +161,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         message @ (Message::ProjectSelected(_)
         | Message::AgentSelected(_)
         | Message::TabSelected(_)
+        | Message::CloseTab(_)
         | Message::NewTab
         | Message::ToggleSidebar
         | Message::OpenNotifications) => message.apply(app).map_task(),

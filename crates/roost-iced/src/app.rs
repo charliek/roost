@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
-use iced::widget::{button, column, container, row, scrollable, stack, text, text_input};
+use iced::widget::{
+    button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+};
 use iced::{window, Alignment, Color, Element, Fill, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
@@ -17,7 +19,10 @@ use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
 use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLock;
-use roost_engine::{LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceEvent};
+use roost_engine::{
+    LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceError, WorkspaceEvent,
+};
+use roost_ipc::agent;
 use roost_ipc::messages::{
     PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
     SidebarDumpProject, SidebarDumpResult,
@@ -31,6 +36,7 @@ use roost_ui_model::{
     custom_command,
     keybind::{self, Accel, KeybindAction},
     notification_inbox, palette, provider,
+    rollup::project_rollup,
 };
 use roost_url::HoverUrl;
 use roost_vt::{
@@ -38,16 +44,15 @@ use roost_vt::{
     TerminalOptions, TerminalSelection,
 };
 
-use crate::input;
 use crate::palette_scroll::Visibility;
 use crate::terminal_widget::{
     resolve_colors, DrawCell, TerminalPointerEvent, TerminalSnapshot, TerminalWidget, CELL_HEIGHT,
     CELL_WIDTH, TERMINAL_PADDING,
 };
 use crate::Message;
+use crate::{chrome, input};
 
 const SIDEBAR_WIDTH: f32 = 220.0;
-const TAB_BAR_HEIGHT: f32 = 44.0;
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
 // Widget operations can observe an incomplete tree while a slower renderer or
@@ -55,6 +60,31 @@ const DEFAULT_ROWS: u16 = 32;
 // later application ticks for roughly two seconds at the 60 Hz subscription,
 // while keeping the work bounded and revision-scoped.
 const PALETTE_GEOMETRY_RETRY_LIMIT: u8 = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseTabOutcome {
+    Closed,
+    AlreadyGone,
+}
+
+fn close_tab_by_id(
+    runtime: &tokio::runtime::Runtime,
+    client: &LocalClient,
+    tab_id: i64,
+) -> Result<CloseTabOutcome> {
+    match runtime.block_on(client.close_tab(tab_id)) {
+        Ok(()) => Ok(CloseTabOutcome::Closed),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<WorkspaceError>(),
+                Some(WorkspaceError::TabNotFound(id)) if *id == tab_id
+            ) =>
+        {
+            Ok(CloseTabOutcome::AlreadyGone)
+        }
+        Err(error) => Err(error),
+    }
+}
 
 fn sidebar_width(collapsed: bool) -> f32 {
     if collapsed {
@@ -1521,7 +1551,8 @@ impl App {
             - sidebar_width(self.workspace.sidebar_collapsed())
             - 2.0 * TERMINAL_PADDING)
             .max(CELL_WIDTH * 2.0);
-        let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
+        let height =
+            (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
         let cols = ((width / CELL_WIDTH).floor() as u16).max(2);
         let rows = ((height / CELL_HEIGHT).floor() as u16).max(2);
         for tab in self.tabs.values_mut() {
@@ -1729,25 +1760,53 @@ impl App {
 
     pub fn view(&self) -> Element<'_, Message> {
         let (active_project, active_tab) = self.workspace.active();
-        let mut sidebar = column![text("ROOST").size(13)].spacing(8).padding(12);
+        let mut sidebar_body = column![].spacing(2).padding([4, 0]);
         for project in &self.projects {
-            let label = if project.id == active_project {
-                format!("●  {}", project.name)
-            } else {
-                format!("   {}", project.name)
-            };
-            let mut project_group = column![button(text(label).size(14))
+            let rollup = project_rollup(
+                project
+                    .tabs
+                    .iter()
+                    .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
+            );
+            let stripe = container(
+                iced::widget::Space::new()
+                    .width(chrome::PROJECT_STRIPE_WIDTH)
+                    .height(chrome::ROW_HEIGHT),
+            )
+            .style(move |_| {
+                let color = if rollup == roost_ipc::agent::AgentLifecycle::Inactive {
+                    Color::TRANSPARENT
+                } else {
+                    agent_color(rollup)
+                };
+                iced::widget::container::Style::default()
+                    .background(color)
+                    .border(iced::border::rounded(2))
+            });
+            let project_pill = container(text(&project.name).size(13))
                 .width(Fill)
-                .on_press(Message::ProjectSelected(project.id))]
-            .spacing(2);
+                .height(chrome::ROW_HEIGHT)
+                .padding([3.0, chrome::PROJECT_LABEL_INSET])
+                .style(chrome::project_pill(project.id == active_project));
+            let project_row = mouse_area(
+                container(
+                    row![
+                        stripe,
+                        iced::widget::Space::new().width(chrome::PROJECT_STRIPE_GAP),
+                        project_pill,
+                        iced::widget::Space::new().width(chrome::PROJECT_RIGHT_INSET)
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .width(Fill)
+                .height(chrome::ROW_HEIGHT),
+            )
+            .on_press(Message::ProjectSelected(project.id));
+            let mut project_group = column![project_row].spacing(2);
             if self.config.show_sidebar_agents {
                 for agent in self.sidebar_agents.get(&project.id).into_iter().flatten() {
-                    let name = if agent.is_active {
-                        format!("{}  ←", agent.name)
-                    } else {
-                        agent.name.clone()
-                    };
-                    let detail = format!("{}  ·  {}", agent.status_text, agent.time_text);
+                    let name = agent.name.clone();
+                    let detail = format!("{} · {}", agent.status_text, agent.time_text);
                     let dot_color = agent_color(agent.lifecycle);
                     let dot =
                         container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
@@ -1755,38 +1814,59 @@ impl App {
                                 .background(dot_color)
                                 .border(iced::border::rounded(3))
                         });
-                    let row = row![
+                    let agent_row = row![
                         dot,
-                        column![
-                            text(name).size(12),
-                            text(detail).size(10).color(Color::from_rgb8(160, 164, 176))
-                        ]
-                        .spacing(1)
+                        text(name).size(11),
+                        text(detail).size(9).color(chrome::MUTED_TEXT)
                     ]
-                    .spacing(7)
+                    .spacing(6)
                     .align_y(Alignment::Center);
                     project_group = project_group.push(
-                        button(row)
+                        button(agent_row)
                             .width(Fill)
-                            .padding([5, 8])
+                            .height(chrome::ROW_HEIGHT)
+                            .padding(iced::Padding {
+                                top: 3.0,
+                                right: 8.0,
+                                bottom: 3.0,
+                                left: chrome::AGENT_DOT_INSET,
+                            })
+                            .style(chrome::agent_button(agent.is_active))
                             .on_press(Message::AgentSelected(agent.tab_id)),
                     );
                 }
             }
-            sidebar = sidebar.push(project_group);
+            sidebar_body = sidebar_body.push(project_group);
         }
         if let Some(status) = &self.status {
-            sidebar = sidebar.push(text(status).size(11).color(Color::from_rgb8(238, 120, 120)));
+            sidebar_body =
+                sidebar_body.push(text(status).size(11).color(Color::from_rgb8(238, 120, 120)));
         }
-        sidebar = sidebar.push(
+        let sidebar_header = container(text("PROJECTS").size(11).color(chrome::MUTED_TEXT))
+            .height(chrome::BAND_HEIGHT)
+            .width(Fill)
+            .padding([10, 12])
+            .style(chrome::surface);
+        let sidebar_footer = container(
             button(text("Hide Sidebar").size(11))
                 .width(Fill)
+                .height(chrome::PILL_HEIGHT)
+                .padding([2, 8])
+                .style(chrome::transparent_button)
                 .on_press(Message::ToggleSidebar),
-        );
-        let sidebar = container(sidebar)
-            .width(SIDEBAR_WIDTH)
-            .height(Fill)
-            .style(container::dark);
+        )
+        .height(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([5, 8])
+        .style(chrome::surface);
+        let sidebar = container(column![
+            sidebar_header,
+            scrollable(sidebar_body).height(Fill),
+            sidebar_footer
+        ])
+        .width(SIDEBAR_WIDTH)
+        .height(Fill)
+        .style(chrome::surface);
 
         let active_project_tabs = self
             .projects
@@ -1795,38 +1875,120 @@ impl App {
             .map(|project| project.tabs.as_slice())
             .unwrap_or(&[]);
         let collapsed = self.workspace.sidebar_collapsed();
-        let mut tabs = row![].spacing(6).padding([7, 10]);
-        if collapsed {
-            tabs = tabs.push(button(text("☰")).on_press(Message::ToggleSidebar));
-        }
+        let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
             let title = if tab.title.is_empty() {
                 "shell"
             } else {
                 &tab.title
             };
-            let label = if tab.id == active_tab {
-                format!("● {title}")
-            } else if tab.has_notification {
-                format!("• {title}")
-            } else {
-                title.to_string()
-            };
-            tabs = tabs.push(button(text(label).size(13)).on_press(Message::TabSelected(tab.id)));
+            let active = tab.id == active_tab;
+            let lifecycle = agent::effective_lifecycle(&tab.agent_state());
+            let status_color = tab_status_color(lifecycle);
+            let dot = container(
+                iced::widget::Space::new()
+                    .width(chrome::TAB_STATUS_SIZE)
+                    .height(chrome::TAB_STATUS_SIZE),
+            )
+            .style(move |_| {
+                iced::widget::container::Style::default()
+                    .background(status_color)
+                    .border(iced::border::rounded(4))
+            });
+            let select = button(
+                row![
+                    dot,
+                    text(title).size(12).color(if active {
+                        chrome::TEXT
+                    } else {
+                        chrome::MUTED_TEXT
+                    })
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .height(chrome::PILL_HEIGHT)
+            .padding([2, 7])
+            .style(chrome::transparent_button)
+            .on_press(Message::TabSelected(tab.id));
+            let mut pill = row![select].align_y(Alignment::Center);
+            if tab.has_notification && !active {
+                pill = pill.push(
+                    container(
+                        iced::widget::Space::new()
+                            .width(chrome::NOTIFICATION_DOT_SIZE)
+                            .height(chrome::NOTIFICATION_DOT_SIZE),
+                    )
+                    .style(chrome::badge),
+                );
+            }
+            if active {
+                pill = pill.push(
+                    button(text("×").size(13))
+                        .width(chrome::PILL_HEIGHT)
+                        .height(chrome::PILL_HEIGHT)
+                        .padding(2)
+                        .style(chrome::transparent_button)
+                        .on_press(Message::CloseTab(tab.id)),
+                );
+            }
+            tab_pills = tab_pills.push(
+                container(pill)
+                    .height(chrome::PILL_HEIGHT)
+                    .padding([0, 2])
+                    .style(chrome::tab_pill(active)),
+            );
         }
-        tabs = tabs.push(button(text("+")).on_press(Message::NewTab));
+        let tab_scroller = scrollable(tab_pills)
+            .horizontal()
+            .width(Fill)
+            .height(chrome::PILL_HEIGHT);
+        let mut tabs = row![].spacing(5).align_y(Alignment::Center);
+        if collapsed {
+            tabs = tabs.push(
+                button(text("☰").size(13))
+                    .width(chrome::PILL_HEIGHT)
+                    .height(chrome::PILL_HEIGHT)
+                    .padding(2)
+                    .style(chrome::transparent_button)
+                    .on_press(Message::ToggleSidebar),
+            );
+        }
+        tabs = tabs.push(tab_scroller).push(
+            button(text("+").size(15))
+                .width(chrome::PILL_HEIGHT)
+                .height(chrome::PILL_HEIGHT)
+                .padding(1)
+                .style(chrome::transparent_button)
+                .on_press(Message::NewTab),
+        );
         let notification_count = self.notification_inbox.count();
         let notification_label = if notification_count == 0 {
-            "Notifications".to_string()
+            "○".to_string()
         } else {
-            format!("Notifications ({notification_count})")
+            format!("•{}", notification_count.min(99))
         };
-        tabs = tabs
-            .push(button(text(notification_label).size(11)).on_press(Message::OpenNotifications));
+        tabs = tabs.push(
+            button(
+                text(notification_label)
+                    .size(11)
+                    .color(if notification_count == 0 {
+                        chrome::MUTED_TEXT
+                    } else {
+                        chrome::NOTIFICATION
+                    }),
+            )
+            .width(chrome::PILL_HEIGHT)
+            .height(chrome::PILL_HEIGHT)
+            .padding(2)
+            .style(chrome::transparent_button)
+            .on_press(Message::OpenNotifications),
+        );
         let tab_bar = container(tabs)
-            .height(TAB_BAR_HEIGHT)
+            .height(chrome::BAND_HEIGHT)
             .width(Fill)
-            .style(container::dark);
+            .padding([5, 8])
+            .style(chrome::dark_surface);
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
             Some(tab) => TerminalWidget {
@@ -1982,6 +2144,20 @@ impl App {
             u32::from(DEFAULT_ROWS),
         )) {
             self.status = Some(error.to_string());
+        }
+        self.reconcile();
+    }
+
+    pub fn close_tab(&mut self, tab_id: i64) {
+        match close_tab_by_id(&self.runtime, &self.client, tab_id) {
+            Ok(CloseTabOutcome::Closed) => {}
+            Ok(CloseTabOutcome::AlreadyGone) => {
+                tracing::debug!(tab_id, "close_tab: rendered tab already gone");
+            }
+            Err(error) => {
+                tracing::warn!(?error, tab_id, "close_tab failed");
+                self.status = Some(error.to_string());
+            }
         }
         self.reconcile();
     }
@@ -2696,7 +2872,7 @@ impl App {
                         - sidebar_width(self.workspace.sidebar_collapsed())
                         - 2.0 * TERMINAL_PADDING)
                         .max(CELL_WIDTH * 2.0);
-                    let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING)
+                    let height = (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING)
                         .max(CELL_HEIGHT * 2.0);
                     tab.resize(
                         ((width / CELL_WIDTH).floor() as u16).max(2),
@@ -3228,6 +3404,7 @@ impl App {
                         f64::from(self.window_size.height),
                         f64::from(sidebar_width(collapsed)),
                         collapsed,
+                        Some(f64::from(chrome::BAND_HEIGHT)),
                     )));
                 }
                 UiRequest::WindowResize {
@@ -3479,6 +3656,14 @@ fn agent_color(lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
     }
 }
 
+fn tab_status_color(lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
+    if lifecycle == roost_ipc::agent::AgentLifecycle::Inactive {
+        Color::TRANSPARENT
+    } else {
+        agent_color(lifecycle)
+    }
+}
+
 fn pointer_action(action: PointerAction) -> roost_vt::MouseAction {
     match action {
         PointerAction::Press => mouse_action::PRESS,
@@ -3580,6 +3765,7 @@ impl Message {
             Self::ProjectSelected(project_id) => app.select_project(project_id),
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
+            Self::CloseTab(tab_id) => app.close_tab(tab_id),
             Self::NewTab => app.new_tab(),
             Self::ToggleSidebar => app.toggle_sidebar(),
             Self::OpenNotifications => return app.open_notifications(),
@@ -3650,7 +3836,8 @@ mod tests {
     fn terminal_geometry_never_produces_zero_grid() {
         let size = Size::new(1.0, 1.0);
         let width = (size.width - SIDEBAR_WIDTH - 2.0 * TERMINAL_PADDING).max(CELL_WIDTH * 2.0);
-        let height = (size.height - TAB_BAR_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
+        let height =
+            (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(CELL_HEIGHT * 2.0);
         assert_eq!(((width / CELL_WIDTH).floor() as u16).max(2), 2);
         assert_eq!(((height / CELL_HEIGHT).floor() as u16).max(2), 2);
     }
@@ -3659,6 +3846,52 @@ mod tests {
     fn collapsed_sidebar_has_no_layout_width() {
         assert_eq!(sidebar_width(false), SIDEBAR_WIDTH);
         assert_eq!(sidebar_width(true), 0.0);
+    }
+
+    #[test]
+    fn rendered_close_keeps_its_exact_id_and_engine_fallback_semantics() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("one", "/tmp").unwrap();
+        let sibling = workspace.open_tab(project.id, "/tmp", "sibling").unwrap();
+        let doomed = workspace.open_tab(project.id, "/tmp", "doomed").unwrap();
+        workspace.focus_tab(doomed.id).unwrap();
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::new(PtySupervisor::new()),
+            "/tmp/roost-iced-close-test.sock".into(),
+        );
+
+        assert_eq!(
+            close_tab_by_id(&runtime, &client, doomed.id).unwrap(),
+            CloseTabOutcome::Closed
+        );
+        assert_eq!(workspace.active(), (project.id, sibling.id));
+
+        // A queued click message retains the ID rendered into it. If another
+        // actor already removed that tab, replaying the stale message is an
+        // expected no-op and cannot close the newly-active sibling.
+        assert_eq!(
+            close_tab_by_id(&runtime, &client, doomed.id).unwrap(),
+            CloseTabOutcome::AlreadyGone
+        );
+        assert!(workspace.tab(sibling.id).is_ok());
+
+        let last_project = workspace.create_project("last", "/tmp").unwrap();
+        let last = workspace.open_tab(last_project.id, "/tmp", "last").unwrap();
+        workspace.focus_tab(last.id).unwrap();
+        assert_eq!(
+            close_tab_by_id(&runtime, &client, last.id).unwrap(),
+            CloseTabOutcome::Closed
+        );
+        assert!(
+            workspace
+                .snapshot()
+                .iter()
+                .all(|project| project.id != last_project.id),
+            "closing a project's last tab must remove the project"
+        );
+        assert_eq!(workspace.active(), (project.id, sibling.id));
     }
 
     #[test]
@@ -4830,6 +5063,15 @@ mod tests {
         assert_eq!(
             agent_color(AgentLifecycle::Failed),
             Color::from_rgb8(0xe0, 0x52, 0x52)
+        );
+        assert_eq!(
+            tab_status_color(AgentLifecycle::Inactive),
+            Color::TRANSPARENT,
+            "inactive tabs reserve the status slot without painting a dot"
+        );
+        assert_eq!(
+            tab_status_color(AgentLifecycle::Working),
+            agent_color(AgentLifecycle::Working)
         );
     }
 

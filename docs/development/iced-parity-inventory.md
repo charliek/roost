@@ -91,6 +91,32 @@ mostly transparent dark chrome with selection applied only to the active row or
 pill. Iced therefore reads as a generic widget demonstration despite having a
 real terminal and shared state behind it.
 
+## Chrome foundation result
+
+The first production-facing styling slice removes the stock-primary-button
+look. Iced now uses an explicit Roost palette and density model rather than its
+theme defaults: `#282828` sidebar chrome, a 34 pt common header/tab seam,
+transparent inactive rows, `#13509d` only for the active project, `#3a3a3a`
+for the active agent row, `#243751` for the active tab pill, and the existing
+shared lifecycle colors for project stripes, agent dots, and tab dots. The
+sidebar header/body/footer and tab overflow/control regions have the same
+ownership structure as the references. Notification state is a compact badge,
+and the active tab has a separate exact-ID close target.
+
+Side-by-side product captures on macOS and real Linux X11 show that the former
+purple/full-width-control concern is closed: the shell now reads as the same
+Roost product rather than a generic Iced demonstration. Both wgpu and tiny-skia
+render the structure consistently. This is a positive styling-feasibility
+decision, not a final parity claim; the remaining P0/P1 work below is mostly
+missing interaction/polish rather than inability to express the look.
+
+Correctness stays in focused reusable gates. `app.window_metrics` now reports
+Iced's optional `terminal_top`, constrained X11 pointer coverage reaches the
+last vertical row and a horizontally scrolled active close button while fixed
+controls remain available, and stale close IDs/fallback/cascade are unit-tested.
+The repeatable comparison fixture remains the human visual gate and is not a
+new permanent parity CI suite.
+
 ## Visual gap register
 
 Priority meanings: P0 blocks a usable parity claim, P1 is required common
@@ -98,18 +124,18 @@ product polish, and P2 is an optional native/toolkit refinement.
 
 | Area | Reference behavior | Current Iced behavior | Priority | Acceptance evidence |
 |---|---|---|---:|---|
-| Shell hierarchy | Sidebar and tab strip are compact chrome bands around a darker terminal | Correct broad columns, but stock controls dominate and the 44 pt tab band is too tall | P0 | Same named fixture; focused band-height/background assertions; side-by-side capture |
-| Sidebar surface | 220 pt default, `#282828` GTK chrome; Swift material resolves near `#3a3a3a`; header reads `PROJECTS` | 220 pt but near-black `#111111`; header reads `ROOST` | P0 | Metrics remain 220 pt; background sample and header-content assertion |
-| Project rows | 28 pt compact rows; active project is an inset deep-blue rounded pill; lifecycle rollup is a narrow leading stripe | Full-width stock indigo buttons; active state is a text bullet; no rollup stripe | P0 | Selected/unselected geometry and color assertions; lifecycle stripe fixture; click E2E |
-| Agent rows | Transparent compact nested rows; only active agent has a faint wash; lifecycle dot, name, status, and time have distinct roles | Every row is an indigo button; active state is an arrow suffix; two-line layout is much taller | P0 | Four-state capture, active-row background assertion, row-height bound, click E2E |
+| Shell hierarchy | Sidebar and tab strip are compact chrome bands around a darker terminal | Closed in chrome slice: compact 34 pt seam and explicit dark surfaces | closed | Same named fixture; focused band-height/background assertions; side-by-side capture |
+| Sidebar surface | 220 pt default, `#282828` GTK chrome; Swift material resolves near `#3a3a3a`; header reads `PROJECTS` | Closed: 220 pt `#282828` surface and `PROJECTS` header | closed | Metrics remain 220 pt; background sample and header-content assertion |
+| Project rows | 28 pt compact rows; active project is an inset deep-blue rounded pill; lifecycle rollup is a narrow leading stripe | Closed: compact transparent rows, active `#13509d` pill, shared rollup stripe | closed | Selected/unselected geometry and color assertions; lifecycle stripe fixture; click E2E |
+| Agent rows | Transparent compact nested rows; only active agent has a faint wash; lifecycle dot, name, status, and time have distinct roles | Shared lifecycle colors/alignment and a gray active wash are implemented; current one-line rows remain taller and typographically less distinct than GTK/AppKit | P1 | Add active-row background and row-height bounds to the existing four-state capture; retain click E2E |
 | Sidebar footer | Centered compact `+ New Project` action in a separated footer | `Hide Sidebar` full-width action occupies list content; no visible project creation | P0 | Real directory-selection/create path plus capture and functional test |
-| Sidebar overflow | Project and agent lists scroll vertically without moving the header/footer | One unscrollable column; enough rows become unreachable below the window | P0 | Small-window many-row fixture, wheel/drag navigation, final-row activation |
+| Sidebar overflow | Project and agent lists scroll vertically without moving the header/footer | Closed: body scrolls independently and final row activates in a constrained real-pointer fixture | closed | Small-window many-row fixture, wheel/drag navigation, final-row activation |
 | Sidebar collapse/resize | Both references expose a toolbar toggle. Swift persists a 160–400 pt user width; GTK uses a 160 pt minimum/default 220 pt `GtkPaned` without persisting a 400 pt cap. Intended Iced policy: persisted 160–400 pt, matching Swift while retaining GTK's 220 pt default | Collapse works through button/command but has no reference-like affordance; fixed 220 pt width | P1 | Keyboard/click/persistence tests; resize metrics and pointer test |
-| Tab strip | About 24 pt pills in a compact band with 6 pt gaps and horizontal overflow | 44 pt band of stock indigo buttons | P0 | Band/pill geometry assertions under both renderers; overflow test |
-| Tab status | Shared lifecycle dot at leading edge, white active label, muted inactive label | State is encoded as text bullet; no faithful status-slot geometry | P0 | Shared lifecycle-color assertion and exact status-slot geometry |
-| Tab close/badge | Active or hovered pill exposes close; inactive notification uses a distinct blue trailing badge | No close control; notification changes the text prefix; global notifications is a text button | P0 | Real click-close test, badge color/position assertion, notification clear test |
+| Tab strip | About 24 pt pills in a compact band with 6 pt gaps and horizontal overflow | Closed for active/manual reachability: 24 pt dark pills in a 34 pt band with independent horizontal overflow | closed | Band/pill geometry assertions under both renderers; overflow test |
+| Tab status | Shared lifecycle dot at leading edge, white active label, muted inactive label | Implemented with shared lifecycle derivation; inactive slots are transparent, but the current parity fixture does not yet pin dot/label geometry | P1 | Add focused status-slot geometry/color capture; retain the semantic color unit test |
+| Tab close/badge | Active or hovered pill exposes close; inactive notification uses a distinct blue trailing badge | Active exact-ID close and blue badge implemented; hover-close remains deferred | P1 | Real click-close test, badge color/position assertion, notification clear test |
 | Tab rename/reorder | Inline rename and pointer drag reorder with visible insertion feedback | IPC operations work, but there is no direct Iced UI | P0 | Keyboard/pointer functional tests, persistence after relaunch |
-| New-tab affordance | Compact plus control following the pills | Working but stock primary button | P1 | Click opens one PTY-backed tab; compact geometry assertion |
+| New-tab affordance | Compact plus control following the pills | Closed: compact fixed plus remains reachable outside overflow and opens a PTY tab | closed | Click opens one PTY-backed tab; compact geometry assertion |
 | Notification entry | Header bell with count badge opens the inbox palette | Text button in the tab band | P1 | Bell/count capture and click-to-palette E2E |
 | Terminal padding | Compact consistent inset around the grid | 12 pt inset, visibly close but not yet measured against both references | P1 | Cell-origin and viewport-edge assertions at fixed size |
 | Terminal scrollback | Wheel/page navigation scrolls retained history locally when mouse reporting is off; alternate-screen behavior follows terminal modes | 2,000 rows are retained but Iced has no local viewport-scroll path; non-reporting wheel events are dropped | P0 | Long-output wheel/page fixture, snap to bottom on non-modifier input, output preservation behavior compared with both references, alternate-screen and mouse-reporting tests |
@@ -120,7 +146,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Mostly inherited stock theme states | P1 | Renderer-neutral state-style unit tests plus real pointer/keyboard capture |
 | File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using UI-owned native adapters | No Iced drop or image-paste adapter | P1 | Text/file/image payload tests, shell escaping parity, platform launch smoke |
 | Native chrome | Platform-appropriate window controls and title/subtitle behavior | Native winit decorations; renderer screenshot cannot compare them directly | P2 | Platform launch artifacts and manual checklist, separate from content pixels |
-| Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | Closed for the current shell: renderer-neutral widget begins at x=220/y=44 with the sidebar and x=0/y=44 collapsed under wgpu/tiny-skia on macOS, X11, and Wayland | closed | Focused product screenshot regression runs in the existing renderer matrix; repeatable parity captures remain available for human review |
+| Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | Closed for the current shell: renderer-neutral widget begins at x=220/y=34 with the sidebar and x=0/y=34 collapsed under wgpu/tiny-skia on macOS, X11, and Wayland | closed | Focused product screenshot regression runs in the existing renderer matrix; repeatable parity captures remain available for human review |
 
 ## Functional interaction gap register
 
@@ -131,12 +157,12 @@ does not justify a second state machine.
 | Operation | Engine/IPC | Iced direct UI | Required adapter work |
 |---|---|---|---|
 | Select project/tab/agent | implemented | implemented | Preserve while restyling; keep one authoritative active state |
-| Sidebar scrolling | UI-owned presentation | missing | Wrap only the project/agent list in a scrollable viewport; keep header/footer fixed |
+| Sidebar scrolling | UI-owned presentation | implemented | Body scrolls independently while the header/footer stay fixed; constrained real-pointer fixture activates the final row |
 | Create project | implemented | missing | Native/portal directory picker, then engine command; no renderer dependency in engine |
 | Rename/delete project | implemented | missing | Context menu or equivalent, inline rename, confirmation/error handling |
 | Reorder projects | implemented | missing | Pointer drag with stable IDs and explicit insertion feedback |
 | Open tab | implemented | implemented | Restyle plus control and preserve PTY launch path |
-| Close tab | implemented | palette/IPC only | Direct pill close with last-tab/project cascade semantics |
+| Close tab | implemented | active-pill close implemented | Keep exact rendered tab IDs and last-tab/project cascade coverage; add hover-close polish separately |
 | Rename/reorder tabs | implemented | missing | Inline rename and pointer drag; persist through engine events |
 | Sidebar collapse | implemented/persisted | implemented | Move affordance into chrome; retain command and shortcut convergence |
 | Sidebar resize | UI-owned geometry | missing | Iced split/drag adapter and persisted width policy |
@@ -168,21 +194,30 @@ renderers, and is pushed only after the complete applicable gate is green.
    sidebar controls; use shared lifecycle/rollup derivation; add a real active
    tab close control; reduce band and row density. Preserve all engine APIs and
    compare the resulting named captures against GTK and Swift.
-4. **Scrollable navigation and shortcut safety:** make the sidebar list and
-   terminal scrollback reachable, then dispatch every configured workspace
-   shortcut before terminal encoding so missing UI commands cannot leak bytes.
-5. **Project manipulation:** portal/native directory selection, create,
+4. **Palette convergence and visual go/no-go:** replace the remaining stock
+   input/button treatment with a scrim, elevated panel, compact semantic rows,
+   and reference-like focus/selection states across command, agent, provider,
+   and notification frames. Refresh the three-target capture and explicitly
+   decide whether Iced still has a credible path to reference-level polish.
+5. **Scrollable navigation and shortcut safety:** make terminal scrollback
+   reachable, then dispatch every configured workspace shortcut before terminal
+   encoding so missing UI commands cannot leak bytes. Sidebar and tab chrome
+   scrolling landed with slice 3.
+6. **Project manipulation:** portal/native directory selection, create,
    rename, delete, reorder, and the shared `new_project` command route.
-6. **Tab manipulation:** inline rename, drag reorder/overflow, hover-close
+7. **Tab manipulation:** inline rename, drag reorder/overflow, hover-close
    behavior, and restoration coverage.
-7. **Sidebar resizing and transient states:** 160–400 pt pointer resize,
+8. **Interaction-cost go/no-go:** after at least one project or tab
+   direct-manipulation path is polished and tested, assess focus, accessibility,
+   text editing, drag feedback, and custom-widget complexity against GTK. Stop
+   treating Iced as a replacement candidate if ordinary product interactions
+   require brittle toolkit workarounds, even if the shared engine remains useful.
+9. **Sidebar resizing and transient states:** 160–400 pt pointer resize,
    persistence, empty/loading/error treatment, hover/focus/disabled states.
-8. **Palette convergence:** scrim, panel elevation, row density, semantic
-   status/trailing columns, and command/agent/provider/notification captures.
-9. **Terminal visual/input convergence:** measured padding/font/baseline,
+10. **Terminal visual/input convergence:** measured padding/font/baseline,
    font commands, cursor/selection/link colors and geometry, file/image drops,
    then both-renderer artifacts.
-10. **Final gap closure:** repeat the inventory against the named fixture;
+11. **Final gap closure:** repeat the inventory against the named fixture;
    accept only explicitly documented native-toolkit differences.
 
 ## First slice contract
@@ -223,3 +258,14 @@ These are sequencing decisions, not accepted final gaps:
   remain required.
 - Arbitrary 2× software-renderer detail remains governed by the capture policy
   in `iced-poc-plan.md`; all focused pixel/geometry gates run at 1×.
+- The footer temporarily retains `Hide Sidebar` until the project-manipulation
+  slice supplies the shared `New Project` route and a portal/native directory
+  picker; the missing direct creation path remains P0.
+- Only the active tab exposes close in this slice. Hover-close, inline
+  rename/reorder, drag insertion feedback, and automatic reveal after
+  programmatic selection of an offscreen tab remain in the tab-manipulation
+  slice. Manual horizontal reachability is already a real-pointer gate.
+- Iced 0.14 does not expose all desired accessibility labels/tooltips through
+  the current compact controls without more adapter work. Semantic icon,
+  tooltip, focus-ring, and assistive-technology refinement remains required
+  before a release claim.

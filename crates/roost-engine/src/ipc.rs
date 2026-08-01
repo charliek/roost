@@ -54,11 +54,12 @@ pub struct DumpData {
 type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
 
 /// Reply for a [`UiRequest::WindowMetrics`]:
-/// `(window_width, window_height, sidebar_width, sidebar_collapsed)`
+/// `(window_width, window_height, sidebar_width, sidebar_collapsed, terminal_top)`
 /// in logical points. The `Result<_, String>` envelope shape matches
 /// every sibling reply (so the shared `ui_call` helper works), but
 /// the UI side always answers `Ok` — GTK widget queries never fail.
-type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<(f64, f64, f64, bool), String>>;
+type WindowMetricsReply =
+    tokio::sync::oneshot::Sender<Result<(f64, f64, f64, bool, Option<f64>), String>>;
 
 /// Reply for [`UiRequest::SidebarDump`]. Read-only: always answers
 /// `Ok`, matching `WindowMetricsReply`.
@@ -664,7 +665,7 @@ async fn dispatch(
         }
         ops::WINDOW_METRICS => {
             let _p: WindowMetricsParams = decode(params)?;
-            let (w, h_, sw, collapsed) = h
+            let (w, h_, sw, collapsed, terminal_top) = h
                 .ui_call(|reply| UiRequest::WindowMetrics { reply })
                 .await?
                 .map_err(|m| HandlerError::new("internal", m))?;
@@ -673,6 +674,7 @@ async fn dispatch(
                 window_height: h_,
                 sidebar_width: sw,
                 sidebar_collapsed: collapsed,
+                terminal_top,
             })
         }
         ops::SIDEBAR_DUMP => {

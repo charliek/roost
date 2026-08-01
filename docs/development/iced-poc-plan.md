@@ -1451,7 +1451,8 @@ audit, unit coverage, and live functional cleanup proofs.
 The released-Canvas rollback is exercised and validated. The focused terminal
 widget suite passes on macOS with wgpu and tiny-skia and in the Linux shed with
 both renderers under X11 and headless Wayland. It checks a distinctive explicit
-cell background at the non-zero `(220, 44)` origin, the `(0, 44)` collapsed
+cell background at the non-zero `(220, terminal_top)` origin, the
+`(0, terminal_top)` collapsed
 origin, the base background at the widget origin and far edges, and
 shape-independent ASCII signal, CJK fallback across the second logical cell,
 and a combining-mark ascent relative to the adjacent plain glyph. A separate Xvfb root
@@ -1487,6 +1488,37 @@ Iced control styling and missing direct manipulation paths as P0 gaps; the
 walking skeleton must not be described as visually or functionally equivalent
 until that register is closed or every remaining difference is explicitly
 accepted as toolkit-native.
+
+### Chrome-feasibility slice result (2026-08-01)
+
+The stock-purple shell was an adapter styling choice, not an Iced constraint.
+The Iced adapter now owns explicit Roost chrome tokens and styles: a `#282828`
+sidebar, one 34-point sidebar/tab seam, compact transparent rows, the shared
+deep-blue active-project treatment, project rollup stripes and per-tab dots
+derived through `roost-ui-model`, a gray active-agent wash, dark compact tab
+pills, a notification badge, and an exact-ID active-tab close control. Only
+the project/agent body scrolls vertically; only the pill region scrolls
+horizontally, leaving collapse, add-tab, notification, header, and footer
+controls fixed and reachable.
+
+The read-only metrics contract exposes optional `terminal_top`; old responses
+deserialize without it and GTK continues to omit it, while Iced geometry tests
+require a finite positive value instead of copying a band constant. Unit tests
+pin style colors, stale close IDs, sibling fallback, and last-tab cascade. The
+existing X11 real-input gate constrains the window, reaches the final sidebar
+row, manually scrolls long tabs to the exact close control, and proves the
+surviving PTY remains usable under wgpu and tiny-skia. Human comparison captures
+remain the visual judge; no dedicated long-running parity job was added.
+
+This closes the fundamental styling-feasibility risk: released Iced can render
+the intended hierarchy, palette, density, states, clipping, and overflow on
+macOS and Linux. It does not yet establish release parity. Project creation and
+management, tab rename/reorder and hover-close, sidebar resizing, terminal
+scrollback/font controls, palette polish, native notifications/drop adapters,
+and accessibility/semantic icon refinement remain named implementation work.
+Programmatic selection does not yet auto-reveal an offscreen tab pill; manual
+horizontal reachability is proven and auto-reveal stays in the tab-manipulation
+slice.
 
 ## Objective acceptance criteria
 

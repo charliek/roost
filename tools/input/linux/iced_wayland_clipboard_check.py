@@ -269,7 +269,7 @@ def main() -> int:
         client.tab_capture_pty_input(tab, drain=True)
         x0 = sidebar + 12 + 4
         x1 = sidebar + 12 + int((len(dragged) - 0.5) * 8.4)
-        y = 44 + 12 + 9
+        y = round(client.terminal_top(metrics)) + 12 + 9
         _inject_drag(width, height, x0, y, x1)
         _wait_for_selection(
             client, tab, dragged, "real-seat Wayland drag selection"

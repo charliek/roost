@@ -19,6 +19,17 @@ ROOSTTEST_DIR = Path(__file__).resolve().parents[1] / "roosttest"
 sys.path.insert(0, str(ROOSTTEST_DIR))
 
 import ui  # noqa: E402
+from client import Roost  # noqa: E402
+
+
+class GeometryContractTests(unittest.TestCase):
+    def test_iced_terminal_top_requires_finite_positive_geometry(self) -> None:
+        client = object.__new__(Roost)
+        self.assertEqual(client.terminal_top({"terminal_top": 34}), 34.0)
+        for value in (None, True, 0, -1, float("inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(AssertionError, "terminal_top"):
+                    client.terminal_top({"terminal_top": value})
 
 
 class TargetContractTests(unittest.TestCase):

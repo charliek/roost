@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402 — pure stdlib PNG decoder, imported not shelled out
 
 
-TAB_BAR_HEIGHT = 44
 TERMINAL_PADDING = 12
 ORIGIN_MARKER = (17, 201, 93)
 
@@ -145,6 +144,7 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
 
     def assert_geometry(collapsed: bool) -> None:
         expected_sidebar = 0 if collapsed else int(roost.window_metrics()["sidebar_width"])
+        terminal_top = round(roost.terminal_top())
         shot_path = artifact_dir / f"terminal-widget-{renderer}-{'collapsed' if collapsed else 'expanded'}.png"
         latest: dict = {}
 
@@ -161,7 +161,7 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
             latest["shot"] = pngtool.load(str(shot_path))
             shot = latest["shot"]
             marker_x = expected_sidebar + TERMINAL_PADDING + 1
-            marker_y = TAB_BAR_HEIGHT + TERMINAL_PADDING + 1
+            marker_y = terminal_top + TERMINAL_PADDING + 1
             return pixel(shot, marker_x, marker_y) == ORIGIN_MARKER
 
         Roost._wait(
@@ -171,12 +171,12 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
         )
         shot = latest["shot"]
         width, height, _bpp, _pixels = shot
-        assert pixel(shot, expected_sidebar + 1, TAB_BAR_HEIGHT + 1) == default_rgb
-        assert pixel(shot, width - 2, TAB_BAR_HEIGHT + 1) == default_rgb
+        assert pixel(shot, expected_sidebar + 1, terminal_top + 1) == default_rgb
+        assert pixel(shot, width - 2, terminal_top + 1) == default_rgb
         assert pixel(shot, width - 2, height - 2) == default_rgb
 
         if not collapsed:
-            glyph_y0 = TAB_BAR_HEIGHT + TERMINAL_PADDING + 18
+            glyph_y0 = terminal_top + TERMINAL_PADDING + 18
             glyph_x0 = expected_sidebar + TERMINAL_PADDING
             # Keep this semantic rather than a glyph-shape golden: ASCII must
             # draw; the CJK glyph must reach its second logical cell (a

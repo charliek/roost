@@ -974,6 +974,11 @@ pub struct WindowMetricsResult {
     pub window_height: f64,
     pub sidebar_width: f64,
     pub sidebar_collapsed: bool,
+    /// Application-owned top edge of the terminal viewport, when the UI can
+    /// report it exactly. Optional so older and native-toolkit adapters keep
+    /// their existing response shape until they expose equivalent geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_top: Option<f64>,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -1817,13 +1822,27 @@ mod tests {
             window_height: 700.0,
             sidebar_width: 220.0,
             sidebar_collapsed: false,
+            terminal_top: Some(34.0),
         });
-        round_trip(&WindowMetricsResult {
+        let native = WindowMetricsResult {
             window_width: 1800.0,
             window_height: 700.0,
             sidebar_width: 0.0,
             sidebar_collapsed: true,
-        });
+            terminal_top: None,
+        };
+        let json = serde_json::to_string(&native).unwrap();
+        assert!(
+            !json.contains("terminal_top"),
+            "None changed the old wire shape"
+        );
+        round_trip(&native);
+
+        let old: WindowMetricsResult = serde_json::from_str(
+            r#"{"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,"sidebar_collapsed":false}"#,
+        )
+        .unwrap();
+        assert_eq!(old.terminal_top, None);
     }
 
     #[test]
