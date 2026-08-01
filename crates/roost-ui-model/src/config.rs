@@ -4,7 +4,7 @@
 //! normalization: same lenient-line parsing (blank lines and
 //! `#`-comments dropped), same forward-compat (unknown keys silently
 //! ignored), same raw-vs-unquoted split per key. The recognized-key
-//! sets are not identical — `link-modifier` is Linux-only,
+//! sets are not identical — `link-modifier` is Rust-UI-only,
 //! `tab-min-width` / `tab-max-width` are Mac-only.
 
 use std::fs;
@@ -57,7 +57,7 @@ pub struct RoostConfig {
     /// `None` means "use the platform default"
     /// ([`keybind::default_link_modifier`]: Cmd on macOS, Alt on
     /// Linux). Set `link-modifier = ctrl` for traditional Ctrl+click.
-    /// GTK-only today — the Swift UI's modifier is fixed to Cmd.
+    /// Consumed by both Rust UIs; the Swift UI's modifier is fixed to Cmd.
     pub link_modifier: Option<AccelMods>,
 
     /// `show-sidebar-agents` — whether the sidebar renders one row

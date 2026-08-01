@@ -87,6 +87,7 @@ cc      = "1.0"
 # Misc
 percent-encoding = "2.3"
 regex            = { version = "1.10" }
+unicode-width    = "0.2"
 
 [profile.release]
 lto         = "thin"

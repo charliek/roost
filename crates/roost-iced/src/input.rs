@@ -34,7 +34,7 @@ pub(crate) fn accelerator(event: &keyboard::Event) -> Option<Accel> {
     })
 }
 
-fn accelerator_modifiers(value: keyboard::Modifiers) -> AccelMods {
+pub(crate) fn accelerator_modifiers(value: keyboard::Modifiers) -> AccelMods {
     let mut result = AccelMods::empty();
     if value.shift() {
         result |= AccelMods::SHIFT;

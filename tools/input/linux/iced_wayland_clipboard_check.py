@@ -8,7 +8,8 @@ avoid programmatic Wayland clipboard seeding (which lacks an input serial):
 * select through IPC, inject the configured Copy chord, then inject Paste and
   require the copied bytes on the initiating PTY;
 * perform a real pointer drag with copy-on-select=clipboard, inject Paste, and
-  require the dragged bytes on the PTY.
+  require the dragged bytes on the PTY;
+* drive native double/triple clicks and a combined Alt+pointer URL hover.
 
 Those prove ordinary system clipboard ownership/read under real keyboard and
 pointer serials. PRIMARY/middle-click remains compositor-protocol-dependent and
@@ -105,6 +106,46 @@ def _inject_drag(width: int, height: int, x0: int, y: int, x1: int) -> None:
         check=True,
     )
     time.sleep(0.5)
+
+
+def _inject_clicks(width: int, height: int, x: int, y: int, count: int) -> None:
+    operations = [f"move {x} {y}"]
+    for _ in range(count):
+        operations.extend(["down LEFT", "up LEFT", "sleep 80"])
+    subprocess.run(
+        [
+            sys.executable,
+            str(INJECT_POINTER),
+            str(width),
+            str(height),
+            *operations,
+        ],
+        check=True,
+    )
+    time.sleep(0.3)
+
+
+def _inject_link_hover(client, width: int, height: int, x: int, y: int) -> None:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(INJECT_POINTER),
+            str(width),
+            str(height),
+            "keydown ALT",
+            f"move {x} {y}",
+            "sleep 1000",
+            f"move 20 {y}",
+            "sleep 200",
+            "keyup ALT",
+        ],
+    )
+    _wait_until(
+        lambda: client.app_cursor_shape() == "pointer",
+        "real-seat Wayland Alt-hover link pointer",
+    )
+    assert process.wait(timeout=5 * SCALE) == 0, "combined Wayland hover injector failed"
+    time.sleep(0.3)
 
 
 def _set_row(client, tab: int, text: str) -> None:
@@ -213,6 +254,35 @@ def main() -> int:
             lambda: _capture_contains(client, tab, dragged.encode()),
             "real-seat Wayland drag copy-on-select to system Paste round trip",
         )
+
+        multi = "alpha/beta tail"
+        _set_row(client, tab, multi)
+        click_x = sidebar + 12 + int(2.5 * 8.4)
+        _inject_clicks(width, height, click_x, y, 2)
+        _wait_until(
+            lambda: client.selection_dump(tab).get("text") == "alpha/beta",
+            "real-seat Wayland native double-click",
+        )
+        time.sleep(0.7)
+        _inject_clicks(width, height, click_x, y, 3)
+        _wait_until(
+            lambda: client.selection_dump(tab).get("text") == multi,
+            "real-seat Wayland native triple-click",
+        )
+
+        url = "https://hover.test/path"
+        _set_row(client, tab, url)
+        client.tab_feed_pty_bytes(tab, b"\x1b]22;crosshair\x1b\\")
+        _wait_until(
+            lambda: client.app_cursor_shape() == "crosshair",
+            "real-seat Wayland OSC cursor baseline",
+        )
+        hover_x = sidebar + 12 + int(8.5 * 8.4)
+        _inject_link_hover(client, width, height, hover_x, y)
+        _wait_until(
+            lambda: client.app_cursor_shape() == "crosshair",
+            "real-seat Wayland link hover restores OSC cursor",
+        )
         assert process.poll() is None, "cage/Iced exited during clipboard checks"
     except Exception:
         for log_path in (cage_log, app_log):
@@ -237,7 +307,7 @@ def main() -> int:
 
     print(
         "PASS: Iced real-seat Wayland system clipboard — explicit Copy/Paste "
-        "and drag copy-on-select/Paste"
+        "drag copy-on-select/Paste, native multi-click, and link hover"
     )
     print("ACCEPTED LIMITATION: cage does not advertise PRIMARY; middle-click is X11-gated")
     return 0

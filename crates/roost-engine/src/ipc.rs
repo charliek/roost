@@ -294,8 +294,9 @@ pub enum UiRequest {
     /// without actually changing native window focus. Targets the active tab.
     /// Gated on `ROOST_TEST_MODE=1`.
     AppSetWindowFocus { focused: bool, reply: UnitReply },
-    /// `app.cursor_shape` — return the active tab's currently
-    /// applied OSC 22 W3C cursor name. Ungated (read-only).
+    /// `app.cursor_shape` — return the active tab's effective W3C cursor name,
+    /// including a UI-owned link-hover override when present. Ungated
+    /// (read-only).
     AppCursorShape {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },

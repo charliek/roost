@@ -2924,6 +2924,7 @@ dependencies = [
  "roost-engine",
  "roost-ipc",
  "roost-ui-model",
+ "roost-url",
  "roost-vt",
  "serde_json",
  "tempfile",
@@ -3006,6 +3007,7 @@ version = "0.0.17"
 dependencies = [
  "bindgen",
  "thiserror 1.0.69",
+ "unicode-width",
 ]
 
 [[package]]

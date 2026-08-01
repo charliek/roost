@@ -31,7 +31,7 @@ the launcher with deterministic commands.
 | `provider` | `label="…" run="…" [timeout=…] [limit=…]` | none | Dynamic, script-backed menu in the custom palette (⌘⇧E / Alt+Shift+E). The script generates rows on demand and acts on the choice. Repeatable; executables in `providers/` (beside this file) are also discovered. See [Extending Roost](../guides/extending.md#3-dynamic-providers). |
 | `copy-on-select` | `off | true | clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow | deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
-| `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. **GTK app only** today. See [the dedicated section below](#link-modifier). |
+| `link-modifier` | `ctrl | alt | super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click in the GTK and Iced apps. See [the dedicated section below](#link-modifier). |
 
 ## `copy-on-select`
 

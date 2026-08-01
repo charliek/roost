@@ -19,6 +19,7 @@ path = "src/main.rs"
 roost-engine = { path = "../roost-engine" }
 roost-ipc = { path = "../roost-ipc" }
 roost-ui-model = { path = "../roost-ui-model" }
+roost-url = { path = "../roost-url" }
 roost-vt = { path = "../roost-vt", features = ["ffi"] }
 
 # Released and exact-pinned for a reproducible long-lived POC. Both renderers

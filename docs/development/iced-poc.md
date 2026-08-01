@@ -27,14 +27,17 @@ toolkit or platform ports not implemented in this slice reply with an explicit
 error; none leave an IPC caller waiting on a dropped reply.
 
 The canvas currently covers foreground/background colors, inverse, bold,
-italic, cursor shapes, grapheme cell text, clipping by the widget, and resize.
-Selection geometry and native system/PRIMARY clipboard access for IPC and OSC
-52 are implemented. User-triggered copy/paste, copy-on-select, links, mouse
-protocols, config-selected theme/font application, desktop notification
-presentation, palette behavior, in-process screenshots, and full product
-styling remain the next parity slices; they are not hidden behind target-wide
-test skips. The default terminal theme is already pushed into libghostty-vt so
-rendering and OSC color queries share one live source of truth.
+italic, cursor shapes, grapheme cell text, clipping, resize, selection, and URL
+underlines. Native Copy/Paste, copy-on-select, PRIMARY middle-click, bracketed
+paste, terminal mouse reporting, configured double/triple-click expansion, and
+modifier-clickable regex/OSC 8 links are implemented. The effective link cursor
+temporarily overrides OSC 22 and restores it on modifier release or leave.
+Palette behavior, in-process screenshots, themes, provider/agent state, and
+notifications have functional coverage. Config-selected font application,
+desktop notification presentation, image/file-URI paste and drag/drop, and full
+product styling remain later parity slices; they are not hidden behind
+target-wide skips. The terminal theme is pushed into libghostty-vt so rendering
+and OSC color queries share one live source of truth.
 
 ## Build, run, and test
 

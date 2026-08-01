@@ -36,6 +36,7 @@ use gtk4::{
 };
 use pangocairo::functions as pango_cairo;
 
+use roost_url::HoverUrl;
 use roost_vt::{
     ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, MouseEncoder,
     MouseEvent, RenderState, ScrollViewport, Terminal, TerminalOptions,
@@ -1145,12 +1146,11 @@ impl TerminalView {
         s.apply_current_cursor_shape(&self.widget);
     }
 
-    /// Read the active OSC 22 W3C cursor name (canonicalised:
-    /// empty body and `"default"` both return `"default"`). Used by
-    /// the `app.cursor_shape` IPC op.
+    /// Read the effective W3C cursor name. A live modifier-link hover
+    /// overrides the canonicalised OSC 22 shape for `app.cursor_shape`.
     pub fn current_cursor_shape_name(&self) -> String {
         let s = self.state.borrow();
-        roost_linux::mouse_routing::canonical_cursor_shape(&s.current_osc_shape)
+        effective_cursor_shape_name(&s.current_osc_shape, s.hover_url.is_some(), s.link_mod_held)
     }
 
     /// Drive a synthetic mouse event into the production
@@ -1654,18 +1654,6 @@ struct TerminalViewState {
     /// a TUI may re-assert OSC 22 `pointer` on every motion event,
     /// and re-pushing the identical name is wasted FFI.
     last_applied_cursor_name: Option<&'static str>,
-}
-
-/// Active URL hover. `col0` is the URL's first column (inclusive);
-/// `col1` is the last column (inclusive); `row` is the viewport row.
-/// Same shape as the Mac UI's `HoverURL` so future refactors that
-/// share more logic land symmetrically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HoverUrl {
-    col0: u16,
-    col1: u16,
-    row: u16,
-    url: String,
 }
 
 /// Selection snapshot for the `selection.dump` IPC op. `text` is the
@@ -2232,14 +2220,19 @@ impl TerminalViewState {
                 url: uri,
             });
         }
-        let row_text = self.text_for_viewport_row(row);
-        let span = roost_url::find_url_at(&row_text, col)?;
-        Some(HoverUrl {
-            col0: span.col0,
-            col1: span.col1,
+        let projection = match roost_vt::TerminalSelection::row_text_projection(
+            &self.terminal,
+            &mut self.render_state,
             row,
-            url: span.url,
-        })
+            self.cols,
+        ) {
+            Ok(projection) => projection,
+            Err(err) => {
+                tracing::warn!(?err, row, "failed to project terminal row for URL hover");
+                return None;
+            }
+        };
+        regex_hover_from_projection(&projection, col, row)
     }
 
     /// Walk an OSC 8 span outward from `(col, row)`. libghostty only
@@ -2248,41 +2241,9 @@ impl TerminalViewState {
     /// shares the URI. Stops at the row edge — line-wrap is a TODO.
     fn osc8_span_at(&self, col: u16, row: u16, uri: &str) -> (u16, u16) {
         let row_y = row as u32;
-        osc8_span_walk(col, self.cols.saturating_sub(1), uri, |c| {
+        roost_url::contiguous_hyperlink_span(col, self.cols.saturating_sub(1), uri, |c| {
             self.terminal.hyperlink_at(c, row_y)
         })
-    }
-
-    /// Build the visible text of one viewport row by walking the
-    /// render state. Each cell contributes exactly **one Unicode
-    /// codepoint** so the click column (cell units) lines up with
-    /// `row.chars().nth(col)` in `word_selection` / `roost_url` —
-    /// codex flagged this on PR #176 after noticing that a row
-    /// starting with `e\u{0301}` would otherwise shift `chars()`
-    /// indices past cell columns. We emit each grapheme's first
-    /// char and drop any trailing combining marks; the terminal
-    /// cell is one display column regardless, so the lossy
-    /// reduction only affects what the algorithms see (no glyph is
-    /// painted from this string). Empty cells fall through as a
-    /// single space.
-    ///
-    /// Same shape as `dump_text`, narrowed to one row.
-    fn text_for_viewport_row(&mut self, target_row: u16) -> String {
-        if let Err(err) = self.render_state.update(&self.terminal) {
-            tracing::warn!(?err, "render_state.update failed for hover URL");
-            return String::new();
-        }
-        let mut line = String::new();
-        let _ = self.render_state.walk(&self.terminal, |row, cell: Cell| {
-            if row != target_row as u32 {
-                return;
-            }
-            match cell.text.chars().next() {
-                Some(c) => line.push(c),
-                None => line.push(' '),
-            }
-        });
-        line
     }
 
     /// Swap the widget's cursor between `pointer` (URL hover with
@@ -2652,7 +2613,8 @@ fn drop_text(file_paths: &[String], string: Option<&str>) -> Option<String> {
 /// Decide which span (word vs line) a double/triple-click should
 /// select for a row of text. Pure helper so the GTK n_press dispatch
 /// stays testable without standing up a `DrawingArea` — same shape
-/// as `osc8_span_walk`. Returns `None` for `click_count < 2` (caller
+/// as `roost_url::contiguous_hyperlink_span`. Returns `None` for
+/// `click_count < 2` (caller
 /// falls through to the single-cell drag path) and for `click_count
 /// == 2` where the clicked cell itself is whitespace. `click_count`
 /// values above 3 fall through to the triple-click line span, matching
@@ -2669,27 +2631,6 @@ fn click_count_span(
         2 => roost_linux::word_selection::expand_word(row_text, col, word_break_chars),
         _ => Some(roost_linux::word_selection::expand_line(row_text)),
     }
-}
-
-/// Walk an OSC 8 hyperlink span outward from `col` while the
-/// per-cell URI lookup `hyperlink_at` keeps returning `Some(uri)`.
-/// Pure function so the `osc8_span_at` method on `TerminalViewState`
-/// can be unit-tested against a stubbed lookup without standing up
-/// a full GTK widget. `max_col` is the rightmost valid column on
-/// the row (inclusive) — typically `cols - 1`.
-fn osc8_span_walk<F>(col: u16, max_col: u16, uri: &str, mut hyperlink_at: F) -> (u16, u16)
-where
-    F: FnMut(u16) -> Option<String>,
-{
-    let mut c0 = col;
-    while c0 > 0 && hyperlink_at(c0 - 1).as_deref() == Some(uri) {
-        c0 -= 1;
-    }
-    let mut c1 = col;
-    while c1 < max_col && hyperlink_at(c1 + 1).as_deref() == Some(uri) {
-        c1 += 1;
-    }
-    (c0, c1)
 }
 
 /// Map an [`AccelMods`] link modifier to the GDK mask(s) that count as
@@ -2712,6 +2653,33 @@ fn link_modifier_mask(m: AccelMods) -> gtk4::gdk::ModifierType {
         set |= M::SUPER_MASK | M::META_MASK;
     }
     set
+}
+
+fn effective_cursor_shape_name(osc_shape: &str, has_hover: bool, link_held: bool) -> String {
+    if has_hover && link_held {
+        "pointer".into()
+    } else {
+        roost_linux::mouse_routing::canonical_cursor_shape(osc_shape)
+    }
+}
+
+fn regex_hover_from_projection(
+    projection: &roost_vt::RowTextProjection,
+    cell_col: u16,
+    row: u16,
+) -> Option<HoverUrl> {
+    let char_col = projection
+        .char_index_at_cell(cell_col)
+        .and_then(|index| u16::try_from(index).ok())?;
+    let span = roost_url::find_url_at(projection.text(), char_col)?;
+    let (col0, col1) =
+        projection.cell_span_for_chars(usize::from(span.col0), usize::from(span.col1))?;
+    Some(HoverUrl {
+        col0,
+        col1,
+        row,
+        url: span.url,
+    })
 }
 
 /// Pixel rectangle (x, y, w, h) for the underline overlay drawn on
@@ -2909,6 +2877,38 @@ mod tests {
         assert_eq!(link_modifier_mask(AccelMods::ALT), M::ALT_MASK);
         // Ctrl link modifier must not be tripped by Cmd/Meta.
         assert!(!M::META_MASK.intersects(link_modifier_mask(AccelMods::CTRL)));
+    }
+
+    #[test]
+    fn effective_cursor_shape_prefers_live_link_hover() {
+        assert_eq!(
+            effective_cursor_shape_name("crosshair", true, true),
+            "pointer"
+        );
+        assert_eq!(
+            effective_cursor_shape_name("crosshair", true, false),
+            "crosshair"
+        );
+        assert_eq!(effective_cursor_shape_name("", false, true), "default");
+    }
+
+    #[test]
+    fn regex_hover_preserves_combining_url_and_wide_tail_cells() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let mut render_state = RenderState::new().unwrap();
+        let url = "https://wide.test/e\u{301}界";
+        terminal.vt_write(url.as_bytes());
+        let projection =
+            roost_vt::TerminalSelection::row_text_projection(&terminal, &mut render_state, 0, 80)
+                .unwrap();
+        let hover = regex_hover_from_projection(&projection, 20, 0).unwrap();
+        assert_eq!(hover.url, url);
+        assert_eq!((hover.col0, hover.col1, hover.row), (0, 20, 0));
     }
 
     const DEFAULT_FG: ColorRgb = ColorRgb::new(0xe5, 0xe5, 0xe5);
@@ -3140,7 +3140,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn osc8_span_walk_finds_contiguous_run() {
+    fn shared_osc8_span_walk_finds_contiguous_run() {
         // Cells 5..9 all carry the same URI; everything else does not.
         let cells: HashMap<u16, &'static str> = HashMap::from_iter([
             (5, "https://x.test"),
@@ -3152,28 +3152,37 @@ mod tests {
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
         // Probing from the middle of the span walks both ways.
-        assert_eq!(osc8_span_walk(7, 79, "https://x.test", lookup), (5, 9));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(7, 79, "https://x.test", lookup),
+            (5, 9)
+        );
         // Probing from the left edge walks only rightward.
-        assert_eq!(osc8_span_walk(5, 79, "https://x.test", lookup), (5, 9));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(5, 79, "https://x.test", lookup),
+            (5, 9)
+        );
         // Probing from the right edge walks only leftward.
-        assert_eq!(osc8_span_walk(9, 79, "https://x.test", lookup), (5, 9));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(9, 79, "https://x.test", lookup),
+            (5, 9)
+        );
     }
 
     #[test]
-    fn osc8_span_walk_handles_single_cell_span() {
+    fn shared_osc8_span_walk_handles_single_cell_span() {
         // A 1-cell URI must report `(col, col)` — no over-walk past the
         // span into adjacent non-OSC-8 cells.
         let cells: HashMap<u16, &'static str> = HashMap::from_iter([(12, "https://only-one.test")]);
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
         assert_eq!(
-            osc8_span_walk(12, 79, "https://only-one.test", lookup),
+            roost_url::contiguous_hyperlink_span(12, 79, "https://only-one.test", lookup),
             (12, 12)
         );
     }
 
     #[test]
-    fn osc8_span_walk_stops_at_right_edge() {
+    fn shared_osc8_span_walk_stops_at_right_edge() {
         // The span runs all the way to the row's last cell — the walk
         // must clamp at `max_col`, not over-run into the next row's
         // first cell.
@@ -3181,11 +3190,14 @@ mod tests {
             HashMap::from_iter([(77, "https://x"), (78, "https://x"), (79, "https://x")]);
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
-        assert_eq!(osc8_span_walk(78, 79, "https://x", lookup), (77, 79));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(78, 79, "https://x", lookup),
+            (77, 79)
+        );
     }
 
     #[test]
-    fn osc8_span_walk_stops_at_uri_boundary() {
+    fn shared_osc8_span_walk_stops_at_uri_boundary() {
         // Adjacent OSC 8 cells with a DIFFERENT URI must not extend
         // the span — different hyperlinks live next to each other in
         // shell output like `ls --hyperlink`.
@@ -3197,8 +3209,14 @@ mod tests {
         ]);
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
-        assert_eq!(osc8_span_walk(4, 79, "https://a", lookup), (3, 4));
-        assert_eq!(osc8_span_walk(5, 79, "https://b", lookup), (5, 6));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(4, 79, "https://a", lookup),
+            (3, 4)
+        );
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(5, 79, "https://b", lookup),
+            (5, 6)
+        );
     }
 
     #[test]
@@ -3224,7 +3242,7 @@ mod tests {
     // pipeline is exercised in the e2e pytest run against a live
     // UI via `tab.expand_selection_at`. The unit-test layer below
     // covers the pure click-count branch in isolation, mirroring
-    // PR #175's `osc8_span_walk` pure-helper coverage.
+    // PR #175's shared OSC 8 span pure-helper coverage.
 
     use roost_linux::word_selection::{WordSpan, DEFAULT_EXTRA_WORD_CHARS};
 

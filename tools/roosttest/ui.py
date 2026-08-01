@@ -7,6 +7,7 @@ the explicit capability table below instead of two-target conditionals.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import platform
 import shutil
@@ -327,6 +328,7 @@ def end_session(target: str) -> None:
     on Mac, the isolated UserDefaults suite)."""
     global _SESSION_STATE_DIR, _GTK_PROC, _GTK_LOG, _ICED_PROC, _ICED_LOG
     quit(target)
+    _cleanup_owned_rust_runtime(target)
     _GTK_PROC = None
     _GTK_LOG = None
     _ICED_PROC = None
@@ -337,6 +339,67 @@ def end_session(target: str) -> None:
     if target == "mac":
         subprocess.run(["defaults", "delete", MAC_TEST_DEFAULTS_SUITE],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def _cleanup_owned_rust_runtime(target: str) -> None:
+    """Remove a harness-owned Rust UI's socket/lock after it has exited.
+
+    Rust single-instance locks are inode-scoped, so unlinking while the child
+    is merely shutting down could permit a second instance. The direct child
+    handle is the ownership proof and the exit wait is the safety fence.
+    """
+    process = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+    if process is None:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"harness-owned {target} UI did not exit; refusing runtime cleanup"
+        ) from error
+    socket = socket_path(target)
+    lock = socket.with_name("roost.lock")
+    if not lock.exists():
+        if socket.exists():
+            raise RuntimeError(
+                f"{target} socket remains without its lock; refusing runtime cleanup"
+            )
+        return
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock, flags)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"{target} runtime lock is held by another process; refusing cleanup"
+            ) from error
+        if _answering_pid(target) is not None:
+            raise RuntimeError(
+                f"a replacement {target} UI owns the socket; refusing cleanup"
+            )
+        locked = os.fstat(fd)
+        named = os.stat(lock, follow_symlinks=False)
+        if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError(f"{target} runtime lock was replaced; refusing cleanup")
+        socket.unlink(missing_ok=True)
+        named = os.stat(lock, follow_symlinks=False)
+        if (locked.st_dev, locked.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError(f"{target} runtime lock changed during cleanup")
+        lock.unlink()
+    finally:
+        os.close(fd)
+
+
+def _answering_pid(target: str) -> int | None:
+    try:
+        client = Roost(socket_path(target))
+        try:
+            return int(client.identify()["pid"])
+        finally:
+            client.close()
+    except (OSError, RoostError, KeyError, TypeError, ValueError):
+        return None
 
 
 def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -> None:
@@ -520,16 +583,24 @@ def _mac_cleanup() -> None:
 
 
 def quit(target: str) -> None:
-    if not is_alive(target):
+    pid = _answering_pid(target)
+    if pid is None:
         return
     if target == "mac":
         subprocess.run(["osascript", "-e", 'tell application "Roost" to quit'], check=False)
     else:
-        c = Roost(socket_path(target))
-        try:
-            pid = c.identify()["pid"]
-        finally:
-            c.close()
+        owned = {"gtk": _GTK_PROC, "iced": _ICED_PROC}.get(target)
+        if owned is not None:
+            if owned.poll() is not None:
+                raise RuntimeError(
+                    f"harness-owned {target} child already exited but pid {pid} answers; "
+                    "refusing to terminate a replacement"
+                )
+            if pid != owned.pid:
+                raise RuntimeError(
+                    f"{target} socket owner changed from harness pid {owned.pid} to {pid}; "
+                    "refusing to terminate it"
+                )
         subprocess.run(["kill", str(pid)], check=False)
     deadline = time.monotonic() + 10
     while is_alive(target) and time.monotonic() < deadline:

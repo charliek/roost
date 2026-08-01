@@ -693,8 +693,9 @@ pub struct AppSetWindowFocusParams {
 }
 
 /// `app.cursor_shape` request: return the W3C cursor name the UI is
-/// currently applying for the active tab. Returns the last-seen OSC
-/// 22 payload, or `"default"` if no shape has been requested yet
+/// currently applying for the active tab. A transient UI-owned link hover may
+/// override the last-seen OSC 22 payload; otherwise returns that payload, or
+/// `"default"` if no shape has been requested yet
 /// (and `"default"` for the empty-string reset form, so callers can
 /// always assert against a non-empty name). Not gated — read-only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

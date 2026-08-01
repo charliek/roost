@@ -32,6 +32,7 @@ use roost_ui_model::{
     keybind::{self, Accel, KeybindAction},
     notification_inbox, palette, provider,
 };
+use roost_url::HoverUrl;
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
     TerminalOptions, TerminalSelection,
@@ -40,8 +41,8 @@ use roost_vt::{
 use crate::input;
 use crate::palette_scroll::Visibility;
 use crate::terminal_canvas::{
-    resolve_colors, DrawCell, TerminalCanvas, TerminalSnapshot, CELL_HEIGHT, CELL_WIDTH,
-    TERMINAL_PADDING,
+    resolve_colors, DrawCell, TerminalCanvas, TerminalPointerEvent, TerminalSnapshot, CELL_HEIGHT,
+    CELL_WIDTH, TERMINAL_PADDING,
 };
 use crate::Message;
 
@@ -324,6 +325,9 @@ pub enum UiTask {
         request_id: u64,
         target: ClipboardOp,
         text: String,
+    },
+    OpenUrl {
+        url: String,
     },
     PaletteVisibility {
         scroll_id: Id,
@@ -611,10 +615,30 @@ struct ProviderRunResult {
     outcome: Result<provider::ProviderOutput, String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct NativePointerOutcome {
     selection_completed: bool,
     paste_selection: bool,
+    open_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativePointerDispatch {
+    action: PointerAction,
+    button: Option<PointerButton>,
+    col: u32,
+    row: u32,
+    mods: u16,
+    click_count: u8,
+    inside: bool,
+    link_modifier_held: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalPointerGesture {
+    Selection,
+    MultiClick,
+    Url,
 }
 
 fn pointer_origin_tab<V>(tabs: &mut HashMap<i64, V>, tab_id: i64) -> Option<&mut V> {
@@ -642,8 +666,12 @@ struct TerminalTab {
     mouse_encoder: MouseEncoder,
     motion_emitter: MotionEmitter,
     tracking_pointer: Option<PointerButton>,
-    selection_drag_active: bool,
+    local_pointer_gesture: Option<LocalPointerGesture>,
+    last_pointer_cell: Option<(u16, u16)>,
+    link_modifier_held: bool,
+    hover_url: Option<HoverUrl>,
     selection: TerminalSelection,
+    word_break_chars: String,
     input_started_at: Instant,
     session: TabSession,
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TabOutput>,
@@ -663,6 +691,7 @@ impl TerminalTab {
         tab_id: i64,
         test_mode: bool,
         theme: Theme,
+        word_break_chars: String,
     ) -> Result<Self> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
@@ -690,8 +719,12 @@ impl TerminalTab {
             mouse_encoder,
             motion_emitter: MotionEmitter::new(),
             tracking_pointer: None,
-            selection_drag_active: false,
+            local_pointer_gesture: None,
+            last_pointer_cell: None,
+            link_modifier_held: false,
+            hover_url: None,
             selection: TerminalSelection::new(),
+            word_break_chars,
             input_started_at: Instant::now(),
             session,
             output_rx,
@@ -753,6 +786,8 @@ impl TerminalTab {
         }
         self.cols = cols;
         self.rows = rows;
+        self.last_pointer_cell = None;
+        self.hover_url = None;
         if let Err(error) = self.terminal.resize(
             cols,
             rows,
@@ -821,26 +856,39 @@ impl TerminalTab {
     /// precedence over local selection for the lifetime of the press.
     fn handle_native_pointer(
         &mut self,
-        action: PointerAction,
-        button: Option<PointerButton>,
-        col: u32,
-        row: u32,
-        mods: u16,
+        event: NativePointerDispatch,
     ) -> Result<NativePointerOutcome> {
+        let NativePointerDispatch {
+            action,
+            button,
+            col,
+            row,
+            mods,
+            click_count,
+            inside,
+            link_modifier_held,
+        } = event;
         let col = col.min(u32::from(self.cols.saturating_sub(1)));
         let row = row.min(u32::from(self.rows.saturating_sub(1)));
         let cell = (col as u16, row as u16);
+        if inside {
+            self.last_pointer_cell = Some(cell);
+        } else {
+            self.last_pointer_cell = None;
+        }
+        self.set_link_modifier_held(link_modifier_held)?;
         match action {
-            PointerAction::Press if self.terminal.mouse_tracking() => {
-                self.selection_drag_active = false;
-                if matches!(
-                    button,
-                    Some(PointerButton::Left | PointerButton::Right | PointerButton::Middle)
-                ) {
-                    self.tracking_pointer = button;
+            PointerAction::Press if button == Some(PointerButton::Left) && link_modifier_held => {
+                if let Some(hover) = self.compute_hover_url(cell.0, cell.1)? {
+                    let url = hover.url.clone();
+                    self.hover_url = Some(hover);
+                    self.local_pointer_gesture = Some(LocalPointerGesture::Url);
+                    return Ok(NativePointerOutcome {
+                        open_url: Some(url),
+                        ..NativePointerOutcome::default()
+                    });
                 }
-                self.dispatch_pointer(action, button, col, row, mods)?;
-                Ok(NativePointerOutcome::default())
+                self.route_press_without_link(button, col, row, mods, click_count)
             }
             PointerAction::Motion if self.tracking_pointer.is_some() => {
                 self.dispatch_pointer(action, self.tracking_pointer, col, row, mods)?;
@@ -851,34 +899,162 @@ impl TerminalTab {
                 self.dispatch_pointer(action, captured, col, row, mods)?;
                 Ok(NativePointerOutcome::default())
             }
-            PointerAction::Motion if self.selection_drag_active => {
-                self.selection.update(&self.terminal, cell.0, cell.1);
-                Ok(NativePointerOutcome::default())
+            PointerAction::Motion => match self.local_pointer_gesture {
+                Some(LocalPointerGesture::Selection) => {
+                    self.selection.update(&self.terminal, cell.0, cell.1);
+                    Ok(NativePointerOutcome::default())
+                }
+                Some(LocalPointerGesture::MultiClick | LocalPointerGesture::Url) => {
+                    Ok(NativePointerOutcome::default())
+                }
+                None if self.terminal.mouse_tracking() => {
+                    self.dispatch_pointer(action, button, col, row, mods)?;
+                    Ok(NativePointerOutcome::default())
+                }
+                None => Ok(NativePointerOutcome::default()),
+            },
+            PointerAction::Release => match self.local_pointer_gesture.take() {
+                Some(LocalPointerGesture::Selection) => {
+                    self.selection.update(&self.terminal, cell.0, cell.1);
+                    Ok(NativePointerOutcome {
+                        selection_completed: true,
+                        ..NativePointerOutcome::default()
+                    })
+                }
+                Some(LocalPointerGesture::MultiClick | LocalPointerGesture::Url) | None => {
+                    Ok(NativePointerOutcome::default())
+                }
+            },
+            PointerAction::Press => {
+                self.route_press_without_link(button, col, row, mods, click_count)
             }
-            PointerAction::Release if self.selection_drag_active => {
-                self.selection_drag_active = false;
-                self.selection.update(&self.terminal, cell.0, cell.1);
-                Ok(NativePointerOutcome {
-                    selection_completed: true,
-                    paste_selection: false,
-                })
-            }
-            PointerAction::Motion if self.terminal.mouse_tracking() => {
-                self.dispatch_pointer(action, button, col, row, mods)?;
-                Ok(NativePointerOutcome::default())
-            }
-            PointerAction::Press if button == Some(PointerButton::Left) => {
-                self.selection_drag_active = self.selection.begin(&self.terminal, cell.0, cell.1);
-                Ok(NativePointerOutcome::default())
-            }
-            PointerAction::Press if button == Some(PointerButton::Middle) => {
-                Ok(NativePointerOutcome {
-                    selection_completed: false,
-                    paste_selection: true,
-                })
-            }
-            _ => Ok(NativePointerOutcome::default()),
         }
+    }
+
+    fn route_press_without_link(
+        &mut self,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+        mods: u16,
+        click_count: u8,
+    ) -> Result<NativePointerOutcome> {
+        let cell = (col as u16, row as u16);
+        if self.terminal.mouse_tracking() {
+            self.local_pointer_gesture = None;
+            if matches!(
+                button,
+                Some(PointerButton::Left | PointerButton::Right | PointerButton::Middle)
+            ) {
+                self.tracking_pointer = button;
+            }
+            self.dispatch_pointer(PointerAction::Press, button, col, row, mods)?;
+            return Ok(NativePointerOutcome::default());
+        }
+        if button == Some(PointerButton::Left)
+            && click_count >= 2
+            && self
+                .expand_selection_at(cell.0, cell.1, click_count)?
+                .is_some()
+        {
+            self.local_pointer_gesture = Some(LocalPointerGesture::MultiClick);
+            return Ok(NativePointerOutcome {
+                selection_completed: true,
+                ..NativePointerOutcome::default()
+            });
+        }
+        if button == Some(PointerButton::Left) {
+            self.local_pointer_gesture = self
+                .selection
+                .begin(&self.terminal, cell.0, cell.1)
+                .then_some(LocalPointerGesture::Selection);
+            return Ok(NativePointerOutcome::default());
+        }
+        if button == Some(PointerButton::Middle) {
+            return Ok(NativePointerOutcome {
+                paste_selection: true,
+                ..NativePointerOutcome::default()
+            });
+        }
+        Ok(NativePointerOutcome::default())
+    }
+
+    fn pointer_leave(&mut self) {
+        self.last_pointer_cell = None;
+        self.hover_url = None;
+    }
+
+    fn reset_pointer_state(&mut self) -> bool {
+        let gesture = self.local_pointer_gesture.take();
+        let tracking = self.tracking_pointer.take();
+        let cell = self.last_pointer_cell.take();
+        let hover = self.hover_url.take();
+        let modifier = std::mem::take(&mut self.link_modifier_held);
+        gesture.is_some() || tracking.is_some() || cell.is_some() || hover.is_some() || modifier
+    }
+
+    fn effective_pointer_shape(&self) -> &str {
+        if self.hover_url.is_some() {
+            "pointer"
+        } else {
+            &self.pointer_shape
+        }
+    }
+
+    fn set_link_modifier_held(&mut self, held: bool) -> Result<()> {
+        self.link_modifier_held = held;
+        self.recompute_hover()
+    }
+
+    fn recompute_hover(&mut self) -> Result<()> {
+        self.hover_url = match (self.link_modifier_held, self.last_pointer_cell) {
+            (true, Some((col, row))) => self.compute_hover_url(col, row)?,
+            _ => None,
+        };
+        Ok(())
+    }
+
+    fn compute_hover_url(&mut self, col: u16, row: u16) -> Result<Option<HoverUrl>> {
+        if let Some(url) = self.terminal.hyperlink_at(col, u32::from(row)) {
+            let (col0, col1) = roost_url::contiguous_hyperlink_span(
+                col,
+                self.cols.saturating_sub(1),
+                &url,
+                |candidate| self.terminal.hyperlink_at(candidate, u32::from(row)),
+            );
+            return Ok(Some(HoverUrl {
+                col0,
+                col1,
+                row,
+                url,
+            }));
+        }
+        let projection = TerminalSelection::row_text_projection(
+            &self.terminal,
+            &mut self.render_state,
+            row,
+            self.cols,
+        )?;
+        let Some(char_col) = projection
+            .char_index_at_cell(col)
+            .and_then(|index| u16::try_from(index).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(span) = roost_url::find_url_at(projection.text(), char_col) else {
+            return Ok(None);
+        };
+        let Some((col0, col1)) =
+            projection.cell_span_for_chars(usize::from(span.col0), usize::from(span.col1))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(HoverUrl {
+            col0,
+            col1,
+            row,
+            url: span.url,
+        }))
     }
 
     fn selected_text(&mut self) -> Result<Option<String>> {
@@ -916,11 +1092,9 @@ impl TerminalTab {
     ) -> Result<Option<ExpandSelectionData>> {
         let row_text = TerminalSelection::row_text(&self.terminal, &mut self.render_state, row)?;
         let span = match click_count {
-            2 => roost_ui_model::word_selection::expand_word(
-                &row_text,
-                col,
-                roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS,
-            ),
+            2 => {
+                roost_ui_model::word_selection::expand_word(&row_text, col, &self.word_break_chars)
+            }
             _ => Some(roost_ui_model::word_selection::expand_line(&row_text)),
         };
         let Some(span) = span else {
@@ -969,6 +1143,7 @@ impl TerminalTab {
     }
 
     fn refresh_snapshot(&mut self) -> Result<()> {
+        self.recompute_hover()?;
         self.render_state.update(&self.terminal)?;
         let colors = self.render_state.colors()?;
         let cursor = self.render_state.cursor();
@@ -1020,6 +1195,15 @@ impl TerminalTab {
             selection_spans: self
                 .selection
                 .visible_spans(&self.terminal, self.cols, self.rows),
+            link_hover: self
+                .hover_url
+                .as_ref()
+                .map(|hover| roost_vt::SelectionSpan {
+                    row: hover.row,
+                    col0: hover.col0,
+                    col1: hover.col1.saturating_add(1),
+                }),
+            pointer_shape: self.effective_pointer_shape().into(),
         };
         Ok(())
     }
@@ -1351,6 +1535,16 @@ impl App {
     pub fn keyboard(&mut self, event: keyboard::Event) -> UiTask {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.modifiers = *modifiers;
+            let held = self.link_modifier_held();
+            let tab_id = self.workspace.active().1;
+            if let Some(tab) = self.tabs.get_mut(&tab_id) {
+                if let Err(error) = tab
+                    .set_link_modifier_held(held)
+                    .and_then(|()| tab.refresh_snapshot())
+                {
+                    tracing::warn!(?error, tab_id, "terminal link hover refresh failed");
+                }
+            }
         }
         if let keyboard::Event::KeyPressed { key, .. } = &event {
             if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
@@ -1440,25 +1634,31 @@ impl App {
         )
     }
 
-    pub fn pointer(
-        &mut self,
-        tab_id: i64,
-        action: PointerAction,
-        button: Option<PointerButton>,
-        col: u32,
-        row: u32,
-    ) -> UiTask {
-        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
-            tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
-            return UiTask::None;
-        };
-        let outcome = match tab.handle_native_pointer(
+    pub fn pointer(&mut self, event: TerminalPointerEvent) -> UiTask {
+        let TerminalPointerEvent {
+            tab_id,
             action,
             button,
             col,
             row,
-            input::ghostty_modifiers(self.modifiers),
-        ) {
+            click_count,
+            inside,
+        } = event;
+        let link_modifier_held = self.link_modifier_held();
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+            tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
+            return UiTask::None;
+        };
+        let outcome = match tab.handle_native_pointer(NativePointerDispatch {
+            action,
+            button,
+            col,
+            row,
+            mods: input::ghostty_modifiers(self.modifiers),
+            click_count,
+            inside,
+            link_modifier_held,
+        }) {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(?error, tab_id, "terminal pointer dispatch failed");
@@ -1489,7 +1689,35 @@ impl App {
             self.clipboard
                 .enqueue_paste_read(ClipboardOp::Selection, tab_id);
         }
-        self.clipboard.start_next()
+        let clipboard = self.clipboard.start_next();
+        match outcome.open_url {
+            Some(url) => UiTask::OpenUrl { url }.then(clipboard),
+            None => clipboard,
+        }
+    }
+
+    pub fn pointer_leave(&mut self, tab_id: i64) {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            tab.pointer_leave();
+            if let Err(error) = tab.refresh_snapshot() {
+                tracing::warn!(?error, tab_id, "terminal hover refresh failed after leave");
+            }
+        }
+    }
+
+    fn link_modifier_held(&self) -> bool {
+        let effective = keybind::resolve_link_modifier(self.config.link_modifier);
+        input::accelerator_modifiers(self.modifiers).intersects(effective)
+    }
+
+    pub fn url_open_completed(&mut self, result: std::result::Result<(), String>) {
+        match result {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(%error, "URL launcher failed");
+                self.status = Some(error);
+            }
+        }
     }
 
     pub fn set_window_focus(&mut self, focused: bool) {
@@ -2437,6 +2665,18 @@ impl App {
             .flat_map(|project| project.tabs.iter().map(|tab| tab.id))
             .collect();
         self.tabs.retain(|tab_id, _| live_ids.contains(tab_id));
+        let active_tab_id = self.workspace.active().1;
+        for (tab_id, tab) in &mut self.tabs {
+            if *tab_id != active_tab_id && tab.reset_pointer_state() {
+                if let Err(error) = tab.refresh_snapshot() {
+                    tracing::warn!(
+                        ?error,
+                        tab_id,
+                        "terminal pointer reset failed after active tab changed"
+                    );
+                }
+            }
+        }
         for tab_id in live_ids {
             if self.tabs.contains_key(&tab_id) {
                 continue;
@@ -2448,6 +2688,7 @@ impl App {
                     tab_id,
                     self.test_mode,
                     Theme::load_bundled(&self.active_theme_name),
+                    self.config.word_break_chars.clone(),
                 )
             };
             match attached {
@@ -3031,7 +3272,7 @@ impl App {
                     let shape = self
                         .tabs
                         .get(&self.workspace.active().1)
-                        .map_or("default", |tab| tab.pointer_shape.as_str());
+                        .map_or("default", TerminalTab::effective_pointer_shape);
                     let _ = reply.send(Ok(shape.into()));
                 }
                 UiRequest::AppActiveTerminalFocused { reply } => {
@@ -3223,7 +3464,8 @@ fn canonical_pointer_shape(name: &str) -> &str {
     match name {
         "default" | "pointer" | "text" | "crosshair" | "grab" | "grabbing" | "not-allowed"
         | "col-resize" | "row-resize" | "n-resize" | "s-resize" | "e-resize" | "w-resize"
-        | "ne-resize" | "nw-resize" | "se-resize" | "sw-resize" => name,
+        | "ne-resize" | "nw-resize" | "se-resize" | "sw-resize" | "wait" | "progress" | "help"
+        | "move" => name,
         _ => "default",
     }
 }
@@ -3378,9 +3620,32 @@ mod tests {
             tab_id,
             true,
             Theme::roost_dark_fallback(),
+            roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
         )
         .expect("attach pointer-test terminal");
         (tab, supervisor)
+    }
+
+    fn native_pointer(
+        tab: &mut TerminalTab,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        cell: (u32, u32),
+        click_count: u8,
+        inside: bool,
+        link_modifier_held: bool,
+    ) -> NativePointerOutcome {
+        tab.handle_native_pointer(NativePointerDispatch {
+            action,
+            button,
+            col: cell.0,
+            row: cell.1,
+            mods: 0,
+            click_count,
+            inside,
+            link_modifier_held,
+        })
+        .expect("native pointer dispatch")
     }
 
     #[test]
@@ -3811,23 +4076,41 @@ mod tests {
         let (mut tab, supervisor) = attached_test_terminal(91);
         tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
 
-        let press = tab
-            .handle_native_pointer(PointerAction::Press, Some(PointerButton::Left), 2, 2, 0)
-            .expect("tracked left press");
+        let press = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 2),
+            1,
+            true,
+            false,
+        );
         assert_eq!(press, NativePointerOutcome::default());
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
-        assert!(!tab.selection_drag_active);
+        assert_eq!(tab.local_pointer_gesture, None);
 
-        let motion = tab
-            .handle_native_pointer(PointerAction::Motion, Some(PointerButton::Left), 5, 2, 0)
-            .expect("tracked left motion");
+        let motion = native_pointer(
+            &mut tab,
+            PointerAction::Motion,
+            Some(PointerButton::Left),
+            (5, 2),
+            0,
+            false,
+            false,
+        );
         assert_eq!(motion, NativePointerOutcome::default());
-        let release = tab
-            .handle_native_pointer(PointerAction::Release, Some(PointerButton::Left), 5, 2, 0)
-            .expect("tracked left release");
+        let release = native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (5, 2),
+            0,
+            false,
+            false,
+        );
         assert_eq!(release, NativePointerOutcome::default());
         assert_eq!(tab.tracking_pointer, None);
-        assert!(!tab.selection_drag_active);
+        assert_eq!(tab.local_pointer_gesture, None);
 
         let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
         assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
@@ -3839,29 +4122,315 @@ mod tests {
         let (mut tab, supervisor) = attached_test_terminal(92);
         tab.write_vt(b"\x1b[?1000h\x1b[?1006h");
 
-        let press = tab
-            .handle_native_pointer(PointerAction::Press, Some(PointerButton::Middle), 3, 3, 0)
-            .expect("tracked middle press");
+        let press = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Middle),
+            (3, 3),
+            1,
+            true,
+            false,
+        );
         assert_eq!(press, NativePointerOutcome::default());
         assert_eq!(tab.tracking_pointer, Some(PointerButton::Middle));
-        let release = tab
-            .handle_native_pointer(PointerAction::Release, Some(PointerButton::Middle), 3, 3, 0)
-            .expect("tracked middle release");
+        let release = native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Middle),
+            (3, 3),
+            0,
+            true,
+            false,
+        );
         assert_eq!(release, NativePointerOutcome::default());
         assert_eq!(tab.tracking_pointer, None);
 
         tab.write_vt(b"\x1b[?1000l");
-        let local = tab
-            .handle_native_pointer(PointerAction::Press, Some(PointerButton::Middle), 3, 3, 0)
-            .expect("local middle press");
+        let local = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Middle),
+            (3, 3),
+            1,
+            true,
+            false,
+        );
         assert_eq!(
             local,
             NativePointerOutcome {
                 selection_completed: false,
                 paste_selection: true,
+                open_url: None,
             }
         );
         supervisor.close(92);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_multi_click_expands_once_and_survives_outside_release() {
+        let (mut tab, supervisor) = attached_test_terminal(93);
+        tab.write_vt(b"\x1b[2J\x1b[Halpha/beta rest");
+
+        let double = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (2, 0),
+            2,
+            true,
+            false,
+        );
+        assert!(double.selection_completed);
+        assert_eq!(
+            tab.local_pointer_gesture,
+            Some(LocalPointerGesture::MultiClick)
+        );
+        assert_eq!(tab.selected_text().unwrap().as_deref(), Some("alpha/beta"));
+
+        assert_eq!(
+            native_pointer(
+                &mut tab,
+                PointerAction::Motion,
+                Some(PointerButton::Left),
+                (40, 8),
+                0,
+                false,
+                false,
+            ),
+            NativePointerOutcome::default()
+        );
+        assert_eq!(
+            native_pointer(
+                &mut tab,
+                PointerAction::Release,
+                Some(PointerButton::Left),
+                (40, 8),
+                0,
+                false,
+                false,
+            ),
+            NativePointerOutcome::default()
+        );
+        assert_eq!(tab.selected_text().unwrap().as_deref(), Some("alpha/beta"));
+
+        let triple = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (0, 0),
+            3,
+            true,
+            false,
+        );
+        assert!(triple.selection_completed);
+        assert_eq!(
+            tab.selected_text().unwrap().as_deref(),
+            Some("alpha/beta rest")
+        );
+        supervisor.close(93);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_word_characters_and_whitespace_fallback_are_native() {
+        let (mut tab, supervisor) = attached_test_terminal(94);
+        tab.word_break_chars = "_".into();
+        tab.write_vt(b"\x1b[2J\x1b[Hone-two  next");
+
+        let word = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (1, 0),
+            2,
+            true,
+            false,
+        );
+        assert!(word.selection_completed);
+        assert_eq!(tab.selected_text().unwrap().as_deref(), Some("one"));
+        let _ = native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (1, 0),
+            0,
+            true,
+            false,
+        );
+
+        let whitespace = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (7, 0),
+            2,
+            true,
+            false,
+        );
+        assert_eq!(whitespace, NativePointerOutcome::default());
+        assert_eq!(
+            tab.local_pointer_gesture,
+            Some(LocalPointerGesture::Selection)
+        );
+        supervisor.close(94);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_selection_drag_keeps_capture_outside_until_release() {
+        let (mut tab, supervisor) = attached_test_terminal(95);
+        tab.write_vt(b"\x1b[2J\x1b[Houtside");
+        let _ = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (0, 0),
+            1,
+            true,
+            false,
+        );
+        let _ = native_pointer(
+            &mut tab,
+            PointerAction::Motion,
+            Some(PointerButton::Left),
+            (6, 0),
+            0,
+            false,
+            false,
+        );
+        let release = native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (6, 0),
+            0,
+            false,
+            false,
+        );
+        assert!(release.selection_completed);
+        assert_eq!(tab.selected_text().unwrap().as_deref(), Some("outside"));
+        supervisor.close(95);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn regex_and_osc8_links_override_tracking_and_preserve_selection() {
+        let (mut tab, supervisor) = attached_test_terminal(96);
+        tab.write_vt(b"\x1b[2J\x1b[Hkeep https://visible.test");
+        assert!(tab.selection.set(&tab.terminal, (0, 0), (3, 0)));
+        tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
+        let opened = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (8, 0),
+            1,
+            true,
+            true,
+        );
+        assert_eq!(opened.open_url.as_deref(), Some("https://visible.test"));
+        assert_eq!(tab.tracking_pointer, None);
+        assert_eq!(tab.selected_text().unwrap().as_deref(), Some("keep"));
+        tab.set_link_modifier_held(false).unwrap();
+        let release = native_pointer(
+            &mut tab,
+            PointerAction::Release,
+            Some(PointerButton::Left),
+            (8, 0),
+            0,
+            false,
+            false,
+        );
+        assert_eq!(release, NativePointerOutcome::default());
+
+        tab.write_vt(
+            b"\x1b[?1002l\x1b[2J\x1b[H\x1b]8;;https://real.test\x1b\\https://shown.test\x1b]8;;\x1b\\",
+        );
+        let hover = native_pointer(&mut tab, PointerAction::Motion, None, (7, 0), 0, true, true);
+        assert_eq!(hover, NativePointerOutcome::default());
+        assert_eq!(
+            tab.hover_url.as_ref().map(|hover| hover.url.as_str()),
+            Some("https://real.test")
+        );
+        assert_eq!(
+            tab.hover_url.as_ref().map(|hover| (hover.col0, hover.col1)),
+            Some((0, 17))
+        );
+
+        let unicode_url = "https://wide.test/e\u{301}界";
+        tab.write_vt(format!("\x1b[2J\x1b[H{unicode_url}").as_bytes());
+        let _ = native_pointer(
+            &mut tab,
+            PointerAction::Motion,
+            None,
+            (20, 0),
+            0,
+            true,
+            true,
+        );
+        assert_eq!(
+            tab.hover_url.as_ref().map(|hover| hover.url.as_str()),
+            Some(unicode_url)
+        );
+        assert_eq!(
+            tab.hover_url.as_ref().map(|hover| (hover.col0, hover.col1)),
+            Some((0, 20))
+        );
+        supervisor.close(96);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modifier_only_hover_composes_with_osc_cursor_and_clears() {
+        let (mut tab, supervisor) = attached_test_terminal(97);
+        tab.pointer_shape = "crosshair".into();
+        tab.write_vt(b"\x1b[2J\x1b[Hhttps://hover.test");
+        let _ = native_pointer(
+            &mut tab,
+            PointerAction::Motion,
+            None,
+            (8, 0),
+            0,
+            true,
+            false,
+        );
+        assert_eq!(tab.effective_pointer_shape(), "crosshair");
+        tab.set_link_modifier_held(true).unwrap();
+        assert_eq!(tab.effective_pointer_shape(), "pointer");
+        tab.set_link_modifier_held(false).unwrap();
+        assert_eq!(tab.effective_pointer_shape(), "crosshair");
+        tab.set_link_modifier_held(true).unwrap();
+        tab.pointer_leave();
+        assert_eq!(tab.effective_pointer_shape(), "crosshair");
+
+        let _ = native_pointer(&mut tab, PointerAction::Motion, None, (8, 0), 0, true, true);
+        tab.write_vt(b"\x1b[2J\x1b[Hno link");
+        tab.refresh_snapshot().unwrap();
+        assert!(tab.hover_url.is_none());
+        supervisor.close(97);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tab_replacement_clears_hover_and_captured_gestures() {
+        let (mut tab, supervisor) = attached_test_terminal(98);
+        tab.write_vt(b"\x1b[2J\x1b[Hhttps://hover.test");
+        let _ = native_pointer(&mut tab, PointerAction::Motion, None, (8, 0), 0, true, true);
+        assert!(tab.hover_url.is_some());
+
+        let _ = native_pointer(
+            &mut tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            (8, 0),
+            1,
+            true,
+            true,
+        );
+        assert_eq!(tab.local_pointer_gesture, Some(LocalPointerGesture::Url));
+        assert!(tab.reset_pointer_state());
+        assert!(tab.hover_url.is_none());
+        assert_eq!(tab.local_pointer_gesture, None);
+        assert_eq!(tab.tracking_pointer, None);
+        assert_eq!(tab.last_pointer_cell, None);
+        assert!(!tab.link_modifier_held);
+        assert!(!tab.reset_pointer_state());
+        supervisor.close(98);
     }
 
     #[test]

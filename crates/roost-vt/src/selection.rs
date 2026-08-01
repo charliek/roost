@@ -4,8 +4,82 @@
 //! rows through output and scrollback instead of drifting with the viewport.
 
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{Point, PointTag, RenderState, Result, Terminal};
+
+/// A terminal row rendered as exact grapheme text plus reversible mappings
+/// between Unicode scalar indices and terminal cell columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTextProjection {
+    text: String,
+    char_cells: Vec<(u16, u16)>,
+    cell_chars: Vec<Option<usize>>,
+}
+
+impl RowTextProjection {
+    fn from_cells<I>(cols: u16, cells: I) -> Self
+    where
+        I: IntoIterator<Item = (u16, String)>,
+    {
+        let mut projection = Self {
+            text: String::new(),
+            char_cells: Vec::new(),
+            cell_chars: vec![None; usize::from(cols)],
+        };
+        let mut covered_until = 0_u16;
+        let mut covered_char = None;
+        for (col, cell_text) in cells {
+            if col >= cols {
+                continue;
+            }
+            for gap_col in covered_until..col {
+                let char_index = projection.char_cells.len();
+                projection.text.push(' ');
+                projection.char_cells.push((gap_col, gap_col));
+                projection.cell_chars[usize::from(gap_col)] = Some(char_index);
+            }
+            if cell_text.is_empty() && col < covered_until {
+                projection.cell_chars[usize::from(col)] = covered_char;
+                continue;
+            }
+            let text = if cell_text.is_empty() {
+                " "
+            } else {
+                cell_text.as_str()
+            };
+            let width = UnicodeWidthStr::width(text).max(1);
+            let cell_end = col
+                .saturating_add(u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX))
+                .min(cols.saturating_sub(1));
+            let first_char = projection.char_cells.len();
+            projection.text.push_str(text);
+            for _ in text.chars() {
+                projection.char_cells.push((col, cell_end));
+            }
+            for cell in col..=cell_end {
+                projection.cell_chars[usize::from(cell)] = Some(first_char);
+            }
+            covered_until = cell_end.saturating_add(1);
+            covered_char = Some(first_char);
+        }
+        projection
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn char_index_at_cell(&self, col: u16) -> Option<usize> {
+        self.cell_chars.get(usize::from(col)).copied().flatten()
+    }
+
+    pub fn cell_span_for_chars(&self, col0: usize, col1: usize) -> Option<(u16, u16)> {
+        let start = self.char_cells.get(col0)?.0;
+        let end = self.char_cells.get(col1)?.1;
+        Some((start, end))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CellSelection {
@@ -184,6 +258,25 @@ impl TerminalSelection {
         Ok(line)
     }
 
+    /// Preserve a row's complete grapheme text while mapping regex/string
+    /// indices back to terminal cells. Wide-cell tails stay attached to their
+    /// leading grapheme and combining scalars are never discarded.
+    pub fn row_text_projection(
+        terminal: &Terminal,
+        render_state: &mut RenderState,
+        target_row: u16,
+        cols: u16,
+    ) -> Result<RowTextProjection> {
+        render_state.update(terminal)?;
+        let mut cells = Vec::new();
+        render_state.walk(terminal, |row, cell| {
+            if row == u32::from(target_row) {
+                cells.push((cell.col, cell.text));
+            }
+        })?;
+        Ok(RowTextProjection::from_cells(cols, cells))
+    }
+
     pub fn selected_text(
         &self,
         terminal: &Terminal,
@@ -306,5 +399,27 @@ mod tests {
         assert_eq!(column_range(0, 3, 4, 8, 80), (4, 80));
         assert_eq!(column_range(1, 3, 4, 8, 80), (0, 80));
         assert_eq!(column_range(2, 3, 4, 8, 80), (0, 8));
+    }
+
+    #[test]
+    fn row_projection_preserves_combining_text_and_maps_wide_tails() {
+        let projection = RowTextProjection::from_cells(
+            5,
+            [
+                (0, "a\u{301}".into()),
+                (1, "界".into()),
+                (2, String::new()),
+                (3, "x".into()),
+                (4, String::new()),
+            ],
+        );
+        assert_eq!(projection.text(), "a\u{301}界x ");
+        assert_eq!(projection.char_index_at_cell(0), Some(0));
+        assert_eq!(projection.char_index_at_cell(2), Some(2));
+        assert_eq!(projection.cell_span_for_chars(0, 3), Some((0, 3)));
+
+        let sparse = RowTextProjection::from_cells(4, [(0, "a".into()), (3, "b".into())]);
+        assert_eq!(sparse.text(), "a  b");
+        assert_eq!(sparse.char_index_at_cell(2), Some(2));
     }
 }

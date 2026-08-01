@@ -10,7 +10,9 @@ copy-on-select from making the explicit-Copy assertion pass accidentally:
   bracketed Paste;
 * copy-on-select=clipboard: a real terminal drag publishes selection text to
   CLIPBOARD + PRIMARY, ordinary Paste reads CLIPBOARD, and middle-click reads
-  PRIMARY.
+  PRIMARY;
+* native double/triple clicks expand a word/line, and Alt-hover composes the
+  link pointer over an OSC 22 cursor without launching a browser.
 
 Set ROOST_REQUIRE_REAL_INPUT=1 in CI/shed so a missing dependency is a failure.
 ROOST_ICED_BIN and ROOSTCTL may point at shed-local Linux artifacts.
@@ -359,6 +361,96 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
     )
 
 
+def _multi_click_and_link_hover(launch: Launch) -> None:
+    row = "alpha/beta tail"
+    _set_row(launch, row)
+    x = 220 + 12 + int(2.5 * 8.4)
+    y = 44 + 12 + 9
+    launch.terminal_pointer(
+        [
+            "mousemove",
+            "--window",
+            launch.window,
+            str(x),
+            str(y),
+            "click",
+            "--repeat",
+            "2",
+            "--delay",
+            "100",
+            "1",
+        ]
+    )
+    _wait_until(
+        lambda: launch.client.selection_dump(launch.tab).get("text") == "alpha/beta",
+        "native double-click word selection",
+    )
+    _wait_until(
+        lambda: launch.client.clipboard_dump("system") == "alpha/beta",
+        "double-click copy-on-select system write",
+    )
+
+    time.sleep(0.7)
+    launch.terminal_pointer(
+        [
+            "mousemove",
+            "--window",
+            launch.window,
+            str(x),
+            str(y),
+            "click",
+            "--repeat",
+            "3",
+            "--delay",
+            "100",
+            "1",
+        ]
+    )
+    _wait_until(
+        lambda: launch.client.selection_dump(launch.tab).get("text") == row,
+        "native triple-click line selection",
+    )
+
+    url = "https://hover.test/path"
+    _set_row(launch, url)
+    launch.client.tab_feed_pty_bytes(launch.tab, b"\x1b]22;crosshair\x1b\\")
+    _wait_until(
+        lambda: launch.client.app_cursor_shape() == "crosshair",
+        "OSC 22 baseline cursor",
+    )
+    url_x = 220 + 12 + int(8.5 * 8.4)
+    launch.terminal_pointer(
+        [
+            "keydown",
+            "alt",
+            "mousemove",
+            "--window",
+            launch.window,
+            str(url_x),
+            str(y),
+        ]
+    )
+    _wait_until(
+        lambda: launch.client.app_cursor_shape() == "pointer",
+        "Alt-hover link pointer over OSC shape",
+    )
+    launch.terminal_pointer(
+        [
+            "mousemove",
+            "--window",
+            launch.window,
+            "20",
+            str(y),
+            "keyup",
+            "alt",
+        ]
+    )
+    _wait_until(
+        lambda: launch.client.app_cursor_shape() == "crosshair",
+        "OSC shape restored after terminal leave",
+    )
+
+
 def main() -> int:
     for tool in ("Xvfb", "xdotool"):
         if shutil.which(tool) is None:
@@ -385,6 +477,7 @@ def main() -> int:
         clipboard = Launch(root, display, "clipboard", "selection")
         launches.append(clipboard)
         _drag_copy_and_middle_paste(clipboard)
+        _multi_click_and_link_hover(clipboard)
     except Exception:
         _preserve_failure(launches)
         for launch in launches:
@@ -405,7 +498,8 @@ def main() -> int:
 
     print(
         "PASS: configured explicit Copy, plain/bracketed Paste, real-drag "
-        "copy-on-select, and middle-click PRIMARY Paste"
+        "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
+        "and link hover cursor composition"
     )
     return 0
 

@@ -6,8 +6,11 @@ Implementation note: the shared-engine extraction, isolated third-target
 contract, and Iced walking skeleton are implemented on `poc/iced`. The walking
 skeleton has been exercised on macOS and in the Linux shed under X11 and
 Wayland with both wgpu and tiny-skia. Product-parity work remains governed by
-the acceptance matrices below; this note does not promote the POC to accepted
-replacement architecture.
+the acceptance matrices below. The current Iced shell is intentionally still a
+walking skeleton: its visual hierarchy and polish differ materially from both
+GTK and Swift, and the remaining functional gaps are not accepted merely
+because screenshot plumbing exists. This note does not promote the POC to
+accepted replacement architecture.
 
 Branch: `poc/iced`
 
@@ -470,9 +473,17 @@ gate, push, and Actions verification before the next slice.
    scrollback, selection/clipboard/paste/URL/mouse reporting, themes/fonts.
 6. **Product surface parity**: project/sidebar/tab interactions, agent states,
    notifications, palette, persistence/relaunch, screenshot/test ops.
-7. **Harness, visuals, CI, and shed**: target-neutral Iced E2E, coexistence,
+7. **Visual and interaction convergence**: audit the same seeded workspace in
+   Swift, GTK, and Iced; then close measured gaps in window hierarchy, sidebar
+   proportions and rows, tab band/pills/badges/close controls, typography,
+   terminal padding/cursor/selection, palette placement, resizing, hover,
+   focus, and disabled/empty/error states. Treat GTK as the Linux visual
+   reference and Swift as a second product reference, allowing only named
+   native-toolkit differences. Each polish slice adds focused geometry/color
+   assertions and refreshed human-comparison artifacts before it is accepted.
+8. **Harness, CI, and shed completion**: target-neutral Iced E2E, coexistence,
    X11/Wayland/macOS matrix, artifacts, Make/docs, final regression gates.
-8. **Final review fixes**: architecture/dependency/diff review, no feature scope;
+9. **Final review fixes**: architecture/dependency/diff review, no feature scope;
    push only after local and shed gates are green.
 
 ## Per-commit gate
@@ -1246,6 +1257,197 @@ The dependency gates continued to show no GTK/libadwaita/Pango/Cairo or
 accelerators and direct pointer-precedence/origin tests. Both were implemented,
 the affected gates above were repeated, and re-review approved the slice with
 no remaining findings.
+
+### Iced native multi-click and URL interaction commit plan
+
+Scope: complete the native terminal click behavior that remains after the
+clipboard slice. Iced's Canvas adapter will turn consecutive primary-button
+presses into deterministic click counts; the existing terminal operation will
+expand a double-click to the shared word span and a triple-or-later click to the
+line span. Holding the effective `link-modifier` over a regex-detected URL or
+OSC 8 hyperlink will underline its full contiguous cell span, show the pointer
+cursor, and make a primary click request a platform URL open. This is an Iced
+presentation/input slice: URL detection reuses `roost-url`, word expansion
+reuses `roost-ui-model`, terminal hyperlink lookup stays in `roost-vt`, and the
+toolkit-neutral engine is unchanged.
+
+Interfaces and ownership: `TerminalCanvasState` owns native click timing, while
+the originating `TerminalTab` owns its last in-bounds pointer cell so App-level
+modifier events can recompute hover without reaching into private widget state.
+Canvas publishes cell-bearing press/motion/release events plus a coordinate-free
+leave event. Canvas tracks its inside/outside transition because Iced's
+`CursorLeft` means leaving the window, while a move from terminal to sidebar is
+an out-of-bounds `CursorMoved`; either path publishes passive leave exactly once
+before cursor-position conversion and clears hover, last in-bounds cell, and
+click sequencing. An already captured gesture is different: one compound
+pointer message carries its clamped cell plus `inside = false`, which App
+interprets as both hover exit and captured dispatch (Canvas can publish only one
+message per update). Tracking and local selection retain ownership and receive
+that clamped out-of-bounds motion/release,
+while multi-click and URL owners retain ownership but consume motion/release
+without mutation. `mouse_interaction` also requires `cursor.is_over(bounds)` so
+a cached link cannot leak the hand cursor over the sidebar. Unsupported or changed buttons reset the
+click sequence even when they do not map to a terminal button. A primary press
+carries a saturated `click_count`; the tracker continues a sequence only when
+the tab, button, cell, and a 500 ms window match, and resets on tab replacement,
+timeout, another button, or pointer leave. The application resolves
+`RoostConfig::link_modifier` through the shared keybind model and passes the
+current modifiers to the originating `TerminalTab`. Each tab owns a shared
+`roost-url` hover value derived from current terminal state. OSC 8 wins over
+regex detection; a contiguous hyperlink-span helper moves to `roost-url` and
+GTK migrates to it so the row/URI boundary algorithm is not duplicated between
+Rust adapters. Pointer motion updates the originating tab's hover, modifier
+changes recompute only the active tab from its app-owned last cell even without
+motion, and leave clears hover. The render snapshot contains only the resolved
+underline span, never a terminal or toolkit handle. Canvas draws that span and
+returns Iced's pointer interaction while it is active.
+
+Click routing is explicit and stable: configured modifier plus a URL has first
+claim, including while terminal mouse reporting is enabled; terminal tracking
+then owns the complete press/motion/release gesture; local multi-click expansion
+then precedes ordinary drag selection. A multi-click-owned gesture suppresses
+subsequent motion/release mutation and emits one selection completion, so
+copy-on-select runs exactly once. A URL-owned gesture preserves the previous
+selection and never triggers copy-on-select. URL ownership latches on the primary
+press, emits exactly one `OpenUrl` then, and consumes motion/release even if the
+modifier is released or hover clears; launcher failure never replays the gesture.
+Whitespace or invalid double-click
+expansion falls back to the ordinary local selection anchor rather than leaving
+stale gesture ownership. Every pointer action remains tagged with its Canvas tab
+ID; switching or closing tabs cannot redirect hover, launch, or selection.
+
+Platform opening remains an Iced UI port. `UiTask::OpenUrl` contains an owned
+string and maps in the binary to an asynchronous, argument-safe `open` (macOS)
+or `xdg-open` (Linux) child process. The task awaits
+`tokio::process::Command::status`, so process waiting is nonblocking and the
+child is always reaped; success means a zero launcher exit status, while spawn
+and nonzero-exit failures return distinct owned errors. No shell is involved and
+the Iced event loop is never blocked. A pure command builder accepts an explicit
+platform enum so both hosts are testable on either OS. App tests inject the
+explicit open task and synthetic success/error completions; runner tests use a
+fake executor and never launch a browser. Completion logs and exposes status
+without mutating engine state. The URL string and no borrowed Rust or toolkit
+object crosses the task boundary.
+
+Invariants: hover computation never holds workspace or PTY supervisor locks and
+never invokes UI code from terminal state access. Link modifier press/release,
+pointer motion/leave, terminal output, resize, and tab replacement cannot retain
+a stale underline. OSC 8 URI identity controls its span; regex URL columns remain
+terminal-cell columns for Unicode/combined rows. Link clicks preserve existing
+selection and tracking state, while a failed launcher is visible but does not
+replay the click into the PTY or selection. Multi-click counts are local adapter
+metadata and do not widen the engine command contract. Iced tabs receive the
+effective configured `word-break-chars` at attachment instead of
+hard-coding the default, so native and IPC expansion share GTK/Swift semantics.
+Swift behavior and both existing native launch adapters remain unchanged;
+GTK keeps its interaction contract while consuming the shared link projection;
+`roost-iced` gains only the focused `roost-url` dependency and still has no
+GTK/libadwaita/Pango/Cairo edge.
+
+Tests and acceptance: pure Canvas tests use injected instants to cover first,
+double, triple, timeout, cell/button/tab reset, saturation, and leave behavior.
+Terminal tests cover shared word/line expansion from native presses, whitespace
+fallback, copy completion exactly once, URL-over-tracking precedence, tracking
+over multi-click, URL selection preservation, closed/switched origin routing,
+regex and OSC 8 precedence/span boundaries, modifier-only hover recomputation,
+configured non-default word-break punctuation, and hover clearing after
+leave/output/resize. Captured-gesture tests cover press inside, drag outside,
+and release for both local selection and terminal tracking, alongside passive
+move-out leave and non-mutating multi-click/URL release. Drawing/state tests cover underline geometry and pointer
+interaction. Platform-port tests assert exact macOS/Linux program/argument
+construction, absolute-URI validation, and deterministic unsupported-platform,
+spawn, and exit-status mapping through a fake runner. Existing
+`tab.expand_selection_at`, selection,
+copy-on-select, mouse-reporting, and URL fixture tests remain green.
+
+A focused real-input X11 test writes a known URL and word to a real PTY, drives
+double/triple clicks with `xdotool`, and verifies selection text plus configured
+copy-on-select through IPC/native clipboard. It also holds the configured link
+modifier and verifies the effective `app.cursor_shape` diagnostic reports the
+link pointer over any OSC 22 shape and restores the OSC shape after modifier
+release/leave; browser launch itself stays behind the testable UI task to avoid
+CI side effects. Run this under wgpu and tiny-skia. The shed real-seat Wayland lane
+repeats multi-click selection and hover input using its existing uinput/cage
+path. macOS has no repository-native trusted pointer injector, so this commit
+requires both renderer lanes' target-neutral operation suite plus cross-platform
+Canvas/App/launcher unit coverage; native macOS multi-click automation is a
+named gap with user impact limited to automation evidence, not implementation.
+Before commit: format,
+warnings-denied clippy, dependency boundaries, full Iced unit/functional and
+renderer matrices, complete GTK and Swift regressions, shed X11/Wayland gates,
+complete diff review, push `poc/iced`, and require green Actions.
+
+Implementation evidence (2026-08-01): Iced now owns Canvas click sequencing
+and captured-gesture state, while `TerminalTab` owns selection/tracking/link
+precedence and emits an owned `OpenUrl` task. `roost-vt::RowTextProjection`
+preserves complete grapheme text and maps Unicode scalar spans back to terminal
+cells, including combining marks, sparse rows, and wide-cell tails; GTK and
+Iced both consume that projection for regex links. `roost-url` owns the shared
+OSC 8 span/value, and GTK migrated off its duplicate. Both Rust UIs report the
+live link cursor override; Iced maps every supported OSC 22 shape to a native
+Iced interaction. The launcher accepts only absolute, control-free URIs and
+passes one owned argument without a shell. Harness teardown now waits for its
+owned Rust child before removing only that target's socket/lock, so a fresh
+Iced run leaves no developer-cache runtime artifact.
+
+The exact pre-commit gates passed: `make check` (workspace format/clippy/tests,
+118 GTK binary tests, 67 Iced tests, 11 `roost-vt` FFI tests, 7 `roost-url`
+tests, 688 Swift Testing tests, 11 XCTest tests, and 14 harness unit tests);
+macOS Iced wgpu and tiny-skia functional lanes each passed 47 tests with two
+named environment/protocol skips; full fresh GTK passed 151 with nine named
+skips and Swift passed 144 with sixteen named skips. In the shed, Iced passed
+65 Linux unit tests plus warnings-denied clippy, both full X11 renderer lanes
+passed 159 tests with only known issue #145 skipped, both headless Wayland
+lanes passed 42 tests, and both X11 and real-seat cage/Wayland renderer lanes
+passed Copy/Paste, drag selection, double/triple click, and live Alt-link hover.
+Cage's missing PRIMARY protocol remains the explicit Wayland-only limitation.
+One combined tiny-skia X11 run timed out while seeding a PTY row after earlier
+clipboard phases, and one loaded tiny-skia cage run timed out during the
+pre-existing drag phase; isolated same-code reruns and the complete final
+matrix both passed, recording these as shed load timing rather than hiding
+them as skips.
+
+The plan/code reviewer first found Canvas padding reusing a stale cell,
+diagnostic/native cursor divergence, lossy combining/wide URL projection,
+wheel events retaining click counts, option-looking OSC 8 launcher input, and
+stale `link-modifier` documentation. Review fixes added grid-vs-padding hit
+testing, captured clamping, native cursor mapping, the shared lossless
+projection in both Rust UIs, wheel reset coverage, absolute-URI validation,
+and documentation updates. A second pass found GTK still on its lossy helper;
+GTK then migrated to the shared projection with a real-terminal Unicode
+regression. The final interaction-diff review closed with no remaining
+findings. A later harness-cleanup review found an ownership/TOCTOU race in
+naive socket removal; the fix now requires the stored child to still be live
+with the answering PID, waits that exact child, acquires the target lock
+non-blocking, refuses a replacement server, and verifies path identity before
+both unlinks. Fourteen harness unit tests cover normal cleanup, absent
+ownership, exited-child PID reuse, changed live ownership, a held replacement
+lock, and a replacement server. The final independent review found one
+additional chorded-button capture bug and one stale URL-offset comment.
+Secondary presses/releases are now consumed without replacing the initiating
+drag/tracking owner, with a focused Canvas regression, and the URL contract now
+names Unicode-scalar offsets plus cell-aware projection. The hardened cleanup
+itself had no further actionable ownership finding after its documented local
+audit, unit coverage, and live functional cleanup proofs.
+
+### Next phase: measured UI polish and parity convergence
+
+The next planning phase starts from an explicit three-UI gap inventory, not
+from the existence of a working Iced terminal. Capture the same seeded
+workspace in Swift, GTK, and Iced at fixed window sizes and record, for each
+visible component, current geometry, colors, typography, interaction state,
+missing behavior, and the intended reference. Prioritize user-visible shell
+structure before decorative detail: window/sidebar/tab/terminal hierarchy,
+sidebar width and row density, active/hover/agent states, tab chrome and
+controls, terminal padding and font metrics, then palette and transient states.
+
+Each resulting commit must pair presentation work with the behavior it exposes
+and prove it under both Iced renderers. Acceptance requires focused geometry or
+color assertions, refreshed side-by-side artifacts, keyboard and pointer
+interaction tests where relevant, and a named explanation for every remaining
+GTK/Swift difference. Full-window pixel equality remains inappropriate, but
+subjective resemblance alone is also insufficient. The final POC cannot claim
+visual or product parity while the inventory contains an unnamed material gap.
 
 ## Objective acceptance criteria
 

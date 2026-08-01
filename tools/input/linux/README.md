@@ -35,12 +35,12 @@ Everything is stdlib Python 3 + bash. No build step.
 | Tool | What it does |
 |------|--------------|
 | `inject_key.py` | Press a key chord (`CTRL SHIFT C`) or type a string (`--type "ls\n"`). Follows keyboard focus. |
-| `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, drags. Needs single monitor. |
+| `inject_pointer.py` | Absolute pointer: `move X Y`, `down/up LEFT\|MIDDLE\|RIGHT`, optional `keydown/keyup CTRL\|ALT\|SUPER`, drags. Needs single monitor. |
 | `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
 | `real_input_check.py` | Self-contained real-input regression: focus + core-sync (click-to-focus, project switch, Alt+digit, Ctrl+PageDown, cycle_tab, pill click, context menu) **and** drag reorder (tab pills + project rows). Spins up its own Xvfb + throwaway Roost and drives **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
-| `iced_clipboard_check.py` | Self-contained Iced/X11 text clipboard gate: configured Copy, plain/bracketed Paste, real drag copy-on-select, and middle-click PRIMARY under Xvfb + xdotool. |
-| `iced_wayland_clipboard_check.py` | Shed/real-kernel Iced Wayland proof under cage + uinput: explicit system Copy→Paste and drag copy-on-select→Paste. PRIMARY is a named compositor limitation. |
+| `iced_clipboard_check.py` | Self-contained Iced/X11 text and click gate: Copy/Paste, drag copy-on-select, middle-click PRIMARY, double/triple-click selection, and modifier-link hover under Xvfb + xdotool. |
+| `iced_wayland_clipboard_check.py` | Shed/real-kernel Iced Wayland proof under cage + uinput: system Copy/Paste, drag copy-on-select, double/triple-click selection, and combined modifier-link hover. PRIMARY is a named compositor limitation. |
 
 PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
 layer: [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
@@ -85,11 +85,11 @@ exits 0.
 ## Iced clipboard real-input checks
 
 The Iced adapter has two complementary real-input gates. X11 is the complete
-text path, including CLIPBOARD and PRIMARY; it runs under both wgpu and
+text/click path, including CLIPBOARD and PRIMARY; it runs under both wgpu and
 tiny-skia in Actions. The Wayland check requires a real Linux kernel with
 `/dev/uinput` and cage's libinput backend, so it runs in the shed. It requires
-the ordinary system clipboard paths to pass using fresh keyboard/pointer input
-serials. Cage does not advertise the PRIMARY selection protocol, so the
+the ordinary system clipboard paths plus native multi-click and link-hover
+input to pass using fresh keyboard/pointer serials. Cage does not advertise the PRIMARY selection protocol, so the
 Linux-terminal middle-click convention remains explicitly X11-gated instead
 of being hidden by a headless Wayland skip.
 

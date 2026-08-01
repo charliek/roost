@@ -3,6 +3,7 @@ mod input;
 mod palette_scroll;
 mod screenshot;
 mod terminal_canvas;
+mod url_launcher;
 
 use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,7 @@ enum Message {
         value: Option<String>,
     },
     ClipboardWriteCompleted(u64),
+    UrlOpenCompleted(Result<(), String>),
     Keyboard(keyboard::Event),
     TerminalPointer(terminal_canvas::TerminalPointer),
     ProjectSelected(i64),
@@ -111,15 +113,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.clipboard_write_completed(request_id).map_task()
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
-        Message::TerminalPointer(event) => app
-            .pointer(
-                event.tab_id,
-                event.action,
-                event.button,
-                event.col,
-                event.row,
-            )
-            .map_task(),
+        Message::UrlOpenCompleted(result) => {
+            app.url_open_completed(result);
+            Task::none()
+        }
+        Message::TerminalPointer(event) => match event {
+            terminal_canvas::TerminalPointer::Event(event) => app.pointer(event).map_task(),
+            terminal_canvas::TerminalPointer::Leave { tab_id } => {
+                app.pointer_leave(tab_id);
+                Task::none()
+            }
+        },
         Message::PaletteQueryChanged(query) => {
             app.palette_query_changed(&query);
             Task::none()
@@ -259,6 +263,9 @@ impl UiTask for app::UiTask {
                     }
                 };
                 write.chain(Task::done(Message::ClipboardWriteCompleted(request_id)))
+            }
+            app::UiTask::OpenUrl { url } => {
+                Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
             }
             app::UiTask::PaletteVisibility {
                 scroll_id,
