@@ -111,6 +111,8 @@ mod mouse_encoder;
 #[cfg(feature = "ffi")]
 mod render_state;
 #[cfg(feature = "ffi")]
+mod selection;
+#[cfg(feature = "ffi")]
 mod terminal;
 
 #[cfg(feature = "ffi")]
@@ -121,6 +123,8 @@ pub use mouse_encoder::{
 };
 #[cfg(feature = "ffi")]
 pub use render_state::{Cell, Colors, CursorInfo, CursorVisualStyle, RenderState, Style};
+#[cfg(feature = "ffi")]
+pub use selection::{SelectionSnapshot, SelectionSpan, TerminalSelection};
 #[cfg(feature = "ffi")]
 pub use terminal::{
     ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Terminal, TerminalOptions,

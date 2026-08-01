@@ -7,7 +7,8 @@ use iced::keyboard;
 use iced::widget::{button, canvas, column, container, row, text};
 use iced::{window, Color, Element, Fill, Size, Task};
 use roost_engine::ipc::{
-    ClipboardOp, DumpData, IpcHandler, ResolvedCellData, ResolvedCellsData, UiRequest,
+    ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
+    SelectionData, UiRequest,
 };
 use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscRouter};
 use roost_engine::pointer::{MotionEmitter, PointerAction, PointerButton};
@@ -20,7 +21,7 @@ use roost_ipc::IpcServer;
 use roost_ui_model::theme::Theme;
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
-    TerminalOptions,
+    TerminalOptions, TerminalSelection,
 };
 
 use crate::input;
@@ -48,6 +49,9 @@ struct TerminalTab {
     encoder: KeyEncoder,
     mouse_encoder: MouseEncoder,
     motion_emitter: MotionEmitter,
+    tracking_pointer: Option<PointerButton>,
+    selection_drag_active: bool,
+    selection: TerminalSelection,
     input_started_at: Instant,
     session: TabSession,
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TabOutput>,
@@ -89,6 +93,9 @@ impl TerminalTab {
             encoder,
             mouse_encoder,
             motion_emitter: MotionEmitter::new(),
+            tracking_pointer: None,
+            selection_drag_active: false,
+            selection: TerminalSelection::new(),
             input_started_at: Instant::now(),
             session,
             output_rx,
@@ -214,6 +221,105 @@ impl TerminalTab {
         Ok(())
     }
 
+    /// Route a native pointer gesture with terminal mouse reporting taking
+    /// precedence over local selection for the lifetime of the press.
+    fn handle_native_pointer(
+        &mut self,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+        mods: u16,
+    ) -> Result<()> {
+        let col = col.min(u32::from(self.cols.saturating_sub(1)));
+        let row = row.min(u32::from(self.rows.saturating_sub(1)));
+        let cell = (col as u16, row as u16);
+        match action {
+            PointerAction::Press if self.terminal.mouse_tracking() => {
+                self.selection_drag_active = false;
+                if matches!(
+                    button,
+                    Some(PointerButton::Left | PointerButton::Right | PointerButton::Middle)
+                ) {
+                    self.tracking_pointer = button;
+                }
+                self.dispatch_pointer(action, button, col, row, mods)
+            }
+            PointerAction::Motion if self.tracking_pointer.is_some() => {
+                self.dispatch_pointer(action, self.tracking_pointer, col, row, mods)
+            }
+            PointerAction::Release if self.tracking_pointer.is_some() => {
+                let captured = self.tracking_pointer.take();
+                self.dispatch_pointer(action, captured, col, row, mods)
+            }
+            PointerAction::Motion if self.selection_drag_active => {
+                self.selection.update(&self.terminal, cell.0, cell.1);
+                Ok(())
+            }
+            PointerAction::Release if self.selection_drag_active => {
+                self.selection_drag_active = false;
+                self.selection.update(&self.terminal, cell.0, cell.1);
+                Ok(())
+            }
+            PointerAction::Motion if self.terminal.mouse_tracking() => {
+                self.dispatch_pointer(action, button, col, row, mods)
+            }
+            PointerAction::Press if button == Some(PointerButton::Left) => {
+                self.selection_drag_active = self.selection.begin(&self.terminal, cell.0, cell.1);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn selection_dump(&mut self) -> Result<Option<SelectionData>> {
+        Ok(self
+            .selection
+            .snapshot(&self.terminal, &mut self.render_state, self.cols, self.rows)?
+            .map(|snapshot| SelectionData {
+                text: snapshot.text,
+                anchor_visible: snapshot.anchor_visible,
+                cursor_visible: snapshot.cursor_visible,
+            }))
+    }
+
+    fn expand_selection_at(
+        &mut self,
+        col: u16,
+        row: u16,
+        click_count: u8,
+    ) -> Result<Option<ExpandSelectionData>> {
+        let row_text = TerminalSelection::row_text(&self.terminal, &mut self.render_state, row)?;
+        let span = match click_count {
+            2 => roost_ui_model::word_selection::expand_word(
+                &row_text,
+                col,
+                roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS,
+            ),
+            _ => Some(roost_ui_model::word_selection::expand_line(&row_text)),
+        };
+        let Some(span) = span else {
+            return Ok(None);
+        };
+        if !self
+            .selection
+            .set(&self.terminal, (span.col0, row), (span.col1, row))
+        {
+            return Ok(None);
+        }
+        let text = self.selection.selected_text(
+            &self.terminal,
+            &mut self.render_state,
+            self.cols,
+            self.rows,
+        )?;
+        Ok(Some(ExpandSelectionData {
+            col0: span.col0,
+            col1: span.col1,
+            text,
+        }))
+    }
+
     fn set_window_focus(&self, focused: bool) {
         let bytes = self.terminal.encode_focus(focused);
         if !bytes.is_empty() {
@@ -269,6 +375,10 @@ impl TerminalTab {
             cursor,
             cells,
             rows_text,
+            selection_background: self.theme.selection_background,
+            selection_spans: self
+                .selection
+                .visible_spans(&self.terminal, self.cols, self.rows),
         };
         Ok(())
     }
@@ -473,7 +583,7 @@ impl App {
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
             return;
         };
-        if let Err(error) = tab.dispatch_pointer(
+        if let Err(error) = tab.handle_native_pointer(
             action,
             button,
             col,
@@ -481,6 +591,9 @@ impl App {
             input::ghostty_modifiers(self.modifiers),
         ) {
             tracing::warn!(?error, active_tab, "terminal pointer dispatch failed");
+        }
+        if let Err(error) = tab.refresh_snapshot() {
+            tracing::warn!(?error, active_tab, "terminal selection refresh failed");
         }
     }
 
@@ -544,7 +657,6 @@ impl App {
             Some(tab) => canvas(TerminalCanvas {
                 tab_id: active_tab,
                 snapshot: tab.snapshot.clone(),
-                mouse_tracking: tab.terminal.mouse_tracking(),
             })
             .width(Fill)
             .height(Fill)
@@ -766,11 +878,44 @@ impl App {
                 UiRequest::PalettePresent { reply, .. } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));
                 }
-                UiRequest::SelectionSet { reply, .. } | UiRequest::SelectionClear { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::SelectionSet {
+                    tab_id,
+                    anchor,
+                    cursor,
+                    reply,
+                } => {
+                    let result = self
+                        .tabs
+                        .get_mut(&tab_id)
+                        .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                        .and_then(|tab| {
+                            if !tab.selection.set(&tab.terminal, anchor, cursor) {
+                                return Err(format!(
+                                    "selection coordinates are outside tab {tab_id}'s viewport"
+                                ));
+                            }
+                            tab.refresh_snapshot().map_err(|error| error.to_string())
+                        });
+                    let _ = reply.send(result);
                 }
-                UiRequest::SelectionDump { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::SelectionClear { tab_id, reply } => {
+                    let result = self
+                        .tabs
+                        .get_mut(&tab_id)
+                        .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                        .and_then(|tab| {
+                            tab.selection.clear();
+                            tab.refresh_snapshot().map_err(|error| error.to_string())
+                        });
+                    let _ = reply.send(result);
+                }
+                UiRequest::SelectionDump { tab_id, reply } => {
+                    let result = self
+                        .tabs
+                        .get_mut(&tab_id)
+                        .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                        .and_then(|tab| tab.selection_dump().map_err(|error| error.to_string()));
+                    let _ = reply.send(result);
                 }
                 UiRequest::ClipboardDump { target, reply } => {
                     let value = match target {
@@ -783,8 +928,34 @@ impl App {
                     ClipboardOp::System => self.system_clipboard = Some(text),
                     ClipboardOp::Selection => self.selection_clipboard = Some(text),
                 },
-                UiRequest::TabExpandSelectionAt { reply, .. } => {
-                    let _ = reply.send(Err(UNSUPPORTED.into()));
+                UiRequest::TabExpandSelectionAt {
+                    tab_id,
+                    col,
+                    row,
+                    click_count,
+                    reply,
+                } => {
+                    let result = if !self.test_mode {
+                        Err(
+                            "tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch"
+                                .into(),
+                        )
+                    } else {
+                        self.tabs
+                            .get_mut(&tab_id)
+                            .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                            .and_then(|tab| {
+                                tab.expand_selection_at(col, row, click_count)
+                                    .map_err(|error| error.to_string())?
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "no word/line span at ({col}, {row}) on tab {tab_id} \
+                                             (whitespace double-click, or row out of range)"
+                                        )
+                                    })
+                            })
+                    };
+                    let _ = reply.send(result);
                 }
                 UiRequest::SidebarDump { reply } => {
                     let _ = reply.send(Err(UNSUPPORTED.into()));

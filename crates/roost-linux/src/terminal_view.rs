@@ -253,7 +253,7 @@ impl TerminalView {
             has_focus: false,
             scrolled_back: false,
             scroll_accum: 0.0,
-            selection: None,
+            selection: roost_vt::TerminalSelection::new(),
             copy_on_select: CopyOnSelect::default(),
             input_callback: None,
             write_pty_buffer,
@@ -640,16 +640,12 @@ impl TerminalView {
                 // a "click without drag" and shouldn't render a
                 // selection rect. drag_update flips it to true on the
                 // first movement.
-                s.selection = s.cell_at(x, y, &widget).and_then(|(col, row)| {
-                    let screen_y = s.screen_y_for_viewport_row(row)?;
-                    Some(Selection {
-                        anchor_col: col,
-                        anchor_screen_y: screen_y,
-                        cursor_col: col,
-                        cursor_screen_y: screen_y,
-                        committed: false,
-                    })
-                });
+                if let Some((col, row)) = s.cell_at(x, y, &widget) {
+                    let s_mut: &mut TerminalViewState = &mut s;
+                    let _ = s_mut.selection.begin(&s_mut.terminal, col, row);
+                } else {
+                    s.selection.clear();
+                }
                 drop(s);
                 widget.queue_draw();
             }
@@ -704,22 +700,11 @@ impl TerminalView {
                     let y = start_y + dy;
                     let cell_w = s.cell_metrics.cell_width;
                     let cell_h = s.cell_metrics.cell_height;
-                    let resolved = cell_at_inner(x, y, cell_w, cell_h).and_then(|(col, row)| {
-                        let screen_y = s.screen_y_for_viewport_row(row)?;
-                        Some((col, screen_y))
-                    });
-                    match (resolved, s.selection.as_mut()) {
-                        (Some((col, screen_y)), Some(sel)) => {
-                            sel.cursor_col = col;
-                            sel.cursor_screen_y = screen_y;
-                        }
-                        (None, Some(_)) => {
-                            // Conversion failed mid-drag — drop the
-                            // selection rather than keep updating a
-                            // stale anchor.
-                            s.selection = None;
-                        }
-                        _ => {}
+                    if let Some((col, row)) = cell_at_inner(x, y, cell_w, cell_h) {
+                        let s_mut: &mut TerminalViewState = &mut s;
+                        let _ = s_mut.selection.update(&s_mut.terminal, col, row);
+                    } else {
+                        s.selection.clear();
                     }
                 }
                 drop(s);
@@ -833,25 +818,30 @@ impl TerminalView {
                     return;
                 };
                 let word_break_chars = s.word_break_chars.clone();
-                let row_text = s.text_for_viewport_row(row);
+                let s_mut: &mut TerminalViewState = &mut s;
+                let row_text = match roost_vt::TerminalSelection::row_text(
+                    &s_mut.terminal,
+                    &mut s_mut.render_state,
+                    row,
+                ) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        tracing::warn!(?err, row, "failed to read row for selection expansion");
+                        return;
+                    }
+                };
                 let click_count = u8::try_from(n_press).unwrap_or(u8::MAX);
                 let Some(span) = click_count_span(&row_text, col, click_count, &word_break_chars)
                 else {
                     return;
                 };
-                let Some(screen_y) = s.screen_y_for_viewport_row(row) else {
+                let s_mut: &mut TerminalViewState = &mut s;
+                if !s_mut
+                    .selection
+                    .set(&s_mut.terminal, (span.col0, row), (span.col1, row))
+                {
                     return;
-                };
-                s.selection = Some(Selection {
-                    anchor_col: span.col0,
-                    anchor_screen_y: screen_y,
-                    cursor_col: span.col1,
-                    cursor_screen_y: screen_y,
-                    // `committed = true` so a single-letter word
-                    // (col0 == col1) still renders + copies; Codex
-                    // flagged on PR #177 review.
-                    committed: true,
-                });
+                }
                 s.multi_click_consumed_this_gesture = true;
                 let mode = s.copy_on_select;
                 drop(s);
@@ -1217,33 +1207,11 @@ impl TerminalView {
     /// as the drag handlers.
     pub fn set_selection(&self, anchor: (u16, u16), cursor: (u16, u16)) -> bool {
         let mut s = self.state.borrow_mut();
-        let resolved = (|| {
-            let anchor_y = s.screen_y_for_viewport_row(anchor.1)?;
-            let cursor_y = s.screen_y_for_viewport_row(cursor.1)?;
-            Some((anchor_y, cursor_y))
-        })();
-        match resolved {
-            Some((anchor_y, cursor_y)) => {
-                s.selection = Some(Selection {
-                    anchor_col: anchor.0,
-                    anchor_screen_y: anchor_y,
-                    cursor_col: cursor.0,
-                    cursor_screen_y: cursor_y,
-                    // IPC-driven selections are deliberate commits;
-                    // single-cell sets must render + copy too.
-                    committed: true,
-                });
-                drop(s);
-                self.widget.queue_draw();
-                true
-            }
-            None => {
-                s.selection = None;
-                drop(s);
-                self.widget.queue_draw();
-                false
-            }
-        }
+        let s_mut: &mut TerminalViewState = &mut s;
+        let selected = s_mut.selection.set(&s_mut.terminal, anchor, cursor);
+        drop(s);
+        self.widget.queue_draw();
+        selected
     }
 
     /// Drive the production word-/line-expansion dispatch (the same
@@ -1264,7 +1232,18 @@ impl TerminalView {
     ) -> Option<(u16, u16, Option<String>)> {
         let span = {
             let mut s = self.state.borrow_mut();
-            let row_text = s.text_for_viewport_row(row);
+            let s_mut: &mut TerminalViewState = &mut s;
+            let row_text = match roost_vt::TerminalSelection::row_text(
+                &s_mut.terminal,
+                &mut s_mut.render_state,
+                row,
+            ) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!(?err, row, "failed to read row for selection expansion");
+                    return None;
+                }
+            };
             let word_break_chars = s.word_break_chars.clone();
             click_count_span(&row_text, col, click_count, &word_break_chars)?
         };
@@ -1277,10 +1256,7 @@ impl TerminalView {
 
     /// Clear any active selection on this terminal.
     pub fn clear_selection(&self) {
-        let had = {
-            let mut s = self.state.borrow_mut();
-            s.selection.take().is_some()
-        };
+        let had = self.state.borrow_mut().selection.clear();
         if had {
             self.widget.queue_draw();
         }
@@ -1291,19 +1267,24 @@ impl TerminalView {
     /// endpoint is currently visible in the viewport. Returns `None`
     /// when no selection is active.
     pub fn dump_selection(&self) -> Option<SelectionDumpData> {
-        let (anchor_screen_y, cursor_screen_y) = {
-            let s = self.state.borrow();
-            let sel = s.selection?;
-            (sel.anchor_screen_y, sel.cursor_screen_y)
+        let mut s = self.state.borrow_mut();
+        let s_mut: &mut TerminalViewState = &mut s;
+        let snapshot = match s_mut.selection.snapshot(
+            &s_mut.terminal,
+            &mut s_mut.render_state,
+            s_mut.cols,
+            s_mut.rows,
+        ) {
+            Ok(snapshot) => snapshot?,
+            Err(err) => {
+                tracing::warn!(?err, "failed to snapshot terminal selection");
+                return None;
+            }
         };
-        let text = selection_text(&self.state);
-        let s = self.state.borrow();
-        let anchor_visible = s.viewport_row_for_screen_y(anchor_screen_y).is_some();
-        let cursor_visible = s.viewport_row_for_screen_y(cursor_screen_y).is_some();
         Some(SelectionDumpData {
-            text,
-            anchor_visible,
-            cursor_visible,
+            text: snapshot.text,
+            anchor_visible: snapshot.anchor_visible,
+            cursor_visible: snapshot.cursor_visible,
         })
     }
 
@@ -1490,7 +1471,7 @@ impl TerminalView {
                     s.scrolled_back = false;
                     s.scroll_accum = 0.0;
                 }
-                let had_selection = s.selection.take().is_some();
+                let had_selection = s.selection.clear();
                 // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
                 // (the safe wrapper landed in commit 1). The encoder
                 // handles modifier conventions, Kitty keyboard protocol,
@@ -1557,7 +1538,7 @@ struct TerminalViewState {
     scroll_accum: f64,
     /// Current drag selection, in (col, screen_y) coordinates.
     /// `None` outside an active drag.
-    selection: Option<Selection>,
+    selection: roost_vt::TerminalSelection,
     /// `copy-on-select` mode from `~/.config/roost/config.conf`,
     /// resolved at startup by `App` and passed through
     /// [`TerminalView::with_theme_font_and_copy`]. Read by `drag_end`
@@ -1694,99 +1675,6 @@ pub struct SelectionDumpData {
     pub text: Option<String>,
     pub anchor_visible: bool,
     pub cursor_visible: bool,
-}
-
-/// Drag-selection state. Rows are stored as libghostty
-/// `PointTag::Screen` y coordinates (the unified screen-including-
-/// scrollback index) so the highlight stays anchored to the same
-/// rows as the user scrolls. Cols are column indices that don't
-/// change with vertical scroll.
-#[derive(Debug, Clone, Copy)]
-struct Selection {
-    anchor_col: u16,
-    anchor_screen_y: u32,
-    cursor_col: u16,
-    cursor_screen_y: u32,
-    /// True when the selection was set as a deliberate commit (the
-    /// multi-click n_press dispatch, `set_selection` from IPC) rather
-    /// than as a single-cell `drag_begin` anchor that the user hasn't
-    /// extended yet. Codex flagged on PR #177 that a double-click on
-    /// a single-letter word (e.g. `i`) returns a `(col, col)` span —
-    /// geometrically equal to a click-without-drag, but the user
-    /// expects to see + copy it. `committed` is the bit that
-    /// distinguishes the two so paint + `selection_text` render the
-    /// single-cell case.
-    committed: bool,
-}
-
-impl Selection {
-    fn is_empty(&self) -> bool {
-        self.anchor_col == self.cursor_col && self.anchor_screen_y == self.cursor_screen_y
-    }
-
-    /// Should the renderer paint this selection / copy-on-select emit
-    /// text for it? A committed single-cell span (e.g. double-click
-    /// on `i`) renders even though `is_empty` is geometrically true;
-    /// an in-progress drag at the anchor cell does not.
-    fn is_visible(&self) -> bool {
-        self.committed || !self.is_empty()
-    }
-
-    /// Normalized `(start_col, start_y, end_col, end_y)` in screen-y
-    /// space. Both ends are exclusive — the cell the user dragged to
-    /// is included, then `+1` makes the bound exclusive for `< end`
-    /// comparisons. Mirrors the Mac UI's `CellSelection.normalized`
-    /// 1:1; pre-rewrite Linux omitted the `+1` on `end_col`, which
-    /// silently dropped the rightmost cell from the paint rectangle
-    /// and the copy text.
-    fn normalized(&self) -> (u16, u32, u16, u32) {
-        if self.anchor_screen_y == self.cursor_screen_y {
-            return (
-                self.anchor_col.min(self.cursor_col),
-                self.anchor_screen_y,
-                self.anchor_col.max(self.cursor_col).saturating_add(1),
-                self.anchor_screen_y.saturating_add(1),
-            );
-        }
-        if self.anchor_screen_y < self.cursor_screen_y {
-            return (
-                self.anchor_col,
-                self.anchor_screen_y,
-                self.cursor_col.saturating_add(1),
-                self.cursor_screen_y.saturating_add(1),
-            );
-        }
-        (
-            self.cursor_col,
-            self.cursor_screen_y,
-            self.anchor_col.saturating_add(1),
-            self.anchor_screen_y.saturating_add(1),
-        )
-    }
-}
-
-/// Compute `[start_col, end_col)` for a single row of a multi-row
-/// selection. Single-row selections use the literal cols; multi-row
-/// selections fill the first row from `start_col` to the right edge,
-/// interior rows full-width, and the last row from the left edge to
-/// `end_col`. Mirrors the Mac UI's `TerminalView.colRange`.
-fn selection_col_range(
-    offset: usize,
-    total_row_span: usize,
-    start_col: u16,
-    end_col: u16,
-    cols: u16,
-) -> (u16, u16) {
-    if total_row_span == 1 {
-        return (start_col, end_col);
-    }
-    if offset == 0 {
-        return (start_col, cols);
-    }
-    if offset == total_row_span - 1 {
-        return (0, end_col);
-    }
-    (0, cols)
 }
 
 impl TerminalViewState {
@@ -2055,66 +1943,32 @@ impl TerminalViewState {
         // Pass D: selection overlay. Translucent fill so cell glyphs
         // and the cursor stay legible underneath. Same shape as the
         // Mac UI's `TerminalView.draw` selection draw.
-        if let Some(sel) = self.selection {
-            if sel.is_visible() {
-                self.paint_selection(cr, sel, cell_w, cell_h);
-            }
-        }
+        let spans = self
+            .selection
+            .visible_spans(&self.terminal, self.cols, self.rows);
+        self.paint_selection(cr, &spans, cell_w, cell_h);
 
         let _ = (width, height);
     }
 
-    fn paint_selection(&self, cr: &cairo::Context, sel: Selection, cell_w: f64, cell_h: f64) {
-        let (sc, sy, ec, ey) = sel.normalized();
+    fn paint_selection(
+        &self,
+        cr: &cairo::Context,
+        spans: &[roost_vt::SelectionSpan],
+        cell_w: f64,
+        cell_h: f64,
+    ) {
         let (r, g, b) = self.theme.selection_background.to_f64();
-        let total_row_span = (ey - sy) as usize;
-        let cols = self.cols;
-        // Walk each row of the selection in screen-y space, resolve
-        // to a viewport row each frame, skip rows currently outside
-        // the visible viewport. This makes the highlight scroll with
-        // the content (the bug fix).
-        for offset in 0..total_row_span {
-            let screen_y = sy.saturating_add(offset as u32);
-            let Some(v_row) = self.viewport_row_for_screen_y(screen_y) else {
-                continue;
-            };
-            let (start_col, end_col) = selection_col_range(offset, total_row_span, sc, ec, cols);
+        for span in spans {
             cr.set_source_rgba(r, g, b, 0.35);
             cr.rectangle(
-                start_col as f64 * cell_w,
-                v_row as f64 * cell_h,
-                end_col.saturating_sub(start_col) as f64 * cell_w,
+                span.col0 as f64 * cell_w,
+                span.row as f64 * cell_h,
+                span.col1.saturating_sub(span.col0) as f64 * cell_w,
                 cell_h,
             );
             let _ = cr.fill();
         }
-    }
-
-    /// Convert a viewport row (0 = top of visible area) to its
-    /// `PointTag::Screen` y coordinate. Returns `None` when libghostty
-    /// rejects the conversion (out-of-range row, no terminal set up
-    /// yet). Used by drag-begin / drag-update to anchor selection in
-    /// scrollback-stable coordinates.
-    fn screen_y_for_viewport_row(&self, row: u16) -> Option<u32> {
-        let pt = roost_vt::Point::viewport(0, row as u32);
-        let screen = self
-            .terminal
-            .convert_point(pt, roost_vt::PointTag::Screen)?;
-        Some(screen.y)
-    }
-
-    /// Convert a `PointTag::Screen` y coordinate back to its current
-    /// viewport row. Returns `None` when the row is scrolled out of
-    /// the visible viewport (caller should clip / skip).
-    fn viewport_row_for_screen_y(&self, screen_y: u32) -> Option<u16> {
-        let pt = roost_vt::Point::screen(0, screen_y);
-        let viewport = self
-            .terminal
-            .convert_point(pt, roost_vt::PointTag::Viewport)?;
-        if viewport.y >= self.rows as u32 {
-            return None;
-        }
-        Some(viewport.y as u16)
     }
 
     /// Handle a single scroll-wheel `dy`. Negative = up (older
@@ -2652,72 +2506,19 @@ fn color_scheme_report(light: bool) -> &'static [u8] {
 /// selection. A fuller scroll-walk-restore implementation is a
 /// follow-up; mirrors the Mac UI's limitation in `selectedPlainText`.
 fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
-    let s = state.borrow();
-    let sel = s.selection?;
-    if !sel.is_visible() {
-        return None;
-    }
-    let (sc, sy, ec, ey) = sel.normalized();
-    let total_row_span = (ey - sy) as usize;
-    if total_row_span == 0 {
-        return None;
-    }
-    let cols = s.cols;
-
-    // Map viewport rows currently representing this selection back to
-    // their selection offset. Off-viewport rows are silently skipped.
-    let mut offset_for_viewport_row: std::collections::HashMap<u32, usize> =
-        std::collections::HashMap::with_capacity(total_row_span);
-    for offset in 0..total_row_span {
-        let screen_y = sy.saturating_add(offset as u32);
-        if let Some(v_row) = s.viewport_row_for_screen_y(screen_y) {
-            offset_for_viewport_row.insert(v_row as u32, offset);
-        }
-    }
-    drop(s);
-    if offset_for_viewport_row.is_empty() {
-        return None;
-    }
-
-    let mut rows: Vec<String> = vec![String::new(); total_row_span];
     let mut s = state.borrow_mut();
-    let TerminalViewState {
-        terminal,
-        render_state,
-        ..
-    } = &mut *s;
-    let _ = render_state.update(terminal);
-    let _ = render_state.walk(terminal, |row, cell| {
-        let Some(&offset) = offset_for_viewport_row.get(&row) else {
-            return;
-        };
-        let (start_col, end_col) = selection_col_range(offset, total_row_span, sc, ec, cols);
-        if cell.col < start_col || cell.col >= end_col {
-            return;
+    let s_mut: &mut TerminalViewState = &mut s;
+    match s_mut.selection.selected_text(
+        &s_mut.terminal,
+        &mut s_mut.render_state,
+        s_mut.cols,
+        s_mut.rows,
+    ) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::warn!(?err, "failed to extract terminal selection text");
+            None
         }
-        if cell.text.is_empty() {
-            rows[offset].push(' ');
-        } else {
-            rows[offset].push_str(&cell.text);
-        }
-    });
-    drop(s);
-
-    // Trim trailing whitespace per row, then drop empty leading and
-    // trailing rows so a partial copy (where the first or last
-    // selection rows scrolled off-screen and are blank in `rows`)
-    // doesn't carry stray newlines into the clipboard.
-    let mut trimmed: Vec<String> = rows.iter().map(|r| r.trim_end().to_string()).collect();
-    while matches!(trimmed.first(), Some(line) if line.is_empty()) {
-        trimmed.remove(0);
-    }
-    while matches!(trimmed.last(), Some(line) if line.is_empty()) {
-        trimmed.pop();
-    }
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.join("\n"))
     }
 }
 
@@ -3124,116 +2925,6 @@ mod tests {
             text: String::new(),
             style,
         }
-    }
-
-    // Selection column-range helper tests. Mirrors
-    // `mac/Tests/RoostTests/SelectionColRangeTests.swift` 1:1 so both
-    // UIs agree on how a multi-row selection's first/middle/last rows
-    // map to per-row [start_col, end_col) extents.
-    const COLS: u16 = 80;
-
-    #[test]
-    fn selection_col_range_single_row_uses_literal_cols() {
-        let (s, e) = selection_col_range(0, 1, 3, 17, COLS);
-        assert_eq!((s, e), (3, 17));
-    }
-
-    #[test]
-    fn selection_col_range_first_row_of_multi_fills_to_right_edge() {
-        let (s, e) = selection_col_range(0, 4, 12, 5, COLS);
-        assert_eq!((s, e), (12, COLS));
-    }
-
-    #[test]
-    fn selection_col_range_interior_row_spans_full_width() {
-        let (s, e) = selection_col_range(1, 4, 12, 5, COLS);
-        assert_eq!((s, e), (0, COLS));
-    }
-
-    #[test]
-    fn selection_col_range_last_row_ends_at_end_col() {
-        let (s, e) = selection_col_range(3, 4, 12, 5, COLS);
-        assert_eq!((s, e), (0, 5));
-    }
-
-    // Selection-rectangle normalization tests — ensure that dragging
-    // in any direction (anchor below cursor, anchor above cursor,
-    // anchor and cursor on same row, same cell) yields a
-    // well-formed normalized rectangle. Catches off-by-ones in the
-    // screen-y vs viewport-row migration.
-    #[test]
-    fn selection_normalized_same_cell_is_empty_zero_span() {
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 100,
-            cursor_col: 5,
-            cursor_screen_y: 100,
-            committed: false,
-        };
-        assert!(sel.is_empty());
-        let (sc, sy, ec, ey) = sel.normalized();
-        // Empty selection still produces a 1-cell normalized rect.
-        assert_eq!((sc, sy, ec, ey), (5, 100, 6, 101));
-    }
-
-    #[test]
-    fn selection_normalized_anchor_above_cursor_keeps_order() {
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 10,
-            cursor_col: 8,
-            cursor_screen_y: 12,
-            committed: false,
-        };
-        let (sc, sy, ec, ey) = sel.normalized();
-        assert_eq!((sc, sy, ec, ey), (5, 10, 9, 13));
-    }
-
-    #[test]
-    fn selection_normalized_cursor_above_anchor_swaps() {
-        let sel = Selection {
-            anchor_col: 8,
-            anchor_screen_y: 12,
-            cursor_col: 5,
-            cursor_screen_y: 10,
-            committed: false,
-        };
-        let (sc, sy, ec, ey) = sel.normalized();
-        // Same rectangle as the previous test — direction-independent.
-        assert_eq!((sc, sy, ec, ey), (5, 10, 9, 13));
-    }
-
-    #[test]
-    fn selection_is_visible_single_cell_uncommitted_hides() {
-        // Drag_begin at a single cell that the user never extended
-        // — anchor == cursor, committed = false. Should NOT render
-        // or copy.
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 10,
-            cursor_col: 5,
-            cursor_screen_y: 10,
-            committed: false,
-        };
-        assert!(sel.is_empty());
-        assert!(!sel.is_visible());
-    }
-
-    #[test]
-    fn selection_is_visible_single_cell_committed_renders() {
-        // Multi-click selected a single-letter word like `i` — the
-        // n_press dispatch sets committed = true so the paint pass
-        // and selection_text still emit the cell, even though it's
-        // geometrically empty. Pins the Codex PR #177 regression.
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 10,
-            cursor_col: 5,
-            cursor_screen_y: 10,
-            committed: true,
-        };
-        assert!(sel.is_empty());
-        assert!(sel.is_visible());
     }
 
     #[test]

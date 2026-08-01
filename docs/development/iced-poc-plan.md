@@ -561,6 +561,44 @@ scrollback, and platform cursor presentation are separate later slices—the
 Canvas forwards mouse-tracking protocol now but deliberately does not pretend
 those local interactions are complete.
 
+### Active mini-plan: shared terminal selection and Iced drag selection
+
+Scope: move renderer-independent terminal selection state, screen/viewport
+coordinate conversion, visible highlight spans, and selected-text extraction
+from the GTK view into `roost-vt::TerminalSelection`. Migrate GTK to that type,
+then use the same type from Iced for selection IPC, word/line expansion via the
+existing `roost-ui-model::word_selection` policy, visible Canvas highlights,
+and native left-button drag selection when terminal mouse reporting is off.
+
+Invariants and interfaces:
+
+- selection endpoints are stored as libghostty screen coordinates so output and
+  scrollback never retarget a selection to unrelated viewport text;
+- `TerminalSelection` exposes explicit set/begin/update/clear, snapshot, visible
+  spans, row text, and selected text operations; it owns no GTK, Iced, clipboard,
+  callback, or renderer object;
+- text/render walks accept the caller-owned `Terminal` and `RenderState`, return
+  explicit `roost-vt::Result`, and never retain borrowed grid references;
+- GTK retains its existing gesture precedence, copy-on-select ports, paint
+  colors, and public behavior while no longer owning the selection state
+  machine; `roost-ui-model::word_selection` remains the single word policy;
+- Iced pointer reporting retains precedence while a tracking press is active;
+  otherwise left press/motion/release mutate only the active tab's selection;
+  tab switches cannot leak gesture or selection state; and
+- selection paint is an adapter concern: the model returns normalized visible
+  cell spans and each renderer chooses its own color/alpha.
+
+Acceptance: shared model tests cover normalization, committed single cells,
+multi-row column ranges, screen-stable coordinates, clipping, extraction, and
+clear/update failure; Iced passes all `test_selection.py` selection assertions
+and `test_word_selection.py`; native Canvas tests cover local drag messages and
+tracking precedence; GTK selection/word tests and full regressions stay green;
+macOS and shed X11/Wayland focused gates pass; dependency boundaries remain
+unchanged. Native CLIPBOARD/PRIMARY read/write tasks, copy/paste shortcuts,
+middle-click paste, URL hit-testing, and double-click timing in the Iced Canvas
+are the next clipboard/input slice. Existing deterministic clipboard shadows
+remain explicit test ports in this commit and are not described as OS-native.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

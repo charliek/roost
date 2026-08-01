@@ -1,7 +1,7 @@
 use iced::widget::canvas;
 use iced::{mouse, Color, Font, Point, Rectangle, Renderer, Size, Theme};
 use roost_engine::pointer::{PointerAction, PointerButton};
-use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle};
+use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 
 pub const CELL_WIDTH: f32 = 8.4;
 pub const CELL_HEIGHT: f32 = 18.0;
@@ -29,6 +29,8 @@ pub struct TerminalSnapshot {
     pub cursor: Option<CursorInfo>,
     pub cells: Vec<DrawCell>,
     pub rows_text: Vec<String>,
+    pub selection_background: ColorRgb,
+    pub selection_spans: Vec<SelectionSpan>,
 }
 
 impl TerminalSnapshot {
@@ -49,6 +51,12 @@ impl TerminalSnapshot {
             cursor: None,
             cells: Vec::new(),
             rows_text: vec![String::new(); usize::from(rows)],
+            selection_background: ColorRgb {
+                r: 72,
+                g: 83,
+                b: 109,
+            },
+            selection_spans: Vec::new(),
         }
     }
 }
@@ -57,7 +65,6 @@ impl TerminalSnapshot {
 pub struct TerminalCanvas {
     pub tab_id: i64,
     pub snapshot: TerminalSnapshot,
-    pub mouse_tracking: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,12 +95,23 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
             state.tab_id = Some(self.tab_id);
             state.pressed = None;
         }
-        if !self.mouse_tracking {
-            state.pressed = None;
-            return None;
-        }
-        let point = cursor.position_in(bounds)?;
-        let (col, row) = cell_at(point, self.snapshot.cols, self.snapshot.rows)?;
+        let captured_gesture = state.pressed.is_some()
+            && matches!(
+                event,
+                canvas::Event::Mouse(
+                    mouse::Event::ButtonReleased(_) | mouse::Event::CursorMoved { .. }
+                )
+            );
+        let point = if captured_gesture {
+            cursor.position_from(Point::new(bounds.x, bounds.y))?
+        } else {
+            cursor.position_in(bounds)?
+        };
+        let (col, row) = if captured_gesture {
+            cell_at_clamped(point, self.snapshot.cols, self.snapshot.rows)?
+        } else {
+            cell_at(point, self.snapshot.cols, self.snapshot.rows)?
+        };
         let pointer = match event {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let button = mouse_button(*button)?;
@@ -143,9 +161,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
             }
             _ => return None,
         };
-        Some(canvas::Action::publish(crate::Message::TerminalPointer(
-            pointer,
-        )))
+        Some(canvas::Action::publish(crate::Message::TerminalPointer(pointer)).and_capture())
     }
 
     fn draw(
@@ -197,6 +213,20 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
             }
         }
 
+        for span in &self.snapshot.selection_spans {
+            frame.fill_rectangle(
+                cell_position(span.col0, u32::from(span.row)),
+                Size::new(
+                    f32::from(span.col1.saturating_sub(span.col0)) * CELL_WIDTH,
+                    CELL_HEIGHT,
+                ),
+                Color {
+                    a: 0.35,
+                    ..color(self.snapshot.selection_background)
+                },
+            );
+        }
+
         if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
             let point = cell_position(cursor.col as u16, cursor.row);
             let cursor_color = color(cursor.color.unwrap_or(self.snapshot.foreground));
@@ -245,6 +275,19 @@ fn cell_at(point: Point, cols: u16, rows: u16) -> Option<(u32, u32)> {
     let col = ((point.x - TERMINAL_PADDING) / CELL_WIDTH).floor() as u32;
     let row = ((point.y - TERMINAL_PADDING) / CELL_HEIGHT).floor() as u32;
     (col < u32::from(cols) && row < u32::from(rows)).then_some((col, row))
+}
+
+fn cell_at_clamped(point: Point, cols: u16, rows: u16) -> Option<(u32, u32)> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let col = ((point.x - TERMINAL_PADDING) / CELL_WIDTH)
+        .floor()
+        .clamp(0.0, f32::from(cols.saturating_sub(1))) as u32;
+    let row = ((point.y - TERMINAL_PADDING) / CELL_HEIGHT)
+        .floor()
+        .clamp(0.0, f32::from(rows.saturating_sub(1))) as u32;
+    Some((col, row))
 }
 
 fn mouse_button(button: mouse::Button) -> Option<PointerButton> {
@@ -299,6 +342,10 @@ mod tests {
             Some((5, 3))
         );
         assert_eq!(cell_at(Point::new(1.0, 1.0), 80, 24), None);
+        assert_eq!(
+            cell_at_clamped(Point::new(-50.0, 9_000.0), 80, 24),
+            Some((0, 23))
+        );
     }
 
     #[test]
@@ -306,7 +353,6 @@ mod tests {
         let program = TerminalCanvas {
             tab_id: 42,
             snapshot: TerminalSnapshot::blank(80, 24),
-            mouse_tracking: true,
         };
         let mut state = TerminalCanvasState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
@@ -350,5 +396,24 @@ mod tests {
         };
         assert_eq!(motion.action, PointerAction::Motion);
         assert_eq!(motion.button, Some(PointerButton::Left));
+
+        let outside = mouse::Cursor::Available(Point::new(-20.0, 900.0));
+        let release = <TerminalCanvas as canvas::Program<crate::Message>>::update(
+            &program,
+            &mut state,
+            &canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            bounds,
+            outside,
+        )
+        .expect("release action")
+        .into_inner()
+        .0
+        .expect("release message");
+        let crate::Message::TerminalPointer(release) = release else {
+            panic!("unexpected release message")
+        };
+        assert_eq!(release.action, PointerAction::Release);
+        assert_eq!((release.col, release.row), (0, 23));
+        assert_eq!(state.pressed, None);
     }
 }
