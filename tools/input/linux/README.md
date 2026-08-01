@@ -39,6 +39,8 @@ Everything is stdlib Python 3 + bash. No build step.
 | `clipread.py` | Print the CLIPBOARD + PRIMARY selections via Gdk4 (see the caveat below). |
 | `single_monitor.sh` | `solo <OUTPUT>` / `restore` — collapse to one enabled output for pointer work, then put the others back. |
 | `real_input_check.py` | Self-contained real-input regression: focus + core-sync (click-to-focus, project switch, Alt+digit, Ctrl+PageDown, cycle_tab, pill click, context menu) **and** drag reorder (tab pills + project rows). Spins up its own Xvfb + throwaway Roost and drives **`xdotool`** — no `/dev/uinput`, no single monitor, no COSMIC. |
+| `iced_clipboard_check.py` | Self-contained Iced/X11 text clipboard gate: configured Copy, plain/bracketed Paste, real drag copy-on-select, and middle-click PRIMARY under Xvfb + xdotool. |
+| `iced_wayland_clipboard_check.py` | Shed/real-kernel Iced Wayland proof under cage + uinput: explicit system Copy→Paste and drag copy-on-select→Paste. PRIMARY is a named compositor limitation. |
 
 PNG inspection (`info`/`pixel`/`textscan`/`findcolor`/`crop`) is in the visual
 layer: [`../../screenshot/pngtool.py`](../../screenshot/pngtool.py).
@@ -79,6 +81,26 @@ unfocused→focused transition pins the focus path under test. Focus is read via
 `app.active_terminal_focused` IPC op (GTK logical focus, observable without a
 window manager). PASS exits 0; a missing `Xvfb`/`xdotool`/binary prints `SKIP` and
 exits 0.
+
+## Iced clipboard real-input checks
+
+The Iced adapter has two complementary real-input gates. X11 is the complete
+text path, including CLIPBOARD and PRIMARY; it runs under both wgpu and
+tiny-skia in Actions. The Wayland check requires a real Linux kernel with
+`/dev/uinput` and cage's libinput backend, so it runs in the shed. It requires
+the ordinary system clipboard paths to pass using fresh keyboard/pointer input
+serials. Cage does not advertise the PRIMARY selection protocol, so the
+Linux-terminal middle-click convention remains explicitly X11-gated instead
+of being hidden by a headless Wayland skip.
+
+```sh
+make test-iced-real-input       # Linux X11, self-contained Xvfb
+make test-iced-wayland-input    # Linux real seat: cage + /dev/uinput
+```
+
+Both checks launch `roost-iced` with private runtime, state, config, log, lock,
+and socket paths. Set `ROOST_ICED_BIN` when the Linux binary lives outside the
+mounted repository target directory, as it does in the shed.
 
 Run any Python tool with `python3 tools/input/linux/<tool>.py ...`; `--help`/no-args
 prints usage.

@@ -1,6 +1,106 @@
 use iced::keyboard::{self, key::Named, Key};
+use roost_ui_model::keybind::{Accel, AccelMods};
 use roost_vt::ffi as ghostty;
 use roost_vt::{key_action, mods, KeyEncoder, KeyEvent, Terminal};
+
+/// Translate an Iced key press into the toolkit-neutral accelerator grammar.
+/// Physical Latin lookup keeps configured letter bindings usable under a
+/// non-Latin layout, matching the terminal encoder's existing behavior.
+pub(crate) fn accelerator(event: &keyboard::Event) -> Option<Accel> {
+    let keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let logical = key.as_ref();
+    let key = match logical {
+        // Prefer the logical value for ASCII so shifted punctuation keeps its
+        // shared GTK-style name (`+` -> `plus`, `{` -> `braceleft`). Physical
+        // Latin is only a layout fallback; taking it first collapses `+` to
+        // `equal` and makes configured punctuation aliases unreachable.
+        Key::Character(value) if value.is_ascii() => canonical_character(value),
+        _ => key
+            .to_latin(*physical_key)
+            .map(|value| canonical_character(&value.to_string()))
+            .or_else(|| accelerator_key(&logical))?,
+    };
+    Some(Accel {
+        modifiers: accelerator_modifiers(*modifiers),
+        key,
+    })
+}
+
+fn accelerator_modifiers(value: keyboard::Modifiers) -> AccelMods {
+    let mut result = AccelMods::empty();
+    if value.shift() {
+        result |= AccelMods::SHIFT;
+    }
+    if value.control() {
+        result |= AccelMods::CTRL;
+    }
+    if value.alt() {
+        result |= AccelMods::ALT;
+    }
+    if value.logo() {
+        result |= AccelMods::SUPER;
+    }
+    result
+}
+
+fn accelerator_key(key: &Key<&str>) -> Option<String> {
+    let name = match key {
+        Key::Character(value) => return Some(canonical_character(value)),
+        Key::Named(Named::Enter) => "return",
+        Key::Named(Named::Tab) => "tab",
+        Key::Named(Named::Backspace) => "backspace",
+        Key::Named(Named::Escape) => "escape",
+        Key::Named(Named::Space) => "space",
+        Key::Named(Named::Delete) => "delete",
+        Key::Named(Named::Insert) => "insert",
+        Key::Named(Named::Home) => "home",
+        Key::Named(Named::End) => "end",
+        Key::Named(Named::PageUp) => "page_up",
+        Key::Named(Named::PageDown) => "page_down",
+        Key::Named(Named::ArrowUp) => "up",
+        Key::Named(Named::ArrowDown) => "down",
+        Key::Named(Named::ArrowLeft) => "left",
+        Key::Named(Named::ArrowRight) => "right",
+        Key::Named(Named::F1) => "f1",
+        Key::Named(Named::F2) => "f2",
+        Key::Named(Named::F3) => "f3",
+        Key::Named(Named::F4) => "f4",
+        Key::Named(Named::F5) => "f5",
+        Key::Named(Named::F6) => "f6",
+        Key::Named(Named::F7) => "f7",
+        Key::Named(Named::F8) => "f8",
+        Key::Named(Named::F9) => "f9",
+        Key::Named(Named::F10) => "f10",
+        Key::Named(Named::F11) => "f11",
+        Key::Named(Named::F12) => "f12",
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+fn canonical_character(value: &str) -> String {
+    let name = match value {
+        "[" => "bracketleft",
+        "{" => "braceleft",
+        "]" => "bracketright",
+        "}" => "braceright",
+        "=" => "equal",
+        "+" => "plus",
+        "-" => "minus",
+        "_" => "underscore",
+        " " => "space",
+        _ => return value.to_ascii_lowercase(),
+    };
+    name.to_string()
+}
 
 pub fn encode_press(
     encoder: &mut KeyEncoder,
@@ -172,6 +272,24 @@ fn character_key(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::keyboard::key::{Code, Physical};
+    use iced::keyboard::Location;
+
+    fn key_press(
+        key: Key,
+        physical_key: Physical,
+        modifiers: keyboard::Modifiers,
+    ) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            physical_key,
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
 
     #[test]
     fn maps_toolkit_keys_without_gtk() {
@@ -200,5 +318,68 @@ mod tests {
             ghostty_modifiers(all),
             mods::SHIFT | mods::CTRL | mods::ALT | mods::SUPER
         );
+    }
+
+    #[test]
+    fn maps_iced_press_to_shared_accelerator_with_exact_modifiers() {
+        let event = key_press(
+            Key::Character("C".into()),
+            Physical::Code(Code::KeyC),
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            accelerator(&event),
+            Some(Accel {
+                modifiers: AccelMods::CTRL | AccelMods::SHIFT,
+                key: "c".into(),
+            })
+        );
+        let with_alt = key_press(
+            Key::Character("c".into()),
+            Physical::Code(Code::KeyC),
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT,
+        );
+        assert_ne!(accelerator(&event), accelerator(&with_alt));
+    }
+
+    #[test]
+    fn accelerator_uses_physical_latin_and_named_key_vocabulary() {
+        let non_latin = key_press(
+            Key::Character("с".into()),
+            Physical::Code(Code::KeyC),
+            keyboard::Modifiers::LOGO,
+        );
+        assert_eq!(accelerator(&non_latin).unwrap().key, "c");
+
+        let insert = key_press(
+            Key::Named(Named::Insert),
+            Physical::Code(Code::Insert),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(accelerator(&insert).unwrap().key, "insert");
+    }
+
+    #[test]
+    fn accelerator_canonicalizes_logical_punctuation_before_physical_fallback() {
+        let bracket = key_press(
+            Key::Character("[".into()),
+            Physical::Code(Code::BracketLeft),
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        );
+        assert_eq!(accelerator(&bracket).unwrap().key, "bracketleft");
+
+        let plus = key_press(
+            Key::Character("+".into()),
+            Physical::Code(Code::Equal),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(accelerator(&plus).unwrap().key, "plus");
+
+        let space = key_press(
+            Key::Named(Named::Space),
+            Physical::Code(Code::Space),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(accelerator(&space).unwrap().key, "space");
     }
 }

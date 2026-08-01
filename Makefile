@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac smoke-mac-launch test-real-input check-iced
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_selection.py tools/roosttest/test_osc52.py
@@ -130,6 +130,12 @@ smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build
 
 test-real-input:  ## GTK real-input regressions: focus/core-sync + drag reorder (self-contained Xvfb+xdotool)
 	uv run --group test python tools/input/linux/real_input_check.py
+
+test-iced-real-input: build-iced  ## Iced real clipboard input (self-contained Linux Xvfb+xdotool)
+	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_clipboard_check.py
+
+test-iced-wayland-input: build-iced  ## Iced system clipboard with cage + a real uinput seat
+	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_wayland_clipboard_check.py
 
 # ---- code quality -----------------------------------------------------
 

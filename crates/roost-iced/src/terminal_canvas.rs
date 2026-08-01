@@ -69,6 +69,7 @@ pub struct TerminalCanvas {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TerminalPointer {
+    pub tab_id: i64,
     pub action: PointerAction,
     pub button: Option<PointerButton>,
     pub col: u32,
@@ -117,6 +118,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                 let button = mouse_button(*button)?;
                 state.pressed = Some(button);
                 TerminalPointer {
+                    tab_id: self.tab_id,
                     action: PointerAction::Press,
                     button: Some(button),
                     col,
@@ -127,6 +129,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                 let button = mouse_button(*button)?;
                 state.pressed = None;
                 TerminalPointer {
+                    tab_id: self.tab_id,
                     action: PointerAction::Release,
                     button: Some(button),
                     col,
@@ -134,6 +137,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                 }
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => TerminalPointer {
+                tab_id: self.tab_id,
                 action: PointerAction::Motion,
                 button: state.pressed,
                 col,
@@ -149,6 +153,7 @@ impl canvas::Program<crate::Message> for TerminalCanvas {
                     return None;
                 }
                 TerminalPointer {
+                    tab_id: self.tab_id,
                     action: PointerAction::Press,
                     button: Some(if vertical > 0.0 {
                         PointerButton::Four
@@ -375,6 +380,7 @@ mod tests {
             panic!("unexpected press message")
         };
         assert_eq!(press.action, PointerAction::Press);
+        assert_eq!(press.tab_id, 42);
         assert_eq!(press.button, Some(PointerButton::Left));
         assert_eq!((press.col, press.row), (5, 3));
 

@@ -111,10 +111,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.clipboard_write_completed(request_id).map_task()
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
-        Message::TerminalPointer(event) => {
-            app.pointer(event.action, event.button, event.col, event.row);
-            Task::none()
-        }
+        Message::TerminalPointer(event) => app
+            .pointer(
+                event.tab_id,
+                event.action,
+                event.button,
+                event.col,
+                event.row,
+            )
+            .map_task(),
         Message::PaletteQueryChanged(query) => {
             app.palette_query_changed(&query);
             Task::none()

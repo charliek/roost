@@ -28,7 +28,9 @@ use roost_ui_model::theme::Theme;
 use roost_ui_model::{
     agent_palette,
     config::{self, RoostConfig},
-    custom_command, notification_inbox, palette, provider,
+    custom_command,
+    keybind::{self, Accel, KeybindAction},
+    notification_inbox, palette, provider,
 };
 use roost_vt::{
     mouse_action, mouse_button, KeyEncoder, MouseEncoder, MouseEvent, RenderState, Terminal,
@@ -346,6 +348,22 @@ impl UiTask {
 type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
 type ClipboardReply = tokio::sync::oneshot::Sender<Result<Option<String>, String>>;
 
+enum ClipboardReadDestination {
+    Ipc(ClipboardReply),
+    Paste { tab_id: i64 },
+}
+
+enum ClipboardReadCompletion {
+    Ipc {
+        reply: ClipboardReply,
+        value: Option<String>,
+    },
+    Paste {
+        tab_id: i64,
+        value: Option<String>,
+    },
+}
+
 #[derive(Debug)]
 enum ClipboardEffect {
     Read {
@@ -387,7 +405,7 @@ struct ClipboardQueue {
     next_request_id: u64,
     queued: VecDeque<ClipboardEffect>,
     active_request_id: Option<u64>,
-    pending_reads: HashMap<u64, ClipboardReply>,
+    pending_reads: HashMap<u64, ClipboardReadDestination>,
 }
 
 impl ClipboardQueue {
@@ -408,9 +426,19 @@ impl ClipboardQueue {
         }
     }
 
-    fn enqueue_read(&mut self, target: ClipboardOp, reply: ClipboardReply) -> u64 {
+    fn enqueue_ipc_read(&mut self, target: ClipboardOp, reply: ClipboardReply) -> u64 {
         let request_id = self.allocate_request_id();
-        self.pending_reads.insert(request_id, reply);
+        self.pending_reads
+            .insert(request_id, ClipboardReadDestination::Ipc(reply));
+        self.queued
+            .push_back(ClipboardEffect::Read { request_id, target });
+        request_id
+    }
+
+    fn enqueue_paste_read(&mut self, target: ClipboardOp, tab_id: i64) -> u64 {
+        let request_id = self.allocate_request_id();
+        self.pending_reads
+            .insert(request_id, ClipboardReadDestination::Paste { tab_id });
         self.queued
             .push_back(ClipboardEffect::Read { request_id, target });
         request_id
@@ -437,16 +465,22 @@ impl ClipboardQueue {
         effect.into_task()
     }
 
-    fn complete_read(&mut self, request_id: u64, value: Option<String>) -> bool {
+    fn complete_read(
+        &mut self,
+        request_id: u64,
+        value: Option<String>,
+    ) -> Option<ClipboardReadCompletion> {
         if self.active_request_id != Some(request_id) {
-            return false;
+            return None;
         }
+        let destination = self.pending_reads.remove(&request_id)?;
         self.active_request_id = None;
-        let Some(reply) = self.pending_reads.remove(&request_id) else {
-            return false;
-        };
-        let _ = reply.send(Ok(value));
-        true
+        Some(match destination {
+            ClipboardReadDestination::Ipc(reply) => ClipboardReadCompletion::Ipc { reply, value },
+            ClipboardReadDestination::Paste { tab_id } => {
+                ClipboardReadCompletion::Paste { tab_id, value }
+            }
+        })
     }
 
     fn complete_write(&mut self, request_id: u64) -> bool {
@@ -473,6 +507,34 @@ fn enqueue_osc_clipboard_write(
     };
     clipboard.enqueue_write(target, text);
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyKind {
+    Explicit,
+    OnSelect(config::CopyOnSelect),
+}
+
+fn enqueue_selection_copy(
+    clipboard: &mut ClipboardQueue,
+    kind: CopyKind,
+    text: Option<String>,
+) -> usize {
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return 0;
+    };
+    let targets: &[ClipboardOp] = match kind {
+        CopyKind::Explicit => &[ClipboardOp::System, ClipboardOp::Selection],
+        CopyKind::OnSelect(config::CopyOnSelect::Off) => &[],
+        CopyKind::OnSelect(config::CopyOnSelect::True) => &[ClipboardOp::Selection],
+        CopyKind::OnSelect(config::CopyOnSelect::Clipboard) => {
+            &[ClipboardOp::System, ClipboardOp::Selection]
+        }
+    };
+    for target in targets {
+        clipboard.enqueue_write(*target, text.clone());
+    }
+    targets.len()
 }
 
 struct ScreenshotRequest {
@@ -547,6 +609,30 @@ struct ProviderRunResult {
     provider: provider::Provider,
     phase: provider::Phase,
     outcome: Result<provider::ProviderOutput, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NativePointerOutcome {
+    selection_completed: bool,
+    paste_selection: bool,
+}
+
+fn pointer_origin_tab<V>(tabs: &mut HashMap<i64, V>, tab_id: i64) -> Option<&mut V> {
+    tabs.get_mut(&tab_id)
+}
+
+fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return Vec::new();
+    };
+    if !terminal.mode_get(2004) {
+        return text.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 struct TerminalTab {
@@ -740,7 +826,7 @@ impl TerminalTab {
         col: u32,
         row: u32,
         mods: u16,
-    ) -> Result<()> {
+    ) -> Result<NativePointerOutcome> {
         let col = col.min(u32::from(self.cols.saturating_sub(1)));
         let row = row.min(u32::from(self.rows.saturating_sub(1)));
         let cell = (col as u16, row as u16);
@@ -753,32 +839,61 @@ impl TerminalTab {
                 ) {
                     self.tracking_pointer = button;
                 }
-                self.dispatch_pointer(action, button, col, row, mods)
+                self.dispatch_pointer(action, button, col, row, mods)?;
+                Ok(NativePointerOutcome::default())
             }
             PointerAction::Motion if self.tracking_pointer.is_some() => {
-                self.dispatch_pointer(action, self.tracking_pointer, col, row, mods)
+                self.dispatch_pointer(action, self.tracking_pointer, col, row, mods)?;
+                Ok(NativePointerOutcome::default())
             }
             PointerAction::Release if self.tracking_pointer.is_some() => {
                 let captured = self.tracking_pointer.take();
-                self.dispatch_pointer(action, captured, col, row, mods)
+                self.dispatch_pointer(action, captured, col, row, mods)?;
+                Ok(NativePointerOutcome::default())
             }
             PointerAction::Motion if self.selection_drag_active => {
                 self.selection.update(&self.terminal, cell.0, cell.1);
-                Ok(())
+                Ok(NativePointerOutcome::default())
             }
             PointerAction::Release if self.selection_drag_active => {
                 self.selection_drag_active = false;
                 self.selection.update(&self.terminal, cell.0, cell.1);
-                Ok(())
+                Ok(NativePointerOutcome {
+                    selection_completed: true,
+                    paste_selection: false,
+                })
             }
             PointerAction::Motion if self.terminal.mouse_tracking() => {
-                self.dispatch_pointer(action, button, col, row, mods)
+                self.dispatch_pointer(action, button, col, row, mods)?;
+                Ok(NativePointerOutcome::default())
             }
             PointerAction::Press if button == Some(PointerButton::Left) => {
                 self.selection_drag_active = self.selection.begin(&self.terminal, cell.0, cell.1);
-                Ok(())
+                Ok(NativePointerOutcome::default())
             }
-            _ => Ok(()),
+            PointerAction::Press if button == Some(PointerButton::Middle) => {
+                Ok(NativePointerOutcome {
+                    selection_completed: false,
+                    paste_selection: true,
+                })
+            }
+            _ => Ok(NativePointerOutcome::default()),
+        }
+    }
+
+    fn selected_text(&mut self) -> Result<Option<String>> {
+        Ok(self.selection.selected_text(
+            &self.terminal,
+            &mut self.render_state,
+            self.cols,
+            self.rows,
+        )?)
+    }
+
+    fn paste(&self, text: Option<&str>) {
+        let bytes = paste_bytes(&self.terminal, text);
+        if !bytes.is_empty() {
+            self.session.send_input(bytes);
         }
     }
 
@@ -974,6 +1089,7 @@ pub struct App {
     test_mode: bool,
     status: Option<String>,
     config: RoostConfig,
+    keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
     palette_session: u64,
@@ -1009,6 +1125,11 @@ pub struct App {
 impl App {
     pub fn bootstrap(profile: &BundleProfile, lock: InstanceLock) -> Result<Self> {
         let config = RoostConfig::load_default();
+        let keybindings = keybind::canonicalize_bindings(
+            keybind::default_bindings(),
+            config.keybinds.clone(),
+            |warning| tracing::warn!("keybind: {warning}"),
+        );
         let active_theme_name = config
             .theme_name
             .clone()
@@ -1066,6 +1187,7 @@ impl App {
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: None,
             config,
+            keybindings,
             active_theme_name,
             palette: None,
             palette_session: 0,
@@ -1171,9 +1293,21 @@ impl App {
     }
 
     pub fn clipboard_read_completed(&mut self, request_id: u64, value: Option<String>) -> UiTask {
-        if !self.clipboard.complete_read(request_id, value) {
+        let Some(completion) = self.clipboard.complete_read(request_id, value) else {
             tracing::warn!(request_id, "ignored stale native clipboard read result");
             return UiTask::None;
+        };
+        match completion {
+            ClipboardReadCompletion::Ipc { reply, value } => {
+                let _ = reply.send(Ok(value));
+            }
+            ClipboardReadCompletion::Paste { tab_id, value } => {
+                if let Some(tab) = self.tabs.get(&tab_id) {
+                    tab.paste(value.as_deref());
+                } else {
+                    tracing::debug!(tab_id, request_id, "discarded paste for a closed tab");
+                }
+            }
         }
         self.clipboard.start_next()
     }
@@ -1218,48 +1352,7 @@ impl App {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.modifiers = *modifiers;
         }
-        if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
-            let palette_modifier = if cfg!(target_os = "macos") {
-                modifiers.logo()
-            } else {
-                modifiers.alt()
-            };
-            let character = match key.as_ref() {
-                Key::Character(value) => Some(value),
-                _ => None,
-            };
-            if self.palette.is_none()
-                && palette_modifier
-                && modifiers.shift()
-                && character.is_some_and(|value| value.eq_ignore_ascii_case("p"))
-            {
-                let _ = self.open_palette("commands");
-                return self.take_palette_focus_task();
-            }
-            if self.palette.is_none()
-                && palette_modifier
-                && modifiers.shift()
-                && character.is_some_and(|value| value.eq_ignore_ascii_case("t"))
-            {
-                let _ = self.open_palette("launcher");
-                return self.take_palette_focus_task();
-            }
-            if self.palette.is_none()
-                && palette_modifier
-                && modifiers.shift()
-                && character.is_some_and(|value| value.eq_ignore_ascii_case("e"))
-            {
-                let _ = self.open_palette("custom");
-                return self.take_palette_focus_task();
-            }
-            if self.palette.is_none()
-                && palette_modifier
-                && modifiers.shift()
-                && character.is_some_and(|value| value.eq_ignore_ascii_case("o"))
-            {
-                let _ = self.open_palette("agents");
-                return self.take_palette_focus_task();
-            }
+        if let keyboard::Event::KeyPressed { key, .. } = &event {
             if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
                 match key.as_ref() {
                     Key::Named(Named::Escape) => self.palette_back_or_dismiss(),
@@ -1279,6 +1372,21 @@ impl App {
         } else if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
             return UiTask::None;
         }
+
+        if let Some(action) = input::accelerator(&event)
+            .and_then(|accelerator| self.keybindings.get(&accelerator).copied())
+        {
+            match action {
+                KeybindAction::Copy => return self.copy_active_selection(),
+                KeybindAction::Paste => return self.paste_into_active(ClipboardOp::System),
+                KeybindAction::CommandPalette => return self.open_bound_palette("commands"),
+                KeybindAction::CommandLauncher => return self.open_bound_palette("launcher"),
+                KeybindAction::CustomPalette => return self.open_bound_palette("custom"),
+                KeybindAction::AgentPalette => return self.open_bound_palette("agents"),
+                _ => {}
+            }
+        }
+
         let KeyboardRoute::Terminal(active_tab) = self.keyboard_route() else {
             return UiTask::None;
         };
@@ -1288,6 +1396,39 @@ impl App {
         let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
         tab.session.send_input(bytes);
         UiTask::None
+    }
+
+    fn open_bound_palette(&mut self, kind: &str) -> UiTask {
+        if let Err(error) = self.open_palette(kind) {
+            self.status = Some(error);
+            return UiTask::None;
+        }
+        self.take_palette_focus_task()
+    }
+
+    fn copy_active_selection(&mut self) -> UiTask {
+        let tab_id = self.workspace.active().1;
+        let text = match self.tabs.get_mut(&tab_id) {
+            Some(tab) => match tab.selected_text() {
+                Ok(text) => text,
+                Err(error) => {
+                    self.status = Some(format!("copy selection from tab {tab_id}: {error}"));
+                    return UiTask::None;
+                }
+            },
+            None => return UiTask::None,
+        };
+        enqueue_selection_copy(&mut self.clipboard, CopyKind::Explicit, text);
+        self.clipboard.start_next()
+    }
+
+    fn paste_into_active(&mut self, target: ClipboardOp) -> UiTask {
+        let tab_id = self.workspace.active().1;
+        if !self.tabs.contains_key(&tab_id) {
+            return UiTask::None;
+        }
+        self.clipboard.enqueue_paste_read(target, tab_id);
+        self.clipboard.start_next()
     }
 
     fn keyboard_route(&self) -> KeyboardRoute {
@@ -1301,27 +1442,54 @@ impl App {
 
     pub fn pointer(
         &mut self,
+        tab_id: i64,
         action: PointerAction,
         button: Option<PointerButton>,
         col: u32,
         row: u32,
-    ) {
-        let (_, active_tab) = self.workspace.active();
-        let Some(tab) = self.tabs.get_mut(&active_tab) else {
-            return;
+    ) -> UiTask {
+        let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
+            tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
+            return UiTask::None;
         };
-        if let Err(error) = tab.handle_native_pointer(
+        let outcome = match tab.handle_native_pointer(
             action,
             button,
             col,
             row,
             input::ghostty_modifiers(self.modifiers),
         ) {
-            tracing::warn!(?error, active_tab, "terminal pointer dispatch failed");
-        }
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(?error, tab_id, "terminal pointer dispatch failed");
+                return UiTask::None;
+            }
+        };
+        let selected_text = if outcome.selection_completed {
+            match tab.selected_text() {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(?error, tab_id, "terminal selection extraction failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = tab.refresh_snapshot() {
-            tracing::warn!(?error, active_tab, "terminal selection refresh failed");
+            tracing::warn!(?error, tab_id, "terminal selection refresh failed");
         }
+        enqueue_selection_copy(
+            &mut self.clipboard,
+            CopyKind::OnSelect(self.config.copy_on_select),
+            selected_text,
+        );
+        #[cfg(target_os = "linux")]
+        if outcome.paste_selection {
+            self.clipboard
+                .enqueue_paste_read(ClipboardOp::Selection, tab_id);
+        }
+        self.clipboard.start_next()
     }
 
     pub fn set_window_focus(&mut self, focused: bool) {
@@ -2947,7 +3115,7 @@ impl App {
                     let _ = reply.send(result);
                 }
                 UiRequest::ClipboardDump { target, reply } => {
-                    self.clipboard.enqueue_read(target, reply);
+                    self.clipboard.enqueue_ipc_read(target, reply);
                     task = task.then(self.clipboard.start_next());
                 }
                 UiRequest::ClipboardWrite { target, text } => {
@@ -3185,6 +3353,36 @@ impl Message {
 mod tests {
     use super::*;
 
+    fn deliver_ipc(completion: ClipboardReadCompletion) {
+        let ClipboardReadCompletion::Ipc { reply, value } = completion else {
+            panic!("expected IPC clipboard completion")
+        };
+        let _ = reply.send(Ok(value));
+    }
+
+    fn attached_test_terminal(tab_id: i64) -> (TerminalTab, Arc<PtySupervisor>) {
+        let supervisor = Arc::new(PtySupervisor::new());
+        let argv = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
+        let _early_output = supervisor
+            .spawn(
+                tab_id,
+                "/tmp",
+                &argv,
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                std::path::Path::new("/tmp/roost-iced-pointer-test.sock"),
+            )
+            .expect("spawn pointer-test PTY");
+        let tab = TerminalTab::attach(
+            Arc::clone(&supervisor),
+            tab_id,
+            true,
+            Theme::roost_dark_fallback(),
+        )
+        .expect("attach pointer-test terminal");
+        (tab, supervisor)
+    }
+
     #[test]
     fn terminal_geometry_never_produces_zero_grid() {
         let size = Size::new(1.0, 1.0);
@@ -3376,7 +3574,7 @@ mod tests {
         // starting concurrently.
         let second_id = queue.enqueue_write(ClipboardOp::System, "B".into());
         let (reply, mut result) = tokio::sync::oneshot::channel();
-        let read_id = queue.enqueue_read(ClipboardOp::System, reply);
+        let read_id = queue.enqueue_ipc_read(ClipboardOp::System, reply);
         assert!(matches!(queue.start_next(), UiTask::None));
         assert!(queue.complete_write(first_id));
         assert!(matches!(
@@ -3395,7 +3593,11 @@ mod tests {
                 target: ClipboardOp::System,
             } if request_id == read_id
         ));
-        assert!(queue.complete_read(read_id, Some("B".into())));
+        deliver_ipc(
+            queue
+                .complete_read(read_id, Some("B".into()))
+                .expect("active read completion"),
+        );
         assert_eq!(result.try_recv().unwrap().unwrap().as_deref(), Some("B"));
     }
 
@@ -3404,15 +3606,19 @@ mod tests {
         let mut queue = ClipboardQueue::default();
         let (first_reply, mut first_result) = tokio::sync::oneshot::channel();
         let (second_reply, mut second_result) = tokio::sync::oneshot::channel();
-        let first_id = queue.enqueue_read(ClipboardOp::System, first_reply);
-        let second_id = queue.enqueue_read(ClipboardOp::Selection, second_reply);
+        let first_id = queue.enqueue_ipc_read(ClipboardOp::System, first_reply);
+        let second_id = queue.enqueue_ipc_read(ClipboardOp::Selection, second_reply);
 
         assert!(matches!(
             queue.start_next(),
             UiTask::ClipboardRead { request_id, .. } if request_id == first_id
         ));
-        assert!(!queue.complete_read(second_id, Some("early".into())));
-        assert!(!queue.complete_read(u64::MAX, Some("unknown".into())));
+        assert!(queue
+            .complete_read(second_id, Some("early".into()))
+            .is_none());
+        assert!(queue
+            .complete_read(u64::MAX, Some("unknown".into()))
+            .is_none());
         assert!(matches!(
             first_result.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -3422,7 +3628,11 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
 
-        assert!(queue.complete_read(first_id, Some("first".into())));
+        deliver_ipc(
+            queue
+                .complete_read(first_id, Some("first".into()))
+                .expect("first completion"),
+        );
         assert_eq!(
             first_result.try_recv().unwrap().unwrap().as_deref(),
             Some("first")
@@ -3431,8 +3641,14 @@ mod tests {
             queue.start_next(),
             UiTask::ClipboardRead { request_id, .. } if request_id == second_id
         ));
-        assert!(!queue.complete_read(first_id, Some("duplicate".into())));
-        assert!(queue.complete_read(second_id, Some("second".into())));
+        assert!(queue
+            .complete_read(first_id, Some("duplicate".into()))
+            .is_none());
+        deliver_ipc(
+            queue
+                .complete_read(second_id, Some("second".into()))
+                .expect("second completion"),
+        );
         assert_eq!(
             second_result.try_recv().unwrap().unwrap().as_deref(),
             Some("second")
@@ -3443,7 +3659,7 @@ mod tests {
     fn clipboard_request_ids_skip_live_entries_after_wrap() {
         let mut queue = ClipboardQueue::default();
         let (reply, _result) = tokio::sync::oneshot::channel();
-        assert_eq!(queue.enqueue_read(ClipboardOp::System, reply), 1);
+        assert_eq!(queue.enqueue_ipc_read(ClipboardOp::System, reply), 1);
         queue.next_request_id = u64::MAX;
         assert_eq!(queue.enqueue_write(ClipboardOp::System, "next".into()), 2);
     }
@@ -3452,18 +3668,264 @@ mod tests {
     fn clipboard_queue_tolerates_caller_cancellation_and_closes_on_drop() {
         let mut queue = ClipboardQueue::default();
         let (cancelled_reply, cancelled_result) = tokio::sync::oneshot::channel();
-        let cancelled_id = queue.enqueue_read(ClipboardOp::System, cancelled_reply);
+        let cancelled_id = queue.enqueue_ipc_read(ClipboardOp::System, cancelled_reply);
         drop(cancelled_result);
         assert!(matches!(
             queue.start_next(),
             UiTask::ClipboardRead { request_id, .. } if request_id == cancelled_id
         ));
-        assert!(queue.complete_read(cancelled_id, Some("ignored".into())));
+        deliver_ipc(
+            queue
+                .complete_read(cancelled_id, Some("ignored".into()))
+                .expect("cancelled caller still has a scoped completion"),
+        );
 
         let (pending_reply, pending_result) = tokio::sync::oneshot::channel();
-        queue.enqueue_read(ClipboardOp::Selection, pending_reply);
+        queue.enqueue_ipc_read(ClipboardOp::Selection, pending_reply);
         drop(queue);
         assert!(pending_result.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn paste_reads_keep_the_initiating_tab_and_reject_stale_results() {
+        let mut queue = ClipboardQueue::default();
+        let first_id = queue.enqueue_paste_read(ClipboardOp::System, 41);
+        let second_id = queue.enqueue_paste_read(ClipboardOp::Selection, 42);
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id, target: ClipboardOp::System }
+                if request_id == first_id
+        ));
+        assert!(queue
+            .complete_read(second_id, Some("wrong".into()))
+            .is_none());
+        let completion = queue
+            .complete_read(first_id, Some("first".into()))
+            .expect("active paste completion");
+        assert!(matches!(
+            completion,
+            ClipboardReadCompletion::Paste { tab_id: 41, value: Some(ref value) }
+                if value == "first"
+        ));
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id, target: ClipboardOp::Selection }
+                if request_id == second_id
+        ));
+    }
+
+    #[test]
+    fn selection_copy_policy_orders_system_before_best_effort_primary() {
+        let mut explicit = ClipboardQueue::default();
+        assert_eq!(
+            enqueue_selection_copy(&mut explicit, CopyKind::Explicit, Some("copy".into())),
+            2
+        );
+        let first_id = match explicit.start_next() {
+            UiTask::ClipboardWrite {
+                request_id,
+                target: ClipboardOp::System,
+                ref text,
+            } if text == "copy" => request_id,
+            _ => panic!("explicit copy must write the system clipboard first"),
+        };
+        assert!(explicit.complete_write(first_id));
+        assert!(matches!(
+            explicit.start_next(),
+            UiTask::ClipboardWrite {
+                target: ClipboardOp::Selection,
+                ref text,
+                ..
+            } if text == "copy"
+        ));
+
+        let mut primary_only = ClipboardQueue::default();
+        assert_eq!(
+            enqueue_selection_copy(
+                &mut primary_only,
+                CopyKind::OnSelect(config::CopyOnSelect::True),
+                Some("selected".into()),
+            ),
+            1
+        );
+        assert!(matches!(
+            primary_only.start_next(),
+            UiTask::ClipboardWrite {
+                target: ClipboardOp::Selection,
+                ..
+            }
+        ));
+
+        let mut disabled = ClipboardQueue::default();
+        assert_eq!(
+            enqueue_selection_copy(
+                &mut disabled,
+                CopyKind::OnSelect(config::CopyOnSelect::Off),
+                Some("ignored".into()),
+            ),
+            0
+        );
+        assert!(matches!(disabled.start_next(), UiTask::None));
+        assert_eq!(
+            enqueue_selection_copy(&mut disabled, CopyKind::Explicit, Some(String::new())),
+            0
+        );
+    }
+
+    #[test]
+    fn paste_bytes_are_empty_plain_or_bracketed_exactly_once() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        assert!(paste_bytes(&terminal, None).is_empty());
+        assert!(paste_bytes(&terminal, Some("")).is_empty());
+        assert_eq!(paste_bytes(&terminal, Some("hello\n")), b"hello\n");
+
+        terminal.vt_write(b"\x1b[?2004h");
+        assert_eq!(
+            paste_bytes(&terminal, Some("hello\n")),
+            b"\x1b[200~hello\n\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn pointer_origin_routing_never_substitutes_the_active_or_a_closed_tab() {
+        let mut tabs = HashMap::from([(41, "origin"), (42, "active")]);
+        assert_eq!(
+            pointer_origin_tab(&mut tabs, 41).map(|value| *value),
+            Some("origin")
+        );
+        tabs.remove(&41);
+        assert_eq!(pointer_origin_tab(&mut tabs, 41), None);
+        assert_eq!(
+            pointer_origin_tab(&mut tabs, 42).map(|value| *value),
+            Some("active")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_left_gesture_never_completes_a_local_selection() {
+        let (mut tab, supervisor) = attached_test_terminal(91);
+        tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
+
+        let press = tab
+            .handle_native_pointer(PointerAction::Press, Some(PointerButton::Left), 2, 2, 0)
+            .expect("tracked left press");
+        assert_eq!(press, NativePointerOutcome::default());
+        assert_eq!(tab.tracking_pointer, Some(PointerButton::Left));
+        assert!(!tab.selection_drag_active);
+
+        let motion = tab
+            .handle_native_pointer(PointerAction::Motion, Some(PointerButton::Left), 5, 2, 0)
+            .expect("tracked left motion");
+        assert_eq!(motion, NativePointerOutcome::default());
+        let release = tab
+            .handle_native_pointer(PointerAction::Release, Some(PointerButton::Left), 5, 2, 0)
+            .expect("tracked left release");
+        assert_eq!(release, NativePointerOutcome::default());
+        assert_eq!(tab.tracking_pointer, None);
+        assert!(!tab.selection_drag_active);
+
+        let captured = tab.input_capture.as_ref().unwrap().lock().unwrap().clone();
+        assert!(captured.windows(3).any(|bytes| bytes == b"\x1b[<"));
+        supervisor.close(91);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_middle_gesture_never_falls_through_to_primary_paste() {
+        let (mut tab, supervisor) = attached_test_terminal(92);
+        tab.write_vt(b"\x1b[?1000h\x1b[?1006h");
+
+        let press = tab
+            .handle_native_pointer(PointerAction::Press, Some(PointerButton::Middle), 3, 3, 0)
+            .expect("tracked middle press");
+        assert_eq!(press, NativePointerOutcome::default());
+        assert_eq!(tab.tracking_pointer, Some(PointerButton::Middle));
+        let release = tab
+            .handle_native_pointer(PointerAction::Release, Some(PointerButton::Middle), 3, 3, 0)
+            .expect("tracked middle release");
+        assert_eq!(release, NativePointerOutcome::default());
+        assert_eq!(tab.tracking_pointer, None);
+
+        tab.write_vt(b"\x1b[?1000l");
+        let local = tab
+            .handle_native_pointer(PointerAction::Press, Some(PointerButton::Middle), 3, 3, 0)
+            .expect("local middle press");
+        assert_eq!(
+            local,
+            NativePointerOutcome {
+                selection_completed: false,
+                paste_selection: true,
+            }
+        );
+        supervisor.close(92);
+    }
+
+    #[test]
+    fn configured_copy_can_replace_a_former_palette_trigger() {
+        let bindings = keybind::canonicalize_bindings(
+            keybind::default_bindings(),
+            vec![
+                ("alt+shift+p".into(), "copy".into()),
+                ("ctrl+shift+v".into(), "unbind".into()),
+                ("ctrl+alt+v".into(), "paste".into()),
+            ],
+            |_| {},
+        );
+        assert_eq!(
+            bindings.get(&keybind::parse_trigger("alt+shift+p").unwrap()),
+            Some(&KeybindAction::Copy)
+        );
+        assert!(!bindings.contains_key(&keybind::parse_trigger("ctrl+shift+v").unwrap()));
+        assert_eq!(
+            bindings.get(&keybind::parse_trigger("ctrl+alt+v").unwrap()),
+            Some(&KeybindAction::Paste)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_v_resolves_through_native_queue_to_initiating_tab_bytes() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+
+        let event = keyboard::Event::KeyPressed {
+            key: Key::Character("v".into()),
+            modified_key: Key::Character("v".into()),
+            physical_key: Physical::Code(Code::KeyV),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::LOGO,
+            text: None,
+            repeat: false,
+        };
+        let bindings =
+            keybind::canonicalize_bindings(keybind::default_bindings(), Vec::new(), |_| {});
+        let accelerator = input::accelerator(&event).expect("native Command-V accelerator");
+        assert_eq!(bindings.get(&accelerator), Some(&KeybindAction::Paste));
+
+        let mut queue = ClipboardQueue::default();
+        let request_id = queue.enqueue_paste_read(ClipboardOp::System, 73);
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardRead { request_id: scheduled, .. } if scheduled == request_id
+        ));
+        let completion = queue
+            .complete_read(request_id, Some("mac paste".into()))
+            .expect("native read completion");
+        let ClipboardReadCompletion::Paste { tab_id, value } = completion else {
+            panic!("expected initiating-tab paste completion")
+        };
+        assert_eq!(tab_id, 73);
+        let terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        assert_eq!(paste_bytes(&terminal, value.as_deref()), b"mac paste");
     }
 
     #[test]

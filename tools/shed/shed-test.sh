@@ -68,6 +68,20 @@ run_drag() {
     ROOST_BIN=$RT/debug/roost ROOSTCTL=$RT/debug/roostctl \
     ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 ROOST_TEST_TIMEOUT_SCALE=5 \
     python3 tools/input/linux/wayland_drag_check.py"
+
+  log "running the Iced X11 real-input clipboard guard"
+  in_shed "cd ~/roost && \
+    ROOST_ICED_BIN=$RT/debug/roost-iced \
+    ICED_BACKEND=tiny-skia ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 \
+    ROOST_TEST_TIMEOUT_SCALE=5 \
+    python3 tools/input/linux/iced_clipboard_check.py"
+
+  log "running the Iced cage+uinput Wayland clipboard guard"
+  in_shed "cd ~/roost && \
+    ROOST_ICED_BIN=$RT/debug/roost-iced \
+    ICED_BACKEND=tiny-skia ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 \
+    ROOST_TEST_TIMEOUT_SCALE=5 \
+    python3 tools/input/linux/iced_wayland_clipboard_check.py"
 }
 
 case "${1:-}" in

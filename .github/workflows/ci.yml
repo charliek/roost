@@ -461,7 +461,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libclang-dev libxkbcommon-x11-0 libwayland-client0 \
-            mesa-vulkan-drivers weston xvfb zsh
+            mesa-vulkan-drivers weston xvfb xdotool zsh
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -537,6 +537,18 @@ jobs:
           tools/roosttest/test_selection.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
+
+      - name: Run Iced real-input clipboard (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_ICED_BIN: ${{ github.workspace }}/target/debug/roost-iced
+          ROOST_REQUIRE_REAL_INPUT: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-real-input-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-real-input-logs
+        run: python3 tools/input/linux/iced_clipboard_check.py
 
       - name: Run Iced functional E2E (Linux Wayland)
         if: runner.os == 'Linux'

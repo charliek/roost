@@ -1146,6 +1146,107 @@ input serial, and PRIMARY depends on compositor protocol support. The next
 clipboard/input slice must resolve or explicitly accept this limitation before
 the POC can claim full Wayland clipboard parity.
 
+### Iced text clipboard interaction commit plan
+
+Scope: connect the existing native Iced clipboard queue to real terminal
+interactions. The effective toolkit-neutral keybind table (defaults plus
+ordered user overrides and `unbind`) supplies Copy and Paste accelerators;
+explicit Copy publishes the active terminal selection to the system clipboard
+and, where available, PRIMARY, while Paste reads the system clipboard and
+sends text to the tab that initiated the read. A completed local left-button
+drag applies `copy-on-select` (`off`, PRIMARY-only `true`, or PRIMARY plus
+system `clipboard`), and a Linux middle-button press reads PRIMARY and pastes
+through the same path. Mouse-reporting gestures retain precedence and never
+copy or paste locally. This slice is text-only: image/file-URI paste, URL
+hover/open, drag-and-drop, and native double/triple-click timing remain named
+later presentation slices.
+
+Interfaces and ownership: `roost-ui-model::keybind` remains authoritative for
+accelerator parsing, platform defaults, override order, and action identity.
+The Iced adapter maps a native key event to the shared `Accel` value without
+introducing a second binding grammar. An already-open palette owns its input;
+otherwise the effective table is resolved before any action, including the
+currently hard-coded palette openers. This slice dispatches effective
+Copy/Paste plus the four already-supported palette actions, so an `unbind` or
+a Copy/Paste replacement on a former palette trigger cannot be bypassed by a
+legacy check; terminal input owns unmatched or not-yet-supported actions.
+`ClipboardQueue` gains an explicit read destination: either an IPC reply or a
+paste request carrying
+the initiating tab ID. Native completion removes exactly that destination;
+the app answers IPC or asks the still-live tab to produce bracketed/unbracketed
+paste bytes. Clipboard callbacks never retain a terminal reference. Pointer
+messages carry the Canvas's originating tab ID, and handling validates that
+origin instead of looking up whichever tab is active at dispatch time. Pointer
+handling returns an explicit local-selection completion to the app, which
+applies config policy and schedules ordered native writes on Iced's event loop.
+No toolkit type enters the engine, `roost-vt`, or shared config/keybind model.
+
+Invariants: palette input keeps precedence and is never captured as a terminal
+Copy/Paste action; configured `unbind` and replacement triggers apply before a
+key reaches the PTY. Empty/unavailable clipboard text and empty selections are
+no-ops. Paste is bound to the initiating tab, not whichever tab happens to be
+active when the async read completes, and safely disappears if that tab has
+closed; a pointer event for a switched-away or closed tab cannot mutate the new
+active terminal. DECSET 2004 wraps non-empty UTF-8 exactly once with
+`ESC[200~` and `ESC[201~`; ordinary paste is byte-exact. Explicit Copy orders system and
+PRIMARY writes deterministically: the system clipboard is scheduled first, then
+best-effort PRIMARY, so Wayland's observed one-update-per-input-serial behavior
+cannot sacrifice ordinary Paste for the secondary selection. `copy-on-select`
+follows the documented three-state policy with that same order for
+`clipboard`; tracking-owned press/motion/release gestures cannot fall through
+to selection, copying, or middle paste. All native effects remain FIFO, never
+hold workspace/terminal locks across an Iced task, and preserve the existing
+IPC/OSC queue semantics and GTK behavior.
+
+Tests and acceptance: pure unit tests cover Iced-key-to-shared-accelerator
+mapping (including exact modifiers), default and overridden Copy/Paste
+bindings, queue destination scoping/stale completion, initiating-tab paste,
+empty/plain/bracketed byte production, copy-on-select policy, pointer-origin
+tagging, and a Copy replacement on a former palette trigger. The existing
+mouse-reporting functional suite covers tracking precedence; pointer dispatch
+uses only the tagged origin and makes a missing/closed origin an explicit
+no-op. A self-contained Xvfb/xdotool check
+launches the real `roost-iced` binary with isolated paths and verifies an
+effective configured Copy key writes the native clipboard, Paste reaches PTY
+capture, bracketed Paste is framed, a real drag triggers copy-on-select, and
+middle-click reads PRIMARY; the explicit-Copy case sets `copy-on-select=off`
+so an earlier drag cannot create a false positive. It is required under both
+Iced renderer lanes in Actions and in the shed. A macOS-only adapter test
+constructs the Iced Command-key event and follows its resolved Paste request
+through queue completion to initiating-tab PTY bytes; the two renderer lanes
+continue to require native system clipboard IPC/OSC coverage. The existing
+selection, mouse-reporting, X11, macOS, and headless Wayland suites remain
+green. The shed real-seat Wayland run must prove an explicit system
+Copy-to-Paste round trip and a `copy-on-select=clipboard` drag-to-Paste round
+trip. Lack of PRIMARY protocol support may only produce a named
+PRIMARY/middle-click accepted limitation after those system paths pass; it is
+not allowed to skip or excuse the whole real-seat check. Run formatting,
+warnings-denied clippy, dependency checks, full GTK and Swift regressions,
+full macOS and shed Iced
+matrices, complete diff review, then commit, push, and require green Actions
+before starting native multi-click or URL behavior.
+
+Implementation evidence (2026-07-31): the slice added eleven focused Iced
+tests (53 total) and passed `make check` plus `make check-iced` on macOS. The
+complete fresh target-neutral suites passed with `157 passed, 3 skipped` for
+Iced, `151 passed, 9 skipped` for GTK, and `144 passed, 16 skipped` for
+Swift/AppKit; every skip printed a narrow capability or pre-existing-issue
+reason. Both macOS Iced renderer runs passed the required functional set
+(`47 passed, 2 skipped` each). In the shed, the Actions-equivalent Iced set
+passed on X11/wgpu (`48 passed, 1 skipped`), X11/tiny-skia (`41 passed,
+1 skipped`), Wayland/wgpu (`42 passed`), and Wayland/tiny-skia (`42 passed`);
+the focused Iced mouse-tracking suite passed all 10 cases. The X11 real-input
+script passed under both renderers, and `tools/shed/shed-test.sh --run` passed
+the existing GTK Wayland pointer-drag guard, the Iced X11 clipboard guard, and
+the Iced real-seat Wayland clipboard guard. The latter proved explicit
+Copy/Paste and drag-copy/Paste before reporting cage's named lack of PRIMARY.
+The dependency gates continued to show no GTK/libadwaita/Pango/Cairo or
+`roost-linux` edge beneath `roost-iced`, and no GTK or Iced edge beneath
+`roost-engine`. Complete diff review requested two fixes—canonical punctuation
+accelerators and direct pointer-precedence/origin tests. Both were implemented,
+the affected gates above were repeated, and re-review approved the slice with
+no remaining findings.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.
