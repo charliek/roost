@@ -13,16 +13,19 @@ use crate::Message;
 const DRAG_THRESHOLD: f32 = 8.0;
 
 /// Provides a same-event root release fallback after direct child ownership.
-/// The boundary delegates without changing capture, then publishes even when a
-/// reflowed scrollable withheld the event from the tab strip.
+/// The boundary delegates without changing capture, then publishes for an
+/// application-owned preview even when a reflowed scrollable withheld the
+/// event from the tab strip.
 pub(crate) struct ReleaseBoundary<'a> {
     content: Element<'a, Message>,
+    enabled: bool,
 }
 
 impl<'a> ReleaseBoundary<'a> {
-    pub(crate) fn new(content: impl Into<Element<'a, Message>>) -> Self {
+    pub(crate) fn new(content: impl Into<Element<'a, Message>>, enabled: bool) -> Self {
         Self {
             content: content.into(),
+            enabled,
         }
     }
 }
@@ -30,14 +33,17 @@ impl<'a> ReleaseBoundary<'a> {
 fn release_after_child<Message>(
     event: &Event,
     shell: &mut Shell<'_, Message>,
+    enabled: bool,
     release: impl FnOnce() -> Message,
     update_child: impl FnOnce(&mut Shell<'_, Message>),
 ) {
     update_child(shell);
-    if matches!(
-        event,
-        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-    ) {
+    if enabled
+        && matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        )
+    {
         tracing::debug!("Iced root observed left-button release");
         shell.publish(release());
     }
@@ -95,6 +101,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReleaseBoundary<'_> {
         release_after_child(
             event,
             shell,
+            self.enabled,
             || Message::TabPointerReleased,
             |shell| {
                 content.as_widget_mut().update(
@@ -709,6 +716,7 @@ mod tests {
             release_after_child(
                 &release,
                 &mut shell,
+                true,
                 || "root",
                 |shell| {
                     shell.publish("child");
@@ -726,6 +734,7 @@ mod tests {
             release_after_child(
                 &release,
                 &mut shell,
+                true,
                 || "root",
                 |shell| {
                     shell.publish("ignored child");
@@ -735,6 +744,40 @@ mod tests {
         };
         assert_eq!(messages, ["ignored child", "root"]);
         assert_eq!(status, iced::event::Status::Ignored);
+
+        messages.clear();
+        let status = {
+            let mut shell = Shell::new(&mut messages);
+            release_after_child(
+                &release,
+                &mut shell,
+                false,
+                || "root",
+                |shell| {
+                    shell.publish("disabled child");
+                    shell.capture_event();
+                },
+            );
+            shell.event_status()
+        };
+        assert_eq!(messages, ["disabled child"]);
+        assert_eq!(status, iced::event::Status::Captured);
+
+        messages.clear();
+        let motion = Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(10.0, 10.0),
+        });
+        let mut shell = Shell::new(&mut messages);
+        release_after_child(
+            &motion,
+            &mut shell,
+            true,
+            || "root",
+            |shell| {
+                shell.publish("motion child");
+            },
+        );
+        assert_eq!(messages, ["motion child"]);
     }
 
     #[test]

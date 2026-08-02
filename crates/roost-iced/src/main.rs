@@ -214,7 +214,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 }
 
 fn view(app: &App) -> iced::Element<'_, Message> {
-    tab_reorder::ReleaseBoundary::new(app.view()).into()
+    tab_reorder::ReleaseBoundary::new(app.view(), app.has_tab_drag_preview()).into()
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {

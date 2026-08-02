@@ -3857,6 +3857,10 @@ impl App {
         );
     }
 
+    pub(crate) fn has_tab_drag_preview(&self) -> bool {
+        self.tab_drag_preview.is_some()
+    }
+
     pub(crate) fn tab_strip_event(&mut self, event: TabStripEvent) {
         match event {
             TabStripEvent::Started {

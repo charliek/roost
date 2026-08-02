@@ -2413,9 +2413,10 @@ making press ownership stable across preview reflow.
 
 The scrollable parent can also withhold the release from the child strip
 entirely. A transparent widget at the application root must therefore delegate
-the event, then unconditionally publish a same-event release fallback even if a
-child captured it. Unlike a runtime-event subscription, this preserves causal
-ordering: an asynchronously delayed release can never settle a later gesture.
+the event, then publish a same-event release fallback for an application-owned
+preview even if a child captured it. Unlike a runtime-event subscription, this
+preserves causal ordering: an asynchronously delayed release can never settle a
+later gesture. Ordinary terminal releases do not create application messages.
 When the strip receives release, its pre-child commit is queued first; when the
 scrollable withholds release, the root fallback remains. The application port
 settles only the matching generation-stamped preview and reuses the same
