@@ -740,6 +740,11 @@ fn build_command(
     // TERM=tmux-256color / xterm-kitty would emit unsupported sequences).
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Forcing TERM makes an inherited TERMINFO wrong: it points at the
+    // launching terminal's private DB (e.g. Ghostty's, which has no
+    // xterm-256color entry), so strict $TERMINFO readers would find no
+    // entry for the TERM Roost advertises.
+    cmd.env_remove("TERMINFO");
     // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
     // links (Ctrl-click), but the `supports-hyperlinks` library many CLIs
     // gate on — Claude Code, anything on chalk/terminal-link — only
