@@ -539,12 +539,6 @@ final class PtySupervisor {
         return out
     }
 
-    /// Whether to bash-auto-bootstrap `resolvedArgv`: the pure predicate
-    /// (`bashAutobootstrap`) AND the shipped roost.bash being present at
-    /// `resourcesDir`. `--posix` and the ENV injection must be applied
-    /// together — a `--posix` shell with no ENV script to source would be
-    /// stuck in POSIX mode with no startup recreation — so `buildArgv` and
-    /// `buildEnv` both gate on this.
     /// Build the NULL-terminated envp array. Inherits the
     /// parent's environment then overlays Roost's injected vars.
     private func buildEnv(tabID: Int64, socketPath: String, argv: [String])

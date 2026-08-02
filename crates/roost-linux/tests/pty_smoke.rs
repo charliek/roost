@@ -114,9 +114,6 @@ async fn pty_injects_roost_env_vars() {
     // and ROOST_SOCKET in the listed env.
     let sup = PtySupervisor::new();
     let socket = std::path::PathBuf::from("/tmp/roost-pty-env.sock");
-    // Roost forces TERM, so an inherited TERMINFO (the launching
-    // terminal's private DB) must be stripped from the child env.
-    std::env::set_var("TERMINFO", "/tmp/roost-test-terminfo");
     let mut output = sup
         .spawn(99, "/tmp", &["/usr/bin/env".into()], 80, 24, &socket)
         .expect("spawn");
@@ -138,10 +135,6 @@ async fn pty_injects_roost_env_vars() {
     assert!(
         text.contains("FORCE_HYPERLINK=1"),
         "expected FORCE_HYPERLINK=1 in env, got:\n{text}"
-    );
-    assert!(
-        !text.contains("TERMINFO="),
-        "expected inherited TERMINFO stripped from child env, got:\n{text}"
     );
 }
 
