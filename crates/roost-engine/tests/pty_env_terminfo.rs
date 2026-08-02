@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use roost_linux::daemon::{PtyOutputEvent, PtySupervisor};
+use roost_engine::pty::{PtyOutputEvent, PtySupervisor};
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::sleep;
 

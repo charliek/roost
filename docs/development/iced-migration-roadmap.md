@@ -75,26 +75,30 @@ Independent of the merge; blocks the next Swift/GTK release regardless.
   regardless of whether it caused the observation. Add the env assertion to
   the E2E env checks on both targets.
 
-### M1 — pre-merge hardening (on `poc/iced`)
+### M1 — pre-merge hardening (on `poc/iced`) — **complete (PR #277)**
 
-1. **Facade decision (decided):** gate `roost-engine::facade` behind
-   `feature = "facade"`, mark it experimental in `shared-rust-engine.md`, and
-   correct that doc's framing — the crate boundary is Swift-ready; the facade
-   is unproven until M5 adopts it. (Adoption by a Rust UI is deliberately
-   deferred to the M5 spike, not done here.)
-2. Fix the Iced lag handler (`crates/roost-iced/src/app.rs` ~5079): it logs
-   "resyncing" but only breaks — either resync via `roost_engine::reconcile`
-   or make log + comment state that recovery comes from the per-tick
-   snapshot.
-3. Add `roost-ui-model` to the CI dependency-boundary guard
-   (`.github/workflows/ci.yml` — currently checks only `roost-engine` and
-   `roost-iced`).
-4. Sweep the ~67 stale GTK/glib/Pango doc references out of
-   `roost-engine`/`roost-ui-model` sources.
-5. Merge `main` → `poc/iced` to pick up M0.
+1. ~~Facade decision~~ **done:** `roost-engine::facade` is gated behind
+   `feature = "facade"` (off by default, tested explicitly in CI),
+   `shared-rust-engine.md` now frames it as experimental. Adoption by a
+   Rust UI is deliberately deferred to the M5 spike.
+2. ~~Iced lag handler~~ **done:** log + comment now state that recovery
+   comes from the per-tick snapshot reconcile; the receiver resubscribes
+   past the stale backlog.
+3. ~~CI boundary guard~~ **done:** `roost-ui-model` added to the
+   toolkit-dependency check; PRs targeting `poc/iced` now trigger CI
+   (previously only pushes did).
+4. ~~Stale GTK doc sweep~~ **done:** toolkit-specific language reworded
+   toolkit-neutrally across `roost-engine`/`roost-ui-model` sources.
+5. ~~Merge `main` → branch~~ **done:** picks up the M0 TERMINFO fix
+   (rename-detection carried it into `roost-engine/src/pty.rs`; its test
+   moved to `roost-engine/tests/`).
 
 ### M2 — merge `poc/iced` to `main`
 
+* **Authorized by the user (2026-08-02)** contingent on M1 complete and
+  full `ci-success` green on the PR — `e2e-mac` (Swift production-ready)
+  and the GTK tiers (no Linux regression) are the goals the merge must
+  meet.
 * PR into `main`; merge is manual after `ci-success` (repo policy).
 * Review focus (highest-residual-risk GTK deltas): `preferred_tab` project
   activation semantics, `terminal_view.rs` extraction (−426 lines: wheel /
