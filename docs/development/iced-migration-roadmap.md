@@ -126,6 +126,12 @@ Slices, each sized for one gauntlet pass:
 * **3e. Polish parity:** notification bell/badge, hover-close, offscreen-tab
   reveal, empty/loading/error states, cursor/selection/link pixel geometry —
   per the P1 rows in the [parity inventory](iced-parity-inventory.md).
+  Known bug (user-observed 2026-08-02, macOS): with several tabs open the
+  Iced tab strip shows artifacts — a gray horizontal bar rendered across
+  the tab row (likely the overflow scrollbar or a drag-reflow remnant) and
+  a tab overlapping the `+` button. Reproduce with 4+ tabs including
+  long-path titles; likely interacts with the tab-drag reflow work
+  (`0abd3e4`, `51e5fad`).
 * **3f. Native desktop notifications** (narrow platform port, per-OS).
 * **3g. Wayland gaps** (native file drop, clipboard seat serial) are
   upstream Iced/winit limitations — track, document, don't block on them.
