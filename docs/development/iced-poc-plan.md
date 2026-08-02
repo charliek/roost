@@ -2022,6 +2022,15 @@ harness unit tests, and retain the normal Rust/Swift regression gate. Commit
 this validation hardening separately before the native file-drop slice so each
 published commit remains independently green and useful.
 
+CI correction: exact native dimensions were not an actual typography
+precondition, and GTK's no-window-manager Xvfb lane correctly cannot promise
+them. The follow-up therefore removes the two test-owned resize requests
+instead of adding a platform branch or weakening any grid assertion. Each test
+opens its tabs in the already mapped, settled harness window, then continues to
+require identical baseline grids, all-live-tab reflow, future-tab inheritance,
+and persistence. Normal window-manager and no-WM environments now exercise the
+same stronger semantic contract.
+
 ### Shared installed-font and Iced family-adapter commit plan
 
 Scope: replace Iced's one-row generic `Monospace` placeholder with the common

@@ -22,19 +22,6 @@ def _grid(roost, tab_id: int) -> tuple[int, int]:
     return dump["cols"], dump["rows"]
 
 
-def _resize_and_wait(roost, width: int, height: int) -> None:
-    """Fence the fixed geometry required by these typography assertions."""
-    roost.window_resize(width, height)
-    roost._wait(
-        lambda: (
-            round(float((metrics := roost.window_metrics())["window_width"])) == width
-            and round(float(metrics["window_height"])) == height
-        ),
-        5.0,
-        f"typography fixture window allocation {width}x{height}",
-    )
-
-
 def _config_lines(path, key: str) -> list[str]:
     return [
         line.strip()
@@ -97,7 +84,6 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
     config_path = owned_rust_config
     seed_before = ui.SEED_CONFIG.read_bytes()
 
-    _resize_and_wait(roost, 960, 640)
     first = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     second = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_attached(roost, first)
@@ -107,7 +93,7 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
     roost._wait(
         lambda: _grid(roost, first) == baseline_grid,
         5.0,
-        "first Rust UI tab receives the fixed-window baseline allocation",
+        "first Rust UI tab receives the shared baseline allocation",
     )
     roost.focus(second)
 
@@ -171,7 +157,6 @@ def test_rust_font_preview_dismiss_and_confirmation_are_commit_bounded(
     hidden_tab = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_attached(roost, active_tab)
     wait_tab_attached(roost, hidden_tab)
-    _resize_and_wait(roost, 960, 640)
     baseline_grid = _grid(roost, hidden_tab)
     roost.focus(active_tab)
     roost._wait(
