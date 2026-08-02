@@ -2002,6 +2002,26 @@ inspection found no GTK/libadwaita/Pango/Cairo/`roost-linux` edge from Iced and
 no GTK/Iced edge from the engine; inverse trees show both `roost-linux` and
 `roost-iced` depending independently on `roost-engine`.
 
+### Typography native-resize fence hardening plan
+
+Scope: make the two fixed-window typography fixtures wait until
+`app.window_metrics` observes their requested rounded logical size. Both GTK
+and Iced acknowledge `window.resize` when they schedule the native request, so
+a late-suite typography test can create tabs on opposite sides of the pending
+allocation even though the resize RPC returned. Preserve the generic driver's
+asynchronous contract because sidebar capability tests intentionally inspect
+and skip window-manager-clamped sizes.
+
+Invariants and acceptance: retain the existing versioned IPC request/response
+and UI implementations; do not add sleeps, target branches, timeout increases,
+or broad skips; use the harness's existing scaled polling/error path; and fence
+both width and height only where exact geometry is a test precondition. Prove
+the formerly order-sensitive GTK typography test inside the complete
+functional suite, rerun Iced's geometry-sensitive functional suite, run
+harness unit tests, and retain the normal Rust/Swift regression gate. Commit
+this validation hardening separately before the native file-drop slice so each
+published commit remains independently green and useful.
+
 ### Shared installed-font and Iced family-adapter commit plan
 
 Scope: replace Iced's one-row generic `Monospace` placeholder with the common
