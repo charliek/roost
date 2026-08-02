@@ -58,16 +58,22 @@ Independent of the merge; blocks the next Swift/GTK release regardless.
       ghostty entries) while Roost forces `TERM=xterm-256color`; ncurses
       falls back to `/usr/share/terminfo`, strict `$TERMINFO` readers would
       not.
-* Next steps: attempt repro on the **GTK** (`Roost-gtk` profile) and
-  **iced** builds on this machine with the same strix `dump_resolved` probe
-  (iced terminal color parity is a known open P1 gap and the most likely
-  true source of the observation). If no repro anywhere, downgrade M0 to a
-  watch item and proceed to M1. Regardless of repro: a small hardening PR to
-  strip `TERMINFO` from PTY child env in both `PtySupervisor.swift` and
-  `roost-engine/src/pty.rs` is justified — forcing `TERM` while inheriting a
-  foreign terminal's private terminfo DB is wrong.
-* Deliverable if a code cause is found: topic branch off `main`, fix with a
-  regression test (shared fixture corpus if parser-related), PR, CI green.
+* **Outcome (2026-08-02): DOWNGRADED TO WATCH ITEM — not reproducible.**
+  The strix probe (tab with `--hold -- strix` in a git cwd, then
+  `tab.dump_resolved`, count distinct foregrounds) renders the identical
+  6-fg/2-bg palette on all three UIs on this machine — Swift (terminal- and
+  `open`-launched, plus typed into the interactive shell), GTK
+  (`Roost-gtk`), and iced — and screenshots confirm the paint, not just the
+  resolver. strix 0.0.7 is unchanged since Jul 26, so the observed binary
+  is the tested binary. If the symptom reappears, re-run this probe first
+  and capture the tab env (`env | sort`) before anything else.
+* **Actionable remainder: TERMINFO env hygiene (small hardening PR to
+  `main`).** Strip `TERMINFO` from PTY child env in both
+  `PtySupervisor.swift` (`buildEnv`) and `roost-engine/src/pty.rs` — Roost
+  forces `TERM=xterm-256color`, so inheriting the host terminal's private
+  terminfo DB (e.g. Ghostty's, which lacks `xterm-256color`) is wrong
+  regardless of whether it caused the observation. Add the env assertion to
+  the E2E env checks on both targets.
 
 ### M1 — pre-merge hardening (on `poc/iced`)
 
