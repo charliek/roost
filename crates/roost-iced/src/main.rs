@@ -4,6 +4,7 @@ mod font_registry;
 mod input;
 mod palette_scroll;
 mod screenshot;
+mod tab_reorder;
 mod terminal_widget;
 mod url_launcher;
 
@@ -49,6 +50,7 @@ enum Message {
     AgentSelected(i64),
     TabSelected(i64),
     BeginRenameTab(i64),
+    TabStrip(tab_reorder::TabStripEvent),
     RenameDraftChanged(String),
     RenameSubmit,
     RenamePointerDismiss,
@@ -146,6 +148,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         },
         Message::RenameDraftChanged(draft) => {
             app.rename_draft_changed(draft);
+            Task::none()
+        }
+        Message::TabStrip(event) => {
+            app.tab_strip_event(event);
             Task::none()
         }
         Message::RenameSubmit => {

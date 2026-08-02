@@ -57,6 +57,7 @@ use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
 use roost_engine::git_metrics;
+use roost_ui_model::reorder::compute_insert_idx;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 
 /// One per project: sidebar row + tab strip + tab content stack.
@@ -6497,26 +6498,6 @@ fn reveal_scroll_value(
     v.clamp(lower, max)
 }
 
-/// M10 sidebar-reorder pure math. Given a source row sitting at
-/// `source_idx` and the user's desired insertion point in the
-/// *with-source* visual order (`raw_target_idx`), return the
-/// listbox `Insert` position the row should be moved to. Returns
-/// `None` when the move would be a no-op (the drag lands on the
-/// source's own slot — either side of itself). Off-by-one is
-/// load-bearing here: when `raw_target_idx > source_idx`, removing
-/// the source first shifts every later index down by one, so the
-/// insert position is `raw_target_idx - 1`. The table-driven test
-/// below exercises the boundary cases.
-fn compute_insert_idx(source_idx: usize, raw_target_idx: usize) -> Option<usize> {
-    if raw_target_idx == source_idx || raw_target_idx == source_idx + 1 {
-        return None;
-    }
-    if raw_target_idx > source_idx {
-        return Some(raw_target_idx - 1);
-    }
-    Some(raw_target_idx)
-}
-
 /// M9.5 one-shot test-and-drain for the server-driven-close
 /// marker. Returns true if the marker was set (caller should
 /// skip the CloseTab RPC); also clears the marker so a second
@@ -6649,11 +6630,12 @@ fn agent_rows_visible(toggle_on: bool, dragging: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_target, agent_rows_visible, compute_insert_idx, drain_server_driven_marker,
+        activation_target, agent_rows_visible, drain_server_driven_marker,
         is_already_attached_or_pending, pick_next_active_project, resolve_launch_cwd,
         restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, ActivationTarget,
         RestoreTab,
     };
+    use roost_ui_model::reorder::compute_insert_idx;
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
 

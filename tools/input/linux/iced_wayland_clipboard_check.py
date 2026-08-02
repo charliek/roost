@@ -208,6 +208,86 @@ def _measure_terminal_cell(client, tab: int, root: Path) -> tuple[int, int]:
     return measured[-1]
 
 
+def _active_pill_bounds(client, root: Path) -> tuple[int, int, int, int]:
+    """Locate stable active-tab chrome in the in-product Wayland capture."""
+    path = root / "wayland-active-tab.png"
+    previous: tuple[int, int, int, int] | None = None
+    for _attempt in range(12):
+        png, _width, _height = client.screenshot(scale=1)
+        path.write_bytes(png)
+        width, height, bpp, pixels = pngtool.load(str(path))
+        metrics = client.window_metrics()
+        sidebar = round(float(metrics["sidebar_width"]))
+        band = round(client.terminal_top(metrics))
+        points: list[tuple[int, int]] = []
+        for y in range(min(band, height)):
+            for x in range(max(0, sidebar), width):
+                offset = (y * width + x) * bpp
+                if tuple(pixels[offset : offset + 3]) == (0x24, 0x37, 0x51):
+                    points.append((x, y))
+        if points:
+            xs, ys = zip(*points)
+            bounds = min(xs), min(ys), max(xs), max(ys)
+            if bounds == previous:
+                return bounds
+            previous = bounds
+        else:
+            previous = None
+        time.sleep(0.1)
+    raise AssertionError(
+        f"active Wayland tab never settled; last bounds {previous!r}; capture {path}"
+    )
+
+
+def _wayland_tab_reorder(client, root: Path, width: int, height: int) -> None:
+    """Prove the Iced strip consumes a real compositor-seat drag."""
+    identity = client.identify()
+    project = int(identity["active_project_id"])
+    home = int(identity["active_tab_id"])
+    second = client.open_tab(project, title="WAYLAND-DRAG-SECOND")
+    third = client.open_tab(project, title="WAYLAND-DRAG-THIRD")
+    client.set_title(second, "WAYLAND-DRAG-SECOND")
+    client.set_title(third, "WAYLAND-DRAG-THIRD")
+    tabs = [home, second, third]
+    for tab_id in tabs:
+        _wait_until(lambda tab_id=tab_id: bool(client.dump(tab_id)), f"Wayland drag tab {tab_id}")
+        client.tab_capture_pty_input(tab_id, drain=True)
+    _wait_until(
+        lambda: client.project_tab_ids(project) == tabs,
+        "initial Wayland direct-drag order",
+    )
+
+    def drag(source: int, target_x: int, expected: list[int], label: str) -> None:
+        client.focus(source)
+        _wait_until(
+            lambda: int(client.identify()["active_tab_id"]) == source,
+            f"{label} source focus",
+        )
+        left, top, right, bottom = _active_pill_bounds(client, root)
+        x0 = left + min(22, max(8, (right - left) // 3))
+        _inject_drag(width, height, x0, (top + bottom) // 2, target_x)
+        _wait_until(
+            lambda: client.project_tab_ids(project) == expected,
+            f"{label} authoritative order",
+        )
+
+    sidebar = round(float(client.window_metrics()["sidebar_width"]))
+    drag(home, sidebar + 440, [second, third, home], "forward Wayland tab drag")
+    drag(home, sidebar + 30, [home, second, third], "backward Wayland tab drag")
+    for tab_id in tabs:
+        assert client.tab_capture_pty_input(tab_id, drain=True) == b"", (
+            tab_id,
+            "tab drag leaked pointer bytes into PTY",
+        )
+    client.close_tab(second)
+    client.close_tab(third)
+    client.focus(home)
+    _wait_until(
+        lambda: client.project_tab_ids(project) == [home],
+        "Wayland direct-drag fixture cleanup",
+    )
+
+
 def _wait_for_selection(client, tab: int, expected: str, description: str) -> None:
     observed: dict[str, object] = {}
 
@@ -311,6 +391,8 @@ def main() -> int:
         cell_width, cell_height = _measure_terminal_cell(client, tab, root)
         print("Wayland terminal cell:", (cell_width, cell_height))
 
+        _wayland_tab_reorder(client, root, width, height)
+
         explicit = f"wayland-copy-{uuid.uuid4().hex[:8]}"
         _set_row(client, tab, explicit)
         client.selection_set(tab, anchor=(0, 0), cursor=(len(explicit) - 1, 0))
@@ -390,8 +472,9 @@ def main() -> int:
         shutil.rmtree(root, ignore_errors=True)
 
     print(
-        "PASS: Iced real-seat Wayland system clipboard — explicit Copy/Paste "
-        "drag copy-on-select/Paste, native multi-click, and link hover"
+        "PASS: Iced real-seat Wayland — stable-ID tab drag in both directions, "
+        "explicit Copy/Paste, drag copy-on-select/Paste, native multi-click, "
+        "and link hover"
     )
     print("ACCEPTED LIMITATION: cage does not advertise PRIMARY; middle-click is X11-gated")
     return 0

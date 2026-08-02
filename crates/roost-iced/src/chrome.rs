@@ -40,13 +40,23 @@ pub fn dark_surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE_DARK)
 }
 
-pub fn tab_pill(active: bool) -> impl Fn(&Theme) -> container::Style {
+pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| {
         let mut style = container::Style::default();
-        if active {
+        if dragging {
+            style = style.background(Color::from_rgba8(0x55, 0x68, 0x7b, 0.65));
+        } else if active {
             style = style.background(ACTIVE_TAB);
         }
-        style.border = Border::default().rounded(6);
+        style.border = Border {
+            color: if dragging {
+                NOTIFICATION
+            } else {
+                Color::TRANSPARENT
+            },
+            width: if dragging { 1.0 } else { 0.0 },
+            radius: 6.0.into(),
+        };
         style
     }
 }
@@ -214,7 +224,7 @@ mod tests {
         let active = project_pill(true)(&theme);
         assert_eq!(active.background, Some(Background::Color(ACTIVE_BLUE)));
         assert_eq!(
-            tab_pill(true)(&theme).background,
+            tab_pill(true, false)(&theme).background,
             Some(Background::Color(ACTIVE_TAB))
         );
     }

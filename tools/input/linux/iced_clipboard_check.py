@@ -147,6 +147,7 @@ class Launch:
                     # hard-coded check runs before the effective table, the
                     # explicit-Copy assertion below fails.
                     "keybind = alt+shift+p = copy",
+                    "keybind = ctrl+shift+p = command_palette",
                     "show-sidebar-agents = false",
                     "",
                 ]
@@ -475,10 +476,10 @@ def _wait_product_extent(
     return requested_width, requested_height
 
 
-def _active_pill_close_point(
+def _active_pill_bounds(
     launch: Launch, expected_extent: tuple[int, int] | None = None
-) -> tuple[int, int]:
-    """Locate the rendered active pill, then target its trailing close sibling."""
+) -> tuple[int, int, int, int]:
+    """Locate stable exact-color bounds for the rendered active tab pill."""
     metrics = launch.client.window_metrics()
     sidebar = round(float(metrics["sidebar_width"]))
     terminal_top = round(launch.client.terminal_top(metrics))
@@ -512,10 +513,18 @@ def _active_pill_close_point(
         if right - left < 35 or bottom - top < 10:
             raise AssertionError(f"active tab pill has implausible bounds {bounds!r}")
         if bounds == previous:
-            return right - 11, terminal_top // 2
+            return bounds
         previous = bounds
         time.sleep(0.1)
     raise AssertionError(f"active tab pill never settled; last bounds: {previous!r}")
+
+
+def _active_pill_close_point(
+    launch: Launch, expected_extent: tuple[int, int] | None = None
+) -> tuple[int, int]:
+    """Locate the rendered active pill, then target its trailing close sibling."""
+    _left, _top, right, _bottom = _active_pill_bounds(launch, expected_extent)
+    return right - 11, round(launch.client.terminal_top()) // 2
 
 
 def _stable_rollup_stripe_point(launch: Launch) -> tuple[int, int]:
@@ -864,9 +873,8 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     _wait_for_inline_editor_closed(launch, rename_tab_baseline, "rename-tab")
     _assert_no_pty_input(launch, [home_tab], "Rename Tab shortcut")
 
-    # The inactive first tab selector is one MouseArea (not a nested Button),
-    # so its double-click must select the stable tab ID before opening that
-    # same target's editor.
+    # The inactive first tab selector is owned by the stable-ID strip gesture,
+    # so its double-click must select that ID before opening the same editor.
     double_click_baseline = _screenshot_color_count(
         launch, (0x4E, 0x9A, 0xF1), "double-click-tab-baseline"
     )
@@ -994,6 +1002,207 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
         "shortcut fixture cleanup",
     )
     return home_project, home_tab
+
+
+def _direct_tab_reorder(
+    launch: Launch, project: int, home_tab: int
+) -> list[str]:
+    """Drive live stable-ID tab reorders and return persisted title order."""
+    second = launch.client.open_tab(project, title="DRAG-SECOND")
+    third = launch.client.open_tab(project, title="DRAG-THIRD")
+    # Lock the labels as user titles. Otherwise the live shell may derive a
+    # cwd/process title before or after persistence, making title order an
+    # invalid proxy for restored position even though the positions are right.
+    launch.client.set_title(second, "DRAG-SECOND")
+    launch.client.set_title(third, "DRAG-THIRD")
+    tabs = [home_tab, second, third]
+    for tab_id in tabs:
+        _wait_until(lambda tab_id=tab_id: _tab_is_attached(launch, tab_id), f"drag tab {tab_id}")
+    _wait_until(
+        lambda: launch.client.project_tab_ids(project) == tabs,
+        "initial direct-drag tab order",
+    )
+    _drain_tabs(launch, tabs)
+
+    def drag_active(
+        source: int,
+        target_x: int,
+        expected: list[int],
+        label: str,
+        *,
+        focus_source: bool = True,
+        release_outside: bool = False,
+    ) -> None:
+        if focus_source:
+            launch.client.focus(source)
+            _wait_until(
+                lambda: int(launch.client.identify()["active_tab_id"]) == source,
+                f"{label} source focus",
+            )
+        else:
+            assert int(launch.client.identify()["active_tab_id"]) != source
+        if focus_source:
+            left, top, right, bottom = _active_pill_bounds(launch)
+            x0 = left + min(22, max(8, (right - left) // 3))
+            y = (top + bottom) // 2
+        else:
+            # This fixture's source is the first inactive pill. An active-pill
+            # color scan would locate `third`, defeating the scenario.
+            x0 = sidebar + 30
+            y = round(launch.client.terminal_top()) // 2
+        pending_error: BaseException | None = None
+        try:
+            launch.terminal_pointer(
+                ["mousemove", "--window", launch.window, str(x0), str(y)]
+            )
+            launch.terminal_pointer(["mousedown", "1"])
+            launch.terminal_pointer(
+                [
+                    "mousemove",
+                    "--window",
+                    launch.window,
+                    str((x0 + target_x) // 2),
+                    str(y),
+                ]
+            )
+            launch.terminal_pointer(
+                ["mousemove", "--window", launch.window, str(target_x), str(y)]
+            )
+            capture_root = os.environ.get("ROOST_CAPTURE_DIR")
+            if capture_root:
+                capture_dir = Path(capture_root)
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                png, _width, _height = launch.client.screenshot(scale=1)
+                capture_name = label.lower().replace(" ", "-")
+                (capture_dir / f"{capture_name}-held.png").write_bytes(png)
+            if release_outside:
+                outside_y = round(launch.client.terminal_top()) + 20
+                launch.terminal_pointer(
+                    [
+                        "mousemove",
+                        "--window",
+                        launch.window,
+                        str(target_x),
+                        str(outside_y),
+                    ]
+                )
+        except BaseException as error:
+            pending_error = error
+            raise
+        finally:
+            try:
+                launch.terminal_pointer(["mouseup", "1"])
+            except Exception as release_error:
+                if pending_error is None:
+                    raise
+                print(
+                    f"failed to release {label} drag while handling {pending_error!r}: "
+                    f"{release_error}",
+                    file=sys.stderr,
+                )
+        _wait_until(
+            lambda: launch.client.project_tab_ids(project) == expected,
+            f"{label} authoritative reorder",
+        )
+        assert int(launch.client.identify()["active_tab_id"]) == source
+        assert launch.process.poll() is None, f"Iced exited during {label}"
+
+    metrics = launch.client.window_metrics()
+    sidebar = round(float(metrics["sidebar_width"]))
+    # The first source is inactive: the press must select its stable ID even
+    # though adding the active close button changes that pill's width mid-drag.
+    drag_active(
+        home_tab,
+        sidebar + 440,
+        [second, third, home_tab],
+        "forward inactive tab",
+        focus_source=False,
+    )
+    # Stay comfortably inside the tab scroller while landing before the first
+    # pill center. Outside the viewport, Iced correctly withholds live pointer
+    # coordinates even though the eventual release still settles.
+    drag_active(home_tab, sidebar + 30, [home_tab, second, third], "backward tab")
+    # Move into the terminal before releasing. The strip no longer has cursor
+    # coordinates, but it still owns and must settle the captured gesture.
+    drag_active(
+        second,
+        sidebar + 440,
+        [home_tab, third, second],
+        "final outside-release tab",
+        release_outside=True,
+    )
+
+    # A modal palette opened from the keyboard while the pointer is still held
+    # must invalidate the preview. Its eventual release cannot commit behind
+    # the overlay, even if the strip does not receive that release directly.
+    launch.client.focus(home_tab)
+    before_palette = launch.client.project_tab_ids(project)
+    left, top, right, bottom = _active_pill_bounds(launch)
+    x0 = left + min(22, max(8, (right - left) // 3))
+    y = (top + bottom) // 2
+    pending_error: BaseException | None = None
+    try:
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(x0), str(y)]
+        )
+        launch.terminal_pointer(["mousedown", "1"])
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(sidebar + 300), str(y)]
+        )
+        # Keep the pointer button physically held while entering the shortcut.
+        # Launch.key focuses the window and clears modifiers, which can synthesize
+        # unrelated pointer settlement on some X11 servers.
+        launch.terminal_pointer(
+            [
+                "keydown",
+                "ctrl",
+                "keydown",
+                "shift",
+                "key",
+                "p",
+                "keyup",
+                "shift",
+                "keyup",
+                "ctrl",
+            ]
+        )
+        _wait_until(
+            lambda: launch.client.palette_state().get("open") is True,
+            "palette opens over held tab drag",
+        )
+    except BaseException as error:
+        pending_error = error
+        raise
+    finally:
+        try:
+            launch.terminal_pointer(["mouseup", "1"])
+        except Exception as release_error:
+            if pending_error is None:
+                raise
+            print(
+                f"failed to release palette-cancel drag while handling {pending_error!r}: "
+                f"{release_error}",
+                file=sys.stderr,
+            )
+    after_palette = launch.client.project_tab_ids(project)
+    assert after_palette == before_palette, (before_palette, after_palette)
+    _assert_stays(
+        lambda: launch.client.project_tab_ids(project) == before_palette,
+        "palette cancels held tab drag",
+    )
+    launch.key("Escape")
+    _wait_until(
+        lambda: launch.client.palette_state().get("open") is False,
+        "palette closes after held-drag cancellation",
+    )
+
+    launch.key("ctrl+1")
+    _wait_until(
+        lambda: int(launch.client.identify()["active_tab_id"]) == home_tab,
+        "shortcut follows direct-drag order",
+    )
+    _assert_no_pty_input(launch, tabs, "direct tab drag and reordered shortcut")
+    return ["RENAMED-TAB", "DRAG-THIRD", "DRAG-SECOND"]
 
 
 def _direct_tab_close(launch: Launch) -> None:
@@ -1593,6 +1802,7 @@ def main() -> int:
         _explicit_copy_and_paste(off)
         _terminal_scrollback_routing(off)
         renamed_project, renamed_tab = _keybind_dispatch(off)
+        dragged_titles = _direct_tab_reorder(off, renamed_project, renamed_tab)
         off.close()
         launches.pop()
 
@@ -1606,6 +1816,18 @@ def main() -> int:
             tab["title"] == "RENAMED-TAB" and tab["user_titled"]
             for tab in restored["tabs"]
         ), (renamed_tab, restored["tabs"])
+        restored_titles = [tab["title"] for tab in restored["tabs"]]
+        assert restored_titles == dragged_titles, (restored_titles, dragged_titles)
+        restored_home = next(
+            int(tab["id"]) for tab in restored["tabs"] if tab["title"] == "RENAMED-TAB"
+        )
+        for tab_id in off.client.project_tab_ids(renamed_project):
+            if tab_id != restored_home:
+                off.client.close_tab(tab_id)
+        _wait_until(
+            lambda: off.client.project_tab_ids(renamed_project) == [restored_home],
+            "persisted direct-drag fixture cleanup",
+        )
         _direct_tab_close(off)
         _chrome_overflow_navigation(off)
         _palette_pointer_routing(off)
@@ -1640,6 +1862,7 @@ def main() -> int:
         "local/tracked/alternate terminal wheel routing and key snap, "
         "exhaustive shortcut dispatch/repeat suppression, "
         "project/tab inline rename with double-click and click-away, "
+        "stable-ID direct tab drag in both directions with persistence, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
         "constrained chrome overflow navigation, and palette pointer routing"
     )

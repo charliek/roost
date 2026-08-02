@@ -2288,6 +2288,103 @@ reorder and project create/delete remain
 intentionally separate authoritative-operation adapters rather than being
 coupled to text editing.
 
+### Iced stable-ID tab drag-reorder commit plan
+
+Scope: add native pointer drag-reordering to the active Iced tab strip while
+preserving single-click selection, double-click inline rename, the active-tab
+close control, horizontal overflow, and the existing keyboard order. Move the
+GTK adapter's insertion-index arithmetic into a toolkit-neutral
+`roost-ui-model::reorder` module and consume the same helper from GTK and Iced.
+The engine remains authoritative: Iced may hold a short-lived visual preview,
+but it commits exactly one stable-ID `LocalClient::reorder_tabs` command on
+release, then rebuilds from a full workspace snapshot. This commit does not
+implement project-row reordering or operating-system file drag-and-drop; those
+reuse the proven gesture/ordering seam in subsequent slices.
+
+Input and ownership design: an Iced custom widget wraps the row of tab pills,
+delegates layout, drawing, operations, overlays, accessibility tree state, and
+child event handling, and owns only the pointer gesture state that a normal
+`MouseArea` cannot retain outside its source bounds. Child controls receive the
+event first, so the close button and inline text editor capture normally and
+never arm a drag. A left press over non-editor pill chrome selects by stable ID
+and records the original ID order and pointer origin. Movement must cross the
+same eight-logical-pixel threshold as GTK before preview begins. Layout child
+bounds determine the insertion point; the shared helper handles remove/insert
+off-by-one behavior. Native release is handled even when the pointer leaves the
+row or viewport. Sub-threshold release remains a click, and a consecutive
+second press selects then opens rename without starting reorder.
+
+Race, recovery, and failure semantics: preview state records project ID,
+source ID, original IDs, and current preview IDs. Every transition validates
+nonzero/unique IDs, exact membership, active project, and the authoritative
+order from which it began. Project switches, tab creation/close, external
+reorder, inline rename, palette ownership, window focus loss, or widget-context
+generation change cancel the gesture and restore the latest full snapshot. A
+no-op release sends no command. A changed release sends once; command failure
+clears the preview, reports a bounded status error, and reconciles the engine
+snapshot. No UI callback occurs from an engine lock, no renderer object enters
+the shared model or engine, and no global pointer/runtime singleton is added.
+
+Tests: table-test the extracted shared insertion helper over every source and
+boundary target plus stable-ID reorder, malformed IDs, and no-op cases; migrate
+the existing GTK table test to the shared API. Unit-test the custom gesture
+state for threshold, selection, double-click, outside release, context
+invalidation, child capture, and one-shot commit. App tests pin preview
+validation, external-snapshot cancellation, no-op behavior, rollback on an
+injected command failure, active-tab continuity, and exact command order.
+Extend physical Linux input coverage to drag inactive and active tabs in both
+directions, verify close/rename remain isolated, assert no PTY bytes, exercise
+shortcut selection in the new order, and relaunch to prove persistence. Run
+X11 and real-seat Wayland coverage under wgpu and tiny-skia, plus macOS native
+functional and screenshot checks. Visual review uses a focused product capture
+of source dimming/live insertion; it does not add a long-lived pixel-golden or
+parity-only CI job.
+
+Plan-review findings incorporated: per-pill `MouseArea::on_move` was rejected
+because it reports only while the cursor remains inside that pill and cannot
+reliably settle an outside release. Asynchronous widget-operation measurement
+was also rejected because it can race a preview rebuild. The row wrapper uses
+the synchronous layout passed to the native event and lets the existing
+scrollable translate cursor/layout coordinates consistently. The first commit
+uses already-visible overflow tabs; edge-triggered autoscroll is a follow-up
+only if physical overflow validation shows that the normal horizontal scroller
+is insufficient. Project reordering follows separately because agent subrows
+change vertical row geometry and deserve their own reviewed rollback tests.
+
+Acceptance: GTK and Iced use the same toolkit-neutral reorder math; Iced drag
+reorder works under native macOS, X11, and Wayland input; the command is stable
+ID based, single-shot, persisted, and fully resynchronized; child close/rename
+and PTY input do not regress; renderer and toolkit dependency boundaries remain
+unchanged; the complete per-commit local, shed, regression, review, push, and
+branch-CI gates are green.
+
+Implementation and validation result: `roost-ui-model::reorder` now owns the
+validated insertion-index and stable-ID movement rules used by both GTK and
+Iced. Iced's custom strip keeps the latest preview order in its synchronous
+gesture reducer, stamps every application message with a render-context
+generation, and commits only after the application revalidates that generation,
+project, source ID, original authoritative order, and exact membership. Modal
+palette ownership, focus loss, rename, project/sidebar actions, and structural
+workspace changes invalidate the generation. A release outside the strip still
+settles an owned drag, while an unrelated release is not captured; the complete
+native-input gate caught the latter distinction by exercising the fixed add-tab
+control after a drag. The reducer also records reversal back to the rendered
+order even when several pointer events arrive before a redraw, so renderer
+latency cannot commit an earlier preview.
+
+The final local gates passed 123 Iced unit tests, the complete workspace suite,
+11 XCTest plus 688 Swift Testing checks, and 38 harness/tool tests; the macOS Iced functional lane
+passed 54 tests with the one documented PRIMARY-selection skip. In the shed,
+the complete X11 real-input gate passed on wgpu and tiny-skia, including
+inactive/active forward and backward movement, release over the terminal,
+palette cancellation, exact zero-PTY-input checks, numeric selection in the new
+order, and process-relaunch persistence. Real-seat cage/uinput Wayland passed
+the same two renderer lanes for bidirectional reorder together with clipboard,
+selection, multi-click, and link-hover behavior. Focused held-gesture captures
+are retained as review artifacts under
+`target/visual-parity-linux-tab-reorder/`; they are human comparison inputs,
+not permanent pixel goldens or a parity-only CI job.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

@@ -52,6 +52,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::palette_scroll::Visibility;
+use crate::tab_reorder::{TabStrip, TabStripEvent};
 use crate::terminal_widget::{
     resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
     TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
@@ -546,6 +547,52 @@ struct RenameEditor {
     draft: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabDragContext {
+    project_id: i64,
+    source_id: i64,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabDragPreview {
+    context: TabDragContext,
+    original_ids: Vec<i64>,
+    ordered_ids: Vec<i64>,
+}
+
+fn same_stable_ids(left: &[i64], right: &[i64]) -> bool {
+    if left.len() != right.len() || left.contains(&0) {
+        return false;
+    }
+    let count = left.len();
+    let left = left.iter().copied().collect::<HashSet<_>>();
+    let right = right.iter().copied().collect::<HashSet<_>>();
+    left.len() == count && right.len() == count && left == right
+}
+
+fn dispatch_tab_drag_commit_with(
+    preview: Option<&TabDragPreview>,
+    authoritative_ids: &[i64],
+    context: &TabDragContext,
+    original_ids: &[i64],
+    ordered_ids: Vec<i64>,
+    apply: impl FnOnce(i64, Vec<i64>) -> Result<(), String>,
+) -> Result<bool, String> {
+    let valid = preview.is_some_and(|preview| {
+        preview.context == *context
+            && preview.original_ids == original_ids
+            && preview.ordered_ids == ordered_ids
+            && authoritative_ids == original_ids
+            && same_stable_ids(&ordered_ids, original_ids)
+    });
+    if !valid || ordered_ids == original_ids {
+        return Ok(false);
+    }
+    apply(context.project_id, ordered_ids)?;
+    Ok(true)
+}
+
 fn rename_target_label(projects: &[Project], target: RenameTarget) -> Option<&str> {
     match target {
         RenameTarget::Project(project_id) => projects
@@ -679,13 +726,6 @@ fn take_rename_focus_request(requested: &mut bool, editor_open: bool, input_id: 
     } else {
         UiTask::None
     }
-}
-
-fn tab_selector_messages(tab_id: i64) -> (Message, Message) {
-    (
-        Message::TabSelected(tab_id),
-        Message::BeginRenameTab(tab_id),
-    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2129,6 +2169,8 @@ pub struct App {
     rename_input_id: Id,
     rename_focus_requested: bool,
     rename_completion_key: Option<RenameCompletionKey>,
+    tab_drag_preview: Option<TabDragPreview>,
+    tab_strip_generation: u64,
     config: RoostConfig,
     typography: TerminalTypography,
     font_registry: &'static FontRegistry,
@@ -2263,6 +2305,8 @@ impl App {
             rename_input_id: Id::unique(),
             rename_focus_requested: false,
             rename_completion_key: None,
+            tab_drag_preview: None,
+            tab_strip_generation: 1,
             config,
             typography,
             font_registry,
@@ -2965,6 +3009,7 @@ impl App {
     pub fn set_window_focus(&mut self, focused: bool) {
         if !focused {
             self.rename_completion_key = None;
+            self.cancel_tab_drag();
         }
         self.workspace.set_window_focused(focused);
         if let Some(tab) = self.tabs.get(&self.workspace.active().1) {
@@ -3092,12 +3137,30 @@ impl App {
         .height(Fill)
         .style(chrome::surface);
 
-        let active_project_tabs = self
+        let active_project_model = self
             .projects
             .iter()
-            .find(|project| project.id == active_project)
-            .map(|project| project.tabs.as_slice())
-            .unwrap_or(&[]);
+            .find(|project| project.id == active_project);
+        let authoritative_tab_ids = active_project_model
+            .map(|project| project.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let visual_tab_ids = self
+            .tab_drag_preview
+            .as_ref()
+            .filter(|preview| {
+                preview.context.project_id == active_project
+                    && preview.original_ids == authoritative_tab_ids
+                    && same_stable_ids(&preview.ordered_ids, &authoritative_tab_ids)
+            })
+            .map(|preview| preview.ordered_ids.clone())
+            .unwrap_or_else(|| authoritative_tab_ids.clone());
+        let active_project_tabs = visual_tab_ids
+            .iter()
+            .filter_map(|tab_id| {
+                active_project_model
+                    .and_then(|project| project.tabs.iter().find(|tab| tab.id == *tab_id))
+            })
+            .collect::<Vec<_>>();
         let collapsed = self.workspace.sidebar_collapsed();
         let mut tab_pills = row![].spacing(6);
         for tab in active_project_tabs {
@@ -3143,25 +3206,20 @@ impl App {
                 .padding([2, 7])
                 .into()
             } else {
-                let (press, double_click) = tab_selector_messages(tab.id);
-                mouse_area(
-                    container(
-                        row![
-                            dot,
-                            text(title).size(12).color(if active {
-                                chrome::TEXT
-                            } else {
-                                chrome::MUTED_TEXT
-                            })
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                    )
-                    .height(chrome::PILL_HEIGHT)
-                    .padding([2, 7]),
+                container(
+                    row![
+                        dot,
+                        text(title).size(12).color(if active {
+                            chrome::TEXT
+                        } else {
+                            chrome::MUTED_TEXT
+                        })
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
                 )
-                .on_press(press)
-                .on_double_click(double_click)
+                .height(chrome::PILL_HEIGHT)
+                .padding([2, 7])
                 .into()
             };
             let mut pill = row![select].align_y(Alignment::Center);
@@ -3189,10 +3247,22 @@ impl App {
                 container(pill)
                     .height(chrome::PILL_HEIGHT)
                     .padding([0, 2])
-                    .style(chrome::tab_pill(active)),
+                    .style(chrome::tab_pill(
+                        active,
+                        self.tab_drag_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.context.source_id == tab.id),
+                    )),
             );
         }
-        let tab_scroller = scrollable(tab_pills)
+        let tab_strip = TabStrip::new(
+            tab_pills,
+            active_project,
+            visual_tab_ids,
+            self.tab_strip_generation,
+            self.rename_editor.is_none(),
+        );
+        let tab_scroller = scrollable(tab_strip)
             .horizontal()
             .width(Fill)
             .height(chrome::PILL_HEIGHT);
@@ -3455,6 +3525,7 @@ impl App {
     }
 
     fn begin_rename_target(&mut self, target: RenameTarget) -> Result<(), String> {
+        self.cancel_tab_drag();
         if self
             .rename_editor
             .as_ref()
@@ -3548,6 +3619,166 @@ impl App {
         }
     }
 
+    fn active_project_tab_ids(&self, project_id: i64) -> Vec<i64> {
+        self.projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.tabs.iter().map(|tab| tab.id).collect())
+            .unwrap_or_default()
+    }
+
+    fn cancel_tab_drag(&mut self) {
+        self.tab_drag_preview = None;
+        self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
+    }
+
+    fn reconcile_tab_drag_preview(&mut self) {
+        let Some(preview) = self.tab_drag_preview.as_ref() else {
+            return;
+        };
+        let active_project = self.workspace.active().0;
+        let authoritative = self.active_project_tab_ids(preview.context.project_id);
+        if active_project != preview.context.project_id || authoritative != preview.original_ids {
+            self.cancel_tab_drag();
+        }
+    }
+
+    fn begin_tab_drag_preview(
+        &mut self,
+        project_id: i64,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: Vec<i64>,
+    ) {
+        let authoritative = self.active_project_tab_ids(project_id);
+        if context_generation != self.tab_strip_generation
+            || self.workspace.active().0 != project_id
+            || authoritative != original_ids
+            || !same_stable_ids(&original_ids, &original_ids)
+            || !original_ids.contains(&source_id)
+        {
+            self.cancel_tab_drag();
+            return;
+        }
+        self.tab_drag_preview = Some(TabDragPreview {
+            context: TabDragContext {
+                project_id,
+                source_id,
+                generation: context_generation,
+            },
+            ordered_ids: original_ids.clone(),
+            original_ids,
+        });
+    }
+
+    fn preview_tab_drag(
+        &mut self,
+        project_id: i64,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: &[i64],
+        ordered_ids: Vec<i64>,
+    ) {
+        let context = TabDragContext {
+            project_id,
+            source_id,
+            generation: context_generation,
+        };
+        let valid = self.tab_drag_preview.as_ref().is_some_and(|preview| {
+            preview.context == context
+                && context_generation == self.tab_strip_generation
+                && preview.original_ids == original_ids
+                && self.active_project_tab_ids(project_id) == original_ids
+                && same_stable_ids(&ordered_ids, original_ids)
+        });
+        if valid {
+            if let Some(preview) = &mut self.tab_drag_preview {
+                preview.ordered_ids = ordered_ids;
+            }
+        } else {
+            self.cancel_tab_drag();
+        }
+    }
+
+    fn commit_tab_drag(
+        &mut self,
+        project_id: i64,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: &[i64],
+        ordered_ids: Vec<i64>,
+    ) {
+        let authoritative = self.active_project_tab_ids(project_id);
+        let context = TabDragContext {
+            project_id,
+            source_id,
+            generation: context_generation,
+        };
+        let result = dispatch_tab_drag_commit_with(
+            self.tab_drag_preview.as_ref(),
+            &authoritative,
+            &context,
+            original_ids,
+            ordered_ids,
+            |project_id, ordered_ids| {
+                self.runtime
+                    .block_on(self.client.reorder_tabs(project_id, ordered_ids))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        self.cancel_tab_drag();
+        if let Err(error) = result {
+            tracing::warn!(?error, project_id, source_id, "Iced tab reorder failed");
+            self.set_status(format!("reorder tabs: {error}"));
+        }
+        self.reconcile();
+    }
+
+    pub(crate) fn tab_strip_event(&mut self, event: TabStripEvent) {
+        match event {
+            TabStripEvent::Started {
+                project_id,
+                source_id,
+                context_generation,
+                original_ids,
+            } => {
+                self.begin_tab_drag_preview(project_id, source_id, context_generation, original_ids)
+            }
+            TabStripEvent::Preview {
+                project_id,
+                source_id,
+                context_generation,
+                original_ids,
+                ordered_ids,
+            } => self.preview_tab_drag(
+                project_id,
+                source_id,
+                context_generation,
+                &original_ids,
+                ordered_ids,
+            ),
+            TabStripEvent::Commit {
+                project_id,
+                source_id,
+                context_generation,
+                original_ids,
+                ordered_ids,
+            } => self.commit_tab_drag(
+                project_id,
+                source_id,
+                context_generation,
+                &original_ids,
+                ordered_ids,
+            ),
+            TabStripEvent::Cancel { context_generation } => {
+                if context_generation == self.tab_strip_generation {
+                    self.cancel_tab_drag();
+                    self.reconcile();
+                }
+            }
+        }
+    }
+
     fn take_rename_focus_task(&mut self) -> UiTask {
         take_rename_focus_request(
             &mut self.rename_focus_requested,
@@ -3557,6 +3788,7 @@ impl App {
     }
 
     pub fn select_project(&mut self, project_id: i64) {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         if let Some(tab_id) = self.workspace.preferred_tab(project_id) {
             let _ = self.focus_tab_and_clear(tab_id, false);
@@ -3569,6 +3801,7 @@ impl App {
     }
 
     pub fn select_agent(&mut self, tab_id: i64) {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         let _ = self.focus_tab_and_clear(tab_id, true);
     }
@@ -3581,6 +3814,7 @@ impl App {
     }
 
     pub fn toggle_sidebar(&mut self) {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         self.set_sidebar_collapsed(!self.workspace.sidebar_collapsed());
     }
@@ -3605,6 +3839,7 @@ impl App {
     }
 
     pub fn new_tab(&mut self) {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         if let Err(error) = self.new_tab_result() {
             self.set_status(error);
@@ -3632,6 +3867,7 @@ impl App {
     }
 
     pub fn close_tab(&mut self, tab_id: i64) {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         if let Err(error) = self.close_tab_result(tab_id) {
             self.set_status(error);
@@ -3680,6 +3916,7 @@ impl App {
     }
 
     fn open_palette(&mut self, kind: &str) -> Result<(), String> {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         let frame = match kind {
             "" | "commands" => command_palette_frame(
@@ -3719,6 +3956,7 @@ impl App {
         items: Vec<(String, String, Option<String>)>,
         reply: tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>,
     ) {
+        self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         if let Err(error) = self.try_dismiss_palette() {
             let _ = reply.send(Err(error));
@@ -4458,6 +4696,7 @@ impl App {
         // Full authoritative snapshot on every UI tick is the recovery path
         // for a slow consumer: deltas are an optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.reconcile_tab_drag_preview();
         self.reconcile_rename_editor();
         self.reconcile_notification_inbox();
         self.refresh_notification_palette();
@@ -5659,6 +5898,101 @@ mod tests {
     }
 
     #[test]
+    fn tab_drag_membership_requires_unique_nonzero_stable_ids() {
+        assert!(same_stable_ids(&[30, 10, 20], &[10, 20, 30]));
+        assert!(!same_stable_ids(&[10, 20], &[10, 20, 30]));
+        assert!(!same_stable_ids(&[10, 10], &[10, 10]));
+        assert!(!same_stable_ids(&[0, 10], &[0, 10]));
+        assert!(!same_stable_ids(&[10, 20, 30], &[10, 20, 40]));
+    }
+
+    #[test]
+    fn tab_drag_commit_dispatches_exactly_once_and_rejects_stale_or_noop_state() {
+        let preview = TabDragPreview {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: vec![10, 20, 30],
+            ordered_ids: vec![20, 30, 10],
+        };
+        let mut calls = Vec::new();
+        let applied = dispatch_tab_drag_commit_with(
+            Some(&preview),
+            &[10, 20, 30],
+            &preview.context,
+            &[10, 20, 30],
+            vec![20, 30, 10],
+            |project_id, ordered_ids| {
+                calls.push((project_id, ordered_ids));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(applied);
+        assert_eq!(calls, vec![(7, vec![20, 30, 10])]);
+
+        for (authoritative, ordered) in [
+            (vec![30, 20, 10], vec![20, 30, 10]),
+            (vec![10, 20, 30], vec![10, 20, 30]),
+            (vec![10, 20, 30], vec![20, 10, 30]),
+        ] {
+            let result = dispatch_tab_drag_commit_with(
+                Some(&preview),
+                &authoritative,
+                &preview.context,
+                &[10, 20, 30],
+                ordered,
+                |_, _| panic!("stale/no-op tab drag dispatched"),
+            );
+            assert_eq!(result, Ok(false));
+        }
+
+        let stale_generation = dispatch_tab_drag_commit_with(
+            Some(&preview),
+            &[10, 20, 30],
+            &TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 5,
+            },
+            &[10, 20, 30],
+            vec![20, 30, 10],
+            |_, _| panic!("stale-generation tab drag dispatched"),
+        );
+        assert_eq!(stale_generation, Ok(false));
+    }
+
+    #[test]
+    fn tab_drag_commit_surfaces_the_authoritative_command_error_once() {
+        let preview = TabDragPreview {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: vec![10, 20],
+            ordered_ids: vec![20, 10],
+        };
+        let mut calls = 0;
+        let error = dispatch_tab_drag_commit_with(
+            Some(&preview),
+            &[10, 20],
+            &preview.context,
+            &[10, 20],
+            vec![20, 10],
+            |_, _| {
+                calls += 1;
+                Err("injected reorder failure".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error, "injected reorder failure");
+    }
+
+    #[test]
     fn rendered_close_keeps_its_exact_id_and_engine_fallback_semantics() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let workspace = Arc::new(Workspace::new());
@@ -5968,13 +6302,6 @@ mod tests {
             rename_target_label(&projects, editor.target),
             Some("remote name")
         );
-    }
-
-    #[test]
-    fn tab_selector_path_owns_select_then_double_click_begin() {
-        let (press, double_click) = tab_selector_messages(91);
-        assert!(matches!(press, Message::TabSelected(91)));
-        assert!(matches!(double_click, Message::BeginRenameTab(91)));
     }
 
     #[test]
