@@ -1,6 +1,8 @@
 # Iced UI and shared Rust engine proof-of-concept plan
 
-Status: POC proposal, not an accepted replacement architecture
+Status: archived design record. Sequencing and milestone governance moved to
+the [Iced migration roadmap](iced-migration-roadmap.md); the acceptance
+matrices and reviewed decisions below remain the reference.
 
 Implementation note: the shared-engine extraction, isolated third-target
 contract, and Iced walking skeleton are implemented on `poc/iced`. The walking
