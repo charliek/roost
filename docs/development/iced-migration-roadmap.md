@@ -38,19 +38,36 @@ gauntlet passes sized one milestone slice at a time.
 
 Independent of the merge; blocks the next Swift/GTK release regardless.
 
-* Symptom: TUIs render in a single color in builds of **all three** UIs from
-  post-v0.0.17 `main`/`poc/iced`; absent in the released v0.0.15.
-* Prime suspects: PR #274's config-parser convergence, commits `6219bd3`
-  (one value semantic across Swift+Rust parsers) and `1721b10` — these are on
-  `main` but in **no tagged release**, matching the observed window exactly.
-  The configured theme value (`Gruvbox Dark Hard`, spaces) and Ghostty theme
-  lines (`palette = 16=#hex` — values containing `=` and `#`) are the likely
-  casualties of a value-semantic change.
-* Root-cause confirmation is in flight; update this section with the
-  confirmed cause before executing the fix.
-* Deliverable: topic branch off `main`, fix in **both** parsers with the
-  failing case added to the shared fixture corpus (`7a02d34` pattern), PR to
-  `main`, CI green.
+* Symptom: TUIs (`strix`, `prox`) reported single-color in builds of all
+  three UIs from `poc/iced` tip; absent in the released v0.0.15.
+* Investigation state (2026-08-02):
+    * **Code window `v0.0.15..poc/iced` is cleared.** The config-parser
+      suspects (`6219bd3`/`1721b10`) were disproven by direct reproduction —
+      both parsers resolve `Gruvbox Dark Hard` + a full 256-entry palette;
+      theme-file parsing never touches the changed value path. The entire
+      Mac color path (`TerminalView.swift`, `RenderState.swift`, themes,
+      shell-integration, libghostty pin, PTY env) is byte-identical to
+      v0.0.15. GTK/roost-vt color paths in the window are ±0 lines.
+    * **Live repro FAILED on the branch Swift build** (this machine): strix
+      renders 6 distinct foregrounds via `tab.dump_resolved` under all three
+      spawn paths — direct argv with the app terminal-launched, direct argv
+      with the app `open`-launched (launchd env), and `strix` typed into the
+      interactive shell. Screenshot + dumps in the session scratchpad.
+    * Known env quirk (unconfirmed as cause, strix unaffected): Roost PTY
+      children inherit `TERMINFO=/Applications/Ghostty.app/...` (only
+      ghostty entries) while Roost forces `TERM=xterm-256color`; ncurses
+      falls back to `/usr/share/terminfo`, strict `$TERMINFO` readers would
+      not.
+* Next steps: attempt repro on the **GTK** (`Roost-gtk` profile) and
+  **iced** builds on this machine with the same strix `dump_resolved` probe
+  (iced terminal color parity is a known open P1 gap and the most likely
+  true source of the observation). If no repro anywhere, downgrade M0 to a
+  watch item and proceed to M1. Regardless of repro: a small hardening PR to
+  strip `TERMINFO` from PTY child env in both `PtySupervisor.swift` and
+  `roost-engine/src/pty.rs` is justified — forcing `TERM` while inheriting a
+  foreign terminal's private terminfo DB is wrong.
+* Deliverable if a code cause is found: topic branch off `main`, fix with a
+  regression test (shared fixture corpus if parser-related), PR, CI green.
 
 ### M1 — pre-merge hardening (on `poc/iced`)
 
