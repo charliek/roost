@@ -545,74 +545,105 @@ final class PtySupervisor {
     /// together — a `--posix` shell with no ENV script to source would be
     /// stuck in POSIX mode with no startup recreation — so `buildArgv` and
     /// `buildEnv` both gate on this.
-    private func shouldBashBootstrap(_ resolvedArgv: [String], resourcesDir: String) -> Bool {
-        bashAutobootstrap(resolvedArgv, isDarwin: true)
-            && FileManager.default.fileExists(
-                atPath: resourcesDir + "/shell-integration/roost.bash")
-    }
-
     /// Build the NULL-terminated envp array. Inherits the
     /// parent's environment then overlays Roost's injected vars.
     private func buildEnv(tabID: Int64, socketPath: String, argv: [String])
         -> [UnsafeMutablePointer<CChar>?]
     {
-        var env: [String: String] = ProcessInfo.processInfo.environment
-        // Advertise the terminal Roost provides — force TERM rather than
-        // inheriting the launching terminal's (a child seeing an inherited
-        // TERM=tmux-256color / xterm-kitty would emit unsupported seqs).
-        env["TERM"] = "xterm-256color"
-        env["COLORTERM"] = "truecolor"
-        // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
-        // links (Cmd-click), but the `supports-hyperlinks` library many
-        // CLIs gate on — Claude Code, anything on chalk/terminal-link —
-        // only allowlists known terminals by TERM_PROGRAM, and "Roost"
-        // isn't one. Without this they emit plain text instead of a link
-        // (e.g. Claude Code's footer "PR #N"). FORCE_HYPERLINK is that
-        // ecosystem's "my terminal supports it" override; honest here
-        // because we genuinely do.
-        env["FORCE_HYPERLINK"] = "1"
-        env["ROOST_TAB_ID"] = String(tabID)
-        env["ROOST_SOCKET"] = socketPath
-        // Roost shell-integration contract: identify the terminal and
-        // point shells at the shipped scripts (under
-        // $ROOST_RESOURCES_DIR/shell-integration). TERM stays
-        // xterm-256color (above) — we don't masquerade as another
-        // terminal. ROOST_SHELL_FEATURES is user-overridable.
-        env["TERM_PROGRAM"] = "Roost"
-        env["TERM_PROGRAM_VERSION"] =
-            (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
-        env["ROOST_SHELL_INTEGRATION"] = "1"
-        env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt,ssh-env"
-        let resourcesDir = Bundle.roostResources.bundleURL.path
-        env["ROOST_RESOURCES_DIR"] = resourcesDir
-        // Auto-bootstrap the shipped integration with no rc edit. Resolve the
-        // same argv `buildArgv` execs (default case → `[$SHELL, -l]`), then:
-        //   * zsh: point ZDOTDIR at our shim — it restores the user's
-        //     ZDOTDIR, runs their real zsh startup, then loads roost.zsh.
-        //   * modern bash: set ENV + ROOST_BASH_INJECT so the `--posix` shell
-        //     sources roost.bash, which recreates startup then loads the
-        //     integration. Apple's bash 3.2 can't (skipped in the helper).
-        let resolvedArgv = loginShellArgv(argv, shell: env["SHELL"] ?? "/bin/sh")
-        let shellName = resolvedArgv.first.map { ($0 as NSString).lastPathComponent } ?? ""
-        if shellName == "zsh" {
-            if let userZdotdir = env["ZDOTDIR"], !userZdotdir.isEmpty {
-                env["ROOST_ZSH_ZDOTDIR"] = userZdotdir
-            }
-            env["ZDOTDIR"] = resourcesDir + "/shell-integration/zsh"
-        } else if shouldBashBootstrap(resolvedArgv, resourcesDir: resourcesDir) {
-            for (key, value) in bashBootstrapEnv(
-                resourcesDir: resourcesDir,
-                existingEnv: env["ENV"],
-                existingHistfile: env["HISTFILE"],
-                home: env["HOME"]
-            ) {
-                env[key] = value
-            }
-        }
+        let env = childEnvironment(
+            base: ProcessInfo.processInfo.environment,
+            tabID: tabID,
+            socketPath: socketPath,
+            argv: argv,
+            resourcesDir: Bundle.roostResources.bundleURL.path,
+            version: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
+        )
         var out: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0)=\($1)") }
         out.append(nil)
         return out
     }
+}
+
+/// Whether to bash-auto-bootstrap `resolvedArgv`: the pure predicate
+/// (`bashAutobootstrap`) AND the shipped roost.bash being present at
+/// `resourcesDir`. `--posix` and the ENV injection must be applied
+/// together — a `--posix` shell with no ENV script to source would be
+/// stuck in POSIX mode with no startup recreation — so `buildArgv` and
+/// `buildEnv` both gate on this.
+func shouldBashBootstrap(_ resolvedArgv: [String], resourcesDir: String) -> Bool {
+    bashAutobootstrap(resolvedArgv, isDarwin: true)
+        && FileManager.default.fileExists(
+            atPath: resourcesDir + "/shell-integration/roost.bash")
+}
+
+/// The environment a Roost tab's child process sees: `base` (the parent's
+/// environment) overlaid with Roost's injected vars. Pure so tests can
+/// assert the contract without spawning a PTY.
+func childEnvironment(
+    base: [String: String],
+    tabID: Int64,
+    socketPath: String,
+    argv: [String],
+    resourcesDir: String,
+    version: String
+) -> [String: String] {
+    var env = base
+    // Advertise the terminal Roost provides — force TERM rather than
+    // inheriting the launching terminal's (a child seeing an inherited
+    // TERM=tmux-256color / xterm-kitty would emit unsupported seqs).
+    env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    // Forcing TERM makes an inherited TERMINFO wrong: it points at the
+    // launching terminal's private DB (e.g. Ghostty's, which has no
+    // xterm-256color entry), so strict $TERMINFO readers would find no
+    // entry for the TERM Roost advertises.
+    env.removeValue(forKey: "TERMINFO")
+    // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
+    // links (Cmd-click), but the `supports-hyperlinks` library many
+    // CLIs gate on — Claude Code, anything on chalk/terminal-link —
+    // only allowlists known terminals by TERM_PROGRAM, and "Roost"
+    // isn't one. Without this they emit plain text instead of a link
+    // (e.g. Claude Code's footer "PR #N"). FORCE_HYPERLINK is that
+    // ecosystem's "my terminal supports it" override; honest here
+    // because we genuinely do.
+    env["FORCE_HYPERLINK"] = "1"
+    env["ROOST_TAB_ID"] = String(tabID)
+    env["ROOST_SOCKET"] = socketPath
+    // Roost shell-integration contract: identify the terminal and
+    // point shells at the shipped scripts (under
+    // $ROOST_RESOURCES_DIR/shell-integration). TERM stays
+    // xterm-256color (above) — we don't masquerade as another
+    // terminal. ROOST_SHELL_FEATURES is user-overridable.
+    env["TERM_PROGRAM"] = "Roost"
+    env["TERM_PROGRAM_VERSION"] = version
+    env["ROOST_SHELL_INTEGRATION"] = "1"
+    env["ROOST_SHELL_FEATURES"] = env["ROOST_SHELL_FEATURES"] ?? "cwd,title,marks,prompt,ssh-env"
+    env["ROOST_RESOURCES_DIR"] = resourcesDir
+    // Auto-bootstrap the shipped integration with no rc edit. Resolve the
+    // same argv `buildArgv` execs (default case → `[$SHELL, -l]`), then:
+    //   * zsh: point ZDOTDIR at our shim — it restores the user's
+    //     ZDOTDIR, runs their real zsh startup, then loads roost.zsh.
+    //   * modern bash: set ENV + ROOST_BASH_INJECT so the `--posix` shell
+    //     sources roost.bash, which recreates startup then loads the
+    //     integration. Apple's bash 3.2 can't (skipped in the helper).
+    let resolvedArgv = loginShellArgv(argv, shell: env["SHELL"] ?? "/bin/sh")
+    let shellName = resolvedArgv.first.map { ($0 as NSString).lastPathComponent } ?? ""
+    if shellName == "zsh" {
+        if let userZdotdir = env["ZDOTDIR"], !userZdotdir.isEmpty {
+            env["ROOST_ZSH_ZDOTDIR"] = userZdotdir
+        }
+        env["ZDOTDIR"] = resourcesDir + "/shell-integration/zsh"
+    } else if shouldBashBootstrap(resolvedArgv, resourcesDir: resourcesDir) {
+        for (key, value) in bashBootstrapEnv(
+            resourcesDir: resourcesDir,
+            existingEnv: env["ENV"],
+            existingHistfile: env["HISTFILE"],
+            home: env["HOME"]
+        ) {
+            env[key] = value
+        }
+    }
+    return env
 }
 
 // MARK: - Helpers
