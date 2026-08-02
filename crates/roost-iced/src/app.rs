@@ -5077,7 +5077,17 @@ impl App {
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(dropped)) => {
-                    tracing::warn!(dropped, "Iced workspace event consumer lagged; resyncing");
+                    // Dropped events are not replayed. Recovery comes from the
+                    // per-tick snapshot reconcile (reconcile_notification_inbox
+                    // rebuilds rows from authoritative workspace state); only
+                    // event-carried notification bodies are lost. Jump to the
+                    // queue head so the next drain starts at live events
+                    // instead of chewing through the stale retained backlog.
+                    tracing::warn!(
+                        dropped,
+                        "Iced workspace event consumer lagged; relying on per-tick snapshot reconcile"
+                    );
+                    self.workspace_events = self.workspace_events.resubscribe();
                     break;
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
