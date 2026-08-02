@@ -1,4 +1,4 @@
-"""Thin JSON-IPC client for a running Roost UI (Mac or GTK).
+"""Thin JSON-IPC client for a running Roost UI (Mac, GTK, or Iced).
 
 Speaks the newline-delimited JSON protocol directly over the Unix socket
 — the same contract `roostctl` uses (see docs/reference/ipc.md). Tests
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import socket
 import time
@@ -42,11 +43,12 @@ class Timeout(RoostError):
 
 
 class Roost:
-    def __init__(self, socket_path: str):
+    def __init__(self, socket_path: str, timeout: float | None = None):
         self.path = str(socket_path)
         self._next_id = 0
         self._buf = b""
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(timeout)
         self._sock.connect(self.path)
 
     # -- lifecycle --------------------------------------------------------
@@ -201,6 +203,12 @@ class Roost:
     def rename_project(self, project_id: int, name: str) -> None:
         self.call("project.rename", {"project_id": str(project_id), "name": name})
 
+    def reorder_projects(self, project_ids: list[int]) -> None:
+        self.call(
+            "project.reorder",
+            {"project_ids": [str(project_id) for project_id in project_ids]},
+        )
+
     def reorder_tabs(self, project_id: int, tab_ids: list[int]) -> None:
         self.call("tab.reorder", {"project_id": str(project_id),
                                   "tab_ids": [str(t) for t in tab_ids]})
@@ -248,9 +256,28 @@ class Roost:
         return base64.b64decode(r["png"]), r["width"], r["height"]
 
     def window_metrics(self) -> dict:
-        """{window_width, window_height, sidebar_width, sidebar_collapsed}
-        in logical points. Backs the sidebar-holds-width regression."""
+        """Window/sidebar logical points plus optional ``terminal_top``.
+
+        Iced reports the exact application-owned terminal origin so pointer and
+        screenshot tests follow live product geometry instead of a copied band
+        constant. Native adapters may omit it.
+        """
         return self.call("app.window_metrics", {})
+
+    def terminal_top(self, metrics: dict | None = None) -> float:
+        """Return a trustworthy application-owned terminal Y origin.
+
+        Iced geometry-sensitive tests deliberately fail when the adapter omits
+        or corrupts this value; silently falling back to a copied chrome height
+        would let the product and test drift together unnoticed.
+        """
+        value = (metrics or self.window_metrics()).get("terminal_top")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise AssertionError(f"window_metrics has no terminal_top: {value!r}")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise AssertionError(f"window_metrics terminal_top is invalid: {value!r}")
+        return value
 
     def window_resize(self, width: float, height: float) -> None:
         """Test-mode only — set the window's logical size."""
@@ -476,11 +503,10 @@ class Roost:
         return res.get("shape", "")
 
     def app_active_terminal_focused(self) -> bool:
-        """Return whether the active tab's terminal holds GTK *logical*
-        keyboard focus (`window.focus_widget() == terminal`). Reads
-        logical focus, so it is observable under the WM-less Xvfb e2e
-        runner. Ungated (read-only); False when there is no active
-        terminal."""
+        """Return whether the active tab's terminal owns the UI's *logical*
+        keyboard route. Toolkit adapters expose this independently of
+        compositor/toplevel focus. Ungated (read-only); False when there is
+        no live active terminal or another in-app surface owns keyboard input."""
         res = self.call("app.active_terminal_focused", {})
         # Direct key access (not .get with a default): a missing field is
         # a protocol violation that should surface, not silently read as

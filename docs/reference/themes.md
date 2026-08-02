@@ -90,14 +90,14 @@ SwiftPM bundle — kept in sync by `make themes-check`:
 ```bash
 # Run from your roost checkout. Copy into BOTH trees.
 SRC="/Applications/Ghostty.app/Contents/Resources/ghostty/themes/Solarized Osaka Night"
-cp "$SRC" crates/roost-linux/src/resources/themes/
+cp "$SRC" crates/roost-ui-model/src/resources/themes/
 cp "$SRC" mac/Sources/Roost/Resources/themes/
 ```
 
 The Mac UI discovers themes by listing its bundle directory, so it picks
 the new file up automatically. The Linux UI embeds them explicitly: add a
 matching entry to the `BUNDLED_THEMES` array in
-`crates/roost-linux/src/theme.rs`. Then rebuild (`cargo build` /
+`crates/roost-ui-model/src/theme.rs`. Then rebuild (`cargo build` /
 `swift build`) and set `theme = Solarized Osaka Night` in `config.conf`.
 If the theme uses keys roost doesn't honor (e.g. `palette-generate`),
 they're silently dropped — the rest still works.

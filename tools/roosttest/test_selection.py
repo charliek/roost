@@ -10,6 +10,7 @@ Run against either UI:
 
     pytest -q tools/roosttest/test_selection.py --roost-target mac
     pytest -q tools/roosttest/test_selection.py --roost-target gtk
+    pytest -q tools/roosttest/test_selection.py --roost-target iced
 """
 
 from __future__ import annotations
@@ -63,9 +64,19 @@ def test_selection_clear(roost, project):
     `None` (`#[serde(skip_serializing_if = "Option::is_none")]`), so
     use `.get()` rather than subscript."""
     tab = roost.open_tab(project, cwd="/tmp")
-    _seed_lines(roost, tab, n=3)
-    roost.selection_set(tab, anchor=(0, 0), cursor=(3, 0))
-    assert roost.selection_dump(tab).get("text") is not None
+    marker = _seed_lines(roost, tab, n=3)
+    dump = roost.dump(tab)
+    target = f"{marker}-row01"
+    rows_text = dump["rows_text"]
+    row_idx = next(i for i, line in enumerate(rows_text) if target in line)
+    col_start = rows_text[row_idx].index(target)
+    col_end = col_start + len(target)
+    roost.selection_set(
+        tab,
+        anchor=(col_start, row_idx),
+        cursor=(col_end - 1, row_idx),
+    )
+    assert roost.selection_dump(tab).get("text") == target
     roost.selection_clear(tab)
     sel = roost.selection_dump(tab)
     assert sel.get("text") is None
@@ -79,9 +90,16 @@ def test_clipboard_write_dump_round_trip(roost, project):
     needed by the OSC 52 PR's E2E test."""
     # Use a unique payload so a leaked prior clipboard value doesn't
     # produce a false pass.
-    payload = f"roost-clip-{uuid.uuid4().hex[:8]}"
-    roost.clipboard_write("system", payload)
-    assert roost.clipboard_dump("system") == payload
+    first = f"roost-clip-a-{uuid.uuid4().hex[:8]}"
+    second = f"roost-clip-b-{uuid.uuid4().hex[:8]}"
+    roost.clipboard_write("system", first)
+    assert roost.clipboard_dump("system") == first
+    # No polling between these calls: the UI adapter must serialize both
+    # fire-and-forget writes ahead of the following native read, even if IPC
+    # delivery straddles event-loop ticks.
+    roost.clipboard_write("system", first)
+    roost.clipboard_write("system", second)
+    assert roost.clipboard_dump("system") == second
 
 
 def test_selection_survives_scroll(roost, project):

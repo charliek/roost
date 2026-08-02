@@ -3,7 +3,7 @@
 // The theme system — same theme files (same names, same on-disk format)
 // as the Rust/Linux UI. The bundled theme files live at
 // `Sources/Roost/Resources/themes/`; the source-of-truth copy is in the
-// Rust crate at `crates/roost-linux/src/resources/themes/`, and the two
+// Rust crate at `crates/roost-ui-model/src/resources/themes/`, and the two
 // trees are kept byte-identical by `make themes-check`. Add a new theme
 // to both trees (and to `BUNDLED_THEMES` in `theme.rs`).
 //

@@ -158,7 +158,7 @@ Selection clears automatically on any PTY output, on resize, and on a new click.
 
 Hold the **link modifier** and hover a URL to highlight it (underline + hand cursor); click while holding it to open the URL in your default browser. This works for both OSC 8 hyperlinks (what tools like Claude Code emit) and plain `https://…` text matched on screen.
 
-The modifier is platform-native by default — **Cmd on macOS, Alt on Linux** — and configurable via `link-modifier` in `config.conf`. **Linux users who prefer the conventional Ctrl+click** set `link-modifier = ctrl`. (Some Linux WMs grab `Alt`+drag to move windows, so Ctrl can be the more reliable choice.) The `link-modifier` setting is honored by the GTK app today; the Swift Mac app is fixed to Cmd. See [`config.md`](../reference/config.md#link-modifier) for details and the broader "prefer Ctrl on Linux" recipe.
+The modifier is platform-native by default — **Cmd on macOS, Alt on Linux** — and configurable via `link-modifier` in `config.conf`. **Linux users who prefer the conventional Ctrl+click** set `link-modifier = ctrl`. (Some Linux WMs grab `Alt`+drag to move windows, so Ctrl can be the more reliable choice.) The `link-modifier` setting is honored by the GTK and Iced apps; the Swift Mac app is fixed to Cmd. See [`config.md`](../reference/config.md#link-modifier) for details and the broader "prefer Ctrl on Linux" recipe.
 
 Pressing any input-producing key when the viewport is scrolled back snaps the viewport to the bottom before delivering the keystroke — same behavior as every other terminal multiplexer.
 

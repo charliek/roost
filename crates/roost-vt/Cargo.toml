@@ -25,6 +25,7 @@ ffi     = ["dep:bindgen"]
 
 [dependencies]
 thiserror = { workspace = true }
+unicode-width = { workspace = true }
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }

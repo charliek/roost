@@ -23,14 +23,52 @@ use std::sync::OnceLock;
 
 /// One URL match within a terminal row. `col0` is the column of the
 /// URL's first char (inclusive); `col1` is the column of the URL's
-/// last char (inclusive). Both are char-position indices into the row
-/// string the caller passed in — terminal cells map to chars 1:1 for
-/// the renderer's `dumpText`-style row builds.
+/// last char (inclusive). Both are Unicode-scalar indices into the row string
+/// the caller passed in. Terminal adapters must map those indices through a
+/// cell-aware projection such as `roost_vt::RowTextProjection`; combining and
+/// wide characters do not map to terminal cells 1:1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlSpan {
     pub col0: u16,
     pub col1: u16,
     pub url: String,
+}
+
+/// A URL resolved at one terminal viewport cell.
+///
+/// The row and inclusive column range are renderer-neutral cell coordinates;
+/// UI adapters can use the value for both hit testing and underline geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoverUrl {
+    pub col0: u16,
+    pub col1: u16,
+    pub row: u16,
+    pub url: String,
+}
+
+/// Walk a contiguous OSC 8 hyperlink span around `col`.
+///
+/// `hyperlink_at` performs the renderer/terminal-specific per-cell lookup. The
+/// shared walk deliberately stops at the inclusive row boundary and whenever
+/// an adjacent cell names a different URI.
+pub fn contiguous_hyperlink_span<F>(
+    col: u16,
+    max_col: u16,
+    uri: &str,
+    mut hyperlink_at: F,
+) -> (u16, u16)
+where
+    F: FnMut(u16) -> Option<String>,
+{
+    let mut col0 = col;
+    while col0 > 0 && hyperlink_at(col0 - 1).as_deref() == Some(uri) {
+        col0 -= 1;
+    }
+    let mut col1 = col;
+    while col1 < max_col && hyperlink_at(col1 + 1).as_deref() == Some(uri) {
+        col1 += 1;
+    }
+    (col0, col1)
 }
 
 /// Compiled regex. `OnceLock` so the first call pays the build cost
@@ -353,6 +391,20 @@ mod tests {
         assert_eq!(all[0].url, "https://one.test");
         assert_eq!(all[1].url, "https://two.test");
         assert!(all[0].col0 < all[1].col0);
+    }
+
+    #[test]
+    fn contiguous_hyperlink_span_stops_at_uri_and_row_boundaries() {
+        let cells = std::collections::HashMap::from([
+            (3, "https://a"),
+            (4, "https://a"),
+            (5, "https://b"),
+            (6, "https://b"),
+            (7, "https://b"),
+        ]);
+        let lookup = |col| cells.get(&col).map(|uri| (*uri).to_string());
+        assert_eq!(contiguous_hyperlink_span(4, 6, "https://a", lookup), (3, 4));
+        assert_eq!(contiguous_hyperlink_span(6, 6, "https://b", lookup), (5, 6));
     }
 }
 

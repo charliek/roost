@@ -16,7 +16,7 @@
 #
 # Usage:
 #   tools/shed/shed-test.sh                 # ensure box, build, run the drag guard
-#   tools/shed/shed-test.sh --build-only    # just build roost-linux in the shed
+#   tools/shed/shed-test.sh --build-only    # build GTK + Iced + roostctl in the shed
 #   tools/shed/shed-test.sh --shell         # ensure box + drop into a shell
 #   tools/shed/shed-test.sh --snapshot-base # cache the provisioned box as roost-base
 #   tools/shed/shed-test.sh --reprovision   # delete box + snapshot, rebuild from scratch
@@ -54,7 +54,7 @@ ensure_box() {
 }
 
 build() {
-  log "building roost-linux + roostctl in the shed (all artifacts shed-local; Mac target/ + ghostty untouched)"
+  log "building GTK + Iced + roostctl in the shed (all artifacts shed-local; Mac target/ + ghostty untouched)"
   in_shed "chmod +x ~/roost/tools/shed/build-in-shed.sh; ~/roost/tools/shed/build-in-shed.sh"
 }
 
@@ -68,6 +68,29 @@ run_drag() {
     ROOST_BIN=$RT/debug/roost ROOSTCTL=$RT/debug/roostctl \
     ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 ROOST_TEST_TIMEOUT_SCALE=5 \
     python3 tools/input/linux/wayland_drag_check.py"
+
+  log "running the Iced X11 real-input clipboard guard"
+  in_shed "cd ~/roost && \
+    ROOST_ICED_BIN=$RT/debug/roost-iced \
+    ICED_BACKEND=tiny-skia ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 \
+    ROOST_TEST_TIMEOUT_SCALE=5 \
+    python3 tools/input/linux/iced_clipboard_check.py"
+
+  log "running the Iced native X11 file-drop guard"
+  # GTK is the external XDND source application here; roost-iced remains
+  # GTK-free and the Cargo boundary gate verifies that independently.
+  in_shed "cd ~/roost && \
+    ROOST_ICED_BIN=$RT/debug/roost-iced \
+    ICED_BACKEND=tiny-skia ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 \
+    ROOST_TEST_TIMEOUT_SCALE=5 \
+    python3 tools/input/linux/iced_native_file_drop_check.py"
+
+  log "running the Iced cage+uinput Wayland clipboard guard"
+  in_shed "cd ~/roost && \
+    ROOST_ICED_BIN=$RT/debug/roost-iced \
+    ICED_BACKEND=tiny-skia ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 \
+    ROOST_TEST_TIMEOUT_SCALE=5 \
+    python3 tools/input/linux/iced_wayland_clipboard_check.py"
 }
 
 case "${1:-}" in

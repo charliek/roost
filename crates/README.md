@@ -8,7 +8,9 @@ Rust workspace for the Roost UIs and supporting crates:
   unit-testable without a running Roost, and session scoping stays in the
   workspace where the current owner is actually known.
 - `roost-cli` — shell-integration CLI; binary is `roostctl`.
-- `roost-linux` — gtk4-rs + libadwaita Linux UI; embeds the workspace + PTY supervisor in-process.
+- `roost-engine` — toolkit-neutral workspace, persistence, PTY runtime, events, and IPC dispatch.
+- `roost-ui-model` — toolkit-neutral config, themes, keybinds, palettes, providers, and projections.
+- `roost-linux` — gtk4-rs + libadwaita adapter over the shared Rust engine.
 - `roost-vt` / `roost-osc` — libghostty-vt FFI wrapper + OSC scanner.
 
 The daemon-era crates (`roost-core`, `roost-proto`, `roost-common`,

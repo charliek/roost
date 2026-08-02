@@ -1,11 +1,9 @@
-//! Mouse-tracking routing decisions + W3C cursor-shape mapping +
-//! mode 1003 motion throttle for the GTK UI.
+//! GTK mouse-routing decisions and W3C cursor-shape mapping.
 //!
 //! Sibling of `mac/Sources/Roost/MouseRouting.swift` (PR A). Same
-//! contract: pure functions + a `MotionEmitter` struct usable
-//! without a `gtk4::DrawingArea`, so unit tests can pin the routing
-//! decision matrix and the 60 Hz throttle without spinning a GTK
-//! event loop.
+//! The toolkit-neutral pointer DTOs and motion throttle live in
+//! `roost-engine`; this adapter retains the established GTK aliases and the
+//! local URL/cursor precedence rules.
 //!
 //! libghostty-vt's `MouseEncoder` already gates on the negotiated
 //! DEC mode (1000 / 1002 / 1003 / 1006 / 1015 / 1016) — an `encode`
@@ -13,25 +11,10 @@
 //! needs to decide whether to call the encoder at all, vs routing
 //! the event to selection / paste / URL hover.
 
-/// One of the three mouse actions libghostty-vt's encoder accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseRoutingAction {
-    Press,
-    Release,
-    Motion,
-}
-
-/// One of the five buttons the encoder reports on. Wheel up =
-/// `Four`, wheel down = `Five`. `None` is used at call sites that
-/// mean "no button" (motion-no-button under mode 1003).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseRoutingButton {
-    Left,
-    Right,
-    Middle,
-    Four,
-    Five,
-}
+/// Engine-owned pointer DTOs retain the GTK adapter's established aliases.
+pub use roost_engine::pointer::{
+    MotionEmitter, PointerAction as MouseRoutingAction, PointerButton as MouseRoutingButton,
+};
 
 /// What the call site should do with this mouse event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,66 +57,6 @@ pub fn compute_mouse_tracking_dispatch(
     MouseRoutingDispatch::Forward {
         action: event_kind,
         button,
-    }
-}
-
-/// 60 Hz cap + per-cell dedup for mode 1003 motion-no-button
-/// reports. Split into `would_emit` (read-only peek) + `commit`
-/// (advance state) so the encoder-decline case doesn't lock
-/// state — mirrors `mac/Sources/Roost/MouseRouting.swift`'s
-/// `MotionEmitter`.
-///
-/// `now_seconds` is a monotonic-clock-style timestamp in seconds
-/// (`std::time::Instant::elapsed`). Tests inject a hand-rolled
-/// clock instead.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct MotionEmitter {
-    /// Last cell we emitted a report for. `None` until the first
-    /// commit. Private so the `would_emit` / `commit` invariants
-    /// are the only way to advance state; tests within this crate
-    /// access via the in-module `mod tests` rules.
-    last_cell: Option<(u32, u32)>,
-    /// Monotonic seconds of the last emit. `None` until the first
-    /// commit.
-    last_emit: Option<f64>,
-}
-
-impl MotionEmitter {
-    /// 60 Hz cap: 16 ms minimum gap between emits.
-    pub const MIN_INTERVAL_SECONDS: f64 = 1.0 / 60.0;
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Pure read-only check: would `commit(col, row, now)` actually
-    /// advance the state and emit? Used by the production path to
-    /// skip the encoder + scratch alloc when the answer is "no".
-    /// The caller must follow up with `commit` after a successful
-    /// encode so the throttle doesn't lock state on events that the
-    /// encoder declined (e.g. mode 1003 toggling on between two
-    /// same-cell motions).
-    pub fn would_emit(&self, col: u32, row: u32, now_seconds: f64) -> bool {
-        if let Some((lc, lr)) = self.last_cell {
-            if lc == col && lr == row {
-                return false;
-            }
-        }
-        if let Some(last) = self.last_emit {
-            if now_seconds - last < Self::MIN_INTERVAL_SECONDS {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Advance the throttle state. Call this only after the encoder
-    /// successfully produced bytes — committing on a declined
-    /// encode would silently suppress the next event the encoder
-    /// would have accepted.
-    pub fn commit(&mut self, col: u32, row: u32, now_seconds: f64) {
-        self.last_cell = Some((col, row));
-        self.last_emit = Some(now_seconds);
     }
 }
 
@@ -186,38 +109,20 @@ pub fn canonical_cursor_shape(name: &str) -> String {
     }
 }
 
-/// Encode the xterm focus-tracking sequence via libghostty-vt's
-/// `ghostty_focus_encode`. CSI I for focus-gained, CSI O for
-/// focus-lost. Returns an empty vector on any FFI hiccup; callers
-/// guard on non-empty before pushing to the PTY.
-///
-/// Sibling of `TerminalView.encodeFocusBytes` on the Mac side. Both
-/// route through the same C API so a regression in libghostty-vt's
-/// encoding lands on both UIs at once.
-pub fn encode_focus_bytes(focused: bool) -> Vec<u8> {
-    use roost_vt::ffi;
-    let event = if focused {
-        ffi::GhosttyFocusEvent_GHOSTTY_FOCUS_GAINED
-    } else {
-        ffi::GhosttyFocusEvent_GHOSTTY_FOCUS_LOST
-    };
-    let mut buf = [0u8; 8];
-    let mut written: usize = 0;
-    // SAFETY: buf is a real local with capacity 8; written is a
-    // real local. ghostty_focus_encode writes at most 8 bytes for
-    // either focus event (CSI I / CSI O — 3 bytes each).
-    let rc = unsafe {
-        ffi::ghostty_focus_encode(event, buf.as_mut_ptr() as *mut _, buf.len(), &mut written)
-    };
-    if rc != 0 || written == 0 {
-        return Vec::new();
-    }
-    buf[..written].to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_focus_bytes(focused: bool) -> Vec<u8> {
+        let mut terminal = roost_vt::Terminal::new(roost_vt::TerminalOptions {
+            cols: 1,
+            rows: 1,
+            max_scrollback: 0,
+        })
+        .expect("allocate focus encoder test terminal");
+        terminal.vt_write(b"\x1b[?1004h");
+        terminal.encode_focus(focused)
+    }
 
     // ---- compute_mouse_tracking_dispatch ----
 
@@ -436,7 +341,7 @@ mod tests {
         // Encoder declined — no commit.
         assert!(e.would_emit(5, 3, 0.050));
         e.commit(5, 3, 0.050);
-        assert_eq!(e.last_cell, Some((5, 3)));
+        assert!(!e.would_emit(5, 3, 0.100));
     }
 
     #[test]

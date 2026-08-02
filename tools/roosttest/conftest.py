@@ -1,6 +1,6 @@
 """pytest fixtures for the Roost E2E suite.
 
-Parameterized by target UI (`--roost-target mac|gtk`, default `$ROOST_TARGET`
+Parameterized by target UI (`--roost-target mac|gtk|iced`, default `$ROOST_TARGET`
 or `gtk`). A session fixture ensures the UI is running (launching it if
 needed, and quitting only what it launched). Each test gets a fresh
 `roost` client and a throwaway `project` that's cascade-cleaned after.
@@ -42,7 +42,7 @@ _DARWIN_DEV_ALLOWLIST: list[str] = [
 def pytest_addoption(parser):
     parser.addoption(
         "--roost-target", action="store", default=None, choices=list(ui.TARGETS),
-        help="which UI to drive (mac|gtk); default $ROOST_TARGET or gtk",
+        help="which UI to drive (mac|gtk|iced); default $ROOST_TARGET or gtk",
     )
     parser.addoption(
         "--roost-fresh", action="store_true", default=False,
@@ -81,7 +81,8 @@ def _ui_session(target, fresh):
     # Capture the captured-log path up front: `end_session` clears the global,
     # but the file persists, so the #234 critical gate below can read it after
     # the UI has fully stopped (complete log, including shutdown-time lines).
-    gtk_log = ui._GTK_LOG if (started_here and target == "gtk") else None
+    spec = ui.TARGET_SPECS[target]
+    gtk_log = ui._GTK_LOG if (started_here and spec.scans_gtk_criticals) else None
     yield
     if started_here:
         ui.end_session(target)

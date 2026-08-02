@@ -538,7 +538,7 @@ pub struct SocketProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetFailure {
     NoLiveTarget(Vec<PathBuf>),
-    Ambiguous,
+    Ambiguous(Vec<String>),
     UnknownProfile(String),
     Path(String),
 }
@@ -734,7 +734,9 @@ async fn probe_ui(selector: &TargetSelector) -> UiProbe {
     let diagnosis = selector.diagnose().await;
     let target = match diagnosis.resolved {
         Ok(t) => Ok(t.socket_path),
-        Err(TargetError::Ambiguous) => Err(TargetFailure::Ambiguous),
+        Err(TargetError::Ambiguous { live }) => Err(TargetFailure::Ambiguous(
+            live.0.iter().map(|kind| kind.as_str().to_owned()).collect(),
+        )),
         Err(TargetError::NoLiveTarget { tried }) => Err(TargetFailure::NoLiveTarget(tried)),
         Err(TargetError::UnknownProfile(v)) => Err(TargetFailure::UnknownProfile(v)),
         Err(TargetError::Path(e)) => Err(TargetFailure::Path(e.to_string())),
@@ -751,7 +753,7 @@ async fn probe_ui(selector: &TargetSelector) -> UiProbe {
             profile: None,
             outcome: classify_socket(path).await,
         }],
-        Err(TargetFailure::NoLiveTarget(_)) | Err(TargetFailure::Ambiguous) => {
+        Err(TargetFailure::NoLiveTarget(_)) | Err(TargetFailure::Ambiguous(_)) => {
             let mut probes = Vec::with_capacity(diagnosis.candidates.len());
             for (kind, path) in &diagnosis.candidates {
                 probes.push(SocketProbe {
@@ -1771,16 +1773,21 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
                 Status::Fail,
                 format!("no Roost UI is listening (tried: {})", paths(tried)),
             ),
-            Err(TargetFailure::Ambiguous) => (
+            Err(TargetFailure::Ambiguous(live)) => (
                 Status::Fail,
                 format!(
-                    "two Roost UIs are running ({candidates}); pass --target mac|gtk or set \
-                     ROOST_BUNDLE_PROFILE"
+                    "multiple Roost UIs are running ({}; sockets: {candidates}); pass \
+                     --target mac|gtk|iced or set \
+                     ROOST_BUNDLE_PROFILE",
+                    live.join(" + ")
                 ),
             ),
             Err(TargetFailure::UnknownProfile(v)) => (
                 Status::Fail,
-                format!("ROOST_BUNDLE_PROFILE={} is not `mac` or `gtk`", redact(v)),
+                format!(
+                    "ROOST_BUNDLE_PROFILE={} is not `mac`, `gtk`, or `iced`",
+                    redact(v)
+                ),
             ),
             Err(TargetFailure::Path(e)) => (
                 Status::Fail,
@@ -3641,6 +3648,24 @@ mod tests {
         assert_status(&report, "ui.target", Status::Fail);
     }
 
+    #[test]
+    fn ambiguity_names_only_the_live_profiles_and_all_selection_options() {
+        let inputs = Inputs {
+            target_candidates: vec![
+                PathBuf::from("/mac/roost.sock"),
+                PathBuf::from("/gtk/roost.sock"),
+                PathBuf::from("/iced/roost.sock"),
+            ],
+            target: Err(TargetFailure::Ambiguous(vec!["gtk".into(), "iced".into()])),
+            ..Inputs::default()
+        };
+        let report = evaluate(&inputs);
+        let detail = &find(&report, "ui.target").detail;
+        assert!(detail.contains("gtk + iced"), "{detail}");
+        assert!(!detail.contains("mac + gtk"), "{detail}");
+        assert!(detail.contains("--target mac|gtk|iced"), "{detail}");
+    }
+
     // -------------------------------------------- old server / zero tabs
 
     #[test]
@@ -5105,7 +5130,7 @@ mod tests {
         let degraded = [
             Inputs::default(),
             Inputs {
-                target: Err(TargetFailure::Ambiguous),
+                target: Err(TargetFailure::Ambiguous(vec!["mac".into(), "iced".into()])),
                 ..Inputs::default()
             },
             Inputs {
@@ -5954,7 +5979,7 @@ mod tests {
                 ..healthy()
             },
             Inputs {
-                target: Err(TargetFailure::Ambiguous),
+                target: Err(TargetFailure::Ambiguous(vec!["mac".into(), "iced".into()])),
                 sockets: Vec::new(),
                 identify: Err(IdentifyFailure::Protocol("drift".into())),
                 ..Inputs::default()

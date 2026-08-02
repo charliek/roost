@@ -6,15 +6,12 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 publish.workspace      = true
-description = "Roost Linux UI — gtk4-rs + libadwaita-rs. Owns its PTY supervisor + state + JSON IPC server (M3+)."
+description = "Roost Linux UI adapter — gtk4-rs + libadwaita-rs over roost-engine"
 
-# M3 of the daemon-removal refactor (2026-05-23): roost-linux is no
-# longer a gRPC client of roost-core. It owns its PTY supervisor,
-# its workspace state, and serves the post-refactor JSON IPC over a
-# Unix socket. `lib.rs` exposes the testable surface; the `roost`
-# bin is a thin wrapper that wires the gtk4-rs application onto the
-# library. (The crate/package stays `roost-linux`; only the produced
-# binary is named `roost` — `roost` = GUI, `roostctl` = CLI on $PATH.)
+# The GTK adapter renders and handles native UI integration. Authoritative
+# workspace/runtime state lives in `roost-engine`; reusable presentation
+# models live in `roost-ui-model`. The package stays `roost-linux`; only its
+# produced binary is named `roost` (`roostctl` is the CLI on PATH).
 
 [lib]
 name = "roost_linux"
@@ -30,6 +27,8 @@ path = "src/main.rs"
 # pulls it from there along with the IPC client/server types it
 # already used.
 roost-ipc    = { path = "../roost-ipc" }
+roost-engine = { path = "../roost-engine" }
+roost-ui-model = { path = "../roost-ui-model" }
 # Phase 7 commit 2: pull in the safe-API wrappers landed in commit 1.
 # Linking `--features ffi` brings in libghostty-vt's static archive,
 # so the gtk-build CI job now needs the third_party/ghostty/build.sh
@@ -46,18 +45,9 @@ roost-osc    = { path = "../roost-osc" }
 # `tests/url-fixtures/` corpus.
 roost-url    = { path = "../roost-url" }
 
-# PTY supervisor copied from roost-core/src/pty.rs at M3a.
-portable-pty = { workspace = true }
-# `close()` escalates SIGHUP→SIGKILL for shells that ignore the
-# hangup; portable-pty's cloned ChildKiller only sends SIGHUP.
-libc = "0.2"
-
 # State persistence via state.json (M3a): atomic write + reload.
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-
-# Single-instance flock-based lock (M3a).
-fs2 = "0.4"
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -81,8 +71,5 @@ glib = "0.21"
 gdk-pixbuf = "0.21"
 # Cairo + Pango for the cell renderer.
 pangocairo = "0.21"
-# AccelMods bitflags for the keybind table.
-bitflags = "2"
-
 [dev-dependencies]
 tempfile = "3"

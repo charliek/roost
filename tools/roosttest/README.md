@@ -1,6 +1,6 @@
 # roosttest — pytest E2E harness
 
-Functional end-to-end tests that drive a **real** Roost UI (Mac or GTK)
+Functional end-to-end tests that drive a **real** Roost UI (Mac, GTK, or Iced)
 over the JSON IPC socket and assert on the op set — exactly what users
 and `roostctl` drive (the [north star](../../docs/development/vision.md#the-command-core-north-star)).
 Most tests read back via `tab.dump` / `tab.list` / `identify`; the
@@ -19,11 +19,15 @@ make e2e-gtk-ci     # CI parity: ROOST_TEST_MODE=1 + --roost-fresh (owns a fresh
 make e2e-mac-ci     # CI parity (DESTRUCTIVE: force-quits any running Roost.app)
 # or directly:
 uv run --group test pytest tools/roosttest --roost-target mac -v
+uv run --group test pytest tools/roosttest --roost-target iced -v
 ```
 
 The session fixture launches the UI if it isn't already running (and
 quits only what it launched), so a bare `make e2e` is self-contained.
 Build first if needed: `make build` (GTK + roostctl) / `make bundle` (Mac).
+`ROOST_GTK_BIN` and `ROOST_ICED_BIN` select explicit Rust UI executables;
+`ROOST_ROOSTCTL` selects the CLI. The shed uses these to run shed-local ELF
+artifacts while the mounted repository's `target/` contains macOS output.
 
 Use the **`*-ci`** targets to reproduce CI locally: they unlock the
 test-mode-gated ops (`ROOST_TEST_MODE=1`) and force a fresh harness-owned

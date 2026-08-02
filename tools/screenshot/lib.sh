@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # Shared helpers for the Roost UI test harness.
 #
-# Both native UIs (Swift Mac, gtk4-rs Linux) speak the same JSON IPC
+# All three UIs (Swift Mac, gtk4-rs, and Iced) speak the same JSON IPC
 # surface, so the driver is one `roostctl` parameterized by
-# `--target {mac,gtk}`. Only *launch* and *quit* differ per UI; this
+# `--target {mac,gtk,iced}`. Only *launch* and *quit* differ per UI; this
 # file isolates those so the scenario scripts stay UI-agnostic.
 #
 # Source it, then call `ut_init <target>` before anything else.
@@ -31,9 +31,8 @@ ut_resolve_roostctl() {
 }
 
 # Per-target socket path (matches roost-ipc's BundleProfile resolver).
-# macOS uses ~/Library/Caches/Roost{,-gtk}; Linux uses XDG (both
-# profiles share one path there, so the value is informational on
-# Linux — `roostctl --target` still disambiguates).
+# macOS uses three `~/Library/Caches/Roost*` namespaces. Linux keeps the
+# production GTK socket under `roost/` and the POC under `roost-iced/`.
 ut_socket_for() {
   case "$1" in
     mac) echo "${HOME}/Library/Caches/Roost/roost.sock" ;;
@@ -44,17 +43,26 @@ ut_socket_for() {
         echo "${XDG_RUNTIME_DIR:-/tmp/roost-$(id -u)}/roost/roost.sock"
       fi
       ;;
-    *) echo "error: unknown target '$1' (want mac|gtk)" >&2; return 1 ;;
+    iced)
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "${HOME}/Library/Caches/Roost-iced/roost.sock"
+      elif [[ -n "${XDG_RUNTIME_DIR:-}" && "${XDG_RUNTIME_DIR}" == /* ]]; then
+        echo "${XDG_RUNTIME_DIR}/roost-iced/roost.sock"
+      else
+        echo "/tmp/roost-iced-$(id -u)/roost.sock"
+      fi
+      ;;
+    *) echo "error: unknown target '$1' (want mac|gtk|iced)" >&2; return 1 ;;
   esac
 }
 
 # --- init ---------------------------------------------------------------
 
-# ut_init <mac|gtk> — sets UT_TARGET, UT_RC (roostctl path), UT_SOCK.
+# ut_init <mac|gtk|iced> — sets UT_TARGET, UT_RC (roostctl path), UT_SOCK.
 ut_init() {
-  UT_TARGET="${1:?usage: ut_init <mac|gtk>}"
-  case "${UT_TARGET}" in mac|gtk) ;; *)
-    echo "error: target must be mac or gtk, got '${UT_TARGET}'" >&2; return 1 ;;
+  UT_TARGET="${1:?usage: ut_init <mac|gtk|iced>}"
+  case "${UT_TARGET}" in mac|gtk|iced) ;; *)
+    echo "error: target must be mac, gtk, or iced, got '${UT_TARGET}'" >&2; return 1 ;;
   esac
   UT_RC="$(ut_resolve_roostctl)"
   UT_SOCK="$(ut_socket_for "${UT_TARGET}")"
@@ -101,6 +109,12 @@ ut_launch() {
       echo "==> launching roost (GTK)"
       ( cd "${UT_REPO_ROOT}" && RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-gtk-uitest.log 2>&1 & )
       ;;
+    iced)
+      local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
+      [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
+      echo "==> launching roost-iced"
+      ( cd "${UT_REPO_ROOT}" && ROOST_BUNDLE_PROFILE=iced RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-iced-uitest.log 2>&1 & )
+      ;;
   esac
   ut_wait_alive
   echo "==> ${UT_TARGET} UI up (pid $(rc identify 2>/dev/null | sed -n 's/^pid=//p'))"
@@ -111,7 +125,7 @@ ut_quit() {
   ut_alive || { echo "==> ${UT_TARGET} UI not running"; return 0; }
   case "${UT_TARGET}" in
     mac) osascript -e 'tell application "Roost" to quit' >/dev/null 2>&1 || true ;;
-    gtk)
+    gtk|iced)
       local pid; pid="$(rc identify 2>/dev/null | sed -n 's/^pid=//p')"
       [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
       ;;

@@ -7,7 +7,8 @@ press+move+release drag stays coherent), then destroys it.
 
 Usage:
   inject_pointer.py WIDTH HEIGHT "move X Y" "down MIDDLE" "up MIDDLE" ...
-Ops: move X Y | down BTN | up BTN | sleep MS   (BTN: LEFT|MIDDLE|RIGHT)
+Ops: move X Y | down BTN | up BTN | keydown KEY | keyup KEY | sleep MS
+(BTN: LEFT|MIDDLE|RIGHT; KEY: CTRL|ALT|SUPER)
 
 IMPORTANT (multi-monitor): a Wayland compositor binds an absolute device to
 a single output, so WIDTH/HEIGHT must be that ONE output's logical size and
@@ -42,6 +43,7 @@ EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 SYN_REPORT = 0
 ABS_X, ABS_Y = 0, 1
 BTN = {"LEFT": 0x110, "MIDDLE": 0x112, "RIGHT": 0x111}
+KEY = {"CTRL": 29, "ALT": 56, "SUPER": 125}
 
 
 def emit(fd, t, c, v):
@@ -66,6 +68,8 @@ def main():
         fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
         for b in BTN.values():
             fcntl.ioctl(fd, UI_SET_KEYBIT, b)
+        for key in KEY.values():
+            fcntl.ioctl(fd, UI_SET_KEYBIT, key)
         fcntl.ioctl(fd, UI_SET_ABSBIT, ABS_X)
         fcntl.ioctl(fd, UI_SET_ABSBIT, ABS_Y)
         name = b"roost-test-ptr".ljust(80, b"\x00")
@@ -109,6 +113,14 @@ def main():
             time.sleep(0.05)
         elif p[0] == "up":
             emit(fd, EV_KEY, BTN[p[1]], 0)
+            syn(fd)
+            time.sleep(0.05)
+        elif p[0] == "keydown":
+            emit(fd, EV_KEY, KEY[p[1]], 1)
+            syn(fd)
+            time.sleep(0.05)
+        elif p[0] == "keyup":
+            emit(fd, EV_KEY, KEY[p[1]], 0)
             syn(fd)
             time.sleep(0.05)
         elif p[0] == "sleep":

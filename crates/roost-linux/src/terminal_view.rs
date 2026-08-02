@@ -22,6 +22,7 @@
 //! can eyeball the renderer on Mac Homebrew GTK.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,19 +37,26 @@ use gtk4::{
 };
 use pangocairo::functions as pango_cairo;
 
+use roost_url::HoverUrl;
 use roost_vt::{
     ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, MouseEncoder,
-    MouseEvent, RenderState, ScrollViewport, Terminal, TerminalOptions,
+    MouseEvent, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
+    TerminalScroll,
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
+
+fn gtk_history_rows(dy: f64) -> f64 {
+    // GtkEventControllerScroll uses positive Y for down. The shared terminal
+    // policy uses positive for older history (up).
+    -dy
+}
 use crate::clipboard;
 use crate::config::CopyOnSelect;
 use crate::focus::safe_grab_focus;
 use crate::key_encoder;
 use crate::keybind::{self, AccelMods};
 use crate::paste_image;
-use crate::shell_escape;
 use crate::sprite;
 use crate::theme::Theme;
 
@@ -251,9 +259,8 @@ impl TerminalView {
             // first focus-in event the user generates after the
             // widget is realized.
             has_focus: false,
-            scrolled_back: false,
-            scroll_accum: 0.0,
-            selection: None,
+            scroll: TerminalScroll::new(),
+            selection: roost_vt::TerminalSelection::new(),
             copy_on_select: CopyOnSelect::default(),
             input_callback: None,
             write_pty_buffer,
@@ -640,16 +647,12 @@ impl TerminalView {
                 // a "click without drag" and shouldn't render a
                 // selection rect. drag_update flips it to true on the
                 // first movement.
-                s.selection = s.cell_at(x, y, &widget).and_then(|(col, row)| {
-                    let screen_y = s.screen_y_for_viewport_row(row)?;
-                    Some(Selection {
-                        anchor_col: col,
-                        anchor_screen_y: screen_y,
-                        cursor_col: col,
-                        cursor_screen_y: screen_y,
-                        committed: false,
-                    })
-                });
+                if let Some((col, row)) = s.cell_at(x, y, &widget) {
+                    let s_mut: &mut TerminalViewState = &mut s;
+                    let _ = s_mut.selection.begin(&s_mut.terminal, col, row);
+                } else {
+                    s.selection.clear();
+                }
                 drop(s);
                 widget.queue_draw();
             }
@@ -704,22 +707,11 @@ impl TerminalView {
                     let y = start_y + dy;
                     let cell_w = s.cell_metrics.cell_width;
                     let cell_h = s.cell_metrics.cell_height;
-                    let resolved = cell_at_inner(x, y, cell_w, cell_h).and_then(|(col, row)| {
-                        let screen_y = s.screen_y_for_viewport_row(row)?;
-                        Some((col, screen_y))
-                    });
-                    match (resolved, s.selection.as_mut()) {
-                        (Some((col, screen_y)), Some(sel)) => {
-                            sel.cursor_col = col;
-                            sel.cursor_screen_y = screen_y;
-                        }
-                        (None, Some(_)) => {
-                            // Conversion failed mid-drag — drop the
-                            // selection rather than keep updating a
-                            // stale anchor.
-                            s.selection = None;
-                        }
-                        _ => {}
+                    if let Some((col, row)) = cell_at_inner(x, y, cell_w, cell_h) {
+                        let s_mut: &mut TerminalViewState = &mut s;
+                        let _ = s_mut.selection.update(&s_mut.terminal, col, row);
+                    } else {
+                        s.selection.clear();
                     }
                 }
                 drop(s);
@@ -833,25 +825,30 @@ impl TerminalView {
                     return;
                 };
                 let word_break_chars = s.word_break_chars.clone();
-                let row_text = s.text_for_viewport_row(row);
+                let s_mut: &mut TerminalViewState = &mut s;
+                let row_text = match roost_vt::TerminalSelection::row_text(
+                    &s_mut.terminal,
+                    &mut s_mut.render_state,
+                    row,
+                ) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        tracing::warn!(?err, row, "failed to read row for selection expansion");
+                        return;
+                    }
+                };
                 let click_count = u8::try_from(n_press).unwrap_or(u8::MAX);
                 let Some(span) = click_count_span(&row_text, col, click_count, &word_break_chars)
                 else {
                     return;
                 };
-                let Some(screen_y) = s.screen_y_for_viewport_row(row) else {
+                let s_mut: &mut TerminalViewState = &mut s;
+                if !s_mut
+                    .selection
+                    .set(&s_mut.terminal, (span.col0, row), (span.col1, row))
+                {
                     return;
-                };
-                s.selection = Some(Selection {
-                    anchor_col: span.col0,
-                    anchor_screen_y: screen_y,
-                    cursor_col: span.col1,
-                    cursor_screen_y: screen_y,
-                    // `committed = true` so a single-letter word
-                    // (col0 == col1) still renders + copies; Codex
-                    // flagged on PR #177 review.
-                    committed: true,
-                });
+                }
                 s.multi_click_consumed_this_gesture = true;
                 let mode = s.copy_on_select;
                 drop(s);
@@ -1155,12 +1152,11 @@ impl TerminalView {
         s.apply_current_cursor_shape(&self.widget);
     }
 
-    /// Read the active OSC 22 W3C cursor name (canonicalised:
-    /// empty body and `"default"` both return `"default"`). Used by
-    /// the `app.cursor_shape` IPC op.
+    /// Read the effective W3C cursor name. A live modifier-link hover
+    /// overrides the canonicalised OSC 22 shape for `app.cursor_shape`.
     pub fn current_cursor_shape_name(&self) -> String {
         let s = self.state.borrow();
-        roost_linux::mouse_routing::canonical_cursor_shape(&s.current_osc_shape)
+        effective_cursor_shape_name(&s.current_osc_shape, s.hover_url.is_some(), s.link_mod_held)
     }
 
     /// Drive a synthetic mouse event into the production
@@ -1217,33 +1213,11 @@ impl TerminalView {
     /// as the drag handlers.
     pub fn set_selection(&self, anchor: (u16, u16), cursor: (u16, u16)) -> bool {
         let mut s = self.state.borrow_mut();
-        let resolved = (|| {
-            let anchor_y = s.screen_y_for_viewport_row(anchor.1)?;
-            let cursor_y = s.screen_y_for_viewport_row(cursor.1)?;
-            Some((anchor_y, cursor_y))
-        })();
-        match resolved {
-            Some((anchor_y, cursor_y)) => {
-                s.selection = Some(Selection {
-                    anchor_col: anchor.0,
-                    anchor_screen_y: anchor_y,
-                    cursor_col: cursor.0,
-                    cursor_screen_y: cursor_y,
-                    // IPC-driven selections are deliberate commits;
-                    // single-cell sets must render + copy too.
-                    committed: true,
-                });
-                drop(s);
-                self.widget.queue_draw();
-                true
-            }
-            None => {
-                s.selection = None;
-                drop(s);
-                self.widget.queue_draw();
-                false
-            }
-        }
+        let s_mut: &mut TerminalViewState = &mut s;
+        let selected = s_mut.selection.set(&s_mut.terminal, anchor, cursor);
+        drop(s);
+        self.widget.queue_draw();
+        selected
     }
 
     /// Drive the production word-/line-expansion dispatch (the same
@@ -1264,7 +1238,18 @@ impl TerminalView {
     ) -> Option<(u16, u16, Option<String>)> {
         let span = {
             let mut s = self.state.borrow_mut();
-            let row_text = s.text_for_viewport_row(row);
+            let s_mut: &mut TerminalViewState = &mut s;
+            let row_text = match roost_vt::TerminalSelection::row_text(
+                &s_mut.terminal,
+                &mut s_mut.render_state,
+                row,
+            ) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!(?err, row, "failed to read row for selection expansion");
+                    return None;
+                }
+            };
             let word_break_chars = s.word_break_chars.clone();
             click_count_span(&row_text, col, click_count, &word_break_chars)?
         };
@@ -1277,10 +1262,7 @@ impl TerminalView {
 
     /// Clear any active selection on this terminal.
     pub fn clear_selection(&self) {
-        let had = {
-            let mut s = self.state.borrow_mut();
-            s.selection.take().is_some()
-        };
+        let had = self.state.borrow_mut().selection.clear();
         if had {
             self.widget.queue_draw();
         }
@@ -1291,19 +1273,24 @@ impl TerminalView {
     /// endpoint is currently visible in the viewport. Returns `None`
     /// when no selection is active.
     pub fn dump_selection(&self) -> Option<SelectionDumpData> {
-        let (anchor_screen_y, cursor_screen_y) = {
-            let s = self.state.borrow();
-            let sel = s.selection?;
-            (sel.anchor_screen_y, sel.cursor_screen_y)
+        let mut s = self.state.borrow_mut();
+        let s_mut: &mut TerminalViewState = &mut s;
+        let snapshot = match s_mut.selection.snapshot(
+            &s_mut.terminal,
+            &mut s_mut.render_state,
+            s_mut.cols,
+            s_mut.rows,
+        ) {
+            Ok(snapshot) => snapshot?,
+            Err(err) => {
+                tracing::warn!(?err, "failed to snapshot terminal selection");
+                return None;
+            }
         };
-        let text = selection_text(&self.state);
-        let s = self.state.borrow();
-        let anchor_visible = s.viewport_row_for_screen_y(anchor_screen_y).is_some();
-        let cursor_visible = s.viewport_row_for_screen_y(cursor_screen_y).is_some();
         Some(SelectionDumpData {
-            text,
-            anchor_visible,
-            cursor_visible,
+            text: snapshot.text,
+            anchor_visible: snapshot.anchor_visible,
+            cursor_visible: snapshot.cursor_visible,
         })
     }
 
@@ -1484,13 +1471,11 @@ impl TerminalView {
                 // and clears any active selection — even when the key
                 // encodes to nothing (dead keys / IME composition /
                 // unmapped), since typing always overrides a selection.
-                let snapped = s.scrolled_back;
-                if s.scrolled_back {
-                    s.terminal.scroll_viewport(ScrollViewport::Bottom);
-                    s.scrolled_back = false;
-                    s.scroll_accum = 0.0;
-                }
-                let had_selection = s.selection.take().is_some();
+                let snapped = {
+                    let s_mut: &mut TerminalViewState = &mut s;
+                    s_mut.scroll.snap_to_bottom(&mut s_mut.terminal)
+                };
+                let had_selection = s.selection.clear();
                 // Phase 7 commit 6: route through `roost_vt::KeyEncoder`
                 // (the safe wrapper landed in commit 1). The encoder
                 // handles modifier conventions, Kitty keyboard protocol,
@@ -1545,19 +1530,12 @@ struct TerminalViewState {
     cell_metrics: CellMetrics,
     cursor_blink_on: bool,
     has_focus: bool,
-    /// True while the viewport has been scrolled back into history.
-    /// Cleared the moment we scroll back to bottom (either via a
-    /// keystroke snap or by the wheel reaching the active region).
-    /// Consulted before encoding a key to decide whether to snap.
-    scrolled_back: bool,
-    /// Smooth-scroll accumulator. Trackpad / Magic Mouse deltas are
-    /// fractional rows; we accumulate until we have a whole row,
-    /// then dispatch. Discrete wheels usually report 1.0+ per notch
-    /// so the accumulator passes through.
-    scroll_accum: f64,
+    /// Shared, per-terminal wheel accumulator, mode router, and
+    /// snap-to-bottom state. Native GTK units stay in this adapter.
+    scroll: TerminalScroll,
     /// Current drag selection, in (col, screen_y) coordinates.
     /// `None` outside an active drag.
-    selection: Option<Selection>,
+    selection: roost_vt::TerminalSelection,
     /// `copy-on-select` mode from `~/.config/roost/config.conf`,
     /// resolved at startup by `App` and passed through
     /// [`TerminalView::with_theme_font_and_copy`]. Read by `drag_end`
@@ -1675,18 +1653,6 @@ struct TerminalViewState {
     last_applied_cursor_name: Option<&'static str>,
 }
 
-/// Active URL hover. `col0` is the URL's first column (inclusive);
-/// `col1` is the last column (inclusive); `row` is the viewport row.
-/// Same shape as the Mac UI's `HoverURL` so future refactors that
-/// share more logic land symmetrically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HoverUrl {
-    col0: u16,
-    col1: u16,
-    row: u16,
-    url: String,
-}
-
 /// Selection snapshot for the `selection.dump` IPC op. `text` is the
 /// extracted plain text (same path as `Alt+C` / Ctrl+Shift+C) or `None`
 /// when the selection has scrolled fully out of the viewport.
@@ -1694,99 +1660,6 @@ pub struct SelectionDumpData {
     pub text: Option<String>,
     pub anchor_visible: bool,
     pub cursor_visible: bool,
-}
-
-/// Drag-selection state. Rows are stored as libghostty
-/// `PointTag::Screen` y coordinates (the unified screen-including-
-/// scrollback index) so the highlight stays anchored to the same
-/// rows as the user scrolls. Cols are column indices that don't
-/// change with vertical scroll.
-#[derive(Debug, Clone, Copy)]
-struct Selection {
-    anchor_col: u16,
-    anchor_screen_y: u32,
-    cursor_col: u16,
-    cursor_screen_y: u32,
-    /// True when the selection was set as a deliberate commit (the
-    /// multi-click n_press dispatch, `set_selection` from IPC) rather
-    /// than as a single-cell `drag_begin` anchor that the user hasn't
-    /// extended yet. Codex flagged on PR #177 that a double-click on
-    /// a single-letter word (e.g. `i`) returns a `(col, col)` span —
-    /// geometrically equal to a click-without-drag, but the user
-    /// expects to see + copy it. `committed` is the bit that
-    /// distinguishes the two so paint + `selection_text` render the
-    /// single-cell case.
-    committed: bool,
-}
-
-impl Selection {
-    fn is_empty(&self) -> bool {
-        self.anchor_col == self.cursor_col && self.anchor_screen_y == self.cursor_screen_y
-    }
-
-    /// Should the renderer paint this selection / copy-on-select emit
-    /// text for it? A committed single-cell span (e.g. double-click
-    /// on `i`) renders even though `is_empty` is geometrically true;
-    /// an in-progress drag at the anchor cell does not.
-    fn is_visible(&self) -> bool {
-        self.committed || !self.is_empty()
-    }
-
-    /// Normalized `(start_col, start_y, end_col, end_y)` in screen-y
-    /// space. Both ends are exclusive — the cell the user dragged to
-    /// is included, then `+1` makes the bound exclusive for `< end`
-    /// comparisons. Mirrors the Mac UI's `CellSelection.normalized`
-    /// 1:1; pre-rewrite Linux omitted the `+1` on `end_col`, which
-    /// silently dropped the rightmost cell from the paint rectangle
-    /// and the copy text.
-    fn normalized(&self) -> (u16, u32, u16, u32) {
-        if self.anchor_screen_y == self.cursor_screen_y {
-            return (
-                self.anchor_col.min(self.cursor_col),
-                self.anchor_screen_y,
-                self.anchor_col.max(self.cursor_col).saturating_add(1),
-                self.anchor_screen_y.saturating_add(1),
-            );
-        }
-        if self.anchor_screen_y < self.cursor_screen_y {
-            return (
-                self.anchor_col,
-                self.anchor_screen_y,
-                self.cursor_col.saturating_add(1),
-                self.cursor_screen_y.saturating_add(1),
-            );
-        }
-        (
-            self.cursor_col,
-            self.cursor_screen_y,
-            self.anchor_col.saturating_add(1),
-            self.anchor_screen_y.saturating_add(1),
-        )
-    }
-}
-
-/// Compute `[start_col, end_col)` for a single row of a multi-row
-/// selection. Single-row selections use the literal cols; multi-row
-/// selections fill the first row from `start_col` to the right edge,
-/// interior rows full-width, and the last row from the left edge to
-/// `end_col`. Mirrors the Mac UI's `TerminalView.colRange`.
-fn selection_col_range(
-    offset: usize,
-    total_row_span: usize,
-    start_col: u16,
-    end_col: u16,
-    cols: u16,
-) -> (u16, u16) {
-    if total_row_span == 1 {
-        return (start_col, end_col);
-    }
-    if offset == 0 {
-        return (start_col, cols);
-    }
-    if offset == total_row_span - 1 {
-        return (0, end_col);
-    }
-    (0, cols)
 }
 
 impl TerminalViewState {
@@ -2055,70 +1928,37 @@ impl TerminalViewState {
         // Pass D: selection overlay. Translucent fill so cell glyphs
         // and the cursor stay legible underneath. Same shape as the
         // Mac UI's `TerminalView.draw` selection draw.
-        if let Some(sel) = self.selection {
-            if sel.is_visible() {
-                self.paint_selection(cr, sel, cell_w, cell_h);
-            }
-        }
+        let spans = self
+            .selection
+            .visible_spans(&self.terminal, self.cols, self.rows);
+        self.paint_selection(cr, &spans, cell_w, cell_h);
 
         let _ = (width, height);
     }
 
-    fn paint_selection(&self, cr: &cairo::Context, sel: Selection, cell_w: f64, cell_h: f64) {
-        let (sc, sy, ec, ey) = sel.normalized();
+    fn paint_selection(
+        &self,
+        cr: &cairo::Context,
+        spans: &[roost_vt::SelectionSpan],
+        cell_w: f64,
+        cell_h: f64,
+    ) {
         let (r, g, b) = self.theme.selection_background.to_f64();
-        let total_row_span = (ey - sy) as usize;
-        let cols = self.cols;
-        // Walk each row of the selection in screen-y space, resolve
-        // to a viewport row each frame, skip rows currently outside
-        // the visible viewport. This makes the highlight scroll with
-        // the content (the bug fix).
-        for offset in 0..total_row_span {
-            let screen_y = sy.saturating_add(offset as u32);
-            let Some(v_row) = self.viewport_row_for_screen_y(screen_y) else {
-                continue;
-            };
-            let (start_col, end_col) = selection_col_range(offset, total_row_span, sc, ec, cols);
+        for span in spans {
             cr.set_source_rgba(r, g, b, 0.35);
             cr.rectangle(
-                start_col as f64 * cell_w,
-                v_row as f64 * cell_h,
-                end_col.saturating_sub(start_col) as f64 * cell_w,
+                span.col0 as f64 * cell_w,
+                span.row as f64 * cell_h,
+                span.col1.saturating_sub(span.col0) as f64 * cell_w,
                 cell_h,
             );
             let _ = cr.fill();
         }
     }
 
-    /// Convert a viewport row (0 = top of visible area) to its
-    /// `PointTag::Screen` y coordinate. Returns `None` when libghostty
-    /// rejects the conversion (out-of-range row, no terminal set up
-    /// yet). Used by drag-begin / drag-update to anchor selection in
-    /// scrollback-stable coordinates.
-    fn screen_y_for_viewport_row(&self, row: u16) -> Option<u32> {
-        let pt = roost_vt::Point::viewport(0, row as u32);
-        let screen = self
-            .terminal
-            .convert_point(pt, roost_vt::PointTag::Screen)?;
-        Some(screen.y)
-    }
-
-    /// Convert a `PointTag::Screen` y coordinate back to its current
-    /// viewport row. Returns `None` when the row is scrolled out of
-    /// the visible viewport (caller should clip / skip).
-    fn viewport_row_for_screen_y(&self, screen_y: u32) -> Option<u16> {
-        let pt = roost_vt::Point::screen(0, screen_y);
-        let viewport = self
-            .terminal
-            .convert_point(pt, roost_vt::PointTag::Viewport)?;
-        if viewport.y >= self.rows as u32 {
-            return None;
-        }
-        Some(viewport.y as u16)
-    }
-
-    /// Handle a single scroll-wheel `dy`. Negative = up (older
-    /// history). 3 modes:
+    /// Handle a single GTK scroll-wheel `dy`. GTK reports negative for
+    /// wheel-up, so this adapter negates it into `TerminalScroll`'s positive-
+    /// toward-history convention. Three modes:
     ///   * Mouse-tracking (DECSET 1000/1002/1003) — encode button-4/5
     ///     reports via `encode_wheel_buttons`, checked first so a
     ///     tracking alt-screen app (htop) gets the report.
@@ -2132,82 +1972,49 @@ impl TerminalViewState {
     /// dispatches them through `input_callback` after dropping the
     /// borrow, per the callback invariant on `TerminalViewState`.
     fn handle_scroll(&mut self, dy: f64, mods: roost_vt::Mods) -> Vec<u8> {
-        // Smooth-scroll accumulator. Trackpad deltas are typically
-        // fractional rows; discrete wheels are integers.
-        self.scroll_accum += dy;
-        // 3 rows per discrete notch matches the Mac UI; for smooth
-        // scroll we step one row at a time so the animation isn't
-        // jumpy.
-        let rows_to_scroll = if self.scroll_accum.abs() >= 1.0 {
-            let rows = self.scroll_accum.trunc() as isize;
-            self.scroll_accum -= rows as f64;
-            rows
-        } else {
-            return Vec::new();
-        };
-
-        // Mouse tracking: the app opted into mouse events, so forward the
-        // wheel as button-4 (up) / button-5 (down) reports at the
-        // pointer's cell. Checked *before* alt-screen — a mouse-tracking
-        // alt-screen app (htop) wants the report, not arrow keys. The
-        // encoder honors the negotiated format (X10 / SGR / pixels).
-        if self.terminal.mouse_tracking() {
-            return self.encode_wheel_buttons(rows_to_scroll, mods);
-        }
-
-        if self.terminal.active_screen() == ActiveScreen::Alternate {
-            // Translate to arrow keys for alt-screen apps.
-            let key = if rows_to_scroll < 0 {
-                roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP
-            } else {
-                roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN
-            };
-            let mut event = match roost_vt::KeyEvent::new() {
-                Ok(ev) => ev,
-                Err(_) => return Vec::new(),
-            };
-            event.set_action(roost_vt::key_action::PRESS);
-            event.set_key(key);
-            event.set_mods(0);
-            self.encoder.sync_from_terminal(&self.terminal);
-            let mut out = Vec::new();
-            for _ in 0..rows_to_scroll.unsigned_abs() {
-                if let Ok(bytes) = self.encoder.encode(&event) {
-                    out.extend_from_slice(&bytes);
-                }
+        let route = self.scroll.route(&mut self.terminal, gtk_history_rows(dy));
+        match route {
+            Some(ScrollRoute::MouseReport { direction, rows }) => {
+                self.encode_wheel_buttons(direction, rows, mods)
             }
-            return out;
+            Some(ScrollRoute::AlternateScreenKey { direction, rows }) => {
+                let key = match direction {
+                    ScrollDirection::History => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP,
+                    ScrollDirection::Bottom => roost_vt::ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN,
+                };
+                let mut event = match roost_vt::KeyEvent::new() {
+                    Ok(event) => event,
+                    Err(_) => return Vec::new(),
+                };
+                event.set_action(roost_vt::key_action::PRESS);
+                event.set_key(key);
+                event.set_mods(0);
+                self.encoder.sync_from_terminal(&self.terminal);
+                let mut out = Vec::new();
+                for _ in 0..rows {
+                    if let Ok(bytes) = self.encoder.encode(&event) {
+                        out.extend_from_slice(&bytes);
+                    }
+                }
+                out
+            }
+            Some(ScrollRoute::LocalViewport { .. }) | None => Vec::new(),
         }
-
-        // Primary screen: local scrollback. Negative dy = scroll up
-        // (older history). libghostty's Delta semantics use negative
-        // for up.
-        self.terminal
-            .scroll_viewport(ScrollViewport::Delta(-rows_to_scroll));
-        // Track whether we're scrolled back. A positive scroll-down
-        // that lands us at the active region clears the flag.
-        if rows_to_scroll < 0 {
-            self.scrolled_back = true;
-        } else if rows_to_scroll > 0 && self.scrolled_back {
-            // Heuristic: if we scrolled down by the request, assume
-            // we're back at bottom. A more precise check would call
-            // a render-state getter for the viewport offset; deferred
-            // since the keystroke snap is the primary "back-to-bottom"
-            // path.
-            self.scrolled_back = false;
-        }
-        Vec::new()
     }
 
     /// Encode one wheel button-press per scrolled row at the pointer's
-    /// current cell. `rows < 0` is wheel-up (button 4); `rows > 0` is
-    /// wheel-down (button 5). Returns the concatenated reports (empty if
+    /// current cell. History is button 4 and Bottom is button 5. Returns the
+    /// concatenated reports (empty if
     /// the encoder declines, e.g. the negotiated format reports nothing).
-    fn encode_wheel_buttons(&mut self, rows: isize, mods: roost_vt::Mods) -> Vec<u8> {
-        let button = if rows < 0 {
-            roost_vt::mouse_button::FOUR // wheel up
-        } else {
-            roost_vt::mouse_button::FIVE // wheel down
+    fn encode_wheel_buttons(
+        &mut self,
+        direction: ScrollDirection,
+        rows: usize,
+        mods: roost_vt::Mods,
+    ) -> Vec<u8> {
+        let button = match direction {
+            ScrollDirection::History => roost_vt::mouse_button::FOUR,
+            ScrollDirection::Bottom => roost_vt::mouse_button::FIVE,
         };
         let cw = self.cell_metrics.cell_width.max(1.0);
         let ch = self.cell_metrics.cell_height.max(1.0);
@@ -2233,7 +2040,7 @@ impl TerminalViewState {
         event.set_position(x, y);
 
         let mut out = Vec::new();
-        for _ in 0..rows.unsigned_abs() {
+        for _ in 0..rows {
             if let Ok(bytes) = self.mouse_encoder.encode(&event) {
                 out.extend_from_slice(&bytes);
             }
@@ -2358,10 +2165,7 @@ impl TerminalViewState {
     /// when mode 1004 is off, so the caller can no-op without an
     /// extra check).
     fn encode_focus_bytes_if_active(&self, focused: bool) -> Vec<u8> {
-        if !self.terminal.mode_get(1004) {
-            return Vec::new();
-        }
-        roost_linux::mouse_routing::encode_focus_bytes(focused)
+        self.terminal.encode_focus(focused)
     }
 
     /// Resolve the URL (if any) covering `(col, row)`. OSC 8 wins
@@ -2381,14 +2185,19 @@ impl TerminalViewState {
                 url: uri,
             });
         }
-        let row_text = self.text_for_viewport_row(row);
-        let span = roost_url::find_url_at(&row_text, col)?;
-        Some(HoverUrl {
-            col0: span.col0,
-            col1: span.col1,
+        let projection = match roost_vt::TerminalSelection::row_text_projection(
+            &self.terminal,
+            &mut self.render_state,
             row,
-            url: span.url,
-        })
+            self.cols,
+        ) {
+            Ok(projection) => projection,
+            Err(err) => {
+                tracing::warn!(?err, row, "failed to project terminal row for URL hover");
+                return None;
+            }
+        };
+        regex_hover_from_projection(&projection, col, row)
     }
 
     /// Walk an OSC 8 span outward from `(col, row)`. libghostty only
@@ -2397,41 +2206,9 @@ impl TerminalViewState {
     /// shares the URI. Stops at the row edge — line-wrap is a TODO.
     fn osc8_span_at(&self, col: u16, row: u16, uri: &str) -> (u16, u16) {
         let row_y = row as u32;
-        osc8_span_walk(col, self.cols.saturating_sub(1), uri, |c| {
+        roost_url::contiguous_hyperlink_span(col, self.cols.saturating_sub(1), uri, |c| {
             self.terminal.hyperlink_at(c, row_y)
         })
-    }
-
-    /// Build the visible text of one viewport row by walking the
-    /// render state. Each cell contributes exactly **one Unicode
-    /// codepoint** so the click column (cell units) lines up with
-    /// `row.chars().nth(col)` in `word_selection` / `roost_url` —
-    /// codex flagged this on PR #176 after noticing that a row
-    /// starting with `e\u{0301}` would otherwise shift `chars()`
-    /// indices past cell columns. We emit each grapheme's first
-    /// char and drop any trailing combining marks; the terminal
-    /// cell is one display column regardless, so the lossy
-    /// reduction only affects what the algorithms see (no glyph is
-    /// painted from this string). Empty cells fall through as a
-    /// single space.
-    ///
-    /// Same shape as `dump_text`, narrowed to one row.
-    fn text_for_viewport_row(&mut self, target_row: u16) -> String {
-        if let Err(err) = self.render_state.update(&self.terminal) {
-            tracing::warn!(?err, "render_state.update failed for hover URL");
-            return String::new();
-        }
-        let mut line = String::new();
-        let _ = self.render_state.walk(&self.terminal, |row, cell: Cell| {
-            if row != target_row as u32 {
-                return;
-            }
-            match cell.text.chars().next() {
-                Some(c) => line.push(c),
-                None => line.push(' '),
-            }
-        });
-        line
     }
 
     /// Swap the widget's cursor between `pointer` (URL hover with
@@ -2655,72 +2432,19 @@ fn color_scheme_report(light: bool) -> &'static [u8] {
 /// selection. A fuller scroll-walk-restore implementation is a
 /// follow-up; mirrors the Mac UI's limitation in `selectedPlainText`.
 fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
-    let s = state.borrow();
-    let sel = s.selection?;
-    if !sel.is_visible() {
-        return None;
-    }
-    let (sc, sy, ec, ey) = sel.normalized();
-    let total_row_span = (ey - sy) as usize;
-    if total_row_span == 0 {
-        return None;
-    }
-    let cols = s.cols;
-
-    // Map viewport rows currently representing this selection back to
-    // their selection offset. Off-viewport rows are silently skipped.
-    let mut offset_for_viewport_row: std::collections::HashMap<u32, usize> =
-        std::collections::HashMap::with_capacity(total_row_span);
-    for offset in 0..total_row_span {
-        let screen_y = sy.saturating_add(offset as u32);
-        if let Some(v_row) = s.viewport_row_for_screen_y(screen_y) {
-            offset_for_viewport_row.insert(v_row as u32, offset);
-        }
-    }
-    drop(s);
-    if offset_for_viewport_row.is_empty() {
-        return None;
-    }
-
-    let mut rows: Vec<String> = vec![String::new(); total_row_span];
     let mut s = state.borrow_mut();
-    let TerminalViewState {
-        terminal,
-        render_state,
-        ..
-    } = &mut *s;
-    let _ = render_state.update(terminal);
-    let _ = render_state.walk(terminal, |row, cell| {
-        let Some(&offset) = offset_for_viewport_row.get(&row) else {
-            return;
-        };
-        let (start_col, end_col) = selection_col_range(offset, total_row_span, sc, ec, cols);
-        if cell.col < start_col || cell.col >= end_col {
-            return;
+    let s_mut: &mut TerminalViewState = &mut s;
+    match s_mut.selection.selected_text(
+        &s_mut.terminal,
+        &mut s_mut.render_state,
+        s_mut.cols,
+        s_mut.rows,
+    ) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::warn!(?err, "failed to extract terminal selection text");
+            None
         }
-        if cell.text.is_empty() {
-            rows[offset].push(' ');
-        } else {
-            rows[offset].push_str(&cell.text);
-        }
-    });
-    drop(s);
-
-    // Trim trailing whitespace per row, then drop empty leading and
-    // trailing rows so a partial copy (where the first or last
-    // selection rows scrolled off-screen and are blank in `rows`)
-    // doesn't carry stray newlines into the clipboard.
-    let mut trimmed: Vec<String> = rows.iter().map(|r| r.trim_end().to_string()).collect();
-    while matches!(trimmed.first(), Some(line) if line.is_empty()) {
-        trimmed.remove(0);
-    }
-    while matches!(trimmed.last(), Some(line) if line.is_empty()) {
-        trimmed.pop();
-    }
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.join("\n"))
     }
 }
 
@@ -2801,60 +2525,28 @@ fn install_file_drop(widget: &DrawingArea, state: &Rc<RefCell<TerminalViewState>
 /// yields no local path is ignored.
 fn drop_value_to_text(value: &glib::Value) -> Option<String> {
     if let Ok(list) = value.get::<gtk4::gdk::FileList>() {
-        let paths: Vec<String> = list
+        let paths = list
             .files()
             .iter()
-            .filter_map(|f| f.path())
-            // Skip non-UTF-8 paths rather than lossily mangling them: a
-            // U+FFFD-substituted path would silently name a different (or
-            // nonexistent) file. A rejected path is a clean no-op. (macOS
-            // enforces Unicode filenames, so the Mac side has no equivalent.)
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect();
-        return drop_text(&paths, None);
+            .filter_map(|file| file.path())
+            .collect::<Vec<_>>();
+        return roost_ui_model::drop_content::resolve(&paths, None);
     }
     if let Ok(file) = value.get::<gtk4::gio::File>() {
-        let paths: Vec<String> = file
-            .path()
-            .iter()
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect();
-        return drop_text(&paths, None);
+        let paths = file.path().into_iter().collect::<Vec<_>>();
+        return roost_ui_model::drop_content::resolve(&paths, None);
     }
     if let Ok(s) = value.get::<String>() {
-        return drop_text(&[], Some(&s));
+        return roost_ui_model::drop_content::resolve(std::iter::empty::<&Path>(), Some(&s));
     }
     None
-}
-
-/// Pure resolver from a drop payload to the text inserted into the PTY: file
-/// paths take priority (shell-escaped, de-duplicated, newline-joined, with any
-/// newline-bearing path dropped — a `\n` would split the join and, at a raw
-/// shell, execute everything after it), else a plain string verbatim (it may be
-/// a command the user wants to run). Returns `None` for an empty payload so the
-/// caller emits no stray `ESC[200~ESC[201~`. Mirrors
-/// `TerminalView.dropContentString` on Mac.
-fn drop_text(file_paths: &[String], string: Option<&str>) -> Option<String> {
-    let mut seen = std::collections::HashSet::new();
-    let escaped: Vec<String> = file_paths
-        .iter()
-        .filter(|p| !p.contains('\n') && !p.contains('\r'))
-        .filter(|p| seen.insert(p.as_str()))
-        .map(|p| shell_escape::escape(p))
-        .collect();
-    if !escaped.is_empty() {
-        return Some(escaped.join("\n"));
-    }
-    match string {
-        Some(s) if !s.is_empty() => Some(s.to_string()),
-        _ => None,
-    }
 }
 
 /// Decide which span (word vs line) a double/triple-click should
 /// select for a row of text. Pure helper so the GTK n_press dispatch
 /// stays testable without standing up a `DrawingArea` — same shape
-/// as `osc8_span_walk`. Returns `None` for `click_count < 2` (caller
+/// as `roost_url::contiguous_hyperlink_span`. Returns `None` for
+/// `click_count < 2` (caller
 /// falls through to the single-cell drag path) and for `click_count
 /// == 2` where the clicked cell itself is whitespace. `click_count`
 /// values above 3 fall through to the triple-click line span, matching
@@ -2871,27 +2563,6 @@ fn click_count_span(
         2 => roost_linux::word_selection::expand_word(row_text, col, word_break_chars),
         _ => Some(roost_linux::word_selection::expand_line(row_text)),
     }
-}
-
-/// Walk an OSC 8 hyperlink span outward from `col` while the
-/// per-cell URI lookup `hyperlink_at` keeps returning `Some(uri)`.
-/// Pure function so the `osc8_span_at` method on `TerminalViewState`
-/// can be unit-tested against a stubbed lookup without standing up
-/// a full GTK widget. `max_col` is the rightmost valid column on
-/// the row (inclusive) — typically `cols - 1`.
-fn osc8_span_walk<F>(col: u16, max_col: u16, uri: &str, mut hyperlink_at: F) -> (u16, u16)
-where
-    F: FnMut(u16) -> Option<String>,
-{
-    let mut c0 = col;
-    while c0 > 0 && hyperlink_at(c0 - 1).as_deref() == Some(uri) {
-        c0 -= 1;
-    }
-    let mut c1 = col;
-    while c1 < max_col && hyperlink_at(c1 + 1).as_deref() == Some(uri) {
-        c1 += 1;
-    }
-    (c0, c1)
 }
 
 /// Map an [`AccelMods`] link modifier to the GDK mask(s) that count as
@@ -2914,6 +2585,33 @@ fn link_modifier_mask(m: AccelMods) -> gtk4::gdk::ModifierType {
         set |= M::SUPER_MASK | M::META_MASK;
     }
     set
+}
+
+fn effective_cursor_shape_name(osc_shape: &str, has_hover: bool, link_held: bool) -> String {
+    if has_hover && link_held {
+        "pointer".into()
+    } else {
+        roost_linux::mouse_routing::canonical_cursor_shape(osc_shape)
+    }
+}
+
+fn regex_hover_from_projection(
+    projection: &roost_vt::RowTextProjection,
+    cell_col: u16,
+    row: u16,
+) -> Option<HoverUrl> {
+    let char_col = projection
+        .char_index_at_cell(cell_col)
+        .and_then(|index| u16::try_from(index).ok())?;
+    let span = roost_url::find_url_at(projection.text(), char_col)?;
+    let (col0, col1) =
+        projection.cell_span_for_chars(usize::from(span.col0), usize::from(span.col1))?;
+    Some(HoverUrl {
+        col0,
+        col1,
+        row,
+        url: span.url,
+    })
 }
 
 /// Pixel rectangle (x, y, w, h) for the underline overlay drawn on
@@ -3093,6 +2791,12 @@ mod tests {
     use roost_vt::{Cell, ColorRgb, Style};
 
     #[test]
+    fn gtk_scroll_sign_normalizes_up_to_positive_history() {
+        assert_eq!(gtk_history_rows(-1.0), 1.0);
+        assert_eq!(gtk_history_rows(1.0), -1.0);
+    }
+
+    #[test]
     fn link_modifier_mask_super_accepts_meta_and_super() {
         use gtk4::gdk::ModifierType as M;
         let mask = link_modifier_mask(AccelMods::SUPER);
@@ -3113,6 +2817,38 @@ mod tests {
         assert!(!M::META_MASK.intersects(link_modifier_mask(AccelMods::CTRL)));
     }
 
+    #[test]
+    fn effective_cursor_shape_prefers_live_link_hover() {
+        assert_eq!(
+            effective_cursor_shape_name("crosshair", true, true),
+            "pointer"
+        );
+        assert_eq!(
+            effective_cursor_shape_name("crosshair", true, false),
+            "crosshair"
+        );
+        assert_eq!(effective_cursor_shape_name("", false, true), "default");
+    }
+
+    #[test]
+    fn regex_hover_preserves_combining_url_and_wide_tail_cells() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let mut render_state = RenderState::new().unwrap();
+        let url = "https://wide.test/e\u{301}界";
+        terminal.vt_write(url.as_bytes());
+        let projection =
+            roost_vt::TerminalSelection::row_text_projection(&terminal, &mut render_state, 0, 80)
+                .unwrap();
+        let hover = regex_hover_from_projection(&projection, 20, 0).unwrap();
+        assert_eq!(hover.url, url);
+        assert_eq!((hover.col0, hover.col1, hover.row), (0, 20, 0));
+    }
+
     const DEFAULT_FG: ColorRgb = ColorRgb::new(0xe5, 0xe5, 0xe5);
     const DEFAULT_BG: ColorRgb = ColorRgb::new(0x1c, 0x1c, 0x1c);
     const EXPLICIT_FG: ColorRgb = ColorRgb::new(0x80, 0xc0, 0x40);
@@ -3127,116 +2863,6 @@ mod tests {
             text: String::new(),
             style,
         }
-    }
-
-    // Selection column-range helper tests. Mirrors
-    // `mac/Tests/RoostTests/SelectionColRangeTests.swift` 1:1 so both
-    // UIs agree on how a multi-row selection's first/middle/last rows
-    // map to per-row [start_col, end_col) extents.
-    const COLS: u16 = 80;
-
-    #[test]
-    fn selection_col_range_single_row_uses_literal_cols() {
-        let (s, e) = selection_col_range(0, 1, 3, 17, COLS);
-        assert_eq!((s, e), (3, 17));
-    }
-
-    #[test]
-    fn selection_col_range_first_row_of_multi_fills_to_right_edge() {
-        let (s, e) = selection_col_range(0, 4, 12, 5, COLS);
-        assert_eq!((s, e), (12, COLS));
-    }
-
-    #[test]
-    fn selection_col_range_interior_row_spans_full_width() {
-        let (s, e) = selection_col_range(1, 4, 12, 5, COLS);
-        assert_eq!((s, e), (0, COLS));
-    }
-
-    #[test]
-    fn selection_col_range_last_row_ends_at_end_col() {
-        let (s, e) = selection_col_range(3, 4, 12, 5, COLS);
-        assert_eq!((s, e), (0, 5));
-    }
-
-    // Selection-rectangle normalization tests — ensure that dragging
-    // in any direction (anchor below cursor, anchor above cursor,
-    // anchor and cursor on same row, same cell) yields a
-    // well-formed normalized rectangle. Catches off-by-ones in the
-    // screen-y vs viewport-row migration.
-    #[test]
-    fn selection_normalized_same_cell_is_empty_zero_span() {
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 100,
-            cursor_col: 5,
-            cursor_screen_y: 100,
-            committed: false,
-        };
-        assert!(sel.is_empty());
-        let (sc, sy, ec, ey) = sel.normalized();
-        // Empty selection still produces a 1-cell normalized rect.
-        assert_eq!((sc, sy, ec, ey), (5, 100, 6, 101));
-    }
-
-    #[test]
-    fn selection_normalized_anchor_above_cursor_keeps_order() {
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 10,
-            cursor_col: 8,
-            cursor_screen_y: 12,
-            committed: false,
-        };
-        let (sc, sy, ec, ey) = sel.normalized();
-        assert_eq!((sc, sy, ec, ey), (5, 10, 9, 13));
-    }
-
-    #[test]
-    fn selection_normalized_cursor_above_anchor_swaps() {
-        let sel = Selection {
-            anchor_col: 8,
-            anchor_screen_y: 12,
-            cursor_col: 5,
-            cursor_screen_y: 10,
-            committed: false,
-        };
-        let (sc, sy, ec, ey) = sel.normalized();
-        // Same rectangle as the previous test — direction-independent.
-        assert_eq!((sc, sy, ec, ey), (5, 10, 9, 13));
-    }
-
-    #[test]
-    fn selection_is_visible_single_cell_uncommitted_hides() {
-        // Drag_begin at a single cell that the user never extended
-        // — anchor == cursor, committed = false. Should NOT render
-        // or copy.
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 10,
-            cursor_col: 5,
-            cursor_screen_y: 10,
-            committed: false,
-        };
-        assert!(sel.is_empty());
-        assert!(!sel.is_visible());
-    }
-
-    #[test]
-    fn selection_is_visible_single_cell_committed_renders() {
-        // Multi-click selected a single-letter word like `i` — the
-        // n_press dispatch sets committed = true so the paint pass
-        // and selection_text still emit the cell, even though it's
-        // geometrically empty. Pins the Codex PR #177 regression.
-        let sel = Selection {
-            anchor_col: 5,
-            anchor_screen_y: 10,
-            cursor_col: 5,
-            cursor_screen_y: 10,
-            committed: true,
-        };
-        assert!(sel.is_empty());
-        assert!(sel.is_visible());
     }
 
     #[test]
@@ -3452,7 +3078,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn osc8_span_walk_finds_contiguous_run() {
+    fn shared_osc8_span_walk_finds_contiguous_run() {
         // Cells 5..9 all carry the same URI; everything else does not.
         let cells: HashMap<u16, &'static str> = HashMap::from_iter([
             (5, "https://x.test"),
@@ -3464,28 +3090,37 @@ mod tests {
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
         // Probing from the middle of the span walks both ways.
-        assert_eq!(osc8_span_walk(7, 79, "https://x.test", lookup), (5, 9));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(7, 79, "https://x.test", lookup),
+            (5, 9)
+        );
         // Probing from the left edge walks only rightward.
-        assert_eq!(osc8_span_walk(5, 79, "https://x.test", lookup), (5, 9));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(5, 79, "https://x.test", lookup),
+            (5, 9)
+        );
         // Probing from the right edge walks only leftward.
-        assert_eq!(osc8_span_walk(9, 79, "https://x.test", lookup), (5, 9));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(9, 79, "https://x.test", lookup),
+            (5, 9)
+        );
     }
 
     #[test]
-    fn osc8_span_walk_handles_single_cell_span() {
+    fn shared_osc8_span_walk_handles_single_cell_span() {
         // A 1-cell URI must report `(col, col)` — no over-walk past the
         // span into adjacent non-OSC-8 cells.
         let cells: HashMap<u16, &'static str> = HashMap::from_iter([(12, "https://only-one.test")]);
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
         assert_eq!(
-            osc8_span_walk(12, 79, "https://only-one.test", lookup),
+            roost_url::contiguous_hyperlink_span(12, 79, "https://only-one.test", lookup),
             (12, 12)
         );
     }
 
     #[test]
-    fn osc8_span_walk_stops_at_right_edge() {
+    fn shared_osc8_span_walk_stops_at_right_edge() {
         // The span runs all the way to the row's last cell — the walk
         // must clamp at `max_col`, not over-run into the next row's
         // first cell.
@@ -3493,11 +3128,14 @@ mod tests {
             HashMap::from_iter([(77, "https://x"), (78, "https://x"), (79, "https://x")]);
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
-        assert_eq!(osc8_span_walk(78, 79, "https://x", lookup), (77, 79));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(78, 79, "https://x", lookup),
+            (77, 79)
+        );
     }
 
     #[test]
-    fn osc8_span_walk_stops_at_uri_boundary() {
+    fn shared_osc8_span_walk_stops_at_uri_boundary() {
         // Adjacent OSC 8 cells with a DIFFERENT URI must not extend
         // the span — different hyperlinks live next to each other in
         // shell output like `ls --hyperlink`.
@@ -3509,8 +3147,14 @@ mod tests {
         ]);
         let lookup = |c: u16| cells.get(&c).map(|s| s.to_string());
 
-        assert_eq!(osc8_span_walk(4, 79, "https://a", lookup), (3, 4));
-        assert_eq!(osc8_span_walk(5, 79, "https://b", lookup), (5, 6));
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(4, 79, "https://a", lookup),
+            (3, 4)
+        );
+        assert_eq!(
+            roost_url::contiguous_hyperlink_span(5, 79, "https://b", lookup),
+            (5, 6)
+        );
     }
 
     #[test]
@@ -3536,7 +3180,7 @@ mod tests {
     // pipeline is exercised in the e2e pytest run against a live
     // UI via `tab.expand_selection_at`. The unit-test layer below
     // covers the pure click-count branch in isolation, mirroring
-    // PR #175's `osc8_span_walk` pure-helper coverage.
+    // PR #175's shared OSC 8 span pure-helper coverage.
 
     use roost_linux::word_selection::{WordSpan, DEFAULT_EXTRA_WORD_CHARS};
 
@@ -3595,76 +3239,6 @@ mod tests {
             click_count_span("see /tmp/foo.txt today", 7, 2, "_-+~:@%"),
             Some(WordSpan { col0: 5, col1: 7 })
         );
-    }
-
-    // Drop-payload resolver. Mirrors `DropContentResolverTests` on Mac so the
-    // two drag-and-drop implementations stay at parity.
-
-    fn p(s: &str) -> String {
-        s.to_string()
-    }
-
-    #[test]
-    fn drop_text_single_file_is_escaped() {
-        assert_eq!(
-            drop_text(&[p("/tmp/My File.png")], None),
-            Some("/tmp/My\\ File.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_multiple_files_are_newline_joined() {
-        assert_eq!(
-            drop_text(&[p("/tmp/a b.png"), p("/tmp/c.png")], None),
-            Some("/tmp/a\\ b.png\n/tmp/c.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_duplicate_files_are_collapsed() {
-        assert_eq!(
-            drop_text(&[p("/tmp/shot.png"), p("/tmp/shot.png")], None),
-            Some("/tmp/shot.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_newline_path_is_dropped() {
-        assert_eq!(drop_text(&[p("/tmp/ev\nil.png")], None), None);
-        assert_eq!(
-            drop_text(&[p("/tmp/ev\nil.png"), p("/tmp/ok.png")], None),
-            Some("/tmp/ok.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_string_is_not_escaped() {
-        assert_eq!(
-            drop_text(&[], Some("git status && ls")),
-            Some("git status && ls".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_multiline_string_is_preserved() {
-        assert_eq!(
-            drop_text(&[], Some("line one\nline two")),
-            Some("line one\nline two".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_files_take_priority_over_string() {
-        assert_eq!(
-            drop_text(&[p("/tmp/a.png")], Some("ignored")),
-            Some("/tmp/a.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_empty_payload_is_none() {
-        assert_eq!(drop_text(&[], None), None);
-        assert_eq!(drop_text(&[], Some("")), None);
     }
 
     // Strict-DECTCEM cursor decision. 1:1 with the Swift suite in

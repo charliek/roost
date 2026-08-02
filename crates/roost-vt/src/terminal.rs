@@ -53,6 +53,24 @@ pub enum ScrollViewport {
     Delta(isize),
 }
 
+/// Authoritative scrollable-area state reported by libghostty-vt.
+///
+/// `offset + len >= total` means the viewport is at the live bottom.  Keep
+/// this wrapper layout-independent so callers never depend on bindgen's C
+/// struct representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Scrollbar {
+    pub fn is_at_bottom(self) -> bool {
+        self.offset.saturating_add(self.len) >= self.total
+    }
+}
+
 /// Result of `Terminal::active_screen()`. The Mac UI's scroll handler
 /// uses this to decide between local scrollback and alt-screen arrow
 /// translation.
@@ -418,6 +436,32 @@ impl Terminal {
         unsafe { sys::ghostty_terminal_scroll_viewport(self.handle, viewport) };
     }
 
+    /// Return the terminal's current viewport position within its scrollable
+    /// rows. This is the authoritative way to distinguish a partial scroll
+    /// toward the bottom from actually reaching the live region.
+    pub fn scrollbar(&self) -> Result<Scrollbar> {
+        let mut out = sys::GhosttyTerminalScrollbar {
+            total: 0,
+            offset: 0,
+            len: 0,
+        };
+        // SAFETY: handle is non-null and `out` is a correctly typed local for
+        // GHOSTTY_TERMINAL_DATA_SCROLLBAR.
+        let rc = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                (&mut out) as *mut sys::GhosttyTerminalScrollbar as *mut _,
+            )
+        };
+        Error::from_result(rc)?;
+        Ok(Scrollbar {
+            total: out.total,
+            offset: out.offset,
+            len: out.len,
+        })
+    }
+
     /// Read a DEC mode bit (e.g. mode 2004 for bracketed paste).
     /// Returns `false` if the mode is not currently set or if the mode
     /// number is unknown to libghostty.
@@ -428,6 +472,36 @@ impl Terminal {
         // Treat any non-success as "false" — the Mac UI does the same.
         Error::from_result(rc).ok();
         out
+    }
+
+    /// Encode the canonical xterm focus report when DEC mode 1004 is active.
+    /// Returns no bytes when the mode is disabled or libghostty rejects the
+    /// request, allowing UI adapters to forward the result directly.
+    pub fn encode_focus(&self, focused: bool) -> Vec<u8> {
+        if !self.mode_get(1004) {
+            return Vec::new();
+        }
+        let event = if focused {
+            sys::GhosttyFocusEvent_GHOSTTY_FOCUS_GAINED
+        } else {
+            sys::GhosttyFocusEvent_GHOSTTY_FOCUS_LOST
+        };
+        let mut buffer = [0_u8; 8];
+        let mut written = 0_usize;
+        // SAFETY: both output pointers refer to live stack values and the
+        // supplied capacity is exactly the backing buffer's size.
+        let rc = unsafe {
+            sys::ghostty_focus_encode(
+                event,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut written,
+            )
+        };
+        if Error::from_result(rc).is_err() || written == 0 || written > buffer.len() {
+            return Vec::new();
+        }
+        buffer[..written].to_vec()
     }
 
     /// True if the active screen is the alternate buffer (vim, less,

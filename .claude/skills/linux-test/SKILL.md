@@ -18,7 +18,8 @@ with the repo mounted via VirtioFS (edit on the Mac, build+test in the VM).
 - macOS / Apple Silicon.
 
 ## Run it (one wrapper)
-`tools/shed/shed-test.sh` provisions on first use and builds shed-local so your
+`tools/shed/shed-test.sh` provisions on first use and builds GTK, Iced, and
+`roostctl` shed-local so your
 Mac `target/` + ghostty outputs are never clobbered. Run it from the repo root.
 The persistent `roost-dev` box IS the day-to-day cache (stop/start reuses its
 build cache); the **snapshot is opt-in** — a bare run does NOT auto-snapshot, so
@@ -39,9 +40,37 @@ non-blocking `e2e-gtk-wayland-drag` job — same signal, locally, before you pus
 
 ## Other tiers in the shed (beyond the drag guard)
 
-`shed-test.sh` runs only the **Wayland drag guard**. The full **pytest `e2e-gtk`
-suite** and the **real-input (XTEST) checks** need extra env knobs — each cost a
-debugging cycle, so they're recorded here.
+`shed-test.sh` runs only the **Wayland drag guard** after building both Rust UIs.
+The full **pytest `e2e-gtk` suite**, Iced X11/Wayland gates, and the **real-input
+(XTEST) checks** need extra env knobs — each cost a debugging cycle, so they're
+recorded here.
+
+### Iced walking-skeleton gates
+
+The shed-local Iced ELF is `~/rt/debug/roost-iced`. Bind-mount the shed-local
+debug directory exactly like the GTK suite, then run the focused functional
+gate under X11 or headless Wayland. Both `wgpu` and `tiny-skia` are required:
+
+```bash
+tools/shed/shed-test.sh --build-only
+shed exec roost-dev -- bash -lc '
+  sudo mount --bind ~/rt/debug ~/roost/target/debug
+  trap "sudo umount ~/roost/target/debug" EXIT
+  mkdir -p /tmp/xdgrt-iced && chmod 700 /tmp/xdgrt-iced
+  cd ~/roost
+  for renderer in wgpu tiny-skia; do
+    XDG_RUNTIME_DIR=/tmp/xdgrt-iced ICED_BACKEND=$renderer ROOST_TEST_MODE=1 \
+      xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+      pytest tools/roosttest/test_smoke.py \
+        tools/roosttest/test_iced_walking_skeleton.py \
+        --roost-target iced --roost-fresh -q
+    ICED_BACKEND=$renderer ROOST_TEST_MODE=1 \
+      tools/wayland/weston-run.sh \
+      pytest tools/roosttest/test_smoke.py \
+        tools/roosttest/test_iced_walking_skeleton.py \
+        --roost-target iced --roost-fresh -q
+  done'
+```
 
 ### pytest e2e-gtk (the required CI gate)
 The pytest harness (`tools/roosttest/ui.py`) **hardcodes `target/debug/roost`**

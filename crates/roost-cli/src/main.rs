@@ -1,4 +1,4 @@
-//! roostctl — shell-integration CLI for the Roost UIs (Mac + Linux).
+//! roostctl — shell-integration CLI for the Roost UIs (Mac, GTK, and Iced).
 //!
 //! Talks JSON over a Unix-domain socket directly to the running UI
 //! process; there is no daemon. The wire format is documented in
@@ -27,9 +27,9 @@
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
 //!   ROOST_SOCKET env var
-//!   --target {mac,gtk}      (resolves to that profile's canonical socket)
+//!   --target {mac,gtk,iced} (resolves to that profile's canonical socket)
 //!   ROOST_BUNDLE_PROFILE    (same effect as --target)
-//!   auto-detect             (probes both; fails on ambiguity)
+//!   auto-detect             (probes all distinct paths; fails on ambiguity)
 //!
 //! See `crates/roost-ipc/src/target.rs` for resolution logic.
 
@@ -82,6 +82,7 @@ struct Args {
 enum TargetArg {
     Mac,
     Gtk,
+    Iced,
 }
 
 impl From<TargetArg> for BundleProfileKind {
@@ -89,6 +90,7 @@ impl From<TargetArg> for BundleProfileKind {
         match t {
             TargetArg::Mac => BundleProfileKind::Mac,
             TargetArg::Gtk => BundleProfileKind::Gtk,
+            TargetArg::Iced => BundleProfileKind::Iced,
         }
     }
 }
@@ -1468,6 +1470,10 @@ mod tests {
         assert!(matches!(
             BundleProfileKind::from(TargetArg::Gtk),
             BundleProfileKind::Gtk
+        ));
+        assert!(matches!(
+            BundleProfileKind::from(TargetArg::Iced),
+            BundleProfileKind::Iced
         ));
     }
 

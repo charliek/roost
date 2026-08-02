@@ -693,8 +693,9 @@ pub struct AppSetWindowFocusParams {
 }
 
 /// `app.cursor_shape` request: return the W3C cursor name the UI is
-/// currently applying for the active tab. Returns the last-seen OSC
-/// 22 payload, or `"default"` if no shape has been requested yet
+/// currently applying for the active tab. A transient UI-owned link hover may
+/// override the last-seen OSC 22 payload; otherwise returns that payload, or
+/// `"default"` if no shape has been requested yet
 /// (and `"default"` for the empty-string reset form, so callers can
 /// always assert against a non-empty name). Not gated — read-only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,20 +709,18 @@ pub struct AppCursorShapeResult {
 }
 
 /// `app.active_terminal_focused` request: report whether the active
-/// tab's TerminalView currently holds GTK *logical* keyboard focus
-/// (`window.focus_widget() == terminal`). Reads logical focus — the
-/// target `grab_focus()` sets, regardless of whether the toplevel owns
-/// the compositor's input focus — so it stays observable under the
-/// bare-Xvfb (no window manager) e2e runner, unlike the global
-/// `:has-focus` property. Not gated — read-only.
+/// tab's terminal owns the UI's *logical* keyboard route. This is
+/// intentionally separate from native toplevel/compositor focus, so
+/// callers can distinguish terminal input ownership from application
+/// activation. Not gated — read-only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppActiveTerminalFocusedParams {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppActiveTerminalFocusedResult {
-    /// True when the active tab's terminal is the window's logical
-    /// focus widget. False when there is no active terminal.
+    /// True when keyboard input is logically routed to the active
+    /// terminal. False when an overlay owns input or no terminal exists.
     pub focused: bool,
 }
 
@@ -969,12 +968,22 @@ pub struct WindowMetricsParams {}
 /// `app.window_metrics` response — logical (point) measurements of the
 /// running UI's window + sidebar. Used by the sidebar layout regression
 /// tests to assert the sidebar holds its width across window resizes.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowMetricsResult {
     pub window_width: f64,
     pub window_height: f64,
     pub sidebar_width: f64,
     pub sidebar_collapsed: bool,
+    /// Application-owned top edge of the terminal viewport, when the UI can
+    /// report it exactly. Optional so older and native-toolkit adapters keep
+    /// their existing response shape until they expose equivalent geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_top: Option<f64>,
+    /// Renderer-resolved terminal family, when the adapter can report it.
+    /// This is diagnostic state rather than a config echo: fallback chains
+    /// report the installed family actually used by the live terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_family: Option<String>,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -1244,16 +1253,14 @@ pub mod ops {
     /// the latest OSC 22 payload, or `"default"` if none has landed.
     /// Used by the e2e suite to assert OSC 22 actually applied.
     pub const APP_CURSOR_SHAPE: &str = "app.cursor_shape";
-    /// Ungated read of whether the active tab's terminal holds GTK
-    /// *logical* keyboard focus (`window.focus_widget() == terminal`).
-    /// Used by the e2e suite to assert navigation lands focus on the
-    /// terminal. Reads logical focus, so it works under the WM-less
-    /// Xvfb runner where the toplevel never gains compositor focus.
+    /// Ungated read of whether the active tab's terminal owns the UI's
+    /// logical keyboard route. This is independent of native toplevel or
+    /// compositor focus and becomes false while an in-app overlay owns input.
     pub const APP_ACTIVE_TERMINAL_FOCUSED: &str = "app.active_terminal_focused";
 
     /// `app.selected_tab_id` — the active project's on-screen selected
     /// tab id (UI truth), for asserting the core and the displayed tab
-    /// agree. GTK-only; read-only, not gated.
+    /// agree. Implemented by the Rust UI adapters; read-only, not gated.
     pub const APP_SELECTED_TAB_ID: &str = "app.selected_tab_id";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
@@ -1820,13 +1827,30 @@ mod tests {
             window_height: 700.0,
             sidebar_width: 220.0,
             sidebar_collapsed: false,
+            terminal_top: Some(34.0),
+            terminal_font_family: Some("JetBrains Mono".to_string()),
         });
-        round_trip(&WindowMetricsResult {
+        let native = WindowMetricsResult {
             window_width: 1800.0,
             window_height: 700.0,
             sidebar_width: 0.0,
             sidebar_collapsed: true,
-        });
+            terminal_top: None,
+            terminal_font_family: None,
+        };
+        let json = serde_json::to_string(&native).unwrap();
+        assert!(
+            !json.contains("terminal_top"),
+            "None changed the old wire shape"
+        );
+        round_trip(&native);
+
+        let old: WindowMetricsResult = serde_json::from_str(
+            r#"{"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,"sidebar_collapsed":false}"#,
+        )
+        .unwrap();
+        assert_eq!(old.terminal_top, None);
+        assert_eq!(old.terminal_font_family, None);
     }
 
     #[test]

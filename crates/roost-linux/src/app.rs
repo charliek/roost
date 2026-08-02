@@ -37,20 +37,16 @@ use roost_linux::reconcile;
 
 use crate::agent_palette;
 use crate::agent_palette::SidebarAgentRow;
-use crate::cell_metrics::DEFAULT_FONT_SIZE_PT;
 use crate::clipboard;
 use crate::config;
 use crate::config::{ClipboardWrite, CopyOnSelect, RoostConfig};
 use crate::custom_command::{self, CustomCommand};
 use crate::events;
 use crate::focus::safe_grab_focus;
-use crate::git_metrics;
 use crate::keybind::{
     canonicalize_bindings, default_bindings, resolve_link_modifier, Accel, AccelMods, KeybindAction,
 };
-use crate::notification_inbox::{
-    compose_title, relative_time, NotificationInbox, NotificationRecord,
-};
+use crate::notification_inbox::{self, compose_title, NotificationInbox, NotificationRecord};
 use crate::palette::{command_items, PaletteCommands, PaletteFrame, PaletteItem};
 use crate::palette_ui::{
     PaletteBehavior, PaletteOutcome, PaletteOverlay, PaletteSnapshot, TOP_GAP,
@@ -60,6 +56,9 @@ use crate::rollup::{project_rollup, rollup_css_class, ROLLUP_CLASSES};
 use crate::tab_session::{TabOutput, TabSession};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
+use roost_engine::git_metrics;
+use roost_ui_model::reorder::compute_insert_idx;
+use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 
 /// One per project: sidebar row + tab strip + tab content stack.
 struct ProjectUi {
@@ -231,26 +230,16 @@ pub struct App {
     /// Count badge overlaid on the HeaderBar notifications bell. Hidden
     /// at zero; `refresh_notif_badge` keeps it in sync with the inbox.
     notif_badge: gtk4::Label,
-    /// Optional font-family override from config. `RefCell` because
-    /// the command palette swaps it live (Select Font…); new tabs
-    /// read the current value at spawn so confirm + revert propagate
-    /// forward, matching the theme story.
-    font_family: RefCell<Option<String>>,
+    /// Toolkit-neutral live family/size state. GTK retains Pango measurement
+    /// and palette presentation; shared transitions live in roost-ui-model.
+    typography: RefCell<TerminalTypography>,
     /// Font family captured when the palette opened, restored on
     /// dismiss-without-confirm so an in-flight live preview reverts.
     /// `None` while the palette is closed or before the first open.
     font_family_at_open: RefCell<Option<Option<String>>>,
-    /// Optional font-size override from config (points). Snapshot
-    /// of the value read at boot; the live size (with FontIncrease /
-    /// FontDecrease / FontReset adjustments) lives in
-    /// `current_font_size_pt`.
-    font_size_pt: Option<f64>,
-    /// Live font size for the active session. Starts at
-    /// `font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT)` and shifts by
-    /// ±1 on each FontIncrease / FontDecrease; FontReset snaps back
-    /// to that baseline. Applied to every TerminalView via
-    /// `apply_font_size_to_all`.
-    current_font_size_pt: RefCell<f64>,
+    /// Installed renderer token resolved from the raw at-open family chain
+    /// when the font frame is built.
+    font_resolved_at_open: RefCell<Option<String>>,
     /// `copy-on-select` from `~/.config/roost/config.conf` (default
     /// `True`). `RefCell` so a future config-reload path can update it
     /// without rebuilding the App; new tabs read the current value
@@ -812,10 +801,12 @@ impl App {
             metrics_cache: RefCell::new(git_metrics::MetricsCache::default()),
             notification_inbox: RefCell::new(NotificationInbox::new()),
             notif_badge: notif_badge.clone(),
-            font_family: RefCell::new(cfg.font_family.clone()),
+            typography: RefCell::new(TerminalTypography::new(
+                cfg.font_family.clone(),
+                cfg.font_size,
+            )),
             font_family_at_open: RefCell::new(None),
-            font_size_pt: cfg.font_size,
-            current_font_size_pt: RefCell::new(cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE_PT)),
+            font_resolved_at_open: RefCell::new(None),
             copy_on_select: RefCell::new(cfg.copy_on_select),
             clipboard_write_policy: RefCell::new(cfg.clipboard_write),
             word_break_chars: RefCell::new(cfg.word_break_chars.clone()),
@@ -2071,10 +2062,9 @@ impl App {
         // still in flight. Avoids the dead-end where the entry has
         // disappeared but the row still owns keyboard focus.
         self.focus_active_terminal();
-        let trimmed = new_name.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(trimmed) = roost_ui_model::rename::committed_label(&new_name) else {
             return; // empty rename = no-op
-        }
+        };
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
@@ -2212,10 +2202,9 @@ impl App {
     /// `commit_rename_project`: fire `SetTabTitle` RPC, let the
     /// WatchEvents `TabTitle` event update the page's title.
     fn commit_rename_tab(self: &Rc<Self>, tab_id: i64, new_title: String) {
-        let trimmed = new_title.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(trimmed) = roost_ui_model::rename::committed_label(&new_title) else {
             return;
-        }
+        };
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
@@ -2532,10 +2521,17 @@ impl App {
         // tab opened after the user has zoomed in matches the
         // existing tabs, rather than snapping back to the config
         // baseline.
+        let (font_family, font_size_pt) = {
+            let typography = self.typography.borrow();
+            (
+                typography.family().map(str::to_owned),
+                typography.current_size_pt(),
+            )
+        };
         let terminal = Rc::new(TerminalView::with_theme_font_and_copy(
             self.theme.borrow().clone(),
-            self.font_family.borrow().as_deref(),
-            Some(*self.current_font_size_pt.borrow()),
+            font_family.as_deref(),
+            Some(font_size_pt),
             *self.copy_on_select.borrow(),
             self.word_break_chars.borrow().clone(),
             self.link_modifier,
@@ -2766,106 +2762,50 @@ impl App {
             let app_for_exit = app_for_attach.clone();
             let session_for_replies = session.clone();
             glib::spawn_future_local(async move {
-                let mut scanner = roost_osc::OscScanner::new();
+                let mut osc_router = roost_engine::osc::OscRouter::new();
                 while let Some(msg) = output_rx.recv().await {
                     match msg {
                         TabOutput::Bytes(data) => {
-                            let events = scanner.feed(&data);
-                            for event in events {
-                                // Synthesise OSC 10/11/12 query
-                                // replies — libghostty-vt drops the
-                                // .query arm, so without us answering
-                                // codex (and reportedly claude-code)
-                                // skip their prompt-row bg SGR. The
-                                // reply rides the same per-tab serial
-                                // PTY-input channel as keystrokes
-                                // (`TabSession::send_input`), so it's
-                                // FIFO-ordered with other writes
-                                // *once enqueued* — not with PTY
-                                // output that hasn't been drained yet.
-                                // Reads libghostty's *currently
-                                // effective* colors so a prior
-                                // `OSC 10/11/12;rgb:…` set is
-                                // reflected in the next query reply
-                                // (vim colorscheme plugins etc.).
-                                if let roost_osc::OscEvent::ColorQuery(n) = event {
-                                    let color = match terminal_for_drain.live_colors() {
-                                        Ok(c) => match n {
-                                            10 => Some(c.foreground),
-                                            11 => Some(c.background),
-                                            // Cursor may be unset; fall
-                                            // back to the theme.
-                                            12 => c.cursor.or_else(|| {
-                                                Some(app_for_osc.theme.borrow().cursor)
-                                            }),
-                                            _ => None,
-                                        },
-                                        // Libghostty isn't reporting a
-                                        // default color yet (theme push
-                                        // hasn't landed, or FFI hiccup);
-                                        // the theme is what we last
-                                        // asked the terminal to render
-                                        // with, so it's the right
-                                        // fallback.
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                ?err,
-                                                "live_colors failed; falling back to theme"
-                                            );
-                                            let theme = app_for_osc.theme.borrow();
-                                            match n {
-                                                10 => Some(theme.foreground),
-                                                11 => Some(theme.background),
-                                                12 => Some(theme.cursor),
-                                                _ => None,
-                                            }
-                                        }
-                                    };
-                                    if let Some(color) = color {
-                                        if let Some(reply) = roost_osc::format_color_query_response(
-                                            n,
-                                            (color.r, color.g, color.b),
-                                        ) {
-                                            session_for_replies.send_input(reply);
-                                        }
-                                    }
-                                    continue;
-                                }
-                                // OSC 4 palette query — answer each index
-                                // from libghostty's live palette (a prior
-                                // `OSC 4;Ps;rgb:…` set wins), falling back to
-                                // the theme palette on FFI error. Same per-tab
-                                // serial reply channel as the OSC 10/11/12 path
-                                // above. opentui (opencode in local mode + other
-                                // TUIs) gates its color detection on a reply to
-                                // `OSC 4;0;?`.
-                                if let roost_osc::OscEvent::PaletteQuery(ref indices) = event {
-                                    let palette = match terminal_for_drain.live_palette() {
-                                        Ok(p) => p,
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                ?err,
-                                                "live_palette failed; falling back to theme palette"
-                                            );
-                                            app_for_osc.theme.borrow().palette
-                                        }
-                                    };
-                                    let mut reply = Vec::new();
-                                    for &idx in indices {
-                                        let color = palette[idx as usize];
-                                        reply.extend_from_slice(
-                                            &roost_osc::format_palette_query_response(
-                                                idx,
-                                                (color.r, color.g, color.b),
-                                            ),
+                            // Read renderer-owned live colors before applying
+                            // this chunk. The shared router stays renderer-free
+                            // and returns ordered, explicit actions.
+                            let theme = app_for_osc.theme.borrow().clone();
+                            let (foreground, background, cursor) =
+                                match terminal_for_drain.live_colors() {
+                                    Ok(colors) => (
+                                        colors.foreground,
+                                        colors.background,
+                                        colors.cursor.unwrap_or(theme.cursor),
+                                    ),
+                                    Err(err) => {
+                                        tracing::debug!(
+                                            ?err,
+                                            "live_colors failed; falling back to theme"
                                         );
+                                        (theme.foreground, theme.background, theme.cursor)
                                     }
-                                    if !reply.is_empty() {
+                                };
+                            let palette = terminal_for_drain.live_palette().unwrap_or_else(|err| {
+                                tracing::debug!(
+                                    ?err,
+                                    "live_palette failed; falling back to theme palette"
+                                );
+                                theme.palette
+                            });
+                            let rgb = |color: roost_vt::ColorRgb| (color.r, color.g, color.b);
+                            let colors = roost_engine::osc::OscColorSnapshot::new(
+                                rgb(foreground),
+                                rgb(background),
+                                rgb(cursor),
+                                palette.map(rgb),
+                            );
+                            for action in osc_router.feed(&data, &colors) {
+                                match action {
+                                    roost_engine::osc::OscAction::PtyInput(reply) => {
                                         session_for_replies.send_input(reply);
                                     }
-                                    continue;
+                                    action => app_for_osc.report_osc_action(tab_id, action),
                                 }
-                                app_for_osc.report_osc_event(tab_id, event);
                             }
                             terminal_for_drain.vt_write(&data);
                         }
@@ -3688,18 +3628,10 @@ impl App {
             KeybindAction::FontIncrease => self.adjust_font_size(1.0),
             KeybindAction::FontDecrease => self.adjust_font_size(-1.0),
             KeybindAction::FontReset => {
-                let baseline = self.font_size_pt.unwrap_or(DEFAULT_FONT_SIZE_PT);
-                let current = *self.current_font_size_pt.borrow();
-                // No-op when the live size already matches the baseline.
-                // Skipping the apply call also skips its config write —
-                // otherwise a stray Cmd+0 on an unconfigured user would
-                // materialize `font-size = <default>` into a config that
-                // never had a font-size line.
-                if (current - baseline).abs() < 0.01 {
-                    return;
+                let reset = self.typography.borrow_mut().reset_size();
+                if let Some(size_pt) = reset {
+                    self.apply_font_size_to_all(size_pt);
                 }
-                *self.current_font_size_pt.borrow_mut() = baseline;
-                self.apply_font_size_to_all(baseline);
             }
             KeybindAction::SwitchProject(n) => self.switch_project_by_index(n as usize),
             KeybindAction::SwitchTab(n) => self.switch_tab_by_index(n as usize),
@@ -3786,25 +3718,19 @@ impl App {
     /// daemon doesn't know or care about font size — it's purely
     /// a UI concern — so no RPC fires.
     fn adjust_font_size(self: &Rc<Self>, delta: f64) {
-        let new = {
-            let mut size = self.current_font_size_pt.borrow_mut();
-            let new = (*size + delta).clamp(6.0, 72.0);
-            if (new - *size).abs() < 0.01 {
-                return;
-            }
-            *size = new;
-            new
-        };
-        self.apply_font_size_to_all(new);
+        let adjusted = self.typography.borrow_mut().adjust_size(delta);
+        if let Some(size_pt) = adjusted {
+            self.apply_font_size_to_all(size_pt);
+        }
     }
 
     /// Push `size_pt` to every TerminalView in every project. Reuses
     /// each view's existing `apply_font` path so cell metrics get
     /// remeasured + a redraw is queued automatically.
     fn apply_font_size_to_all(self: &Rc<Self>, size_pt: f64) {
+        let family = self.typography.borrow().family().map(str::to_owned);
         {
             let projects = self.projects.borrow();
-            let family = self.font_family.borrow();
             for ui in projects.values() {
                 let tabs = ui.tabs.borrow();
                 for tab_ui in tabs.values() {
@@ -3872,17 +3798,16 @@ impl App {
     /// family slot to support size-only updates, so we must pass an
     /// explicit family string to revert visually.
     fn set_active_font_family(self: &Rc<Self>, family: Option<String>) {
-        // Clone the to-be-applied family BEFORE moving into the
-        // RefCell so the per-tab loop below can read it without
-        // holding a live borrow across arbitrary view code (any
-        // future apply_font side-effect that re-enters would
-        // otherwise trip a BorrowError).
-        let applied: String = family
-            .as_deref()
-            .unwrap_or(crate::cell_metrics::DEFAULT_FONT_FAMILY)
-            .to_string();
-        *self.font_family.borrow_mut() = family;
-        let size = *self.current_font_size_pt.borrow();
+        // Resolve owned values and drop the model borrow before invoking any
+        // TerminalView code; renderer callbacks must never run under it.
+        let (applied, size) = {
+            let mut typography = self.typography.borrow_mut();
+            typography.set_family(family);
+            (
+                typography.effective_family().to_string(),
+                typography.current_size_pt(),
+            )
+        };
         let projects = self.projects.borrow();
         for ui in projects.values() {
             let tabs = ui.tabs.borrow();
@@ -3906,27 +3831,25 @@ impl App {
     /// against the live value would still drop the fallback.
     fn commit_font_family(self: &Rc<Self>, name: &str) {
         let opened = self.font_family_at_open.borrow().clone().flatten();
-        let opened_primary = opened
-            .as_deref()
-            .and_then(|s| s.split(',').map(str::trim).find(|t| !t.is_empty()));
-        if opened_primary
-            .map(|p| p.eq_ignore_ascii_case(name))
-            .unwrap_or(false)
-        {
-            // No-op confirm: restore the opened chain to live state
-            // (an interim preview may have replaced it with the bare
-            // primary) and DON'T rewrite the file — it already has
-            // the chain the user opened with.
-            if *self.font_family.borrow() != opened {
-                self.set_active_font_family(opened);
-            }
-            return;
+        let resolved = self
+            .font_resolved_at_open
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "Monospace".to_string());
+        let live = self.typography.borrow().family().map(str::to_owned);
+        let confirmation =
+            typography::confirm_family(opened.as_deref(), &resolved, live.as_deref(), name);
+        match confirmation.apply {
+            FamilyApply::Keep => {}
+            FamilyApply::Set(family) => self.set_active_font_family(family),
         }
-        self.set_active_font_family(Some(name.to_string()));
-        if let Err(e) = write_back_font_family(name) {
+        let Some(persist) = confirmation.persist else {
+            return;
+        };
+        if let Err(e) = write_back_font_family(&persist) {
             tracing::warn!(
                 error = %e,
-                family = name,
+                family = persist,
                 "failed to persist font-family to config.conf"
             );
         }
@@ -3942,7 +3865,9 @@ impl App {
             return;
         }
         *self.theme_name_at_open.borrow_mut() = Some(self.active_theme_name.borrow().clone());
-        *self.font_family_at_open.borrow_mut() = Some(self.font_family.borrow().clone());
+        *self.font_family_at_open.borrow_mut() =
+            Some(self.typography.borrow().family().map(str::to_owned));
+        *self.font_resolved_at_open.borrow_mut() = None;
 
         // Reverse map (action → shortcut label) from the canonicalized
         // bindings, so each command row shows its keybind hint. First
@@ -4592,24 +4517,10 @@ impl App {
             .as_ref()
             .map(|o| o.driver().snapshot().query)
             .unwrap_or_default();
-        // Roost's own roostctl, resolved as a sibling of the running
-        // binary (`/usr/bin/roost` → `/usr/bin/roostctl` from the .deb;
-        // `target/debug/roost` → `…/roostctl` in dev). Canonicalize first
-        // so a symlinked launch resolves to the real install dir, and
-        // require the executable bit (mirrors provider discovery in
-        // config.rs, and matches the Mac `isExecutableFile` check). Lets a
-        // provider shell out without roostctl on PATH.
-        let roostctl = std::env::current_exe()
-            .ok()
-            .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
-            .and_then(|exe| exe.parent().map(|d| d.join("roostctl")))
-            .filter(|p| {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(p)
-                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false)
-            })
-            .map(|p| p.to_string_lossy().into_owned());
+        // Roost's own roostctl, resolved as an executable sibling of the
+        // canonical running binary. The shared runtime helper keeps GTK and
+        // Iced provider environments byte-for-byte aligned.
+        let roostctl = roost_engine::process::sibling_executable("roostctl");
         provider::ProviderContext {
             socket,
             query,
@@ -4656,61 +4567,27 @@ impl App {
         ctx: provider::ProviderContext,
         timeout_secs: u64,
     ) -> Result<provider::ProviderOutput, String> {
-        use std::process::Stdio;
         use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
 
         let argv = provider::invocation_argv(&shell, &run, shell_interpret, phase);
         let env = provider::invocation_env(phase, &ctx);
         let stdin_json = provider::invocation_stdin(phase, &ctx);
-
         let has_roostctl = env.iter().any(|(k, _)| k == "ROOST_ROOSTCTL");
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        // If Roost couldn't resolve its own roostctl, strip any inherited
-        // ROOST_ROOSTCTL so the script's `${ROOST_ROOSTCTL:-roostctl}` PATH
-        // fallback actually fires (don't leak a stale parent value).
-        if !has_roostctl {
-            cmd.env_remove("ROOST_ROOSTCTL");
-        }
-        // Only set the cwd if it still exists — the active tab's dir may
-        // have been removed; don't let that fail the whole spawn (inherit
-        // Roost's cwd instead).
-        if !ctx.active_cwd.is_empty() && std::path::Path::new(&ctx.active_cwd).is_dir() {
-            cmd.current_dir(&ctx.active_cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(|e| format!("spawn provider: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(stdin_json.as_bytes()).await;
-            // stdin drops here → EOF for the child.
-        }
-        let output =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-            {
-                Err(_) => return Err(format!("provider timed out after {timeout_secs}s")),
-                Ok(Err(e)) => return Err(format!("provider io error: {e}")),
-                Ok(Ok(o)) => o,
-            };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail = stderr.lines().last().unwrap_or("").trim().to_string();
-            let code = output.status.code().unwrap_or(-1);
-            return Err(if tail.is_empty() {
-                format!("provider exited with status {code}")
-            } else {
-                format!("provider exited {code}: {tail}")
-            });
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let request = roost_engine::process::ProcessRequest {
+            argv,
+            env,
+            env_remove: (!has_roostctl)
+                .then(|| "ROOST_ROOSTCTL".to_string())
+                .into_iter()
+                .collect(),
+            stdin: stdin_json.into_bytes(),
+            cwd: (!ctx.active_cwd.is_empty()).then(|| ctx.active_cwd.into()),
+            timeout: Duration::from_secs(timeout_secs),
+        };
+        let stdout = roost_engine::process::run(request)
+            .await
+            .map_err(|error| error.to_string())?
+            .stdout;
         // Activate is a side-effect phase: ignore non-JSON stdout (e.g. the
         // tab id `roostctl tab open` prints) so it doesn't fail parsing.
         match phase {
@@ -4749,53 +4626,21 @@ impl App {
     /// `PaletteCommands::SPECS`) so "View Notifications" can show the
     /// live pending count.
     fn notification_command_items(self: &Rc<Self>) -> Vec<PaletteItem> {
-        let count = self.notification_inbox.borrow().count();
-        let view_title = if count > 0 {
-            format!("View Notifications ({count})")
-        } else {
-            "View Notifications".to_string()
-        };
-        vec![
-            PaletteItem::new(PaletteCommands::VIEW_NOTIFICATIONS_ID, view_title),
-            PaletteItem::new(
-                PaletteCommands::CLEAR_NOTIFICATIONS_ID,
-                "Clear All Notifications",
-            ),
-        ]
+        notification_inbox::command_items(self.notification_inbox.borrow().count())
     }
 
     /// Build the notifications sub-frame from the live inbox snapshot.
     /// Each row encodes its tab id as `notif:<id>` (parsed on confirm to
     /// jump). An empty inbox shows a single non-actionable row.
     fn notifications_frame(self: &Rc<Self>) -> PaletteFrame {
-        let inbox = self.notification_inbox.borrow();
-        let items: Vec<PaletteItem> = if inbox.is_empty() {
-            vec![PaletteItem::new("notif:none", "No notifications")]
-        } else {
-            inbox
-                .snapshot()
-                .iter()
-                .map(|r| {
-                    let trailing = relative_time(r.at.elapsed().as_secs());
-                    let subtitle = if r.body.is_empty() {
-                        None
-                    } else {
-                        Some(r.body.clone())
-                    };
-                    PaletteItem::new(format!("notif:{}", r.tab_id), r.title.clone())
-                        .with_subtitle(subtitle)
-                        .with_trailing(Some(trailing))
-                })
-                .collect()
-        };
-        PaletteFrame::new("notifications", "Jump to a notification…", items)
+        notification_inbox::frame(&self.notification_inbox.borrow())
     }
 
     /// Confirm on a notification row → focus that project + tab (which
     /// clears the tab's notification → drops the row). The "No
     /// notifications" sentinel is a no-op.
     fn notifications_behavior(self: &Rc<Self>) -> PaletteBehavior {
-        self.jump_to_tab_behavior(notif_tab_id)
+        self.jump_to_tab_behavior(notification_inbox::tab_id)
     }
 
     /// "Clear All Notifications": clear each pending tab's notification
@@ -4935,6 +4780,7 @@ impl App {
         *self.palette.borrow_mut() = None;
         *self.theme_name_at_open.borrow_mut() = None;
         *self.font_family_at_open.borrow_mut() = None;
+        *self.font_resolved_at_open.borrow_mut() = None;
         self.focus_active_terminal();
     }
 
@@ -5057,23 +4903,13 @@ impl App {
     /// live family.
     fn font_frame(self: &Rc<Self>) -> PaletteFrame {
         let families = self.available_font_families();
-        let active = self
-            .font_family
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| crate::cell_metrics::DEFAULT_FONT_FAMILY.to_string());
-        // Match against the primary entry of a comma list (e.g. the
-        // default `"JetBrains Mono, Monospace"` should pre-select
-        // "JetBrains Mono"). Fall back to row 0 if not found.
-        let primary = active
-            .split(',')
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .unwrap_or("");
+        let active = self.typography.borrow().effective_family().to_string();
+        let resolved = typography::resolve_family_name(&active, &families);
         let selection = families
             .iter()
-            .position(|n| n.eq_ignore_ascii_case(primary))
+            .position(|name| name.eq_ignore_ascii_case(&resolved))
             .unwrap_or(0);
+        *self.font_resolved_at_open.borrow_mut() = Some(resolved);
         let items = families
             .into_iter()
             .map(|n| PaletteItem::new(n.clone(), n))
@@ -5109,9 +4945,9 @@ impl App {
     /// already active).
     fn preview_font_family(self: &Rc<Self>, name: &str) {
         let already = self
-            .font_family
+            .typography
             .borrow()
-            .as_deref()
+            .family()
             .map(|s| s == name)
             .unwrap_or(false);
         if already {
@@ -5128,38 +4964,12 @@ impl App {
         let Some(target) = self.font_family_at_open.borrow().clone() else {
             return;
         };
-        let current = self.font_family.borrow().clone();
+        let current = self.typography.borrow().family().map(str::to_owned);
         if current == target {
             return;
         }
         self.set_active_font_family(target);
     }
-
-    /// Curated programming fonts that look great in a terminal, in a
-    /// thoughtful order. The first entry that's actually installed
-    /// becomes the top of the picker; uninstalled entries are skipped.
-    /// Mirrors the Swift `availableFontFamilies` curated list.
-    const CURATED_FONTS: &'static [&'static str] = &[
-        "JetBrains Mono",
-        "JetBrainsMono Nerd Font",
-        "Fira Code",
-        "Fira Mono",
-        "Hack",
-        "Source Code Pro",
-        "Cascadia Code",
-        "Cascadia Mono",
-        "IBM Plex Mono",
-        "Inconsolata",
-        "Iosevka",
-        "DejaVu Sans Mono",
-        "Ubuntu Mono",
-        "Liberation Mono",
-        "Noto Sans Mono",
-        // Mac-only families (no-op on Linux when not installed).
-        "SF Mono",
-        "Menlo",
-        "Monaco",
-    ];
 
     /// Enumerate font families for the picker: curated first
     /// (filtered to installed), then every other monospace family
@@ -5177,40 +4987,35 @@ impl App {
             return vec!["Monospace".to_string()];
         };
         let families = font_map.list_families();
-        // Build a name→is_monospace map (case-insensitive lookup).
-        let mut installed: Vec<(String, bool)> = families
+        let installed = families
             .iter()
             .map(|family| (family.name().to_string(), family.is_monospace()))
-            .collect();
-        installed.sort_by_key(|a| a.0.to_lowercase());
+            .collect::<Vec<_>>();
+        typography::ordered_monospace_families(installed)
+    }
 
-        let canonical_name = |name: &str| -> Option<String> {
-            installed
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(n, _)| n.clone())
+    /// Every safe installed Pango family for resolving diagnostic config
+    /// chains. Unlike the picker this intentionally retains proportional
+    /// families: Pango accepts those in an explicit user configuration, so
+    /// reporting against only picker rows could disagree with live rendering.
+    fn installed_font_family_names(self: &Rc<Self>) -> Vec<String> {
+        let context = self.window.pango_context();
+        let Some(font_map) = context.font_map() else {
+            return Vec::new();
         };
-
-        let mut out: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::<String>::new();
-        for entry in Self::CURATED_FONTS {
-            if let Some(n) = canonical_name(entry) {
-                let key = n.to_lowercase();
-                if seen.insert(key) {
-                    out.push(n);
-                }
-            }
-        }
-        for (n, is_mono) in &installed {
-            if !is_mono {
-                continue;
-            }
-            let key = n.to_lowercase();
-            if seen.insert(key) {
-                out.push(n.clone());
-            }
-        }
-        out
+        let mut names = font_map
+            .list_families()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .filter(|name| typography::font_family_name_is_safe(name))
+            .collect::<Vec<_>>();
+        names.sort_by(|left, right| {
+            left.to_lowercase()
+                .cmp(&right.to_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        names
     }
 
     fn active_terminal_view(self: &Rc<Self>) -> Option<Rc<TerminalView>> {
@@ -5767,7 +5572,9 @@ impl App {
     /// sidebar that's the start child of the `gtk4::Paned` we built
     /// with `resize_start_child(false) + shrink_start_child(false)`,
     /// so it equals the paned position when visible.
-    fn ipc_window_metrics(self: &Rc<Self>) -> Result<(f64, f64, f64, bool), String> {
+    fn ipc_window_metrics(
+        self: &Rc<Self>,
+    ) -> Result<(f64, f64, f64, bool, Option<f64>, Option<String>), String> {
         let w = self.window.width() as f64;
         let h = self.window.height() as f64;
         let collapsed = !self.sidebar_box.is_visible();
@@ -5776,7 +5583,10 @@ impl App {
         } else {
             self.sidebar_box.width() as f64
         };
-        Ok((w, h, sw, collapsed))
+        let families = self.installed_font_family_names();
+        let family =
+            typography::resolve_family_name(self.typography.borrow().effective_family(), &families);
+        Ok((w, h, sw, collapsed, None, Some(family)))
     }
 
     /// `app.sidebar_dump` — read every project's *last-rendered* agent
@@ -6000,14 +5810,14 @@ impl App {
     /// UI's `RoostApp.reportOsc` path; the daemon decides whether
     /// to emit `TabTitleChanged` / `TabCwdChanged` /
     /// `NotificationEvent` / etc.
-    fn report_osc_event(self: &Rc<Self>, tab_id: i64, event: roost_osc::OscEvent) {
-        use roost_osc::OscEvent as E;
+    fn report_osc_action(self: &Rc<Self>, tab_id: i64, action: roost_engine::osc::OscAction) {
+        use roost_engine::osc::OscAction as A;
         // OSC 52 short-circuits before the daemon dispatch: it's not
         // workspace state, just an action. Honoring it on the UI side
         // is correct because only the UI has the OS clipboard handle.
         // `clipboard-write = deny` drops silently + logs at info,
         // matching Ghostty's behavior (Surface.zig:2164-2166).
-        if let E::Clipboard { target, text } = event {
+        if let A::ClipboardWrite { target, text } = action {
             if *self.clipboard_write_policy.borrow() == config::ClipboardWrite::Deny {
                 tracing::info!(
                     tab_id,
@@ -6028,40 +5838,16 @@ impl App {
         // `set_cursor_from_name` on pointer-in-view, and resets on
         // alt-screen exit. Mirrors the Mac UI's
         // `applyCurrentCursorShapeIfNeeded` path.
-        if let E::MouseShape(name) = event {
+        if let A::PointerShape(name) = action {
             if let Some(view) = self.terminal_view_for(tab_id) {
                 view.apply_mouse_shape(&name);
             }
             return;
         }
-        let (command, payload): (u32, String) = match event {
-            E::Title(t) => (0, t),
-            // OSC 7 wire format is `file://<host>/<path>`. The
-            // scanner already stripped `file://[host]` so `p`
-            // starts with `/`. Wrap back as `file://<empty-host>/<p>`
-            // = `file:///path` so the daemon's parse_cwd_from_osc7
-            // doesn't mistake the first path segment for a host
-            // (caught during Phase 7 smoke testing — sending
-            // `file:/<path>` produced cwd `/<second-component>`).
-            E::Pwd(p) => (7, format!("file://{}", p)),
-            E::Notification { title, body } => {
-                if body.is_empty() {
-                    (9, title)
-                } else {
-                    (777, format!("notify;{title};{body}"))
-                }
-            }
-            E::ColorQuery(n) => (n as u32, "?".to_string()),
-            // OSC 133 prompt/command mark — pass the body through to
-            // apply_osc, which maps it to tab state (P4b).
-            E::CommandMark(body) => (133, body),
-            // Handled by the short-circuits above; unreachable here.
-            E::Clipboard { .. } => unreachable!(),
-            // Handled above via `apply_mouse_shape` on the tab's view.
-            E::MouseShape(_) => unreachable!(),
-            // Handled by the drain's OSC 4 reply short-circuit; never
-            // routed to the daemon.
-            E::PaletteQuery(_) => unreachable!(),
+        let (command, payload): (u32, String) = match action {
+            A::Workspace { command, payload } => (command, payload),
+            A::PtyInput(_) => unreachable!("PTY replies are handled by the drain"),
+            A::ClipboardWrite { .. } | A::PointerShape(_) => unreachable!(),
         };
         let Some(client) = self.client.borrow().clone() else {
             return;
@@ -6129,13 +5915,18 @@ impl App {
     /// `ActiveChanged` reaction body — syncing there would echo the core's
     /// *previous* selection back over the one the caller asked for.
     fn activate_project_from_ui(self: &Rc<Self>, project_id: i64) {
+        let preferred_tab = self
+            .client
+            .borrow()
+            .as_ref()
+            .and_then(|client| client.workspace.preferred_tab(project_id));
         self.set_active_project(project_id);
         // An empty project (no tab yet) has nothing to focus, so the
         // core's active selection stays put until its first tab opens. In
         // normal use a project always has >=1 tab — closing the last tab
         // cascades the project away — so this only bites a raw IPC
         // `project.create` with no `tab.open`.
-        if let Some(tab_id) = self.active_tab_id(project_id) {
+        if let Some(tab_id) = preferred_tab.or_else(|| self.active_tab_id(project_id)) {
             self.sync_core_active_tab(tab_id);
         }
     }
@@ -6169,15 +5960,7 @@ impl App {
     /// `focus_tab_by_id`), so repeating the action walks the inbox.
     fn jump_to_unread(self: &Rc<Self>) {
         let active_pid = *self.active_project_id.borrow();
-        let target = {
-            let inbox = self.notification_inbox.borrow();
-            let pending = inbox.snapshot();
-            pending
-                .iter()
-                .find(|r| r.project_id == active_pid)
-                .or_else(|| pending.first())
-                .map(|r| r.tab_id)
-        };
+        let target = notification_inbox::next_unread(&self.notification_inbox.borrow(), active_pid);
         if let Some(tab_id) = target {
             self.reveal_and_focus_tab(tab_id);
         }
@@ -6560,13 +6343,6 @@ fn activation_target(
     }
 }
 
-/// Parse a notification row's item id (`notif:<tab_id>`) into the tab
-/// id. Returns `None` for the `notif:none` sentinel and any malformed
-/// id, so the confirm handler treats those as no-ops.
-fn notif_tab_id(item_id: &str) -> Option<i64> {
-    item_id.strip_prefix("notif:").and_then(|s| s.parse().ok())
-}
-
 /// Tilde-abbreviated cwd of `ui`'s currently selected tab (or the
 /// first tab if no selection exists yet). Empty string when the
 /// project has no attached tabs — caller uses that as the "subtitle
@@ -6722,26 +6498,6 @@ fn reveal_scroll_value(
     v.clamp(lower, max)
 }
 
-/// M10 sidebar-reorder pure math. Given a source row sitting at
-/// `source_idx` and the user's desired insertion point in the
-/// *with-source* visual order (`raw_target_idx`), return the
-/// listbox `Insert` position the row should be moved to. Returns
-/// `None` when the move would be a no-op (the drag lands on the
-/// source's own slot — either side of itself). Off-by-one is
-/// load-bearing here: when `raw_target_idx > source_idx`, removing
-/// the source first shifts every later index down by one, so the
-/// insert position is `raw_target_idx - 1`. The table-driven test
-/// below exercises the boundary cases.
-fn compute_insert_idx(source_idx: usize, raw_target_idx: usize) -> Option<usize> {
-    if raw_target_idx == source_idx || raw_target_idx == source_idx + 1 {
-        return None;
-    }
-    if raw_target_idx > source_idx {
-        return Some(raw_target_idx - 1);
-    }
-    Some(raw_target_idx)
-}
-
 /// M9.5 one-shot test-and-drain for the server-driven-close
 /// marker. Returns true if the marker was set (caller should
 /// skip the CloseTab RPC); also clears the marker so a second
@@ -6778,7 +6534,7 @@ fn write_back_font_family(name: &str) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
         return Ok(());
     };
-    let quoted = format!("\"{}\"", name);
+    let quoted = typography::quote_font_family(name);
     config::set_key(&path, "font-family", &quoted)
 }
 
@@ -6789,7 +6545,7 @@ fn write_back_font_size(size_pt: f64) -> std::io::Result<()> {
     let Some(path) = config::config_path() else {
         return Ok(());
     };
-    let formatted = format_font_size(size_pt);
+    let formatted = typography::format_font_size(size_pt);
     config::set_key(&path, "font-size", &formatted)
 }
 
@@ -6807,21 +6563,6 @@ fn write_back_show_sidebar_agents(value: bool) -> std::io::Result<()> {
         "show-sidebar-agents",
         if value { "true" } else { "false" },
     )
-}
-
-/// Format a font size in points for the config file. Whole numbers
-/// render as integers; non-whole values keep up to two decimal places
-/// so a `font-size = 14.5` round-trip cleanly. Split out for testing
-/// (no I/O).
-fn format_font_size(size_pt: f64) -> String {
-    if (size_pt.round() - size_pt).abs() < 0.001 {
-        format!("{}", size_pt.round() as i64)
-    } else {
-        // Two decimals is plenty for point sizes; trim trailing zeros.
-        let s = format!("{:.2}", size_pt);
-        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-        trimmed.to_string()
-    }
 }
 
 pub fn parse_tab_id_from_page(page: &libadwaita::TabPage) -> Option<i64> {
@@ -6889,11 +6630,12 @@ fn agent_rows_visible(toggle_on: bool, dragging: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_target, agent_rows_visible, compute_insert_idx, drain_server_driven_marker,
-        format_font_size, is_already_attached_or_pending, notif_tab_id, pick_next_active_project,
-        resolve_launch_cwd, restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home,
-        ActivationTarget, RestoreTab,
+        activation_target, agent_rows_visible, drain_server_driven_marker,
+        is_already_attached_or_pending, pick_next_active_project, resolve_launch_cwd,
+        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, ActivationTarget,
+        RestoreTab,
     };
+    use roost_ui_model::reorder::compute_insert_idx;
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
 
@@ -6974,19 +6716,6 @@ mod tests {
     fn reveal_scroll_clamps_when_content_shorter_than_page() {
         // content (upper 60) narrower than the viewport (100) → never overscroll.
         assert_eq!(reveal_scroll_value(0.0, 0.0, 60.0, 100.0, 10.0, 50.0), 0.0);
-    }
-
-    /// The notification-row id parser: `notif:<tab>` → the tab id; the
-    /// `notif:none` empty sentinel + malformed ids → `None` (so confirm
-    /// treats them as no-ops rather than jumping to a bogus tab).
-    #[test]
-    fn notif_tab_id_parses_only_well_formed_ids() {
-        assert_eq!(notif_tab_id("notif:42"), Some(42));
-        assert_eq!(notif_tab_id("notif:-3"), Some(-3));
-        assert_eq!(notif_tab_id("notif:none"), None);
-        assert_eq!(notif_tab_id("notif:"), None);
-        assert_eq!(notif_tab_id("new_tab"), None);
-        assert_eq!(notif_tab_id("notif:1.5"), None);
     }
 
     /// `restore_open_specs` encodes the seed-one-when-empty rule: a
@@ -7178,22 +6907,5 @@ mod tests {
         assert_eq!(resolve_launch_cwd(None, "/t"), "/t");
         // Both empty stays empty (open_tab then resolves project → $HOME).
         assert_eq!(resolve_launch_cwd(None, ""), "");
-    }
-
-    #[test]
-    fn format_font_size_whole_renders_as_integer() {
-        assert_eq!(format_font_size(14.0), "14");
-        assert_eq!(format_font_size(8.0), "8");
-        // Floating-point fuzz like 14.0000000001 still rounds.
-        assert_eq!(format_font_size(14.0 + f64::EPSILON), "14");
-    }
-
-    #[test]
-    fn format_font_size_keeps_decimals_when_needed() {
-        assert_eq!(format_font_size(14.5), "14.5");
-        // Trailing zeros are trimmed (no "14.50").
-        assert_eq!(format_font_size(14.50), "14.5");
-        // Two-decimal precision is preserved.
-        assert_eq!(format_font_size(13.25), "13.25");
     }
 }

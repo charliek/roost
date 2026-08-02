@@ -51,6 +51,9 @@ pub mod ffi {
 
 use thiserror::Error;
 
+mod color;
+pub use color::ColorRgb;
+
 /// libghostty-vt's success return code, mirrored locally so wrapper
 /// callsites don't need to import bindgen names. Defined alongside
 /// `Error::from_result` so the conversion path is in one place.
@@ -108,6 +111,10 @@ mod mouse_encoder;
 #[cfg(feature = "ffi")]
 mod render_state;
 #[cfg(feature = "ffi")]
+mod scroll;
+#[cfg(feature = "ffi")]
+mod selection;
+#[cfg(feature = "ffi")]
 mod terminal;
 
 #[cfg(feature = "ffi")]
@@ -117,10 +124,14 @@ pub use mouse_encoder::{
     mouse_action, mouse_button, MouseAction, MouseButton, MouseEncoder, MouseEvent,
 };
 #[cfg(feature = "ffi")]
-pub use render_state::{Cell, ColorRgb, Colors, CursorInfo, CursorVisualStyle, RenderState, Style};
+pub use render_state::{Cell, Colors, CursorInfo, CursorVisualStyle, RenderState, Style};
+#[cfg(feature = "ffi")]
+pub use scroll::{ScrollDirection, ScrollRoute, TerminalScroll};
+#[cfg(feature = "ffi")]
+pub use selection::{RowTextProjection, SelectionSnapshot, SelectionSpan, TerminalSelection};
 #[cfg(feature = "ffi")]
 pub use terminal::{
-    ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Terminal, TerminalOptions,
+    ActiveScreen, GridRef, Point, PointTag, ScrollViewport, Scrollbar, Terminal, TerminalOptions,
 };
 
 // ============================================================================

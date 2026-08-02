@@ -5,7 +5,7 @@
 // id counter; persists projects + next_id to `state.json` at the
 // bundle profile's `stateDir`.
 //
-// Mirrors `crates/roost-linux/src/daemon/state.rs` semantically:
+// Mirrors `crates/roost-engine/src/workspace.rs` semantically:
 // in-memory `BTreeMap`-style storage, atomic write via tmp +
 // rename, corrupt state.json → start empty. Persists each project's
 // tab layout (title + cwd + position) + the active selection, loaded
@@ -546,7 +546,7 @@ final class Workspace {
         // tilde-abbreviated path via `setTabTitleFromOSC` —
         // latest-wins. Event order is cwd-then-title
         // (cause-then-effect). See the Rust twin in
-        // `crates/roost-linux/src/daemon/state.rs::set_tab_cwd` and
+        // `crates/roost-engine/src/workspace.rs::set_tab_cwd` and
         // issue #196.
         if !t.userTitled {
             let newTitle = deriveTitle(cwd: cwd)

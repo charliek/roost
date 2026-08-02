@@ -7,9 +7,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, poc/iced]
   pull_request:
-    branches: [main]
+    branches: [main, poc/iced]
 
 permissions:
   contents: read
@@ -56,6 +56,7 @@ jobs:
               - 'tests/**'
             tests:
               - 'tools/roosttest/**'
+              - 'tools/roosttest_unit/**'
               - 'tools/input/linux/**'
               - 'tools/wayland/**'
               - 'pyproject.toml'
@@ -89,10 +90,20 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        # `--exclude roost-linux` because that crate needs GTK4 + libadwaita
-        # installed — handled by the dedicated `gtk-build` job instead of
-        # bloating this lint runner with the GTK toolchain.
-        run: cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
+        # UI crates have native dependencies and dedicated strict lint jobs.
+        # Keep this runner the toolkit-neutral core lane.
+        run: cargo clippy --workspace --exclude roost-linux --exclude roost-iced --all-targets -- -D warnings
+
+  harness-unit:
+    needs: changes
+    if: needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Functional harness target contract
+        run: python3 -m unittest discover -s tools/roosttest_unit -v
 
   themes-parity:
     needs: changes
@@ -107,7 +118,7 @@ jobs:
       # the copies against drift — adding a theme to one UI only is a
       # classic miss.
       - name: Bundled themes byte-identical across UIs
-        run: diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
+        run: diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes
 
   rust-build:
     needs: changes
@@ -176,6 +187,11 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --exclude roost-linux
+
+      # The experimental Swift-facing facade is feature-gated with no
+      # production consumer; test it explicitly so the gated code stays green.
+      - name: cargo test (roost-engine with facade)
+        run: cargo test -p roost-engine --features facade
 
   swift-mac:
     needs: changes
@@ -424,6 +440,198 @@ jobs:
         # #234) guards (they survive the `-A warnings` as later, more-specific
         # flags).
         run: cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types -D clippy::disallowed_methods
+
+  # Iced walking skeleton: exact released Iced + libghostty-vt on both host
+  # platforms, with the common IPC harness driving a real PTY-backed window.
+  # The Linux leg selects X11 under Xvfb; its wgpu renderer uses Mesa's
+  # software Vulkan implementation when the runner exposes no physical GPU.
+  iced-build-e2e:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        renderer: [wgpu, tiny-skia]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Iced native dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fonts-noto-cjk libclang-dev libxkbcommon-x11-0 libwayland-client0 \
+            mesa-vulkan-drivers weston xvfb xdotool zsh
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + Iced target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-iced-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-iced-${{ runner.os }}-
+
+      - name: Build Iced + roostctl
+        run: cargo build -p roost-iced -p roost-cli
+
+      - name: Test and lint Iced
+        run: |
+          cargo test -p roost-iced
+          cargo clippy -p roost-iced --all-targets -- -D warnings
+
+      - name: Verify toolkit dependency boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced) v'; then
+            echo "FAIL: roost-engine depends on a UI toolkit"
+            exit 1
+          fi
+          if cargo tree -p roost-ui-model | grep -E '(^| )(gtk4|libadwaita|iced|pango|cairo-rs|wgpu) v'; then
+            echo "FAIL: roost-ui-model depends on a UI toolkit or renderer"
+            exit 1
+          fi
+          if cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs|roost-linux) v'; then
+            echo "FAIL: roost-iced depends on GTK or roost-linux"
+            exit 1
+          fi
+
+      - name: Run Iced functional E2E (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-x11-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_notifications.py
+          tools/roosttest/test_provider.py
+          tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_focus.py
+          tools/roosttest/test_palette.py
+          tools/roosttest/test_selection.py
+          tools/roosttest/test_osc52.py
+          --roost-target iced --roost-fresh -v
+
+      - name: Run Iced real-input clipboard (Linux X11)
+        if: runner.os == 'Linux'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_ICED_BIN: ${{ github.workspace }}/target/debug/roost-iced
+          ROOST_REQUIRE_REAL_INPUT: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-real-input-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-real-input-logs
+        run: python3 tools/input/linux/iced_clipboard_check.py
+
+      - name: Run Iced functional E2E (Linux Wayland)
+        if: runner.os == 'Linux'
+        # weston's headless backend has no input seat. Iced 0.14's
+        # smithay-clipboard correctly refuses wl_data_device ownership without
+        # a focused seat/serial, so native clipboard coverage runs in the X11
+        # lane above. This lane still requires the complete non-clipboard
+        # Wayland renderer suite; the POC plan records the real-seat evidence
+        # and remaining programmatic-write limitation.
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-wayland-logs
+        run: >
+          tools/wayland/weston-run.sh
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_notifications.py
+          tools/roosttest/test_provider.py
+          tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_focus.py
+          tools/roosttest/test_palette.py
+          --roost-target iced --roost-fresh -v
+
+      - name: Run Iced functional E2E (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ICED_BACKEND: ${{ matrix.renderer }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-logs
+        run: >
+          uv run --group test pytest
+          tools/roosttest/test_smoke.py
+          tools/roosttest/test_iced_walking_skeleton.py
+          tools/roosttest/test_notifications.py
+          tools/roosttest/test_provider.py
+          tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_focus.py
+          tools/roosttest/test_palette.py
+          tools/roosttest/test_selection.py
+          tools/roosttest/test_osc52.py
+          --roost-target iced --roost-fresh -v
+
+      - name: Collect Iced diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-logs/*.log' \
+            -exec cp '{}' diagnostics/ \; 2>/dev/null || true
+          while IFS= read -r screenshot; do
+            suite="$(basename "$(dirname "${screenshot}")")"
+            cp "${screenshot}" "diagnostics/${suite}-$(basename "${screenshot}")"
+          done < <(find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-artifacts/*.png' 2>/dev/null)
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            cp "$HOME"/Library/Logs/DiagnosticReports/roost-iced*.ips diagnostics/ 2>/dev/null || true
+          fi
+          ls -la diagnostics || true
+
+      - name: Upload Iced diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-iced-${{ matrix.os }}-${{ matrix.renderer }}-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Functional E2E: launch the real GTK UI headless under Xvfb and drive
   # it through the IPC op set with the pytest harness (tools/roosttest).
@@ -874,13 +1082,13 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, themes-parity, rust-build, swift-mac, gtk-build, e2e-gtk, e2e-mac]
+    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then

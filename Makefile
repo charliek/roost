@@ -1,7 +1,8 @@
 # Roost — common dev tasks. Run `make` (or `make help`) to list them.
 #
-# Two native UIs around libghostty-vt: Swift + AppKit (mac/) and
-# Rust + gtk4-rs (crates/roost-linux), plus the roostctl CLI. See
+# Three native UIs around libghostty-vt: Swift + AppKit (mac/),
+# Rust + gtk4-rs (crates/roost-linux), and the isolated Iced POC
+# (crates/roost-iced), plus the roostctl CLI. See
 # docs/development/vision.md for the architecture + north star.
 
 .DEFAULT_GOAL := help
@@ -37,9 +38,12 @@ $(GHOSTTY_LIB):
 
 # ---- build ------------------------------------------------------------
 
-.PHONY: build build-mac bundle build-all
+.PHONY: build build-iced build-mac bundle build-all
 build: $(GHOSTTY_LIB)  ## cargo build the workspace (GTK UI + roostctl)
 	cargo build
+
+build-iced: $(GHOSTTY_LIB)  ## Build the isolated Iced POC binary
+	cargo build -p roost-iced
 
 build-mac: $(GHOSTTY_LIB)  ## swift build the Mac app
 	cd $(MAC_DIR) && swift build
@@ -51,29 +55,50 @@ build-all: build bundle  ## Build both UIs + the Mac bundle
 
 # ---- run --------------------------------------------------------------
 
-.PHONY: run-gtk run-mac
+.PHONY: run-gtk run-iced run-mac
 run-gtk: build  ## Launch the GTK UI (Roost-gtk profile)
 	./target/debug/roost
+
+run-iced: build-iced  ## Launch the Iced POC (Roost-iced profile)
+	ROOST_BUNDLE_PROFILE=iced ./target/debug/roost-iced
 
 run-mac: bundle  ## Launch the bundled Mac app
 	open $(APP)
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-mac e2e e2e-gtk e2e-mac e2e-gtk-ci e2e-mac-ci smoke-gtk smoke-mac smoke-mac-launch test-real-input
-test: test-rust test-mac  ## All unit/integration tests (Rust + Swift)
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced
+
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py
+ICED_CLIPBOARD_TESTS := tools/roosttest/test_selection.py tools/roosttest/test_osc52.py
+test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
 test-rust:  ## cargo test --workspace
 	cargo test --workspace
 
+test-iced:  ## Iced unit tests (renderer + input + adapter)
+	cargo test -p roost-iced
+
 test-mac:  ## swift test (Mac)
 	cd $(MAC_DIR) && swift test
 
-e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk, default gtk; launches the UI)
+test-harness:  ## Fast unit tests for target/path/capability harness wiring
+	python3 -m unittest discover -s tools/roosttest_unit -v
+
+e2e:  ## pytest E2E suite (ROOST_TARGET=mac|gtk|iced, default gtk; launches the UI)
 	uv run --group test pytest tools/roosttest
 
 e2e-gtk:  ## E2E against the GTK UI
 	uv run --group test pytest tools/roosttest --roost-target gtk
+
+e2e-iced:  ## Required functional E2E against Iced
+	@tests='$(ICED_E2E_TESTS)'; \
+	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
+	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
+	uv run --group test pytest $$tests --roost-target iced
+
+e2e-iced-clipboard:  ## Native Iced clipboard/OSC E2E (macOS or Linux X11; not headless Wayland)
+	uv run --group test pytest $(ICED_CLIPBOARD_TESTS) --roost-target iced
 
 e2e-mac:  ## E2E against the Mac app
 	uv run --group test pytest tools/roosttest --roost-target mac
@@ -81,14 +106,26 @@ e2e-mac:  ## E2E against the Mac app
 e2e-gtk-ci:  ## GTK E2E at CI parity (test-mode + fresh harness-owned UI, isolated state)
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target gtk --roost-fresh
 
+e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated state)
+	@tests='$(ICED_E2E_TESTS)'; \
+	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
+	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
+	ROOST_TEST_MODE=1 uv run --group test pytest $$tests --roost-target iced --roost-fresh
+
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh
 
 smoke-gtk:  ## Screenshot-driven UI smoke against a running GTK UI
 	tools/screenshot/smoke.sh gtk
 
+smoke-iced:  ## Screenshot-driven UI smoke against a running Iced UI
+	tools/screenshot/smoke.sh iced
+
 smoke-mac:  ## Screenshot-driven UI smoke against a running Mac app
 	tools/screenshot/smoke.sh mac
+
+visual-parity:  ## DESTRUCTIVE: close live target UIs, then capture a hermetic comparison fixture
+	python3 tools/screenshot/parity.py
 
 smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build-tree resources, asserts it starts)
 	./mac/scripts/bundle.sh debug
@@ -96,6 +133,12 @@ smoke-mac-launch:  ## Clean-install launch check (bundles Roost.app, hides build
 
 test-real-input:  ## GTK real-input regressions: focus/core-sync + drag reorder (self-contained Xvfb+xdotool)
 	uv run --group test python tools/input/linux/real_input_check.py
+
+test-iced-real-input: build-iced  ## Iced real clipboard input (self-contained Linux Xvfb+xdotool)
+	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_clipboard_check.py
+
+test-iced-wayland-input: build-iced  ## Iced system clipboard with cage + a real uinput seat
+	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_wayland_clipboard_check.py
 
 # ---- code quality -----------------------------------------------------
 
@@ -113,8 +156,15 @@ clippy:  ## Lint Rust at CI parity (warnings are errors)
 	cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 	cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types -D clippy::disallowed_methods
 
+check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency boundaries
+	cargo clippy -p roost-iced --all-targets -- -D warnings
+	@! cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs|roost-linux) v' || \
+		( echo "roost-iced has a forbidden GTK dependency"; exit 1 )
+	@! cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced) v' || \
+		( echo "roost-engine has a UI toolkit dependency"; exit 1 )
+
 themes-check:  ## Assert the Rust + Mac bundled-theme copies are byte-identical
-	diff -r crates/roost-linux/src/resources/themes mac/Sources/Roost/Resources/themes
+	diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes
 
 check: fmt-check clippy themes-check test  ## Pre-push gate: fmt-check + clippy + themes-check + tests
 

@@ -47,12 +47,20 @@ mise install                           # Rust + Zig
 
 The IPC sockets live at:
 
-| OS | Mac UI socket | Linux UI socket |
-|---|---|---|
-| macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` (Gtk dev profile) |
-| Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` (falls back to `/tmp/roost-<uid>/roost.sock` if `XDG_RUNTIME_DIR` is unset) |
+| OS | Swift/AppKit | GTK | Iced POC |
+|---|---|---|---|
+| macOS | `~/Library/Caches/Roost/roost.sock` | `~/Library/Caches/Roost-gtk/roost.sock` | `~/Library/Caches/Roost-iced/roost.sock` |
+| Linux | n/a | `$XDG_RUNTIME_DIR/roost/roost.sock` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock` |
 
-Both UIs write a log file **and** tee to stdout: the Mac app to `~/Library/Logs/Roost/roost.log`, the Linux UI (`roost-linux`) to `$XDG_STATE_HOME/roost/roost.log` (default `~/.local/state/roost/roost.log`). On macOS the Gtk dev profile uses a distinct `~/Library/Logs/Roost-gtk/roost.log`, so the Swift app and `roost-linux` don't clobber each other when run side by side. `roostctl --help` and `docs/reference/ipc.md` document the wire surface.
+Without `XDG_RUNTIME_DIR`, Linux falls back to `/tmp/roost-<uid>` for GTK and
+`/tmp/roost-iced-<uid>` for Iced. State, lock, and log paths use the same
+profile separation. Select a live UI with `roostctl --target mac|gtk|iced`.
+
+Each UI writes a log file **and** tees to stdout. Iced uses
+`~/Library/Logs/Roost-iced/roost.log` on macOS and
+`$XDG_STATE_HOME/roost-iced/roost.log` on Linux; its socket, lock, state, and
+log paths are distinct from Swift and GTK. `roostctl --help` and
+`docs/reference/ipc.md` document the wire surface.
 
 ## Tests
 
@@ -63,7 +71,9 @@ Rust tests live next to the code they exercise. Major coverage:
 | `roost-ipc` | Frame reader/writer, JSON wire vectors, target selection (probe alive + env precedence) |
 | `roost-osc` | OSC 9 / 777 streaming parser, ST terminator, hook suppression |
 | `roost-vt` | FFI smoke tests against the vendored `libghostty-vt` archive (gated on `--features ffi`) |
-| `roost-linux` | Workspace state machine, PTY supervisor, IPC dispatch, single-instance flock |
+| `roost-engine` | Workspace, PTY supervision, persistence, events, IPC dispatch, instance lock |
+| `roost-ui-model` | Config, theme, keybind, palette, provider, and agent projection models |
+| `roost-linux` | GTK presentation, native ports, input, and terminal rendering adapter |
 | `roost-cli` | Escape decoder, shell quoter, target arg mapping |
 
 Mac tests are under `mac/Tests/RoostTests/`; they cover the workspace state machine, PTY supervisor lifecycle, IPC server framing, single-instance flock, renderer, OSC scanner, key encoder, drag/drop math, and tab pill state machine. They run in headless `swift test` (no NSWindow required for any covered surface).

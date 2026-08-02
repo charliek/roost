@@ -5,8 +5,8 @@
 # a labeled PNG per step into an output dir alongside a manifest.md that
 # says what each shot should show.
 #
-#   tools/uitest/smoke.sh mac                 # default outdir
-#   tools/uitest/smoke.sh gtk /tmp/roost-gtk  # custom outdir
+#   tools/screenshot/smoke.sh mac                  # default outdir
+#   tools/screenshot/smoke.sh iced /tmp/roost-iced # custom outdir
 #
 # The screenshots are the verification surface: an agent (or human)
 # reads them against manifest.md. The script asserts the mechanical
@@ -16,7 +16,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-TARGET="${1:?usage: smoke.sh <mac|gtk> [outdir]}"
+TARGET="${1:?usage: smoke.sh <mac|gtk|iced> [outdir]}"
 ut_init "${TARGET}"
 OUT="${2:-/tmp/roost-uitest-${TARGET}-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${OUT}"
@@ -76,7 +76,10 @@ HOOK_ENV=(env "ROOST_TAB_ID=${TAB_A}" "ROOST_SOCKET=${UT_SOCK}")
 "${HOOK_ENV[@]}" "${UT_RC}" claude-hook session-start </dev/null >/dev/null
 "${HOOK_ENV[@]}" "${UT_RC}" claude-hook prompt-submit </dev/null >/dev/null
 assert_state "${TAB_A}" running
-echo '{"message":"choose a path"}' | "${HOOK_ENV[@]}" "${UT_RC}" claude-hook notification >/dev/null
+# The shared agent contract only moves lifecycle for an explicit blocking
+# notification type; an untyped notification is informational and deliberately
+# leaves `running` unchanged.
+echo '{"message":"choose a path","notification_type":"agent_needs_input"}' | "${HOOK_ENV[@]}" "${UT_RC}" claude-hook notification >/dev/null
 assert_state "${TAB_A}" needs_input
 "${HOOK_ENV[@]}" "${UT_RC}" claude-hook stop </dev/null >/dev/null
 assert_state "${TAB_A}" idle

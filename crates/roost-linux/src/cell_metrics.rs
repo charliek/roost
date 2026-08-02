@@ -12,15 +12,7 @@
 
 use gtk4::pango::{self, FontDescription};
 use gtk4::prelude::{FontFamilyExt, FontMapExt};
-
-/// Default font family chain. JetBrains Mono is preferred when
-/// installed; falls through to system monospace via Pango's
-/// `Monospace` alias. The full font-family fallback resolution
-/// lands in commit 11.
-pub const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono, Monospace";
-
-/// Default font size in points. Matches the Mac UI default.
-pub const DEFAULT_FONT_SIZE_PT: f64 = 13.0;
+pub use roost_ui_model::typography::{DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE_PT};
 
 /// Pango-measured cell metrics.
 #[derive(Debug, Clone, Copy)]

@@ -1,17 +1,26 @@
-//! In-process daemon — PTY supervision + state + JSON persistence.
+//! Compatibility exports for the toolkit-neutral application engine.
 //!
-//! Copied + adapted from `crates/roost-core/src/{pty,state}.rs` at
-//! the daemon-removal M3. The roost-core originals stay in place
-//! through M6 to keep the workspace building, and are deleted in
-//! M7 along with the rest of the daemon.
+//! New UI-independent code should depend on `roost-engine` directly. These
+//! exports preserve the GTK crate's established internal and test paths while
+//! the presentation adapter is migrated in small, reviewable steps.
 
-pub mod pty;
-pub mod state;
-pub mod store_json;
-
-pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, SupervisorEvent};
-pub use state::{
-    AttentionSource, RestoreLayout, RestoreProject, RestoreTab, Workspace, WorkspaceError,
-    WorkspaceEvent,
+pub use roost_engine::persistence::{persist_state, read_state, SnapshotFile};
+pub use roost_engine::{
+    AttentionSource, PtyError, PtyOutputEvent, PtySupervisor, RestoreLayout, RestoreProject,
+    RestoreTab, SupervisorEvent, Workspace, WorkspaceError, WorkspaceEvent,
 };
-pub use store_json::{persist_state, read_state, SnapshotFile};
+
+/// Compatibility namespace for callers that previously named `daemon::state`.
+pub mod state {
+    pub use roost_engine::workspace::*;
+}
+
+/// Compatibility namespace for callers that previously named `daemon::store_json`.
+pub mod store_json {
+    pub use roost_engine::persistence::*;
+}
+
+/// Compatibility namespace for callers that previously named `daemon::pty`.
+pub mod pty {
+    pub use roost_engine::pty::*;
+}

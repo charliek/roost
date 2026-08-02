@@ -9,8 +9,12 @@
 #                   roost-osc test fixtures.
 #   * roost-agent — pure agent adapters: hook event JSON in,
 #                   `tab.agent_report` params out. No I/O.
-#   * roost-linux — gtk4-rs + libadwaita Linux UI. Embeds the workspace,
-#                   PTY supervisor, and IPC server in-process.
+#   * roost-engine — toolkit-neutral workspace, persistence, PTY runtime,
+#                    application commands/events, and IPC dispatch.
+#   * roost-ui-model — toolkit-neutral config, theme, palette, keybind,
+#                      provider, agent projection, and selection models.
+#   * roost-linux — gtk4-rs + libadwaita Linux UI adapter.
+#   * roost-iced — Iced POC UI adapter, isolated from GTK dependencies.
 #   * roost-cli   — shell-integration CLI; binary is `roostctl`.
 #
 # `roost-linux` is in `default-members`: the workspace builds the whole
@@ -31,8 +35,11 @@ members = [
     "crates/roost-osc",
     "crates/roost-url",
     "crates/roost-agent",
+    "crates/roost-engine",
+    "crates/roost-ui-model",
     "crates/roost-cli",
     "crates/roost-linux",
+    "crates/roost-iced",
 ]
 
 [workspace.package]
@@ -80,6 +87,7 @@ cc      = "1.0"
 # Misc
 percent-encoding = "2.3"
 regex            = { version = "1.10" }
+unicode-width    = "0.2"
 
 [profile.release]
 lto         = "thin"

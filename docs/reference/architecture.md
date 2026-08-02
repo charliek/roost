@@ -1,6 +1,8 @@
 # Architecture
 
-Roost ships two native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed the workspace + PTY supervisor in-process. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+Roost ships two production native UIs — Swift + AppKit on macOS (`Roost.app`) and Rust + gtk4-rs on Linux (`roost-linux`) — that each embed their runtime in-process. The GTK runtime's authoritative state is provided by the toolkit-neutral `roost-engine` crate. External tooling (the `roostctl` CLI, Claude Code hooks) talks to a running UI via newline-delimited JSON over a Unix-domain socket; the wire format is documented in [`docs/reference/ipc.md`](ipc.md). `libghostty-vt` is vendored once and linked directly into both UIs for in-process VT parsing and rendering.
+
+The `poc/iced` branch proposes extending the shared Rust engine to Iced and, incrementally, Swift. This is a POC architecture proposal, not approval to migrate the production AppKit implementation; see [the reviewed Iced POC plan](../development/iced-poc-plan.md).
 
 For the durable design rationale (why two languages, why in-process, why local UDS) see [Vision](../development/vision.md).
 
@@ -11,7 +13,7 @@ For the durable design rationale (why two languages, why in-process, why local U
 | Window + chrome | Swift + AppKit | Rust + gtk4-rs + libadwaita |
 | Renderer | Core Graphics over libghostty-vt cell grid | Cairo + Pango over libghostty-vt cell grid |
 | Terminal engine | `libghostty-vt` (vendored, shared archive) | `libghostty-vt` (vendored, shared archive) |
-| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-linux/src/daemon/state.rs` |
+| Workspace | `mac/Sources/Roost/Workspace.swift` (`@MainActor`) | `crates/roost-engine/src/workspace.rs` |
 | PTY supervisor | `mac/Sources/Roost/PtySupervisor.swift` (forkpty + DispatchSourceRead) | `crates/roost-linux/src/daemon/pty.rs` (`portable-pty` + tokio tasks) |
 | Persistence | `state.json` via tmp + fsync + `replaceItemAt` | `state.json` via tmp + fsync + rename + parent-dir fsync |
 | IPC server | `mac/Sources/Roost/IPCServer.swift` (Darwin sockets) | `crates/roost-ipc/src/server.rs` (tokio `UnixListener`) |
@@ -103,7 +105,7 @@ The Mac PTY read path uses a dedicated pattern: the `DispatchSourceRead` closure
 - `libghostty-vt` lives inside each UI for VT parsing + rendering.
 - OSC scanning lives in the UI (`OscScanner.swift` on macOS, `roost-osc` crate on Linux) because OSC parsing walks the same byte stream the VT parser does. OSC events apply directly to the local workspace via `LocalClient.applyOSC`.
 - Terminal *query* replies (the program asking the terminal for its colors, device attributes, etc.) split across two channels — embedder-synthesized OSC color replies vs. libghostty-answered device replies. See [Terminal query replies](terminal-queries.md) for which is which and why.
-- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket (`~/Library/Caches/Roost/roost.sock` for Mac, `$XDG_RUNTIME_DIR/roost/roost.sock` for Linux). `roostctl --target {mac,gtk}` routes to the right one; `roostctl` with no `--target` auto-detects via a parallel `connect()` probe of both candidate sockets.
+- The IPC server is per-UI: external tooling (`roostctl`, Claude hooks) talks to the bundle profile's socket. The Iced POC adds isolated `Roost-iced`/`roost-iced` paths alongside the existing Mac and GTK paths. `roostctl --target {mac,gtk,iced}` routes explicitly; with no selector it probes every distinct candidate concurrently and requires a choice if multiple UIs answer.
 - Single-instance enforcement uses `flock(LOCK_EX | LOCK_NB)` on a pidfile next to the socket. Second launches read the holder PID and exit 0. `ROOST_ALLOW_MULTI=1` bypasses for dev/test workflows.
 
 See [Vision → Decision log](../development/vision.md#decision-log) for the rationale behind each major choice.

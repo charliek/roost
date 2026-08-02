@@ -90,6 +90,22 @@ func bundleProfileGtkIsDistinctFromMac() {
 }
 
 @Test
+func bundleProfileIcedIsDistinctFromMacAndGtk() {
+    let mac = BundleProfile.mac(environment: ["HOME": "/Users/tester"])
+    let gtk = BundleProfile.gtk(environment: ["HOME": "/Users/tester"])
+    let iced = BundleProfile.iced(environment: ["HOME": "/Users/tester"])
+    #expect(iced.appID == "ai.stridelabs.Roost.iced")
+    #expect(iced.appLabel == "Roost-iced")
+    #expect(iced.socketPath == "/Users/tester/Library/Caches/Roost-iced/roost.sock")
+    #expect(iced.stateDir == "/Users/tester/Library/Application Support/Roost-iced")
+    #expect(iced.logDir == "/Users/tester/Library/Logs/Roost-iced")
+    #expect(iced.socketPath != mac.socketPath)
+    #expect(iced.socketPath != gtk.socketPath)
+    #expect(iced.lockPath != mac.lockPath)
+    #expect(iced.lockPath != gtk.lockPath)
+}
+
+@Test
 func bundleProfileEnvOverridesDefault() {
     let p = BundleProfile.currentForBinary(
         default: .mac,
@@ -100,6 +116,19 @@ func bundleProfileEnvOverridesDefault() {
     )
     #expect(p.kind == .gtk)
     #expect(p.appID == "ai.stridelabs.Roost.gtk")
+}
+
+@Test
+func bundleProfileIcedEnvOverridesDefault() {
+    let p = BundleProfile.currentForBinary(
+        default: .mac,
+        environment: [
+            "HOME": "/Users/tester",
+            "ROOST_BUNDLE_PROFILE": "iced",
+        ]
+    )
+    #expect(p.kind == .iced)
+    #expect(p.appID == "ai.stridelabs.Roost.iced")
 }
 
 // MARK: - ROOST_STATE_DIR override (lockstep with paths.rs apply_state_dir_override)
@@ -170,4 +199,3 @@ func sidebarVisibleStateSurvivesReopen() {
     defaults.set(true, forKey: "RoostSidebarVisible")
     #expect(RoostApp.sidebarVisibleOnLaunch(defaults) == true)
 }
-

@@ -1,0 +1,86 @@
+# Roost engine shell integration (zsh).
+#
+# Sourced inside a Roost tab to make the header subtitle, the tab label,
+# and new-tab cwd inheritance follow `cd` via OSC 7, and to set a sane
+# default prompt. Safe everywhere: gated on $ROOST_TAB_ID (no-op outside
+# Roost), idempotent (safe to source twice), and interactive-only.
+#
+# Roost also resolves a new tab's cwd natively, so cwd inheritance works
+# without this file; sourcing it adds the live subtitle/title + a default
+# prompt, and reports cwd over SSH (where the native read can't reach).
+#
+# Feature flags via $ROOST_SHELL_FEATURES (comma list; `no-<feature>`
+# disables): cwd, title, marks, prompt, ssh-env.
+#
+# `ssh-env` adds `-o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK"`
+# to every `ssh` invocation so modern TUIs (opencode, neovim with
+# truecolor themes) render correctly on remote hosts. Equivalent to
+# Ghostty's `shell-integration-features.ssh-env`. Requires the remote
+# sshd to `AcceptEnv` those variables (Debian/Ubuntu defaults only
+# accept LANG LC_*; users may need to extend `AcceptEnv` server-side
+# for the env to take effect).
+#
+# KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/roost.zsh
+
+[[ -o interactive ]] || return 0
+[[ -n "${ROOST_TAB_ID:-}" ]] || return 0
+[[ -n "${_ROOST_ZSH_LOADED:-}" ]] && return 0
+typeset -g _ROOST_ZSH_LOADED=1
+
+_roost_feature() {
+  case ",${ROOST_SHELL_FEATURES:-cwd,title,marks,prompt,ssh-env}," in
+    (*",no-$1,"*) return 1 ;;
+    (*) return 0 ;;
+  esac
+}
+
+# `ssh-env` feature: forward terminal-capability env vars across the
+# SSH boundary. The macOS default `ssh_config` only sends LANG + LC_*,
+# so COLORTERM is silently dropped — opencode and other modern TUIs
+# then fall back to 256-color and look broken. `builtin command ssh`
+# bypasses any user-defined `ssh` alias/function, mirroring Ghostty's
+# `ssh-env` (ghostty.zsh::ssh). Whether the remote accepts these vars
+# depends on its `AcceptEnv` setting; SendEnv with a rejecting server
+# is a silent no-op (no worse than current behavior).
+#
+# `function ssh { ... }` (no parens) is the zsh-specific syntax that
+# skips alias expansion on the function name — without it, an existing
+# `alias ssh=...` would re-expand `ssh` before the parser sees it and
+# the function definition would silently land on the wrong name. The
+# function body still picks up zsh aliases on `command` if the user
+# defined one, so `builtin command` short-circuits both layers.
+if _roost_feature ssh-env; then
+  function ssh {
+    builtin command ssh \
+      -o "SendEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION FORCE_HYPERLINK" \
+      "$@"
+  }
+fi
+
+__roost_osc7() {
+  _roost_feature cwd || return 0
+  printf '\033]7;file://%s%s\033\\' "${HOST}" "$PWD"
+}
+
+__roost_title() {
+  _roost_feature title || return 0
+  printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
+}
+
+# OSC 133 command marks: C before a command runs (preexec), D when it
+# ends / at the next prompt (precmd). Roost maps C -> running, D -> cleared.
+__roost_mark_c() { _roost_feature marks && printf '\033]133;C\033\\'; }
+__roost_mark_d() { _roost_feature marks && printf '\033]133;D\033\\'; }
+
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __roost_osc7
+add-zsh-hook precmd __roost_title
+add-zsh-hook preexec __roost_mark_c
+add-zsh-hook precmd __roost_mark_d
+
+# Default prompt (cwd in blue + a plain $) only when the user hasn't set
+# one — zsh's stock default PROMPT is '%m%# ', else empty.
+if _roost_feature prompt && [[ -z "${PS1:-}" || "$PS1" == '%m%# ' ]]; then
+  PROMPT='%F{blue}%~%f $ '
+  export ROOST_PS1_APPLIED=1
+fi
