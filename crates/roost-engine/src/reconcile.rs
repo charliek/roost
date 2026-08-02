@@ -5,8 +5,9 @@
 //! `TabOpened` / `ProjectDeleted` / reorder events. [`plan`] diffs
 //! the live UI membership against a ground-truth snapshot and returns
 //! the adds / removes / reorders / active-selection to apply. Keeping
-//! it pure makes it unit-testable without a glib main loop or GTK
-//! display, and keeps the GTK application code in `app.rs` thin.
+//! it pure makes it unit-testable without a UI toolkit main loop or
+//! display, and keeps each UI adapter's application code in `app.rs`
+//! thin.
 //!
 //! Only *membership* is read from the current UI — the target
 //! ordering and active selection come entirely from the snapshot and

@@ -157,8 +157,8 @@ pub fn confirm_family(
     }
 
     FamilyConfirmation {
-        // Preserve GTK's commit boundary: a newly selected family is applied
-        // even when the highlight preview already made it live.
+        // Preserve the established commit boundary: a newly selected family
+        // is applied even when the highlight preview already made it live.
         apply: FamilyApply::Set(Some(selected.to_owned())),
         persist: Some(selected.to_owned()),
     }
@@ -178,7 +178,8 @@ pub fn font_family_name_is_safe(name: &str) -> bool {
 ///
 /// Adapters own discovery. Curated entries are retained when installed even
 /// if platform metadata fails to mark them monospace, matching the historical
-/// GTK/Swift picker policy. The generic alias is always present exactly once
+/// picker policy shared by the UI adapters (GTK, Iced, Swift). The generic
+/// alias is always present exactly once
 /// so an unavailable configured chain can be represented and preselected.
 pub fn ordered_monospace_families(
     installed: impl IntoIterator<Item = (String, bool)>,
@@ -309,7 +310,7 @@ mod tests {
         assert_eq!(tiny.adjust_size(0.009), None);
         assert_eq!(tiny.current_size_pt(), 13.0);
 
-        // Preserve the former GTK transition boundary exactly: because the
+        // Preserve the established transition boundary exactly: because the
         // computed binary difference is just below 0.01, 0.01 is a no-op;
         // the next representable user-scale delta crosses the threshold.
         assert_eq!(tiny.adjust_size(0.01), None);

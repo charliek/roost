@@ -2,7 +2,7 @@
 //! command palette ("View Notifications") and the HeaderBar button
 //! badge.
 //!
-//! The PURE, GTK-free store — like `palette::PaletteState` /
+//! The PURE, toolkit-free store — like `palette::PaletteState` /
 //! `rollup::project_rollup`, it's unit-tested in isolation. The wiring
 //! in `app.rs` composes records (from the live project/tab model) and
 //! drives membership off the `has_notification` edges it already
@@ -53,7 +53,7 @@ impl NotificationRecord {
 }
 
 /// Ordered, newest-first ring of pending notifications, one entry per
-/// tab, capped at [`CAP`]. Pure value type — no GTK dependencies.
+/// tab, capped at [`CAP`]. Pure value type — no UI toolkit dependencies.
 #[derive(Debug, Default)]
 pub struct NotificationInbox {
     records: Vec<NotificationRecord>,

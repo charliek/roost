@@ -9,10 +9,11 @@
 //! Threading: the handler trait is `Send + Sync`. tokio drives the
 //! accept + read loops on worker threads; the handler itself
 //! mutates the workspace via its own internal `Mutex`, so there's
-//! no need for the UI's glib main loop to be involved. The actual
-//! UI updates flow through `Workspace::subscribe` — `app.rs`
-//! (M3b) installs a `glib::MainContext::channel` and listens
-//! there.
+//! no need for the UI adapter's main loop to be involved. The actual
+//! UI updates flow through `Workspace::subscribe` — each adapter
+//! installs a receiver on its own main-loop mechanism and listens
+//! there (GTK's `app.rs` (M3b) installs a `glib::MainContext::channel`;
+//! Iced drains its subscription on its own event loop).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,8 +39,8 @@ use roost_ipc::messages::{
 };
 use roost_ipc::{Handler, HandlerError};
 
-/// Text snapshot of a tab's terminal viewport, produced on the GTK main
-/// thread for the `tab.dump` op. Neutral (lib-side) types so this crate
+/// Text snapshot of a tab's terminal viewport, produced on the UI
+/// adapter's main thread for the `tab.dump` op. Neutral (lib-side) types so this crate
 /// stays independent of the bin's `TerminalView`; the UI fills it from
 /// `TerminalView::dump`. `cursor` is `(row, col, visible)`.
 pub struct DumpData {
@@ -58,7 +59,8 @@ type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), 
 /// terminal_top, terminal_font_family)`
 /// in logical points. The `Result<_, String>` envelope shape matches
 /// every sibling reply (so the shared `ui_call` helper works), but
-/// the UI side always answers `Ok` — GTK widget queries never fail.
+/// the UI side always answers `Ok` — UI adapter widget/state queries
+/// never fail.
 type WindowMetricsReply = tokio::sync::oneshot::Sender<
     Result<(f64, f64, f64, bool, Option<f64>, Option<String>), String>,
 >;
@@ -163,8 +165,9 @@ pub struct ResolvedCellData {
 }
 
 /// One unit of work the IPC handler (a tokio worker thread) hands to the
-/// GTK main thread — the single seam for anything an op needs to do
-/// against GTK / libghostty, which are main-thread-only. The UI drains
+/// UI adapter's main thread — the single seam for anything an op needs
+/// to do against the UI toolkit / libghostty, which are main-thread-only.
+/// The UI drains
 /// one channel of these and matches; request-reply variants carry a
 /// `oneshot` the main thread answers on. Adding a UI-touching op is a
 /// new variant here + one arm in the UI's drain loop, instead of a
@@ -337,8 +340,8 @@ pub struct IpcHandler {
     /// App label / app id pair from the active bundle profile.
     pub app_label: String,
     pub app_id: String,
-    /// Set by the running UI: ops that must touch GTK / libghostty
-    /// (activate, screenshot, dump) forward a [`UiRequest`] here for the
+    /// Set by the running UI: ops that must touch the UI toolkit /
+    /// libghostty (activate, screenshot, dump) forward a [`UiRequest`] here for the
     /// main thread to service. `None` in headless contexts (tests), so
     /// those ops no-op (activate) or error `internal` (screenshot/dump).
     ui_tx: Option<tokio::sync::mpsc::UnboundedSender<UiRequest>>,
@@ -363,15 +366,16 @@ impl IpcHandler {
     }
 
     /// Wire the UI request channel so main-thread-only ops (activate,
-    /// screenshot, dump) can reach GTK / libghostty. The UI installs the
-    /// sender; the matching receiver is drained on the GTK main thread.
+    /// screenshot, dump) can reach the UI toolkit / libghostty. The UI
+    /// installs the sender; the matching receiver is drained on the UI
+    /// adapter's main thread.
     pub fn with_ui(mut self, tx: tokio::sync::mpsc::UnboundedSender<UiRequest>) -> Self {
         self.ui_tx = Some(tx);
         self
     }
 
-    /// Hand a request-reply [`UiRequest`] to the GTK main thread and
-    /// await its answer. The outer `Result` reports channel/UI health
+    /// Hand a request-reply [`UiRequest`] to the UI adapter's main thread
+    /// and await its answer. The outer `Result` reports channel/UI health
     /// (no UI attached, UI gone, reply dropped); the inner `Result` is
     /// the op's own outcome, which the caller maps to the right error
     /// code (e.g. `not-found` for a missing tab). Shared by the
@@ -630,8 +634,8 @@ async fn dispatch(
             // unknown fields) rather than ACK-ing arbitrary payloads.
             let _p: AppActivateParams = decode(params)?;
             // Second-launch window raise (#6). Best-effort: forward to
-            // the GTK main thread if wired. A dropped receiver (window
-            // gone) or a headless handler is a no-op.
+            // the UI adapter's main thread if wired. A dropped receiver
+            // (window gone) or a headless handler is a no-op.
             if let Some(tx) = &h.ui_tx {
                 let _ = tx.send(UiRequest::Activate);
             }

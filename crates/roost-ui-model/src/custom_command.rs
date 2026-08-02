@@ -2,8 +2,8 @@
 //!
 //! Parses the repeated `command =` config key into [`CustomCommand`]s,
 //! builds the login-shell argv that runs one in a fresh tab, and turns a
-//! command list into launcher [`PaletteItem`]s. Kept split from the
-//! GTK/app layer (`app.rs`) so the tokenizer + argv builder are
+//! command list into launcher [`PaletteItem`]s. Kept split from each UI
+//! adapter's `app.rs` (GTK, Iced) so the tokenizer + argv builder are
 //! unit-tested in isolation, mirroring
 //! `mac/Sources/Roost/CustomCommand.swift`.
 //!

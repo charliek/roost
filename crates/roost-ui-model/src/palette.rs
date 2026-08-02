@@ -2,7 +2,8 @@
 //!
 //! Port of `mac/Sources/Roost/Palette.swift`: the items, the fuzzy
 //! matcher, and the `PaletteState` navigation/filter/selection machine.
-//! Kept split from the GTK overlay (`palette_ui.rs`) so the logic is
+//! Kept split from each UI adapter's overlay (GTK's `palette_ui.rs`,
+//! Iced's `palette_scroll.rs`) so the logic is
 //! unit-tested in isolation. Themes, commands, and any future picker are
 //! just different `PaletteFrame`s pushed onto the state.
 
@@ -286,7 +287,7 @@ impl PaletteFrame {
     }
 }
 
-/// Pure navigation/filter/selection over a stack of frames. No GTK,
+/// Pure navigation/filter/selection over a stack of frames. No UI toolkit,
 /// no callbacks, no side effects — the overlay reads `matches()` /
 /// `selected_item()` and drives transitions; effects (preview, run,
 /// revert) live in the overlay keyed off frame/item ids.
