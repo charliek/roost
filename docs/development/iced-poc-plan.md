@@ -2501,6 +2501,72 @@ and 38 harness/tool-test regression gate. Cargo dependency checks remained
 empty for forbidden toolkit edges and confirmed that GTK and Iced independently
 consume `roost-ui-model`.
 
+### Shared native file-drop commit plan
+
+Scope: give Iced a native file-drop adapter on macOS and X11,
+and move GTK's complete pure drop-payload resolver beside the existing shared
+shell escaping in `roost-ui-model`. The Iced window subscription preserves the
+originating window ID and starts a `window::Event::FileDropped` batch only while
+the active terminal owns keyboard input; palettes and inline editors cannot
+start one. The first event stamps the active terminal's stable tab ID, and
+continuation path events retain that origin even if focus changes. The application
+batches the one-path-per-event stream for 50 ms, resolves the batch once, and
+sends it through that tab's existing bracketed-paste-aware path. GTK keeps its
+terminal-attached native `DropTarget` and changes only to call the shared
+resolver.
+
+Invariants: the first native event owns the stable tab ID even when its path is
+later rejected; every subsequent path inside the 50 ms interval extends the
+deadline without changing ownership; a newly arriving path first flushes an
+expired batch; a focus change never splits or retargets an existing batch; and
+a closed origin, all-invalid batch, or empty payload emits no PTY bytes. With no
+native gesture ID, two genuinely separate drops less than 50 ms apart coalesce
+to the first origin; that bounded tradeoff is preferable to splitting one
+multi-file gesture across tabs. The shared resolver owns raw-path
+first-seen deduplication, non-UTF-8 and CR/LF rejection, shell escaping,
+newline joining, file priority, and GTK's plain-text fallback. It contains no
+GTK, Iced, PTY, or renderer type. Image files are supported as ordinary paths;
+clipboard image materialization, raw text/URI drops in Iced, and drag sources
+remain separate adapters.
+
+Iced 0.14/winit also does not expose native drag coordinates: X11 receives but
+discards Xdnd position and macOS emits path events without a point. A real
+external drag commonly makes Iced's ordinary mouse cursor unavailable, so
+cursor hit-testing would reject valid drops or use stale coordinates. This
+slice honestly accepts a supported file dropped anywhere in the owned Iced
+window as input for the active terminal. Exact terminal-surface targeting
+remains a named difference from GTK/Swift until upstream supplies coordinates
+or Roost adds a native port.
+
+Iced 0.14 documents `FileHovered`, `FileDropped`, and `FilesHoveredLeft` as not
+implemented on Wayland. This slice therefore requires native macOS and X11
+drop evidence plus both Wayland renderer regression suites, but it does not
+claim a Wayland external-drop pass. The user-visible Wayland gap remains named
+until Iced/winit implements the protocol or Roost adds a narrow platform port.
+
+Tests and acceptance: move and expand the existing GTK resolver vectors in the
+shared crate, including non-UTF-8 paths on Unix. Unit-test window-ID event
+mapping and input-route rejection, coalescing/order/deduplication, exact deadline and expired-on-push
+behavior, invalid first paths, two gestures, origin focus changes, closed
+origins, and exact plain/bracketed PTY bytes with one wrapper around a complete
+multi-file batch. Run GTK regressions, Iced unit/clippy/E2E, dependency-tree
+guards, the full local regression gate, shed X11/Wayland under both renderers,
+and require native macOS/X11 external-drag smoke evidence.
+Correctness tests remain permanent. A small shed-only native X11 XDND guard uses
+GTK as an external source application without adding a GTK dependency to Iced;
+the macOS Finder capture remains review evidence. This does not add a
+long-running parity-only CI job.
+
+Validation result: a real Finder drag on macOS reached the active Iced terminal
+as `ESC [ 200 ~ /Users/charliek/Desktop/Roost\\ Drop\\ Smoke...png ESC [ 201 ~`.
+The reusable shed guard then drove a real XDND gesture from an independent GTK
+source window into Iced and captured the complete escaped temporary pathname
+inside one bracketed-paste frame under both wgpu and tiny-skia. The source app
+is test infrastructure only; Cargo boundary checks continue to prove that the
+Iced product does not link GTK. Both Wayland renderer regression suites remain
+required, while native Wayland file drop is not claimed because Iced 0.14 does
+not emit those events.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

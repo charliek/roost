@@ -76,6 +76,15 @@ run_drag() {
     ROOST_TEST_TIMEOUT_SCALE=5 \
     python3 tools/input/linux/iced_clipboard_check.py"
 
+  log "running the Iced native X11 file-drop guard"
+  # GTK is the external XDND source application here; roost-iced remains
+  # GTK-free and the Cargo boundary gate verifies that independently.
+  in_shed "cd ~/roost && \
+    ROOST_ICED_BIN=$RT/debug/roost-iced \
+    ICED_BACKEND=tiny-skia ROOST_TEST_MODE=1 ROOST_REQUIRE_REAL_INPUT=1 \
+    ROOST_TEST_TIMEOUT_SCALE=5 \
+    python3 tools/input/linux/iced_native_file_drop_check.py"
+
   log "running the Iced cage+uinput Wayland clipboard guard"
   in_shed "cd ~/roost && \
     ROOST_ICED_BIN=$RT/debug/roost-iced \

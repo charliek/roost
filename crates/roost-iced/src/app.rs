@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,89 @@ const PALETTE_AGENT_PROJECT_MAX_COLUMNS: usize = 24;
 const PALETTE_AGENT_LEFT_MAX_COLUMNS: usize = 58;
 const PALETTE_AGENT_STATUS_FLOOR_COLUMNS: usize = 18;
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
+const FILE_DROP_DEBOUNCE: Duration = Duration::from_millis(50);
+
+#[derive(Debug, PartialEq, Eq)]
+struct PendingFileDrop {
+    tab_id: i64,
+    paths: Vec<PathBuf>,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+struct FileDropQueue {
+    pending: Option<PendingFileDrop>,
+}
+
+impl FileDropQueue {
+    /// Add one native path event. Iced/winit emits one event per path and no
+    /// successful-drop terminator, so a short extending deadline defines one
+    /// multi-file gesture. An expired gesture is returned before the new event
+    /// is installed, preventing delayed ticks from merging two gestures. With
+    /// no native gesture ID, every event inside the deadline belongs to the
+    /// first stable origin even if focus changes to another terminal, a
+    /// palette, or an editor between per-path events.
+    fn push_at(
+        &mut self,
+        new_origin: Option<i64>,
+        path: PathBuf,
+        now: Instant,
+    ) -> (Option<PendingFileDrop>, bool) {
+        let flush = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| now >= pending.deadline);
+        let ready = flush.then(|| self.pending.take()).flatten();
+        match &mut self.pending {
+            Some(pending) => {
+                pending.paths.push(path);
+                pending.deadline = now + FILE_DROP_DEBOUNCE;
+                (ready, true)
+            }
+            None => {
+                let Some(tab_id) = new_origin else {
+                    return (ready, false);
+                };
+                self.pending = Some(PendingFileDrop {
+                    tab_id,
+                    paths: vec![path],
+                    deadline: now + FILE_DROP_DEBOUNCE,
+                });
+                (ready, true)
+            }
+        }
+    }
+
+    fn take_ready_at(&mut self, now: Instant) -> Option<PendingFileDrop> {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| now >= pending.deadline)
+            .then(|| self.pending.take())
+            .flatten()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileDropDisposition {
+    Pasted,
+    Invalid,
+    ClosedOrigin,
+}
+
+fn dispatch_file_drop_batch(
+    batch: PendingFileDrop,
+    origin_live: bool,
+    paste: impl FnOnce(&str),
+) -> FileDropDisposition {
+    if !origin_live {
+        return FileDropDisposition::ClosedOrigin;
+    }
+    let Some(text) = roost_ui_model::drop_content::resolve(batch.paths, None) else {
+        return FileDropDisposition::Invalid;
+    };
+    paste(&text);
+    FileDropDisposition::Pasted
+}
 
 #[derive(Debug, Default)]
 struct StatusBanner {
@@ -759,6 +842,19 @@ enum KeyboardRoute {
     Editor,
     Palette,
     Terminal(i64),
+}
+
+fn native_file_drop_origin(
+    app_window: Option<window::Id>,
+    event_window: window::Id,
+    route: KeyboardRoute,
+) -> Option<i64> {
+    (app_window == Some(event_window))
+        .then_some(route)
+        .and_then(|route| match route {
+            KeyboardRoute::Terminal(tab_id) => Some(tab_id),
+            KeyboardRoute::None | KeyboardRoute::Editor | KeyboardRoute::Palette => None,
+        })
 }
 
 fn resolve_keyboard_route(
@@ -2237,6 +2333,7 @@ pub struct App {
     rename_completion_key: Option<RenameCompletionKey>,
     tab_drag_preview: Option<TabDragPreview>,
     tab_strip_generation: u64,
+    file_drops: FileDropQueue,
     config: RoostConfig,
     typography: TerminalTypography,
     font_registry: &'static FontRegistry,
@@ -2373,6 +2470,7 @@ impl App {
             rename_completion_key: None,
             tab_drag_preview: None,
             tab_strip_generation: 1,
+            file_drops: FileDropQueue::default(),
             config,
             typography,
             font_registry,
@@ -2444,12 +2542,16 @@ impl App {
     }
 
     pub fn tick(&mut self) -> UiTask {
-        self.status.expire_at(Instant::now());
+        let now = Instant::now();
+        self.status.expire_at(now);
         let mut task = self.service_ui_requests();
         self.service_agent_metrics();
         self.service_provider_results();
         self.service_workspace_events();
         self.reconcile();
+        if let Some(batch) = self.file_drops.take_ready_at(now) {
+            self.deliver_file_drop(batch);
+        }
         let mut exited = Vec::new();
         let mut osc_actions = Vec::new();
         let mut output_error = None;
@@ -2489,6 +2591,43 @@ impl App {
         task = task.then(self.take_palette_visibility_task());
         task = task.then(self.screenshots.start_next(self.window_id));
         task
+    }
+
+    pub fn file_dropped(&mut self, window_id: window::Id, path: PathBuf) {
+        if self.window_id != Some(window_id) {
+            tracing::debug!("ignored native file drop for an unowned window");
+            return;
+        }
+        let new_origin = native_file_drop_origin(self.window_id, window_id, self.keyboard_route());
+        let (ready, accepted) = self.file_drops.push_at(new_origin, path, Instant::now());
+        if let Some(batch) = ready {
+            self.deliver_file_drop(batch);
+        }
+        if !accepted {
+            tracing::debug!("ignored native file drop without an active terminal input route");
+        }
+    }
+
+    fn deliver_file_drop(&mut self, batch: PendingFileDrop) {
+        let tab_id = batch.tab_id;
+        let origin_live = self.workspace.tab(tab_id).is_ok() && self.tabs.contains_key(&tab_id);
+        let disposition = dispatch_file_drop_batch(batch, origin_live, |text| {
+            // The stable origin was stamped by the first window event. It
+            // cannot change when another tab gains focus during debounce.
+            self.tabs
+                .get(&tab_id)
+                .expect("live file-drop origin must have a terminal adapter")
+                .paste(Some(text));
+        });
+        match disposition {
+            FileDropDisposition::Pasted => {}
+            FileDropDisposition::Invalid => {
+                tracing::debug!(tab_id, "ignored file drop with no safe local paths")
+            }
+            FileDropDisposition::ClosedOrigin => {
+                tracing::debug!(tab_id, "discarded file drop for a closed tab")
+            }
+        }
     }
 
     pub fn clipboard_read_completed(&mut self, request_id: u64, value: Option<String>) -> UiTask {
@@ -5819,6 +5958,238 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_drop_queue_extends_deadline_and_preserves_stable_origin() {
+        let start = Instant::now();
+        let mut queue = FileDropQueue::default();
+        assert_eq!(
+            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            (None, true)
+        );
+        assert_eq!(
+            queue.push_at(
+                Some(7),
+                PathBuf::from("/tmp/second"),
+                start + Duration::from_millis(40)
+            ),
+            (None, true)
+        );
+        assert!(queue
+            .take_ready_at(start + Duration::from_millis(89))
+            .is_none());
+        let batch = queue
+            .take_ready_at(start + Duration::from_millis(90))
+            .expect("extended deadline is inclusive");
+        assert_eq!(batch.tab_id, 7);
+        assert_eq!(
+            batch.paths,
+            [PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+        );
+    }
+
+    #[test]
+    fn file_drop_queue_flushes_expired_gestures_and_keeps_first_origin_across_focus() {
+        let start = Instant::now();
+        let mut queue = FileDropQueue::default();
+        assert_eq!(
+            queue.push_at(None, PathBuf::from("/tmp/unowned"), start),
+            (None, false),
+            "an unowned event cannot start a batch"
+        );
+        assert_eq!(
+            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            (None, true)
+        );
+        let (expired, accepted) = queue.push_at(
+            Some(7),
+            PathBuf::from("/tmp/second"),
+            start + FILE_DROP_DEBOUNCE,
+        );
+        let expired = expired.expect("deadline boundary flushes before accepting a path");
+        assert!(accepted);
+        assert_eq!(expired.tab_id, 7);
+        assert_eq!(expired.paths, [PathBuf::from("/tmp/first")]);
+
+        assert_eq!(
+            queue.push_at(
+                Some(9),
+                PathBuf::from("/tmp/third"),
+                start + FILE_DROP_DEBOUNCE + Duration::from_millis(1),
+            ),
+            (None, true),
+            "focus change inside one native batch must not split or retarget it"
+        );
+        assert_eq!(
+            queue.push_at(
+                None,
+                PathBuf::from("/tmp/fourth"),
+                start + FILE_DROP_DEBOUNCE + Duration::from_millis(2),
+            ),
+            (None, true),
+            "palette/editor route inside one native batch must not truncate it"
+        );
+        let current = queue
+            .take_ready_at(start + 2 * FILE_DROP_DEBOUNCE + Duration::from_millis(2))
+            .expect("second gesture remains independently flushable at its extended deadline");
+        assert_eq!(current.tab_id, 7);
+        assert_eq!(
+            current.paths,
+            [
+                PathBuf::from("/tmp/second"),
+                PathBuf::from("/tmp/third"),
+                PathBuf::from("/tmp/fourth")
+            ]
+        );
+    }
+
+    #[test]
+    fn native_file_drop_requires_the_owned_window_and_terminal_input_route() {
+        let owned = window::Id::unique();
+        let other = window::Id::unique();
+        assert_eq!(
+            native_file_drop_origin(Some(owned), owned, KeyboardRoute::Terminal(42)),
+            Some(42)
+        );
+        assert_eq!(
+            native_file_drop_origin(Some(owned), other, KeyboardRoute::Terminal(42)),
+            None
+        );
+        assert_eq!(
+            native_file_drop_origin(None, owned, KeyboardRoute::Terminal(42)),
+            None
+        );
+        for route in [
+            KeyboardRoute::None,
+            KeyboardRoute::Editor,
+            KeyboardRoute::Palette,
+        ] {
+            assert_eq!(native_file_drop_origin(Some(owned), owned, route), None);
+        }
+    }
+
+    #[test]
+    fn file_drop_batch_is_one_plain_or_bracketed_paste_and_never_retargets() {
+        let start = Instant::now();
+        let batch = || PendingFileDrop {
+            tab_id: 41,
+            paths: vec![
+                PathBuf::from("/tmp/My File.png"),
+                PathBuf::from("/tmp/My File.png"),
+                PathBuf::from("/tmp/second.png"),
+            ],
+            deadline: start,
+        };
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 10,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .unwrap();
+        let mut calls = 0;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            dispatch_file_drop_batch(batch(), true, |text| {
+                calls += 1;
+                bytes = paste_bytes(&terminal, Some(text));
+            }),
+            FileDropDisposition::Pasted
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(bytes, b"/tmp/My\\ File.png\n/tmp/second.png");
+
+        terminal.vt_write(b"\x1b[?2004h");
+        assert_eq!(
+            dispatch_file_drop_batch(batch(), true, |text| {
+                calls += 1;
+                bytes = paste_bytes(&terminal, Some(text));
+            }),
+            FileDropDisposition::Pasted
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            bytes,
+            b"\x1b[200~/tmp/My\\ File.png\n/tmp/second.png\x1b[201~"
+        );
+
+        assert_eq!(
+            dispatch_file_drop_batch(batch(), false, |_| panic!("closed origin retargeted")),
+            FileDropDisposition::ClosedOrigin
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_drop_batch_reaches_terminal_session_capture_exactly_once() {
+        let (mut tab, supervisor) = attached_test_terminal(9_043);
+        let capture = tab.input_capture.as_ref().unwrap();
+        let batch = || PendingFileDrop {
+            tab_id: 9_043,
+            paths: vec![
+                PathBuf::from("/tmp/My File.png"),
+                PathBuf::from("/tmp/second.png"),
+            ],
+            deadline: Instant::now(),
+        };
+
+        assert_eq!(
+            dispatch_file_drop_batch(batch(), true, |text| tab.paste(Some(text))),
+            FileDropDisposition::Pasted
+        );
+        assert_eq!(
+            capture.lock().unwrap().as_slice(),
+            b"/tmp/My\\ File.png\n/tmp/second.png"
+        );
+
+        capture.lock().unwrap().clear();
+        tab.terminal.vt_write(b"\x1b[?2004h");
+        assert_eq!(
+            dispatch_file_drop_batch(batch(), true, |text| tab.paste(Some(text))),
+            FileDropDisposition::Pasted
+        );
+        assert_eq!(
+            capture.lock().unwrap().as_slice(),
+            b"\x1b[200~/tmp/My\\ File.png\n/tmp/second.png\x1b[201~"
+        );
+        supervisor.close(9_043);
+    }
+
+    #[test]
+    fn file_drop_invalid_first_path_keeps_origin_but_emits_no_empty_write() {
+        let start = Instant::now();
+        let invalid = PendingFileDrop {
+            tab_id: 77,
+            paths: vec![PathBuf::from("/tmp/unsafe\npath")],
+            deadline: start,
+        };
+        assert_eq!(
+            dispatch_file_drop_batch(invalid, true, |_| panic!("invalid path pasted")),
+            FileDropDisposition::Invalid
+        );
+
+        let mut queue = FileDropQueue::default();
+        assert_eq!(
+            queue.push_at(Some(77), PathBuf::from("/tmp/unsafe\npath"), start),
+            (None, true)
+        );
+        assert_eq!(
+            queue.push_at(
+                Some(77),
+                PathBuf::from("/tmp/safe path"),
+                start + Duration::from_millis(1),
+            ),
+            (None, true)
+        );
+        let batch = queue
+            .take_ready_at(start + Duration::from_millis(51))
+            .unwrap();
+        assert_eq!(batch.tab_id, 77);
+        let mut resolved = None;
+        assert_eq!(
+            dispatch_file_drop_batch(batch, true, |text| resolved = Some(text.to_string())),
+            FileDropDisposition::Pasted
+        );
+        assert_eq!(resolved.as_deref(), Some("/tmp/safe\\ path"));
+    }
 
     fn deliver_ipc(completion: ClipboardReadCompletion) {
         let ClipboardReadCompletion::Ipc { reply, value } = completion else {

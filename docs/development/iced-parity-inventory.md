@@ -135,7 +135,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Tab status | Shared lifecycle dot at leading edge, white active label, muted inactive label | Implemented with shared lifecycle derivation; inactive slots are transparent, but the current parity fixture does not yet pin dot/label geometry | P1 | Add focused status-slot geometry/color capture; retain the semantic color unit test |
 | Tab close/badge | Active or hovered pill exposes close; inactive notification uses a distinct blue trailing badge | Active exact-ID close and blue badge implemented; hover-close remains deferred | P1 | Real click-close test, badge color/position assertion, notification clear test |
 | Tab rename | Inline rename through double-click or the configured command, with authoritative persistence | Closed: compact inline editor uses stable IDs, select-all focus, Enter commit, Escape/click-away cancel, and shared GTK/Iced trim/no-op policy | closed | X11 physical shortcut/double-click/Enter/Escape/click-away gate, zero PTY leakage, relaunch persistence, and named GTK/Iced captures |
-| Tab reorder | Pointer drag reorder with visible insertion feedback | IPC operation exists, but there is no direct Iced drag UI | P0 | Stable-ID pointer functional tests, insertion geometry capture, persistence after relaunch |
+| Tab reorder | Pointer drag reorder with visible insertion feedback | Closed: stable-ID drag preview, insertion feedback, exact authoritative commit, cancellation, overflow, and relaunch persistence work under both renderers | closed | Bidirectional physical X11/Wayland input, outside-release/palette cancellation, zero PTY leakage, and named product captures |
 | New-tab affordance | Compact plus control following the pills | Closed: compact fixed plus remains reachable outside overflow and opens a PTY tab | closed | Click opens one PTY-backed tab; compact geometry assertion |
 | Notification entry | Header bell with count badge opens the inbox palette | Text button in the tab band | P1 | Bell/count capture and click-to-palette E2E |
 | Terminal padding | Compact consistent inset around the grid | 12 pt inset, visibly close but not yet measured against both references | P1 | Cell-origin and viewport-edge assertions at fixed size |
@@ -145,7 +145,7 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Palette placement | Centered, elevated compact panel over an undimmed terminal, styled semantic rows, keyboard focus, and scrolling | Closed for the visual-feasibility slice: exact reference neutrals, border/shadow, content-sized 660 pt card capped at 500 pt, compact command/agent/notification/provider rows, shortcut hints, fuzzy-match accents, disabled state, and a narrow neutral scrollbar | closed | Five named GTK/Iced captures; focus/scroll tests plus real row/card/outside pointer routing |
 | Empty/loading/error states | Deliberate shell placeholders without changing hierarchy | Plain `Starting terminal…`; status errors are appended to the sidebar | P1 | Seeded empty/loading/error snapshots and recovery tests |
 | Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Mostly inherited stock theme states | P1 | Renderer-neutral state-style unit tests plus real pointer/keyboard capture |
-| File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using UI-owned native adapters | No Iced drop or image-paste adapter | P1 | Text/file/image payload tests, shell escaping parity, platform launch smoke |
+| File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using terminal-attached native adapters | Local file drops anywhere in the owned Iced window target the active terminal when no palette/editor owns input, using the shared GTK/Iced resolver and bracketed-paste path on macOS/X11; exact hit-testing, raw text/URI drops, clipboard image materialization, and native Wayland DnD remain | P1 | Shared payload/PTY-byte tests, real Finder evidence, and a reusable shed XDND guard proven under wgpu/tiny-skia; retain the upstream-backed coordinate/Wayland gaps |
 | Native chrome | Platform-appropriate window controls and title/subtitle behavior | Native winit decorations; renderer screenshot cannot compare them directly | P2 | Platform launch artifacts and manual checklist, separate from content pixels |
 | Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | Closed for the current shell: renderer-neutral widget begins at x=220/y=34 with the sidebar and x=0/y=34 collapsed under wgpu/tiny-skia on macOS, X11, and Wayland | closed | Focused product screenshot regression runs in the existing renderer matrix; repeatable parity captures remain available for human review |
 
@@ -166,7 +166,7 @@ does not justify a second state machine.
 | Open tab | implemented | implemented | Restyle plus control and preserve PTY launch path |
 | Close tab | implemented | active-pill close implemented | Keep exact rendered tab IDs and last-tab/project cascade coverage; add hover-close polish separately |
 | Rename tabs | implemented | implemented | Double-click/configured command uses the authoritative operation; physical input proves focus, cancel, commit, zero PTY leakage, and restoration |
-| Reorder tabs | implemented | missing | Pointer drag with stable IDs and insertion feedback; persist through engine events |
+| Reorder tabs | implemented | implemented | Stable-ID pointer preview commits through the authoritative operation and persists; hover-close and automatic offscreen reveal remain polish |
 | Sidebar collapse | implemented/persisted | implemented | Move affordance into chrome; retain command and shortcut convergence |
 | Sidebar resize | UI-owned geometry | missing | Iced split/drag adapter and persisted width policy |
 | Notifications inbox | shared model/UI port | implemented | Replace text control with bell/badge without changing model |
@@ -176,7 +176,7 @@ does not justify a second state machine.
 | Configured workspace shortcuts | shared keybinding IDs | exhaustive dispatch is implemented; supported actions route to the workspace/UI port and unavailable project actions show a deterministic status without PTY bytes | Implement the remaining project adapters behind the already-safe action routes |
 | Font increase/decrease/reset | shared keybinding IDs/config | implemented | Renderer-measured metrics reflow all live tabs atomically and persist exact values; new tabs inherit the live typography |
 | Terminal scrollback | shared VT policy | wheel implemented | Add explicit PageUp/PageDown local commands; preserve the shared mode precedence and physical wheel gate |
-| Text/file/image drop | UI-owned native adapter | missing | Normalize payloads, reuse shared escaping where possible, then send explicit PTY bytes |
+| Text/file/image drop | UI-owned native adapter | partial | macOS/X11 local files batch to a stable active tab, share GTK normalization, and honor bracketed paste; Iced 0.14 has no drag coordinates, so the owned window is the current target boundary. Add exact native hit-testing, raw text/URI and clipboard-image adapters, plus a Wayland solution |
 | Native notifications | engine action exists | deferred | Add platform adapter only; never issue native UI calls from engine locks |
 
 ## Ordered implementation slices
@@ -210,8 +210,9 @@ renderers, and is pushed only after the complete applicable gate is green.
 6. **Project manipulation:** inline rename is complete; add portal/native
    directory selection, create, delete, pointer reorder, and the shared
    `new_project` command route.
-7. **Tab manipulation:** inline rename and restoration coverage are complete;
-   add pointer drag reorder/overflow and hover-close behavior.
+7. **Tab manipulation:** inline rename, pointer drag reorder/overflow, and
+   restoration coverage are complete; add hover-close and automatic offscreen
+   reveal behavior.
 8. **Interaction-cost go/no-go:** after at least one project or tab
    direct-manipulation path is polished and tested, assess focus, accessibility,
    text editing, drag feedback, and custom-widget complexity against GTK. Stop
@@ -295,10 +296,20 @@ These are sequencing decisions, not accepted final gaps:
 - The footer temporarily retains `Hide Sidebar` until the project-manipulation
   slice supplies the shared `New Project` route and a portal/native directory
   picker; the missing direct creation path remains P0.
-- Only the active tab exposes close in this slice. Hover-close, pointer
-  reorder, drag insertion feedback, and automatic reveal after
+- Only the active tab exposes close. Hover-close and automatic reveal after
   programmatic selection of an offscreen tab remain in the tab-manipulation
-  slice. Manual horizontal reachability is already a real-pointer gate.
+  slice. Pointer reorder, drag insertion feedback, persistence, and manual
+  horizontal reachability are physical-input gates.
+- Iced 0.14's native `FileDropped` event is explicitly unavailable on Wayland.
+  Local file drops therefore work on macOS/X11 in the current adapter; an
+  accepted Linux replacement still needs upstream support or a narrow Wayland
+  platform port. Raw text/URI drops and clipboard image materialization also
+  remain separate UI-adapter work.
+- Iced 0.14/winit does not expose the native drag position on macOS or X11, and
+  the ordinary mouse cursor may be unavailable or stale during external DnD.
+  The current honest boundary is therefore the owned Iced window: a file drop
+  targets the active terminal only while no palette/editor owns input. Exact
+  terminal-surface targeting needs upstream coordinates or a native port.
 - Iced 0.14 does not expose all desired accessibility labels/tooltips through
   the current compact controls without more adapter work. Semantic icon,
   tooltip, focus-ring, and assistive-technology refinement remains required

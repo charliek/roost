@@ -45,6 +45,10 @@ enum Message {
     CapturedEscape,
     CapturedEnterRelease,
     TerminalPointer(terminal_widget::TerminalPointer),
+    WindowFileDropped {
+        window_id: window::Id,
+        path: std::path::PathBuf,
+    },
     ProjectSelected(i64),
     BeginRenameProject(i64),
     AgentSelected(i64),
@@ -147,6 +151,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::WindowFileDropped { window_id, path } => {
+            app.file_dropped(window_id, path);
+            Task::none()
+        }
         Message::RenameDraftChanged(draft) => {
             app.rename_draft_changed(draft);
             Task::none()
@@ -222,11 +230,7 @@ fn subscription(_app: &App) -> Subscription<Message> {
         time::every(Duration::from_millis(16)).map(|_| Message::Tick),
         window::open_events().map(Message::WindowOpened),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
-        window::events().filter_map(|(id, event)| match event {
-            window::Event::Focused => Some(Message::WindowFocus(id, true)),
-            window::Event::Unfocused => Some(Message::WindowFocus(id, false)),
-            _ => None,
-        }),
+        window::events().filter_map(|(id, event)| window_event_message(id, event)),
         event::listen_with(|event, status, _window| {
             let Event::Keyboard(event) = event else {
                 return None;
@@ -241,6 +245,18 @@ fn subscription(_app: &App) -> Subscription<Message> {
             }
         }),
     ])
+}
+
+fn window_event_message(id: window::Id, event: window::Event) -> Option<Message> {
+    match event {
+        window::Event::Focused => Some(Message::WindowFocus(id, true)),
+        window::Event::Unfocused => Some(Message::WindowFocus(id, false)),
+        window::Event::FileDropped(path) => Some(Message::WindowFileDropped {
+            window_id: id,
+            path,
+        }),
+        _ => None,
+    }
 }
 
 /// Text inputs capture Escape before `keyboard::listen`, but Escape is an
@@ -435,5 +451,23 @@ mod tests {
         };
         assert!(is_enter_release(&release));
         assert!(!is_enter_release(&press(Key::Named(Named::Enter))));
+    }
+
+    #[test]
+    fn native_file_drop_mapping_preserves_window_and_raw_path() {
+        let id = window::Id::unique();
+        let path = std::path::PathBuf::from("/tmp/My File.png");
+        let message = window_event_message(id, window::Event::FileDropped(path.clone()))
+            .expect("file drop maps to an application message");
+        let Message::WindowFileDropped {
+            window_id,
+            path: mapped,
+        } = message
+        else {
+            panic!("unexpected native file-drop message")
+        };
+        assert_eq!(window_id, id);
+        assert_eq!(mapped, path);
+        assert!(window_event_message(id, window::Event::FilesHoveredLeft).is_none());
     }
 }

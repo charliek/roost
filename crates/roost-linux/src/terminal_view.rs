@@ -22,6 +22,7 @@
 //! can eyeball the renderer on Mac Homebrew GTK.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,7 +57,6 @@ use crate::focus::safe_grab_focus;
 use crate::key_encoder;
 use crate::keybind::{self, AccelMods};
 use crate::paste_image;
-use crate::shell_escape;
 use crate::sprite;
 use crate::theme::Theme;
 
@@ -2525,54 +2525,21 @@ fn install_file_drop(widget: &DrawingArea, state: &Rc<RefCell<TerminalViewState>
 /// yields no local path is ignored.
 fn drop_value_to_text(value: &glib::Value) -> Option<String> {
     if let Ok(list) = value.get::<gtk4::gdk::FileList>() {
-        let paths: Vec<String> = list
+        let paths = list
             .files()
             .iter()
-            .filter_map(|f| f.path())
-            // Skip non-UTF-8 paths rather than lossily mangling them: a
-            // U+FFFD-substituted path would silently name a different (or
-            // nonexistent) file. A rejected path is a clean no-op. (macOS
-            // enforces Unicode filenames, so the Mac side has no equivalent.)
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect();
-        return drop_text(&paths, None);
+            .filter_map(|file| file.path())
+            .collect::<Vec<_>>();
+        return roost_ui_model::drop_content::resolve(&paths, None);
     }
     if let Ok(file) = value.get::<gtk4::gio::File>() {
-        let paths: Vec<String> = file
-            .path()
-            .iter()
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect();
-        return drop_text(&paths, None);
+        let paths = file.path().into_iter().collect::<Vec<_>>();
+        return roost_ui_model::drop_content::resolve(&paths, None);
     }
     if let Ok(s) = value.get::<String>() {
-        return drop_text(&[], Some(&s));
+        return roost_ui_model::drop_content::resolve(std::iter::empty::<&Path>(), Some(&s));
     }
     None
-}
-
-/// Pure resolver from a drop payload to the text inserted into the PTY: file
-/// paths take priority (shell-escaped, de-duplicated, newline-joined, with any
-/// newline-bearing path dropped — a `\n` would split the join and, at a raw
-/// shell, execute everything after it), else a plain string verbatim (it may be
-/// a command the user wants to run). Returns `None` for an empty payload so the
-/// caller emits no stray `ESC[200~ESC[201~`. Mirrors
-/// `TerminalView.dropContentString` on Mac.
-fn drop_text(file_paths: &[String], string: Option<&str>) -> Option<String> {
-    let mut seen = std::collections::HashSet::new();
-    let escaped: Vec<String> = file_paths
-        .iter()
-        .filter(|p| !p.contains('\n') && !p.contains('\r'))
-        .filter(|p| seen.insert(p.as_str()))
-        .map(|p| shell_escape::escape(p))
-        .collect();
-    if !escaped.is_empty() {
-        return Some(escaped.join("\n"));
-    }
-    match string {
-        Some(s) if !s.is_empty() => Some(s.to_string()),
-        _ => None,
-    }
 }
 
 /// Decide which span (word vs line) a double/triple-click should
@@ -3272,76 +3239,6 @@ mod tests {
             click_count_span("see /tmp/foo.txt today", 7, 2, "_-+~:@%"),
             Some(WordSpan { col0: 5, col1: 7 })
         );
-    }
-
-    // Drop-payload resolver. Mirrors `DropContentResolverTests` on Mac so the
-    // two drag-and-drop implementations stay at parity.
-
-    fn p(s: &str) -> String {
-        s.to_string()
-    }
-
-    #[test]
-    fn drop_text_single_file_is_escaped() {
-        assert_eq!(
-            drop_text(&[p("/tmp/My File.png")], None),
-            Some("/tmp/My\\ File.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_multiple_files_are_newline_joined() {
-        assert_eq!(
-            drop_text(&[p("/tmp/a b.png"), p("/tmp/c.png")], None),
-            Some("/tmp/a\\ b.png\n/tmp/c.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_duplicate_files_are_collapsed() {
-        assert_eq!(
-            drop_text(&[p("/tmp/shot.png"), p("/tmp/shot.png")], None),
-            Some("/tmp/shot.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_newline_path_is_dropped() {
-        assert_eq!(drop_text(&[p("/tmp/ev\nil.png")], None), None);
-        assert_eq!(
-            drop_text(&[p("/tmp/ev\nil.png"), p("/tmp/ok.png")], None),
-            Some("/tmp/ok.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_string_is_not_escaped() {
-        assert_eq!(
-            drop_text(&[], Some("git status && ls")),
-            Some("git status && ls".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_multiline_string_is_preserved() {
-        assert_eq!(
-            drop_text(&[], Some("line one\nline two")),
-            Some("line one\nline two".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_files_take_priority_over_string() {
-        assert_eq!(
-            drop_text(&[p("/tmp/a.png")], Some("ignored")),
-            Some("/tmp/a.png".to_string())
-        );
-    }
-
-    #[test]
-    fn drop_text_empty_payload_is_none() {
-        assert_eq!(drop_text(&[], None), None);
-        assert_eq!(drop_text(&[], Some("")), None);
     }
 
     // Strict-DECTCEM cursor decision. 1:1 with the Swift suite in

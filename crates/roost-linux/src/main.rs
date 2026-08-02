@@ -28,7 +28,6 @@ mod palette_ui;
 mod paste_image;
 mod provider;
 mod rollup;
-mod shell_escape;
 mod sprite;
 mod tab_session;
 mod terminal_view;
