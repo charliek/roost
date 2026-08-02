@@ -34,9 +34,18 @@ notifications, URL launching, screenshot capture, and event-loop marshalling.
 
 ## Boundary
 
-`EngineCommand` reuses serializable `roost-ipc` request DTOs. `Engine::execute`
-returns an owned `CommandResult` or a typed `EngineError` with a stable status
-key. `EngineSnapshot` is a versioned, owned, ordered replacement projection.
+The crate boundary in production use today is the concrete API: `Workspace`,
+`LocalClient`, `PtySupervisor`, and `roost_engine::ipc`'s exhaustively-matched
+`UiRequest` port, consumed by both the GTK and Iced adapters.
+
+The `facade` module (`Engine`/`EngineCommand`/`EngineSnapshot`/
+`EngineEventStream`) is the **experimental** Swift-facing boundary. It has no
+production consumer yet and is feature-gated (`roost-engine/facade`, tested in
+CI but off by default) until a real adapter adopts it and proves the seam —
+see the migration roadmap's M5. Its design: `EngineCommand` reuses
+serializable `roost-ipc` request DTOs. `Engine::execute` returns an owned
+`CommandResult` or a typed `EngineError` with a stable status key.
+`EngineSnapshot` is a versioned, owned, ordered replacement projection.
 Every committed workspace transition has a monotonic in-process revision;
 compound events share that revision and retain their established order.
 

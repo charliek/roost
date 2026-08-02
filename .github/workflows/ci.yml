@@ -188,6 +188,11 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --exclude roost-linux
 
+      # The experimental Swift-facing facade is feature-gated with no
+      # production consumer; test it explicitly so the gated code stays green.
+      - name: cargo test (roost-engine with facade)
+        run: cargo test -p roost-engine --features facade
+
   swift-mac:
     needs: changes
     if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
