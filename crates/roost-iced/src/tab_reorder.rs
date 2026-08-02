@@ -12,6 +12,160 @@ use crate::Message;
 
 const DRAG_THRESHOLD: f32 = 8.0;
 
+/// Provides a same-event root release fallback after direct child ownership.
+/// The boundary delegates without changing capture, then publishes even when a
+/// reflowed scrollable withheld the event from the tab strip.
+pub(crate) struct ReleaseBoundary<'a> {
+    content: Element<'a, Message>,
+}
+
+impl<'a> ReleaseBoundary<'a> {
+    pub(crate) fn new(content: impl Into<Element<'a, Message>>) -> Self {
+        Self {
+            content: content.into(),
+        }
+    }
+}
+
+fn release_after_child<Message>(
+    event: &Event,
+    shell: &mut Shell<'_, Message>,
+    release: impl FnOnce() -> Message,
+    update_child: impl FnOnce(&mut Shell<'_, Message>),
+) {
+    update_child(shell);
+    if matches!(
+        event,
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+    ) {
+        tracing::debug!("Iced root observed left-button release");
+        shell.publish(release());
+    }
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for ReleaseBoundary<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let content = &mut self.content;
+        let child_tree = &mut tree.children[0];
+        release_after_child(
+            event,
+            shell,
+            || Message::TabPointerReleased,
+            |shell| {
+                content.as_widget_mut().update(
+                    child_tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+                );
+            },
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a> From<ReleaseBoundary<'a>> for Element<'a, Message> {
+    fn from(boundary: ReleaseBoundary<'a>) -> Self {
+        Element::new(boundary)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabStripEvent {
     Started {
@@ -33,6 +187,12 @@ pub(crate) enum TabStripEvent {
         context_generation: u64,
         original_ids: Vec<i64>,
         ordered_ids: Vec<i64>,
+    },
+    Ended {
+        project_id: i64,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: Vec<i64>,
     },
     Cancel {
         context_generation: u64,
@@ -90,6 +250,18 @@ struct State {
     previous_click: Option<ScopedClick>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseSettlement {
+    Unowned,
+    Owned(Option<TabStripEvent>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PressSettlement {
+    Started(TabStripEvent),
+    DoubleClick,
+}
+
 impl State {
     fn previous_click_for(
         &self,
@@ -113,10 +285,11 @@ impl State {
         context_generation: u64,
     ) -> Option<TabStripEvent> {
         let gesture = self.gesture.take()?;
-        if !gesture.dragging {
-            return None;
-        }
-        if context_valid(&gesture, project_id, ids, context_generation) {
+        if !context_valid(&gesture, project_id, ids, context_generation) {
+            Some(TabStripEvent::Cancel {
+                context_generation: gesture.context_generation,
+            })
+        } else if gesture.dragging {
             Some(TabStripEvent::Commit {
                 project_id: gesture.project_id,
                 source_id: gesture.source_id,
@@ -125,10 +298,71 @@ impl State {
                 ordered_ids: gesture.ordered_ids,
             })
         } else {
-            Some(TabStripEvent::Cancel {
+            Some(TabStripEvent::Ended {
+                project_id: gesture.project_id,
+                source_id: gesture.source_id,
                 context_generation: gesture.context_generation,
+                original_ids: gesture.original_ids,
             })
         }
+    }
+
+    fn arm_press(
+        &mut self,
+        position: Point,
+        project_id: i64,
+        source_id: i64,
+        ids: &[i64],
+        context_generation: u64,
+    ) -> PressSettlement {
+        let click = mouse::Click::new(
+            position,
+            mouse::Button::Left,
+            self.previous_click_for(project_id, source_id, context_generation),
+        );
+        self.previous_click = Some(ScopedClick {
+            click,
+            project_id,
+            source_id,
+            context_generation,
+        });
+        if click.kind() == mouse::click::Kind::Double {
+            self.gesture = None;
+            PressSettlement::DoubleClick
+        } else {
+            self.gesture = Some(Gesture {
+                project_id,
+                source_id,
+                original_ids: ids.to_vec(),
+                ordered_ids: ids.to_vec(),
+                origin: position,
+                context_generation,
+                dragging: false,
+            });
+            PressSettlement::Started(TabStripEvent::Started {
+                project_id,
+                source_id,
+                context_generation,
+                original_ids: ids.to_vec(),
+            })
+        }
+    }
+
+    fn settle_owned_release(
+        &mut self,
+        event: &Event,
+        project_id: i64,
+        ids: &[i64],
+        context_generation: u64,
+    ) -> ReleaseSettlement {
+        if !matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        ) || self.gesture.is_none()
+        {
+            return ReleaseSettlement::Unowned;
+        }
+        ReleaseSettlement::Owned(self.settle_release(project_id, ids, context_generation))
     }
 }
 
@@ -233,6 +467,22 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        match tree.state.downcast_mut::<State>().settle_owned_release(
+            event,
+            self.project_id,
+            &self.ids,
+            self.context_generation,
+        ) {
+            ReleaseSettlement::Unowned => {}
+            ReleaseSettlement::Owned(settlement) => {
+                if let Some(event) = settlement {
+                    shell.publish(Message::TabStrip(event));
+                }
+                shell.capture_event();
+                return;
+            }
+        }
+
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -286,31 +536,27 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
                 let Some(source_id) = id_at(layout, &self.ids, position) else {
                     return;
                 };
-                let click = mouse::Click::new(
-                    position,
-                    mouse::Button::Left,
-                    state.previous_click_for(self.project_id, source_id, self.context_generation),
-                );
-                state.previous_click = Some(ScopedClick {
-                    click,
-                    project_id: self.project_id,
+                tracing::debug!(
+                    ?position,
                     source_id,
-                    context_generation: self.context_generation,
-                });
+                    ids = ?self.ids,
+                    child_bounds = ?layout.children().map(|child| child.bounds()).collect::<Vec<_>>(),
+                    "Iced tab strip armed pointer press"
+                );
                 shell.publish(Message::TabSelected(source_id));
-                if click.kind() == mouse::click::Kind::Double {
-                    state.gesture = None;
-                    shell.publish(Message::BeginRenameTab(source_id));
-                } else {
-                    state.gesture = Some(Gesture {
-                        project_id: self.project_id,
-                        source_id,
-                        original_ids: self.ids.clone(),
-                        ordered_ids: self.ids.clone(),
-                        origin: position,
-                        context_generation: self.context_generation,
-                        dragging: false,
-                    });
+                match state.arm_press(
+                    position,
+                    self.project_id,
+                    source_id,
+                    &self.ids,
+                    self.context_generation,
+                ) {
+                    PressSettlement::Started(event) => {
+                        shell.publish(Message::TabStrip(event));
+                    }
+                    PressSettlement::DoubleClick => {
+                        shell.publish(Message::BeginRenameTab(source_id));
+                    }
                 }
                 shell.capture_event();
             }
@@ -323,12 +569,6 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
                 };
                 if !gesture.dragging && crossed_threshold(gesture.origin, position) {
                     gesture.dragging = true;
-                    shell.publish(Message::TabStrip(TabStripEvent::Started {
-                        project_id: gesture.project_id,
-                        source_id: gesture.source_id,
-                        context_generation: gesture.context_generation,
-                        original_ids: gesture.original_ids.clone(),
-                    }));
                 }
                 if !gesture.dragging {
                     return;
@@ -360,17 +600,6 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
                     }
                 }
                 shell.capture_event();
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                let owned = state.gesture.is_some();
-                if let Some(event) =
-                    state.settle_release(self.project_id, &self.ids, self.context_generation)
-                {
-                    shell.publish(Message::TabStrip(event));
-                }
-                if owned {
-                    shell.capture_event();
-                }
             }
             Event::Window(window::Event::Unfocused) => {
                 state.previous_click = None;
@@ -472,6 +701,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn root_release_follows_child_without_changing_child_capture() {
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let mut messages = Vec::new();
+        let status = {
+            let mut shell = Shell::new(&mut messages);
+            release_after_child(
+                &release,
+                &mut shell,
+                || "root",
+                |shell| {
+                    shell.publish("child");
+                    shell.capture_event();
+                },
+            );
+            shell.event_status()
+        };
+        assert_eq!(messages, ["child", "root"]);
+        assert_eq!(status, iced::event::Status::Captured);
+
+        messages.clear();
+        let status = {
+            let mut shell = Shell::new(&mut messages);
+            release_after_child(
+                &release,
+                &mut shell,
+                || "root",
+                |shell| {
+                    shell.publish("ignored child");
+                },
+            );
+            shell.event_status()
+        };
+        assert_eq!(messages, ["ignored child", "root"]);
+        assert_eq!(status, iced::event::Status::Ignored);
+    }
+
+    #[test]
     fn threshold_is_inclusive_and_direction_independent() {
         let origin = Point::new(10.0, 10.0);
         assert!(!crossed_threshold(origin, Point::new(17.9, 10.0)));
@@ -525,7 +791,35 @@ mod tests {
     }
 
     #[test]
-    fn release_cancels_stale_context_and_subthreshold_click_does_not_commit() {
+    fn armed_left_release_is_owned_before_children_and_other_releases_are_not() {
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let mut state = State {
+            gesture: Some(gesture(true)),
+            ..State::default()
+        };
+        assert!(matches!(
+            state.settle_owned_release(&release, 7, &[10, 20, 30], 4),
+            ReleaseSettlement::Owned(Some(TabStripEvent::Commit { .. }))
+        ));
+        assert_eq!(
+            state.settle_owned_release(&release, 7, &[10, 20, 30], 4),
+            ReleaseSettlement::Unowned
+        );
+
+        let right_release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
+        let mut right = State {
+            gesture: Some(gesture(true)),
+            ..State::default()
+        };
+        assert_eq!(
+            right.settle_owned_release(&right_release, 7, &[10, 20, 30], 4),
+            ReleaseSettlement::Unowned
+        );
+        assert!(right.gesture.is_some());
+    }
+
+    #[test]
+    fn release_cancels_stale_context_and_subthreshold_click_ends_without_commit() {
         let mut stale = State {
             gesture: Some(gesture(true)),
             ..State::default()
@@ -541,8 +835,36 @@ mod tests {
             gesture: Some(gesture(false)),
             ..State::default()
         };
-        assert_eq!(click.settle_release(7, &[10, 20, 30], 4), None);
+        assert_eq!(
+            click.settle_release(7, &[10, 20, 30], 4),
+            Some(TabStripEvent::Ended {
+                project_id: 7,
+                source_id: 10,
+                context_generation: 4,
+                original_ids: vec![10, 20, 30],
+            })
+        );
         assert!(click.gesture.is_none());
+    }
+
+    #[test]
+    fn ended_inactive_press_preserves_the_second_press_as_a_double_click() {
+        let position = Point::new(250.0, 17.0);
+        let ids = [10, 20, 30];
+        let mut state = State::default();
+        assert!(matches!(
+            state.arm_press(position, 7, 10, &ids, 4),
+            PressSettlement::Started(TabStripEvent::Started { source_id: 10, .. })
+        ));
+        assert!(matches!(
+            state.settle_release(7, &ids, 4),
+            Some(TabStripEvent::Ended { source_id: 10, .. })
+        ));
+        assert_eq!(
+            state.arm_press(position, 7, 10, &ids, 4),
+            PressSettlement::DoubleClick
+        );
+        assert!(state.gesture.is_none());
     }
 
     #[test]

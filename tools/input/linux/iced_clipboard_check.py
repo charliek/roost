@@ -1050,31 +1050,101 @@ def _direct_tab_reorder(
             # color scan would locate `third`, defeating the scenario.
             x0 = sidebar + 30
             y = round(launch.client.terminal_top()) // 2
+        preview_path = launch.root / f"{label.lower().replace(' ', '-')}-preview.png"
+
+        def preview_accent_capture() -> tuple[tuple[int, int] | None, bytes]:
+            png, _width, _height = launch.client.screenshot(scale=1)
+            preview_path.write_bytes(png)
+            width, height, bpp, pixels = pngtool.load(str(preview_path))
+            metrics = launch.client.window_metrics()
+            band = min(round(launch.client.terminal_top(metrics)), height)
+            left = max(0, round(float(metrics["sidebar_width"])))
+            accent = (0x4E, 0x9A, 0xF1)
+            runs: list[tuple[int, int]] = []
+            for row in range(band):
+                start: int | None = None
+                for column in range(left, width):
+                    offset = (row * width + column) * bpp
+                    if tuple(pixels[offset : offset + 3]) == accent:
+                        start = column if start is None else start
+                    elif start is not None:
+                        if column - start >= 40:
+                            runs.append((start, column - 1))
+                        start = None
+                if start is not None and width - start >= 40:
+                    runs.append((start, width - 1))
+            longest = max(runs, key=lambda run: run[1] - run[0], default=None)
+            return longest, png
+
+        baseline_run, baseline_png = preview_accent_capture()
+        assert baseline_run is None, (label, "unexpected pre-drag accent", baseline_run)
+        capture_root = os.environ.get("ROOST_CAPTURE_DIR")
+        if capture_root:
+            capture_dir = Path(capture_root)
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            capture_name = label.lower().replace(" ", "-")
+            (capture_dir / f"{capture_name}-before.png").write_bytes(baseline_png)
         pending_error: BaseException | None = None
         try:
             launch.terminal_pointer(
                 ["mousemove", "--window", launch.window, str(x0), str(y)]
             )
             launch.terminal_pointer(["mousedown", "1"])
-            launch.terminal_pointer(
-                [
-                    "mousemove",
-                    "--window",
-                    launch.window,
-                    str((x0 + target_x) // 2),
-                    str(y),
-                ]
-            )
-            launch.terminal_pointer(
-                ["mousemove", "--window", launch.window, str(target_x), str(y)]
-            )
-            capture_root = os.environ.get("ROOST_CAPTURE_DIR")
+            if not focus_source:
+                _wait_until(
+                    lambda: int(launch.client.identify()["active_tab_id"])
+                    == source,
+                    f"{label} press selects its stable ID",
+                )
+            pressed_capture: list[bytes] = []
+
+            def source_press_rendered() -> bool:
+                run, png = preview_accent_capture()
+                if run is None:
+                    return False
+                left, right = run
+                if not (left <= x0 <= right):
+                    return False
+                pressed_capture[:] = [png]
+                return True
+
+            # The held-source accent is a product-visible causal fence: Iced
+            # has consumed the native press at the intended stable-ID pill
+            # before the first trajectory sample can change cursor position.
+            _wait_until(source_press_rendered, f"{label} source press render")
             if capture_root:
-                capture_dir = Path(capture_root)
-                capture_dir.mkdir(parents=True, exist_ok=True)
-                png, _width, _height = launch.client.screenshot(scale=1)
-                capture_name = label.lower().replace(" ", "-")
-                (capture_dir / f"{capture_name}-held.png").write_bytes(png)
+                (capture_dir / f"{capture_name}-pressed.png").write_bytes(
+                    pressed_capture[-1]
+                )
+            # Tiny-skia on a loaded CI runner can process XTEST more slowly
+            # than xdotool submits it. Separate each trajectory sample so the
+            # existing terminal_pointer fence leaves the native event loop
+            # time to observe press, threshold crossing, preview, and release.
+            for step in range(1, 9):
+                x = round(x0 + (target_x - x0) * step / 8)
+                launch.terminal_pointer(
+                    ["mousemove", "--window", launch.window, str(x), str(y)]
+                )
+            held_capture: list[bytes] = []
+
+            def preview_rendered() -> bool:
+                run, png = preview_accent_capture()
+                if run is None:
+                    return False
+                left, right = run
+                if target_x < x0:
+                    at_target = left <= target_x
+                else:
+                    at_target = right >= target_x - 60
+                if not at_target:
+                    return False
+                held_capture[:] = [png]
+                return True
+
+            _wait_until(preview_rendered, f"{label} held preview render")
+            held_png = held_capture[-1]
+            if capture_root:
+                (capture_dir / f"{capture_name}-held.png").write_bytes(held_png)
             if release_outside:
                 outside_y = round(launch.client.terminal_top()) + 20
                 launch.terminal_pointer(

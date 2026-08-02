@@ -2385,6 +2385,92 @@ are retained as review artifacts under
 `target/visual-parity-linux-tab-reorder/`; they are human comparison inputs,
 not permanent pixel goldens or a parity-only CI job.
 
+### Iced X11 drag scheduling hardening follow-up plan
+
+Scope: harden the physical X11 driver after the first published tab-drag
+commit's tiny-skia CI lane reported a full Iced event subscription and missed
+the initial inactive drag, then fix any product ownership defect exposed by a
+verified final preview. Preserve every product assertion and application
+invariant; do not add retries around authoritative outcomes or weaken the test.
+After the native press, require the stable source ID to become the active tab
+before moving, then deliver a stepped trajectory with scheduling space between
+native XTEST events, matching the proven real-seat Wayland injector. Complete
+an in-product baseline capture before the press, then poll product captures
+after the final move until the dragged source's unique tab-band accent has
+appeared at the expected leading or trailing insertion boundary. This verifies
+that Iced incorporated and rendered the final held preview rather than treating
+screenshot completion or any intermediate accent as a causal fence. It
+separates “the press selected the stable ID,” “the final preview was rendered,”
+and “the drag reordered,” and keeps failures diagnostic.
+
+The CI-scale shed reproduction rendered the final backward preview at the
+expected leading boundary but still failed to commit its release. The strip
+must therefore settle a gesture it armed before honoring a release captured by
+the newly reflowed child tree. Child controls retain first ownership of presses;
+because a close button or inline editor press never arms the strip, their
+releases remain child-owned. This preserves exact close/editor isolation while
+making press ownership stable across preview reflow.
+
+The scrollable parent can also withhold the release from the child strip
+entirely. A transparent widget at the application root must therefore delegate
+the event, then unconditionally publish a same-event release fallback even if a
+child captured it. Unlike a runtime-event subscription, this preserves causal
+ordering: an asynchronously delayed release can never settle a later gesture.
+When the strip receives release, its pre-child commit is queued first; when the
+scrollable withholds release, the root fallback remains. The application port
+settles only the matching generation-stamped preview and reuses the same
+authoritative commit validator. A mismatched or duplicate request is a true
+no-op; the first matching root or direct-strip request clears the preview and
+increments its generation exactly once. The boundary must not itself capture
+release and must transparently forward the child tree, layout, rendering,
+operations, mouse interaction, and overlays.
+
+The instrumented CI-scale reproduction proved correct root settlement but also
+showed that tiny-skia processed an active-tab press only after the first
+trajectory sample: the cursor had moved from x=492 to x=462 and armed the
+adjacent stable ID. The strip therefore publishes its existing `Started`
+identity as soon as a non-double-click press is owned, while retaining the same
+eight-pixel reorder threshold. The original-order preview renders the subtle
+held-source accent and gives the physical driver a product-visible causal fence
+before it submits movement. A directly received subthreshold release publishes
+an exact `Ended` identity: the app clears only a matching, authoritative,
+original-order preview without dispatch, reconcile, or generation change, so
+stable-ID double-click history remains intact. Crossing the threshold and then
+returning to the original order remains a real commit settlement and increments
+the generation once. If a parent ever withholds a subthreshold release, the
+root fallback safely clears and invalidates the still-armed widget gesture.
+
+Plan review rejected the first global-subscription design because its buffered
+message could race a later gesture. It also identified one future constraint:
+an Iced advanced overlay is updated before the application root and can prevent
+the boundary from observing a captured release. The current palette is a normal
+stack child, and no current advanced overlay can coexist with an armed tab
+drag. Any future advanced overlay must cancel the preview when it opens or
+forward release settlement explicitly.
+
+Tests and acceptance: review the narrow harness diff, compile the Python driver,
+rebuild the shed-local Iced ELF, and run the complete tiny-skia X11 real-input
+gate with CI's timeout scale. The existing forward/backward/outside-release,
+palette cancellation, zero PTY bytes, relaunch persistence, close/overflow, and
+clipboard assertions must all remain enabled. Rerun focused Rust reorder tests,
+warnings-denied lint, and diff checks; publish a separate follow-up commit and
+require the complete branch Actions matrix to turn green without rerunning only
+the failed GitHub job.
+
+Validation result: all 130 Iced unit tests and warnings-denied clippy passed.
+The complete CI-scale physical X11 suite passed under tiny-skia and wgpu,
+including inactive-tab double-click rename, the press-render fence, forward and
+backward reorder, outside release, palette cancellation, zero PTY bytes, and
+relaunch persistence. The wgpu run printed the previously observed transient
+`X_SetInputFocus BadMatch` diagnostics while completing every assertion. The
+real-seat Wayland suite passed under both renderers with bidirectional reorder,
+clipboard, selection, native multi-click, and link-hover coverage. `make
+e2e-iced-ci` passed 54 tests with the one documented macOS PRIMARY skip, and
+`make check` passed the full Rust, GTK, Swift (11 XCTest plus 688 Swift Testing),
+and 38 harness/tool-test regression gate. Cargo dependency checks remained
+empty for forbidden toolkit edges and confirmed that GTK and Iced independently
+consume `roost-ui-model`.
+
 ## Objective acceptance criteria
 
 - `poc/iced` HEAD is pushed with green required Actions and no PR or package.

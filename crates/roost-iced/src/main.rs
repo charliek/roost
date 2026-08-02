@@ -51,6 +51,7 @@ enum Message {
     TabSelected(i64),
     BeginRenameTab(i64),
     TabStrip(tab_reorder::TabStripEvent),
+    TabPointerReleased,
     RenameDraftChanged(String),
     RenameSubmit,
     RenamePointerDismiss,
@@ -98,7 +99,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    iced::application(boot, update, App::view)
+    iced::application(boot, update, view)
         .title(WINDOW_TITLE)
         .theme(theme)
         .subscription(subscription)
@@ -154,6 +155,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.tab_strip_event(event);
             Task::none()
         }
+        Message::TabPointerReleased => {
+            app.tab_pointer_released();
+            Task::none()
+        }
         Message::RenameSubmit => {
             app.submit_rename_editor();
             Task::none()
@@ -206,6 +211,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::ToggleSidebar
         | Message::OpenNotifications) => message.apply(app).map_task(),
     }
+}
+
+fn view(app: &App) -> iced::Element<'_, Message> {
+    tab_reorder::ReleaseBoundary::new(app.view()).into()
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {

@@ -561,6 +561,29 @@ struct TabDragPreview {
     ordered_ids: Vec<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabDragCommitRequest {
+    context: TabDragContext,
+    original_ids: Vec<i64>,
+    ordered_ids: Vec<i64>,
+}
+
+impl From<&TabDragPreview> for TabDragCommitRequest {
+    fn from(preview: &TabDragPreview) -> Self {
+        Self {
+            context: preview.context.clone(),
+            original_ids: preview.original_ids.clone(),
+            ordered_ids: preview.ordered_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TabDragSettlement {
+    Ignored,
+    Settled(Result<bool, String>),
+}
+
 fn same_stable_ids(left: &[i64], right: &[i64]) -> bool {
     if left.len() != right.len() || left.contains(&0) {
         return false;
@@ -591,6 +614,49 @@ fn dispatch_tab_drag_commit_with(
     }
     apply(context.project_id, ordered_ids)?;
     Ok(true)
+}
+
+fn settle_tab_drag_commit_with(
+    preview: &mut Option<TabDragPreview>,
+    authoritative_ids: &[i64],
+    request: TabDragCommitRequest,
+    apply: impl FnOnce(i64, Vec<i64>) -> Result<(), String>,
+) -> TabDragSettlement {
+    if preview
+        .as_ref()
+        .is_none_or(|preview| preview.context != request.context)
+    {
+        return TabDragSettlement::Ignored;
+    }
+
+    let result = dispatch_tab_drag_commit_with(
+        preview.as_ref(),
+        authoritative_ids,
+        &request.context,
+        &request.original_ids,
+        request.ordered_ids,
+        apply,
+    );
+    *preview = None;
+    TabDragSettlement::Settled(result)
+}
+
+fn end_tab_drag_preview_if_owned(
+    preview: &mut Option<TabDragPreview>,
+    authoritative_ids: &[i64],
+    context: &TabDragContext,
+    original_ids: &[i64],
+) -> bool {
+    let owned = preview.as_ref().is_some_and(|preview| {
+        preview.context == *context
+            && preview.original_ids == original_ids
+            && preview.ordered_ids == original_ids
+            && authoritative_ids == original_ids
+    });
+    if owned {
+        *preview = None;
+    }
+    owned
 }
 
 fn rename_target_label(projects: &[Project], target: RenameTarget) -> Option<&str> {
@@ -3700,6 +3766,27 @@ impl App {
         }
     }
 
+    fn end_tab_drag_preview(
+        &mut self,
+        project_id: i64,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: &[i64],
+    ) {
+        let context = TabDragContext {
+            project_id,
+            source_id,
+            generation: context_generation,
+        };
+        let authoritative = self.active_project_tab_ids(project_id);
+        end_tab_drag_preview_if_owned(
+            &mut self.tab_drag_preview,
+            &authoritative,
+            &context,
+            original_ids,
+        );
+    }
+
     fn commit_tab_drag(
         &mut self,
         project_id: i64,
@@ -3709,29 +3796,65 @@ impl App {
         ordered_ids: Vec<i64>,
     ) {
         let authoritative = self.active_project_tab_ids(project_id);
-        let context = TabDragContext {
-            project_id,
-            source_id,
-            generation: context_generation,
-        };
-        let result = dispatch_tab_drag_commit_with(
-            self.tab_drag_preview.as_ref(),
-            &authoritative,
-            &context,
-            original_ids,
+        let request = TabDragCommitRequest {
+            context: TabDragContext {
+                project_id,
+                source_id,
+                generation: context_generation,
+            },
+            original_ids: original_ids.to_vec(),
             ordered_ids,
+        };
+        let runtime = &self.runtime;
+        let client = &self.client;
+        let settlement = settle_tab_drag_commit_with(
+            &mut self.tab_drag_preview,
+            &authoritative,
+            request,
             |project_id, ordered_ids| {
-                self.runtime
-                    .block_on(self.client.reorder_tabs(project_id, ordered_ids))
+                runtime
+                    .block_on(client.reorder_tabs(project_id, ordered_ids))
                     .map_err(|error| error.to_string())
             },
         );
-        self.cancel_tab_drag();
+        tracing::debug!(
+            ?settlement,
+            project_id,
+            source_id,
+            context_generation,
+            "Iced tab drag settlement"
+        );
+        let TabDragSettlement::Settled(result) = settlement else {
+            return;
+        };
+        self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
         if let Err(error) = result {
             tracing::warn!(?error, project_id, source_id, "Iced tab reorder failed");
             self.set_status(format!("reorder tabs: {error}"));
         }
         self.reconcile();
+    }
+
+    pub(crate) fn tab_pointer_released(&mut self) {
+        let Some(preview) = self.tab_drag_preview.as_ref() else {
+            tracing::debug!("Iced root release had no tab drag preview");
+            return;
+        };
+        tracing::debug!(
+            project_id = preview.context.project_id,
+            source_id = preview.context.source_id,
+            generation = preview.context.generation,
+            ordered_ids = ?preview.ordered_ids,
+            "Iced root release settling tab drag preview"
+        );
+        let request = TabDragCommitRequest::from(preview);
+        self.commit_tab_drag(
+            request.context.project_id,
+            request.context.source_id,
+            request.context.generation,
+            &request.original_ids,
+            request.ordered_ids,
+        );
     }
 
     pub(crate) fn tab_strip_event(&mut self, event: TabStripEvent) {
@@ -3770,6 +3893,14 @@ impl App {
                 &original_ids,
                 ordered_ids,
             ),
+            TabStripEvent::Ended {
+                project_id,
+                source_id,
+                context_generation,
+                original_ids,
+            } => {
+                self.end_tab_drag_preview(project_id, source_id, context_generation, &original_ids)
+            }
             TabStripEvent::Cancel { context_generation } => {
                 if context_generation == self.tab_strip_generation {
                     self.cancel_tab_drag();
@@ -5962,6 +6093,166 @@ mod tests {
             |_, _| panic!("stale-generation tab drag dispatched"),
         );
         assert_eq!(stale_generation, Ok(false));
+    }
+
+    #[test]
+    fn tab_drag_settlement_is_owned_once_in_either_release_order() {
+        let preview = TabDragPreview {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: vec![10, 20, 30],
+            ordered_ids: vec![20, 30, 10],
+        };
+        let fallback = TabDragCommitRequest::from(&preview);
+        let direct = fallback.clone();
+
+        for (first, second) in [
+            (fallback.clone(), direct.clone()),
+            (direct.clone(), fallback.clone()),
+        ] {
+            let mut current = Some(preview.clone());
+            let mut calls = 0;
+            let first_result = settle_tab_drag_commit_with(
+                &mut current,
+                &[10, 20, 30],
+                first,
+                |project_id, ordered_ids| {
+                    calls += 1;
+                    assert_eq!(project_id, 7);
+                    assert_eq!(ordered_ids, [20, 30, 10]);
+                    Ok(())
+                },
+            );
+            assert_eq!(first_result, TabDragSettlement::Settled(Ok(true)));
+            assert!(current.is_none());
+
+            let second_result =
+                settle_tab_drag_commit_with(&mut current, &[10, 20, 30], second, |_, _| {
+                    panic!("duplicate tab release dispatched")
+                });
+            assert_eq!(second_result, TabDragSettlement::Ignored);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn stale_or_unowned_release_does_not_clear_a_newer_preview() {
+        let newer = TabDragPreview {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 20,
+                generation: 5,
+            },
+            original_ids: vec![10, 20, 30],
+            ordered_ids: vec![20, 10, 30],
+        };
+        let stale = TabDragCommitRequest {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: vec![10, 20, 30],
+            ordered_ids: vec![20, 30, 10],
+        };
+        let mut current = Some(newer.clone());
+        assert_eq!(
+            settle_tab_drag_commit_with(&mut current, &[10, 20, 30], stale, |_, _| {
+                panic!("stale release dispatched")
+            }),
+            TabDragSettlement::Ignored
+        );
+        assert_eq!(current, Some(newer));
+
+        let mut absent = None;
+        assert_eq!(
+            settle_tab_drag_commit_with(
+                &mut absent,
+                &[10, 20, 30],
+                TabDragCommitRequest {
+                    context: TabDragContext {
+                        project_id: 7,
+                        source_id: 10,
+                        generation: 4,
+                    },
+                    original_ids: vec![10, 20, 30],
+                    ordered_ids: vec![20, 30, 10],
+                },
+                |_, _| panic!("unowned release dispatched"),
+            ),
+            TabDragSettlement::Ignored
+        );
+    }
+
+    #[test]
+    fn exact_subthreshold_end_clears_without_accepting_stale_or_moved_state() {
+        let original = vec![10, 20, 30];
+        let context = TabDragContext {
+            project_id: 7,
+            source_id: 10,
+            generation: 4,
+        };
+        let preview = TabDragPreview {
+            context: context.clone(),
+            original_ids: original.clone(),
+            ordered_ids: original.clone(),
+        };
+        let mut exact = Some(preview.clone());
+        assert!(end_tab_drag_preview_if_owned(
+            &mut exact, &original, &context, &original,
+        ));
+        assert!(exact.is_none());
+
+        let mut stale = Some(preview.clone());
+        assert!(!end_tab_drag_preview_if_owned(
+            &mut stale,
+            &original,
+            &TabDragContext {
+                generation: 5,
+                ..context.clone()
+            },
+            &original,
+        ));
+        assert_eq!(stale, Some(preview.clone()));
+
+        let moved = TabDragPreview {
+            ordered_ids: vec![20, 10, 30],
+            ..preview
+        };
+        let mut moved_state = Some(moved.clone());
+        assert!(!end_tab_drag_preview_if_owned(
+            &mut moved_state,
+            &original,
+            &context,
+            &original,
+        ));
+        assert_eq!(moved_state, Some(moved));
+    }
+
+    #[test]
+    fn crossed_threshold_return_to_origin_is_a_settled_noop() {
+        let original = vec![10, 20, 30];
+        let preview = TabDragPreview {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: original.clone(),
+            ordered_ids: original.clone(),
+        };
+        let request = TabDragCommitRequest::from(&preview);
+        let mut current = Some(preview);
+        assert_eq!(
+            settle_tab_drag_commit_with(&mut current, &original, request, |_, _| {
+                panic!("return-to-origin commit dispatched a reorder")
+            }),
+            TabDragSettlement::Settled(Ok(false))
+        );
+        assert!(current.is_none());
     }
 
     #[test]
