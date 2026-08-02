@@ -4,9 +4,9 @@
 //! One row per tab an agent owns: status dot + project + name + status
 //! text + elapsed time (+ git metrics, filled asynchronously). Every
 //! rendered value is derived here from the core workspace snapshot, so
-//! the GTK overlay stays a dumb renderer and the whole mapping —
+//! each UI adapter's overlay stays a dumb renderer and the whole mapping —
 //! population filter, status vocabulary, name fallback, time buckets,
-//! ordering — is unit-testable without GTK.
+//! ordering — is unit-testable without a UI toolkit.
 //!
 //! The lifecycle input is [`agent::effective_lifecycle`], the same value
 //! the tab pill, the TabPage icon, and the sidebar rollup render, so the

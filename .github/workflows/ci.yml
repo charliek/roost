@@ -9,7 +9,7 @@ on:
   push:
     branches: [main, poc/iced]
   pull_request:
-    branches: [main]
+    branches: [main, poc/iced]
 
 permissions:
   contents: read
@@ -187,6 +187,11 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --exclude roost-linux
+
+      # The experimental Swift-facing facade is feature-gated with no
+      # production consumer; test it explicitly so the gated code stays green.
+      - name: cargo test (roost-engine with facade)
+        run: cargo test -p roost-engine --features facade
 
   swift-mac:
     needs: changes
@@ -508,6 +513,10 @@ jobs:
           set -euo pipefail
           if cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced) v'; then
             echo "FAIL: roost-engine depends on a UI toolkit"
+            exit 1
+          fi
+          if cargo tree -p roost-ui-model | grep -E '(^| )(gtk4|libadwaita|iced|pango|cairo-rs|wgpu) v'; then
+            echo "FAIL: roost-ui-model depends on a UI toolkit or renderer"
             exit 1
           fi
           if cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs|roost-linux) v'; then

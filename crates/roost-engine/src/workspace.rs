@@ -86,7 +86,8 @@ struct Inner {
     active_tab_id: i64,
     /// Whether the sidebar is collapsed (hidden). UI-set via
     /// `set_sidebar_collapsed`; persisted so a relaunch restores it
-    /// (GTK parity with the Mac UI's `RoostSidebarVisible`).
+    /// (Rust UI adapter (GTK, Iced) parity with the Mac UI's
+    /// `RoostSidebarVisible`).
     sidebar_collapsed: bool,
     /// Whether the UI window currently has focus. Half of the
     /// notification-suppression predicate (plan §3.5); reported by the
@@ -473,8 +474,8 @@ impl Workspace {
     }
 
     /// The sidebar's persisted collapsed state. The UI reads this at
-    /// startup to restore the user's hide/show choice (GTK parity with
-    /// the Mac UI's `RoostSidebarVisible`).
+    /// startup to restore the user's hide/show choice (Rust UI adapter
+    /// (GTK, Iced) parity with the Mac UI's `RoostSidebarVisible`).
     pub fn sidebar_collapsed(&self) -> bool {
         self.inner.lock().unwrap().sidebar_collapsed
     }
@@ -525,6 +526,7 @@ impl Workspace {
         (inner.revision, self.snapshot_locked(&inner))
     }
 
+    #[cfg(feature = "facade")]
     pub(crate) fn snapshot_parts(&self) -> (u64, Vec<Project>, i64, i64, bool) {
         let inner = self.inner.lock().unwrap();
         (
@@ -2591,8 +2593,9 @@ mod tests {
 
     #[test]
     fn sidebar_collapsed_persists_across_reopen() {
-        // GTK parity with the Mac UI's RoostSidebarVisible: the user's
-        // hide/show choice survives quit + relaunch. Backs the locally-run
+        // Rust UI adapter (GTK, Iced) parity with the Mac UI's
+        // RoostSidebarVisible: the user's hide/show choice survives quit
+        // + relaunch. Backs the locally-run
         // e2e `test_sidebar_collapsed_state_survives_relaunch`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");

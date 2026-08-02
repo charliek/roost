@@ -2,9 +2,10 @@
 //!
 //! Daemon-removal refactor M3b: each `TabSession` subscribes to the
 //! in-process [`crate::PtySupervisor`]'s broadcast for its
-//! tab and forwards bytes / exit events to the GTK main thread via a
-//! tokio mpsc channel. The renderer drains the receiver inside a
-//! `glib::spawn_future_local` so all `vt_write` calls stay
+//! tab and forwards bytes / exit events to the UI adapter's main
+//! thread via a tokio mpsc channel. The renderer drains the receiver
+//! on the adapter's own main-loop task (GTK's via
+//! `glib::spawn_future_local`) so all `vt_write` calls stay
 //! main-thread.
 //!
 //! Pre-M3b this module wrapped a gRPC bidi stream to `roost-core`'s
@@ -167,9 +168,9 @@ impl TabSession {
         }
         // Test-mode tap: mirror into the capture buffer before
         // enqueuing. Capture order matches submission order because
-        // `send_input` is only ever called from the GTK main thread
-        // (the `terminal_view.set_on_input` closure runs there, the
-        // OSC drain runs there via `glib::spawn_future_local`, paste
+        // `send_input` is only ever called from the UI adapter's main
+        // thread (the terminal view's input handler runs there, the
+        // OSC drain runs there on the adapter's main-loop task, paste
         // runs there). No concurrent producers → the capture
         // observes the same byte order the cmd_rx drain enqueues.
         //
@@ -187,9 +188,9 @@ impl TabSession {
             }
         }
         // Enqueue on the per-tab serial channel. `unbounded_send`
-        // never blocks the GTK main thread and preserves submission
-        // order; the prior per-call `tokio::spawn` could reorder
-        // keystrokes under the multi-thread runtime.
+        // never blocks the UI adapter's main thread and preserves
+        // submission order; the prior per-call `tokio::spawn` could
+        // reorder keystrokes under the multi-thread runtime.
         let _ = self.cmd_tx.send(PtyCommand::Input(data));
     }
 

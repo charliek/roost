@@ -2,8 +2,10 @@
 //!
 //! Daemon-removal refactor M3b: replaces the gRPC `WatchEvents` stream
 //! with an in-process subscription to [`crate::Workspace`]'s
-//! broadcast channel. Events flow to the GTK main loop via an
-//! unbounded mpsc channel that `glib::spawn_future_local` drains.
+//! broadcast channel. Events flow to the UI adapter's main thread via
+//! an unbounded mpsc channel that the adapter drains on its own
+//! main-loop task (GTK's `app.rs` drains it via
+//! `glib::spawn_future_local`).
 
 use std::sync::Arc;
 

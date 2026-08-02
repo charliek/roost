@@ -52,7 +52,8 @@ pub struct SnapshotFile {
     /// relaunch restores the user's hide/show choice. Defaulted so a
     /// file from an older build (no key) loads as "expanded". The Mac
     /// UI persists the same choice in UserDefaults (`RoostSidebarVisible`);
-    /// this is the GTK equivalent, kept at behavioral parity.
+    /// this is the Rust UI adapters' (GTK, Iced) equivalent, kept at
+    /// behavioral parity.
     #[serde(default)]
     pub sidebar_collapsed: bool,
 }

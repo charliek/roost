@@ -9,6 +9,11 @@
 
 pub mod application;
 pub mod events;
+// Experimental Swift-facing boundary (`Engine`/`EngineCommand`/owned
+// snapshots). No production consumer yet — both Rust UIs use the concrete
+// `Workspace`/`LocalClient` APIs — so it stays feature-gated until a UI
+// adopts it and proves the seam (roadmap M5).
+#[cfg(feature = "facade")]
 pub mod facade;
 pub mod git_metrics;
 pub mod ipc;
@@ -23,6 +28,7 @@ pub mod single_instance;
 pub mod workspace;
 
 pub use application::LocalClient;
+#[cfg(feature = "facade")]
 pub use facade::{
     CommandResult, Engine, EngineCommand, EngineError, EngineEvent, EngineEventStream,
     EngineSnapshot,
