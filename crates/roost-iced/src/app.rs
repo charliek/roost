@@ -493,18 +493,170 @@ fn font_palette_frame(registry: &FontRegistry, resolved: &str) -> palette::Palet
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameTarget {
+    Project(i64),
+    Tab(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameCompletionKey {
+    Enter,
+    Escape,
+}
+
+fn consume_rename_completion_key(
+    pending: &mut Option<RenameCompletionKey>,
+    event: &keyboard::Event,
+) -> bool {
+    let Some(key) = *pending else {
+        return false;
+    };
+    let matches = matches!(
+        (key, event),
+        (
+            RenameCompletionKey::Enter,
+            keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Enter),
+                ..
+            } | keyboard::Event::KeyReleased {
+                key: Key::Named(Named::Enter),
+                ..
+            },
+        ) | (
+            RenameCompletionKey::Escape,
+            keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Escape),
+                ..
+            } | keyboard::Event::KeyReleased {
+                key: Key::Named(Named::Escape),
+                ..
+            },
+        )
+    );
+    if matches && matches!(event, keyboard::Event::KeyReleased { .. }) {
+        *pending = None;
+    }
+    matches
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenameEditor {
+    target: RenameTarget,
+    opened_label: String,
+    draft: String,
+}
+
+fn rename_target_label(projects: &[Project], target: RenameTarget) -> Option<&str> {
+    match target {
+        RenameTarget::Project(project_id) => projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.name.as_str()),
+        RenameTarget::Tab(tab_id) => projects
+            .iter()
+            .flat_map(|project| &project.tabs)
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.title.as_str()),
+    }
+}
+
+fn begin_rename_editor(projects: &[Project], target: RenameTarget) -> Result<RenameEditor, String> {
+    let id = match target {
+        RenameTarget::Project(id) | RenameTarget::Tab(id) => id,
+    };
+    if id == 0 {
+        return Err("no active project or tab to rename".into());
+    }
+    let label = rename_target_label(projects, target)
+        .ok_or_else(|| format!("rename target {target:?} is no longer available"))?;
+    Ok(RenameEditor {
+        target,
+        opened_label: label.to_string(),
+        draft: label.to_string(),
+    })
+}
+
+fn rename_editor_is_renderable(
+    editor: &RenameEditor,
+    projects: &[Project],
+    active_project: i64,
+    sidebar_collapsed: bool,
+) -> bool {
+    match editor.target {
+        RenameTarget::Project(project_id) => {
+            !sidebar_collapsed && projects.iter().any(|project| project.id == project_id)
+        }
+        RenameTarget::Tab(tab_id) => projects
+            .iter()
+            .find(|project| project.id == active_project)
+            .is_some_and(|project| project.tabs.iter().any(|tab| tab.id == tab_id)),
+    }
+}
+
+fn submit_rename_editor_with(
+    editor: &mut Option<RenameEditor>,
+    apply: impl FnOnce(RenameTarget, &str) -> Result<(), String>,
+) -> Result<bool, String> {
+    let Some(current) = editor.as_ref() else {
+        return Ok(false);
+    };
+    let Some(label) = roost_ui_model::rename::committed_label(&current.draft) else {
+        *editor = None;
+        return Ok(false);
+    };
+    let target = current.target;
+    apply(target, &label)?;
+    *editor = None;
+    Ok(true)
+}
+
+fn submit_rename_editor_once_with(
+    editor: &mut Option<RenameEditor>,
+    pending: &mut Option<RenameCompletionKey>,
+    apply: impl FnOnce(RenameTarget, &str) -> Result<(), String>,
+) -> Result<bool, String> {
+    if editor.is_none() || *pending == Some(RenameCompletionKey::Enter) {
+        return Ok(false);
+    }
+    *pending = Some(RenameCompletionKey::Enter);
+    submit_rename_editor_with(editor, apply)
+}
+
+fn retain_palette_focus_after_back<T>(
+    requested: &mut bool,
+    palette_open: bool,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    *requested = palette_open;
+    result
+}
+
+fn arm_rename_completion_for_open_editor(
+    pending: &mut Option<RenameCompletionKey>,
+    editor_open: bool,
+) {
+    if editor_open {
+        *pending = Some(RenameCompletionKey::Enter);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyboardRoute {
     None,
+    Editor,
     Palette,
     Terminal(i64),
 }
 
 fn resolve_keyboard_route(
+    editor_open: bool,
     palette_open: bool,
     active_tab: i64,
     active_terminal_live: bool,
 ) -> KeyboardRoute {
-    if palette_open {
+    if editor_open {
+        KeyboardRoute::Editor
+    } else if palette_open {
         KeyboardRoute::Palette
     } else if active_terminal_live {
         KeyboardRoute::Terminal(active_tab)
@@ -519,6 +671,21 @@ fn take_palette_focus_request(requested: &mut bool, input_id: &Id) -> UiTask {
     } else {
         UiTask::None
     }
+}
+
+fn take_rename_focus_request(requested: &mut bool, editor_open: bool, input_id: &Id) -> UiTask {
+    if std::mem::take(requested) && editor_open {
+        UiTask::FocusWidget(input_id.clone()).then(UiTask::SelectAllWidget(input_id.clone()))
+    } else {
+        UiTask::None
+    }
+}
+
+fn tab_selector_messages(tab_id: i64) -> (Message, Message) {
+    (
+        Message::TabSelected(tab_id),
+        Message::BeginRenameTab(tab_id),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -685,6 +852,7 @@ pub enum UiTask {
     Then(Box<UiTask>, Box<UiTask>),
     Focus(window::Id),
     FocusWidget(Id),
+    SelectAllWidget(Id),
     Resize(window::Id, Size),
     Screenshot(window::Id),
     ClipboardRead {
@@ -1957,6 +2125,10 @@ pub struct App {
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
+    rename_editor: Option<RenameEditor>,
+    rename_input_id: Id,
+    rename_focus_requested: bool,
+    rename_completion_key: Option<RenameCompletionKey>,
     config: RoostConfig,
     typography: TerminalTypography,
     font_registry: &'static FontRegistry,
@@ -2087,6 +2259,10 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: StatusBanner::default(),
+            rename_editor: None,
+            rename_input_id: Id::unique(),
+            rename_focus_requested: false,
+            rename_completion_key: None,
             config,
             typography,
             font_registry,
@@ -2199,6 +2375,7 @@ impl App {
             let _ = self.workspace.close_tab(tab_id);
             self.tabs.remove(&tab_id);
         }
+        task = task.then(self.take_rename_focus_task());
         task = task.then(self.take_palette_visibility_task());
         task = task.then(self.screenshots.start_next(self.window_id));
         task
@@ -2269,6 +2446,9 @@ impl App {
     }
 
     pub fn keyboard(&mut self, event: keyboard::Event) -> UiTask {
+        if consume_rename_completion_key(&mut self.rename_completion_key, &event) {
+            return UiTask::None;
+        }
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.modifiers = *modifiers;
             let held = self.link_modifier_held();
@@ -2282,22 +2462,33 @@ impl App {
                 }
             }
         }
+        if matches!(self.keyboard_route(), KeyboardRoute::Editor) {
+            if let keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Escape),
+                repeat: false,
+                ..
+            } = &event
+            {
+                self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                self.cancel_rename_editor();
+            }
+            // TextInput owns printable input and on_submit owns Enter. The
+            // global listener consumes every editor event so no accelerator or
+            // terminal encoder can observe the same key.
+            return UiTask::None;
+        }
         if let keyboard::Event::KeyPressed { key, .. } = &event {
             if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
                 match key.as_ref() {
                     Key::Named(Named::Escape) => self.palette_back_or_dismiss(),
                     Key::Named(Named::ArrowUp) => self.move_palette_selection(-1),
                     Key::Named(Named::ArrowDown) => self.move_palette_selection(1),
-                    Key::Named(Named::Enter) => {
-                        if let Err(error) = self.confirm_palette_selection() {
-                            self.set_status(error);
-                        }
-                    }
+                    Key::Named(Named::Enter) => self.palette_confirm(),
                     _ => {}
                 }
                 // The text input widget consumes printable events. Never let
                 // a palette keystroke leak through to the active PTY.
-                return UiTask::None;
+                return self.take_palette_focus_task();
             }
         } else if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
             return UiTask::None;
@@ -2324,6 +2515,30 @@ impl App {
         let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
         tab.session.send_input(bytes);
         UiTask::None
+    }
+
+    /// Handle the one captured text-input key that belongs to application
+    /// surface state. Never route a captured Escape into the terminal if the
+    /// editor or palette disappeared before this queued message is applied.
+    pub fn captured_escape(&mut self) -> UiTask {
+        match self.keyboard_route() {
+            KeyboardRoute::Editor => {
+                self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                self.cancel_rename_editor();
+                UiTask::None
+            }
+            KeyboardRoute::Palette => {
+                self.palette_back_or_dismiss();
+                self.take_palette_focus_task()
+            }
+            KeyboardRoute::None | KeyboardRoute::Terminal(_) => UiTask::None,
+        }
+    }
+
+    pub fn captured_enter_release(&mut self) {
+        if self.rename_completion_key == Some(RenameCompletionKey::Enter) {
+            self.rename_completion_key = None;
+        }
     }
 
     fn dispatch_keybind_action(&mut self, action: KeybindAction, repeat: bool) -> UiTask {
@@ -2361,9 +2576,13 @@ impl App {
             }
             KeybindAction::NewProject => Err("New Project is not available in Iced yet".into()),
             KeybindAction::RenameProject => {
-                Err("Rename Project is not available in Iced yet".into())
+                self.begin_rename_target(RenameTarget::Project(self.workspace.active().0))?;
+                Ok(UiTask::None)
             }
-            KeybindAction::RenameTab => Err("Rename Tab is not available in Iced yet".into()),
+            KeybindAction::RenameTab => {
+                self.begin_rename_target(RenameTarget::Tab(self.workspace.active().1))?;
+                Ok(UiTask::None)
+            }
             KeybindAction::CloseProject => Err("Close Project is not available in Iced yet".into()),
             KeybindAction::JumpToUnread => {
                 let active_project_id = self.workspace.active().0;
@@ -2622,6 +2841,7 @@ impl App {
     fn keyboard_route(&self) -> KeyboardRoute {
         let active_tab = self.workspace.active().1;
         resolve_keyboard_route(
+            self.rename_editor.is_some(),
             self.palette.is_some(),
             active_tab,
             self.tabs.contains_key(&active_tab),
@@ -2638,6 +2858,9 @@ impl App {
             click_count,
             inside,
         } = event;
+        if action == PointerAction::Press {
+            self.cancel_editor_for_interaction();
+        }
         let link_modifier_held = self.link_modifier_held();
         let Some(tab) = pointer_origin_tab(&mut self.tabs, tab_id) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
@@ -2740,6 +2963,9 @@ impl App {
     }
 
     pub fn set_window_focus(&mut self, focused: bool) {
+        if !focused {
+            self.rename_completion_key = None;
+        }
         self.workspace.set_window_focused(focused);
         if let Some(tab) = self.tabs.get(&self.workspace.active().1) {
             tab.set_window_focus(focused);
@@ -2771,7 +2997,20 @@ impl App {
                     .background(color)
                     .border(iced::border::rounded(2))
             });
-            let project_pill = container(text(&project.name).size(13))
+            let project_label: Element<'_, Message> = match self.rename_editor.as_ref() {
+                Some(editor) if editor.target == RenameTarget::Project(project.id) => {
+                    text_input("Project name", &editor.draft)
+                        .id(self.rename_input_id.clone())
+                        .on_input(Message::RenameDraftChanged)
+                        .on_submit(Message::RenameSubmit)
+                        .size(13)
+                        .padding([1, 3])
+                        .style(chrome::inline_rename_input)
+                        .into()
+                }
+                _ => text(&project.name).size(13).into(),
+            };
+            let project_pill = container(project_label)
                 .width(Fill)
                 .height(chrome::ROW_HEIGHT)
                 .padding([3.0, chrome::PROJECT_LABEL_INSET])
@@ -2789,7 +3028,8 @@ impl App {
                 .width(Fill)
                 .height(chrome::ROW_HEIGHT),
             )
-            .on_press(Message::ProjectSelected(project.id));
+            .on_press(Message::ProjectSelected(project.id))
+            .on_double_click(Message::BeginRenameProject(project.id));
             let mut project_group = column![project_row].spacing(2);
             if self.config.show_sidebar_agents {
                 for agent in self.sidebar_agents.get(&project.id).into_iter().flatten() {
@@ -2879,22 +3119,51 @@ impl App {
                     .background(status_color)
                     .border(iced::border::rounded(4))
             });
-            let select = button(
-                row![
-                    dot,
-                    text(title).size(12).color(if active {
-                        chrome::TEXT
-                    } else {
-                        chrome::MUTED_TEXT
-                    })
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-            )
-            .height(chrome::PILL_HEIGHT)
-            .padding([2, 7])
-            .style(chrome::transparent_button)
-            .on_press(Message::TabSelected(tab.id));
+            let select: Element<'_, Message> = if let Some(editor) = self
+                .rename_editor
+                .as_ref()
+                .filter(|editor| editor.target == RenameTarget::Tab(tab.id))
+            {
+                container(
+                    row![
+                        dot,
+                        text_input("Tab name", &editor.draft)
+                            .id(self.rename_input_id.clone())
+                            .on_input(Message::RenameDraftChanged)
+                            .on_submit(Message::RenameSubmit)
+                            .width(140)
+                            .size(12)
+                            .padding([1, 3])
+                            .style(chrome::inline_rename_input)
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .height(chrome::PILL_HEIGHT)
+                .padding([2, 7])
+                .into()
+            } else {
+                let (press, double_click) = tab_selector_messages(tab.id);
+                mouse_area(
+                    container(
+                        row![
+                            dot,
+                            text(title).size(12).color(if active {
+                                chrome::TEXT
+                            } else {
+                                chrome::MUTED_TEXT
+                            })
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .height(chrome::PILL_HEIGHT)
+                    .padding([2, 7]),
+                )
+                .on_press(press)
+                .on_double_click(double_click)
+                .into()
+            };
             let mut pill = row![select].align_y(Alignment::Center);
             if tab.has_notification && !active {
                 pill = pill.push(
@@ -3010,7 +3279,13 @@ impl App {
             content
         };
         let Some(palette) = &self.palette else {
-            return content;
+            return if self.rename_editor.is_some() {
+                mouse_area(content)
+                    .on_press(Message::RenamePointerDismiss)
+                    .into()
+            } else {
+                content
+            };
         };
 
         let frame = palette.current();
@@ -3179,17 +3454,122 @@ impl App {
             .into()
     }
 
+    fn begin_rename_target(&mut self, target: RenameTarget) -> Result<(), String> {
+        if self
+            .rename_editor
+            .as_ref()
+            .is_some_and(|editor| editor.target == target)
+        {
+            self.rename_focus_requested = true;
+            return Ok(());
+        }
+        if matches!(target, RenameTarget::Project(_)) && self.workspace.sidebar_collapsed() {
+            self.set_sidebar_collapsed(false);
+        }
+        let editor = begin_rename_editor(&self.projects, target)?;
+        if !rename_editor_is_renderable(
+            &editor,
+            &self.projects,
+            self.workspace.active().0,
+            self.workspace.sidebar_collapsed(),
+        ) {
+            return Err(format!("rename target {target:?} is not visible"));
+        }
+        self.rename_editor = Some(editor);
+        self.rename_focus_requested = true;
+        Ok(())
+    }
+
+    pub fn begin_rename_project(&mut self, project_id: i64) {
+        if let Err(error) = self.begin_rename_target(RenameTarget::Project(project_id)) {
+            self.set_status(error);
+        }
+    }
+
+    pub fn begin_rename_tab(&mut self, tab_id: i64) {
+        if let Err(error) = self.begin_rename_target(RenameTarget::Tab(tab_id)) {
+            self.set_status(error);
+        }
+    }
+
+    pub fn rename_draft_changed(&mut self, draft: String) {
+        if let Some(editor) = &mut self.rename_editor {
+            editor.draft = draft;
+        }
+    }
+
+    pub fn submit_rename_editor(&mut self) {
+        let client = self.client.clone();
+        let runtime = &self.runtime;
+        match submit_rename_editor_once_with(
+            &mut self.rename_editor,
+            &mut self.rename_completion_key,
+            |target, label| match target {
+                RenameTarget::Project(project_id) => runtime
+                    .block_on(client.rename_project(project_id, label))
+                    .map_err(|error| error.to_string()),
+                RenameTarget::Tab(tab_id) => runtime
+                    .block_on(client.set_tab_title(tab_id, label))
+                    .map_err(|error| error.to_string()),
+            },
+        ) {
+            Ok(_) => {
+                self.rename_focus_requested = false;
+                self.reconcile();
+            }
+            Err(error) => self.set_status(error),
+        }
+    }
+
+    fn cancel_rename_editor(&mut self) {
+        self.rename_editor = None;
+        self.rename_focus_requested = false;
+    }
+
+    pub fn rename_pointer_dismiss(&mut self) {
+        self.cancel_rename_editor();
+    }
+
+    fn cancel_editor_for_interaction(&mut self) {
+        self.cancel_rename_editor();
+    }
+
+    fn reconcile_rename_editor(&mut self) {
+        let visible = self.rename_editor.as_ref().is_none_or(|editor| {
+            rename_editor_is_renderable(
+                editor,
+                &self.projects,
+                self.workspace.active().0,
+                self.workspace.sidebar_collapsed(),
+            )
+        });
+        if !visible {
+            self.cancel_rename_editor();
+        }
+    }
+
+    fn take_rename_focus_task(&mut self) -> UiTask {
+        take_rename_focus_request(
+            &mut self.rename_focus_requested,
+            self.rename_editor.is_some(),
+            &self.rename_input_id,
+        )
+    }
+
     pub fn select_project(&mut self, project_id: i64) {
+        self.cancel_editor_for_interaction();
         if let Some(tab_id) = self.workspace.preferred_tab(project_id) {
             let _ = self.focus_tab_and_clear(tab_id, false);
         }
     }
 
     pub fn select_tab(&mut self, tab_id: i64) {
+        self.cancel_editor_for_interaction();
         let _ = self.focus_tab_and_clear(tab_id, false);
     }
 
     pub fn select_agent(&mut self, tab_id: i64) {
+        self.cancel_editor_for_interaction();
         let _ = self.focus_tab_and_clear(tab_id, true);
     }
 
@@ -3201,6 +3581,7 @@ impl App {
     }
 
     pub fn toggle_sidebar(&mut self) {
+        self.cancel_editor_for_interaction();
         self.set_sidebar_collapsed(!self.workspace.sidebar_collapsed());
     }
 
@@ -3224,6 +3605,7 @@ impl App {
     }
 
     pub fn new_tab(&mut self) {
+        self.cancel_editor_for_interaction();
         if let Err(error) = self.new_tab_result() {
             self.set_status(error);
         }
@@ -3250,6 +3632,7 @@ impl App {
     }
 
     pub fn close_tab(&mut self, tab_id: i64) {
+        self.cancel_editor_for_interaction();
         if let Err(error) = self.close_tab_result(tab_id) {
             self.set_status(error);
         }
@@ -3285,15 +3668,19 @@ impl App {
         if let Err(error) = self.confirm_palette_selection() {
             self.set_status(error);
         }
+        arm_rename_completion_for_open_editor(
+            &mut self.rename_completion_key,
+            self.rename_editor.is_some(),
+        );
     }
 
-    pub fn palette_pointer_dismiss(&mut self) {
-        if let Err(error) = self.try_dismiss_palette() {
-            self.set_status(error);
-        }
+    pub fn palette_pointer_dismiss(&mut self) -> UiTask {
+        self.dismiss_palette_with_focus_recovery();
+        self.take_palette_focus_task()
     }
 
     fn open_palette(&mut self, kind: &str) -> Result<(), String> {
+        self.cancel_editor_for_interaction();
         let frame = match kind {
             "" | "commands" => command_palette_frame(
                 self.notification_inbox.count(),
@@ -3332,6 +3719,7 @@ impl App {
         items: Vec<(String, String, Option<String>)>,
         reply: tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>,
     ) {
+        self.cancel_editor_for_interaction();
         if let Err(error) = self.try_dismiss_palette() {
             let _ = reply.send(Err(error));
             return;
@@ -3742,6 +4130,16 @@ impl App {
                     }
                     self.clear_palette_state();
                 }
+                "rename_project" => {
+                    let project_id = self.workspace.active().0;
+                    self.clear_palette_state();
+                    self.begin_rename_target(RenameTarget::Project(project_id))?;
+                }
+                "rename_tab" => {
+                    let tab_id = self.workspace.active().1;
+                    self.clear_palette_state();
+                    self.begin_rename_target(RenameTarget::Tab(tab_id))?;
+                }
                 "custom_commands" => {
                     if let Some(state) = &mut self.palette {
                         state.push(provider_palette_frame(&self.config.providers));
@@ -3904,9 +4302,7 @@ impl App {
             .as_ref()
             .is_none_or(palette::PaletteState::is_root);
         if is_root {
-            if let Err(error) = self.try_dismiss_palette() {
-                self.set_status(error);
-            }
+            self.dismiss_palette_with_focus_recovery();
             return;
         }
         let frame = self
@@ -3919,6 +4315,11 @@ impl App {
             "fonts" => self.restore_palette_family(),
             _ => Ok(()),
         };
+        let restored = retain_palette_focus_after_back(
+            &mut self.palette_focus_requested,
+            self.palette.is_some(),
+            restored,
+        );
         if let Err(error) = restored {
             self.set_status(error);
             return;
@@ -3930,6 +4331,18 @@ impl App {
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
+    fn dismiss_palette_with_focus_recovery(&mut self) {
+        let result = self.try_dismiss_palette();
+        let result = retain_palette_focus_after_back(
+            &mut self.palette_focus_requested,
+            self.palette.is_some(),
+            result,
+        );
+        if let Err(error) = result {
+            self.set_status(error);
+        }
+    }
+
     fn try_dismiss_palette(&mut self) -> Result<(), String> {
         self.restore_palette_theme()?;
         self.restore_palette_family()?;
@@ -3939,6 +4352,7 @@ impl App {
 
     fn clear_palette_state(&mut self) {
         self.palette = None;
+        self.palette_focus_requested = false;
         self.palette_theme_at_open = None;
         self.palette_family_at_open = None;
         self.palette_resolved_family_at_open = None;
@@ -4044,6 +4458,7 @@ impl App {
         // Full authoritative snapshot on every UI tick is the recovery path
         // for a slow consumer: deltas are an optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        self.reconcile_rename_editor();
         self.reconcile_notification_inbox();
         self.refresh_notification_palette();
         self.refresh_sidebar_agents();
@@ -5013,8 +5428,10 @@ impl Message {
     pub(crate) fn apply(self, app: &mut App) -> UiTask {
         match self {
             Self::ProjectSelected(project_id) => app.select_project(project_id),
+            Self::BeginRenameProject(project_id) => app.begin_rename_project(project_id),
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
+            Self::BeginRenameTab(tab_id) => app.begin_rename_tab(tab_id),
             Self::CloseTab(tab_id) => app.close_tab(tab_id),
             Self::NewTab => app.new_tab(),
             Self::ToggleSidebar => app.toggle_sidebar(),
@@ -5288,16 +5705,300 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_route_requires_a_live_terminal_and_gives_palette_precedence() {
-        assert_eq!(resolve_keyboard_route(false, 7, false), KeyboardRoute::None);
+    fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, 7, true),
+            resolve_keyboard_route(false, false, 7, false),
+            KeyboardRoute::None
+        );
+        assert_eq!(
+            resolve_keyboard_route(false, false, 7, true),
             KeyboardRoute::Terminal(7)
         );
         assert_eq!(
-            resolve_keyboard_route(true, 7, true),
+            resolve_keyboard_route(false, true, 7, true),
             KeyboardRoute::Palette
         );
+        assert_eq!(
+            resolve_keyboard_route(true, true, 7, true),
+            KeyboardRoute::Editor
+        );
+    }
+
+    fn rename_fixture() -> (Vec<Project>, i64, i64, i64) {
+        let workspace = Workspace::new();
+        let first = workspace.create_project("First", "/tmp").unwrap();
+        let first_tab = workspace.open_tab(first.id, "/tmp", "alpha").unwrap();
+        let second = workspace.create_project("Second", "/var").unwrap();
+        let second_tab = workspace.open_tab(second.id, "/var", "beta").unwrap();
+        (workspace.snapshot(), first.id, first_tab.id, second_tab.id)
+    }
+
+    #[test]
+    fn rename_editor_uses_typed_stable_targets_and_visibility() {
+        let (projects, first_project, first_tab, second_tab) = rename_fixture();
+        let project = begin_rename_editor(&projects, RenameTarget::Project(first_project)).unwrap();
+        assert_eq!(project.opened_label, "First");
+        assert!(rename_editor_is_renderable(
+            &project,
+            &projects,
+            first_project,
+            false
+        ));
+        assert!(!rename_editor_is_renderable(
+            &project,
+            &projects,
+            first_project,
+            true
+        ));
+
+        let tab = begin_rename_editor(&projects, RenameTarget::Tab(first_tab)).unwrap();
+        assert!(rename_editor_is_renderable(
+            &tab,
+            &projects,
+            first_project,
+            false
+        ));
+        assert!(!rename_editor_is_renderable(
+            &tab,
+            &projects,
+            projects.last().unwrap().id,
+            false
+        ));
+        assert!(begin_rename_editor(&projects, RenameTarget::Tab(second_tab)).is_ok());
+        assert!(begin_rename_editor(&projects, RenameTarget::Project(0)).is_err());
+        assert!(begin_rename_editor(&projects, RenameTarget::Tab(i64::MAX)).is_err());
+    }
+
+    #[test]
+    fn rename_completion_keys_are_consumed_through_release_only() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+
+        let press = |named, code, repeat| keyboard::Event::KeyPressed {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: Physical::Code(code),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat,
+        };
+        let release = |named, code| keyboard::Event::KeyReleased {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: Physical::Code(code),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+        };
+
+        let mut pending = Some(RenameCompletionKey::Enter);
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &press(Named::Enter, Code::Enter, true)
+        ));
+        assert_eq!(pending, Some(RenameCompletionKey::Enter));
+        assert!(!consume_rename_completion_key(
+            &mut pending,
+            &press(Named::ArrowDown, Code::ArrowDown, false)
+        ));
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &release(Named::Enter, Code::Enter)
+        ));
+        assert_eq!(pending, None);
+        assert!(!consume_rename_completion_key(
+            &mut pending,
+            &press(Named::Enter, Code::Enter, false)
+        ));
+
+        pending = Some(RenameCompletionKey::Escape);
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &press(Named::Escape, Code::Escape, true)
+        ));
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &release(Named::Escape, Code::Escape)
+        ));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn failed_rename_submit_dispatches_once_per_enter_press() {
+        let mut editor = Some(RenameEditor {
+            target: RenameTarget::Project(7),
+            opened_label: "old".into(),
+            draft: "recover me".into(),
+        });
+        let mut pending = None;
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
+                calls.set(calls.get() + 1);
+                Err("injected failure".into())
+            }),
+            Err("injected failure".into())
+        );
+        assert_eq!(pending, Some(RenameCompletionKey::Enter));
+        assert!(editor.is_some(), "failed command must retain the draft");
+        assert_eq!(
+            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
+                calls.set(calls.get() + 1);
+                Err("repeat must not dispatch".into())
+            }),
+            Ok(false)
+        );
+        assert_eq!(calls.get(), 1);
+
+        // The captured key-release event clears this guard while the TextInput
+        // remains focused. A later physical press may deliberately retry once.
+        pending = None;
+        assert!(
+            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn held_palette_enter_cannot_submit_the_editor_it_opens() {
+        let mut editor = Some(RenameEditor {
+            target: RenameTarget::Tab(9),
+            opened_label: "title".into(),
+            draft: "title".into(),
+        });
+        let mut pending = None;
+        arm_rename_completion_for_open_editor(&mut pending, editor.is_some());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            }),
+            Ok(false)
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(editor.is_some());
+
+        pending = None; // captured release from the palette-confirming Enter
+        assert!(
+            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(editor.is_none());
+    }
+
+    #[test]
+    fn rename_submit_trims_dispatches_exact_target_and_is_idempotent() {
+        let mut editor = Some(RenameEditor {
+            target: RenameTarget::Tab(42),
+            opened_label: "old".into(),
+            draft: "  new  title  ".into(),
+        });
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            submit_rename_editor_with(&mut editor, |target, label| {
+                calls.borrow_mut().push((target, label.to_string()));
+                Ok(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            submit_rename_editor_with(&mut editor, |target, label| {
+                calls.borrow_mut().push((target, label.to_string()));
+                Ok(())
+            }),
+            Ok(false),
+            "a queued second on_submit must be a no-op"
+        );
+        assert_eq!(
+            calls.into_inner(),
+            [(RenameTarget::Tab(42), "new  title".to_string())]
+        );
+    }
+
+    #[test]
+    fn empty_rename_never_dispatches_and_failure_keeps_the_draft() {
+        let mut empty = Some(RenameEditor {
+            target: RenameTarget::Project(7),
+            opened_label: "old".into(),
+            draft: " \t ".into(),
+        });
+        assert_eq!(
+            submit_rename_editor_with(&mut empty, |_, _| panic!("empty rename dispatched")),
+            Ok(false)
+        );
+        assert!(empty.is_none());
+
+        let expected = RenameEditor {
+            target: RenameTarget::Project(7),
+            opened_label: "old".into(),
+            draft: "recover me".into(),
+        };
+        let mut failed = Some(expected.clone());
+        assert_eq!(
+            submit_rename_editor_with(&mut failed, |_, _| Err("injected failure".into())),
+            Err("injected failure".into())
+        );
+        assert_eq!(failed, Some(expected));
+    }
+
+    #[test]
+    fn concurrent_snapshot_rename_never_overwrites_the_draft() {
+        let (mut projects, project_id, _, _) = rename_fixture();
+        let mut editor = begin_rename_editor(&projects, RenameTarget::Project(project_id)).unwrap();
+        editor.draft = "my draft".into();
+        projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+            .unwrap()
+            .name = "remote name".into();
+        assert!(rename_editor_is_renderable(
+            &editor, &projects, project_id, false
+        ));
+        assert_eq!(editor.draft, "my draft");
+        assert_eq!(
+            rename_target_label(&projects, editor.target),
+            Some("remote name")
+        );
+    }
+
+    #[test]
+    fn tab_selector_path_owns_select_then_double_click_begin() {
+        let (press, double_click) = tab_selector_messages(91);
+        assert!(matches!(press, Message::TabSelected(91)));
+        assert!(matches!(double_click, Message::BeginRenameTab(91)));
+    }
+
+    #[test]
+    fn rename_focus_request_chains_focus_then_select_all_once() {
+        let input_id = Id::unique();
+        let mut requested = true;
+        let UiTask::Then(first, second) =
+            take_rename_focus_request(&mut requested, true, &input_id)
+        else {
+            panic!("rename begin must compose two widget operations")
+        };
+        assert!(matches!(*first, UiTask::FocusWidget(_)));
+        assert!(matches!(*second, UiTask::SelectAllWidget(_)));
+        assert!(!requested);
+        assert!(matches!(
+            take_rename_focus_request(&mut requested, true, &input_id),
+            UiTask::None
+        ));
+        requested = true;
+        assert!(matches!(
+            take_rename_focus_request(&mut requested, false, &input_id),
+            UiTask::None
+        ));
+        assert!(!requested, "hidden editor must clear stale focus work");
     }
 
     #[test]
@@ -5313,6 +6014,27 @@ mod tests {
             take_palette_focus_request(&mut requested, &input_id),
             UiTask::None
         ));
+    }
+
+    #[test]
+    fn failed_palette_restore_reclaims_focus_for_back_and_dismiss() {
+        let mut requested = false;
+        assert_eq!(
+            retain_palette_focus_after_back(
+                &mut requested,
+                true,
+                Err::<(), _>("injected restore failure".into())
+            ),
+            Err("injected restore failure".into())
+        );
+        assert!(requested);
+
+        requested = true;
+        assert_eq!(
+            retain_palette_focus_after_back(&mut requested, false, Ok::<_, String>(())),
+            Ok(())
+        );
+        assert!(!requested, "successful dismissal leaves no field to focus");
     }
 
     #[test]

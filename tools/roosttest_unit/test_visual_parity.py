@@ -207,6 +207,19 @@ class ManifestTests(unittest.TestCase):
                     for name in parity.PALETTE_VARIANTS
                 },
             },
+            "chrome": {
+                "available": True,
+                "variants": {
+                    "project_rename": {
+                        "png": "project-rename.png",
+                        "sha256": "9" * 64,
+                    },
+                    "tab_rename": {
+                        "png": "tab-rename.png",
+                        "sha256": "8" * 64,
+                    },
+                }
+            },
             "font_comparison": {
                 "fixture": "Latin | bold | italic | é | 界",
                 "baseline_font": "JetBrains Mono",
@@ -236,6 +249,12 @@ class ManifestTests(unittest.TestCase):
             "[provider](iced-linux-x11-wgpu-1/palette-provider.png)", rendered
         )
         self.assertIn(
+            "[project_rename](iced-linux-x11-wgpu-1/project-rename.png)", rendered
+        )
+        self.assertIn(
+            "[tab_rename](iced-linux-x11-wgpu-1/tab-rename.png)", rendered
+        )
+        self.assertIn(
             "[after](iced-linux-x11-wgpu-1/terminal-font-alternate.png)", rendered
         )
         self.assertIn("dirty", rendered)
@@ -262,6 +281,25 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provider palette provenance"):
             parity.validate_measurement(document, "run-7", "abc123")
 
+    def test_measurement_requires_inline_rename_chrome_provenance(self):
+        document = self.document()
+        del document["chrome"]["variants"]["project_rename"]
+        with self.assertRaisesRegex(ValueError, "project_rename chrome provenance"):
+            parity.validate_measurement(document, "run-7", "abc123")
+
+    def test_declared_unavailable_chrome_needs_a_reason_not_false_provenance(self):
+        document = self.document()
+        document["chrome"] = {
+            "available": False,
+            "reason": "native editor is outside the product capture boundary",
+        }
+        parity.validate_measurement(document, "run-7", "abc123")
+        rendered = parity.format_manifest([document], "run-7", "abc123")
+        self.assertIn("unavailable: native editor", rendered)
+        del document["chrome"]["reason"]
+        with self.assertRaisesRegex(ValueError, "missing a reason"):
+            parity.validate_measurement(document, "run-7", "abc123")
+
     def test_font_comparison_requires_provenance_and_a_changed_terminal_region(self):
         document = self.document()
         del document["font_comparison"]["alternate_png"]
@@ -283,6 +321,8 @@ class ManifestTests(unittest.TestCase):
             (root / "palette.png").write_bytes(b"palette")
             for name, variant in document["palette"]["variants"].items():
                 (root / variant["png"]).write_bytes(name.encode())
+            (root / "project-rename.png").write_bytes(b"rename")
+            (root / "tab-rename.png").write_bytes(b"tab rename")
             document["shell"]["sha256"] = parity.sha256(root / "shell.png")
             document["palette"]["sha256"] = parity.sha256(root / "palette.png")
             document["font_comparison"]["baseline_sha256"] = document["shell"][
@@ -290,6 +330,12 @@ class ManifestTests(unittest.TestCase):
             ]
             for name, variant in document["palette"]["variants"].items():
                 variant["sha256"] = parity.sha256(root / variant["png"])
+            document["chrome"]["variants"]["project_rename"]["sha256"] = (
+                parity.sha256(root / "project-rename.png")
+            )
+            document["chrome"]["variants"]["tab_rename"]["sha256"] = parity.sha256(
+                root / "tab-rename.png"
+            )
             with self.assertRaisesRegex(ValueError, "terminal-font-alternate.png"):
                 parity.validate_artifact_files(document, root)
 

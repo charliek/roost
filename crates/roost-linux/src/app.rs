@@ -2061,10 +2061,9 @@ impl App {
         // still in flight. Avoids the dead-end where the entry has
         // disappeared but the row still owns keyboard focus.
         self.focus_active_terminal();
-        let trimmed = new_name.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(trimmed) = roost_ui_model::rename::committed_label(&new_name) else {
             return; // empty rename = no-op
-        }
+        };
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
@@ -2202,10 +2201,9 @@ impl App {
     /// `commit_rename_project`: fire `SetTabTitle` RPC, let the
     /// WatchEvents `TabTitle` event update the page's title.
     fn commit_rename_tab(self: &Rc<Self>, tab_id: i64, new_title: String) {
-        let trimmed = new_title.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(trimmed) = roost_ui_model::rename::committed_label(&new_title) else {
             return;
-        }
+        };
         let Some(client) = self.client.borrow().clone() else {
             return;
         };

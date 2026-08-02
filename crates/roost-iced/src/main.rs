@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use iced::{keyboard, time, window, Size, Subscription, Task, Theme};
+use iced::keyboard::key::Named;
+use iced::keyboard::Key;
+use iced::{event, keyboard, time, window, Event, Size, Subscription, Task, Theme};
 use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
@@ -39,10 +41,17 @@ enum Message {
     ClipboardWriteCompleted(u64),
     UrlOpenCompleted(Result<(), String>),
     Keyboard(keyboard::Event),
+    CapturedEscape,
+    CapturedEnterRelease,
     TerminalPointer(terminal_widget::TerminalPointer),
     ProjectSelected(i64),
+    BeginRenameProject(i64),
     AgentSelected(i64),
     TabSelected(i64),
+    BeginRenameTab(i64),
+    RenameDraftChanged(String),
+    RenameSubmit,
+    RenamePointerDismiss,
     CloseTab(i64),
     NewTab,
     ToggleSidebar,
@@ -118,6 +127,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.clipboard_write_completed(request_id).map_task()
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
+        Message::CapturedEscape => app.captured_escape().map_task(),
+        Message::CapturedEnterRelease => {
+            app.captured_enter_release();
+            Task::none()
+        }
         Message::UrlOpenCompleted(result) => {
             app.url_open_completed(result);
             Task::none()
@@ -130,6 +144,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::RenameDraftChanged(draft) => {
+            app.rename_draft_changed(draft);
+            Task::none()
+        }
+        Message::RenameSubmit => {
+            app.submit_rename_editor();
+            Task::none()
+        }
+        Message::RenamePointerDismiss => {
+            app.rename_pointer_dismiss();
+            Task::none()
+        }
         Message::PaletteQueryChanged(query) => {
             app.palette_query_changed(&query);
             Task::none()
@@ -142,10 +168,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.palette_confirm();
             Task::none()
         }
-        Message::PaletteDismiss => {
-            app.palette_pointer_dismiss();
-            Task::none()
-        }
+        Message::PaletteDismiss => app.palette_pointer_dismiss().map_task(),
         Message::PaletteCardPressed => Task::none(),
         Message::PaletteScrolled => {
             app.palette_scrolled();
@@ -168,8 +191,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         message @ (Message::ProjectSelected(_)
+        | Message::BeginRenameProject(_)
         | Message::AgentSelected(_)
         | Message::TabSelected(_)
+        | Message::BeginRenameTab(_)
         | Message::CloseTab(_)
         | Message::NewTab
         | Message::ToggleSidebar
@@ -187,8 +212,45 @@ fn subscription(_app: &App) -> Subscription<Message> {
             window::Event::Unfocused => Some(Message::WindowFocus(id, false)),
             _ => None,
         }),
-        keyboard::listen().map(Message::Keyboard),
+        event::listen_with(|event, status, _window| {
+            let Event::Keyboard(event) = event else {
+                return None;
+            };
+            match status {
+                event::Status::Ignored => Some(Message::Keyboard(event)),
+                event::Status::Captured if is_escape_press(&event) => Some(Message::CapturedEscape),
+                event::Status::Captured if is_enter_release(&event) => {
+                    Some(Message::CapturedEnterRelease)
+                }
+                event::Status::Captured => None,
+            }
+        }),
     ])
+}
+
+/// Text inputs capture Escape before `keyboard::listen`, but Escape is an
+/// application-level cancel for inline rename and palette frames. Forward that
+/// one captured press while keeping captured Enter/printable input widget-owned
+/// so submit and activation cannot dispatch twice.
+fn is_escape_press(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Escape),
+            repeat: false,
+            ..
+        }
+    )
+}
+
+fn is_enter_release(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyReleased {
+            key: Key::Named(Named::Enter),
+            ..
+        }
+    )
 }
 
 fn theme(_app: &App) -> Theme {
@@ -252,6 +314,7 @@ impl UiTask for app::UiTask {
             app::UiTask::Then(first, second) => first.map_task().chain(second.map_task()),
             app::UiTask::Focus(id) => window::gain_focus(id),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
+            app::UiTask::SelectAllWidget(id) => iced::widget::operation::select_all(id),
             app::UiTask::Resize(id, size) => window::resize(id, size),
             app::UiTask::Screenshot(id) => window::screenshot(id).map(Message::ScreenshotCaptured),
             app::UiTask::ClipboardRead { request_id, target } => {
@@ -307,5 +370,55 @@ impl UiTask for app::UiTask {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::key::{Code, Physical};
+    use iced::keyboard::Location;
+
+    fn press(key: Key) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            physical_key: Physical::Code(Code::Escape),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn captured_keyboard_forwarding_recognizes_escape_only() {
+        assert!(is_escape_press(&press(Key::Named(Named::Escape))));
+        assert!(!is_escape_press(&press(Key::Named(Named::Enter))));
+        assert!(!is_escape_press(&press(Key::Character("x".into()))));
+    }
+
+    #[test]
+    fn captured_enter_release_is_forwarded_for_failed_submit_rearming() {
+        let keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+            ..
+        } = press(Key::Named(Named::Enter))
+        else {
+            unreachable!()
+        };
+        let release = keyboard::Event::KeyReleased {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+        };
+        assert!(is_enter_release(&release));
+        assert!(!is_enter_release(&press(Key::Named(Named::Enter))));
     }
 }

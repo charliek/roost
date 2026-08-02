@@ -9,6 +9,7 @@ pub mod keybind;
 pub mod notification_inbox;
 pub mod palette;
 pub mod provider;
+pub mod rename;
 pub mod rollup;
 pub mod shell_escape;
 pub mod theme;

@@ -137,7 +137,7 @@ class Launch:
         self.state_dir = self.root / "state"
         self.config = self.root / "config.conf"
         for path in (self.runtime_dir, self.data_dir, self.state_dir):
-            path.mkdir(parents=True)
+            path.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.chmod(0o700)
         self.config.write_text(
             "\n".join(
@@ -205,6 +205,24 @@ class Launch:
             check=True,
         )
         time.sleep(0.15)
+
+    def type_text(self, value: str) -> None:
+        subprocess.run(
+            [
+                "xdotool",
+                "windowfocus",
+                "--sync",
+                self.window,
+                "type",
+                "--clearmodifiers",
+                "--delay",
+                "18",
+                value,
+            ],
+            env=self.xenv,
+            check=True,
+        )
+        time.sleep(0.2)
 
     def terminal_pointer(self, commands: list[str]) -> None:
         subprocess.run(
@@ -357,6 +375,27 @@ def _hold_key(launch: Launch, modifier: str, key: str, seconds: float = 1.2) -> 
     time.sleep(0.2)
 
 
+def _hold_plain_key(launch: Launch, key: str, seconds: float = 1.2) -> None:
+    subprocess.run(
+        [
+            "xdotool",
+            "windowfocus",
+            "--sync",
+            launch.window,
+            "keydown",
+            "--clearmodifiers",
+            key,
+            "sleep",
+            str(seconds * SCALE),
+            "keyup",
+            key,
+        ],
+        env=launch.xenv,
+        check=True,
+    )
+    time.sleep(0.2)
+
+
 def _screenshot_color_count(launch: Launch, color: tuple[int, int, int], name: str) -> int:
     png, _width, _height = launch.client.screenshot(scale=1)
     path = launch.root / f"{name}.png"
@@ -367,6 +406,39 @@ def _screenshot_color_count(launch: Launch, color: tuple[int, int, int], name: s
         for y in range(height)
         for x in range(width)
     )
+
+
+def _wait_for_inline_editor_focus(
+    launch: Launch, baseline: int, name: str
+) -> None:
+    """Wait for the renderer-owned focused border before sending replacement text."""
+    _wait_until(
+        lambda: _screenshot_color_count(
+            launch, (0x4E, 0x9A, 0xF1), f"{name}-focused"
+        )
+        >= baseline + 40,
+        f"{name} focused inline editor",
+    )
+
+
+def _wait_for_inline_editor_closed(
+    launch: Launch, baseline: int, name: str
+) -> None:
+    _wait_until(
+        lambda: _screenshot_color_count(
+            launch, (0x4E, 0x9A, 0xF1), f"{name}-closed"
+        )
+        <= baseline + 10,
+        f"{name} inline editor closed",
+    )
+
+
+def _open_inline_editor_with_key(launch: Launch, combo: str, name: str) -> None:
+    baseline = _screenshot_color_count(
+        launch, (0x4E, 0x9A, 0xF1), f"{name}-baseline"
+    )
+    launch.key(combo)
+    _wait_for_inline_editor_focus(launch, baseline, name)
 
 
 def _tab_is_attached(launch: Launch, tab_id: int) -> bool:
@@ -485,6 +557,24 @@ def _click_window_control(launch: Launch, x: int, y: int) -> None:
     launch.terminal_pointer(["mouseup", "1"])
 
 
+def _double_click_window_control(launch: Launch, x: int, y: int) -> None:
+    launch.terminal_pointer(
+        [
+            "mousemove",
+            "--window",
+            launch.window,
+            str(x),
+            str(y),
+            "click",
+            "--repeat",
+            "2",
+            "--delay",
+            "100",
+            "1",
+        ]
+    )
+
+
 def _palette_color_bounds(
     launch: Launch, color: tuple[int, int, int], minimum_pixels: int
 ) -> tuple[int, int, int, int]:
@@ -548,6 +638,19 @@ def _palette_pointer_routing(launch: Launch) -> None:
         lambda: launch.client.palette_state().get("frame") == "themes",
         "exact selected palette row activation",
     )
+    # A captured Escape pops the nested frame and must explicitly return
+    # keyboard ownership to the restored root TextInput.
+    launch.key("Escape")
+    _wait_until(
+        lambda: launch.client.palette_state().get("frame") == "commands",
+        "nested palette Escape returns to root",
+    )
+    launch.key("ctrl+a")
+    launch.type_text("toggle sidebar")
+    _wait_until(
+        lambda: launch.client.palette_state().get("query") == "toggle sidebar",
+        "nested palette Escape restores text input focus",
+    )
     launch.client.palette_dismiss()
 
     # The fixed add-tab control is deliberately outside the card. The first
@@ -565,8 +668,32 @@ def _palette_pointer_routing(launch: Launch) -> None:
         "outside dismissal does not click through to add-tab",
     )
 
+    # The Enter that confirms a palette rename command is still physically
+    # held while the inline TextInput appears. Its repeats must not immediately
+    # submit and close the newly opened editor.
+    active_tab = int(launch.client.identify()["active_tab_id"])
+    title_before = launch.client.tab(active_tab)["title"]
+    launch.client.palette_open("commands")
+    state = launch.client.palette_query("rename tab")
+    assert state["items"][state["selection"]]["id"] == "rename_tab", state
+    _hold_plain_key(launch, "Return")
+    _wait_until(
+        lambda: launch.client.palette_state().get("open") is False,
+        "held palette Enter opens inline rename",
+    )
+    _assert_stays(
+        lambda: not launch.client.app_active_terminal_focused(),
+        "held palette Enter leaves inline rename open",
+    )
+    assert launch.client.tab(active_tab)["title"] == title_before
+    launch.key("Escape")
+    _wait_until(
+        launch.client.app_active_terminal_focused,
+        "Escape closes held-Enter palette rename editor",
+    )
 
-def _keybind_dispatch(launch: Launch) -> None:
+
+def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     """Exercise the shared configured action table through physical XTEST keys."""
     identity = launch.client.identify()
     home_project = int(identity["active_project_id"])
@@ -690,28 +817,167 @@ def _keybind_dispatch(launch: Launch) -> None:
         "held Close Tab repeat suppression",
     )
 
-    # Unsupported actions are still application-owned. Their error remains
-    # visible globally while collapsed, then a successful shortcut clears it.
+    # Inline project/tab rename owns physical text input, never the PTY. A
+    # project shortcut reveals the collapsed sidebar so its editor cannot trap
+    # keys while hidden.
+    launch.client.focus(home_tab)
     if not launch.client.window_metrics()["sidebar_collapsed"]:
         launch.key("alt+b")
-    active = int(launch.client.identify()["active_tab_id"])
-    _drain_tabs(launch, [active])
-    launch.key("alt+shift+r")
-    _assert_no_pty_input(launch, [active], "unsupported Rename Project shortcut")
     _wait_until(
-        lambda: _screenshot_color_count(
-            launch, (0xEE, 0x78, 0x78), "unsupported-shortcut-toast"
-        )
-        >= 4,
-        "global unsupported-action status toast",
+        lambda: launch.client.window_metrics()["sidebar_collapsed"],
+        "sidebar collapsed before Rename Project",
     )
-    launch.key("alt+b")
+    _drain_tabs(launch, [home_tab])
+    project_editor_baseline = _screenshot_color_count(
+        launch, (0x4E, 0x9A, 0xF1), "rename-project-baseline"
+    )
+    launch.key("alt+shift+r")
     _wait_until(
-        lambda: _screenshot_color_count(
-            launch, (0xEE, 0x78, 0x78), "supported-shortcut-clears-toast"
-        )
-        == 0,
-        "successful shortcut status clear",
+        lambda: not launch.client.window_metrics()["sidebar_collapsed"],
+        "Rename Project reveals its inline editor",
+    )
+    _wait_for_inline_editor_focus(
+        launch, project_editor_baseline, "rename-project"
+    )
+    launch.type_text("RENAMED-PROJECT")
+    launch.key("Return")
+    _wait_until(
+        lambda: launch.client.project(home_project)["name"] == "RENAMED-PROJECT",
+        "Rename Project shortcut commit",
+    )
+    _wait_for_inline_editor_closed(
+        launch, project_editor_baseline, "rename-project"
+    )
+    _assert_no_pty_input(launch, [home_tab], "Rename Project shortcut")
+
+    rename_tab_baseline = _screenshot_color_count(
+        launch, (0x4E, 0x9A, 0xF1), "rename-tab-baseline"
+    )
+    launch.key("alt+r")
+    _wait_for_inline_editor_focus(launch, rename_tab_baseline, "rename-tab")
+    launch.type_text("RENAMED-TAB")
+    _hold_plain_key(launch, "Return")
+    _wait_until(
+        lambda: launch.client.tab(home_tab)["title"] == "RENAMED-TAB",
+        "Rename Tab shortcut commit",
+    )
+    _wait_for_inline_editor_closed(launch, rename_tab_baseline, "rename-tab")
+    _assert_no_pty_input(launch, [home_tab], "Rename Tab shortcut")
+
+    # The inactive first tab selector is one MouseArea (not a nested Button),
+    # so its double-click must select the stable tab ID before opening that
+    # same target's editor.
+    double_click_baseline = _screenshot_color_count(
+        launch, (0x4E, 0x9A, 0xF1), "double-click-tab-baseline"
+    )
+    metrics = launch.client.window_metrics()
+    _double_click_window_control(
+        launch,
+        round(float(metrics["sidebar_width"])) + 45,
+        17,
+    )
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == sibling,
+        "inactive tab double-click selection",
+    )
+    _wait_for_inline_editor_focus(
+        launch, double_click_baseline, "double-click-tab"
+    )
+    launch.type_text("DOUBLE-TAB")
+    launch.key("Return")
+    _wait_until(
+        lambda: launch.client.tab(sibling)["title"] == "DOUBLE-TAB",
+        "tab double-click inline rename",
+    )
+    _wait_for_inline_editor_closed(
+        launch, double_click_baseline, "double-click-tab"
+    )
+    _assert_no_pty_input(launch, [home_tab, sibling], "tab double-click rename")
+
+    # The first project is inactive and was authoritatively reordered to the
+    # first sidebar row above. Its double-click selects and renames that exact
+    # stable project ID.
+    launch.client.focus(home_tab)
+    project_double_baseline = _screenshot_color_count(
+        launch, (0x4E, 0x9A, 0xF1), "double-click-project-baseline"
+    )
+    _double_click_window_control(launch, 100, 52)
+    _wait_until(
+        lambda: launch.client.identify()["active_project_id"] == other_project,
+        "inactive project double-click selection",
+    )
+    _wait_for_inline_editor_focus(
+        launch, project_double_baseline, "double-click-project"
+    )
+    launch.type_text("DOUBLE-PROJECT")
+    launch.key("Return")
+    _wait_until(
+        lambda: launch.client.project(other_project)["name"] == "DOUBLE-PROJECT",
+        "project double-click inline rename",
+    )
+    _wait_for_inline_editor_closed(
+        launch, project_double_baseline, "double-click-project"
+    )
+    launch.client.focus(home_tab)
+
+    # Escape and terminal click-away both discard the draft and clear pending
+    # editor focus. The next ordinary key must route to the terminal.
+    cancel_project_baseline = _screenshot_color_count(
+        launch, (0x4E, 0x9A, 0xF1), "cancel-project-baseline"
+    )
+    launch.key("alt+shift+r")
+    _wait_for_inline_editor_focus(
+        launch, cancel_project_baseline, "cancel-project"
+    )
+    launch.type_text("CANCELLED-PROJECT")
+    _hold_plain_key(launch, "Escape")
+    _assert_stays(
+        lambda: launch.client.project(home_project)["name"] == "RENAMED-PROJECT",
+        "Escape cancels project rename",
+    )
+    _wait_for_inline_editor_closed(
+        launch, cancel_project_baseline, "cancel-project"
+    )
+    _assert_no_pty_input(launch, [home_tab], "Escape project rename")
+
+    _open_inline_editor_with_key(launch, "alt+shift+r", "clickaway-project")
+    launch.type_text("CLICKAWAY-PROJECT")
+    metrics = launch.client.window_metrics()
+    _click_window_control(
+        launch,
+        round(float(metrics["sidebar_width"])) + 80,
+        round(launch.client.terminal_top(metrics)) + 80,
+    )
+    _assert_stays(
+        lambda: launch.client.project(home_project)["name"] == "RENAMED-PROJECT",
+        "terminal click-away cancels project rename",
+    )
+    _drain_tabs(launch, [home_tab])
+    launch.key("x")
+    _wait_until(
+        lambda: _capture_contains(launch, b"x"),
+        "terminal keyboard route resumes after rename click-away",
+    )
+
+    # Blank sidebar chrome has no child action to emit a cancellation. The
+    # root pointer catcher must still close the editor instead of leaving a
+    # defocused, invisible keyboard trap behind.
+    _open_inline_editor_with_key(launch, "alt+shift+r", "blank-click-project")
+    launch.type_text("BLANK-CLICK-PROJECT")
+    _click_window_control(launch, 100, 330)
+    _wait_until(
+        launch.client.app_active_terminal_focused,
+        "blank chrome click cancels rename keyboard ownership",
+    )
+    _assert_stays(
+        lambda: launch.client.project(home_project)["name"] == "RENAMED-PROJECT",
+        "blank chrome click discards project rename draft",
+    )
+    _drain_tabs(launch, [home_tab])
+    launch.key("y")
+    _wait_until(
+        lambda: _capture_contains(launch, b"y"),
+        "terminal keyboard route resumes after blank chrome click",
     )
 
     # Restore the launch fixture for the independent close/overflow checks
@@ -727,6 +993,7 @@ def _keybind_dispatch(launch: Launch) -> None:
         and launch.client.identify()["active_tab_id"] == home_tab,
         "shortcut fixture cleanup",
     )
+    return home_project, home_tab
 
 
 def _direct_tab_close(launch: Launch) -> None:
@@ -1325,7 +1592,20 @@ def main() -> int:
         launches.append(off)
         _explicit_copy_and_paste(off)
         _terminal_scrollback_routing(off)
-        _keybind_dispatch(off)
+        renamed_project, renamed_tab = _keybind_dispatch(off)
+        off.close()
+        launches.pop()
+
+        # The same harness-owned profile must restore the authoritative names,
+        # not merely keep an adapter-local label alive until process exit.
+        off = Launch(root, display, "off", "explicit")
+        launches.append(off)
+        restored = off.client.project(renamed_project)
+        assert restored["name"] == "RENAMED-PROJECT"
+        assert any(
+            tab["title"] == "RENAMED-TAB" and tab["user_titled"]
+            for tab in restored["tabs"]
+        ), (renamed_tab, restored["tabs"])
         _direct_tab_close(off)
         _chrome_overflow_navigation(off)
         _palette_pointer_routing(off)
@@ -1359,6 +1639,7 @@ def main() -> int:
         "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
         "local/tracked/alternate terminal wheel routing and key snap, "
         "exhaustive shortcut dispatch/repeat suppression, "
+        "project/tab inline rename with double-click and click-away, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
         "constrained chrome overflow navigation, and palette pointer routing"
     )

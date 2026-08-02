@@ -1512,10 +1512,10 @@ remain the visual judge; no dedicated long-running parity job was added.
 
 This closes the fundamental styling-feasibility risk: released Iced can render
 the intended hierarchy, palette, density, states, clipping, and overflow on
-macOS and Linux. It does not yet establish release parity. Project creation and
-management, tab rename/reorder and hover-close, sidebar resizing, terminal
-scrollback/font controls, palette polish, native notifications/drop adapters,
-and accessibility/semantic icon refinement remain named implementation work.
+macOS and Linux. It does not yet establish release parity. Project creation,
+deletion and reorder, tab reorder and hover-close, sidebar resizing, remaining
+terminal interaction/visual checks, native notifications/drop adapters, and
+accessibility/semantic icon refinement remain named implementation work.
 Programmatic selection does not yet auto-reveal an offscreen tab pill; manual
 horizontal reachability is proven and auto-reveal stays in the tab-manipulation
 slice.
@@ -2162,6 +2162,131 @@ Wayland GTK drag gate and Iced X11/Wayland real-input gates passed. Local
 evidence is under `target/visual-parity/8ded829-32bc4d8577/` and
 `target/visual-parity-linux-fonts/`; these ignored artifacts are reproducible,
 not committed goldens.
+
+### Iced authoritative inline-rename commit plan
+
+Scope: implement in-place project and tab rename in Iced as the first direct-
+manipulation/text-editing feasibility slice. A double-click on a project row or
+tab pill and the existing configured `rename_project` / `rename_tab` actions
+(including command-palette activation) open one compact editor seeded from the
+authoritative snapshot. `RenameTarget::{Project(i64), Tab(i64)}` distinguishes
+the stable command target; the editor retains its at-open label and mutable
+draft. An absent/zero active target does not create an editor and returns one
+deterministic status. Project creation/deletion, context menus, drag reorder,
+hover-close, and sidebar resizing remain separate commits.
+
+Ownership and flow: Iced owns only the ephemeral editor and widget-focus
+request. It calls the existing `LocalClient` operation and then reconciles from
+`Workspace::snapshot`; it never optimistically mutates project or tab DTOs or
+adds a renderer type to `roost-engine` / `roost-ui-model`. A small pure
+`roost-ui-model` rename-decision helper owns the native Rust UI policy already
+used by GTK: trim the submitted label and treat empty/whitespace as a no-op.
+GTK migrates to that helper in this commit, while the engine remains the
+authoritative mutation layer and continues to accept the serializable IPC
+contract verbatim. Tests pin the exact string sent to `LocalClient` and prove a
+no-op never invokes it.
+
+Reconcile updates ordinary chrome from the newest snapshot but never overwrites
+the active draft while its stable target remains visible. Cancel therefore
+reveals a concurrent authoritative rename, while submit deliberately wins by
+issuing a later command. Reorder keeps an editor only by stable ID and only
+while visible. A deleted target, a tab whose project is no longer active, or a
+project hidden by sidebar collapse cancels the editor and any pending focus.
+Command failure keeps the draft recoverable and surfaces the exact error through
+the existing status port.
+
+Keyboard and focus protocol: editor state has precedence over application
+accelerators and terminal encoding. Printable keys update only the Iced text
+input. `TextInput::on_submit` is the sole Enter commit owner; the global editor
+keyboard route consumes Enter without dispatch. Iced reports Escape as a
+captured text-input event, so the application event port forwards that one
+non-repeat press to the editor/palette cancellation route. It also forwards a
+captured Enter release so a failed command that retains the field can re-arm
+only for the next physical press. A cleared target makes a duplicate queued
+submit idempotent. From the first Enter submit or Escape cancel, an explicit
+completion-key guard consumes only that same key through its release so repeat
+cannot retry a failed command or leak into the PTY; ordinary terminal
+Enter/Escape repeat is unchanged. The same guard is armed when a physical
+palette Enter opens an editor, preventing that still-held key from immediately
+submitting the newly mounted field.
+Begin focus/select-all is represented by one pending editor input ID. Direct
+shortcut/message paths and palette activation set the same request; `tick`
+drains it exactly once after service/reconcile and chains focus then select-all
+onto the existing `UiTask::then` accumulator. Palette state and its pending
+focus/visibility are cleared before editor focus; every cancellation clears a
+stale editor-focus request.
+
+All semantic click-away behavior goes through one
+`cancel_editor_for_interaction` path:
+terminal pointer press, project/tab/agent selection, tab close/new, sidebar
+toggle, notification/palette open, and any other chrome action cancel before
+dispatch. While an editor is open, a root pointer catcher additionally cancels
+ignored blank-chrome and scrollbar presses so the widget cannot defocus while
+application keyboard ownership remains modal. The project row already has the
+required non-interactive child under
+one `MouseArea`. The tab's nested selector `Button` would capture events before
+an outer `MouseArea`, so this commit replaces only that selector with a styled
+non-interactive container inside one `MouseArea` owning both
+`on_press(TabSelected(id))` and `on_double_click(BeginRenameTab(id))`; the exact
+close button remains outside. Iced's second-press event order selects first and
+then begins the editor, which is pinned by a focused path test.
+
+Tests and acceptance: pure tests cover begin/change/cancel/submit, both queued
+Enter message orders, repeats, exact target kind/ID dispatch, no-target and
+empty values, failure retention, same-target external rename, stale/hidden
+target reconciliation, keyboard precedence, terminal/chrome click-away, and
+pending-focus task composition with same-tick screenshot/clipboard/resize work.
+Existing engine rename/title/event/persistence suites remain authoritative.
+The X11 real-input lane must physically rename a project and tab through
+shortcuts/replacement typing, exercise required inactive-row double-click begin,
+held Enter and Escape, terminal and blank-chrome click-away, assert authoritative
+state and relaunch persistence, and prove zero captured PTY bytes. It also pops
+a nested palette with Escape and types into the restored root field to guard
+focus ownership. Wayland/macOS limitations may be narrowly documented, but
+double-click is not optional in X11. Capture the select-all inline editor beside
+GTK/Iced for visual review without adding a long-running pixel-parity job. Run
+both macOS renderers, Linux X11/Wayland renderers, complete GTK/AppKit
+regressions, shed input, dependency checks, independent diff review, and branch
+CI. Acceptance requires both commands to stop reporting unsupported, no shadow
+or hidden keyboard trap, no PTY leakage, and compact usable editing on macOS and
+Linux.
+
+### Iced authoritative inline-rename result (2026-08-01)
+
+Project and tab rename now converge on the existing authoritative workspace
+operations from direct Iced interaction, configured shortcuts, and command-
+palette activation. The only adapter-owned state is a stable typed target,
+at-open label, draft, and one-shot focus request. GTK and Iced share the pure
+`roost-ui-model` trim/empty/no-op decision; successful edits reconcile from a
+fresh engine snapshot instead of mutating UI DTOs optimistically. Failures keep
+the draft recoverable, concurrent external updates remain visible after cancel,
+and deleted or hidden targets clear the editor without leaking focus.
+
+The compact fields use explicit Roost styles and remain inside the project row
+or active tab pill; the close control remains available while a tab title is
+edited. The comparison schema emits named `project_rename` and `tab_rename`
+captures for human inspection without adding pixel goldens or a permanent
+parity job. GTK and Iced product captures place these editors reliably; AppKit
+product screenshots do not reliably composite native inline fields at their
+window coordinates, so the manifest records that state as explicitly
+unavailable instead of publishing a detached field as parity evidence. The X11
+physical-input gate exercises shortcut and double-click
+entry on inactive project/tab rows, replacement typing, held Enter and Escape,
+terminal and blank-chrome click-away, zero PTY bytes, and process relaunch with
+both labels restored. The same physical lane proves Escape from a nested palette
+restores root text-input focus before further typing. Pure tests pin exact stable-ID
+dispatch, no-op/idempotent behavior, failure retention, concurrent snapshots,
+keyboard precedence, completion-key release guarding, and focus/select-all
+draining. The native Iced event port
+also forwards a text-input-captured Escape to the application cancel route,
+forwards only Enter release for failed-submit re-arming, and keeps captured
+printable input widget-owned; the physical gate caught and now pins that
+distinction so a defocused editor cannot retain a hidden keyboard trap. Nested
+back navigation and root/pointer dismissal reclaim palette text-input focus
+whenever theme/font restoration fails and leaves the palette open. Pointer drag
+reorder and project create/delete remain
+intentionally separate authoritative-operation adapters rather than being
+coupled to text editing.
 
 ## Objective acceptance criteria
 

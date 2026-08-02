@@ -133,6 +133,45 @@ def test_activate_new_tab_dispatches_command(roost, project, palette):
     )
 
 
+@pytest.mark.parametrize("command", ["rename_project", "rename_tab"])
+def test_activate_rename_command_enters_chrome_without_mutating(
+    target, roost, project, palette, command
+):
+    """Rename command rows close the palette and enter native inline editing.
+
+    The functional harness deliberately does not synthesize text editing here;
+    physical X11 coverage owns replacement typing, Enter, Escape, and PTY-byte
+    isolation. This target-neutral check pins command routing and the absence of
+    an optimistic workspace mutation.
+    """
+    tab = roost.open_tab(project, cwd="/tmp", title="rename-command-tab")
+    # `tab.open` titles are initially shell-derived and may race an OSC 7 cwd
+    # update. Pin a user title before asserting that palette activation itself
+    # does not mutate either authoritative label.
+    roost.set_title(tab, "rename-command-tab")
+    roost.focus(tab)
+    if target != "mac":
+        roost._wait(
+            roost.app_active_terminal_focused,
+            5.0,
+            "live terminal owns logical keyboard route before rename activation",
+        )
+    before_project = roost.project(project)["name"]
+    before_title = roost.tab(tab)["title"]
+    palette.palette_open()
+    state = palette.palette_activate(command)
+    assert state["open"] is False
+    if target != "mac":
+        roost._wait(
+            lambda: not roost.app_active_terminal_focused(),
+            5.0,
+            "rename activation transfers logical keyboard ownership to the "
+            "native inline editor",
+        )
+    assert roost.project(project)["name"] == before_project
+    assert roost.tab(tab)["title"] == before_title
+
+
 def test_open_launcher_frame(palette):
     st = palette.palette_open(kind="launcher")
     assert st["open"] is True

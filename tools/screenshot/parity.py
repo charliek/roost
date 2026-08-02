@@ -25,7 +25,7 @@ from typing import Iterable
 
 import pngtool
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCENARIO = "workspace-shell-v1"
 SCALE = 1
 TERMINAL_BACKGROUND = (0x1E, 0x1E, 0x1E)
@@ -45,6 +45,7 @@ PALETTE_VARIANTS = (
     "provider",
     "fonts",
 )
+CHROME_VARIANTS = ("project_rename", "tab_rename")
 
 Image = tuple[int, int, int, bytes]
 
@@ -417,6 +418,16 @@ def validate_measurement(document: dict, run_id: str, commit: str) -> None:
             variant = variants.get(name, {})
             if not variant.get("png") or not variant.get("sha256"):
                 raise ValueError(f"measurement is missing {name} palette provenance")
+    chrome = document.get("chrome", {})
+    if chrome.get("available") is False:
+        if not chrome.get("reason"):
+            raise ValueError("unavailable chrome capture is missing a reason")
+    else:
+        variants = chrome.get("variants", {})
+        for name in CHROME_VARIANTS:
+            variant = variants.get(name, {})
+            if not variant.get("png") or not variant.get("sha256"):
+                raise ValueError(f"measurement is missing {name} chrome provenance")
     font = document.get("font_comparison", {})
     for field in (
         "fixture",
@@ -457,6 +468,12 @@ def validate_artifact_files(document: dict, artifact_dir: Path) -> None:
             (variant["png"], variant["sha256"])
             for variant in palette["variants"].values()
         )
+    chrome = document["chrome"]
+    if chrome.get("available") is not False:
+        expected.extend(
+            (variant["png"], variant["sha256"])
+            for variant in chrome["variants"].values()
+        )
     font = document["font_comparison"]
     expected.append((font["baseline_png"], font["baseline_sha256"]))
     if font["alternate_available"]:
@@ -484,6 +501,7 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
         key = environment_key(metadata)
         palette = document["palette"]
         font = document["font_comparison"]
+        chrome = document["chrome"]
         executable = metadata["executable"]
         if palette.get("available") is not False:
             palette_link = " ".join(
@@ -492,6 +510,13 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
             )
         else:
             palette_link = f"unavailable: {palette.get('reason', 'unspecified')}"
+        if chrome.get("available") is False:
+            chrome_link = f"unavailable: {chrome.get('reason', 'unspecified')}"
+        else:
+            chrome_link = " ".join(
+                f"[{name}]({key}/{chrome['variants'][name]['png']})"
+                for name in CHROME_VARIANTS
+            )
         if font["alternate_available"]:
             font_link = (
                 f"{font['baseline_font']} [before]({key}/{font['baseline_png']}) → "
@@ -501,7 +526,8 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
             font_link = f"unavailable: {font['reason']}"
         rows.append(
             "| {target} | {os} | {display} | {renderer} | {size} | {sidebar} | "
-            "{top} | [shell]({shell_link}) | {palette_link} | {font_link} | {source} | "
+            "{top} | [shell]({shell_link}) | {palette_link} | {chrome_link} | "
+            "{font_link} | {source} | "
             "`{executable}` | `{digest}` |".format(
                 target=metadata["target"],
                 os=metadata["os"],
@@ -512,6 +538,7 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
                 top=shell["terminal_top"],
                 shell_link=f"{key}/{shell['png']}",
                 palette_link=palette_link,
+                chrome_link=chrome_link,
                 font_link=font_link,
                 source="dirty" if metadata["source_dirty"] else "clean",
                 executable=executable["sha256"],
@@ -526,9 +553,10 @@ def format_manifest(documents: Iterable[dict], run_id: str, commit: str) -> str:
         "Hashes record provenance only; they are not golden-image assertions.\n\n"
         "Agent elapsed times are dynamic and excluded from visual comparison.\n\n"
         "| Target | OS | Display | Renderer | Shell size | Sidebar sample | "
-        "Terminal top | Shell | Palettes | Font comparison | Source | Executable SHA-256 | "
+        "Terminal top | Shell | Palettes | Chrome states | Font comparison | Source | "
+        "Executable SHA-256 | "
         "Shell SHA-256 |\n"
-        "|---|---|---|---|---:|---|---:|---|---|---|---|---|---|\n"
+        "|---|---|---|---|---:|---|---:|---|---|---|---|---|---|---|\n"
     )
     return header + "\n".join(rows) + "\n"
 

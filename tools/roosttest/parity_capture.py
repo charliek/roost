@@ -142,6 +142,8 @@ def _write_measurements(
     shell_path: Path,
     palette_path: Path | None,
     palette_variants: dict[str, Path],
+    chrome_variants: dict[str, Path],
+    chrome_unavailable_reason: str | None,
     metrics: dict,
     fixture: dict,
     font_comparison: dict,
@@ -192,6 +194,22 @@ def _write_measurements(
         "window_metrics": metrics,
         "shell": shell,
         "palette": palette_measurement,
+        "chrome": (
+            {"available": False, "reason": chrome_unavailable_reason}
+            if chrome_unavailable_reason
+            else {
+                "available": True,
+                "variants": {
+                    name: {
+                        "png": path.name,
+                        "sha256": parity.sha256(path),
+                        "width": parity.pngtool.load(str(path))[0],
+                        "height": parity.pngtool.load(str(path))[1],
+                    }
+                    for name, path in sorted(chrome_variants.items())
+                },
+            }
+        ),
         "font_comparison": font_comparison,
     }
     parity.atomic_json(output / "measurements.json", document)
@@ -485,6 +503,38 @@ def test_capture_visual_parity_fixture(roost, target):
                 "generic aliases may resolve to the same physical face"
             )
 
+    chrome_variants = {}
+    chrome_unavailable_reason = None
+    rename_extent = None
+    tab_rename_extent = None
+    if target == "mac":
+        # AppKit's product screenshot path does not reliably composite native
+        # inline text fields at their window coordinates. Naming the limitation
+        # is more useful than publishing a detached field as parity evidence.
+        chrome_unavailable_reason = (
+            "AppKit product screenshots do not reliably place native inline "
+            "text editors; compare GTK and Iced editor captures"
+        )
+    else:
+        # A command-palette rename activation enters application-owned chrome
+        # and closes the overlay. Capture the compact selected-all editor itself;
+        # the next harness launch owns cleanup, so no synthetic keyboard path is
+        # mixed into this visual fixture.
+        roost.palette_open("commands")
+        rename_state = roost.palette_activate("rename_project")
+        assert rename_state["open"] is False
+        rename_path = output / "project-rename.png"
+        rename_extent = _capture_settled(roost, rename_path)
+        roost.palette_open("commands")
+        tab_rename_state = roost.palette_activate("rename_tab")
+        assert tab_rename_state["open"] is False
+        tab_rename_path = output / "tab-rename.png"
+        tab_rename_extent = _capture_settled(roost, tab_rename_path)
+        chrome_variants = {
+            "project_rename": rename_path,
+            "tab_rename": tab_rename_path,
+        }
+
     fixture = {
         "project": PROJECT_NAME,
         "tabs": [
@@ -516,6 +566,8 @@ def test_capture_visual_parity_fixture(roost, target):
         shell_path,
         palette_path,
         palette_variants,
+        chrome_variants,
+        chrome_unavailable_reason,
         metrics,
         fixture,
         font_comparison,
@@ -538,6 +590,20 @@ def test_capture_visual_parity_fixture(roost, target):
             ) == extent
     else:
         assert document["palette"]["available"] is False
+    if chrome_unavailable_reason:
+        assert document["chrome"] == {
+            "available": False,
+            "reason": chrome_unavailable_reason,
+        }
+    else:
+        assert (
+            document["chrome"]["variants"]["project_rename"]["width"],
+            document["chrome"]["variants"]["project_rename"]["height"],
+        ) == rename_extent
+        assert (
+            document["chrome"]["variants"]["tab_rename"]["width"],
+            document["chrome"]["variants"]["tab_rename"]["height"],
+        ) == tab_rename_extent
     assert tuple(shell["terminal_sample"]) == parity.TERMINAL_BACKGROUND
     assert shell["terminal_top"] is not None
     assert shell["terminal_left"] is not None

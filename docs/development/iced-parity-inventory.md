@@ -134,7 +134,8 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Tab strip | About 24 pt pills in a compact band with 6 pt gaps and horizontal overflow | Closed for active/manual reachability: 24 pt dark pills in a 34 pt band with independent horizontal overflow | closed | Band/pill geometry assertions under both renderers; overflow test |
 | Tab status | Shared lifecycle dot at leading edge, white active label, muted inactive label | Implemented with shared lifecycle derivation; inactive slots are transparent, but the current parity fixture does not yet pin dot/label geometry | P1 | Add focused status-slot geometry/color capture; retain the semantic color unit test |
 | Tab close/badge | Active or hovered pill exposes close; inactive notification uses a distinct blue trailing badge | Active exact-ID close and blue badge implemented; hover-close remains deferred | P1 | Real click-close test, badge color/position assertion, notification clear test |
-| Tab rename/reorder | Inline rename and pointer drag reorder with visible insertion feedback | IPC operations work, but there is no direct Iced UI | P0 | Keyboard/pointer functional tests, persistence after relaunch |
+| Tab rename | Inline rename through double-click or the configured command, with authoritative persistence | Closed: compact inline editor uses stable IDs, select-all focus, Enter commit, Escape/click-away cancel, and shared GTK/Iced trim/no-op policy | closed | X11 physical shortcut/double-click/Enter/Escape/click-away gate, zero PTY leakage, relaunch persistence, and named GTK/Iced captures |
+| Tab reorder | Pointer drag reorder with visible insertion feedback | IPC operation exists, but there is no direct Iced drag UI | P0 | Stable-ID pointer functional tests, insertion geometry capture, persistence after relaunch |
 | New-tab affordance | Compact plus control following the pills | Closed: compact fixed plus remains reachable outside overflow and opens a PTY tab | closed | Click opens one PTY-backed tab; compact geometry assertion |
 | Notification entry | Header bell with count badge opens the inbox palette | Text button in the tab band | P1 | Bell/count capture and click-to-palette E2E |
 | Terminal padding | Compact consistent inset around the grid | 12 pt inset, visibly close but not yet measured against both references | P1 | Cell-origin and viewport-edge assertions at fixed size |
@@ -159,11 +160,13 @@ does not justify a second state machine.
 | Select project/tab/agent | implemented | implemented | Preserve while restyling; keep one authoritative active state |
 | Sidebar scrolling | UI-owned presentation | implemented | Body scrolls independently while the header/footer stay fixed; constrained real-pointer fixture activates the final row |
 | Create project | implemented | missing | Native/portal directory picker, then engine command; no renderer dependency in engine |
-| Rename/delete project | implemented | missing | Context menu or equivalent, inline rename, confirmation/error handling |
+| Rename project | implemented | implemented | Compact stable-ID inline editor; shared trim/no-op policy, physical input, exact dispatch, and relaunch persistence are covered |
+| Delete project | implemented | missing | Context menu or equivalent, confirmation, and deterministic error handling |
 | Reorder projects | implemented | missing | Pointer drag with stable IDs and explicit insertion feedback |
 | Open tab | implemented | implemented | Restyle plus control and preserve PTY launch path |
 | Close tab | implemented | active-pill close implemented | Keep exact rendered tab IDs and last-tab/project cascade coverage; add hover-close polish separately |
-| Rename/reorder tabs | implemented | missing | Inline rename and pointer drag; persist through engine events |
+| Rename tabs | implemented | implemented | Double-click/configured command uses the authoritative operation; physical input proves focus, cancel, commit, zero PTY leakage, and restoration |
+| Reorder tabs | implemented | missing | Pointer drag with stable IDs and insertion feedback; persist through engine events |
 | Sidebar collapse | implemented/persisted | implemented | Move affordance into chrome; retain command and shortcut convergence |
 | Sidebar resize | UI-owned geometry | missing | Iced split/drag adapter and persisted width policy |
 | Notifications inbox | shared model/UI port | implemented | Replace text control with bell/badge without changing model |
@@ -204,10 +207,11 @@ renderers, and is pushed only after the complete applicable gate is green.
    reachable, then dispatch every configured workspace shortcut before terminal
    encoding so missing UI commands cannot leak bytes. Sidebar and tab chrome
    scrolling landed with slice 3.
-6. **Project manipulation:** portal/native directory selection, create,
-   rename, delete, reorder, and the shared `new_project` command route.
-7. **Tab manipulation:** inline rename, drag reorder/overflow, hover-close
-   behavior, and restoration coverage.
+6. **Project manipulation:** inline rename is complete; add portal/native
+   directory selection, create, delete, pointer reorder, and the shared
+   `new_project` command route.
+7. **Tab manipulation:** inline rename and restoration coverage are complete;
+   add pointer drag reorder/overflow and hover-close behavior.
 8. **Interaction-cost go/no-go:** after at least one project or tab
    direct-manipulation path is polished and tested, assess focus, accessibility,
    text editing, drag feedback, and custom-widget complexity against GTK. Stop
@@ -291,8 +295,8 @@ These are sequencing decisions, not accepted final gaps:
 - The footer temporarily retains `Hide Sidebar` until the project-manipulation
   slice supplies the shared `New Project` route and a portal/native directory
   picker; the missing direct creation path remains P0.
-- Only the active tab exposes close in this slice. Hover-close, inline
-  rename/reorder, drag insertion feedback, and automatic reveal after
+- Only the active tab exposes close in this slice. Hover-close, pointer
+  reorder, drag insertion feedback, and automatic reveal after
   programmatic selection of an offscreen tab remain in the tab-manipulation
   slice. Manual horizontal reachability is already a real-pointer gate.
 - Iced 0.14 does not expose all desired accessibility labels/tooltips through

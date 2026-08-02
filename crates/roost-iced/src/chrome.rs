@@ -125,6 +125,22 @@ pub fn palette_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     }
 }
 
+pub fn inline_rename_input(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused { .. });
+    text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border {
+            color: if focused { NOTIFICATION } else { MUTED_TEXT },
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        icon: MUTED_TEXT,
+        placeholder: MUTED_TEXT,
+        value: TEXT,
+        selection: NOTIFICATION.scale_alpha(0.65),
+    }
+}
+
 pub fn palette_scrollable(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
     let mut style = scrollable::default(theme, status);
     let rail = scrollable::Rail {
