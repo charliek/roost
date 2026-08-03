@@ -1122,6 +1122,10 @@ impl App {
                     self.clear_palette_state();
                     self.new_tab();
                 }
+                "new_project" => {
+                    self.clear_palette_state();
+                    self.new_project_result()?;
+                }
                 "close_tab" => {
                     let tab_id = self.workspace.active().1;
                     self.clear_palette_state();

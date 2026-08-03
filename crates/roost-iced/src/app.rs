@@ -148,6 +148,33 @@ fn close_tab_by_id(
     }
 }
 
+fn create_project_flow(
+    runtime: &tokio::runtime::Runtime,
+    client: &LocalClient,
+) -> Result<(i64, i64), String> {
+    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let project = runtime
+        .block_on(client.create_project("", &cwd))
+        .map_err(|error| error.to_string())?;
+    let tab = runtime
+        .block_on(client.open_tab(
+            project.id,
+            &cwd,
+            "",
+            &[],
+            u32::from(DEFAULT_COLS),
+            u32::from(DEFAULT_ROWS),
+        ))
+        .map_err(|error| error.to_string())?;
+    // `open_tab` already steals the selection, but create's activation must
+    // not depend on another op's side effect.
+    client
+        .workspace
+        .focus_tab(tab.id)
+        .map_err(|error| error.to_string())?;
+    Ok((project.id, tab.id))
+}
+
 fn sidebar_width(collapsed: bool) -> f32 {
     if collapsed {
         0.0
@@ -789,7 +816,10 @@ impl App {
                 }
                 Ok(UiTask::None)
             }
-            KeybindAction::NewProject => Err("New Project is not available in Iced yet".into()),
+            KeybindAction::NewProject => {
+                self.new_project_result()?;
+                Ok(UiTask::None)
+            }
             KeybindAction::RenameProject => {
                 self.begin_rename_target(RenameTarget::Project(self.workspace.active().0))?;
                 Ok(UiTask::None)
@@ -969,18 +999,30 @@ impl App {
             }
             sidebar_body = sidebar_body.push(project_group);
         }
-        let sidebar_header = container(text("PROJECTS").size(11).color(chrome::MUTED_TEXT))
-            .height(chrome::BAND_HEIGHT)
-            .width(Fill)
-            .padding([10, 12])
-            .style(chrome::surface);
+        let sidebar_header = container(
+            row![
+                text("PROJECTS").size(11).color(chrome::MUTED_TEXT),
+                iced::widget::Space::new().width(Fill),
+                button(text("«").size(11))
+                    .width(chrome::PILL_HEIGHT)
+                    .height(chrome::PILL_HEIGHT)
+                    .padding(2)
+                    .style(chrome::transparent_button)
+                    .on_press(Message::ToggleSidebar)
+            ]
+            .align_y(Alignment::Center),
+        )
+        .height(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([5, 12])
+        .style(chrome::surface);
         let sidebar_footer = container(
-            button(text("Hide Sidebar").size(11))
+            button(text("+ New Project").size(11))
                 .width(Fill)
                 .height(chrome::PILL_HEIGHT)
                 .padding([2, 8])
                 .style(chrome::transparent_button)
-                .on_press(Message::ToggleSidebar),
+                .on_press(Message::NewProject),
         )
         .height(chrome::BAND_HEIGHT)
         .width(Fill)
@@ -1461,6 +1503,21 @@ impl App {
         Ok(())
     }
 
+    pub fn new_project(&mut self) {
+        self.cancel_tab_drag();
+        self.cancel_editor_for_interaction();
+        if let Err(error) = self.new_project_result() {
+            self.set_status(error);
+        }
+    }
+
+    fn new_project_result(&mut self) -> Result<(), String> {
+        self.set_sidebar_collapsed(false);
+        create_project_flow(&self.runtime, &self.client)?;
+        self.reconcile();
+        Ok(())
+    }
+
     pub fn close_tab(&mut self, tab_id: i64) {
         self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
@@ -1692,6 +1749,7 @@ impl Message {
             Self::BeginRenameTab(tab_id) => app.begin_rename_tab(tab_id),
             Self::CloseTab(tab_id) => app.close_tab(tab_id),
             Self::NewTab => app.new_tab(),
+            Self::NewProject => app.new_project(),
             Self::ToggleSidebar => app.toggle_sidebar(),
             Self::OpenNotifications => return app.open_notifications(),
             _ => {}
@@ -1839,6 +1897,31 @@ mod tests {
             "closing a project's last tab must remove the project"
         );
         assert_eq!(workspace.active(), (project.id, sibling.id));
+    }
+
+    #[test]
+    fn created_project_is_named_seeded_with_one_tab_and_activated() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let workspace = Arc::new(Workspace::new());
+        workspace.create_project("existing", "/tmp").unwrap();
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::new(PtySupervisor::new()),
+            "/tmp/roost-iced-create-project-test.sock".into(),
+        );
+
+        let (project_id, tab_id) = create_project_flow(&runtime, &client).unwrap();
+
+        let snapshot = workspace.snapshot();
+        let created = snapshot
+            .iter()
+            .find(|project| project.id == project_id)
+            .expect("created project in snapshot");
+        assert_eq!(created.name, "Untitled 2");
+        assert_eq!(created.tabs.len(), 1);
+        assert_eq!(created.tabs[0].id, tab_id);
+        assert_eq!(created.tabs[0].cwd, created.cwd);
+        assert_eq!(workspace.active(), (project_id, tab_id));
     }
 
     #[test]

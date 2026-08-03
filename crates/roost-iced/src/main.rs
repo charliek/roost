@@ -61,6 +61,7 @@ enum Message {
     RenamePointerDismiss,
     CloseTab(i64),
     NewTab,
+    NewProject,
     ToggleSidebar,
     OpenNotifications,
     PaletteQueryChanged(String),
@@ -216,6 +217,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::BeginRenameTab(_)
         | Message::CloseTab(_)
         | Message::NewTab
+        | Message::NewProject
         | Message::ToggleSidebar
         | Message::OpenNotifications) => message.apply(app).map_task(),
     }
