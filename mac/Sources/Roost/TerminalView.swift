@@ -1783,14 +1783,17 @@ final class TerminalView: NSView {
     /// without a synthesised `NSDraggingInfo`; mirrors `drop_text` on GTK.
     static func dropContentString(fileURLs: [URL], url: String?, string: String?) -> String? {
         // De-duplicate by standardized path (Finder lists one file under several
-        // URL-shaped entries) and drop any path containing a newline — a `\n`
-        // would split the newline-join into bogus extra paths and, at a raw
-        // shell, execute everything after it. Such filenames are pathological;
-        // screenshots never have them.
+        // URL-shaped entries) and drop any path carrying a newline or an ESC — a
+        // `\n` would split the newline-join into bogus extra paths and, at a raw
+        // shell, execute everything after it; an ESC would smuggle a control
+        // sequence (e.g. a bracketed-paste marker) into the PTY. Rejecting, not
+        // stripping, so the escaped text always names the real file. Mirrors
+        // `drop_content::resolve`. Such filenames are pathological; screenshots
+        // never have them.
         var seen = Set<String>()
         let paths = fileURLs
             .map { $0.standardizedFileURL.path }
-            .filter { !$0.contains(where: \.isNewline) }
+            .filter { !$0.contains(where: { $0.isNewline || $0 == "\u{1b}" }) }
             .filter { seen.insert($0).inserted }
         if !paths.isEmpty {
             return paths.map { ShellEscape.escape($0) }.joined(separator: "\n")

@@ -13,8 +13,12 @@ use crate::shell_escape;
 /// input.
 ///
 /// Paths are de-duplicated by their raw platform representation before UTF-8
-/// conversion. Non-UTF-8 and newline-bearing paths are ignored instead of
-/// being lossily changed into a different filename or multiple shell lines.
+/// conversion. Non-UTF-8 paths and paths bearing a control character no
+/// filename may legitimately carry (`\n`, `\r`, ESC) are ignored rather than
+/// repaired: a newline would split the join into bogus extra shell lines and an
+/// ESC would smuggle a control sequence (e.g. a bracketed-paste marker) into
+/// the PTY, while stripping either would silently turn the path into a
+/// different filename. Rejecting keeps `shell_escape::escape` lossless.
 /// If at least one safe path remains, paths take priority over `text` and are
 /// newline-joined in first-seen order. Otherwise non-empty text is returned
 /// verbatim.
@@ -32,7 +36,7 @@ where
                 return None;
             }
             let path = path.to_str()?;
-            (!path.contains(['\n', '\r'])).then(|| shell_escape::escape(path))
+            (!path.contains(['\n', '\r', '\u{1b}'])).then(|| shell_escape::escape(path))
         })
         .collect::<Vec<_>>();
     if !escaped.is_empty() {
@@ -74,6 +78,16 @@ mod tests {
         assert_eq!(resolve(["/tmp/ev\nil.png", "/tmp/ev\ril.png"], None), None);
         assert_eq!(
             resolve(["/tmp/ev\nil.png", "/tmp/ok.png"], None),
+            Some("/tmp/ok.png".to_string())
+        );
+    }
+
+    /// Shared with the Swift `testControlBearingPathIsDropped` vector.
+    #[test]
+    fn escape_bearing_paths_are_rejected() {
+        assert_eq!(resolve(["/tmp/ev\u{1b}[201~il.png"], None), None);
+        assert_eq!(
+            resolve(["/tmp/ev\u{1b}[201~il.png", "/tmp/ok.png"], None),
             Some("/tmp/ok.png".to_string())
         );
     }

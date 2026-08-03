@@ -13,18 +13,14 @@
 /// screenshot filename) pass through unchanged, which modern shells handle as
 /// UTF-8 literals.
 ///
-/// ESC (0x1b) is dropped outright rather than backslash-escaped: no legitimate
-/// filename needs it, a backslash does not neutralize it for the terminal
-/// parser, and a crafted name could otherwise smuggle a control sequence (e.g.
-/// a bracketed-paste marker) into the PTY through the file-drop path. Defense
-/// in depth with `bracketed_paste::wrap`, which strips the markers again at the
-/// paste boundary.
+/// This is a pure escaper: every input character reaches the output, so the
+/// escaped string still names the same file. Control characters that no
+/// filename may legitimately carry (`\n`, `\r`, ESC) are rejected earlier, at
+/// the drop boundary in `drop_content::resolve` — dropping them here would let
+/// two distinct filenames collapse to the same PTY input.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch == '\u{1b}' {
-            continue;
-        }
         if matches!(
             ch,
             '\\' | ' '
@@ -117,12 +113,17 @@ mod tests {
         assert_eq!(escape("\\ "), "\\\\\\ ");
     }
 
-    /// Shared verbatim with the Swift `testDropsEscapeByte` vector: the ESC is
-    /// dropped, the `[` that follows it is escaped like any other metacharacter.
+    /// Shared verbatim with the Swift `testEscapeBytePassesThrough` vector: the
+    /// escaper never drops input (that would make the escaped string name a
+    /// different file), so ESC survives and only the `[` after it is escaped.
+    /// ESC-bearing paths are rejected up in `drop_content::resolve`.
     #[test]
-    fn escape_byte_is_dropped() {
-        assert_eq!(escape("/tmp/ev\u{1b}[201~il.png"), "/tmp/ev\\[201~il.png");
-        assert_eq!(escape("\u{1b}"), "");
+    fn escape_byte_passes_through() {
+        assert_eq!(
+            escape("/tmp/ev\u{1b}[201~il.png"),
+            "/tmp/ev\u{1b}\\[201~il.png"
+        );
+        assert_eq!(escape("\u{1b}"), "\u{1b}");
     }
 
     #[test]

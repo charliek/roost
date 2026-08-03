@@ -23,17 +23,15 @@ enum ShellEscape {
     /// screenshot filename) pass through unchanged, which modern shells handle as
     /// UTF-8 literals.
     ///
-    /// ESC (0x1b) is dropped outright rather than backslash-escaped: no
-    /// legitimate filename needs it, a backslash does not neutralize it for the
-    /// terminal parser, and a crafted name could otherwise smuggle a control
-    /// sequence (e.g. a bracketed-paste marker) into the PTY through the
-    /// file-drop path. Defense in depth with `wrapBracketedPaste`, which strips
-    /// the markers again at the paste boundary.
+    /// This is a pure escaper: every input character reaches the output, so the
+    /// escaped string still names the same file. Control characters that no
+    /// filename may legitimately carry (newlines, ESC) are rejected earlier, at
+    /// the drop boundary in `TerminalView.dropContentString` — dropping them
+    /// here would let two distinct filenames collapse to the same PTY input.
     static func escape(_ str: String) -> String {
         var out = String()
         out.reserveCapacity(str.count)
         for ch in str {
-            if ch == "\u{1b}" { continue }
             if characters.contains(ch) {
                 out.append("\\")
             }

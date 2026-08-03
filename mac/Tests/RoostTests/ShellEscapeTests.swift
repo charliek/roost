@@ -49,12 +49,16 @@ final class ShellEscapeTests: XCTestCase {
         XCTAssertEqual(ShellEscape.escape("\\ "), "\\\\\\ ")
     }
 
-    /// Shared verbatim with the Rust `escape_byte_is_dropped` vector: ESC is
-    /// dropped, the `[` that follows it is escaped like any other
-    /// metacharacter.
-    func testDropsEscapeByte() {
-        XCTAssertEqual(ShellEscape.escape("/tmp/ev\u{1B}[201~il.png"), "/tmp/ev\\[201~il.png")
-        XCTAssertEqual(ShellEscape.escape("\u{1B}"), "")
+    /// Shared verbatim with the Rust `escape_byte_passes_through` vector: the
+    /// escaper never drops input (that would make the escaped string name a
+    /// different file), so ESC survives and only the `[` after it is escaped.
+    /// ESC-bearing paths are rejected up in `TerminalView.dropContentString`.
+    func testEscapeBytePassesThrough() {
+        XCTAssertEqual(
+            ShellEscape.escape("/tmp/ev\u{1B}[201~il.png"),
+            "/tmp/ev\u{1B}\\[201~il.png"
+        )
+        XCTAssertEqual(ShellEscape.escape("\u{1B}"), "\u{1B}")
     }
 }
 
@@ -115,6 +119,24 @@ final class DropContentResolverTests: XCTestCase {
         XCTAssertEqual(
             TerminalView.dropContentString(
                 fileURLs: [fileURL("/tmp/ev\nil.png"), fileURL("/tmp/ok.png")], url: nil, string: nil
+            ),
+            "/tmp/ok.png"
+        )
+    }
+
+    /// Shared with the Rust `escape_bearing_paths_are_rejected` vector: an ESC
+    /// in a filename is rejected at the drop boundary rather than stripped by
+    /// the escaper.
+    func testControlBearingPathIsDropped() {
+        XCTAssertNil(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{1B}[201~il.png")], url: nil, string: nil
+            )
+        )
+        XCTAssertEqual(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{1B}[201~il.png"), fileURL("/tmp/ok.png")],
+                url: nil, string: nil
             ),
             "/tmp/ok.png"
         )
