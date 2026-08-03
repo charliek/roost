@@ -93,7 +93,10 @@ Independent of the merge; blocks the next Swift/GTK release regardless.
    (rename-detection carried it into `roost-engine/src/pty.rs`; its test
    moved to `roost-engine/tests/`).
 
-### M2 — merge `poc/iced` to `main`
+### M2 — merge `poc/iced` to `main` — **complete (PR #278, merged 2026-08-02)**
+
+All gates green on the merge: `e2e-mac`, the three GTK tiers, and the
+full iced 2×2 matrix. `poc/iced` is retired (merged, branch pointer kept).
 
 * **Authorized by the user (2026-08-02)** contingent on M1 complete and
   full `ci-success` green on the PR — `e2e-mac` (Swift production-ready)
@@ -113,7 +116,7 @@ Independent of the merge; blocks the next Swift/GTK release regardless.
 
 Slices, each sized for one gauntlet pass:
 
-* **3a. `App` decomposition first.** Split the 8.8k-line
+* **3a. `App` decomposition first (in progress — plan 009).** Split the 8.8k-line
   `crates/roost-iced/src/app.rs` single `impl` (111 methods) into
   `app/` submodules (projects, palette, rename, notifications, clipboard,
   drag, osc). Mechanical; do it *before* adding surface area.
