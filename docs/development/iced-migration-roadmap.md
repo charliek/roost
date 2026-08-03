@@ -34,9 +34,9 @@ gauntlet passes sized one milestone slice at a time.
 
 ## Milestones
 
-### M0 — hotfix the unreleased color regression on `main`
+### M0 — color regression investigation — **closed (not reproducible)**
 
-Independent of the merge; blocks the next Swift/GTK release regardless.
+Independent of the merge; kept as the reproduction recipe if it returns.
 
 * Symptom: TUIs (`strix`, `prox`) reported single-color in builds of all
   three UIs from `poc/iced` tip; absent in the released v0.0.15.
@@ -67,13 +67,10 @@ Independent of the merge; blocks the next Swift/GTK release regardless.
   resolver. strix 0.0.7 is unchanged since Jul 26, so the observed binary
   is the tested binary. If the symptom reappears, re-run this probe first
   and capture the tab env (`env | sort`) before anything else.
-* **Actionable remainder: TERMINFO env hygiene (small hardening PR to
-  `main`).** Strip `TERMINFO` from PTY child env in both
-  `PtySupervisor.swift` (`buildEnv`) and `roost-engine/src/pty.rs` — Roost
-  forces `TERM=xterm-256color`, so inheriting the host terminal's private
-  terminfo DB (e.g. Ghostty's, which lacks `xterm-256color`) is wrong
-  regardless of whether it caused the observation. Add the env assertion to
-  the E2E env checks on both targets.
+* **Actionable remainder: TERMINFO env hygiene — done (PR #276, merged
+  2026-08-02).** `TERMINFO` is stripped from PTY child env in both
+  `PtySupervisor.swift` (`childEnvironment`) and the Rust PTY spawn, with
+  env-assertion tests on both sides.
 
 ### M1 — pre-merge hardening (on `poc/iced`) — **complete (PR #277)**
 
@@ -136,15 +133,43 @@ Slices, each sized for one gauntlet pass:
 * **3e. Polish parity:** notification bell/badge, hover-close, offscreen-tab
   reveal, empty/loading/error states, cursor/selection/link pixel geometry —
   per the P1 rows in the [parity inventory](iced-parity-inventory.md).
-  Known bug (user-observed 2026-08-02, macOS): with several tabs open the
-  Iced tab strip shows artifacts — a gray horizontal bar rendered across
-  the tab row (likely the overflow scrollbar or a drag-reflow remnant) and
-  a tab overlapping the `+` button. Reproduce with 4+ tabs including
-  long-path titles; likely interacts with the tab-drag reflow work
-  (`0abd3e4`, `51e5fad`).
+  Includes the user-visible tab-strip artifact bug ([#281]) — fold it into
+  whichever slice touches the tab strip first rather than waiting for 3e.
 * **3f. Native desktop notifications** (narrow platform port, per-OS).
 * **3g. Wayland gaps** (native file drop, clipboard seat serial) are
   upstream Iced/winit limitations — track, document, don't block on them.
+
+Slice order is deliberate: 3b/3c close the honest `Err("… not available in
+Iced yet")` stubs (the last functional gaps blocking M4); 3d is the
+architecture cleanup that everything real-time depends on; 3e/3f/3g are
+polish and platform work that can interleave.
+
+### Maintenance backlog (filed, not scheduled)
+
+Work this migration surfaced that should not block a slice. Pull one in
+when it touches the code you are already in:
+
+| item | issue |
+|---|---|
+| Iced tab-strip artifacts with several tabs open (user-visible) | [#281] |
+| Rust/Swift drop-path filter divergence (`isNewline` superset; Swift-only URL branch) | [#282] |
+| `roost-linux` clippy `type_complexity` debt keeping it out of the lint gate | [#283] |
+| No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) | [#284] |
+| No real-input (CGEvent) harness on macOS — uinput tier is Linux-only | [#285] |
+| `roost-engine::facade` has no consumer; prove it or delete it (blocks M5) | [#286] |
+| Mac `app.window_metrics` omits `terminal_top` / `terminal_font_family` | [#287] |
+| `app/interactions.rs` at 2,960 lines — finer split when fixtures allow | [#288] |
+| swift-testing runner SIGABRT on fast value-check swarms (XCTest workaround) | [#289] |
+
+[#281]: https://github.com/charliek/roost/issues/281
+[#282]: https://github.com/charliek/roost/issues/282
+[#283]: https://github.com/charliek/roost/issues/283
+[#284]: https://github.com/charliek/roost/issues/284
+[#285]: https://github.com/charliek/roost/issues/285
+[#286]: https://github.com/charliek/roost/issues/286
+[#287]: https://github.com/charliek/roost/issues/287
+[#288]: https://github.com/charliek/roost/issues/288
+[#289]: https://github.com/charliek/roost/issues/289
 
 ### M4 — ship Iced to Linux users
 
@@ -159,9 +184,11 @@ real-input tier passes on Iced for the drag/clipboard guards.
 The Swift app's polish and daily use make replacement remote; the question
 is where shared Rust reduces duplication *without* slowdowns.
 
-1. Prove the facade: port one Rust UI's workspace mutations onto
+1. Prove the facade ([#286]): port one Rust UI's workspace mutations onto
    `Engine::execute` + `EngineEventStream` so the Swift-facing boundary has a
-   real consumer before Swift bets on it.
+   real consumer before Swift bets on it. It is feature-gated
+   (`roost-engine/facade`, off by default) until then; if adoption never
+   happens, delete it rather than carry a parallel API.
 2. FFI spike: `roost-engine-ffi` staticlib + cbindgen header, outbound-only
    (snapshot/events polling per the POC plan's ABI v1), measured for call
    overhead and allocator churn.
