@@ -52,7 +52,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::palette_scroll::Visibility;
-use crate::tab_reorder::{TabStrip, TabStripEvent};
+use crate::strip_reorder::{ReorderStrip, StripEvent};
 use crate::terminal_widget::{
     resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
     TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
@@ -1310,7 +1310,7 @@ impl App {
                     )),
             );
         }
-        let tab_strip = TabStrip::new(
+        let tab_strip = ReorderStrip::tabs(
             tab_pills,
             active_project,
             visual_tab_ids,

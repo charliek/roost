@@ -1,4 +1,7 @@
-//! Native pointer gesture adapter for stable-ID tab reordering.
+//! Native pointer gesture adapter for stable-ID reordering strips. The
+//! tab strip is one instantiation; the widget is axis- and
+//! message-parametrized so a vertical strip can reuse the same gesture
+//! state machine.
 
 use iced::advanced::layout;
 use iced::advanced::overlay;
@@ -102,7 +105,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReleaseBoundary<'_> {
             event,
             shell,
             self.enabled,
-            || Message::TabPointerReleased,
+            || Message::StripPointerReleased,
             |shell| {
                 content.as_widget_mut().update(
                     child_tree, event, layout, cursor, renderer, clipboard, shell, viewport,
@@ -173,30 +176,48 @@ impl<'a> From<ReleaseBoundary<'a>> for Element<'a, Message> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Axis {
+    Horizontal,
+    // Only the unit tests instantiate this until the vertical (project)
+    // strip call site lands.
+    #[allow(dead_code)]
+    Vertical,
+}
+
+/// `scope_id` scopes a gesture to the surface it started on (the active
+/// project id for the tab strip, `0` for the project list) — it is only
+/// ever compared for equality, never run through `same_members`' zero
+/// reject, which applies to the item-id list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TabStripEvent {
+pub(crate) enum StripEvent {
     Started {
-        project_id: i64,
+        scope_id: i64,
         source_id: i64,
         context_generation: u64,
         original_ids: Vec<i64>,
     },
+    DragBegan {
+        scope_id: i64,
+        source_id: i64,
+        context_generation: u64,
+    },
     Preview {
-        project_id: i64,
+        scope_id: i64,
         source_id: i64,
         context_generation: u64,
         original_ids: Vec<i64>,
         ordered_ids: Vec<i64>,
     },
     Commit {
-        project_id: i64,
+        scope_id: i64,
         source_id: i64,
         context_generation: u64,
         original_ids: Vec<i64>,
         ordered_ids: Vec<i64>,
     },
     Ended {
-        project_id: i64,
+        scope_id: i64,
         source_id: i64,
         context_generation: u64,
         original_ids: Vec<i64>,
@@ -206,16 +227,20 @@ pub(crate) enum TabStripEvent {
     },
 }
 
-pub(crate) struct TabStrip<'a> {
+pub(crate) struct ReorderStrip<'a> {
     content: Element<'a, Message>,
-    project_id: i64,
+    axis: Axis,
+    scope_id: i64,
     ids: Vec<i64>,
     context_generation: u64,
     enabled: bool,
+    on_select: fn(i64) -> Message,
+    on_rename: fn(i64) -> Message,
+    on_event: fn(StripEvent) -> Message,
 }
 
-impl<'a> TabStrip<'a> {
-    pub(crate) fn new(
+impl<'a> ReorderStrip<'a> {
+    pub(crate) fn tabs(
         content: impl Into<Element<'a, Message>>,
         project_id: i64,
         ids: Vec<i64>,
@@ -224,17 +249,21 @@ impl<'a> TabStrip<'a> {
     ) -> Self {
         Self {
             content: content.into(),
-            project_id,
+            axis: Axis::Horizontal,
+            scope_id: project_id,
             ids,
             context_generation,
             enabled,
+            on_select: Message::TabSelected,
+            on_rename: Message::BeginRenameTab,
+            on_event: Message::TabStrip,
         }
     }
 }
 
 #[derive(Debug)]
 struct Gesture {
-    project_id: i64,
+    scope_id: i64,
     source_id: i64,
     original_ids: Vec<i64>,
     ordered_ids: Vec<i64>,
@@ -246,7 +275,7 @@ struct Gesture {
 #[derive(Clone, Copy, Debug)]
 struct ScopedClick {
     click: mouse::Click,
-    project_id: i64,
+    scope_id: i64,
     source_id: i64,
     context_generation: u64,
 }
@@ -260,25 +289,25 @@ struct State {
 #[derive(Debug, PartialEq, Eq)]
 enum ReleaseSettlement {
     Unowned,
-    Owned(Option<TabStripEvent>),
+    Owned(Option<StripEvent>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum PressSettlement {
-    Started(TabStripEvent),
+    Started(StripEvent),
     DoubleClick,
 }
 
 impl State {
     fn previous_click_for(
         &self,
-        project_id: i64,
+        scope_id: i64,
         source_id: i64,
         context_generation: u64,
     ) -> Option<mouse::Click> {
         self.previous_click
             .filter(|previous| {
-                previous.project_id == project_id
+                previous.scope_id == scope_id
                     && previous.source_id == source_id
                     && previous.context_generation == context_generation
             })
@@ -287,26 +316,26 @@ impl State {
 
     fn settle_release(
         &mut self,
-        project_id: i64,
+        scope_id: i64,
         ids: &[i64],
         context_generation: u64,
-    ) -> Option<TabStripEvent> {
+    ) -> Option<StripEvent> {
         let gesture = self.gesture.take()?;
-        if !context_valid(&gesture, project_id, ids, context_generation) {
-            Some(TabStripEvent::Cancel {
+        if !context_valid(&gesture, scope_id, ids, context_generation) {
+            Some(StripEvent::Cancel {
                 context_generation: gesture.context_generation,
             })
         } else if gesture.dragging {
-            Some(TabStripEvent::Commit {
-                project_id: gesture.project_id,
+            Some(StripEvent::Commit {
+                scope_id: gesture.scope_id,
                 source_id: gesture.source_id,
                 context_generation: gesture.context_generation,
                 original_ids: gesture.original_ids,
                 ordered_ids: gesture.ordered_ids,
             })
         } else {
-            Some(TabStripEvent::Ended {
-                project_id: gesture.project_id,
+            Some(StripEvent::Ended {
+                scope_id: gesture.scope_id,
                 source_id: gesture.source_id,
                 context_generation: gesture.context_generation,
                 original_ids: gesture.original_ids,
@@ -317,7 +346,7 @@ impl State {
     fn arm_press(
         &mut self,
         position: Point,
-        project_id: i64,
+        scope_id: i64,
         source_id: i64,
         ids: &[i64],
         context_generation: u64,
@@ -325,11 +354,11 @@ impl State {
         let click = mouse::Click::new(
             position,
             mouse::Button::Left,
-            self.previous_click_for(project_id, source_id, context_generation),
+            self.previous_click_for(scope_id, source_id, context_generation),
         );
         self.previous_click = Some(ScopedClick {
             click,
-            project_id,
+            scope_id,
             source_id,
             context_generation,
         });
@@ -338,7 +367,7 @@ impl State {
             PressSettlement::DoubleClick
         } else {
             self.gesture = Some(Gesture {
-                project_id,
+                scope_id,
                 source_id,
                 original_ids: ids.to_vec(),
                 ordered_ids: ids.to_vec(),
@@ -346,8 +375,8 @@ impl State {
                 context_generation,
                 dragging: false,
             });
-            PressSettlement::Started(TabStripEvent::Started {
-                project_id,
+            PressSettlement::Started(StripEvent::Started {
+                scope_id,
                 source_id,
                 context_generation,
                 original_ids: ids.to_vec(),
@@ -355,10 +384,25 @@ impl State {
         }
     }
 
+    /// Threshold crossing is published once per gesture: `Started` fires
+    /// on bare press, so only this transition means "a drag is underway".
+    fn begin_drag(&mut self, position: Point) -> Option<StripEvent> {
+        let gesture = self.gesture.as_mut()?;
+        if gesture.dragging || !crossed_threshold(gesture.origin, position) {
+            return None;
+        }
+        gesture.dragging = true;
+        Some(StripEvent::DragBegan {
+            scope_id: gesture.scope_id,
+            source_id: gesture.source_id,
+            context_generation: gesture.context_generation,
+        })
+    }
+
     fn settle_owned_release(
         &mut self,
         event: &Event,
-        project_id: i64,
+        scope_id: i64,
         ids: &[i64],
         context_generation: u64,
     ) -> ReleaseSettlement {
@@ -369,7 +413,7 @@ impl State {
         {
             return ReleaseSettlement::Unowned;
         }
-        ReleaseSettlement::Owned(self.settle_release(project_id, ids, context_generation))
+        ReleaseSettlement::Owned(self.settle_release(scope_id, ids, context_generation))
     }
 }
 
@@ -384,10 +428,13 @@ fn same_members(ids: &[i64], expected: &[i64]) -> bool {
     left.windows(2).all(|pair| pair[0] != pair[1]) && left == right
 }
 
-fn raw_target_index(layout: Layout<'_>, x: f32) -> usize {
+fn raw_target_index(axis: Axis, layout: Layout<'_>, position: Point) -> usize {
     layout
         .children()
-        .take_while(|child| x >= child.bounds().center_x())
+        .take_while(|child| match axis {
+            Axis::Horizontal => position.x >= child.bounds().center_x(),
+            Axis::Vertical => position.y >= child.bounds().center_y(),
+        })
         .count()
 }
 
@@ -413,13 +460,13 @@ fn next_preview_order(
     Ok((ordered_ids != current_preview).then_some(ordered_ids))
 }
 
-fn context_valid(gesture: &Gesture, project_id: i64, ids: &[i64], context_generation: u64) -> bool {
+fn context_valid(gesture: &Gesture, scope_id: i64, ids: &[i64], context_generation: u64) -> bool {
     gesture.context_generation == context_generation
-        && gesture.project_id == project_id
+        && gesture.scope_id == scope_id
         && same_members(ids, &gesture.original_ids)
 }
 
-impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
+impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
     }
@@ -476,14 +523,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
     ) {
         match tree.state.downcast_mut::<State>().settle_owned_release(
             event,
-            self.project_id,
+            self.scope_id,
             &self.ids,
             self.context_generation,
         ) {
             ReleaseSettlement::Unowned => {}
             ReleaseSettlement::Owned(settlement) => {
                 if let Some(event) = settlement {
-                    shell.publish(Message::TabStrip(event));
+                    shell.publish((self.on_event)(event));
                 }
                 shell.capture_event();
                 return;
@@ -511,7 +558,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
         if !self.enabled {
             state.previous_click = None;
             if let Some(gesture) = state.gesture.take() {
-                shell.publish(Message::TabStrip(TabStripEvent::Cancel {
+                shell.publish((self.on_event)(StripEvent::Cancel {
                     context_generation: gesture.context_generation,
                 }));
             }
@@ -519,7 +566,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
         }
 
         if state.previous_click.is_some_and(|previous| {
-            previous.project_id != self.project_id
+            previous.scope_id != self.scope_id
                 || previous.context_generation != self.context_generation
                 || !self.ids.contains(&previous.source_id)
         }) {
@@ -527,10 +574,10 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
         }
 
         if let Some(gesture) = state.gesture.take_if(|gesture| {
-            !context_valid(gesture, self.project_id, &self.ids, self.context_generation)
+            !context_valid(gesture, self.scope_id, &self.ids, self.context_generation)
         }) {
             state.previous_click = None;
-            shell.publish(Message::TabStrip(TabStripEvent::Cancel {
+            shell.publish((self.on_event)(StripEvent::Cancel {
                 context_generation: gesture.context_generation,
             }));
         }
@@ -548,39 +595,42 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
                     source_id,
                     ids = ?self.ids,
                     child_bounds = ?layout.children().map(|child| child.bounds()).collect::<Vec<_>>(),
-                    "Iced tab strip armed pointer press"
+                    "Iced reorder strip armed pointer press"
                 );
-                shell.publish(Message::TabSelected(source_id));
+                shell.publish((self.on_select)(source_id));
                 match state.arm_press(
                     position,
-                    self.project_id,
+                    self.scope_id,
                     source_id,
                     &self.ids,
                     self.context_generation,
                 ) {
                     PressSettlement::Started(event) => {
-                        shell.publish(Message::TabStrip(event));
+                        shell.publish((self.on_event)(event));
                     }
                     PressSettlement::DoubleClick => {
-                        shell.publish(Message::BeginRenameTab(source_id));
+                        shell.publish((self.on_rename)(source_id));
                     }
                 }
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                let Some(gesture) = &mut state.gesture else {
+                if state.gesture.is_none() {
                     return;
-                };
+                }
                 let Some(position) = cursor.position() else {
                     return;
                 };
-                if !gesture.dragging && crossed_threshold(gesture.origin, position) {
-                    gesture.dragging = true;
+                if let Some(began) = state.begin_drag(position) {
+                    shell.publish((self.on_event)(began));
                 }
+                let Some(gesture) = &mut state.gesture else {
+                    return;
+                };
                 if !gesture.dragging {
                     return;
                 }
-                let raw_target = raw_target_index(layout, position.x);
+                let raw_target = raw_target_index(self.axis, layout, position);
                 match next_preview_order(
                     &self.ids,
                     gesture.source_id,
@@ -589,8 +639,8 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
                 ) {
                     Ok(Some(ordered_ids)) => {
                         gesture.ordered_ids.clone_from(&ordered_ids);
-                        shell.publish(Message::TabStrip(TabStripEvent::Preview {
-                            project_id: gesture.project_id,
+                        shell.publish((self.on_event)(StripEvent::Preview {
+                            scope_id: gesture.scope_id,
                             source_id: gesture.source_id,
                             context_generation: gesture.context_generation,
                             original_ids: gesture.original_ids.clone(),
@@ -601,9 +651,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
                     Err(_) => {
                         let context_generation = gesture.context_generation;
                         state.gesture = None;
-                        shell.publish(Message::TabStrip(TabStripEvent::Cancel {
-                            context_generation,
-                        }));
+                        shell.publish((self.on_event)(StripEvent::Cancel { context_generation }));
                     }
                 }
                 shell.capture_event();
@@ -611,7 +659,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
             Event::Window(window::Event::Unfocused) => {
                 state.previous_click = None;
                 if let Some(gesture) = state.gesture.take() {
-                    shell.publish(Message::TabStrip(TabStripEvent::Cancel {
+                    shell.publish((self.on_event)(StripEvent::Cancel {
                         context_generation: gesture.context_generation,
                     }));
                 }
@@ -697,8 +745,8 @@ impl Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'_> {
     }
 }
 
-impl<'a> From<TabStrip<'a>> for Element<'a, Message> {
-    fn from(strip: TabStrip<'a>) -> Self {
+impl<'a> From<ReorderStrip<'a>> for Element<'a, Message> {
+    fn from(strip: ReorderStrip<'a>) -> Self {
         Element::new(strip)
     }
 }
@@ -800,7 +848,7 @@ mod tests {
 
     fn gesture(dragging: bool) -> Gesture {
         Gesture {
-            project_id: 7,
+            scope_id: 7,
             source_id: 10,
             original_ids: vec![10, 20, 30],
             ordered_ids: if dragging {
@@ -822,8 +870,8 @@ mod tests {
         };
         assert_eq!(
             state.settle_release(7, &[10, 20, 30], 4),
-            Some(TabStripEvent::Commit {
-                project_id: 7,
+            Some(StripEvent::Commit {
+                scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
                 original_ids: vec![10, 20, 30],
@@ -842,7 +890,7 @@ mod tests {
         };
         assert!(matches!(
             state.settle_owned_release(&release, 7, &[10, 20, 30], 4),
-            ReleaseSettlement::Owned(Some(TabStripEvent::Commit { .. }))
+            ReleaseSettlement::Owned(Some(StripEvent::Commit { .. }))
         ));
         assert_eq!(
             state.settle_owned_release(&release, 7, &[10, 20, 30], 4),
@@ -869,7 +917,7 @@ mod tests {
         };
         assert_eq!(
             stale.settle_release(7, &[10, 20, 30], 5),
-            Some(TabStripEvent::Cancel {
+            Some(StripEvent::Cancel {
                 context_generation: 4,
             })
         );
@@ -880,8 +928,8 @@ mod tests {
         };
         assert_eq!(
             click.settle_release(7, &[10, 20, 30], 4),
-            Some(TabStripEvent::Ended {
-                project_id: 7,
+            Some(StripEvent::Ended {
+                scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
                 original_ids: vec![10, 20, 30],
@@ -897,11 +945,11 @@ mod tests {
         let mut state = State::default();
         assert!(matches!(
             state.arm_press(position, 7, 10, &ids, 4),
-            PressSettlement::Started(TabStripEvent::Started { source_id: 10, .. })
+            PressSettlement::Started(StripEvent::Started { source_id: 10, .. })
         ));
         assert!(matches!(
             state.settle_release(7, &ids, 4),
-            Some(TabStripEvent::Ended { source_id: 10, .. })
+            Some(StripEvent::Ended { source_id: 10, .. })
         ));
         assert_eq!(
             state.arm_press(position, 7, 10, &ids, 4),
@@ -916,7 +964,7 @@ mod tests {
         let state = State {
             previous_click: Some(ScopedClick {
                 click,
-                project_id: 7,
+                scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
             }),
@@ -926,6 +974,92 @@ mod tests {
         assert!(state.previous_click_for(7, 20, 4).is_none());
         assert!(state.previous_click_for(8, 10, 4).is_none());
         assert!(state.previous_click_for(7, 10, 5).is_none());
+    }
+
+    #[test]
+    fn drag_began_publishes_once_per_threshold_crossing() {
+        let ids = [10, 20, 30];
+        let origin = Point::new(100.0, 20.0);
+        let mut state = State::default();
+        assert!(matches!(
+            state.arm_press(origin, 7, 10, &ids, 4),
+            PressSettlement::Started(StripEvent::Started { .. })
+        ));
+        assert_eq!(state.begin_drag(Point::new(104.0, 20.0)), None);
+        assert_eq!(
+            state.begin_drag(Point::new(108.0, 20.0)),
+            Some(StripEvent::DragBegan {
+                scope_id: 7,
+                source_id: 10,
+                context_generation: 4,
+            })
+        );
+        assert_eq!(state.begin_drag(Point::new(180.0, 60.0)), None);
+        assert_eq!(state.begin_drag(origin), None);
+        assert!(matches!(
+            state.settle_release(7, &ids, 4),
+            Some(StripEvent::Commit { .. })
+        ));
+
+        assert_eq!(state.begin_drag(Point::new(180.0, 60.0)), None);
+        let elsewhere = Point::new(400.0, 20.0);
+        assert!(matches!(
+            state.arm_press(elsewhere, 7, 30, &ids, 4),
+            PressSettlement::Started(StripEvent::Started { .. })
+        ));
+        assert_eq!(
+            state.begin_drag(Point::new(408.0, 20.0)),
+            Some(StripEvent::DragBegan {
+                scope_id: 7,
+                source_id: 30,
+                context_generation: 4,
+            })
+        );
+    }
+
+    fn stacked_rows(heights: [f32; 3]) -> layout::Node {
+        let mut top = 0.0;
+        let children = heights
+            .iter()
+            .map(|height| {
+                let node =
+                    layout::Node::new(Size::new(200.0, *height)).move_to(Point::new(0.0, top));
+                top += height;
+                node
+            })
+            .collect();
+        layout::Node::with_children(Size::new(200.0, top), children)
+    }
+
+    #[test]
+    fn vertical_target_index_counts_rows_past_their_centers_with_mixed_heights() {
+        // Centers at y = 20, 50, 90 for heights 40 / 20 / 60.
+        let node = stacked_rows([40.0, 20.0, 60.0]);
+        let layout = Layout::new(&node);
+        let index = |y| raw_target_index(Axis::Vertical, layout, Point::new(10.0, y));
+        assert_eq!(index(0.0), 0);
+        assert_eq!(index(19.9), 0);
+        assert_eq!(index(20.0), 1);
+        assert_eq!(index(49.9), 1);
+        assert_eq!(index(50.0), 2);
+        assert_eq!(index(89.9), 2);
+        assert_eq!(index(90.0), 3);
+        assert_eq!(index(500.0), 3);
+
+        // The vertical axis ignores x; the horizontal axis reads only x
+        // (every row shares center_x = 100).
+        assert_eq!(
+            raw_target_index(Axis::Vertical, layout, Point::new(500.0, 20.0)),
+            1
+        );
+        assert_eq!(
+            raw_target_index(Axis::Horizontal, layout, Point::new(500.0, 20.0)),
+            3
+        );
+        assert_eq!(
+            raw_target_index(Axis::Horizontal, layout, Point::new(99.9, 500.0)),
+            0
+        );
     }
 
     #[test]
@@ -952,8 +1086,8 @@ mod tests {
         };
         assert_eq!(
             state.settle_release(7, &rendered, 4),
-            Some(TabStripEvent::Commit {
-                project_id: 7,
+            Some(StripEvent::Commit {
+                scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
                 original_ids: rendered.to_vec(),

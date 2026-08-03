@@ -4,7 +4,7 @@ mod font_registry;
 mod input;
 mod palette_scroll;
 mod screenshot;
-mod tab_reorder;
+mod strip_reorder;
 mod terminal_widget;
 mod url_launcher;
 
@@ -54,8 +54,8 @@ enum Message {
     AgentSelected(i64),
     TabSelected(i64),
     BeginRenameTab(i64),
-    TabStrip(tab_reorder::TabStripEvent),
-    TabPointerReleased,
+    TabStrip(strip_reorder::StripEvent),
+    StripPointerReleased,
     RenameDraftChanged(String),
     RenameSubmit,
     RenamePointerDismiss,
@@ -167,8 +167,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.tab_strip_event(event);
             Task::none()
         }
-        Message::TabPointerReleased => {
-            app.tab_pointer_released();
+        Message::StripPointerReleased => {
+            app.strip_pointer_released();
             Task::none()
         }
         Message::RenameSubmit => {
@@ -229,7 +229,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 }
 
 fn view(app: &App) -> iced::Element<'_, Message> {
-    tab_reorder::ReleaseBoundary::new(app.view(), app.has_tab_drag_preview()).into()
+    strip_reorder::ReleaseBoundary::new(app.view(), app.has_tab_drag_preview()).into()
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {

@@ -520,7 +520,7 @@ impl App {
         self.reconcile();
     }
 
-    pub(crate) fn tab_pointer_released(&mut self) {
+    pub(crate) fn strip_pointer_released(&mut self) {
         let Some(preview) = self.tab_drag_preview.as_ref() else {
             tracing::debug!("Iced root release had no tab drag preview");
             return;
@@ -546,18 +546,22 @@ impl App {
         self.tab_drag_preview.is_some()
     }
 
-    pub(crate) fn tab_strip_event(&mut self, event: TabStripEvent) {
+    pub(crate) fn tab_strip_event(&mut self, event: StripEvent) {
         match event {
-            TabStripEvent::Started {
-                project_id,
+            StripEvent::Started {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
                 self.begin_tab_drag_preview(project_id, source_id, context_generation, original_ids)
             }
-            TabStripEvent::Preview {
-                project_id,
+            // Tab visuals key off preview presence, so the threshold
+            // crossing changes nothing here; the event exists for the
+            // project strip's agent-row hiding.
+            StripEvent::DragBegan { .. } => {}
+            StripEvent::Preview {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
@@ -569,8 +573,8 @@ impl App {
                 &original_ids,
                 ordered_ids,
             ),
-            TabStripEvent::Commit {
-                project_id,
+            StripEvent::Commit {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
@@ -582,15 +586,15 @@ impl App {
                 &original_ids,
                 ordered_ids,
             ),
-            TabStripEvent::Ended {
-                project_id,
+            StripEvent::Ended {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
                 self.end_tab_drag_preview(project_id, source_id, context_generation, &original_ids)
             }
-            TabStripEvent::Cancel { context_generation } => {
+            StripEvent::Cancel { context_generation } => {
                 if context_generation == self.tab_strip_generation {
                     self.cancel_tab_drag();
                     self.reconcile();
