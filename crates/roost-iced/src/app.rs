@@ -94,6 +94,7 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
+const CONFIRM_PANEL_WIDTH: f32 = 420.0;
 
 #[derive(Debug, Default)]
 struct StatusBanner {
@@ -123,6 +124,53 @@ impl StatusBanner {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmDeleteProject {
+    project_id: i64,
+    name: String,
+}
+
+fn confirm_delete_target(projects: &[Project], project_id: i64) -> Option<ConfirmDeleteProject> {
+    projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| ConfirmDeleteProject {
+            project_id: project.id,
+            name: project.name.clone(),
+        })
+}
+
+fn reconcile_confirm_delete(confirm: &mut Option<ConfirmDeleteProject>, projects: &[Project]) {
+    if let Some(open) = confirm.as_ref() {
+        // Re-resolve rather than only checking liveness: an external
+        // rename while the dialog is open must not leave the user
+        // approving a deletion under a stale label.
+        *confirm = confirm_delete_target(projects, open.project_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmDialogAction {
+    Delete,
+    Cancel,
+}
+
+fn confirm_dialog_action(event: &keyboard::Event) -> Option<ConfirmDialogAction> {
+    match event {
+        keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Enter),
+            repeat: false,
+            ..
+        } => Some(ConfirmDialogAction::Delete),
+        keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Escape),
+            repeat: false,
+            ..
+        } => Some(ConfirmDialogAction::Cancel),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseTabOutcome {
     Closed,
@@ -145,6 +193,31 @@ fn close_tab_by_id(
             Ok(CloseTabOutcome::AlreadyGone)
         }
         Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteProjectOutcome {
+    Deleted,
+    AlreadyGone,
+}
+
+fn delete_project_flow(
+    runtime: &tokio::runtime::Runtime,
+    client: &LocalClient,
+    project_id: i64,
+) -> Result<DeleteProjectOutcome, String> {
+    match runtime.block_on(client.delete_project(project_id)) {
+        Ok(_) => Ok(DeleteProjectOutcome::Deleted),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<WorkspaceError>(),
+                Some(WorkspaceError::ProjectNotFound(id)) if *id == project_id
+            ) =>
+        {
+            Ok(DeleteProjectOutcome::AlreadyGone)
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -276,18 +349,22 @@ fn accel_label(accel: &Accel) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyboardRoute {
     None,
+    Confirm,
     Editor,
     Palette,
     Terminal(i64),
 }
 
 fn resolve_keyboard_route(
+    confirm_open: bool,
     editor_open: bool,
     palette_open: bool,
     active_tab: i64,
     active_terminal_live: bool,
 ) -> KeyboardRoute {
-    if editor_open {
+    if confirm_open {
+        KeyboardRoute::Confirm
+    } else if editor_open {
         KeyboardRoute::Editor
     } else if palette_open {
         KeyboardRoute::Palette
@@ -386,6 +463,7 @@ pub struct App {
     rename_completion_key: Option<RenameCompletionKey>,
     tab_drag_preview: Option<TabDragPreview>,
     tab_strip_generation: u64,
+    confirm_delete: Option<ConfirmDeleteProject>,
     file_drops: FileDropQueue,
     config: RoostConfig,
     typography: TerminalTypography,
@@ -523,6 +601,7 @@ impl App {
             rename_completion_key: None,
             tab_drag_preview: None,
             tab_strip_generation: 1,
+            confirm_delete: None,
             file_drops: FileDropQueue::default(),
             config,
             typography,
@@ -704,6 +783,22 @@ impl App {
                 }
             }
         }
+        if matches!(self.keyboard_route(), KeyboardRoute::Confirm) {
+            match confirm_dialog_action(&event) {
+                Some(ConfirmDialogAction::Delete) => {
+                    self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                    self.execute_confirmed_delete();
+                }
+                Some(ConfirmDialogAction::Cancel) => {
+                    self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                    self.cancel_confirm_delete();
+                }
+                None => {}
+            }
+            // The modal owns the keyboard: every other event is swallowed so
+            // no accelerator or terminal encoder can observe it.
+            return UiTask::None;
+        }
         if matches!(self.keyboard_route(), KeyboardRoute::Editor) {
             if let keyboard::Event::KeyPressed {
                 key: Key::Named(Named::Escape),
@@ -773,6 +868,10 @@ impl App {
                 self.palette_back_or_dismiss();
                 self.take_palette_focus_task()
             }
+            KeyboardRoute::Confirm => {
+                self.cancel_confirm_delete();
+                UiTask::None
+            }
             KeyboardRoute::None | KeyboardRoute::Terminal(_) => UiTask::None,
         }
     }
@@ -828,7 +927,12 @@ impl App {
                 self.begin_rename_target(RenameTarget::Tab(self.workspace.active().1))?;
                 Ok(UiTask::None)
             }
-            KeybindAction::CloseProject => Err("Close Project is not available in Iced yet".into()),
+            KeybindAction::CloseProject => {
+                // The sentinel id 0 is never in the snapshot, so
+                // `confirm_close_project` settles it as a silent no-op.
+                self.confirm_close_project(self.workspace.active().0)?;
+                Ok(UiTask::None)
+            }
             KeybindAction::JumpToUnread => {
                 let active_project_id = self.workspace.active().0;
                 if let Some(tab_id) =
@@ -887,6 +991,7 @@ impl App {
     fn keyboard_route(&self) -> KeyboardRoute {
         let active_tab = self.workspace.active().1;
         resolve_keyboard_route(
+            self.confirm_delete.is_some(),
             self.rename_editor.is_some(),
             self.palette.is_some(),
             active_tab,
@@ -898,6 +1003,7 @@ impl App {
         if !focused {
             self.rename_completion_key = None;
             self.cancel_tab_drag();
+            self.cancel_confirm_delete();
         }
         self.workspace.set_window_focused(focused);
         if let Some(tab) = self.tabs.get(&self.workspace.active().1) {
@@ -906,6 +1012,55 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let content = self.view_body();
+        let Some(confirm) = &self.confirm_delete else {
+            return content;
+        };
+        let panel = container(
+            column![
+                text("Delete project?").size(15).font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::default()
+                }),
+                text(format!(
+                    "“{}” and all of its tabs will be deleted. This cannot be undone.",
+                    confirm.name
+                ))
+                .size(12)
+                .color(chrome::MUTED_TEXT),
+                row![
+                    iced::widget::Space::new().width(Fill),
+                    button(text("Cancel").size(12))
+                        .padding([4, 12])
+                        .style(chrome::transparent_button)
+                        .on_press(Message::ConfirmDeleteCancel),
+                    button(text("Delete").size(12))
+                        .padding([4, 12])
+                        .style(chrome::danger_button)
+                        .on_press(Message::ConfirmDeleteConfirm)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            ]
+            .spacing(12),
+        )
+        .width(Fill)
+        .max_width(CONFIRM_PANEL_WIDTH)
+        .height(Shrink)
+        .padding(16)
+        .style(chrome::palette_panel);
+        let overlay = container(mouse_area(panel).on_press(Message::ConfirmDeleteCardPressed))
+            .padding(16)
+            .center(Fill);
+        let catcher = mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
+            .on_press(Message::ConfirmDeleteCancel);
+        stack![content, catcher, overlay]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
+    fn view_body(&self) -> Element<'_, Message> {
         let (active_project, active_tab) = self.workspace.active();
         let mut sidebar_body = column![].spacing(2).padding([4, 0]);
         for project in &self.projects {
@@ -1160,7 +1315,7 @@ impl App {
             active_project,
             visual_tab_ids,
             self.tab_strip_generation,
-            self.rename_editor.is_none(),
+            self.rename_editor.is_none() && self.confirm_delete.is_none(),
         );
         let tab_scroller = scrollable(tab_strip)
             .horizontal()
@@ -1518,6 +1673,41 @@ impl App {
         Ok(())
     }
 
+    fn confirm_close_project(&mut self, project_id: i64) -> Result<(), String> {
+        let Some(target) = confirm_delete_target(&self.projects, project_id) else {
+            return Ok(());
+        };
+        self.cancel_tab_drag();
+        self.cancel_editor_for_interaction();
+        self.dismiss_palette_with_focus_recovery();
+        self.confirm_delete = Some(target);
+        Ok(())
+    }
+
+    fn cancel_confirm_delete(&mut self) {
+        self.confirm_delete = None;
+    }
+
+    fn execute_confirmed_delete(&mut self) {
+        let Some(confirm) = self.confirm_delete.take() else {
+            return;
+        };
+        match delete_project_flow(&self.runtime, &self.client, confirm.project_id) {
+            Ok(DeleteProjectOutcome::Deleted) => {}
+            Ok(DeleteProjectOutcome::AlreadyGone) => {
+                tracing::debug!(
+                    project_id = confirm.project_id,
+                    "confirmed delete: project already gone"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, project_id = confirm.project_id, "delete project failed");
+                self.set_status(error);
+            }
+        }
+        self.reconcile();
+    }
+
     pub fn close_tab(&mut self, tab_id: i64) {
         self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
@@ -1751,6 +1941,8 @@ impl Message {
             Self::NewTab => app.new_tab(),
             Self::NewProject => app.new_project(),
             Self::ToggleSidebar => app.toggle_sidebar(),
+            Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
+            Self::ConfirmDeleteConfirm => app.execute_confirmed_delete(),
             Self::OpenNotifications => return app.open_notifications(),
             _ => {}
         }
@@ -1927,21 +2119,210 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, 7, false),
+            resolve_keyboard_route(false, false, false, 7, false),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, 7, true),
+            resolve_keyboard_route(false, false, false, 7, true),
             KeyboardRoute::Terminal(7)
         );
         assert_eq!(
-            resolve_keyboard_route(false, true, 7, true),
+            resolve_keyboard_route(false, false, true, 7, true),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(true, true, 7, true),
+            resolve_keyboard_route(false, true, true, 7, true),
             KeyboardRoute::Editor
         );
+        // An open confirm outranks every other surface, so no keystroke can
+        // reach an accelerator or the active PTY while it is up.
+        assert_eq!(
+            resolve_keyboard_route(true, true, true, 7, true),
+            KeyboardRoute::Confirm
+        );
+        assert_eq!(
+            resolve_keyboard_route(true, false, false, 7, true),
+            KeyboardRoute::Confirm
+        );
+    }
+
+    #[test]
+    fn confirm_delete_targets_only_projects_present_in_the_snapshot() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("doomed", "/tmp").unwrap();
+        let snapshot = workspace.snapshot();
+
+        assert_eq!(
+            confirm_delete_target(&snapshot, project.id),
+            Some(ConfirmDeleteProject {
+                project_id: project.id,
+                name: "doomed".into()
+            })
+        );
+        assert_eq!(confirm_delete_target(&snapshot, 0), None);
+        assert_eq!(confirm_delete_target(&snapshot, project.id + 1), None);
+    }
+
+    #[test]
+    fn a_confirm_whose_project_vanished_externally_is_auto_dismissed() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("doomed", "/tmp").unwrap();
+        let snapshot = workspace.snapshot();
+        let mut confirm = confirm_delete_target(&snapshot, project.id);
+
+        reconcile_confirm_delete(&mut confirm, &snapshot);
+        assert!(confirm.is_some(), "a live project keeps its confirm open");
+
+        workspace.rename_project(project.id, "relabeled").unwrap();
+        reconcile_confirm_delete(&mut confirm, &workspace.snapshot());
+        assert_eq!(
+            confirm.as_ref().map(|confirm| confirm.name.as_str()),
+            Some("relabeled"),
+            "an external rename must relabel the open confirm"
+        );
+
+        workspace.delete_project(project.id).unwrap();
+        reconcile_confirm_delete(&mut confirm, &workspace.snapshot());
+        assert_eq!(confirm, None);
+    }
+
+    #[test]
+    fn confirm_dialog_answers_only_a_fresh_enter_or_escape_press() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+
+        let press = |key: Key, code, repeat| keyboard::Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            physical_key: Physical::Code(code),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat,
+        };
+        let release = |key: Key, code| keyboard::Event::KeyReleased {
+            modified_key: key.clone(),
+            key,
+            physical_key: Physical::Code(code),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+        };
+
+        assert_eq!(
+            confirm_dialog_action(&press(Key::Named(Named::Enter), Code::Enter, false)),
+            Some(ConfirmDialogAction::Delete)
+        );
+        assert_eq!(
+            confirm_dialog_action(&press(Key::Named(Named::Escape), Code::Escape, false)),
+            Some(ConfirmDialogAction::Cancel)
+        );
+        assert_eq!(
+            confirm_dialog_action(&press(Key::Named(Named::Enter), Code::Enter, true)),
+            None
+        );
+        assert_eq!(
+            confirm_dialog_action(&release(Key::Named(Named::Enter), Code::Enter)),
+            None
+        );
+        assert_eq!(
+            confirm_dialog_action(&press(Key::Character("a".into()), Code::KeyA, false)),
+            None
+        );
+
+        // Answering arms the same latch the rename editor uses, so the held
+        // repeats and the release of that key never reach the PTY.
+        let mut pending = Some(RenameCompletionKey::Enter);
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &press(Key::Named(Named::Enter), Code::Enter, true)
+        ));
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &release(Key::Named(Named::Enter), Code::Enter)
+        ));
+        assert_eq!(pending, None);
+
+        let mut pending = Some(RenameCompletionKey::Escape);
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &press(Key::Named(Named::Escape), Code::Escape, true)
+        ));
+        assert!(consume_rename_completion_key(
+            &mut pending,
+            &release(Key::Named(Named::Escape), Code::Escape)
+        ));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn confirmed_delete_cascades_tabs_and_ptys_with_the_engine_id_fallback() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let workspace = Arc::new(Workspace::new());
+        let supervisor = Arc::new(PtySupervisor::new());
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(&supervisor),
+            "/tmp/roost-iced-delete-project-test.sock".into(),
+        );
+        let open = |project_id| {
+            runtime
+                .block_on(client.open_tab(
+                    project_id,
+                    "/tmp",
+                    "",
+                    &[],
+                    u32::from(DEFAULT_COLS),
+                    u32::from(DEFAULT_ROWS),
+                ))
+                .unwrap()
+        };
+        let keeper = workspace.create_project("keeper", "/tmp").unwrap();
+        let keeper_tab = open(keeper.id);
+        let doomed = workspace.create_project("doomed", "/tmp").unwrap();
+        let doomed_first = open(doomed.id);
+        let doomed_second = open(doomed.id);
+        let last_row = workspace.create_project("last row", "/tmp").unwrap();
+        let last_row_tab = open(last_row.id);
+        // The engine falls back to the lowest remaining project id, not the
+        // first sidebar row — pin that after a reorder puts them at odds.
+        workspace
+            .reorder_projects(&[last_row.id, doomed.id, keeper.id])
+            .unwrap();
+        workspace.focus_tab(doomed_first.id).unwrap();
+
+        assert_eq!(
+            delete_project_flow(&runtime, &client, doomed.id).unwrap(),
+            DeleteProjectOutcome::Deleted
+        );
+        assert!(workspace
+            .snapshot()
+            .iter()
+            .all(|project| project.id != doomed.id));
+        assert!(workspace.tab(doomed_first.id).is_err());
+        assert!(workspace.tab(doomed_second.id).is_err());
+        assert!(!supervisor.has(doomed_first.id));
+        assert!(!supervisor.has(doomed_second.id));
+        assert!(supervisor.has(keeper_tab.id));
+        assert_eq!(workspace.active(), (keeper.id, keeper_tab.id));
+
+        // A stale confirm settles as a silent dismiss, never as an error.
+        assert_eq!(
+            delete_project_flow(&runtime, &client, doomed.id).unwrap(),
+            DeleteProjectOutcome::AlreadyGone
+        );
+
+        assert_eq!(
+            delete_project_flow(&runtime, &client, keeper.id).unwrap(),
+            DeleteProjectOutcome::Deleted
+        );
+        assert_eq!(
+            delete_project_flow(&runtime, &client, last_row.id).unwrap(),
+            DeleteProjectOutcome::Deleted
+        );
+        assert!(workspace.snapshot().is_empty());
+        assert_eq!(workspace.active(), (0, 0));
+        assert!(!supervisor.has(keeper_tab.id));
+        assert!(!supervisor.has(last_row_tab.id));
     }
 
     #[test]

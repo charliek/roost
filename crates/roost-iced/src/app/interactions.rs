@@ -152,6 +152,7 @@ fn take_rename_focus_request(requested: &mut bool, editor_open: bool, input_id: 
 impl App {
     pub(super) fn begin_rename_target(&mut self, target: RenameTarget) -> Result<(), String> {
         self.cancel_tab_drag();
+        self.cancel_confirm_delete();
         if self
             .rename_editor
             .as_ref()
@@ -603,6 +604,13 @@ impl App {
 
 impl App {
     pub fn pointer(&mut self, event: TerminalPointerEvent) -> UiTask {
+        // The confirm overlay's catcher only owns primary presses;
+        // motion, right/middle presses, and releases would otherwise
+        // reach a mouse-tracking PTY (middle-press can even paste).
+        // A destructive modal must leak no pointer input.
+        if self.confirm_delete.is_some() {
+            return UiTask::None;
+        }
         let TerminalPointerEvent {
             tab_id,
             action,
@@ -812,7 +820,10 @@ pub(super) fn native_file_drop_origin(
         .then_some(route)
         .and_then(|route| match route {
             KeyboardRoute::Terminal(tab_id) => Some(tab_id),
-            KeyboardRoute::None | KeyboardRoute::Editor | KeyboardRoute::Palette => None,
+            KeyboardRoute::None
+            | KeyboardRoute::Confirm
+            | KeyboardRoute::Editor
+            | KeyboardRoute::Palette => None,
         })
 }
 

@@ -11,6 +11,7 @@ impl App {
         // Full authoritative snapshot on every UI tick is the recovery path
         // for a slow consumer: deltas are an optimization, never UI truth.
         self.projects = self.workspace.snapshot();
+        reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
         self.reconcile_tab_drag_preview();
         self.reconcile_rename_editor();
         self.reconcile_notification_inbox();

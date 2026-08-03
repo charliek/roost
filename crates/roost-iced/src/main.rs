@@ -62,6 +62,9 @@ enum Message {
     CloseTab(i64),
     NewTab,
     NewProject,
+    ConfirmDeleteCancel,
+    ConfirmDeleteConfirm,
+    ConfirmDeleteCardPressed,
     ToggleSidebar,
     OpenNotifications,
     PaletteQueryChanged(String),
@@ -189,7 +192,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::PaletteDismiss => app.palette_pointer_dismiss().map_task(),
-        Message::PaletteCardPressed => Task::none(),
+        Message::PaletteCardPressed | Message::ConfirmDeleteCardPressed => Task::none(),
         Message::PaletteScrolled => {
             app.palette_scrolled();
             Task::none()
@@ -218,6 +221,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::CloseTab(_)
         | Message::NewTab
         | Message::NewProject
+        | Message::ConfirmDeleteCancel
+        | Message::ConfirmDeleteConfirm
         | Message::ToggleSidebar
         | Message::OpenNotifications) => message.apply(app).map_task(),
     }

@@ -31,6 +31,8 @@ pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
 pub const PALETTE_PLACEHOLDER: Color = Color::from_rgb8(0x9e, 0x9e, 0x9e);
 pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
 pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
+pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
+pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);
 
 pub fn surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE)
@@ -84,6 +86,21 @@ pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
     chrome_button(None, status, 4.0)
+}
+
+pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (DANGER_ACCENT, TEXT),
+        button::Status::Active => (DANGER, TEXT),
+        button::Status::Disabled => (DANGER.scale_alpha(0.5), MUTED_TEXT.scale_alpha(0.5)),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().rounded(4),
+        shadow: Shadow::default(),
+        snap: true,
+    }
 }
 
 pub fn palette_panel(_: &Theme) -> container::Style {
@@ -274,6 +291,23 @@ mod tests {
         let disabled = palette_row(false, false)(&theme, button::Status::Hovered);
         assert_eq!(disabled.background, None);
         assert_eq!(disabled.text_color, PALETTE_PLACEHOLDER.scale_alpha(0.6));
+    }
+
+    #[test]
+    fn danger_button_always_paints_a_destructive_fill() {
+        let theme = Theme::Dark;
+        assert_eq!(
+            danger_button(&theme, button::Status::Active).background,
+            Some(Background::Color(DANGER))
+        );
+        assert_eq!(
+            danger_button(&theme, button::Status::Hovered).background,
+            Some(Background::Color(DANGER_ACCENT))
+        );
+        assert_eq!(
+            danger_button(&theme, button::Status::Active).text_color,
+            TEXT
+        );
     }
 
     #[test]
