@@ -116,10 +116,13 @@ full iced 2×2 matrix. `poc/iced` is retired (merged, branch pointer kept).
 
 Slices, each sized for one gauntlet pass:
 
-* **3a. `App` decomposition (complete — plan 009).** Split the 8.8k-line
-  `crates/roost-iced/src/app.rs` single `impl` (111 methods) into
-  `app/` submodules (projects, palette, rename, notifications, clipboard,
-  drag, osc). Mechanical; do it *before* adding surface area.
+* **3a. `App` decomposition (complete — plan 009).** Split the 8.9k-line
+  `crates/roost-iced/src/app.rs` into `app/` submodules as shipped:
+  `terminal_tab` (TerminalTab + geometry + pointer types), `palettes`
+  (palette/typography/provider), `interactions` (rename, tab drag,
+  pointer, clipboard/drop, screenshot), `servicing` (UiRequest/OSC/
+  reconcile/metrics); parent keeps struct, orchestrators, keyboard, and
+  projects/sidebar. Mechanical, behavior-preserving.
 * **3b. Project lifecycle UI:** create (directory picker), delete
   (confirmation + cascade), reorder (adapt `tab_reorder.rs` pattern). Engine
   ops already exist and are unit-tested; this is UI wiring. Removes the
