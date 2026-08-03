@@ -1,5 +1,5 @@
 // Shell-escape + drop-payload-resolver tests, Swift companion to the GTK suite
-// in `crates/roost-linux/src/shell_escape.rs::tests`. The escape vectors are
+// in `crates/roost-ui-model/src/shell_escape.rs::tests`. The escape vectors are
 // shared verbatim with the Rust side so the two drag-and-drop implementations
 // stay byte-identical (the cross-UI parity the north star asks for).
 //
@@ -47,6 +47,18 @@ final class ShellEscapeTests: XCTestCase {
         )
         // "\ " -> escape the backslash, then the space.
         XCTAssertEqual(ShellEscape.escape("\\ "), "\\\\\\ ")
+    }
+
+    /// Shared verbatim with the Rust `escape_byte_passes_through` vector: the
+    /// escaper never drops input (that would make the escaped string name a
+    /// different file), so ESC survives and only the `[` after it is escaped.
+    /// ESC-bearing paths are rejected up in `TerminalView.dropContentString`.
+    func testEscapeBytePassesThrough() {
+        XCTAssertEqual(
+            ShellEscape.escape("/tmp/ev\u{1B}[201~il.png"),
+            "/tmp/ev\u{1B}\\[201~il.png"
+        )
+        XCTAssertEqual(ShellEscape.escape("\u{1B}"), "\u{1B}")
     }
 }
 
@@ -107,6 +119,24 @@ final class DropContentResolverTests: XCTestCase {
         XCTAssertEqual(
             TerminalView.dropContentString(
                 fileURLs: [fileURL("/tmp/ev\nil.png"), fileURL("/tmp/ok.png")], url: nil, string: nil
+            ),
+            "/tmp/ok.png"
+        )
+    }
+
+    /// Shared with the Rust `escape_bearing_paths_are_rejected` vector: an ESC
+    /// in a filename is rejected at the drop boundary rather than stripped by
+    /// the escaper.
+    func testControlBearingPathIsDropped() {
+        XCTAssertNil(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{1B}[201~il.png")], url: nil, string: nil
+            )
+        )
+        XCTAssertEqual(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{1B}[201~il.png"), fileURL("/tmp/ok.png")],
+                url: nil, string: nil
             ),
             "/tmp/ok.png"
         )

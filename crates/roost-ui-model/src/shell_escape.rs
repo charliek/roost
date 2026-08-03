@@ -12,6 +12,12 @@
 /// non-ASCII codepoints (e.g. the U+202F narrow-no-break space in a macOS
 /// screenshot filename) pass through unchanged, which modern shells handle as
 /// UTF-8 literals.
+///
+/// This is a pure escaper: every input character reaches the output, so the
+/// escaped string still names the same file. Control characters that no
+/// filename may legitimately carry (`\n`, `\r`, ESC) are rejected earlier, at
+/// the drop boundary in `drop_content::resolve` — dropping them here would let
+/// two distinct filenames collapse to the same PTY input.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -105,6 +111,19 @@ mod tests {
     #[test]
     fn already_backslashed_space_gets_both_escaped() {
         assert_eq!(escape("\\ "), "\\\\\\ ");
+    }
+
+    /// Shared verbatim with the Swift `testEscapeBytePassesThrough` vector: the
+    /// escaper never drops input (that would make the escaped string name a
+    /// different file), so ESC survives and only the `[` after it is escaped.
+    /// ESC-bearing paths are rejected up in `drop_content::resolve`.
+    #[test]
+    fn escape_byte_passes_through() {
+        assert_eq!(
+            escape("/tmp/ev\u{1b}[201~il.png"),
+            "/tmp/ev\u{1b}\\[201~il.png"
+        );
+        assert_eq!(escape("\u{1b}"), "\u{1b}");
     }
 
     #[test]
