@@ -116,7 +116,7 @@ full iced 2×2 matrix. `poc/iced` is retired (merged, branch pointer kept).
 
 Slices, each sized for one gauntlet pass:
 
-* **3a. `App` decomposition first (in progress — plan 009).** Split the 8.8k-line
+* **3a. `App` decomposition (complete — plan 009).** Split the 8.8k-line
   `crates/roost-iced/src/app.rs` single `impl` (111 methods) into
   `app/` submodules (projects, palette, rename, notifications, clipboard,
   drag, osc). Mechanical; do it *before* adding surface area.
