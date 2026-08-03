@@ -120,10 +120,18 @@ Slices, each sized for one gauntlet pass:
   pointer, clipboard/drop, screenshot), `servicing` (UiRequest/OSC/
   reconcile/metrics); parent keeps struct, orchestrators, keyboard, and
   projects/sidebar. Mechanical, behavior-preserving.
-* **3b. Project lifecycle UI:** create (directory picker), delete
-  (confirmation + cascade), reorder (adapt `tab_reorder.rs` pattern). Engine
-  ops already exist and are unit-tested; this is UI wiring. Removes the
-  `Err("… not available in Iced yet")` stubs.
+* **3b. Project lifecycle UI:** create, delete (confirmation + cascade),
+  reorder (adapt `tab_reorder.rs` pattern), plus a sidebar-footer
+  `+ New Project` affordance. Engine ops already exist and are
+  unit-tested (`create_project`/`delete_project`/`reorder_projects` on
+  `LocalClient`); this is UI wiring. Removes the `Err("… not available in
+  Iced yet")` stubs at `app.rs:792` (NewProject) and `:801` (CloseProject).
+  **Parity note (verified 2026-08-03):** neither shipped UI uses a
+  directory picker — GTK's `create_new_project` passes name `""` + cwd
+  `$HOME`, Mac's sidebar `+ New Project` passes `("", "")`. Match that;
+  a folder picker is a separate future enhancement, not part of parity.
+  GTK's delete goes through `confirm_and_delete_project` (confirmation
+  first, engine cascade after).
 * **3c. Sidebar resize** with persisted width (replaces the hardcoded
   `SIDEBAR_WIDTH: f32 = 220.0`).
 * **3d. Tick → push subscriptions.** Replace the 16 ms full-snapshot poll
