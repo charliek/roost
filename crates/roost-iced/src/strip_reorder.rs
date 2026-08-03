@@ -179,9 +179,6 @@ impl<'a> From<ReleaseBoundary<'a>> for Element<'a, Message> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Axis {
     Horizontal,
-    // Only the unit tests instantiate this until the vertical (project)
-    // strip call site lands.
-    #[allow(dead_code)]
     Vertical,
 }
 
@@ -257,6 +254,27 @@ impl<'a> ReorderStrip<'a> {
             on_select: Message::TabSelected,
             on_rename: Message::BeginRenameTab,
             on_event: Message::TabStrip,
+        }
+    }
+
+    /// The sidebar project list is one strip for the whole window, so it has
+    /// no scope to key gestures to; `0` is the constant it compares against.
+    pub(crate) fn projects(
+        content: impl Into<Element<'a, Message>>,
+        ids: Vec<i64>,
+        context_generation: u64,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            axis: Axis::Vertical,
+            scope_id: 0,
+            ids,
+            context_generation,
+            enabled,
+            on_select: Message::ProjectSelected,
+            on_rename: Message::BeginRenameProject,
+            on_event: Message::ProjectStrip,
         }
     }
 }

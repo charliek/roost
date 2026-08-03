@@ -717,7 +717,7 @@ impl App {
     }
 
     pub(super) fn open_palette(&mut self, kind: &str) -> Result<(), String> {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.cancel_confirm_delete();
         let frame = match kind {
@@ -758,7 +758,7 @@ impl App {
         items: Vec<(String, String, Option<String>)>,
         reply: tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>,
     ) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.cancel_confirm_delete();
         if let Err(error) = self.try_dismiss_palette() {

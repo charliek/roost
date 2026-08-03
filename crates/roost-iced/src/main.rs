@@ -55,6 +55,7 @@ enum Message {
     TabSelected(i64),
     BeginRenameTab(i64),
     TabStrip(strip_reorder::StripEvent),
+    ProjectStrip(strip_reorder::StripEvent),
     StripPointerReleased,
     RenameDraftChanged(String),
     RenameSubmit,
@@ -167,6 +168,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.tab_strip_event(event);
             Task::none()
         }
+        Message::ProjectStrip(event) => {
+            app.project_strip_event(event);
+            Task::none()
+        }
         Message::StripPointerReleased => {
             app.strip_pointer_released();
             Task::none()
@@ -229,7 +234,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 }
 
 fn view(app: &App) -> iced::Element<'_, Message> {
-    strip_reorder::ReleaseBoundary::new(app.view(), app.has_tab_drag_preview()).into()
+    strip_reorder::ReleaseBoundary::new(app.view(), app.has_drag_preview()).into()
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {

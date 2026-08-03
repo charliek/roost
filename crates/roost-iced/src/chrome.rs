@@ -25,6 +25,7 @@ pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
 pub const NOTIFICATION: Color = Color::from_rgb8(0x4e, 0x9a, 0xf1);
+pub const DRAGGED_PILL: Color = Color::from_rgba8(0x55, 0x68, 0x7b, 0.65);
 pub const PALETTE_SURFACE: Color = Color::from_rgb8(0x2d, 0x2d, 0x33);
 pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
 pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
@@ -42,25 +43,29 @@ pub fn dark_surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE_DARK)
 }
 
-pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| {
-        let mut style = container::Style::default();
-        if dragging {
-            style = style.background(Color::from_rgba8(0x55, 0x68, 0x7b, 0.65));
-        } else if active {
-            style = style.background(ACTIVE_TAB);
-        }
-        style.border = Border {
-            color: if dragging {
-                NOTIFICATION
-            } else {
-                Color::TRANSPARENT
-            },
-            width: if dragging { 1.0 } else { 0.0 },
-            radius: 6.0.into(),
-        };
-        style
+/// Both strips share one drag affordance, so the dragged row and the dragged
+/// tab stay visually identical; only the resting fill and radius differ.
+fn pill(active_background: Color, radius: f32, active: bool, dragging: bool) -> container::Style {
+    let mut style = container::Style::default();
+    if dragging {
+        style = style.background(DRAGGED_PILL);
+    } else if active {
+        style = style.background(active_background);
     }
+    style.border = Border {
+        color: if dragging {
+            NOTIFICATION
+        } else {
+            Color::TRANSPARENT
+        },
+        width: if dragging { 1.0 } else { 0.0 },
+        radius: radius.into(),
+    };
+    style
+}
+
+pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| pill(ACTIVE_TAB, 6.0, active, dragging)
 }
 
 pub fn badge(_: &Theme) -> container::Style {
@@ -69,15 +74,8 @@ pub fn badge(_: &Theme) -> container::Style {
         .border(Border::default().rounded(NOTIFICATION_DOT_SIZE / 2.0))
 }
 
-pub fn project_pill(active: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| {
-        let mut style = container::Style::default();
-        if active {
-            style = style.background(ACTIVE_BLUE);
-        }
-        style.border = Border::default().rounded(5);
-        style
-    }
+pub fn project_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| pill(ACTIVE_BLUE, 5.0, active, dragging)
 }
 
 pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
@@ -238,8 +236,13 @@ mod tests {
     #[test]
     fn active_rows_and_pills_use_roost_selection_colors() {
         let theme = Theme::Dark;
-        let active = project_pill(true)(&theme);
+        let active = project_pill(true, false)(&theme);
         assert_eq!(active.background, Some(Background::Color(ACTIVE_BLUE)));
+        assert_eq!(
+            project_pill(true, true)(&theme).border.color,
+            NOTIFICATION,
+            "the dragged project row is outlined like the dragged tab pill"
+        );
         assert_eq!(
             tab_pill(true, false)(&theme).background,
             Some(Background::Color(ACTIVE_TAB))

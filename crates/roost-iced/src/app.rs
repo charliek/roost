@@ -69,10 +69,10 @@ mod servicing;
 mod terminal_tab;
 
 use self::interactions::{
-    arm_rename_completion_for_open_editor, consume_rename_completion_key,
+    agent_rows_hidden, arm_rename_completion_for_open_editor, consume_rename_completion_key,
     enqueue_osc_clipboard_write, native_file_drop_origin, paste_bytes, same_stable_ids,
-    ClipboardQueue, FileDropQueue, RenameCompletionKey, RenameEditor, RenameTarget,
-    ScreenshotQueue, TabDragPreview,
+    ClipboardQueue, FileDropQueue, ProjectDragPreview, RenameCompletionKey, RenameEditor,
+    RenameTarget, ScreenshotQueue, TabDragPreview,
 };
 use self::palettes::{
     apply_with_rollback, ellipsize_palette_text, palette_agent_left_text, palette_row_id,
@@ -463,6 +463,8 @@ pub struct App {
     rename_completion_key: Option<RenameCompletionKey>,
     tab_drag_preview: Option<TabDragPreview>,
     tab_strip_generation: u64,
+    project_drag_preview: Option<ProjectDragPreview>,
+    project_strip_generation: u64,
     confirm_delete: Option<ConfirmDeleteProject>,
     file_drops: FileDropQueue,
     config: RoostConfig,
@@ -601,6 +603,8 @@ impl App {
             rename_completion_key: None,
             tab_drag_preview: None,
             tab_strip_generation: 1,
+            project_drag_preview: None,
+            project_strip_generation: 1,
             confirm_delete: None,
             file_drops: FileDropQueue::default(),
             config,
@@ -988,6 +992,12 @@ impl App {
         }
     }
 
+    /// A modal owns the pointer while it is up, so neither strip arms a
+    /// gesture behind it.
+    fn strip_gestures_enabled(&self) -> bool {
+        self.rename_editor.is_none() && self.confirm_delete.is_none()
+    }
+
     fn keyboard_route(&self) -> KeyboardRoute {
         let active_tab = self.workspace.active().1;
         resolve_keyboard_route(
@@ -1002,7 +1012,7 @@ impl App {
     pub fn set_window_focus(&mut self, focused: bool) {
         if !focused {
             self.rename_completion_key = None;
-            self.cancel_tab_drag();
+            self.cancel_drags();
             self.cancel_confirm_delete();
         }
         self.workspace.set_window_focused(focused);
@@ -1062,8 +1072,31 @@ impl App {
 
     fn view_body(&self) -> Element<'_, Message> {
         let (active_project, active_tab) = self.workspace.active();
+        let authoritative_project_ids = self.sidebar_project_ids();
+        let visual_project_ids = self
+            .project_drag_preview
+            .as_ref()
+            .filter(|preview| {
+                preview.context.generation == self.project_strip_generation
+                    && preview.original_ids == authoritative_project_ids
+                    && same_stable_ids(&preview.ordered_ids, &authoritative_project_ids)
+            })
+            .map(|preview| preview.ordered_ids.clone())
+            .unwrap_or(authoritative_project_ids);
+        // Sidebar rows are large, so the drag styling waits for the threshold
+        // rather than flashing on every ordinary click.
+        let dragged_project = self
+            .project_drag_preview
+            .as_ref()
+            .filter(|preview| preview.dragging)
+            .map(|preview| preview.context.source_id);
+        let hide_agent_rows = agent_rows_hidden(self.project_drag_preview.as_ref());
         let mut sidebar_body = column![].spacing(2).padding([4, 0]);
-        for project in &self.projects {
+        for project in visual_project_ids.iter().filter_map(|project_id| {
+            self.projects
+                .iter()
+                .find(|project| project.id == *project_id)
+        }) {
             let rollup = project_rollup(
                 project
                     .tabs
@@ -1102,24 +1135,23 @@ impl App {
                 .width(Fill)
                 .height(chrome::ROW_HEIGHT)
                 .padding([3.0, chrome::PROJECT_LABEL_INSET])
-                .style(chrome::project_pill(project.id == active_project));
-            let project_row = mouse_area(
-                container(
-                    row![
-                        stripe,
-                        iced::widget::Space::new().width(chrome::PROJECT_STRIPE_GAP),
-                        project_pill,
-                        iced::widget::Space::new().width(chrome::PROJECT_RIGHT_INSET)
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .width(Fill)
-                .height(chrome::ROW_HEIGHT),
+                .style(chrome::project_pill(
+                    project.id == active_project,
+                    dragged_project == Some(project.id),
+                ));
+            let project_row = container(
+                row![
+                    stripe,
+                    iced::widget::Space::new().width(chrome::PROJECT_STRIPE_GAP),
+                    project_pill,
+                    iced::widget::Space::new().width(chrome::PROJECT_RIGHT_INSET)
+                ]
+                .align_y(Alignment::Center),
             )
-            .on_press(Message::ProjectSelected(project.id))
-            .on_double_click(Message::BeginRenameProject(project.id));
+            .width(Fill)
+            .height(chrome::ROW_HEIGHT);
             let mut project_group = column![project_row].spacing(2);
-            if self.config.show_sidebar_agents {
+            if self.config.show_sidebar_agents && !hide_agent_rows {
                 for agent in self.sidebar_agents.get(&project.id).into_iter().flatten() {
                     let name = agent.name.clone();
                     let detail = format!("{} · {}", agent.status_text, agent.time_text);
@@ -1183,9 +1215,18 @@ impl App {
         .width(Fill)
         .padding([5, 8])
         .style(chrome::surface);
+        // The strip delegates layout to its content, so its layout node is the
+        // column's: one child per project group, which is what the gesture's
+        // hit-testing and target index walk.
+        let project_strip = ReorderStrip::projects(
+            sidebar_body,
+            visual_project_ids,
+            self.project_strip_generation,
+            self.strip_gestures_enabled(),
+        );
         let sidebar = container(column![
             sidebar_header,
-            scrollable(sidebar_body).height(Fill),
+            scrollable(project_strip).height(Fill),
             sidebar_footer
         ])
         .width(SIDEBAR_WIDTH)
@@ -1315,7 +1356,7 @@ impl App {
             active_project,
             visual_tab_ids,
             self.tab_strip_generation,
-            self.rename_editor.is_none() && self.confirm_delete.is_none(),
+            self.strip_gestures_enabled(),
         );
         let tab_scroller = scrollable(tab_strip)
             .horizontal()
@@ -1580,6 +1621,11 @@ impl App {
     }
 
     pub fn select_project(&mut self, project_id: i64) {
+        // The project strip publishes this on press, immediately before the
+        // gesture's start event; cancelling the project drag here would bump
+        // the generation the pending start still carries and no drag could
+        // ever arm. The project strip cancels the tab drag itself when it
+        // arms, exactly as the tab strip does in reverse.
         self.cancel_tab_drag();
         self.cancel_editor_for_interaction();
         if let Some(tab_id) = self.workspace.preferred_tab(project_id) {
@@ -1593,7 +1639,7 @@ impl App {
     }
 
     pub fn select_agent(&mut self, tab_id: i64) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         let _ = self.focus_tab_and_clear(tab_id, true);
     }
@@ -1606,7 +1652,7 @@ impl App {
     }
 
     pub fn toggle_sidebar(&mut self) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.set_sidebar_collapsed(!self.workspace.sidebar_collapsed());
     }
@@ -1631,7 +1677,7 @@ impl App {
     }
 
     pub fn new_tab(&mut self) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         if let Err(error) = self.new_tab_result() {
             self.set_status(error);
@@ -1659,7 +1705,7 @@ impl App {
     }
 
     pub fn new_project(&mut self) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         if let Err(error) = self.new_project_result() {
             self.set_status(error);
@@ -1677,7 +1723,7 @@ impl App {
         let Some(target) = confirm_delete_target(&self.projects, project_id) else {
             return Ok(());
         };
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.dismiss_palette_with_focus_recovery();
         self.confirm_delete = Some(target);
@@ -1709,7 +1755,7 @@ impl App {
     }
 
     pub fn close_tab(&mut self, tab_id: i64) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
         if let Err(error) = self.close_tab_result(tab_id) {
             self.set_status(error);
