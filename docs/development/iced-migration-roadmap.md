@@ -160,7 +160,7 @@ when it touches the code you are already in:
 | item | issue |
 |---|---|
 | Iced tab-strip artifacts with several tabs open (user-visible) | [#281] |
-| Rust/Swift drop-path filter divergence (`isNewline` superset; Swift-only URL branch) | [#282] |
+| **Security-adjacent:** Swift's dragged-URL drop branch has no control-char rejection (mitigated by the paste-boundary wrap from #280, not closed); Rust/Swift filter predicates also diverge | [#282] |
 | `roost-linux` clippy `type_complexity` debt keeping it out of the lint gate | [#283] |
 | No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) | [#284] |
 | No real-input (CGEvent) harness on macOS — uinput tier is Linux-only | [#285] |
