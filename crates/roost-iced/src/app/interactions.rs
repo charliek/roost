@@ -1013,14 +1013,7 @@ pub(super) fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
     let Some(text) = text.filter(|text| !text.is_empty()) else {
         return Vec::new();
     };
-    if !terminal.mode_get(2004) {
-        return text.as_bytes().to_vec();
-    }
-    let mut bytes = Vec::with_capacity(text.len() + 12);
-    bytes.extend_from_slice(b"\x1b[200~");
-    bytes.extend_from_slice(text.as_bytes());
-    bytes.extend_from_slice(b"\x1b[201~");
-    bytes
+    roost_ui_model::bracketed_paste::wrap(text, terminal.mode_get(2004))
 }
 
 impl App {
@@ -2274,6 +2267,11 @@ mod tests {
         assert_eq!(
             paste_bytes(&terminal, Some("hello\n")),
             b"\x1b[200~hello\n\x1b[201~"
+        );
+        // A clipboard carrying the end marker can't close the region early.
+        assert_eq!(
+            paste_bytes(&terminal, Some("\x1b[201~rm -rf /\n")),
+            b"\x1b[200~rm -rf /\n\x1b[201~"
         );
     }
 

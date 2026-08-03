@@ -1,5 +1,5 @@
 // Shell-escape + drop-payload-resolver tests, Swift companion to the GTK suite
-// in `crates/roost-linux/src/shell_escape.rs::tests`. The escape vectors are
+// in `crates/roost-ui-model/src/shell_escape.rs::tests`. The escape vectors are
 // shared verbatim with the Rust side so the two drag-and-drop implementations
 // stay byte-identical (the cross-UI parity the north star asks for).
 //
@@ -47,6 +47,14 @@ final class ShellEscapeTests: XCTestCase {
         )
         // "\ " -> escape the backslash, then the space.
         XCTAssertEqual(ShellEscape.escape("\\ "), "\\\\\\ ")
+    }
+
+    /// Shared verbatim with the Rust `escape_byte_is_dropped` vector: ESC is
+    /// dropped, the `[` that follows it is escaped like any other
+    /// metacharacter.
+    func testDropsEscapeByte() {
+        XCTAssertEqual(ShellEscape.escape("/tmp/ev\u{1B}[201~il.png"), "/tmp/ev\\[201~il.png")
+        XCTAssertEqual(ShellEscape.escape("\u{1B}"), "")
     }
 }
 

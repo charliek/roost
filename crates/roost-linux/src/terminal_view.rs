@@ -2448,8 +2448,9 @@ fn selection_text(state: &Rc<RefCell<TerminalViewState>>) -> Option<String> {
     }
 }
 
-/// Feed pasted `text` into the PTY, wrapping in bracketed-paste escapes
-/// (`ESC[200~` … `ESC[201~`) when DECSET 2004 is active. Shared by
+/// Feed pasted `text` into the PTY through `bracketed_paste::wrap`, which
+/// frames it in `ESC[200~` … `ESC[201~` (and strips embedded markers) when
+/// DECSET 2004 is active. Shared by
 /// Ctrl+Shift+V (CLIPBOARD) and, on Linux, middle-click (PRIMARY); the
 /// async clipboard read lives in `clipboard::read`. Reads the callback
 /// out of the borrow before invoking, per the callback invariant on
@@ -2467,16 +2468,7 @@ fn paste_text_into(state: &Rc<RefCell<TerminalViewState>>, text: String) {
         (s.terminal.mode_get(2004), s.input_callback.clone())
     };
     let Some(cb) = cb else { return };
-    let bytes = if bracketed {
-        let mut buf = Vec::with_capacity(text.len() + 8);
-        buf.extend_from_slice(b"\x1b[200~");
-        buf.extend_from_slice(text.as_bytes());
-        buf.extend_from_slice(b"\x1b[201~");
-        buf
-    } else {
-        text.into_bytes()
-    };
-    cb(bytes);
+    cb(roost_ui_model::bracketed_paste::wrap(&text, bracketed));
 }
 
 /// Install a destination-only file/text drop handler on the terminal.

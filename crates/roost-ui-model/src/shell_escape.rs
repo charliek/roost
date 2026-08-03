@@ -12,9 +12,19 @@
 /// non-ASCII codepoints (e.g. the U+202F narrow-no-break space in a macOS
 /// screenshot filename) pass through unchanged, which modern shells handle as
 /// UTF-8 literals.
+///
+/// ESC (0x1b) is dropped outright rather than backslash-escaped: no legitimate
+/// filename needs it, a backslash does not neutralize it for the terminal
+/// parser, and a crafted name could otherwise smuggle a control sequence (e.g.
+/// a bracketed-paste marker) into the PTY through the file-drop path. Defense
+/// in depth with `bracketed_paste::wrap`, which strips the markers again at the
+/// paste boundary.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
+        if ch == '\u{1b}' {
+            continue;
+        }
         if matches!(
             ch,
             '\\' | ' '
@@ -105,6 +115,14 @@ mod tests {
     #[test]
     fn already_backslashed_space_gets_both_escaped() {
         assert_eq!(escape("\\ "), "\\\\\\ ");
+    }
+
+    /// Shared verbatim with the Swift `testDropsEscapeByte` vector: the ESC is
+    /// dropped, the `[` that follows it is escaped like any other metacharacter.
+    #[test]
+    fn escape_byte_is_dropped() {
+        assert_eq!(escape("/tmp/ev\u{1b}[201~il.png"), "/tmp/ev\\[201~il.png");
+        assert_eq!(escape("\u{1b}"), "");
     }
 
     #[test]
