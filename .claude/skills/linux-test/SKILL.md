@@ -114,12 +114,43 @@ shed exec roost-dev -- bash -lc '
     python3 tools/input/linux/real_input_check.py'
 ```
 
+The **Iced** sibling `tools/input/linux/iced_clipboard_check.py` (CI's
+"Run Iced real-input clipboard" step, which also covers tab/project drag
+reorder and the delete-confirm keyboard flow) works the same way but reads
+**`ROOST_ICED_BIN`** instead of `ROOST_BIN`:
+
+```bash
+shed exec roost-dev -- bash -lc '
+  cd ~/roost
+  ROOST_ICED_BIN=$HOME/rt/debug/roost-iced ROOSTCTL=$HOME/rt/debug/roostctl \
+    ROOST_TEST_MODE=1 ROOST_TEST_TIMEOUT_SCALE=3 \
+    python3 -u tools/input/linux/iced_clipboard_check.py > /tmp/iced-ri.log 2>&1;
+  echo EXIT=$?; tail -5 /tmp/iced-ri.log'
+```
+
 ### visual screenshot on real Linux
 Launch the shed binary directly under Xvfb (skip the harness), seed via
 `roostctl`, `screenshot` to a mount path, read it on the Mac (`target/` is
 gitignored): `… screenshot --out ~/roost/target/.shot.png` then open
 `target/.shot.png` on the Mac. GTK chrome differs Linux↔macOS, so this is the
 way to see the *real* Linux render (translucency still needs a real compositor).
+
+Iced specifics (each cost a cycle):
+- **Socket namespace differs per profile**: GTK is
+  `$XDG_RUNTIME_DIR/roost/roost.sock` but Iced is
+  `$XDG_RUNTIME_DIR/roost-iced/roost.sock` (`paths.rs` — `roost-iced/`
+  namespace). Waiting on the GTK path against an Iced binary times out with
+  the app demonstrably alive.
+- Isolate a hand-launched instance with fresh `XDG_RUNTIME_DIR` +
+  `XDG_STATE_HOME` (+ cache/data/config) so it can't collide with a
+  harness-launched one, then dial it explicitly:
+  `roostctl --socket $XDG_RUNTIME_DIR/roost-iced/roost.sock …`.
+- **UI-only states are reachable headlessly via the palette ops**:
+  `roostctl … palette open` then `palette activate <id>` (positional id,
+  e.g. `close_project`) drives the same dispatch as the keybind — that's how
+  to screenshot modal overlays (delete confirm etc.) with no XTEST.
+- `roostctl project list` rows read `project <id> — <name> …`: the id is
+  **field 2** (`awk '{print $2}'`), not field 1.
 
 ## How it works (so you can debug it)
 - **`.shed/provision.yaml`** — an `install` hook (once: GTK4-dev, cage, seatd,
@@ -155,3 +186,9 @@ way to see the *real* Linux render (translucency still needs a real compositor).
 - Piping a hung test through `| tail` loses its output (Python buffers stdout off
   a tty, and a kill drops the buffer). Use `python3 -u … > file 2>&1` so partial
   output survives a hang — essential when the thing you're testing *is* a hang.
+- **`pkill -f` inside `shed exec … bash -lc '…'` kills the script's own
+  shell**: the `-f` pattern matches the full `bash -lc <script>` command line,
+  which *contains* the pattern you typed — the script dies mid-run (its tail
+  never executes) and `shed exec` returns 255. Use `pkill -x <binary-name>`,
+  anchor the pattern to the binary path (`pkill -f '^/home/shed/rt/debug/…'`),
+  or kill by saved PID (`APP=$!; kill $APP`).
