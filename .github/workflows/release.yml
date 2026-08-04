@@ -40,6 +40,7 @@ concurrency:
 jobs:
   version-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
@@ -65,6 +66,7 @@ jobs:
   # Poll because that run may still be in flight when the tag fires.
   ci-gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     permissions:
       contents: read
       checks: read
@@ -101,6 +103,7 @@ jobs:
   create-release:
     needs: [version-check, ci-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -148,6 +151,7 @@ jobs:
           - { runner: ubuntu-24.04,     arch: amd64, label: "Linux — Intel / AMD 64-bit (.deb)" }
           - { runner: ubuntu-24.04-arm, arch: arm64, label: "Linux — ARM 64-bit (.deb)" }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
         with:
@@ -232,6 +236,7 @@ jobs:
   mac:
     needs: create-release
     runs-on: macos-26   # arm64 — pinned; ships Xcode 26 by default, which
+    timeout-minutes: 90
                         # actool needs to compile mac/AppIcon.icon (the Tahoe
                         # glass icon). On older Xcode, bundle.sh still builds but
                         # falls back to the flat (framed) .icns. See
@@ -545,6 +550,7 @@ jobs:
   dispatch-apt-charliek:
     needs: linux
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Decide whether to dispatch
         id: guard

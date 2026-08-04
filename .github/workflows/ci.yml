@@ -17,6 +17,7 @@ permissions:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       mac: ${{ steps.filter.outputs.mac }}
@@ -68,6 +69,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
@@ -98,6 +100,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
@@ -109,6 +112,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.mac == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
@@ -128,6 +132,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -197,6 +202,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mac == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -368,6 +374,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -643,6 +650,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.linux == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1088,6 +1096,7 @@ jobs:
     needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Verify no required job failed
         run: |
