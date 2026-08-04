@@ -3,7 +3,7 @@ use super::*;
 // ── rename ──
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RenameTarget {
+pub(crate) enum RenameTarget {
     Project(i64),
     Tab(i64),
 }
@@ -103,33 +103,93 @@ fn rename_editor_is_renderable(
     }
 }
 
-fn submit_rename_editor_with(
-    editor: &mut Option<RenameEditor>,
-    apply: impl FnOnce(RenameTarget, &str) -> Result<(), String>,
-) -> Result<bool, String> {
+/// What a submit resolves to before anything is dispatched. The engine
+/// call is no longer part of the decision — it cannot answer on the UI
+/// thread — so the editor's fate is split across the dispatch and the
+/// completion that quotes its op id back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RenameSubmission {
+    /// A rename is already in flight for this editor. The submit is a
+    /// no-op down to the last field: a second Enter must not dispatch a
+    /// second rename, and must not disturb the editor the first one is
+    /// still waiting on.
+    InFlight,
+    /// Nothing to dispatch — no editor, the Enter guard already armed, or
+    /// a draft that commits to nothing (which dismisses the editor, as it
+    /// always has).
+    Settled,
+    Dispatch {
+        target: RenameTarget,
+        label: String,
+        op: u64,
+    },
+}
+
+fn plan_rename_submission(editor: &mut Option<RenameEditor>, op: u64) -> RenameSubmission {
     let Some(current) = editor.as_ref() else {
-        return Ok(false);
+        return RenameSubmission::Settled;
     };
     let Some(label) = roost_ui_model::rename::committed_label(&current.draft) else {
         *editor = None;
-        return Ok(false);
+        return RenameSubmission::Settled;
     };
-    let target = current.target;
-    apply(target, &label)?;
-    *editor = None;
-    Ok(true)
+    RenameSubmission::Dispatch {
+        target: current.target,
+        label,
+        op,
+    }
 }
 
-fn submit_rename_editor_once_with(
+fn plan_rename_submission_once(
     editor: &mut Option<RenameEditor>,
     pending: &mut Option<RenameCompletionKey>,
-    apply: impl FnOnce(RenameTarget, &str) -> Result<(), String>,
-) -> Result<bool, String> {
+    in_flight: Option<u64>,
+    op: u64,
+) -> RenameSubmission {
+    if in_flight.is_some() {
+        return RenameSubmission::InFlight;
+    }
     if editor.is_none() || *pending == Some(RenameCompletionKey::Enter) {
-        return Ok(false);
+        return RenameSubmission::Settled;
     }
     *pending = Some(RenameCompletionKey::Enter);
-    submit_rename_editor_with(editor, apply)
+    plan_rename_submission(editor, op)
+}
+
+/// How a rename completion lands. The op id is the whole guard: the
+/// editor the completion was dispatched from may have been dismissed and
+/// a new one opened over the same target since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenameCompletion {
+    /// The completion belongs to an editor that is no longer waiting for
+    /// it. Nothing is said and nothing is touched.
+    Stale,
+    /// The rename landed — the editor closes, as it did the instant the
+    /// blocking call returned.
+    Closed,
+    /// The rename failed — the editor stays open with the error in the
+    /// banner (`interactions.rs` has behaved this way since the editor
+    /// existed; a failed rename must not eat the user's draft).
+    Failed,
+}
+
+fn resolve_rename_completion(
+    in_flight: &mut Option<u64>,
+    editor: &mut Option<RenameEditor>,
+    op: u64,
+    result: &Result<(), String>,
+) -> RenameCompletion {
+    if *in_flight != Some(op) {
+        return RenameCompletion::Stale;
+    }
+    *in_flight = None;
+    match result {
+        Ok(()) => {
+            *editor = None;
+            RenameCompletion::Closed
+        }
+        Err(_) => RenameCompletion::Failed,
+    }
 }
 
 pub(super) fn arm_rename_completion_for_open_editor(
@@ -178,16 +238,18 @@ impl App {
         Ok(())
     }
 
-    pub fn begin_rename_project(&mut self, project_id: i64) {
+    pub fn begin_rename_project(&mut self, project_id: i64) -> UiTask {
         if let Err(error) = self.begin_rename_target(RenameTarget::Project(project_id)) {
             self.set_status(error);
         }
+        self.take_rename_focus_task()
     }
 
-    pub fn begin_rename_tab(&mut self, tab_id: i64) {
+    pub fn begin_rename_tab(&mut self, tab_id: i64) -> UiTask {
         if let Err(error) = self.begin_rename_target(RenameTarget::Tab(tab_id)) {
             self.set_status(error);
         }
+        self.take_rename_focus_task()
     }
 
     pub fn rename_draft_changed(&mut self, draft: String) {
@@ -196,32 +258,78 @@ impl App {
         }
     }
 
-    pub fn submit_rename_editor(&mut self) {
-        let client = self.client.clone();
-        let runtime = &self.runtime;
-        match submit_rename_editor_once_with(
+    /// The editor no longer closes here on success — it closes when the
+    /// engine says the rename landed. Until then it stays on screen with
+    /// its draft, and a second Enter is refused rather than queued.
+    pub fn submit_rename_editor(&mut self) -> UiTask {
+        let op = self.take_engine_op_id();
+        match plan_rename_submission_once(
             &mut self.rename_editor,
             &mut self.rename_completion_key,
-            |target, label| match target {
-                RenameTarget::Project(project_id) => runtime
-                    .block_on(client.rename_project(project_id, label))
-                    .map_err(|error| error.to_string()),
-                RenameTarget::Tab(tab_id) => runtime
-                    .block_on(client.set_tab_title(tab_id, label))
-                    .map_err(|error| error.to_string()),
-            },
+            self.rename_op,
+            op,
         ) {
-            Ok(_) => {
+            RenameSubmission::InFlight => {
+                tracing::debug!(?self.rename_op, "ignored rename submit while one is in flight");
+                UiTask::None
+            }
+            RenameSubmission::Settled => {
                 self.rename_focus_requested = false;
                 self.reconcile();
+                UiTask::None
             }
-            Err(error) => self.set_status(error),
+            RenameSubmission::Dispatch { target, label, op } => {
+                self.rename_op = Some(op);
+                let client = self.client.clone();
+                self.engine_op(
+                    async move {
+                        match target {
+                            RenameTarget::Project(project_id) => {
+                                client.rename_project(project_id, &label).await
+                            }
+                            RenameTarget::Tab(tab_id) => client.set_tab_title(tab_id, &label).await,
+                        }
+                        .map_err(|error| error.to_string())
+                    },
+                    move |result| EngineOpResult::Renamed { op, target, result },
+                )
+            }
         }
     }
 
+    pub(super) fn rename_completed(
+        &mut self,
+        op: u64,
+        target: RenameTarget,
+        result: Result<(), String>,
+    ) {
+        match resolve_rename_completion(&mut self.rename_op, &mut self.rename_editor, op, &result) {
+            RenameCompletion::Stale => {
+                tracing::debug!(
+                    op,
+                    ?target,
+                    "dropped a rename completion no editor is awaiting"
+                );
+            }
+            RenameCompletion::Closed => {
+                self.rename_focus_requested = false;
+            }
+            RenameCompletion::Failed => {
+                let error = result.unwrap_err();
+                tracing::warn!(%error, ?target, "rename failed");
+                self.set_status(error);
+            }
+        }
+    }
+
+    /// Dismissing an editor mid-flight is allowed: dropping the op id is
+    /// what turns the rename still on its way back into a completion
+    /// nobody is waiting for, so it can neither reopen this editor nor
+    /// close the next one.
     pub(super) fn cancel_rename_editor(&mut self) {
         self.rename_editor = None;
         self.rename_focus_requested = false;
+        self.rename_op = None;
     }
 
     pub fn rename_pointer_dismiss(&mut self) {
@@ -269,6 +377,19 @@ pub(super) struct TabDragPreview {
     pub(super) context: TabDragContext,
     pub(super) original_ids: Vec<i64>,
     pub(super) ordered_ids: Vec<i64>,
+    /// Set once the reorder is dispatched. It marks the preview as
+    /// already settled — no second release can re-commit it — and it is
+    /// the id the completion must quote to be allowed to clear it.
+    pub(super) pending_op: Option<u64>,
+}
+
+impl TabDragPreview {
+    /// Whether this pill is the one being carried. A dispatched preview
+    /// outlives the gesture only to hold the order: the pointer is up, so
+    /// the drag styling comes off at the release, as it always did.
+    pub(super) fn drags(&self, tab_id: i64) -> bool {
+        self.pending_op.is_none() && self.context.source_id == tab_id
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,7 +412,17 @@ impl From<&TabDragPreview> for TabDragCommitRequest {
 #[derive(Debug, PartialEq, Eq)]
 enum TabDragSettlement {
     Ignored,
-    Settled(Result<bool, String>),
+    /// The gesture resolved to nothing to reorder — a drag that landed
+    /// back where it started, or a preview the authoritative order has
+    /// already moved out from under.
+    Settled,
+    /// The reorder is on its way to the engine under this op id. The
+    /// preview stays on screen until the completion (or the reorder
+    /// event that beats it) says otherwise.
+    Dispatched {
+        ordered_ids: Vec<i64>,
+        op: u64,
+    },
 }
 
 /// Ids a gesture can be keyed to: unique, and never the `0` placeholder a
@@ -317,51 +448,75 @@ fn cancel_drag_preview<T>(preview: &mut Option<T>, generation: &mut u64) {
     preview.take();
 }
 
-fn dispatch_tab_drag_commit_with(
+fn tab_drag_commit_is_valid(
     preview: Option<&TabDragPreview>,
     authoritative_ids: &[i64],
     context: &TabDragContext,
     original_ids: &[i64],
-    ordered_ids: Vec<i64>,
-    apply: impl FnOnce(i64, Vec<i64>) -> Result<(), String>,
-) -> Result<bool, String> {
+    ordered_ids: &[i64],
+) -> bool {
     let valid = preview.is_some_and(|preview| {
         preview.context == *context
             && preview.original_ids == original_ids
             && preview.ordered_ids == ordered_ids
             && authoritative_ids == original_ids
-            && same_stable_ids(&ordered_ids, original_ids)
+            && same_stable_ids(ordered_ids, original_ids)
     });
-    if !valid || ordered_ids == original_ids {
-        return Ok(false);
-    }
-    apply(context.project_id, ordered_ids)?;
-    Ok(true)
+    valid && ordered_ids != original_ids
 }
 
-fn settle_tab_drag_commit_with(
+/// Settle a release against the preview it claims. A preview that already
+/// dispatched keeps its order on screen but is no longer commitable — the
+/// root release boundary publishes its own release right behind the
+/// strip's commit, and both name the same gesture.
+fn settle_tab_drag_commit(
     preview: &mut Option<TabDragPreview>,
     authoritative_ids: &[i64],
     request: TabDragCommitRequest,
-    apply: impl FnOnce(i64, Vec<i64>) -> Result<(), String>,
+    op: u64,
 ) -> TabDragSettlement {
     if preview
         .as_ref()
-        .is_none_or(|preview| preview.context != request.context)
+        .is_none_or(|preview| preview.pending_op.is_some() || preview.context != request.context)
     {
         return TabDragSettlement::Ignored;
     }
 
-    let result = dispatch_tab_drag_commit_with(
+    if !tab_drag_commit_is_valid(
         preview.as_ref(),
         authoritative_ids,
         &request.context,
         &request.original_ids,
-        request.ordered_ids,
-        apply,
-    );
-    *preview = None;
-    TabDragSettlement::Settled(result)
+        &request.ordered_ids,
+    ) {
+        *preview = None;
+        return TabDragSettlement::Settled;
+    }
+
+    if let Some(preview) = preview.as_mut() {
+        preview.pending_op = Some(op);
+    }
+    TabDragSettlement::Dispatched {
+        ordered_ids: request.ordered_ids,
+        op,
+    }
+}
+
+/// A completion clears only the preview that dispatched it. A newer drag
+/// carries a different id (or none yet), so an older reorder reporting
+/// back cannot pull the order out from under the gesture that replaced it.
+fn clear_dispatched_preview<T>(
+    preview: &mut Option<T>,
+    op: u64,
+    pending_op: impl Fn(&T) -> Option<u64>,
+) -> bool {
+    let owned = preview
+        .as_ref()
+        .is_some_and(|preview| pending_op(preview) == Some(op));
+    if owned {
+        *preview = None;
+    }
+    owned
 }
 
 fn end_tab_drag_preview_if_owned(
@@ -432,6 +587,7 @@ impl App {
             },
             ordered_ids: original_ids.clone(),
             original_ids,
+            pending_op: None,
         });
     }
 
@@ -492,7 +648,7 @@ impl App {
         context_generation: u64,
         original_ids: &[i64],
         ordered_ids: Vec<i64>,
-    ) {
+    ) -> UiTask {
         let authoritative = self.active_project_tab_ids(project_id);
         let request = TabDragCommitRequest {
             context: TabDragContext {
@@ -503,18 +659,9 @@ impl App {
             original_ids: original_ids.to_vec(),
             ordered_ids,
         };
-        let runtime = &self.runtime;
-        let client = &self.client;
-        let settlement = settle_tab_drag_commit_with(
-            &mut self.tab_drag_preview,
-            &authoritative,
-            request,
-            |project_id, ordered_ids| {
-                runtime
-                    .block_on(client.reorder_tabs(project_id, ordered_ids))
-                    .map_err(|error| error.to_string())
-            },
-        );
+        let op = self.take_engine_op_id();
+        let settlement =
+            settle_tab_drag_commit(&mut self.tab_drag_preview, &authoritative, request, op);
         tracing::debug!(
             ?settlement,
             project_id,
@@ -522,20 +669,63 @@ impl App {
             context_generation,
             "Iced tab drag settlement"
         );
-        let TabDragSettlement::Settled(result) = settlement else {
-            return;
-        };
-        self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
-        if let Err(error) = result {
-            tracing::warn!(?error, project_id, source_id, "Iced tab reorder failed");
-            self.set_status(format!("reorder tabs: {error}"));
+        match settlement {
+            TabDragSettlement::Ignored => UiTask::None,
+            // The generation burns the moment the gesture stops being the
+            // widget's: whatever the strip still holds carries the old one
+            // and can no longer re-arm, cancel, or preview against it.
+            TabDragSettlement::Settled => {
+                self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
+                self.reconcile();
+                UiTask::None
+            }
+            TabDragSettlement::Dispatched { ordered_ids, op } => {
+                self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
+                let client = self.client.clone();
+                let dispatched = ordered_ids.clone();
+                self.engine_op(
+                    async move {
+                        client
+                            .reorder_tabs(project_id, dispatched)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    move |result| EngineOpResult::TabsReordered {
+                        op,
+                        project_id,
+                        ordered_ids,
+                        result,
+                    },
+                )
+            }
         }
-        self.reconcile();
+    }
+
+    /// The preview outlives the dispatch so a successful reorder never
+    /// snaps: by the time the completion lands the authoritative order is
+    /// the previewed one (often via the reorder event, which clears the
+    /// preview first). A failure clears it too — that clear *is* the
+    /// rollback, with the reconcile behind it restoring the real order.
+    pub(super) fn tab_reorder_completed(
+        &mut self,
+        op: u64,
+        project_id: i64,
+        ordered_ids: &[i64],
+        result: Result<(), String>,
+    ) {
+        let cleared =
+            clear_dispatched_preview(&mut self.tab_drag_preview, op, |preview| preview.pending_op);
+        if let Err(error) = result {
+            tracing::warn!(?error, project_id, ?ordered_ids, "Iced tab reorder failed");
+            self.set_status(format!("reorder tabs: {error}"));
+        } else if !cleared {
+            tracing::debug!(op, project_id, "tab reorder completed past its preview");
+        }
     }
 
     /// At most one preview exists — the strips cancel each other when a
     /// gesture arms — so this settles whichever one owns the release.
-    pub(crate) fn strip_pointer_released(&mut self) {
+    pub(crate) fn strip_pointer_released(&mut self) -> UiTask {
         if let Some(preview) = self.tab_drag_preview.as_ref() {
             tracing::debug!(
                 project_id = preview.context.project_id,
@@ -551,7 +741,7 @@ impl App {
                 request.context.generation,
                 &request.original_ids,
                 request.ordered_ids,
-            );
+            )
         } else if let Some(preview) = self.project_drag_preview.as_ref() {
             tracing::debug!(
                 source_id = preview.context.source_id,
@@ -565,7 +755,9 @@ impl App {
                 request.context.generation,
                 &request.original_ids,
                 request.ordered_ids,
-            );
+            )
+        } else {
+            UiTask::None
         }
     }
 
@@ -573,7 +765,7 @@ impl App {
         self.tab_drag_preview.is_some() || self.project_drag_preview.is_some()
     }
 
-    pub(crate) fn tab_strip_event(&mut self, event: StripEvent) {
+    pub(crate) fn tab_strip_event(&mut self, event: StripEvent) -> UiTask {
         match event {
             StripEvent::Started {
                 scope_id: project_id,
@@ -581,25 +773,34 @@ impl App {
                 context_generation,
                 original_ids,
             } => {
-                self.begin_tab_drag_preview(project_id, source_id, context_generation, original_ids)
+                self.begin_tab_drag_preview(
+                    project_id,
+                    source_id,
+                    context_generation,
+                    original_ids,
+                );
+                UiTask::None
             }
             // Tab visuals key off preview presence, so the threshold
             // crossing changes nothing here; the event exists for the
             // project strip's agent-row hiding.
-            StripEvent::DragBegan { .. } => {}
+            StripEvent::DragBegan { .. } => UiTask::None,
             StripEvent::Preview {
                 scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
                 ordered_ids,
-            } => self.preview_tab_drag(
-                project_id,
-                source_id,
-                context_generation,
-                &original_ids,
-                ordered_ids,
-            ),
+            } => {
+                self.preview_tab_drag(
+                    project_id,
+                    source_id,
+                    context_generation,
+                    &original_ids,
+                    ordered_ids,
+                );
+                UiTask::None
+            }
             StripEvent::Commit {
                 scope_id: project_id,
                 source_id,
@@ -619,13 +820,15 @@ impl App {
                 context_generation,
                 original_ids,
             } => {
-                self.end_tab_drag_preview(project_id, source_id, context_generation, &original_ids)
+                self.end_tab_drag_preview(project_id, source_id, context_generation, &original_ids);
+                UiTask::None
             }
             StripEvent::Cancel { context_generation } => {
                 if context_generation == self.tab_strip_generation {
                     self.cancel_tab_drag();
                     self.reconcile();
                 }
+                UiTask::None
             }
         }
     }
@@ -645,6 +848,18 @@ pub(super) struct ProjectDragPreview {
     pub(super) original_ids: Vec<i64>,
     pub(super) ordered_ids: Vec<i64>,
     pub(super) dragging: bool,
+    /// Set once the reorder is dispatched — see [`TabDragPreview::pending_op`].
+    pub(super) pending_op: Option<u64>,
+}
+
+impl ProjectDragPreview {
+    /// Whether the sidebar draws this preview's order instead of the
+    /// authoritative one. A dispatched preview burned its generation on
+    /// the way out, so the generation alone would drop it — and dropping
+    /// it is the snap-back the optimistic order exists to avoid.
+    pub(super) fn orders_the_strip(&self, strip_generation: u64) -> bool {
+        self.pending_op.is_some() || self.context.generation == strip_generation
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -667,7 +882,8 @@ impl From<&ProjectDragPreview> for ProjectDragCommitRequest {
 #[derive(Debug, PartialEq, Eq)]
 enum ProjectDragSettlement {
     Ignored,
-    Settled(Result<bool, String>),
+    Settled,
+    Dispatched { ordered_ids: Vec<i64>, op: u64 },
 }
 
 /// Agent sub-rows change every project group's height, so they are hidden
@@ -677,51 +893,58 @@ pub(super) fn agent_rows_hidden(preview: Option<&ProjectDragPreview>) -> bool {
     preview.is_some_and(|preview| preview.dragging)
 }
 
-fn dispatch_project_drag_commit_with(
+fn project_drag_commit_is_valid(
     preview: Option<&ProjectDragPreview>,
     authoritative_ids: &[i64],
     context: &ProjectDragContext,
     original_ids: &[i64],
-    ordered_ids: Vec<i64>,
-    apply: impl FnOnce(Vec<i64>) -> Result<(), String>,
-) -> Result<bool, String> {
+    ordered_ids: &[i64],
+) -> bool {
     let valid = preview.is_some_and(|preview| {
         preview.context == *context
             && preview.original_ids == original_ids
             && preview.ordered_ids == ordered_ids
             && authoritative_ids == original_ids
-            && same_stable_ids(&ordered_ids, original_ids)
+            && same_stable_ids(ordered_ids, original_ids)
     });
-    if !valid || ordered_ids == original_ids {
-        return Ok(false);
-    }
-    apply(ordered_ids)?;
-    Ok(true)
+    valid && ordered_ids != original_ids
 }
 
-fn settle_project_drag_commit_with(
+fn settle_project_drag_commit(
     preview: &mut Option<ProjectDragPreview>,
     authoritative_ids: &[i64],
     request: ProjectDragCommitRequest,
-    apply: impl FnOnce(Vec<i64>) -> Result<(), String>,
+    op: u64,
 ) -> ProjectDragSettlement {
     if preview
         .as_ref()
-        .is_none_or(|preview| preview.context != request.context)
+        .is_none_or(|preview| preview.pending_op.is_some() || preview.context != request.context)
     {
         return ProjectDragSettlement::Ignored;
     }
 
-    let result = dispatch_project_drag_commit_with(
+    if !project_drag_commit_is_valid(
         preview.as_ref(),
         authoritative_ids,
         &request.context,
         &request.original_ids,
-        request.ordered_ids,
-        apply,
-    );
-    *preview = None;
-    ProjectDragSettlement::Settled(result)
+        &request.ordered_ids,
+    ) {
+        *preview = None;
+        return ProjectDragSettlement::Settled;
+    }
+
+    if let Some(preview) = preview.as_mut() {
+        preview.pending_op = Some(op);
+        // The pointer is up: the row stops looking dragged and the agent
+        // sub-rows come back now, exactly as they did when the preview
+        // died at the release. Only the order is held back.
+        preview.dragging = false;
+    }
+    ProjectDragSettlement::Dispatched {
+        ordered_ids: request.ordered_ids,
+        op,
+    }
 }
 
 /// `None` rejects the press: the caller cancels rather than arming a gesture
@@ -745,6 +968,7 @@ fn arm_project_drag_preview(
         ordered_ids: original_ids.clone(),
         original_ids,
         dragging: false,
+        pending_op: None,
     })
 }
 
@@ -926,7 +1150,7 @@ impl App {
         context_generation: u64,
         original_ids: &[i64],
         ordered_ids: Vec<i64>,
-    ) {
+    ) -> UiTask {
         let authoritative = self.sidebar_project_ids();
         let request = ProjectDragCommitRequest {
             context: ProjectDragContext {
@@ -936,48 +1160,81 @@ impl App {
             original_ids: original_ids.to_vec(),
             ordered_ids,
         };
-        let runtime = &self.runtime;
-        let client = &self.client;
-        let settlement = settle_project_drag_commit_with(
-            &mut self.project_drag_preview,
-            &authoritative,
-            request,
-            |ordered_ids| {
-                runtime
-                    .block_on(client.reorder_projects(ordered_ids))
-                    .map_err(|error| error.to_string())
-            },
-        );
+        let op = self.take_engine_op_id();
+        let settlement =
+            settle_project_drag_commit(&mut self.project_drag_preview, &authoritative, request, op);
         tracing::debug!(
             ?settlement,
             source_id,
             context_generation,
             "Iced project drag settlement"
         );
-        let ProjectDragSettlement::Settled(result) = settlement else {
-            return;
-        };
-        self.project_strip_generation = self.project_strip_generation.wrapping_add(1);
-        if let Err(error) = result {
-            tracing::warn!(?error, source_id, "Iced project reorder failed");
-            self.set_status(format!("reorder projects: {error}"));
+        match settlement {
+            ProjectDragSettlement::Ignored => UiTask::None,
+            ProjectDragSettlement::Settled => {
+                self.project_strip_generation = self.project_strip_generation.wrapping_add(1);
+                self.reconcile();
+                UiTask::None
+            }
+            ProjectDragSettlement::Dispatched { ordered_ids, op } => {
+                self.project_strip_generation = self.project_strip_generation.wrapping_add(1);
+                let client = self.client.clone();
+                let dispatched = ordered_ids.clone();
+                self.engine_op(
+                    async move {
+                        client
+                            .reorder_projects(dispatched)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    move |result| EngineOpResult::ProjectsReordered {
+                        op,
+                        ordered_ids,
+                        result,
+                    },
+                )
+            }
         }
-        self.reconcile();
     }
 
-    pub(crate) fn project_strip_event(&mut self, event: StripEvent) {
+    /// See [`App::tab_reorder_completed`] — the sidebar keeps its
+    /// optimistic order on exactly the same terms.
+    pub(super) fn project_reorder_completed(
+        &mut self,
+        op: u64,
+        ordered_ids: &[i64],
+        result: Result<(), String>,
+    ) {
+        let cleared = clear_dispatched_preview(&mut self.project_drag_preview, op, |preview| {
+            preview.pending_op
+        });
+        if let Err(error) = result {
+            tracing::warn!(?error, ?ordered_ids, "Iced project reorder failed");
+            self.set_status(format!("reorder projects: {error}"));
+        } else if !cleared {
+            tracing::debug!(op, "project reorder completed past its preview");
+        }
+    }
+
+    pub(crate) fn project_strip_event(&mut self, event: StripEvent) -> UiTask {
         match event {
             StripEvent::Started {
                 scope_id: _,
                 source_id,
                 context_generation,
                 original_ids,
-            } => self.begin_project_drag_preview(source_id, context_generation, original_ids),
+            } => {
+                self.begin_project_drag_preview(source_id, context_generation, original_ids);
+                UiTask::None
+            }
             StripEvent::DragBegan {
                 scope_id: _,
                 source_id,
                 context_generation,
-            } => self.begin_project_drag(source_id, context_generation),
+            } => {
+                self.begin_project_drag(source_id, context_generation);
+                UiTask::None
+            }
             StripEvent::Preview {
                 scope_id: _,
                 source_id,
@@ -985,7 +1242,13 @@ impl App {
                 original_ids,
                 ordered_ids,
             } => {
-                self.preview_project_drag(source_id, context_generation, &original_ids, ordered_ids)
+                self.preview_project_drag(
+                    source_id,
+                    context_generation,
+                    &original_ids,
+                    ordered_ids,
+                );
+                UiTask::None
             }
             StripEvent::Commit {
                 scope_id: _,
@@ -1001,12 +1264,16 @@ impl App {
                 source_id,
                 context_generation,
                 original_ids,
-            } => self.end_project_drag_preview(source_id, context_generation, &original_ids),
+            } => {
+                self.end_project_drag_preview(source_id, context_generation, &original_ids);
+                UiTask::None
+            }
             StripEvent::Cancel { context_generation } => {
                 if context_generation == self.project_strip_generation {
                     self.cancel_project_drag();
                     self.reconcile();
                 }
+                UiTask::None
             }
         }
     }
@@ -1053,6 +1320,10 @@ impl App {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(?error, tab_id, "terminal pointer dispatch failed");
+                // The dispatch moves the pointer cell and hover before it
+                // can fail, so the tab is left mid-gesture. Publish what it
+                // actually holds — nothing else will.
+                refresh_or_warn(tab_id, tab, "failed pointer dispatch");
                 return UiTask::None;
             }
         };
@@ -1067,9 +1338,7 @@ impl App {
         } else {
             None
         };
-        if let Err(error) = tab.refresh_snapshot() {
-            tracing::warn!(?error, tab_id, "terminal selection refresh failed");
-        }
+        refresh_or_warn(tab_id, tab, "pointer dispatch");
         enqueue_selection_copy(
             &mut self.clipboard,
             CopyKind::OnSelect(self.config.copy_on_select),
@@ -1190,6 +1459,12 @@ impl FileDropQueue {
                 (ready, true)
             }
         }
+    }
+
+    /// When the pending gesture is due, for the one-shot the drop path
+    /// schedules. `None` means nothing is pending and no shot is owed.
+    pub(super) fn pending_deadline(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|pending| pending.deadline)
     }
 
     pub(super) fn take_ready_at(&mut self, now: Instant) -> Option<PendingFileDrop> {
@@ -1576,32 +1851,11 @@ mod tests {
         let _ = reply.send(Ok(value));
     }
 
+    /// These tests drive the terminal directly with `write_vt`, so the
+    /// feed receiver is surplus.
     fn attached_test_terminal(tab_id: i64) -> (TerminalTab, Arc<PtySupervisor>) {
-        let supervisor = Arc::new(PtySupervisor::new());
-        let argv = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
-        let _early_output = supervisor
-            .spawn(
-                tab_id,
-                "/tmp",
-                &argv,
-                DEFAULT_COLS,
-                DEFAULT_ROWS,
-                std::path::Path::new("/tmp/roost-iced-pointer-test.sock"),
-            )
-            .expect("spawn pointer-test PTY");
-        let mut tab = TerminalTab::attach(
-            Arc::clone(&supervisor),
-            tab_id,
-            true,
-            Theme::roost_dark_fallback(),
-            roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
-        )
-        .expect("attach pointer-test terminal");
-        let metrics = TerminalMetrics::measure(13.0).expect("pointer-test terminal metrics");
-        tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, 1)
-            .expect("install pointer-test terminal metrics")
-            .expect("new pointer-test terminal changes geometry");
-        (tab, supervisor)
+        let (feed_tx, _) = engine_feed::channel();
+        attach_test_terminal(tab_id, feed_tx)
     }
 
     fn native_pointer(
@@ -1661,6 +1915,61 @@ mod tests {
         assert_eq!(
             batch.paths,
             [PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+        );
+    }
+
+    /// Each accepted path schedules a one-shot for the deadline it saw, so
+    /// a path that extends the window leaves an earlier shot in flight.
+    /// Nothing cancels it: the shot that fires early re-checks the
+    /// deadline, finds it moved, and delivers nothing — the later shot
+    /// carries the batch.
+    #[test]
+    fn a_file_drop_shot_whose_deadline_moved_delivers_nothing() {
+        let start = Instant::now();
+        let mut queue = FileDropQueue::default();
+        assert_eq!(
+            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            (None, true)
+        );
+        let first_shot = queue.pending_deadline().expect("the first path is pending");
+        assert_eq!(first_shot, start + FILE_DROP_DEBOUNCE);
+
+        assert_eq!(
+            queue.push_at(
+                Some(7),
+                PathBuf::from("/tmp/second"),
+                start + Duration::from_millis(30),
+            ),
+            (None, true)
+        );
+        let second_shot = queue
+            .pending_deadline()
+            .expect("the batch is still pending");
+        assert!(
+            second_shot > first_shot,
+            "the second path extended the window"
+        );
+
+        assert!(
+            queue.take_ready_at(first_shot).is_none(),
+            "the stale shot finds a deadline that moved"
+        );
+        let batch = queue
+            .take_ready_at(second_shot)
+            .expect("the shot the extension scheduled delivers the whole gesture");
+        assert_eq!(
+            batch.paths,
+            [PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+        );
+        assert!(
+            queue.pending_deadline().is_none(),
+            "a delivered gesture owes no further shot"
+        );
+        assert!(
+            queue
+                .take_ready_at(second_shot + FILE_DROP_DEBOUNCE)
+                .is_none(),
+            "and a shot that arrives after delivery is a no-op"
         );
     }
 
@@ -1876,50 +2185,48 @@ mod tests {
         assert!(!same_stable_ids(&[10, 20, 30], &[10, 20, 40]));
     }
 
-    #[test]
-    fn tab_drag_commit_dispatches_exactly_once_and_rejects_stale_or_noop_state() {
-        let preview = TabDragPreview {
+    fn tab_drag_preview_at(generation: u64, ordered_ids: Vec<i64>) -> TabDragPreview {
+        TabDragPreview {
             context: TabDragContext {
                 project_id: 7,
                 source_id: 10,
-                generation: 4,
+                generation,
             },
             original_ids: vec![10, 20, 30],
-            ordered_ids: vec![20, 30, 10],
-        };
-        let mut calls = Vec::new();
-        let applied = dispatch_tab_drag_commit_with(
+            ordered_ids,
+            pending_op: None,
+        }
+    }
+
+    #[test]
+    fn tab_drag_commit_dispatches_exactly_once_and_rejects_stale_or_noop_state() {
+        let preview = tab_drag_preview_at(4, vec![20, 30, 10]);
+        assert!(tab_drag_commit_is_valid(
             Some(&preview),
             &[10, 20, 30],
             &preview.context,
             &[10, 20, 30],
-            vec![20, 30, 10],
-            |project_id, ordered_ids| {
-                calls.push((project_id, ordered_ids));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(applied);
-        assert_eq!(calls, vec![(7, vec![20, 30, 10])]);
+            &[20, 30, 10],
+        ));
 
         for (authoritative, ordered) in [
             (vec![30, 20, 10], vec![20, 30, 10]),
             (vec![10, 20, 30], vec![10, 20, 30]),
             (vec![10, 20, 30], vec![20, 10, 30]),
         ] {
-            let result = dispatch_tab_drag_commit_with(
-                Some(&preview),
-                &authoritative,
-                &preview.context,
-                &[10, 20, 30],
-                ordered,
-                |_, _| panic!("stale/no-op tab drag dispatched"),
+            assert!(
+                !tab_drag_commit_is_valid(
+                    Some(&preview),
+                    &authoritative,
+                    &preview.context,
+                    &[10, 20, 30],
+                    &ordered,
+                ),
+                "{authoritative:?} → {ordered:?} is stale or a no-op"
             );
-            assert_eq!(result, Ok(false));
         }
 
-        let stale_generation = dispatch_tab_drag_commit_with(
+        assert!(!tab_drag_commit_is_valid(
             Some(&preview),
             &[10, 20, 30],
             &TabDragContext {
@@ -1928,23 +2235,16 @@ mod tests {
                 generation: 5,
             },
             &[10, 20, 30],
-            vec![20, 30, 10],
-            |_, _| panic!("stale-generation tab drag dispatched"),
-        );
-        assert_eq!(stale_generation, Ok(false));
+            &[20, 30, 10],
+        ));
     }
 
+    /// The strip's own commit and the root release boundary publish from
+    /// the same mouse-up, in that order. The dispatched preview is what
+    /// makes the second one inert now that the first no longer clears it.
     #[test]
     fn tab_drag_settlement_is_owned_once_in_either_release_order() {
-        let preview = TabDragPreview {
-            context: TabDragContext {
-                project_id: 7,
-                source_id: 10,
-                generation: 4,
-            },
-            original_ids: vec![10, 20, 30],
-            ordered_ids: vec![20, 30, 10],
-        };
+        let preview = tab_drag_preview_at(4, vec![20, 30, 10]);
         let fallback = TabDragCommitRequest::from(&preview);
         let direct = fallback.clone();
 
@@ -1953,27 +2253,28 @@ mod tests {
             (direct.clone(), fallback.clone()),
         ] {
             let mut current = Some(preview.clone());
-            let mut calls = 0;
-            let first_result = settle_tab_drag_commit_with(
-                &mut current,
-                &[10, 20, 30],
-                first,
-                |project_id, ordered_ids| {
-                    calls += 1;
-                    assert_eq!(project_id, 7);
-                    assert_eq!(ordered_ids, [20, 30, 10]);
-                    Ok(())
-                },
+            assert_eq!(
+                settle_tab_drag_commit(&mut current, &[10, 20, 30], first, 9),
+                TabDragSettlement::Dispatched {
+                    ordered_ids: vec![20, 30, 10],
+                    op: 9,
+                }
             );
-            assert_eq!(first_result, TabDragSettlement::Settled(Ok(true)));
-            assert!(current.is_none());
+            assert_eq!(
+                current.as_ref().and_then(|preview| preview.pending_op),
+                Some(9),
+                "the preview stays on screen, marked as already settled"
+            );
 
-            let second_result =
-                settle_tab_drag_commit_with(&mut current, &[10, 20, 30], second, |_, _| {
-                    panic!("duplicate tab release dispatched")
-                });
-            assert_eq!(second_result, TabDragSettlement::Ignored);
-            assert_eq!(calls, 1);
+            assert_eq!(
+                settle_tab_drag_commit(&mut current, &[10, 20, 30], second, 10),
+                TabDragSettlement::Ignored
+            );
+            assert_eq!(
+                current.as_ref().and_then(|preview| preview.pending_op),
+                Some(9),
+                "the duplicate release neither re-dispatches nor re-keys"
+            );
         }
     }
 
@@ -1987,6 +2288,7 @@ mod tests {
             },
             original_ids: vec![10, 20, 30],
             ordered_ids: vec![20, 10, 30],
+            pending_op: None,
         };
         let stale = TabDragCommitRequest {
             context: TabDragContext {
@@ -1999,16 +2301,14 @@ mod tests {
         };
         let mut current = Some(newer.clone());
         assert_eq!(
-            settle_tab_drag_commit_with(&mut current, &[10, 20, 30], stale, |_, _| {
-                panic!("stale release dispatched")
-            }),
+            settle_tab_drag_commit(&mut current, &[10, 20, 30], stale, 9),
             TabDragSettlement::Ignored
         );
         assert_eq!(current, Some(newer));
 
         let mut absent = None;
         assert_eq!(
-            settle_tab_drag_commit_with(
+            settle_tab_drag_commit(
                 &mut absent,
                 &[10, 20, 30],
                 TabDragCommitRequest {
@@ -2020,10 +2320,67 @@ mod tests {
                     original_ids: vec![10, 20, 30],
                     ordered_ids: vec![20, 30, 10],
                 },
-                |_, _| panic!("unowned release dispatched"),
+                9,
             ),
             TabDragSettlement::Ignored
         );
+    }
+
+    /// The pinned concurrency case: a second drag settles before the first
+    /// reorder reports back. The older completion must not pull the newer
+    /// gesture's order off the screen.
+    #[test]
+    fn a_superseded_reorder_completion_leaves_the_newer_drags_preview_alone() {
+        let mut current = Some(tab_drag_preview_at(4, vec![20, 30, 10]));
+        let first = TabDragCommitRequest::from(current.as_ref().unwrap());
+        assert!(matches!(
+            settle_tab_drag_commit(&mut current, &[10, 20, 30], first, 1),
+            TabDragSettlement::Dispatched { op: 1, .. }
+        ));
+
+        // The second gesture arms against the reordered list and settles
+        // while op 1 is still in flight.
+        let mut second_preview = tab_drag_preview_at(5, vec![30, 10, 20]);
+        second_preview.original_ids = vec![20, 30, 10];
+        current = Some(second_preview.clone());
+        let second = TabDragCommitRequest::from(&second_preview);
+        assert!(matches!(
+            settle_tab_drag_commit(&mut current, &[20, 30, 10], second, 2),
+            TabDragSettlement::Dispatched { op: 2, .. }
+        ));
+
+        assert!(
+            !clear_dispatched_preview(&mut current, 1, |preview| preview.pending_op),
+            "op 1 no longer owns any preview"
+        );
+        assert_eq!(
+            current.as_ref().map(|preview| preview.ordered_ids.clone()),
+            Some(vec![30, 10, 20]),
+            "the newer drag keeps its optimistic order"
+        );
+
+        assert!(clear_dispatched_preview(&mut current, 2, |preview| {
+            preview.pending_op
+        }));
+        assert!(current.is_none());
+    }
+
+    /// A preview the user dropped before its op reported back leaves the
+    /// completion with nothing to clear — and it must not resurrect it.
+    #[test]
+    fn a_reorder_completion_with_no_preview_left_clears_nothing() {
+        let mut current: Option<TabDragPreview> = None;
+        assert!(!clear_dispatched_preview(&mut current, 1, |preview| {
+            preview.pending_op
+        }));
+        assert!(current.is_none());
+
+        let mut armed = Some(tab_drag_preview_at(4, vec![20, 30, 10]));
+        assert!(
+            !clear_dispatched_preview(&mut armed, 1, |preview| preview.pending_op),
+            "a preview that never dispatched is owned by no completion"
+        );
+        assert!(armed.is_some());
     }
 
     #[test]
@@ -2038,6 +2395,7 @@ mod tests {
             context: context.clone(),
             original_ids: original.clone(),
             ordered_ids: original.clone(),
+            pending_op: None,
         };
         let mut exact = Some(preview.clone());
         assert!(end_tab_drag_preview_if_owned(
@@ -2071,55 +2429,19 @@ mod tests {
         assert_eq!(moved_state, Some(moved));
     }
 
+    /// A gesture that dropped where it started has nothing to send, so it
+    /// clears immediately — there is no completion coming to clear it.
     #[test]
     fn crossed_threshold_return_to_origin_is_a_settled_noop() {
         let original = vec![10, 20, 30];
-        let preview = TabDragPreview {
-            context: TabDragContext {
-                project_id: 7,
-                source_id: 10,
-                generation: 4,
-            },
-            original_ids: original.clone(),
-            ordered_ids: original.clone(),
-        };
+        let preview = tab_drag_preview_at(4, original.clone());
         let request = TabDragCommitRequest::from(&preview);
         let mut current = Some(preview);
         assert_eq!(
-            settle_tab_drag_commit_with(&mut current, &original, request, |_, _| {
-                panic!("return-to-origin commit dispatched a reorder")
-            }),
-            TabDragSettlement::Settled(Ok(false))
+            settle_tab_drag_commit(&mut current, &original, request, 9),
+            TabDragSettlement::Settled
         );
         assert!(current.is_none());
-    }
-
-    #[test]
-    fn tab_drag_commit_surfaces_the_authoritative_command_error_once() {
-        let preview = TabDragPreview {
-            context: TabDragContext {
-                project_id: 7,
-                source_id: 10,
-                generation: 4,
-            },
-            original_ids: vec![10, 20],
-            ordered_ids: vec![20, 10],
-        };
-        let mut calls = 0;
-        let error = dispatch_tab_drag_commit_with(
-            Some(&preview),
-            &[10, 20],
-            &preview.context,
-            &[10, 20],
-            vec![20, 10],
-            |_, _| {
-                calls += 1;
-                Err("injected reorder failure".into())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(calls, 1);
-        assert_eq!(error, "injected reorder failure");
     }
 
     fn project_drag_preview(dragging: bool) -> ProjectDragPreview {
@@ -2135,6 +2457,7 @@ mod tests {
                 vec![10, 20, 30]
             },
             dragging,
+            pending_op: None,
         }
     }
 
@@ -2262,6 +2585,7 @@ mod tests {
             },
             original_ids: vec![101, 102],
             ordered_ids: vec![102, 101],
+            pending_op: None,
         });
         let mut tab_generation = 4;
 
@@ -2284,39 +2608,32 @@ mod tests {
     #[test]
     fn project_drag_commit_dispatches_exactly_once_and_rejects_stale_or_noop_state() {
         let preview = project_drag_preview(true);
-        let mut calls = Vec::new();
-        let applied = dispatch_project_drag_commit_with(
+        assert!(project_drag_commit_is_valid(
             Some(&preview),
             &[10, 20, 30],
             &preview.context,
             &[10, 20, 30],
-            vec![20, 30, 10],
-            |ordered_ids| {
-                calls.push(ordered_ids);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(applied);
-        assert_eq!(calls, vec![vec![20, 30, 10]]);
+            &[20, 30, 10],
+        ));
 
         for (authoritative, ordered) in [
             (vec![30, 20, 10], vec![20, 30, 10]),
             (vec![10, 20, 30], vec![10, 20, 30]),
             (vec![10, 20, 30], vec![20, 10, 30]),
         ] {
-            let result = dispatch_project_drag_commit_with(
-                Some(&preview),
-                &authoritative,
-                &preview.context,
-                &[10, 20, 30],
-                ordered,
-                |_| panic!("stale/no-op project drag dispatched"),
+            assert!(
+                !project_drag_commit_is_valid(
+                    Some(&preview),
+                    &authoritative,
+                    &preview.context,
+                    &[10, 20, 30],
+                    &ordered,
+                ),
+                "{authoritative:?} → {ordered:?} is stale or a no-op"
             );
-            assert_eq!(result, Ok(false));
         }
 
-        let stale_generation = dispatch_project_drag_commit_with(
+        assert!(!project_drag_commit_is_valid(
             Some(&preview),
             &[10, 20, 30],
             &ProjectDragContext {
@@ -2324,10 +2641,8 @@ mod tests {
                 generation: 5,
             },
             &[10, 20, 30],
-            vec![20, 30, 10],
-            |_| panic!("stale-generation project drag dispatched"),
-        );
-        assert_eq!(stale_generation, Ok(false));
+            &[20, 30, 10],
+        ));
     }
 
     #[test]
@@ -2338,27 +2653,57 @@ mod tests {
         let preview = project_drag_preview(true);
         let request = ProjectDragCommitRequest::from(&preview);
         let mut current = Some(preview);
-        let mut calls = 0;
 
-        let settled = settle_project_drag_commit_with(
-            &mut current,
-            &[10, 20, 30],
-            request.clone(),
-            |ordered_ids| {
-                calls += 1;
-                assert_eq!(ordered_ids, [20, 30, 10]);
-                Ok(())
-            },
+        assert_eq!(
+            settle_project_drag_commit(&mut current, &[10, 20, 30], request.clone(), 9),
+            ProjectDragSettlement::Dispatched {
+                ordered_ids: vec![20, 30, 10],
+                op: 9,
+            }
         );
-        assert_eq!(settled, ProjectDragSettlement::Settled(Ok(true)));
-        assert!(current.is_none());
+        assert_eq!(
+            current.as_ref().and_then(|preview| preview.pending_op),
+            Some(9)
+        );
 
-        let duplicate =
-            settle_project_drag_commit_with(&mut current, &[10, 20, 30], request, |_| {
-                panic!("duplicate project release dispatched")
-            });
-        assert_eq!(duplicate, ProjectDragSettlement::Ignored);
-        assert_eq!(calls, 1);
+        assert_eq!(
+            settle_project_drag_commit(&mut current, &[10, 20, 30], request, 10),
+            ProjectDragSettlement::Ignored
+        );
+        assert_eq!(
+            current.as_ref().and_then(|preview| preview.pending_op),
+            Some(9)
+        );
+    }
+
+    /// The sidebar keeps drawing a dispatched preview even though its
+    /// generation is already burned — that burn is what rejects the stale
+    /// widget events, and reading it as "not current" would snap the
+    /// projects back for the length of the round trip.
+    #[test]
+    fn a_dispatched_project_preview_still_orders_the_sidebar_after_the_generation_burn() {
+        let armed = project_drag_preview(true);
+        assert!(armed.orders_the_strip(4));
+        assert!(!armed.orders_the_strip(5));
+
+        let mut preview = Some(armed.clone());
+        let request = ProjectDragCommitRequest::from(&armed);
+        assert!(matches!(
+            settle_project_drag_commit(&mut preview, &[10, 20, 30], request, 9),
+            ProjectDragSettlement::Dispatched { op: 9, .. }
+        ));
+        let dispatched = preview.expect("the dispatched preview stays on screen");
+        assert!(dispatched.orders_the_strip(5));
+        // Everything else about the gesture ends at the release: the row
+        // stops looking dragged and the agent sub-rows come back.
+        assert!(!agent_rows_hidden(Some(&dispatched)));
+
+        let tab = TabDragPreview {
+            pending_op: Some(9),
+            ..tab_drag_preview_at(4, vec![20, 30, 10])
+        };
+        assert!(!tab.drags(10), "the carried pill's styling ends too");
+        assert!(tab_drag_preview_at(4, vec![20, 30, 10]).drags(10));
     }
 
     #[test]
@@ -2420,16 +2765,14 @@ mod tests {
             vec![20, 30, 10]
         ));
         let request = ProjectDragCommitRequest::from(preview.as_ref().unwrap());
-        let mut calls = Vec::new();
         assert_eq!(
-            settle_project_drag_commit_with(&mut preview, &ids, request, |ordered_ids| {
-                calls.push(ordered_ids);
-                Ok(())
-            }),
-            ProjectDragSettlement::Settled(Ok(true))
+            settle_project_drag_commit(&mut preview, &ids, request, 9),
+            ProjectDragSettlement::Dispatched {
+                ordered_ids: vec![20, 30, 10],
+                op: 9,
+            }
         );
-        assert_eq!(calls, vec![vec![20, 30, 10]]);
-        assert!(preview.is_none());
+        assert_eq!(preview.and_then(|preview| preview.pending_op), Some(9));
     }
 
     #[test]
@@ -2456,18 +2799,25 @@ mod tests {
             original_ids: ids.clone(),
             ordered_ids: ordered.clone(),
             dragging: true,
+            pending_op: None,
         });
         let request = ProjectDragCommitRequest::from(preview.as_ref().unwrap());
 
-        assert_eq!(
-            settle_project_drag_commit_with(&mut preview, &ids, request, |ordered_ids| {
-                runtime
-                    .block_on(client.reorder_projects(ordered_ids))
-                    .map_err(|error| error.to_string())
-            }),
-            ProjectDragSettlement::Settled(Ok(true))
-        );
-        assert!(preview.is_none());
+        let ProjectDragSettlement::Dispatched { ordered_ids, op } =
+            settle_project_drag_commit(&mut preview, &ids, request, 9)
+        else {
+            panic!("a moved project drag settles into a dispatch");
+        };
+        assert_eq!(op, 9);
+        runtime
+            .block_on(client.reorder_projects(ordered_ids))
+            .unwrap();
+
+        // The completion clears the preview it dispatched; the sidebar has
+        // been showing this order the whole time, so nothing moves.
+        assert!(clear_dispatched_preview(&mut preview, 9, |preview| {
+            preview.pending_op
+        }));
         assert_eq!(
             workspace
                 .snapshot()
@@ -2568,131 +2918,206 @@ mod tests {
         assert_eq!(pending, None);
     }
 
-    #[test]
-    fn failed_rename_submit_dispatches_once_per_enter_press() {
-        let mut editor = Some(RenameEditor {
-            target: RenameTarget::Project(7),
+    fn rename_editor_for(target: RenameTarget, draft: &str) -> Option<RenameEditor> {
+        Some(RenameEditor {
+            target,
             opened_label: "old".into(),
-            draft: "recover me".into(),
-        });
+            draft: draft.into(),
+        })
+    }
+
+    /// The failure semantics that predate the async dispatch: the engine
+    /// said no, so the editor stays up holding the draft the user typed.
+    /// Only the moment it is decided moved — from the blocking call's
+    /// return to the completion.
+    #[test]
+    fn a_failed_rename_keeps_the_editor_open_with_its_draft() {
+        let mut editor = rename_editor_for(RenameTarget::Project(7), "recover me");
         let mut pending = None;
-        let calls = std::cell::Cell::new(0);
+        let mut in_flight = None;
         assert_eq!(
-            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
-                calls.set(calls.get() + 1);
-                Err("injected failure".into())
-            }),
-            Err("injected failure".into())
+            plan_rename_submission_once(&mut editor, &mut pending, in_flight, 1),
+            RenameSubmission::Dispatch {
+                target: RenameTarget::Project(7),
+                label: "recover me".into(),
+                op: 1,
+            }
         );
         assert_eq!(pending, Some(RenameCompletionKey::Enter));
-        assert!(editor.is_some(), "failed command must retain the draft");
-        assert_eq!(
-            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
-                calls.set(calls.get() + 1);
-                Err("repeat must not dispatch".into())
-            }),
-            Ok(false)
-        );
-        assert_eq!(calls.get(), 1);
+        in_flight = Some(1);
 
-        // The captured key-release event clears this guard while the TextInput
-        // remains focused. A later physical press may deliberately retry once.
-        pending = None;
-        assert!(
-            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
-                calls.set(calls.get() + 1);
-                Ok(())
-            })
-            .unwrap()
+        assert_eq!(
+            resolve_rename_completion(
+                &mut in_flight,
+                &mut editor,
+                1,
+                &Err("injected failure".into())
+            ),
+            RenameCompletion::Failed
         );
-        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            editor.as_ref().map(|editor| editor.draft.clone()),
+            Some("recover me".to_string()),
+            "a failed rename must not eat the draft"
+        );
+        assert_eq!(
+            in_flight, None,
+            "the failure releases the guard for a retry"
+        );
+
+        // The captured key-release clears the Enter guard while the
+        // TextInput keeps focus, so a deliberate retry dispatches again.
+        pending = None;
+        assert_eq!(
+            plan_rename_submission_once(&mut editor, &mut pending, in_flight, 2),
+            RenameSubmission::Dispatch {
+                target: RenameTarget::Project(7),
+                label: "recover me".into(),
+                op: 2,
+            }
+        );
+    }
+
+    /// The Enter guard covers the key's own press/release pair; the op id
+    /// covers everything after it, up to the completion. Without the
+    /// second guard the released Enter would re-arm and submit again into
+    /// an engine already renaming.
+    #[test]
+    fn a_rename_in_flight_refuses_a_second_submit() {
+        let mut editor = rename_editor_for(RenameTarget::Tab(9), "new title");
+        let mut pending = None;
+        assert!(matches!(
+            plan_rename_submission_once(&mut editor, &mut pending, None, 1),
+            RenameSubmission::Dispatch { op: 1, .. }
+        ));
+
+        pending = None; // the captured Enter release
+        assert_eq!(
+            plan_rename_submission_once(&mut editor, &mut pending, Some(1), 2),
+            RenameSubmission::InFlight
+        );
+        assert_eq!(pending, None, "a refused submit re-arms nothing");
+        assert!(editor.is_some());
     }
 
     #[test]
     fn held_palette_enter_cannot_submit_the_editor_it_opens() {
-        let mut editor = Some(RenameEditor {
-            target: RenameTarget::Tab(9),
-            opened_label: "title".into(),
-            draft: "title".into(),
-        });
+        let mut editor = rename_editor_for(RenameTarget::Tab(9), "title");
         let mut pending = None;
         arm_rename_completion_for_open_editor(&mut pending, editor.is_some());
-        let calls = std::cell::Cell::new(0);
         assert_eq!(
-            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
-                calls.set(calls.get() + 1);
-                Ok(())
-            }),
-            Ok(false)
+            plan_rename_submission_once(&mut editor, &mut pending, None, 1),
+            RenameSubmission::Settled
         );
-        assert_eq!(calls.get(), 0);
         assert!(editor.is_some());
 
         pending = None; // captured release from the palette-confirming Enter
+        assert_eq!(
+            plan_rename_submission_once(&mut editor, &mut pending, None, 2),
+            RenameSubmission::Dispatch {
+                target: RenameTarget::Tab(9),
+                label: "title".into(),
+                op: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rename_submit_trims_dispatches_exact_target_and_closes_on_success() {
+        let mut editor = rename_editor_for(RenameTarget::Tab(42), "  new  title  ");
+        assert_eq!(
+            plan_rename_submission(&mut editor, 1),
+            RenameSubmission::Dispatch {
+                target: RenameTarget::Tab(42),
+                label: "new  title".into(),
+                op: 1,
+            }
+        );
         assert!(
-            submit_rename_editor_once_with(&mut editor, &mut pending, |_, _| {
-                calls.set(calls.get() + 1);
-                Ok(())
-            })
-            .unwrap()
+            editor.is_some(),
+            "the editor stays up until the engine confirms"
         );
-        assert_eq!(calls.get(), 1);
+
+        let mut in_flight = Some(1);
+        assert_eq!(
+            resolve_rename_completion(&mut in_flight, &mut editor, 1, &Ok(())),
+            RenameCompletion::Closed
+        );
         assert!(editor.is_none());
+        assert_eq!(in_flight, None);
     }
 
     #[test]
-    fn rename_submit_trims_dispatches_exact_target_and_is_idempotent() {
-        let mut editor = Some(RenameEditor {
-            target: RenameTarget::Tab(42),
-            opened_label: "old".into(),
-            draft: "  new  title  ".into(),
-        });
-        let calls = std::cell::RefCell::new(Vec::new());
+    fn empty_rename_never_dispatches() {
+        let mut empty = rename_editor_for(RenameTarget::Project(7), " \t ");
         assert_eq!(
-            submit_rename_editor_with(&mut editor, |target, label| {
-                calls.borrow_mut().push((target, label.to_string()));
-                Ok(())
-            }),
-            Ok(true)
-        );
-        assert_eq!(
-            submit_rename_editor_with(&mut editor, |target, label| {
-                calls.borrow_mut().push((target, label.to_string()));
-                Ok(())
-            }),
-            Ok(false),
-            "a queued second on_submit must be a no-op"
-        );
-        assert_eq!(
-            calls.into_inner(),
-            [(RenameTarget::Tab(42), "new  title".to_string())]
-        );
-    }
-
-    #[test]
-    fn empty_rename_never_dispatches_and_failure_keeps_the_draft() {
-        let mut empty = Some(RenameEditor {
-            target: RenameTarget::Project(7),
-            opened_label: "old".into(),
-            draft: " \t ".into(),
-        });
-        assert_eq!(
-            submit_rename_editor_with(&mut empty, |_, _| panic!("empty rename dispatched")),
-            Ok(false)
+            plan_rename_submission(&mut empty, 1),
+            RenameSubmission::Settled
         );
         assert!(empty.is_none());
 
-        let expected = RenameEditor {
-            target: RenameTarget::Project(7),
-            opened_label: "old".into(),
-            draft: "recover me".into(),
-        };
-        let mut failed = Some(expected.clone());
+        let mut absent = None;
         assert_eq!(
-            submit_rename_editor_with(&mut failed, |_, _| Err("injected failure".into())),
-            Err("injected failure".into())
+            plan_rename_submission(&mut absent, 1),
+            RenameSubmission::Settled
         );
-        assert_eq!(failed, Some(expected));
+    }
+
+    /// The pinned concurrency case: the user dismisses the editor and
+    /// opens another one over a different target before the first rename
+    /// reports back. The stale completion must neither close the new
+    /// editor nor raise its error over it.
+    #[test]
+    fn a_rename_completion_for_a_dismissed_editor_touches_the_reopened_one() {
+        let mut editor = rename_editor_for(RenameTarget::Project(7), "first");
+        let mut pending = None;
+        let mut in_flight = None;
+        assert!(matches!(
+            plan_rename_submission_once(&mut editor, &mut pending, in_flight, 1),
+            RenameSubmission::Dispatch { op: 1, .. }
+        ));
+        in_flight = Some(1);
+
+        // Dismissal drops both the editor and the id it was waiting on —
+        // `App::cancel_rename_editor` does exactly this pair — so the first
+        // rename is already unowned before it reports back.
+        assert_eq!(
+            plan_rename_submission_once(&mut editor, &mut pending, in_flight, 2),
+            RenameSubmission::InFlight
+        );
+        in_flight = None;
+        editor = rename_editor_for(RenameTarget::Tab(9), "second");
+        pending = None;
+
+        let reopened = editor.clone();
+        assert_eq!(
+            resolve_rename_completion(&mut in_flight, &mut editor, 1, &Ok(())),
+            RenameCompletion::Stale
+        );
+        assert_eq!(editor, reopened, "the stale success closed nothing");
+        assert_eq!(
+            resolve_rename_completion(
+                &mut in_flight,
+                &mut editor,
+                1,
+                &Err("first rename failed".into())
+            ),
+            RenameCompletion::Stale,
+            "and its error belongs to no banner"
+        );
+        assert_eq!(editor, reopened);
+
+        // The reopened editor submits on its own id and is answered by it.
+        assert!(matches!(
+            plan_rename_submission_once(&mut editor, &mut pending, in_flight, 2),
+            RenameSubmission::Dispatch { op: 2, .. }
+        ));
+        in_flight = Some(2);
+        assert_eq!(
+            resolve_rename_completion(&mut in_flight, &mut editor, 2, &Ok(())),
+            RenameCompletion::Closed
+        );
+        assert!(editor.is_none());
     }
 
     #[test]

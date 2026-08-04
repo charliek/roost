@@ -178,6 +178,16 @@ def test_osc11_set_then_query_replies_with_new_bg(roost, project):
     assert b"0000/1111/2222" in reply
 ```
 
+**Seed only after the tab goes quiet.** `tab.feed_pty_bytes` applies its
+bytes as soon as the UI services the op and does *not* serialize with PTY
+output still in flight, so a seed sent at `wait_tab_attached` time can land
+*ahead* of the shell's prompt — which then overwrites (or appends to) the
+seeded row. Any test that seeds viewport content, or state the shell also
+writes (OSC 7 cwd, OSC 0 title), waits on `util.wait_tab_quiet(roost, tab)`
+first: non-empty `tab.dump` text that is byte-identical across consecutive
+polls. Condition wait, never a sleep. Tests that only feed drain-observable
+queries (device-attribute replies, mode enables) don't need it.
+
 For resolver-output asserts (theme bold-color, SGR inverse swap,
 etc.), `roost.tab_dump_resolved(tab)` walks the viewport through the
 production color resolver and returns per-cell `{fg, bg, bold,

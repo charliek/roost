@@ -3,6 +3,8 @@
 //! message-parametrized so a vertical strip can reuse the same gesture
 //! state machine.
 
+use std::time::{Duration, Instant};
+
 use iced::advanced::layout;
 use iced::advanced::overlay;
 use iced::advanced::renderer;
@@ -290,18 +292,66 @@ struct Gesture {
     dragging: bool,
 }
 
+/// Wall-clock reach of a double-click, matching what Iced's own
+/// [`mouse::Click`] allows.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
+/// How many rendered frames may separate the two presses when the wall
+/// clock alone would refuse them. Iced charges its 300 ms from the moment
+/// each press is *processed*, and with the 16 ms tick gone the app is
+/// idle when the first press lands: it is processed at once and the frame
+/// that press schedules — 200 ms and up under software rendering — is
+/// spent inside the budget, so the second press reads as a fresh single
+/// click and the rename never opens. Frames are the honest unit for that
+/// case; a stalled renderer only ever gets a couple of them in edgewise
+/// (the repaint that blew the budget was two of these, and a healthy
+/// wgpu frame pair measures three inside 94 ms — well under the wall
+/// window that already accepts it).
+const DOUBLE_CLICK_FRAME_GRACE: u64 = 4;
+/// The ceiling the frame grace may never exceed. An idle app renders
+/// nothing between presses, so frames alone would call two deliberate
+/// clicks seconds apart one gesture.
+const DOUBLE_CLICK_STALL_CEILING: Duration = Duration::from_millis(1000);
+const DOUBLE_CLICK_DISTANCE: f32 = 6.0;
+
 #[derive(Clone, Copy, Debug)]
-struct ScopedClick {
-    click: mouse::Click,
+struct ScopedPress {
+    position: Point,
+    at: Instant,
+    /// The strip's frame counter when this press was processed — the
+    /// budget the wall clock cannot see.
+    frame: u64,
     scope_id: i64,
     source_id: i64,
     context_generation: u64,
 }
 
+fn press_continues_gesture(
+    previous: &ScopedPress,
+    position: Point,
+    at: Instant,
+    frame: u64,
+) -> bool {
+    if previous.position.distance(position) >= DOUBLE_CLICK_DISTANCE {
+        return false;
+    }
+    let gap = at.saturating_duration_since(previous.at);
+    let frame_gap = frame.saturating_sub(previous.frame);
+    // The grace branch requires at least one rendered frame between the
+    // presses: it exists for a renderer stalled mid-double-click, and a
+    // zero-frame gap means nothing stalled — two slow clicks on an
+    // already-selected row (no redraw between them) must stay two clicks.
+    gap <= DOUBLE_CLICK_WINDOW
+        || (frame_gap > 0
+            && frame_gap <= DOUBLE_CLICK_FRAME_GRACE
+            && gap <= DOUBLE_CLICK_STALL_CEILING)
+}
+
 #[derive(Debug, Default)]
 struct State {
     gesture: Option<Gesture>,
-    previous_click: Option<ScopedClick>,
+    previous_press: Option<ScopedPress>,
+    /// Rendered frames since the strip existed. Only differences matter.
+    frames: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -317,19 +367,17 @@ enum PressSettlement {
 }
 
 impl State {
-    fn previous_click_for(
+    fn previous_press_for(
         &self,
         scope_id: i64,
         source_id: i64,
         context_generation: u64,
-    ) -> Option<mouse::Click> {
-        self.previous_click
-            .filter(|previous| {
-                previous.scope_id == scope_id
-                    && previous.source_id == source_id
-                    && previous.context_generation == context_generation
-            })
-            .map(|previous| previous.click)
+    ) -> Option<ScopedPress> {
+        self.previous_press.filter(|previous| {
+            previous.scope_id == scope_id
+                && previous.source_id == source_id
+                && previous.context_generation == context_generation
+        })
     }
 
     fn settle_release(
@@ -364,23 +412,27 @@ impl State {
     fn arm_press(
         &mut self,
         position: Point,
+        at: Instant,
         scope_id: i64,
         source_id: i64,
         ids: &[i64],
         context_generation: u64,
     ) -> PressSettlement {
-        let click = mouse::Click::new(
+        let press = ScopedPress {
             position,
-            mouse::Button::Left,
-            self.previous_click_for(scope_id, source_id, context_generation),
-        );
-        self.previous_click = Some(ScopedClick {
-            click,
+            at,
+            frame: self.frames,
             scope_id,
             source_id,
             context_generation,
-        });
-        if click.kind() == mouse::click::Kind::Double {
+        };
+        let double = self
+            .previous_press_for(scope_id, source_id, context_generation)
+            .is_some_and(|previous| press_continues_gesture(&previous, position, at, self.frames));
+        // A third press must start over rather than rename again, which is
+        // what Iced's own Double → Triple step bought.
+        self.previous_press = (!double).then_some(press);
+        if double {
             self.gesture = None;
             PressSettlement::DoubleClick
         } else {
@@ -567,14 +619,19 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
         );
 
         let state = tree.state.downcast_mut::<State>();
+        // Counted before every early return: the frame budget only means
+        // anything if a stalled renderer still moves it.
+        if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
+            state.frames = state.frames.wrapping_add(1);
+        }
         if shell.is_event_captured() {
             if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
-                state.previous_click = None;
+                state.previous_press = None;
             }
             return;
         }
         if !self.enabled {
-            state.previous_click = None;
+            state.previous_press = None;
             if let Some(gesture) = state.gesture.take() {
                 shell.publish((self.on_event)(StripEvent::Cancel {
                     context_generation: gesture.context_generation,
@@ -583,18 +640,18 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
             return;
         }
 
-        if state.previous_click.is_some_and(|previous| {
+        if state.previous_press.is_some_and(|previous| {
             previous.scope_id != self.scope_id
                 || previous.context_generation != self.context_generation
                 || !self.ids.contains(&previous.source_id)
         }) {
-            state.previous_click = None;
+            state.previous_press = None;
         }
 
         if let Some(gesture) = state.gesture.take_if(|gesture| {
             !context_valid(gesture, self.scope_id, &self.ids, self.context_generation)
         }) {
-            state.previous_click = None;
+            state.previous_press = None;
             shell.publish((self.on_event)(StripEvent::Cancel {
                 context_generation: gesture.context_generation,
             }));
@@ -611,6 +668,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                 tracing::debug!(
                     ?position,
                     source_id,
+                    frames = state.frames,
                     ids = ?self.ids,
                     child_bounds = ?layout.children().map(|child| child.bounds()).collect::<Vec<_>>(),
                     "Iced reorder strip armed pointer press"
@@ -618,6 +676,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                 shell.publish((self.on_select)(source_id));
                 match state.arm_press(
                     position,
+                    Instant::now(),
                     self.scope_id,
                     source_id,
                     &self.ids,
@@ -675,7 +734,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ReorderStrip<'_> {
                 shell.capture_event();
             }
             Event::Window(window::Event::Unfocused) => {
-                state.previous_click = None;
+                state.previous_press = None;
                 if let Some(gesture) = state.gesture.take() {
                     shell.publish((self.on_event)(StripEvent::Cancel {
                         context_generation: gesture.context_generation,
@@ -960,9 +1019,10 @@ mod tests {
     fn ended_inactive_press_preserves_the_second_press_as_a_double_click() {
         let position = Point::new(250.0, 17.0);
         let ids = [10, 20, 30];
+        let now = Instant::now();
         let mut state = State::default();
         assert!(matches!(
-            state.arm_press(position, 7, 10, &ids, 4),
+            state.arm_press(position, now, 7, 10, &ids, 4),
             PressSettlement::Started(StripEvent::Started { source_id: 10, .. })
         ));
         assert!(matches!(
@@ -970,28 +1030,82 @@ mod tests {
             Some(StripEvent::Ended { source_id: 10, .. })
         ));
         assert_eq!(
-            state.arm_press(position, 7, 10, &ids, 4),
+            state.arm_press(position, now + Duration::from_millis(100), 7, 10, &ids, 4),
             PressSettlement::DoubleClick
         );
         assert!(state.gesture.is_none());
+        // The third press starts over: a double-click must not rename on
+        // every further press of the same sequence.
+        assert!(matches!(
+            state.arm_press(position, now + Duration::from_millis(200), 7, 10, &ids, 4),
+            PressSettlement::Started(StripEvent::Started { source_id: 10, .. })
+        ));
+    }
+
+    /// The regression the frame grace exists for: a software-rendered
+    /// frame between the presses spends the whole 300 ms wall budget, and
+    /// the gesture must survive it — but only while the renderer is what
+    /// ate the time.
+    #[test]
+    fn a_stalled_frame_between_presses_still_reads_as_one_double_click() {
+        let position = Point::new(100.0, 52.0);
+        let now = Instant::now();
+        let previous = ScopedPress {
+            position,
+            at: now,
+            frame: 4,
+            scope_id: 7,
+            source_id: 10,
+            context_generation: 4,
+        };
+
+        assert!(press_continues_gesture(
+            &previous,
+            position,
+            now + Duration::from_millis(511),
+            6,
+        ));
+        assert!(
+            !press_continues_gesture(&previous, position, now + Duration::from_millis(511), 40),
+            "a busy renderer that kept up is a fresh click, not a stalled gesture"
+        );
+        assert!(
+            !press_continues_gesture(&previous, position, now + Duration::from_millis(4_000), 6,),
+            "an idle app renders nothing, so frames alone must not fuse deliberate clicks"
+        );
+        assert!(
+            !press_continues_gesture(
+                &previous,
+                Point::new(140.0, 52.0),
+                now + Duration::from_millis(100),
+                4,
+            ),
+            "a press on another spot is another gesture"
+        );
+        assert!(
+            !press_continues_gesture(&previous, position, now + Duration::from_millis(511), 4),
+            "no rendered frame between the presses means nothing stalled — \
+             two slow clicks on an already-selected row stay two clicks"
+        );
     }
 
     #[test]
     fn double_click_history_is_scoped_to_stable_id_project_and_generation() {
-        let click = mouse::Click::new(Point::new(10.0, 10.0), mouse::Button::Left, None);
         let state = State {
-            previous_click: Some(ScopedClick {
-                click,
+            previous_press: Some(ScopedPress {
+                position: Point::new(10.0, 10.0),
+                at: Instant::now(),
+                frame: 0,
                 scope_id: 7,
                 source_id: 10,
                 context_generation: 4,
             }),
             ..State::default()
         };
-        assert!(state.previous_click_for(7, 10, 4).is_some());
-        assert!(state.previous_click_for(7, 20, 4).is_none());
-        assert!(state.previous_click_for(8, 10, 4).is_none());
-        assert!(state.previous_click_for(7, 10, 5).is_none());
+        assert!(state.previous_press_for(7, 10, 4).is_some());
+        assert!(state.previous_press_for(7, 20, 4).is_none());
+        assert!(state.previous_press_for(8, 10, 4).is_none());
+        assert!(state.previous_press_for(7, 10, 5).is_none());
     }
 
     #[test]
@@ -1000,7 +1114,7 @@ mod tests {
         let origin = Point::new(100.0, 20.0);
         let mut state = State::default();
         assert!(matches!(
-            state.arm_press(origin, 7, 10, &ids, 4),
+            state.arm_press(origin, Instant::now(), 7, 10, &ids, 4),
             PressSettlement::Started(StripEvent::Started { .. })
         ));
         assert_eq!(state.begin_drag(Point::new(104.0, 20.0)), None);
@@ -1022,7 +1136,7 @@ mod tests {
         assert_eq!(state.begin_drag(Point::new(180.0, 60.0)), None);
         let elsewhere = Point::new(400.0, 20.0);
         assert!(matches!(
-            state.arm_press(elsewhere, 7, 30, &ids, 4),
+            state.arm_press(elsewhere, Instant::now(), 7, 30, &ids, 4),
             PressSettlement::Started(StripEvent::Started { .. })
         ));
         assert_eq!(

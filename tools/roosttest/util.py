@@ -149,6 +149,60 @@ def wait_tab_attached(roost, tab_id: int, timeout: float = 5.0) -> None:
         time.sleep(0.05)
 
 
+def wait_tab_quiet(
+    roost,
+    tab_id: int,
+    *,
+    stable_polls: int = 3,
+    interval: float = 0.1,
+    timeout: float = 10.0,
+) -> None:
+    """Wait until a freshly opened tab's shell has painted AND gone quiet.
+
+    The rung above `wait_tab_attached` that any test seeding viewport
+    content with `tab.feed_pty_bytes` needs. Attach only means the
+    TerminalView is live; the shell's own startup bytes (prompt, OSC 7 /
+    OSC 0 / OSC 133 marks) are still in flight behind it. `feed_pty_bytes`
+    applies its bytes the moment the UI services the op and does NOT
+    serialize with PTY output already queued, so a seed sent at attach can
+    land BEFORE the prompt — the prompt then appends to the row we just
+    seeded (observed: triple-click on a seeded `hello world` selecting
+    through col 33 because the prompt trailed it).
+
+    Quiet is defined as: the viewport is non-empty (something painted) and
+    `tab.dump`'s text is byte-identical across `stable_polls` consecutive
+    polls. That is a condition wait, not a sleep — a shell that is still
+    writing resets the counter and we keep polling to the deadline. Both
+    the deadline and the poll interval go through `scaled_timeout`, so the
+    quiet window widens with `ROOST_TEST_TIMEOUT_SCALE` on slow runners.
+
+    Raises `client.Timeout` (with a viewport tail) if the tab never
+    settles — a shell that never stops writing makes any seed racy, so
+    that is a real failure, not something to paper over.
+    """
+    wait_tab_attached(roost, tab_id)
+    eff_interval = scaled_timeout(interval)
+    deadline = time.monotonic() + scaled_timeout(timeout)
+    previous: str | None = None
+    stable = 0
+    while True:
+        text = roost._safe_dump_text(tab_id)
+        if text.strip() and text == previous:
+            stable += 1
+            if stable >= stable_polls:
+                return
+        else:
+            stable = 0
+        previous = text
+        if time.monotonic() >= deadline:
+            raise Timeout(
+                f"tab {tab_id} never went quiet ({stable_polls} identical "
+                f"tab.dump polls) within {timeout}s (scaled). Viewport tail:\n"
+                f"{previous}"
+            )
+        time.sleep(eff_interval)
+
+
 def _tab_list_snapshot(roost, tab_id: int, budget: float = 2.0) -> str:
     """Best-effort `tab.list` summary for timeout diagnostics. Runs the
     IPC call on a daemon thread with a hard join budget: the client's

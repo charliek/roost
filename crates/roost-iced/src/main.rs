@@ -1,5 +1,6 @@
 mod app;
 mod chrome;
+mod engine_feed;
 mod font_registry;
 mod input;
 mod palette_scroll;
@@ -31,7 +32,22 @@ const WINDOW_TITLE: &str = "Roost — Iced POC";
 
 #[derive(Debug, Clone)]
 enum Message {
-    Tick,
+    /// The engine feed has (probably) something to drain — see
+    /// `engine_feed::wake_subscription`. Spurious wakes are expected and
+    /// free.
+    EngineReady,
+    /// A mutation dispatched to the engine runtime finished. Carries only
+    /// `Send + Clone` data — errors arrive already stringified.
+    EngineOp(app::EngineOpResult),
+    /// A banner is up and its expiry is due. Armed only while one is.
+    StatusTick,
+    /// A palette visibility request is outstanding. Armed only while one is.
+    PaletteRetryTick,
+    /// A tab the workspace lists still has no terminal. Armed only while
+    /// the pending-attach set is non-empty.
+    AttachRetryTick,
+    /// A file-drop debounce window elapsed — a one-shot, not a timer.
+    FileDropDeadline,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
     WindowFocus(window::Id, bool),
@@ -128,7 +144,24 @@ fn main() -> anyhow::Result<()> {
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
-        Message::Tick => app.tick().map_task(),
+        Message::EngineReady => app.service_engine_ready().map_task(),
+        Message::EngineOp(result) => {
+            app.engine_op_completed(result);
+            Task::none()
+        }
+        Message::StatusTick => {
+            app.expire_status();
+            Task::none()
+        }
+        Message::PaletteRetryTick => app.take_palette_visibility_task().map_task(),
+        Message::AttachRetryTick => {
+            app.retry_pending_attachments();
+            Task::none()
+        }
+        Message::FileDropDeadline => {
+            app.file_drop_deadline();
+            Task::none()
+        }
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
         Message::WindowFocus(id, focused) => {
@@ -162,25 +195,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         },
         Message::WindowFileDropped { window_id, path } => {
-            app.file_dropped(window_id, path);
-            Task::none()
+            app.file_dropped(window_id, path).map_task()
         }
         Message::RenameDraftChanged(draft) => {
             app.rename_draft_changed(draft);
             Task::none()
         }
-        Message::TabStrip(event) => {
-            app.tab_strip_event(event);
-            Task::none()
-        }
-        Message::ProjectStrip(event) => {
-            app.project_strip_event(event);
-            Task::none()
-        }
-        Message::StripPointerReleased => {
-            app.strip_pointer_released();
-            Task::none()
-        }
+        Message::TabStrip(event) => app.tab_strip_event(event).map_task(),
+        Message::ProjectStrip(event) => app.project_strip_event(event).map_task(),
+        Message::StripPointerReleased => app.strip_pointer_released().map_task(),
         Message::SidebarResizeDragged { width } => {
             app.sidebar_resize_dragged(width);
             Task::none()
@@ -189,10 +212,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.sidebar_resize_ended();
             Task::none()
         }
-        Message::RenameSubmit => {
-            app.submit_rename_editor();
-            Task::none()
-        }
+        Message::RenameSubmit => app.submit_rename_editor().map_task(),
         Message::RenamePointerDismiss => {
             app.rename_pointer_dismiss();
             Task::none()
@@ -201,14 +221,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.palette_query_changed(&query);
             Task::none()
         }
-        Message::PaletteActivate(id) => {
-            app.palette_activate(&id);
-            Task::none()
-        }
-        Message::PaletteConfirm => {
-            app.palette_confirm();
-            Task::none()
-        }
+        Message::PaletteActivate(id) => app.palette_activate(&id).map_task(),
+        Message::PaletteConfirm => app.palette_confirm().map_task(),
         Message::PaletteDismiss => app.palette_pointer_dismiss().map_task(),
         Message::PaletteCardPressed | Message::ConfirmDeleteCardPressed => Task::none(),
         Message::PaletteScrolled => {
@@ -250,9 +264,43 @@ fn view(app: &App) -> iced::Element<'_, Message> {
     strip_reorder::ReleaseBoundary::new(app.view(), app.has_drag_preview()).into()
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
-    Subscription::batch([
-        time::every(Duration::from_millis(16)).map(|_| Message::Tick),
+/// Which state-conditional timers the subscription set carries. Kept as a
+/// plain value so the state → armed-members mapping is testable without a
+/// window, a renderer, or a bootstrapped `App`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ArmedTimers {
+    status: bool,
+    palette_retry: bool,
+    attach_retry: bool,
+}
+
+impl ArmedTimers {
+    fn of(app: &App) -> Self {
+        Self {
+            status: app.status_active(),
+            palette_retry: app.palette_retry_pending(),
+            attach_retry: app.attach_retry_pending(),
+        }
+    }
+
+    /// How many conditional members this state should contribute — the
+    /// expected-length term the subscription test asserts against.
+    #[cfg(test)]
+    fn count(self) -> usize {
+        usize::from(self.status) + usize::from(self.palette_retry) + usize::from(self.attach_retry)
+    }
+}
+
+fn subscription(app: &App) -> Subscription<Message> {
+    subscription_with(app.wake_handle(), ArmedTimers::of(app))
+}
+
+fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subscription<Message> {
+    let mut members = vec![
+        // Unconditional, and identified by a constant hash: the wake
+        // stream must survive every conditional member joining or leaving
+        // this batch, because a restarted stream can drop a permit.
+        engine_feed::wake_subscription(wake),
         window::open_events().map(Message::WindowOpened),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         window::events().filter_map(|(id, event)| window_event_message(id, event)),
@@ -269,7 +317,23 @@ fn subscription(_app: &App) -> Subscription<Message> {
                 event::Status::Captured => None,
             }
         }),
-    ])
+    ];
+    // Every remaining unconditional member above is event-driven: with
+    // the 16 ms tick gone, an idle app schedules no timer at all. Each
+    // conditional member's recipe is its interval plus the TypeId of its
+    // mapping closure, so two of them sharing an interval is not a
+    // collision — `conditional_timers_join_the_subscription_set_only_with_the_state_that_needs_them`
+    // holds that.
+    if armed.status {
+        members.push(time::every(app::STATUS_TICK_INTERVAL).map(|_| Message::StatusTick));
+    }
+    if armed.palette_retry {
+        members.push(time::every(app::PALETTE_RETRY_INTERVAL).map(|_| Message::PaletteRetryTick));
+    }
+    if armed.attach_retry {
+        members.push(time::every(app::ATTACH_RETRY_INTERVAL).map(|_| Message::AttachRetryTick));
+    }
+    Subscription::batch(members)
 }
 
 fn window_event_message(id: window::Id, event: window::Event) -> Option<Message> {
@@ -368,6 +432,7 @@ impl UiTask for app::UiTask {
         match self {
             app::UiTask::None => Task::none(),
             app::UiTask::Then(first, second) => first.map_task().chain(second.map_task()),
+            app::UiTask::EngineOp(future) => Task::future(future).map(Message::EngineOp),
             app::UiTask::Focus(id) => window::gain_focus(id),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::SelectAllWidget(id) => iced::widget::operation::select_all(id),
@@ -397,6 +462,9 @@ impl UiTask for app::UiTask {
             }
             app::UiTask::OpenUrl { url } => {
                 Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
+            }
+            app::UiTask::FileDropDeadline(delay) => {
+                Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }
             app::UiTask::PaletteVisibility {
                 scroll_id,
@@ -431,7 +499,11 @@ impl UiTask for app::UiTask {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::hash::Hasher as _;
+
     use super::*;
+    use iced::advanced::subscription;
     use iced::keyboard::key::{Code, Physical};
     use iced::keyboard::Location;
 
@@ -444,6 +516,78 @@ mod tests {
             modifiers: keyboard::Modifiers::empty(),
             text: None,
             repeat: false,
+        }
+    }
+
+    /// The ids Iced's tracker keys this subscription set on.
+    fn recipe_ids(subscription: Subscription<Message>) -> Vec<u64> {
+        subscription::into_recipes(subscription)
+            .iter()
+            .map(|recipe| {
+                let mut hasher = subscription::Hasher::default();
+                recipe.hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect()
+    }
+
+    fn armed(status: bool, palette_retry: bool, attach_retry: bool) -> ArmedTimers {
+        ArmedTimers {
+            status,
+            palette_retry,
+            attach_retry,
+        }
+    }
+
+    /// The five members an idle app always carries: the engine wake plus
+    /// the window-open, window-resize, window-event and keyboard
+    /// listeners. All four listeners are event-driven and the wake only
+    /// fires when the feed is fed, so this count is also the "no periodic
+    /// wakeups when idle" guard — a timer that crept back into the
+    /// unconditional set would move it.
+    const UNCONDITIONAL_MEMBERS: usize = 5;
+
+    /// The whole point of the conditional members: an idle app carries
+    /// none of them, each piece of live state adds exactly its own, and
+    /// none of them displaces an unconditional member — the wake stream
+    /// least of all, whose identity must survive this churn.
+    #[test]
+    fn conditional_timers_join_the_subscription_set_only_with_the_state_that_needs_them() {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let idle = recipe_ids(subscription_with(Arc::clone(&wake), ArmedTimers::default()));
+        assert_eq!(ArmedTimers::default().count(), 0, "idle arms no timer");
+        assert_eq!(
+            idle.len(),
+            UNCONDITIONAL_MEMBERS,
+            "an idle app subscribes to the wake and the window/keyboard events, nothing periodic"
+        );
+
+        for timers in [
+            armed(false, false, false),
+            armed(true, false, false),
+            armed(false, true, false),
+            armed(false, false, true),
+            armed(true, true, false),
+            armed(true, false, true),
+            armed(false, true, true),
+            armed(true, true, true),
+        ] {
+            let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
+            let unique: HashSet<u64> = ids.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                ids.len(),
+                "{timers:?}: two members sharing a recipe id would silently drop one"
+            );
+            assert_eq!(
+                ids.len(),
+                idle.len() + timers.count(),
+                "{timers:?}: armed member count"
+            );
+            assert!(
+                idle.iter().all(|id| unique.contains(id)),
+                "{timers:?}: the unconditional members keep their identity"
+            );
         }
     }
 

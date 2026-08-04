@@ -1,9 +1,11 @@
 use super::*;
 
 // Widget operations can observe an incomplete tree while a slower renderer or
-// compositor is still materializing a newly-pushed palette frame. Retry on
-// later application ticks for roughly two seconds at the 60 Hz subscription,
-// while keeping the work bounded and revision-scoped.
+// compositor is still materializing a newly-pushed palette frame. Retry while
+// a request is pending, bounded and revision-scoped. The cadence is what makes
+// the limit worth the roughly two seconds it was written for, so the two
+// constants only mean anything together.
+pub(crate) const PALETTE_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const PALETTE_GEOMETRY_RETRY_LIMIT: u8 = 120;
 
 pub(super) const PALETTE_AGENT_PROJECT_MAX_COLUMNS: usize = 24;
@@ -15,6 +17,54 @@ pub(super) const PALETTE_AGENT_PROJECT_MAX_COLUMNS: usize = 24;
 const PALETTE_AGENT_LEFT_MAX_COLUMNS: usize = 58;
 
 const PALETTE_AGENT_STATUS_FLOOR_COLUMNS: usize = 18;
+
+/// The `palette.activate` reply for a palette that is closed — what
+/// `palette_state_result` answers whenever no palette is open, and what an
+/// activation whose row dispatched an engine op answers with when that op
+/// succeeds. Every such row dismisses the palette at dispatch, so this is
+/// the state the invocation produced; re-reading the live palette at
+/// completion time would answer with whatever someone else has opened
+/// since.
+pub(super) fn closed_palette_state_result() -> PaletteStateResult {
+    PaletteStateResult::default()
+}
+
+/// What one [`App::activate_palette`] owes the `palette.activate` reply.
+pub(super) enum PaletteReplyRoute {
+    /// The row finished on the UI thread; this is its reply, error
+    /// included — `palette.activate` is the one palette request allowed
+    /// to return an operation error.
+    Ready(Result<PaletteStateResult, String>),
+    /// The row dispatched an engine op. The reply is this op's to send,
+    /// and until then it is parked under this id.
+    Deferred(u64),
+}
+
+/// One activation's two products: the reply it owes and the Iced task
+/// carrying whatever it dispatched.
+pub(super) struct PaletteActivation {
+    pub(super) reply: PaletteReplyRoute,
+    pub(super) task: UiTask,
+}
+
+impl PaletteActivation {
+    fn ready(result: Result<PaletteStateResult, String>) -> Self {
+        Self {
+            reply: PaletteReplyRoute::Ready(result),
+            task: UiTask::None,
+        }
+    }
+
+    /// The banner half of a non-IPC activation: keybind and pointer
+    /// routes have no reply to send, so an operation error reaches the
+    /// user as the status banner instead.
+    fn error(self) -> (Option<String>, UiTask) {
+        match self.reply {
+            PaletteReplyRoute::Ready(Err(error)) => (Some(error), self.task),
+            PaletteReplyRoute::Ready(Ok(_)) | PaletteReplyRoute::Deferred(_) => (None, self.task),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PaletteTextRun {
@@ -314,6 +364,15 @@ impl PaletteVisibilityRequest {
             _ => Self::None,
         }
     }
+
+    /// An outstanding request is the whole pending condition: every retry
+    /// path — first request, scroll re-measure, missing-row and clipped-row
+    /// retries — ends by setting one, and `take_palette_visibility_task`
+    /// acts on nothing else. Arming the retry timer reads the same
+    /// predicate the guard does, so the two cannot drift.
+    pub(super) fn is_pending(self) -> bool {
+        self != Self::None
+    }
 }
 
 fn queue_visibility_request(
@@ -457,7 +516,7 @@ fn dynamic_refresh_request(
     }
 }
 
-pub(super) struct ProviderRunResult {
+pub(crate) struct ProviderRunResult {
     palette_session: u64,
     request: u64,
     origin_frame: String,
@@ -545,7 +604,7 @@ impl App {
         let (cols, rows) = terminal_grid(self.window_size, self.effective_sidebar_width(), metrics);
         let mut tab_ids = self.tabs.keys().copied().collect::<Vec<_>>();
         tab_ids.sort_unstable();
-        let applied = apply_geometry_batch(
+        let batched = apply_geometry_batch(
             &tab_ids,
             cols,
             rows,
@@ -574,17 +633,23 @@ impl App {
                     .map(|()| None)
                     .map_err(|error| error.to_string()),
             },
-        )
-        .map_err(|failure| {
-            let mut message = format!(
-                "apply {operation} to tab {}: {}",
-                failure.tab_id, failure.apply
-            );
-            for (tab_id, error) in failure.rollback {
-                message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+        );
+        let applied = match batched {
+            Ok(applied) => applied,
+            Err(failure) => {
+                let mut message = format!(
+                    "apply {operation} to tab {}: {}",
+                    failure.tab_id, failure.apply
+                );
+                for (tab_id, error) in failure.rollback {
+                    message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+                }
+                // A rolled-back tab was resized twice and reflow is lossy,
+                // so its snapshot describes neither geometry.
+                self.refresh_regridded(&tab_ids, operation);
+                return Err(message);
             }
-            message
-        })?;
+        };
 
         let mut pointer_releases = Vec::new();
         for (tab_id, change) in &applied {
@@ -622,6 +687,7 @@ impl App {
                             ));
                         }
                     }
+                    self.refresh_regridded(&tab_ids, operation);
                     return Err(message);
                 }
             }
@@ -636,11 +702,25 @@ impl App {
             }
         }
         for (tab_id, change) in applied {
-            if let Some(tab) = self.tabs.get(&tab_id) {
+            if let Some(tab) = self.tabs.get_mut(&tab_id) {
                 tab.commit_geometry(change);
+                refresh_or_warn(tab_id, tab, operation);
             }
         }
         Ok(())
+    }
+
+    /// New metrics mean new cell dimensions and a re-wrapped viewport, and
+    /// the pointer cancel that accompanies them drops hover. A tab whose
+    /// geometry moved is not drawable until its snapshot is rebuilt. The
+    /// failure paths cannot say which tabs moved — a rollback is itself a
+    /// re-grid — so they refresh every tab they touched.
+    fn refresh_regridded(&mut self, tab_ids: &[i64], operation: &str) {
+        for tab_id in tab_ids {
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                refresh_or_warn(*tab_id, tab, operation);
+            }
+        }
     }
 
     fn apply_font_family(&mut self, family: Option<String>) -> Result<(), String> {
@@ -691,20 +771,27 @@ impl App {
         report_palette_query_result(&mut self.status, result.map(drop), Instant::now());
     }
 
-    pub fn palette_activate(&mut self, id: &str) {
-        if let Err(error) = self.activate_palette(id) {
+    /// The palette's rename rows open the inline editor, so every
+    /// activation route ends with the rename-focus tail rather than
+    /// waiting for a timer to notice the request.
+    pub fn palette_activate(&mut self, id: &str) -> UiTask {
+        let (error, task) = self.activate_palette(id).error();
+        if let Some(error) = error {
             self.set_status(error);
         }
+        task.then(self.take_rename_focus_task())
     }
 
-    pub fn palette_confirm(&mut self) {
-        if let Err(error) = self.confirm_palette_selection() {
+    pub fn palette_confirm(&mut self) -> UiTask {
+        let (error, task) = self.confirm_palette_selection().error();
+        if let Some(error) = error {
             self.set_status(error);
         }
         arm_rename_completion_for_open_editor(
             &mut self.rename_completion_key,
             self.rename_editor.is_some(),
         );
+        task.then(self.take_rename_focus_task())
     }
 
     pub fn palette_pointer_dismiss(&mut self) -> UiTask {
@@ -829,12 +916,14 @@ impl App {
         self.palette_reveal_attempts = 0;
     }
 
-    pub(super) fn take_palette_visibility_task(&mut self) -> UiTask {
+    /// Also the `Message::PaletteRetryTick` handler: a pending request is
+    /// exactly what arms that timer.
+    pub fn take_palette_visibility_task(&mut self) -> UiTask {
         if self.window_id.is_none() {
             return UiTask::None;
         }
         let request = self.palette_visibility_request;
-        if request == PaletteVisibilityRequest::None {
+        if !request.is_pending() {
             return UiTask::None;
         }
         let Some(state) = &self.palette else {
@@ -997,7 +1086,7 @@ impl App {
 
     pub(super) fn palette_state_result(&self) -> PaletteStateResult {
         let Some(state) = &self.palette else {
-            return PaletteStateResult::default();
+            return closed_palette_state_result();
         };
         let frame = state.current();
         PaletteStateResult {
@@ -1042,38 +1131,87 @@ impl App {
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
-    fn confirm_palette_selection(&mut self) -> Result<PaletteStateResult, String> {
+    fn confirm_palette_selection(&mut self) -> PaletteActivation {
         let id = self
             .palette
             .as_ref()
             .and_then(palette::PaletteState::selected_item)
-            .ok_or_else(|| "no actionable palette row selected".to_string())?
-            .id;
-        self.activate_palette(&id)
+            .map(|item| item.id);
+        match id {
+            Some(id) => self.activate_palette(&id),
+            None => PaletteActivation::ready(Err("no actionable palette row selected".into())),
+        }
     }
 
-    pub(super) fn activate_palette(&mut self, id: &str) -> Result<PaletteStateResult, String> {
-        let (frame_id, item) = {
-            let state = self
-                .palette
-                .as_mut()
-                .ok_or_else(|| "no palette open".to_string())?;
-            let matches = state.matches();
-            let index = matches
-                .iter()
-                .position(|matched| matched.item.id == id)
-                .ok_or_else(|| format!("no palette row with id {id:?}"))?;
-            state.set_selection(index);
-            let item = matches[index].item.clone();
-            (state.current().id.clone(), item)
+    /// Run the row `id` and say what its `palette.activate` reply is: the
+    /// state the action produced, the operation error it failed with, or
+    /// — for the four rows that now mutate the engine off the UI thread —
+    /// the op id whose completion owes that answer.
+    pub(super) fn activate_palette(&mut self, id: &str) -> PaletteActivation {
+        let resolved = self
+            .palette
+            .as_mut()
+            .ok_or_else(|| "no palette open".to_string())
+            .and_then(|state| {
+                let matches = state.matches();
+                let index = matches
+                    .iter()
+                    .position(|matched| matched.item.id == id)
+                    .ok_or_else(|| format!("no palette row with id {id:?}"))?;
+                state.set_selection(index);
+                let item = matches[index].item.clone();
+                Ok((state.current().id.clone(), item))
+            });
+        let (frame_id, item) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => return PaletteActivation::ready(Err(error)),
         };
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
 
         if !item.actionable {
-            return Ok(self.palette_state_result());
+            return PaletteActivation::ready(Ok(self.palette_state_result()));
         }
 
-        match frame_id.as_str() {
+        let dispatch = match self.run_palette_row(&frame_id, item) {
+            Ok(dispatch) => dispatch,
+            Err(error) => return PaletteActivation::ready(Err(error)),
+        };
+        if self.palette.is_some() {
+            self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
+        } else {
+            self.clear_palette_geometry();
+        }
+        PaletteActivation {
+            reply: match dispatch.op {
+                Some(op) => {
+                    // The deferred reply answers with the closed state,
+                    // which is only the truth because every dispatching
+                    // row dismisses the palette first. A row that
+                    // dispatched while leaving the palette open would
+                    // need its own answer, not this one.
+                    debug_assert!(
+                        self.palette.is_none(),
+                        "a palette row that dispatches an engine op must dismiss the palette"
+                    );
+                    PaletteReplyRoute::Deferred(op)
+                }
+                None => PaletteReplyRoute::Ready(Ok(self.palette_state_result())),
+            },
+            task: dispatch.task,
+        }
+    }
+
+    /// The row bodies themselves. Returns what the row dispatched, so
+    /// [`Self::activate_palette`] can decide whether the reply is ready
+    /// now or owed by a completion; `Err` is the operation error
+    /// `palette.activate` is uniquely allowed to return.
+    fn run_palette_row(
+        &mut self,
+        frame_id: &str,
+        item: palette::PaletteItem,
+    ) -> Result<EngineDispatch, String> {
+        let mut dispatch = EngineDispatch::default();
+        match frame_id {
             "commands" => match item.id.as_str() {
                 palette::PaletteCommands::SELECT_THEME_ID => {
                     if let Some(state) = &mut self.palette {
@@ -1112,17 +1250,22 @@ impl App {
                         }
                     }
                     self.clear_palette_state();
+                    // The cleared flags broadcast, but the inbox rows this
+                    // command exists to drop are rebuilt by reconcile —
+                    // waiting for the round trip would let the next IPC
+                    // request observe them.
+                    self.reconcile();
                     if let Some(error) = first_error {
                         return Err(error);
                     }
                 }
                 "new_tab" => {
                     self.clear_palette_state();
-                    self.new_tab();
+                    dispatch = self.new_tab_dispatch();
                 }
                 "new_project" => {
                     self.clear_palette_state();
-                    self.new_project_result()?;
+                    dispatch = self.new_project_dispatch();
                 }
                 "close_project" => {
                     let project_id = self.workspace.active().0;
@@ -1132,10 +1275,7 @@ impl App {
                 "close_tab" => {
                     let tab_id = self.workspace.active().1;
                     self.clear_palette_state();
-                    self.runtime
-                        .block_on(self.client.close_tab(tab_id))
-                        .map_err(|error| error.to_string())?;
-                    self.reconcile();
+                    dispatch = self.close_tab_dispatch(tab_id);
                 }
                 "cycle_tab_next" => {
                     self.cycle_tab(1)?;
@@ -1207,17 +1347,7 @@ impl App {
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
                 let argv = custom_command::launch_argv(&shell, &command);
                 self.clear_palette_state();
-                self.runtime
-                    .block_on(self.client.open_tab(
-                        project_id,
-                        &cwd,
-                        &command.title,
-                        &argv,
-                        u32::from(DEFAULT_COLS),
-                        u32::from(DEFAULT_ROWS),
-                    ))
-                    .map_err(|error| error.to_string())?;
-                self.reconcile();
+                dispatch = self.open_tab_dispatch(project_id, cwd, command.title, argv);
             }
             "themes" => {
                 let persistence_error = self.commit_theme_name(&item.id)?;
@@ -1283,12 +1413,7 @@ impl App {
                 ))
             }
         }
-        if self.palette.is_some() {
-            self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
-        } else {
-            self.clear_palette_geometry();
-        }
-        Ok(self.palette_state_result())
+        Ok(dispatch)
     }
 
     fn preview_selected_palette_item(&mut self) -> Result<(), String> {
@@ -1447,7 +1572,7 @@ impl App {
             before_layout != self.palette_layout_signature(),
             before_render != self.palette_render_signature(),
         );
-        if request != PaletteVisibilityRequest::None {
+        if request.is_pending() {
             self.invalidate_palette_geometry(request);
         }
     }
@@ -1479,7 +1604,7 @@ impl App {
             before_layout != self.palette_layout_signature(),
             before_render != self.palette_render_signature(),
         );
-        if request != PaletteVisibilityRequest::None {
+        if request.is_pending() {
             self.invalidate_palette_geometry(request);
         }
         self.spawn_agent_metrics(&cwds);
@@ -1516,7 +1641,7 @@ impl App {
             cwd: (!context.active_cwd.is_empty()).then(|| context.active_cwd.into()),
             timeout: Duration::from_secs(provider.timeout_secs),
         };
-        let tx = self.provider_tx.clone();
+        let feed = self.feed_tx.clone();
         let result_provider = provider;
         let task = self.runtime.spawn(async move {
             let stdout = process::run(process_request)
@@ -1533,14 +1658,14 @@ impl App {
                 .await
                 .map_err(|error| format!("provider task failed: {error}"))
                 .and_then(|outcome| outcome);
-            let _ = tx.send(ProviderRunResult {
+            feed.send(EngineFeed::Provider(Box::new(ProviderRunResult {
                 palette_session,
                 request,
                 origin_frame,
                 provider: result_provider,
                 phase,
                 outcome,
-            });
+            })));
         });
     }
 
@@ -1574,70 +1699,65 @@ impl App {
         }
     }
 
-    pub(super) fn service_provider_results(&mut self) {
-        while let Ok(result) = self.provider_rx.try_recv() {
-            let current_frame = self
-                .palette
-                .as_ref()
-                .map(|state| state.current().id.as_str());
-            if !provider_result_is_current(
-                self.palette.is_some(),
-                self.palette_session,
-                self.provider_request,
-                current_frame,
-                &result,
-            ) {
-                continue;
-            }
-            let before_layout = self.palette_layout_signature();
-            let before_render = self.palette_render_signature();
-            match result.outcome {
-                Ok(output)
-                    if result.phase == provider::Phase::Activate && output.items.is_empty() =>
-                {
-                    if let Err(error) = self.try_dismiss_palette() {
-                        self.set_status(error);
-                    }
-                }
-                Ok(output) => {
-                    let placeholder = if output.placeholder.is_empty() {
-                        format!("{}…", result.provider.title)
-                    } else {
-                        output.placeholder.clone()
-                    };
-                    let items = provider::output_palette_items(&output, result.provider.limit);
-                    let frame_id = format!("provider:items:{}", result.request);
-                    self.provider_frames
-                        .insert(frame_id.clone(), result.provider);
-                    if let Some(state) = &mut self.palette {
-                        state.push(palette::PaletteFrame::new(frame_id, placeholder, items));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "provider run failed");
-                    let frame_id = format!("provider:items:{}", result.request);
-                    let items =
-                        vec![
-                            palette::PaletteItem::new("provider:_error", "Provider failed")
-                                .with_subtitle(Some(error))
-                                .with_actionable(false),
-                        ];
-                    if let Some(state) = &mut self.palette {
-                        state.push(palette::PaletteFrame::new(
-                            frame_id,
-                            "Provider error",
-                            items,
-                        ));
-                    }
+    pub(super) fn apply_provider_result(&mut self, result: ProviderRunResult) {
+        let current_frame = self
+            .palette
+            .as_ref()
+            .map(|state| state.current().id.as_str());
+        if !provider_result_is_current(
+            self.palette.is_some(),
+            self.palette_session,
+            self.provider_request,
+            current_frame,
+            &result,
+        ) {
+            return;
+        }
+        let before_layout = self.palette_layout_signature();
+        let before_render = self.palette_render_signature();
+        match result.outcome {
+            Ok(output) if result.phase == provider::Phase::Activate && output.items.is_empty() => {
+                if let Err(error) = self.try_dismiss_palette() {
+                    self.set_status(error);
                 }
             }
-            let request = dynamic_refresh_request(
-                before_layout != self.palette_layout_signature(),
-                before_render != self.palette_render_signature(),
-            );
-            if self.palette.is_some() && request != PaletteVisibilityRequest::None {
-                self.invalidate_palette_geometry(request);
+            Ok(output) => {
+                let placeholder = if output.placeholder.is_empty() {
+                    format!("{}…", result.provider.title)
+                } else {
+                    output.placeholder.clone()
+                };
+                let items = provider::output_palette_items(&output, result.provider.limit);
+                let frame_id = format!("provider:items:{}", result.request);
+                self.provider_frames
+                    .insert(frame_id.clone(), result.provider);
+                if let Some(state) = &mut self.palette {
+                    state.push(palette::PaletteFrame::new(frame_id, placeholder, items));
+                }
             }
+            Err(error) => {
+                tracing::warn!(%error, "provider run failed");
+                let frame_id = format!("provider:items:{}", result.request);
+                let items = vec![
+                    palette::PaletteItem::new("provider:_error", "Provider failed")
+                        .with_subtitle(Some(error))
+                        .with_actionable(false),
+                ];
+                if let Some(state) = &mut self.palette {
+                    state.push(palette::PaletteFrame::new(
+                        frame_id,
+                        "Provider error",
+                        items,
+                    ));
+                }
+            }
+        }
+        let request = dynamic_refresh_request(
+            before_layout != self.palette_layout_signature(),
+            before_render != self.palette_render_signature(),
+        );
+        if self.palette.is_some() && request.is_pending() {
+            self.invalidate_palette_geometry(request);
         }
     }
 }
@@ -1645,6 +1765,26 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every row that dispatches an engine op dismisses the palette
+    /// first, so a synchronous version of it would have read this exact
+    /// state back out of `palette_state_result` — which is why the
+    /// deferred reply is allowed to build it at completion time instead
+    /// of re-reading a palette that has moved on.
+    #[test]
+    fn the_closed_state_a_deferred_reply_carries_is_what_a_dismissed_palette_reads() {
+        let closed = closed_palette_state_result();
+        assert_eq!(closed, PaletteStateResult::default());
+        assert!(!closed.open);
+        assert_eq!(closed.frame, None);
+        assert!(closed.query.is_empty());
+        assert_eq!(closed.selection, 0);
+        assert!(closed.items.is_empty());
+        assert_eq!(
+            closed.selected_in_view, None,
+            "a closed palette reports no geometry, however the last open one measured"
+        );
+    }
 
     #[test]
     fn typed_palette_query_errors_are_visible_without_hiding_prior_state() {
@@ -2031,6 +2171,60 @@ mod tests {
             ),
             PaletteVisibilityRequest::Reveal,
             "content refresh cannot downgrade an in-flight structural reveal"
+        );
+    }
+
+    /// The retry subscription is armed off the request field alone, so
+    /// every path that still owes work must leave one set — and the paths
+    /// that are finished must not, or an idle app keeps a 16 ms timer.
+    #[test]
+    fn the_retry_predicate_tracks_every_path_that_still_owes_a_visibility_pass() {
+        assert!(!PaletteVisibilityRequest::None.is_pending());
+        assert!(PaletteVisibilityRequest::Measure.is_pending());
+        assert!(PaletteVisibilityRequest::Reveal.is_pending());
+
+        // A scroll re-measure owes a pass.
+        let mut selected_in_view = Some(true);
+        let mut retries = 0;
+        let mut request = PaletteVisibilityRequest::None;
+        let mut generation = 1;
+        queue_scroll_measurement(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut generation,
+            false,
+        );
+        assert!(request.is_pending());
+
+        // So does a reveal that measured the row clipped, until the
+        // budget runs out — and then nothing is owed.
+        let mut reveal_required = true;
+        request = PaletteVisibilityRequest::None;
+        assert!(!apply_visible_result(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut reveal_required,
+            true,
+            false,
+        ));
+        assert!(request.is_pending());
+
+        request = PaletteVisibilityRequest::None;
+        retries = PALETTE_GEOMETRY_RETRY_LIMIT;
+        reveal_required = true;
+        assert!(apply_visible_result(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut reveal_required,
+            true,
+            false,
+        ));
+        assert!(
+            !request.is_pending(),
+            "an exhausted budget disarms the retry timer"
         );
     }
 

@@ -38,6 +38,12 @@ The crate boundary in production use today is the concrete API: `Workspace`,
 `LocalClient`, `PtySupervisor`, and `roost_engine::ipc`'s exhaustively-matched
 `UiRequest` port, consumed by both the GTK and Iced adapters.
 
+`events::subscribe` bridges `Workspace`'s broadcast channel into an unbounded
+mpsc that both adapters drain on their own main-loop task — GTK via
+`glib::spawn_future_local`, Iced via the `EngineFeed` wake subscription —
+folding lag or the startup gap into a full-state `Resync` either adapter
+reconciles against.
+
 The `facade` module (`Engine`/`EngineCommand`/`EngineSnapshot`/
 `EngineEventStream`) is the **experimental** Swift-facing boundary. It has no
 production consumer yet and is feature-gated (`roost-engine/facade`, tested in
