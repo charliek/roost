@@ -1714,6 +1714,17 @@ impl App {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.dismiss_palette_with_focus_recovery();
+        // The modal drops pointer events, so a held terminal button would
+        // never see its release: settle every tab's pointer state (synthetic
+        // release into tracking PTYs) before the modal owns input.
+        for (tab_id, tab) in &mut self.tabs {
+            match tab.prepare_pointer_cancel() {
+                Ok(release) => tab.commit_pointer_cancel(release),
+                Err(error) => {
+                    tracing::warn!(?error, tab_id, "pointer cancel before delete confirm")
+                }
+            }
+        }
         self.confirm_delete = Some(target);
         Ok(())
     }

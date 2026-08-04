@@ -124,9 +124,13 @@ shed exec roost-dev -- bash -lc '
   cd ~/roost
   ROOST_ICED_BIN=$HOME/rt/debug/roost-iced ROOSTCTL=$HOME/rt/debug/roostctl \
     ROOST_TEST_MODE=1 ROOST_TEST_TIMEOUT_SCALE=3 \
-    python3 -u tools/input/linux/iced_clipboard_check.py > /tmp/iced-ri.log 2>&1;
-  echo EXIT=$?; tail -5 /tmp/iced-ri.log'
+    python3 -u tools/input/linux/iced_clipboard_check.py > /tmp/iced-ri.log 2>&1
+  status=$?
+  echo "EXIT=$status"; tail -5 /tmp/iced-ri.log
+  exit "$status"'
 ```
+(Capture the status before `tail` and re-exit with it — otherwise the log
+print masks a failure and `shed exec` reports success.)
 
 ### visual screenshot on real Linux
 Launch the shed binary directly under Xvfb (skip the harness), seed via

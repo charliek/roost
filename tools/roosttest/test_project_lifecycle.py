@@ -375,3 +375,12 @@ def test_iced_deleting_every_project_lands_in_empty_state_and_ui_survives(roost,
         4.0,
         "project.create works again after emptying the workspace",
     )
+    # A bare project is not the bootstrap baseline: seed and focus one
+    # tab so later test files inherit a live active selection.
+    recovery_tab = roost.open_tab(recovery_pid, cwd="/tmp")
+    roost.focus(recovery_tab)
+    roost._wait(
+        lambda: roost.identify()["active_tab_id"] == recovery_tab,
+        4.0,
+        "the recovery project holds the session's active tab baseline",
+    )
