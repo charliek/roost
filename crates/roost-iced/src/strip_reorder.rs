@@ -335,8 +335,14 @@ fn press_continues_gesture(
         return false;
     }
     let gap = at.saturating_duration_since(previous.at);
+    let frame_gap = frame.saturating_sub(previous.frame);
+    // The grace branch requires at least one rendered frame between the
+    // presses: it exists for a renderer stalled mid-double-click, and a
+    // zero-frame gap means nothing stalled — two slow clicks on an
+    // already-selected row (no redraw between them) must stay two clicks.
     gap <= DOUBLE_CLICK_WINDOW
-        || (frame.saturating_sub(previous.frame) <= DOUBLE_CLICK_FRAME_GRACE
+        || (frame_gap > 0
+            && frame_gap <= DOUBLE_CLICK_FRAME_GRACE
             && gap <= DOUBLE_CLICK_STALL_CEILING)
 }
 
@@ -1075,6 +1081,11 @@ mod tests {
                 4,
             ),
             "a press on another spot is another gesture"
+        );
+        assert!(
+            !press_continues_gesture(&previous, position, now + Duration::from_millis(511), 4),
+            "no rendered frame between the presses means nothing stalled — \
+             two slow clicks on an already-selected row stay two clicks"
         );
     }
 

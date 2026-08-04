@@ -92,6 +92,9 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
     # land ahead of the shell's prompt and be overwritten by it.
     wait_tab_quiet(roost, tab)
     _toggle_to_visible(roost)
+    # The sidebar transition re-grids the PTY, which can repaint the prompt
+    # after the wait above — quiet again so the seed can't be overwritten.
+    wait_tab_quiet(roost, tab)
     # Cell (0,0): distinctive explicit background. Row 2: high-contrast ASCII,
     # wide, combining, and plain clusters for a shape-independent glyph
     # fallback/shaping smoke.
