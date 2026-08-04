@@ -1605,6 +1605,15 @@ def _sidebar_resize_grip(launch: Launch) -> None:
             ["mousemove", "--window", launch.window, str(x0), str(y)]
         )
         launch.terminal_pointer(["mousedown", "1"])
+        # `mouse::Event::ButtonPressed` carries no position, so iced hit-tests
+        # a press against the newest cursor position in the event batch it is
+        # drained with — not the position the button actually went down at.
+        # A UI running a frame behind (routine on a loaded CI box) drains the
+        # press together with the first drag move and evaluates it 8px away,
+        # outside the grip's 6px zone, so no drag ever starts and the wait
+        # below times out with the sidebar untouched. Let the press drain on
+        # its own before the pointer moves again.
+        time.sleep(0.5 * SCALE)
         # Separate XTEST submissions per sample, like the tab/project drags
         # above: a single batched xdotool motion can be coalesced past the
         # grip's move handling.
