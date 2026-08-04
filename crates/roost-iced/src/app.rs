@@ -690,6 +690,28 @@ impl App {
         opened.task
     }
 
+    /// The wake this app's feed notifies on, for the subscription that
+    /// drives [`Self::service_engine_ready`].
+    pub fn wake_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.feed_rx.wake_handle()
+    }
+
+    /// A feed wake: the engine half of [`Self::tick`], and only that half.
+    /// Both drivers run the same [`Self::service_engine`] drain — which
+    /// reconciles, refreshes and closes exited tabs off the batch it
+    /// observed — and both end it by starting a queued screenshot, so an
+    /// IPC screenshot request in this very batch does not wait a frame.
+    ///
+    /// What stays tick-only is what a wake cannot answer for: the
+    /// time-based work (status expiry, the file-drop debounce) and the
+    /// rename/palette tails, which C4 moves onto their own triggers. An
+    /// empty drain reconciles and refreshes nothing, which is what makes
+    /// the spurious wakes the permit model guarantees free.
+    pub fn service_engine_ready(&mut self) -> UiTask {
+        let (task, _batch) = self.service_engine();
+        task.then(self.screenshots.start_next(self.window_id))
+    }
+
     pub fn tick(&mut self) -> UiTask {
         let now = Instant::now();
         self.status.expire_at(now);

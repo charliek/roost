@@ -33,6 +33,10 @@ const WINDOW_TITLE: &str = "Roost — Iced POC";
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
+    /// The engine feed has (probably) something to drain — see
+    /// `engine_feed::wake_subscription`. Spurious wakes are expected and
+    /// free.
+    EngineReady,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
     WindowFocus(window::Id, bool),
@@ -130,6 +134,7 @@ fn main() -> anyhow::Result<()> {
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::Tick => app.tick().map_task(),
+        Message::EngineReady => app.service_engine_ready().map_task(),
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
         Message::WindowFocus(id, focused) => {
@@ -251,8 +256,12 @@ fn view(app: &App) -> iced::Element<'_, Message> {
     strip_reorder::ReleaseBoundary::new(app.view(), app.has_drag_preview()).into()
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
+fn subscription(app: &App) -> Subscription<Message> {
     Subscription::batch([
+        // Unconditional, and identified by a constant hash: the wake
+        // stream must survive every conditional member joining or leaving
+        // this batch, because a restarted stream can drop a permit.
+        engine_feed::wake_subscription(app.wake_handle()),
         time::every(Duration::from_millis(16)).map(|_| Message::Tick),
         window::open_events().map(Message::WindowOpened),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),

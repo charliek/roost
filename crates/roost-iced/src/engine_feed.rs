@@ -7,20 +7,24 @@
 //! the app drains it in FIFO order. One channel means one ordering across
 //! those sources and one place to wake on.
 //!
-//! The [`Notify`] every sender carries is that wake source. Nothing
-//! subscribes to it yet — the 16 ms tick still drives the drain — but it
-//! is load-bearing plumbing: plan 012 C3 turns it into the Iced
-//! subscription that replaces the tick, and the send-then-notify ordering
-//! it enforces here is what makes that subscription lossless.
+//! The [`Notify`] every sender carries is that wake source, and
+//! [`wake_subscription`] is what turns it into `Message::EngineReady`.
+//! The send-then-notify ordering enforced here is what makes that
+//! subscription lossless. The 16 ms tick still runs alongside it as a
+//! fallback drain driver until the trigger relocation lands.
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use iced::futures::stream;
+use iced::Subscription;
 use roost_engine::ipc::UiRequest;
 use roost_engine::session::TabOutput;
 use roost_engine::{Workspace, WorkspaceEvent};
 use tokio::sync::{mpsc, Notify};
 
 use crate::app::{AgentMetricsResult, ProviderRunResult};
+use crate::Message;
 
 /// Items drained in one batch before the drain returns to the event loop.
 /// A PTY or IPC flood must not starve rendering, so a capped drain
@@ -88,11 +92,8 @@ impl EngineFeedReceiver {
         Some(item)
     }
 
-    /// The wake this feed notifies on. C3's subscription stream clones it;
-    /// its identity must stay stable for the lifetime of the app. Only the
-    /// tests read it until then — the 16 ms tick is still the drain driver,
-    /// so the permits it accumulates go unread by design.
-    #[allow(dead_code)]
+    /// The wake this feed notifies on. [`wake_subscription`] clones it
+    /// into the stream that drives the drain.
     pub(crate) fn wake_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.wake)
     }
@@ -135,6 +136,47 @@ pub(crate) fn channel() -> (EngineFeedSender, EngineFeedReceiver) {
         },
         EngineFeedReceiver { rx, wake },
     )
+}
+
+/// The recipe identity of the wake subscription. Iced keys a running
+/// subscription on `TypeId` + the hash of its recipe data
+/// (`iced_futures-0.14.0/src/subscription.rs:486-489`, tracker
+/// `subscription/tracker.rs:74-84`) and drops any stream whose id is
+/// missing from the next set (`tracker.rs:126`) — so an identity that
+/// moved would restart the stream, and a canceled `Notify::notified()`
+/// waiter can lose its permit on the way out. A constant is therefore the
+/// whole hash: `Arc<Notify>` is not `Hash`, and its pointer is neither
+/// stable nor meaningful as an identity.
+const ENGINE_WAKE_ID: &str = "roost-iced::engine_feed::wake";
+
+/// Recipe data for [`wake_subscription`]: the wake to await, plus the
+/// constant that is its entire identity.
+struct EngineWake {
+    wake: Arc<Notify>,
+}
+
+impl Hash for EngineWake {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        ENGINE_WAKE_ID.hash(state);
+    }
+}
+
+/// The subscription that replaces polling: every feed send notifies the
+/// wake, and this stream turns each notification into one
+/// `Message::EngineReady`.
+///
+/// The stream is rebuilt from the `Arc<Notify>` clone alone — no
+/// take-once receiver, no state consumed at construction — so the recipe
+/// stays a pure value that Iced may hash as often as it likes. Wakes
+/// coalesce (a `Notify` holds at most one permit), which is exactly the
+/// batching the drain wants: one wake, one drain of everything queued.
+pub(crate) fn wake_subscription(wake: Arc<Notify>) -> Subscription<Message> {
+    Subscription::run_with(EngineWake { wake }, |data: &EngineWake| {
+        stream::unfold(Arc::clone(&data.wake), |wake| async move {
+            wake.notified().await;
+            Some((Message::EngineReady, wake))
+        })
+    })
 }
 
 /// Adapter task: workspace broadcast → feed, through the same bridge GTK
@@ -183,6 +225,11 @@ pub(crate) async fn pump_ui_requests(
 
 #[cfg(test)]
 mod tests {
+    use std::hash::Hasher as _;
+
+    use iced::advanced::subscription;
+    use iced::futures::{Stream, StreamExt};
+
     use super::*;
 
     fn drain(rx: &mut EngineFeedReceiver) -> (Vec<EngineFeed>, EngineBatch) {
@@ -192,6 +239,35 @@ mod tests {
             items.push(item);
         }
         (items, batch)
+    }
+
+    /// Materialize the subscription's stream the way Iced's runtime does:
+    /// take the recipe apart and run it against the (here empty) shell
+    /// event stream every recipe is handed.
+    fn wake_stream(wake: Arc<Notify>) -> impl Stream<Item = Message> + Unpin {
+        let mut recipes = subscription::into_recipes(wake_subscription(wake));
+        assert_eq!(recipes.len(), 1, "the wake is exactly one recipe");
+        recipes
+            .pop()
+            .expect("one recipe")
+            .stream(stream::empty().boxed())
+    }
+
+    /// The id Iced's tracker would key this subscription on.
+    fn wake_recipe_id(wake: Arc<Notify>) -> u64 {
+        let recipes = subscription::into_recipes(wake_subscription(wake));
+        let mut hasher = subscription::Hasher::default();
+        recipes[0].hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The next message the stream already has, without blocking the test.
+    async fn next_now(stream: &mut (impl Stream<Item = Message> + Unpin)) -> Option<Message> {
+        tokio::select! {
+            biased;
+            item = stream.next() => item,
+            () = std::future::ready(()) => None,
+        }
     }
 
     /// Whether a wake permit is pending, without blocking the test.
@@ -412,5 +488,104 @@ mod tests {
         // overflow is the in-band lag conversion.
         let lag = resyncs.next().expect("the lag resync is delivered in-band");
         assert_eq!(lag.len(), 300, "the lag resync carries the full snapshot");
+    }
+
+    /// A wake is a hint that the feed has work, never a per-item signal:
+    /// `Notify` holds at most one permit, so a burst of sends costs the UI
+    /// one drain — which is the batching the whole design leans on.
+    #[tokio::test]
+    async fn a_burst_of_sends_coalesces_into_one_wake() {
+        let (tx, rx) = channel();
+        let wake = rx.wake_handle();
+        for _ in 0..16 {
+            assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+        }
+        assert!(took_wake(&wake).await, "the burst arms the wake");
+        assert!(
+            !took_wake(&wake).await,
+            "sixteen sends leave one permit, not sixteen"
+        );
+    }
+
+    /// The same property through the subscription: a burst that lands
+    /// before the stream is ever polled yields exactly one `EngineReady`,
+    /// and the drain that follows sees all sixteen items.
+    #[tokio::test]
+    async fn a_burst_yields_one_engine_ready_covering_the_whole_batch() {
+        let (tx, mut rx) = channel();
+        let mut stream = wake_stream(rx.wake_handle());
+        for _ in 0..16 {
+            assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+        }
+
+        assert!(matches!(
+            next_now(&mut stream).await,
+            Some(Message::EngineReady)
+        ));
+        assert!(
+            next_now(&mut stream).await.is_none(),
+            "one wake, one message"
+        );
+        let (items, _) = drain(&mut rx);
+        assert_eq!(items.len(), 16, "the single wake drains everything queued");
+    }
+
+    /// The boot race: an adapter task can send before Iced has built the
+    /// subscription's stream. The permit is stored, so the stream's very
+    /// first wait completes immediately instead of stranding the batch
+    /// until some unrelated later send.
+    #[tokio::test]
+    async fn a_send_before_the_stream_exists_still_wakes_it() {
+        let (tx, rx) = channel();
+        assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+
+        let mut stream = wake_stream(rx.wake_handle());
+        assert!(
+            matches!(next_now(&mut stream).await, Some(Message::EngineReady)),
+            "the stored permit is delivered to the first waiter"
+        );
+    }
+
+    /// The other side of the race: a send that lands after the drain has
+    /// already decided the feed was empty. Send-then-notify means the item
+    /// is queued before the permit exists, so the permit cannot be
+    /// consumed by a drain that ran too early to see it.
+    #[tokio::test]
+    async fn a_send_during_a_drain_rearms_the_wake() {
+        let (tx, mut rx) = channel();
+        let wake = rx.wake_handle();
+        assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+        assert!(took_wake(&wake).await, "the first send armed the wake");
+
+        let (first, _) = drain(&mut rx);
+        assert_eq!(first.len(), 1);
+        // The drain has returned to the event loop; the adapter sends now.
+        assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+
+        assert!(took_wake(&wake).await, "the late send arms the wake again");
+        let (second, _) = drain(&mut rx);
+        assert_eq!(second.len(), 1, "and its item is still there to drain");
+    }
+
+    /// Iced keys a running subscription on the hash of its recipe data and
+    /// drops any stream missing from the next set, so a recipe whose hash
+    /// moved would be restarted — and a canceled `notified()` waiter can
+    /// lose its permit on the way out. The hash must therefore be the
+    /// constant and nothing else: not the `Arc`, not the app instance.
+    #[tokio::test]
+    async fn the_wake_recipe_id_is_constant() {
+        let first = wake_recipe_id(Arc::new(Notify::new()));
+        let second = wake_recipe_id(Arc::new(Notify::new()));
+        assert_eq!(
+            first, second,
+            "the wake keeps one identity across constructions"
+        );
+
+        let shared = Arc::new(Notify::new());
+        assert_eq!(
+            wake_recipe_id(Arc::clone(&shared)),
+            first,
+            "and the Arc it carries is not part of that identity"
+        );
     }
 }
