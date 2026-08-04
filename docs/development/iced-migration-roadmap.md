@@ -139,6 +139,11 @@ Slices, each sized for one gauntlet pass:
 * **3e. Polish parity:** notification bell/badge, hover-close, offscreen-tab
   reveal, empty/loading/error states, cursor/selection/link pixel geometry —
   per the P1 rows in the [parity inventory](iced-parity-inventory.md).
+  Also sidebar/chrome visual polish (subtle color differences, separator
+  lines, the footer chip's exact bezel, and a spike on the Mac app's
+  frosted/translucent look — likely `window-vibrancy` over a transparent
+  iced window on macOS; compositor-dependent on Linux). **Plan this slice
+  with the user in the loop — they want to give detailed direction here.**
   Includes the user-visible tab-strip artifact bug ([#281]) — fold it into
   whichever slice touches the tab strip first rather than waiting for 3e.
   Carried from 3b (plan 010): designing the empty state after the last
