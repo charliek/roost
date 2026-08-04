@@ -77,12 +77,13 @@ use self::interactions::{
     RenameTarget, ScreenshotQueue, TabDragPreview,
 };
 pub(crate) use self::palettes::ProviderRunResult;
+pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
 use self::palettes::{
     apply_with_rollback, ellipsize_palette_text, palette_agent_left_text, palette_row_id,
     palette_title_runs, FontSizeTransition, PaletteVisibilityRequest,
     PALETTE_AGENT_PROJECT_MAX_COLUMNS,
 };
-pub(crate) use self::servicing::AgentMetricsResult;
+pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::terminal_tab::{
     apply_geometry_batch, pointer_origin_tab, refresh_or_warn, terminal_grid,
     GeometryBatchOperation, NativePointerDispatch, TerminalTab,
@@ -96,6 +97,10 @@ use self::terminal_tab::{
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
+/// How often the banner's expiry is checked while one is up. Coarse
+/// against the five-second life it polices — the banner is allowed to
+/// outlive its deadline by up to one of these.
+pub(crate) const STATUS_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const CONFIRM_PANEL_WIDTH: f32 = 420.0;
 
 #[derive(Debug, Default)]
@@ -123,6 +128,10 @@ impl StatusBanner {
 
     fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    fn is_active(&self) -> bool {
+        self.message.is_some()
     }
 }
 
@@ -405,6 +414,9 @@ pub enum UiTask {
     OpenUrl {
         url: String,
     },
+    /// One-shot: wake once the file-drop gesture's debounce window has
+    /// elapsed. Scheduled where the deadline is set, never polled.
+    FileDropDeadline(Duration),
     PaletteVisibility {
         scroll_id: Id,
         row_id: Id,
@@ -478,6 +490,7 @@ pub struct App {
     project_drag_preview: Option<ProjectDragPreview>,
     project_strip_generation: u64,
     confirm_delete: Option<ConfirmDeleteProject>,
+    pending_attachments: servicing::PendingAttachments,
     file_drops: FileDropQueue,
     config: RoostConfig,
     typography: TerminalTypography,
@@ -621,6 +634,7 @@ impl App {
             project_drag_preview: None,
             project_strip_generation: 1,
             confirm_delete: None,
+            pending_attachments: servicing::PendingAttachments::default(),
             file_drops: FileDropQueue::default(),
             config,
             typography,
@@ -702,16 +716,22 @@ impl App {
     /// observed — and both end it by starting a queued screenshot, so an
     /// IPC screenshot request in this very batch does not wait a frame.
     ///
-    /// What stays tick-only is what a wake cannot answer for: the
-    /// time-based work (status expiry, the file-drop debounce) and the
-    /// rename/palette tails, which C4 moves onto their own triggers. An
-    /// empty drain reconciles and refreshes nothing, which is what makes
-    /// the spurious wakes the permit model guarantees free.
+    /// The rest of the tick's work — status expiry, the file-drop
+    /// debounce, the rename and palette tails, the attach retry — now has
+    /// its own trigger (see the conditional subscription members and
+    /// [`Self::file_dropped`]); the tick keeps running them until it is
+    /// deleted. An empty drain reconciles and refreshes nothing, which is
+    /// what makes the spurious wakes the permit model guarantees free.
     pub fn service_engine_ready(&mut self) -> UiTask {
         let (task, _batch) = self.service_engine();
         task.then(self.screenshots.start_next(self.window_id))
     }
 
+    /// The fallback driver. Everything below now has a trigger of its own
+    /// — the feed wake, the conditional timers, the file-drop one-shot,
+    /// and the handlers that end with the rename tail — so this is a
+    /// duplicate pass rather than the only one, which is what lets it be
+    /// deleted whole.
     pub fn tick(&mut self) -> UiTask {
         let now = Instant::now();
         self.status.expire_at(now);
@@ -731,19 +751,54 @@ impl App {
         task
     }
 
-    pub fn file_dropped(&mut self, window_id: window::Id, path: PathBuf) {
+    pub fn file_dropped(&mut self, window_id: window::Id, path: PathBuf) -> UiTask {
         if self.window_id != Some(window_id) {
             tracing::debug!("ignored native file drop for an unowned window");
-            return;
+            return UiTask::None;
         }
+        let now = Instant::now();
         let new_origin = native_file_drop_origin(self.window_id, window_id, self.keyboard_route());
-        let (ready, accepted) = self.file_drops.push_at(new_origin, path, Instant::now());
+        let (ready, accepted) = self.file_drops.push_at(new_origin, path, now);
         if let Some(batch) = ready {
             self.deliver_file_drop(batch);
         }
         if !accepted {
             tracing::debug!("ignored native file drop without an active terminal input route");
         }
+        // Every accepted path schedules its own one-shot, including the
+        // ones that only extended the window. The earlier shots then fire
+        // against a deadline that has moved and find nothing ready, which
+        // is why they need no cancellation.
+        match self.file_drops.pending_deadline() {
+            Some(deadline) => UiTask::FileDropDeadline(deadline.saturating_duration_since(now)),
+            None => UiTask::None,
+        }
+    }
+
+    /// A file-drop debounce window elapsed. Stale shots — one whose
+    /// deadline a later path extended — find nothing ready and do nothing.
+    pub fn file_drop_deadline(&mut self) {
+        if let Some(batch) = self.file_drops.take_ready_at(Instant::now()) {
+            self.deliver_file_drop(batch);
+        }
+    }
+
+    /// The status banner is up, so its expiry is due — `Message::StatusTick`.
+    pub fn expire_status(&mut self) {
+        self.status.expire_at(Instant::now());
+    }
+
+    pub fn status_active(&self) -> bool {
+        self.status.is_active()
+    }
+
+    pub fn palette_retry_pending(&self) -> bool {
+        self.palette_visibility_request.is_pending()
+    }
+
+    /// A tab whose budget ran out stays tracked but stops arming this.
+    pub fn attach_retry_pending(&self) -> bool {
+        self.pending_attachments.has_retryable()
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -841,16 +896,19 @@ impl App {
         }
         if let keyboard::Event::KeyPressed { key, .. } = &event {
             if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
+                let mut task = UiTask::None;
                 match key.as_ref() {
                     Key::Named(Named::Escape) => self.palette_back_or_dismiss(),
                     Key::Named(Named::ArrowUp) => self.move_palette_selection(-1),
                     Key::Named(Named::ArrowDown) => self.move_palette_selection(1),
-                    Key::Named(Named::Enter) => self.palette_confirm(),
+                    // Confirming a rename row closes the palette and opens
+                    // the inline editor, which carries its own focus tail.
+                    Key::Named(Named::Enter) => task = self.palette_confirm(),
                     _ => {}
                 }
                 // The text input widget consumes printable events. Never let
                 // a palette keystroke leak through to the active PTY.
-                return self.take_palette_focus_task();
+                return self.take_palette_focus_task().then(task);
             }
         } else if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
             return UiTask::None;
@@ -946,11 +1004,11 @@ impl App {
             }
             KeybindAction::RenameProject => {
                 self.begin_rename_target(RenameTarget::Project(self.workspace.active().0))?;
-                Ok(UiTask::None)
+                Ok(self.take_rename_focus_task())
             }
             KeybindAction::RenameTab => {
                 self.begin_rename_target(RenameTarget::Tab(self.workspace.active().1))?;
-                Ok(UiTask::None)
+                Ok(self.take_rename_focus_task())
             }
             KeybindAction::CloseProject => {
                 // The sentinel id 0 is never in the snapshot, so
@@ -2044,10 +2102,10 @@ impl Message {
     pub(crate) fn apply(self, app: &mut App) -> UiTask {
         match self {
             Self::ProjectSelected(project_id) => app.select_project(project_id),
-            Self::BeginRenameProject(project_id) => app.begin_rename_project(project_id),
+            Self::BeginRenameProject(project_id) => return app.begin_rename_project(project_id),
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
-            Self::BeginRenameTab(tab_id) => app.begin_rename_tab(tab_id),
+            Self::BeginRenameTab(tab_id) => return app.begin_rename_tab(tab_id),
             Self::CloseTab(tab_id) => app.close_tab(tab_id),
             Self::NewTab => app.new_tab(),
             Self::NewProject => app.new_project(),
@@ -2107,16 +2165,28 @@ mod tests {
     fn status_banner_replaces_clears_and_expires_deterministically() {
         let now = Instant::now();
         let mut status = StatusBanner::default();
+        assert!(
+            !status.is_active(),
+            "an app with no banner arms no expiry timer"
+        );
         status.set_at("first", now);
         assert_eq!(status.message(), Some("first"));
+        assert!(status.is_active());
         status.set_at("replacement", now + Duration::from_secs(1));
         assert_eq!(status.message(), Some("replacement"));
+        status.expire_at(now + Duration::from_secs(1));
+        assert!(
+            status.is_active(),
+            "the timer stays armed until the banner's own deadline"
+        );
         status.expire_at(now + Duration::from_secs(1) + STATUS_BANNER_DURATION);
         assert_eq!(status.message(), None);
+        assert!(!status.is_active(), "expiry disarms the timer");
 
         status.set_at("clear me", now);
         status.clear();
         assert_eq!(status.message(), None);
+        assert!(!status.is_active());
     }
 
     #[test]

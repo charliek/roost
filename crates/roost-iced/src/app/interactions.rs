@@ -178,16 +178,18 @@ impl App {
         Ok(())
     }
 
-    pub fn begin_rename_project(&mut self, project_id: i64) {
+    pub fn begin_rename_project(&mut self, project_id: i64) -> UiTask {
         if let Err(error) = self.begin_rename_target(RenameTarget::Project(project_id)) {
             self.set_status(error);
         }
+        self.take_rename_focus_task()
     }
 
-    pub fn begin_rename_tab(&mut self, tab_id: i64) {
+    pub fn begin_rename_tab(&mut self, tab_id: i64) -> UiTask {
         if let Err(error) = self.begin_rename_target(RenameTarget::Tab(tab_id)) {
             self.set_status(error);
         }
+        self.take_rename_focus_task()
     }
 
     pub fn rename_draft_changed(&mut self, draft: String) {
@@ -1194,6 +1196,12 @@ impl FileDropQueue {
         }
     }
 
+    /// When the pending gesture is due, for the one-shot the drop path
+    /// schedules. `None` means nothing is pending and no shot is owed.
+    pub(super) fn pending_deadline(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|pending| pending.deadline)
+    }
+
     pub(super) fn take_ready_at(&mut self, now: Instant) -> Option<PendingFileDrop> {
         self.pending
             .as_ref()
@@ -1642,6 +1650,61 @@ mod tests {
         assert_eq!(
             batch.paths,
             [PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+        );
+    }
+
+    /// Each accepted path schedules a one-shot for the deadline it saw, so
+    /// a path that extends the window leaves an earlier shot in flight.
+    /// Nothing cancels it: the shot that fires early re-checks the
+    /// deadline, finds it moved, and delivers nothing — the later shot
+    /// carries the batch.
+    #[test]
+    fn a_file_drop_shot_whose_deadline_moved_delivers_nothing() {
+        let start = Instant::now();
+        let mut queue = FileDropQueue::default();
+        assert_eq!(
+            queue.push_at(Some(7), PathBuf::from("/tmp/first"), start),
+            (None, true)
+        );
+        let first_shot = queue.pending_deadline().expect("the first path is pending");
+        assert_eq!(first_shot, start + FILE_DROP_DEBOUNCE);
+
+        assert_eq!(
+            queue.push_at(
+                Some(7),
+                PathBuf::from("/tmp/second"),
+                start + Duration::from_millis(30),
+            ),
+            (None, true)
+        );
+        let second_shot = queue
+            .pending_deadline()
+            .expect("the batch is still pending");
+        assert!(
+            second_shot > first_shot,
+            "the second path extended the window"
+        );
+
+        assert!(
+            queue.take_ready_at(first_shot).is_none(),
+            "the stale shot finds a deadline that moved"
+        );
+        let batch = queue
+            .take_ready_at(second_shot)
+            .expect("the shot the extension scheduled delivers the whole gesture");
+        assert_eq!(
+            batch.paths,
+            [PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+        );
+        assert!(
+            queue.pending_deadline().is_none(),
+            "a delivered gesture owes no further shot"
+        );
+        assert!(
+            queue
+                .take_ready_at(second_shot + FILE_DROP_DEBOUNCE)
+                .is_none(),
+            "and a shot that arrives after delivery is a no-op"
         );
     }
 

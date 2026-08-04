@@ -1,9 +1,11 @@
 use super::*;
 
 // Widget operations can observe an incomplete tree while a slower renderer or
-// compositor is still materializing a newly-pushed palette frame. Retry on
-// later application ticks for roughly two seconds at the 60 Hz subscription,
-// while keeping the work bounded and revision-scoped.
+// compositor is still materializing a newly-pushed palette frame. Retry while
+// a request is pending, bounded and revision-scoped. The cadence is what makes
+// the limit worth the roughly two seconds it was written for, so the two
+// constants only mean anything together.
+pub(crate) const PALETTE_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const PALETTE_GEOMETRY_RETRY_LIMIT: u8 = 120;
 
 pub(super) const PALETTE_AGENT_PROJECT_MAX_COLUMNS: usize = 24;
@@ -313,6 +315,15 @@ impl PaletteVisibilityRequest {
             (Self::Measure, _) | (_, Self::Measure) => Self::Measure,
             _ => Self::None,
         }
+    }
+
+    /// An outstanding request is the whole pending condition: every retry
+    /// path — first request, scroll re-measure, missing-row and clipped-row
+    /// retries — ends by setting one, and `take_palette_visibility_task`
+    /// acts on nothing else. Arming the retry timer reads the same
+    /// predicate the guard does, so the two cannot drift.
+    pub(super) fn is_pending(self) -> bool {
+        self != Self::None
     }
 }
 
@@ -712,13 +723,17 @@ impl App {
         report_palette_query_result(&mut self.status, result.map(drop), Instant::now());
     }
 
-    pub fn palette_activate(&mut self, id: &str) {
+    /// The palette's rename rows open the inline editor, so every
+    /// activation route ends with the rename-focus tail rather than
+    /// waiting for a timer to notice the request.
+    pub fn palette_activate(&mut self, id: &str) -> UiTask {
         if let Err(error) = self.activate_palette(id) {
             self.set_status(error);
         }
+        self.take_rename_focus_task()
     }
 
-    pub fn palette_confirm(&mut self) {
+    pub fn palette_confirm(&mut self) -> UiTask {
         if let Err(error) = self.confirm_palette_selection() {
             self.set_status(error);
         }
@@ -726,6 +741,7 @@ impl App {
             &mut self.rename_completion_key,
             self.rename_editor.is_some(),
         );
+        self.take_rename_focus_task()
     }
 
     pub fn palette_pointer_dismiss(&mut self) -> UiTask {
@@ -850,12 +866,14 @@ impl App {
         self.palette_reveal_attempts = 0;
     }
 
-    pub(super) fn take_palette_visibility_task(&mut self) -> UiTask {
+    /// Also the `Message::PaletteRetryTick` handler: a pending request is
+    /// exactly what arms that timer.
+    pub fn take_palette_visibility_task(&mut self) -> UiTask {
         if self.window_id.is_none() {
             return UiTask::None;
         }
         let request = self.palette_visibility_request;
-        if request == PaletteVisibilityRequest::None {
+        if !request.is_pending() {
             return UiTask::None;
         }
         let Some(state) = &self.palette else {
@@ -1468,7 +1486,7 @@ impl App {
             before_layout != self.palette_layout_signature(),
             before_render != self.palette_render_signature(),
         );
-        if request != PaletteVisibilityRequest::None {
+        if request.is_pending() {
             self.invalidate_palette_geometry(request);
         }
     }
@@ -1500,7 +1518,7 @@ impl App {
             before_layout != self.palette_layout_signature(),
             before_render != self.palette_render_signature(),
         );
-        if request != PaletteVisibilityRequest::None {
+        if request.is_pending() {
             self.invalidate_palette_geometry(request);
         }
         self.spawn_agent_metrics(&cwds);
@@ -1652,7 +1670,7 @@ impl App {
             before_layout != self.palette_layout_signature(),
             before_render != self.palette_render_signature(),
         );
-        if self.palette.is_some() && request != PaletteVisibilityRequest::None {
+        if self.palette.is_some() && request.is_pending() {
             self.invalidate_palette_geometry(request);
         }
     }
@@ -2047,6 +2065,60 @@ mod tests {
             ),
             PaletteVisibilityRequest::Reveal,
             "content refresh cannot downgrade an in-flight structural reveal"
+        );
+    }
+
+    /// The retry subscription is armed off the request field alone, so
+    /// every path that still owes work must leave one set — and the paths
+    /// that are finished must not, or an idle app keeps a 16 ms timer.
+    #[test]
+    fn the_retry_predicate_tracks_every_path_that_still_owes_a_visibility_pass() {
+        assert!(!PaletteVisibilityRequest::None.is_pending());
+        assert!(PaletteVisibilityRequest::Measure.is_pending());
+        assert!(PaletteVisibilityRequest::Reveal.is_pending());
+
+        // A scroll re-measure owes a pass.
+        let mut selected_in_view = Some(true);
+        let mut retries = 0;
+        let mut request = PaletteVisibilityRequest::None;
+        let mut generation = 1;
+        queue_scroll_measurement(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut generation,
+            false,
+        );
+        assert!(request.is_pending());
+
+        // So does a reveal that measured the row clipped, until the
+        // budget runs out — and then nothing is owed.
+        let mut reveal_required = true;
+        request = PaletteVisibilityRequest::None;
+        assert!(!apply_visible_result(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut reveal_required,
+            true,
+            false,
+        ));
+        assert!(request.is_pending());
+
+        request = PaletteVisibilityRequest::None;
+        retries = PALETTE_GEOMETRY_RETRY_LIMIT;
+        reveal_required = true;
+        assert!(apply_visible_result(
+            &mut selected_in_view,
+            &mut retries,
+            &mut request,
+            &mut reveal_required,
+            true,
+            false,
+        ));
+        assert!(
+            !request.is_pending(),
+            "an exhausted budget disarms the retry timer"
         );
     }
 
