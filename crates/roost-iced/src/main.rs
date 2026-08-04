@@ -4,6 +4,7 @@ mod font_registry;
 mod input;
 mod palette_scroll;
 mod screenshot;
+mod sidebar_resize;
 mod strip_reorder;
 mod terminal_widget;
 mod url_launcher;
@@ -67,6 +68,10 @@ enum Message {
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
     ToggleSidebar,
+    SidebarResizeDragged {
+        width: f32,
+    },
+    SidebarResizeEnded,
     OpenNotifications,
     PaletteQueryChanged(String),
     PaletteActivate(String),
@@ -174,6 +179,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::StripPointerReleased => {
             app.strip_pointer_released();
+            Task::none()
+        }
+        Message::SidebarResizeDragged { width } => {
+            app.sidebar_resize_dragged(width);
+            Task::none()
+        }
+        Message::SidebarResizeEnded => {
+            app.sidebar_resize_ended();
             Task::none()
         }
         Message::RenameSubmit => {

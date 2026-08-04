@@ -55,7 +55,7 @@ impl App {
                 Ok(mut tab) => {
                     let (cols, rows) = terminal_grid(
                         self.window_size,
-                        self.workspace.sidebar_collapsed(),
+                        self.effective_sidebar_width(),
                         self.terminal_metrics,
                     );
                     match tab.apply_geometry(
@@ -420,7 +420,7 @@ impl App {
                     let _ = reply.send(Ok((
                         f64::from(self.window_size.width),
                         f64::from(self.window_size.height),
-                        f64::from(sidebar_width(collapsed)),
+                        f64::from(self.effective_sidebar_width()),
                         collapsed,
                         Some(f64::from(chrome::BAND_HEIGHT)),
                         Some(resolved_family),
