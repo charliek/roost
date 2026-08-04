@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotFile {
     pub next_id: i64,
     #[serde(default)]
@@ -56,6 +56,39 @@ pub struct SnapshotFile {
     /// behavioral parity.
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// The sidebar's width in logical points at save time, so a
+    /// relaunch restores the user's drag. Defaulted so a file from an
+    /// older build (no key) loads as the default width. The Mac UI
+    /// persists the same value in UserDefaults (`RoostSidebarWidth`);
+    /// this is the Rust UI adapters' (GTK, Iced) equivalent, kept at
+    /// behavioral parity. Values outside
+    /// [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`] are clamped when
+    /// the workspace loads them.
+    ///
+    /// [`SIDEBAR_MIN_WIDTH`]: crate::SIDEBAR_MIN_WIDTH
+    /// [`SIDEBAR_MAX_WIDTH`]: crate::SIDEBAR_MAX_WIDTH
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f64,
+}
+
+fn default_sidebar_width() -> f64 {
+    crate::workspace::SIDEBAR_DEFAULT_WIDTH
+}
+
+/// Hand-written rather than derived: `SnapshotFile::default()` is the
+/// absent / empty / malformed `state.json` path, and a derived `0.0`
+/// width would clamp up to the minimum on open instead of the default.
+impl Default for SnapshotFile {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            projects: Vec::new(),
+            active_project_id: 0,
+            active_tab_position: 0,
+            sidebar_collapsed: false,
+            sidebar_width: default_sidebar_width(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +257,7 @@ mod tests {
             active_project_id: 1,
             active_tab_position: 1,
             sidebar_collapsed: true,
+            sidebar_width: 300.0,
             projects: vec![ProjectSnapshot {
                 id: 1,
                 name: "Roost".into(),
@@ -268,8 +302,23 @@ mod tests {
         assert_eq!(back.active_project_id, 0);
         assert_eq!(back.active_tab_position, 0);
         assert!(!back.sidebar_collapsed, "absent key defaults to expanded");
+        assert_eq!(
+            back.sidebar_width,
+            crate::workspace::SIDEBAR_DEFAULT_WIDTH,
+            "absent key defaults to the default width"
+        );
         assert_eq!(back.projects.len(), 1);
         assert!(back.projects[0].tabs.is_empty());
+    }
+
+    #[test]
+    fn default_snapshot_carries_default_sidebar_width() {
+        // Not derived: this is the absent/malformed state.json path, and
+        // a derived 0.0 would clamp up to the minimum on open.
+        assert_eq!(
+            SnapshotFile::default().sidebar_width,
+            crate::workspace::SIDEBAR_DEFAULT_WIDTH
+        );
     }
 
     #[test]

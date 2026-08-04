@@ -36,5 +36,5 @@ pub use facade::{
 pub use pty::{PtyError, PtyOutputEvent, PtySupervisor, SupervisorEvent};
 pub use workspace::{
     AttentionSource, RestoreLayout, RestoreProject, RestoreTab, VersionedWorkspaceEvent, Workspace,
-    WorkspaceError, WorkspaceEvent,
+    WorkspaceError, WorkspaceEvent, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
