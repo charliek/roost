@@ -825,6 +825,10 @@ impl App {
     pub(super) fn cancel_drags(&mut self) {
         self.cancel_tab_drag();
         self.cancel_project_drag();
+        // An interrupted resize keeps its width — the callers here are the
+        // interaction choke points where an overlay restructures the root and
+        // strands the grip's widget state mid-drag.
+        self.commit_sidebar_drag();
     }
 
     pub(super) fn reconcile_project_drag_preview(&mut self) {

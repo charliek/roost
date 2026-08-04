@@ -77,7 +77,7 @@ Measured baseline facts:
 | Surface | Swift | GTK | Iced at `dea73a5` |
 |---|---:|---:|---:|
 | Requested content capture | 1100×700 | 1100×700 | 1100×700 |
-| Sidebar width | 220 pt | 220 pt | 220 pt |
+| Sidebar width | 220 pt (resizable 160–400, persisted in `RoostSidebarWidth` UserDefaults) | 220 pt (resizable 160–400, persisted in `state.json`) | 220 pt (resizable 160–400, persisted in `state.json`) |
 | Sidebar body sample | `#3a3a3a` | `#282828` | `#111111` |
 | Terminal body sample | `#1e1e1e` | `#1e1e1e` | `#1e1e1e` |
 | Application-owned tab band | about 32 pt | about 34 pt below header | 44 pt |

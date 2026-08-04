@@ -118,11 +118,10 @@ pub(super) fn apply_geometry_batch(
 
 pub(super) fn terminal_grid(
     size: Size,
-    sidebar_collapsed: bool,
+    sidebar_width: f32,
     metrics: TerminalMetrics,
 ) -> (u16, u16) {
-    let width = (size.width - sidebar_width(sidebar_collapsed) - 2.0 * TERMINAL_PADDING)
-        .max(metrics.cell_width * 2.0);
+    let width = (size.width - sidebar_width - 2.0 * TERMINAL_PADDING).max(metrics.cell_width * 2.0);
     let height =
         (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(metrics.cell_height * 2.0);
     (

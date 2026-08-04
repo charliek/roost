@@ -42,6 +42,23 @@ use crate::persistence::{persist_state, read_state, ProjectSnapshot, SnapshotFil
 /// `tab.list`.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Narrowest the sidebar may be dragged, in logical points.
+pub const SIDEBAR_MIN_WIDTH: f64 = 160.0;
+/// Widest the sidebar may be dragged, in logical points.
+pub const SIDEBAR_MAX_WIDTH: f64 = 400.0;
+/// Sidebar width before the user has ever dragged it.
+pub const SIDEBAR_DEFAULT_WIDTH: f64 = 220.0;
+
+/// The one place the sidebar-width semantics live, shared by the
+/// setter and the `state.json` restore path so they can't diverge:
+/// a non-finite width is no width at all, anything else clamps into
+/// [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`].
+fn normalize_sidebar_width(width: f64) -> Option<f64> {
+    width
+        .is_finite()
+        .then(|| width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
+}
+
 #[derive(Clone, Debug)]
 struct ProjectRow {
     id: i64,
@@ -89,6 +106,11 @@ struct Inner {
     /// (Rust UI adapter (GTK, Iced) parity with the Mac UI's
     /// `RoostSidebarVisible`).
     sidebar_collapsed: bool,
+    /// The sidebar's width in logical points. UI-set via
+    /// `set_sidebar_width`; persisted so a relaunch restores it
+    /// (Rust UI adapter (GTK, Iced) parity with the Mac UI's
+    /// `RoostSidebarWidth`).
+    sidebar_width: f64,
     /// Whether the UI window currently has focus. Half of the
     /// notification-suppression predicate (plan §3.5); reported by the
     /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
@@ -112,6 +134,7 @@ impl Default for Inner {
             active_project_id: 0,
             active_tab_id: 0,
             sidebar_collapsed: false,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             // Focused until a UI says otherwise: a headless or IPC-only
             // workspace never reports focus, and the alternative default
             // would leave the active tab permanently "unseen" — silently
@@ -405,6 +428,8 @@ impl Workspace {
         let mut inner = Inner {
             next_id: snapshot.next_id.max(1),
             sidebar_collapsed: snapshot.sidebar_collapsed,
+            sidebar_width: normalize_sidebar_width(snapshot.sidebar_width)
+                .unwrap_or(SIDEBAR_DEFAULT_WIDTH),
             ..Inner::default()
         };
 
@@ -491,6 +516,32 @@ impl Workspace {
             return;
         }
         inner.sidebar_collapsed = collapsed;
+        self.commit(inner, Vec::new(), Persist::Write);
+    }
+
+    /// The sidebar's persisted width in logical points. The UI reads
+    /// this at startup to restore the user's drag (Rust UI adapter
+    /// (GTK, Iced) parity with the Mac UI's `RoostSidebarWidth`).
+    pub fn sidebar_width(&self) -> f64 {
+        self.inner.lock().unwrap().sidebar_width
+    }
+
+    /// Record the sidebar's width and persist it, clamped into
+    /// [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`]. Emits no event —
+    /// the UI that dragged already resized its own widget; this only
+    /// writes the choice through so a relaunch restores it. A no-op (no
+    /// write) when the normalized width is unchanged, so a drag that
+    /// settles on the clamp can't churn `state.json`, and a non-finite
+    /// width is ignored outright.
+    pub fn set_sidebar_width(&self, width: f64) {
+        let Some(width) = normalize_sidebar_width(width) else {
+            return;
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if inner.sidebar_width == width {
+            return;
+        }
+        inner.sidebar_width = width;
         self.commit(inner, Vec::new(), Persist::Write);
     }
 
@@ -1584,6 +1635,7 @@ impl Inner {
             active_project_id: self.active_project_id,
             active_tab_position,
             sidebar_collapsed: self.sidebar_collapsed,
+            sidebar_width: self.sidebar_width,
             projects: self
                 .projects
                 .values()
@@ -2699,6 +2751,125 @@ mod tests {
         assert!(
             !ws3.sidebar_collapsed(),
             "expanded state must survive reopen"
+        );
+    }
+
+    #[test]
+    fn sidebar_width_persists_across_reopen() {
+        // Rust UI adapter (GTK, Iced) parity with the Mac UI's
+        // RoostSidebarWidth: the user's drag survives quit + relaunch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            assert_eq!(ws.sidebar_width(), SIDEBAR_DEFAULT_WIDTH);
+            ws.set_sidebar_width(300.0);
+            assert_eq!(ws.sidebar_width(), 300.0);
+        }
+        let ws2 = Workspace::open(path.clone());
+        assert_eq!(ws2.sidebar_width(), 300.0, "width must survive reopen");
+        ws2.set_sidebar_width(180.0);
+        drop(ws2);
+        let ws3 = Workspace::open(path);
+        assert_eq!(ws3.sidebar_width(), 180.0, "a later drag persists too");
+    }
+
+    #[test]
+    fn sidebar_width_defaults_when_state_file_absent_or_malformed() {
+        assert_eq!(Workspace::new().sidebar_width(), SIDEBAR_DEFAULT_WIDTH);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("state.json");
+        assert_eq!(
+            Workspace::open(missing).sidebar_width(),
+            SIDEBAR_DEFAULT_WIDTH
+        );
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, b"not json").unwrap();
+        assert_eq!(
+            Workspace::open(malformed).sidebar_width(),
+            SIDEBAR_DEFAULT_WIDTH
+        );
+    }
+
+    #[test]
+    fn sidebar_width_defaults_for_legacy_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, br#"{"next_id":5,"projects":[]}"#).unwrap();
+        assert_eq!(
+            Workspace::open(path).sidebar_width(),
+            SIDEBAR_DEFAULT_WIDTH,
+            "a file predating the key loads as the default width"
+        );
+    }
+
+    #[test]
+    fn sidebar_width_clamps_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for (stored, expected) in [(90.0, SIDEBAR_MIN_WIDTH), (1000.0, SIDEBAR_MAX_WIDTH)] {
+            let path = dir.path().join(format!("state-{stored}.json"));
+            std::fs::write(
+                &path,
+                format!(r#"{{"next_id":1,"projects":[],"sidebar_width":{stored}}}"#),
+            )
+            .unwrap();
+            assert_eq!(Workspace::open(path).sidebar_width(), expected);
+        }
+    }
+
+    #[test]
+    fn sidebar_width_non_finite_in_state_file_falls_back_to_default() {
+        // JSON has no NaN/Infinity literal, but a hand-edited file can
+        // still overflow f64 — the restore path must land on the
+        // default rather than a clamped infinity.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            br#"{"next_id":1,"projects":[],"sidebar_width":1e400}"#,
+        )
+        .unwrap();
+        assert_eq!(Workspace::open(path).sidebar_width(), SIDEBAR_DEFAULT_WIDTH);
+    }
+
+    #[test]
+    fn sidebar_width_clamps_in_setter() {
+        let ws = Workspace::new();
+        ws.set_sidebar_width(90.0);
+        assert_eq!(ws.sidebar_width(), SIDEBAR_MIN_WIDTH);
+        ws.set_sidebar_width(1000.0);
+        assert_eq!(ws.sidebar_width(), SIDEBAR_MAX_WIDTH);
+    }
+
+    #[test]
+    fn sidebar_width_ignores_non_finite_input() {
+        let ws = Workspace::new();
+        ws.set_sidebar_width(300.0);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            ws.set_sidebar_width(bad);
+            assert_eq!(ws.sidebar_width(), 300.0, "{bad} must be ignored");
+        }
+    }
+
+    #[test]
+    fn sidebar_width_unchanged_does_not_commit() {
+        // The revision only moves on a commit, and a commit is what
+        // rewrites state.json — so a re-set of the same (or same-after-
+        // clamp) width must leave it alone.
+        let ws = Workspace::new();
+        ws.set_sidebar_width(300.0);
+        let (revision, _) = ws.snapshot_with_revision();
+        ws.set_sidebar_width(300.0);
+        ws.set_sidebar_width(f64::NAN);
+        assert_eq!(ws.snapshot_with_revision().0, revision);
+        ws.set_sidebar_width(1000.0);
+        ws.set_sidebar_width(500.0);
+        assert_eq!(
+            ws.snapshot_with_revision().0,
+            revision + 1,
+            "both clamp to the max, so only the first commits"
         );
     }
 

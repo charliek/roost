@@ -37,6 +37,14 @@ protocol UiBridge: AnyObject {
     /// sidebar is collapsed. Drives `app.window_metrics`, used by the
     /// sidebar-holds-width regression suite.
     func sidebarMetrics() -> (width: CGFloat, collapsed: Bool)
+    /// Set the sidebar pane's width, clamping to
+    /// `[RoostApp.sidebarMinWidth, RoostApp.sidebarMaxWidth]` and
+    /// persisting the clamped value. Drives the test-only
+    /// `sidebar.set_width` op — the programmatic twin of dragging the
+    /// seam. The gate check (`ROOST_TEST_MODE=1`) lives in the handler,
+    /// not here. A collapsed sidebar stays collapsed; the width becomes
+    /// what expanding will reveal.
+    func setSidebarWidth(_ width: CGFloat)
     /// The sidebar's last-rendered agent rows, per project, plus the
     /// agents-visible toggle. Drives `app.sidebar_dump`: reads the same
     /// `renderedAgents` cache the sidebar paints from, not a fresh

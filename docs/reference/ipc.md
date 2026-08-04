@@ -588,6 +588,38 @@ during a drag are transient UI state, not part of this contract.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
+### `sidebar.set_width` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Sets the projects
+sidebar's logical width — the programmatic twin of dragging the seam,
+so the e2e suite can pin resize + persistence without a real pointer.
+
+Request: `{"params": {"width": 260.0}}`. Response: `{}`.
+
+The UI routes the width through the workspace, which **clamps** it to
+`[160, 400]` and persists it, so an out-of-band width (`90`, `1000`)
+succeeds and lands on the nearest bound rather than erroring. Read the
+applied value back with `app.window_metrics`.
+
+`width` must be finite and positive; zero, negative, and non-finite
+values are rejected with `invalid-param` before reaching the UI.
+
+While the sidebar is collapsed the op still succeeds: it persists the
+width and updates what expanding will reveal. `app.window_metrics`
+reports a collapsed sidebar as `sidebar_width < 1.0` until it is
+expanded: GTK and Iced report a literal `0.0`, while the Mac UI reports
+the collapsed pane's real frame width. Assert `< 1.0`, not `== 0.0`.
+
+Two authority caveats, mirroring `window.resize`'s "the compositor
+remains authoritative" stance: the persisted value is the *requested*
+logical width, and a window too narrow to honor it may render the
+seam narrower (GTK's paned constrains the divider to its allocation) —
+`app.window_metrics` reports the live width, so assert against that.
+And the op is not defined concurrent with a live pointer drag of the
+seam: a drag in flight re-anchors on its press-time width and its
+release wins. Harnesses drive one or the other, never both at once.
+
 ### Command palette (`palette.*`)
 
 Drive the command-palette overlay — open it, read its rows, filter,

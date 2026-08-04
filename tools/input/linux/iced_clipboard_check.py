@@ -1546,6 +1546,135 @@ def _project_lifecycle(launch: Launch, home_project: int, home_tab: int) -> None
     )
 
 
+def _sidebar_resize_grip(launch: Launch) -> None:
+    """Drag the sidebar/terminal seam through SidebarResizeGrip's real
+    pointer path (crates/roost-iced/src/sidebar_resize.rs).
+
+    The grip's hit zone straddles the seam at `sidebar_width` +/- 3px and
+    claims a press inside it outright (`Ownership::Own`) before the content
+    ever sees the event, so a press landing there must never start a
+    terminal selection. `dragged_width` anchors the new width on the
+    press-time width plus the pointer's travel from the press x
+    (`start_width + (x - start_x)`), so pressing exactly on the seam and
+    moving +60px lands at seed_width + 60.
+    """
+    tolerance = 2.0
+
+    def width_within(expected: float) -> bool:
+        current = float(launch.client.window_metrics()["sidebar_width"])
+        return abs(current - expected) <= tolerance
+
+    metrics = launch.client.window_metrics()
+    starting_collapsed = bool(metrics["sidebar_collapsed"])
+    if starting_collapsed:
+        # Collapsing drops the grip from the widget tree (sidebar_resize.rs
+        # module doc); expand via the same keybind the chrome-overflow
+        # segment already uses so the grip exists to drag.
+        launch.key("alt+b")
+        _wait_until(
+            lambda: not launch.client.window_metrics()["sidebar_collapsed"],
+            "sidebar expand before resize-grip drag",
+        )
+        metrics = launch.client.window_metrics()
+    starting_width = float(metrics["sidebar_width"])
+    assert starting_width > 0, (
+        "resize-grip drag expects a laid-out sidebar; "
+        f"metrics={metrics!r}"
+    )
+
+    seed_width = 220.0
+    launch.client.sidebar_set_width(seed_width)
+    _wait_until(
+        lambda: width_within(seed_width), "seeded sidebar width before resize-grip drag"
+    )
+
+    launch.client.selection_clear(launch.tab)
+    baseline_selection = launch.client.selection_dump(launch.tab)
+    assert not baseline_selection.get("text"), baseline_selection
+    _drain_tabs(launch, [launch.tab])
+
+    delta = 60.0
+    x0 = round(seed_width)
+    target_x = round(seed_width + delta)
+    expected_width = seed_width + delta
+    y = round(float(launch.client.window_metrics()["window_height"]) / 2)
+
+    pending_error: BaseException | None = None
+    try:
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(x0), str(y)]
+        )
+        launch.terminal_pointer(["mousedown", "1"])
+        # `mouse::Event::ButtonPressed` carries no position, so iced hit-tests
+        # a press against the newest cursor position in the event batch it is
+        # drained with — not the position the button actually went down at.
+        # A UI running a frame behind (routine on a loaded CI box) drains the
+        # press together with the first drag move and evaluates it 8px away,
+        # outside the grip's 6px zone, so no drag ever starts and the wait
+        # below times out with the sidebar untouched. Let the press drain on
+        # its own before the pointer moves again.
+        time.sleep(0.5 * SCALE)
+        # Separate XTEST submissions per sample, like the tab/project drags
+        # above: a single batched xdotool motion can be coalesced past the
+        # grip's move handling.
+        for step in range(1, 9):
+            x = round(x0 + (target_x - x0) * step / 8)
+            launch.terminal_pointer(
+                ["mousemove", "--window", launch.window, str(x), str(y)]
+            )
+        # The live drag overlay (`sidebar_drag_width` in app.rs) is
+        # IPC-observable before release; fence on it the same way the tab
+        # drags fence on their rendered preview.
+        _wait_until(
+            lambda: width_within(expected_width),
+            "held resize-grip drag reaches the target width",
+        )
+    except BaseException as error:
+        pending_error = error
+        raise
+    finally:
+        try:
+            launch.terminal_pointer(["mouseup", "1"])
+        except Exception as release_error:
+            if pending_error is None:
+                raise
+            print(
+                f"failed to release resize-grip drag while handling {pending_error!r}: "
+                f"{release_error}",
+                file=sys.stderr,
+            )
+
+    _wait_until(lambda: width_within(expected_width), "resize-grip drag committed width")
+    _assert_stays(
+        lambda: width_within(expected_width), "committed resize-grip drag width"
+    )
+    assert launch.process.poll() is None, "Iced exited during the resize-grip drag"
+
+    # The hit-zone claim must beat TerminalWidget: no selection may exist
+    # after a drag that started and ended inside the grip's zone.
+    selection = launch.client.selection_dump(launch.tab)
+    assert not selection.get("text"), selection
+    _assert_no_pty_input(launch, [launch.tab], "sidebar resize-grip drag")
+
+    # Relaunch persistence of the committed width is covered by
+    # tools/roosttest/test_sidebar_resize.py; this segment only proves the
+    # real pointer path, so it stays lean and restores the fixture.
+    # Never drive sidebar.set_width concurrent with a live drag (the seam
+    # drag re-anchors on its press-time width and its release wins,
+    # docs/reference/ipc.md sidebar.set_width) — the drag above has already
+    # released and settled by this point.
+    launch.client.sidebar_set_width(starting_width)
+    _wait_until(
+        lambda: width_within(starting_width), "resize-grip fixture width restored"
+    )
+    if starting_collapsed:
+        launch.key("alt+b")
+        _wait_until(
+            lambda: launch.client.window_metrics()["sidebar_collapsed"],
+            "resize-grip fixture collapse restored",
+        )
+
+
 def _direct_tab_close(launch: Launch) -> None:
     identity = launch.client.identify()
     project = int(identity["active_project_id"])
@@ -2170,6 +2299,7 @@ def main() -> int:
         renamed_project, renamed_tab = _keybind_dispatch(off)
         dragged_titles = _direct_tab_reorder(off, renamed_project, renamed_tab)
         _project_lifecycle(off, renamed_project, renamed_tab)
+        _sidebar_resize_grip(off)
         off.close()
         launches.pop()
 
@@ -2231,6 +2361,7 @@ def main() -> int:
         "project/tab inline rename with double-click and click-away, "
         "stable-ID direct tab drag in both directions with persistence, "
         "sidebar project drag reorder with sub-threshold select, "
+        "sidebar resize-grip drag with no selection leak or PTY leak, "
         "keybind-opened delete confirm cancelled and confirmed without PTY leaks, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
         "constrained chrome overflow navigation, and palette pointer routing"

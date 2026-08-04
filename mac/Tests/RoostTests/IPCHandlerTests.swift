@@ -112,6 +112,16 @@ struct IPCHandlerDispatchTests {
         )
     }
 
+    @Test func sidebarSetWidthRequiresTestMode() async {
+        let handler = await makeHandler()
+        await expectError(
+            "not-enabled",
+            "sidebar.set_width",
+            AnyCodable(["width": 260.0] as [String: Any]),
+            on: handler
+        )
+    }
+
     @Test func renameMissingProjectIsNotFound() async {
         // mapWorkspace(.projectNotFound) → not-found.
         let handler = await makeHandler()

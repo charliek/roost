@@ -52,6 +52,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::palette_scroll::Visibility;
+use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
 use crate::terminal_widget::{
     resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
@@ -90,7 +91,6 @@ use self::terminal_tab::{
     TerminalGeometry,
 };
 
-const SIDEBAR_WIDTH: f32 = 220.0;
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
@@ -248,12 +248,20 @@ fn create_project_flow(
     Ok((project.id, tab.id))
 }
 
-fn sidebar_width(collapsed: bool) -> f32 {
+fn effective_sidebar_width(collapsed: bool, width: f32) -> f32 {
     if collapsed {
         0.0
     } else {
-        SIDEBAR_WIDTH
+        width
     }
+}
+
+/// A published drag width is worth applying only while the grip exists — a
+/// collapsed sidebar has none, so the update is stale — and only when it moves
+/// the sidebar: a pointer travelling past a clamp bound would otherwise re-grid
+/// every tab for an identical frame.
+fn drag_width_is_actionable(collapsed: bool, live_width: f32, width: f32) -> bool {
+    !collapsed && width != live_width
 }
 
 fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
@@ -454,6 +462,10 @@ pub struct App {
     pending_window_resize: Option<Size>,
     screenshots: ScreenshotQueue,
     window_size: Size,
+    /// Set only while the seam is being dragged; the engine holds the
+    /// committed width, and persisting per pointer-move would rewrite
+    /// `state.json` on every frame.
+    sidebar_drag_width: Option<f32>,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
@@ -594,6 +606,7 @@ impl App {
             pending_window_resize: None,
             screenshots: ScreenshotQueue::default(),
             window_size: Size::new(1100.0, 720.0),
+            sidebar_drag_width: None,
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: StatusBanner::default(),
@@ -745,17 +758,29 @@ impl App {
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
+        // A toast restructures the root widget tree, which drops the grip's
+        // widget state — a live drag would never publish its end.
+        self.commit_sidebar_drag();
         self.status.set_at(message, Instant::now());
+    }
+
+    fn live_sidebar_width(&self) -> f32 {
+        self.sidebar_drag_width
+            .unwrap_or_else(|| self.workspace.sidebar_width() as f32)
+    }
+
+    fn effective_sidebar_width(&self) -> f32 {
+        effective_sidebar_width(
+            self.workspace.sidebar_collapsed(),
+            self.live_sidebar_width(),
+        )
     }
 
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
         self.window_size = size;
-        let (cols, rows) = terminal_grid(
-            size,
-            self.workspace.sidebar_collapsed(),
-            self.terminal_metrics,
-        );
+        let (cols, rows) =
+            terminal_grid(size, self.effective_sidebar_width(), self.terminal_metrics);
         for (tab_id, tab) in &mut self.tabs {
             match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
                 Ok(Some(change)) => tab.commit_geometry(change),
@@ -1217,7 +1242,7 @@ impl App {
             scrollable(project_strip).height(Fill),
             sidebar_footer
         ])
-        .width(SIDEBAR_WIDTH)
+        .width(self.live_sidebar_width())
         .height(Fill)
         .style(chrome::surface);
 
@@ -1421,7 +1446,11 @@ impl App {
         let content: Element<'_, Message> = if collapsed {
             main.width(Fill).height(Fill).into()
         } else {
-            row![sidebar, main].width(Fill).height(Fill).into()
+            SidebarResizeGrip::new(
+                row![sidebar, main].width(Fill).height(Fill),
+                self.live_sidebar_width(),
+            )
+            .into()
         };
         let content: Element<'_, Message> = if let Some(status) = self.status.message() {
             let toast = container(text(status).size(12).color(chrome::ERROR_TEXT))
@@ -1651,7 +1680,36 @@ impl App {
         self.set_sidebar_collapsed(!self.workspace.sidebar_collapsed());
     }
 
+    pub fn sidebar_resize_dragged(&mut self, width: f32) {
+        if !drag_width_is_actionable(
+            self.workspace.sidebar_collapsed(),
+            self.live_sidebar_width(),
+            width,
+        ) {
+            return;
+        }
+        self.sidebar_drag_width = Some(width);
+        self.resize(self.window_size);
+    }
+
+    pub fn sidebar_resize_ended(&mut self) {
+        self.commit_sidebar_drag();
+    }
+
+    fn commit_sidebar_drag(&mut self) {
+        if let Some(width) = self.sidebar_drag_width.take() {
+            self.workspace.set_sidebar_width(f64::from(width));
+        }
+    }
+
     fn set_sidebar_collapsed(&mut self, collapsed: bool) {
+        // Collapsing drops the grip widget from the tree, so a drag that is
+        // still live never publishes its end. Commit first so the width the
+        // session shows is the width a relaunch restores. Expanding keeps the
+        // grip, so a drag in flight there is still the widget's to finish.
+        if collapsed {
+            self.commit_sidebar_drag();
+        }
         self.workspace.set_sidebar_collapsed(collapsed);
         self.resize(self.window_size);
     }
@@ -2009,13 +2067,38 @@ mod tests {
     fn terminal_geometry_never_produces_zero_grid() {
         let size = Size::new(1.0, 1.0);
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
-        assert_eq!(terminal_grid(size, false, metrics), (2, 2));
+        assert_eq!(terminal_grid(size, 220.0, metrics), (2, 2));
     }
 
     #[test]
     fn collapsed_sidebar_has_no_layout_width() {
-        assert_eq!(sidebar_width(false), SIDEBAR_WIDTH);
-        assert_eq!(sidebar_width(true), 0.0);
+        assert_eq!(effective_sidebar_width(false, 220.0), 220.0);
+        assert_eq!(effective_sidebar_width(false, 340.0), 340.0);
+        assert_eq!(effective_sidebar_width(true, 340.0), 0.0);
+    }
+
+    #[test]
+    fn a_drag_width_that_lands_after_a_collapse_is_ignored() {
+        // The grip is gone once collapsed, so the queued width is stale: it
+        // must not overlay the engine value the sidebar shows on expand.
+        assert!(!drag_width_is_actionable(true, 220.0, 320.0));
+        assert_eq!(effective_sidebar_width(false, 220.0), 220.0);
+
+        assert!(drag_width_is_actionable(false, 220.0, 320.0));
+        assert!(!drag_width_is_actionable(false, 320.0, 320.0));
+    }
+
+    #[test]
+    fn a_wider_sidebar_leaves_the_terminal_fewer_columns() {
+        let size = Size::new(1100.0, 720.0);
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let (default_cols, default_rows) = terminal_grid(size, 220.0, metrics);
+        let (wide_cols, wide_rows) = terminal_grid(size, 300.0, metrics);
+        assert!(
+            wide_cols < default_cols,
+            "300px sidebar must yield fewer columns than 220px: {wide_cols} vs {default_cols}"
+        );
+        assert_eq!(wide_rows, default_rows, "sidebar width must not touch rows");
     }
 
     #[test]

@@ -130,13 +130,17 @@ Slices, each sized for one gauntlet pass:
   XTEST project drag, sub-threshold select, keybind confirm
   cancel/confirm with no PTY leak) and functional e2e
   (`tools/roosttest/test_project_lifecycle.py`).
-* **3c. Sidebar resize** with persisted width (replaces the hardcoded
-  `SIDEBAR_WIDTH: f32 = 220.0`). Discovery done (2026-08-04): the Mac app
-  is the reference implementation — already resizable + persisted
-  (160–400 clamp, default 220, `RoostSidebarWidth` UserDefaults); GTK
-  drags but forgets on relaunch; iced is fixed-width. Scope brief +
-  verified surface map: `~/.claude/plans/roost/
-  BRIEF-011-iced-sidebar-resize-and-subscriptions.md`.
+* **3c. Sidebar resize (complete — plan 011).** Shipped: iced seam drag via
+  a zero-footprint `SidebarResizeGrip` (exclusive event ownership so a seam
+  press never starts a terminal selection), 160–400 clamp, engine-persisted
+  width in `state.json` with default 220 (replacing the hardcoded
+  `SIDEBAR_WIDTH: f32 = 220.0`); GTK's drag-but-forgets-on-relaunch bug
+  fixed as a ride-along; a test-mode `sidebar.set_width` op on all three
+  UIs (finite out-of-band widths clamp, non-finite → `invalid-param`,
+  without test mode → `not-enabled`); functional e2e
+  (`tools/roosttest/test_sidebar_resize.py`, wired into `ICED_E2E_TESTS`
+  and `ci.yml`); and a real-input grip segment in
+  `tools/input/linux/iced_clipboard_check.py`.
 * **3d. Tick → push subscriptions.** Replace the 16 ms full-snapshot poll
   and the UI-thread `block_on` calls with Iced stream subscriptions and
   event-driven reconcile. Do before more real-time features stack onto the
@@ -168,7 +172,7 @@ Slices, each sized for one gauntlet pass:
   upstream Iced/winit limitations — track, document, don't block on them.
 
 Slice order is deliberate: 3b closed the honest `Err("… not available in
-Iced yet")` stubs — the grep now has zero hits, and 3c is the last
+Iced yet")` stubs — the grep now has zero hits — and 3c closed the last
 functional gap blocking M4; 3d is the
 architecture cleanup that everything real-time depends on; 3e/3f/3g are
 polish and platform work that can interleave.

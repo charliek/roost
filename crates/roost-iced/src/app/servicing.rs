@@ -55,7 +55,7 @@ impl App {
                 Ok(mut tab) => {
                     let (cols, rows) = terminal_grid(
                         self.window_size,
-                        self.workspace.sidebar_collapsed(),
+                        self.effective_sidebar_width(),
                         self.terminal_metrics,
                     );
                     match tab.apply_geometry(
@@ -420,7 +420,7 @@ impl App {
                     let _ = reply.send(Ok((
                         f64::from(self.window_size.width),
                         f64::from(self.window_size.height),
-                        f64::from(sidebar_width(collapsed)),
+                        f64::from(self.effective_sidebar_width()),
                         collapsed,
                         Some(f64::from(chrome::BAND_HEIGHT)),
                         Some(resolved_family),
@@ -449,6 +449,20 @@ impl App {
                             // ID exists instead of rejecting a ready server.
                             self.pending_window_resize = Some(size);
                         }
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+                UiRequest::SidebarSetWidth { width, reply } => {
+                    let result = if !self.test_mode {
+                        Err("ROOST_TEST_MODE=1 is required".into())
+                    } else {
+                        // A drag overlay still in flight would shadow the width
+                        // the op just set — commit it first so the op's value is
+                        // the one the layout and the next relaunch both see.
+                        self.commit_sidebar_drag();
+                        self.workspace.set_sidebar_width(width);
+                        self.resize(self.window_size);
                         Ok(())
                     };
                     let _ = reply.send(result);

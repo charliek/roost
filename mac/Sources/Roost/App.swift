@@ -71,9 +71,33 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// narrower and the "Untitled N" rows truncate awkwardly under
     /// the body font), 400pt cap (past that the terminal grid
     /// shrinks too aggressively on a 1200pt window).
-    static let sidebarMinWidth: CGFloat = 160
-    static let sidebarMaxWidth: CGFloat = 400
-    private static let sidebarWidthDefaultsKey = "RoostSidebarWidth"
+    nonisolated static let sidebarMinWidth: CGFloat = 160
+    nonisolated static let sidebarMaxWidth: CGFloat = 400
+    nonisolated private static let sidebarWidthDefaultsKey = "RoostSidebarWidth"
+
+    /// Clamp a requested sidebar width into the configured band.
+    /// Pure + nonisolated so `sidebar.set_width`'s arithmetic is
+    /// unit-tested without standing up AppKit — the wire contract says
+    /// an out-of-band but finite width lands on the nearest bound
+    /// rather than erroring, matching the Rust UIs (which clamp in the
+    /// workspace).
+    nonisolated static func clampSidebarWidth(_ width: CGFloat) -> CGFloat {
+        max(sidebarMinWidth, min(sidebarMaxWidth, width))
+    }
+
+    /// Clamp + write a sidebar width straight to `defaults`, returning
+    /// the stored value. Used by the collapsed arm of
+    /// `setSidebarWidth`: `splitViewDidResizeSubviews` — the ordinary
+    /// save path — skips zero-width layouts, so nothing else would
+    /// persist the new width while the sidebar is hidden.
+    @discardableResult
+    nonisolated static func persistSidebarWidth(
+        _ width: CGFloat, in defaults: UserDefaults
+    ) -> CGFloat {
+        let clamped = clampSidebarWidth(width)
+        defaults.set(Double(clamped), forKey: sidebarWidthDefaultsKey)
+        return clamped
+    }
 
     /// Defaults store for UI prefs (sidebar visibility + width). Normally
     /// `UserDefaults.standard`; when `ROOST_DEFAULTS_SUITE` is set (the E2E
@@ -589,7 +613,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // happens before the split view has a meaningful frame in
         // the window's coord space, so the position is silently
         // discarded.
-        let initialSidebarWidth = sidebarWidth
+        //
+        // The width applied below is read from `sidebarRestoreWidth` at
+        // the time this runs, not captured now: it is seated to the same
+        // launch width above, so the ordinary path is unchanged — but the
+        // IPC socket is already reachable, and a `sidebar.set_width`
+        // landing in this window updates `sidebarRestoreWidth`. Reading it
+        // late honors that op instead of clobbering it with a stale local.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if let split = self.sidebarPane?.superview as? NSSplitView {
@@ -604,7 +634,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     split.setPosition(0, ofDividerAt: 0)
                     self.sidebarCollapsingProgrammatically = false
                 } else {
-                    split.setPosition(initialSidebarWidth, ofDividerAt: 0)
+                    let restore = self.sidebarRestoreWidth
+                    self.sidebarPreferredWidthConstraint?.constant = restore
+                    split.setPosition(restore, ofDividerAt: 0)
                 }
             }
             // Now that the splitter is at its intended position,
@@ -5587,6 +5619,46 @@ extension RoostApp: UiBridge {
         return (width: w, collapsed: w < 1)
     }
 
+    /// `sidebar.set_width`: seat the divider at `width`, clamped to the
+    /// configured band. The programmatic twin of dragging the seam, so
+    /// it must land in the same persisted state a drag would.
+    ///
+    /// Collapsed is preserved, not overridden — the op updates what ⌘B
+    /// will reveal (`sidebarRestoreWidth`) and writes the width through
+    /// to defaults itself, since the `splitViewDidResizeSubviews` save
+    /// path skips zero-width layouts.
+    ///
+    /// Both arms persist directly, expanded included: the IPC socket is
+    /// reachable from `RoostBackend.start` before the window finishes
+    /// launching, and until `sidebarPersistenceActive` flips at the end
+    /// of that sequence the delegate save path is inert — an early op
+    /// would `setPosition` and persist nothing. The direct write is
+    /// idempotent with the delegate's later one (same value, same key).
+    func setSidebarWidth(_ width: CGFloat) {
+        let clamped = Self.clampSidebarWidth(width)
+        // Always the expand target, so a collapse/expand round-trip —
+        // and the deferred launch restoration, which reads this — lands
+        // on the requested width.
+        sidebarRestoreWidth = clamped
+        Self.persistSidebarWidth(clamped, in: Self.uiDefaults)
+        // A zero-width pane means ⌘B-collapsed... or that launch hasn't
+        // seated the divider yet, which reads the same here. No explicit
+        // readiness flag is needed: an op landing in that window falls
+        // into this persist-only arm, and the deferred restoration then
+        // applies `sidebarRestoreWidth` — which this call just set — so
+        // the width is honored either way.
+        guard let sidebarPane,
+              let split = sidebarPane.superview as? NSSplitView,
+              sidebarPane.frame.width >= 1
+        else { return }
+        // Keep the auto-layout anchor and the divider position in sync,
+        // as launch and `toggleSidebar`'s restore arm both do — a
+        // constant left behind at the old width pulls the pane back on
+        // the next layout pass.
+        sidebarPreferredWidthConstraint?.constant = clamped
+        split.setPosition(clamped, ofDividerAt: 0)
+    }
+
     /// `app.sidebar_dump`: every project's last-rendered agent rows, in
     /// sidebar order, plus the agents-visible toggle. Order and
     /// membership come from the **workspace** snapshot, not the UI's
@@ -6250,10 +6322,12 @@ extension RoostApp: NSSplitViewDelegate {
     /// window resize; the band check below skips the ⌘B-collapsed
     /// state (frame.width = 0). Does NOT mutate
     /// `sidebarPreferredWidthConstraint` — that runaway-loop pattern
-    /// was what PR #159 introduced. The constraint stays pinned at
-    /// its launch-time value; user drag is preserved via NSSplitView's
-    /// internal "user-set" position, and `resizeSubviewsWithOldSize`
-    /// above is what holds the sidebar across window resize.
+    /// was what PR #159 introduced. The constraint is only ever moved
+    /// by one-shot programmatic width changes (launch, `toggleSidebar`,
+    /// `setSidebarWidth`), never from inside a layout callback like this
+    /// one; user drag is preserved via NSSplitView's internal "user-set"
+    /// position, and `resizeSubviewsWithOldSize` above is what holds the
+    /// sidebar across window resize.
     func splitViewDidResizeSubviews(_ notification: Notification) {
         guard sidebarPersistenceActive else { return }
         guard let sidebar = sidebarPane else { return }

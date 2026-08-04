@@ -1038,6 +1038,18 @@ pub struct WindowResizeParams {
     pub height: f64,
 }
 
+/// `sidebar.set_width` request — programmatically set the projects
+/// sidebar's logical width. The UI clamps through the workspace to
+/// `SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH`, so an out-of-band value
+/// lands at the nearest bound rather than being rejected. Test-mode
+/// only (gated by `ROOST_TEST_MODE=1`); see the op const comment block
+/// below for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarSetWidthParams {
+    pub width: f64,
+}
+
 // ============================================================================
 // Event data types
 // ============================================================================
@@ -1230,6 +1242,11 @@ pub mod ops {
     /// sidebar layout regression suite (`tools/roosttest`); a real user
     /// resizes the window themselves.
     pub const WINDOW_RESIZE: &str = "window.resize";
+    /// Programmatically set the projects sidebar's width. Gated for the
+    /// same reason as `window.resize`: harness-only driver for the
+    /// sidebar resize e2e (`tools/roosttest`); a real user drags the
+    /// seam. The width is clamped by the workspace, not by the wire.
+    pub const SIDEBAR_SET_WIDTH: &str = "sidebar.set_width";
     /// Ungated companion: a richer read of the same render state
     /// `tab.dump` already exposes. Pins the resolver call site
     /// (theme bold-color → `resolve_cell_colors`) end-to-end.
@@ -1892,6 +1909,13 @@ mod tests {
         });
         let bad = r#"{"width":1100.0,"height":700.0,"extra":"x"}"#;
         assert!(serde_json::from_str::<WindowResizeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn sidebar_set_width_params_reject_unknown_field() {
+        round_trip(&SidebarSetWidthParams { width: 260.0 });
+        let bad = r#"{"width":260.0,"extra":"x"}"#;
+        assert!(serde_json::from_str::<SidebarSetWidthParams>(bad).is_err());
     }
 
     #[test]

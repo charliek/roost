@@ -542,11 +542,7 @@ impl App {
         operation: &str,
     ) -> Result<(), String> {
         let metric_generation = self.metric_generation.wrapping_add(1).max(1);
-        let (cols, rows) = terminal_grid(
-            self.window_size,
-            self.workspace.sidebar_collapsed(),
-            metrics,
-        );
+        let (cols, rows) = terminal_grid(self.window_size, self.effective_sidebar_width(), metrics);
         let mut tab_ids = self.tabs.keys().copied().collect::<Vec<_>>();
         tab_ids.sort_unstable();
         let applied = apply_geometry_batch(

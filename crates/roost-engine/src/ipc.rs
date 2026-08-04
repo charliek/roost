@@ -29,13 +29,14 @@ use roost_ipc::messages::{
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
     SelectionDumpResult, SelectionSetParams, SidebarDumpParams, SidebarDumpResult,
-    TabAgentReportResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams,
+    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
 
@@ -283,6 +284,13 @@ pub enum UiRequest {
         height: f64,
         reply: UnitReply,
     },
+    /// `sidebar.set_width` — programmatically set the projects
+    /// sidebar's logical width. The UI routes it through
+    /// `Workspace::set_sidebar_width`, which clamps and persists, so an
+    /// out-of-band width lands at the nearest bound. Gated like
+    /// `TabFeedPtyBytes` (ROOST_TEST_MODE=1); drives the sidebar-resize
+    /// e2e.
+    SidebarSetWidth { width: f64, reply: UnitReply },
     /// `tab.dispatch_mouse_event` — drive a synthetic mouse event
     /// into the production routing path at cell-grid coords. Same
     /// path the real GestureClick / GestureDrag / EventControllerMotion
@@ -893,6 +901,22 @@ async fn dispatch(
             h.ui_call(|reply| UiRequest::WindowResize {
                 width: p.width,
                 height: p.height,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
+        ops::SIDEBAR_SET_WIDTH => {
+            let p: SidebarSetWidthParams = decode(params)?;
+            if !(p.width.is_finite() && p.width > 0.0) {
+                return Err(HandlerError::invalid_param(format!(
+                    "width must be positive and finite (got {})",
+                    p.width
+                )));
+            }
+            h.ui_call(|reply| UiRequest::SidebarSetWidth {
+                width: p.width,
                 reply,
             })
             .await?
