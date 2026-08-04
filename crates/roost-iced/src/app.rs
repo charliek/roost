@@ -50,6 +50,7 @@ use roost_vt::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
 use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::palette_scroll::Visibility;
 use crate::sidebar_resize::SidebarResizeGrip;
@@ -75,12 +76,13 @@ use self::interactions::{
     ClipboardQueue, FileDropQueue, ProjectDragPreview, RenameCompletionKey, RenameEditor,
     RenameTarget, ScreenshotQueue, TabDragPreview,
 };
+pub(crate) use self::palettes::ProviderRunResult;
 use self::palettes::{
     apply_with_rollback, ellipsize_palette_text, palette_agent_left_text, palette_row_id,
-    palette_title_runs, FontSizeTransition, PaletteVisibilityRequest, ProviderRunResult,
+    palette_title_runs, FontSizeTransition, PaletteVisibilityRequest,
     PALETTE_AGENT_PROJECT_MAX_COLUMNS,
 };
-use self::servicing::AgentMetricsResult;
+pub(crate) use self::servicing::AgentMetricsResult;
 use self::terminal_tab::{
     apply_geometry_batch, pointer_origin_tab, terminal_grid, GeometryBatchOperation,
     NativePointerDispatch, TerminalTab,
@@ -456,8 +458,6 @@ pub struct App {
     projects: Vec<Project>,
     sidebar_agents: HashMap<i64, Vec<SidebarDumpAgentRow>>,
     notification_inbox: notification_inbox::NotificationInbox,
-    workspace_events: tokio::sync::broadcast::Receiver<WorkspaceEvent>,
-    ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiRequest>,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
     screenshots: ScreenshotQueue,
@@ -503,18 +503,18 @@ pub struct App {
     palette_visibility_retries: u8,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
-    metrics_tx: tokio::sync::mpsc::UnboundedSender<AgentMetricsResult>,
-    metrics_rx: tokio::sync::mpsc::UnboundedReceiver<AgentMetricsResult>,
     provider_request: u64,
-    provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderRunResult>,
-    provider_rx: tokio::sync::mpsc::UnboundedReceiver<ProviderRunResult>,
     provider_frames: HashMap<String, provider::Provider>,
     palette_present_reply:
         Option<tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>>,
     clipboard: ClipboardQueue,
-    // Field order is intentional: terminal sessions and IPC receivers are
-    // dropped before the runtime; the lock is held until every runtime task
-    // has been cancelled and joined by Runtime::drop.
+    // Field order is intentional: terminal sessions and the engine feed
+    // (whose receiver carries the wake every sender notifies on) are
+    // dropped before the runtime — a dropped receiver is how the adapter
+    // tasks learn to stop. The lock is held until every runtime task has
+    // been cancelled and joined by Runtime::drop.
+    feed_rx: EngineFeedReceiver,
+    feed_tx: EngineFeedSender,
     runtime: tokio::runtime::Runtime,
     _lock: InstanceLock,
 }
@@ -562,7 +562,6 @@ impl App {
             .build()
             .context("build Iced engine runtime")?;
         let workspace = Arc::new(Workspace::open(profile.state_json_path()));
-        let workspace_events = workspace.subscribe();
         let supervisor = Arc::new(PtySupervisor::new());
         let client = LocalClient::new(
             Arc::clone(&workspace),
@@ -572,9 +571,14 @@ impl App {
 
         hydrate_workspace(&runtime, &client)?;
 
+        let (feed_tx, feed_rx) = engine_feed::channel();
+        // One feed, one arrival order across sources — see engine_feed.
+        runtime.spawn(engine_feed::pump_workspace_events(
+            Arc::clone(&workspace),
+            feed_tx.clone(),
+        ));
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (provider_tx, provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -600,8 +604,6 @@ impl App {
             projects: Vec::new(),
             sidebar_agents: HashMap::new(),
             notification_inbox: notification_inbox::NotificationInbox::new(),
-            workspace_events,
-            ui_rx,
             window_id: None,
             pending_window_resize: None,
             screenshots: ScreenshotQueue::default(),
@@ -644,14 +646,12 @@ impl App {
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
-            metrics_tx,
-            metrics_rx,
             provider_request: 0,
-            provider_tx,
-            provider_rx,
             provider_frames: HashMap::new(),
             palette_present_reply: None,
             clipboard: ClipboardQueue::default(),
+            feed_rx,
+            feed_tx,
             runtime,
             _lock: lock,
         };
@@ -693,11 +693,12 @@ impl App {
     pub fn tick(&mut self) -> UiTask {
         let now = Instant::now();
         self.status.expire_at(now);
-        let mut task = self.service_ui_requests();
-        self.service_agent_metrics();
-        self.service_provider_results();
-        self.service_workspace_events();
-        self.reconcile();
+        let (mut task, feed_batch) = self.service_engine();
+        // The drain already reconciled if it saw anything; the tick keeps
+        // reconciling otherwise, so a tick still reconciles exactly once.
+        if !feed_batch.should_reconcile() {
+            self.reconcile();
+        }
         if let Some(batch) = self.file_drops.take_ready_at(now) {
             self.deliver_file_drop(batch);
         }

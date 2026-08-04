@@ -457,7 +457,7 @@ fn dynamic_refresh_request(
     }
 }
 
-pub(super) struct ProviderRunResult {
+pub(crate) struct ProviderRunResult {
     palette_session: u64,
     request: u64,
     origin_frame: String,
@@ -1516,7 +1516,7 @@ impl App {
             cwd: (!context.active_cwd.is_empty()).then(|| context.active_cwd.into()),
             timeout: Duration::from_secs(provider.timeout_secs),
         };
-        let tx = self.provider_tx.clone();
+        let feed = self.feed_tx.clone();
         let result_provider = provider;
         let task = self.runtime.spawn(async move {
             let stdout = process::run(process_request)
@@ -1533,14 +1533,14 @@ impl App {
                 .await
                 .map_err(|error| format!("provider task failed: {error}"))
                 .and_then(|outcome| outcome);
-            let _ = tx.send(ProviderRunResult {
+            feed.send(EngineFeed::Provider(Box::new(ProviderRunResult {
                 palette_session,
                 request,
                 origin_frame,
                 provider: result_provider,
                 phase,
                 outcome,
-            });
+            })));
         });
     }
 
@@ -1574,70 +1574,65 @@ impl App {
         }
     }
 
-    pub(super) fn service_provider_results(&mut self) {
-        while let Ok(result) = self.provider_rx.try_recv() {
-            let current_frame = self
-                .palette
-                .as_ref()
-                .map(|state| state.current().id.as_str());
-            if !provider_result_is_current(
-                self.palette.is_some(),
-                self.palette_session,
-                self.provider_request,
-                current_frame,
-                &result,
-            ) {
-                continue;
-            }
-            let before_layout = self.palette_layout_signature();
-            let before_render = self.palette_render_signature();
-            match result.outcome {
-                Ok(output)
-                    if result.phase == provider::Phase::Activate && output.items.is_empty() =>
-                {
-                    if let Err(error) = self.try_dismiss_palette() {
-                        self.set_status(error);
-                    }
-                }
-                Ok(output) => {
-                    let placeholder = if output.placeholder.is_empty() {
-                        format!("{}…", result.provider.title)
-                    } else {
-                        output.placeholder.clone()
-                    };
-                    let items = provider::output_palette_items(&output, result.provider.limit);
-                    let frame_id = format!("provider:items:{}", result.request);
-                    self.provider_frames
-                        .insert(frame_id.clone(), result.provider);
-                    if let Some(state) = &mut self.palette {
-                        state.push(palette::PaletteFrame::new(frame_id, placeholder, items));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "provider run failed");
-                    let frame_id = format!("provider:items:{}", result.request);
-                    let items =
-                        vec![
-                            palette::PaletteItem::new("provider:_error", "Provider failed")
-                                .with_subtitle(Some(error))
-                                .with_actionable(false),
-                        ];
-                    if let Some(state) = &mut self.palette {
-                        state.push(palette::PaletteFrame::new(
-                            frame_id,
-                            "Provider error",
-                            items,
-                        ));
-                    }
+    pub(super) fn apply_provider_result(&mut self, result: ProviderRunResult) {
+        let current_frame = self
+            .palette
+            .as_ref()
+            .map(|state| state.current().id.as_str());
+        if !provider_result_is_current(
+            self.palette.is_some(),
+            self.palette_session,
+            self.provider_request,
+            current_frame,
+            &result,
+        ) {
+            return;
+        }
+        let before_layout = self.palette_layout_signature();
+        let before_render = self.palette_render_signature();
+        match result.outcome {
+            Ok(output) if result.phase == provider::Phase::Activate && output.items.is_empty() => {
+                if let Err(error) = self.try_dismiss_palette() {
+                    self.set_status(error);
                 }
             }
-            let request = dynamic_refresh_request(
-                before_layout != self.palette_layout_signature(),
-                before_render != self.palette_render_signature(),
-            );
-            if self.palette.is_some() && request != PaletteVisibilityRequest::None {
-                self.invalidate_palette_geometry(request);
+            Ok(output) => {
+                let placeholder = if output.placeholder.is_empty() {
+                    format!("{}…", result.provider.title)
+                } else {
+                    output.placeholder.clone()
+                };
+                let items = provider::output_palette_items(&output, result.provider.limit);
+                let frame_id = format!("provider:items:{}", result.request);
+                self.provider_frames
+                    .insert(frame_id.clone(), result.provider);
+                if let Some(state) = &mut self.palette {
+                    state.push(palette::PaletteFrame::new(frame_id, placeholder, items));
+                }
             }
+            Err(error) => {
+                tracing::warn!(%error, "provider run failed");
+                let frame_id = format!("provider:items:{}", result.request);
+                let items = vec![
+                    palette::PaletteItem::new("provider:_error", "Provider failed")
+                        .with_subtitle(Some(error))
+                        .with_actionable(false),
+                ];
+                if let Some(state) = &mut self.palette {
+                    state.push(palette::PaletteFrame::new(
+                        frame_id,
+                        "Provider error",
+                        items,
+                    ));
+                }
+            }
+        }
+        let request = dynamic_refresh_request(
+            before_layout != self.palette_layout_signature(),
+            before_render != self.palette_render_signature(),
+        );
+        if self.palette.is_some() && request != PaletteVisibilityRequest::None {
+            self.invalidate_palette_geometry(request);
         }
     }
 }
