@@ -31,7 +31,7 @@ use roost_ipc::messages::{
 };
 use tokio::runtime::Handle;
 
-use roost_linux::daemon::{RestoreTab, WorkspaceEvent};
+use roost_linux::daemon::{RestoreTab, Workspace, WorkspaceEvent};
 use roost_linux::local_client::LocalClient;
 use roost_linux::reconcile;
 
@@ -712,11 +712,11 @@ impl App {
             .orientation(gtk4::Orientation::Horizontal)
             .resize_start_child(false)
             .shrink_start_child(false)
-            .position(220)
+            .position(client.workspace.sidebar_width().round() as i32)
             .start_child(&sidebar_box)
             .end_child(&content_column)
             .build();
-        Self::tighten_paned_grab_zone(&paned);
+        Self::tighten_paned_grab_zone(&paned, client.workspace.clone(), &sidebar_box);
 
         // Line up the sidebar "PROJECTS" header band and the tab-strip band to
         // the same height so the two top bands meet flush across the paned seam
@@ -5049,7 +5049,11 @@ impl App {
     /// win). Removing the internal `GestureDrag`/`GesturePan` and
     /// re-implementing resize with a tight hit test makes "resize"
     /// engage exactly where the resize cursor shows.
-    fn tighten_paned_grab_zone(paned: &gtk4::Paned) {
+    fn tighten_paned_grab_zone(
+        paned: &gtk4::Paned,
+        workspace: Arc<Workspace>,
+        sidebar_box: &gtk4::Box,
+    ) {
         let controllers = paned.observe_controllers();
         let mut internal = Vec::new();
         for i in 0..controllers.n_items() {
@@ -5094,6 +5098,21 @@ impl App {
             let start_pos = start_pos.clone();
             move |_g, dx, _dy| {
                 paned.set_position(*start_pos.borrow() + dx as i32);
+            }
+        });
+        // `drag-end` also fires for denied sequences (a press outside the
+        // ±2px grab zone above claims Denied, not Claimed, but GestureDrag
+        // still emits begin/end around it) — persisting the paned's
+        // unrelated position on those is benign only because the engine
+        // setter no-ops when the width is unchanged; don't drop the guard
+        // below thinking this makes it redundant.
+        resize.connect_drag_end({
+            let paned = paned.clone();
+            let sidebar_box = sidebar_box.clone();
+            move |_g, _dx, _dy| {
+                if sidebar_box.is_visible() {
+                    workspace.set_sidebar_width(paned.position() as f64);
+                }
             }
         });
         paned.add_controller(resize);
