@@ -1816,6 +1816,87 @@ mod tests {
         assert!(ws.snapshot().is_empty());
     }
 
+    fn project_ids_in_order(ws: &Workspace) -> Vec<i64> {
+        ws.snapshot().iter().map(|p| p.id).collect()
+    }
+
+    #[test]
+    fn reorder_projects_rewrites_the_snapshot_order() {
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap().id;
+        let b = ws.create_project("b", "").unwrap().id;
+        let c = ws.create_project("c", "").unwrap().id;
+        let mut rx = ws.subscribe();
+
+        ws.reorder_projects(&[c, a, b]).unwrap();
+
+        assert_eq!(project_ids_in_order(&ws), vec![c, a, b]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ProjectsReordered { project_ids }) if project_ids == vec![c, a, b]
+        ));
+    }
+
+    #[test]
+    fn reorder_projects_appends_unlisted_by_position_then_id() {
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap().id;
+        let b = ws.create_project("b", "").unwrap().id;
+        let c = ws.create_project("c", "").unwrap().id;
+        ws.reorder_projects(&[c, a, b]).unwrap();
+        let mut rx = ws.subscribe();
+
+        // Listed ids lead in the given order; the rest keep their
+        // relative order (c before a) behind them.
+        ws.reorder_projects(&[b]).unwrap();
+
+        assert_eq!(project_ids_in_order(&ws), vec![b, c, a]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ProjectsReordered { project_ids }) if project_ids == vec![b, c, a]
+        ));
+    }
+
+    #[test]
+    fn reorder_projects_rejects_unknown_ids_before_mutating() {
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap().id;
+        let b = ws.create_project("b", "").unwrap().id;
+        let mut rx = ws.subscribe();
+
+        assert!(matches!(
+            ws.reorder_projects(&[b, 999, a]),
+            Err(WorkspaceError::ProjectNotFound(999))
+        ));
+
+        assert_eq!(project_ids_in_order(&ws), vec![a, b]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Duplicate ids are not rejected here: the last occurrence wins the
+    /// position and the emitted payload keeps the duplicate. Callers
+    /// uphold uniqueness — the UI validates stable ids and
+    /// `roost_ui_model::reorder::moved_ids` rejects duplicate drag
+    /// orders. Pinned as current behavior, not endorsed as a contract.
+    #[test]
+    fn reorder_projects_current_duplicate_id_behavior() {
+        let ws = Workspace::new();
+        let a = ws.create_project("a", "").unwrap().id;
+        let b = ws.create_project("b", "").unwrap().id;
+        let c = ws.create_project("c", "").unwrap().id;
+        let mut rx = ws.subscribe();
+
+        ws.reorder_projects(&[b, b, a]).unwrap();
+
+        // b takes position 1 (its second slot), a takes 2, unlisted c 3.
+        assert_eq!(project_ids_in_order(&ws), vec![b, a, c]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::ProjectsReordered { project_ids })
+                if project_ids == vec![b, b, a, c]
+        ));
+    }
+
     #[test]
     fn ensure_default_project_creates_only_once() {
         let ws = Workspace::new();

@@ -25,12 +25,15 @@ pub const ACTIVE_AGENT: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
 pub const TEXT: Color = Color::from_rgb8(0xf2, 0xf2, 0xf2);
 pub const MUTED_TEXT: Color = Color::from_rgb8(0xa0, 0xa4, 0xb0);
 pub const NOTIFICATION: Color = Color::from_rgb8(0x4e, 0x9a, 0xf1);
+pub const DRAGGED_PILL: Color = Color::from_rgba8(0x55, 0x68, 0x7b, 0.65);
 pub const PALETTE_SURFACE: Color = Color::from_rgb8(0x2d, 0x2d, 0x33);
 pub const PALETTE_SELECTION: Color = Color::from_rgb8(0x48, 0x48, 0x4e);
 pub const PALETTE_HOVER: Color = Color::from_rgb8(0x3d, 0x3d, 0x43);
 pub const PALETTE_PLACEHOLDER: Color = Color::from_rgb8(0x9e, 0x9e, 0x9e);
 pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
 pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
+pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
+pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);
 
 pub fn surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE)
@@ -40,25 +43,29 @@ pub fn dark_surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE_DARK)
 }
 
-pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| {
-        let mut style = container::Style::default();
-        if dragging {
-            style = style.background(Color::from_rgba8(0x55, 0x68, 0x7b, 0.65));
-        } else if active {
-            style = style.background(ACTIVE_TAB);
-        }
-        style.border = Border {
-            color: if dragging {
-                NOTIFICATION
-            } else {
-                Color::TRANSPARENT
-            },
-            width: if dragging { 1.0 } else { 0.0 },
-            radius: 6.0.into(),
-        };
-        style
+/// Both strips share one drag affordance, so the dragged row and the dragged
+/// tab stay visually identical; only the resting fill and radius differ.
+fn pill(active_background: Color, radius: f32, active: bool, dragging: bool) -> container::Style {
+    let mut style = container::Style::default();
+    if dragging {
+        style = style.background(DRAGGED_PILL);
+    } else if active {
+        style = style.background(active_background);
     }
+    style.border = Border {
+        color: if dragging {
+            NOTIFICATION
+        } else {
+            Color::TRANSPARENT
+        },
+        width: if dragging { 1.0 } else { 0.0 },
+        radius: radius.into(),
+    };
+    style
+}
+
+pub fn tab_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| pill(ACTIVE_TAB, 6.0, active, dragging)
 }
 
 pub fn badge(_: &Theme) -> container::Style {
@@ -67,15 +74,8 @@ pub fn badge(_: &Theme) -> container::Style {
         .border(Border::default().rounded(NOTIFICATION_DOT_SIZE / 2.0))
 }
 
-pub fn project_pill(active: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| {
-        let mut style = container::Style::default();
-        if active {
-            style = style.background(ACTIVE_BLUE);
-        }
-        style.border = Border::default().rounded(5);
-        style
-    }
+pub fn project_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| pill(ACTIVE_BLUE, 5.0, active, dragging)
 }
 
 pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
@@ -84,6 +84,43 @@ pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
     chrome_button(None, status, 4.0)
+}
+
+/// The sidebar-footer "+ New Project" chip: a centered rounded button with
+/// a resting fill, matching the shipped Mac bezel and GTK chip affordances
+/// rather than the flat text buttons used elsewhere in the chrome.
+pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered => PALETTE_SELECTION,
+        button::Status::Pressed => ACTIVE_TAB,
+        button::Status::Active => ACTIVE_AGENT,
+        button::Status::Disabled => ACTIVE_AGENT.scale_alpha(0.5),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: match status {
+            button::Status::Disabled => MUTED_TEXT.scale_alpha(0.5),
+            _ => TEXT,
+        },
+        border: Border::default().rounded(6.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (DANGER_ACCENT, TEXT),
+        button::Status::Active => (DANGER, TEXT),
+        button::Status::Disabled => (DANGER.scale_alpha(0.5), MUTED_TEXT.scale_alpha(0.5)),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().rounded(4),
+        shadow: Shadow::default(),
+        snap: true,
+    }
 }
 
 pub fn palette_panel(_: &Theme) -> container::Style {
@@ -221,8 +258,13 @@ mod tests {
     #[test]
     fn active_rows_and_pills_use_roost_selection_colors() {
         let theme = Theme::Dark;
-        let active = project_pill(true)(&theme);
+        let active = project_pill(true, false)(&theme);
         assert_eq!(active.background, Some(Background::Color(ACTIVE_BLUE)));
+        assert_eq!(
+            project_pill(true, true)(&theme).border.color,
+            NOTIFICATION,
+            "the dragged project row is outlined like the dragged tab pill"
+        );
         assert_eq!(
             tab_pill(true, false)(&theme).background,
             Some(Background::Color(ACTIVE_TAB))
@@ -274,6 +316,23 @@ mod tests {
         let disabled = palette_row(false, false)(&theme, button::Status::Hovered);
         assert_eq!(disabled.background, None);
         assert_eq!(disabled.text_color, PALETTE_PLACEHOLDER.scale_alpha(0.6));
+    }
+
+    #[test]
+    fn danger_button_always_paints_a_destructive_fill() {
+        let theme = Theme::Dark;
+        assert_eq!(
+            danger_button(&theme, button::Status::Active).background,
+            Some(Background::Color(DANGER))
+        );
+        assert_eq!(
+            danger_button(&theme, button::Status::Hovered).background,
+            Some(Background::Color(DANGER_ACCENT))
+        );
+        assert_eq!(
+            danger_button(&theme, button::Status::Active).text_color,
+            TEXT
+        );
     }
 
     #[test]

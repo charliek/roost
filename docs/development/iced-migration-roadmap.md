@@ -120,18 +120,16 @@ Slices, each sized for one gauntlet pass:
   pointer, clipboard/drop, screenshot), `servicing` (UiRequest/OSC/
   reconcile/metrics); parent keeps struct, orchestrators, keyboard, and
   projects/sidebar. Mechanical, behavior-preserving.
-* **3b. Project lifecycle UI:** create, delete (confirmation + cascade),
-  reorder (adapt `tab_reorder.rs` pattern), plus a sidebar-footer
-  `+ New Project` affordance. Engine ops already exist and are
-  unit-tested (`create_project`/`delete_project`/`reorder_projects` on
-  `LocalClient`); this is UI wiring. Removes the `Err("… not available in
-  Iced yet")` stubs at `app.rs:792` (NewProject) and `:801` (CloseProject).
-  **Parity note (verified 2026-08-03):** neither shipped UI uses a
-  directory picker — GTK's `create_new_project` passes name `""` + cwd
-  `$HOME`, Mac's sidebar `+ New Project` passes `("", "")`. Match that;
-  a folder picker is a separate future enhancement, not part of parity.
-  GTK's delete goes through `confirm_and_delete_project` (confirmation
-  first, engine cascade after).
+* **3b. Project lifecycle UI (complete — plan 010).** Shipped: create
+  (keybind + palette + sidebar-footer `+ New Project`, name `""` + cwd
+  `$HOME`, no directory picker — matching both shipped UIs), delete
+  behind an in-app confirm overlay then engine cascade, and pointer
+  reorder via the project instantiation of `strip_reorder.rs`. Both
+  `Err("… not available in Iced yet")` stubs are gone. Covered by the
+  real-input guard (`tools/input/linux/iced_clipboard_check.py`:
+  XTEST project drag, sub-threshold select, keybind confirm
+  cancel/confirm with no PTY leak) and functional e2e
+  (`tools/roosttest/test_project_lifecycle.py`).
 * **3c. Sidebar resize** with persisted width (replaces the hardcoded
   `SIDEBAR_WIDTH: f32 = 220.0`).
 * **3d. Tick → push subscriptions.** Replace the 16 ms full-snapshot poll
@@ -141,14 +139,25 @@ Slices, each sized for one gauntlet pass:
 * **3e. Polish parity:** notification bell/badge, hover-close, offscreen-tab
   reveal, empty/loading/error states, cursor/selection/link pixel geometry —
   per the P1 rows in the [parity inventory](iced-parity-inventory.md).
+  Also sidebar/chrome visual polish (subtle color differences, separator
+  lines, the footer chip's exact bezel, and a spike on the Mac app's
+  frosted/translucent look — likely `window-vibrancy` over a transparent
+  iced window on macOS; compositor-dependent on Linux). **Plan this slice
+  with the user in the loop — they want to give detailed direction here.**
   Includes the user-visible tab-strip artifact bug ([#281]) — fold it into
   whichever slice touches the tab strip first rather than waiting for 3e.
+  Carried from 3b (plan 010): designing the empty state after the last
+  project is deleted — iced lands in the engine's empty workspace state
+  while both shipped UIs close their window — and tightening the confirm
+  overlay's pointer modality (it blocks presses but, like the palette,
+  passes wheel/hover through) are 3e items.
 * **3f. Native desktop notifications** (narrow platform port, per-OS).
 * **3g. Wayland gaps** (native file drop, clipboard seat serial) are
   upstream Iced/winit limitations — track, document, don't block on them.
 
-Slice order is deliberate: 3b/3c close the honest `Err("… not available in
-Iced yet")` stubs (the last functional gaps blocking M4); 3d is the
+Slice order is deliberate: 3b closed the honest `Err("… not available in
+Iced yet")` stubs — the grep now has zero hits, and 3c is the last
+functional gap blocking M4; 3d is the
 architecture cleanup that everything real-time depends on; 3e/3f/3g are
 polish and platform work that can interleave.
 

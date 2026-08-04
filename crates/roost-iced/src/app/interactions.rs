@@ -151,7 +151,8 @@ fn take_rename_focus_request(requested: &mut bool, editor_open: bool, input_id: 
 
 impl App {
     pub(super) fn begin_rename_target(&mut self, target: RenameTarget) -> Result<(), String> {
-        self.cancel_tab_drag();
+        self.cancel_drags();
+        self.cancel_confirm_delete();
         if self
             .rename_editor
             .as_ref()
@@ -293,14 +294,27 @@ enum TabDragSettlement {
     Settled(Result<bool, String>),
 }
 
+/// Ids a gesture can be keyed to: unique, and never the `0` placeholder a
+/// not-yet-persisted row carries.
+pub(super) fn stable_ids(ids: &[i64]) -> bool {
+    !ids.contains(&0) && ids.iter().copied().collect::<HashSet<_>>().len() == ids.len()
+}
+
 pub(super) fn same_stable_ids(left: &[i64], right: &[i64]) -> bool {
-    if left.len() != right.len() || left.contains(&0) {
-        return false;
-    }
-    let count = left.len();
-    let left = left.iter().copied().collect::<HashSet<_>>();
-    let right = right.iter().copied().collect::<HashSet<_>>();
-    left.len() == count && right.len() == count && left == right
+    stable_ids(left)
+        && stable_ids(right)
+        && left.len() == right.len()
+        && left.iter().copied().collect::<HashSet<_>>()
+            == right.iter().copied().collect::<HashSet<_>>()
+}
+
+/// Clearing a preview always burns its generation: a gesture the widget is
+/// still holding carries the old one and can never re-arm against the new.
+/// Both strips cancel through here, which is also how one strip evicts the
+/// other when it arms.
+fn cancel_drag_preview<T>(preview: &mut Option<T>, generation: &mut u64) {
+    *generation = generation.wrapping_add(1);
+    preview.take();
 }
 
 fn dispatch_tab_drag_commit_with(
@@ -378,8 +392,7 @@ impl App {
     }
 
     pub(super) fn cancel_tab_drag(&mut self) {
-        self.tab_drag_preview = None;
-        self.tab_strip_generation = self.tab_strip_generation.wrapping_add(1);
+        cancel_drag_preview(&mut self.tab_drag_preview, &mut self.tab_strip_generation);
     }
 
     pub(super) fn reconcile_tab_drag_preview(&mut self) {
@@ -400,11 +413,12 @@ impl App {
         context_generation: u64,
         original_ids: Vec<i64>,
     ) {
+        self.cancel_project_drag();
         let authoritative = self.active_project_tab_ids(project_id);
         if context_generation != self.tab_strip_generation
             || self.workspace.active().0 != project_id
             || authoritative != original_ids
-            || !same_stable_ids(&original_ids, &original_ids)
+            || !stable_ids(&original_ids)
             || !original_ids.contains(&source_id)
         {
             self.cancel_tab_drag();
@@ -519,44 +533,62 @@ impl App {
         self.reconcile();
     }
 
-    pub(crate) fn tab_pointer_released(&mut self) {
-        let Some(preview) = self.tab_drag_preview.as_ref() else {
-            tracing::debug!("Iced root release had no tab drag preview");
-            return;
-        };
-        tracing::debug!(
-            project_id = preview.context.project_id,
-            source_id = preview.context.source_id,
-            generation = preview.context.generation,
-            ordered_ids = ?preview.ordered_ids,
-            "Iced root release settling tab drag preview"
-        );
-        let request = TabDragCommitRequest::from(preview);
-        self.commit_tab_drag(
-            request.context.project_id,
-            request.context.source_id,
-            request.context.generation,
-            &request.original_ids,
-            request.ordered_ids,
-        );
+    /// At most one preview exists — the strips cancel each other when a
+    /// gesture arms — so this settles whichever one owns the release.
+    pub(crate) fn strip_pointer_released(&mut self) {
+        if let Some(preview) = self.tab_drag_preview.as_ref() {
+            tracing::debug!(
+                project_id = preview.context.project_id,
+                source_id = preview.context.source_id,
+                generation = preview.context.generation,
+                ordered_ids = ?preview.ordered_ids,
+                "Iced root release settling tab drag preview"
+            );
+            let request = TabDragCommitRequest::from(preview);
+            self.commit_tab_drag(
+                request.context.project_id,
+                request.context.source_id,
+                request.context.generation,
+                &request.original_ids,
+                request.ordered_ids,
+            );
+        } else if let Some(preview) = self.project_drag_preview.as_ref() {
+            tracing::debug!(
+                source_id = preview.context.source_id,
+                generation = preview.context.generation,
+                ordered_ids = ?preview.ordered_ids,
+                "Iced root release settling project drag preview"
+            );
+            let request = ProjectDragCommitRequest::from(preview);
+            self.commit_project_drag(
+                request.context.source_id,
+                request.context.generation,
+                &request.original_ids,
+                request.ordered_ids,
+            );
+        }
     }
 
-    pub(crate) fn has_tab_drag_preview(&self) -> bool {
-        self.tab_drag_preview.is_some()
+    pub(crate) fn has_drag_preview(&self) -> bool {
+        self.tab_drag_preview.is_some() || self.project_drag_preview.is_some()
     }
 
-    pub(crate) fn tab_strip_event(&mut self, event: TabStripEvent) {
+    pub(crate) fn tab_strip_event(&mut self, event: StripEvent) {
         match event {
-            TabStripEvent::Started {
-                project_id,
+            StripEvent::Started {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
                 self.begin_tab_drag_preview(project_id, source_id, context_generation, original_ids)
             }
-            TabStripEvent::Preview {
-                project_id,
+            // Tab visuals key off preview presence, so the threshold
+            // crossing changes nothing here; the event exists for the
+            // project strip's agent-row hiding.
+            StripEvent::DragBegan { .. } => {}
+            StripEvent::Preview {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
@@ -568,8 +600,8 @@ impl App {
                 &original_ids,
                 ordered_ids,
             ),
-            TabStripEvent::Commit {
-                project_id,
+            StripEvent::Commit {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
@@ -581,17 +613,394 @@ impl App {
                 &original_ids,
                 ordered_ids,
             ),
-            TabStripEvent::Ended {
-                project_id,
+            StripEvent::Ended {
+                scope_id: project_id,
                 source_id,
                 context_generation,
                 original_ids,
             } => {
                 self.end_tab_drag_preview(project_id, source_id, context_generation, &original_ids)
             }
-            TabStripEvent::Cancel { context_generation } => {
+            StripEvent::Cancel { context_generation } => {
                 if context_generation == self.tab_strip_generation {
                     self.cancel_tab_drag();
+                    self.reconcile();
+                }
+            }
+        }
+    }
+}
+
+// ── project drag ──
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProjectDragContext {
+    pub(super) source_id: i64,
+    pub(super) generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProjectDragPreview {
+    pub(super) context: ProjectDragContext,
+    pub(super) original_ids: Vec<i64>,
+    pub(super) ordered_ids: Vec<i64>,
+    pub(super) dragging: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectDragCommitRequest {
+    context: ProjectDragContext,
+    original_ids: Vec<i64>,
+    ordered_ids: Vec<i64>,
+}
+
+impl From<&ProjectDragPreview> for ProjectDragCommitRequest {
+    fn from(preview: &ProjectDragPreview) -> Self {
+        Self {
+            context: preview.context.clone(),
+            original_ids: preview.original_ids.clone(),
+            ordered_ids: preview.ordered_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectDragSettlement {
+    Ignored,
+    Settled(Result<bool, String>),
+}
+
+/// Agent sub-rows change every project group's height, so they are hidden
+/// only once the gesture crosses the drag threshold — the strip publishes
+/// its start on a bare press, which must leave the sidebar untouched.
+pub(super) fn agent_rows_hidden(preview: Option<&ProjectDragPreview>) -> bool {
+    preview.is_some_and(|preview| preview.dragging)
+}
+
+fn dispatch_project_drag_commit_with(
+    preview: Option<&ProjectDragPreview>,
+    authoritative_ids: &[i64],
+    context: &ProjectDragContext,
+    original_ids: &[i64],
+    ordered_ids: Vec<i64>,
+    apply: impl FnOnce(Vec<i64>) -> Result<(), String>,
+) -> Result<bool, String> {
+    let valid = preview.is_some_and(|preview| {
+        preview.context == *context
+            && preview.original_ids == original_ids
+            && preview.ordered_ids == ordered_ids
+            && authoritative_ids == original_ids
+            && same_stable_ids(&ordered_ids, original_ids)
+    });
+    if !valid || ordered_ids == original_ids {
+        return Ok(false);
+    }
+    apply(ordered_ids)?;
+    Ok(true)
+}
+
+fn settle_project_drag_commit_with(
+    preview: &mut Option<ProjectDragPreview>,
+    authoritative_ids: &[i64],
+    request: ProjectDragCommitRequest,
+    apply: impl FnOnce(Vec<i64>) -> Result<(), String>,
+) -> ProjectDragSettlement {
+    if preview
+        .as_ref()
+        .is_none_or(|preview| preview.context != request.context)
+    {
+        return ProjectDragSettlement::Ignored;
+    }
+
+    let result = dispatch_project_drag_commit_with(
+        preview.as_ref(),
+        authoritative_ids,
+        &request.context,
+        &request.original_ids,
+        request.ordered_ids,
+        apply,
+    );
+    *preview = None;
+    ProjectDragSettlement::Settled(result)
+}
+
+/// `None` rejects the press: the caller cancels rather than arming a gesture
+/// against a list the sidebar no longer renders.
+fn arm_project_drag_preview(
+    authoritative_ids: &[i64],
+    strip_generation: u64,
+    source_id: i64,
+    context_generation: u64,
+    original_ids: Vec<i64>,
+) -> Option<ProjectDragPreview> {
+    let armable = context_generation == strip_generation
+        && authoritative_ids == original_ids
+        && stable_ids(&original_ids)
+        && original_ids.contains(&source_id);
+    armable.then(|| ProjectDragPreview {
+        context: ProjectDragContext {
+            source_id,
+            generation: context_generation,
+        },
+        ordered_ids: original_ids.clone(),
+        original_ids,
+        dragging: false,
+    })
+}
+
+fn mark_project_drag_dragging(
+    preview: &mut Option<ProjectDragPreview>,
+    strip_generation: u64,
+    context: &ProjectDragContext,
+) -> bool {
+    let Some(current) = preview.as_mut() else {
+        return false;
+    };
+    let owned = context.generation == strip_generation && current.context == *context;
+    if owned {
+        current.dragging = true;
+    }
+    owned
+}
+
+fn preview_project_drag_if_owned(
+    preview: &mut Option<ProjectDragPreview>,
+    authoritative_ids: &[i64],
+    strip_generation: u64,
+    context: &ProjectDragContext,
+    original_ids: &[i64],
+    ordered_ids: Vec<i64>,
+) -> bool {
+    let Some(current) = preview.as_mut() else {
+        return false;
+    };
+    let owned = context.generation == strip_generation
+        && authoritative_ids == original_ids
+        && same_stable_ids(&ordered_ids, original_ids)
+        && current.context == *context
+        && current.original_ids == original_ids;
+    if owned {
+        current.ordered_ids = ordered_ids;
+    }
+    owned
+}
+
+fn project_drag_preview_is_stale(
+    preview: Option<&ProjectDragPreview>,
+    authoritative_ids: &[i64],
+) -> bool {
+    preview.is_some_and(|preview| preview.original_ids != authoritative_ids)
+}
+
+fn end_project_drag_preview_if_owned(
+    preview: &mut Option<ProjectDragPreview>,
+    authoritative_ids: &[i64],
+    context: &ProjectDragContext,
+    original_ids: &[i64],
+) -> bool {
+    let owned = preview.as_ref().is_some_and(|preview| {
+        preview.context == *context
+            && preview.original_ids == original_ids
+            && preview.ordered_ids == original_ids
+            && authoritative_ids == original_ids
+    });
+    if owned {
+        *preview = None;
+    }
+    owned
+}
+
+impl App {
+    pub(super) fn sidebar_project_ids(&self) -> Vec<i64> {
+        self.projects.iter().map(|project| project.id).collect()
+    }
+
+    pub(super) fn cancel_project_drag(&mut self) {
+        cancel_drag_preview(
+            &mut self.project_drag_preview,
+            &mut self.project_strip_generation,
+        );
+    }
+
+    pub(super) fn cancel_drags(&mut self) {
+        self.cancel_tab_drag();
+        self.cancel_project_drag();
+    }
+
+    pub(super) fn reconcile_project_drag_preview(&mut self) {
+        if self.project_drag_preview.is_none() {
+            return;
+        }
+        // Project drags span the whole sidebar, so the full project-id list
+        // is the authority — unlike tabs, no active-project scope applies.
+        let authoritative = self.sidebar_project_ids();
+        if project_drag_preview_is_stale(self.project_drag_preview.as_ref(), &authoritative) {
+            self.cancel_project_drag();
+        }
+    }
+
+    fn begin_project_drag_preview(
+        &mut self,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: Vec<i64>,
+    ) {
+        self.cancel_tab_drag();
+        let authoritative = self.sidebar_project_ids();
+        match arm_project_drag_preview(
+            &authoritative,
+            self.project_strip_generation,
+            source_id,
+            context_generation,
+            original_ids,
+        ) {
+            Some(preview) => self.project_drag_preview = Some(preview),
+            None => self.cancel_project_drag(),
+        }
+    }
+
+    fn begin_project_drag(&mut self, source_id: i64, context_generation: u64) {
+        let context = ProjectDragContext {
+            source_id,
+            generation: context_generation,
+        };
+        if !mark_project_drag_dragging(
+            &mut self.project_drag_preview,
+            self.project_strip_generation,
+            &context,
+        ) {
+            self.cancel_project_drag();
+        }
+    }
+
+    fn preview_project_drag(
+        &mut self,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: &[i64],
+        ordered_ids: Vec<i64>,
+    ) {
+        let context = ProjectDragContext {
+            source_id,
+            generation: context_generation,
+        };
+        let authoritative = self.sidebar_project_ids();
+        if !preview_project_drag_if_owned(
+            &mut self.project_drag_preview,
+            &authoritative,
+            self.project_strip_generation,
+            &context,
+            original_ids,
+            ordered_ids,
+        ) {
+            self.cancel_project_drag();
+        }
+    }
+
+    fn end_project_drag_preview(
+        &mut self,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: &[i64],
+    ) {
+        let context = ProjectDragContext {
+            source_id,
+            generation: context_generation,
+        };
+        let authoritative = self.sidebar_project_ids();
+        end_project_drag_preview_if_owned(
+            &mut self.project_drag_preview,
+            &authoritative,
+            &context,
+            original_ids,
+        );
+    }
+
+    fn commit_project_drag(
+        &mut self,
+        source_id: i64,
+        context_generation: u64,
+        original_ids: &[i64],
+        ordered_ids: Vec<i64>,
+    ) {
+        let authoritative = self.sidebar_project_ids();
+        let request = ProjectDragCommitRequest {
+            context: ProjectDragContext {
+                source_id,
+                generation: context_generation,
+            },
+            original_ids: original_ids.to_vec(),
+            ordered_ids,
+        };
+        let runtime = &self.runtime;
+        let client = &self.client;
+        let settlement = settle_project_drag_commit_with(
+            &mut self.project_drag_preview,
+            &authoritative,
+            request,
+            |ordered_ids| {
+                runtime
+                    .block_on(client.reorder_projects(ordered_ids))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        tracing::debug!(
+            ?settlement,
+            source_id,
+            context_generation,
+            "Iced project drag settlement"
+        );
+        let ProjectDragSettlement::Settled(result) = settlement else {
+            return;
+        };
+        self.project_strip_generation = self.project_strip_generation.wrapping_add(1);
+        if let Err(error) = result {
+            tracing::warn!(?error, source_id, "Iced project reorder failed");
+            self.set_status(format!("reorder projects: {error}"));
+        }
+        self.reconcile();
+    }
+
+    pub(crate) fn project_strip_event(&mut self, event: StripEvent) {
+        match event {
+            StripEvent::Started {
+                scope_id: _,
+                source_id,
+                context_generation,
+                original_ids,
+            } => self.begin_project_drag_preview(source_id, context_generation, original_ids),
+            StripEvent::DragBegan {
+                scope_id: _,
+                source_id,
+                context_generation,
+            } => self.begin_project_drag(source_id, context_generation),
+            StripEvent::Preview {
+                scope_id: _,
+                source_id,
+                context_generation,
+                original_ids,
+                ordered_ids,
+            } => {
+                self.preview_project_drag(source_id, context_generation, &original_ids, ordered_ids)
+            }
+            StripEvent::Commit {
+                scope_id: _,
+                source_id,
+                context_generation,
+                original_ids,
+                ordered_ids,
+            } => {
+                self.commit_project_drag(source_id, context_generation, &original_ids, ordered_ids)
+            }
+            StripEvent::Ended {
+                scope_id: _,
+                source_id,
+                context_generation,
+                original_ids,
+            } => self.end_project_drag_preview(source_id, context_generation, &original_ids),
+            StripEvent::Cancel { context_generation } => {
+                if context_generation == self.project_strip_generation {
+                    self.cancel_project_drag();
                     self.reconcile();
                 }
             }
@@ -603,6 +1012,13 @@ impl App {
 
 impl App {
     pub fn pointer(&mut self, event: TerminalPointerEvent) -> UiTask {
+        // The confirm overlay's catcher only owns primary presses;
+        // motion, right/middle presses, and releases would otherwise
+        // reach a mouse-tracking PTY (middle-press can even paste).
+        // A destructive modal must leak no pointer input.
+        if self.confirm_delete.is_some() {
+            return UiTask::None;
+        }
         let TerminalPointerEvent {
             tab_id,
             action,
@@ -812,7 +1228,10 @@ pub(super) fn native_file_drop_origin(
         .then_some(route)
         .and_then(|route| match route {
             KeyboardRoute::Terminal(tab_id) => Some(tab_id),
-            KeyboardRoute::None | KeyboardRoute::Editor | KeyboardRoute::Palette => None,
+            KeyboardRoute::None
+            | KeyboardRoute::Confirm
+            | KeyboardRoute::Editor
+            | KeyboardRoute::Palette => None,
         })
 }
 
@@ -1697,6 +2116,362 @@ mod tests {
         .unwrap_err();
         assert_eq!(calls, 1);
         assert_eq!(error, "injected reorder failure");
+    }
+
+    fn project_drag_preview(dragging: bool) -> ProjectDragPreview {
+        ProjectDragPreview {
+            context: ProjectDragContext {
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: vec![10, 20, 30],
+            ordered_ids: if dragging {
+                vec![20, 30, 10]
+            } else {
+                vec![10, 20, 30]
+            },
+            dragging,
+        }
+    }
+
+    #[test]
+    fn project_drag_arms_only_for_the_current_generation_and_rendered_membership() {
+        let ids = vec![10, 20, 30];
+        let armed = arm_project_drag_preview(&ids, 4, 20, 4, ids.clone())
+            .expect("a current-generation press on a rendered project arms");
+        assert_eq!(
+            armed.context,
+            ProjectDragContext {
+                source_id: 20,
+                generation: 4,
+            }
+        );
+        assert_eq!(armed.ordered_ids, ids);
+        assert!(!armed.dragging, "a bare press is not yet a drag");
+
+        assert!(arm_project_drag_preview(&ids, 5, 20, 4, ids.clone()).is_none());
+        assert!(arm_project_drag_preview(&[10, 20], 4, 20, 4, ids.clone()).is_none());
+        assert!(arm_project_drag_preview(&ids, 4, 99, 4, ids.clone()).is_none());
+        assert!(arm_project_drag_preview(&[10, 0], 4, 10, 4, vec![10, 0]).is_none());
+    }
+
+    #[test]
+    fn project_drag_threshold_gates_agent_row_hiding() {
+        let context = ProjectDragContext {
+            source_id: 10,
+            generation: 4,
+        };
+        assert!(!agent_rows_hidden(None));
+
+        let mut pressed = Some(project_drag_preview(false));
+        assert!(
+            !agent_rows_hidden(pressed.as_ref()),
+            "an ordinary click must leave the agent rows in place"
+        );
+        assert!(mark_project_drag_dragging(&mut pressed, 4, &context));
+        assert!(agent_rows_hidden(pressed.as_ref()));
+
+        let mut stale = Some(project_drag_preview(false));
+        assert!(!mark_project_drag_dragging(&mut stale, 5, &context));
+        assert!(!mark_project_drag_dragging(
+            &mut stale,
+            4,
+            &ProjectDragContext {
+                source_id: 20,
+                generation: 4,
+            }
+        ));
+        assert!(!agent_rows_hidden(stale.as_ref()));
+
+        let mut absent = None;
+        assert!(!mark_project_drag_dragging(&mut absent, 4, &context));
+    }
+
+    #[test]
+    fn project_drag_preview_updates_only_for_the_owning_gesture() {
+        let ids = vec![10, 20, 30];
+        let context = ProjectDragContext {
+            source_id: 10,
+            generation: 4,
+        };
+        let mut preview = Some(project_drag_preview(false));
+        assert!(preview_project_drag_if_owned(
+            &mut preview,
+            &ids,
+            4,
+            &context,
+            &ids,
+            vec![20, 10, 30]
+        ));
+        assert_eq!(preview.as_ref().unwrap().ordered_ids, [20, 10, 30]);
+
+        for (authoritative, strip_generation, context, ordered) in [
+            (ids.clone(), 5, context.clone(), vec![30, 20, 10]),
+            (vec![10, 20], 4, context.clone(), vec![30, 20, 10]),
+            (ids.clone(), 4, context.clone(), vec![10, 20]),
+            (
+                ids.clone(),
+                4,
+                ProjectDragContext {
+                    source_id: 20,
+                    generation: 4,
+                },
+                vec![30, 20, 10],
+            ),
+        ] {
+            assert!(!preview_project_drag_if_owned(
+                &mut preview,
+                &authoritative,
+                strip_generation,
+                &context,
+                &ids,
+                ordered
+            ));
+        }
+        assert_eq!(preview.as_ref().unwrap().ordered_ids, [20, 10, 30]);
+    }
+
+    #[test]
+    fn external_project_reorder_mid_drag_marks_the_preview_stale() {
+        let preview = project_drag_preview(true);
+        assert!(!project_drag_preview_is_stale(
+            Some(&preview),
+            &[10, 20, 30]
+        ));
+        assert!(project_drag_preview_is_stale(Some(&preview), &[30, 20, 10]));
+        assert!(project_drag_preview_is_stale(
+            Some(&preview),
+            &[10, 20, 30, 40]
+        ));
+        assert!(project_drag_preview_is_stale(Some(&preview), &[10, 20]));
+        assert!(!project_drag_preview_is_stale(None, &[10, 20]));
+    }
+
+    #[test]
+    fn arming_either_strip_cancels_the_other_and_burns_its_generation() {
+        let ids = vec![10, 20, 30];
+        let mut tab_preview = Some(TabDragPreview {
+            context: TabDragContext {
+                project_id: 7,
+                source_id: 10,
+                generation: 4,
+            },
+            original_ids: vec![101, 102],
+            ordered_ids: vec![102, 101],
+        });
+        let mut tab_generation = 4;
+
+        // A project press evicts the tab preview before arming its own.
+        cancel_drag_preview(&mut tab_preview, &mut tab_generation);
+        assert!(tab_preview.is_none());
+        assert_eq!(tab_generation, 5);
+        let mut project_preview = arm_project_drag_preview(&ids, 4, 10, 4, ids.clone());
+        assert!(project_preview.is_some());
+
+        // The reverse eviction burns the project generation, so the press the
+        // strip already published against the old one can no longer arm.
+        let mut project_generation = 4;
+        cancel_drag_preview(&mut project_preview, &mut project_generation);
+        assert!(project_preview.is_none());
+        assert_eq!(project_generation, 5);
+        assert!(arm_project_drag_preview(&ids, project_generation, 10, 4, ids.clone()).is_none());
+    }
+
+    #[test]
+    fn project_drag_commit_dispatches_exactly_once_and_rejects_stale_or_noop_state() {
+        let preview = project_drag_preview(true);
+        let mut calls = Vec::new();
+        let applied = dispatch_project_drag_commit_with(
+            Some(&preview),
+            &[10, 20, 30],
+            &preview.context,
+            &[10, 20, 30],
+            vec![20, 30, 10],
+            |ordered_ids| {
+                calls.push(ordered_ids);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(applied);
+        assert_eq!(calls, vec![vec![20, 30, 10]]);
+
+        for (authoritative, ordered) in [
+            (vec![30, 20, 10], vec![20, 30, 10]),
+            (vec![10, 20, 30], vec![10, 20, 30]),
+            (vec![10, 20, 30], vec![20, 10, 30]),
+        ] {
+            let result = dispatch_project_drag_commit_with(
+                Some(&preview),
+                &authoritative,
+                &preview.context,
+                &[10, 20, 30],
+                ordered,
+                |_| panic!("stale/no-op project drag dispatched"),
+            );
+            assert_eq!(result, Ok(false));
+        }
+
+        let stale_generation = dispatch_project_drag_commit_with(
+            Some(&preview),
+            &[10, 20, 30],
+            &ProjectDragContext {
+                source_id: 10,
+                generation: 5,
+            },
+            &[10, 20, 30],
+            vec![20, 30, 10],
+            |_| panic!("stale-generation project drag dispatched"),
+        );
+        assert_eq!(stale_generation, Ok(false));
+    }
+
+    #[test]
+    fn project_drag_settlement_is_owned_once_across_both_release_paths() {
+        // The widget's own commit and the root release boundary build equal
+        // requests, so whichever arrives first settles and the other is a
+        // no-op regardless of order.
+        let preview = project_drag_preview(true);
+        let request = ProjectDragCommitRequest::from(&preview);
+        let mut current = Some(preview);
+        let mut calls = 0;
+
+        let settled = settle_project_drag_commit_with(
+            &mut current,
+            &[10, 20, 30],
+            request.clone(),
+            |ordered_ids| {
+                calls += 1;
+                assert_eq!(ordered_ids, [20, 30, 10]);
+                Ok(())
+            },
+        );
+        assert_eq!(settled, ProjectDragSettlement::Settled(Ok(true)));
+        assert!(current.is_none());
+
+        let duplicate =
+            settle_project_drag_commit_with(&mut current, &[10, 20, 30], request, |_| {
+                panic!("duplicate project release dispatched")
+            });
+        assert_eq!(duplicate, ProjectDragSettlement::Ignored);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn exact_subthreshold_project_end_clears_without_accepting_stale_or_moved_state() {
+        let original = vec![10, 20, 30];
+        let preview = project_drag_preview(false);
+        let context = preview.context.clone();
+
+        let mut exact = Some(preview.clone());
+        assert!(end_project_drag_preview_if_owned(
+            &mut exact, &original, &context, &original,
+        ));
+        assert!(exact.is_none());
+
+        let mut stale = Some(preview.clone());
+        assert!(!end_project_drag_preview_if_owned(
+            &mut stale,
+            &original,
+            &ProjectDragContext {
+                generation: 5,
+                ..context.clone()
+            },
+            &original,
+        ));
+        assert_eq!(stale, Some(preview.clone()));
+
+        let moved = project_drag_preview(true);
+        let mut moved_state = Some(moved.clone());
+        assert!(!end_project_drag_preview_if_owned(
+            &mut moved_state,
+            &original,
+            &context,
+            &original,
+        ));
+        assert_eq!(moved_state, Some(moved));
+    }
+
+    #[test]
+    fn project_drag_commit_after_the_agent_row_hide_uses_the_gesture_id_list() {
+        let ids = vec![10, 20, 30];
+        let context = ProjectDragContext {
+            source_id: 10,
+            generation: 4,
+        };
+        let mut preview = arm_project_drag_preview(&ids, 4, 10, 4, ids.clone());
+        assert!(!agent_rows_hidden(preview.as_ref()));
+        assert!(mark_project_drag_dragging(&mut preview, 4, &context));
+        assert!(agent_rows_hidden(preview.as_ref()));
+
+        // Hiding the agent rows reflows every group, so the strip recomputes
+        // its target index from live bounds; settlement compares ids only and
+        // is unaffected by the changed geometry.
+        assert!(preview_project_drag_if_owned(
+            &mut preview,
+            &ids,
+            4,
+            &context,
+            &ids,
+            vec![20, 30, 10]
+        ));
+        let request = ProjectDragCommitRequest::from(preview.as_ref().unwrap());
+        let mut calls = Vec::new();
+        assert_eq!(
+            settle_project_drag_commit_with(&mut preview, &ids, request, |ordered_ids| {
+                calls.push(ordered_ids);
+                Ok(())
+            }),
+            ProjectDragSettlement::Settled(Ok(true))
+        );
+        assert_eq!(calls, vec![vec![20, 30, 10]]);
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn project_drag_commit_reorders_the_engine_project_list() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let workspace = Arc::new(Workspace::new());
+        let mut ids = Vec::new();
+        for name in ["first", "second", "third"] {
+            let project = workspace.create_project(name, "/tmp").unwrap();
+            workspace.open_tab(project.id, "/tmp", name).unwrap();
+            ids.push(project.id);
+        }
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::new(PtySupervisor::new()),
+            "/tmp/roost-iced-project-drag-test.sock".into(),
+        );
+        let ordered = vec![ids[2], ids[0], ids[1]];
+        let mut preview = Some(ProjectDragPreview {
+            context: ProjectDragContext {
+                source_id: ids[2],
+                generation: 4,
+            },
+            original_ids: ids.clone(),
+            ordered_ids: ordered.clone(),
+            dragging: true,
+        });
+        let request = ProjectDragCommitRequest::from(preview.as_ref().unwrap());
+
+        assert_eq!(
+            settle_project_drag_commit_with(&mut preview, &ids, request, |ordered_ids| {
+                runtime
+                    .block_on(client.reorder_projects(ordered_ids))
+                    .map_err(|error| error.to_string())
+            }),
+            ProjectDragSettlement::Settled(Ok(true))
+        );
+        assert!(preview.is_none());
+        assert_eq!(
+            workspace
+                .snapshot()
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            ordered
+        );
     }
 
     #[test]

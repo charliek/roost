@@ -46,6 +46,13 @@ ICED_BIN = Path(
 )
 SCALE = float(os.environ.get("ROOST_TEST_TIMEOUT_SCALE", "1") or "1")
 
+# Sidebar project rows: chrome::ROW_HEIGHT, the sidebar body column's spacing,
+# and its `padding([4, 0])` top inset (crates/roost-iced/src/app.rs). The band
+# above them is read from the product instead of copied.
+SIDEBAR_ROW_HEIGHT = 28
+SIDEBAR_ROW_SPACING = 2
+SIDEBAR_BODY_TOP_PADDING = 4
+
 
 def _skip(message: str) -> NoReturn:
     if os.environ.get("ROOST_REQUIRE_REAL_INPUT") == "1":
@@ -397,15 +404,29 @@ def _hold_plain_key(launch: Launch, key: str, seconds: float = 1.2) -> None:
     time.sleep(0.2)
 
 
-def _screenshot_color_count(launch: Launch, color: tuple[int, int, int], name: str) -> int:
+def _screenshot_color_count(
+    launch: Launch,
+    color: tuple[int, int, int],
+    name: str,
+    region: tuple[float, float, float, float] | None = None,
+) -> int:
+    """Count exact-color pixels, optionally within a fractional
+    (x0, y0, x1, y1) window region so a fence can't be satisfied by
+    ambient content elsewhere in the frame."""
     png, _width, _height = launch.client.screenshot(scale=1)
     path = launch.root / f"{name}.png"
     path.write_bytes(png)
     width, height, bpp, data = pngtool.load(str(path))
+    x0, y0, x1, y1 = (0, 0, width, height)
+    if region is not None:
+        x0 = int(region[0] * width)
+        y0 = int(region[1] * height)
+        x1 = int(region[2] * width)
+        y1 = int(region[3] * height)
     return sum(
         tuple(data[(y * width + x) * bpp : (y * width + x) * bpp + 3]) == color
-        for y in range(height)
-        for x in range(width)
+        for y in range(y0, y1)
+        for x in range(x0, x1)
     )
 
 
@@ -1275,6 +1296,256 @@ def _direct_tab_reorder(
     return ["RENAMED-TAB", "DRAG-THIRD", "DRAG-SECOND"]
 
 
+def _project_ids(launch: Launch) -> list[int]:
+    """Authoritative sidebar order — the snapshot sorts by persisted position."""
+    return [int(project["id"]) for project in launch.client.list()]
+
+
+def _sidebar_row_center(launch: Launch, index: int) -> tuple[int, int]:
+    """Window-relative center of the index-th sidebar project row.
+
+    The band height and sidebar width come from the live product metrics the
+    tab-strip checks already trust, so a chrome layout change fails as a
+    verified wrong-row click below rather than as an unexplained drag result.
+    """
+    metrics = launch.client.window_metrics()
+    x = round(float(metrics["sidebar_width"])) // 2
+    top = (
+        round(launch.client.terminal_top(metrics))
+        + SIDEBAR_BODY_TOP_PADDING
+        + index * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_SPACING)
+    )
+    return x, top + SIDEBAR_ROW_HEIGHT // 2
+
+
+def _confirm_delete_fill_pixels(launch: Launch, name: str) -> int:
+    """Count the destructive Delete button fill (chrome::danger_button).
+
+    Scoped to the central window region: the confirm panel is a centered
+    420px-max card, so terminal content near the edges can never satisfy
+    the fence even if it paints the exact danger color."""
+    return _screenshot_color_count(
+        launch,
+        (0x8A, 0x2A, 0x2A),
+        f"{name}-confirm",
+        region=(0.25, 0.25, 0.75, 0.75),
+    )
+
+
+def _wait_confirm_delete_open(launch: Launch, name: str) -> None:
+    _wait_until(
+        lambda: _confirm_delete_fill_pixels(launch, name) >= 200,
+        f"{name} delete-confirm overlay painted",
+    )
+
+
+def _wait_confirm_delete_closed(launch: Launch, name: str) -> None:
+    _wait_until(
+        lambda: _confirm_delete_fill_pixels(launch, name) <= 10,
+        f"{name} delete-confirm overlay dismissed",
+    )
+
+
+def _project_lifecycle(launch: Launch, home_project: int, home_tab: int) -> None:
+    """Drive real sidebar project drags and the keybind-opened delete confirm."""
+    agents_visible = launch.client.sidebar_dump()["agents_visible"]
+    assert not agents_visible, (
+        "project row geometry assumes show-sidebar-agents = false; sidebar_dump "
+        f"reports agents_visible={agents_visible!r}"
+    )
+    baseline = _project_ids(launch)
+    assert baseline == [home_project], (
+        "project lifecycle expects the single-project fixture left by the tab "
+        f"checks; sidebar holds {baseline!r}"
+    )
+
+    alpha = launch.client.create_project("DRAG-PROJECT-ALPHA", "/tmp")
+    alpha_tab = launch.client.open_tab(alpha, "/tmp", "ALPHA-SHELL")
+    beta = launch.client.create_project("DRAG-PROJECT-BETA", "/tmp")
+    beta_tab = launch.client.open_tab(beta, "/tmp", "BETA-SHELL")
+    for tab_id in (alpha_tab, beta_tab):
+        _wait_until(
+            lambda tab_id=tab_id: _tab_is_attached(launch, tab_id),
+            f"project lifecycle tab {tab_id} PTY",
+        )
+    ordered = [home_project, alpha, beta]
+    launch.client.reorder_projects(ordered)
+    _wait_until(
+        lambda: _project_ids(launch) == ordered,
+        "initial project lifecycle sidebar order",
+    )
+
+    # Verify every row hit target against the engine before dragging. A press
+    # landing one row off would otherwise produce a plausible-looking but wrong
+    # committed order with no diagnostic. The last project is active first, so
+    # every row click below is an observable transition rather than a no-op.
+    launch.client.focus(beta_tab)
+    _wait_until(
+        lambda: int(launch.client.identify()["active_project_id"]) == beta,
+        "last project active before the row hit-target sweep",
+    )
+    for index, project_id in enumerate(ordered):
+        x, y = _sidebar_row_center(launch, index)
+        _click_window_control(launch, x, y)
+        _wait_until(
+            lambda project_id=project_id: int(
+                launch.client.identify()["active_project_id"]
+            )
+            == project_id,
+            f"sidebar project row {index} hit target selects project {project_id}",
+        )
+    _assert_stays(
+        lambda: _project_ids(launch) == ordered,
+        "sub-threshold row hit-target clicks leave the project order untouched",
+    )
+
+    tabs = launch.client.project_tab_ids(home_project) + [alpha_tab, beta_tab]
+    _drain_tabs(launch, tabs)
+
+    source_x, source_y = _sidebar_row_center(launch, 0)
+    second_y = _sidebar_row_center(launch, 1)[1]
+    third_y = _sidebar_row_center(launch, 2)[1]
+    # The strip's target index counts row centers at or above the pointer, so
+    # the midpoint between the second and third centers is the insertion
+    # boundary directly below the second row with maximum margin either side.
+    target_y = (second_y + third_y) // 2
+    expected = [alpha, home_project, beta]
+    pending_error: BaseException | None = None
+    try:
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(source_x), str(source_y)]
+        )
+        launch.terminal_pointer(["mousedown", "1"])
+        # The strip publishes its selection on press. That activation is the
+        # IPC-observable causal fence proving Iced consumed the press at the
+        # intended stable ID before the first trajectory sample moves on.
+        _wait_until(
+            lambda: int(launch.client.identify()["active_project_id"]) == home_project,
+            "project drag press selects its stable ID",
+        )
+        # Sample the trajectory in separate XTEST submissions like the tab
+        # drag: a single batched motion can be coalesced past the 8 px
+        # threshold and the preview it is supposed to produce.
+        for step in range(1, 9):
+            y = round(source_y + (target_y - source_y) * step / 8)
+            launch.terminal_pointer(
+                ["mousemove", "--window", launch.window, str(source_x), str(y)]
+            )
+    except BaseException as error:
+        pending_error = error
+        raise
+    finally:
+        try:
+            launch.terminal_pointer(["mouseup", "1"])
+        except Exception as release_error:
+            if pending_error is None:
+                raise
+            print(
+                f"failed to release project drag while handling {pending_error!r}: "
+                f"{release_error}",
+                file=sys.stderr,
+            )
+    _wait_until(
+        lambda: _project_ids(launch) == expected,
+        "project drag authoritative reorder",
+    )
+    _assert_stays(
+        lambda: _project_ids(launch) == expected,
+        "committed project drag order",
+    )
+    assert launch.process.poll() is None, "Iced exited during the project drag"
+
+    # A press/release below the 8 px threshold is an ordinary selection: it
+    # must never publish a reorder.
+    click_x, click_y = _sidebar_row_center(launch, 2)
+    pending_error = None
+    try:
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(click_x), str(click_y)]
+        )
+        launch.terminal_pointer(["mousedown", "1"])
+        launch.terminal_pointer(
+            [
+                "mousemove",
+                "--window",
+                launch.window,
+                str(click_x + 3),
+                str(click_y + 2),
+            ]
+        )
+    except BaseException as error:
+        pending_error = error
+        raise
+    finally:
+        try:
+            launch.terminal_pointer(["mouseup", "1"])
+        except Exception as release_error:
+            if pending_error is None:
+                raise
+            print(
+                f"failed to release sub-threshold project click while handling "
+                f"{pending_error!r}: {release_error}",
+                file=sys.stderr,
+            )
+    _wait_until(
+        lambda: int(launch.client.identify()["active_project_id"]) == beta,
+        "sub-threshold project click selection",
+    )
+    _assert_stays(
+        lambda: _project_ids(launch) == expected,
+        "sub-threshold project click does not reorder",
+    )
+    _assert_no_pty_input(launch, tabs, "project drag and sub-threshold click")
+
+    # Close Project confirms first. Escape must cancel it, and the held key's
+    # repeats and release must be latched instead of reaching any PTY, so the
+    # drain deliberately happens before the shortcut that opens the dialog.
+    _drain_tabs(launch, tabs)
+    launch.key("alt+shift+w")
+    _wait_confirm_delete_open(launch, "cancel-project-delete")
+    _wait_until(
+        lambda: not launch.client.app_active_terminal_focused(),
+        "delete confirm owns the keyboard route",
+    )
+    _hold_plain_key(launch, "Escape")
+    _wait_confirm_delete_closed(launch, "cancel-project-delete")
+    _wait_until(
+        launch.client.app_active_terminal_focused,
+        "terminal keyboard route resumes after delete confirm cancel",
+    )
+    _assert_stays(
+        lambda: launch.client.project(beta) is not None,
+        "Escape cancels the project delete confirm",
+    )
+    _assert_no_pty_input(launch, tabs, "cancelled project delete confirm")
+
+    survivors = [tab_id for tab_id in tabs if tab_id != beta_tab]
+    _drain_tabs(launch, tabs)
+    launch.key("alt+shift+w")
+    _wait_confirm_delete_open(launch, "confirm-project-delete")
+    _hold_plain_key(launch, "Return")
+    _wait_until(
+        lambda: launch.client.project(beta) is None,
+        "held Enter confirms the project delete",
+    )
+    _wait_confirm_delete_closed(launch, "confirm-project-delete")
+    # The engine's fallback is the lowest remaining project ID, which after the
+    # drag above is deliberately not the first sidebar row.
+    _wait_until(
+        lambda: int(launch.client.identify()["active_project_id"]) == home_project,
+        "lowest-remaining-ID project fallback after the confirmed delete",
+    )
+    _assert_no_pty_input(launch, survivors, "confirmed project delete")
+
+    launch.client.delete_project(alpha)
+    launch.client.focus(home_tab)
+    _wait_until(
+        lambda: _project_ids(launch) == baseline
+        and int(launch.client.identify()["active_tab_id"]) == home_tab,
+        "project lifecycle fixture cleanup",
+    )
+
+
 def _direct_tab_close(launch: Launch) -> None:
     identity = launch.client.identify()
     project = int(identity["active_project_id"])
@@ -1488,6 +1759,9 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
         "last sidebar row activation after vertical scroll",
     )
 
+    # The fixed footer is now "+ New Project" (plan 010): clicking it after
+    # a body scroll must still hit the footer, not a scrolled row.
+    before_footer_click = set(_project_ids(launch))
     launch.terminal_pointer(
         [
             "mousemove",
@@ -1500,8 +1774,30 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
         ]
     )
     _wait_until(
+        lambda: set(_project_ids(launch)) - before_footer_click,
+        "fixed sidebar footer creates a project after body scroll",
+    )
+    footer_created = set(_project_ids(launch)) - before_footer_click
+    _wait_until(
+        lambda: launch.client.identify()["active_project_id"] in footer_created,
+        "footer-created project activation",
+    )
+    for project_id in footer_created:
+        launch.client.delete_project(project_id)
+    launch.client.focus(last_project_tab)
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == last_project_tab,
+        "focus restored after footer-created project cleanup",
+    )
+
+    # The sidebar has no pointer collapse control (the header « was removed
+    # after user testing; parity with Mac, where collapse is keybind/menu
+    # only) — collapse via the ToggleSidebar default so the collapsed-state
+    # ☰ restore control below is still exercised by a real click.
+    launch.key("alt+b")
+    _wait_until(
         lambda: launch.client.window_metrics()["sidebar_collapsed"],
-        "fixed sidebar footer after body scroll",
+        "keybind sidebar collapse after body scroll",
     )
     assert launch.client.identify()["active_tab_id"] == last_project_tab
     launch.terminal_pointer(
@@ -1873,6 +2169,7 @@ def main() -> int:
         _terminal_scrollback_routing(off)
         renamed_project, renamed_tab = _keybind_dispatch(off)
         dragged_titles = _direct_tab_reorder(off, renamed_project, renamed_tab)
+        _project_lifecycle(off, renamed_project, renamed_tab)
         off.close()
         launches.pop()
 
@@ -1933,6 +2230,8 @@ def main() -> int:
         "exhaustive shortcut dispatch/repeat suppression, "
         "project/tab inline rename with double-click and click-away, "
         "stable-ID direct tab drag in both directions with persistence, "
+        "sidebar project drag reorder with sub-threshold select, "
+        "keybind-opened delete confirm cancelled and confirmed without PTY leaks, "
         "link hover cursor composition, exact-ID tab close/fallback/cascade, "
         "constrained chrome overflow navigation, and palette pointer routing"
     )

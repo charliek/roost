@@ -717,8 +717,9 @@ impl App {
     }
 
     pub(super) fn open_palette(&mut self, kind: &str) -> Result<(), String> {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
+        self.cancel_confirm_delete();
         let frame = match kind {
             "" | "commands" => command_palette_frame(
                 self.notification_inbox.count(),
@@ -757,8 +758,9 @@ impl App {
         items: Vec<(String, String, Option<String>)>,
         reply: tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>,
     ) {
-        self.cancel_tab_drag();
+        self.cancel_drags();
         self.cancel_editor_for_interaction();
+        self.cancel_confirm_delete();
         if let Err(error) = self.try_dismiss_palette() {
             let _ = reply.send(Err(error));
             return;
@@ -1122,6 +1124,15 @@ impl App {
                     self.clear_palette_state();
                     self.new_tab();
                 }
+                "new_project" => {
+                    self.clear_palette_state();
+                    self.new_project_result()?;
+                }
+                "close_project" => {
+                    let project_id = self.workspace.active().0;
+                    self.clear_palette_state();
+                    self.confirm_close_project(project_id)?;
+                }
                 "close_tab" => {
                     let tab_id = self.workspace.active().1;
                     self.clear_palette_state();
@@ -1370,7 +1381,7 @@ impl App {
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 
-    fn dismiss_palette_with_focus_recovery(&mut self) {
+    pub(super) fn dismiss_palette_with_focus_recovery(&mut self) {
         let result = self.try_dismiss_palette();
         let result = retain_palette_focus_after_back(
             &mut self.palette_focus_requested,
