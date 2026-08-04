@@ -6,6 +6,56 @@ pub(crate) struct AgentMetricsResult {
     outcomes: Result<Vec<git_metrics::ProbeOutcome>, String>,
 }
 
+/// What one drain batch's PTY items produced. Collected during the drain
+/// and applied at its tail, so bytes for the same tab coalesce into a
+/// single snapshot rebuild however many items carried them.
+#[derive(Debug, Default)]
+pub(super) struct TabOutputBatch {
+    /// Tabs whose terminal state moved this batch — the only ones whose
+    /// snapshot needs rebuilding. Every other tab renders the snapshot it
+    /// already has.
+    pub(super) touched: HashSet<i64>,
+    pub(super) osc_actions: Vec<(i64, Vec<OscAction>)>,
+    pub(super) exited: Vec<i64>,
+    pub(super) error: Option<String>,
+}
+
+pub(super) fn collect_tab_output(
+    tabs: &mut HashMap<i64, TerminalTab>,
+    collected: &mut TabOutputBatch,
+    tab_id: i64,
+    output: TabOutput,
+) {
+    let Some(tab) = tabs.get_mut(&tab_id) else {
+        // A forwarder outlives its tab by however long its last items sit
+        // on the feed: the tab was already dropped by the reconcile that
+        // saw the workspace stop listing it.
+        tracing::trace!(tab_id, "dropped PTY output for a tab that is gone");
+        return;
+    };
+    match output {
+        TabOutput::Bytes(bytes) => {
+            let actions = tab.write_vt(&bytes);
+            // Most chunks of a flood carry no OSC at all; an empty entry
+            // would still cost a push and an `apply_osc_actions` hop.
+            if !actions.is_empty() {
+                collected.osc_actions.push((tab_id, actions));
+            }
+            collected.touched.insert(tab_id);
+        }
+        TabOutput::Exit { status, reason } => {
+            tracing::info!(tab_id, status, %reason, "PTY exited");
+            collected.exited.push(tab_id);
+        }
+        TabOutput::Error(error) => {
+            // Broadcast lag cannot be reconstructed. Surface it and keep
+            // the workspace alive so IPC/UI state still resyncs.
+            collected.error = Some(format!("tab {tab_id}: {error}"));
+            tracing::error!(tab_id, %error, "PTY output stream lost bytes");
+        }
+    }
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // Full authoritative snapshot on every UI tick is the recovery path
@@ -28,13 +78,7 @@ impl App {
         let active_tab_id = self.workspace.active().1;
         for (tab_id, tab) in &mut self.tabs {
             if *tab_id != active_tab_id && tab.reset_pointer_state() {
-                if let Err(error) = tab.refresh_snapshot() {
-                    tracing::warn!(
-                        ?error,
-                        tab_id,
-                        "terminal pointer reset failed after active tab changed"
-                    );
-                }
+                refresh_or_warn(*tab_id, tab, "pointer reset after active tab changed");
             }
         }
         for tab_id in live_ids {
@@ -49,6 +93,7 @@ impl App {
                     self.test_mode,
                     Theme::load_bundled(&self.active_theme_name),
                     self.config.word_break_chars.clone(),
+                    self.feed_tx.clone(),
                 )
             };
             match attached {
@@ -66,6 +111,10 @@ impl App {
                     ) {
                         Ok(Some(change)) => {
                             tab.commit_geometry(change);
+                            // A fresh tab's snapshot is the blank default
+                            // until something refreshes it; nothing else
+                            // will until the PTY emits its first bytes.
+                            refresh_or_warn(tab_id, &mut tab, "newly attached tab");
                             self.tabs.insert(tab_id, tab);
                         }
                         Ok(None) => {
@@ -89,9 +138,13 @@ impl App {
     pub(super) fn service_engine(&mut self) -> (UiTask, EngineBatch) {
         let mut task = UiTask::None;
         let mut batch = EngineBatch::default();
+        let mut pty = TabOutputBatch::default();
         while let Some(item) = self.feed_rx.try_next(&mut batch) {
             match item {
                 EngineFeed::Workspace(event) => self.apply_workspace_event(event),
+                EngineFeed::Tab(tab_id, output) => {
+                    collect_tab_output(&mut self.tabs, &mut pty, tab_id, output);
+                }
                 EngineFeed::UiRequest(request) => {
                     task = task.then(self.apply_ui_request(request));
                 }
@@ -99,8 +152,27 @@ impl App {
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
             }
         }
+        if let Some(error) = pty.error {
+            self.set_status(error);
+        }
+        // OSC actions first: `OscAction::PointerShape` mutates the tab, so
+        // a refresh that ran before them would publish the shape the batch
+        // just replaced and leave the new one waiting for whatever
+        // unrelated event refreshes the tab next.
+        for (tab_id, actions) in pty.osc_actions {
+            task = task.then(self.apply_osc_actions(tab_id, actions));
+        }
+        for tab_id in &pty.touched {
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                refresh_or_warn(*tab_id, tab, "PTY output");
+            }
+        }
         if batch.should_reconcile() {
             self.reconcile();
+        }
+        for tab_id in pty.exited {
+            let _ = self.workspace.close_tab(tab_id);
+            self.tabs.remove(&tab_id);
         }
         // Idle ticks would otherwise bury every informative record under
         // ~60 empty ones a second.
@@ -108,6 +180,7 @@ impl App {
             tracing::trace!(
                 items = batch.items,
                 workspace_events = batch.workspace_events,
+                non_tab_bytes = batch.non_tab_bytes,
                 capped = batch.capped,
                 "engine feed batch"
             );
@@ -378,18 +451,23 @@ impl App {
                 data,
                 reply,
             } => {
-                let mut actions = None;
+                // Same ordering as the feed batch's tail: an OSC action can
+                // mutate the tab (pointer shape), so it lands before the
+                // refresh that publishes it, never after. That second
+                // lookup is the price of handing `self` to `apply_osc_actions`.
                 let result = if !self.test_mode {
-                    Err("ROOST_TEST_MODE=1 is required".into())
-                } else if let Some(tab) = self.tabs.get_mut(&tab_id) {
-                    actions = Some(tab.write_vt(&data));
-                    tab.refresh_snapshot().map_err(|error| error.to_string())
+                    Err("ROOST_TEST_MODE=1 is required".to_string())
+                } else if let Some(actions) =
+                    self.tabs.get_mut(&tab_id).map(|tab| tab.write_vt(&data))
+                {
+                    task = task.then(self.apply_osc_actions(tab_id, actions));
+                    self.tabs
+                        .get_mut(&tab_id)
+                        .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                        .and_then(|tab| tab.refresh_snapshot().map_err(|error| error.to_string()))
                 } else {
                     Err(format!("tab {tab_id} has no live terminal"))
                 };
-                if let Some(actions) = actions {
-                    task = task.then(self.apply_osc_actions(tab_id, actions));
-                }
                 let _ = reply.send(result);
             }
             UiRequest::TabCapturePtyInput {
@@ -601,14 +679,21 @@ impl App {
                         .get_mut(&tab_id)
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| {
-                            tab.expand_selection_at(col, row, click_count)
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| {
-                                    format!(
-                                        "no word/line span at ({col}, {row}) on tab {tab_id} \
+                            let expanded = tab.expand_selection_at(col, row, click_count);
+                            // The op commits the selection before it can
+                            // fail extracting that selection's text, so the
+                            // snapshot is republished either way: on
+                            // success the reply must not describe a span
+                            // the rendering does not show, and on failure
+                            // the committed selection must not stay
+                            // invisible.
+                            refresh_or_warn(tab_id, tab, "expand selection");
+                            expanded.map_err(|error| error.to_string())?.ok_or_else(|| {
+                                format!(
+                                    "no word/line span at ({col}, {row}) on tab {tab_id} \
                                          (whitespace double-click, or row out of range)"
-                                    )
-                                })
+                                )
+                            })
                         })
                 };
                 let _ = reply.send(result);
@@ -677,5 +762,194 @@ impl App {
             }
         }
         self.clipboard.start_next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These tests hand `collect_tab_output` the items a forwarder would
+    /// have delivered, so the feed receiver is surplus.
+    fn attached(tab_id: i64) -> (HashMap<i64, TerminalTab>, Arc<PtySupervisor>) {
+        let (feed_tx, _) = engine_feed::channel();
+        let (tab, supervisor) = attach_test_terminal(tab_id, feed_tx);
+        (HashMap::from([(tab_id, tab)]), supervisor)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bytes_write_through_and_touch_only_their_own_tab() {
+        let (mut tabs, supervisor) = attached(70);
+        let mut collected = TabOutputBatch::default();
+
+        collect_tab_output(
+            &mut tabs,
+            &mut collected,
+            70,
+            TabOutput::Bytes(b"\x1b[2J\x1b[Hhello".to_vec()),
+        );
+
+        assert_eq!(collected.touched, HashSet::from([70]));
+        assert!(
+            collected.osc_actions.is_empty(),
+            "plain output carries no OSC, so the tail has nothing to apply"
+        );
+        assert!(collected.exited.is_empty());
+        assert!(collected.error.is_none());
+        let tab = tabs.get_mut(&70).expect("the tab is still attached");
+        tab.refresh_snapshot().expect("refresh the touched tab");
+        assert_eq!(tab.snapshot.rows_text[0], "hello");
+        supervisor.close(70);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_for_a_tab_that_is_gone_is_dropped() {
+        let (mut tabs, supervisor) = attached(71);
+        let mut collected = TabOutputBatch::default();
+
+        for output in [
+            TabOutput::Bytes(b"late".to_vec()),
+            TabOutput::Exit {
+                status: 0,
+                reason: "shell exited".into(),
+            },
+            TabOutput::Error("broadcast lagged".into()),
+        ] {
+            collect_tab_output(&mut tabs, &mut collected, 999, output);
+        }
+
+        assert!(collected.touched.is_empty());
+        assert!(collected.osc_actions.is_empty());
+        assert!(collected.exited.is_empty());
+        assert!(collected.error.is_none());
+        supervisor.close(71);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exit_is_collected_for_close_and_an_error_becomes_a_status() {
+        let (mut tabs, supervisor) = attached(72);
+        let mut collected = TabOutputBatch::default();
+
+        collect_tab_output(
+            &mut tabs,
+            &mut collected,
+            72,
+            TabOutput::Exit {
+                status: 0,
+                reason: "shell exited".into(),
+            },
+        );
+        collect_tab_output(
+            &mut tabs,
+            &mut collected,
+            72,
+            TabOutput::Error("broadcast lagged: dropped 3 message(s)".into()),
+        );
+
+        assert_eq!(collected.exited, vec![72]);
+        assert_eq!(
+            collected.error.as_deref(),
+            Some("tab 72: broadcast lagged: dropped 3 message(s)")
+        );
+        assert!(
+            collected.touched.is_empty(),
+            "neither an exit nor an error changes what the tab renders"
+        );
+        supervisor.close(72);
+    }
+
+    /// The premise the batch tail's OSC-before-refresh order rests on: the
+    /// snapshot holds a *copy* of `pointer_shape` taken at refresh time, so
+    /// an OSC action that lands after a refresh stays invisible until some
+    /// unrelated event refreshes the tab again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pointer_shape_reaches_the_snapshot_only_through_a_later_refresh() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(73, feed_tx);
+        tab.refresh_snapshot().expect("initial snapshot");
+        assert_eq!(tab.snapshot.pointer_shape, "default");
+
+        // What `App::apply_osc_actions` does for OscAction::PointerShape.
+        tab.pointer_shape = canonical_pointer_shape("crosshair").into();
+        assert_eq!(
+            tab.snapshot.pointer_shape, "default",
+            "a refresh ordered before the OSC would have published this"
+        );
+
+        tab.refresh_snapshot().expect("post-OSC snapshot");
+        assert_eq!(tab.snapshot.pointer_shape, "crosshair");
+        supervisor.close(73);
+    }
+
+    /// Accumulate one tab's PTY bytes off `rx` until `needle` shows up or
+    /// the window elapses. Returns what was seen either way, so the same
+    /// helper serves the positive and the negative assertion.
+    async fn feed_text_until(
+        rx: &mut EngineFeedReceiver,
+        tab_id: i64,
+        needle: &str,
+        window: Duration,
+    ) -> String {
+        let deadline = Instant::now() + window;
+        let mut seen = String::new();
+        while Instant::now() < deadline && !seen.contains(needle) {
+            let mut batch = EngineBatch::default();
+            while let Some(item) = rx.try_next(&mut batch) {
+                if let EngineFeed::Tab(id, TabOutput::Bytes(bytes)) = item {
+                    if id == tab_id {
+                        seen.push_str(&String::from_utf8_lossy(&bytes));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        seen
+    }
+
+    /// `reconcile`'s failed-geometry arm builds a tab and then discards it,
+    /// and a later attach takes the same PTY over. The discarded tab's
+    /// forwarder must not outlive it: the second `TabSession::attach`
+    /// cannot reuse the initial receiver, so a survivor would put a second
+    /// FIFO stream on the feed and interleave it with the real one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discarded_tab_takes_its_output_forwarder_with_it() {
+        let (discarded_feed, mut discarded_rx) = engine_feed::channel();
+        let (discarded, supervisor) = attach_test_terminal(74, discarded_feed);
+        drop(discarded);
+
+        let (live_feed, mut live_rx) = engine_feed::channel();
+        let tab = TerminalTab::attach(
+            Arc::clone(&supervisor),
+            74,
+            true,
+            Theme::roost_dark_fallback(),
+            roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
+            live_feed,
+        )
+        .expect("re-attach the PTY the discarded tab left running");
+        tab.session.send_input(b"forwarder-marker\n".to_vec());
+
+        let live =
+            feed_text_until(&mut live_rx, 74, "forwarder-marker", Duration::from_secs(5)).await;
+        assert!(
+            live.contains("forwarder-marker"),
+            "the re-attached tab is the live stream: {live:?}"
+        );
+
+        // The marker has already round-tripped, so a forwarder that
+        // outlived its tab has had its chance; this window is slack, not
+        // synchronisation.
+        let stale = feed_text_until(
+            &mut discarded_rx,
+            74,
+            "forwarder-marker",
+            Duration::from_millis(250),
+        )
+        .await;
+        assert!(
+            !stale.contains("forwarder-marker"),
+            "the discarded tab's forwarder went with it: {stale:?}"
+        );
+        supervisor.close(74);
     }
 }

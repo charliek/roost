@@ -1053,6 +1053,10 @@ impl App {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(?error, tab_id, "terminal pointer dispatch failed");
+                // The dispatch moves the pointer cell and hover before it
+                // can fail, so the tab is left mid-gesture. Publish what it
+                // actually holds — nothing else will.
+                refresh_or_warn(tab_id, tab, "failed pointer dispatch");
                 return UiTask::None;
             }
         };
@@ -1067,9 +1071,7 @@ impl App {
         } else {
             None
         };
-        if let Err(error) = tab.refresh_snapshot() {
-            tracing::warn!(?error, tab_id, "terminal selection refresh failed");
-        }
+        refresh_or_warn(tab_id, tab, "pointer dispatch");
         enqueue_selection_copy(
             &mut self.clipboard,
             CopyKind::OnSelect(self.config.copy_on_select),
@@ -1576,32 +1578,11 @@ mod tests {
         let _ = reply.send(Ok(value));
     }
 
+    /// These tests drive the terminal directly with `write_vt`, so the
+    /// feed receiver is surplus.
     fn attached_test_terminal(tab_id: i64) -> (TerminalTab, Arc<PtySupervisor>) {
-        let supervisor = Arc::new(PtySupervisor::new());
-        let argv = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
-        let _early_output = supervisor
-            .spawn(
-                tab_id,
-                "/tmp",
-                &argv,
-                DEFAULT_COLS,
-                DEFAULT_ROWS,
-                std::path::Path::new("/tmp/roost-iced-pointer-test.sock"),
-            )
-            .expect("spawn pointer-test PTY");
-        let mut tab = TerminalTab::attach(
-            Arc::clone(&supervisor),
-            tab_id,
-            true,
-            Theme::roost_dark_fallback(),
-            roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
-        )
-        .expect("attach pointer-test terminal");
-        let metrics = TerminalMetrics::measure(13.0).expect("pointer-test terminal metrics");
-        tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, 1)
-            .expect("install pointer-test terminal metrics")
-            .expect("new pointer-test terminal changes geometry");
-        (tab, supervisor)
+        let (feed_tx, _) = engine_feed::channel();
+        attach_test_terminal(tab_id, feed_tx)
     }
 
     fn native_pointer(

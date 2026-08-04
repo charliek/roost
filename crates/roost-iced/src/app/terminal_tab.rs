@@ -30,6 +30,17 @@ pub(super) fn pointer_origin_tab<V>(tabs: &mut HashMap<i64, V>, tab_id: i64) -> 
     tabs.get_mut(&tab_id)
 }
 
+/// Republish what a tab renders after something moved its terminal state.
+/// Takes the tab rather than the app so the sites that hold a `&mut` into
+/// `App::tabs` — the resize and pointer-cancel loops — can call it too.
+/// A failure is logged, not propagated: every caller is a UI-side publish
+/// with no error channel, and the next refresh retries from scratch.
+pub(super) fn refresh_or_warn(tab_id: i64, tab: &mut TerminalTab, reason: &str) {
+    if let Err(error) = tab.refresh_snapshot() {
+        tracing::warn!(?error, tab_id, reason, "terminal snapshot refresh failed");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct TerminalGeometry {
     pub(super) cols: u16,
@@ -116,6 +127,44 @@ pub(super) fn apply_geometry_batch(
     Ok(applied)
 }
 
+/// A tab attached to a real PTY running `cat`, sized to the default grid
+/// with measured metrics installed — the shape `reconcile` produces. The
+/// caller owns the feed channel so it can choose whether to observe what
+/// the tab's forwarder puts on it; dropping the receiver on the spot is
+/// fine and simply ends the forwarder.
+#[cfg(test)]
+pub(super) fn attach_test_terminal(
+    tab_id: i64,
+    feed: EngineFeedSender,
+) -> (TerminalTab, Arc<PtySupervisor>) {
+    let supervisor = Arc::new(PtySupervisor::new());
+    let argv = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
+    let _early_output = supervisor
+        .spawn(
+            tab_id,
+            "/tmp",
+            &argv,
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            std::path::Path::new("/tmp/roost-iced-terminal-test.sock"),
+        )
+        .expect("spawn test PTY");
+    let mut tab = TerminalTab::attach(
+        Arc::clone(&supervisor),
+        tab_id,
+        true,
+        Theme::roost_dark_fallback(),
+        roost_ui_model::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
+        feed,
+    )
+    .expect("attach test terminal");
+    let metrics = TerminalMetrics::measure(13.0).expect("test terminal metrics");
+    tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS, metrics, 1)
+        .expect("install test terminal metrics")
+        .expect("new test terminal changes geometry");
+    (tab, supervisor)
+}
+
 pub(super) fn terminal_grid(
     size: Size,
     sidebar_width: f32,
@@ -146,7 +195,7 @@ pub(super) struct TerminalTab {
     pub(super) word_break_chars: String,
     input_started_at: Instant,
     pub(super) session: TabSession,
-    pub(super) output_rx: tokio::sync::mpsc::UnboundedReceiver<TabOutput>,
+    output_forwarder: tokio::task::AbortHandle,
     reply_buffer: Arc<Mutex<Vec<u8>>>,
     pub(super) input_capture: Option<InputCapture>,
     osc_router: OscRouter,
@@ -159,13 +208,32 @@ pub(super) struct TerminalTab {
     pub(super) metric_generation: u64,
 }
 
+impl Drop for TerminalTab {
+    /// The forwarder owns this tab's PTY receiver, so its life must end
+    /// with the tab's. A tab that is built and then discarded — the
+    /// failed-geometry arm of `reconcile` — would otherwise leave a live
+    /// stream behind, and the retry that attaches the same PTY again
+    /// cannot reuse the initial receiver (`TabSession::attach` falls back
+    /// to a fresh subscription), so two streams would interleave into one
+    /// terminal. Aborting drops the receiver, which ends the engine-side
+    /// bridge on its next send: the cascade that holding the receiver on
+    /// the tab used to give for free.
+    fn drop(&mut self) {
+        self.output_forwarder.abort();
+    }
+}
+
 impl TerminalTab {
+    /// Attach the UI to a spawned PTY. Must be called inside the app
+    /// runtime (`Runtime::enter`): both `TabSession::attach` and the
+    /// output forwarder this spawns bind to the ambient runtime.
     pub(super) fn attach(
         supervisor: Arc<PtySupervisor>,
         tab_id: i64,
         test_mode: bool,
         theme: Theme,
         word_break_chars: String,
+        feed: EngineFeedSender,
     ) -> Result<Self> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
@@ -186,6 +254,11 @@ impl TerminalTab {
         let input_capture = test_mode.then(|| Arc::new(Mutex::new(Vec::new())));
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         let session = TabSession::attach(supervisor, tab_id, output_tx, input_capture.clone())?;
+        // The per-tab channel stays — only its drain moves. This forwarder
+        // is what puts PTY output in the same arrival order as everything
+        // else the app reacts to, and what arms the feed's wake for it.
+        let output_forwarder =
+            tokio::spawn(engine_feed::pump_tab_output(tab_id, output_rx, feed)).abort_handle();
         Ok(Self {
             terminal,
             render_state,
@@ -202,7 +275,7 @@ impl TerminalTab {
             word_break_chars,
             input_started_at: Instant::now(),
             session,
-            output_rx,
+            output_forwarder,
             reply_buffer,
             input_capture,
             osc_router: OscRouter::new(),

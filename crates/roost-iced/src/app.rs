@@ -84,13 +84,13 @@ use self::palettes::{
 };
 pub(crate) use self::servicing::AgentMetricsResult;
 use self::terminal_tab::{
-    apply_geometry_batch, pointer_origin_tab, terminal_grid, GeometryBatchOperation,
-    NativePointerDispatch, TerminalTab,
+    apply_geometry_batch, pointer_origin_tab, refresh_or_warn, terminal_grid,
+    GeometryBatchOperation, NativePointerDispatch, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
-    GeometryBatchFailure, GeometryChange, LocalPointerGesture, NativePointerOutcome,
-    TerminalGeometry,
+    attach_test_terminal, GeometryBatchFailure, GeometryChange, LocalPointerGesture,
+    NativePointerOutcome, TerminalGeometry,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -694,48 +694,14 @@ impl App {
         let now = Instant::now();
         self.status.expire_at(now);
         let (mut task, feed_batch) = self.service_engine();
-        // The drain already reconciled if it saw anything; the tick keeps
-        // reconciling otherwise, so a tick still reconciles exactly once.
+        // The drain already reconciled if it saw anything that needs one;
+        // the tick keeps reconciling otherwise, so a tick still reconciles
+        // exactly once.
         if !feed_batch.should_reconcile() {
             self.reconcile();
         }
         if let Some(batch) = self.file_drops.take_ready_at(now) {
             self.deliver_file_drop(batch);
-        }
-        let mut exited = Vec::new();
-        let mut osc_actions = Vec::new();
-        let mut output_error = None;
-        for (tab_id, tab) in &mut self.tabs {
-            while let Ok(output) = tab.output_rx.try_recv() {
-                match output {
-                    TabOutput::Bytes(bytes) => {
-                        osc_actions.push((*tab_id, tab.write_vt(&bytes)));
-                    }
-                    TabOutput::Exit { status, reason } => {
-                        tracing::info!(tab_id, status, %reason, "PTY exited");
-                        exited.push(*tab_id);
-                    }
-                    TabOutput::Error(error) => {
-                        // Broadcast lag cannot be reconstructed. Surface it and
-                        // keep the workspace alive so IPC/UI state still resyncs.
-                        output_error = Some(format!("tab {tab_id}: {error}"));
-                        tracing::error!(tab_id, %error, "PTY output stream lost bytes");
-                    }
-                }
-            }
-            if let Err(error) = tab.refresh_snapshot() {
-                tracing::warn!(tab_id, ?error, "terminal snapshot refresh failed");
-            }
-        }
-        if let Some(error) = output_error {
-            self.set_status(error);
-        }
-        for (tab_id, actions) in osc_actions {
-            task = task.then(self.apply_osc_actions(tab_id, actions));
-        }
-        for tab_id in exited {
-            let _ = self.workspace.close_tab(tab_id);
-            self.tabs.remove(&tab_id);
         }
         task = task.then(self.take_rename_focus_task());
         task = task.then(self.take_palette_visibility_task());
@@ -784,7 +750,14 @@ impl App {
             terminal_grid(size, self.effective_sidebar_width(), self.terminal_metrics);
         for (tab_id, tab) in &mut self.tabs {
             match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
-                Ok(Some(change)) => tab.commit_geometry(change),
+                Ok(Some(change)) => {
+                    tab.commit_geometry(change);
+                    // A re-grid rewrites the viewport and drops hover, so
+                    // the snapshot the widget draws describes the old
+                    // dimensions until it is rebuilt. Window resizes,
+                    // sidebar width drags and collapse all land here.
+                    refresh_or_warn(*tab_id, tab, "window re-grid");
+                }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(?error, tab_id, cols, rows, "terminal resize failed")
@@ -1784,7 +1757,13 @@ impl App {
         // release into tracking PTYs) before the modal owns input.
         for (tab_id, tab) in &mut self.tabs {
             match tab.prepare_pointer_cancel() {
-                Ok(release) => tab.commit_pointer_cancel(release),
+                Ok(release) => {
+                    tab.commit_pointer_cancel(release);
+                    // The cancel drops hover, so the link underline and
+                    // pointer shape the snapshot carries are decorations
+                    // for a gesture that no longer exists.
+                    refresh_or_warn(*tab_id, tab, "pointer cancel before delete confirm");
+                }
                 Err(error) => {
                     tracing::warn!(?error, tab_id, "pointer cancel before delete confirm")
                 }

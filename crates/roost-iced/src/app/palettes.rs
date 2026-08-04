@@ -545,7 +545,7 @@ impl App {
         let (cols, rows) = terminal_grid(self.window_size, self.effective_sidebar_width(), metrics);
         let mut tab_ids = self.tabs.keys().copied().collect::<Vec<_>>();
         tab_ids.sort_unstable();
-        let applied = apply_geometry_batch(
+        let batched = apply_geometry_batch(
             &tab_ids,
             cols,
             rows,
@@ -574,17 +574,23 @@ impl App {
                     .map(|()| None)
                     .map_err(|error| error.to_string()),
             },
-        )
-        .map_err(|failure| {
-            let mut message = format!(
-                "apply {operation} to tab {}: {}",
-                failure.tab_id, failure.apply
-            );
-            for (tab_id, error) in failure.rollback {
-                message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+        );
+        let applied = match batched {
+            Ok(applied) => applied,
+            Err(failure) => {
+                let mut message = format!(
+                    "apply {operation} to tab {}: {}",
+                    failure.tab_id, failure.apply
+                );
+                for (tab_id, error) in failure.rollback {
+                    message.push_str(&format!("; rollback tab {tab_id}: {error}"));
+                }
+                // A rolled-back tab was resized twice and reflow is lossy,
+                // so its snapshot describes neither geometry.
+                self.refresh_regridded(&tab_ids, operation);
+                return Err(message);
             }
-            message
-        })?;
+        };
 
         let mut pointer_releases = Vec::new();
         for (tab_id, change) in &applied {
@@ -622,6 +628,7 @@ impl App {
                             ));
                         }
                     }
+                    self.refresh_regridded(&tab_ids, operation);
                     return Err(message);
                 }
             }
@@ -636,11 +643,25 @@ impl App {
             }
         }
         for (tab_id, change) in applied {
-            if let Some(tab) = self.tabs.get(&tab_id) {
+            if let Some(tab) = self.tabs.get_mut(&tab_id) {
                 tab.commit_geometry(change);
+                refresh_or_warn(tab_id, tab, operation);
             }
         }
         Ok(())
+    }
+
+    /// New metrics mean new cell dimensions and a re-wrapped viewport, and
+    /// the pointer cancel that accompanies them drops hover. A tab whose
+    /// geometry moved is not drawable until its snapshot is rebuilt. The
+    /// failure paths cannot say which tabs moved — a rollback is itself a
+    /// re-grid — so they refresh every tab they touched.
+    fn refresh_regridded(&mut self, tab_ids: &[i64], operation: &str) {
+        for tab_id in tab_ids {
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                refresh_or_warn(*tab_id, tab, operation);
+            }
+        }
     }
 
     fn apply_font_family(&mut self, family: Option<String>) -> Result<(), String> {

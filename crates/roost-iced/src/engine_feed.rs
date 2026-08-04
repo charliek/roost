@@ -1,17 +1,11 @@
 //! The single engine → UI feed.
 //!
-//! Workspace events, IPC `UiRequest`s, git-metrics probes and provider
-//! subprocesses all land on one unbounded channel — the first two through
-//! an adapter task on the app runtime, the latter two sent directly from
-//! the runtime task that produced the result — and the app drains it in
-//! FIFO order. One channel means one ordering across those sources and one
-//! place to wake on.
-//!
-//! PTY output is the deliberate exception: it is still drained per tab in
-//! `App::tick`, so it neither shares that ordering nor arms this wake.
-//! Plan 012 C2 moves it onto the feed, which is a precondition for C3 —
-//! a tick-less app whose only wake is this one would otherwise stop
-//! rendering a tab that is emitting bytes and nothing else.
+//! Workspace events, per-tab PTY output, IPC `UiRequest`s, git-metrics
+//! probes and provider subprocesses all land on one unbounded channel —
+//! the first three through an adapter task on the app runtime, the latter
+//! two sent directly from the runtime task that produced the result — and
+//! the app drains it in FIFO order. One channel means one ordering across
+//! those sources and one place to wake on.
 //!
 //! The [`Notify`] every sender carries is that wake source. Nothing
 //! subscribes to it yet — the 16 ms tick still drives the drain — but it
@@ -22,6 +16,7 @@
 use std::sync::Arc;
 
 use roost_engine::ipc::UiRequest;
+use roost_engine::session::TabOutput;
 use roost_engine::{Workspace, WorkspaceEvent};
 use tokio::sync::{mpsc, Notify};
 
@@ -35,6 +30,9 @@ const ENGINE_FEED_BATCH_CAP: usize = 256;
 
 pub(crate) enum EngineFeed {
     Workspace(WorkspaceEvent),
+    /// One tab's PTY output, tagged with the tab it came from — the tag
+    /// is what lets every tab share this channel.
+    Tab(i64, TabOutput),
     UiRequest(UiRequest),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
@@ -86,6 +84,7 @@ impl EngineFeedReceiver {
         let item = self.rx.try_recv().ok()?;
         batch.items += 1;
         batch.workspace_events |= matches!(item, EngineFeed::Workspace(_));
+        batch.non_tab_bytes |= !matches!(item, EngineFeed::Tab(_, TabOutput::Bytes(_)));
         Some(item)
     }
 
@@ -104,6 +103,9 @@ impl EngineFeedReceiver {
 pub(crate) struct EngineBatch {
     pub(crate) items: usize,
     pub(crate) workspace_events: bool,
+    /// At least one item was something other than `Tab(_, Bytes)` — the
+    /// single fact the reconcile rule turns on.
+    pub(crate) non_tab_bytes: bool,
     pub(crate) capped: bool,
 }
 
@@ -113,11 +115,13 @@ impl EngineBatch {
     }
 
     /// A wake that drained nothing costs nothing: spurious wakes are
-    /// guaranteed by the permit model and must stay free. Workspace events
-    /// always force the full-snapshot reconcile — that stays true when C2
-    /// narrows the rule for batches carrying only PTY bytes.
+    /// guaranteed by the permit model and must stay free. Neither does a
+    /// batch of pure PTY bytes — the common case under a flood: bytes move
+    /// terminal state, which the touched-tab refresh publishes, and the
+    /// workspace mutations they can trigger (OSC 7/9, title changes)
+    /// round-trip back as workspace events carrying their own reconcile.
     pub(crate) fn should_reconcile(&self) -> bool {
-        self.workspace_events || !self.is_empty()
+        self.workspace_events || self.non_tab_bytes
     }
 }
 
@@ -145,6 +149,23 @@ pub(crate) async fn pump_workspace_events(workspace: Arc<Workspace>, feed: Engin
         }
     }
     bridge.abort();
+}
+
+/// Adapter task: one tab's PTY output → feed, tagged with the tab id.
+/// Spawned at attach and ended by the tab's own channel closing, which
+/// `TabSession`'s pump does after the PTY exits or the supervisor drops
+/// it. A forwarder that dies before delivering `Exit` leaks nothing: the
+/// next reconcile prunes any tab the workspace no longer lists.
+pub(crate) async fn pump_tab_output(
+    tab_id: i64,
+    mut rx: mpsc::UnboundedReceiver<TabOutput>,
+    feed: EngineFeedSender,
+) {
+    while let Some(output) = rx.recv().await {
+        if !feed.send(EngineFeed::Tab(tab_id, output)) {
+            break;
+        }
+    }
 }
 
 /// Adapter task: IPC ingress → feed. The handler keeps its own
@@ -248,6 +269,99 @@ mod tests {
         assert!(rx.try_next(&mut batch).is_none());
         assert!(batch.workspace_events, "the drain classifies the item");
         assert!(batch.should_reconcile());
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_nothing_but_tab_bytes_skips_the_reconcile() {
+        let (tx, mut rx) = channel();
+        for _ in 0..3 {
+            assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+        }
+
+        let (items, batch) = drain(&mut rx);
+        assert_eq!(items.len(), 3);
+        assert!(!batch.workspace_events);
+        assert!(!batch.non_tab_bytes);
+        assert!(
+            !batch.should_reconcile(),
+            "PTY bytes move terminal state, not workspace state"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_non_bytes_item_makes_the_whole_batch_reconcile() {
+        for tail in [
+            EngineFeed::UiRequest(UiRequest::Activate),
+            EngineFeed::Tab(
+                7,
+                TabOutput::Exit {
+                    status: 0,
+                    reason: "shell exited".into(),
+                },
+            ),
+            EngineFeed::Tab(7, TabOutput::Error("broadcast lagged".into())),
+            EngineFeed::Workspace(WorkspaceEvent::TabClosed { tab_id: 7 }),
+        ] {
+            let (tx, mut rx) = channel();
+            assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+            assert!(tx.send(tail));
+
+            let (items, batch) = drain(&mut rx);
+            assert_eq!(items.len(), 2);
+            assert!(batch.non_tab_bytes);
+            assert!(batch.should_reconcile());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tab_forwarder_tags_its_output_and_ends_with_its_channel() {
+        let (feed_tx, mut rx) = channel();
+        let (tab_tx, tab_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+
+        assert!(tab_tx.send(TabOutput::Bytes(b"out".to_vec())).is_ok());
+        assert!(tab_tx
+            .send(TabOutput::Exit {
+                status: 0,
+                reason: "shell exited".into(),
+            })
+            .is_ok());
+        drop(tab_tx);
+        forwarder.await.expect("the forwarder ends, not panics");
+
+        let (items, batch) = drain(&mut rx);
+        assert!(matches!(items[0], EngineFeed::Tab(7, TabOutput::Bytes(_))));
+        assert!(matches!(
+            items[1],
+            EngineFeed::Tab(7, TabOutput::Exit { .. })
+        ));
+        assert!(batch.should_reconcile(), "the exit closes a tab");
+    }
+
+    /// `TerminalTab`'s `Drop` aborts its forwarder; this is the half of
+    /// that cascade the tab cannot express itself. The aborted task takes
+    /// the tab's receiver with it, which is how the engine-side bridge
+    /// learns — on its very next send — that it has nobody left to feed.
+    #[tokio::test]
+    async fn aborting_a_forwarder_closes_the_channel_it_drained() {
+        let (feed_tx, mut rx) = channel();
+        let (tab_tx, tab_rx) = mpsc::unbounded_channel();
+        let forwarder = tokio::spawn(pump_tab_output(7, tab_rx, feed_tx));
+        assert!(tab_tx.send(TabOutput::Bytes(b"live".to_vec())).is_ok());
+        tokio::task::yield_now().await;
+
+        forwarder.abort();
+        assert!(
+            forwarder.await.unwrap_err().is_cancelled(),
+            "awaiting the aborted handle guarantees the task is dropped"
+        );
+
+        assert!(
+            tab_tx.send(TabOutput::Bytes(b"after".to_vec())).is_err(),
+            "the engine bridge cannot keep feeding a tab that is gone"
+        );
+        let (items, _) = drain(&mut rx);
+        assert_eq!(items.len(), 1, "only what was forwarded before the abort");
     }
 
     /// The lag path for real: overflow the workspace broadcast while the
