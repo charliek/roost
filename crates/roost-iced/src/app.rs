@@ -72,11 +72,12 @@ mod palettes;
 mod servicing;
 mod terminal_tab;
 
+pub(crate) use self::interactions::RenameTarget;
 use self::interactions::{
     agent_rows_hidden, arm_rename_completion_for_open_editor, consume_rename_completion_key,
     enqueue_osc_clipboard_write, native_file_drop_origin, paste_bytes, same_stable_ids,
     ClipboardQueue, FileDropQueue, ProjectDragPreview, RenameCompletionKey, RenameEditor,
-    RenameTarget, ScreenshotQueue, TabDragPreview,
+    ScreenshotQueue, TabDragPreview,
 };
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
@@ -246,6 +247,28 @@ pub enum EngineOpResult {
         project_id: i64,
         result: Result<DeleteProjectOutcome, String>,
     },
+    /// `op` is the id the editor recorded at dispatch: a completion that
+    /// no longer matches belongs to an editor the user has already
+    /// dismissed, and touches nothing.
+    Renamed {
+        op: u64,
+        target: RenameTarget,
+        result: Result<(), String>,
+    },
+    /// `op` is the id the drag preview recorded at dispatch, so a
+    /// superseded reorder's completion cannot clear a newer drag's
+    /// preview.
+    TabsReordered {
+        op: u64,
+        project_id: i64,
+        ordered_ids: Vec<i64>,
+        result: Result<(), String>,
+    },
+    ProjectsReordered {
+        op: u64,
+        ordered_ids: Vec<i64>,
+        result: Result<(), String>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -304,6 +327,14 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
                 Some(error)
             }
         },
+        // The op-id-guarded state machines report their own outcome:
+        // whether a rename or a reorder owes the banner anything depends
+        // on the op id it carries and not on the result alone, so
+        // `engine_op_completed` routes those to the state machine that
+        // dispatched them rather than here.
+        EngineOpResult::Renamed { .. }
+        | EngineOpResult::TabsReordered { .. }
+        | EngineOpResult::ProjectsReordered { .. } => None,
     }
 }
 
@@ -569,6 +600,13 @@ pub struct App {
     rename_input_id: Id,
     rename_focus_requested: bool,
     rename_completion_key: Option<RenameCompletionKey>,
+    /// The rename dispatched and not yet reported back. It blocks a
+    /// second submit and identifies which completion the open editor is
+    /// still waiting for; a completion carrying any other id belongs to
+    /// an editor that has since been dismissed.
+    rename_op: Option<u64>,
+    /// Monotonic source of the ids that guard in-flight engine ops.
+    next_engine_op: u64,
     tab_drag_preview: Option<TabDragPreview>,
     tab_strip_generation: u64,
     project_drag_preview: Option<ProjectDragPreview>,
@@ -718,6 +756,8 @@ impl App {
             rename_input_id: Id::unique(),
             rename_focus_requested: false,
             rename_completion_key: None,
+            rename_op: None,
+            next_engine_op: 1,
             tab_drag_preview: None,
             tab_strip_generation: 1,
             project_drag_preview: None,
@@ -833,16 +873,41 @@ impl App {
         UiTask::EngineOp(spawn_engine_op(self.runtime_handle.clone(), op, complete))
     }
 
+    /// The id an about-to-be-dispatched op is guarded by.
+    fn take_engine_op_id(&mut self) -> u64 {
+        let op = self.next_engine_op;
+        self.next_engine_op = self.next_engine_op.wrapping_add(1);
+        op
+    }
+
     /// An engine mutation reported back — `Message::EngineOp`.
     ///
-    /// Reconcile runs on every arm, success or failure. A batch of feed
-    /// events is not a substitute: the tolerated already-gone outcomes
-    /// broadcast nothing at all, and a failed op leaves UI state that
-    /// optimistically anticipated it needing the authoritative snapshot
-    /// back.
+    /// Reconcile runs on every arm, success or failure — including the
+    /// arms that drop a stale completion. A batch of feed events is not a
+    /// substitute: the tolerated already-gone outcomes broadcast nothing
+    /// at all, and a failed op leaves UI state that optimistically
+    /// anticipated it needing the authoritative snapshot back.
     pub fn engine_op_completed(&mut self, result: EngineOpResult) {
-        if let Some(error) = engine_op_status(result) {
-            self.set_status(error);
+        match result {
+            simple @ (EngineOpResult::TabClosed { .. } | EngineOpResult::ProjectDeleted { .. }) => {
+                if let Some(error) = engine_op_status(simple) {
+                    self.set_status(error);
+                }
+            }
+            EngineOpResult::Renamed { op, target, result } => {
+                self.rename_completed(op, target, result)
+            }
+            EngineOpResult::TabsReordered {
+                op,
+                project_id,
+                ordered_ids,
+                result,
+            } => self.tab_reorder_completed(op, project_id, &ordered_ids, result),
+            EngineOpResult::ProjectsReordered {
+                op,
+                ordered_ids,
+                result,
+            } => self.project_reorder_completed(op, &ordered_ids, result),
         }
         self.reconcile();
     }
@@ -1254,7 +1319,7 @@ impl App {
             .project_drag_preview
             .as_ref()
             .filter(|preview| {
-                preview.context.generation == self.project_strip_generation
+                preview.orders_the_strip(self.project_strip_generation)
                     && preview.original_ids == authoritative_project_ids
                     && same_stable_ids(&preview.ordered_ids, &authoritative_project_ids)
             })
@@ -1512,7 +1577,7 @@ impl App {
                         active,
                         self.tab_drag_preview
                             .as_ref()
-                            .is_some_and(|preview| preview.context.source_id == tab.id),
+                            .is_some_and(|preview| preview.drags(tab.id)),
                     )),
             );
         }

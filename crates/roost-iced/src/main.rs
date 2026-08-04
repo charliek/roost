@@ -201,18 +201,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.rename_draft_changed(draft);
             Task::none()
         }
-        Message::TabStrip(event) => {
-            app.tab_strip_event(event);
-            Task::none()
-        }
-        Message::ProjectStrip(event) => {
-            app.project_strip_event(event);
-            Task::none()
-        }
-        Message::StripPointerReleased => {
-            app.strip_pointer_released();
-            Task::none()
-        }
+        Message::TabStrip(event) => app.tab_strip_event(event).map_task(),
+        Message::ProjectStrip(event) => app.project_strip_event(event).map_task(),
+        Message::StripPointerReleased => app.strip_pointer_released().map_task(),
         Message::SidebarResizeDragged { width } => {
             app.sidebar_resize_dragged(width);
             Task::none()
@@ -221,10 +212,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.sidebar_resize_ended();
             Task::none()
         }
-        Message::RenameSubmit => {
-            app.submit_rename_editor();
-            Task::none()
-        }
+        Message::RenameSubmit => app.submit_rename_editor().map_task(),
         Message::RenamePointerDismiss => {
             app.rename_pointer_dismiss();
             Task::none()
