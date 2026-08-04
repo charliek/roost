@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -183,17 +185,16 @@ fn confirm_dialog_action(event: &keyboard::Event) -> Option<ConfirmDialogAction>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloseTabOutcome {
+pub enum CloseTabOutcome {
     Closed,
     AlreadyGone,
 }
 
-fn close_tab_by_id(
-    runtime: &tokio::runtime::Runtime,
-    client: &LocalClient,
-    tab_id: i64,
-) -> Result<CloseTabOutcome> {
-    match runtime.block_on(client.close_tab(tab_id)) {
+/// Runs on the engine runtime, not the UI thread. The `anyhow::Error` is
+/// classified and stringified here so nothing but `Send + Clone` data
+/// crosses back into a message.
+async fn close_tab_by_id(client: &LocalClient, tab_id: i64) -> Result<CloseTabOutcome, String> {
+    match client.close_tab(tab_id).await {
         Ok(()) => Ok(CloseTabOutcome::Closed),
         Err(error)
             if matches!(
@@ -203,22 +204,21 @@ fn close_tab_by_id(
         {
             Ok(CloseTabOutcome::AlreadyGone)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeleteProjectOutcome {
+pub enum DeleteProjectOutcome {
     Deleted,
     AlreadyGone,
 }
 
-fn delete_project_flow(
-    runtime: &tokio::runtime::Runtime,
+async fn delete_project_flow(
     client: &LocalClient,
     project_id: i64,
 ) -> Result<DeleteProjectOutcome, String> {
-    match runtime.block_on(client.delete_project(project_id)) {
+    match client.delete_project(project_id).await {
         Ok(_) => Ok(DeleteProjectOutcome::Deleted),
         Err(error)
             if matches!(
@@ -229,6 +229,81 @@ fn delete_project_flow(
             Ok(DeleteProjectOutcome::AlreadyGone)
         }
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// What a mutation that ran off the UI thread reported back, carried by
+/// `Message::EngineOp`. Every payload is `Send + Clone + 'static` and
+/// every error is already a `String`: an `anyhow::Error` never rides in a
+/// message.
+#[derive(Debug, Clone)]
+pub enum EngineOpResult {
+    TabClosed {
+        tab_id: i64,
+        result: Result<CloseTabOutcome, String>,
+    },
+    ProjectDeleted {
+        project_id: i64,
+        result: Result<DeleteProjectOutcome, String>,
+    },
+}
+
+/// Build the future behind [`UiTask::EngineOp`]: the op runs on the
+/// engine runtime, the Iced task only awaits the join, and `complete`
+/// turns whichever way it went into the message the UI thread handles.
+///
+/// A join failure — the op panicked, or the runtime is shutting down —
+/// becomes that op's own error rather than a dropped completion: every
+/// dispatch owes the UI exactly one [`EngineOpResult`].
+fn spawn_engine_op<T: Send + 'static>(
+    handle: tokio::runtime::Handle,
+    op: impl Future<Output = Result<T, String>> + Send + 'static,
+    complete: impl FnOnce(Result<T, String>) -> EngineOpResult + Send + 'static,
+) -> EngineOpFuture {
+    Box::pin(async move {
+        let result = match handle.spawn(op).await {
+            Ok(result) => result,
+            Err(error) => Err(error.to_string()),
+        };
+        complete(result)
+    })
+}
+
+/// Fold a completed engine op into what it owes the status banner, and
+/// log what it owes the log.
+///
+/// The `AlreadyGone` outcomes are successes, not errors: the entity the
+/// user asked to remove is gone, which is the state they asked for. They
+/// stay silent for the same reason they did when these calls blocked the
+/// UI thread — but they are also precisely the outcomes the engine
+/// returns *before* committing anything, so they broadcast no workspace
+/// event and the completion is the only thing that will ever trigger the
+/// reconcile they need. Hence [`App::engine_op_completed`] reconciles on
+/// every arm.
+fn engine_op_status(result: EngineOpResult) -> Option<String> {
+    match result {
+        EngineOpResult::TabClosed { tab_id, result } => match result {
+            Ok(CloseTabOutcome::Closed) => None,
+            Ok(CloseTabOutcome::AlreadyGone) => {
+                tracing::debug!(tab_id, "close_tab: rendered tab already gone");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, tab_id, "close_tab failed");
+                Some(error)
+            }
+        },
+        EngineOpResult::ProjectDeleted { project_id, result } => match result {
+            Ok(DeleteProjectOutcome::Deleted) => None,
+            Ok(DeleteProjectOutcome::AlreadyGone) => {
+                tracing::debug!(project_id, "confirmed delete: project already gone");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, project_id, "delete project failed");
+                Some(error)
+            }
+        },
     }
 }
 
@@ -394,9 +469,18 @@ fn resolve_keyboard_route(
     }
 }
 
+/// An engine mutation in flight. Boxed rather than generic because
+/// [`UiTask`] is the one shape every `App` method returns, and the
+/// Iced-side mapping is `Task::future(_).map(Message::EngineOp)`.
+pub type EngineOpFuture = Pin<Box<dyn Future<Output = EngineOpResult> + Send>>;
+
 pub enum UiTask {
     None,
     Then(Box<UiTask>, Box<UiTask>),
+    /// A mutation dispatched to the engine runtime. Its completion comes
+    /// back as `Message::EngineOp`, never as a return value — the UI
+    /// thread does not wait for the engine.
+    EngineOp(EngineOpFuture),
     Focus(window::Id),
     FocusWidget(Id),
     SelectAllWidget(Id),
@@ -521,6 +605,11 @@ pub struct App {
     palette_present_reply:
         Option<tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>>,
     clipboard: ClipboardQueue,
+    /// A clone of `runtime`'s handle, so a mutation can be spawned onto
+    /// the engine runtime from a `&self` method and awaited by an Iced
+    /// task. Cheap and `Send`; dropping one is inert, so it takes no part
+    /// in the ordering below.
+    runtime_handle: tokio::runtime::Handle,
     // Field order is intentional: terminal sessions and the engine feed
     // (whose receiver carries the wake every sender notifies on) are
     // dropped before the runtime — a dropped receiver is how the adapter
@@ -664,6 +753,7 @@ impl App {
             provider_frames: HashMap::new(),
             palette_present_reply: None,
             clipboard: ClipboardQueue::default(),
+            runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
             runtime,
@@ -725,6 +815,36 @@ impl App {
     pub fn service_engine_ready(&mut self) -> UiTask {
         self.service_engine()
             .then(self.screenshots.start_next(self.window_id))
+    }
+
+    /// Dispatch an engine mutation without blocking the UI thread.
+    ///
+    /// The op itself runs on the engine runtime — `handle.spawn` keeps
+    /// engine work (and the `tokio::spawn`s it may do) on the runtime that
+    /// owns it — while the Iced task only awaits the join. A join failure
+    /// (the op panicked, or the runtime is shutting down) surfaces as that
+    /// op's own error, so no dispatch can end in a completion that never
+    /// arrives.
+    fn engine_op<T: Send + 'static>(
+        &self,
+        op: impl Future<Output = Result<T, String>> + Send + 'static,
+        complete: impl FnOnce(Result<T, String>) -> EngineOpResult + Send + 'static,
+    ) -> UiTask {
+        UiTask::EngineOp(spawn_engine_op(self.runtime_handle.clone(), op, complete))
+    }
+
+    /// An engine mutation reported back — `Message::EngineOp`.
+    ///
+    /// Reconcile runs on every arm, success or failure. A batch of feed
+    /// events is not a substitute: the tolerated already-gone outcomes
+    /// broadcast nothing at all, and a failed op leaves UI state that
+    /// optimistically anticipated it needing the authoritative snapshot
+    /// back.
+    pub fn engine_op_completed(&mut self, result: EngineOpResult) {
+        if let Some(error) = engine_op_status(result) {
+            self.set_status(error);
+        }
+        self.reconcile();
     }
 
     pub fn file_dropped(&mut self, window_id: window::Id, path: PathBuf) -> UiTask {
@@ -840,10 +960,11 @@ impl App {
             }
         }
         if matches!(self.keyboard_route(), KeyboardRoute::Confirm) {
+            let mut task = UiTask::None;
             match confirm_dialog_action(&event) {
                 Some(ConfirmDialogAction::Delete) => {
                     self.rename_completion_key = Some(RenameCompletionKey::Enter);
-                    self.execute_confirmed_delete();
+                    task = self.execute_confirmed_delete();
                 }
                 Some(ConfirmDialogAction::Cancel) => {
                     self.rename_completion_key = Some(RenameCompletionKey::Escape);
@@ -852,8 +973,9 @@ impl App {
                 None => {}
             }
             // The modal owns the keyboard: every other event is swallowed so
-            // no accelerator or terminal encoder can observe it.
-            return UiTask::None;
+            // no accelerator or terminal encoder can observe it. The only
+            // thing that leaves here is the confirmed deletion's own task.
+            return task;
         }
         if matches!(self.keyboard_route(), KeyboardRoute::Editor) {
             if let keyboard::Event::KeyPressed {
@@ -969,10 +1091,10 @@ impl App {
             }
             KeybindAction::CloseTab => {
                 let tab_id = self.workspace.active().1;
-                if tab_id != 0 {
-                    self.close_tab_result(tab_id)?;
+                if tab_id == 0 {
+                    return Ok(UiTask::None);
                 }
-                Ok(UiTask::None)
+                Ok(self.close_tab_task(tab_id))
             }
             KeybindAction::NewProject => {
                 self.new_project_result()?;
@@ -1833,47 +1955,34 @@ impl App {
         self.confirm_delete = None;
     }
 
-    fn execute_confirmed_delete(&mut self) {
+    /// The overlay is dismissed here, at the confirm, exactly as it was
+    /// when the deletion blocked the UI thread — the user's answer is
+    /// taken before the engine hears about it, and a failure surfaces as a
+    /// status banner rather than by leaving the dialog up.
+    fn execute_confirmed_delete(&mut self) -> UiTask {
         let Some(confirm) = self.confirm_delete.take() else {
-            return;
+            return UiTask::None;
         };
-        match delete_project_flow(&self.runtime, &self.client, confirm.project_id) {
-            Ok(DeleteProjectOutcome::Deleted) => {}
-            Ok(DeleteProjectOutcome::AlreadyGone) => {
-                tracing::debug!(
-                    project_id = confirm.project_id,
-                    "confirmed delete: project already gone"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(%error, project_id = confirm.project_id, "delete project failed");
-                self.set_status(error);
-            }
-        }
-        self.reconcile();
+        let project_id = confirm.project_id;
+        let client = self.client.clone();
+        self.engine_op(
+            async move { delete_project_flow(&client, project_id).await },
+            move |result| EngineOpResult::ProjectDeleted { project_id, result },
+        )
     }
 
-    pub fn close_tab(&mut self, tab_id: i64) {
+    pub fn close_tab(&mut self, tab_id: i64) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        if let Err(error) = self.close_tab_result(tab_id) {
-            self.set_status(error);
-        }
+        self.close_tab_task(tab_id)
     }
 
-    fn close_tab_result(&mut self, tab_id: i64) -> Result<(), String> {
-        match close_tab_by_id(&self.runtime, &self.client, tab_id) {
-            Ok(CloseTabOutcome::Closed) => {}
-            Ok(CloseTabOutcome::AlreadyGone) => {
-                tracing::debug!(tab_id, "close_tab: rendered tab already gone");
-            }
-            Err(error) => {
-                tracing::warn!(?error, tab_id, "close_tab failed");
-                return Err(error.to_string());
-            }
-        }
-        self.reconcile();
-        Ok(())
+    fn close_tab_task(&self, tab_id: i64) -> UiTask {
+        let client = self.client.clone();
+        self.engine_op(
+            async move { close_tab_by_id(&client, tab_id).await },
+            move |result| EngineOpResult::TabClosed { tab_id, result },
+        )
     }
 
     fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
@@ -2092,12 +2201,12 @@ impl Message {
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::BeginRenameTab(tab_id) => return app.begin_rename_tab(tab_id),
-            Self::CloseTab(tab_id) => app.close_tab(tab_id),
+            Self::CloseTab(tab_id) => return app.close_tab(tab_id),
             Self::NewTab => app.new_tab(),
             Self::NewProject => app.new_project(),
             Self::ToggleSidebar => app.toggle_sidebar(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
-            Self::ConfirmDeleteConfirm => app.execute_confirmed_delete(),
+            Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             Self::OpenNotifications => return app.open_notifications(),
             _ => {}
         }
@@ -2237,6 +2346,96 @@ mod tests {
         assert_eq!(workspace.preferred_tab(first.id), Some(first_tab.id));
     }
 
+    /// The tolerated outcomes are the whole reason completions reconcile:
+    /// both of them are answered by the engine *before* it commits
+    /// anything, so they broadcast no workspace event and nothing else
+    /// would ever tell the UI to look again. They must therefore stay
+    /// silent (the user got the state they asked for) while
+    /// `engine_op_completed` reconciles unconditionally around this
+    /// verdict.
+    #[test]
+    fn a_tolerated_already_gone_completion_raises_no_banner() {
+        for result in [
+            EngineOpResult::TabClosed {
+                tab_id: 7,
+                result: Ok(CloseTabOutcome::AlreadyGone),
+            },
+            EngineOpResult::TabClosed {
+                tab_id: 7,
+                result: Ok(CloseTabOutcome::Closed),
+            },
+            EngineOpResult::ProjectDeleted {
+                project_id: 3,
+                result: Ok(DeleteProjectOutcome::AlreadyGone),
+            },
+            EngineOpResult::ProjectDeleted {
+                project_id: 3,
+                result: Ok(DeleteProjectOutcome::Deleted),
+            },
+        ] {
+            assert_eq!(
+                engine_op_status(result.clone()),
+                None,
+                "{result:?} is a success, banner-wise"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_completion_surfaces_the_engine_error_as_the_banner() {
+        assert_eq!(
+            engine_op_status(EngineOpResult::TabClosed {
+                tab_id: 7,
+                result: Err("close exploded".into()),
+            }),
+            Some("close exploded".to_string())
+        );
+        assert_eq!(
+            engine_op_status(EngineOpResult::ProjectDeleted {
+                project_id: 3,
+                result: Err("delete exploded".into()),
+            }),
+            Some("delete exploded".to_string())
+        );
+    }
+
+    /// Every dispatch owes the UI exactly one completion. A panicking op
+    /// would otherwise leave the mutation with no reconcile and no banner
+    /// — the stall this whole shape exists to make impossible — so the
+    /// join failure is folded into the op's own error. (The panic message
+    /// tokio prints here is expected test output.)
+    #[test]
+    fn an_engine_op_completes_through_its_own_result_even_when_the_task_panics() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let completed = runtime.block_on(spawn_engine_op(
+            runtime.handle().clone(),
+            async { Ok(CloseTabOutcome::Closed) },
+            |result| EngineOpResult::TabClosed { tab_id: 7, result },
+        ));
+        assert!(matches!(
+            completed,
+            EngineOpResult::TabClosed {
+                tab_id: 7,
+                result: Ok(CloseTabOutcome::Closed)
+            }
+        ));
+
+        let panicked = runtime.block_on(spawn_engine_op(
+            runtime.handle().clone(),
+            async { panic!("engine op panicked") },
+            |result: Result<DeleteProjectOutcome, String>| EngineOpResult::ProjectDeleted {
+                project_id: 3,
+                result,
+            },
+        ));
+        let EngineOpResult::ProjectDeleted { project_id, result } = panicked else {
+            panic!("a delete's join failure must stay a delete completion")
+        };
+        assert_eq!(project_id, 3);
+        assert!(result.is_err(), "a lost task is that op's own error");
+        assert!(engine_op_status(EngineOpResult::ProjectDeleted { project_id, result }).is_some());
+    }
+
     #[test]
     fn rendered_close_keeps_its_exact_id_and_engine_fallback_semantics() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2252,7 +2451,9 @@ mod tests {
         );
 
         assert_eq!(
-            close_tab_by_id(&runtime, &client, doomed.id).unwrap(),
+            runtime
+                .block_on(close_tab_by_id(&client, doomed.id))
+                .unwrap(),
             CloseTabOutcome::Closed
         );
         assert_eq!(workspace.active(), (project.id, sibling.id));
@@ -2261,7 +2462,9 @@ mod tests {
         // actor already removed that tab, replaying the stale message is an
         // expected no-op and cannot close the newly-active sibling.
         assert_eq!(
-            close_tab_by_id(&runtime, &client, doomed.id).unwrap(),
+            runtime
+                .block_on(close_tab_by_id(&client, doomed.id))
+                .unwrap(),
             CloseTabOutcome::AlreadyGone
         );
         assert!(workspace.tab(sibling.id).is_ok());
@@ -2270,7 +2473,7 @@ mod tests {
         let last = workspace.open_tab(last_project.id, "/tmp", "last").unwrap();
         workspace.focus_tab(last.id).unwrap();
         assert_eq!(
-            close_tab_by_id(&runtime, &client, last.id).unwrap(),
+            runtime.block_on(close_tab_by_id(&client, last.id)).unwrap(),
             CloseTabOutcome::Closed
         );
         assert!(
@@ -2490,7 +2693,9 @@ mod tests {
         workspace.focus_tab(doomed_first.id).unwrap();
 
         assert_eq!(
-            delete_project_flow(&runtime, &client, doomed.id).unwrap(),
+            runtime
+                .block_on(delete_project_flow(&client, doomed.id))
+                .unwrap(),
             DeleteProjectOutcome::Deleted
         );
         assert!(workspace
@@ -2506,16 +2711,22 @@ mod tests {
 
         // A stale confirm settles as a silent dismiss, never as an error.
         assert_eq!(
-            delete_project_flow(&runtime, &client, doomed.id).unwrap(),
+            runtime
+                .block_on(delete_project_flow(&client, doomed.id))
+                .unwrap(),
             DeleteProjectOutcome::AlreadyGone
         );
 
         assert_eq!(
-            delete_project_flow(&runtime, &client, keeper.id).unwrap(),
+            runtime
+                .block_on(delete_project_flow(&client, keeper.id))
+                .unwrap(),
             DeleteProjectOutcome::Deleted
         );
         assert_eq!(
-            delete_project_flow(&runtime, &client, last_row.id).unwrap(),
+            runtime
+                .block_on(delete_project_flow(&client, last_row.id))
+                .unwrap(),
             DeleteProjectOutcome::Deleted
         );
         assert!(workspace.snapshot().is_empty());

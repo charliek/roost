@@ -36,6 +36,9 @@ enum Message {
     /// `engine_feed::wake_subscription`. Spurious wakes are expected and
     /// free.
     EngineReady,
+    /// A mutation dispatched to the engine runtime finished. Carries only
+    /// `Send + Clone` data — errors arrive already stringified.
+    EngineOp(app::EngineOpResult),
     /// A banner is up and its expiry is due. Armed only while one is.
     StatusTick,
     /// A palette visibility request is outstanding. Armed only while one is.
@@ -142,6 +145,10 @@ fn main() -> anyhow::Result<()> {
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::EngineReady => app.service_engine_ready().map_task(),
+        Message::EngineOp(result) => {
+            app.engine_op_completed(result);
+            Task::none()
+        }
         Message::StatusTick => {
             app.expire_status();
             Task::none()
@@ -437,6 +444,7 @@ impl UiTask for app::UiTask {
         match self {
             app::UiTask::None => Task::none(),
             app::UiTask::Then(first, second) => first.map_task().chain(second.map_task()),
+            app::UiTask::EngineOp(future) => Task::future(future).map(Message::EngineOp),
             app::UiTask::Focus(id) => window::gain_focus(id),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::SelectAllWidget(id) => iced::widget::operation::select_all(id),
