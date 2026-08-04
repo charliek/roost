@@ -19,7 +19,7 @@ import os
 import pytest
 
 from client import RoostError
-from util import wait_tab_attached
+from util import wait_tab_attached, wait_tab_quiet
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -28,7 +28,13 @@ TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 def _seed_row(roost, tab_id: int, text: str, row: int = 10) -> None:
     """Feed `text` onto a viewport row clear of the shell's startup
     noise. Same prefix trick as `test_feed_pty_bytes_lands_on_terminal`
-    so a slow shell on CI can't race with our marker."""
+    so a slow shell on CI can't race with our marker.
+
+    `wait_tab_quiet` first: `feed_pty_bytes` doesn't serialize with PTY
+    output still in flight, so seeding at attach can land ahead of the
+    prompt, which then appends to the seeded row (triple-click then
+    selects `hello world` + the prompt)."""
+    wait_tab_quiet(roost, tab_id)
     payload = b"\x1b[2J\x1b[" + str(row + 1).encode() + b";1H" + text.encode("utf-8")
     roost.tab_feed_pty_bytes(tab_id, payload)
     roost.wait_text(tab_id, text, timeout=5.0)

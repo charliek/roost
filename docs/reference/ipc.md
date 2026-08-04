@@ -330,6 +330,16 @@ Request:
 
 `data` is base64-encoded raw bytes. Response: `{}`.
 
+**Ordering:** the bytes are applied the moment the UI services the op.
+They are *not* serialized against PTY output still in flight from the
+shell, so an injection sent right after a tab attaches can be applied
+*before* the shell's startup bytes — the prompt then lands on top of
+(or appended to) whatever was just seeded. Harnesses must wait for the
+tab to go quiet before seeding: attach is not enough, the predicate has
+to observe the shell painting and then stopping (`tools/roosttest`'s
+`util.wait_tab_quiet` — non-empty `tab.dump` text, byte-identical
+across consecutive polls).
+
 ### `tab.capture_pty_input` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` at UI launch.** Returns (and by default

@@ -35,7 +35,7 @@ import time
 import pytest
 
 from client import scaled_timeout
-from util import drain_until_match, wait_tab_attached
+from util import drain_until_match, wait_tab_attached, wait_tab_quiet
 
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -73,7 +73,10 @@ class TestOscPipeline:
         strongest signal we can get from the bundled-theme set.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        # Quiet, not just attached: `feed_pty_bytes` applies immediately
+        # and does not serialize with PTY output still in flight, so a
+        # seed sent at attach can land ahead of the prompt.
+        wait_tab_quiet(roost, tab)
         # Clear + home + bold "B" + reset + non-bold "N", on a row
         # the shell startup won't touch.
         roost.tab_feed_pty_bytes(
@@ -99,7 +102,7 @@ class TestOscPipeline:
         leave `has_explicit_bg: false`.
         """
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(
             tab,
             b"\x1b[2J\x1b[10;1H\x1b[7mX",
@@ -253,7 +256,10 @@ class TestOscPipeline:
         regression in the OSC dispatch surfaces without depending on
         shell integration."""
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        # Quiet first: an integrated shell emits its own OSC 7 with the
+        # real cwd at the prompt, and `feed_pty_bytes` doesn't serialize
+        # behind it — seeding at attach can be overwritten a tick later.
+        wait_tab_quiet(roost, tab)
         roost.tab_feed_pty_bytes(tab, b"\x1b]7;file:///usr\x07")
         # The dispatch fires asynchronously on the UI loop; poll
         # tab.list until cwd reflects.
@@ -272,7 +278,9 @@ class TestOscPipeline:
         until the user explicitly renames (then `user_titled=true`
         locks it). Pins the OSC dispatch end-to-end."""
         tab = roost.open_tab(project, cwd="/tmp")
-        wait_tab_attached(roost, tab)
+        # Quiet first: the shell re-emits its title on every prompt, so a
+        # seed racing the first prompt can be clobbered before we poll.
+        wait_tab_quiet(roost, tab)
         marker = "roost-osc0-title-test"
         roost.tab_feed_pty_bytes(tab, b"\x1b]0;" + marker.encode("ascii") + b"\x07")
         deadline = time.monotonic() + scaled_timeout(5.0)

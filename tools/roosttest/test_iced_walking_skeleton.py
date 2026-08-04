@@ -19,7 +19,7 @@ import pytest
 from client import Roost, scaled_timeout
 import ui
 from test_sidebar_collapse_persistence import _toggle_to_collapsed, _toggle_to_visible
-from util import drain_until_match, wait_tab_attached
+from util import drain_until_match, wait_tab_attached, wait_tab_quiet
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402 — pure stdlib PNG decoder, imported not shelled out
@@ -87,7 +87,10 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
     pixels or encode GTK/Iced visual parity.
     """
     tab = roost.open_tab(project, cwd="/tmp")
-    wait_tab_attached(roost, tab)
+    # Quiet, not just attached: `feed_pty_bytes` applies immediately and does
+    # not serialize with PTY output still in flight, so seeding at attach can
+    # land ahead of the shell's prompt and be overwritten by it.
+    wait_tab_quiet(roost, tab)
     _toggle_to_visible(roost)
     # Cell (0,0): distinctive explicit background. Row 2: high-contrast ASCII,
     # wide, combining, and plain clusters for a shape-independent glyph
