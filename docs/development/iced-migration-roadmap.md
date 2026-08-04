@@ -141,10 +141,18 @@ Slices, each sized for one gauntlet pass:
   (`tools/roosttest/test_sidebar_resize.py`, wired into `ICED_E2E_TESTS`
   and `ci.yml`); and a real-input grip segment in
   `tools/input/linux/iced_clipboard_check.py`.
-* **3d. Tick → push subscriptions.** Replace the 16 ms full-snapshot poll
-  and the UI-thread `block_on` calls with Iced stream subscriptions and
-  event-driven reconcile. Do before more real-time features stack onto the
-  poll.
+* **3d. Tick → push subscriptions (complete — plan 012).** Shipped: the
+  16 ms full-snapshot poll and all UI-thread `block_on` calls are gone; one
+  `EngineFeed` channel (workspace events via the shared `events::subscribe`
+  bridge — boot `Resync` + `Lagged`→`Resync`, GTK-parity lag recovery —
+  plus per-tab PTY, IPC `UiRequest`s, metrics, provider results) drained by
+  a `Notify`-backed wake subscription with stable identity; the only
+  timers left are three state-conditional ones (status 500ms,
+  palette-geometry 16ms, attach-retry 25ms — the last closing the
+  `TabOpened`-before-spawn race with GTK-parity bounded budget); mutations
+  are async engine ops with op-id-guarded rename/reorder state machines
+  and op-id-keyed deferred `palette.activate` replies; idle CPU measured
+  ~73% → 0.0% in the shed.
 * **3e. Polish parity:** notification bell/badge, hover-close, offscreen-tab
   reveal, empty/loading/error states, cursor/selection/link pixel geometry —
   per the P1 rows in the [parity inventory](iced-parity-inventory.md).
@@ -173,7 +181,7 @@ Slices, each sized for one gauntlet pass:
 
 Slice order is deliberate: 3b closed the honest `Err("… not available in
 Iced yet")` stubs — the grep now has zero hits — and 3c closed the last
-functional gap blocking M4; 3d is the
+functional gap blocking M4; 3d closed the
 architecture cleanup that everything real-time depends on; 3e/3f/3g are
 polish and platform work that can interleave.
 
@@ -194,6 +202,7 @@ when it touches the code you are already in:
 | Mac `app.window_metrics` omits `terminal_top` / `terminal_font_family` | [#287] |
 | `app/interactions.rs` at 2,960 lines — finer split when fixtures allow | [#288] |
 | swift-testing runner SIGABRT on fast value-check swarms (XCTest workaround) | [#289] |
+| Iced hit-tests positionless presses at the batch-newest cursor (SidebarResizeGrip + ReorderStrip) | [#295] |
 
 [#281]: https://github.com/charliek/roost/issues/281
 [#282]: https://github.com/charliek/roost/issues/282
@@ -205,6 +214,7 @@ when it touches the code you are already in:
 [#288]: https://github.com/charliek/roost/issues/288
 [#289]: https://github.com/charliek/roost/issues/289
 [#292]: https://github.com/charliek/roost/issues/292
+[#295]: https://github.com/charliek/roost/issues/295
 
 ### M4 — ship Iced to Linux users
 
