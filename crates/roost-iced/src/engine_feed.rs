@@ -8,10 +8,11 @@
 //! those sources and one place to wake on.
 //!
 //! The [`Notify`] every sender carries is that wake source, and
-//! [`wake_subscription`] is what turns it into `Message::EngineReady`.
+//! [`wake_subscription`] is what turns it into `Message::EngineReady` —
+//! the only thing that drains the feed now that the 16 ms tick is gone.
 //! The send-then-notify ordering enforced here is what makes that
-//! subscription lossless. The 16 ms tick still runs alongside it as a
-//! fallback drain driver until the trigger relocation lands.
+//! subscription lossless, and losslessness is no longer optional: a
+//! missed wake is a stalled surface, not a 16 ms delay.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -87,8 +88,12 @@ impl EngineFeedReceiver {
         }
         let item = self.rx.try_recv().ok()?;
         batch.items += 1;
-        batch.workspace_events |= matches!(item, EngineFeed::Workspace(_));
-        batch.non_tab_bytes |= !matches!(item, EngineFeed::Tab(_, TabOutput::Bytes(_)));
+        let workspace = matches!(item, EngineFeed::Workspace(_));
+        let tab_bytes = matches!(item, EngineFeed::Tab(_, TabOutput::Bytes(_)));
+        batch.workspace_events |= workspace;
+        batch.non_tab_bytes |= !tab_bytes;
+        batch.workspace_dirty |= workspace;
+        batch.dirty |= !tab_bytes;
         Some(item)
     }
 
@@ -100,6 +105,10 @@ impl EngineFeedReceiver {
 }
 
 /// What one drain batch contained, for the post-drain economy rules.
+/// `items`/`workspace_events`/`non_tab_bytes`/`capped` describe the whole
+/// batch (they are what the trace reports); the two dirty flags describe
+/// only what has landed *since the last reconcile*, because a drain may
+/// reconcile in its middle as well as at its end.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct EngineBatch {
     pub(crate) items: usize,
@@ -108,11 +117,34 @@ pub(crate) struct EngineBatch {
     /// single fact the reconcile rule turns on.
     pub(crate) non_tab_bytes: bool,
     pub(crate) capped: bool,
+    dirty: bool,
+    workspace_dirty: bool,
 }
 
 impl EngineBatch {
     pub(crate) fn is_empty(&self) -> bool {
         self.items == 0
+    }
+
+    /// Whether a workspace event has landed since the last reconcile.
+    /// The drain checks this before servicing an IPC request so a read op
+    /// answers from a cache that already contains the mutation that
+    /// preceded it in this batch.
+    pub(crate) fn workspace_dirty(&self) -> bool {
+        self.workspace_dirty
+    }
+
+    /// The drain reconciled: everything drained so far is folded into the
+    /// UI's cache.
+    pub(crate) fn mark_reconciled(&mut self) {
+        self.dirty = false;
+        self.workspace_dirty = false;
+    }
+
+    /// Something the drain *did* — as opposed to something it drained —
+    /// left the cache behind again, so the tail still owes a reconcile.
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     /// A wake that drained nothing costs nothing: spurious wakes are
@@ -121,8 +153,11 @@ impl EngineBatch {
     /// terminal state, which the touched-tab refresh publishes, and the
     /// workspace mutations they can trigger (OSC 7/9, title changes)
     /// round-trip back as workspace events carrying their own reconcile.
+    ///
+    /// This is the tail question — "is the cache still behind?" — so a
+    /// mid-drain reconcile answers it too.
     pub(crate) fn should_reconcile(&self) -> bool {
-        self.workspace_events || self.non_tab_bytes
+        self.dirty
     }
 }
 
@@ -361,6 +396,86 @@ mod tests {
         assert!(
             !batch.should_reconcile(),
             "PTY bytes move terminal state, not workspace state"
+        );
+    }
+
+    /// The bookkeeping behind the mid-drain reconcile. `App` has no test
+    /// constructor (bootstrap needs a profile, the instance lock and the
+    /// Iced runtime), so the drain loop's decision is exercised here at
+    /// the seam it turns on: the flags, in the order `service_engine`
+    /// reads and clears them. An IPC read that follows a mutation in the
+    /// same batch must not answer from the pre-mutation cache.
+    #[tokio::test]
+    async fn a_request_after_a_workspace_event_reconciles_mid_drain() {
+        let (tx, mut rx) = channel();
+        assert!(tx.send(EngineFeed::Workspace(WorkspaceEvent::TabClosed {
+            tab_id: 7
+        })));
+        assert!(tx.send(EngineFeed::UiRequest(UiRequest::Activate)));
+        assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+
+        let mut batch = EngineBatch::default();
+        let mut mid_drain_reconciles = 0;
+        while let Some(item) = rx.try_next(&mut batch) {
+            if matches!(item, EngineFeed::UiRequest(_)) {
+                assert!(
+                    batch.workspace_dirty(),
+                    "the event that preceded this request is not folded into the cache yet"
+                );
+                mid_drain_reconciles += 1;
+                batch.mark_reconciled();
+                assert!(
+                    !batch.should_reconcile(),
+                    "one reconcile answers the tail question too"
+                );
+                // Servicing the request can mutate the workspace itself.
+                batch.mark_dirty();
+            }
+        }
+
+        assert_eq!(mid_drain_reconciles, 1, "one extra reconcile, not one each");
+        assert!(
+            batch.should_reconcile(),
+            "the request's own mutations still owe the tail a reconcile"
+        );
+        assert!(
+            !batch.workspace_dirty(),
+            "no workspace event landed after the mid-drain reconcile"
+        );
+        assert!(
+            batch.workspace_events && batch.non_tab_bytes,
+            "the whole-batch stats keep describing the whole batch"
+        );
+    }
+
+    /// The other half of the lifecycle: a reconcile clears the slate, and
+    /// only what lands afterwards can dirty it again — PTY bytes never do.
+    #[tokio::test]
+    async fn only_what_lands_after_a_reconcile_dirties_the_batch_again() {
+        let (tx, mut rx) = channel();
+        let mut batch = EngineBatch::default();
+
+        assert!(tx.send(EngineFeed::Workspace(WorkspaceEvent::TabClosed {
+            tab_id: 7
+        })));
+        assert!(rx.try_next(&mut batch).is_some());
+        assert!(batch.workspace_dirty() && batch.should_reconcile());
+        batch.mark_reconciled();
+
+        assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));
+        assert!(rx.try_next(&mut batch).is_some());
+        assert!(
+            !batch.should_reconcile() && !batch.workspace_dirty(),
+            "PTY bytes move terminal state, never the workspace cache"
+        );
+
+        assert!(tx.send(EngineFeed::Workspace(WorkspaceEvent::TabClosed {
+            tab_id: 8
+        })));
+        assert!(rx.try_next(&mut batch).is_some());
+        assert!(
+            batch.workspace_dirty() && batch.should_reconcile(),
+            "a later event re-arms both the mid-drain and the tail reconcile"
         );
     }
 

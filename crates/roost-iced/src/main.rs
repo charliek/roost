@@ -32,7 +32,6 @@ const WINDOW_TITLE: &str = "Roost — Iced POC";
 
 #[derive(Debug, Clone)]
 enum Message {
-    Tick,
     /// The engine feed has (probably) something to drain — see
     /// `engine_feed::wake_subscription`. Spurious wakes are expected and
     /// free.
@@ -142,7 +141,6 @@ fn main() -> anyhow::Result<()> {
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
-        Message::Tick => app.tick().map_task(),
         Message::EngineReady => app.service_engine_ready().map_task(),
         Message::StatusTick => {
             app.expire_status();
@@ -308,7 +306,6 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
         // stream must survive every conditional member joining or leaving
         // this batch, because a restarted stream can drop a permit.
         engine_feed::wake_subscription(wake),
-        time::every(Duration::from_millis(16)).map(|_| Message::Tick),
         window::open_events().map(Message::WindowOpened),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         window::events().filter_map(|(id, event)| window_event_message(id, event)),
@@ -326,8 +323,10 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
             }
         }),
     ];
-    // Each conditional member's recipe is its interval plus the TypeId of
-    // its mapping closure, so sharing 16 ms with the tick is not a
+    // Every remaining unconditional member above is event-driven: with
+    // the 16 ms tick gone, an idle app schedules no timer at all. Each
+    // conditional member's recipe is its interval plus the TypeId of its
+    // mapping closure, so two of them sharing an interval is not a
     // collision — `conditional_timers_join_the_subscription_set_only_with_the_state_that_needs_them`
     // holds that.
     if armed.status {
@@ -544,6 +543,14 @@ mod tests {
         }
     }
 
+    /// The five members an idle app always carries: the engine wake plus
+    /// the window-open, window-resize, window-event and keyboard
+    /// listeners. All four listeners are event-driven and the wake only
+    /// fires when the feed is fed, so this count is also the "no periodic
+    /// wakeups when idle" guard — a timer that crept back into the
+    /// unconditional set would move it.
+    const UNCONDITIONAL_MEMBERS: usize = 5;
+
     /// The whole point of the conditional members: an idle app carries
     /// none of them, each piece of live state adds exactly its own, and
     /// none of them displaces an unconditional member — the wake stream
@@ -553,6 +560,11 @@ mod tests {
         let wake = Arc::new(tokio::sync::Notify::new());
         let idle = recipe_ids(subscription_with(Arc::clone(&wake), ArmedTimers::default()));
         assert_eq!(ArmedTimers::default().count(), 0, "idle arms no timer");
+        assert_eq!(
+            idle.len(),
+            UNCONDITIONAL_MEMBERS,
+            "an idle app subscribes to the wake and the window/keyboard events, nothing periodic"
+        );
 
         for timers in [
             armed(false, false, false),

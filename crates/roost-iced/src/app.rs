@@ -710,45 +710,21 @@ impl App {
         self.feed_rx.wake_handle()
     }
 
-    /// A feed wake: the engine half of [`Self::tick`], and only that half.
-    /// Both drivers run the same [`Self::service_engine`] drain — which
-    /// reconciles, refreshes and closes exited tabs off the batch it
-    /// observed — and both end it by starting a queued screenshot, so an
-    /// IPC screenshot request in this very batch does not wait a frame.
+    /// The sole drain driver: everything asynchronous reaches the app
+    /// through the feed, and every feed send wakes this. The
+    /// [`Self::service_engine`] drain reconciles, refreshes and closes
+    /// exited tabs off the batch it observed, and this ends it by starting
+    /// a queued screenshot, so an IPC screenshot request in this very
+    /// batch does not wait a frame.
     ///
-    /// The rest of the tick's work — status expiry, the file-drop
-    /// debounce, the rename and palette tails, the attach retry — now has
-    /// its own trigger (see the conditional subscription members and
-    /// [`Self::file_dropped`]); the tick keeps running them until it is
-    /// deleted. An empty drain reconciles and refreshes nothing, which is
-    /// what makes the spurious wakes the permit model guarantees free.
+    /// An empty drain reconciles and refreshes nothing, which is what
+    /// makes the spurious wakes the permit model guarantees free — and a
+    /// batch of nothing but PTY bytes now genuinely skips the workspace
+    /// reconcile (see `EngineBatch::should_reconcile`), because no
+    /// periodic pass runs one behind its back any more.
     pub fn service_engine_ready(&mut self) -> UiTask {
-        let (task, _batch) = self.service_engine();
-        task.then(self.screenshots.start_next(self.window_id))
-    }
-
-    /// The fallback driver. Everything below now has a trigger of its own
-    /// — the feed wake, the conditional timers, the file-drop one-shot,
-    /// and the handlers that end with the rename tail — so this is a
-    /// duplicate pass rather than the only one, which is what lets it be
-    /// deleted whole.
-    pub fn tick(&mut self) -> UiTask {
-        let now = Instant::now();
-        self.status.expire_at(now);
-        let (mut task, feed_batch) = self.service_engine();
-        // The drain already reconciled if it saw anything that needs one;
-        // the tick keeps reconciling otherwise, so a tick still reconciles
-        // exactly once.
-        if !feed_batch.should_reconcile() {
-            self.reconcile();
-        }
-        if let Some(batch) = self.file_drops.take_ready_at(now) {
-            self.deliver_file_drop(batch);
-        }
-        task = task.then(self.take_rename_focus_task());
-        task = task.then(self.take_palette_visibility_task());
-        task = task.then(self.screenshots.start_next(self.window_id));
-        task
+        self.service_engine()
+            .then(self.screenshots.start_next(self.window_id))
     }
 
     pub fn file_dropped(&mut self, window_id: window::Id, path: PathBuf) -> UiTask {
@@ -1945,6 +1921,10 @@ impl App {
         self.focus_tab_and_clear(tab_id, false)
     }
 
+    /// Every focus change in the UI — strip clicks, sidebar rows, the
+    /// cycle/switch keybinds, jump-to-unread, the agent and notification
+    /// palettes — funnels through here, so this is the one place that owes
+    /// them a reconcile.
     fn focus_tab_and_clear(&mut self, tab_id: i64, reveal_sidebar: bool) -> Result<(), String> {
         self.workspace
             .focus_tab(tab_id)
@@ -1955,6 +1935,12 @@ impl App {
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
         }
+        // Both mutations above broadcast, so a reconcile would eventually
+        // arrive on the feed — but only after the bridge task runs, which
+        // is not ordered against the next IPC request the same feed
+        // carries. Reconciling here keeps "the UI mutated it, the UI shows
+        // it" synchronous, exactly as the client-op sites do.
+        self.reconcile();
         Ok(())
     }
 

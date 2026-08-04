@@ -1151,6 +1151,11 @@ impl App {
                         }
                     }
                     self.clear_palette_state();
+                    // The cleared flags broadcast, but the inbox rows this
+                    // command exists to drop are rebuilt by reconcile —
+                    // waiting for the round trip would let the next IPC
+                    // request observe them.
+                    self.reconcile();
                     if let Some(error) = first_error {
                         return Err(error);
                     }

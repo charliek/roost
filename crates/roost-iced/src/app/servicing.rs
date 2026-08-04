@@ -166,8 +166,10 @@ pub(super) fn collect_tab_output(
 
 impl App {
     pub(super) fn reconcile(&mut self) {
-        // Full authoritative snapshot on every UI tick is the recovery path
-        // for a slow consumer: deltas are an optimization, never UI truth.
+        // A full authoritative snapshot on every reconcile is the recovery
+        // path for a slow consumer — a lagged broadcast arrives as a
+        // `Resync` and this rebuild is what heals it: deltas are an
+        // optimization, never UI truth.
         self.projects = self.workspace.snapshot();
         reconcile_confirm_delete(&mut self.confirm_delete, &self.projects);
         self.reconcile_tab_drag_preview();
@@ -313,8 +315,12 @@ impl App {
 
     /// Drain one batch off the engine feed and apply it. Every
     /// asynchronous source shares the channel, so the batch is applied in
-    /// arrival order across sources rather than source by source.
-    pub(super) fn service_engine(&mut self) -> (UiTask, EngineBatch) {
+    /// arrival order across sources rather than source by source. What the
+    /// batch contained never leaves this function — the economy rules it
+    /// decides (reconcile or not, refresh which tabs) are applied at its
+    /// tail, plus the one reconcile a request may pull forward into the
+    /// middle of the drain so it does not read a stale cache.
+    pub(super) fn service_engine(&mut self) -> UiTask {
         let mut task = UiTask::None;
         let mut batch = EngineBatch::default();
         let mut pty = TabOutputBatch::default();
@@ -325,7 +331,26 @@ impl App {
                     collect_tab_output(&mut self.tabs, &mut pty, tab_id, output);
                 }
                 EngineFeed::UiRequest(request) => {
+                    // IPC reads (`tab.dump`, `palette.state`,
+                    // `sidebar.dump`) answer from `self.projects`, which is
+                    // only as fresh as the last reconcile. Replies are
+                    // eventually consistent by design — every client in
+                    // `tools/roosttest` condition-waits rather than
+                    // asserting on the first reply — but when a mutation
+                    // event already landed in THIS batch there is no
+                    // reason to make a caller wait for it: fold it in
+                    // first. At most one extra reconcile per mixed batch,
+                    // and none for the pure-request and pure-PTY batches
+                    // that dominate.
+                    if batch.workspace_dirty() {
+                        self.reconcile();
+                        batch.mark_reconciled();
+                    }
                     task = task.then(self.apply_ui_request(request));
+                    // The request may itself have mutated the workspace
+                    // (`tab.open`, `palette.activate`), and the reconcile
+                    // above — if it ran — predates that.
+                    batch.mark_dirty();
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
@@ -338,6 +363,13 @@ impl App {
         // a refresh that ran before them would publish the shape the batch
         // just replaced and leave the new one waiting for whatever
         // unrelated event refreshes the tab next.
+        //
+        // A mid-drain reconcile can have dropped a tab these actions were
+        // collected for; every arm already resolves the tab through the
+        // map (or hands the id to the engine, which answers `NotFound`),
+        // so a vanished tab is a no-op rather than a panic. The
+        // touched-tab refresh below and the exit list further down are
+        // guarded the same way.
         for (tab_id, actions) in pty.osc_actions {
             task = task.then(self.apply_osc_actions(tab_id, actions));
         }
@@ -364,7 +396,7 @@ impl App {
                 "engine feed batch"
             );
         }
-        (task, batch)
+        task
     }
 
     fn apply_workspace_event(&mut self, event: WorkspaceEvent) {
