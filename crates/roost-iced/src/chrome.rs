@@ -86,6 +86,28 @@ pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
     chrome_button(None, status, 4.0)
 }
 
+/// The sidebar-footer "+ New Project" chip: a centered rounded button with
+/// a resting fill, matching the shipped Mac bezel and GTK chip affordances
+/// rather than the flat text buttons used elsewhere in the chrome.
+pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered => PALETTE_SELECTION,
+        button::Status::Pressed => ACTIVE_TAB,
+        button::Status::Active => ACTIVE_AGENT,
+        button::Status::Disabled => ACTIVE_AGENT.scale_alpha(0.5),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: match status {
+            button::Status::Disabled => MUTED_TEXT.scale_alpha(0.5),
+            _ => TEXT,
+        },
+        border: Border::default().rounded(6.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
     let (background, text_color) = match status {
         button::Status::Hovered | button::Status::Pressed => (DANGER_ACCENT, TEXT),

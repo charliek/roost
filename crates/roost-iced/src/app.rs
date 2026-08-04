@@ -1186,33 +1186,21 @@ impl App {
             }
             sidebar_body = sidebar_body.push(project_group);
         }
-        let sidebar_header = container(
-            row![
-                text("PROJECTS").size(11).color(chrome::MUTED_TEXT),
-                iced::widget::Space::new().width(Fill),
-                button(text("«").size(11))
-                    .width(chrome::PILL_HEIGHT)
-                    .height(chrome::PILL_HEIGHT)
-                    .padding(2)
-                    .style(chrome::transparent_button)
-                    .on_press(Message::ToggleSidebar)
-            ]
-            .align_y(Alignment::Center),
-        )
-        .height(chrome::BAND_HEIGHT)
-        .width(Fill)
-        .padding([5, 12])
-        .style(chrome::surface);
+        let sidebar_header = container(text("PROJECTS").size(11).color(chrome::MUTED_TEXT))
+            .height(chrome::BAND_HEIGHT)
+            .width(Fill)
+            .padding([10, 12])
+            .style(chrome::surface);
         let sidebar_footer = container(
             button(text("+ New Project").size(11))
-                .width(Fill)
                 .height(chrome::PILL_HEIGHT)
-                .padding([2, 8])
-                .style(chrome::transparent_button)
+                .padding([4, 12])
+                .style(chrome::footer_chip_button)
                 .on_press(Message::NewProject),
         )
         .height(chrome::BAND_HEIGHT)
         .width(Fill)
+        .center_x(Fill)
         .padding([5, 8])
         .style(chrome::surface);
         // The strip delegates layout to its content, so its layout node is the

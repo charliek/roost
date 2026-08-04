@@ -1790,27 +1790,14 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
         "focus restored after footer-created project cleanup",
     )
 
-    # Collapse moved to the header band's trailing « button: a 24px square
-    # ending 12px (container padding) short of the sidebar's right edge,
-    # vertically centered in the BAND_HEIGHT header the product reports as
-    # terminal_top.
-    metrics = launch.client.window_metrics()
-    header_toggle_x = round(float(metrics["sidebar_width"])) - 12 - 24 // 2
-    header_toggle_y = round(launch.client.terminal_top(metrics)) // 2
-    launch.terminal_pointer(
-        [
-            "mousemove",
-            "--window",
-            launch.window,
-            str(header_toggle_x),
-            str(header_toggle_y),
-            "click",
-            "1",
-        ]
-    )
+    # The sidebar has no pointer collapse control (the header « was removed
+    # after user testing; parity with Mac, where collapse is keybind/menu
+    # only) — collapse via the ToggleSidebar default so the collapsed-state
+    # ☰ restore control below is still exercised by a real click.
+    launch.key("alt+b")
     _wait_until(
         lambda: launch.client.window_metrics()["sidebar_collapsed"],
-        "fixed sidebar header collapse control after body scroll",
+        "keybind sidebar collapse after body scroll",
     )
     assert launch.client.identify()["active_tab_id"] == last_project_tab
     launch.terminal_pointer(
