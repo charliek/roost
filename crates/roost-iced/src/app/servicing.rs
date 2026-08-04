@@ -812,9 +812,23 @@ impl App {
                 let _ = reply.send(self.query_palette(&query));
             }
             UiRequest::PaletteActivate { id, reply } => {
-                let _ = reply.send(self.activate_palette(&id));
+                let activation = self.activate_palette(&id);
+                match activation.reply {
+                    PaletteReplyRoute::Ready(result) => {
+                        let _ = reply.send(result);
+                    }
+                    // The client stays blocked until this row's engine op
+                    // reports back: `palette.activate` answers with what
+                    // its action produced, and for these rows the action
+                    // has not produced it yet.
+                    PaletteReplyRoute::Deferred(op) => {
+                        self.palette_activate_replies.insert(op, reply);
+                    }
+                }
                 // The rename rows open the inline editor from here too.
-                task = task.then(self.take_rename_focus_task());
+                task = task
+                    .then(activation.task)
+                    .then(self.take_rename_focus_task());
             }
             UiRequest::PaletteDismiss { reply } => {
                 let result = self

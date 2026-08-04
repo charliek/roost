@@ -83,7 +83,7 @@ pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
 use self::palettes::{
     apply_with_rollback, ellipsize_palette_text, palette_agent_left_text, palette_row_id,
-    palette_title_runs, FontSizeTransition, PaletteVisibilityRequest,
+    palette_title_runs, FontSizeTransition, PaletteReplyRoute, PaletteVisibilityRequest,
     PALETTE_AGENT_PROJECT_MAX_COLUMNS,
 };
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
@@ -239,13 +239,32 @@ async fn delete_project_flow(
 /// message.
 #[derive(Debug, Clone)]
 pub enum EngineOpResult {
+    /// `op` is the id the dispatch allocated. A `palette.activate` that
+    /// dispatched this close is parked on it — see
+    /// [`settle_palette_activation`] — and every other route simply has
+    /// nothing stashed under it.
     TabClosed {
+        op: u64,
         tab_id: i64,
         result: Result<CloseTabOutcome, String>,
     },
     ProjectDeleted {
         project_id: i64,
         result: Result<DeleteProjectOutcome, String>,
+    },
+    /// One tab opened: the new-tab routes and the launcher's rows. `op`
+    /// keys the deferred palette reply exactly as [`Self::TabClosed`]'s
+    /// does.
+    TabOpened {
+        op: u64,
+        project_id: i64,
+        result: Result<i64, String>,
+    },
+    /// A project and its first tab, from the one compound op that
+    /// creates both.
+    ProjectCreated {
+        op: u64,
+        result: Result<(i64, i64), String>,
     },
     /// `op` is the id the editor recorded at dispatch: a completion that
     /// no longer matches belongs to an editor the user has already
@@ -305,7 +324,7 @@ fn spawn_engine_op<T: Send + 'static>(
 /// every arm.
 fn engine_op_status(result: EngineOpResult) -> Option<String> {
     match result {
-        EngineOpResult::TabClosed { tab_id, result } => match result {
+        EngineOpResult::TabClosed { tab_id, result, .. } => match result {
             Ok(CloseTabOutcome::Closed) => None,
             Ok(CloseTabOutcome::AlreadyGone) => {
                 tracing::debug!(tab_id, "close_tab: rendered tab already gone");
@@ -335,34 +354,129 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         EngineOpResult::Renamed { .. }
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. } => None,
+        EngineOpResult::TabOpened {
+            project_id, result, ..
+        } => match result {
+            Ok(tab_id) => {
+                tracing::debug!(project_id, tab_id, "opened tab");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, project_id, "open tab failed");
+                Some(error)
+            }
+        },
+        EngineOpResult::ProjectCreated { result, .. } => match result {
+            Ok((project_id, tab_id)) => {
+                tracing::debug!(project_id, tab_id, "created project");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "create project failed");
+                Some(error)
+            }
+        },
     }
 }
 
-fn create_project_flow(
-    runtime: &tokio::runtime::Runtime,
-    client: &LocalClient,
-) -> Result<(i64, i64), String> {
+impl EngineOpResult {
+    /// The id a deferred `palette.activate` reply would be stashed
+    /// under. Only the completions whose rows became asynchronous carry
+    /// one; the rest can owe no IPC reply, so they answer `None` rather
+    /// than probe the stash.
+    fn palette_op(&self) -> Option<u64> {
+        match self {
+            Self::TabClosed { op, .. }
+            | Self::TabOpened { op, .. }
+            | Self::ProjectCreated { op, .. } => Some(*op),
+            // Delete reaches the palette only through the confirm
+            // overlay, which answers `palette.activate` the moment it
+            // opens; renames and reorders have no palette row at all.
+            Self::ProjectDeleted { .. }
+            | Self::Renamed { .. }
+            | Self::TabsReordered { .. }
+            | Self::ProjectsReordered { .. } => None,
+        }
+    }
+}
+
+/// Create a project and seed it with its first tab — one op, two engine
+/// calls sequential *inside* the future, so the UI thread never waits
+/// between them.
+///
+/// A tab-open failure after the create committed rolls the project back
+/// too: `LocalClient::open_tab`'s spawn-failure path closes the tab it
+/// opened, and closing a project's last tab deletes the project. The
+/// error is reported and the completion's reconcile shows the rollback,
+/// exactly as the blocking version behaved when its second call failed.
+async fn create_project_flow(client: &LocalClient) -> Result<(i64, i64), String> {
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    let project = runtime
-        .block_on(client.create_project("", &cwd))
+    let project = client
+        .create_project("", &cwd)
+        .await
         .map_err(|error| error.to_string())?;
-    let tab = runtime
-        .block_on(client.open_tab(
-            project.id,
-            &cwd,
-            "",
-            &[],
-            u32::from(DEFAULT_COLS),
-            u32::from(DEFAULT_ROWS),
-        ))
-        .map_err(|error| error.to_string())?;
+    let tab_id = open_tab_flow(client, project.id, cwd, String::new(), Vec::new()).await?;
     // `open_tab` already steals the selection, but create's activation must
     // not depend on another op's side effect.
     client
         .workspace
-        .focus_tab(tab.id)
+        .focus_tab(tab_id)
         .map_err(|error| error.to_string())?;
-    Ok((project.id, tab.id))
+    Ok((project.id, tab_id))
+}
+
+/// The one tab-open op behind every route that opens one: the new-tab
+/// button, keybind and palette row, the launcher's command rows, and
+/// create-project's seed tab.
+async fn open_tab_flow(
+    client: &LocalClient,
+    project_id: i64,
+    cwd: String,
+    title: String,
+    argv: Vec<String>,
+) -> Result<i64, String> {
+    client
+        .open_tab(
+            project_id,
+            &cwd,
+            &title,
+            &argv,
+            u32::from(DEFAULT_COLS),
+            u32::from(DEFAULT_ROWS),
+        )
+        .await
+        .map(|tab| tab.id)
+        .map_err(|error| error.to_string())
+}
+
+/// A `palette.activate` reply channel, parked while the row's action is
+/// in flight (`roost_engine::ipc`'s `PaletteReply`).
+type PaletteActivateReply = tokio::sync::oneshot::Sender<Result<PaletteStateResult, String>>;
+
+/// Answer the `palette.activate` invocation that dispatched `op`, if that
+/// invocation came from IPC; the keybind and pointer routes through the
+/// same rows stash nothing and this is a no-op for them.
+///
+/// The reply belongs to the INVOCATION, not to the palette. A client is
+/// blocked on it, so it is sent whatever the palette is doing by now —
+/// dismissed, reopened on another frame, or never reopened. That is also
+/// why success answers with the closed state built here rather than a
+/// live `palette_state_result()`: every row that dispatches an op
+/// dismisses the palette at dispatch, so the closed state is what this
+/// invocation produced, and whatever is open at completion time belongs
+/// to someone else.
+fn settle_palette_activation(
+    pending: &mut HashMap<u64, PaletteActivateReply>,
+    op: u64,
+    error: Option<String>,
+) {
+    let Some(reply) = pending.remove(&op) else {
+        return;
+    };
+    let _ = reply.send(match error {
+        Some(error) => Err(error),
+        None => Ok(palettes::closed_palette_state_result()),
+    });
 }
 
 fn effective_sidebar_width(collapsed: bool, width: f32) -> f32 {
@@ -505,7 +619,9 @@ fn resolve_keyboard_route(
 /// Iced-side mapping is `Task::future(_).map(Message::EngineOp)`.
 pub type EngineOpFuture = Pin<Box<dyn Future<Output = EngineOpResult> + Send>>;
 
+#[derive(Default)]
 pub enum UiTask {
+    #[default]
     None,
     Then(Box<UiTask>, Box<UiTask>),
     /// A mutation dispatched to the engine runtime. Its completion comes
@@ -540,6 +656,18 @@ pub enum UiTask {
         measurement_generation: u64,
         reveal: bool,
     },
+}
+
+/// A dispatched engine mutation: the Iced task that will deliver its
+/// completion, plus the id that completion will carry.
+///
+/// `op` is `None` when the route settled without dispatching anything — a
+/// guard turned the action into a no-op — and there is then no completion
+/// for a deferred `palette.activate` reply to wait on.
+#[derive(Default)]
+struct EngineDispatch {
+    task: UiTask,
+    op: Option<u64>,
 }
 
 impl UiTask {
@@ -642,6 +770,12 @@ pub struct App {
     provider_frames: HashMap<String, provider::Provider>,
     palette_present_reply:
         Option<tokio::sync::oneshot::Sender<Result<PalettePresentResult, String>>>,
+    /// `palette.activate` replies owed by engine ops still in flight,
+    /// keyed by op id. Separate from `palette_present_reply` in every
+    /// way: that one belongs to an open `palette.present` and is answered
+    /// by the user's pick or dismiss, these belong to invocations whose
+    /// row already ran and are answered by their own completion.
+    palette_activate_replies: HashMap<u64, PaletteActivateReply>,
     clipboard: ClipboardQueue,
     /// A clone of `runtime`'s handle, so a mutation can be spawned onto
     /// the engine runtime from a `&self` method and awaited by an Iced
@@ -792,6 +926,7 @@ impl App {
             provider_request: 0,
             provider_frames: HashMap::new(),
             palette_present_reply: None,
+            palette_activate_replies: HashMap::new(),
             clipboard: ClipboardQueue::default(),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
@@ -888,9 +1023,23 @@ impl App {
     /// at all, and a failed op leaves UI state that optimistically
     /// anticipated it needing the authoritative snapshot back.
     pub fn engine_op_completed(&mut self, result: EngineOpResult) {
+        // The reply an async palette row's client is blocked on, held
+        // until after the reconcile below: a client that reads state the
+        // moment it is answered must not race the UI's own fold-in of the
+        // action it just heard about.
+        let mut deferred_activation = None;
         match result {
-            simple @ (EngineOpResult::TabClosed { .. } | EngineOpResult::ProjectDeleted { .. }) => {
-                if let Some(error) = engine_op_status(simple) {
+            simple @ (EngineOpResult::TabClosed { .. }
+            | EngineOpResult::ProjectDeleted { .. }
+            | EngineOpResult::TabOpened { .. }
+            | EngineOpResult::ProjectCreated { .. }) => {
+                let palette_op = simple.palette_op();
+                let error = engine_op_status(simple);
+                // The banner's verdict and the IPC reply's are the same
+                // verdict: an outcome silent enough to raise no banner is
+                // an outcome the client hears as success.
+                deferred_activation = palette_op.map(|op| (op, error.clone()));
+                if let Some(error) = error {
                     self.set_status(error);
                 }
             }
@@ -910,6 +1059,9 @@ impl App {
             } => self.project_reorder_completed(op, &ordered_ids, result),
         }
         self.reconcile();
+        if let Some((op, error)) = deferred_activation {
+            settle_palette_activation(&mut self.palette_activate_replies, op, error);
+        }
     }
 
     pub fn file_dropped(&mut self, window_id: window::Id, path: PathBuf) -> UiTask {
@@ -1150,21 +1302,15 @@ impl App {
 
     fn dispatch_keybind_action_once(&mut self, action: KeybindAction) -> Result<UiTask, String> {
         match action {
-            KeybindAction::NewTab => {
-                self.new_tab_result()?;
-                Ok(UiTask::None)
-            }
+            KeybindAction::NewTab => Ok(self.new_tab_dispatch().task),
             KeybindAction::CloseTab => {
                 let tab_id = self.workspace.active().1;
                 if tab_id == 0 {
                     return Ok(UiTask::None);
                 }
-                Ok(self.close_tab_task(tab_id))
+                Ok(self.close_tab_dispatch(tab_id).task)
             }
-            KeybindAction::NewProject => {
-                self.new_project_result()?;
-                Ok(UiTask::None)
-            }
+            KeybindAction::NewProject => Ok(self.new_project_dispatch().task),
             KeybindAction::RenameProject => {
                 self.begin_rename_target(RenameTarget::Project(self.workspace.active().0))?;
                 Ok(self.take_rename_focus_task())
@@ -1945,47 +2091,68 @@ impl App {
         }
     }
 
-    pub fn new_tab(&mut self) {
+    pub fn new_tab(&mut self) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        if let Err(error) = self.new_tab_result() {
-            self.set_status(error);
-        }
+        self.new_tab_dispatch().task
     }
 
-    fn new_tab_result(&mut self) -> Result<(), String> {
+    /// The new-tab route every surface shares. Nothing follows the
+    /// dispatch: `Workspace::open_tab` steals the active selection in the
+    /// same commit that creates the tab, so focus is the engine's answer
+    /// and the completion's reconcile is the whole tail. Nothing here
+    /// reads `self.tabs` for the new id, so there is no intent to pend.
+    fn new_tab_dispatch(&mut self) -> EngineDispatch {
         let (project_id, _) = self.workspace.active();
         if project_id == 0 {
-            return Ok(());
+            return EngineDispatch::default();
         }
         let cwd = self.launch_cwd(project_id);
-        self.runtime
-            .block_on(self.client.open_tab(
-                project_id,
-                &cwd,
-                "",
-                &[],
-                u32::from(DEFAULT_COLS),
-                u32::from(DEFAULT_ROWS),
-            ))
-            .map_err(|error| error.to_string())?;
-        self.reconcile();
-        Ok(())
+        self.open_tab_dispatch(project_id, cwd, String::new(), Vec::new())
     }
 
-    pub fn new_project(&mut self) {
-        self.cancel_drags();
-        self.cancel_editor_for_interaction();
-        if let Err(error) = self.new_project_result() {
-            self.set_status(error);
+    fn open_tab_dispatch(
+        &mut self,
+        project_id: i64,
+        cwd: String,
+        title: String,
+        argv: Vec<String>,
+    ) -> EngineDispatch {
+        let op = self.take_engine_op_id();
+        let client = self.client.clone();
+        EngineDispatch {
+            task: self.engine_op(
+                async move { open_tab_flow(&client, project_id, cwd, title, argv).await },
+                move |result| EngineOpResult::TabOpened {
+                    op,
+                    project_id,
+                    result,
+                },
+            ),
+            op: Some(op),
         }
     }
 
-    fn new_project_result(&mut self) -> Result<(), String> {
+    pub fn new_project(&mut self) -> UiTask {
+        self.cancel_drags();
+        self.cancel_editor_for_interaction();
+        self.new_project_dispatch().task
+    }
+
+    /// The sidebar is expanded here, at the dispatch, rather than when
+    /// the project lands: revealing where the new project will appear is
+    /// the user's own gesture answered, not the engine's report.
+    fn new_project_dispatch(&mut self) -> EngineDispatch {
         self.set_sidebar_collapsed(false);
-        create_project_flow(&self.runtime, &self.client)?;
-        self.reconcile();
-        Ok(())
+        let op = self.take_engine_op_id();
+        let client = self.client.clone();
+        EngineDispatch {
+            task: self.engine_op(
+                async move { create_project_flow(&client).await },
+                move |result| EngineOpResult::ProjectCreated { op, result },
+            ),
+            op: Some(op),
+        }
     }
 
     fn confirm_close_project(&mut self, project_id: i64) -> Result<(), String> {
@@ -2039,15 +2206,19 @@ impl App {
     pub fn close_tab(&mut self, tab_id: i64) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.close_tab_task(tab_id)
+        self.close_tab_dispatch(tab_id).task
     }
 
-    fn close_tab_task(&self, tab_id: i64) -> UiTask {
+    fn close_tab_dispatch(&mut self, tab_id: i64) -> EngineDispatch {
+        let op = self.take_engine_op_id();
         let client = self.client.clone();
-        self.engine_op(
-            async move { close_tab_by_id(&client, tab_id).await },
-            move |result| EngineOpResult::TabClosed { tab_id, result },
-        )
+        EngineDispatch {
+            task: self.engine_op(
+                async move { close_tab_by_id(&client, tab_id).await },
+                move |result| EngineOpResult::TabClosed { op, tab_id, result },
+            ),
+            op: Some(op),
+        }
     }
 
     fn cycle_tab(&mut self, delta: isize) -> Result<(), String> {
@@ -2267,8 +2438,8 @@ impl Message {
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::BeginRenameTab(tab_id) => return app.begin_rename_tab(tab_id),
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
-            Self::NewTab => app.new_tab(),
-            Self::NewProject => app.new_project(),
+            Self::NewTab => return app.new_tab(),
+            Self::NewProject => return app.new_project(),
             Self::ToggleSidebar => app.toggle_sidebar(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
@@ -2422,10 +2593,12 @@ mod tests {
     fn a_tolerated_already_gone_completion_raises_no_banner() {
         for result in [
             EngineOpResult::TabClosed {
+                op: 1,
                 tab_id: 7,
                 result: Ok(CloseTabOutcome::AlreadyGone),
             },
             EngineOpResult::TabClosed {
+                op: 1,
                 tab_id: 7,
                 result: Ok(CloseTabOutcome::Closed),
             },
@@ -2450,6 +2623,7 @@ mod tests {
     fn a_failed_completion_surfaces_the_engine_error_as_the_banner() {
         assert_eq!(
             engine_op_status(EngineOpResult::TabClosed {
+                op: 1,
                 tab_id: 7,
                 result: Err("close exploded".into()),
             }),
@@ -2475,11 +2649,16 @@ mod tests {
         let completed = runtime.block_on(spawn_engine_op(
             runtime.handle().clone(),
             async { Ok(CloseTabOutcome::Closed) },
-            |result| EngineOpResult::TabClosed { tab_id: 7, result },
+            |result| EngineOpResult::TabClosed {
+                op: 1,
+                tab_id: 7,
+                result,
+            },
         ));
         assert!(matches!(
             completed,
             EngineOpResult::TabClosed {
+                op: 1,
                 tab_id: 7,
                 result: Ok(CloseTabOutcome::Closed)
             }
@@ -2562,7 +2741,7 @@ mod tests {
             "/tmp/roost-iced-create-project-test.sock".into(),
         );
 
-        let (project_id, tab_id) = create_project_flow(&runtime, &client).unwrap();
+        let (project_id, tab_id) = runtime.block_on(create_project_flow(&client)).unwrap();
 
         let snapshot = workspace.snapshot();
         let created = snapshot
@@ -2581,6 +2760,287 @@ mod tests {
         // runners; macOS only won the race).
         runtime.block_on(client.delete_project(project_id)).unwrap();
         assert!(!client.supervisor.has(tab_id));
+    }
+
+    /// The compound op's two calls are sequential inside one future, so a
+    /// failure at the second one happens with the first already
+    /// committed. It must surface as the op's error rather than as a
+    /// silent half-create — the completion's reconcile then shows
+    /// whatever the engine's own rollback left (here: none of it, because
+    /// rolling the seed tab back closes the project it was the last tab
+    /// of).
+    #[test]
+    fn create_project_reports_a_failure_that_lands_after_the_project_committed() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let workspace = Arc::new(Workspace::new());
+        let supervisor = Arc::new(PtySupervisor::new());
+        // Ids are one sequential counter, so the flow's project takes the
+        // next one and its seed tab the one after. Squatting on that id
+        // makes the seed tab's PTY spawn fail for real (`DuplicateTab`)
+        // with the project already in the workspace.
+        let probe = workspace.create_project("probe", "/tmp").unwrap();
+        let doomed_tab_id = probe.id + 2;
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(&supervisor),
+            "/tmp/roost-iced-create-project-midfail-test.sock".into(),
+        );
+        runtime
+            .block_on(async {
+                supervisor.spawn(
+                    doomed_tab_id,
+                    "/tmp",
+                    &["/bin/sh".to_string(), "-c".into(), "cat".into()],
+                    DEFAULT_COLS,
+                    DEFAULT_ROWS,
+                    std::path::Path::new("/tmp/roost-iced-create-project-midfail-test.sock"),
+                )
+            })
+            .expect("occupy the id the seed tab will be allocated");
+
+        let error = runtime
+            .block_on(create_project_flow(&client))
+            .expect_err("the seed tab cannot spawn");
+
+        assert!(
+            engine_op_status(EngineOpResult::ProjectCreated {
+                op: 1,
+                result: Err(error),
+            })
+            .is_some(),
+            "a mid-flow failure owes the user a banner"
+        );
+        assert_eq!(
+            workspace
+                .snapshot()
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            vec![probe.id],
+            "the engine rolled the seed tab back, and with it the project it was the last tab of"
+        );
+
+        supervisor.close(doomed_tab_id);
+    }
+
+    #[test]
+    fn an_opened_tab_is_silent_and_a_failed_open_is_the_banner() {
+        assert_eq!(
+            engine_op_status(EngineOpResult::TabOpened {
+                op: 1,
+                project_id: 3,
+                result: Ok(9),
+            }),
+            None
+        );
+        assert_eq!(
+            engine_op_status(EngineOpResult::TabOpened {
+                op: 1,
+                project_id: 3,
+                result: Err("spawn shell failed".into()),
+            }),
+            Some("spawn shell failed".to_string())
+        );
+        assert_eq!(
+            engine_op_status(EngineOpResult::ProjectCreated {
+                op: 2,
+                result: Ok((3, 9)),
+            }),
+            None
+        );
+        assert_eq!(
+            engine_op_status(EngineOpResult::ProjectCreated {
+                op: 2,
+                result: Err("create exploded".into()),
+            }),
+            Some("create exploded".to_string())
+        );
+    }
+
+    /// Only the rows that became asynchronous can have a client parked on
+    /// them. Every other completion must answer `None` rather than probe
+    /// the stash — a delete reaches the palette through the confirm
+    /// overlay, which replies the moment it opens, and renames/reorders
+    /// have no palette row at all.
+    #[test]
+    fn only_the_async_palette_rows_completions_can_owe_a_reply() {
+        assert_eq!(
+            EngineOpResult::TabClosed {
+                op: 4,
+                tab_id: 7,
+                result: Ok(CloseTabOutcome::Closed),
+            }
+            .palette_op(),
+            Some(4)
+        );
+        assert_eq!(
+            EngineOpResult::TabOpened {
+                op: 5,
+                project_id: 3,
+                result: Ok(9),
+            }
+            .palette_op(),
+            Some(5)
+        );
+        assert_eq!(
+            EngineOpResult::ProjectCreated {
+                op: 6,
+                result: Ok((3, 9)),
+            }
+            .palette_op(),
+            Some(6)
+        );
+        assert_eq!(
+            EngineOpResult::ProjectDeleted {
+                project_id: 3,
+                result: Ok(DeleteProjectOutcome::Deleted),
+            }
+            .palette_op(),
+            None
+        );
+        assert_eq!(
+            EngineOpResult::Renamed {
+                op: 7,
+                target: RenameTarget::Tab(9),
+                result: Ok(()),
+            }
+            .palette_op(),
+            None
+        );
+        assert_eq!(
+            EngineOpResult::TabsReordered {
+                op: 8,
+                project_id: 3,
+                ordered_ids: vec![9],
+                result: Ok(()),
+            }
+            .palette_op(),
+            None
+        );
+        assert_eq!(
+            EngineOpResult::ProjectsReordered {
+                op: 9,
+                ordered_ids: vec![3],
+                result: Ok(()),
+            }
+            .palette_op(),
+            None
+        );
+    }
+
+    /// `palette.activate` replies with the state its action produced. For
+    /// a row that dismissed the palette and dispatched an op, that state
+    /// is the closed one — and it is built at completion time from the
+    /// contract, not read off whatever palette exists by then.
+    #[test]
+    fn a_deferred_activation_answers_with_the_closed_state_its_row_produced() {
+        let mut pending = HashMap::new();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        pending.insert(11, tx);
+
+        settle_palette_activation(&mut pending, 11, None);
+
+        assert_eq!(rx.try_recv(), Ok(Ok(PaletteStateResult::default())));
+        assert!(pending.is_empty(), "a settled reply is not held twice");
+    }
+
+    /// The one palette request allowed to fail keeps failing: an async
+    /// row's engine error reaches the blocked client as the operation
+    /// error, exactly as it did when the row blocked the UI thread.
+    #[test]
+    fn a_deferred_activation_answers_a_failed_row_with_its_operation_error() {
+        let mut pending = HashMap::new();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        pending.insert(11, tx);
+
+        settle_palette_activation(&mut pending, 11, Some("close exploded".into()));
+
+        assert_eq!(rx.try_recv(), Ok(Err("close exploded".to_string())));
+    }
+
+    /// Two clients, two invocations, two ids: each hears its own row's
+    /// outcome, and neither completion can answer the other's client.
+    #[test]
+    fn concurrent_activations_each_answer_their_own_client() {
+        let mut pending = HashMap::new();
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        pending.insert(20, first_tx);
+        pending.insert(21, second_tx);
+
+        settle_palette_activation(&mut pending, 21, Some("open exploded".into()));
+
+        assert_eq!(second_rx.try_recv(), Ok(Err("open exploded".to_string())));
+        assert_eq!(
+            first_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "the other invocation is still waiting on its own op"
+        );
+
+        settle_palette_activation(&mut pending, 20, None);
+        assert_eq!(first_rx.try_recv(), Ok(Ok(PaletteStateResult::default())));
+    }
+
+    /// The stash is keyed by op id and nothing else, so the palette's own
+    /// life cannot invalidate a reply: the client blocked on this
+    /// invocation is answered even though the palette it activated is
+    /// long gone and a different one is open in its place.
+    #[test]
+    fn a_deferred_reply_is_sent_even_after_the_palette_reopened() {
+        let mut pending = HashMap::new();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        pending.insert(30, tx);
+
+        // What `palette_state_result()` would answer by completion time:
+        // somebody else's palette, which this reply must never carry.
+        let reopened = PaletteStateResult {
+            open: true,
+            frame: Some("launcher".into()),
+            ..PaletteStateResult::default()
+        };
+
+        settle_palette_activation(&mut pending, 30, None);
+
+        let delivered = rx.try_recv().expect("the client is still owed an answer");
+        assert_eq!(delivered, Ok(PaletteStateResult::default()));
+        assert_ne!(delivered, Ok(reopened));
+    }
+
+    /// `palette.present`'s reply is a different promise on a different
+    /// field, fulfilled by the user's pick or dismiss. Settling an
+    /// activation must not consume it — a present left waiting is a
+    /// client hung until the app exits.
+    #[test]
+    fn settling_an_activation_leaves_the_present_reply_untouched() {
+        let mut pending = HashMap::new();
+        let (activate_tx, mut activate_rx) = tokio::sync::oneshot::channel();
+        pending.insert(40, activate_tx);
+        let (present_tx, mut present_rx) =
+            tokio::sync::oneshot::channel::<Result<PalettePresentResult, String>>();
+        let present_reply = Some(present_tx);
+
+        settle_palette_activation(&mut pending, 40, None);
+
+        assert!(activate_rx.try_recv().is_ok());
+        assert_eq!(
+            present_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "the present is still waiting for the user"
+        );
+        assert!(
+            present_reply.is_some(),
+            "and its sender is still held for them"
+        );
+    }
+
+    /// A completion whose invocation was never an IPC one — the keybind,
+    /// the button, the pointer — finds nothing stashed and settles
+    /// nothing. The op id still exists; only the reply is optional.
+    #[test]
+    fn a_non_ipc_activation_settles_no_reply() {
+        let mut pending: HashMap<u64, PaletteActivateReply> = HashMap::new();
+        settle_palette_activation(&mut pending, 50, None);
+        assert!(pending.is_empty());
     }
 
     #[test]
