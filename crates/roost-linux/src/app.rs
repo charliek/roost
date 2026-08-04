@@ -199,6 +199,10 @@ pub struct App {
     /// dismiss-without-confirm so an in-flight live preview reverts.
     /// `None` while the palette is closed.
     theme_name_at_open: RefCell<Option<String>>,
+    /// The sidebar / content splitter. `sidebar_box` is its start child;
+    /// its position **is** the sidebar's width. Held so
+    /// `sidebar.set_width` can drive the seam programmatically.
+    paned: gtk4::Paned,
     /// `gtk::Overlay` wrapping the content below the header, so the
     /// command palette card can float centered over the whole window.
     content_overlay: gtk4::Overlay,
@@ -793,6 +797,7 @@ impl App {
             theme: RefCell::new(theme),
             active_theme_name: RefCell::new(active_theme_name),
             theme_name_at_open: RefCell::new(None),
+            paned: paned.clone(),
             content_overlay: content_overlay.clone(),
             _band_size_group: band_size_group,
             palette: RefCell::new(None),
@@ -1103,6 +1108,9 @@ impl App {
                             reply,
                         } => {
                             let _ = reply.send(app.ipc_window_resize(width, height));
+                        }
+                        UiRequest::SidebarSetWidth { width, reply } => {
+                            let _ = reply.send(app.ipc_sidebar_set_width(width));
                         }
                         UiRequest::TabDispatchMouseEvent {
                             tab_id,
@@ -5644,6 +5652,28 @@ impl App {
         }
         self.window
             .set_default_size(width.round() as i32, height.round() as i32);
+        Ok(())
+    }
+
+    /// `sidebar.set_width` (test-mode only) — set the sidebar's width
+    /// through the workspace, which clamps to
+    /// `SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH` and persists, then
+    /// mirror the *clamped* value onto the paned. Gated for the same
+    /// reason as `window.resize`.
+    ///
+    /// The paned retains its position while the start child is hidden,
+    /// so setting it while the sidebar is collapsed is safe — the width
+    /// is what expanding will reveal.
+    fn ipc_sidebar_set_width(self: &Rc<Self>, width: f64) -> Result<(), String> {
+        if !self.test_mode {
+            return Err("sidebar.set_width requires ROOST_TEST_MODE=1 at UI launch".into());
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return Err("workspace is not connected yet".into());
+        };
+        client.workspace.set_sidebar_width(width);
+        self.paned
+            .set_position(client.workspace.sidebar_width().round() as i32);
         Ok(())
     }
 

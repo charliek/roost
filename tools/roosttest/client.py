@@ -283,6 +283,13 @@ class Roost:
         """Test-mode only — set the window's logical size."""
         self.call("window.resize", {"width": float(width), "height": float(height)})
 
+    def sidebar_set_width(self, width: float) -> None:
+        """Test-mode only — set the sidebar's logical width. The UI
+        clamps to [160, 400] through the workspace, so an out-of-band
+        width succeeds at the nearest bound; read the applied value
+        back with window_metrics()."""
+        self.call("sidebar.set_width", {"width": float(width)})
+
     def sidebar_dump(self) -> dict:
         """{agents_visible, projects: [{project_id, agents: [{tab_id,
         name, lifecycle, status_text, time_text, is_active}]}]}. The

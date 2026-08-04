@@ -453,6 +453,20 @@ impl App {
                     };
                     let _ = reply.send(result);
                 }
+                UiRequest::SidebarSetWidth { width, reply } => {
+                    let result = if !self.test_mode {
+                        Err("ROOST_TEST_MODE=1 is required".into())
+                    } else {
+                        // A drag overlay still in flight would shadow the width
+                        // the op just set — commit it first so the op's value is
+                        // the one the layout and the next relaunch both see.
+                        self.commit_sidebar_drag();
+                        self.workspace.set_sidebar_width(width);
+                        self.resize(self.window_size);
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
                 UiRequest::AppSetWindowFocus { focused, reply } => {
                     let result = if self.test_mode {
                         self.set_window_focus(focused);
