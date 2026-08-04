@@ -1346,8 +1346,14 @@ impl App {
             self.tab_strip_generation,
             self.strip_gestures_enabled(),
         );
+        // A zero-width scrollbar: any visible indicator overlays the 24px
+        // pills themselves and reads as a band across the tab row (#281) —
+        // the stock 10px filled rail, and even a 2px hover sliver, both did.
+        // Wheel/trackpad scrolling is independent of the scrollbar's size.
         let tab_scroller = scrollable(tab_strip)
-            .horizontal()
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
             .width(Fill)
             .height(chrome::PILL_HEIGHT);
         let mut tabs = row![].spacing(5).align_y(Alignment::Center);
@@ -1580,7 +1586,7 @@ impl App {
                     .scroller_width(4)
                     .margin(2),
             ))
-            .style(chrome::palette_scrollable)
+            .style(chrome::overlay_scrollable)
             .height(Shrink);
         let divider = container(
             container(iced::widget::Space::new().height(1))

@@ -188,7 +188,13 @@ pub fn inline_rename_input(_: &Theme, status: text_input::Status) -> text_input:
     }
 }
 
-pub fn palette_scrollable(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+/// Overlay-style scrollbar: no rail fill, just a translucent scroller. The
+/// stock iced style always paints a full-length rail, which reads as a solid
+/// band wherever it overlays short content — used by the palette list below.
+/// The tab strip needs zero chrome instead (its own `Scrollbar::hidden()` in
+/// `app.rs`, #281): even this style's translucent scroller was too visible
+/// overlaying the 24px tab pills.
+pub fn overlay_scrollable(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
     let mut style = scrollable::default(theme, status);
     let rail = scrollable::Rail {
         background: None,
@@ -290,6 +296,20 @@ mod tests {
         assert!((project_text - AGENT_DOT_INSET).abs() <= 1.0);
         assert_eq!(TAB_STATUS_SIZE, 7.0);
         assert_eq!(NOTIFICATION_DOT_SIZE, 8.0);
+    }
+
+    #[test]
+    fn overlay_scrollable_never_fills_a_rail() {
+        let theme = Theme::Dark;
+        let style = overlay_scrollable(
+            &theme,
+            scrollable::Status::Active {
+                is_horizontal_scrollbar_disabled: false,
+                is_vertical_scrollbar_disabled: false,
+            },
+        );
+        assert_eq!(style.horizontal_rail.background, None);
+        assert_eq!(style.vertical_rail.background, None);
     }
 
     #[test]
