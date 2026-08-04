@@ -131,7 +131,12 @@ Slices, each sized for one gauntlet pass:
   cancel/confirm with no PTY leak) and functional e2e
   (`tools/roosttest/test_project_lifecycle.py`).
 * **3c. Sidebar resize** with persisted width (replaces the hardcoded
-  `SIDEBAR_WIDTH: f32 = 220.0`).
+  `SIDEBAR_WIDTH: f32 = 220.0`). Discovery done (2026-08-04): the Mac app
+  is the reference implementation — already resizable + persisted
+  (160–400 clamp, default 220, `RoostSidebarWidth` UserDefaults); GTK
+  drags but forgets on relaunch; iced is fixed-width. Scope brief +
+  verified surface map: `~/.claude/plans/roost/
+  BRIEF-011-iced-sidebar-resize-and-subscriptions.md`.
 * **3d. Tick → push subscriptions.** Replace the 16 ms full-snapshot poll
   and the UI-thread `block_on` calls with Iced stream subscriptions and
   event-driven reconcile. Do before more real-time features stack onto the
@@ -144,8 +149,15 @@ Slices, each sized for one gauntlet pass:
   frosted/translucent look — likely `window-vibrancy` over a transparent
   iced window on macOS; compositor-dependent on Linux). **Plan this slice
   with the user in the loop — they want to give detailed direction here.**
-  Includes the user-visible tab-strip artifact bug ([#281]) — fold it into
-  whichever slice touches the tab strip first rather than waiting for 3e.
+  The tab-strip artifact bug ([#281]) that was folded in here is **fixed**
+  (PR #291, merged 2026-08-04): the strip scrollbar is `Scrollbar::hidden()`
+  — live testing rejected both a resting and a hover-revealed sliver, so any
+  visible indicator over the pills is a regression, and
+  `tools/roosttest/test_tab_strip_pixels.py` guards it (its allowlist of
+  wide-run band colors must be updated by any 3e band-background change).
+  Two 3e items named during that testing: the band background under the
+  tabs should match the Swift look, and tab-band metrics differ (iced
+  34px band / 5px above pills vs Swift `tabBarHeight` 32 / centerY ≈4px).
   Carried from 3b (plan 010): designing the empty state after the last
   project is deleted — iced lands in the engine's empty workspace state
   while both shipped UIs close their window — and tightening the confirm
@@ -168,7 +180,8 @@ when it touches the code you are already in:
 
 | item | issue |
 |---|---|
-| Iced tab-strip artifacts with several tabs open (user-visible) | [#281] |
+| ~~Iced tab-strip artifacts with several tabs open~~ **fixed** (PR #291) | [#281] |
+| Iced SIGABRT: swash subtract-with-overflow panic during glyph shaping (debug build; trigger unknown — launch with `RUST_BACKTRACE=1` to capture) | [#292] |
 | **Security-adjacent:** Swift's dragged-URL drop branch has no control-char rejection (mitigated by the paste-boundary wrap from #280, not closed); Rust/Swift filter predicates also diverge | [#282] |
 | `roost-linux` clippy `type_complexity` debt keeping it out of the lint gate | [#283] |
 | No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) | [#284] |
@@ -187,6 +200,7 @@ when it touches the code you are already in:
 [#287]: https://github.com/charliek/roost/issues/287
 [#288]: https://github.com/charliek/roost/issues/288
 [#289]: https://github.com/charliek/roost/issues/289
+[#292]: https://github.com/charliek/roost/issues/292
 
 ### M4 — ship Iced to Linux users
 
