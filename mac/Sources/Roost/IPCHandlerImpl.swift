@@ -95,6 +95,9 @@ actor IPCHandlerImpl: IPCHandler {
         case "window.resize":
             try await self.windowResize(params: params)
             return AnyCodable([:] as [String: Any])
+        case "sidebar.set_width":
+            try await self.sidebarSetWidth(params: params)
+            return AnyCodable([:] as [String: Any])
         case "palette.open":
             return try await encodeResult(self.paletteOpen(params: params))
         case "palette.state":
@@ -1084,6 +1087,36 @@ actor IPCHandlerImpl: IPCHandler {
             display: true, animate: false
         )
     }
+
+    /// `sidebar.set_width` (test-mode only): set the projects sidebar's
+    /// width, the programmatic twin of dragging the seam. Gated for the
+    /// same reason as `window.resize`.
+    ///
+    /// Only the non-finite / non-positive widths are rejected here: an
+    /// in-range-but-out-of-band width (90, 1000) clamps to
+    /// `[sidebarMinWidth, sidebarMaxWidth]` inside the bridge and
+    /// succeeds, matching the Rust UIs (where the workspace clamps).
+    @MainActor
+    private func sidebarSetWidth(params: AnyCodable?) async throws {
+        guard RoostBackend.shared.testMode else {
+            throw IPCHandlerError(
+                code: "not-enabled",
+                message: "sidebar.set_width requires ROOST_TEST_MODE=1 at UI launch"
+            )
+        }
+        let p = try decodeParams(
+            params, as: IPCSidebarSetWidthParams.self, expected: ["width"]
+        )
+        guard p.width.isFinite, p.width > 0 else {
+            throw IPCHandlerError.invalidParam(
+                "width must be positive and finite; got \(p.width)"
+            )
+        }
+        guard let ui = RoostBackend.shared.ui else {
+            throw IPCHandlerError.internalError("no UI for sidebar.set_width")
+        }
+        ui.setSidebarWidth(CGFloat(p.width))
+    }
 }
 
 // MARK: - Param decoding helpers
@@ -1360,6 +1393,12 @@ struct IPCSidebarDumpResult: Codable {
 private struct IPCWindowResizeParams: Codable {
     let width: Double
     let height: Double
+}
+
+/// `sidebar.set_width` params — mirrors `SidebarSetWidthParams` in
+/// `crates/roost-ipc/src/messages.rs`. Test-mode-gated by the handler.
+private struct IPCSidebarSetWidthParams: Codable {
+    let width: Double
 }
 
 private struct IPCProjectCreateParams: Codable {

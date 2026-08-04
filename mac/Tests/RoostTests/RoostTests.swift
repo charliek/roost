@@ -199,3 +199,37 @@ func sidebarVisibleStateSurvivesReopen() {
     defaults.set(true, forKey: "RoostSidebarVisible")
     #expect(RoostApp.sidebarVisibleOnLaunch(defaults) == true)
 }
+
+// MARK: - Sidebar width clamp + persistence (sidebar.set_width)
+//
+// The wire contract (docs/reference/ipc.md) says a finite out-of-band
+// width lands on the nearest bound rather than erroring, and that the
+// op persists while the sidebar is collapsed. Both live in these two
+// nonisolated helpers, so they're testable without AppKit.
+
+@Test
+func sidebarWidthClampsToBand() {
+    #expect(RoostApp.clampSidebarWidth(260) == 260)
+    // Below the floor / above the cap → nearest bound, never an error.
+    #expect(RoostApp.clampSidebarWidth(90) == RoostApp.sidebarMinWidth)
+    #expect(RoostApp.clampSidebarWidth(1000) == RoostApp.sidebarMaxWidth)
+    // Exact bounds are in-band.
+    #expect(RoostApp.clampSidebarWidth(RoostApp.sidebarMinWidth) == RoostApp.sidebarMinWidth)
+    #expect(RoostApp.clampSidebarWidth(RoostApp.sidebarMaxWidth) == RoostApp.sidebarMaxWidth)
+}
+
+@Test
+func sidebarWidthPersistsClampedValue() {
+    let suite = "ai.stridelabs.Roost.test.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    // The collapsed arm of `setSidebarWidth` writes through here —
+    // `splitViewDidResizeSubviews` skips zero-width layouts, so this is
+    // the only thing that persists a width while the sidebar is hidden.
+    #expect(RoostApp.persistSidebarWidth(300, in: defaults) == 300)
+    #expect(defaults.double(forKey: "RoostSidebarWidth") == 300)
+    // Out-of-band: the *clamped* width is what's stored, so a relaunch
+    // reads back a value already inside the band.
+    #expect(RoostApp.persistSidebarWidth(1000, in: defaults) == RoostApp.sidebarMaxWidth)
+    #expect(defaults.double(forKey: "RoostSidebarWidth") == Double(RoostApp.sidebarMaxWidth))
+}
