@@ -607,7 +607,9 @@ values are rejected with `invalid-param` before reaching the UI.
 
 While the sidebar is collapsed the op still succeeds: it persists the
 width and updates what expanding will reveal. `app.window_metrics`
-keeps reporting `sidebar_width: 0.0` until the sidebar is expanded.
+reports a collapsed sidebar as `sidebar_width < 1.0` until it is
+expanded: GTK and Iced report a literal `0.0`, while the Mac UI reports
+the collapsed pane's real frame width. Assert `< 1.0`, not `== 0.0`.
 
 Two authority caveats, mirroring `window.resize`'s "the compositor
 remains authoritative" stance: the persisted value is the *requested*
