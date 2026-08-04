@@ -2160,6 +2160,13 @@ mod tests {
         assert_eq!(created.tabs[0].id, tab_id);
         assert_eq!(created.tabs[0].cwd, created.cwd);
         assert_eq!(workspace.active(), (project_id, tab_id));
+
+        // Close the spawned PTY before the runtime drops: Runtime::drop
+        // joins its blocking tasks, and a live shell parks the reader loop
+        // in a blocking read forever (deterministic hang on loaded Linux
+        // runners; macOS only won the race).
+        runtime.block_on(client.delete_project(project_id)).unwrap();
+        assert!(!client.supervisor.has(tab_id));
     }
 
     #[test]
