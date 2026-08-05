@@ -27,7 +27,7 @@ use libadwaita::{ApplicationWindow, TabView, WindowTitle};
 use roost_ipc::agent::{self, AgentLifecycle, AgentTabState};
 use roost_ipc::messages::{
     PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
-    SidebarDumpResult, Tab,
+    SidebarDumpResult, Tab, WindowMetricsResult,
 };
 use tokio::runtime::Handle;
 
@@ -5607,9 +5607,7 @@ impl App {
     /// sidebar that's the start child of the `gtk4::Paned` we built
     /// with `resize_start_child(false) + shrink_start_child(false)`,
     /// so it equals the paned position when visible.
-    fn ipc_window_metrics(
-        self: &Rc<Self>,
-    ) -> Result<(f64, f64, f64, bool, Option<f64>, Option<String>), String> {
+    fn ipc_window_metrics(self: &Rc<Self>) -> Result<WindowMetricsResult, String> {
         let w = self.window.width() as f64;
         let h = self.window.height() as f64;
         let collapsed = !self.sidebar_box.is_visible();
@@ -5621,7 +5619,14 @@ impl App {
         let families = self.installed_font_family_names();
         let family =
             typography::resolve_family_name(self.typography.borrow().effective_family(), &families);
-        Ok((w, h, sw, collapsed, None, Some(family)))
+        Ok(WindowMetricsResult {
+            window_width: w,
+            window_height: h,
+            sidebar_width: sw,
+            sidebar_collapsed: collapsed,
+            terminal_top: None,
+            terminal_font_family: Some(family),
+        })
     }
 
     /// `app.sidebar_dump` — read every project's *last-rendered* agent

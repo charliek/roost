@@ -55,16 +55,12 @@ pub struct DumpData {
 /// on success, an error message on failure.
 type ScreenshotReply = tokio::sync::oneshot::Sender<Result<(Vec<u8>, u32, u32), String>>;
 
-/// Reply for a [`UiRequest::WindowMetrics`]:
-/// `(window_width, window_height, sidebar_width, sidebar_collapsed,
-/// terminal_top, terminal_font_family)`
-/// in logical points. The `Result<_, String>` envelope shape matches
-/// every sibling reply (so the shared `ui_call` helper works), but
+/// Reply for a [`UiRequest::WindowMetrics`]: the window/sidebar/terminal
+/// geometry in logical points. The `Result<_, String>` envelope shape
+/// matches every sibling reply (so the shared `ui_call` helper works), but
 /// the UI side always answers `Ok` — UI adapter widget/state queries
 /// never fail.
-type WindowMetricsReply = tokio::sync::oneshot::Sender<
-    Result<(f64, f64, f64, bool, Option<f64>, Option<String>), String>,
->;
+type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<WindowMetricsResult, String>>;
 
 /// Reply for [`UiRequest::SidebarDump`]. Read-only: always answers
 /// `Ok`, matching `WindowMetricsReply`.
@@ -679,18 +675,11 @@ async fn dispatch(
         }
         ops::WINDOW_METRICS => {
             let _p: WindowMetricsParams = decode(params)?;
-            let (w, h_, sw, collapsed, terminal_top, terminal_font_family) = h
+            let result = h
                 .ui_call(|reply| UiRequest::WindowMetrics { reply })
                 .await?
                 .map_err(|m| HandlerError::new("internal", m))?;
-            encode(&WindowMetricsResult {
-                window_width: w,
-                window_height: h_,
-                sidebar_width: sw,
-                sidebar_collapsed: collapsed,
-                terminal_top,
-                terminal_font_family,
-            })
+            encode(&result)
         }
         ops::SIDEBAR_DUMP => {
             let _p: SidebarDumpParams = decode(params)?;

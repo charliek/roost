@@ -4,8 +4,9 @@
 # types so a reorder can't regress back onto that crash. clippy resolves real
 # type references, so this (unlike a text grep) ignores the comments that name
 # these types to explain their removal, and catches builder/glob-import forms.
-# Enforced by `cargo clippy -p roost-linux -- -D clippy::disallowed_types` in the
-# gtk-build CI job (rust-lint excludes roost-linux — it needs the GTK toolchain).
+# Enforced by the full `cargo clippy -p roost-linux -- -D warnings` gate in the
+# gtk-build CI job (disallowed-types is warn-by-default, so `-D warnings` catches
+# it; rust-lint excludes roost-linux — it needs the GTK toolchain).
 disallowed-types = [
     { path = "gtk4::DragSource", reason = "reorder must use GtkGestureDrag — GtkDnD's drag-icon surface aborts on Wayland (#236)" },
     { path = "gtk4::DropTarget", reason = "reorder must use GtkGestureDrag — GtkDnD's drag-icon surface aborts on Wayland (#236)" },
@@ -16,8 +17,9 @@ disallowed-types = [
 # widget (mid attach / tab switch) walks a dead focus chain and trips
 # `gtk_widget_get_parent: GTK_IS_WIDGET` — the #234 storm/crash. Sites that must
 # always focus (the palette / rename entries, where a *missed* focus is the bug)
-# opt out with a local `#[allow]`. Enforced by `-D clippy::disallowed_methods`
-# in the gtk-build CI job alongside the disallowed-types guard above.
+# opt out with a local `#[allow]`. Enforced by the same full `-D warnings` gate
+# in the gtk-build CI job (disallowed-methods is warn-by-default) alongside the
+# disallowed-types guard above.
 disallowed-methods = [
     { path = "gtk4::prelude::WidgetExt::grab_focus", reason = "use crate::focus::safe_grab_focus — a raw grab on an un-rooted widget walks a dead focus chain (#234)" },
 ]

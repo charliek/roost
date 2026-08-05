@@ -720,14 +720,14 @@ impl App {
                     .resolve(self.typography.effective_family())
                     .name
                     .to_string();
-                let _ = reply.send(Ok((
-                    f64::from(self.window_size.width),
-                    f64::from(self.window_size.height),
-                    f64::from(self.effective_sidebar_width()),
-                    collapsed,
-                    Some(f64::from(chrome::BAND_HEIGHT)),
-                    Some(resolved_family),
-                )));
+                let _ = reply.send(Ok(WindowMetricsResult {
+                    window_width: f64::from(self.window_size.width),
+                    window_height: f64::from(self.window_size.height),
+                    sidebar_width: f64::from(self.effective_sidebar_width()),
+                    sidebar_collapsed: collapsed,
+                    terminal_top: Some(f64::from(chrome::BAND_HEIGHT)),
+                    terminal_font_family: Some(resolved_family),
+                }));
             }
             UiRequest::WindowResize {
                 width,

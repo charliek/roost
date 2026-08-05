@@ -152,9 +152,11 @@ fmt-check:  ## Check formatting (what CI's rust-lint runs)
 clippy:  ## Lint Rust at CI parity (warnings are errors)
 	# `-D warnings` matches the `rust-lint` CI job. Without it `make check`
 	# passed while CI failed, which is worse than no local gate at all.
-	# roost-linux is linted separately (it needs GTK), mirroring CI's split.
+	# roost-linux is linted separately (it needs GTK), mirroring CI's split;
+	# it's clippy-clean (issue #283) so it gets the same full `-D warnings`
+	# gate, not a narrow denylist.
 	cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
-	cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types -D clippy::disallowed_methods
+	cargo clippy -p roost-linux --all-targets -- -D warnings
 
 check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency boundaries
 	cargo clippy -p roost-iced --all-targets -- -D warnings
