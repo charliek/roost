@@ -29,6 +29,7 @@ cover that arm in unit tests.
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -239,7 +240,35 @@ class TestSidebarResize:
         a user: a wider sidebar MUST take columns away from the shell.
         """
         _seed_baseline(roost)
+
         tab = _live_tab(roost, project)
+
+        # One-op-set parity (issue #287): with a terminal live and mounted
+        # (guaranteed by `_live_tab` above — Mac omits the fields until one
+        # is), every UI answers `terminal_font_family` as a non-empty string
+        # on `app.window_metrics` (iced resolves the active family, GTK
+        # reports the family it fell back to, Mac reports
+        # `TerminalView.font`'s family). `terminal_top` stays optional —
+        # GTK omits the KEY entirely; an explicit `null` (also what serde
+        # emits for a non-finite f64) is a contract violation, so the
+        # omitted-vs-null distinction is asserted, not `.get()`-flattened.
+        metrics = roost.window_metrics()
+        family = metrics.get("terminal_font_family")
+        assert isinstance(family, str) and family, (
+            f"terminal_font_family must be a non-empty string on every UI; "
+            f"got {family!r} (metrics {metrics})"
+        )
+        if "terminal_top" in metrics:
+            top = metrics["terminal_top"]
+            assert (
+                isinstance(top, (int, float))
+                and not isinstance(top, bool)
+                and math.isfinite(top)
+                and top > 0
+            ), (
+                f"terminal_top, when reported, must be a finite positive "
+                f"number; got {top!r} (metrics {metrics})"
+            )
         baseline_cols = _settled_cols(roost, tab, BASELINE_WIDTH_PT)
 
         roost.sidebar_set_width(WIDER_WIDTH_PT)

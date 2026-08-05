@@ -2522,14 +2522,14 @@ fn drop_value_to_text(value: &glib::Value) -> Option<String> {
             .iter()
             .filter_map(|file| file.path())
             .collect::<Vec<_>>();
-        return roost_ui_model::drop_content::resolve(&paths, None);
+        return roost_ui_model::drop_content::resolve(&paths, None, None);
     }
     if let Ok(file) = value.get::<gtk4::gio::File>() {
         let paths = file.path().into_iter().collect::<Vec<_>>();
-        return roost_ui_model::drop_content::resolve(&paths, None);
+        return roost_ui_model::drop_content::resolve(&paths, None, None);
     }
     if let Ok(s) = value.get::<String>() {
-        return roost_ui_model::drop_content::resolve(std::iter::empty::<&Path>(), Some(&s));
+        return roost_ui_model::drop_content::resolve(std::iter::empty::<&Path>(), None, Some(&s));
     }
     None
 }

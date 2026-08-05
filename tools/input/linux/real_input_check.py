@@ -505,7 +505,13 @@ def _check_left_edge_drag_selects(r, env_x, wait_tab_attached) -> None:
     the separator's styled box (~22px into the terminal), so selecting a
     line from its start silently resized the sidebar instead;
     `App::tighten_paned_grab_zone` replaces it with a separator-only hit
-    zone. Also proves the separator itself still resizes."""
+    zone. Also proves the separator itself still resizes. #252 widened the
+    zone 4px into the sidebar side (no selectable text competes there);
+    that asymmetry is unit-pinned in app.rs (`paned_claims_press` tests)
+    rather than probed here — the separator's screen x carries an unknown
+    CSD margin (that's why the scan below covers sb+1..sb+9 rather than a
+    single offset), so a fixed sidebar-side offset range can't reliably
+    land inside a 4px band under that margin."""
     pid = r.create_project(name="edge-drag", cwd="/tmp")
     tab = r.open_tab(pid, cwd="/tmp")
     wait_tab_attached(r, tab)

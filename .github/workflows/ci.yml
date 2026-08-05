@@ -429,25 +429,17 @@ jobs:
       - name: cargo test -p roost-linux
         run: cargo test -p roost-linux
 
-      # Regression guard: tab + project reorder were converted from GtkDnD to
-      # GtkGestureDrag because the DnD drag-icon surface aborts the process on
-      # Wayland (gdksurface-wayland.c:348:frame_callback), and synthetic input
-      # can't reliably reproduce that in CI. clippy's disallowed-types (see
-      # clippy.toml) forbids the DnD transport types semantically — it resolves
-      # real references, so it ignores the comments that name those types and
-      # catches builder/glob-import forms a text grep would miss. Only
-      # disallowed_types is denied, so roost-linux's other (un-linted) clippy
-      # warnings don't fail the build; rust-lint excludes roost-linux because it
-      # needs the GTK toolchain that this job already has.
-      - name: No GtkDnD reorder + no raw grab_focus (clippy disallowed-types/methods)
-        # `-A warnings` first: roost-linux is NOT clippy-clean (that's exactly
-        # why rust-lint excludes it), and the toolchain action sets
-        # RUSTFLAGS=-D warnings — so without allowing the rest, every
-        # pre-existing clippy lint would error here. We deny ONLY the
-        # disallowed_types (GtkDnD #236) + disallowed_methods (raw grab_focus
-        # #234) guards (they survive the `-A warnings` as later, more-specific
-        # flags).
-        run: cargo clippy -p roost-linux --all-targets -- -A warnings -D clippy::disallowed_types -D clippy::disallowed_methods
+      # roost-linux is clippy-clean (issue #283 closed out the last
+      # type_complexity holdout), so this runs the same full gate as
+      # rust-lint / Iced's "Test and lint Iced" step below — no more
+      # `-A warnings` narrow denylist. disallowed_types (GtkDnD #236) and
+      # disallowed_methods (raw grab_focus #234) are warn-by-default clippy
+      # lints, so `-D warnings` still catches regressions on both; clippy.toml
+      # stays the source of truth for which types/methods are disallowed.
+      # rust-lint excludes roost-linux because it needs the GTK toolchain
+      # that only this job has.
+      - name: cargo clippy -p roost-linux
+        run: cargo clippy -p roost-linux --all-targets -- -D warnings
 
   # Iced walking skeleton: exact released Iced + libghostty-vt on both host
   # platforms, with the common IPC harness driving a real PTY-backed window.
