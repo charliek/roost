@@ -1491,7 +1491,7 @@ fn dispatch_file_drop_batch(
     if !origin_live {
         return FileDropDisposition::ClosedOrigin;
     }
-    let Some(text) = roost_ui_model::drop_content::resolve(batch.paths, None) else {
+    let Some(text) = roost_ui_model::drop_content::resolve(batch.paths, None, None) else {
         return FileDropDisposition::Invalid;
     };
     paste(&text);

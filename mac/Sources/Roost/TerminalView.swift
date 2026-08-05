@@ -1778,9 +1778,12 @@ final class TerminalView: NSView {
     /// `.fileURL` and `.URL` — we must insert the path, not the `file://` URL),
     /// then a dragged web URL, then plain text. Paths and URLs are shell-escaped;
     /// plain text is not (it may be a command the user wants to run). Multiple
-    /// files are newline-joined. Returns nil for an empty payload so the caller
-    /// emits no stray `ESC[200~ESC[201~`. Factored out so it's unit-testable
-    /// without a synthesised `NSDraggingInfo`; mirrors `drop_text` on GTK.
+    /// files are newline-joined. A path or URL carrying a newline or an ESC is
+    /// treated as absent, so a rejected URL falls through to the plain-text
+    /// branch rather than being silently repaired. Returns nil for an empty
+    /// payload so the caller emits no stray `ESC[200~ESC[201~`. Factored out so
+    /// it's unit-testable without a synthesised `NSDraggingInfo`; mirrors
+    /// `drop_content::resolve`.
     static func dropContentString(fileURLs: [URL], url: String?, string: String?) -> String? {
         // De-duplicate by standardized path (Finder lists one file under several
         // URL-shaped entries) and drop any path carrying a newline or an ESC — a
@@ -1790,15 +1793,18 @@ final class TerminalView: NSView {
         // stripping, so the escaped text always names the real file. Mirrors
         // `drop_content::resolve`. Such filenames are pathological; screenshots
         // never have them.
+        func isSafeDropContent(_ candidate: String) -> Bool {
+            !candidate.contains(where: { $0.isNewline || $0 == "\u{1b}" })
+        }
         var seen = Set<String>()
         let paths = fileURLs
             .map { $0.standardizedFileURL.path }
-            .filter { !$0.contains(where: { $0.isNewline || $0 == "\u{1b}" }) }
+            .filter(isSafeDropContent)
             .filter { seen.insert($0).inserted }
         if !paths.isEmpty {
             return paths.map { ShellEscape.escape($0) }.joined(separator: "\n")
         }
-        if let url, !url.isEmpty {
+        if let url, !url.isEmpty, isSafeDropContent(url) {
             return ShellEscape.escape(url)
         }
         if let string, !string.isEmpty {

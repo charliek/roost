@@ -84,6 +84,7 @@ final class DropContentResolverTests: XCTestCase {
         )
     }
 
+    /// Shared with the Rust `url_is_escaped_when_no_safe_path_remains` vector.
     func testWebURLIsEscapedWhenNoFiles() {
         // `?` and `&` are in the escape set; `:` `/` `.` `=` are not.
         XCTAssertEqual(
@@ -91,6 +92,46 @@ final class DropContentResolverTests: XCTestCase {
                 fileURLs: [], url: "https://example.com/a?b=c&d=e", string: "ignored"
             ),
             "https://example.com/a\\?b=c\\&d=e"
+        )
+    }
+
+    /// Shared with the Rust `control_bearing_url_falls_through_to_text` vector:
+    /// a rejected URL is absent, not stripped, so the deliberately unfiltered
+    /// string fallback answers instead.
+    func testControlBearingURLFallsThroughToString() {
+        for control in ["\n", "\u{0B}", "\u{0C}", "\r", "\u{85}", "\u{2028}", "\u{2029}", "\u{1B}"] {
+            XCTAssertEqual(
+                TerminalView.dropContentString(
+                    fileURLs: [], url: "https://example.com/\(control)evil", string: "fallback"
+                ),
+                "fallback",
+                "url bearing \(control.unicodeScalars.map(\.value)) should fall through"
+            )
+        }
+    }
+
+    /// Shared with the Rust `control_bearing_url_and_text_yields_raw_text`
+    /// vector. Documents the accepted #282 baseline: a drag can populate both
+    /// `.URL` and `.string` with the same control-bearing text, and the
+    /// rejected URL then falls through to the deliberately unfiltered string
+    /// arm, so the raw text reaches the PTY. That plain-text boundary is owned
+    /// by #280's bracketed-paste mitigations — and because we reject rather
+    /// than strip, the URL arm must not launder the payload into an escaped
+    /// form here either.
+    func testControlBearingURLAndStringYieldsRawString() {
+        let payload = "https://example.com/\u{1B}[201~evil"
+        XCTAssertEqual(
+            TerminalView.dropContentString(fileURLs: [], url: payload, string: payload),
+            payload
+        )
+    }
+
+    /// Shared with the Rust `control_bearing_url_without_text_is_none` vector.
+    func testControlBearingURLWithoutStringIsNil() {
+        XCTAssertNil(
+            TerminalView.dropContentString(
+                fileURLs: [], url: "https://example.com/\u{1B}[201~evil", string: nil
+            )
         )
     }
 
@@ -110,6 +151,8 @@ final class DropContentResolverTests: XCTestCase {
         )
     }
 
+    /// Shared with the Rust `newline_and_carriage_return_paths_are_rejected`
+    /// vector.
     func testNewlineBearingPathIsDropped() {
         // A lone pathological path → nil (no stray brackets).
         XCTAssertNil(
@@ -119,6 +162,66 @@ final class DropContentResolverTests: XCTestCase {
         XCTAssertEqual(
             TerminalView.dropContentString(
                 fileURLs: [fileURL("/tmp/ev\nil.png"), fileURL("/tmp/ok.png")], url: nil, string: nil
+            ),
+            "/tmp/ok.png"
+        )
+        XCTAssertNil(
+            TerminalView.dropContentString(fileURLs: [fileURL("/tmp/ev\ril.png")], url: nil, string: nil)
+        )
+    }
+
+    /// Shared with the Rust `vertical_tab_bearing_paths_are_rejected` vector.
+    func testVerticalTabBearingPathIsDropped() {
+        XCTAssertNil(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{0B}il.png")], url: nil, string: nil
+            )
+        )
+        XCTAssertEqual(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{0B}il.png"), fileURL("/tmp/ok.png")],
+                url: nil, string: nil
+            ),
+            "/tmp/ok.png"
+        )
+    }
+
+    /// Shared with the Rust `form_feed_bearing_paths_are_rejected` vector.
+    func testFormFeedBearingPathIsDropped() {
+        XCTAssertNil(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{0C}il.png")], url: nil, string: nil
+            )
+        )
+        XCTAssertEqual(
+            TerminalView.dropContentString(
+                fileURLs: [fileURL("/tmp/ev\u{0C}il.png"), fileURL("/tmp/ok.png")],
+                url: nil, string: nil
+            ),
+            "/tmp/ok.png"
+        )
+    }
+
+    /// Shared with the Rust `unicode_newline_bearing_paths_are_rejected`
+    /// vector: NEL, LS and PS are `isNewline` scalars too.
+    func testUnicodeNewlineBearingPathIsDropped() {
+        for control in ["\u{85}", "\u{2028}", "\u{2029}"] {
+            XCTAssertNil(
+                TerminalView.dropContentString(
+                    fileURLs: [fileURL("/tmp/ev\(control)il.png")], url: nil, string: nil
+                ),
+                "path bearing \(control.unicodeScalars.map(\.value)) should be dropped"
+            )
+        }
+        XCTAssertEqual(
+            TerminalView.dropContentString(
+                fileURLs: [
+                    fileURL("/tmp/ev\u{85}il.png"),
+                    fileURL("/tmp/ev\u{2028}il.png"),
+                    fileURL("/tmp/ev\u{2029}il.png"),
+                    fileURL("/tmp/ok.png"),
+                ],
+                url: nil, string: nil
             ),
             "/tmp/ok.png"
         )
