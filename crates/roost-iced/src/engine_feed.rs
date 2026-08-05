@@ -41,6 +41,12 @@ pub(crate) enum EngineFeed {
     UiRequest(UiRequest),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
+    /// The user clicked the OS notification banner for this tab. It travels
+    /// the feed like every other engine → UI item so the jump it triggers is
+    /// ordered against the events that may have closed the tab meanwhile.
+    NotificationActivated {
+        tab_id: i64,
+    },
 }
 
 /// The only way to put an item on the feed. Raw senders are never handed
@@ -492,6 +498,7 @@ mod tests {
             ),
             EngineFeed::Tab(7, TabOutput::Error("broadcast lagged".into())),
             EngineFeed::Workspace(WorkspaceEvent::TabClosed { tab_id: 7 }),
+            EngineFeed::NotificationActivated { tab_id: 7 },
         ] {
             let (tx, mut rx) = channel();
             assert!(tx.send(EngineFeed::Tab(7, TabOutput::Bytes(b"out".to_vec()))));

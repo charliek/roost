@@ -496,6 +496,20 @@ fn drag_width_is_actionable(collapsed: bool, live_width: f32, width: f32) -> boo
     !collapsed && width != live_width
 }
 
+/// The core half of every focus change: the two ops the UI owes the
+/// workspace, in order. `focus_tab`'s error is also the "is this tab still
+/// there?" guard — a route holding only a `&Workspace` (the notification
+/// banner's click, which arrives with no `&mut App` in hand) gets both from
+/// this one call.
+fn focus_tab_in_core(workspace: &Workspace, tab_id: i64) -> Result<(), String> {
+    workspace
+        .focus_tab(tab_id)
+        .map_err(|error| error.to_string())?;
+    workspace
+        .set_tab_has_notification(tab_id, false)
+        .map_err(|error| error.to_string())
+}
+
 fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
     if len == 0 || current >= len {
         return None;
@@ -930,7 +944,7 @@ impl App {
             palette_present_reply: None,
             palette_activate_replies: HashMap::new(),
             clipboard: ClipboardQueue::default(),
-            desktop_notifications: DesktopNotifications::new(runtime.handle()),
+            desktop_notifications: DesktopNotifications::new(runtime.handle(), feed_tx.clone()),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
@@ -2290,12 +2304,7 @@ impl App {
     /// palettes — funnels through here, so this is the one place that owes
     /// them a reconcile.
     fn focus_tab_and_clear(&mut self, tab_id: i64, reveal_sidebar: bool) -> Result<(), String> {
-        self.workspace
-            .focus_tab(tab_id)
-            .map_err(|error| error.to_string())?;
-        self.workspace
-            .set_tab_has_notification(tab_id, false)
-            .map_err(|error| error.to_string())?;
+        focus_tab_in_core(&self.workspace, tab_id)?;
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
         }

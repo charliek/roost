@@ -164,6 +164,26 @@ pub(super) fn collect_tab_output(
     }
 }
 
+/// A click on the OS notification banner, decided off the core alone so it
+/// is testable without an `App`: focus the tab the banner named and clear
+/// its pending notification, then say what raise the click earned. `None`
+/// is a tab that closed between the banner and the click — GTK's
+/// `focus_tab_by_id` bails on the same `focus_tab` error.
+///
+/// The raise is best-effort: a window that has not opened yet has no id,
+/// and the focus still landed in the core either way.
+fn notification_activation(
+    workspace: &Workspace,
+    window_id: Option<window::Id>,
+    tab_id: i64,
+) -> Option<UiTask> {
+    if let Err(error) = focus_tab_in_core(workspace, tab_id) {
+        tracing::debug!(tab_id, %error, "notification click named a tab that is gone");
+        return None;
+    }
+    Some(window_id.map_or(UiTask::None, UiTask::Focus))
+}
+
 impl App {
     pub(super) fn reconcile(&mut self) {
         // A full authoritative snapshot on every reconcile is the recovery
@@ -354,6 +374,21 @@ impl App {
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
+                EngineFeed::NotificationActivated { tab_id } => {
+                    if let Some(raise) =
+                        notification_activation(&self.workspace, self.window_id, tab_id)
+                    {
+                        // The rest of a notification jump, exactly as the
+                        // palette's rows do it: reveal the sidebar so the
+                        // user sees which project they landed in, and fold
+                        // the two ops above into the cache now rather than
+                        // waiting for their broadcast to come back around.
+                        self.set_sidebar_collapsed(false);
+                        self.reconcile();
+                        batch.mark_reconciled();
+                        task = task.then(raise);
+                    }
+                }
             }
         }
         if let Some(error) = pty.error {
@@ -1422,5 +1457,56 @@ mod tests {
             "the discarded tab's forwarder went with it: {stale:?}"
         );
         supervisor.close(74);
+    }
+
+    /// The banner-click path is the one focus route that never has a
+    /// `&mut App` behind it, so what it owes the core — focus the tab, clear
+    /// its pending notification, and only then earn a raise — is pinned
+    /// here. A tab that closed between the banner and the click must move
+    /// nothing at all.
+    #[test]
+    fn a_banner_click_focuses_its_tab_clears_it_and_raises_the_window() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").expect("project");
+        let clicked = workspace.open_tab(project.id, "/tmp", "one").expect("tab");
+        let other = workspace.open_tab(project.id, "/tmp", "two").expect("tab");
+        workspace
+            .set_tab_has_notification(clicked.id, true)
+            .expect("mark pending");
+        workspace.focus_tab(other.id).expect("focus elsewhere");
+        let pending = |tab_id: i64| {
+            workspace
+                .snapshot()
+                .iter()
+                .flat_map(|project| project.tabs.iter())
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.has_notification)
+        };
+
+        let window = window::Id::unique();
+        let raise = notification_activation(&workspace, Some(window), clicked.id)
+            .expect("the tab the banner named is still there");
+        assert!(matches!(raise, UiTask::Focus(id) if id == window));
+        assert_eq!(workspace.active().1, clicked.id);
+        assert_eq!(
+            pending(clicked.id),
+            Some(false),
+            "the jump clears the badge"
+        );
+
+        // No window id yet (or a headless run): the focus still landed in
+        // the core, and only the raise is skipped.
+        assert!(matches!(
+            notification_activation(&workspace, None, other.id),
+            Some(UiTask::None)
+        ));
+        assert_eq!(workspace.active().1, other.id);
+
+        workspace.close_tab(clicked.id).expect("close the tab");
+        assert!(
+            notification_activation(&workspace, Some(window), clicked.id).is_none(),
+            "a banner outliving its tab is a no-op"
+        );
+        assert_eq!(workspace.active().1, other.id, "and moves nothing");
     }
 }
