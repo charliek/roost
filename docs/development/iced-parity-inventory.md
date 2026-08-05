@@ -304,8 +304,8 @@ These are sequencing decisions, not accepted final gaps:
 - Iced 0.14's native `FileDropped` event is explicitly unavailable on Wayland.
   Local file drops therefore work on macOS/X11 in the current adapter; an
   accepted Linux replacement still needs upstream support or a narrow Wayland
-  platform port. Raw text/URI drops and clipboard image materialization also
-  remain separate UI-adapter work.
+  platform port. Clipboard image materialization shipped in plan 015; raw
+  text/URI drops remain upstream-blocked (#302).
 - Iced 0.14/winit does not expose the native drag position on macOS or X11, and
   the ordinary mouse cursor may be unavailable or stale during external DnD.
   The current honest boundary is therefore the owned Iced window: a file drop

@@ -36,8 +36,8 @@ iced = { version = "=0.14.0", default-features = false, features = [
 
 anyhow = { workspace = true }
 # Clipboard image reads only — Iced owns the text clipboard. `image-data`
-# hands us raw RGBA (we encode the PNG with `png` below, so arboard's own
-# image dep stays out of the picture); `wayland-data-control` lets the
+# hands us raw RGBA (arboard's `image` dep does the decode; the PNG we
+# write is encoded with `png` below); `wayland-data-control` lets the
 # read work on a Wayland compositor with no window focused.
 arboard = { version = "3.6", default-features = false, features = [
     "image-data",
