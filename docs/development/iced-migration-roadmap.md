@@ -175,15 +175,34 @@ Slices, each sized for one gauntlet pass:
   while both shipped UIs close their window — and tightening the confirm
   overlay's pointer modality (it blocks presses but, like the palette,
   passes wheel/hover through) are 3e items.
-* **3f. Native desktop notifications** (narrow platform port, per-OS).
-* **3g. Wayland gaps** (native file drop, clipboard seat serial) are
-  upstream Iced/winit limitations — track, document, don't block on them.
+* **3f. Native desktop notifications (complete — plan 015).** Shipped: a
+  Linux D-Bus adapter via notify-rust 4.18 (`z-with-tokio`: zbus 5 rides
+  the app's existing tokio runtime), a per-OS backend seam (non-Linux
+  targets log and no-op), GTK-parity per-tab replace-not-stack semantics,
+  and click-to-focus through the freedesktop default action → focus tab +
+  clear badge + reveal sidebar + best-effort raise. Adapter-only; engine-side
+  suppression is untouched. macOS backend and .desktop shell-grouping/icon
+  follow-ups tracked in [#303].
+* **3g. Wayland/drop gaps (documentation-complete — plan 015, tracked in
+  [#302]).** Four upstream iced/winit limitations, pinned discipline
+  track and document only — no in-process workarounds, no upstream
+  engagement: no drop coordinates (`window::Event::FileDropped(path)`
+  carries no cursor position, so exact hit-testing is impossible
+  in-process); no text/URI-list drop events (winit exposes no raw-text or
+  URI-list drop event at all); no native Wayland DnD (winit delivers no
+  file-drop events under Wayland); and a clipboard seat-serial gap
+  (Wayland clipboard writes need a seat serial the stack doesn't thread,
+  so the iced clipboard e2e tier skips under Wayland — `Makefile`
+  `e2e-iced`/`e2e-iced-ci` gate on `WAYLAND_DISPLAY`, documented in
+  `ci.yml`). Exit condition: an iced/winit release that delivers any of
+  these becomes its own adoption slice.
 
 Slice order is deliberate: 3b closed the honest `Err("… not available in
 Iced yet")` stubs — the grep now has zero hits — and 3c closed the last
 functional gap blocking M4; 3d closed the
-architecture cleanup that everything real-time depends on; 3e/3f/3g are
-polish and platform work that can interleave.
+architecture cleanup that everything real-time depends on; 3f is done and
+3g is documentation-complete via [#302] — only 3e (polish, user-directed)
+remains open on this track.
 
 ### Maintenance backlog (filed, not scheduled)
 
@@ -221,6 +240,8 @@ when it touches the code you are already in:
 [#297]: https://github.com/charliek/roost/issues/297
 [#299]: https://github.com/charliek/roost/issues/299
 [#300]: https://github.com/charliek/roost/issues/300
+[#302]: https://github.com/charliek/roost/issues/302
+[#303]: https://github.com/charliek/roost/issues/303
 
 ### M4 — ship Iced to Linux users
 
