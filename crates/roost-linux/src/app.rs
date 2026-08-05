@@ -5082,18 +5082,14 @@ impl App {
             let start_pos = start_pos.clone();
             move |g, x, _y| {
                 let pos = paned.position();
-                // Separator box: [position .. end-child x]. The grab zone is
-                // ASYMMETRIC: 4px into the sidebar side, 2px into the terminal
-                // side. Sidebar side is widened because nothing there competes
-                // for the gesture (no selectable text); the terminal side stays
-                // tight so a drag starting at column 0 still resolves to text
-                // selection, not a resize — the deliberate outcome of #251.
+                // Separator box: [position .. end-child x]. See
+                // `paned_claims_press` for the (asymmetric) grab zone.
                 let sep_end = paned
                     .end_child()
                     .and_then(|c| c.compute_bounds(&paned))
                     .map(|b| b.x() as i32)
                     .unwrap_or(pos + 6);
-                if (x as i32) < pos - 4 || (x as i32) > sep_end + 2 {
+                if !paned_claims_press(x as i32, pos, sep_end) {
                     g.set_state(gtk4::EventSequenceState::Denied);
                     return;
                 }
@@ -6689,17 +6685,54 @@ fn agent_rows_visible(toggle_on: bool, dragging: bool) -> bool {
     toggle_on && !dragging
 }
 
+/// Whether `App::tighten_paned_grab_zone`'s resize gesture claims a press at
+/// screen x `x`, given the separator box `[pos .. sep_end]`. The zone is
+/// ASYMMETRIC (#252): 4px into the sidebar side (nothing there competes for
+/// the gesture — no selectable text), 2px into the terminal side (kept tight
+/// so a drag starting at column 0 still resolves to text selection, not a
+/// resize — the deliberate outcome of #251). Pulled out as a pure function
+/// so the asymmetry is unit-pinned here rather than only reachable through a
+/// real GTK press — a screen-coordinate input-injection probe can't
+/// discriminate the widening under the separator's unknown CSD margin.
+fn paned_claims_press(x: i32, pos: i32, sep_end: i32) -> bool {
+    x >= pos - 4 && x <= sep_end + 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         activation_target, agent_rows_visible, drain_server_driven_marker,
-        is_already_attached_or_pending, pick_next_active_project, resolve_launch_cwd,
-        restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home, ActivationTarget,
-        RestoreTab,
+        is_already_attached_or_pending, paned_claims_press, pick_next_active_project,
+        resolve_launch_cwd, restore_open_specs, reveal_scroll_value, tilde_abbreviate_with_home,
+        ActivationTarget, RestoreTab,
     };
     use roost_ui_model::reorder::compute_insert_idx;
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn paned_claims_press_asymmetric_bounds() {
+        // Separator box [pos=100 .. sep_end=106]. Sidebar side widened 4px,
+        // terminal side kept tight at 2px (#252 / #251) — pin BOTH edges on
+        // BOTH sides so a revert or a symmetrizing "fix" fails this test.
+        let (pos, sep_end) = (100, 106);
+        assert!(
+            paned_claims_press(pos - 4, pos, sep_end),
+            "sidebar-side edge (pos-4) must claim"
+        );
+        assert!(
+            !paned_claims_press(pos - 5, pos, sep_end),
+            "one px past the sidebar-side edge (pos-5) must deny"
+        );
+        assert!(
+            paned_claims_press(sep_end + 2, pos, sep_end),
+            "terminal-side edge (sep_end+2) must claim"
+        );
+        assert!(
+            !paned_claims_press(sep_end + 3, pos, sep_end),
+            "one px past the terminal-side edge (sep_end+3) must deny"
+        );
+    }
 
     #[test]
     fn agent_rows_stay_hidden_while_a_reorder_drag_is_armed() {
