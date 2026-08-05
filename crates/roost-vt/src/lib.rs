@@ -126,7 +126,7 @@ pub use mouse_encoder::{
 #[cfg(feature = "ffi")]
 pub use render_state::{Cell, Colors, CursorInfo, CursorVisualStyle, RenderState, Style};
 #[cfg(feature = "ffi")]
-pub use scroll::{ScrollDirection, ScrollRoute, TerminalScroll};
+pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, TerminalScroll};
 #[cfg(feature = "ffi")]
 pub use selection::{RowTextProjection, SelectionSnapshot, SelectionSpan, TerminalSelection};
 #[cfg(feature = "ffi")]
