@@ -96,3 +96,8 @@ strip       = "debuginfo"
 
 [profile.dev]
 debug = "limited"
+
+[patch.crates-io]
+# Vendored swash 0.2.10 (pristine in this commit; the #292
+# zero-long-metrics guard lands in the follow-up commit).
+swash = { path = "third_party/swash" }
