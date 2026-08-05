@@ -570,8 +570,9 @@ can expose equivalent trustworthy geometry. Consumers that require exact
 coordinates must reject a missing, non-finite, or non-positive value instead
 of copying a chrome-height constant. `terminal_font_family` is the resolved
 family the live terminal is actually rendering with (post-fallback-chain, not
-a config echo) and is reported by all three adapters. This operation is
-ungated and read-only.
+a config echo) and is reported by all three adapters once a terminal is live
+— the Mac adapter omits both fields until a terminal view is mounted (fresh
+launch, no tabs). This operation is ungated and read-only.
 
 ### `app.sidebar_dump`
 

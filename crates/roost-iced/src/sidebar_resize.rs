@@ -101,7 +101,10 @@ fn owns_event(
     // travelled *after* the button went down, so the last move the grip
     // actually saw is the honest press anchor (issue #295). A pointer that
     // left the window invalidates it — the next entry can land anywhere, and
-    // no move need be observed before the press.
+    // no move need be observed before the press. Moves consumed by an iced
+    // overlay never reach the grip and fire no CursorLeft, so the anchor can
+    // sit stale across an overlay session; accepted — the first post-overlay
+    // move refreshes it, and a press before that is a narrow window.
     match event {
         Event::Mouse(mouse::Event::CursorMoved { position, .. }) => {
             state.last_cursor = Some(*position);

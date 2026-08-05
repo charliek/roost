@@ -4,7 +4,8 @@
 # types so a reorder can't regress back onto that crash. clippy resolves real
 # type references, so this (unlike a text grep) ignores the comments that name
 # these types to explain their removal, and catches builder/glob-import forms.
-# Enforced by the full `cargo clippy -p roost-linux -- -D warnings` gate in the
+# Enforced by the full `cargo clippy -p roost-linux --all-targets -- -D
+# warnings` gate in the
 # gtk-build CI job (disallowed-types is warn-by-default, so `-D warnings` catches
 # it; rust-lint excludes roost-linux — it needs the GTK toolchain).
 disallowed-types = [

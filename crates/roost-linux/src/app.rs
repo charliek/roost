@@ -5038,9 +5038,11 @@ impl App {
 
     /// Replace `GtkPaned`'s built-in resize gestures with one whose hit
     /// zone is the separator itself, plus a small asymmetric grab margin:
-    /// 4px into the sidebar side (no selectable text competes there), 2px
-    /// into the terminal side (kept tight so column-0 text selection wins
-    /// — see #251).
+    /// 4px into the sidebar side, 2px into the terminal side (kept tight
+    /// so column-0 text selection wins — see #251). The sidebar side has
+    /// no selectable text, but its overlay scrollbar hugs the seam — the
+    /// 4px (not the 6-10px #252 floated) bounds how much of that
+    /// scrollbar's ~16px hover column a seam press can steal.
     ///
     /// GTK's internal capture-phase drag gesture claims any press within
     /// `HANDLE_EXTRA_SIZE` (6px) of the separator's styled box — with the

@@ -29,6 +29,7 @@ cover that arm in unit tests.
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -240,25 +241,34 @@ class TestSidebarResize:
         """
         _seed_baseline(roost)
 
-        # One-op-set parity (issue #287): every UI answers
-        # `terminal_font_family` as a non-empty string on `app.window_metrics`
-        # (iced resolves the active family, GTK reports the family it fell
-        # back to, Mac now reports `TerminalView.font`'s family). `terminal_top`
-        # stays optional — GTK omits the key entirely — but when a UI does
-        # report it, it must be a real positive offset, not `0`/a placeholder.
+        tab = _live_tab(roost, project)
+
+        # One-op-set parity (issue #287): with a terminal live and mounted
+        # (guaranteed by `_live_tab` above — Mac omits the fields until one
+        # is), every UI answers `terminal_font_family` as a non-empty string
+        # on `app.window_metrics` (iced resolves the active family, GTK
+        # reports the family it fell back to, Mac reports
+        # `TerminalView.font`'s family). `terminal_top` stays optional —
+        # GTK omits the KEY entirely; an explicit `null` (also what serde
+        # emits for a non-finite f64) is a contract violation, so the
+        # omitted-vs-null distinction is asserted, not `.get()`-flattened.
         metrics = roost.window_metrics()
         family = metrics.get("terminal_font_family")
         assert isinstance(family, str) and family, (
             f"terminal_font_family must be a non-empty string on every UI; "
             f"got {family!r} (metrics {metrics})"
         )
-        top = metrics.get("terminal_top")
-        if top is not None:
-            assert isinstance(top, (int, float)) and not isinstance(top, bool) and top > 0, (
-                f"terminal_top, when reported, must be > 0; got {top!r} (metrics {metrics})"
+        if "terminal_top" in metrics:
+            top = metrics["terminal_top"]
+            assert (
+                isinstance(top, (int, float))
+                and not isinstance(top, bool)
+                and math.isfinite(top)
+                and top > 0
+            ), (
+                f"terminal_top, when reported, must be a finite positive "
+                f"number; got {top!r} (metrics {metrics})"
             )
-
-        tab = _live_tab(roost, project)
         baseline_cols = _settled_cols(roost, tab, BASELINE_WIDTH_PT)
 
         roost.sidebar_set_width(WIDER_WIDTH_PT)
