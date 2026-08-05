@@ -162,6 +162,8 @@ check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency
 		( echo "roost-iced has a forbidden GTK dependency"; exit 1 )
 	@! cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced) v' || \
 		( echo "roost-engine has a UI toolkit dependency"; exit 1 )
+	@cargo tree -p roost-iced | grep -q 'swash v0.2.10 (.*third_party/swash)' || \
+		( echo "swash [patch.crates-io] not applied"; exit 1 )
 
 themes-check:  ## Assert the Rust + Mac bundled-theme copies are byte-identical
 	diff -r crates/roost-ui-model/src/resources/themes mac/Sources/Roost/Resources/themes

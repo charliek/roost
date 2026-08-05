@@ -43,4 +43,5 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicode-width = { workspace = true }
 
 [dev-dependencies]
+swash = "=0.2.10"
 tempfile = "3"

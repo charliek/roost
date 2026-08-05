@@ -41,6 +41,7 @@ jobs:
               - 'clippy.toml'
               - 'crates/**'
               - 'third_party/ghostty/**'
+              - 'third_party/swash/**'
             rust:
               - *rustcore
             mac:
