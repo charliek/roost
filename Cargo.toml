@@ -98,6 +98,6 @@ strip       = "debuginfo"
 debug = "limited"
 
 [patch.crates-io]
-# Vendored swash 0.2.10 (pristine in this commit; the #292
-# zero-long-metrics guard lands in the follow-up commit).
+# Vendored swash 0.2.10 carrying the #292 zero-long-metrics guard.
+# See third_party/swash/README.roost.md and CLAUDE.md § Library preferences.
 swash = { path = "third_party/swash" }

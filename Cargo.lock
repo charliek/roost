@@ -2847,6 +2847,7 @@ dependencies = [
  "roost-url",
  "roost-vt",
  "serde_json",
+ "swash",
  "tempfile",
  "tokio",
  "tracing",
