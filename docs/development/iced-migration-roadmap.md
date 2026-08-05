@@ -240,7 +240,40 @@ plan 011/slice 3c replaced with persisted 160-400 pt). The audit should
 re-verify every row against current behavior, close what shipped, and
 decide [#284] (visual-parity CI gate: required for M4 or waived).
 
-### M5 — Rust under Swift (exploration, not a commitment)
+### Possible direction — macOS side-by-side evaluation (not committed)
+
+Recorded 2026-08-05: the Iced work has landed better than expected, and
+replacing the Swift app is now a *possible* direction rather than a
+non-goal — but it is not guaranteed, a lot of testing stands between here
+and any commitment, and **Swift remains the production daily driver
+regardless** (guardrail #1 unchanged). Two consequences today:
+
+1. **Design Iced platform-clean now.** New roost-iced capability with a
+   native surface gets a per-OS backend seam rather than a Linux-only
+   shape — notifications (slice 3f) are the first instance: Linux D-Bus
+   ships; the macOS backend (`UNUserNotificationCenter`, which needs a
+   real .app bundle identity + code signature) is deferred, not
+   designed out. No macOS backend gets half-shipped from an unbundled
+   binary.
+2. **M5 is frozen pending this direction** — see below.
+
+If the direction firms up, the evaluation vehicle is a parallel-install
+signed+notarized DMG (the `ai.stridelabs.Roost.iced` profile is already
+fully isolated for side-by-side running), gated on a robustness pass:
+release-profile CI coverage for Iced, the [#299] swash release-hang fix
+(a Mac daily driver meets the full macOS font universe), a panic-hook
+crash/feedback story, and a mac-UX gap audit (menu bar, cmd-key
+conventions, dock badge — plus 3e's vibrancy spike). Guardrail #3's
+"absent from release artifacts" would be amended consciously at that
+point (separate opt-in artifact, never bundled into the Swift release).
+
+### M5 — Rust under Swift (exploration, frozen)
+
+Frozen 2026-08-05 pending the possible-direction note above: if a
+full Iced replacement is evaluated, a Swift-facing FFI boundary is
+likely wasted investment — [#286] holds at "don't invest, don't
+delete" until the direction resolves. Original exploration plan kept
+below for when/if it resumes.
 
 The Swift app's polish and daily use make replacement remote; the question
 is where shared Rust reduces duplication *without* slowdowns.
