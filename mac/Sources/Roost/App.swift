@@ -5915,6 +5915,58 @@ extension RoostApp: UiBridge {
         return session.terminalView.currentCursorShapeName()
     }
 
+    /// `app.window_metrics`'s optional `terminal_top` /
+    /// `terminal_font_family` — the active tab's terminal viewport top
+    /// offset + resolved font family (issue #287, one-op-set parity
+    /// with iced's `chrome::BAND_HEIGHT` + resolved-family reply and
+    /// GTK's family-only reply). `nil` when there's no live terminal
+    /// view (fresh launch before any tab is opened).
+    ///
+    /// Gathers the raw inputs (which need a live `RoostApp`/window,
+    /// so aren't constructible headlessly) and hands them to the pure
+    /// `Self.terminalMetrics(contentView:terminalView:font:)` below,
+    /// which carries the actual derivation and IS unit-testable
+    /// without a live window (`WindowMetricsTests.swift`).
+    func terminalMetrics() -> (top: CGFloat, fontFamily: String)? {
+        guard let pid = activeProjectID,
+              let session = activeSessionByProject[pid]
+        else { return nil }
+        return Self.terminalMetrics(
+            contentView: window?.contentView,
+            terminalView: session.terminalView,
+            font: session.terminalView.font
+        )
+    }
+
+    /// Pure derivation behind `terminalMetrics()`. `nil` whenever any
+    /// input is missing/unmounted — `contentView` (no window yet),
+    /// `terminalView` (no active session), or a `terminalView` not
+    /// currently mounted in the view hierarchy (`superview == nil`) —
+    /// so a caller can drive this directly with stand-in `NSView`s to
+    /// pin the nil-tolerance contract headlessly.
+    ///
+    /// AppKit content views are unflipped (y=0 at the bottom), so the
+    /// terminal's on-screen top edge is `contentView.bounds.height -
+    /// terminalFrameInContentSpace.maxY`, not `frame.origin.y`.
+    /// `terminalView.convert(_:to:)` walks the actual (super)view
+    /// chain — root → split → pane → terminalContainer →
+    /// terminalView in the real app — rather than assuming a fixed
+    /// nesting depth, so this stays correct if a flipped container is
+    /// ever inserted along that path.
+    static func terminalMetrics(
+        contentView: NSView?,
+        terminalView: NSView?,
+        font: NSFont?
+    ) -> (top: CGFloat, fontFamily: String)? {
+        guard let contentView, let terminalView, let font,
+              terminalView.superview != nil
+        else { return nil }
+        let frameInContent = terminalView.convert(terminalView.bounds, to: contentView)
+        let top = contentView.bounds.height - frameInContent.maxY
+        let family = font.familyName ?? font.fontName
+        return (top: top, fontFamily: family)
+    }
+
     /// Map the live `PalettePanel` (if any) to a `PaletteSnapshot`.
     private func paletteSnapshot() -> PaletteSnapshot {
         guard let panel = palette else { return .closed }

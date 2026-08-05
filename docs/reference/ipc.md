@@ -558,15 +558,20 @@ Request: `{"params": {}}`.
 
 ```json
 {"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,
- "sidebar_collapsed":false,"terminal_top":34.0}
+ "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono"}
 ```
 
-`terminal_top` is optional for wire compatibility. Iced reports the exact
-application-owned top edge of its terminal viewport; native adapters may omit
-the field until they can expose equivalent trustworthy geometry. Consumers
-that require exact Iced coordinates must reject a missing, non-finite, or
-non-positive value instead of copying a chrome-height constant. This operation
-is ungated and read-only.
+`terminal_top` and `terminal_font_family` are optional for wire compatibility
+(omitted, not `null`, when an adapter has nothing to report). Iced reports the
+exact application-owned top edge of its terminal viewport (the chrome-band
+height above it); the Mac UI reports the AppKit terminal view's top offset,
+measured from the content view's top edge; GTK omits `terminal_top` until it
+can expose equivalent trustworthy geometry. Consumers that require exact
+coordinates must reject a missing, non-finite, or non-positive value instead
+of copying a chrome-height constant. `terminal_font_family` is the resolved
+family the live terminal is actually rendering with (post-fallback-chain, not
+a config echo) and is reported by all three adapters. This operation is
+ungated and read-only.
 
 ### `app.sidebar_dump`
 

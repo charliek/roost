@@ -239,6 +239,25 @@ class TestSidebarResize:
         a user: a wider sidebar MUST take columns away from the shell.
         """
         _seed_baseline(roost)
+
+        # One-op-set parity (issue #287): every UI answers
+        # `terminal_font_family` as a non-empty string on `app.window_metrics`
+        # (iced resolves the active family, GTK reports the family it fell
+        # back to, Mac now reports `TerminalView.font`'s family). `terminal_top`
+        # stays optional — GTK omits the key entirely — but when a UI does
+        # report it, it must be a real positive offset, not `0`/a placeholder.
+        metrics = roost.window_metrics()
+        family = metrics.get("terminal_font_family")
+        assert isinstance(family, str) and family, (
+            f"terminal_font_family must be a non-empty string on every UI; "
+            f"got {family!r} (metrics {metrics})"
+        )
+        top = metrics.get("terminal_top")
+        if top is not None:
+            assert isinstance(top, (int, float)) and not isinstance(top, bool) and top > 0, (
+                f"terminal_top, when reported, must be > 0; got {top!r} (metrics {metrics})"
+            )
+
         tab = _live_tab(roost, project)
         baseline_cols = _settled_cols(roost, tab, BASELINE_WIDTH_PT)
 

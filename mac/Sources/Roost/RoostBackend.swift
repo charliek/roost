@@ -136,6 +136,14 @@ protocol UiBridge: AnyObject {
     /// canonical form — empty body and `"default"` both map to
     /// `"default"`). Used by the `app.cursor_shape` IPC op.
     func currentCursorShape() -> String
+
+    /// Active tab's terminal viewport top offset (points, measured
+    /// down from the content view's top edge) + the resolved font
+    /// family in use — the optional `terminal_top` /
+    /// `terminal_font_family` fields on `app.window_metrics` (iced/GTK
+    /// parity, issue #287). `nil` when no terminal view is live (fresh
+    /// launch, no tabs).
+    func terminalMetrics() -> (top: CGFloat, fontFamily: String)?
 }
 
 /// Outcome from `UiBridge.expandTabSelectionAt` — mirrors

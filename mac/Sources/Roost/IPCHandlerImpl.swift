@@ -1004,11 +1004,20 @@ actor IPCHandlerImpl: IPCHandler {
         // break cross-platform width/height equivalence for callers
         // that drive both UIs through the same op.
         let content = window.contentRect(forFrameRect: window.frame)
+        // Optional, terminal-view-only geometry/font (issue #287): nil
+        // when there's no live terminal (fresh launch, no tabs) rather
+        // than a fabricated 0/empty-string value — the wire contract's
+        // `skip_serializing_if = "Option::is_none"` then omits the
+        // fields entirely, matching iced/GTK's absent-vs-present
+        // semantics rather than emitting `null`.
+        let terminal = ui.terminalMetrics()
         return IPCWindowMetricsResult(
             windowWidth: Double(content.width),
             windowHeight: Double(content.height),
             sidebarWidth: Double(metrics.width),
-            sidebarCollapsed: metrics.collapsed
+            sidebarCollapsed: metrics.collapsed,
+            terminalTop: terminal.map { Double($0.top) },
+            terminalFontFamily: terminal?.fontFamily
         )
     }
 
@@ -1342,11 +1351,24 @@ private struct IPCWindowMetricsResult: Codable {
     let windowHeight: Double
     let sidebarWidth: Double
     let sidebarCollapsed: Bool
+    /// Optional wire fields (mirrors `WindowMetricsResult` in
+    /// `crates/roost-ipc/src/messages.rs`'s `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]`). `Optional`-typed
+    /// stored properties get `encodeIfPresent`/`decodeIfPresent` from
+    /// Swift's synthesized `Codable` conformance (no custom
+    /// `init(from:)`/`encode(to:)` needed here, matching
+    /// `IPCPaletteStateResult.frame` elsewhere in this file), so `nil`
+    /// omits the key on encode rather than emitting `null` — matching
+    /// the Rust `skip_serializing_if` behavior byte-for-byte.
+    let terminalTop: Double?
+    let terminalFontFamily: String?
     enum CodingKeys: String, CodingKey {
         case windowWidth = "window_width"
         case windowHeight = "window_height"
         case sidebarWidth = "sidebar_width"
         case sidebarCollapsed = "sidebar_collapsed"
+        case terminalTop = "terminal_top"
+        case terminalFontFamily = "terminal_font_family"
     }
 }
 
