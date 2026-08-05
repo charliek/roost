@@ -505,7 +505,9 @@ def _check_left_edge_drag_selects(r, env_x, wait_tab_attached) -> None:
     the separator's styled box (~22px into the terminal), so selecting a
     line from its start silently resized the sidebar instead;
     `App::tighten_paned_grab_zone` replaces it with a separator-only hit
-    zone. Also proves the separator itself still resizes."""
+    zone. Also proves the separator itself still resizes, from BOTH the
+    terminal side (tight, 2px) and the sidebar side (widened, 4px — #252,
+    a press a few px shy of the seam used to miss it)."""
     pid = r.create_project(name="edge-drag", cwd="/tmp")
     tab = r.open_tab(pid, cwd="/tmp")
     wait_tab_attached(r, tab)
@@ -535,6 +537,7 @@ def _check_left_edge_drag_selects(r, env_x, wait_tab_attached) -> None:
 
     # The separator must still resize: probe the few px around the seam
     # (its exact screen x shifts with the CSD margin).
+    resized_at = None
     for probe in range(sb + 1, sb + 10):
         _drag(env_x, probe, y0, probe + 60, y0)
         now = int(r.window_metrics()["sidebar_width"])
@@ -545,11 +548,40 @@ def _check_left_edge_drag_selects(r, env_x, wait_tab_attached) -> None:
             restored = int(r.window_metrics()["sidebar_width"])
             assert restored == sb, \
                 f"separator undo failed: sidebar width {restored}, expected {sb}"
-            print(f"  left-edge drag selection OK "
-                  f"(selected {len(text)} chars; separator resizes at "
-                  f"x=+{probe - sb})")
-            return
-    raise AssertionError("separator drag never resized the sidebar")
+            resized_at = probe - sb
+            break
+    if resized_at is None:
+        raise AssertionError("separator drag never resized the sidebar")
+
+    # #252: the grab zone is asymmetric — widened 4px into the sidebar side
+    # (no selectable text competes there), so a press a couple px shy of the
+    # seam still grabs instead of missing. Probe sep-6..sep-3, mirroring the
+    # terminal-side range probe above (a single offset would flake the same
+    # way against CSD margin drift).
+    sidebar_resized_at = None
+    for probe in range(sb - 6, sb - 2):
+        _drag(env_x, probe, y0, probe - 40, y0)
+        now = int(r.window_metrics()["sidebar_width"])
+        if now != sb:
+            # Undo from a seam-relative point guaranteed inside the 4px band
+            # of the NEW seam (`now`), not `probe`'s original offset from the
+            # OLD seam (`sb`): a probe that only hit because of the overscan
+            # (sep-6/sep-5, outside the 4px band under aligned coords) would
+            # put `probe + (now - sb)` outside the band relative to `now`
+            # too, and the undo press itself would get Denied.
+            undo_x0 = now - 2
+            _drag(env_x, undo_x0, y0, undo_x0 + (sb - now), y0)
+            restored = int(r.window_metrics()["sidebar_width"])
+            assert restored == sb, \
+                f"sidebar-side separator undo failed: sidebar width {restored}, expected {sb}"
+            sidebar_resized_at = sb - probe
+            break
+    assert sidebar_resized_at is not None, \
+        "sidebar-side grab zone (sep-6..sep-3) never resized the sidebar (#252)"
+
+    print(f"  left-edge drag selection OK "
+          f"(selected {len(text)} chars; separator resizes at "
+          f"x=+{resized_at}, sidebar-side grab at x=-{sidebar_resized_at})")
 
 
 def _check_sidebar_reorder(r, rc, env_x, tmp: Path, roost) -> None:

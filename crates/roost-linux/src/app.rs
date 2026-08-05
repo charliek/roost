@@ -5037,7 +5037,10 @@ impl App {
     }
 
     /// Replace `GtkPaned`'s built-in resize gestures with one whose hit
-    /// zone is the separator itself (±2px), no more.
+    /// zone is the separator itself, plus a small asymmetric grab margin:
+    /// 4px into the sidebar side (no selectable text competes there), 2px
+    /// into the terminal side (kept tight so column-0 text selection wins
+    /// — see #251).
     ///
     /// GTK's internal capture-phase drag gesture claims any press within
     /// `HANDLE_EXTRA_SIZE` (6px) of the separator's styled box — with the
@@ -5079,13 +5082,18 @@ impl App {
             let start_pos = start_pos.clone();
             move |g, x, _y| {
                 let pos = paned.position();
-                // Separator box: [position .. end-child x]. ±2px slop.
+                // Separator box: [position .. end-child x]. The grab zone is
+                // ASYMMETRIC: 4px into the sidebar side, 2px into the terminal
+                // side. Sidebar side is widened because nothing there competes
+                // for the gesture (no selectable text); the terminal side stays
+                // tight so a drag starting at column 0 still resolves to text
+                // selection, not a resize — the deliberate outcome of #251.
                 let sep_end = paned
                     .end_child()
                     .and_then(|c| c.compute_bounds(&paned))
                     .map(|b| b.x() as i32)
                     .unwrap_or(pos + 6);
-                if (x as i32) < pos - 2 || (x as i32) > sep_end + 2 {
+                if (x as i32) < pos - 4 || (x as i32) > sep_end + 2 {
                     g.set_state(gtk4::EventSequenceState::Denied);
                     return;
                 }
@@ -5101,8 +5109,8 @@ impl App {
             }
         });
         // `drag-end` also fires for denied sequences (a press outside the
-        // ±2px grab zone above claims Denied, not Claimed, but GestureDrag
-        // still emits begin/end around it) — persisting the paned's
+        // asymmetric grab zone above claims Denied, not Claimed, but
+        // GestureDrag still emits begin/end around it) — persisting the paned's
         // unrelated position on those is benign only because the engine
         // setter no-ops when the width is unchanged; don't drop the guard
         // below thinking this makes it redundant.
