@@ -54,6 +54,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
 use crate::font_registry::{system_font_registry, FontRegistry};
+use crate::notifications::DesktopNotifications;
 use crate::palette_scroll::Visibility;
 use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
@@ -777,6 +778,7 @@ pub struct App {
     /// row already ran and are answered by their own completion.
     palette_activate_replies: HashMap<u64, PaletteActivateReply>,
     clipboard: ClipboardQueue,
+    desktop_notifications: DesktopNotifications,
     /// A clone of `runtime`'s handle, so a mutation can be spawned onto
     /// the engine runtime from a `&self` method and awaited by an Iced
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
@@ -928,6 +930,7 @@ impl App {
             palette_present_reply: None,
             palette_activate_replies: HashMap::new(),
             clipboard: ClipboardQueue::default(),
+            desktop_notifications: DesktopNotifications::new(runtime.handle()),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,

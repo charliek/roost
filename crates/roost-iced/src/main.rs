@@ -3,6 +3,7 @@ mod chrome;
 mod engine_feed;
 mod font_registry;
 mod input;
+mod notifications;
 mod palette_scroll;
 mod screenshot;
 mod sidebar_resize;

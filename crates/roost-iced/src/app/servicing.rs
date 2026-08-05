@@ -403,22 +403,33 @@ impl App {
         match event {
             WorkspaceEvent::NotificationFired {
                 tab_id,
-                title: _,
+                title,
                 body,
             } => {
-                if let Some((project_id, title)) = self.notification_title(tab_id) {
+                if let Some((project_id, row_title)) = self.notification_title(tab_id) {
                     self.notification_inbox
                         .upsert(notification_inbox::NotificationRecord::new(
-                            tab_id, project_id, title, body,
+                            tab_id,
+                            project_id,
+                            row_title,
+                            body.clone(),
                         ));
                 }
+                self.desktop_notifications.fire(tab_id, title, body);
             }
             WorkspaceEvent::TabNotification {
                 tab_id,
                 has_pending: false,
-            }
-            | WorkspaceEvent::TabClosed { tab_id } => {
+            } => {
+                // A clear keeps the tab's server id: the banner may still
+                // be on the desktop, and GTK's constant per-tab id makes a
+                // later re-notify replace it — forgetting the id here
+                // would stack a duplicate beside it instead.
                 self.notification_inbox.remove(tab_id);
+            }
+            WorkspaceEvent::TabClosed { tab_id } => {
+                self.notification_inbox.remove(tab_id);
+                self.desktop_notifications.retire(tab_id);
             }
             WorkspaceEvent::ProjectDeleted { project_id } => {
                 let stale: Vec<i64> = self

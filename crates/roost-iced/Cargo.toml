@@ -42,6 +42,14 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicode-width = { workspace = true }
 
+# The desktop-notification backend is per-OS: this one talks
+# `org.freedesktop.Notifications` over D-Bus. `z-with-tokio` keeps zbus on
+# the app's tokio runtime instead of pulling in async-io/smol.
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.11", default-features = false, features = [
+    "z-with-tokio",
+] }
+
 [dev-dependencies]
 swash = "=0.2.10"
 tempfile = "3"
