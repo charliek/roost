@@ -193,16 +193,19 @@ when it touches the code you are already in:
 | item | issue |
 |---|---|
 | ~~Iced tab-strip artifacts with several tabs open~~ **fixed** (PR #291) | [#281] |
-| Iced SIGABRT: swash subtract-with-overflow panic during glyph shaping (debug build; trigger unknown — launch with `RUST_BACKTRACE=1` to capture) | [#292] |
-| **Security-adjacent:** Swift's dragged-URL drop branch has no control-char rejection (mitigated by the paste-boundary wrap from #280, not closed); Rust/Swift filter predicates also diverge | [#282] |
-| `roost-linux` clippy `type_complexity` debt keeping it out of the lint gate | [#283] |
-| No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) | [#284] |
+| ~~Iced SIGABRT: swash subtract-with-overflow panic during glyph shaping~~ **fixed** (PR #298: vendored patched swash 0.2.10 under `third_party/swash` via `[patch.crates-io]` — trigger was a zero-long-metrics font; crafted-font regression test) | [#292] |
+| ~~**Security-adjacent:** Swift's dragged-URL drop branch unfiltered; Rust/Swift filter predicates diverge~~ **fixed** (PR #301: converged 8-scalar predicate + URL branch both languages, cross-pinned vectors) | [#282] |
+| ~~`roost-linux` clippy `type_complexity` debt keeping it out of the lint gate~~ **fixed** (PR #301: gtk-build now runs the full `-D warnings` gate) | [#283] |
+| ~~Mac `app.window_metrics` omits `terminal_top` / `terminal_font_family`~~ **fixed** (PR #301) | [#287] |
+| ~~Iced hit-tests positionless presses at the batch-newest cursor~~ **fixed for `SidebarResizeGrip`** (PR #301, harness dwell removed); the `ReorderStrip` half is blocked by scrollable event/cursor space mismatch → split to [#300] | [#295] |
+| Iced `ReorderStrip` presses still batch-cursor-anchored: iced scrollables pass children a translated cursor but the raw untranslated event, so an event-position anchor is off by the scroll offset | [#300] |
+| Vendored swash: three further malformed-font robustness findings (incl. a verified upstream format-4 bitmap-index infinite loop — release-build hang) | [#299] |
+| Terminal multi-click is wall-clock-only — **parked deliberately** (PR #301 triage): porting the strip's frame-grace would fuse deliberate slow clicks into word-select on idle terminals (a click schedules a redraw, so a 1-2 frame gap is the normal idle signature, not a stall); revisit only if it actually flakes | [#297] |
+| No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) — decide "required or waived" as part of the M4 entry audit | [#284] |
 | No real-input (CGEvent) harness on macOS — uinput tier is Linux-only | [#285] |
 | `roost-engine::facade` has no consumer; prove it or delete it (blocks M5) | [#286] |
-| Mac `app.window_metrics` omits `terminal_top` / `terminal_font_family` | [#287] |
 | `app/interactions.rs` at 2,960 lines — finer split when fixtures allow | [#288] |
 | swift-testing runner SIGABRT on fast value-check swarms (XCTest workaround) | [#289] |
-| Iced hit-tests positionless presses at the batch-newest cursor (SidebarResizeGrip + ReorderStrip) | [#295] |
 
 [#281]: https://github.com/charliek/roost/issues/281
 [#282]: https://github.com/charliek/roost/issues/282
@@ -215,6 +218,9 @@ when it touches the code you are already in:
 [#289]: https://github.com/charliek/roost/issues/289
 [#292]: https://github.com/charliek/roost/issues/292
 [#295]: https://github.com/charliek/roost/issues/295
+[#297]: https://github.com/charliek/roost/issues/297
+[#299]: https://github.com/charliek/roost/issues/299
+[#300]: https://github.com/charliek/roost/issues/300
 
 ### M4 — ship Iced to Linux users
 
@@ -223,6 +229,16 @@ Release packaging + appcast/apt integration, a state-migration decision
 period behind an explicit opt-in, then the GTK deprecation decision. Entry
 criteria: M3 complete, parity inventory shows no open P0/P1, and the
 real-input tier passes on Iced for the drag/clipboard guards.
+
+Entry-criteria status (2026-08-05): the real-input criterion is **met** —
+PR #301 removed the last harness workaround (the seam-press dwell) and the
+full Iced drag/clipboard guard passes in the shed and on CI. The
+no-open-P0/P1 criterion needs a **parity-inventory refresh audit** before
+it can be evaluated honestly: several rows predate shipped slices (e.g.
+the sidebar-resize row still describes the fixed 220 pt width that
+plan 011/slice 3c replaced with persisted 160-400 pt). The audit should
+re-verify every row against current behavior, close what shipped, and
+decide [#284] (visual-parity CI gate: required for M4 or waived).
 
 ### M5 — Rust under Swift (exploration, not a commitment)
 
