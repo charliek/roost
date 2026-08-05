@@ -5,6 +5,8 @@ mod font_registry;
 mod input;
 mod notifications;
 mod palette_scroll;
+mod paste_image;
+mod png_encode;
 mod screenshot;
 mod sidebar_resize;
 mod strip_reorder;
@@ -58,6 +60,12 @@ enum Message {
         value: Option<String>,
     },
     ClipboardWriteCompleted(u64),
+    /// A clipboard image probe finished. `path` is the temp PNG to paste,
+    /// or `None` when the clipboard held no usable image.
+    PasteImageMaterialized {
+        tab_id: i64,
+        path: Option<String>,
+    },
     UrlOpenCompleted(Result<(), String>),
     Keyboard(keyboard::Event),
     CapturedEscape,
@@ -176,6 +184,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ClipboardWriteCompleted(request_id) => {
             app.clipboard_write_completed(request_id).map_task()
+        }
+        Message::PasteImageMaterialized { tab_id, path } => {
+            app.paste_image_materialized(tab_id, path.as_deref());
+            Task::none()
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
         Message::CapturedEscape => app.captured_escape().map_task(),
@@ -464,6 +476,27 @@ impl UiTask for app::UiTask {
             app::UiTask::OpenUrl { url } => {
                 Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
             }
+            // `spawn_blocking` is legal here because iced_winit wraps every
+            // `update` in `Executor::enter`, i.e. this runs inside the
+            // application's tokio runtime. The blocking pool is what keeps
+            // the clipboard round-trip and the PNG encode off the UI thread.
+            app::UiTask::PasteImageProbe { tab_id } => Task::perform(
+                tokio::task::spawn_blocking(paste_image::materialize),
+                move |joined| {
+                    let path = match joined {
+                        Ok(Ok(path)) => Some(path.to_string_lossy().into_owned()),
+                        Ok(Err(error)) => {
+                            tracing::debug!(tab_id, %error, "clipboard image paste found nothing");
+                            None
+                        }
+                        Err(error) => {
+                            tracing::debug!(tab_id, %error, "clipboard image probe did not join");
+                            None
+                        }
+                    };
+                    Message::PasteImageMaterialized { tab_id, path }
+                },
+            ),
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }

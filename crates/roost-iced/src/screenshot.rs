@@ -41,19 +41,7 @@ pub fn encode(capture: &Screenshot, requested_scale: u32) -> Result<(Vec<u8>, u3
     } else {
         nearest_neighbor_rgba(&capture.rgba, source_width, source_height, width, height)?
     };
-    let mut png_bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|error| format!("encode screenshot PNG header: {error}"))?;
-        writer
-            .write_image_data(&rgba)
-            .map_err(|error| format!("encode screenshot PNG pixels: {error}"))?;
-    }
+    let png_bytes = crate::png_encode::encode_rgba8(width, height, &rgba, png::Compression::Fast)?;
     Ok((png_bytes, width, height))
 }
 

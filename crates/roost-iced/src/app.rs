@@ -660,6 +660,12 @@ pub enum UiTask {
     OpenUrl {
         url: String,
     },
+    /// A paste found no text on the system clipboard — go look for an
+    /// image. The read + PNG encode block, so this runs off the UI
+    /// thread and reports back as `Message::PasteImageMaterialized`.
+    PasteImageProbe {
+        tab_id: i64,
+    },
     /// One-shot: wake once the file-drop gesture's debounce window has
     /// elapsed. Scheduled where the deadline is set, never polled.
     FileDropDeadline(Duration),

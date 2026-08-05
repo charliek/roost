@@ -1520,7 +1520,12 @@ type ClipboardReply = tokio::sync::oneshot::Sender<Result<Option<String>, String
 
 enum ClipboardReadDestination {
     Ipc(ClipboardReply),
-    Paste { tab_id: i64 },
+    /// `target` rides along because the image fallback is system-clipboard
+    /// only — see [`paste_read_followup`].
+    Paste {
+        tab_id: i64,
+        target: ClipboardOp,
+    },
 }
 
 enum ClipboardReadCompletion {
@@ -1530,6 +1535,7 @@ enum ClipboardReadCompletion {
     },
     Paste {
         tab_id: i64,
+        target: ClipboardOp,
         value: Option<String>,
     },
 }
@@ -1607,8 +1613,10 @@ impl ClipboardQueue {
 
     fn enqueue_paste_read(&mut self, target: ClipboardOp, tab_id: i64) -> u64 {
         let request_id = self.allocate_request_id();
-        self.pending_reads
-            .insert(request_id, ClipboardReadDestination::Paste { tab_id });
+        self.pending_reads.insert(
+            request_id,
+            ClipboardReadDestination::Paste { tab_id, target },
+        );
         self.queued
             .push_back(ClipboardEffect::Read { request_id, target });
         request_id
@@ -1647,9 +1655,11 @@ impl ClipboardQueue {
         self.active_request_id = None;
         Some(match destination {
             ClipboardReadDestination::Ipc(reply) => ClipboardReadCompletion::Ipc { reply, value },
-            ClipboardReadDestination::Paste { tab_id } => {
-                ClipboardReadCompletion::Paste { tab_id, value }
-            }
+            ClipboardReadDestination::Paste { tab_id, target } => ClipboardReadCompletion::Paste {
+                tab_id,
+                target,
+                value,
+            },
         })
     }
 
@@ -1707,6 +1717,42 @@ fn enqueue_selection_copy(
     targets.len()
 }
 
+/// What a settled paste read owes the event loop: resume the clipboard
+/// queue, and — system clipboard only, empty text only — probe for an
+/// image behind it.
+///
+/// The queue goes first so a clipboard effect already waiting behind this
+/// read doesn't stall for the length of a blocking image read. Selection
+/// pastes never probe: PRIMARY carries text, and the GTK UI's
+/// `paste_from_clipboard` has no image branch for it either.
+fn paste_read_followup(
+    clipboard: &mut ClipboardQueue,
+    target: ClipboardOp,
+    tab_id: i64,
+    text: Option<&str>,
+) -> UiTask {
+    let probe = match target {
+        ClipboardOp::Selection => UiTask::None,
+        ClipboardOp::System if text.is_some_and(|text| !text.is_empty()) => UiTask::None,
+        ClipboardOp::System => UiTask::PasteImageProbe { tab_id },
+    };
+    clipboard.start_next().then(probe)
+}
+
+/// Paste a materialized image path into the tab whose paste asked for it
+/// — never the active tab, which may have changed while the clipboard
+/// read blocked. `None` means the probe found no image and already
+/// logged why.
+fn deliver_paste_image(tabs: &HashMap<i64, TerminalTab>, tab_id: i64, path: Option<&str>) {
+    let Some(path) = path else {
+        return;
+    };
+    match tabs.get(&tab_id) {
+        Some(tab) => tab.paste(Some(path)),
+        None => tracing::debug!(tab_id, "discarded clipboard image paste for a closed tab"),
+    }
+}
+
 pub(super) fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
     let Some(text) = text.filter(|text| !text.is_empty()) else {
         return Vec::new();
@@ -1745,16 +1791,28 @@ impl App {
         match completion {
             ClipboardReadCompletion::Ipc { reply, value } => {
                 let _ = reply.send(Ok(value));
+                self.clipboard.start_next()
             }
-            ClipboardReadCompletion::Paste { tab_id, value } => {
-                if let Some(tab) = self.tabs.get(&tab_id) {
-                    tab.paste(value.as_deref());
-                } else {
+            ClipboardReadCompletion::Paste {
+                tab_id,
+                target,
+                value,
+            } => {
+                let Some(tab) = self.tabs.get(&tab_id) else {
                     tracing::debug!(tab_id, request_id, "discarded paste for a closed tab");
-                }
+                    return self.clipboard.start_next();
+                };
+                tab.paste(value.as_deref());
+                paste_read_followup(&mut self.clipboard, target, tab_id, value.as_deref())
             }
         }
-        self.clipboard.start_next()
+    }
+
+    /// A clipboard image probe reported back. Two pastes racing produce
+    /// two temp files and two pastes — tolerated: each one is what the
+    /// user asked for, and the file the loser wrote is still theirs.
+    pub fn paste_image_materialized(&self, tab_id: i64, path: Option<&str>) {
+        deliver_paste_image(&self.tabs, tab_id, path);
     }
 
     pub fn clipboard_write_completed(&mut self, request_id: u64) -> UiTask {
@@ -3387,8 +3445,11 @@ mod tests {
             .expect("active paste completion");
         assert!(matches!(
             completion,
-            ClipboardReadCompletion::Paste { tab_id: 41, value: Some(ref value) }
-                if value == "first"
+            ClipboardReadCompletion::Paste {
+                tab_id: 41,
+                target: ClipboardOp::System,
+                value: Some(ref value),
+            } if value == "first"
         ));
         assert!(matches!(
             queue.start_next(),
@@ -3508,7 +3569,7 @@ mod tests {
         let completion = queue
             .complete_read(request_id, Some("mac paste".into()))
             .expect("native read completion");
-        let ClipboardReadCompletion::Paste { tab_id, value } = completion else {
+        let ClipboardReadCompletion::Paste { tab_id, value, .. } = completion else {
             panic!("expected initiating-tab paste completion")
         };
         assert_eq!(tab_id, 73);
@@ -3519,6 +3580,81 @@ mod tests {
         })
         .expect("terminal");
         assert_eq!(paste_bytes(&terminal, value.as_deref()), b"mac paste");
+    }
+
+    #[test]
+    fn only_an_empty_system_paste_probes_for_a_clipboard_image() {
+        let mut queue = ClipboardQueue::default();
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, None),
+            UiTask::PasteImageProbe { tab_id: 7 }
+        ));
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("")),
+            UiTask::PasteImageProbe { tab_id: 7 }
+        ));
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("text")),
+            UiTask::None
+        ));
+        // GTK parity: a PRIMARY paste has no image branch at all.
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::Selection, 7, None),
+            UiTask::None
+        ));
+
+        // An effect already waiting on the queue starts now, not after the
+        // blocking probe.
+        let queued = queue.enqueue_write(ClipboardOp::System, "queued".into());
+        let UiTask::Then(first, second) =
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, None)
+        else {
+            panic!("the clipboard queue must resume alongside the probe")
+        };
+        assert!(matches!(
+            *first,
+            UiTask::ClipboardWrite { request_id, .. } if request_id == queued
+        ));
+        assert!(matches!(*second, UiTask::PasteImageProbe { tab_id: 7 }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_materialized_image_path_reaches_only_the_tab_that_pasted() {
+        let (tab, supervisor) = attached_test_terminal(9_101);
+        let capture = tab.input_capture.clone().expect("test-mode input capture");
+        let mut tabs = HashMap::from([(9_101_i64, tab)]);
+
+        deliver_paste_image(
+            &tabs,
+            9_101,
+            Some("/tmp/roost-image-1-0123456789abcdef.png"),
+        );
+        assert_eq!(
+            capture.lock().unwrap().as_slice(),
+            b"/tmp/roost-image-1-0123456789abcdef.png"
+        );
+
+        capture.lock().unwrap().clear();
+        tabs.get_mut(&9_101).unwrap().write_vt(b"\x1b[?2004h");
+        deliver_paste_image(
+            &tabs,
+            9_101,
+            Some("/tmp/roost-image-2-fedcba9876543210.png"),
+        );
+        assert_eq!(
+            capture.lock().unwrap().as_slice(),
+            b"\x1b[200~/tmp/roost-image-2-fedcba9876543210.png\x1b[201~"
+        );
+
+        capture.lock().unwrap().clear();
+        deliver_paste_image(&tabs, 9_101, None);
+        deliver_paste_image(
+            &tabs,
+            9_102,
+            Some("/tmp/roost-image-3-00112233445566ff.png"),
+        );
+        assert!(capture.lock().unwrap().is_empty());
+        supervisor.close(9_101);
     }
 
     #[test]
