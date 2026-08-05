@@ -37,6 +37,26 @@ pub enum ScrollRoute {
     LocalViewport { scrolled_back: bool },
 }
 
+/// Direction of a page-wise viewport action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDirection {
+    /// Toward older scrollback (Page Up).
+    Up,
+    /// Toward the live bottom (Page Down).
+    Down,
+}
+
+/// Explicit adapter work selected by [`TerminalScroll::route_page`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageRoute {
+    /// Encode the page key itself and send it to the application. Unlike the
+    /// wheel there is no arrow synthesis: Page Up/Down are real keys the
+    /// running application already understands.
+    Forward,
+    /// The shared policy moved libghostty's local viewport itself.
+    LocalViewport { scrolled_back: bool },
+}
+
 /// Per-terminal wheel accumulator and snap-to-bottom state.
 #[derive(Debug, Default)]
 pub struct TerminalScroll {
@@ -85,21 +105,58 @@ impl TerminalScroll {
             return Some(ScrollRoute::AlternateScreenKey { direction, rows });
         }
 
+        Some(ScrollRoute::LocalViewport {
+            scrolled_back: self.move_local_viewport(terminal, whole_rows),
+        })
+    }
+
+    /// Route a page-wise viewport request (Page Up / Page Down).
+    ///
+    /// Precedence matches [`TerminalScroll::route`], but forwarding hands the
+    /// real page key to the application instead of synthesizing arrows. A local
+    /// page moves exactly one full viewport with no overlap and discards any
+    /// accumulated wheel fraction, which a page jump invalidates.
+    pub fn route_page(
+        &mut self,
+        terminal: &mut Terminal,
+        direction: PageDirection,
+        viewport_rows: usize,
+    ) -> PageRoute {
+        if terminal.mouse_tracking() {
+            return PageRoute::Forward;
+        }
+        if terminal.active_screen() == ActiveScreen::Alternate {
+            return PageRoute::Forward;
+        }
+
+        let rows = isize::try_from(viewport_rows.max(1)).unwrap_or(isize::MAX);
+        let history_rows = match direction {
+            PageDirection::Up => rows,
+            PageDirection::Down => -rows,
+        };
+        self.fractional_history_rows = 0.0;
+        self.last_direction = 0;
+        PageRoute::LocalViewport {
+            scrolled_back: self.move_local_viewport(terminal, history_rows),
+        }
+    }
+
+    /// Move the local viewport by whole rows (positive = toward older history)
+    /// and refresh the snap state from the authoritative scrollbar.
+    fn move_local_viewport(&mut self, terminal: &mut Terminal, history_rows: isize) -> bool {
         // libghostty's delta is negative toward older history, the inverse of
         // this API's positive-history convention.
-        terminal.scroll_viewport(ScrollViewport::Delta(-whole_rows));
+        terminal.scroll_viewport(ScrollViewport::Delta(-history_rows));
         match terminal.scrollbar() {
             Ok(scrollbar) => self.scrolled_back = !scrollbar.is_at_bottom(),
-            Err(_) if whole_rows > 0 => self.scrolled_back = true,
+            Err(_) if history_rows > 0 => self.scrolled_back = true,
             Err(_) => {
                 // A failed authoritative query after a downward move must not
                 // guess that bottom was reached. Preserve the prior state so
                 // the next real terminal key still snaps safely.
             }
         }
-        Some(ScrollRoute::LocalViewport {
-            scrolled_back: self.scrolled_back,
-        })
+        self.scrolled_back
     }
 
     /// Snap a locally scrolled terminal to the live bottom immediately before
@@ -140,6 +197,24 @@ mod tests {
         terminal.vt_write(b"old\r\nline\r\nnew\r\nlive");
         assert!(terminal.scrollbar().expect("scrollbar").is_at_bottom());
         terminal
+    }
+
+    fn terminal_with_paged_history() -> Terminal {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 4,
+            max_scrollback: 64,
+        })
+        .expect("terminal");
+        for index in 0..16 {
+            terminal.vt_write(format!("line{index}\r\n").as_bytes());
+        }
+        assert!(terminal.scrollbar().expect("scrollbar").is_at_bottom());
+        terminal
+    }
+
+    fn viewport_offset(terminal: &Terminal) -> u64 {
+        terminal.scrollbar().expect("scrollbar").offset
     }
 
     #[test]
@@ -233,5 +308,125 @@ mod tests {
         for delta in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert_eq!(scroll.route(&mut terminal, delta), None);
         }
+    }
+
+    #[test]
+    fn page_mouse_tracking_precedes_alternate_screen() {
+        let mut terminal = terminal();
+        terminal.vt_write(b"\x1b[?1049h\x1b[?1000h");
+        let mut scroll = TerminalScroll::new();
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, 4),
+            PageRoute::Forward
+        );
+    }
+
+    #[test]
+    fn page_on_alternate_screen_forwards_the_real_key() {
+        let mut terminal = terminal();
+        terminal.vt_write(b"\x1b[?1049h");
+        let mut scroll = TerminalScroll::new();
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Down, 4),
+            PageRoute::Forward
+        );
+        assert!(!scroll.is_scrolled_back());
+    }
+
+    #[test]
+    fn pages_walk_local_history_and_clamp_at_both_ends() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        let bottom = viewport_offset(&terminal);
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, 4),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        let first = viewport_offset(&terminal);
+        assert_eq!(bottom - first, 4);
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, 4),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        let second = viewport_offset(&terminal);
+        assert_eq!(first - second, 4);
+
+        for _ in 0..8 {
+            scroll.route_page(&mut terminal, PageDirection::Up, 4);
+        }
+        assert_eq!(viewport_offset(&terminal), 0, "page up clamps at the top");
+
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Down, 4),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert_eq!(viewport_offset(&terminal), 4);
+    }
+
+    #[test]
+    fn page_down_at_bottom_stays_at_bottom() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        let bottom = viewport_offset(&terminal);
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Down, 4),
+            PageRoute::LocalViewport {
+                scrolled_back: false
+            }
+        );
+        assert_eq!(viewport_offset(&terminal), bottom);
+        assert!(!scroll.is_scrolled_back());
+    }
+
+    #[test]
+    fn page_size_is_the_viewport_and_zero_rows_moves_one() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        let bottom = viewport_offset(&terminal);
+        scroll.route_page(&mut terminal, PageDirection::Up, 3);
+        assert_eq!(bottom - viewport_offset(&terminal), 3);
+        scroll.route_page(&mut terminal, PageDirection::Up, 0);
+        assert_eq!(bottom - viewport_offset(&terminal), 4);
+    }
+
+    #[test]
+    fn page_discards_stale_wheel_momentum() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        assert_eq!(scroll.route(&mut terminal, 0.5), None);
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, 4),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert_eq!(
+            scroll.route(&mut terminal, 0.5),
+            None,
+            "the page must discard the fraction accumulated before it"
+        );
+    }
+
+    #[test]
+    fn page_uses_authoritative_bottom_state_for_snap() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, 4),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert!(scroll.is_scrolled_back());
+        assert!(scroll.snap_to_bottom(&mut terminal));
+        assert!(!scroll.is_scrolled_back());
+        assert!(terminal.scrollbar().expect("scrollbar").is_at_bottom());
+        assert!(!scroll.snap_to_bottom(&mut terminal));
     }
 }

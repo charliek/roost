@@ -1520,7 +1520,12 @@ type ClipboardReply = tokio::sync::oneshot::Sender<Result<Option<String>, String
 
 enum ClipboardReadDestination {
     Ipc(ClipboardReply),
-    Paste { tab_id: i64 },
+    /// `target` rides along because the image fallback is system-clipboard
+    /// only — see [`paste_read_followup`].
+    Paste {
+        tab_id: i64,
+        target: ClipboardOp,
+    },
 }
 
 enum ClipboardReadCompletion {
@@ -1530,6 +1535,7 @@ enum ClipboardReadCompletion {
     },
     Paste {
         tab_id: i64,
+        target: ClipboardOp,
         value: Option<String>,
     },
 }
@@ -1607,8 +1613,10 @@ impl ClipboardQueue {
 
     fn enqueue_paste_read(&mut self, target: ClipboardOp, tab_id: i64) -> u64 {
         let request_id = self.allocate_request_id();
-        self.pending_reads
-            .insert(request_id, ClipboardReadDestination::Paste { tab_id });
+        self.pending_reads.insert(
+            request_id,
+            ClipboardReadDestination::Paste { tab_id, target },
+        );
         self.queued
             .push_back(ClipboardEffect::Read { request_id, target });
         request_id
@@ -1647,9 +1655,11 @@ impl ClipboardQueue {
         self.active_request_id = None;
         Some(match destination {
             ClipboardReadDestination::Ipc(reply) => ClipboardReadCompletion::Ipc { reply, value },
-            ClipboardReadDestination::Paste { tab_id } => {
-                ClipboardReadCompletion::Paste { tab_id, value }
-            }
+            ClipboardReadDestination::Paste { tab_id, target } => ClipboardReadCompletion::Paste {
+                tab_id,
+                target,
+                value,
+            },
         })
     }
 
@@ -1707,6 +1717,42 @@ fn enqueue_selection_copy(
     targets.len()
 }
 
+/// What a settled paste read owes the event loop: resume the clipboard
+/// queue, and — system clipboard only, empty text only — probe for an
+/// image behind it.
+///
+/// The queue goes first so a clipboard effect already waiting behind this
+/// read doesn't stall for the length of a blocking image read. Selection
+/// pastes never probe: PRIMARY carries text, and the GTK UI's
+/// `paste_from_clipboard` has no image branch for it either.
+fn paste_read_followup(
+    clipboard: &mut ClipboardQueue,
+    target: ClipboardOp,
+    tab_id: i64,
+    text: Option<&str>,
+) -> UiTask {
+    let probe = match target {
+        ClipboardOp::Selection => UiTask::None,
+        ClipboardOp::System if text.is_some_and(|text| !text.is_empty()) => UiTask::None,
+        ClipboardOp::System => UiTask::PasteImageProbe { tab_id },
+    };
+    clipboard.start_next().then(probe)
+}
+
+/// Paste a materialized image path into the tab whose paste asked for it
+/// — never the active tab, which may have changed while the clipboard
+/// read blocked. `None` means the probe found no image and already
+/// logged why.
+fn deliver_paste_image(tabs: &HashMap<i64, TerminalTab>, tab_id: i64, path: Option<&str>) {
+    let Some(path) = path else {
+        return;
+    };
+    match tabs.get(&tab_id) {
+        Some(tab) => tab.paste(Some(path)),
+        None => tracing::debug!(tab_id, "discarded clipboard image paste for a closed tab"),
+    }
+}
+
 pub(super) fn paste_bytes(terminal: &Terminal, text: Option<&str>) -> Vec<u8> {
     let Some(text) = text.filter(|text| !text.is_empty()) else {
         return Vec::new();
@@ -1745,16 +1791,28 @@ impl App {
         match completion {
             ClipboardReadCompletion::Ipc { reply, value } => {
                 let _ = reply.send(Ok(value));
+                self.clipboard.start_next()
             }
-            ClipboardReadCompletion::Paste { tab_id, value } => {
-                if let Some(tab) = self.tabs.get(&tab_id) {
-                    tab.paste(value.as_deref());
-                } else {
+            ClipboardReadCompletion::Paste {
+                tab_id,
+                target,
+                value,
+            } => {
+                let Some(tab) = self.tabs.get(&tab_id) else {
                     tracing::debug!(tab_id, request_id, "discarded paste for a closed tab");
-                }
+                    return self.clipboard.start_next();
+                };
+                tab.paste(value.as_deref());
+                paste_read_followup(&mut self.clipboard, target, tab_id, value.as_deref())
             }
         }
-        self.clipboard.start_next()
+    }
+
+    /// A clipboard image probe reported back. Two pastes racing produce
+    /// two temp files and two pastes — tolerated: each one is what the
+    /// user asked for, and the file the loser wrote is still theirs.
+    pub fn paste_image_materialized(&self, tab_id: i64, path: Option<&str>) {
+        deliver_paste_image(&self.tabs, tab_id, path);
     }
 
     pub fn clipboard_write_completed(&mut self, request_id: u64) -> UiTask {
@@ -3387,8 +3445,11 @@ mod tests {
             .expect("active paste completion");
         assert!(matches!(
             completion,
-            ClipboardReadCompletion::Paste { tab_id: 41, value: Some(ref value) }
-                if value == "first"
+            ClipboardReadCompletion::Paste {
+                tab_id: 41,
+                target: ClipboardOp::System,
+                value: Some(ref value),
+            } if value == "first"
         ));
         assert!(matches!(
             queue.start_next(),
@@ -3508,7 +3569,7 @@ mod tests {
         let completion = queue
             .complete_read(request_id, Some("mac paste".into()))
             .expect("native read completion");
-        let ClipboardReadCompletion::Paste { tab_id, value } = completion else {
+        let ClipboardReadCompletion::Paste { tab_id, value, .. } = completion else {
             panic!("expected initiating-tab paste completion")
         };
         assert_eq!(tab_id, 73);
@@ -3519,6 +3580,81 @@ mod tests {
         })
         .expect("terminal");
         assert_eq!(paste_bytes(&terminal, value.as_deref()), b"mac paste");
+    }
+
+    #[test]
+    fn only_an_empty_system_paste_probes_for_a_clipboard_image() {
+        let mut queue = ClipboardQueue::default();
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, None),
+            UiTask::PasteImageProbe { tab_id: 7 }
+        ));
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("")),
+            UiTask::PasteImageProbe { tab_id: 7 }
+        ));
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, Some("text")),
+            UiTask::None
+        ));
+        // GTK parity: a PRIMARY paste has no image branch at all.
+        assert!(matches!(
+            paste_read_followup(&mut queue, ClipboardOp::Selection, 7, None),
+            UiTask::None
+        ));
+
+        // An effect already waiting on the queue starts now, not after the
+        // blocking probe.
+        let queued = queue.enqueue_write(ClipboardOp::System, "queued".into());
+        let UiTask::Then(first, second) =
+            paste_read_followup(&mut queue, ClipboardOp::System, 7, None)
+        else {
+            panic!("the clipboard queue must resume alongside the probe")
+        };
+        assert!(matches!(
+            *first,
+            UiTask::ClipboardWrite { request_id, .. } if request_id == queued
+        ));
+        assert!(matches!(*second, UiTask::PasteImageProbe { tab_id: 7 }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_materialized_image_path_reaches_only_the_tab_that_pasted() {
+        let (tab, supervisor) = attached_test_terminal(9_101);
+        let capture = tab.input_capture.clone().expect("test-mode input capture");
+        let mut tabs = HashMap::from([(9_101_i64, tab)]);
+
+        deliver_paste_image(
+            &tabs,
+            9_101,
+            Some("/tmp/roost-image-1-0123456789abcdef.png"),
+        );
+        assert_eq!(
+            capture.lock().unwrap().as_slice(),
+            b"/tmp/roost-image-1-0123456789abcdef.png"
+        );
+
+        capture.lock().unwrap().clear();
+        tabs.get_mut(&9_101).unwrap().write_vt(b"\x1b[?2004h");
+        deliver_paste_image(
+            &tabs,
+            9_101,
+            Some("/tmp/roost-image-2-fedcba9876543210.png"),
+        );
+        assert_eq!(
+            capture.lock().unwrap().as_slice(),
+            b"\x1b[200~/tmp/roost-image-2-fedcba9876543210.png\x1b[201~"
+        );
+
+        capture.lock().unwrap().clear();
+        deliver_paste_image(&tabs, 9_101, None);
+        deliver_paste_image(
+            &tabs,
+            9_102,
+            Some("/tmp/roost-image-3-00112233445566ff.png"),
+        );
+        assert!(capture.lock().unwrap().is_empty());
+        supervisor.close(9_101);
     }
 
     #[test]
@@ -3842,6 +3978,211 @@ mod tests {
             .clone();
         assert_eq!(captured, b"\x1b[A\x1b[A");
         alternate_supervisor.close(193);
+    }
+
+    fn page_press(named: Named, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+
+        let code = match named {
+            Named::PageUp => Code::PageUp,
+            _ => Code::PageDown,
+        };
+        keyboard::Event::KeyPressed {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: Physical::Code(code),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    fn encode_page_press(tab: &mut TerminalTab, named: Named, modifiers: keyboard::Modifiers) {
+        let bytes = input::encode_press(
+            &mut tab.encoder,
+            &tab.terminal,
+            page_press(named, modifiers),
+        );
+        tab.session.send_input(bytes);
+    }
+
+    fn captured_input(tab: &TerminalTab) -> Vec<u8> {
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clone()
+    }
+
+    fn clear_captured_input(tab: &TerminalTab) {
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+    }
+
+    fn viewport_offset(tab: &TerminalTab) -> u64 {
+        tab.terminal.scrollbar().expect("scrollbar").offset
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bare_pages_walk_local_history_without_reaching_the_pty() {
+        let (mut tab, supervisor) = attached_test_terminal(194);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("baseline snapshot");
+        clear_captured_input(&tab);
+        let bottom = viewport_offset(&tab);
+        assert_eq!(tab.dump().rows_text[0], format!("history-{bottom:03}"));
+
+        let page = u64::from(DEFAULT_ROWS);
+        for count in 1..=3 {
+            assert_eq!(
+                tab.handle_page(PageDirection::Up).expect("local page up"),
+                PageRoute::LocalViewport {
+                    scrolled_back: true
+                }
+            );
+            let offset = viewport_offset(&tab);
+            assert_eq!(bottom - offset, page * count, "page {count} moved one page");
+            assert_eq!(
+                tab.dump().rows_text[0],
+                format!("history-{offset:03}"),
+                "the published snapshot follows the local viewport"
+            );
+        }
+        assert!(
+            captured_input(&tab).is_empty(),
+            "a local page must not send anything to the PTY"
+        );
+
+        assert_eq!(
+            tab.handle_page(PageDirection::Down)
+                .expect("local page down"),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert_eq!(bottom - viewport_offset(&tab), page * 2);
+
+        assert!(tab.scroll.is_scrolled_back());
+        assert!(tab
+            .snap_to_bottom_for_input()
+            .expect("snap after local pages"));
+        assert_eq!(viewport_offset(&tab), bottom);
+        assert!(captured_input(&tab).is_empty());
+        supervisor.close(194);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_page_preserves_the_active_selection() {
+        let (mut tab, supervisor) = attached_test_terminal(195);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("baseline snapshot");
+        assert!(tab.selection.set(&tab.terminal, (0, 0), (6, 0)));
+        let selected = tab.selected_text().expect("selection text");
+        assert_eq!(selected.as_deref(), Some("history"));
+
+        assert_eq!(
+            tab.handle_page(PageDirection::Up).expect("local page up"),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert!(
+            tab.selection.is_active(),
+            "a local page must not drop the selection"
+        );
+        assert!(
+            tab.snapshot.selection_spans.is_empty(),
+            "the selected rows paged out of the viewport"
+        );
+
+        assert_eq!(
+            tab.handle_page(PageDirection::Down)
+                .expect("local page down"),
+            PageRoute::LocalViewport {
+                scrolled_back: false
+            }
+        );
+        assert_eq!(
+            tab.selected_text().expect("selection survives the page"),
+            selected,
+            "the same cells are selected once they are visible again"
+        );
+        supervisor.close(195);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pages_forward_to_the_application_on_tracking_and_alternate_screen() {
+        let (mut tracked, tracked_supervisor) = attached_test_terminal(196);
+        tracked.write_vt(b"\x1b[?1000h\x1b[?1006h");
+        clear_captured_input(&tracked);
+        assert_eq!(
+            tracked
+                .handle_page(PageDirection::Up)
+                .expect("tracked page"),
+            PageRoute::Forward
+        );
+        encode_page_press(&mut tracked, Named::PageUp, keyboard::Modifiers::empty());
+        assert_eq!(captured_input(&tracked), b"\x1b[5~");
+        tracked_supervisor.close(196);
+
+        let (mut alternate, alternate_supervisor) = attached_test_terminal(197);
+        alternate.write_vt(b"\x1b[?1049h");
+        clear_captured_input(&alternate);
+        assert_eq!(
+            alternate
+                .handle_page(PageDirection::Up)
+                .expect("alternate-screen page up"),
+            PageRoute::Forward
+        );
+        assert!(
+            captured_input(&alternate).is_empty(),
+            "forwarding is the app's encode, not the policy's"
+        );
+        encode_page_press(&mut alternate, Named::PageUp, keyboard::Modifiers::empty());
+        assert_eq!(captured_input(&alternate), b"\x1b[5~");
+
+        clear_captured_input(&alternate);
+        assert_eq!(
+            alternate
+                .handle_page(PageDirection::Down)
+                .expect("alternate-screen page down"),
+            PageRoute::Forward
+        );
+        encode_page_press(
+            &mut alternate,
+            Named::PageDown,
+            keyboard::Modifiers::empty(),
+        );
+        assert_eq!(captured_input(&alternate), b"\x1b[6~");
+        assert!(!alternate.scroll.is_scrolled_back());
+        alternate_supervisor.close(197);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modified_page_keys_stay_on_the_encode_path() {
+        let (mut tab, supervisor) = attached_test_terminal(198);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        clear_captured_input(&tab);
+        let bottom = viewport_offset(&tab);
+
+        assert_eq!(
+            input::bare_page_direction(
+                &page_press(Named::PageUp, keyboard::Modifiers::SHIFT),
+                keyboard::Modifiers::SHIFT
+            ),
+            None
+        );
+        encode_page_press(&mut tab, Named::PageUp, keyboard::Modifiers::SHIFT);
+        assert_eq!(captured_input(&tab), b"\x1b[5;2~");
+        assert_eq!(
+            viewport_offset(&tab),
+            bottom,
+            "a modified page key belongs to the application, not the viewport"
+        );
+        supervisor.close(198);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

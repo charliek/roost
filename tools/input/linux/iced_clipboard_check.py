@@ -14,7 +14,9 @@ copy-on-select from making the explicit-Copy assertion pass accidentally:
 * native double/triple clicks expand a word/line, and Alt-hover composes the
   link pointer over an OSC 22 cursor without launching a browser.
 * physical wheel input reaches local history, snaps on the next terminal key,
-  emits terminal mouse reports, and becomes arrows on an untracked alt screen.
+  emits terminal mouse reports, and becomes arrows on an untracked alt screen;
+* physical Page Up/Down walks local history a viewport at a time without
+  reaching the PTY, and forwards the real page key on an alt screen.
 
 Set ROOST_REQUIRE_REAL_INPUT=1 in CI/shed so a missing dependency is a failure.
 ROOST_ICED_BIN and ROOSTCTL may point at shed-local Linux artifacts.
@@ -2057,6 +2059,74 @@ def _terminal_scrollback_routing(launch: Launch) -> None:
     )
 
 
+def _page_history_top(launch: Launch) -> int | None:
+    """The `page-history-NNN` index on the first visible row, if it is one."""
+    rows = launch.client.dump(launch.tab).get("rows_text", [])
+    if not rows or not rows[0].startswith("page-history-"):
+        return None
+    try:
+        return int(rows[0][len("page-history-") :])
+    except ValueError:
+        return None
+
+
+def _terminal_page_key_routing(launch: Launch) -> None:
+    """Drive both shared page-key routes through native XTEST."""
+    rows = "".join(f"page-history-{index:03}\r\n" for index in range(400))
+    launch.client.tab_feed_pty_bytes(
+        launch.tab, b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[2J\x1b[H" + rows.encode()
+    )
+    _wait_until(
+        lambda: "page-history-399"
+        in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
+        "page history fixture at live bottom",
+    )
+    dump = launch.client.dump(launch.tab)
+    viewport_rows = int(dump["rows"])
+    bottom_top = _page_history_top(launch)
+    assert bottom_top is not None, dump
+    launch.client.tab_capture_pty_input(launch.tab, drain=True)
+
+    # X names the page keys `Prior` and `Next`.
+    for count in range(1, 4):
+        launch.key("Prior")
+        expected = bottom_top - viewport_rows * count
+        _wait_until(
+            lambda expected=expected: _page_history_top(launch) == expected,
+            f"physical Page Up {count} reveals one more page of local history",
+        )
+    _assert_no_pty_input(launch, [launch.tab], "local Page Up")
+
+    launch.key("Next")
+    _wait_until(
+        lambda: _page_history_top(launch) == bottom_top - viewport_rows * 2,
+        "physical Page Down walks back toward the live bottom",
+    )
+    _assert_no_pty_input(launch, [launch.tab], "local Page Down")
+
+    launch.key("x")
+    _wait_until(
+        lambda: "page-history-399"
+        in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
+        "terminal key snaps the paged viewport to live bottom",
+    )
+    _wait_until(lambda: _capture_contains(launch, b"x"), "post-page terminal key bytes")
+
+    launch.client.tab_feed_pty_bytes(launch.tab, b"\x1b[?1000l\x1b[?1006l\x1b[?1049h")
+    launch.client.tab_capture_pty_input(launch.tab, drain=True)
+    launch.key("Prior")
+    _wait_until(
+        lambda: _capture_contains(launch, b"\x1b[5~"), "alt-screen Page Up key bytes"
+    )
+    launch.key("Next")
+    _wait_until(
+        lambda: _capture_contains(launch, b"\x1b[6~"), "alt-screen Page Down key bytes"
+    )
+    launch.client.tab_feed_pty_bytes(
+        launch.tab, b"\x1b[?1049l\x1b[?1000l\x1b[?1006l\x1b[2J\x1b[H"
+    )
+
+
 def _drag_copy_and_middle_paste(launch: Launch) -> None:
     marker = f"drag-{uuid.uuid4().hex[:8]}"
     _set_row(launch, marker)
@@ -2287,6 +2357,7 @@ def main() -> int:
         launches.append(off)
         _explicit_copy_and_paste(off)
         _terminal_scrollback_routing(off)
+        _terminal_page_key_routing(off)
         renamed_project, renamed_tab = _keybind_dispatch(off)
         dragged_titles = _direct_tab_reorder(off, renamed_project, renamed_tab)
         _project_lifecycle(off, renamed_project, renamed_tab)
@@ -2348,6 +2419,7 @@ def main() -> int:
         "PASS: configured explicit Copy, plain/bracketed Paste, real-drag "
         "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
         "local/tracked/alternate terminal wheel routing and key snap, "
+        "local page-key scrollback with alt-screen page-key forwarding, "
         "exhaustive shortcut dispatch/repeat suppression, "
         "project/tab inline rename with double-click and click-away, "
         "stable-ID direct tab drag in both directions with persistence, "

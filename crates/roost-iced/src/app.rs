@@ -47,13 +47,14 @@ use roost_ui_model::{
 use roost_url::HoverUrl;
 use roost_vt::{
     key_action, mouse_action, mouse_button, KeyEncoder, KeyEvent, MouseEncoder, MouseEvent,
-    RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions, TerminalScroll,
-    TerminalSelection,
+    PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
+    TerminalScroll, TerminalSelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
 use crate::font_registry::{system_font_registry, FontRegistry};
+use crate::notifications::DesktopNotifications;
 use crate::palette_scroll::Visibility;
 use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
@@ -495,6 +496,20 @@ fn drag_width_is_actionable(collapsed: bool, live_width: f32, width: f32) -> boo
     !collapsed && width != live_width
 }
 
+/// The core half of every focus change: the two ops the UI owes the
+/// workspace, in order. `focus_tab`'s error is also the "is this tab still
+/// there?" guard — a route holding only a `&Workspace` (the notification
+/// banner's click, which arrives with no `&mut App` in hand) gets both from
+/// this one call.
+fn focus_tab_in_core(workspace: &Workspace, tab_id: i64) -> Result<(), String> {
+    workspace
+        .focus_tab(tab_id)
+        .map_err(|error| error.to_string())?;
+    workspace
+        .set_tab_has_notification(tab_id, false)
+        .map_err(|error| error.to_string())
+}
+
 fn clamped_tab_index(current: usize, len: usize, delta: isize) -> Option<usize> {
     if len == 0 || current >= len {
         return None;
@@ -645,6 +660,12 @@ pub enum UiTask {
     OpenUrl {
         url: String,
     },
+    /// A paste found no text on the system clipboard — go look for an
+    /// image. The read + PNG encode block, so this runs off the UI
+    /// thread and reports back as `Message::PasteImageMaterialized`.
+    PasteImageProbe {
+        tab_id: i64,
+    },
     /// One-shot: wake once the file-drop gesture's debounce window has
     /// elapsed. Scheduled where the deadline is set, never polled.
     FileDropDeadline(Duration),
@@ -777,6 +798,7 @@ pub struct App {
     /// row already ran and are answered by their own completion.
     palette_activate_replies: HashMap<u64, PaletteActivateReply>,
     clipboard: ClipboardQueue,
+    desktop_notifications: DesktopNotifications,
     /// A clone of `runtime`'s handle, so a mutation can be spawned onto
     /// the engine runtime from a `&self` method and awaited by an Iced
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
@@ -928,6 +950,7 @@ impl App {
             palette_present_reply: None,
             palette_activate_replies: HashMap::new(),
             clipboard: ClipboardQueue::default(),
+            desktop_notifications: DesktopNotifications::new(runtime.handle(), feed_tx.clone()),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
@@ -1242,6 +1265,22 @@ impl App {
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
             return UiTask::None;
         };
+        // A bare page key scrolls this tab's own scrollback whenever the shared
+        // policy keeps it local — no snap, no encode, nothing on the PTY. The
+        // bypass is the policy's decision, never the key's: `Forward` (mouse
+        // tracking, alternate screen) falls through to the normal encode below.
+        if let Some(direction) = input::bare_page_direction(&event, self.modifiers) {
+            match tab.handle_page(direction) {
+                Ok(PageRoute::LocalViewport { .. }) => return UiTask::None,
+                Ok(PageRoute::Forward) => {}
+                Err(error) => {
+                    // Only the repaint after a completed local move can fail,
+                    // so the key is still consumed; the next refresh recovers.
+                    tracing::warn!(?error, active_tab, "terminal page scroll failed");
+                    return UiTask::None;
+                }
+            }
+        }
         if input::should_snap_for_terminal_input(&event) {
             if let Err(error) = tab.snap_to_bottom_for_input() {
                 tracing::warn!(?error, active_tab, "terminal snap-to-bottom failed");
@@ -2271,12 +2310,7 @@ impl App {
     /// palettes — funnels through here, so this is the one place that owes
     /// them a reconcile.
     fn focus_tab_and_clear(&mut self, tab_id: i64, reveal_sidebar: bool) -> Result<(), String> {
-        self.workspace
-            .focus_tab(tab_id)
-            .map_err(|error| error.to_string())?;
-        self.workspace
-            .set_tab_has_notification(tab_id, false)
-            .map_err(|error| error.to_string())?;
+        focus_tab_in_core(&self.workspace, tab_id)?;
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
         }

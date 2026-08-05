@@ -40,8 +40,8 @@ use pangocairo::functions as pango_cairo;
 use roost_url::HoverUrl;
 use roost_vt::{
     ActiveScreen, Cell, ColorRgb, CursorInfo, CursorVisualStyle, KeyEncoder, MouseEncoder,
-    MouseEvent, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
-    TerminalScroll,
+    MouseEvent, PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal,
+    TerminalOptions, TerminalScroll,
 };
 
 use crate::cell_metrics::{default_font_description, CellMetrics};
@@ -1459,6 +1459,19 @@ impl TerminalView {
                     unshifted,
                 };
                 let mut s = state.borrow_mut();
+                // A bare Page Up/Down scrolls this tab's own scrollback
+                // whenever the shared policy keeps it local — no snap, no
+                // selection clear, no encode. `Forward` (mouse tracking,
+                // alternate screen) falls through to the normal path below,
+                // byte-identical to today's behavior.
+                if let Some(direction) = bare_page_direction(key, mods) {
+                    let route = s.handle_page_key(direction);
+                    if matches!(route, PageRoute::LocalViewport { .. }) {
+                        drop(s);
+                        widget.queue_draw();
+                        return glib::Propagation::Stop;
+                    }
+                }
                 // A bare modifier (incl. the modifier that begins a copy
                 // chord such as Alt+C / Ctrl+Shift+C) must NOT disturb the
                 // selection or the scrollback position: clearing on that
@@ -1954,6 +1967,15 @@ impl TerminalViewState {
             );
             let _ = cr.fill();
         }
+    }
+
+    /// Handle a bare Page Up / Page Down key through the shared scroll
+    /// policy. `Forward` (mouse tracking, alternate screen) leaves the key
+    /// for the normal encode path; `LocalViewport` has already moved the
+    /// viewport, so the caller only needs to schedule a repaint.
+    fn handle_page_key(&mut self, direction: PageDirection) -> PageRoute {
+        self.scroll
+            .route_page(&mut self.terminal, direction, usize::from(self.rows))
     }
 
     /// Handle a single GTK scroll-wheel `dy`. GTK reports negative for
@@ -2773,6 +2795,30 @@ fn is_modifier_key(key: gtk4::gdk::Key) -> bool {
     )
 }
 
+/// The page direction of a bare Page Up / Page Down (or keypad variant)
+/// press, or `None` for anything else. "Bare" excludes Shift/Ctrl/Alt/
+/// Super/Meta; CapsLock's `LOCK_MASK` is deliberately not in the
+/// disqualifying mask, so a locked CapsLock must not demote local paging
+/// to a forwarded key. GDK4's `ModifierType` has no NumLock bit at all
+/// (GTK4 dropped the X11 `MOD2_MASK`), so NumLock can't demote it either.
+fn bare_page_direction(
+    key: gtk4::gdk::Key,
+    mods: gtk4::gdk::ModifierType,
+) -> Option<PageDirection> {
+    use gtk4::gdk::Key as K;
+    use gtk4::gdk::ModifierType as M;
+    let disqualifying =
+        M::SHIFT_MASK | M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::META_MASK;
+    if mods.intersects(disqualifying) {
+        return None;
+    }
+    match key {
+        K::Page_Up | K::KP_Page_Up => Some(PageDirection::Up),
+        K::Page_Down | K::KP_Page_Down => Some(PageDirection::Down),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Inverse + bold-accent resolver tests. The Pass A walk feeds
@@ -2786,6 +2832,148 @@ mod tests {
     fn gtk_scroll_sign_normalizes_up_to_positive_history() {
         assert_eq!(gtk_history_rows(-1.0), 1.0);
         assert_eq!(gtk_history_rows(1.0), -1.0);
+    }
+
+    #[test]
+    fn bare_page_direction_classifies_page_and_keypad_keys() {
+        use gtk4::gdk::Key as K;
+        use gtk4::gdk::ModifierType as M;
+        assert_eq!(
+            bare_page_direction(K::Page_Up, M::empty()),
+            Some(PageDirection::Up)
+        );
+        assert_eq!(
+            bare_page_direction(K::KP_Page_Up, M::empty()),
+            Some(PageDirection::Up)
+        );
+        assert_eq!(
+            bare_page_direction(K::Page_Down, M::empty()),
+            Some(PageDirection::Down)
+        );
+        assert_eq!(
+            bare_page_direction(K::KP_Page_Down, M::empty()),
+            Some(PageDirection::Down)
+        );
+        assert_eq!(bare_page_direction(K::Up, M::empty()), None);
+    }
+
+    #[test]
+    fn bare_page_direction_ignores_lock_modifiers() {
+        use gtk4::gdk::Key as K;
+        use gtk4::gdk::ModifierType as M;
+        // CapsLock's LOCK_MASK must not demote local paging to a forwarded
+        // key. GDK4 has no NumLock bit at all (see bare_page_direction's
+        // doc comment), so there is nothing further to assert for it here.
+        assert_eq!(
+            bare_page_direction(K::Page_Up, M::LOCK_MASK),
+            Some(PageDirection::Up)
+        );
+        assert_eq!(
+            bare_page_direction(K::KP_Page_Down, M::LOCK_MASK),
+            Some(PageDirection::Down)
+        );
+    }
+
+    #[test]
+    fn bare_page_direction_disqualified_by_real_modifiers() {
+        use gtk4::gdk::Key as K;
+        use gtk4::gdk::ModifierType as M;
+        for modifier in [
+            M::SHIFT_MASK,
+            M::CONTROL_MASK,
+            M::ALT_MASK,
+            M::SUPER_MASK,
+            M::META_MASK,
+        ] {
+            assert_eq!(
+                bare_page_direction(K::Page_Up, modifier),
+                None,
+                "{modifier:?} must forward Page_Up"
+            );
+            assert_eq!(
+                bare_page_direction(K::Page_Down, modifier),
+                None,
+                "{modifier:?} must forward Page_Down"
+            );
+        }
+    }
+
+    fn paged_history_terminal() -> Terminal {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 4,
+            max_scrollback: 64,
+        })
+        .expect("terminal");
+        for index in 0..16 {
+            terminal.vt_write(format!("line{index}\r\n").as_bytes());
+        }
+        terminal
+    }
+
+    fn viewport_offset(terminal: &Terminal) -> u64 {
+        terminal.scrollbar().expect("scrollbar").offset
+    }
+
+    // `TerminalViewState::handle_page_key` is `self.scroll.route_page(&mut
+    // self.terminal, direction, usize::from(self.rows))` verbatim.
+    // Constructing a full TerminalViewState needs a realized GTK widget
+    // (pango context, cell metrics) that a headless unit test can't produce,
+    // so these exercise the exact delegation directly against
+    // `TerminalScroll` + `Terminal`, the same style roost-vt's own
+    // route_page suite (crates/roost-vt/src/scroll.rs) uses. Selection
+    // preservation on the local route is therefore verified by inspection
+    // of the key controller closure (the local-route branch returns before
+    // the selection.clear() call) rather than by a state-level assertion.
+    #[test]
+    fn handle_page_key_semantics_walk_local_history_a_full_page_per_call() {
+        let mut terminal = paged_history_terminal();
+        let mut scroll = TerminalScroll::new();
+        let bottom = viewport_offset(&terminal);
+        let rows: u16 = 4;
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, usize::from(rows)),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert_eq!(bottom - viewport_offset(&terminal), 4);
+        assert_eq!(
+            scroll.route_page(&mut terminal, PageDirection::Up, usize::from(rows)),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert_eq!(bottom - viewport_offset(&terminal), 8);
+    }
+
+    #[test]
+    fn handle_page_key_semantics_forward_on_alternate_screen_and_mouse_tracking() {
+        let mut alt_screen = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 4,
+            max_scrollback: 64,
+        })
+        .expect("terminal");
+        alt_screen.vt_write(b"\x1b[?1049h");
+        let mut scroll = TerminalScroll::new();
+        assert_eq!(
+            scroll.route_page(&mut alt_screen, PageDirection::Down, 4),
+            PageRoute::Forward
+        );
+
+        let mut tracking = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 4,
+            max_scrollback: 64,
+        })
+        .expect("terminal");
+        tracking.vt_write(b"\x1b[?1000h");
+        let mut tracking_scroll = TerminalScroll::new();
+        assert_eq!(
+            tracking_scroll.route_page(&mut tracking, PageDirection::Up, 4),
+            PageRoute::Forward
+        );
     }
 
     #[test]

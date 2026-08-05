@@ -1,7 +1,7 @@
 use iced::keyboard::{self, key::Named, Key};
 use roost_ui_model::keybind::{Accel, AccelMods};
 use roost_vt::ffi as ghostty;
-use roost_vt::{key_action, mods, KeyEncoder, KeyEvent, Terminal};
+use roost_vt::{key_action, mods, KeyEncoder, KeyEvent, PageDirection, Terminal};
 
 /// Translate an Iced key press into the toolkit-neutral accelerator grammar.
 /// Physical Latin lookup keeps configured letter bindings usable under a
@@ -74,6 +74,29 @@ pub(crate) fn should_snap_for_terminal_input(event: &keyboard::Event) -> bool {
                 | Named::Super
         )
     )
+}
+
+/// The page direction of an unmodified Page Up / Page Down press, or `None`
+/// for anything else. Any modifier — including Logo — hands the key back to
+/// the application, so only the bare key can reach the local viewport. The
+/// tracked window modifiers are checked alongside the event's own bits so a
+/// held modifier disqualifies the press from either source. Repeats are
+/// deliberately included: holding the key pages repeatedly.
+pub(crate) fn bare_page_direction(
+    event: &keyboard::Event,
+    tracked: keyboard::Modifiers,
+) -> Option<PageDirection> {
+    let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        return None;
+    };
+    if !tracked.is_empty() || !modifiers.is_empty() {
+        return None;
+    }
+    match key {
+        Key::Named(Named::PageUp) => Some(PageDirection::Up),
+        Key::Named(Named::PageDown) => Some(PageDirection::Down),
+        _ => None,
+    }
 }
 
 fn accelerator_key(key: &Key<&str>) -> Option<String> {
@@ -372,6 +395,79 @@ mod tests {
                 modifiers: keyboard::Modifiers::empty(),
             }
         ));
+    }
+
+    #[test]
+    fn only_bare_page_keys_claim_the_local_viewport() {
+        let empty = keyboard::Modifiers::empty();
+        let page_up = key_press(
+            Key::Named(Named::PageUp),
+            Physical::Code(Code::PageUp),
+            empty,
+        );
+        let page_down = key_press(
+            Key::Named(Named::PageDown),
+            Physical::Code(Code::PageDown),
+            empty,
+        );
+        assert_eq!(
+            bare_page_direction(&page_up, empty),
+            Some(PageDirection::Up)
+        );
+        assert_eq!(
+            bare_page_direction(&page_down, empty),
+            Some(PageDirection::Down)
+        );
+        assert_eq!(
+            bare_page_direction(
+                &key_press(
+                    Key::Named(Named::ArrowUp),
+                    Physical::Code(Code::ArrowUp),
+                    empty
+                ),
+                empty
+            ),
+            None
+        );
+
+        for modifier in [
+            keyboard::Modifiers::SHIFT,
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ] {
+            assert_eq!(
+                bare_page_direction(&page_up, modifier),
+                None,
+                "tracked modifier {modifier:?} must not page locally"
+            );
+            assert_eq!(
+                bare_page_direction(
+                    &key_press(
+                        Key::Named(Named::PageUp),
+                        Physical::Code(Code::PageUp),
+                        modifier
+                    ),
+                    empty
+                ),
+                None,
+                "event modifier {modifier:?} must not page locally"
+            );
+        }
+
+        assert_eq!(
+            bare_page_direction(
+                &keyboard::Event::KeyReleased {
+                    key: Key::Named(Named::PageUp),
+                    modified_key: Key::Named(Named::PageUp),
+                    physical_key: Physical::Code(Code::PageUp),
+                    location: Location::Standard,
+                    modifiers: empty,
+                },
+                empty
+            ),
+            None
+        );
     }
 
     #[test]

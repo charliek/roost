@@ -35,12 +35,28 @@ iced = { version = "=0.14.0", default-features = false, features = [
 ] }
 
 anyhow = { workspace = true }
+# Clipboard image reads only — Iced owns the text clipboard. `image-data`
+# hands us raw RGBA (arboard's `image` dep does the decode; the PNG we
+# write is encoded with `png` below); `wayland-data-control` lets the
+# read work on a Wayland compositor with no window focused.
+arboard = { version = "3.6", default-features = false, features = [
+    "image-data",
+    "wayland-data-control",
+] }
 png = "=0.18.1"
 serde_json = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicode-width = { workspace = true }
+
+# The desktop-notification backend is per-OS: this one talks
+# `org.freedesktop.Notifications` over D-Bus. `z-with-tokio` keeps zbus on
+# the app's tokio runtime instead of pulling in async-io/smol.
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.11", default-features = false, features = [
+    "z-with-tokio",
+] }
 
 [dev-dependencies]
 swash = "=0.2.10"

@@ -123,6 +123,8 @@ on the main thread.
 | libghostty-vt        | cgo via `roost-vt` (`--features ffi`)                          | Pinned Ghostty SHA in `third_party/ghostty/build.sh`.                                                |
 | JSON IPC             | `roost-ipc` (server + client + framing + paths + target picker) | Newline-delimited JSON, 16 MiB frame cap; client + server share the wire-types module.               |
 | swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a one-line zero-long-metrics guard (issue #292 — debug SIGABRT when iced/cosmic-text shapes such a font). `README.roost.md` has the delta + removal condition. |
+| notify-rust           | iced-side Linux desktop notifications (`crates/roost-iced`)   | Target-scoped to Linux; `z-with-tokio` = zbus 5 riding the app's existing tokio runtime. macOS backend deliberately absent — issue #303. |
+| arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
 
 If you need a new dependency, prefer Sendable-safe / pure-Rust /
 pure-Swift options. cgo via `roost-vt` is permitted because there's
