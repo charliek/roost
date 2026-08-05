@@ -41,6 +41,7 @@ struct Drag {
 #[derive(Debug, Default)]
 struct State {
     drag: Option<Drag>,
+    last_cursor: Option<Point>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,11 +74,14 @@ fn cursor_in_zone(bounds: Rectangle, seam_x: f32, position: Point) -> bool {
         && (position.x - seam_x).abs() <= GRIP_HALF_WIDTH
 }
 
+fn over_seam_at(layout: Layout<'_>, position: Point) -> bool {
+    seam_x(layout).is_some_and(|seam| cursor_in_zone(layout.bounds(), seam, position))
+}
+
 fn over_seam(layout: Layout<'_>, cursor: mouse::Cursor) -> bool {
     cursor
         .position()
-        .zip(seam_x(layout))
-        .is_some_and(|(position, seam)| cursor_in_zone(layout.bounds(), seam, position))
+        .is_some_and(|position| over_seam_at(layout, position))
 }
 
 fn dragged_width(drag: Drag, x: f32) -> f32 {
@@ -87,10 +91,31 @@ fn dragged_width(drag: Drag, x: f32) -> f32 {
 fn owns_event(
     state: &mut State,
     event: &Event,
-    cursor: Option<Point>,
-    in_zone: bool,
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
     current_width: f32,
 ) -> Ownership {
+    // Recorded before every early return: `ButtonPressed` carries no position
+    // of its own, and iced hit-tests it against the newest cursor of the batch
+    // it was drained with. A frame behind, that is wherever the pointer
+    // travelled *after* the button went down, so the last move the grip
+    // actually saw is the honest press anchor (issue #295). A pointer that
+    // left the window invalidates it — the next entry can land anywhere, and
+    // no move need be observed before the press.
+    match event {
+        Event::Mouse(mouse::Event::CursorMoved { position, .. }) => {
+            state.last_cursor = Some(*position);
+        }
+        Event::Mouse(mouse::Event::CursorLeft) => state.last_cursor = None,
+        _ => {}
+    }
+    // Anchoring only ever *replaces* an available batch cursor. With no cursor
+    // at all the grip has always been a no-op, and a stale anchor must not
+    // start arming presses it used to ignore.
+    let anchored = cursor
+        .position()
+        .map(|batch| state.last_cursor.unwrap_or(batch));
+
     match event {
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
             // A second press during a live drag belongs to the grip too: it
@@ -99,7 +124,7 @@ fn owns_event(
             if state.drag.is_some() {
                 return Ownership::Own(None);
             }
-            let Some(position) = cursor.filter(|_| in_zone) else {
+            let Some(position) = anchored.filter(|position| over_seam_at(layout, *position)) else {
                 return Ownership::Delegate;
             };
             state.drag = Some(Drag {
@@ -204,8 +229,8 @@ impl Widget<Message, iced::Theme, iced::Renderer> for SidebarResizeGrip<'_> {
         match owns_event(
             tree.state.downcast_mut::<State>(),
             event,
-            cursor.position(),
-            over_seam(layout, cursor),
+            layout,
+            cursor,
             self.current_width,
         ) {
             Ownership::Delegate => {}
@@ -323,29 +348,34 @@ mod tests {
         })
     }
 
+    fn left() -> Event {
+        Event::Mouse(mouse::Event::CursorLeft)
+    }
+
     fn dragging() -> State {
         State {
             drag: Some(Drag {
                 start_x: 220.0,
                 start_width: 220.0,
             }),
+            ..State::default()
         }
     }
 
+    /// Drives the real ownership path: the seam zone is computed from
+    /// `sidebar_width`'s layout, never handed in precomputed.
     fn owns(
         state: &mut State,
         event: &Event,
+        sidebar_width: f32,
         cursor_x: Option<f32>,
-        in_zone: bool,
         current_width: f32,
     ) -> Ownership {
-        owns_event(
-            state,
-            event,
-            cursor_x.map(|x| Point::new(x, 20.0)),
-            in_zone,
-            current_width,
-        )
+        let node = split(sidebar_width);
+        let cursor = cursor_x.map_or(mouse::Cursor::Unavailable, |x| {
+            mouse::Cursor::Available(Point::new(x, 20.0))
+        });
+        owns_event(state, event, Layout::new(&node), cursor, current_width)
     }
 
     #[test]
@@ -390,7 +420,7 @@ mod tests {
     fn seam_press_is_owned_and_a_press_elsewhere_is_delegated() {
         let mut state = State::default();
         assert_eq!(
-            owns(&mut state, &press(), Some(221.0), true, 220.0),
+            owns(&mut state, &press(), 220.0, Some(221.0), 220.0),
             Ownership::Own(None)
         );
         assert_eq!(
@@ -403,7 +433,7 @@ mod tests {
 
         let mut elsewhere = State::default();
         assert_eq!(
-            owns(&mut elsewhere, &press(), Some(600.0), false, 220.0),
+            owns(&mut elsewhere, &press(), 220.0, Some(600.0), 220.0),
             Ownership::Delegate
         );
         assert_eq!(elsewhere.drag, None);
@@ -413,31 +443,31 @@ mod tests {
     fn motion_and_release_are_owned_only_while_a_drag_is_live() {
         let mut idle = State::default();
         assert_eq!(
-            owns(&mut idle, &moved(600.0), Some(600.0), false, 220.0),
+            owns(&mut idle, &moved(600.0), 220.0, Some(600.0), 220.0),
             Ownership::Delegate
         );
         assert_eq!(
-            owns(&mut idle, &release(), Some(600.0), false, 220.0),
+            owns(&mut idle, &release(), 220.0, Some(600.0), 220.0),
             Ownership::Delegate
         );
 
         let mut live = dragging();
         assert_eq!(
-            owns(&mut live, &moved(300.0), Some(300.0), false, 220.0),
+            owns(&mut live, &moved(300.0), 220.0, Some(300.0), 220.0),
             Ownership::Own(Some(GripEvent::Dragged { width: 300.0 }))
         );
         // The pointer left the window: the drag still owns the motion.
         assert_eq!(
-            owns(&mut live, &moved(280.0), None, false, 220.0),
+            owns(&mut live, &moved(280.0), 220.0, None, 220.0),
             Ownership::Own(Some(GripEvent::Dragged { width: 280.0 }))
         );
         assert_eq!(
-            owns(&mut live, &release(), None, false, 220.0),
+            owns(&mut live, &release(), 220.0, None, 220.0),
             Ownership::Own(Some(GripEvent::Ended))
         );
         assert_eq!(live.drag, None);
         assert_eq!(
-            owns(&mut live, &release(), None, false, 220.0),
+            owns(&mut live, &release(), 220.0, None, 220.0),
             Ownership::Delegate
         );
     }
@@ -446,7 +476,7 @@ mod tests {
     fn a_move_that_recomputes_the_current_width_owns_without_publishing() {
         let mut live = dragging();
         assert_eq!(
-            owns(&mut live, &moved(220.0), Some(220.0), false, 220.0),
+            owns(&mut live, &moved(220.0), 220.0, Some(220.0), 220.0),
             Ownership::Own(None)
         );
         // Past the clamp bound the width stops moving, so neither does the app.
@@ -455,9 +485,10 @@ mod tests {
                 start_x: 220.0,
                 start_width: MIN_WIDTH,
             }),
+            ..State::default()
         };
         assert_eq!(
-            owns(&mut clamped, &moved(100.0), Some(100.0), false, MIN_WIDTH),
+            owns(&mut clamped, &moved(100.0), 220.0, Some(100.0), MIN_WIDTH),
             Ownership::Own(None)
         );
     }
@@ -467,12 +498,12 @@ mod tests {
         let mut live = dragging();
         let unfocused = Event::Window(window::Event::Unfocused);
         assert_eq!(
-            owns(&mut live, &unfocused, None, false, 220.0),
+            owns(&mut live, &unfocused, 220.0, None, 220.0),
             Ownership::PublishAndDelegate(GripEvent::Ended)
         );
         assert_eq!(live.drag, None);
         assert_eq!(
-            owns(&mut live, &unfocused, None, false, 220.0),
+            owns(&mut live, &unfocused, 220.0, None, 220.0),
             Ownership::Delegate
         );
     }
@@ -483,10 +514,10 @@ mod tests {
             start_x: 220.0,
             start_width: 220.0,
         };
-        for (cursor_x, in_zone) in [(Some(221.0), true), (Some(600.0), false), (None, false)] {
+        for cursor_x in [Some(221.0), Some(600.0), None] {
             let mut live = dragging();
             assert_eq!(
-                owns(&mut live, &press(), cursor_x, in_zone, 300.0),
+                owns(&mut live, &press(), 220.0, cursor_x, 300.0),
                 Ownership::Own(None),
                 "press at {cursor_x:?} during a drag must never reach the content"
             );
@@ -499,7 +530,7 @@ mod tests {
         let mut live = dragging();
         let right_press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right));
         assert_eq!(
-            owns(&mut live, &right_press, Some(220.0), true, 220.0),
+            owns(&mut live, &right_press, 220.0, Some(220.0), 220.0),
             Ownership::Delegate
         );
         assert!(live.drag.is_some());
@@ -511,12 +542,105 @@ mod tests {
         // disagree mid-frame; the press must anchor on the reported width.
         let mut state = State::default();
         assert!(matches!(
-            owns(&mut state, &press(), Some(300.0), true, 300.0),
+            owns(&mut state, &press(), 300.0, Some(300.0), 300.0),
             Ownership::Own { .. }
         ));
         assert_eq!(
-            owns(&mut state, &moved(340.0), Some(340.0), false, 300.0),
+            owns(&mut state, &moved(340.0), 300.0, Some(340.0), 300.0),
             Ownership::Own(Some(GripEvent::Dragged { width: 340.0 }))
         );
+    }
+
+    #[test]
+    fn a_press_is_hit_tested_where_the_last_move_landed_not_at_the_batch_cursor() {
+        // The batch reports 600 for both events — a frame-behind UI drains
+        // the press together with the move that followed it.
+        let mut state = State::default();
+        assert_eq!(
+            owns(&mut state, &moved(221.0), 220.0, Some(600.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(
+            owns(&mut state, &press(), 220.0, Some(600.0), 220.0),
+            Ownership::Own(None)
+        );
+        assert_eq!(
+            state.drag,
+            Some(Drag {
+                start_x: 221.0,
+                start_width: 220.0,
+            })
+        );
+
+        // The inverse: a press whose honest position left the zone must not
+        // be rescued by a batch cursor that drifted back onto the seam.
+        let mut away = State::default();
+        assert_eq!(
+            owns(&mut away, &moved(600.0), 220.0, Some(221.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(
+            owns(&mut away, &press(), 220.0, Some(221.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(away.drag, None);
+    }
+
+    #[test]
+    fn a_press_before_any_move_falls_back_to_the_batch_cursor() {
+        let mut state = State::default();
+        assert_eq!(
+            owns(&mut state, &press(), 220.0, Some(222.0), 220.0),
+            Ownership::Own(None)
+        );
+        assert_eq!(
+            state.drag,
+            Some(Drag {
+                start_x: 222.0,
+                start_width: 220.0,
+            })
+        );
+
+        let mut outside = State::default();
+        assert_eq!(
+            owns(&mut outside, &press(), 220.0, Some(600.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(outside.drag, None);
+    }
+
+    #[test]
+    fn a_pointer_that_left_the_window_drops_the_anchor() {
+        // Re-entering somewhere else and pressing before any move is observed
+        // must not be hit-tested where the pointer used to be.
+        let mut state = State::default();
+        assert_eq!(
+            owns(&mut state, &moved(221.0), 220.0, Some(221.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(
+            owns(&mut state, &left(), 220.0, None, 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(state.last_cursor, None);
+        assert_eq!(
+            owns(&mut state, &press(), 220.0, Some(600.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(state.drag, None);
+    }
+
+    #[test]
+    fn a_press_with_no_batch_cursor_stays_a_no_op_however_fresh_the_anchor() {
+        let mut state = State::default();
+        assert_eq!(
+            owns(&mut state, &moved(221.0), 220.0, Some(221.0), 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(
+            owns(&mut state, &press(), 220.0, None, 220.0),
+            Ownership::Delegate
+        );
+        assert_eq!(state.drag, None);
     }
 }
