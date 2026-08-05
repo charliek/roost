@@ -47,8 +47,8 @@ use roost_ui_model::{
 use roost_url::HoverUrl;
 use roost_vt::{
     key_action, mouse_action, mouse_button, KeyEncoder, KeyEvent, MouseEncoder, MouseEvent,
-    RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions, TerminalScroll,
-    TerminalSelection,
+    PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
+    TerminalScroll, TerminalSelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1242,6 +1242,22 @@ impl App {
         let Some(tab) = self.tabs.get_mut(&active_tab) else {
             return UiTask::None;
         };
+        // A bare page key scrolls this tab's own scrollback whenever the shared
+        // policy keeps it local — no snap, no encode, nothing on the PTY. The
+        // bypass is the policy's decision, never the key's: `Forward` (mouse
+        // tracking, alternate screen) falls through to the normal encode below.
+        if let Some(direction) = input::bare_page_direction(&event, self.modifiers) {
+            match tab.handle_page(direction) {
+                Ok(PageRoute::LocalViewport { .. }) => return UiTask::None,
+                Ok(PageRoute::Forward) => {}
+                Err(error) => {
+                    // Only the repaint after a completed local move can fail,
+                    // so the key is still consumed; the next refresh recovers.
+                    tracing::warn!(?error, active_tab, "terminal page scroll failed");
+                    return UiTask::None;
+                }
+            }
+        }
         if input::should_snap_for_terminal_input(&event) {
             if let Err(error) = tab.snap_to_bottom_for_input() {
                 tracing::warn!(?error, active_tab, "terminal snap-to-bottom failed");

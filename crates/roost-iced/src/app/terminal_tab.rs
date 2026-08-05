@@ -548,6 +548,19 @@ impl TerminalTab {
         Ok(())
     }
 
+    /// Route a Page Up / Page Down press through the shared scroll policy.
+    /// A local page repaints here and reports `LocalViewport` so the caller
+    /// consumes the key; `Forward` leaves the key to the normal encode path.
+    pub(super) fn handle_page(&mut self, direction: PageDirection) -> Result<PageRoute> {
+        let route = self
+            .scroll
+            .route_page(&mut self.terminal, direction, usize::from(self.rows));
+        if matches!(route, PageRoute::LocalViewport { .. }) {
+            self.refresh_snapshot()?;
+        }
+        Ok(route)
+    }
+
     pub(super) fn snap_to_bottom_for_input(&mut self) -> Result<bool> {
         let snapped = self.scroll.snap_to_bottom(&mut self.terminal);
         if snapped {

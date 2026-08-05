@@ -3844,6 +3844,211 @@ mod tests {
         alternate_supervisor.close(193);
     }
 
+    fn page_press(named: Named, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+
+        let code = match named {
+            Named::PageUp => Code::PageUp,
+            _ => Code::PageDown,
+        };
+        keyboard::Event::KeyPressed {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: Physical::Code(code),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    fn encode_page_press(tab: &mut TerminalTab, named: Named, modifiers: keyboard::Modifiers) {
+        let bytes = input::encode_press(
+            &mut tab.encoder,
+            &tab.terminal,
+            page_press(named, modifiers),
+        );
+        tab.session.send_input(bytes);
+    }
+
+    fn captured_input(tab: &TerminalTab) -> Vec<u8> {
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clone()
+    }
+
+    fn clear_captured_input(tab: &TerminalTab) {
+        tab.input_capture.as_ref().unwrap().lock().unwrap().clear();
+    }
+
+    fn viewport_offset(tab: &TerminalTab) -> u64 {
+        tab.terminal.scrollbar().expect("scrollbar").offset
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bare_pages_walk_local_history_without_reaching_the_pty() {
+        let (mut tab, supervisor) = attached_test_terminal(194);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("baseline snapshot");
+        clear_captured_input(&tab);
+        let bottom = viewport_offset(&tab);
+        assert_eq!(tab.dump().rows_text[0], format!("history-{bottom:03}"));
+
+        let page = u64::from(DEFAULT_ROWS);
+        for count in 1..=3 {
+            assert_eq!(
+                tab.handle_page(PageDirection::Up).expect("local page up"),
+                PageRoute::LocalViewport {
+                    scrolled_back: true
+                }
+            );
+            let offset = viewport_offset(&tab);
+            assert_eq!(bottom - offset, page * count, "page {count} moved one page");
+            assert_eq!(
+                tab.dump().rows_text[0],
+                format!("history-{offset:03}"),
+                "the published snapshot follows the local viewport"
+            );
+        }
+        assert!(
+            captured_input(&tab).is_empty(),
+            "a local page must not send anything to the PTY"
+        );
+
+        assert_eq!(
+            tab.handle_page(PageDirection::Down)
+                .expect("local page down"),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert_eq!(bottom - viewport_offset(&tab), page * 2);
+
+        assert!(tab.scroll.is_scrolled_back());
+        assert!(tab
+            .snap_to_bottom_for_input()
+            .expect("snap after local pages"));
+        assert_eq!(viewport_offset(&tab), bottom);
+        assert!(captured_input(&tab).is_empty());
+        supervisor.close(194);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_page_preserves_the_active_selection() {
+        let (mut tab, supervisor) = attached_test_terminal(195);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("baseline snapshot");
+        assert!(tab.selection.set(&tab.terminal, (0, 0), (6, 0)));
+        let selected = tab.selected_text().expect("selection text");
+        assert_eq!(selected.as_deref(), Some("history"));
+
+        assert_eq!(
+            tab.handle_page(PageDirection::Up).expect("local page up"),
+            PageRoute::LocalViewport {
+                scrolled_back: true
+            }
+        );
+        assert!(
+            tab.selection.is_active(),
+            "a local page must not drop the selection"
+        );
+        assert!(
+            tab.snapshot.selection_spans.is_empty(),
+            "the selected rows paged out of the viewport"
+        );
+
+        assert_eq!(
+            tab.handle_page(PageDirection::Down)
+                .expect("local page down"),
+            PageRoute::LocalViewport {
+                scrolled_back: false
+            }
+        );
+        assert_eq!(
+            tab.selected_text().expect("selection survives the page"),
+            selected,
+            "the same cells are selected once they are visible again"
+        );
+        supervisor.close(195);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pages_forward_to_the_application_on_tracking_and_alternate_screen() {
+        let (mut tracked, tracked_supervisor) = attached_test_terminal(196);
+        tracked.write_vt(b"\x1b[?1000h\x1b[?1006h");
+        clear_captured_input(&tracked);
+        assert_eq!(
+            tracked
+                .handle_page(PageDirection::Up)
+                .expect("tracked page"),
+            PageRoute::Forward
+        );
+        encode_page_press(&mut tracked, Named::PageUp, keyboard::Modifiers::empty());
+        assert_eq!(captured_input(&tracked), b"\x1b[5~");
+        tracked_supervisor.close(196);
+
+        let (mut alternate, alternate_supervisor) = attached_test_terminal(197);
+        alternate.write_vt(b"\x1b[?1049h");
+        clear_captured_input(&alternate);
+        assert_eq!(
+            alternate
+                .handle_page(PageDirection::Up)
+                .expect("alternate-screen page up"),
+            PageRoute::Forward
+        );
+        assert!(
+            captured_input(&alternate).is_empty(),
+            "forwarding is the app's encode, not the policy's"
+        );
+        encode_page_press(&mut alternate, Named::PageUp, keyboard::Modifiers::empty());
+        assert_eq!(captured_input(&alternate), b"\x1b[5~");
+
+        clear_captured_input(&alternate);
+        assert_eq!(
+            alternate
+                .handle_page(PageDirection::Down)
+                .expect("alternate-screen page down"),
+            PageRoute::Forward
+        );
+        encode_page_press(
+            &mut alternate,
+            Named::PageDown,
+            keyboard::Modifiers::empty(),
+        );
+        assert_eq!(captured_input(&alternate), b"\x1b[6~");
+        assert!(!alternate.scroll.is_scrolled_back());
+        alternate_supervisor.close(197);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modified_page_keys_stay_on_the_encode_path() {
+        let (mut tab, supervisor) = attached_test_terminal(198);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        clear_captured_input(&tab);
+        let bottom = viewport_offset(&tab);
+
+        assert_eq!(
+            input::bare_page_direction(
+                &page_press(Named::PageUp, keyboard::Modifiers::SHIFT),
+                keyboard::Modifiers::SHIFT
+            ),
+            None
+        );
+        encode_page_press(&mut tab, Named::PageUp, keyboard::Modifiers::SHIFT);
+        assert_eq!(captured_input(&tab), b"\x1b[5;2~");
+        assert_eq!(
+            viewport_offset(&tab),
+            bottom,
+            "a modified page key belongs to the application, not the viewport"
+        );
+        supervisor.close(198);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tracked_middle_gesture_never_falls_through_to_primary_paste() {
         let (mut tab, supervisor) = attached_test_terminal(92);
