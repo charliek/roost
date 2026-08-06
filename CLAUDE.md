@@ -125,6 +125,7 @@ on the main thread.
 | swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a one-line zero-long-metrics guard (issue #292 — debug SIGABRT when iced/cosmic-text shapes such a font). `README.roost.md` has the delta + removal condition. |
 | notify-rust           | iced-side Linux desktop notifications (`crates/roost-iced`)   | Target-scoped to Linux; `z-with-tokio` = zbus 5 riding the app's existing tokio runtime. macOS backend deliberately absent — issue #303. |
 | arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
+| Inter (bundled font)   | `third_party/inter` (`include_bytes!` via `roost-iced`)       | v4.1 static Regular/Medium/SemiBold, SIL OFL 1.1; iced chrome font only (terminal cells keep the configured monospace); single `chrome_font()` seam so a future config swap is small. `README.roost.md` has provenance + removal condition. |
 
 If you need a new dependency, prefer Sendable-safe / pure-Rust /
 pure-Swift options. cgo via `roost-vt` is permitted because there's

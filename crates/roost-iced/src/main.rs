@@ -142,6 +142,10 @@ fn main() -> anyhow::Result<()> {
         .title(WINDOW_TITLE)
         .theme(theme)
         .subscription(subscription)
+        .font(include_bytes!("../../../third_party/inter/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
+        .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
+        .default_font(chrome::chrome_font(iced::font::Weight::Normal))
         .window(window::Settings {
             size: Size::new(1100.0, 720.0),
             min_size: Some(Size::new(640.0, 360.0)),

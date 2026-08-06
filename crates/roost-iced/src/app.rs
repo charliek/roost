@@ -1455,10 +1455,9 @@ impl App {
         };
         let panel = container(
             column![
-                text("Delete project?").size(15).font(Font {
-                    weight: font::Weight::Bold,
-                    ..Font::default()
-                }),
+                text("Delete project?")
+                    .size(15)
+                    .font(chrome::chrome_font(font::Weight::Semibold)),
                 text(format!(
                     "“{}” and all of its tabs will be deleted. This cannot be undone.",
                     confirm.name
@@ -1613,11 +1612,16 @@ impl App {
             }
             sidebar_body = sidebar_body.push(project_group);
         }
-        let sidebar_header = container(text("PROJECTS").size(11).color(chrome::MUTED_TEXT))
-            .height(chrome::BAND_HEIGHT)
-            .width(Fill)
-            .padding([10, 12])
-            .style(chrome::surface);
+        let sidebar_header = container(
+            text("PROJECTS")
+                .size(11)
+                .color(chrome::MUTED_TEXT)
+                .font(chrome::chrome_font(font::Weight::Semibold)),
+        )
+        .height(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([10, 12])
+        .style(chrome::surface);
         let sidebar_footer = container(
             button(text("+ New Project").size(11))
                 .height(chrome::PILL_HEIGHT)
@@ -1720,11 +1724,18 @@ impl App {
                 container(
                     row![
                         dot,
-                        text(title).size(12).color(if active {
-                            chrome::TEXT
-                        } else {
-                            chrome::MUTED_TEXT
-                        })
+                        text(title)
+                            .size(12)
+                            .color(if active {
+                                chrome::TEXT
+                            } else {
+                                chrome::MUTED_TEXT
+                            })
+                            .font(chrome::chrome_font(if active {
+                                font::Weight::Medium
+                            } else {
+                                font::Weight::Normal
+                            }))
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -1918,10 +1929,7 @@ impl App {
                     container(
                         text(project)
                             .size(14)
-                            .font(Font {
-                                weight: font::Weight::Bold,
-                                ..Font::default()
-                            })
+                            .font(chrome::chrome_font(font::Weight::Semibold))
                             .color(primary_color)
                             .wrapping(iced::widget::text::Wrapping::None)
                     )
@@ -1961,10 +1969,7 @@ impl App {
                             },
                         );
                         if run.matched && actionable {
-                            span = span.font(Font {
-                                weight: font::Weight::Semibold,
-                                ..Font::default()
-                            });
+                            span = span.font(chrome::chrome_font(font::Weight::Semibold));
                         }
                         span
                     })

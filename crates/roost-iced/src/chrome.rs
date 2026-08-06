@@ -1,5 +1,5 @@
 use iced::widget::{button, container, scrollable, text_input};
-use iced::{Background, Border, Color, Shadow, Theme, Vector};
+use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
 /// on the same seam. Native window decorations remain outside this geometry.
@@ -15,6 +15,13 @@ pub const TAB_STATUS_SIZE: f32 = 7.0;
 pub const NOTIFICATION_DOT_SIZE: f32 = 8.0;
 pub const PALETTE_WIDTH: f32 = 660.0;
 pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
+
+/// The chrome's bundled sans (`third_party/inter/`, loaded via
+/// `include_bytes!` in `main.rs`). This is the exact name-table family
+/// cosmic-text reports for all three static weights it registers — Regular,
+/// Medium, and SemiBold group under one "Inter" family, so a `Weight` alone
+/// selects the right instance.
+pub const CHROME_FONT_FAMILY: &str = "Inter";
 
 pub const SURFACE: Color = Color::from_rgb8(0x28, 0x28, 0x28);
 pub const SURFACE_DARK: Color = Color::from_rgb8(0x21, 0x21, 0x21);
@@ -34,6 +41,14 @@ pub const PALETTE_MATCH: Color = Color::from_rgb8(0x5f, 0xa3, 0xf0);
 pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
 pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
 pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);
+
+pub fn chrome_font(weight: iced::font::Weight) -> Font {
+    Font {
+        family: iced::font::Family::Name(CHROME_FONT_FAMILY),
+        weight,
+        ..Font::default()
+    }
+}
 
 pub fn surface(_: &Theme) -> container::Style {
     container::Style::default().background(SURFACE)
