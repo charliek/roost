@@ -225,7 +225,11 @@ def test_sidebar_divider_hairline_only_while_expanded(roost, target, tmp_path):
     inside `sidebar_width` (plan 016 W1.3) so the terminal grid keeps every
     pixel the sidebar leaves it — a divider that grew its own layout column
     would still look right but would steal a cell. It is absent when the
-    sidebar is collapsed, like the Mac's NSSplitView divider."""
+    sidebar is collapsed, like the Mac's NSSplitView divider.
+
+    Pixel oracle by design: like the rest of this module (#281/#291), the
+    subject is renderer-only chrome with no textual IPC surface — the
+    narrow, documented exception to roosttest's text-not-pixels rule."""
     if target != "iced":
         pytest.skip("iced chrome hairline; mac uses NSSplitView's divider and gtk has none")
 
