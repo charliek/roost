@@ -43,6 +43,7 @@ use roost_ui_model::{
     keybind::{self, Accel, AccelMods, KeybindAction},
     notification_inbox, palette, provider,
     rollup::project_rollup,
+    window_title,
 };
 use roost_url::HoverUrl;
 use roost_vt::{
@@ -494,6 +495,16 @@ fn effective_sidebar_width(collapsed: bool, width: f32) -> f32 {
 /// every tab for an identical frame.
 fn drag_width_is_actionable(collapsed: bool, live_width: f32, width: f32) -> bool {
     !collapsed && width != live_width
+}
+
+/// Closing the sidebar from a drag past the collapse threshold is the one
+/// collapse that must *not* commit the live drag: the widths that gesture
+/// published all sat at the clamp floor on its way down, so committing would
+/// remember 160 where the user had, say, 300. Dropping the drag leaves the
+/// persisted width untouched and a reopen restores the pre-drag sidebar.
+fn drop_drag_and_collapse(drag_width: &mut Option<f32>, workspace: &Workspace) {
+    *drag_width = None;
+    workspace.set_sidebar_collapsed(true);
 }
 
 /// The core half of every focus change: the two ops the UI owes the
@@ -1455,10 +1466,9 @@ impl App {
         };
         let panel = container(
             column![
-                text("Delete project?").size(15).font(Font {
-                    weight: font::Weight::Bold,
-                    ..Font::default()
-                }),
+                text("Delete project?")
+                    .size(15)
+                    .font(chrome::chrome_font(font::Weight::Semibold)),
                 text(format!(
                     "“{}” and all of its tabs will be deleted. This cannot be undone.",
                     confirm.name
@@ -1530,10 +1540,11 @@ impl App {
                     .iter()
                     .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
             );
+            let notifying = project.tabs.iter().any(|tab| tab.has_notification);
             let stripe = container(
                 iced::widget::Space::new()
                     .width(chrome::PROJECT_STRIPE_WIDTH)
-                    .height(chrome::ROW_HEIGHT),
+                    .height(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_STRIPE_INSET_Y),
             )
             .style(move |_| {
                 let color = if rollup == roost_ipc::agent::AgentLifecycle::Inactive {
@@ -1552,26 +1563,66 @@ impl App {
                         .on_input(Message::RenameDraftChanged)
                         .on_submit(Message::RenameSubmit)
                         .size(13)
+                        // Absolute line height so the editor's total height is
+                        // integral: the default relative line height makes it
+                        // ~18.9px, and centering that inside the pill puts the
+                        // 1px focus border on half-pixels — tiny-skia at scale 1
+                        // then blends the border away (fuzzy on screen, and the
+                        // real-input harness counts exact border pixels).
+                        .line_height(iced::widget::text::LineHeight::Absolute(18.0.into()))
                         .padding([1, 3])
                         .style(chrome::inline_rename_input)
                         .into()
                 }
-                _ => text(&project.name).size(13).into(),
+                // Label leading, notification-dot slot trailing: the spacer
+                // holds that slot open against the pill's trailing inset
+                // (`PROJECT_DOT_INSET`, matched by the pill container's own
+                // right padding — chrome::badge lands 8px from the pill's
+                // right edge for free). The rename editor keeps the whole
+                // pill instead — a fill spacer beside it would halve the
+                // field, and no dot renders beside the editor.
+                _ => {
+                    let mut label_row = row![
+                        text(&project.name).size(13),
+                        iced::widget::Space::new().width(Fill)
+                    ]
+                    .align_y(Alignment::Center);
+                    if notifying {
+                        label_row = label_row.push(
+                            container(
+                                iced::widget::Space::new()
+                                    .width(chrome::NOTIFICATION_DOT_SIZE)
+                                    .height(chrome::NOTIFICATION_DOT_SIZE),
+                            )
+                            .style(chrome::badge),
+                        );
+                    }
+                    label_row.width(Fill).into()
+                }
             };
             let project_pill = container(project_label)
                 .width(Fill)
-                .height(chrome::ROW_HEIGHT)
-                .padding([3.0, chrome::PROJECT_LABEL_INSET])
+                .center_y(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_PILL_INSET_Y)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: chrome::PROJECT_DOT_INSET,
+                    bottom: 0.0,
+                    left: chrome::PROJECT_LABEL_INSET,
+                })
                 .style(chrome::project_pill(
                     project.id == active_project,
                     dragged_project == Some(project.id),
                 ));
+            // The rail sits at the row's leading edge, inside the pill's own
+            // 6px inset — the two never overlap, so a plain row places both
+            // without a stack layer between the strip and its rows.
             let project_row = container(
                 row![
                     stripe,
-                    iced::widget::Space::new().width(chrome::PROJECT_STRIPE_GAP),
+                    iced::widget::Space::new()
+                        .width(chrome::PROJECT_PILL_INSET_X - chrome::PROJECT_STRIPE_WIDTH),
                     project_pill,
-                    iced::widget::Space::new().width(chrome::PROJECT_RIGHT_INSET)
+                    iced::widget::Space::new().width(chrome::PROJECT_PILL_INSET_X)
                 ]
                 .align_y(Alignment::Center),
             )
@@ -1613,23 +1664,28 @@ impl App {
             }
             sidebar_body = sidebar_body.push(project_group);
         }
-        let sidebar_header = container(text("PROJECTS").size(11).color(chrome::MUTED_TEXT))
-            .height(chrome::BAND_HEIGHT)
-            .width(Fill)
-            .padding([10, 12])
-            .style(chrome::surface);
+        let sidebar_header = container(
+            text("PROJECTS")
+                .size(11)
+                .color(chrome::MUTED_TEXT)
+                .font(chrome::chrome_font(font::Weight::Semibold)),
+        )
+        .center_y(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([0, 12])
+        .style(chrome::band);
         let sidebar_footer = container(
-            button(text("+ New Project").size(11))
+            button(text("+ New Project").size(13))
                 .height(chrome::PILL_HEIGHT)
-                .padding([4, 12])
+                .padding([3, 12])
                 .style(chrome::footer_chip_button)
                 .on_press(Message::NewProject),
         )
         .height(chrome::BAND_HEIGHT)
         .width(Fill)
         .center_x(Fill)
-        .padding([5, 8])
-        .style(chrome::surface);
+        .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
+        .style(chrome::band);
         // The strip delegates layout to its content, so its layout node is the
         // column's: one child per project group, which is what the gesture's
         // hit-testing and target index walk.
@@ -1639,14 +1695,22 @@ impl App {
             self.project_strip_generation,
             self.strip_gestures_enabled(),
         );
+        // The hairline lives inside the sidebar's own width — the outer
+        // container paints it and pads the three region fills off it — so the
+        // terminal grid keeps every pixel `sidebar_width` leaves it and the
+        // resize grip's seam still lands on the sidebar's right edge.
         let sidebar = container(column![
             sidebar_header,
-            scrollable(project_strip).height(Fill),
+            container(scrollable(project_strip).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(chrome::list),
             sidebar_footer
         ])
         .width(self.live_sidebar_width())
         .height(Fill)
-        .style(chrome::surface);
+        .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
+        .style(chrome::divider);
 
         let active_project_model = self
             .projects
@@ -1707,6 +1771,9 @@ impl App {
                             .on_submit(Message::RenameSubmit)
                             .width(140)
                             .size(12)
+                            // Same integral-height rationale as the project
+                            // rename editor above.
+                            .line_height(iced::widget::text::LineHeight::Absolute(18.0.into(),))
                             .padding([1, 3])
                             .style(chrome::inline_rename_input)
                     ]
@@ -1720,11 +1787,18 @@ impl App {
                 container(
                     row![
                         dot,
-                        text(title).size(12).color(if active {
-                            chrome::TEXT
-                        } else {
-                            chrome::MUTED_TEXT
-                        })
+                        text(title)
+                            .size(12)
+                            .color(if active {
+                                chrome::TEXT
+                            } else {
+                                chrome::MUTED_TEXT
+                            })
+                            .font(chrome::chrome_font(if active {
+                                font::Weight::Medium
+                            } else {
+                                font::Weight::Normal
+                            }))
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -1773,62 +1847,36 @@ impl App {
             self.tab_strip_generation,
             self.strip_gestures_enabled(),
         );
+        let add_tab_button = button(text("+").size(16).color(chrome::MUTED_TEXT))
+            .width(chrome::PILL_HEIGHT)
+            .height(chrome::PILL_HEIGHT)
+            .padding(1)
+            .style(chrome::transparent_button)
+            .on_press(Message::NewTab);
+        // The `+` is a sibling of the strip — never inside its content, since
+        // the strip walks its own layout children for reorder hit-testing and
+        // an extra child there would corrupt the drag target index. As a
+        // sibling row inside the scrollable it hugs the last pill and scrolls
+        // with overflow (Mac parity: the Mac's trailing ＋ scrolls with the
+        // strip too; under overflow it scrolls offscreen — accepted, #281).
+        let tab_strip_row = row![tab_strip, add_tab_button]
+            .spacing(6)
+            .align_y(Alignment::Center);
         // A zero-width scrollbar: any visible indicator overlays the 24px
         // pills themselves and reads as a band across the tab row (#281) —
         // the stock 10px filled rail, and even a 2px hover sliver, both did.
         // Wheel/trackpad scrolling is independent of the scrollbar's size.
-        let tab_scroller = scrollable(tab_strip)
+        let tab_scroller = scrollable(tab_strip_row)
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::hidden(),
             ))
             .width(Fill)
             .height(chrome::PILL_HEIGHT);
-        let mut tabs = row![].spacing(5).align_y(Alignment::Center);
-        if collapsed {
-            tabs = tabs.push(
-                button(text("☰").size(13))
-                    .width(chrome::PILL_HEIGHT)
-                    .height(chrome::PILL_HEIGHT)
-                    .padding(2)
-                    .style(chrome::transparent_button)
-                    .on_press(Message::ToggleSidebar),
-            );
-        }
-        tabs = tabs.push(tab_scroller).push(
-            button(text("+").size(15))
-                .width(chrome::PILL_HEIGHT)
-                .height(chrome::PILL_HEIGHT)
-                .padding(1)
-                .style(chrome::transparent_button)
-                .on_press(Message::NewTab),
-        );
-        let notification_count = self.notification_inbox.count();
-        let notification_label = if notification_count == 0 {
-            "○".to_string()
-        } else {
-            format!("•{}", notification_count.min(99))
-        };
-        tabs = tabs.push(
-            button(
-                text(notification_label)
-                    .size(11)
-                    .color(if notification_count == 0 {
-                        chrome::MUTED_TEXT
-                    } else {
-                        chrome::NOTIFICATION
-                    }),
-            )
-            .width(chrome::PILL_HEIGHT)
-            .height(chrome::PILL_HEIGHT)
-            .padding(2)
-            .style(chrome::transparent_button)
-            .on_press(Message::OpenNotifications),
-        );
-        let tab_bar = container(tabs)
+        let tab_bar = container(tab_scroller)
             .height(chrome::BAND_HEIGHT)
             .width(Fill)
-            .padding([5, 8])
-            .style(chrome::dark_surface);
+            .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
+            .style(chrome::band);
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
@@ -1918,10 +1966,7 @@ impl App {
                     container(
                         text(project)
                             .size(14)
-                            .font(Font {
-                                weight: font::Weight::Bold,
-                                ..Font::default()
-                            })
+                            .font(chrome::chrome_font(font::Weight::Semibold))
                             .color(primary_color)
                             .wrapping(iced::widget::text::Wrapping::None)
                     )
@@ -1961,10 +2006,7 @@ impl App {
                             },
                         );
                         if run.matched && actionable {
-                            span = span.font(Font {
-                                weight: font::Weight::Semibold,
-                                ..Font::default()
-                            });
+                            span = span.font(chrome::chrome_font(font::Weight::Semibold));
                         }
                         span
                     })
@@ -2069,13 +2111,6 @@ impl App {
         let _ = self.focus_tab_and_clear(tab_id, true);
     }
 
-    pub fn open_notifications(&mut self) -> UiTask {
-        if let Err(error) = self.open_palette("notifications") {
-            self.set_status(error);
-        }
-        self.take_palette_focus_task()
-    }
-
     pub fn toggle_sidebar(&mut self) {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
@@ -2098,6 +2133,20 @@ impl App {
         self.commit_sidebar_drag();
     }
 
+    /// The grip dragged the seam past the collapse threshold. Same discipline
+    /// as `toggle_sidebar` — the sidebar leaves the tree, so anything anchored
+    /// in it is stranded — but the drag itself is dropped, not committed, and
+    /// dropped *first*: both `cancel_drags` and `set_sidebar_collapsed` commit
+    /// a live drag, and committing here would pin the remembered width at the
+    /// clamp floor the gesture last published instead of the width the sidebar
+    /// had before it started.
+    pub fn sidebar_drag_collapsed(&mut self) {
+        drop_drag_and_collapse(&mut self.sidebar_drag_width, &self.workspace);
+        self.cancel_drags();
+        self.cancel_editor_for_interaction();
+        self.resize(self.window_size);
+    }
+
     fn commit_sidebar_drag(&mut self) {
         if let Some(width) = self.sidebar_drag_width.take() {
             self.workspace.set_sidebar_width(f64::from(width));
@@ -2109,6 +2158,9 @@ impl App {
         // still live never publishes its end. Commit first so the width the
         // session shows is the width a relaunch restores. Expanding keeps the
         // grip, so a drag in flight there is still the widget's to finish.
+        // The one collapse that does not come through here is the grip's own
+        // drag-to-collapse (`sidebar_drag_collapsed`), which drops that drag
+        // rather than committing a width the user dragged away from.
         if collapsed {
             self.commit_sidebar_drag();
         }
@@ -2323,6 +2375,31 @@ impl App {
         Ok(())
     }
 
+    /// The window title, recomposed from live state on every update batch
+    /// (iced's `window::State::synchronize` re-calls the title fn and only
+    /// touches the OS window when the string changed).
+    ///
+    /// Mirrors the Mac's priority: the active tab's cwd — which OSC 7 keeps
+    /// current through `Workspace::set_tab_cwd` — falling back to the
+    /// project's static cwd before a tab has reported one. The native
+    /// foreground-process lookup `launch_cwd` uses is deliberately not
+    /// consulted here: this runs every batch, and the Mac subtitle tracks
+    /// OSC 7 only.
+    pub fn window_title(&self, home: &str) -> String {
+        let (project_id, tab_id) = self.workspace.active();
+        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
+            return window_title::DEFAULT_WINDOW_TITLE.to_string();
+        };
+        let cwd = project
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.cwd.as_str())
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or(project.cwd.as_str());
+        window_title::window_title(&project.name, cwd, home)
+    }
+
     fn launch_cwd(&self, project_id: i64) -> String {
         let active_tab = self.workspace.active().1;
         if let Some(native) = self.supervisor.foreground_cwd(active_tab) {
@@ -2474,10 +2551,8 @@ impl Message {
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
             Self::NewTab => return app.new_tab(),
             Self::NewProject => return app.new_project(),
-            Self::ToggleSidebar => app.toggle_sidebar(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
-            Self::OpenNotifications => return app.open_notifications(),
             _ => {}
         }
         UiTask::None
@@ -2511,6 +2586,37 @@ mod tests {
 
         assert!(drag_width_is_actionable(false, 220.0, 320.0));
         assert!(!drag_width_is_actionable(false, 320.0, 320.0));
+    }
+
+    #[test]
+    fn a_drag_collapse_drops_the_live_width_so_a_reopen_restores_the_pre_drag_one() {
+        let workspace = Workspace::new();
+        workspace.set_sidebar_width(300.0);
+
+        // What the app holds when the grip publishes `Collapse`: the drag's
+        // last actionable width, pinned at the clamp floor on its way down.
+        let mut drag_width = Some(160.0);
+        drop_drag_and_collapse(&mut drag_width, &workspace);
+
+        assert_eq!(drag_width, None, "the live drag is dropped, not committed");
+        assert!(workspace.sidebar_collapsed());
+        assert_eq!(
+            workspace.sidebar_width(),
+            300.0,
+            "reopening restores the width the sidebar had before the drag"
+        );
+        assert_eq!(
+            effective_sidebar_width(workspace.sidebar_collapsed(), 300.0),
+            0.0
+        );
+
+        // The contrast that motivates the separate path: committing first —
+        // what every other collapse does — would remember the floor.
+        let committing = Workspace::new();
+        committing.set_sidebar_width(300.0);
+        committing.set_sidebar_width(160.0);
+        committing.set_sidebar_collapsed(true);
+        assert_eq!(committing.sidebar_width(), 160.0);
     }
 
     #[test]

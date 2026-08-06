@@ -1,23 +1,55 @@
 use iced::widget::{button, container, scrollable, text_input};
-use iced::{Background, Border, Color, Shadow, Theme, Vector};
+use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
 /// One application-owned band height keeps the sidebar header and tab strip
 /// on the same seam. Native window decorations remain outside this geometry.
-pub const BAND_HEIGHT: f32 = 34.0;
-pub const ROW_HEIGHT: f32 = 28.0;
+pub const BAND_HEIGHT: f32 = 32.0;
+pub const ROW_HEIGHT: f32 = 32.0;
 pub const PILL_HEIGHT: f32 = 24.0;
+/// Vertical padding that centers a `PILL_HEIGHT` pill inside a `BAND_HEIGHT`
+/// band — shared by the sidebar footer and the tab strip so both bands stay
+/// in sync if either height changes.
+pub const BAND_PILL_PADDING_Y: f32 = (BAND_HEIGHT - PILL_HEIGHT) / 2.0;
+/// The agent-rollup rail: 3px at the project row's leading edge, gapped 5px
+/// top and bottom (Mac `SidebarRowView.drawBackground`, App.swift:5402-5405)
+/// so adjacent active projects read as discrete segments rather than one
+/// merged bar. It lives entirely inside the selection pill's leading inset,
+/// so rail and pill never overlap.
 pub const PROJECT_STRIPE_WIDTH: f32 = 3.0;
-pub const PROJECT_STRIPE_GAP: f32 = 11.0;
-pub const PROJECT_LABEL_INSET: f32 = 10.0;
-pub const PROJECT_RIGHT_INSET: f32 = 8.0;
+pub const PROJECT_STRIPE_INSET_Y: f32 = 5.0;
+/// The selection pill is inset from the row's bounds on all four sides
+/// (Mac `bounds.insetBy(dx: 6, dy: 1)`, App.swift:5419).
+pub const PROJECT_PILL_INSET_X: f32 = 6.0;
+pub const PROJECT_PILL_INSET_Y: f32 = 1.0;
+/// Label leading inset and notification-dot trailing inset, both measured
+/// from the pill's own edges. The label inset is what puts the project name
+/// on the same left edge as the agent rows nested under it.
+pub const PROJECT_LABEL_INSET: f32 = 18.0;
+pub const PROJECT_DOT_INSET: f32 = 8.0;
 pub const AGENT_DOT_INSET: f32 = 25.0;
 pub const TAB_STATUS_SIZE: f32 = 7.0;
 pub const NOTIFICATION_DOT_SIZE: f32 = 8.0;
 pub const PALETTE_WIDTH: f32 = 660.0;
 pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
 
-pub const SURFACE: Color = Color::from_rgb8(0x28, 0x28, 0x28);
-pub const SURFACE_DARK: Color = Color::from_rgb8(0x21, 0x21, 0x21);
+/// The chrome's bundled sans (`third_party/inter/`, loaded via
+/// `include_bytes!` in `main.rs`). This is the exact name-table family
+/// cosmic-text reports for all three static weights it registers — Regular,
+/// Medium, and SemiBold group under one "Inter" family, so a `Weight` alone
+/// selects the right instance.
+pub const CHROME_FONT_FAMILY: &str = "Inter";
+
+/// The one solid chrome band: sidebar header, sidebar footer, tab band.
+pub const BAND: Color = Color::from_rgb8(0x24, 0x29, 0x2c);
+/// The sidebar's scrollable project list, one step lighter than the bands.
+pub const LIST: Color = Color::from_rgb8(0x2d, 0x32, 0x35);
+/// Hairline between the sidebar and the terminal, drawn inside the sidebar's
+/// own width so the terminal grid keeps every pixel it is sized for.
+pub const DIVIDER: Color = Color::from_rgb8(0x1a, 0x1d, 0x1e);
+pub const DIVIDER_WIDTH: f32 = 1.0;
+pub const FOOTER_CHIP: Color = Color::from_rgb8(0x34, 0x39, 0x3c);
+pub const FOOTER_CHIP_HOVER: Color = Color::from_rgb8(0x3e, 0x44, 0x47);
+pub const FOOTER_CHIP_PRESSED: Color = Color::from_rgb8(0x2a, 0x2f, 0x32);
 pub const ACTIVE_BLUE: Color = Color::from_rgb8(0x13, 0x50, 0x9d);
 pub const ACTIVE_TAB: Color = Color::from_rgb8(0x24, 0x37, 0x51);
 pub const HOVER: Color = Color::from_rgb8(0x39, 0x39, 0x39);
@@ -35,12 +67,24 @@ pub const ERROR_TEXT: Color = Color::from_rgb8(0xee, 0x78, 0x78);
 pub const DANGER: Color = Color::from_rgb8(0x8a, 0x2a, 0x2a);
 pub const DANGER_ACCENT: Color = Color::from_rgb8(0xa8, 0x33, 0x33);
 
-pub fn surface(_: &Theme) -> container::Style {
-    container::Style::default().background(SURFACE)
+pub fn chrome_font(weight: iced::font::Weight) -> Font {
+    Font {
+        family: iced::font::Family::Name(CHROME_FONT_FAMILY),
+        weight,
+        ..Font::default()
+    }
 }
 
-pub fn dark_surface(_: &Theme) -> container::Style {
-    container::Style::default().background(SURFACE_DARK)
+pub fn band(_: &Theme) -> container::Style {
+    container::Style::default().background(BAND)
+}
+
+pub fn list(_: &Theme) -> container::Style {
+    container::Style::default().background(LIST)
+}
+
+pub fn divider(_: &Theme) -> container::Style {
+    container::Style::default().background(DIVIDER)
 }
 
 /// Both strips share one drag affordance, so the dragged row and the dragged
@@ -75,7 +119,7 @@ pub fn badge(_: &Theme) -> container::Style {
 }
 
 pub fn project_pill(active: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| pill(ACTIVE_BLUE, 5.0, active, dragging)
+    move |_| pill(ACTIVE_BLUE, 6.0, active, dragging)
 }
 
 pub fn agent_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
@@ -91,10 +135,10 @@ pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
 /// rather than the flat text buttons used elsewhere in the chrome.
 pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
     let background = match status {
-        button::Status::Hovered => PALETTE_SELECTION,
-        button::Status::Pressed => ACTIVE_TAB,
-        button::Status::Active => ACTIVE_AGENT,
-        button::Status::Disabled => ACTIVE_AGENT.scale_alpha(0.5),
+        button::Status::Hovered => FOOTER_CHIP_HOVER,
+        button::Status::Pressed => FOOTER_CHIP_PRESSED,
+        button::Status::Active => FOOTER_CHIP,
+        button::Status::Disabled => FOOTER_CHIP.scale_alpha(0.5),
     };
     button::Style {
         background: Some(Background::Color(background)),
@@ -278,6 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn chrome_regions_split_into_one_band_color_and_one_list_color() {
+        let theme = Theme::Dark;
+        assert_eq!(band(&theme).background, Some(Background::Color(BAND)));
+        assert_eq!(list(&theme).background, Some(Background::Color(LIST)));
+        assert_eq!(divider(&theme).background, Some(Background::Color(DIVIDER)));
+        assert_ne!(BAND, LIST, "the list region reads lighter than the bands");
+        assert_eq!(DIVIDER_WIDTH, 1.0);
+    }
+
+    #[test]
+    fn footer_chip_rests_on_a_filled_bezel_and_dims_when_disabled() {
+        let theme = Theme::Dark;
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Active).background,
+            Some(Background::Color(FOOTER_CHIP))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Hovered).background,
+            Some(Background::Color(FOOTER_CHIP_HOVER))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Pressed).background,
+            Some(Background::Color(FOOTER_CHIP_PRESSED))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Disabled).background,
+            Some(Background::Color(FOOTER_CHIP.scale_alpha(0.5)))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Active).text_color,
+            TEXT
+        );
+    }
+
+    #[test]
     fn inactive_controls_are_transparent_until_hovered() {
         let theme = Theme::Dark;
         assert_eq!(
@@ -292,10 +371,24 @@ mod tests {
 
     #[test]
     fn project_and_agent_content_share_the_reference_left_edge() {
-        let project_text = PROJECT_STRIPE_WIDTH + PROJECT_STRIPE_GAP + PROJECT_LABEL_INSET;
+        let project_text = PROJECT_PILL_INSET_X + PROJECT_LABEL_INSET;
         assert!((project_text - AGENT_DOT_INSET).abs() <= 1.0);
         assert_eq!(TAB_STATUS_SIZE, 7.0);
         assert_eq!(NOTIFICATION_DOT_SIZE, 8.0);
+    }
+
+    #[test]
+    fn row_and_band_metrics_center_their_content() {
+        assert_eq!(BAND_PILL_PADDING_Y, 4.0, "4px above and below a pill");
+        // The pill is inset inside the row, the rail is gapped inside it, and
+        // the rail stops short of where the pill begins.
+        assert_eq!(ROW_HEIGHT - 2.0 * PROJECT_PILL_INSET_Y, 30.0);
+        assert_eq!(ROW_HEIGHT - 2.0 * PROJECT_STRIPE_INSET_Y, 22.0);
+        assert_eq!(
+            PROJECT_PILL_INSET_X - PROJECT_STRIPE_WIDTH,
+            3.0,
+            "the rail clears the pill's leading edge"
+        );
     }
 
     #[test]

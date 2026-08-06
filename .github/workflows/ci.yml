@@ -541,8 +541,10 @@ jobs:
           tools/roosttest/test_notifications.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_tab_strip_pixels.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
+          tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
           tools/roosttest/test_selection.py
@@ -584,8 +586,10 @@ jobs:
           tools/roosttest/test_notifications.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_tab_strip_pixels.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
+          tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
           --roost-target iced --roost-fresh -v
@@ -606,8 +610,10 @@ jobs:
           tools/roosttest/test_notifications.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
+          tools/roosttest/test_tab_strip_pixels.py
           tools/roosttest/test_focus.py
           tools/roosttest/test_palette.py
+          tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
           tools/roosttest/test_selection.py

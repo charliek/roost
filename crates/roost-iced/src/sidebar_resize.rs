@@ -18,6 +18,10 @@ const GRIP_HALF_WIDTH: f32 = 3.0;
 const MIN_WIDTH: f32 = SIDEBAR_MIN_WIDTH as f32;
 const MAX_WIDTH: f32 = SIDEBAR_MAX_WIDTH as f32;
 
+/// Unclamped width at which a drag stops being a resize and becomes a
+/// collapse — NSSplitView snaps closed well past its floor rather than at it.
+const COLLAPSE_THRESHOLD: f32 = MIN_WIDTH / 2.0;
+
 pub(crate) struct SidebarResizeGrip<'a> {
     content: Element<'a, Message>,
     current_width: f32,
@@ -46,8 +50,13 @@ struct State {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum GripEvent {
-    Dragged { width: f32 },
+    Dragged {
+        width: f32,
+    },
     Ended,
+    /// The pointer went far enough past the floor to close the sidebar. Ends
+    /// the gesture too — the grip leaves the tree with the sidebar.
+    Collapse,
 }
 
 /// `capture_event` alone does not stop delegation, so ownership has to be
@@ -84,8 +93,15 @@ fn over_seam(layout: Layout<'_>, cursor: mouse::Cursor) -> bool {
         .is_some_and(|position| over_seam_at(layout, position))
 }
 
+/// Where the pointer actually is, before the engine's bounds are applied.
+/// The clamped width hides everything below the floor, so the collapse
+/// decision has to read this instead.
+fn unclamped_width(drag: Drag, x: f32) -> f32 {
+    drag.start_width + (x - drag.start_x)
+}
+
 fn dragged_width(drag: Drag, x: f32) -> f32 {
-    (drag.start_width + (x - drag.start_x)).clamp(MIN_WIDTH, MAX_WIDTH)
+    unclamped_width(drag, x).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
 fn owns_event(
@@ -140,6 +156,15 @@ fn owns_event(
         // the window, where `mouse::Cursor` reports nothing.
         Event::Mouse(mouse::Event::CursorMoved { position, .. }) => match state.drag {
             Some(drag) => {
+                // Ordering is the contract: the collapse is decided before the
+                // clamped width is published, so no `Dragged { 160 }` can
+                // follow the close, and the drag is dropped in the same arm so
+                // no later move in this batch (or the next) publishes a width
+                // for a sidebar that is already gone.
+                if unclamped_width(drag, position.x) < COLLAPSE_THRESHOLD {
+                    state.drag = None;
+                    return Ownership::Own(Some(GripEvent::Collapse));
+                }
                 // A pointer travelling past a clamp bound recomputes the same
                 // width every move; publishing it would request a redraw per
                 // move for a frame that cannot differ.
@@ -171,6 +196,7 @@ fn grip_message(event: GripEvent) -> Message {
     match event {
         GripEvent::Dragged { width } => Message::SidebarResizeDragged { width },
         GripEvent::Ended => Message::SidebarResizeEnded,
+        GripEvent::Collapse => Message::SidebarDragCollapsed,
     }
 }
 
@@ -411,12 +437,80 @@ mod tests {
         assert_eq!(dragged_width(drag, 100.0), MIN_WIDTH);
         assert_eq!(dragged_width(drag, 900.0), MAX_WIDTH);
 
+        // The clamp is what hides sub-floor travel; the collapse decision
+        // reads the raw width instead.
+        assert_eq!(unclamped_width(drag, 100.0), 100.0);
+        assert_eq!(unclamped_width(drag, 900.0), 900.0);
+
         // A drag started off-center keeps the grab offset.
         let offset = Drag {
             start_x: 222.0,
             start_width: 220.0,
         };
         assert_eq!(dragged_width(offset, 262.0), 260.0);
+    }
+
+    #[test]
+    fn a_drag_past_the_collapse_threshold_publishes_collapse_and_ends_the_gesture() {
+        // start_width 220 at start_x 220 → the pointer's x *is* the unclamped
+        // width. 79 is the first position below the 80px threshold.
+        let mut live = dragging();
+        assert_eq!(
+            owns(&mut live, &moved(79.0), 220.0, Some(79.0), MIN_WIDTH),
+            Ownership::Own(Some(GripEvent::Collapse))
+        );
+        assert_eq!(
+            live.drag, None,
+            "the collapse ends the gesture — the grip leaves the tree with the sidebar"
+        );
+    }
+
+    #[test]
+    fn a_drag_at_or_above_the_threshold_still_clamps_to_the_floor() {
+        for x in [80.0, 81.0, 120.0] {
+            let mut live = dragging();
+            assert_eq!(
+                owns(&mut live, &moved(x), 220.0, Some(x), 220.0),
+                Ownership::Own(Some(GripEvent::Dragged { width: MIN_WIDTH })),
+                "an unclamped width of {x} is still a resize, not a collapse"
+            );
+            assert!(live.drag.is_some(), "the gesture stays live at {x}");
+        }
+    }
+
+    #[test]
+    fn no_width_is_published_after_a_collapse_in_the_same_batch() {
+        let mut live = dragging();
+        assert_eq!(
+            owns(&mut live, &moved(40.0), 220.0, Some(40.0), MIN_WIDTH),
+            Ownership::Own(Some(GripEvent::Collapse))
+        );
+        // Whatever the rest of the batch does — further travel, or a swing
+        // back over the old seam — the drag is gone, so nothing publishes.
+        assert_eq!(
+            owns(&mut live, &moved(20.0), 220.0, Some(20.0), MIN_WIDTH),
+            Ownership::Delegate
+        );
+        assert_eq!(
+            owns(&mut live, &moved(300.0), 220.0, Some(300.0), MIN_WIDTH),
+            Ownership::Delegate
+        );
+    }
+
+    #[test]
+    fn the_release_left_dangling_by_a_collapse_is_delegated() {
+        // The real tree drops the grip on collapse, so this release never
+        // reaches it; in a tree that still has one it must behave like any
+        // release with no live drag — no `Ended`, content's to handle.
+        let mut live = dragging();
+        assert_eq!(
+            owns(&mut live, &moved(40.0), 220.0, Some(40.0), MIN_WIDTH),
+            Ownership::Own(Some(GripEvent::Collapse))
+        );
+        assert_eq!(
+            owns(&mut live, &release(), 220.0, Some(40.0), MIN_WIDTH),
+            Ownership::Delegate
+        );
     }
 
     #[test]
@@ -482,7 +576,9 @@ mod tests {
             owns(&mut live, &moved(220.0), 220.0, Some(220.0), 220.0),
             Ownership::Own(None)
         );
-        // Past the clamp bound the width stops moving, so neither does the app.
+        // Between the clamp bound and the collapse threshold the width stops
+        // moving, so neither does the app. (Below the threshold it is a
+        // collapse instead — see the drag-past-the-threshold tests.)
         let mut clamped = State {
             drag: Some(Drag {
                 start_x: 220.0,
@@ -491,7 +587,7 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            owns(&mut clamped, &moved(100.0), 220.0, Some(100.0), MIN_WIDTH),
+            owns(&mut clamped, &moved(190.0), 220.0, Some(190.0), MIN_WIDTH),
             Ownership::Own(None)
         );
     }

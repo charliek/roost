@@ -51,9 +51,13 @@ SCALE = float(os.environ.get("ROOST_TEST_TIMEOUT_SCALE", "1") or "1")
 # Sidebar project rows: chrome::ROW_HEIGHT, the sidebar body column's spacing,
 # and its `padding([4, 0])` top inset (crates/roost-iced/src/app.rs). The band
 # above them is read from the product instead of copied.
-SIDEBAR_ROW_HEIGHT = 28
+SIDEBAR_ROW_HEIGHT = 32
 SIDEBAR_ROW_SPACING = 2
 SIDEBAR_BODY_TOP_PADDING = 4
+# crates/roost-iced/src/terminal_widget.rs: the grid is edge-pinned, so a cell
+# offset is measured straight off the terminal widget's origin. Named rather
+# than folded away so the next inset change stays a one-line edit here.
+TERMINAL_PADDING = 0
 
 
 def _skip(message: str) -> NoReturn:
@@ -121,8 +125,11 @@ def _wait_window(display: str) -> str:
     holder: list[str] = []
 
     def find() -> bool:
+        # By class, not name: the window title is dynamic since plan 016
+        # ("{project} – {cwd}"), but WM_CLASS carries the fixed
+        # application_id the app sets on Linux.
         result = subprocess.run(
-            ["xdotool", "search", "--name", "Roost"],
+            ["xdotool", "search", "--class", "Roost"],
             env=env,
             capture_output=True,
             text=True,
@@ -275,8 +282,8 @@ def _measure_terminal_cell(launch: Launch) -> tuple[int, int]:
         image = pngtool.load(str(path))
         width, height, bpp, pixels = image
         metrics = launch.client.window_metrics()
-        x0 = round(float(metrics["sidebar_width"])) + 12
-        y0 = round(launch.client.terminal_top(metrics)) + 12
+        x0 = round(float(metrics["sidebar_width"])) + TERMINAL_PADDING
+        y0 = round(launch.client.terminal_top(metrics)) + TERMINAL_PADDING
 
         def pixel(x: int, y: int) -> tuple[int, int, int]:
             offset = (y * width + x) * bpp
@@ -550,6 +557,19 @@ def _active_pill_close_point(
     return right - 11, round(launch.client.terminal_top()) // 2
 
 
+# The add-tab `+` is a sibling of the tab strip inside the scrollable (plan
+# 016 C4) — never a fixed right-pinned control — so it hugs the last pill
+# with the strip's 6px spacing and is itself PILL_HEIGHT (24px) wide. Its
+# click center sits 6 + 24/2 = 18px past whichever pill currently renders
+# last, not at a window-relative constant.
+_ADD_TAB_OFFSET = 18
+
+
+def _add_tab_point(pill_right: int, band_center_y: int) -> tuple[int, int]:
+    """Compute the `+` control's click point from the last pill's right edge."""
+    return pill_right + _ADD_TAB_OFFSET, band_center_y
+
+
 def _stable_rollup_stripe_point(launch: Launch) -> tuple[int, int]:
     """Locate one stable waiting-agent project stripe after focus settles."""
     path = launch.root / "chrome-project-rollup-stripe.png"
@@ -685,12 +705,16 @@ def _palette_pointer_routing(launch: Launch) -> None:
     )
     launch.client.palette_dismiss()
 
-    # The fixed add-tab control is deliberately outside the card. The first
-    # click dismisses exactly once and cannot also activate that control.
+    # The add-tab control is deliberately outside the card. The first click
+    # dismisses exactly once and cannot also activate that control. The
+    # window still has its one launch-default tab here (a known tab set), so
+    # its pill is both the active AND last one — the `+` sits right after it.
     before = len(launch.client.project_tab_ids(project))
-    launch.client.palette_open("commands")
     terminal_top = round(launch.client.terminal_top())
-    _click_window_control(launch, width - 49, terminal_top // 2)
+    _left, _top, pill_right, _bottom = _active_pill_bounds(launch, (width, 360))
+    add_x, add_y = _add_tab_point(pill_right, terminal_top // 2)
+    launch.client.palette_open("commands")
+    _click_window_control(launch, add_x, add_y)
     _wait_until(
         lambda: launch.client.palette_state().get("open") is False,
         "outside click palette dismissal",
@@ -905,7 +929,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     _double_click_window_control(
         launch,
         round(float(metrics["sidebar_width"])) + 45,
-        17,
+        round(launch.client.terminal_top(metrics) / 2),
     )
     _wait_until(
         lambda: launch.client.identify()["active_tab_id"] == sibling,
@@ -1805,38 +1829,40 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
     _click_window_control(launch, x, y)
     _wait_until(lambda: launch.client.tab(last_tab) is None, "scrolled active tab close")
 
+    # The `+` is a scrolling sibling of the strip now, not a window-pinned
+    # control (Mac parity, plan 016 C4) — closing the scrolled-into-view tab
+    # can leave it anywhere, so re-focus the true last remaining tab and
+    # re-scroll to the strip's tail (a no-op past the end) before deriving
+    # the click point from that pill's actual rendered right edge.
     before = len(launch.client.project_tab_ids(home_project))
+    remaining_last_tab = launch.client.project_tab_ids(home_project)[-1]
+    launch.client.focus(remaining_last_tab)
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == remaining_last_tab,
+        "remaining last tab selection before add-tab click",
+    )
     launch.terminal_pointer(
         [
             "mousemove",
             "--window",
             launch.window,
-            str(width - 49),
+            str(sidebar + 120),
             str(terminal_top // 2),
             "click",
-            "1",
+            "--repeat",
+            "35",
+            "--delay",
+            "15",
+            "7",
         ]
     )
+    _left, _top, pill_right, _bottom = _active_pill_bounds(launch, (width, height))
+    add_x, add_y = _add_tab_point(pill_right, terminal_top // 2)
+    _click_window_control(launch, add_x, add_y)
     _wait_until(
         lambda: len(launch.client.project_tab_ids(home_project)) == before + 1,
-        "fixed add-tab control outside horizontal overflow",
+        "add-tab click still lands after the strip scrolls to its tail",
     )
-    launch.terminal_pointer(
-        [
-            "mousemove",
-            "--window",
-            launch.window,
-            str(width - 20),
-            str(terminal_top // 2),
-            "click",
-            "1",
-        ]
-    )
-    _wait_until(
-        lambda: launch.client.palette_state().get("frame") == "notifications",
-        "fixed notification control outside horizontal overflow",
-    )
-    launch.client.palette_dismiss()
 
     last_project = 0
     last_project_tab = 0
@@ -1890,7 +1916,7 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
             "--window",
             launch.window,
             "110",
-            str(height - 17),
+            str(height - terminal_top // 2),
             "click",
             "1",
         ]
@@ -1913,29 +1939,20 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
     )
 
     # The sidebar has no pointer collapse control (the header « was removed
-    # after user testing; parity with Mac, where collapse is keybind/menu
-    # only) — collapse via the ToggleSidebar default so the collapsed-state
-    # ☰ restore control below is still exercised by a real click.
+    # after user testing) and, as of plan 016 C4, no pointer restore control
+    # either — the collapsed-band ☰ affordance is gone too. Collapse and
+    # restore are both keybind/palette only now (Mac parity: no in-window
+    # affordance when collapsed).
     launch.key("alt+b")
     _wait_until(
         lambda: launch.client.window_metrics()["sidebar_collapsed"],
         "keybind sidebar collapse after body scroll",
     )
     assert launch.client.identify()["active_tab_id"] == last_project_tab
-    launch.terminal_pointer(
-        [
-            "mousemove",
-            "--window",
-            launch.window,
-            "20",
-            str(terminal_top // 2),
-            "click",
-            "1",
-        ]
-    )
+    launch.key("alt+b")
     _wait_until(
         lambda: not launch.client.window_metrics()["sidebar_collapsed"],
-        "fixed collapsed-sidebar control",
+        "keybind sidebar restore (no in-window ☰ affordance, plan 016 C4)",
     )
 
 
@@ -2002,8 +2019,12 @@ def _terminal_scrollback_routing(launch: Launch) -> None:
         in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
         "terminal history fixture at live bottom",
     )
-    terminal_x = 220 + 12 + 4
-    terminal_y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
+    terminal_x = 220 + TERMINAL_PADDING + 4
+    terminal_y = (
+        round(launch.client.terminal_top())
+        + TERMINAL_PADDING
+        + launch.cell_height // 2
+    )
 
     def wheel(button: int) -> None:
         launch.terminal_pointer(
@@ -2134,12 +2155,13 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
     launch.client.clipboard_write("system", baseline)
     launch.client.clipboard_write("selection", baseline)
 
-    # Window-relative client coordinates: sidebar + terminal padding and the
-    # live application-owned terminal origin. End on the last marker cell because
-    # TerminalSelection's committed range is inclusive at pointer release.
-    x0 = 220 + 12 + launch.cell_width // 2
-    x1 = 220 + 12 + int((len(marker) - 0.5) * launch.cell_width)
-    y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
+    # Window-relative client coordinates: sidebar + the terminal inset (zero —
+    # the grid is edge-pinned) and the live application-owned terminal origin.
+    # End on the last marker cell because TerminalSelection's committed range
+    # is inclusive at pointer release.
+    x0 = 220 + TERMINAL_PADDING + launch.cell_width // 2
+    x1 = 220 + TERMINAL_PADDING + int((len(marker) - 0.5) * launch.cell_width)
+    y = round(launch.client.terminal_top()) + TERMINAL_PADDING + launch.cell_height // 2
     # Keep the press, motion, and release as separate XTEST submissions. The
     # tiny-skia event loop can process a single batched xdotool sequence only
     # after its release, coalescing away the drag motion. IPC observation while
@@ -2249,8 +2271,8 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
 def _multi_click_and_link_hover(launch: Launch) -> None:
     row = "alpha/beta tail"
     _set_row(launch, row)
-    x = 220 + 12 + int(2.5 * launch.cell_width)
-    y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
+    x = 220 + TERMINAL_PADDING + int(2.5 * launch.cell_width)
+    y = round(launch.client.terminal_top()) + TERMINAL_PADDING + launch.cell_height // 2
     launch.terminal_pointer(
         [
             "mousemove",
@@ -2303,7 +2325,7 @@ def _multi_click_and_link_hover(launch: Launch) -> None:
         lambda: launch.client.app_cursor_shape() == "crosshair",
         "OSC 22 baseline cursor",
     )
-    url_x = 220 + 12 + int(8.5 * launch.cell_width)
+    url_x = 220 + TERMINAL_PADDING + int(8.5 * launch.cell_width)
     launch.terminal_pointer(
         [
             "keydown",

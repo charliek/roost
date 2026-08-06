@@ -14,7 +14,7 @@ mod terminal_widget;
 mod url_launcher;
 
 use std::fs::OpenOptions;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -31,7 +31,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 
-const WINDOW_TITLE: &str = "Roost — Iced POC";
+/// `$HOME` for the cwd segment of the window title. Read once: the title fn
+/// runs on every update batch, and the value cannot change under a live
+/// process.
+static HOME_DIR: LazyLock<String> = LazyLock::new(|| {
+    std::env::var_os("HOME")
+        .map(|home| home.to_string_lossy().into_owned())
+        .unwrap_or_default()
+});
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -92,12 +99,11 @@ enum Message {
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
-    ToggleSidebar,
     SidebarResizeDragged {
         width: f32,
     },
     SidebarResizeEnded,
-    OpenNotifications,
+    SidebarDragCollapsed,
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
@@ -139,16 +145,46 @@ fn main() -> anyhow::Result<()> {
     };
 
     iced::application(boot, update, view)
-        .title(WINDOW_TITLE)
+        .title(title)
         .theme(theme)
         .subscription(subscription)
-        .window(window::Settings {
-            size: Size::new(1100.0, 720.0),
-            min_size: Some(Size::new(640.0, 360.0)),
-            ..window::Settings::default()
-        })
+        .font(include_bytes!("../../../third_party/inter/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
+        .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
+        .default_font(chrome::chrome_font(iced::font::Weight::Normal))
+        .window(window_settings())
         .run()
         .context("run Iced application")
+}
+
+/// macOS `titlebar_transparent` drops the standard titlebar material so the
+/// bar takes the window's own background, landing much closer to the Swift
+/// app's solid `#24292C` band than the stock dark chrome. `title_hidden` and
+/// `fullsize_content_view` stay off deliberately: the latter would slide
+/// content under the titlebar, and `servicing.rs` reports
+/// `terminal_top = BAND_HEIGHT` (the macOS pixel lane scans those rows), so
+/// it is not a window-settings change alone. Linux `PlatformSpecific` is a
+/// disjoint struct: `application_id` fills WM_CLASS (X11) / app_id (Wayland),
+/// which winit otherwise leaves empty — the dynamic window title made an
+/// empty class unfindable for tooling, and the id matches the notification
+/// adapter's `desktop-entry` hint so shells group both under one identity.
+fn window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(1100.0, 720.0),
+        min_size: Some(Size::new(640.0, 360.0)),
+        #[cfg(target_os = "macos")]
+        platform_specific: window::settings::PlatformSpecific {
+            titlebar_transparent: true,
+            title_hidden: false,
+            fullsize_content_view: false,
+        },
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "ai.stridelabs.Roost.iced".to_owned(),
+            ..window::settings::PlatformSpecific::default()
+        },
+        ..window::Settings::default()
+    }
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -225,6 +261,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.sidebar_resize_ended();
             Task::none()
         }
+        Message::SidebarDragCollapsed => {
+            app.sidebar_drag_collapsed();
+            Task::none()
+        }
         Message::RenameSubmit => app.submit_rename_editor().map_task(),
         Message::RenamePointerDismiss => {
             app.rename_pointer_dismiss();
@@ -267,9 +307,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewTab
         | Message::NewProject
         | Message::ConfirmDeleteCancel
-        | Message::ConfirmDeleteConfirm
-        | Message::ToggleSidebar
-        | Message::OpenNotifications) => message.apply(app).map_task(),
+        | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }
 }
 
@@ -384,6 +422,10 @@ fn is_enter_release(event: &keyboard::Event) -> bool {
             ..
         }
     )
+}
+
+fn title(app: &App) -> String {
+    app.window_title(&HOME_DIR)
 }
 
 fn theme(_app: &App) -> Theme {

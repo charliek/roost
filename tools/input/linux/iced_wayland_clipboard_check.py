@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
+from iced_clipboard_check import TERMINAL_PADDING  # noqa: E402
 
 ICED_BIN = Path(
     os.environ.get("ROOST_ICED_BIN") or REPO / "target" / "debug" / "roost-iced"
@@ -183,8 +184,8 @@ def _measure_terminal_cell(client, tab: int, root: Path) -> tuple[int, int]:
         path.write_bytes(png)
         width, height, bpp, pixels = pngtool.load(str(path))
         metrics = client.window_metrics()
-        x0 = round(float(metrics["sidebar_width"])) + 12
-        y0 = round(client.terminal_top(metrics)) + 12
+        x0 = round(float(metrics["sidebar_width"])) + TERMINAL_PADDING
+        y0 = round(client.terminal_top(metrics)) + TERMINAL_PADDING
 
         def pixel(x: int, y: int) -> tuple[int, int, int]:
             offset = (y * width + x) * bpp
@@ -408,9 +409,9 @@ def main() -> int:
         _set_row(client, tab, dragged)
         client.selection_clear(tab)
         client.tab_capture_pty_input(tab, drain=True)
-        x0 = sidebar + 12 + cell_width // 2
-        x1 = sidebar + 12 + int((len(dragged) - 0.5) * cell_width)
-        y = round(client.terminal_top(metrics)) + 12 + cell_height // 2
+        x0 = sidebar + TERMINAL_PADDING + cell_width // 2
+        x1 = sidebar + TERMINAL_PADDING + int((len(dragged) - 0.5) * cell_width)
+        y = round(client.terminal_top(metrics)) + TERMINAL_PADDING + cell_height // 2
         _inject_drag(width, height, x0, y, x1)
         _wait_for_selection(
             client, tab, dragged, "real-seat Wayland drag selection"
@@ -423,7 +424,7 @@ def main() -> int:
 
         multi = "alpha/beta tail"
         _set_row(client, tab, multi)
-        click_x = sidebar + 12 + int(2.5 * cell_width)
+        click_x = sidebar + TERMINAL_PADDING + int(2.5 * cell_width)
         _inject_clicks(width, height, click_x, y, 2)
         _wait_until(
             lambda: client.selection_dump(tab).get("text") == "alpha/beta",
@@ -443,7 +444,7 @@ def main() -> int:
             lambda: client.app_cursor_shape() == "crosshair",
             "real-seat Wayland OSC cursor baseline",
         )
-        hover_x = sidebar + 12 + int(8.5 * cell_width)
+        hover_x = sidebar + TERMINAL_PADDING + int(8.5 * cell_width)
         _inject_link_hover(client, width, height, hover_x, y)
         _wait_until(
             lambda: client.app_cursor_shape() == "crosshair",

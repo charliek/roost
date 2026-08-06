@@ -294,20 +294,24 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
     )
 
     if target == "iced":
-        # The active project's failed rollup is a 3x28 strip at the true
-        # sidebar edge. Rounded ends may shorten the exact-color centreline,
-        # so pin the edge and require the bulk of the reference-height run.
+        # The active project's failed rollup is a 3x22 rail at the true sidebar
+        # edge: `chrome::ROW_HEIGHT` (32) less the 5px gap top and bottom that
+        # keeps adjacent active projects discrete. Its 2px corner radius eats
+        # the ends of the exact-color centreline, so require the bulk of it.
         stripe_run = _longest_vertical_run(shot, 0, LIFECYCLE_COLORS["failed"])
-        assert stripe_run >= 24, (
+        assert stripe_run >= 18, (
             f"Iced project rollup must occupy the true sidebar edge at x=0 "
-            f"for approximately 28px; longest failed-color run was {stripe_run}px "
+            f"for approximately 22px; longest failed-color run was {stripe_run}px "
             f"(screenshot: {shot_path})"
         )
         sidebar_w = round(float(roost.window_metrics()["sidebar_width"]))
+        # The pill spans the row less its 6px horizontal inset, and stands 30px
+        # tall in the 32px row — both far larger than any dot or badge, which
+        # is all this filter has to exclude.
         selections = [
             bounds
             for bounds in _color_components(shot, sidebar_w, ICED_ACTIVE_PROJECT)
-            if bounds[2] - bounds[0] >= 150 and bounds[3] - bounds[1] >= 20
+            if bounds[2] - bounds[0] >= 100 and bounds[3] - bounds[1] >= 15
         ]
         assert len(selections) == 1, (
             f"expected one Iced active-project selection pill, got {selections} "
@@ -315,8 +319,11 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
         )
         left, _top, right, _bottom = selections[0]
         right_inset = sidebar_w - 1 - right
-        assert abs(left - 14) <= 1 and abs(right_inset - 8) <= 1, (
-            f"Iced project selection must be independently inset from the rollup "
-            f"and divider; got left={left}, right inset={right_inset} "
-            f"(screenshot: {shot_path})"
+        # Mac parity: `bounds.insetBy(dx: 6, dy: 1)`. The right inset is read
+        # against the divider column the sidebar reserves inside its own width,
+        # so it measures one larger than the geometric 6.
+        assert abs(left - 6) <= 1 and abs(right_inset - 7) <= 1, (
+            f"Iced project selection must be inset 6px inside the row, clear of "
+            f"the rollup rail and the divider; got left={left}, right "
+            f"inset={right_inset} (screenshot: {shot_path})"
         )
