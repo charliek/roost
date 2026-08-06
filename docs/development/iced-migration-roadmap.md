@@ -153,28 +153,53 @@ Slices, each sized for one gauntlet pass:
   are async engine ops with op-id-guarded rename/reorder state machines
   and op-id-keyed deferred `palette.activate` replies; idle CPU measured
   ~73% → 0.0% in the shed.
-* **3e. Polish parity:** notification bell/badge, hover-close, offscreen-tab
-  reveal, empty/loading/error states, cursor/selection/link pixel geometry —
-  per the P1 rows in the [parity inventory](iced-parity-inventory.md).
-  Also sidebar/chrome visual polish (subtle color differences, separator
-  lines, the footer chip's exact bezel, and a spike on the Mac app's
-  frosted/translucent look — likely `window-vibrancy` over a transparent
-  iced window on macOS; compositor-dependent on Linux). **Plan this slice
-  with the user in the loop — they want to give detailed direction here.**
-  The tab-strip artifact bug ([#281]) that was folded in here is **fixed**
-  (PR #291, merged 2026-08-04): the strip scrollbar is `Scrollbar::hidden()`
-  — live testing rejected both a resting and a hover-revealed sliver, so any
-  visible indicator over the pills is a regression, and
-  `tools/roosttest/test_tab_strip_pixels.py` guards it (its allowlist of
-  wide-run band colors must be updated by any 3e band-background change).
-  Two 3e items named during that testing: the band background under the
-  tabs should match the Swift look, and tab-band metrics differ (iced
-  34px band / 5px above pills vs Swift `tabBarHeight` 32 / centerY ≈4px).
-  Carried from 3b (plan 010): designing the empty state after the last
-  project is deleted — iced lands in the engine's empty workspace state
-  while both shipped UIs close their window — and tightening the confirm
-  overlay's pointer modality (it blocks presses but, like the palette,
-  passes wheel/hover through) are 3e items.
+* **3e. Polish parity batch 1 (complete — plan 016).** Shipped: Inter
+  bundled as the chrome font (`third_party/inter/`, static Regular/
+  Medium/SemiBold registered under one cosmic-text family, single
+  `chrome_font()` seam); the Mac color system (`BAND #24292c` for the
+  sidebar header/footer + tab band, `LIST #2d3235` for the scrollable
+  project list, a `DIVIDER` hairline drawn *inside* the sidebar's own
+  width so `terminal_grid` keeps every pixel at zero inset); metrics
+  matched to the measured Mac reference (`BAND_HEIGHT` 32, `ROW_HEIGHT`
+  32 — the plan's draft value of 24 was corrected to 32 against the
+  frozen reference mid-implementation; `TERMINAL_PADDING` 0 on all
+  sides); one unified project-row layout serving both the metrics and
+  the notification dots (a 3px rollup rail at the row's leading edge
+  gapped 5px top/bottom, a selection pill inset 6px horizontal/1px
+  vertical with radius 6, label aligned with the agent rows' left
+  edge); the header bell removed in favor of Mac-parity sidebar
+  notification dots (any project with a notifying tab, active project
+  included) alongside the existing pill badges — the palette/keybind
+  remain the inbox entry; the ☰ collapsed-sidebar button removed with
+  no replacement in-window affordance (Mac parity — reopen via
+  keybind/palette); the in-strip `+` now scrolls with the pills and
+  can go offscreen under overflow (Mac-parity accepted behavior — the
+  Mac's own ＋ scrolls with the strip too); drag-to-collapse below
+  half the 160pt floor (80px, unclamped) collapses the sidebar and
+  reopens at its pre-drag committed width (recorded parity divergence:
+  NSSplitView lets a drag continue past the floor and re-expand within
+  the same gesture — here the grip leaves the tree at collapse, so
+  drag-back-to-reopen within one gesture is impossible); a dynamic
+  window title (`{project} – {abbreviated cwd}`, pure helper in
+  `roost-ui-model/src/window_title.rs`) plus a transparent titlebar on
+  macOS rendering the band color; and the tab-strip pixel guard
+  updated for the new chrome plus a new `test_z_typography.py`, both
+  wired into all three ci.yml iced lanes (closing a CI gap — they were
+  in Makefile `ICED_E2E_TESTS` but no ci.yml list, so the scrollbar/
+  band pixel guard never ran on CI for iced before this). Two items
+  flagged for Charlie's review rather than resolved by the plan: the
+  divider hairline shipped as `#1a1d1e`, sampled during implementation
+  rather than matched to the Mac's literal black divider (a
+  one-constant change if he wants it darker); and the zero
+  left-terminal-inset against the divider may read cramped (his call,
+  not reworked speculatively). The tab-strip artifact bug ([#281])
+  that was folded into 3e's original scope is **fixed** (PR #291,
+  merged 2026-08-04): the strip scrollbar is `Scrollbar::hidden()` and
+  `tools/roosttest/test_tab_strip_pixels.py` guards it. The remainder
+  of 3e's original scope — hover-close, offscreen-tab reveal, empty/
+  loading/error states, cursor/selection/link pixel geometry, and the
+  frosted/translucent spike — split out as **3h** below (plan 016,
+  W8); do not read those as still-3e.
 * **3f. Native desktop notifications (complete — plan 015).** Shipped: a
   Linux D-Bus adapter via notify-rust 4.18 (`z-with-tokio`: zbus 5 rides
   the app's existing tokio runtime), a per-OS backend seam (non-Linux
@@ -196,13 +221,32 @@ Slices, each sized for one gauntlet pass:
   `e2e-iced`/`e2e-iced-ci` gate on `WAYLAND_DISPLAY`, documented in
   `ci.yml`). Exit condition: an iced/winit release that delivers any of
   these becomes its own adoption slice.
+* **3h. Polish parity II (user-directed).** The remainder of 3e's
+  original scope, split out by plan 016 (W8) once batch 1 (chrome
+  parity) shipped: typography glyph-baseline comparison; cursor/
+  selection/link pixel geometry; empty/loading/error states, including
+  the empty-workspace state after the last project is deleted (today
+  iced lands in the engine's empty workspace state while both shipped
+  UIs close their window instead); confirm-overlay pointer modality
+  tightening (it blocks presses but, like the palette, passes wheel/
+  hover through); hover/focus/disabled state styles; the frosted/
+  translucent window-vibrancy spike (likely `window-vibrancy` over a
+  transparent iced window on macOS, compositor-dependent on Linux —
+  decision is Charlie's); agent-row height/typography distinctness;
+  tab status dot/label geometry; the hover-close decision (note: the
+  shipped Mac shows × only on the active pill with no hover reveal —
+  App.swift:4747 — so adding hover-close to iced would be a *product*
+  decision, not a parity port); and offscreen-tab reveal after
+  programmatic selection. **Plan this slice with the user in the
+  loop — they want to give detailed direction here,** as with 3e.
 
 Slice order is deliberate: 3b closed the honest `Err("… not available in
 Iced yet")` stubs — the grep now has zero hits — and 3c closed the last
 functional gap blocking M4; 3d closed the
 architecture cleanup that everything real-time depends on; 3f is done and
-3g is documentation-complete via [#302] — only 3e (polish, user-directed)
-remains open on this track.
+3g is documentation-complete via [#302]; 3e closed chrome parity batch 1
+(plan 016) — only 3h (polish parity II, user-directed) remains open on
+this track.
 
 ### Maintenance backlog (filed, not scheduled)
 
