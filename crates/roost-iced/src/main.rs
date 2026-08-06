@@ -164,8 +164,10 @@ fn main() -> anyhow::Result<()> {
 /// content under the titlebar, and `servicing.rs` reports
 /// `terminal_top = BAND_HEIGHT` (the macOS pixel lane scans those rows), so
 /// it is not a window-settings change alone. Linux `PlatformSpecific` is a
-/// disjoint struct (application_id / override_redirect) — the cfg keeps it
-/// out of that build entirely.
+/// disjoint struct: `application_id` fills WM_CLASS (X11) / app_id (Wayland),
+/// which winit otherwise leaves empty — the dynamic window title made an
+/// empty class unfindable for tooling, and the id matches the notification
+/// adapter's `desktop-entry` hint so shells group both under one identity.
 fn window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(1100.0, 720.0),
@@ -175,6 +177,11 @@ fn window_settings() -> window::Settings {
             titlebar_transparent: true,
             title_hidden: false,
             fullsize_content_view: false,
+        },
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "ai.stridelabs.Roost.iced".to_owned(),
+            ..window::settings::PlatformSpecific::default()
         },
         ..window::Settings::default()
     }

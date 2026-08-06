@@ -125,8 +125,11 @@ def _wait_window(display: str) -> str:
     holder: list[str] = []
 
     def find() -> bool:
+        # By class, not name: the window title is dynamic since plan 016
+        # ("{project} – {cwd}"), but WM_CLASS carries the fixed
+        # application_id the app sets on Linux.
         result = subprocess.run(
-            ["xdotool", "search", "--name", "Roost"],
+            ["xdotool", "search", "--class", "Roost"],
             env=env,
             capture_output=True,
             text=True,
