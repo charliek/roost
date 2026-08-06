@@ -17,4 +17,5 @@ pub mod rollup;
 pub mod shell_escape;
 pub mod theme;
 pub mod typography;
+pub mod window_title;
 pub mod word_selection;

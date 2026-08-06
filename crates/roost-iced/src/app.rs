@@ -43,6 +43,7 @@ use roost_ui_model::{
     keybind::{self, Accel, AccelMods, KeybindAction},
     notification_inbox, palette, provider,
     rollup::project_rollup,
+    window_title,
 };
 use roost_url::HoverUrl;
 use roost_vt::{
@@ -2362,6 +2363,31 @@ impl App {
         // it" synchronous, exactly as the client-op sites do.
         self.reconcile();
         Ok(())
+    }
+
+    /// The window title, recomposed from live state on every update batch
+    /// (iced's `window::State::synchronize` re-calls the title fn and only
+    /// touches the OS window when the string changed).
+    ///
+    /// Mirrors the Mac's priority: the active tab's cwd — which OSC 7 keeps
+    /// current through `Workspace::set_tab_cwd` — falling back to the
+    /// project's static cwd before a tab has reported one. The native
+    /// foreground-process lookup `launch_cwd` uses is deliberately not
+    /// consulted here: this runs every batch, and the Mac subtitle tracks
+    /// OSC 7 only.
+    pub fn window_title(&self, home: &str) -> String {
+        let (project_id, tab_id) = self.workspace.active();
+        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
+            return window_title::DEFAULT_WINDOW_TITLE.to_string();
+        };
+        let cwd = project
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.cwd.as_str())
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or(project.cwd.as_str());
+        window_title::window_title(&project.name, cwd, home)
     }
 
     fn launch_cwd(&self, project_id: i64) -> String {
