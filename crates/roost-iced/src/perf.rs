@@ -29,6 +29,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// `RenderStats` + `TabRenderStats` moved to `roost-ui-model::render_stats`
+/// once GTK needed the identical shape (plan 018 D4); re-exported here so
+/// every call site in this crate keeps compiling unchanged.
+pub use roost_ui_model::render_stats::{RenderStats, TabRenderStats};
+
 static REFRESH_CALLS: AtomicU64 = AtomicU64::new(0);
 static REFRESH_NANOS: AtomicU64 = AtomicU64::new(0);
 static ROWS_REBUILT: AtomicU64 = AtomicU64::new(0);
@@ -36,47 +41,6 @@ static CELLS_WALKED: AtomicU64 = AtomicU64::new(0);
 static DRAW_CALLS: AtomicU64 = AtomicU64::new(0);
 static DRAW_NANOS: AtomicU64 = AtomicU64::new(0);
 static FILL_TEXT_CALLS: AtomicU64 = AtomicU64::new(0);
-
-/// A read of the process-global aggregate at one instant. Every field is a
-/// running total since process start (or the last [`reset`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RenderStats {
-    pub refresh_calls: u64,
-    pub refresh_nanos: u64,
-    pub rows_rebuilt: u64,
-    pub cells_walked: u64,
-    pub draw_calls: u64,
-    pub draw_nanos: u64,
-    pub fill_text_calls: u64,
-}
-
-/// Per-tab counters, folded into the global aggregate on every refresh.
-/// There is deliberately no per-tab equivalent of `draw_calls` /
-/// `draw_nanos` / `fill_text_calls`: `TerminalWidget::draw` renders from a
-/// `TerminalSnapshot` clone handed to it by iced and has no way back to the
-/// `TerminalTab` that produced it, so those three counters only exist in
-/// the global aggregate.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TabRenderStats {
-    pub refresh_calls: u64,
-    pub refresh_nanos: u64,
-    pub rows_rebuilt: u64,
-    pub cells_walked: u64,
-}
-
-impl TabRenderStats {
-    pub(crate) fn record_refresh(
-        &mut self,
-        elapsed: Duration,
-        rows_rebuilt: u64,
-        cells_walked: u64,
-    ) {
-        self.refresh_calls += 1;
-        self.refresh_nanos += elapsed.as_nanos() as u64;
-        self.rows_rebuilt += rows_rebuilt;
-        self.cells_walked += cells_walked;
-    }
-}
 
 /// Read the global aggregate. Backs the `app.render_stats` IPC op.
 pub fn snapshot() -> RenderStats {
