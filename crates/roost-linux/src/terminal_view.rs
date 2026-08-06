@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::cairo;
 use gtk4::glib;
@@ -286,6 +286,7 @@ impl TerminalView {
             current_osc_shape: String::new(),
             was_alt_screen_active: false,
             osc_shape_set_in_this_chunk: false,
+            render_stats: roost_ui_model::render_stats::TabRenderStats::default(),
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -1664,6 +1665,36 @@ struct TerminalViewState {
     /// a TUI may re-assert OSC 22 `pointer` on every motion event,
     /// and re-pushing the identical name is wasted FFI.
     last_applied_cursor_name: Option<&'static str>,
+    /// Per-view refresh counters, folded into `crate::perf`'s global
+    /// aggregate on every [`Self::refresh_passes`]. Non-atomic and
+    /// per-view so unit tests can assert on deltas without racing
+    /// whatever other tests are painting concurrently — see
+    /// `roost_ui_model::render_stats::TabRenderStats`.
+    render_stats: roost_ui_model::render_stats::TabRenderStats,
+}
+
+/// The draw lists [`TerminalViewState::refresh_passes`] hands to
+/// `paint` — the output of the renderer-free half of a frame.
+///
+/// Overlay invariant: cursor, selection and link-underline stay
+/// *overlay* passes computed at draw time. Nothing overlay-driven
+/// (blink phase, focus, hover, selection extent) may be baked into
+/// these lists, or plan 018 C4's row cache would have to invalidate on
+/// every blink tick.
+#[derive(Default)]
+struct RefreshedPasses {
+    /// Pass A — per-cell bg fills, only for cells that override the
+    /// default. (A cell carrying the default bg is already covered by
+    /// `paint`'s canvas fill.) `(row, col, bg)`.
+    bg_pass: Vec<(u32, u16, ColorRgb)>,
+    /// Pass B — per-cell glyphs. `(row, col, resolved fg, text)`.
+    glyph_pass: Vec<(u32, u16, ColorRgb, String)>,
+    /// The cursor cell's glyph + resolved fg, so pass C's block cursor
+    /// can re-draw the underlying glyph inverted.
+    cursor_cell_text: Option<(String, ColorRgb)>,
+    /// Cursor as of this frame's snapshot. Read once here so the walk
+    /// and the draw phase can never disagree about where it is.
+    cursor: Option<CursorInfo>,
 }
 
 /// Selection snapshot for the `selection.dump` IPC op. `text` is the
@@ -1784,17 +1815,26 @@ impl TerminalViewState {
         }
     }
 
-    fn paint(&mut self, widget: &DrawingArea, cr: &cairo::Context, width: f64, height: f64) {
+    /// The renderer-free half of a frame: snapshot the terminal, walk it,
+    /// and hand `paint` the draw lists. No Cairo, no Pango, no widget —
+    /// which is what lets the counter assertions drive it headless.
+    ///
+    /// Returns `None` when the snapshot failed and the frame must be
+    /// skipped; a skipped frame folds neither a refresh nor a draw into
+    /// the counters.
+    ///
+    /// This still walks the FULL grid. `rows_rebuilt` / `cells_walked`
+    /// therefore currently equal the whole viewport — the seam and the
+    /// counter meanings are what this commit establishes so plan 018's
+    /// C4 can swap the internals for `walk_dirty` + a per-row cache
+    /// without moving the measurement boundary underneath the numbers.
+    fn refresh_passes(&mut self) -> Option<RefreshedPasses> {
+        let refresh_started_at = Instant::now();
         // Snapshot terminal state for this frame.
         if let Err(err) = self.render_state.update(&self.terminal) {
             tracing::warn!(?err, "render_state.update failed; skipping frame");
-            return;
+            return None;
         }
-        let colors = self.render_state.colors().unwrap_or(roost_vt::Colors {
-            foreground: self.theme.foreground,
-            background: self.theme.background,
-            cursor: None,
-        });
         // Theme wins over libghostty's compiled-in default when no
         // SGR override is set on the cell. M6 P3 on the Mac side
         // pushes the theme into libghostty so `colors.foreground/
@@ -1804,6 +1844,86 @@ impl TerminalViewState {
         let default_bg = self.theme.background;
         let bold_color = self.theme.bold_color;
 
+        // Cursor cell glyph + override fg — captured during the walk
+        // so the block cursor can re-draw the underlying glyph in
+        // inverted color in pass C.
+        let cursor = self.render_state.cursor();
+        let mut passes = RefreshedPasses {
+            cursor,
+            ..RefreshedPasses::default()
+        };
+
+        let mut rows_rebuilt: u64 = 0;
+        let mut cells_walked: u64 = 0;
+        // The walk emits cells in row-major order, so a row boundary is
+        // just "the row index changed since the last cell".
+        let mut last_row: Option<u32> = None;
+        self.render_state
+            .walk(&self.terminal, |row, cell: Cell| {
+                cells_walked += 1;
+                if last_row != Some(row) {
+                    rows_rebuilt += 1;
+                    last_row = Some(row);
+                }
+                // Apply SGR inverse + bold-accent rules. Without this,
+                // codex's `\e[7m`-highlighted prompt row renders against
+                // the canvas-default bg and the gray prompt disappears
+                // (the visible regression the PR fixes). The theme's
+                // optional `bold-color` accent (Ghostty `bold-color = …`)
+                // colors bold default-fg cells when present; themes
+                // that don't set it keep the canvas-default fg.
+                let (fg, bg, has_explicit_bg) =
+                    resolve_cell_colors(&cell, default_fg, default_bg, bold_color);
+                if has_explicit_bg && bg != default_bg {
+                    passes.bg_pass.push((row, cell.col, bg));
+                }
+                if !cell.text.is_empty() && cell.text != " " {
+                    passes
+                        .glyph_pass
+                        .push((row, cell.col, fg, cell.text.clone()));
+                }
+                if let Some(c) = cursor.as_ref() {
+                    if c.row == row && c.col == cell.col as u32 {
+                        passes.cursor_cell_text = Some((cell.text.clone(), fg));
+                    }
+                }
+            })
+            .ok();
+
+        let elapsed = refresh_started_at.elapsed();
+        self.render_stats
+            .record_refresh(elapsed, rows_rebuilt, cells_walked);
+        crate::perf::record_refresh(elapsed, rows_rebuilt, cells_walked);
+        Some(passes)
+    }
+
+    fn paint(&mut self, widget: &DrawingArea, cr: &cairo::Context, width: f64, height: f64) {
+        let Some(passes) = self.refresh_passes() else {
+            return;
+        };
+        let RefreshedPasses {
+            bg_pass,
+            glyph_pass,
+            cursor_cell_text,
+            cursor,
+        } = passes;
+
+        // Everything below is the Cairo phase — `draw_*` in the
+        // counters. `crate::perf`'s module doc carries the split.
+        let draw_started_at = Instant::now();
+        // Counts glyph draws the pass emits: one per `show_layout` AND
+        // one per sprite (a sprite *replaces* a glyph draw). iced has no
+        // sprite path, so this field is not apples-to-apples across UIs.
+        let mut fill_text_calls: u64 = 0;
+
+        let colors = self.render_state.colors().unwrap_or(roost_vt::Colors {
+            foreground: self.theme.foreground,
+            background: self.theme.background,
+            cursor: None,
+        });
+        let default_fg = self.theme.foreground;
+        let default_bg = self.theme.background;
+
         // Pass A: canvas + per-cell backgrounds.
         set_cairo_color(cr, default_bg);
         let _ = cr.paint();
@@ -1811,16 +1931,6 @@ impl TerminalViewState {
         let cell_w = self.cell_metrics.cell_width;
         let cell_h = self.cell_metrics.cell_height;
 
-        // Pass A — per-cell bg fills only for cells that override
-        // the default. (A cell carrying the default bg is already
-        // painted by the canvas fill above.)
-        let mut bg_pass: Vec<(u32, u16, ColorRgb)> = Vec::new();
-        // Pass B — per-cell glyphs.
-        let mut glyph_pass: Vec<(u32, u16, ColorRgb, String)> = Vec::new();
-        // Cursor cell glyph + override fg — captured during the walk
-        // so the block cursor can re-draw the underlying glyph in
-        // inverted color in pass C.
-        let cursor = self.render_state.cursor();
         // Strict-DECTCEM cursor decision, computed ONCE per frame so the
         // glyph-skip pass and `paint_cursor` can't disagree (#246).
         let cursor_mode = cursor.as_ref().and_then(|c| {
@@ -1832,32 +1942,6 @@ impl TerminalViewState {
                 c.visual_style,
             )
         });
-        let mut cursor_cell_text: Option<(String, ColorRgb)> = None;
-
-        self.render_state
-            .walk(&self.terminal, |row, cell: Cell| {
-                // Apply SGR inverse + bold-accent rules. Without this,
-                // codex's `\e[7m`-highlighted prompt row renders against
-                // the canvas-default bg and the gray prompt disappears
-                // (the visible regression the PR fixes). The theme's
-                // optional `bold-color` accent (Ghostty `bold-color = …`)
-                // colors bold default-fg cells when present; themes
-                // that don't set it keep the canvas-default fg.
-                let (fg, bg, has_explicit_bg) =
-                    resolve_cell_colors(&cell, default_fg, default_bg, bold_color);
-                if has_explicit_bg && bg != default_bg {
-                    bg_pass.push((row, cell.col, bg));
-                }
-                if !cell.text.is_empty() && cell.text != " " {
-                    glyph_pass.push((row, cell.col, fg, cell.text.clone()));
-                }
-                if let Some(c) = cursor.as_ref() {
-                    if c.row == row && c.col == cell.col as u32 {
-                        cursor_cell_text = Some((cell.text.clone(), fg));
-                    }
-                }
-            })
-            .ok();
 
         for (row, col, bg) in &bg_pass {
             set_cairo_color(cr, *bg);
@@ -1899,6 +1983,7 @@ impl TerminalViewState {
             let mut chars = text.chars();
             if let (Some(c), None) = (chars.next(), chars.next()) {
                 if sprite::draw_cell_sprite(cr, x, y, cell_w, cell_h, *fg, c as u32) {
+                    fill_text_calls += 1;
                     continue;
                 }
             }
@@ -1906,6 +1991,7 @@ impl TerminalViewState {
             layout.set_text(text);
             cr.move_to(x, y);
             pango_cairo::show_layout(cr, &layout);
+            fill_text_calls += 1;
         }
 
         // Pass C: cursor.
@@ -1945,6 +2031,8 @@ impl TerminalViewState {
             .selection
             .visible_spans(&self.terminal, self.cols, self.rows);
         self.paint_selection(cr, &spans, cell_w, cell_h);
+
+        crate::perf::record_draw(draw_started_at.elapsed(), fill_text_calls);
 
         let _ = (width, height);
     }

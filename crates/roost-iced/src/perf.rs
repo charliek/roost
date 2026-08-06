@@ -26,59 +26,38 @@
 //!   tests don't construct. There is no per-tab equivalent of them for the
 //!   same reason — see [`TabRenderStats`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// `RenderStats` + `TabRenderStats` moved to `roost-ui-model::render_stats`
-/// once GTK needed the identical shape (plan 018 D4); re-exported here so
-/// every call site in this crate keeps compiling unchanged.
+/// `RenderStats` + `TabRenderStats` + the atomic aggregate machinery moved
+/// to `roost-ui-model::render_stats` once GTK needed the identical shape
+/// (plan 018 D4); re-exported here so every call site in this crate keeps
+/// compiling unchanged.
 pub use roost_ui_model::render_stats::{RenderStats, TabRenderStats};
 
-static REFRESH_CALLS: AtomicU64 = AtomicU64::new(0);
-static REFRESH_NANOS: AtomicU64 = AtomicU64::new(0);
-static ROWS_REBUILT: AtomicU64 = AtomicU64::new(0);
-static CELLS_WALKED: AtomicU64 = AtomicU64::new(0);
-static DRAW_CALLS: AtomicU64 = AtomicU64::new(0);
-static DRAW_NANOS: AtomicU64 = AtomicU64::new(0);
-static FILL_TEXT_CALLS: AtomicU64 = AtomicU64::new(0);
+use roost_ui_model::render_stats::RenderStatsAggregate;
+
+/// This UI's process-global aggregate. GTK holds its own in
+/// `roost-linux::perf`; the two never mix.
+static AGGREGATE: RenderStatsAggregate = RenderStatsAggregate::new();
 
 /// Read the global aggregate. Backs the `app.render_stats` IPC op.
 pub fn snapshot() -> RenderStats {
-    RenderStats {
-        refresh_calls: REFRESH_CALLS.load(Ordering::Relaxed),
-        refresh_nanos: REFRESH_NANOS.load(Ordering::Relaxed),
-        rows_rebuilt: ROWS_REBUILT.load(Ordering::Relaxed),
-        cells_walked: CELLS_WALKED.load(Ordering::Relaxed),
-        draw_calls: DRAW_CALLS.load(Ordering::Relaxed),
-        draw_nanos: DRAW_NANOS.load(Ordering::Relaxed),
-        fill_text_calls: FILL_TEXT_CALLS.load(Ordering::Relaxed),
-    }
+    AGGREGATE.snapshot()
 }
 
 /// Zero the global aggregate. Useful before an operation known to skew it
 /// (see the screenshot trap above) so the next read is uncontaminated.
 /// Exposed over IPC as `app.render_stats` with `reset: true`.
 pub fn reset() {
-    REFRESH_CALLS.store(0, Ordering::Relaxed);
-    REFRESH_NANOS.store(0, Ordering::Relaxed);
-    ROWS_REBUILT.store(0, Ordering::Relaxed);
-    CELLS_WALKED.store(0, Ordering::Relaxed);
-    DRAW_CALLS.store(0, Ordering::Relaxed);
-    DRAW_NANOS.store(0, Ordering::Relaxed);
-    FILL_TEXT_CALLS.store(0, Ordering::Relaxed);
+    AGGREGATE.reset();
 }
 
 /// Fold one `refresh_snapshot` call into the global aggregate.
 pub(crate) fn record_refresh(elapsed: Duration, rows_rebuilt: u64, cells_walked: u64) {
-    REFRESH_CALLS.fetch_add(1, Ordering::Relaxed);
-    REFRESH_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-    ROWS_REBUILT.fetch_add(rows_rebuilt, Ordering::Relaxed);
-    CELLS_WALKED.fetch_add(cells_walked, Ordering::Relaxed);
+    AGGREGATE.record_refresh(elapsed, rows_rebuilt, cells_walked);
 }
 
 /// Fold one `TerminalWidget::draw` call into the global aggregate.
 pub(crate) fn record_draw(elapsed: Duration, fill_text_calls: u64) {
-    DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
-    DRAW_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-    FILL_TEXT_CALLS.fetch_add(fill_text_calls, Ordering::Relaxed);
+    AGGREGATE.record_draw(elapsed, fill_text_calls);
 }

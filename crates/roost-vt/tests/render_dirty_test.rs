@@ -298,6 +298,77 @@ fn in_place_write_without_scrolling_stays_partial() {
 }
 
 #[test]
+fn repeated_update_without_walk_sheds_no_damage() {
+    // `update` must never *lower* dirty state — only `walk_dirty`
+    // consumes it. Both UIs' refresh paths call `update` before their
+    // cache guards, and diagnostics (`tab.dump`, `tab.dump_resolved`)
+    // call `update` again out of band between frames. If a second
+    // `update` shed the pending damage, an IPC dump interleaved with
+    // PTY output would silently drop the rows the next paint owed.
+    let (mut t, mut rs) = settled(80, 24);
+
+    t.vt_write(b"\x1b[7;1Hhello");
+    rs.update(&t).expect("update");
+    assert_eq!(rs.dirty().expect("dirty"), Dirty::Partial);
+    rs.update(&t).expect("second update");
+    assert_eq!(
+        rs.dirty().expect("dirty"),
+        Dirty::Partial,
+        "a second update must not shed the pending damage"
+    );
+
+    let (state, rows) = visit(&mut rs, &t);
+    assert_eq!(state, Dirty::Partial);
+    assert!(
+        rows.contains(&6),
+        "the written row must still be visited after two updates; got {rows:?}"
+    );
+}
+
+#[test]
+fn mark_full_survives_an_update() {
+    // A cache guard that raises `Full` before the next `update` (or a
+    // caller that gets the order wrong) must still get a full visit.
+    // Plan 018 D2 pins update-before-guards as the ordering; this
+    // property is what makes ANY ordering safe by construction — guards
+    // only ever raise, and `update` never lowers.
+    let (t, mut rs) = settled(80, 24);
+
+    rs.mark_full().expect("mark_full");
+    rs.update(&t).expect("update");
+    assert_eq!(
+        rs.dirty().expect("dirty"),
+        Dirty::Full,
+        "a no-change update must not lower a Full raised before it"
+    );
+
+    let (state, rows) = visit(&mut rs, &t);
+    assert_eq!(state, Dirty::Full);
+    assert_eq!(rows, (0..24).collect::<Vec<u32>>());
+}
+
+#[test]
+fn osc4_palette_bytes_report_full() {
+    // Both UIs' row caches depend on the OSC 4 palette path reporting
+    // Full: a palette entry change re-colors every cell that references
+    // it, and neither UI compares the palette itself (measured probe
+    // [S6], plans 017/018). Unlike OSC 10/11 — which libghostty reports
+    // Clean for, and which the UIs' resolvers never read — OSC 4 *does*
+    // reach the resolvers through per-cell indexed colors. If a Ghostty
+    // pin bump regresses this, fail loudly here rather than as a
+    // stale-colors rendering bug nobody can trace.
+    let (mut t, mut rs) = settled(80, 24);
+
+    t.vt_write(b"\x1b]4;1;#abcdef\x07");
+    rs.update(&t).expect("update");
+
+    assert_eq!(rs.dirty().expect("dirty"), Dirty::Full);
+    let (state, rows) = visit(&mut rs, &t);
+    assert_eq!(state, Dirty::Full);
+    assert_eq!(rows, (0..24).collect::<Vec<u32>>());
+}
+
+#[test]
 fn osc_default_color_change_reports_clean_known_limitation() {
     // KNOWN LIMITATION, pinned deliberately. At our Ghostty pin, changing
     // the default background via OSC 11 as PTY bytes marks NOTHING dirty
