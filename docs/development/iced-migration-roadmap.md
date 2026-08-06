@@ -274,12 +274,20 @@ three walk the full grid on every update.
   wraps exactly `update` / `colors` / `cursor` / `walk`. The pinned
   `third_party/ghostty/out/include/ghostty/vt/render.h` also offers
   global dirty (`GHOSTTY_RENDER_STATE_DATA_DIRTY` → false/partial/full),
-  per-row dirty via the row iterator, the matching setters for resetting
-  both layers, and a two-phase `begin_update` / `end_update` split (only
-  the first needs terminal access, so the lock can be released before the
-  deferred work). Wrap all of it. `../libghostty-rs`'s
-  `crates/libghostty-vt/src/render.rs` is MIT and a good reference
-  implementation — its typestate around begin/end is worth copying.
+  per-row dirty (`ROW_DATA_DIRTY` via the row iterator), and the matching
+  `OPTION_DIRTY` / `ROW_OPTION_DIRTY` setters for resetting both layers.
+  Wrap those. No bindgen work: all four constants are already in the
+  generated `sys` module, so this is pure safe-wrapper surface.
+  **Footgun to handle explicitly** (render.h calls it "an extremely
+  important detail"): the two dirty layers are independent — clearing the
+  global state does *not* clear per-row flags, and `update` only ever
+  sets, never clears. The caller owns both resets.
+  **Two-phase `begin_update` / `end_update` is NOT available at our pin** —
+  it landed upstream after `c74f6d5` (present at `../ghostty` tip and in
+  `../libghostty-rs`, absent from our generated bindings). It is an E8
+  follow-on, not part of E2; don't plan around it.
+  `../libghostty-rs`'s `crates/libghostty-vt/src/render.rs` is MIT and a
+  useful reference for the dirty accessors regardless.
 * **E3. Dirty-row snapshot rebuild.** Consumes E2. `refresh_snapshot`
   (`app/terminal_tab.rs`) currently rebuilds the whole grid per PTY
   update, allocating `vec![vec![String::new(); cols]; rows]` — a `String`
@@ -313,7 +321,10 @@ three walk the full grid on every update.
   eventually regardless. A large share of the cost is revalidating the
   **Swift** build — `mac/Package.swift` links the same static archive —
   so the price drops sharply if Swift is retiring. That is why this sits
-  after the M6 decision, not before it.
+  after the M6 decision, not before it. Carries E2's deferred half: the
+  two-phase `begin_update` / `end_update` split arrives with the newer
+  pin, letting the renderer drop the terminal lock before the deferred
+  work — a latency win under heavy PTY output.
 * **E9. `libghostty-rs` integration spike + library audit.** Depends on
   E8. Checked out at `../libghostty-rs` (tip `72ac98f`, 2026-07-29, MIT,
   not on crates.io — fine, `publish = false`). It is broader than
