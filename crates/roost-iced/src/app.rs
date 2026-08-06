@@ -1529,6 +1529,7 @@ impl App {
                     .iter()
                     .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
             );
+            let notifying = project.tabs.iter().any(|tab| tab.has_notification);
             let stripe = container(
                 iced::widget::Space::new()
                     .width(chrome::PROJECT_STRIPE_WIDTH)
@@ -1555,18 +1556,31 @@ impl App {
                         .style(chrome::inline_rename_input)
                         .into()
                 }
-                // Label leading, notification-dot slot trailing: the spacer is
-                // what holds that slot open against the pill's trailing inset
-                // (the dot itself arrives with the sidebar-dot work). The
-                // rename editor keeps the whole pill instead — a fill spacer
-                // beside it would halve the field.
-                _ => row![
-                    text(&project.name).size(13),
-                    iced::widget::Space::new().width(Fill)
-                ]
-                .width(Fill)
-                .align_y(Alignment::Center)
-                .into(),
+                // Label leading, notification-dot slot trailing: the spacer
+                // holds that slot open against the pill's trailing inset
+                // (`PROJECT_DOT_INSET`, matched by the pill container's own
+                // right padding — chrome::badge lands 8px from the pill's
+                // right edge for free). The rename editor keeps the whole
+                // pill instead — a fill spacer beside it would halve the
+                // field, and no dot renders beside the editor.
+                _ => {
+                    let mut label_row = row![
+                        text(&project.name).size(13),
+                        iced::widget::Space::new().width(Fill)
+                    ]
+                    .align_y(Alignment::Center);
+                    if notifying {
+                        label_row = label_row.push(
+                            container(
+                                iced::widget::Space::new()
+                                    .width(chrome::NOTIFICATION_DOT_SIZE)
+                                    .height(chrome::NOTIFICATION_DOT_SIZE),
+                            )
+                            .style(chrome::badge),
+                        );
+                    }
+                    label_row.width(Fill).into()
+                }
             };
             let project_pill = container(project_label)
                 .width(Fill)
@@ -1812,58 +1826,32 @@ impl App {
             self.tab_strip_generation,
             self.strip_gestures_enabled(),
         );
+        let add_tab_button = button(text("+").size(16).color(chrome::MUTED_TEXT))
+            .width(chrome::PILL_HEIGHT)
+            .height(chrome::PILL_HEIGHT)
+            .padding(1)
+            .style(chrome::transparent_button)
+            .on_press(Message::NewTab);
+        // The `+` is a sibling of the strip — never inside its content, since
+        // the strip walks its own layout children for reorder hit-testing and
+        // an extra child there would corrupt the drag target index. As a
+        // sibling row inside the scrollable it hugs the last pill and scrolls
+        // with overflow (Mac parity: the Mac's trailing ＋ scrolls with the
+        // strip too; under overflow it scrolls offscreen — accepted, #281).
+        let tab_strip_row = row![tab_strip, add_tab_button]
+            .spacing(6)
+            .align_y(Alignment::Center);
         // A zero-width scrollbar: any visible indicator overlays the 24px
         // pills themselves and reads as a band across the tab row (#281) —
         // the stock 10px filled rail, and even a 2px hover sliver, both did.
         // Wheel/trackpad scrolling is independent of the scrollbar's size.
-        let tab_scroller = scrollable(tab_strip)
+        let tab_scroller = scrollable(tab_strip_row)
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::hidden(),
             ))
             .width(Fill)
             .height(chrome::PILL_HEIGHT);
-        let mut tabs = row![].spacing(5).align_y(Alignment::Center);
-        if collapsed {
-            tabs = tabs.push(
-                button(text("☰").size(13))
-                    .width(chrome::PILL_HEIGHT)
-                    .height(chrome::PILL_HEIGHT)
-                    .padding(2)
-                    .style(chrome::transparent_button)
-                    .on_press(Message::ToggleSidebar),
-            );
-        }
-        tabs = tabs.push(tab_scroller).push(
-            button(text("+").size(15))
-                .width(chrome::PILL_HEIGHT)
-                .height(chrome::PILL_HEIGHT)
-                .padding(1)
-                .style(chrome::transparent_button)
-                .on_press(Message::NewTab),
-        );
-        let notification_count = self.notification_inbox.count();
-        let notification_label = if notification_count == 0 {
-            "○".to_string()
-        } else {
-            format!("•{}", notification_count.min(99))
-        };
-        tabs = tabs.push(
-            button(
-                text(notification_label)
-                    .size(11)
-                    .color(if notification_count == 0 {
-                        chrome::MUTED_TEXT
-                    } else {
-                        chrome::NOTIFICATION
-                    }),
-            )
-            .width(chrome::PILL_HEIGHT)
-            .height(chrome::PILL_HEIGHT)
-            .padding(2)
-            .style(chrome::transparent_button)
-            .on_press(Message::OpenNotifications),
-        );
-        let tab_bar = container(tabs)
+        let tab_bar = container(tab_scroller)
             .height(chrome::BAND_HEIGHT)
             .width(Fill)
             .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
@@ -2100,13 +2088,6 @@ impl App {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
         let _ = self.focus_tab_and_clear(tab_id, true);
-    }
-
-    pub fn open_notifications(&mut self) -> UiTask {
-        if let Err(error) = self.open_palette("notifications") {
-            self.set_status(error);
-        }
-        self.take_palette_focus_task()
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -2507,10 +2488,8 @@ impl Message {
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
             Self::NewTab => return app.new_tab(),
             Self::NewProject => return app.new_project(),
-            Self::ToggleSidebar => app.toggle_sidebar(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
-            Self::OpenNotifications => return app.open_notifications(),
             _ => {}
         }
         UiTask::None

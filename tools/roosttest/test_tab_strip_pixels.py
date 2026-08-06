@@ -147,10 +147,10 @@ def test_overflowing_tab_strip_paints_no_scrollbar_band(roost, project, target, 
         if shot is None:
             return False
         width = shot[0]
-        # The +/notification buttons occupy the last ~70px of the band, and
-        # the empty-inbox glyph is itself MUTED_TEXT (codex review finding) —
-        # exclude that cluster so only tab-title glyphs can satisfy the probe.
-        rightmost = _rightmost_title_pixel(shot, sidebar_w + 2, width - 70, BAND_HEIGHT)
+        # Nothing is pinned at the band's right edge anymore (bell removed,
+        # `+` moved in-strip — plan 016 C4), so the probe scans the full
+        # band width; no carve-out needed.
+        rightmost = _rightmost_title_pixel(shot, sidebar_w + 2, width, BAND_HEIGHT)
         state["shot"], state["sidebar_w"], state["rightmost"] = shot, sidebar_w, rightmost
         # A title glyph within 150px of the right edge proves the pills run
         # to the strip's clip edge, i.e. the scrollable is overflowing and

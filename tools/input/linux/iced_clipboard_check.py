@@ -554,6 +554,19 @@ def _active_pill_close_point(
     return right - 11, round(launch.client.terminal_top()) // 2
 
 
+# The add-tab `+` is a sibling of the tab strip inside the scrollable (plan
+# 016 C4) — never a fixed right-pinned control — so it hugs the last pill
+# with the strip's 6px spacing and is itself PILL_HEIGHT (24px) wide. Its
+# click center sits 6 + 24/2 = 18px past whichever pill currently renders
+# last, not at a window-relative constant.
+_ADD_TAB_OFFSET = 18
+
+
+def _add_tab_point(pill_right: int, band_center_y: int) -> tuple[int, int]:
+    """Compute the `+` control's click point from the last pill's right edge."""
+    return pill_right + _ADD_TAB_OFFSET, band_center_y
+
+
 def _stable_rollup_stripe_point(launch: Launch) -> tuple[int, int]:
     """Locate one stable waiting-agent project stripe after focus settles."""
     path = launch.root / "chrome-project-rollup-stripe.png"
@@ -689,12 +702,16 @@ def _palette_pointer_routing(launch: Launch) -> None:
     )
     launch.client.palette_dismiss()
 
-    # The fixed add-tab control is deliberately outside the card. The first
-    # click dismisses exactly once and cannot also activate that control.
+    # The add-tab control is deliberately outside the card. The first click
+    # dismisses exactly once and cannot also activate that control. The
+    # window still has its one launch-default tab here (a known tab set), so
+    # its pill is both the active AND last one — the `+` sits right after it.
     before = len(launch.client.project_tab_ids(project))
-    launch.client.palette_open("commands")
     terminal_top = round(launch.client.terminal_top())
-    _click_window_control(launch, width - 49, terminal_top // 2)
+    _left, _top, pill_right, _bottom = _active_pill_bounds(launch, (width, 360))
+    add_x, add_y = _add_tab_point(pill_right, terminal_top // 2)
+    launch.client.palette_open("commands")
+    _click_window_control(launch, add_x, add_y)
     _wait_until(
         lambda: launch.client.palette_state().get("open") is False,
         "outside click palette dismissal",
@@ -1809,38 +1826,40 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
     _click_window_control(launch, x, y)
     _wait_until(lambda: launch.client.tab(last_tab) is None, "scrolled active tab close")
 
+    # The `+` is a scrolling sibling of the strip now, not a window-pinned
+    # control (Mac parity, plan 016 C4) — closing the scrolled-into-view tab
+    # can leave it anywhere, so re-focus the true last remaining tab and
+    # re-scroll to the strip's tail (a no-op past the end) before deriving
+    # the click point from that pill's actual rendered right edge.
     before = len(launch.client.project_tab_ids(home_project))
+    remaining_last_tab = launch.client.project_tab_ids(home_project)[-1]
+    launch.client.focus(remaining_last_tab)
+    _wait_until(
+        lambda: launch.client.identify()["active_tab_id"] == remaining_last_tab,
+        "remaining last tab selection before add-tab click",
+    )
     launch.terminal_pointer(
         [
             "mousemove",
             "--window",
             launch.window,
-            str(width - 49),
+            str(sidebar + 120),
             str(terminal_top // 2),
             "click",
-            "1",
+            "--repeat",
+            "35",
+            "--delay",
+            "15",
+            "7",
         ]
     )
+    _left, _top, pill_right, _bottom = _active_pill_bounds(launch, (width, height))
+    add_x, add_y = _add_tab_point(pill_right, terminal_top // 2)
+    _click_window_control(launch, add_x, add_y)
     _wait_until(
         lambda: len(launch.client.project_tab_ids(home_project)) == before + 1,
-        "fixed add-tab control outside horizontal overflow",
+        "add-tab click still lands after the strip scrolls to its tail",
     )
-    launch.terminal_pointer(
-        [
-            "mousemove",
-            "--window",
-            launch.window,
-            str(width - 20),
-            str(terminal_top // 2),
-            "click",
-            "1",
-        ]
-    )
-    _wait_until(
-        lambda: launch.client.palette_state().get("frame") == "notifications",
-        "fixed notification control outside horizontal overflow",
-    )
-    launch.client.palette_dismiss()
 
     last_project = 0
     last_project_tab = 0
@@ -1917,29 +1936,20 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
     )
 
     # The sidebar has no pointer collapse control (the header « was removed
-    # after user testing; parity with Mac, where collapse is keybind/menu
-    # only) — collapse via the ToggleSidebar default so the collapsed-state
-    # ☰ restore control below is still exercised by a real click.
+    # after user testing) and, as of plan 016 C4, no pointer restore control
+    # either — the collapsed-band ☰ affordance is gone too. Collapse and
+    # restore are both keybind/palette only now (Mac parity: no in-window
+    # affordance when collapsed).
     launch.key("alt+b")
     _wait_until(
         lambda: launch.client.window_metrics()["sidebar_collapsed"],
         "keybind sidebar collapse after body scroll",
     )
     assert launch.client.identify()["active_tab_id"] == last_project_tab
-    launch.terminal_pointer(
-        [
-            "mousemove",
-            "--window",
-            launch.window,
-            "20",
-            str(terminal_top // 2),
-            "click",
-            "1",
-        ]
-    )
+    launch.key("alt+b")
     _wait_until(
         lambda: not launch.client.window_metrics()["sidebar_collapsed"],
-        "fixed collapsed-sidebar control",
+        "keybind sidebar restore (no in-window ☰ affordance, plan 016 C4)",
     )
 
 

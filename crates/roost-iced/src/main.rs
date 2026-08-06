@@ -92,12 +92,10 @@ enum Message {
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
-    ToggleSidebar,
     SidebarResizeDragged {
         width: f32,
     },
     SidebarResizeEnded,
-    OpenNotifications,
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
@@ -271,9 +269,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewTab
         | Message::NewProject
         | Message::ConfirmDeleteCancel
-        | Message::ConfirmDeleteConfirm
-        | Message::ToggleSidebar
-        | Message::OpenNotifications) => message.apply(app).map_task(),
+        | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }
 }
 
