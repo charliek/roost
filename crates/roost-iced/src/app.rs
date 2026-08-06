@@ -73,6 +73,12 @@ mod interactions;
 mod palettes;
 mod servicing;
 mod terminal_tab;
+// The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
+// how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
+// `attach_test_terminal` fixture it depends on; it carries no production
+// code, so the whole module (not just an inner `mod tests`) is test-only.
+#[cfg(test)]
+mod perf_bench;
 
 pub(crate) use self::interactions::RenameTarget;
 use self::interactions::{
