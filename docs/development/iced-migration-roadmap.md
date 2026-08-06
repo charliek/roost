@@ -255,11 +255,14 @@ Entry-criteria status (2026-08-05): the real-input criterion is **met** —
 PR #301 removed the last harness workaround (the seam-press dwell) and the
 full Iced drag/clipboard guard passes in the shed and on CI. The
 no-open-P0/P1 criterion needs a **parity-inventory refresh audit** before
-it can be evaluated honestly: several rows predate shipped slices (e.g.
-the sidebar-resize row still describes the fixed 220 pt width that
-plan 011/slice 3c replaced with persisted 160-400 pt). The audit should
-re-verify every row against current behavior, close what shipped, and
-decide [#284] (visual-parity CI gate: required for M4 or waived).
+it can be evaluated honestly: rows can lag shipped slices (the
+sidebar-resize row described the pre-3c fixed 220 pt width until the
+plan 015 closeout caught it; others may hide the same drift). The audit
+should re-verify every row against current behavior, close what shipped,
+and decide [#284] (visual-parity CI gate: required for M4 or waived).
+After plan 015, the open P1 set is expected to be exactly the 3e polish
+scope plus the upstream-blocked drops row ([#302]) — the audit confirms
+that expectation rather than assuming it.
 
 ### Possible direction — macOS side-by-side evaluation (not committed)
 
