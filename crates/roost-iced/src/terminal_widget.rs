@@ -569,11 +569,14 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
         _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        let draw_started_at = Instant::now();
         let bounds = layout.bounds();
         let Some(clip) = bounds.intersection(viewport) else {
+            crate::perf::record_draw(draw_started_at.elapsed(), 0);
             return;
         };
 
+        let mut fill_text_calls: u64 = 0;
         renderer.with_layer(clip, |renderer| {
             fill_quad(renderer, bounds, color(self.snapshot.background));
             let metrics = self.metrics;
@@ -611,6 +614,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                         color(cell.foreground),
                         clip,
                     );
+                    fill_text_calls += 1;
                 }
             }
 
@@ -692,6 +696,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 }
             }
         });
+        crate::perf::record_draw(draw_started_at.elapsed(), fill_text_calls);
     }
 }
 

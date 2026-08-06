@@ -1509,4 +1509,41 @@ mod tests {
         );
         assert_eq!(workspace.active().1, other.id, "and moves nothing");
     }
+
+    /// Pins the per-tab counters `refresh_snapshot` maintains. These are
+    /// asserted on the tab's own `TabRenderStats`, not the process-global
+    /// aggregate in `perf` — `cargo test -p roost-iced` runs concurrently
+    /// with other tests that spawn their own PTY and refresh their own
+    /// tab, and a global counter would pick up their activity too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_snapshot_updates_the_tabs_own_render_stats() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(75, feed_tx);
+        assert_eq!(tab.render_stats, crate::perf::TabRenderStats::default());
+
+        tab.refresh_snapshot().expect("refresh");
+
+        assert_eq!(tab.render_stats.refresh_calls, 1);
+        assert_eq!(
+            tab.render_stats.rows_rebuilt,
+            u64::from(DEFAULT_ROWS),
+            "the current refresh always rebuilds the whole grid"
+        );
+        assert_eq!(
+            tab.render_stats.cells_walked,
+            u64::from(DEFAULT_COLS) * u64::from(DEFAULT_ROWS)
+        );
+        assert!(
+            tab.render_stats.refresh_nanos > 0,
+            "refresh does real work, so elapsed time should be nonzero"
+        );
+
+        tab.refresh_snapshot().expect("second refresh");
+        assert_eq!(
+            tab.render_stats.refresh_calls, 2,
+            "counters accumulate across calls rather than resetting"
+        );
+
+        supervisor.close(75);
+    }
 }

@@ -206,6 +206,7 @@ pub(super) struct TerminalTab {
     rows: u16,
     pub(super) applied_metrics: Option<TerminalMetrics>,
     pub(super) metric_generation: u64,
+    pub(super) render_stats: crate::perf::TabRenderStats,
 }
 
 impl Drop for TerminalTab {
@@ -286,6 +287,7 @@ impl TerminalTab {
             rows: DEFAULT_ROWS,
             applied_metrics: None,
             metric_generation: 0,
+            render_stats: crate::perf::TabRenderStats::default(),
         })
     }
 
@@ -877,13 +879,16 @@ impl TerminalTab {
     }
 
     pub(super) fn refresh_snapshot(&mut self) -> Result<()> {
+        let refresh_started_at = Instant::now();
         self.recompute_hover()?;
         self.render_state.update(&self.terminal)?;
         let colors = self.render_state.colors()?;
         let cursor = self.render_state.cursor();
         let mut cells = Vec::new();
         let mut rows = vec![vec![String::new(); usize::from(self.cols)]; usize::from(self.rows)];
+        let mut cells_walked: u64 = 0;
         self.render_state.walk(&self.terminal, |row, cell| {
+            cells_walked += 1;
             if row >= u32::from(self.rows) || cell.col >= self.cols {
                 return;
             }
@@ -913,6 +918,11 @@ impl TerminalTab {
                 });
             }
         })?;
+        // The full-grid rebuild below always touches every row of `rows`,
+        // so its length is the truthful "rows rebuilt" count today. Once
+        // the rebuild goes incremental (C5), `rows` will hold only the
+        // rebuilt rows and this stays correct without changing.
+        let rows_rebuilt = rows.len() as u64;
         let rows_text = rows
             .into_iter()
             .map(|row| row.concat().trim_end().to_string())
@@ -939,6 +949,10 @@ impl TerminalTab {
                 }),
             pointer_shape: self.effective_pointer_shape().into(),
         };
+        let elapsed = refresh_started_at.elapsed();
+        self.render_stats
+            .record_refresh(elapsed, rows_rebuilt, cells_walked);
+        crate::perf::record_refresh(elapsed, rows_rebuilt, cells_walked);
         Ok(())
     }
 
