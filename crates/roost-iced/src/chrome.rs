@@ -23,8 +23,17 @@ pub const PALETTE_MAX_HEIGHT: f32 = 500.0;
 /// selects the right instance.
 pub const CHROME_FONT_FAMILY: &str = "Inter";
 
-pub const SURFACE: Color = Color::from_rgb8(0x28, 0x28, 0x28);
-pub const SURFACE_DARK: Color = Color::from_rgb8(0x21, 0x21, 0x21);
+/// The one solid chrome band: sidebar header, sidebar footer, tab band.
+pub const BAND: Color = Color::from_rgb8(0x24, 0x29, 0x2c);
+/// The sidebar's scrollable project list, one step lighter than the bands.
+pub const LIST: Color = Color::from_rgb8(0x2d, 0x32, 0x35);
+/// Hairline between the sidebar and the terminal, drawn inside the sidebar's
+/// own width so the terminal grid keeps every pixel it is sized for.
+pub const DIVIDER: Color = Color::from_rgb8(0x1a, 0x1d, 0x1e);
+pub const DIVIDER_WIDTH: f32 = 1.0;
+pub const FOOTER_CHIP: Color = Color::from_rgb8(0x34, 0x39, 0x3c);
+pub const FOOTER_CHIP_HOVER: Color = Color::from_rgb8(0x3e, 0x44, 0x47);
+pub const FOOTER_CHIP_PRESSED: Color = Color::from_rgb8(0x2a, 0x2f, 0x32);
 pub const ACTIVE_BLUE: Color = Color::from_rgb8(0x13, 0x50, 0x9d);
 pub const ACTIVE_TAB: Color = Color::from_rgb8(0x24, 0x37, 0x51);
 pub const HOVER: Color = Color::from_rgb8(0x39, 0x39, 0x39);
@@ -50,12 +59,16 @@ pub fn chrome_font(weight: iced::font::Weight) -> Font {
     }
 }
 
-pub fn surface(_: &Theme) -> container::Style {
-    container::Style::default().background(SURFACE)
+pub fn band(_: &Theme) -> container::Style {
+    container::Style::default().background(BAND)
 }
 
-pub fn dark_surface(_: &Theme) -> container::Style {
-    container::Style::default().background(SURFACE_DARK)
+pub fn list(_: &Theme) -> container::Style {
+    container::Style::default().background(LIST)
+}
+
+pub fn divider(_: &Theme) -> container::Style {
+    container::Style::default().background(DIVIDER)
 }
 
 /// Both strips share one drag affordance, so the dragged row and the dragged
@@ -106,10 +119,10 @@ pub fn transparent_button(_: &Theme, status: button::Status) -> button::Style {
 /// rather than the flat text buttons used elsewhere in the chrome.
 pub fn footer_chip_button(_: &Theme, status: button::Status) -> button::Style {
     let background = match status {
-        button::Status::Hovered => PALETTE_SELECTION,
-        button::Status::Pressed => ACTIVE_TAB,
-        button::Status::Active => ACTIVE_AGENT,
-        button::Status::Disabled => ACTIVE_AGENT.scale_alpha(0.5),
+        button::Status::Hovered => FOOTER_CHIP_HOVER,
+        button::Status::Pressed => FOOTER_CHIP_PRESSED,
+        button::Status::Active => FOOTER_CHIP,
+        button::Status::Disabled => FOOTER_CHIP.scale_alpha(0.5),
     };
     button::Style {
         background: Some(Background::Color(background)),
@@ -289,6 +302,41 @@ mod tests {
         assert_eq!(
             tab_pill(true, false)(&theme).background,
             Some(Background::Color(ACTIVE_TAB))
+        );
+    }
+
+    #[test]
+    fn chrome_regions_split_into_one_band_color_and_one_list_color() {
+        let theme = Theme::Dark;
+        assert_eq!(band(&theme).background, Some(Background::Color(BAND)));
+        assert_eq!(list(&theme).background, Some(Background::Color(LIST)));
+        assert_eq!(divider(&theme).background, Some(Background::Color(DIVIDER)));
+        assert_ne!(BAND, LIST, "the list region reads lighter than the bands");
+        assert_eq!(DIVIDER_WIDTH, 1.0);
+    }
+
+    #[test]
+    fn footer_chip_rests_on_a_filled_bezel_and_dims_when_disabled() {
+        let theme = Theme::Dark;
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Active).background,
+            Some(Background::Color(FOOTER_CHIP))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Hovered).background,
+            Some(Background::Color(FOOTER_CHIP_HOVER))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Pressed).background,
+            Some(Background::Color(FOOTER_CHIP_PRESSED))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Disabled).background,
+            Some(Background::Color(FOOTER_CHIP.scale_alpha(0.5)))
+        );
+        assert_eq!(
+            footer_chip_button(&theme, button::Status::Active).text_color,
+            TEXT
         );
     }
 

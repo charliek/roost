@@ -1621,11 +1621,11 @@ impl App {
         .height(chrome::BAND_HEIGHT)
         .width(Fill)
         .padding([10, 12])
-        .style(chrome::surface);
+        .style(chrome::band);
         let sidebar_footer = container(
-            button(text("+ New Project").size(11))
+            button(text("+ New Project").size(13))
                 .height(chrome::PILL_HEIGHT)
-                .padding([4, 12])
+                .padding([3, 12])
                 .style(chrome::footer_chip_button)
                 .on_press(Message::NewProject),
         )
@@ -1633,7 +1633,7 @@ impl App {
         .width(Fill)
         .center_x(Fill)
         .padding([5, 8])
-        .style(chrome::surface);
+        .style(chrome::band);
         // The strip delegates layout to its content, so its layout node is the
         // column's: one child per project group, which is what the gesture's
         // hit-testing and target index walk.
@@ -1643,14 +1643,22 @@ impl App {
             self.project_strip_generation,
             self.strip_gestures_enabled(),
         );
+        // The hairline lives inside the sidebar's own width — the outer
+        // container paints it and pads the three region fills off it — so the
+        // terminal grid keeps every pixel `sidebar_width` leaves it and the
+        // resize grip's seam still lands on the sidebar's right edge.
         let sidebar = container(column![
             sidebar_header,
-            scrollable(project_strip).height(Fill),
+            container(scrollable(project_strip).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(chrome::list),
             sidebar_footer
         ])
         .width(self.live_sidebar_width())
         .height(Fill)
-        .style(chrome::surface);
+        .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
+        .style(chrome::divider);
 
         let active_project_model = self
             .projects
@@ -1839,7 +1847,7 @@ impl App {
             .height(chrome::BAND_HEIGHT)
             .width(Fill)
             .padding([5, 8])
-            .style(chrome::dark_surface);
+            .style(chrome::band);
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
