@@ -343,16 +343,30 @@ recorded alongside it rather than quietly edited away.
   (the `cached_defaults` guard above). Tripwire tests in
   `crates/roost-vt/tests/render_dirty_test.rs` will fail loudly if a
   future Ghostty bump changes this.
-* **E3b. Dirty-row rebuild for GTK + real `render_stats` — not started.**
-  Split out of E3, which originally read "GTK's `terminal_view.rs` gets
-  the same treatment." Two parts: `crates/roost-linux/src/terminal_view.rs`
-  adopts `walk_dirty` the same way `roost-iced` did, and
-  `app.render_stats` gets a real implementation — today it answers with
-  zeroed counters as a deliberate parity placeholder
-  (`crates/roost-linux/src/app.rs`'s `UiRequest::AppRenderStats` arm),
-  so the op's contract is identical on both Rust UIs while only one
-  collects real numbers. GTK is unaffected by the E1–E3 pass beyond that
-  placeholder, since `walk` itself was left unchanged.
+* **E3b. Dirty-row rebuild for GTK + real `render_stats` — done
+  (plan 018).** Shipped, gated by a measurement the same way E4 was
+  killed by one: C3 landed counters + a renderer-free `refresh_cache`
+  seam first, and the cache proceeded only after the walk measured
+  **1.09 ms/frame** (release, shed) on blink-driven idle frames — past
+  the pre-stated go threshold. Shipped shape mirrors iced's E3 with
+  GTK's inputs: `RenderedRow { bg, glyphs }` grid on `TerminalViewState`,
+  guards on `(cols, rows)` + a `GuardKey` of the resolver's actual
+  inputs (theme fg/bg/`bold_color` — the last never pushed into
+  libghostty, so that guard alone catches a bold_color-only change —
+  plus cell metrics) + a theme generation; cursor glyph looked up from
+  the cache at paint time (a blink frame visits zero rows, so the old
+  during-the-walk capture would have blanked the block cursor's glyph).
+  `app.render_stats` on GTK returns real counters. Measured (release,
+  shed): idle/blink refresh **1.09 ms → 13.6 µs/frame** (~80×), zero
+  rows rebuilt; a 300-line scroll burst rebuilds once instead of every
+  frame. **Follow-up recorded, not done:** the *draw* phase is GTK's
+  real cost — 15–25 ms/frame under Xvfb, ~2,400 per-cell pango
+  `set_text`+`show_layout` calls repeated in full on every blink frame.
+  Routes: per-row damage clipping of the Cairo phase, and/or pango-side
+  run drawing — which, unlike iced, has drift-free designs (negative
+  `letter_spacing`, per-glyph x-positioning; see E4's corrected scope).
+  Xvfb-software-rendering caveat recorded with the numbers in plan 018's
+  artifacts.
 * **E4. Run coalescing — measured NO-GO (2026-08-06, plan 018).** The
   entry below first recorded a GO from plan 017's numbers; further
   measurement the same day reversed it, and the reversal is exactly why
