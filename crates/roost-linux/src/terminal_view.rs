@@ -287,6 +287,11 @@ impl TerminalView {
             was_alt_screen_active: false,
             osc_shape_set_in_this_chunk: false,
             render_stats: roost_ui_model::render_stats::TabRenderStats::default(),
+            grid: Vec::new(),
+            cached_grid_size: None,
+            cached_guard_key: None,
+            theme_generation: 0,
+            cached_theme_generation: None,
         }));
 
         // Draw function: hand a Cairo context per redraw.
@@ -1065,6 +1070,9 @@ impl TerminalView {
             let _ = s.terminal.set_color_cursor(theme.cursor);
             let _ = s.terminal.set_color_palette(&theme.palette);
             s.theme = theme.clone();
+            // Every theme application lands here, so this is the one
+            // place the row cache's generation guard must move.
+            s.theme_generation = s.theme_generation.wrapping_add(1);
             if s.terminal.mode_get(2031) {
                 s.input_callback.clone()
             } else {
@@ -1666,34 +1674,114 @@ struct TerminalViewState {
     /// and re-pushing the identical name is wasted FFI.
     last_applied_cursor_name: Option<&'static str>,
     /// Per-view refresh counters, folded into `crate::perf`'s global
-    /// aggregate on every [`Self::refresh_passes`]. Non-atomic and
+    /// aggregate on every [`Self::refresh_cache`]. Non-atomic and
     /// per-view so unit tests can assert on deltas without racing
     /// whatever other tests are painting concurrently — see
     /// `roost_ui_model::render_stats::TabRenderStats`.
     render_stats: roost_ui_model::render_stats::TabRenderStats,
+    /// Cached draw content, one entry per viewport row (index = row).
+    /// Rebuilt only for the rows libghostty reports dirty; see
+    /// [`Self::refresh_cache`]'s caching invariant.
+    grid: Vec<RenderedRow>,
+    /// Grid dimensions the cache was built for. Guard 1.
+    cached_grid_size: Option<(u16, u16)>,
+    /// Resolver + geometry inputs the cache was built with. Guard 2.
+    cached_guard_key: Option<GuardKey>,
+    /// Bumped by every theme apply; guard 3 (belt-and-braces over
+    /// guard 2, which already covers the resolver's own inputs).
+    theme_generation: u64,
+    /// `theme_generation` the cache was built at. Guard 3.
+    cached_theme_generation: Option<u64>,
 }
 
-/// The draw lists [`TerminalViewState::refresh_passes`] hands to
-/// `paint` — the output of the renderer-free half of a frame.
+/// One viewport row's cached draw content: the output of the
+/// renderer-free walk, replayed by `paint` on every frame.
 ///
-/// Overlay invariant: cursor, selection and link-underline stay
-/// *overlay* passes computed at draw time. Nothing overlay-driven
-/// (blink phase, focus, hover, selection extent) may be baked into
-/// these lists, or plan 018 C4's row cache would have to invalidate on
-/// every blink tick.
-#[derive(Default)]
-struct RefreshedPasses {
-    /// Pass A — per-cell bg fills, only for cells that override the
-    /// default. (A cell carrying the default bg is already covered by
-    /// `paint`'s canvas fill.) `(row, col, bg)`.
-    bg_pass: Vec<(u32, u16, ColorRgb)>,
-    /// Pass B — per-cell glyphs. `(row, col, resolved fg, text)`.
-    glyph_pass: Vec<(u32, u16, ColorRgb, String)>,
-    /// The cursor cell's glyph + resolved fg, so pass C's block cursor
-    /// can re-draw the underlying glyph inverted.
-    cursor_cell_text: Option<(String, ColorRgb)>,
-    /// Cursor as of this frame's snapshot. Read once here so the walk
-    /// and the draw phase can never disagree about where it is.
+/// **Overlay invariant.** This holds terminal *content* only. The
+/// cursor, the selection, the link underline and the focus state are
+/// draw-time overlays computed in `paint` from live state, and are
+/// never baked in here — otherwise a cursor blink tick (which changes
+/// no cell) would have to invalidate the cache, and the headline
+/// zero-rebuild win would be gone.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct RenderedRow {
+    /// Pass A — cells whose background overrides the default. (A cell
+    /// carrying the default bg is already covered by `paint`'s canvas
+    /// fill.) `(col, bg)`, ascending by column.
+    bg: Vec<(u16, ColorRgb)>,
+    /// Pass B — non-blank cells. `(col, resolved fg, cluster text)`,
+    /// ascending by column.
+    glyphs: Vec<(u16, ColorRgb, String)>,
+}
+
+impl RenderedRow {
+    /// Resolve one viewport row from libghostty's cells for that row.
+    ///
+    /// Everything this reads is a parameter — the row's vt cells plus
+    /// the three resolver inputs, which are exactly the color members of
+    /// [`GuardKey`]. Adding a fourth input here means extending that key
+    /// (see [`TerminalViewState::refresh_cache`]'s caching invariant).
+    fn build(
+        cells: &[Cell],
+        default_fg: ColorRgb,
+        default_bg: ColorRgb,
+        bold_color: Option<ColorRgb>,
+    ) -> Self {
+        let mut row = RenderedRow::default();
+        for cell in cells {
+            // Apply SGR inverse + bold-accent rules. Without this,
+            // codex's `\e[7m`-highlighted prompt row renders against
+            // the canvas-default bg and the gray prompt disappears
+            // (the visible regression the PR fixes). The theme's
+            // optional `bold-color` accent (Ghostty `bold-color = …`)
+            // colors bold default-fg cells when present; themes
+            // that don't set it keep the canvas-default fg.
+            let (fg, bg, has_explicit_bg) =
+                resolve_cell_colors(cell, default_fg, default_bg, bold_color);
+            if has_explicit_bg && bg != default_bg {
+                row.bg.push((cell.col, bg));
+            }
+            if !cell.text.is_empty() && cell.text != " " {
+                row.glyphs.push((cell.col, fg, cell.text.clone()));
+            }
+        }
+        row
+    }
+}
+
+/// Everything besides a row's own vt cells that decides what
+/// [`RenderedRow::build`] produces, plus the cell geometry. Compared
+/// once per frame in [`TerminalViewState::refresh_cache`]; any change
+/// forces a full rebuild.
+///
+/// `bold_color` is the load-bearing member: it is a roost-side theme key
+/// that is **never** pushed into libghostty, so a `bold_color`-only
+/// theme change is invisible to native dirty tracking and this guard is
+/// the only thing that catches it. The fg/bg pair is belt-and-braces
+/// (`TerminalView::set_theme` pushes both into libghostty, which reports
+/// `Full`).
+///
+/// `cell_metrics` is belt-and-braces too, and cheap: the cache stores
+/// *logical* cells, so pixel geometry is a paint-time input and a font
+/// change that keeps the grid identical leaves the cache byte-valid; one
+/// that changes the grid trips guard 1 via reflow anyway. The `f64`s are
+/// keyed by their bit patterns so the whole key stays `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuardKey {
+    default_fg: ColorRgb,
+    default_bg: ColorRgb,
+    bold_color: Option<ColorRgb>,
+    cell_width_bits: u64,
+    cell_height_bits: u64,
+}
+
+/// The per-frame scalars [`TerminalViewState::refresh_cache`] hands to
+/// `paint`. Cell content is deliberately NOT here: it lives in
+/// [`TerminalViewState::grid`], which the refresh updates in place.
+struct RefreshedFrame {
+    /// Cursor as of this frame's snapshot. Read once in the refresh so
+    /// the cache update and the draw phase can never disagree about
+    /// where it is.
     cursor: Option<CursorInfo>,
 }
 
@@ -1815,98 +1903,156 @@ impl TerminalViewState {
         }
     }
 
-    /// The renderer-free half of a frame: snapshot the terminal, walk it,
-    /// and hand `paint` the draw lists. No Cairo, no Pango, no widget —
+    /// Raise the dirty state to `Full` and report whether it took. A
+    /// caller records its new cache key only when this returns `true`,
+    /// so a failed invalidation is retried on the next frame instead of
+    /// being lost.
+    fn invalidate_all_rows(&mut self) -> bool {
+        match self.render_state.mark_full() {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(?err, "mark_full failed; cache invalidation deferred");
+                false
+            }
+        }
+    }
+
+    /// The renderer-free half of a frame: snapshot the terminal, rebuild
+    /// the rows libghostty reports dirty into [`Self::grid`], and hand
+    /// `paint` this frame's scalars. No Cairo, no Pango, no widget —
     /// which is what lets the counter assertions drive it headless.
     ///
     /// Returns `None` when the snapshot failed and the frame must be
     /// skipped; a skipped frame folds neither a refresh nor a draw into
     /// the counters.
     ///
-    /// This still walks the FULL grid. `rows_rebuilt` / `cells_walked`
-    /// therefore currently equal the whole viewport — the seam and the
-    /// counter meanings are what this commit establishes so plan 018's
-    /// C4 can swap the internals for `walk_dirty` + a per-row cache
-    /// without moving the measurement boundary underneath the numbers.
-    fn refresh_passes(&mut self) -> Option<RefreshedPasses> {
+    /// **Caching invariant.** A cached [`RenderedRow`] is valid exactly
+    /// while (a) libghostty reports its row undirty and (b) the
+    /// [`GuardKey`] inputs `RenderedRow::build` reads besides the row's
+    /// own vt cells are unchanged. Anything that changes what a row
+    /// should render must therefore either mark that row dirty inside
+    /// libghostty or move one of the keys guarded below — and whoever
+    /// adds an input to `RenderedRow::build` must extend `GuardKey` with
+    /// it, or the cache goes stale on exactly that input.
+    ///
+    /// What the guards do and don't carry here: GTK **does** push the
+    /// theme into libghostty (`TerminalView::set_theme` sets all four
+    /// color groups), which reports `Full`, so guards 2/3 are
+    /// belt-and-braces for a theme apply — except for `bold_color`,
+    /// which never reaches libghostty at all and which guard 2 alone
+    /// catches. What `paint` never reads is libghostty's *reported*
+    /// colors for the cell defaults: it resolves them from `self.theme`.
+    /// So an OSC 10/11 set or DECSCNM — which move the reported defaults
+    /// with nothing marked dirty — change nothing GTK draws, and need no
+    /// fourth key today (pinned by `tests/osc_set_theme_indifference.rs`;
+    /// the day GTK starts consuming those colors, that is where the key
+    /// goes). The one reported color `paint` does consume is the OSC 12
+    /// cursor color, and that is an overlay, never cached.
+    ///
+    /// Ordering: `update` runs BEFORE the guards, and each guard calls
+    /// `mark_full` BEFORE recording its new key. Guards only ever raise
+    /// the dirty state and `update` never lowers it (pinned by
+    /// `roost-vt`'s `update; update; walk_dirty` tripwire), so the order
+    /// is safe in both directions.
+    fn refresh_cache(&mut self) -> Option<RefreshedFrame> {
         let refresh_started_at = Instant::now();
         // Snapshot terminal state for this frame.
         if let Err(err) = self.render_state.update(&self.terminal) {
             tracing::warn!(?err, "render_state.update failed; skipping frame");
             return None;
         }
-        // Theme wins over libghostty's compiled-in default when no
-        // SGR override is set on the cell. M6 P3 on the Mac side
-        // pushes the theme into libghostty so `colors.foreground/
-        // background` already carries the theme — until commit 11
-        // does the same here, fall back to the theme directly.
-        let default_fg = self.theme.foreground;
-        let default_bg = self.theme.background;
-        let bold_color = self.theme.bold_color;
-
-        // Cursor cell glyph + override fg — captured during the walk
-        // so the block cursor can re-draw the underlying glyph in
-        // inverted color in pass C.
         let cursor = self.render_state.cursor();
-        let mut passes = RefreshedPasses {
-            cursor,
-            ..RefreshedPasses::default()
-        };
 
+        // Guard 1 — grid size, both axes: a width-only resize leaves the
+        // row count alone while invalidating every cached row's column
+        // content.
+        let size = (self.cols, self.rows);
+        if self.cached_grid_size != Some(size) && self.invalidate_all_rows() {
+            self.grid = vec![RenderedRow::default(); usize::from(self.rows)];
+            self.cached_grid_size = Some(size);
+        }
+        // Guard 2 — the resolver's inputs + cell geometry.
+        let key = GuardKey {
+            default_fg: self.theme.foreground,
+            default_bg: self.theme.background,
+            bold_color: self.theme.bold_color,
+            cell_width_bits: self.cell_metrics.cell_width.to_bits(),
+            cell_height_bits: self.cell_metrics.cell_height.to_bits(),
+        };
+        if self.cached_guard_key != Some(key) && self.invalidate_all_rows() {
+            self.cached_guard_key = Some(key);
+        }
+        // Guard 3 — theme generation.
+        if self.cached_theme_generation != Some(self.theme_generation) && self.invalidate_all_rows()
+        {
+            self.cached_theme_generation = Some(self.theme_generation);
+        }
+
+        let GuardKey {
+            default_fg,
+            default_bg,
+            bold_color,
+            ..
+        } = key;
+        let grid = &mut self.grid;
         let mut rows_rebuilt: u64 = 0;
         let mut cells_walked: u64 = 0;
-        // The walk emits cells in row-major order, so a row boundary is
-        // just "the row index changed since the last cell".
-        let mut last_row: Option<u32> = None;
-        self.render_state
-            .walk(&self.terminal, |row, cell: Cell| {
-                cells_walked += 1;
-                if last_row != Some(row) {
-                    rows_rebuilt += 1;
-                    last_row = Some(row);
-                }
-                // Apply SGR inverse + bold-accent rules. Without this,
-                // codex's `\e[7m`-highlighted prompt row renders against
-                // the canvas-default bg and the gray prompt disappears
-                // (the visible regression the PR fixes). The theme's
-                // optional `bold-color` accent (Ghostty `bold-color = …`)
-                // colors bold default-fg cells when present; themes
-                // that don't set it keep the canvas-default fg.
-                let (fg, bg, has_explicit_bg) =
-                    resolve_cell_colors(&cell, default_fg, default_bg, bold_color);
-                if has_explicit_bg && bg != default_bg {
-                    passes.bg_pass.push((row, cell.col, bg));
-                }
-                if !cell.text.is_empty() && cell.text != " " {
-                    passes
-                        .glyph_pass
-                        .push((row, cell.col, fg, cell.text.clone()));
-                }
-                if let Some(c) = cursor.as_ref() {
-                    if c.row == row && c.col == cell.col as u32 {
-                        passes.cursor_cell_text = Some((cell.text.clone(), fg));
-                    }
-                }
+        if let Err(err) = self
+            .render_state
+            .walk_dirty(&self.terminal, |row, cells: &[Cell]| {
+                cells_walked += cells.len() as u64;
+                // Clamped against the cache's own length, not `self.rows`:
+                // the size guard keeps the two equal, and reading the
+                // length here means a row index past the end can never
+                // index out of bounds even if that ever stopped holding.
+                let Some(slot) = grid.get_mut(row as usize) else {
+                    return;
+                };
+                // `walk_dirty` hands each visited row its COMPLETE cell
+                // slice exactly once, so replacing the row wholesale can
+                // never leave a half-built row in the cache.
+                *slot = RenderedRow::build(cells, default_fg, default_bg, bold_color);
+                rows_rebuilt += 1;
             })
-            .ok();
+        {
+            // Residual damage is safe by `walk_dirty`'s contract: the
+            // next frame redraws more than necessary, never less.
+            tracing::warn!(?err, "walk_dirty failed; some rows may be stale this frame");
+        }
 
         let elapsed = refresh_started_at.elapsed();
         self.render_stats
             .record_refresh(elapsed, rows_rebuilt, cells_walked);
         crate::perf::record_refresh(elapsed, rows_rebuilt, cells_walked);
-        Some(passes)
+        Some(RefreshedFrame { cursor })
+    }
+
+    /// The cursor cell's glyph + resolved fg, for the block cursor's
+    /// glyph redraw in pass C. Looked up in the row cache at draw time.
+    ///
+    /// Provenance: this used to be captured *during* the walk. Under the
+    /// dirty-row cache the walk visits only dirty rows, so a blink frame
+    /// would never see the cursor cell and the glyph would vanish from
+    /// under the block. Reading the cache instead is byte-equivalent to
+    /// the old capture: `paint_cursor` ignores the fg entirely
+    /// (`Some((text, _fg))`) and redraws only when
+    /// `!text.is_empty() && text != " "`, while the cache stores exactly
+    /// the non-blank glyphs (`RenderedRow::build` applies that same
+    /// predicate). So a `None` here takes precisely the branch a
+    /// captured blank cursor cell took: fill the block, draw no glyph.
+    fn cursor_cell_text(&self, cursor: &CursorInfo) -> Option<(String, ColorRgb)> {
+        self.grid
+            .get(cursor.row as usize)?
+            .glyphs
+            .iter()
+            .find(|(col, _, _)| u32::from(*col) == cursor.col)
+            .map(|(_, fg, text)| (text.clone(), *fg))
     }
 
     fn paint(&mut self, widget: &DrawingArea, cr: &cairo::Context, width: f64, height: f64) {
-        let Some(passes) = self.refresh_passes() else {
+        let Some(RefreshedFrame { cursor }) = self.refresh_cache() else {
             return;
         };
-        let RefreshedPasses {
-            bg_pass,
-            glyph_pass,
-            cursor_cell_text,
-            cursor,
-        } = passes;
 
         // Everything below is the Cairo phase — `draw_*` in the
         // counters. `crate::perf`'s module doc carries the split.
@@ -1943,10 +2089,13 @@ impl TerminalViewState {
             )
         });
 
-        for (row, col, bg) in &bg_pass {
-            set_cairo_color(cr, *bg);
-            cr.rectangle(*col as f64 * cell_w, *row as f64 * cell_h, cell_w, cell_h);
-            let _ = cr.fill();
+        for (row, cached) in self.grid.iter().enumerate() {
+            let y = row as f64 * cell_h;
+            for (col, bg) in &cached.bg {
+                set_cairo_color(cr, *bg);
+                cr.rectangle(*col as f64 * cell_w, y, cell_w, cell_h);
+                let _ = cr.fill();
+            }
         }
 
         // Pass B: glyphs. Box-drawing (U+2500..U+257F) and block-
@@ -1958,44 +2107,49 @@ impl TerminalViewState {
         let pango_ctx = widget.pango_context();
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_font_description(Some(&self.font_desc));
-        for (row, col, fg, text) in &glyph_pass {
-            // Skip drawing the glyph at the cursor cell when the block
-            // cursor is about to redraw it inverted. Same per-frame
-            // decision `paint_cursor` uses, so the skip can never
-            // disagree with the paint (blank-cell hazard fixed by
-            // construction). `wide_tail` cells keep their glyph — the
-            // wide-char cell to the left carries the cursor.
-            if let Some(c) = cursor.as_ref() {
-                if c.row == *row
-                    && c.col == *col as u32
-                    && cursor_mode == Some(CursorRenderMode::Block)
-                    && !c.wide_tail
-                {
-                    continue;
+        for (row, cached) in self.grid.iter().enumerate() {
+            let y = row as f64 * cell_h;
+            for (col, fg, text) in &cached.glyphs {
+                // Skip drawing the glyph at the cursor cell when the block
+                // cursor is about to redraw it inverted. A draw-time
+                // filter against the live cursor, never baked into the
+                // cached row (overlay invariant on `RenderedRow`). Same
+                // per-frame decision `paint_cursor` uses, so the skip can
+                // never disagree with the paint (blank-cell hazard fixed
+                // by construction). `wide_tail` cells keep their glyph —
+                // the wide-char cell to the left carries the cursor.
+                if let Some(c) = cursor.as_ref() {
+                    if c.row as usize == row
+                        && c.col == *col as u32
+                        && cursor_mode == Some(CursorRenderMode::Block)
+                        && !c.wide_tail
+                    {
+                        continue;
+                    }
                 }
-            }
-            let x = *col as f64 * cell_w;
-            let y = *row as f64 * cell_h;
-            // Sprite-render single-codepoint cells whose codepoint
-            // falls in one of the geometric ranges. Multi-codepoint
-            // graphemes (emoji ZWJ etc.) skip this path because the
-            // sprite layer is by-codepoint, not by-grapheme.
-            let mut chars = text.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                if sprite::draw_cell_sprite(cr, x, y, cell_w, cell_h, *fg, c as u32) {
-                    fill_text_calls += 1;
-                    continue;
+                let x = *col as f64 * cell_w;
+                // Sprite-render single-codepoint cells whose codepoint
+                // falls in one of the geometric ranges. Multi-codepoint
+                // graphemes (emoji ZWJ etc.) skip this path because the
+                // sprite layer is by-codepoint, not by-grapheme.
+                let mut chars = text.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if sprite::draw_cell_sprite(cr, x, y, cell_w, cell_h, *fg, c as u32) {
+                        fill_text_calls += 1;
+                        continue;
+                    }
                 }
+                set_cairo_color(cr, *fg);
+                layout.set_text(text);
+                cr.move_to(x, y);
+                pango_cairo::show_layout(cr, &layout);
+                fill_text_calls += 1;
             }
-            set_cairo_color(cr, *fg);
-            layout.set_text(text);
-            cr.move_to(x, y);
-            pango_cairo::show_layout(cr, &layout);
-            fill_text_calls += 1;
         }
 
         // Pass C: cursor.
         if let (Some(c), Some(mode)) = (cursor.as_ref(), cursor_mode) {
+            let cursor_cell_text = self.cursor_cell_text(c);
             self.paint_cursor(
                 cr,
                 &layout,
@@ -3613,5 +3767,324 @@ mod tests {
         // DEC 2031: light → `CSI ? 997 ; 2 n`, dark → `CSI ? 997 ; 1 n`.
         assert_eq!(color_scheme_report(true), b"\x1b[?997;2n");
         assert_eq!(color_scheme_report(false), b"\x1b[?997;1n");
+    }
+}
+
+#[cfg(test)]
+mod dirty_row_cache_tests {
+    //! Plan 018 C4 — the GTK twin of plan 017's C6 counter tests.
+    //!
+    //! These live here, not in `crates/roost-linux/tests/` as the repo
+    //! convention prefers, because `TerminalViewState` and
+    //! [`TerminalViewState::refresh_cache`] are declared in the binary's
+    //! module tree (`main.rs`), so an integration-test crate cannot name
+    //! them. Driving the real seam is the point of C3's renderer-free
+    //! split, so an in-module test wins over an integration test that
+    //! could only re-implement the cache.
+    //!
+    //! Every test drives `refresh_cache` directly — no Cairo, no widget,
+    //! no display — and asserts on `render_stats` deltas plus the cached
+    //! grid's content.
+    use super::*;
+    use roost_vt::ScrollViewport;
+
+    /// Cell metrics are a paint-time input the cache never stores, so
+    /// any plausible pair does; these make `reflow` arithmetic obvious.
+    const CELL_W: f64 = 8.0;
+    const CELL_H: f64 = 16.0;
+
+    fn test_state(cols: u16, rows: u16) -> TerminalViewState {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: 200,
+        })
+        .expect("Terminal::new");
+        let theme = Theme::roost_dark_fallback();
+        // Mirror `with_theme`: the boot path pushes all four color
+        // groups into libghostty before the first frame.
+        let _ = terminal.set_color_background(theme.background);
+        let _ = terminal.set_color_foreground(theme.foreground);
+        let _ = terminal.set_color_cursor(theme.cursor);
+        let _ = terminal.set_color_palette(&theme.palette);
+
+        TerminalViewState {
+            terminal,
+            render_state: RenderState::new().expect("RenderState::new"),
+            encoder: KeyEncoder::new().expect("KeyEncoder::new"),
+            mouse_encoder: MouseEncoder::new().expect("MouseEncoder::new"),
+            pointer: (0.0, 0.0),
+            theme,
+            font_desc: default_font_description(),
+            cell_metrics: CellMetrics {
+                cell_width: CELL_W,
+                cell_height: CELL_H,
+                baseline: 12.0,
+            },
+            cursor_blink_on: true,
+            has_focus: true,
+            scroll: TerminalScroll::new(),
+            selection: roost_vt::TerminalSelection::new(),
+            copy_on_select: CopyOnSelect::default(),
+            input_callback: None,
+            write_pty_buffer: Arc::new(Mutex::new(Vec::new())),
+            cols,
+            rows,
+            on_resize: None,
+            hover_url: None,
+            link_modifier: keybind::default_link_modifier(),
+            link_mod_held: false,
+            url_opener: Rc::new(|_| {}),
+            link_click_consumed_this_gesture: false,
+            pointer_inside: false,
+            last_applied_cursor_name: None,
+            multi_click_consumed_this_gesture: false,
+            word_break_chars: roost_linux::word_selection::DEFAULT_EXTRA_WORD_CHARS.to_string(),
+            tracking_press_consumed_this_gesture: false,
+            right_tracking_press_consumed_this_gesture: false,
+            motion_emitter: roost_linux::mouse_routing::MotionEmitter::new(),
+            current_osc_shape: String::new(),
+            was_alt_screen_active: false,
+            osc_shape_set_in_this_chunk: false,
+            render_stats: roost_ui_model::render_stats::TabRenderStats::default(),
+            grid: Vec::new(),
+            cached_grid_size: None,
+            cached_guard_key: None,
+            theme_generation: 0,
+            cached_theme_generation: None,
+        }
+    }
+
+    /// One refresh, reported as `(cursor, rows_rebuilt, cells_walked)`
+    /// deltas off the per-view counters.
+    fn refresh(state: &mut TerminalViewState) -> (Option<CursorInfo>, u64, u64) {
+        let before = state.render_stats;
+        let frame = state.refresh_cache().expect("refresh_cache");
+        (
+            frame.cursor,
+            state.render_stats.rows_rebuilt - before.rows_rebuilt,
+            state.render_stats.cells_walked - before.cells_walked,
+        )
+    }
+
+    /// Viewport row indices whose cached content differs from `before`.
+    fn changed_rows(before: &[RenderedRow], after: &[RenderedRow]) -> Vec<usize> {
+        assert_eq!(before.len(), after.len(), "grid length changed");
+        (0..after.len())
+            .filter(|i| before[*i] != after[*i])
+            .collect()
+    }
+
+    fn glyph_at(row: &RenderedRow, col: u16) -> Option<(ColorRgb, String)> {
+        row.glyphs
+            .iter()
+            .find(|(c, _, _)| *c == col)
+            .map(|(_, fg, text)| (*fg, text.clone()))
+    }
+
+    #[test]
+    fn settled_view_rebuilds_no_rows() {
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"hello");
+        let (_, rows, cells) = refresh(&mut state);
+        assert_eq!(rows, 6, "first frame builds the whole grid");
+        assert_eq!(cells, 120, "6 rows × 20 cols");
+
+        let (_, rows, cells) = refresh(&mut state);
+        assert_eq!(
+            (rows, cells),
+            (0, 0),
+            "a frame with no terminal change must walk nothing"
+        );
+    }
+
+    #[test]
+    fn single_row_write_rebuilds_only_that_row() {
+        let mut state = test_state(20, 6);
+        // Park the cursor on row 2 so the follow-up write can't dirty a
+        // second row.
+        state.terminal.vt_write(b"\x1b[3;1Habc");
+        refresh(&mut state);
+        let before = state.grid.clone();
+
+        state.terminal.vt_write(b"XYZ");
+        let (_, rows, cells) = refresh(&mut state);
+        assert_eq!(rows, 1, "only the written row is dirty");
+        assert_eq!(cells, 20, "one row of cells");
+        assert_eq!(changed_rows(&before, &state.grid), vec![2]);
+        assert_eq!(
+            glyph_at(&state.grid[2], 3).map(|(_, t)| t),
+            Some("X".to_string())
+        );
+    }
+
+    #[test]
+    fn theme_apply_rebuilds_every_row() {
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"hello");
+        refresh(&mut state);
+
+        // What `TerminalView::set_theme` does to the view state, minus
+        // the widget: swap the theme and bump the generation.
+        state.theme = Theme {
+            foreground: ColorRgb::new(0x11, 0x22, 0x33),
+            ..state.theme.clone()
+        };
+        state.theme_generation += 1;
+
+        let (_, rows, _) = refresh(&mut state);
+        assert_eq!(rows, 6, "a theme apply invalidates every cached row");
+        assert_eq!(
+            glyph_at(&state.grid[0], 0).map(|(fg, _)| fg),
+            Some(ColorRgb::new(0x11, 0x22, 0x33)),
+            "cached rows must carry the new default fg"
+        );
+    }
+
+    #[test]
+    fn bold_color_only_theme_change_rebuilds_every_row() {
+        // The guard-2-alone case: `bold_color` is a roost-side theme key
+        // that is NEVER pushed into libghostty, so native dirty tracking
+        // cannot see this change and no generation bump is applied here
+        // — the `GuardKey` comparison is the only thing that can catch
+        // it. Removing `bold_color` from the key fails this test.
+        let mut state = test_state(20, 6);
+        state.theme.bold_color = None;
+        state.terminal.vt_write(b"\x1b[1mX");
+        refresh(&mut state);
+        assert_eq!(
+            glyph_at(&state.grid[0], 0).map(|(fg, _)| fg),
+            Some(state.theme.foreground)
+        );
+
+        let accent = ColorRgb::new(0xaa, 0xbb, 0xcc);
+        state.theme.bold_color = Some(accent);
+
+        let (_, rows, _) = refresh(&mut state);
+        assert_eq!(rows, 6, "a bold_color-only change invalidates every row");
+        assert_eq!(
+            glyph_at(&state.grid[0], 0).map(|(fg, _)| fg),
+            Some(accent),
+            "the rebuilt row must carry the new bold accent"
+        );
+    }
+
+    #[test]
+    fn width_only_resize_rebuilds_every_row() {
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"hello");
+        refresh(&mut state);
+
+        // 15 × 6 cells: the width moves, the row count does not.
+        assert!(state.reflow(15.0 * CELL_W, 6.0 * CELL_H, false));
+        assert_eq!((state.cols, state.rows), (15, 6));
+
+        let (_, rows, cells) = refresh(&mut state);
+        assert_eq!(rows, 6, "a width-only resize invalidates every row");
+        assert_eq!(cells, 90, "6 rows × the new 15 cols");
+        assert_eq!(state.cached_grid_size, Some((15, 6)));
+        assert_eq!(state.grid.len(), 6);
+    }
+
+    #[test]
+    fn viewport_scroll_rebuilds_every_row_and_changes_content() {
+        let mut state = test_state(20, 6);
+        for line in 0..12 {
+            state
+                .terminal
+                .vt_write(format!("line{line}\r\n").as_bytes());
+        }
+        refresh(&mut state);
+        let before = state.grid.clone();
+
+        state.terminal.scroll_viewport(ScrollViewport::Delta(-3));
+        let (_, rows, _) = refresh(&mut state);
+        assert_eq!(rows, 6, "a viewport scroll invalidates every row");
+        assert!(
+            !changed_rows(&before, &state.grid).is_empty(),
+            "scrolling into scrollback must change what the rows hold"
+        );
+    }
+
+    #[test]
+    fn cursor_blink_frame_rebuilds_no_rows_and_keeps_the_cursor_glyph() {
+        // A5b: the headline zero-rebuild frame. The cursor's underlying
+        // glyph is read out of the cache at draw time, so it survives a
+        // frame that walks nothing.
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"AB\x1b[1;1H");
+        let (cursor, _, _) = refresh(&mut state);
+        let cursor = cursor.expect("cursor in viewport");
+        assert_eq!((cursor.row, cursor.col), (0, 0));
+
+        state.cursor_blink_on = !state.cursor_blink_on;
+        let (cursor, rows, cells) = refresh(&mut state);
+        assert_eq!((rows, cells), (0, 0), "a blink tick walks nothing");
+
+        let cursor = cursor.expect("cursor in viewport");
+        assert_eq!(
+            state.cursor_cell_text(&cursor),
+            Some(("A".to_string(), state.theme.foreground)),
+            "the block cursor's glyph must still be found in the cache"
+        );
+
+        // A blank cursor cell finds nothing — exactly the branch the old
+        // in-walk capture took for a blank cell (fill, no glyph redraw).
+        state.terminal.vt_write(b"\x1b[1;5H");
+        let (cursor, _, _) = refresh(&mut state);
+        let cursor = cursor.expect("cursor in viewport");
+        assert_eq!(state.cursor_cell_text(&cursor), None);
+    }
+
+    #[test]
+    fn focus_loss_frame_rebuilds_no_rows() {
+        // A5b's second named frame: focus is an overlay input
+        // (`cursor_render_mode`), never a cell input.
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"hello");
+        refresh(&mut state);
+
+        state.has_focus = false;
+        let (_, rows, cells) = refresh(&mut state);
+        assert_eq!((rows, cells), (0, 0));
+    }
+
+    #[test]
+    fn osc11_background_set_rebuilds_no_rows() {
+        // GTK's resolver reads `self.theme`, never libghostty's reported
+        // colors, so an OSC 11 set changes nothing GTK draws and needs
+        // no guard. Consistent with C2's pin
+        // (`tests/osc_set_theme_indifference.rs`) — this asserts the
+        // cache did not change that.
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"hello");
+        refresh(&mut state);
+        let before = state.grid.clone();
+        let theme_bg = state.theme.background;
+
+        state.terminal.vt_write(b"\x1b]11;rgb:ff/00/00\x07");
+        let (_, rows, cells) = refresh(&mut state);
+        assert_eq!((rows, cells), (0, 0), "an OSC 11 set dirties no row");
+        assert_eq!(state.theme.background, theme_bg);
+        assert_eq!(changed_rows(&before, &state.grid), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn dump_between_write_and_refresh_keeps_the_dirty_rows() {
+        // A5c: `dump_text` runs its own full `walk`, which is
+        // dirty-neutral. An IPC dump landing between a PTY write and the
+        // next frame must not swallow that frame's damage.
+        let mut state = test_state(20, 6);
+        state.terminal.vt_write(b"\x1b[3;1Habc");
+        refresh(&mut state);
+        let before = state.grid.clone();
+
+        state.terminal.vt_write(b"XYZ");
+        let dump = state.dump_text();
+        assert_eq!(dump.rows_text[2], "abcXYZ");
+
+        let (_, rows, _) = refresh(&mut state);
+        assert_eq!(rows, 1, "the dump's full walk must not clear the damage");
+        assert_eq!(changed_rows(&before, &state.grid), vec![2]);
     }
 }

@@ -9,10 +9,11 @@
 //! - `TerminalView::paint` resolves the default fg/bg it actually draws
 //!   with from `self.theme.foreground` / `self.theme.background` —
 //!   never from `RenderState::colors()` (libghostty's reported/live
-//!   colors) — see the comment at `crates/roost-linux/src/
-//!   terminal_view.rs:1799-1804`. `TerminalViewState` and `paint` are
-//!   declared only in `main.rs` (binary-only), so they aren't
-//!   constructible from this integration-test crate; this test exercises
+//!   colors) — see `TerminalViewState::refresh_cache`'s caching
+//!   invariant in `crates/roost-linux/src/terminal_view.rs`.
+//!   `TerminalViewState` and `paint` are declared only in `main.rs`
+//!   (binary-only), so they aren't constructible from this
+//!   integration-test crate; this test exercises
 //!   the highest constructible seam instead — the same `roost_vt::
 //!   Terminal` + `RenderState` level `osc_dynamic_color.rs` already uses
 //!   — and asserts both halves of the fact directly: (a) libghostty's
@@ -39,7 +40,7 @@ use roost_ui_model::theme::Theme;
 use roost_vt::{ColorRgb, RenderState, Terminal, TerminalOptions};
 
 /// Mirrors `TerminalView::paint`'s resolution exactly
-/// (`terminal_view.rs:1799-1804`): the default bg drawn is always
+/// (see `refresh_cache`'s guard block): the default bg drawn is always
 /// `theme.background`, full stop — `RenderState::colors()` is read (and
 /// its `background` field ignored for this purpose) only because the
 /// production code path also calls it every frame; a hypothetical GTK

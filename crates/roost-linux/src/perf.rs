@@ -8,8 +8,8 @@
 //! comparing numbers across the two UIs):
 //!
 //! - GTK's `paint` is refresh *and* draw in one pass. The seam is
-//!   `TerminalViewState::refresh_passes` (renderer-free: `update` +
-//!   walk + counters, no Cairo) — `refresh_*` counts that phase,
+//!   `TerminalViewState::refresh_cache` (renderer-free: `update` +
+//!   dirty-row walk + counters, no Cairo) — `refresh_*` counts that phase,
 //!   `draw_*` counts the Cairo phase that consumes its output. One
 //!   `paint` therefore folds in exactly one refresh and one draw, unlike
 //!   iced where a refresh (on PTY output) and a draw (on window redraw)
@@ -42,7 +42,7 @@ pub(crate) fn reset() {
     AGGREGATE.reset();
 }
 
-/// Fold one `refresh_passes` call into the global aggregate.
+/// Fold one `refresh_cache` call into the global aggregate.
 pub(crate) fn record_refresh(elapsed: Duration, rows_rebuilt: u64, cells_walked: u64) {
     AGGREGATE.record_refresh(elapsed, rows_rebuilt, cells_walked);
 }
