@@ -640,7 +640,8 @@ Caveat: `app.screenshot` re-renders the window, so taking a screenshot
 inflates the three draw counters. Read before capturing, or reset
 after.
 
-Ungated, read-only — always available, matching `tab.dump_resolved`.
+Ungated — always available, matching `tab.dump_resolved`. Not
+read-only: `reset: true` reads the counters and then zeroes them.
 The GTK UI answers with the same shape, all counters zero: its
 renderer has no instrumentation yet, and a uniform contract across
 both Rust UIs beats an op one of them refuses. CLI: `roostctl

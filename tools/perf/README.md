@@ -46,13 +46,21 @@ this output.
   the viewport never scrolls, then refreshing. The vim/htop shape.
 - **W3 — scrolling stream (CONTROL).** 200 iterations of plain
   `line\r\n` output that scrolls the viewport, then refreshing.
-  **This workload is expected to show NO improvement, ever.** libghostty
-  full-rebuilds its render state whenever the viewport's scroll pin
-  changes (`third_party/ghostty/src/src/terminal/render.zig:299-302`),
-  so no amount of dirty-tracking on our side changes what it hands back.
-  It's in the harness precisely so a before/after table has a control
-  that stays flat — **a flat W3 is a PASS**, not a disappointment. Do not
-  "fix" it.
+  **This workload is the control: expect little or no gain in
+  rows-rebuilt, ever.** libghostty full-rebuilds its render state
+  whenever the viewport's scroll pin changes
+  (`third_party/ghostty/src/src/terminal/render.zig:299-302`), so no
+  amount of dirty-tracking on our side reduces the rows it hands back —
+  E3 measured 32.00 -> 27.50 rows/refresh here, against 32.00 -> 0.16
+  for W1.
+
+  Its *timing* can still improve, and did: 2.0x (116,609 -> 57,473
+  ns/refresh) in the E3 measurement, because removing the dense
+  `vec![vec![String::new(); cols]; rows]` allocation made even a full
+  rebuild cheaper. So judge W3 on **rows_per_refresh staying high**, not
+  on its clock. A W3 whose rows/refresh collapses means rows are being
+  served from a stale cache across a viewport move — that is a bug, not
+  a win.
 
 ### What it can't measure
 
@@ -80,9 +88,9 @@ diff before.txt after.txt
 ```
 
 Read `rows_per_refresh` first — it's the direct measure of "how much of
-the grid did this refresh actually touch." W1 today reports the full 32
-rows/refresh; the point of dirty tracking is driving that toward 0
-without moving W3.
+the grid did this refresh actually touch." Pre-E3 every workload
+reported the full 32 rows/refresh; the point of dirty tracking is
+driving W1 and W2 toward 0 while W3 stays high.
 
 ## The running-app readout: `tools/perf/render-stats.sh`
 

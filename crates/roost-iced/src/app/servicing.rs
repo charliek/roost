@@ -1638,7 +1638,7 @@ mod tests {
     async fn changing_the_default_background_rebuilds_cached_rows() {
         let (feed_tx, _) = engine_feed::channel();
         let (mut tab, supervisor) = attach_test_terminal(78, feed_tx);
-        tab.write_vt(b"\x1b[2J\x1bH\x1b[1;1Hcolored");
+        tab.write_vt(b"\x1b[2J\x1b[1;1Hcolored");
         tab.refresh_snapshot()
             .expect("refresh with the row written");
         let before = tab.snapshot.background;

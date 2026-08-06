@@ -275,9 +275,10 @@ pub enum UiRequest {
     /// regression suite. Ungated (read-only).
     WindowMetrics { reply: WindowMetricsReply },
     /// `app.render_stats` — read the UI's render-path counters, and
-    /// zero them afterward when `reset`. Ungated (read-only, and the
-    /// counters are the only way to measure the real draw path: it
-    /// needs a live renderer no unit test can construct).
+    /// zero them afterward when `reset`. Ungated. Not read-only: with
+    /// `reset` it reads and then clears. The counters are the only way
+    /// to measure the real draw path, which needs a live renderer no
+    /// unit test can construct.
     AppRenderStats {
         reset: bool,
         reply: RenderStatsReply,

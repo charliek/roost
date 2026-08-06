@@ -325,11 +325,17 @@ recorded alongside it rather than quietly edited away.
   | W2 in-place TUI redraw | 110,025 | 6,163 | 17.9x | 32.00 → 2.15 |
   | W3 scrolling stream (control) | 116,609 | 57,473 | 2.0x | 32.00 → 27.50 |
 
-  **Important limitation:** streaming/scrolling output is unimproved by
-  design (W3, per E1's correction above) — the wins are concentrated in
-  in-place TUI redraws and the non-PTY refresh callers, above all mouse
-  motion (W1), which previously rebuilt the entire grid on every pointer
-  event for zero content change.
+  **Important limitation:** streaming/scrolling output gets **no
+  dirty-tracking benefit** — W3 barely moves in rows rebuilt (32.00 →
+  27.50) because libghostty full-rebuilds on any viewport-pin change, per
+  E1's correction above. Its 2.0x clock gain is a *separate* effect: E3
+  also deleted the dense `vec![vec![String::new(); cols]; rows]`
+  allocation, which cost a `String` per cell including blanks, so even
+  full rebuilds got cheaper. Judge W3 on rows/refresh staying high, not
+  on its timing. The dirty-tracking wins are concentrated in in-place TUI
+  redraws and the non-PTY refresh callers — above all mouse motion (W1),
+  which previously rebuilt the entire grid on every pointer event for
+  zero content change.
   **libghostty limitation worked around:** `OSC 10`/`OSC 11` and DECSCNM
   change the reported default colors while libghostty reports
   `dirty=Clean` with zero rows flagged — the dirty API alone can't see

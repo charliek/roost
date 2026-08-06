@@ -399,6 +399,7 @@ impl RenderState {
         let _ = terminal;
 
         let mut cells: Vec<Cell> = Vec::new();
+        let mut retry_pending = false;
         for row_idx in 0u32.. {
             // SAFETY: iter handle non-null.
             if !unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
@@ -418,6 +419,7 @@ impl RenderState {
                 if self.bind_row_cells().is_err() {
                     // Leave this row's flag SET so the next walk retries
                     // it, and don't call `f` with a partial row.
+                    retry_pending = true;
                     continue;
                 }
 
@@ -436,7 +438,16 @@ impl RenderState {
             }
         }
 
-        self.set_global_dirty(sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_FALSE)?;
+        // A row we could not read kept its flag, but clearing the global
+        // layer to FALSE would strand it: the next `walk_dirty` reads
+        // `Clean` and visits nothing at all, so the retry the contract
+        // promises would never happen. Leave the frame `Partial` instead,
+        // which is exactly what the surviving row flags mean.
+        self.set_global_dirty(if retry_pending {
+            sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_PARTIAL
+        } else {
+            sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_FALSE
+        })?;
         Ok(global)
     }
 
