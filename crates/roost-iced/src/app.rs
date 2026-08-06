@@ -47,9 +47,9 @@ use roost_ui_model::{
 };
 use roost_url::HoverUrl;
 use roost_vt::{
-    key_action, mouse_action, mouse_button, KeyEncoder, KeyEvent, MouseEncoder, MouseEvent,
-    PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
-    TerminalScroll, TerminalSelection,
+    key_action, mouse_action, mouse_button, ColorRgb, KeyEncoder, KeyEvent, MouseEncoder,
+    MouseEvent, PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal,
+    TerminalOptions, TerminalScroll, TerminalSelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -60,7 +60,7 @@ use crate::palette_scroll::Visibility;
 use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
 use crate::terminal_widget::{
-    resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
+    DrawCell, RenderedRow, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
     TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
 };
 use crate::Message;

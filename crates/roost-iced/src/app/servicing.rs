@@ -1319,7 +1319,7 @@ mod tests {
         assert!(collected.error.is_none());
         let tab = tabs.get_mut(&70).expect("the tab is still attached");
         tab.refresh_snapshot().expect("refresh the touched tab");
-        assert_eq!(tab.snapshot.rows_text[0], "hello");
+        assert_eq!(tab.snapshot.grid[0].text, "hello");
         supervisor.close(70);
     }
 
@@ -1542,7 +1542,7 @@ mod tests {
         assert_eq!(
             tab.render_stats.rows_rebuilt,
             u64::from(DEFAULT_ROWS),
-            "the current refresh always rebuilds the whole grid"
+            "the first refresh has no cached grid, so it rebuilds every row"
         );
         assert_eq!(
             tab.render_stats.cells_walked,
@@ -1558,7 +1558,176 @@ mod tests {
             tab.render_stats.refresh_calls, 2,
             "counters accumulate across calls rather than resetting"
         );
+        assert_eq!(
+            tab.render_stats.rows_rebuilt,
+            u64::from(DEFAULT_ROWS),
+            "nothing touched the terminal, so the second refresh rebuilds \
+             zero rows and the total does not move"
+        );
+        assert_eq!(
+            tab.render_stats.cells_walked,
+            u64::from(DEFAULT_COLS) * u64::from(DEFAULT_ROWS),
+            "and walks no cells either"
+        );
 
         supervisor.close(75);
+    }
+
+    /// The failure a per-row cache can silently produce is "right cells,
+    /// wrong row" — content landing one row off, or a stale row surviving
+    /// a rebuild. A substring search over the joined dump would not catch
+    /// either, so this writes a distinct marker to one row at a time and
+    /// checks the WHOLE row vector element-for-element after every write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_rebuild_keeps_every_row_at_its_own_index() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(76, feed_tx);
+        // Absolute positioning only: a scroll would move every row and
+        // turn this into a full-rebuild test by accident.
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        tab.refresh_snapshot().expect("refresh the cleared grid");
+
+        let rows = usize::from(DEFAULT_ROWS);
+        let mut expected = vec![String::new(); rows];
+        // Out of order on purpose, and not every row: a cache that keys on
+        // walk order rather than the reported row index passes an
+        // in-order fill.
+        for (step, row) in [4usize, 1, rows - 1, 0, 9, 4].into_iter().enumerate() {
+            let marker = format!("marker-{step}-row-{row}");
+            tab.write_vt(format!("\x1b[{};1H{marker}", row + 1).as_bytes());
+            tab.refresh_snapshot().expect("refresh after the write");
+            expected[row] = marker;
+            assert_eq!(
+                tab.dump().rows_text,
+                expected,
+                "after step {step} (row {row}) every row must hold exactly its own content"
+            );
+        }
+
+        supervisor.close(76);
+    }
+
+    /// `TerminalSnapshot::blank` fills its rows with an empty string while
+    /// `refresh_snapshot` builds `" "`-filled rows and trims them. Both
+    /// must land on `""`, because `tab.dump` — and the whole e2e suite
+    /// through it — reads one before the first refresh and the other
+    /// after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blank_snapshot_and_a_refreshed_empty_grid_dump_the_same_rows() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(77, feed_tx);
+        let blank = tab.dump().rows_text;
+        assert_eq!(blank, vec![String::new(); usize::from(DEFAULT_ROWS)]);
+
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        tab.refresh_snapshot().expect("refresh the cleared grid");
+        assert_eq!(
+            tab.dump().rows_text,
+            blank,
+            "a refreshed empty grid trims down to the same rows blank starts at"
+        );
+
+        supervisor.close(77);
+    }
+
+    /// `OSC 11` changes the terminal's default background with libghostty
+    /// reporting nothing dirty, so only `refresh_snapshot`'s cached-default
+    /// guard keeps cached rows from freezing at the old color. Without it
+    /// the untouched row below would keep rendering the old background.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changing_the_default_background_rebuilds_cached_rows() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(78, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1bH\x1b[1;1Hcolored");
+        tab.refresh_snapshot()
+            .expect("refresh with the row written");
+        let before = tab.snapshot.background;
+
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        tab.write_vt(b"\x1b]11;rgb:00/00/ff\x07");
+        tab.refresh_snapshot().expect("refresh after OSC 11");
+
+        assert_ne!(
+            tab.snapshot.background, before,
+            "OSC 11 must reach the render state's default background"
+        );
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            u64::from(DEFAULT_ROWS),
+            "a default-color change invalidates every cached row"
+        );
+        let resolved = tab.resolved_cells();
+        let cell = resolved
+            .cells
+            .iter()
+            .find(|cell| cell.row == 0 && cell.col == 0)
+            .expect("row 0 col 0 is in the resolved grid");
+        assert_eq!(
+            cell.bg,
+            (
+                tab.snapshot.background.r,
+                tab.snapshot.background.g,
+                tab.snapshot.background.b
+            ),
+            "the rebuilt row resolves against the new default, not the cached one"
+        );
+
+        supervisor.close(78);
+    }
+
+    /// `tab.dump_resolved` densifies the sparse per-row cells back into a
+    /// full grid. It is the one consumer that has to re-derive a cell's row
+    /// from its grid position now that `DrawCell` no longer carries one, so
+    /// it gets its own coverage: dense, row-major, and each cell resolved
+    /// against the row it actually came from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_cells_densifies_the_grid_row_major_from_the_row_index() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(79, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        // Row 3 (1-based) col 2 (1-based) — off both axes' origin, so a
+        // transposed or off-by-one index cannot coincide with the truth.
+        tab.write_vt(b"\x1b[3;2H\x1b[1;41mX\x1b[0m");
+        tab.refresh_snapshot().expect("refresh");
+
+        let resolved = tab.resolved_cells();
+        assert_eq!(resolved.cols, DEFAULT_COLS);
+        assert_eq!(resolved.rows, DEFAULT_ROWS);
+        assert_eq!(
+            resolved.cells.len(),
+            usize::from(DEFAULT_COLS) * usize::from(DEFAULT_ROWS),
+            "the resolved grid is dense"
+        );
+        for (index, cell) in resolved.cells.iter().enumerate() {
+            assert_eq!(cell.row, (index / usize::from(DEFAULT_COLS)) as u32);
+            assert_eq!(cell.col, (index % usize::from(DEFAULT_COLS)) as u16);
+        }
+
+        let marked = &resolved.cells[2 * usize::from(DEFAULT_COLS) + 1];
+        assert_eq!(marked.text, "X");
+        assert!(marked.bold);
+        assert!(marked.has_explicit_bg);
+        let red = tab.theme.palette[1];
+        assert_eq!(
+            marked.bg,
+            (red.r, red.g, red.b),
+            "SGR 41 resolves through the theme palette's red"
+        );
+
+        let neighbor = &resolved.cells[2 * usize::from(DEFAULT_COLS)];
+        assert_eq!(neighbor.text, " ");
+        assert!(!neighbor.has_explicit_bg);
+        assert!(!neighbor.bold);
+        assert_eq!(
+            neighbor.bg,
+            (
+                tab.snapshot.background.r,
+                tab.snapshot.background.g,
+                tab.snapshot.background.b
+            ),
+            "an untouched cell falls back to the terminal default"
+        );
+
+        supervisor.close(79);
     }
 }

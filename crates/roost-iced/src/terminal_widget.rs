@@ -11,6 +11,7 @@ use iced::{
 };
 use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -124,9 +125,12 @@ fn draw_font(base: Font, text: &str, bold: bool, italic: bool) -> Font {
     }
 }
 
+/// One resolved cell. Deliberately carries no row index: its row is the
+/// index of the [`RenderedRow`] that owns it. Storing the row here as well
+/// would let the two disagree, which is exactly the "right cells, wrong
+/// row" failure the per-row cache could otherwise hide.
 #[derive(Debug, Clone)]
 pub struct DrawCell {
-    pub row: u32,
     pub col: u16,
     pub text: String,
     pub foreground: ColorRgb,
@@ -137,6 +141,74 @@ pub struct DrawCell {
     pub inverse: bool,
 }
 
+/// One viewport row's render output, shared behind an `Arc` so cloning a
+/// snapshot (which `App::view` does every frame) is O(rows) refcount bumps
+/// rather than O(cells) `String` clones, and so a row libghostty reports
+/// undirty survives a refresh without being rebuilt.
+///
+/// **Overlay invariant — a `RenderedRow` holds terminal content ONLY.**
+/// Selection tint, link-hover underline and the cursor are snapshot-level
+/// fields drawn in separate passes after the cell loop in
+/// [`TerminalWidget::draw`], and must NEVER be baked into a [`DrawCell`]'s
+/// colors. A row is cached across refreshes; folding selection into a
+/// cell's background would freeze the tint in the cache, which surfaces as
+/// "the selection sometimes doesn't clear".
+#[derive(Debug, Default)]
+pub struct RenderedRow {
+    /// Sparse: only the cells that draw something, ascending by column.
+    pub cells: Vec<DrawCell>,
+    /// The row's text, joined and `trim_end`ed — what `tab.dump` returns.
+    pub text: String,
+}
+
+impl RenderedRow {
+    /// Resolve one viewport row from libghostty's cells for that row.
+    ///
+    /// Everything this reads is a parameter — the row's vt cells, the
+    /// terminal's default fg/bg pair, and the grid width. That list IS the
+    /// cache key `TerminalTab::refresh_snapshot` guards on; adding a
+    /// fourth input here means extending those guards (see that function's
+    /// caching invariant).
+    pub fn build(cells: &[roost_vt::Cell], defaults: (ColorRgb, ColorRgb), cols: u16) -> Self {
+        let mut row = RenderedRow {
+            cells: Vec::new(),
+            text: String::with_capacity(usize::from(cols)),
+        };
+        for cell in cells {
+            // libghostty yields a row's cells in ascending, gapless column
+            // order, so appending is the same string the old
+            // index-into-a-dense-`Vec<String>`-then-`concat` build produced
+            // — including for a short row, whose missing tail contributed
+            // empty strings there and contributes nothing here.
+            if cell.col >= cols {
+                continue;
+            }
+            let text = if cell.text.is_empty() {
+                " "
+            } else {
+                cell.text.as_str()
+            };
+            row.text.push_str(text);
+            let (foreground, background) =
+                resolve_colors(cell.fg, cell.bg, defaults, cell.style.inverse);
+            if text != " " || cell.bg.is_some() || cell.style.inverse {
+                row.cells.push(DrawCell {
+                    col: cell.col,
+                    text: text.to_string(),
+                    foreground,
+                    background,
+                    explicit_background: cell.bg.is_some() || cell.style.inverse,
+                    bold: cell.style.bold,
+                    italic: cell.style.italic,
+                    inverse: cell.style.inverse,
+                });
+            }
+        }
+        row.text.truncate(row.text.trim_end().len());
+        row
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalSnapshot {
     pub cols: u16,
@@ -144,8 +216,8 @@ pub struct TerminalSnapshot {
     pub foreground: ColorRgb,
     pub background: ColorRgb,
     pub cursor: Option<CursorInfo>,
-    pub cells: Vec<DrawCell>,
-    pub rows_text: Vec<String>,
+    /// Indexed by viewport row; `grid.len() == rows`.
+    pub grid: Vec<Arc<RenderedRow>>,
     pub selection_background: ColorRgb,
     pub selection_spans: Vec<SelectionSpan>,
     pub link_hover: Option<SelectionSpan>,
@@ -154,6 +226,11 @@ pub struct TerminalSnapshot {
 
 impl TerminalSnapshot {
     pub fn blank(cols: u16, rows: u16) -> Self {
+        // Every row shares one empty `RenderedRow`: rows are replaced
+        // wholesale, never mutated in place. `RenderedRow::text` is `""`
+        // here, which is what a `refresh_snapshot`-built blank row also
+        // trims down to — `tab.dump` depends on the two agreeing.
+        let blank_row = Arc::new(RenderedRow::default());
         Self {
             cols,
             rows,
@@ -168,8 +245,7 @@ impl TerminalSnapshot {
                 b: 24,
             },
             cursor: None,
-            cells: Vec::new(),
-            rows_text: vec![String::new(); usize::from(rows)],
+            grid: vec![blank_row; usize::from(rows)],
             selection_background: ColorRgb {
                 r: 72,
                 g: 83,
@@ -581,40 +657,46 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             fill_quad(renderer, bounds, color(self.snapshot.background));
             let metrics = self.metrics;
 
-            for cell in &self.snapshot.cells {
-                let position = cell_position(bounds.position(), cell.col, cell.row, metrics);
-                if cell.explicit_background {
-                    fill_quad(
-                        renderer,
-                        // Preserve the Canvas path's overdraw policy. Adjacent
-                        // antialiased quads can otherwise expose hairlines of
-                        // the default background under tiny-skia.
-                        Rectangle::new(
-                            position,
-                            Size::new(metrics.cell_width, metrics.cell_height),
-                        ),
-                        color(cell.background),
-                    );
-                }
-                if !cell.text.is_empty() && cell.text != " " {
-                    let font = draw_font(metrics.font, cell.text.as_str(), cell.bold, cell.italic);
-                    renderer.fill_text(
-                        text::Text {
-                            content: cell.text.clone(),
-                            bounds: Size::new(f32::INFINITY, metrics.cell_height),
-                            size: Pixels(metrics.font_pixels),
-                            line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
-                            font,
-                            align_x: text::Alignment::Default,
-                            align_y: iced::alignment::Vertical::Top,
-                            shaping: text::Shaping::Auto,
-                            wrapping: text::Wrapping::None,
-                        },
-                        Point::new(position.x, position.y + 1.0),
-                        color(cell.foreground),
-                        clip,
-                    );
-                    fill_text_calls += 1;
+            for (row_idx, row) in self.snapshot.grid.iter().enumerate() {
+                // The row index comes from the grid position, never from
+                // the cell — see `DrawCell`.
+                let row_y = row_idx as u32;
+                for cell in &row.cells {
+                    let position = cell_position(bounds.position(), cell.col, row_y, metrics);
+                    if cell.explicit_background {
+                        fill_quad(
+                            renderer,
+                            // Preserve the Canvas path's overdraw policy. Adjacent
+                            // antialiased quads can otherwise expose hairlines of
+                            // the default background under tiny-skia.
+                            Rectangle::new(
+                                position,
+                                Size::new(metrics.cell_width, metrics.cell_height),
+                            ),
+                            color(cell.background),
+                        );
+                    }
+                    if !cell.text.is_empty() && cell.text != " " {
+                        let font =
+                            draw_font(metrics.font, cell.text.as_str(), cell.bold, cell.italic);
+                        renderer.fill_text(
+                            text::Text {
+                                content: cell.text.clone(),
+                                bounds: Size::new(f32::INFINITY, metrics.cell_height),
+                                size: Pixels(metrics.font_pixels),
+                                line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
+                                font,
+                                align_x: text::Alignment::Default,
+                                align_y: iced::alignment::Vertical::Top,
+                                shaping: text::Shaping::Auto,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(position.x, position.y + 1.0),
+                            color(cell.foreground),
+                            clip,
+                        );
+                        fill_text_calls += 1;
+                    }
                 }
             }
 

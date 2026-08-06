@@ -202,6 +202,20 @@ pub(super) struct TerminalTab {
     pub(super) pointer_shape: String,
     pub(super) theme: Theme,
     pub(super) snapshot: TerminalSnapshot,
+    /// The per-row render cache `refresh_snapshot` maintains; the snapshot
+    /// gets a clone of it (O(rows) refcount bumps). The three `cached_*`
+    /// fields are the keys this cache is valid under — see
+    /// `refresh_snapshot`'s caching invariant.
+    grid: Vec<Arc<RenderedRow>>,
+    cached_grid_size: Option<(u16, u16)>,
+    cached_defaults: Option<(ColorRgb, ColorRgb)>,
+    cached_theme_generation: Option<u64>,
+    /// Bumped whenever a theme lands on this tab. Nothing theme-derived
+    /// besides the default fg/bg pair enters `RenderedRow::build` today,
+    /// but GTK's twin resolver already pulls the theme's `bold_color`, so
+    /// this fails the cache safe toward over-rebuilding if that override
+    /// ever lands here.
+    theme_generation: u64,
     cols: u16,
     rows: u16,
     pub(super) applied_metrics: Option<TerminalMetrics>,
@@ -283,6 +297,13 @@ impl TerminalTab {
             pointer_shape: "default".into(),
             theme,
             snapshot: TerminalSnapshot::blank(DEFAULT_COLS, DEFAULT_ROWS),
+            // Left empty on purpose: the first `refresh_snapshot` finds no
+            // cached grid size, sizes the grid and forces a full rebuild.
+            grid: Vec::new(),
+            cached_grid_size: None,
+            cached_defaults: None,
+            cached_theme_generation: None,
+            theme_generation: 0,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             applied_metrics: None,
@@ -871,6 +892,9 @@ impl TerminalTab {
 
     fn apply_theme_candidate(&mut self, theme: &Theme) -> Result<()> {
         self.theme = theme.clone();
+        // Every theme application — including `set_theme`'s rollback —
+        // lands here, so this is the one place the generation must move.
+        self.theme_generation = self.theme_generation.wrapping_add(1);
         self.terminal.set_color_foreground(theme.foreground)?;
         self.terminal.set_color_background(theme.background)?;
         self.terminal.set_color_cursor(theme.cursor)?;
@@ -878,63 +902,79 @@ impl TerminalTab {
         self.refresh_snapshot()
     }
 
+    /// Rebuild the snapshot from the terminal, reusing every cached row
+    /// libghostty reports as unchanged.
+    ///
+    /// **Caching invariant.** A cached `RenderedRow` is valid exactly
+    /// while (a) libghostty reports its row undirty and (b) the inputs
+    /// `RenderedRow::build` reads besides the row's own vt cells — the
+    /// default fg/bg pair and the grid width — are unchanged. Everything
+    /// that alters what a row should render must therefore either mark
+    /// that row dirty inside libghostty or move one of the cache keys
+    /// guarded below. Anyone adding a third input to `RenderedRow::build`
+    /// must add a guard for it here.
+    ///
+    /// The default-color guard is not belt-and-braces: `OSC 10`/`OSC 11`
+    /// and DECSCNM (`CSI ?5h`) change the terminal's default fg/bg with
+    /// libghostty reporting `Clean` and no row flagged (measured; pinned
+    /// by `crates/roost-vt/tests/render_dirty_test.rs`). Since
+    /// `resolve_colors` folds those defaults into every cell that does not
+    /// set its own, a cached row would otherwise freeze at the old color.
     pub(super) fn refresh_snapshot(&mut self) -> Result<()> {
         let refresh_started_at = Instant::now();
         self.recompute_hover()?;
         self.render_state.update(&self.terminal)?;
         let colors = self.render_state.colors()?;
         let cursor = self.render_state.cursor();
-        let mut cells = Vec::new();
-        let mut rows = vec![vec![String::new(); usize::from(self.cols)]; usize::from(self.rows)];
+
+        // Each guard raises the dirty state BEFORE recording its new key,
+        // so a failed `mark_full` leaves the key stale and the next
+        // refresh retries the invalidation rather than skipping it.
+        let size = (self.cols, self.rows);
+        if self.cached_grid_size != Some(size) {
+            // Both axes: a width-only resize leaves the row count alone
+            // while invalidating every cached row's column content.
+            self.render_state.mark_full()?;
+            // Every slot shares one empty row — rows are replaced
+            // wholesale by the walk below, never mutated in place.
+            let blank_row = Arc::new(RenderedRow::default());
+            self.grid = vec![blank_row; usize::from(self.rows)];
+            self.cached_grid_size = Some(size);
+        }
+        let defaults = (colors.foreground, colors.background);
+        if self.cached_defaults != Some(defaults) {
+            self.render_state.mark_full()?;
+            self.cached_defaults = Some(defaults);
+        }
+        if self.cached_theme_generation != Some(self.theme_generation) {
+            self.render_state.mark_full()?;
+            self.cached_theme_generation = Some(self.theme_generation);
+        }
+
+        let cols = self.cols;
+        let grid = &mut self.grid;
+        let mut rows_rebuilt: u64 = 0;
         let mut cells_walked: u64 = 0;
-        self.render_state.walk(&self.terminal, |row, cell| {
-            cells_walked += 1;
-            if row >= u32::from(self.rows) || cell.col >= self.cols {
+        self.render_state.walk_dirty(&self.terminal, |row, cells| {
+            cells_walked += cells.len() as u64;
+            // Clamped against the cache's own length, not `self.rows`:
+            // the guard above keeps the two equal, and reading the length
+            // here means a row index past the end can never index out of
+            // bounds even if that ever stopped holding.
+            if row as usize >= grid.len() {
                 return;
             }
-            let text = if cell.text.is_empty() {
-                " ".to_string()
-            } else {
-                cell.text
-            };
-            rows[row as usize][usize::from(cell.col)] = text.clone();
-            let (foreground, background) = resolve_colors(
-                cell.fg,
-                cell.bg,
-                (colors.foreground, colors.background),
-                cell.style.inverse,
-            );
-            if text != " " || cell.bg.is_some() || cell.style.inverse {
-                cells.push(DrawCell {
-                    row,
-                    col: cell.col,
-                    text,
-                    foreground,
-                    background,
-                    explicit_background: cell.bg.is_some() || cell.style.inverse,
-                    bold: cell.style.bold,
-                    italic: cell.style.italic,
-                    inverse: cell.style.inverse,
-                });
-            }
+            grid[row as usize] = Arc::new(RenderedRow::build(cells, defaults, cols));
+            rows_rebuilt += 1;
         })?;
-        // The full-grid rebuild below always touches every row of `rows`,
-        // so its length is the truthful "rows rebuilt" count today. Once
-        // the rebuild goes incremental (C5), `rows` will hold only the
-        // rebuilt rows and this stays correct without changing.
-        let rows_rebuilt = rows.len() as u64;
-        let rows_text = rows
-            .into_iter()
-            .map(|row| row.concat().trim_end().to_string())
-            .collect();
+
         self.snapshot = TerminalSnapshot {
             cols: self.cols,
             rows: self.rows,
             foreground: colors.foreground,
             background: colors.background,
             cursor,
-            cells,
-            rows_text,
+            grid: self.grid.clone(),
             selection_background: self.theme.selection_background,
             selection_spans: self
                 .selection
@@ -965,21 +1005,26 @@ impl TerminalTab {
                 .cursor
                 .filter(|cursor| cursor.visible)
                 .map(|cursor| (cursor.row, cursor.col, cursor.visible)),
-            rows_text: self.snapshot.rows_text.clone(),
+            rows_text: self
+                .snapshot
+                .grid
+                .iter()
+                .map(|row| row.text.clone())
+                .collect(),
         }
     }
 
     pub(super) fn resolved_cells(&self) -> ResolvedCellsData {
-        let mut by_position: HashMap<(u32, u16), &DrawCell> = self
-            .snapshot
-            .cells
-            .iter()
-            .map(|cell| ((cell.row, cell.col), cell))
-            .collect();
         let mut cells = Vec::with_capacity(usize::from(self.cols) * usize::from(self.rows));
         for row in 0..u32::from(self.rows) {
+            let mut by_col: HashMap<u16, &DrawCell> = self
+                .snapshot
+                .grid
+                .get(row as usize)
+                .map(|rendered| rendered.cells.iter().map(|cell| (cell.col, cell)).collect())
+                .unwrap_or_default();
             for col in 0..self.cols {
-                let cell = by_position.remove(&(row, col));
+                let cell = by_col.remove(&col);
                 let foreground = cell.map_or(self.snapshot.foreground, |cell| cell.foreground);
                 let background = cell.map_or(self.snapshot.background, |cell| cell.background);
                 cells.push(ResolvedCellData {
