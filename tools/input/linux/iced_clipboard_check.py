@@ -51,9 +51,13 @@ SCALE = float(os.environ.get("ROOST_TEST_TIMEOUT_SCALE", "1") or "1")
 # Sidebar project rows: chrome::ROW_HEIGHT, the sidebar body column's spacing,
 # and its `padding([4, 0])` top inset (crates/roost-iced/src/app.rs). The band
 # above them is read from the product instead of copied.
-SIDEBAR_ROW_HEIGHT = 28
+SIDEBAR_ROW_HEIGHT = 32
 SIDEBAR_ROW_SPACING = 2
 SIDEBAR_BODY_TOP_PADDING = 4
+# crates/roost-iced/src/terminal_widget.rs: the grid is edge-pinned, so a cell
+# offset is measured straight off the terminal widget's origin. Named rather
+# than folded away so the next inset change stays a one-line edit here.
+TERMINAL_PADDING = 0
 
 
 def _skip(message: str) -> NoReturn:
@@ -275,8 +279,8 @@ def _measure_terminal_cell(launch: Launch) -> tuple[int, int]:
         image = pngtool.load(str(path))
         width, height, bpp, pixels = image
         metrics = launch.client.window_metrics()
-        x0 = round(float(metrics["sidebar_width"])) + 12
-        y0 = round(launch.client.terminal_top(metrics)) + 12
+        x0 = round(float(metrics["sidebar_width"])) + TERMINAL_PADDING
+        y0 = round(launch.client.terminal_top(metrics)) + TERMINAL_PADDING
 
         def pixel(x: int, y: int) -> tuple[int, int, int]:
             offset = (y * width + x) * bpp
@@ -905,7 +909,7 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     _double_click_window_control(
         launch,
         round(float(metrics["sidebar_width"])) + 45,
-        17,
+        round(launch.client.terminal_top(metrics) / 2),
     )
     _wait_until(
         lambda: launch.client.identify()["active_tab_id"] == sibling,
@@ -1890,7 +1894,7 @@ def _chrome_overflow_navigation(launch: Launch) -> None:
             "--window",
             launch.window,
             "110",
-            str(height - 17),
+            str(height - terminal_top // 2),
             "click",
             "1",
         ]
@@ -2002,8 +2006,12 @@ def _terminal_scrollback_routing(launch: Launch) -> None:
         in "\n".join(launch.client.dump(launch.tab).get("rows_text", [])),
         "terminal history fixture at live bottom",
     )
-    terminal_x = 220 + 12 + 4
-    terminal_y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
+    terminal_x = 220 + TERMINAL_PADDING + 4
+    terminal_y = (
+        round(launch.client.terminal_top())
+        + TERMINAL_PADDING
+        + launch.cell_height // 2
+    )
 
     def wheel(button: int) -> None:
         launch.terminal_pointer(
@@ -2134,12 +2142,13 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
     launch.client.clipboard_write("system", baseline)
     launch.client.clipboard_write("selection", baseline)
 
-    # Window-relative client coordinates: sidebar + terminal padding and the
-    # live application-owned terminal origin. End on the last marker cell because
-    # TerminalSelection's committed range is inclusive at pointer release.
-    x0 = 220 + 12 + launch.cell_width // 2
-    x1 = 220 + 12 + int((len(marker) - 0.5) * launch.cell_width)
-    y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
+    # Window-relative client coordinates: sidebar + the terminal inset (zero —
+    # the grid is edge-pinned) and the live application-owned terminal origin.
+    # End on the last marker cell because TerminalSelection's committed range
+    # is inclusive at pointer release.
+    x0 = 220 + TERMINAL_PADDING + launch.cell_width // 2
+    x1 = 220 + TERMINAL_PADDING + int((len(marker) - 0.5) * launch.cell_width)
+    y = round(launch.client.terminal_top()) + TERMINAL_PADDING + launch.cell_height // 2
     # Keep the press, motion, and release as separate XTEST submissions. The
     # tiny-skia event loop can process a single batched xdotool sequence only
     # after its release, coalescing away the drag motion. IPC observation while
@@ -2249,8 +2258,8 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
 def _multi_click_and_link_hover(launch: Launch) -> None:
     row = "alpha/beta tail"
     _set_row(launch, row)
-    x = 220 + 12 + int(2.5 * launch.cell_width)
-    y = round(launch.client.terminal_top()) + 12 + launch.cell_height // 2
+    x = 220 + TERMINAL_PADDING + int(2.5 * launch.cell_width)
+    y = round(launch.client.terminal_top()) + TERMINAL_PADDING + launch.cell_height // 2
     launch.terminal_pointer(
         [
             "mousemove",
@@ -2303,7 +2312,7 @@ def _multi_click_and_link_hover(launch: Launch) -> None:
         lambda: launch.client.app_cursor_shape() == "crosshair",
         "OSC 22 baseline cursor",
     )
-    url_x = 220 + 12 + int(8.5 * launch.cell_width)
+    url_x = 220 + TERMINAL_PADDING + int(8.5 * launch.cell_width)
     launch.terminal_pointer(
         [
             "keydown",

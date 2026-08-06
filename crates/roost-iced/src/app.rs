@@ -1532,7 +1532,7 @@ impl App {
             let stripe = container(
                 iced::widget::Space::new()
                     .width(chrome::PROJECT_STRIPE_WIDTH)
-                    .height(chrome::ROW_HEIGHT),
+                    .height(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_STRIPE_INSET_Y),
             )
             .style(move |_| {
                 let color = if rollup == roost_ipc::agent::AgentLifecycle::Inactive {
@@ -1555,22 +1555,42 @@ impl App {
                         .style(chrome::inline_rename_input)
                         .into()
                 }
-                _ => text(&project.name).size(13).into(),
+                // Label leading, notification-dot slot trailing: the spacer is
+                // what holds that slot open against the pill's trailing inset
+                // (the dot itself arrives with the sidebar-dot work). The
+                // rename editor keeps the whole pill instead — a fill spacer
+                // beside it would halve the field.
+                _ => row![
+                    text(&project.name).size(13),
+                    iced::widget::Space::new().width(Fill)
+                ]
+                .width(Fill)
+                .align_y(Alignment::Center)
+                .into(),
             };
             let project_pill = container(project_label)
                 .width(Fill)
-                .height(chrome::ROW_HEIGHT)
-                .padding([3.0, chrome::PROJECT_LABEL_INSET])
+                .center_y(chrome::ROW_HEIGHT - 2.0 * chrome::PROJECT_PILL_INSET_Y)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: chrome::PROJECT_DOT_INSET,
+                    bottom: 0.0,
+                    left: chrome::PROJECT_LABEL_INSET,
+                })
                 .style(chrome::project_pill(
                     project.id == active_project,
                     dragged_project == Some(project.id),
                 ));
+            // The rail sits at the row's leading edge, inside the pill's own
+            // 6px inset — the two never overlap, so a plain row places both
+            // without a stack layer between the strip and its rows.
             let project_row = container(
                 row![
                     stripe,
-                    iced::widget::Space::new().width(chrome::PROJECT_STRIPE_GAP),
+                    iced::widget::Space::new()
+                        .width(chrome::PROJECT_PILL_INSET_X - chrome::PROJECT_STRIPE_WIDTH),
                     project_pill,
-                    iced::widget::Space::new().width(chrome::PROJECT_RIGHT_INSET)
+                    iced::widget::Space::new().width(chrome::PROJECT_PILL_INSET_X)
                 ]
                 .align_y(Alignment::Center),
             )
@@ -1618,9 +1638,9 @@ impl App {
                 .color(chrome::MUTED_TEXT)
                 .font(chrome::chrome_font(font::Weight::Semibold)),
         )
-        .height(chrome::BAND_HEIGHT)
+        .center_y(chrome::BAND_HEIGHT)
         .width(Fill)
-        .padding([10, 12])
+        .padding([0, 12])
         .style(chrome::band);
         let sidebar_footer = container(
             button(text("+ New Project").size(13))
@@ -1632,7 +1652,7 @@ impl App {
         .height(chrome::BAND_HEIGHT)
         .width(Fill)
         .center_x(Fill)
-        .padding([5, 8])
+        .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
         .style(chrome::band);
         // The strip delegates layout to its content, so its layout node is the
         // column's: one child per project group, which is what the gesture's
@@ -1846,7 +1866,7 @@ impl App {
         let tab_bar = container(tabs)
             .height(chrome::BAND_HEIGHT)
             .width(Fill)
-            .padding([5, 8])
+            .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
             .style(chrome::band);
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_tab) {

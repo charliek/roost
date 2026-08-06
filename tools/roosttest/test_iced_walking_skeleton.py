@@ -25,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402 — pure stdlib PNG decoder, imported not shelled out
 
 
-TERMINAL_PADDING = 12
+# crates/roost-iced/src/terminal_widget.rs — the grid is edge-pinned, so the
+# origin cell paints AT the widget origin and there is no gutter to skip.
+TERMINAL_PADDING = 0
 ORIGIN_MARKER = (17, 201, 93)
 
 
@@ -186,7 +188,12 @@ def test_iced_terminal_widget_uses_its_layout_origin_and_full_extent(
         )
         shot = latest["shot"]
         width, height, _bpp, _pixels = shot
-        assert pixel(shot, expected_sidebar + 1, terminal_top + 1) == default_rgb
+        # Edge-pinned grid: the origin cell paints AT the widget origin, so the
+        # pixel one in from the sidebar seam and one below the band — formerly
+        # inset gutter — is the marker. The exact corner is what pins the inset
+        # at zero: a 1px gutter would still satisfy the +1/+1 probe above.
+        assert pixel(shot, expected_sidebar, terminal_top) == ORIGIN_MARKER
+        assert pixel(shot, expected_sidebar + 1, terminal_top + 1) == ORIGIN_MARKER
         assert pixel(shot, width - 2, terminal_top + 1) == default_rgb
         assert pixel(shot, width - 2, height - 2) == default_rgb
 

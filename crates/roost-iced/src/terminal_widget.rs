@@ -14,7 +14,11 @@ use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
-pub const TERMINAL_PADDING: f32 = 12.0;
+/// The grid is edge-pinned: it starts at the widget's own origin and keeps
+/// every pixel the layout gives it (Mac parity — `app.window_metrics` puts
+/// the terminal flush under the tab band). Kept as a named seam so the cell
+/// math below stays symbolic.
+pub const TERMINAL_PADDING: f32 = 0.0;
 const POINT_TO_LOGICAL_PIXEL: f64 = 96.0 / 72.0;
 const TERMINAL_LINE_HEIGHT: f32 = 1.2;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -879,7 +883,36 @@ mod tests {
             ),
             Some((5, 3))
         );
-        assert_eq!(cell_at(Point::new(1.0, 1.0), 80, 24, metrics()), None);
+        // Edge-pinned grid: the widget's own origin is cell (0, 0) — there is
+        // no inset gutter to reject — so only points before the origin or past
+        // the last cell fall outside.
+        assert_eq!(
+            cell_at(
+                Point::new(TERMINAL_PADDING, TERMINAL_PADDING),
+                80,
+                24,
+                metrics()
+            ),
+            Some((0, 0))
+        );
+        assert_eq!(
+            cell_at(
+                Point::new(TERMINAL_PADDING - 1.0, TERMINAL_PADDING),
+                80,
+                24,
+                metrics()
+            ),
+            None
+        );
+        assert_eq!(
+            cell_at(
+                Point::new(TERMINAL_PADDING + 80.0 * CELL_WIDTH, TERMINAL_PADDING),
+                80,
+                24,
+                metrics()
+            ),
+            None
+        );
         assert_eq!(
             cell_at_clamped(Point::new(-50.0, 9_000.0), 80, 24, metrics()),
             Some((0, 23))
