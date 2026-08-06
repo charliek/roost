@@ -1563,6 +1563,13 @@ impl App {
                         .on_input(Message::RenameDraftChanged)
                         .on_submit(Message::RenameSubmit)
                         .size(13)
+                        // Absolute line height so the editor's total height is
+                        // integral: the default relative line height makes it
+                        // ~18.9px, and centering that inside the pill puts the
+                        // 1px focus border on half-pixels — tiny-skia at scale 1
+                        // then blends the border away (fuzzy on screen, and the
+                        // real-input harness counts exact border pixels).
+                        .line_height(iced::widget::text::LineHeight::Absolute(18.0.into()))
                         .padding([1, 3])
                         .style(chrome::inline_rename_input)
                         .into()
@@ -1764,6 +1771,9 @@ impl App {
                             .on_submit(Message::RenameSubmit)
                             .width(140)
                             .size(12)
+                            // Same integral-height rationale as the project
+                            // rename editor above.
+                            .line_height(iced::widget::text::LineHeight::Absolute(18.0.into(),))
                             .padding([1, 3])
                             .style(chrome::inline_rename_input)
                     ]
