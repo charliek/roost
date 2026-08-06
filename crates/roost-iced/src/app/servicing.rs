@@ -759,6 +759,21 @@ impl App {
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
             }
+            UiRequest::AppRenderStats { reset, reply } => {
+                let stats = crate::perf::snapshot();
+                if reset {
+                    crate::perf::reset();
+                }
+                let _ = reply.send(Ok(AppRenderStatsResult {
+                    refresh_calls: stats.refresh_calls as i64,
+                    refresh_nanos: stats.refresh_nanos as i64,
+                    rows_rebuilt: stats.rows_rebuilt as i64,
+                    cells_walked: stats.cells_walked as i64,
+                    draw_calls: stats.draw_calls as i64,
+                    draw_nanos: stats.draw_nanos as i64,
+                    fill_text_calls: stats.fill_text_calls as i64,
+                }));
+            }
             UiRequest::WindowMetrics { reply } => {
                 let collapsed = self.workspace.sidebar_collapsed();
                 let resolved_family = self

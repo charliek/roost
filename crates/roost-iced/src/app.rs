@@ -29,8 +29,8 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
-    SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    AppRenderStatsResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
+    SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
 };
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;

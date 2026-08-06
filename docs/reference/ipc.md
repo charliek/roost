@@ -604,6 +604,48 @@ during a drag are transient UI state, not part of this contract.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
+### `app.render_stats`
+
+Read the running UI's render-path counters. This is the only way to
+measure the real draw path: `TerminalWidget::draw` needs a live
+renderer, which unit tests cannot construct.
+
+Request: `{"params": {"reset": false}}`. `reset` defaults to `false`,
+so `{"params": {}}` — or no `params` at all — is a plain read.
+
+Response:
+```json
+{"refresh_calls": "412", "refresh_nanos": "51500000",
+ "rows_rebuilt": "9888", "cells_walked": "790400",
+ "draw_calls": "377", "draw_nanos": "94250000",
+ "fill_text_calls": "9048"}
+```
+
+Every counter is a **string-wrapped int64** (the same
+`string_int64` convention the envelope `id` uses, above):
+the nanosecond accumulators pass 2^53 after roughly 104 days of
+measured render time, and the rest ride the same convention so the
+shape is uniform. All are running totals since process start, or since
+the last `reset: true`.
+
+`refresh_calls` / `refresh_nanos` cover the snapshot rebuild that walks
+libghostty's render state; `rows_rebuilt` and `cells_walked` are what
+that walk touched. `draw_calls` / `draw_nanos` / `fill_text_calls`
+cover the widget draw pass.
+
+`reset: true` zeroes the counters **after** the read, so a caller can
+read-reset, run a workload, then read the delta directly.
+
+Caveat: `app.screenshot` re-renders the window, so taking a screenshot
+inflates the three draw counters. Read before capturing, or reset
+after.
+
+Ungated, read-only — always available, matching `tab.dump_resolved`.
+The GTK UI answers with the same shape, all counters zero: its
+renderer has no instrumentation yet, and a uniform contract across
+both Rust UIs beats an op one of them refuses. CLI: `roostctl
+render-stats [--reset]`.
+
 ### `sidebar.set_width` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

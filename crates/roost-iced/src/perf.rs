@@ -12,8 +12,8 @@
 //!   counters are what unit tests assert on, and they sidestep that flake
 //!   class entirely by construction.
 //! - [`snapshot`] reads a process-global `AtomicU64` aggregate that every
-//!   tab folds its work into. This is what a later IPC op reads out of a
-//!   running app; no test asserts on it.
+//!   tab folds its work into. This is what the `app.render_stats` IPC op
+//!   reads out of a running app; no test asserts on it.
 //!
 //! Two traps to know about before trusting a number out of this module:
 //!
@@ -39,11 +39,6 @@ static FILL_TEXT_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// A read of the process-global aggregate at one instant. Every field is a
 /// running total since process start (or the last [`reset`]).
-///
-/// `snapshot`/`reset` have no caller yet — the IPC op that exposes this to
-/// `roostctl` lands in a later commit — so this and they are allowed dead
-/// for now rather than stubbed with a fake caller.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderStats {
     pub refresh_calls: u64,
@@ -83,8 +78,7 @@ impl TabRenderStats {
     }
 }
 
-/// Read the global aggregate.
-#[allow(dead_code)]
+/// Read the global aggregate. Backs the `app.render_stats` IPC op.
 pub fn snapshot() -> RenderStats {
     RenderStats {
         refresh_calls: REFRESH_CALLS.load(Ordering::Relaxed),
@@ -99,7 +93,7 @@ pub fn snapshot() -> RenderStats {
 
 /// Zero the global aggregate. Useful before an operation known to skew it
 /// (see the screenshot trap above) so the next read is uncontaminated.
-#[allow(dead_code)]
+/// Exposed over IPC as `app.render_stats` with `reset: true`.
 pub fn reset() {
     REFRESH_CALLS.store(0, Ordering::Relaxed);
     REFRESH_NANOS.store(0, Ordering::Relaxed);

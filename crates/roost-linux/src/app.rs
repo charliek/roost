@@ -26,8 +26,8 @@ use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, TabView, WindowTitle};
 use roost_ipc::agent::{self, AgentLifecycle, AgentTabState};
 use roost_ipc::messages::{
-    PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpProject,
-    SidebarDumpResult, Tab, WindowMetricsResult,
+    AppRenderStatsResult, PaletteItemView, PaletteStateResult, Project, SidebarDumpAgentRow,
+    SidebarDumpProject, SidebarDumpResult, Tab, WindowMetricsResult,
 };
 use tokio::runtime::Handle;
 
@@ -1098,6 +1098,16 @@ impl App {
                         }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
+                        }
+                        UiRequest::AppRenderStats { reset: _, reply } => {
+                            // Deliberate placeholder: the GTK renderer has no
+                            // perf instrumentation yet (roadmap slice E3b).
+                            // Zeros keep the op's contract identical on both
+                            // Rust UIs — refusing here would make this the
+                            // first op one Rust UI answers and the other
+                            // doesn't, and there is no `unsupported` error
+                            // code to refuse with.
+                            let _ = reply.send(Ok(AppRenderStatsResult::default()));
                         }
                         UiRequest::SidebarDump { reply } => {
                             let _ = reply.send(app.ipc_sidebar_dump());

@@ -1,0 +1,7 @@
+{
+  "id": "21",
+  "op": "app.render_stats",
+  "params": {
+    "reset": false
+  }
+}
