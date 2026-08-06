@@ -96,6 +96,7 @@ enum Message {
         width: f32,
     },
     SidebarResizeEnded,
+    SidebarDragCollapsed,
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
@@ -225,6 +226,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SidebarResizeEnded => {
             app.sidebar_resize_ended();
+            Task::none()
+        }
+        Message::SidebarDragCollapsed => {
+            app.sidebar_drag_collapsed();
             Task::none()
         }
         Message::RenameSubmit => app.submit_rename_editor().map_task(),

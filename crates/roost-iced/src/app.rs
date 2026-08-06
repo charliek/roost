@@ -496,6 +496,16 @@ fn drag_width_is_actionable(collapsed: bool, live_width: f32, width: f32) -> boo
     !collapsed && width != live_width
 }
 
+/// Closing the sidebar from a drag past the collapse threshold is the one
+/// collapse that must *not* commit the live drag: the widths that gesture
+/// published all sat at the clamp floor on its way down, so committing would
+/// remember 160 where the user had, say, 300. Dropping the drag leaves the
+/// persisted width untouched and a reopen restores the pre-drag sidebar.
+fn drop_drag_and_collapse(drag_width: &mut Option<f32>, workspace: &Workspace) {
+    *drag_width = None;
+    workspace.set_sidebar_collapsed(true);
+}
+
 /// The core half of every focus change: the two ops the UI owes the
 /// workspace, in order. `focus_tab`'s error is also the "is this tab still
 /// there?" guard — a route holding only a `&Workspace` (the notification
@@ -2112,6 +2122,20 @@ impl App {
         self.commit_sidebar_drag();
     }
 
+    /// The grip dragged the seam past the collapse threshold. Same discipline
+    /// as `toggle_sidebar` — the sidebar leaves the tree, so anything anchored
+    /// in it is stranded — but the drag itself is dropped, not committed, and
+    /// dropped *first*: both `cancel_drags` and `set_sidebar_collapsed` commit
+    /// a live drag, and committing here would pin the remembered width at the
+    /// clamp floor the gesture last published instead of the width the sidebar
+    /// had before it started.
+    pub fn sidebar_drag_collapsed(&mut self) {
+        drop_drag_and_collapse(&mut self.sidebar_drag_width, &self.workspace);
+        self.cancel_drags();
+        self.cancel_editor_for_interaction();
+        self.resize(self.window_size);
+    }
+
     fn commit_sidebar_drag(&mut self) {
         if let Some(width) = self.sidebar_drag_width.take() {
             self.workspace.set_sidebar_width(f64::from(width));
@@ -2123,6 +2147,9 @@ impl App {
         // still live never publishes its end. Commit first so the width the
         // session shows is the width a relaunch restores. Expanding keeps the
         // grip, so a drag in flight there is still the widget's to finish.
+        // The one collapse that does not come through here is the grip's own
+        // drag-to-collapse (`sidebar_drag_collapsed`), which drops that drag
+        // rather than committing a width the user dragged away from.
         if collapsed {
             self.commit_sidebar_drag();
         }
@@ -2523,6 +2550,37 @@ mod tests {
 
         assert!(drag_width_is_actionable(false, 220.0, 320.0));
         assert!(!drag_width_is_actionable(false, 320.0, 320.0));
+    }
+
+    #[test]
+    fn a_drag_collapse_drops_the_live_width_so_a_reopen_restores_the_pre_drag_one() {
+        let workspace = Workspace::new();
+        workspace.set_sidebar_width(300.0);
+
+        // What the app holds when the grip publishes `Collapse`: the drag's
+        // last actionable width, pinned at the clamp floor on its way down.
+        let mut drag_width = Some(160.0);
+        drop_drag_and_collapse(&mut drag_width, &workspace);
+
+        assert_eq!(drag_width, None, "the live drag is dropped, not committed");
+        assert!(workspace.sidebar_collapsed());
+        assert_eq!(
+            workspace.sidebar_width(),
+            300.0,
+            "reopening restores the width the sidebar had before the drag"
+        );
+        assert_eq!(
+            effective_sidebar_width(workspace.sidebar_collapsed(), 300.0),
+            0.0
+        );
+
+        // The contrast that motivates the separate path: committing first —
+        // what every other collapse does — would remember the floor.
+        let committing = Workspace::new();
+        committing.set_sidebar_width(300.0);
+        committing.set_sidebar_width(160.0);
+        committing.set_sidebar_collapsed(true);
+        assert_eq!(committing.sidebar_width(), 160.0);
     }
 
     #[test]
