@@ -260,42 +260,104 @@ finding: **libghostty-vt's render-state dirty tracking is exposed in the
 pinned header and wrapped by nobody** — not Swift, not GTK, not Iced. All
 three walk the full grid on every update.
 
-* **E1. Renderer baseline measurement.** Frame time under a full-screen
-  scrolling TUI at max window size, both renderers (wgpu + tiny-skia),
-  both OSes. Runs first: its number is what decides whether E4 is worth
-  doing. Context for why this is a measurement and not an assumption —
-  the per-cell `renderer.fill_text` in `terminal_widget.rs` looked like
-  an Iced-specific regression and is not one: `iced_wgpu`'s text pipeline
-  caches shaping in a keyed atlas, and the Swift renderer is *more* naive
-  (`TerminalView.swift` per-cell `NSAttributedString.draw`, whose own
-  comment names a glyph atlas as the next-tier optimization). Treat the
-  renderer as uniformly naive across all three UIs, not as an Iced risk.
-* **E2. Render-state dirty coverage.** `crates/roost-vt/src/render_state.rs`
-  wraps exactly `update` / `colors` / `cursor` / `walk`. The pinned
-  `third_party/ghostty/out/include/ghostty/vt/render.h` also offers
-  global dirty (`GHOSTTY_RENDER_STATE_DATA_DIRTY` → false/partial/full),
-  per-row dirty (`ROW_DATA_DIRTY` via the row iterator), and the matching
-  `OPTION_DIRTY` / `ROW_OPTION_DIRTY` setters for resetting both layers.
-  Wrap those. No bindgen work: all four constants are already in the
-  generated `sys` module, so this is pure safe-wrapper surface.
-  **Footgun to handle explicitly** (render.h calls it "an extremely
-  important detail"): the two dirty layers are independent — clearing the
-  global state does *not* clear per-row flags, and `update` only ever
-  sets, never clears. The caller owns both resets.
+The E-entries below were written as predictions before any of this
+shipped; where the measured result corrected one, that correction is
+recorded alongside it rather than quietly edited away.
+
+* **E1. Renderer baseline measurement — done, prediction corrected.**
+  The original plan was frame time under a full-screen scrolling TUI at
+  max window size. That workload is precisely the one E3 cannot move:
+  libghostty full-rebuilds its render state whenever the viewport pin
+  changes ("If our viewport pin changed, we do a full rebuild" —
+  `third_party/ghostty/src/src/terminal/render.zig:299-302`), so any
+  output that scrolls is a full rebuild by construction, independent of
+  our dirty-tracking wrapper. Measuring only that would have produced a
+  near-flat number and fed a false "no win here" into E4's go/no-go.
+  What actually shipped: deterministic per-tab counters
+  (`refresh_calls` / `refresh_nanos` / `rows_rebuilt` / `cells_walked`,
+  plus `draw_calls` / `draw_nanos` / `fill_text_calls` for the
+  draw path) and CPU-side span timings, exercised by three workloads —
+  W1 pointer-motion storm, W2 in-place TUI redraw, W3 scrolling stream
+  as an explicit control expected to stay flat — readable three ways:
+  CI unit tests, an `#[ignore]`d in-crate harness (`make perf-refresh`),
+  and the `app.render_stats` IPC op via `roostctl render-stats`
+  (`make perf-render-stats`), which is the only way to get draw-path
+  numbers at all (no unit test constructs a live `iced::Renderer`).
+  Locked-Mac caveat: presented frame rate is meaningless on a locked or
+  occluded Mac (macOS throttles presentation), which is why this
+  measures CPU spans and counters instead. See `tools/perf/README.md`
+  for the harness.
+* **E2. Render-state dirty coverage — done.** Shipped in
+  `crates/roost-vt/src/render_state.rs`: `Dirty { Clean, Partial, Full }`,
+  `dirty()`, `mark_full()`, `dirty_rows()`, `walk_dirty()`. The footgun
+  (render.h's "extremely important detail" that clearing one dirty layer
+  does not clear the other) is handled by making consumption imply
+  reset — `walk_dirty` clears BOTH layers together, and there is
+  deliberately no public way to lower the dirty state otherwise: a
+  general `set_dirty` would have made `set_dirty(Clean)` the very
+  footgun this wrapper exists to prevent. `walk` is unchanged, so E2 is
+  purely additive and GTK is untouched by it. 14 tests in
+  `crates/roost-vt/tests/render_dirty_test.rs` pin the measured
+  semantics.
   **Two-phase `begin_update` / `end_update` is NOT available at our pin** —
   it landed upstream after `c74f6d5` (present at `../ghostty` tip and in
   `../libghostty-rs`, absent from our generated bindings). It is an E8
   follow-on, not part of E2; don't plan around it.
   `../libghostty-rs`'s `crates/libghostty-vt/src/render.rs` is MIT and a
   useful reference for the dirty accessors regardless.
-* **E3. Dirty-row snapshot rebuild.** Consumes E2. `refresh_snapshot`
-  (`app/terminal_tab.rs`) currently rebuilds the whole grid per PTY
-  update, allocating `vec![vec![String::new(); cols]; rows]` — a `String`
-  per cell including blanks — plus a `String` per `DrawCell`. Rebuild only
-  dirty rows. GTK's `terminal_view.rs` gets the same treatment.
-* **E4. Run coalescing** — **conditional on E1.** Merge adjacent cells
-  sharing fg/bg/style into one `fill_text` run. A `roost-ui-model` change,
-  so GTK benefits too. Do not start this without E1's number.
+* **E3. Dirty-row snapshot rebuild — done for `roost-iced`.** Consumes
+  E2. `refresh_snapshot` (`app/terminal_tab.rs`) used to rebuild the
+  whole grid per PTY update, allocating `vec![vec![String::new(); cols];
+  rows]` — a `String` per cell including blanks — plus a `String` per
+  `DrawCell`. Shipped shape: `TerminalSnapshot`'s `cells` + `rows_text`
+  became `grid: Vec<Arc<RenderedRow>>`, `DrawCell` lost its `row` field
+  so the row index has exactly one source of truth (the owning
+  `RenderedRow`'s position), and three invalidation guards force a full
+  rebuild outside `walk_dirty`'s own signal: grid size on both axes,
+  the default fg/bg pair, and a theme generation counter.
+  Measured (`refresh_snapshot`, `--release`, N=200/workload, before =
+  `f3e2657` pre-E3, after = this branch's HEAD, both built fresh in a
+  `git worktree` back-to-back):
+
+  | workload | before ns/refresh | after ns/refresh | speedup | rows rebuilt/refresh |
+  |---|---|---|---|---|
+  | W1 pointer-motion storm | 107,605 | 956 | 113x | 32.00 → 0.16 |
+  | W2 in-place TUI redraw | 110,025 | 6,163 | 17.9x | 32.00 → 2.15 |
+  | W3 scrolling stream (control) | 116,609 | 57,473 | 2.0x | 32.00 → 27.50 |
+
+  **Important limitation:** streaming/scrolling output is unimproved by
+  design (W3, per E1's correction above) — the wins are concentrated in
+  in-place TUI redraws and the non-PTY refresh callers, above all mouse
+  motion (W1), which previously rebuilt the entire grid on every pointer
+  event for zero content change.
+  **libghostty limitation worked around:** `OSC 10`/`OSC 11` and DECSCNM
+  change the reported default colors while libghostty reports
+  `dirty=Clean` with zero rows flagged — the dirty API alone can't see
+  it — so the consumer must compare the default fg/bg pair itself
+  (the `cached_defaults` guard above). Tripwire tests in
+  `crates/roost-vt/tests/render_dirty_test.rs` will fail loudly if a
+  future Ghostty bump changes this.
+* **E3b. Dirty-row rebuild for GTK + real `render_stats` — not started.**
+  Split out of E3, which originally read "GTK's `terminal_view.rs` gets
+  the same treatment." Two parts: `crates/roost-linux/src/terminal_view.rs`
+  adopts `walk_dirty` the same way `roost-iced` did, and
+  `app.render_stats` gets a real implementation — today it answers with
+  zeroed counters as a deliberate parity placeholder
+  (`crates/roost-linux/src/app.rs`'s `UiRequest::AppRenderStats` arm),
+  so the op's contract is identical on both Rust UIs while only one
+  collects real numbers. GTK is unaffected by the E1–E3 pass beyond that
+  placeholder, since `walk` itself was left unchanged.
+* **E4. Run coalescing — future work, GO per E1's number.** Merge
+  adjacent cells sharing fg/bg/style into one `fill_text` run. A
+  `roost-ui-model` change, so GTK benefits too. Was "conditional on E1
+  — do not start this without E1's number"; that number now exists:
+  a running (debug-build) app doing a 300-line scrolling burst on a full
+  screen issues ~2,410 `fill_text` calls per draw (one per visible
+  cell), and draw now dominates a refresh at ~1.37 ms vs. ~1 µs for an
+  idle refresh post-E3 (696 µs for a full refresh). `fill_text_calls` is
+  a deterministic counter (host- and build-independent); the nanosecond
+  figures are debug-build and indicative only. Not being done in this
+  pass.
 * **E5. Sprite parity in Iced.** `mac/Sources/Roost/Sprite.swift` and
   `crates/roost-linux/src/sprite.rs` draw U+2500–U+259F (box-drawing,
   block elements) geometrically because font glyphs don't tile
