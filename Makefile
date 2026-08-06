@@ -73,8 +73,13 @@ ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walkin
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_selection.py tools/roosttest/test_osc52.py
 test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
-test-rust:  ## cargo test --workspace
+# roost-vt's tests/*.rs all start with `#![cfg(feature = "ffi")]`, so the
+# `--workspace` run compiles and then silently skips every one of them. The
+# second line mirrors CI's separate `cargo test -p roost-vt --features ffi`
+# step (.github/workflows/ci.yml, rust job) so `make test` runs them too.
+test-rust:  ## cargo test --workspace (+ roost-vt ffi tests, cfg-gated out of the default run)
 	cargo test --workspace
+	cargo test -p roost-vt --features ffi
 
 test-iced:  ## Iced unit tests (renderer + input + adapter)
 	cargo test -p roost-iced
