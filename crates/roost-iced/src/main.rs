@@ -125,8 +125,36 @@ enum Message {
     },
 }
 
+/// The compiled-in default profile, and only the default:
+/// `ROOST_BUNDLE_PROFILE` still overrides it inside `BundleProfile::resolve`,
+/// which is what keeps the dev harnesses correct no matter how the binary was
+/// compiled — they all pin that variable explicitly.
+///
+/// A packaged Linux build adopts the production `roost` namespace the GTK
+/// package already owns, so an in-place upgrade keeps the user's socket,
+/// `state.json` and logs. The `linux` guard keeps the feature inert
+/// everywhere else: on macOS `Gtk` resolves `Roost-gtk`, the *GTK dev*
+/// profile — not the Swift app — so an unguarded feature would collide with
+/// the macOS GTK binary that CLAUDE.md supports running side by side.
+///
+/// Parameterized rather than a bare `#[cfg]` at the call site so all four
+/// cells are unit-testable in a single build.
+fn default_profile_kind(packaged: bool, linux: bool) -> BundleProfileKind {
+    if packaged && linux {
+        BundleProfileKind::Gtk
+    } else {
+        BundleProfileKind::Iced
+    }
+}
+
+/// The two `cfg!`s `main` actually resolves its profile from, hoisted to
+/// consts so a test can assert against the same values rather than
+/// re-evaluating its own copy (which would pass even if these drifted).
+const PACKAGED: bool = cfg!(feature = "linux-package");
+const PACKAGED_PLATFORM: bool = cfg!(target_os = "linux");
+
 fn main() -> anyhow::Result<()> {
-    let profile = BundleProfile::resolve(BundleProfileKind::Iced)?;
+    let profile = BundleProfile::resolve(default_profile_kind(PACKAGED, PACKAGED_PLATFORM))?;
     init_logging(&profile)?;
     roost_engine::crash::install_panic_hook(
         profile.log_dir.clone(),
@@ -762,5 +790,39 @@ mod tests {
         assert_eq!(window_id, id);
         assert_eq!(mapped, path);
         assert!(window_event_message(id, window::Event::FilesHoveredLeft).is_none());
+    }
+
+    #[test]
+    fn only_a_packaged_linux_build_adopts_the_production_profile() {
+        assert_eq!(
+            default_profile_kind(true, true),
+            BundleProfileKind::Gtk,
+            "the Linux .deb adopts the `roost` namespace in place"
+        );
+        assert_eq!(default_profile_kind(true, false), BundleProfileKind::Iced);
+        assert_eq!(default_profile_kind(false, true), BundleProfileKind::Iced);
+        assert_eq!(default_profile_kind(false, false), BundleProfileKind::Iced);
+    }
+
+    /// The four-cell test above never compiles the feature, so it passes
+    /// whether or not the gate reaches the call site. This one asserts on
+    /// `PACKAGED` — the same const `main` resolves from — so it fails if the
+    /// feature stops flowing to the profile decision. Asserting a locally
+    /// re-evaluated `cfg!(feature = ...)` here instead would be tautological.
+    ///
+    /// A misspelled feature name is caught earlier and harder: an unknown
+    /// name makes `cfg!` an `unexpected_cfgs` warning, and both the Makefile
+    /// and CI lint this crate with `-D warnings`.
+    #[cfg(feature = "linux-package")]
+    #[test]
+    fn the_packaging_feature_reaches_the_profile_decision() {
+        // Passing `PACKAGED` (not a re-evaluated `cfg!`) is what makes this
+        // real: if the feature stopped reaching `main`'s const, this would be
+        // `default_profile_kind(false, true)` — `Iced`, and the test fails.
+        assert_eq!(
+            default_profile_kind(PACKAGED, true),
+            BundleProfileKind::Gtk,
+            "a packaged Linux build must adopt the production profile"
+        );
     }
 }

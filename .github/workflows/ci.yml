@@ -511,6 +511,13 @@ jobs:
         run: |
           cargo test -p roost-iced
           cargo clippy -p roost-iced --all-targets -- -D warnings
+          # `linux-package` is off in every dev and CI build, so without this
+          # pair the packaging configuration would first compile during a
+          # release build. The clippy pass also carries the real protection
+          # against a `cfg!(feature = ...)` typo: an unknown feature name is
+          # an `unexpected_cfgs` warning, which -D warnings turns into an error.
+          cargo test -p roost-iced --features linux-package
+          cargo clippy -p roost-iced --features linux-package --all-targets -- -D warnings
 
       - name: Verify toolkit dependency boundaries
         shell: bash
