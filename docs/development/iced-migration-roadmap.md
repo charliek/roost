@@ -343,27 +343,69 @@ recorded alongside it rather than quietly edited away.
   (the `cached_defaults` guard above). Tripwire tests in
   `crates/roost-vt/tests/render_dirty_test.rs` will fail loudly if a
   future Ghostty bump changes this.
-* **E3b. Dirty-row rebuild for GTK + real `render_stats` — not started.**
-  Split out of E3, which originally read "GTK's `terminal_view.rs` gets
-  the same treatment." Two parts: `crates/roost-linux/src/terminal_view.rs`
-  adopts `walk_dirty` the same way `roost-iced` did, and
-  `app.render_stats` gets a real implementation — today it answers with
-  zeroed counters as a deliberate parity placeholder
-  (`crates/roost-linux/src/app.rs`'s `UiRequest::AppRenderStats` arm),
-  so the op's contract is identical on both Rust UIs while only one
-  collects real numbers. GTK is unaffected by the E1–E3 pass beyond that
-  placeholder, since `walk` itself was left unchanged.
-* **E4. Run coalescing — future work, GO per E1's number.** Merge
-  adjacent cells sharing fg/bg/style into one `fill_text` run. A
-  `roost-ui-model` change, so GTK benefits too. Was "conditional on E1
-  — do not start this without E1's number"; that number now exists:
-  a running (debug-build) app doing a 300-line scrolling burst on a full
-  screen issues ~2,410 `fill_text` calls per draw (one per visible
-  cell), and draw now dominates a refresh at ~1.37 ms vs. ~1 µs for an
-  idle refresh post-E3 (696 µs for a full refresh). `fill_text_calls` is
-  a deterministic counter (host- and build-independent); the nanosecond
-  figures are debug-build and indicative only. Not being done in this
-  pass.
+* **E3b. Dirty-row rebuild for GTK + real `render_stats` — done
+  (plan 018).** Shipped, gated by a measurement the same way E4 was
+  killed by one: C3 landed counters + a renderer-free `refresh_cache`
+  seam first, and the cache proceeded only after the walk measured
+  **1.09 ms/frame** (release, shed) on blink-driven idle frames — past
+  the pre-stated go threshold. Shipped shape mirrors iced's E3 with
+  GTK's inputs: `RenderedRow { bg, glyphs }` grid on `TerminalViewState`,
+  guards on `(cols, rows)` + a `GuardKey` of the resolver's actual
+  inputs (theme fg/bg/`bold_color` — the last never pushed into
+  libghostty, so that guard alone catches a bold_color-only change —
+  plus cell metrics) + a theme generation; cursor glyph looked up from
+  the cache at paint time (a blink frame visits zero rows, so the old
+  during-the-walk capture would have blanked the block cursor's glyph).
+  `app.render_stats` on GTK returns real counters. Measured (release,
+  shed): idle/blink refresh **1.09 ms → 13.6 µs/frame** (~80×), zero
+  rows rebuilt; a 300-line scroll burst rebuilds once instead of every
+  frame. **Follow-up recorded, not done:** the *draw* phase is GTK's
+  real cost — 15–25 ms/frame under Xvfb, ~2,400 per-cell pango
+  `set_text`+`show_layout` calls repeated in full on every blink frame.
+  Routes: per-row damage clipping of the Cairo phase, and/or pango-side
+  run drawing — which, unlike iced, has drift-free designs (negative
+  `letter_spacing`, per-glyph x-positioning; see E4's corrected scope).
+  Xvfb-software-rendering caveat recorded with the numbers in plan 018's
+  artifacts.
+* **E4. Run coalescing — measured NO-GO (2026-08-06, plan 018).** The
+  entry below first recorded a GO from plan 017's numbers; further
+  measurement the same day reversed it, and the reversal is exactly why
+  the "do not start without the number" gate existed. Three
+  disqualifiers, strongest first:
+  1. **Grid drift.** Both UIs position cells at the **floored** font
+     advance (`terminal_widget.rs` `measured.width.floor()`;
+     `crates/roost-linux/src/cell_metrics.rs:60-63`, floored against
+     smearing) while a shaped run advances at the natural fractional
+     width — measured 8.83 px vs 8 at 11 pt, so a coalesced 60-cell run
+     lands up to **+50 px** off the grid. Shaping is exactly linear
+     (60×"M" = 60 × one "M"; mixed ASCII likewise), so the drift is
+     purely the floor. Precisely scoped: this forecloses **naive run
+     drawing without per-glyph positioning** — pango offers two
+     drift-free designs (a negative `letter_spacing` attribute forcing
+     per-cell advance, or shaping once and overriding per-glyph
+     x-positions via glyph-string draw), and iced offers none at its
+     public `fill_text` layer. Un-flooring would fix it globally but is
+     a user-visible geometry change (cols per window width, hit-testing,
+     selection, every pixel test) and would break the sprite renderer,
+     which tiles box-drawing glyphs by integer `cell_w`/`cell_h` —
+     reintroducing the seams sprites exist to fix.
+  2. **The motivating cost was a debug artifact.** The GO cited
+     ~1.37 ms/draw; a **release** build on the same host and workload
+     measures **172 µs/draw** for a worst-case full-screen dense redraw
+     — ~1% of a 60 fps frame budget. (`fill_text_calls` ≈ 2,410/draw is
+     build-independent; the cost it implied was not.)
+  3. `iced_wgpu` keys shaped-text caching on the content string:
+     per-cell single chars repeat massively (cache-friendly); unique
+     coalesced run strings would miss every frame under scrolling.
+     (Argument, not measurement — recorded as such.)
+  Probe source + raw numbers archived with plan 018
+  (`e4-nogo-evidence.txt`). The W1–W3 harness and `fill_text_calls`
+  counter stay — they are what made this decision cheap. **Exit
+  conditions: the grid stops flooring, OR a per-glyph-positioned draw
+  path exists** (pango glyph strings today, an iced glyph-atlas path if
+  E5-adjacent work ever builds one) — and in either case only with a
+  release-build number showing a cost worth chasing, which today's
+  172 µs is not.
 * **E5. Sprite parity in Iced.** `mac/Sources/Roost/Sprite.swift` and
   `crates/roost-linux/src/sprite.rs` draw U+2500–U+259F (box-drawing,
   block elements) geometrically because font glyphs don't tile

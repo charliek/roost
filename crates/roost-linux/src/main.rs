@@ -26,6 +26,7 @@ mod notification_inbox;
 mod palette;
 mod palette_ui;
 mod paste_image;
+mod perf;
 mod provider;
 mod rollup;
 mod sprite;

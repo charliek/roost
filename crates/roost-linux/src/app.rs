@@ -1099,15 +1099,20 @@ impl App {
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
                         }
-                        UiRequest::AppRenderStats { reset: _, reply } => {
-                            // Deliberate placeholder: the GTK renderer has no
-                            // perf instrumentation yet (roadmap slice E3b).
-                            // Zeros keep the op's contract identical on both
-                            // Rust UIs — refusing here would make this the
-                            // first op one Rust UI answers and the other
-                            // doesn't, and there is no `unsupported` error
-                            // code to refuse with.
-                            let _ = reply.send(Ok(AppRenderStatsResult::default()));
+                        UiRequest::AppRenderStats { reset, reply } => {
+                            let stats = crate::perf::snapshot();
+                            if reset {
+                                crate::perf::reset();
+                            }
+                            let _ = reply.send(Ok(AppRenderStatsResult {
+                                refresh_calls: stats.refresh_calls as i64,
+                                refresh_nanos: stats.refresh_nanos as i64,
+                                rows_rebuilt: stats.rows_rebuilt as i64,
+                                cells_walked: stats.cells_walked as i64,
+                                draw_calls: stats.draw_calls as i64,
+                                draw_nanos: stats.draw_nanos as i64,
+                                fill_text_calls: stats.fill_text_calls as i64,
+                            }));
                         }
                         UiRequest::SidebarDump { reply } => {
                             let _ = reply.send(app.ipc_sidebar_dump());
