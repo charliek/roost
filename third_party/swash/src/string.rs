@@ -326,7 +326,13 @@ impl<'a> Iterator for Chars<'a> {
                 Some(from_u32(c).unwrap_or(rep))
             }
             Encoding::MacRoman => {
-                let c = self.bytes[self.cur] as u32;
+                // XXX: roost delta vs upstream 0.2.10 (issue #299, see
+                // README.roost.md): `chars()` takes `len` from the record's
+                // declared length but falls back to an empty slice when that
+                // length overruns the string storage, so an unchecked index here
+                // panics in both profiles. Ending the iterator matches the
+                // bounds-checked reads in the sibling arms.
+                let c = *self.bytes.get(self.cur)? as u32;
                 self.cur += 1;
                 if c > 127 {
                     let idx = c as usize - 128;

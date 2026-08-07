@@ -17,6 +17,20 @@ upstream version to move to.
   format 4's records begin at `base + 4`, past the u32 `numGlyphs`). These
   deltas are safety fixes only — lookup results stay as upstream computes
   them.
+* `src/internal/var.rs` — three subtraction guards for malformed variation
+  tables, each of which SIGABRTs debug builds and wraps harmlessly in release
+  (issue #299): `Fvar::get_instance` underflows `inst_size - 2` when `fvar`
+  declares an `instanceSize` below 2, `item_delta` underflows
+  `count - short_count` when an item variation data subtable declares
+  `shortDeltaCount` greater than `regionIndexCount`, and `metric_delta`
+  underflows `count - 1` when an `HVAR`/`VVAR` delta set index map declares
+  `mapCount == 0`.
+* `src/string.rs::Chars::next` — a bounds-checked read in the MacRoman arm,
+  which indexed its slice directly and so panicked in **both** profiles
+  (issue #299). `chars()` takes its length from the name record's declared
+  string length but falls back to an empty slice when that length overruns the
+  table's storage area, so any font with such a record crashed on the first
+  character. The iterator now ends there instead.
 
 Wired in via `[patch.crates-io]` in the workspace root `Cargo.toml`.
 Authoritative rationale: `CLAUDE.md` § Library preferences.
