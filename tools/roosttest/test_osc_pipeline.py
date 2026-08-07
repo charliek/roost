@@ -23,8 +23,8 @@ Closes both coverage gaps that #142 and #145 left open:
 Plus parity coverage for the other OSC-routed behaviors (title /
 cwd / notification) that are currently unit-tested only.
 
-Both targets run these in CI (e2e-gtk + e2e-mac) with
-`ROOST_TEST_MODE: "1"` set in the workflow env block.
+Every UI target runs these in CI (e2e-gtk, e2e-mac, and the three iced
+lanes) with `ROOST_TEST_MODE: "1"` set in the workflow env block.
 """
 
 from __future__ import annotations

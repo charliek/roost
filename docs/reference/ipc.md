@@ -631,7 +631,10 @@ the last `reset: true`.
 `refresh_calls` / `refresh_nanos` cover the snapshot rebuild that walks
 libghostty's render state; `rows_rebuilt` and `cells_walked` are what
 that walk touched. `draw_calls` / `draw_nanos` / `fill_text_calls`
-cover the widget draw pass.
+cover the widget draw pass. `fill_text_calls` counts glyph draws the
+pass emitted — a sprite-rendered cell (box drawing, blocks) *replaces*
+a glyph draw and counts as one on both UIs, so the field is comparable
+across them.
 
 `reset: true` zeroes the counters **after** the read, so a caller can
 read-reset, run a workload, then read the delta directly.
@@ -642,10 +645,10 @@ after.
 
 Ungated — always available, matching `tab.dump_resolved`. Not
 read-only: `reset: true` reads the counters and then zeroes them.
-The GTK UI answers with the same shape, all counters zero: its
-renderer has no instrumentation yet, and a uniform contract across
-both Rust UIs beats an op one of them refuses. CLI: `roostctl
-render-stats [--reset]`.
+The GTK UI answers with the same shape and real numbers; its `paint`
+folds one refresh and one draw into a single pass, so `refresh_*` and
+`draw_*` always advance together there, unlike iced where the two are
+scheduled independently. CLI: `roostctl render-stats [--reset]`.
 
 ### `sidebar.set_width` *(test-only — gated)*
 

@@ -15,6 +15,11 @@
 //!   tab folds its work into. This is what the `app.render_stats` IPC op
 //!   reads out of a running app; no test asserts on it.
 //!
+//! `fill_text_calls` counts glyph draws the pass emitted: one per
+//! `fill_text` **plus** one per sprite-rendered cell, because a sprite
+//! *replaces* a glyph draw. GTK counts its sprite draws the same way, so
+//! this field is comparable across the two UIs.
+//!
 //! Two traps to know about before trusting a number out of this module:
 //!
 //! - `iced::window::screenshot` re-renders the window, so `roostctl

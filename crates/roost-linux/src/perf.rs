@@ -16,8 +16,9 @@
 //!   are independently scheduled.
 //! - `fill_text_calls` counts `pango_cairo::show_layout` calls **plus**
 //!   sprite draws, because a sprite *replaces* a glyph draw — the number
-//!   means "glyph draws the pass emitted". iced has no sprite path
-//!   (roadmap E5), so this field is not apples-to-apples across UIs.
+//!   means "glyph draws the pass emitted". iced counts its own sprite
+//!   draws the same way (roadmap E5), so this field *is* comparable
+//!   across the two UIs.
 //! - `rows_rebuilt` / `cells_walked` mean the same as iced: rows visited
 //!   by the walk and cells handed to the per-cell callback.
 //!

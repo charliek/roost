@@ -279,7 +279,8 @@ scoreboard. All numbers are release builds; workloads are E1's W1–W3.
 | E4 run coalescing | — | — | — | **NO-GO**: release draw cost was already 172 µs/frame; floored-grid drift up to +50 px @ 60 cols |
 
 Not perf but shipped in the same track: E7 crash robustness (panic
-hooks + crash files in both Rust UIs; #299's malformed-font guards).
+hooks + crash files in both Rust UIs; #299's malformed-font guards) and
+E5 sprite parity in iced (shared `roost_ui_model::sprite` geometry).
 
 **Consider-later items are tracked in [#309]** (renderer-performance
 deferred considerations): the GTK *draw* phase (15–25 ms/frame Xvfb,
@@ -432,15 +433,33 @@ from there rather than re-deriving.
   E5-adjacent work ever builds one) — and in either case only with a
   release-build number showing a cost worth chasing, which today's
   172 µs is not.
-* **E5. Sprite parity in Iced.** `mac/Sources/Roost/Sprite.swift` and
-  `crates/roost-linux/src/sprite.rs` draw U+2500–U+259F (box-drawing,
-  block elements) geometrically because font glyphs don't tile
-  pixel-perfectly across adjacent cells. **`roost-iced` has no sprite
-  path at all** — so TUI chrome shows hairline seams there and not in
-  either shipped UI. This is a regression against our own shipped Linux
-  UI, not a macOS concern. The Linux sibling is already Rust: move it to
-  a shared crate and add the draw call. Add the matching row to the
-  parity inventory (it has none today, which is why this went unnoticed).
+* **E5. Sprite parity in Iced.** ✅ **Complete (plan 020).** The gap:
+  `mac/Sources/Roost/Sprite.swift` and `crates/roost-linux/src/sprite.rs`
+  draw U+2500–U+259F (box-drawing, block elements) geometrically because
+  font glyphs don't tile pixel-perfectly across adjacent cells, and
+  `roost-iced` had no sprite path at all — hairline seams in TUI chrome
+  that neither shipped UI has. Shipped shape: the geometry moved to
+  `roost_ui_model::sprite` as pure-data primitives (rects+alpha, corner
+  arcs, diagonals), with `arc_path` as the single source of path geometry
+  and `tessellate` flattening the stroked primitives into stamped rects
+  for quad-only renderers. GTK's `sprite.rs` became a thin cairo adapter
+  (2,715 → 569 lines) with behavior pinned three ways: the unchanged
+  pixel-assertion suite, a committed golden-hash fixture (153 codepoints
+  × 3 cell sizes, generated from the pre-refactor renderer; the 7 stroked
+  glyphs excluded as cairo-version-sensitive), and byte-identical
+  verification. iced draws sprites as integer-edge-snapped `fill_quad`s
+  inside the glyph pass — iced has no per-quad AA switch, so edge
+  snapping is the seam mechanism there — and sprite draws count into
+  `fill_text_calls` on both UIs, making that counter apples-to-apples
+  (the old cross-UI caveat is resolved). e2e guard:
+  `tools/roosttest/test_sprite_pixels.py` (seam + internal-edge + counter
+  assertions) in all three iced CI lanes. Cross-UI differences recorded,
+  decided not discovered: wgpu blends the shade glyphs' (░▒▓) alpha in
+  linear space so iced shades render lighter than cairo's sRGB blend;
+  arcs/diagonals are stamped-quad staircases vs cairo's AA strokes; and
+  iced's interleaved bg+glyph draw order can shave diagonal overshoot at
+  explicit-bg boundaries where GTK's two-pass order preserves it. No CI
+  cross-UI pixel gate, per [#284].
 * **E6. IME input.** `crates/roost-iced/src/input.rs` handles no `Ime`
   events, so dead keys, CJK input, and the emoji picker are broken.
   winit surfaces IME on both platforms — this is a Linux-shipping gap
@@ -546,7 +565,8 @@ and decide [#284] (visual-parity CI gate: required for M4 or waived).
 After plan 015, the open P1 set is expected to be exactly the 3e polish
 scope plus the upstream-blocked drops row ([#302]) — the audit confirms
 that expectation rather than assuming it. Amended 2026-08-06: add the new
-box-drawing/sprite row (engine-track slice E5) to that expected set. It is
+box-drawing/sprite row (engine-track slice E5) to that expected set —
+then closed by plan 020 the same track, so it drops back out. It is
 a genuine P1 gap against *both* references, and the fact that it went
 unnoticed until a Ghostty-comparison pass — because the inventory had no
 row for it — is exactly the drift the audit exists to catch. Treat
@@ -600,7 +620,8 @@ macOS side-by-side evaluation" note. Two standing consequences:
    from M5 (Iced replaces Swift vs. Rust under Swift); keep them separate
    so the frozen thing stays frozen.
 
-**Entry gate:** E5 and E7 complete; release-profile CI coverage for Iced;
+**Entry gate:** E5 (plan 020) and E7 (plan 019) are both complete;
+remaining: release-profile CI coverage for Iced, and the
 parity-inventory audit clean. Note the reference bar here is the **Swift
 app**, which is consistently stricter than M4's GTK bar — the inventory
 tracks both, and M6 is the superset.
