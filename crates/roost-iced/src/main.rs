@@ -192,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
         .default_font(chrome::chrome_font(iced::font::Weight::Normal))
-        .window(window_settings())
+        .window(window_settings(&profile))
         .run()
         .context("run Iced application")
 }
@@ -229,9 +229,13 @@ fn forced_test_panic() {
 /// it is not a window-settings change alone. Linux `PlatformSpecific` is a
 /// disjoint struct: `application_id` fills WM_CLASS (X11) / app_id (Wayland),
 /// which winit otherwise leaves empty — the dynamic window title made an
-/// empty class unfindable for tooling, and the id matches the notification
-/// adapter's `desktop-entry` hint so shells group both under one identity.
-fn window_settings() -> window::Settings {
+/// empty class unfindable for tooling. The id comes from the resolved
+/// profile, so a packaged build announces the production identity the
+/// installed desktop entry already declares as its `StartupWMClass`; it is
+/// the same id the notification adapter sends as its `desktop-entry` hint,
+/// so shells group both under one identity.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn window_settings(profile: &BundleProfile) -> window::Settings {
     window::Settings {
         size: Size::new(1100.0, 720.0),
         min_size: Some(Size::new(640.0, 360.0)),
@@ -243,7 +247,7 @@ fn window_settings() -> window::Settings {
         },
         #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific {
-            application_id: "ai.stridelabs.Roost.iced".to_owned(),
+            application_id: profile.app_id.to_owned(),
             ..window::settings::PlatformSpecific::default()
         },
         ..window::Settings::default()

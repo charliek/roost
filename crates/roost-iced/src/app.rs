@@ -1093,7 +1093,11 @@ impl App {
             palette_present_reply: None,
             palette_activate_replies: HashMap::new(),
             clipboard: ClipboardQueue::default(),
-            desktop_notifications: DesktopNotifications::new(runtime.handle(), feed_tx.clone()),
+            desktop_notifications: DesktopNotifications::new(
+                runtime.handle(),
+                feed_tx.clone(),
+                profile.app_id.to_owned(),
+            ),
             runtime_handle: runtime.handle().clone(),
             feed_rx,
             feed_tx,
