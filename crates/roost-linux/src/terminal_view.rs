@@ -2058,8 +2058,9 @@ impl TerminalViewState {
         // counters. `crate::perf`'s module doc carries the split.
         let draw_started_at = Instant::now();
         // Counts glyph draws the pass emits: one per `show_layout` AND
-        // one per sprite (a sprite *replaces* a glyph draw). iced has no
-        // sprite path, so this field is not apples-to-apples across UIs.
+        // one per sprite (a sprite *replaces* a glyph draw). iced counts
+        // its sprite draws the same way, so this field is comparable
+        // across the two UIs.
         let mut fill_text_calls: u64 = 0;
 
         let colors = self.render_state.colors().unwrap_or(roost_vt::Colors {

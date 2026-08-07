@@ -10,6 +10,7 @@ use iced::{
     Renderer, Size, Theme,
 };
 use roost_engine::pointer::{PointerAction, PointerButton};
+use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, SpritePrimitive};
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -677,6 +678,25 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                         );
                     }
                     if !cell.text.is_empty() && cell.text != " " {
+                        // Sprite-render single-codepoint cells whose codepoint
+                        // falls in one of the geometric ranges (GTK does the
+                        // same in `terminal_view::paint`). Multi-codepoint
+                        // graphemes skip this path because the sprite layer is
+                        // by-codepoint, not by-grapheme.
+                        let mut chars = cell.text.chars();
+                        if let (Some(c), None) = (chars.next(), chars.next()) {
+                            if let Some(geometry) = sprite_geometry(
+                                c as u32,
+                                f64::from(metrics.cell_width),
+                                f64::from(metrics.cell_height),
+                            ) {
+                                draw_sprite(renderer, position, &geometry, color(cell.foreground));
+                                // A sprite *replaces* a glyph draw, so it counts
+                                // as one — same semantics as GTK.
+                                fill_text_calls += 1;
+                                continue;
+                            }
+                        }
                         let font =
                             draw_font(metrics.font, cell.text.as_str(), cell.bold, cell.italic);
                         renderer.fill_text(
@@ -785,6 +805,54 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
 impl From<TerminalWidget> for Element<'_, crate::Message> {
     fn from(widget: TerminalWidget) -> Self {
         Self::new(widget)
+    }
+}
+
+/// Draw one cell's sprite geometry as quads at `origin`.
+///
+/// iced has no per-quad antialiasing switch (GTK gets `Antialias::None`
+/// for the block layer, hence `SpriteGeometry::antialias` being ignored
+/// here). A fractional shared edge between two quads composites to a
+/// hairline — partial coverage twice is not full coverage — so the seam
+/// story on this side is **integer edge snapping**: each rect's absolute
+/// edges are rounded before the `Rectangle` is built. Cell strides are
+/// integers (floored metrics), so adjacent cells round their shared edge
+/// to the same integer and tiling is exact regardless of a fractional
+/// widget origin. The f64→f32 cast happens after rounding; integer values
+/// at terminal magnitudes are exactly representable in f32.
+fn draw_sprite(
+    renderer: &mut Renderer,
+    origin: Point,
+    geometry: &SpriteGeometry,
+    foreground: Color,
+) {
+    for prim in &geometry.primitives {
+        let alpha = match *prim {
+            SpritePrimitive::Rect { alpha, .. } => alpha,
+            SpritePrimitive::CornerArc { .. } | SpritePrimitive::Diagonal { .. } => 1.0,
+        };
+        let fill = Color {
+            a: alpha as f32,
+            ..foreground
+        };
+        for rect in tessellate(prim) {
+            let left = (f64::from(origin.x) + rect.x).round();
+            let top = (f64::from(origin.y) + rect.y).round();
+            let right = (f64::from(origin.x) + rect.x + rect.w).round();
+            let bottom = (f64::from(origin.y) + rect.y + rect.h).round();
+            let (w, h) = (right - left, bottom - top);
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            fill_quad(
+                renderer,
+                Rectangle::new(
+                    Point::new(left as f32, top as f32),
+                    Size::new(w as f32, h as f32),
+                ),
+                fill,
+            );
+        }
     }
 }
 

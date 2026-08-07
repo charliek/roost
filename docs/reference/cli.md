@@ -207,7 +207,7 @@ roostctl render-stats --reset     # read, then zero for a clean next delta
 
 Prints one counter per line plus two derived averages (`ns_per_refresh`, `ns_per_draw`, shown as `-` when the matching call count is zero). `--reset` zeroes the counters **after** the read, so the read-reset / run workload / read pattern gives you a delta directly.
 
-`refresh_*` covers the snapshot rebuild that walks libghostty's render state (with `rows_rebuilt` / `cells_walked` measuring what it touched); `draw_*` and `fill_text_calls` cover the widget draw pass. Note that `roostctl screenshot` re-renders the window and so inflates the draw counters — read before capturing, or reset after. The GTK UI reports all zeros (no instrumentation yet). Backed by the `app.render_stats` IPC op — see [ipc.md](ipc.md).
+`refresh_*` covers the snapshot rebuild that walks libghostty's render state (with `rows_rebuilt` / `cells_walked` measuring what it touched); `draw_*` and `fill_text_calls` cover the widget draw pass. Note that `roostctl screenshot` re-renders the window and so inflates the draw counters — read before capturing, or reset after. Both Rust UIs report real numbers, and `fill_text_calls` counts sprite-rendered cells (box drawing, blocks) as glyph draws on both, so it is comparable across them. Backed by the `app.render_stats` IPC op — see [ipc.md](ipc.md).
 
 ## `palette` subcommands
 
