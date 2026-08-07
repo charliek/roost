@@ -68,6 +68,71 @@ class PixelMeasurementTests(unittest.TestCase):
                 image(20, 70, multiple_fills), blue, 20, 0, 70
             )
 
+    def test_near_tolerates_rounding_but_not_a_different_color(self):
+        selected = parity.PALETTE_SELECTION
+        self.assertTrue(parity.near((0x48, 0x48, 0x4D), selected))
+        self.assertTrue(parity.near((0x48, 0x48, 0x4C), selected))
+        self.assertFalse(parity.near((0x48, 0x48, 0x4B), selected))
+        self.assertFalse(parity.near((0x48, 0x48, 0x52), selected))
+
+    def test_ink_predicates_classify_aa_text_by_color_shape_not_fixed_targets(self):
+        self.assertTrue(parity.is_bright_neutral_ink((236, 236, 237)))
+        self.assertFalse(parity.is_bright_neutral_ink((170, 170, 173)))
+        self.assertTrue(parity.is_red_dominant_ink((221, 82, 82)))
+        self.assertTrue(parity.is_red_dominant_ink((210, 81, 81)))
+        self.assertFalse(parity.is_red_dominant_ink((72, 72, 77)))
+        self.assertFalse(parity.is_red_dominant_ink((130, 76, 79)))
+        self.assertFalse(
+            parity.is_red_dominant_ink(parity.LIFECYCLE_COLORS["waiting"])
+        )
+        self.assertFalse(parity.is_bright_neutral_ink(parity.LIFECYCLE_COLORS["waiting"]))
+
+    def test_color_components_tolerance_matches_rounded_palette_selection_only(self):
+        selected = parity.PALETTE_SELECTION
+        rounded = (0x48, 0x48, 0x4D)
+        fills = [(0, 0, 0)] * 60
+        for y in range(1, 5):
+            for x in range(2, 6):
+                fills[y * 10 + x] = rounded
+        shot = image(10, 6, fills)
+
+        self.assertEqual(
+            parity.color_components(shot, selected, (0, 0, 10, 6), minimum_side=4), []
+        )
+        self.assertEqual(
+            parity.color_components(shot, selected, (0, 0, 10, 6), minimum_side=4, tol=2),
+            [{"left": 2, "top": 1, "right": 5, "bottom": 4, "pixels": 16}],
+        )
+
+    def test_measure_agent_palette_tolerates_aa_drifted_text_over_rounded_selection(self):
+        background = (0x48, 0x48, 0x4D)
+        bold_name_aa = (236, 236, 237)
+        status_aa = (210, 81, 81)
+        width, height = 60, 20
+        fills = [(0, 0, 0)] * (width * height)
+        for y in range(2, 18):
+            for x in range(width):
+                fills[y * width + x] = background
+        muted_metric_aa = (170, 170, 173)
+        for y in range(5, 10):
+            for x in range(26, 30):
+                fills[y * width + x] = bold_name_aa
+            for x in range(40, 45):
+                fills[y * width + x] = status_aa
+            for x in range(50, 54):
+                fills[y * width + x] = muted_metric_aa
+        shot = image(width, height, fills)
+
+        with mock.patch.object(parity.pngtool, "load", return_value=shot):
+            measurement = parity.measure_agent_palette(Path("shot.png"), sidebar_width=0)
+
+        self.assertEqual(measurement["selected_bounds"]["top"], 2)
+        self.assertEqual(measurement["selected_bounds"]["bottom"], 17)
+        self.assertEqual(measurement["name_right"], 29)
+        self.assertEqual(measurement["status_left"], 40)
+        self.assertEqual(measurement["status_right"], 44)
+        self.assertGreater(measurement["trailing_ink_pixels"], 0)
+
     def test_counts_runs_and_components_are_geometry_not_text_based(self):
         black = (0, 0, 0)
         blue = parity.LIFECYCLE_COLORS["working"]

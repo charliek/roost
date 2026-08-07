@@ -521,7 +521,7 @@ when it touches the code you are already in:
 | Iced `ReorderStrip` presses still batch-cursor-anchored: iced scrollables pass children a translated cursor but the raw untranslated event, so an event-position anchor is off by the scroll offset | [#300] |
 | ~~Vendored swash: three further malformed-font robustness findings (incl. a verified upstream format-4 bitmap-index infinite loop — release-build hang)~~ **fixed** (plan 019: five guards in `third_party/swash` — strike.rs bisection typo, var.rs ×3 debug underflows, string.rs OOB read — each with a crafted-font regression test; the format-4 record-offset off-by-one is documented residual, README.roost.md has the delta list) | [#299] |
 | Terminal multi-click is wall-clock-only — **parked deliberately** (PR #301 triage): porting the strip's frame-grace would fuse deliberate slow clicks into word-select on idle terminals (a click schedules a redraw, so a 1-2 frame gap is the normal idle signature, not a stall); revisit only if it actually flakes | [#297] |
-| No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) — decide "required or waived" as part of the M4 entry audit | [#284] |
+| No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) — the plan-021 audit recorded a **waive** recommendation with a revisit trigger (see the M4 entry-criteria block); Charlie's final call pending | [#284] |
 | No real-input (CGEvent) harness on macOS — uinput tier is Linux-only | [#285] |
 | `roost-engine::facade` has no consumer; prove it or delete it (blocks M5) | [#286] |
 | `app/interactions.rs` at 2,960 lines — finer split when fixtures allow | [#288] |
@@ -543,6 +543,7 @@ when it touches the code you are already in:
 [#299]: https://github.com/charliek/roost/issues/299
 [#300]: https://github.com/charliek/roost/issues/300
 [#302]: https://github.com/charliek/roost/issues/302
+[#311]: https://github.com/charliek/roost/issues/311
 [#303]: https://github.com/charliek/roost/issues/303
 
 ### M4 — ship Iced to Linux users
@@ -555,23 +556,55 @@ real-input tier passes on Iced for the drag/clipboard guards.
 
 Entry-criteria status (2026-08-05): the real-input criterion is **met** —
 PR #301 removed the last harness workaround (the seam-press dwell) and the
-full Iced drag/clipboard guard passes in the shed and on CI. The
-no-open-P0/P1 criterion needs a **parity-inventory refresh audit** before
-it can be evaluated honestly: rows can lag shipped slices (the
-sidebar-resize row described the pre-3c fixed 220 pt width until the
-plan 015 closeout caught it; others may hide the same drift). The audit
-should re-verify every row against current behavior, close what shipped,
-and decide [#284] (visual-parity CI gate: required for M4 or waived).
-After plan 015, the open P1 set is expected to be exactly the 3e polish
-scope plus the upstream-blocked drops row ([#302]) — the audit confirms
-that expectation rather than assuming it. Amended 2026-08-06: add the new
-box-drawing/sprite row (engine-track slice E5) to that expected set —
-then closed by plan 020 the same track, so it drops back out. It is
-a genuine P1 gap against *both* references, and the fact that it went
-unnoticed until a Ghostty-comparison pass — because the inventory had no
-row for it — is exactly the drift the audit exists to catch. Treat
-"is there a row for this at all?" as an audit question, not just "is this
-row current?".
+full Iced drag/clipboard guard passes in the shed and on CI.
+
+**Refresh audit result (2026-08-07, plan 021, main@166d2d6).** Every
+inventory row was re-verified with named evidence (suite runs on macOS +
+shed Linux both renderers, hermetic parity captures, code refs — method
+block in the inventory). Six rows were stale in iced's favor and closed
+(the Sidebar-footer P0 and the create/delete/reorder/New-Project-command
+functional rows all described the pre-plan-010 world; workspace-shortcut
+adapters were already complete), several closed rows had drifted prose
+corrected, and four rows were added under the "is there a row for this at
+all?" question (terminal IME; window vibrancy; context menus; terminal
+bell — the last a recorded all-three-UIs absence, not an iced gap). The
+audited open set is:
+
+* **Open P0: none.**
+* **Open P1:** (a) the user-directed **3h polish cluster** (3h above
+  names the authoritative full scope) — agent-row typography, tab-status
+  geometry fixture, hover-close product decision, glyph-baseline
+  comparison (typography + padding halves), cursor/selection/link pixel
+  geometry, empty/loading/error states, remaining hover/focus states,
+  offscreen-tab reveal, and confirm-overlay pointer modality; (b) **file/image drops**, upstream-blocked
+  ([#302]); (c) **terminal IME**, engine slice E6 in flight under plan
+  021; (d) one objective one-constant fix: iced's tab notification badge
+  is `#4e9af1` where GTK deliberately hardcodes the Mac's `#007aff` —
+  found by the audit, filed as [#311].
+* The subjective P1s in (a) are Charlie-directed by design; M4's
+  "no open P0/P1" criterion therefore reduces to: land E6, fix the badge
+  constant, and either complete or explicitly waive the 3h items and the
+  #302-blocked remainder for the beta — his call, flagged in the plan-021
+  checklist. To be precise about waiver semantics: the criterion itself is
+  unchanged and this audit waives nothing — [#284]'s recommendation covers
+  only the cross-toolkit CI-gate question, and any per-row waiver is an
+  owner decision that must be recorded on the row in the inventory before
+  M4 can be declared entered.
+
+**[#284] recommendation (recorded by the audit; final call is Charlie's):
+waive** the cross-toolkit golden-image CI gate for M4. Cross-toolkit pixel
+identity is structurally unattainable (per-platform text rasterization;
+wgpu's linear-space alpha blending vs cairo sRGB — an accepted E5
+divergence; per-capture native-chrome ownership), and the audit itself hit
+the fragility class directly: a cairo/pango update shifted GTK's
+alpha-composited palette-selection color and its AA text pixels enough to
+break `parity.py`'s exact matches on a visually correct capture (fixed by
+scoped tolerances/predicates, plan 021). The focused per-UI pixel guards
+(sidebar, tab-strip, sprite, typography suites) stay the CI-enforced
+regression layer; `parity.py` captures stay the human release-review
+artifact. Revisit trigger: reopen if a shipped visual regression is ever
+traced to a gap the parity captures would have caught, or at the M6
+go/no-go review, whichever comes first.
 
 ### M5 — Rust under Swift (exploration, frozen)
 

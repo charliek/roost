@@ -58,6 +58,28 @@ def pixel(image: Image, x: int, y: int) -> tuple[int, int, int]:
     return data[offset], data[offset + 1], data[offset + 2]
 
 
+def near(value: tuple[int, int, int], target: tuple[int, int, int], tol: int = 2) -> bool:
+    # alpha(#ffffff, 0.13)-over-card compositing rounds to a library-version-dependent
+    # blue channel (e.g. cairo 0x4E vs 0x4D); tolerate a couple of LSBs, not a real color.
+    return all(abs(a - b) <= tol for a, b in zip(value, target))
+
+
+# AA text never reliably hits exact constants across pango versions; presence
+# checks classify ink semantically (near-neutral-bright / red-dominant) instead
+# of matching a fixed color, so geometry (which stays exact) doesn't erode as
+# per-glyph coverage varies.
+def is_bright_neutral_ink(value: tuple[int, int, int]) -> bool:
+    r, g, b = value
+    return min(r, g, b) >= 180 and max(r, g, b) - min(r, g, b) <= 12
+
+
+def is_red_dominant_ink(value: tuple[int, int, int]) -> bool:
+    # The near-equal g/b term separates failed red from waiting orange
+    # (240,160,64), whose r-dominance alone would pass.
+    r, g, b = value
+    return r >= 150 and r - max(g, b) >= 50 and abs(g - b) <= 30
+
+
 def count_color(
     image: Image,
     color: tuple[int, int, int],
@@ -144,13 +166,14 @@ def color_components(
     color: tuple[int, int, int],
     bounds: tuple[int, int, int, int],
     minimum_side: int = 5,
+    tol: int = 0,
 ) -> list[dict[str, int]]:
     left, top, right, bottom = bounds
     points = {
         (x, y)
         for y in range(top, bottom)
         for x in range(left, right)
-        if pixel(image, x, y) == color
+        if near(pixel(image, x, y), color, tol)
     }
     return [
         component
@@ -287,6 +310,7 @@ def measure_agent_palette(path: Path, sidebar_width: int) -> dict:
         PALETTE_SELECTION,
         (sidebar_width, 0, width, height),
         minimum_side=12,
+        tol=2,
     )
     if not selected:
         raise ValueError("agent palette has no selected-row background")
@@ -297,20 +321,20 @@ def measure_agent_palette(path: Path, sidebar_width: int) -> dict:
         x
         for y in range(top, bottom + 1)
         for x in range(left + 24, right + 1)
-        if pixel(image, x, y) in PALETTE_PRIMARY_TEXT
+        if is_bright_neutral_ink(pixel(image, x, y))
     ]
     status_x = [
         x
         for y in range(top, bottom + 1)
         for x in range(left + 32, right + 1)
-        if pixel(image, x, y) == LIFECYCLE_COLORS["failed"]
+        if is_red_dominant_ink(pixel(image, x, y))
     ]
     if not primary_x or not status_x:
         raise ValueError("agent palette selected row is missing name or failed status text")
     name_right = max(primary_x)
     status_left, status_right = min(status_x), max(status_x)
     trailing_ink_pixels = sum(
-        pixel(image, x, y) != PALETTE_SELECTION
+        not near(pixel(image, x, y), PALETTE_SELECTION)
         for y in range(top + 6, bottom - 5)
         for x in range(max(status_right + 2, right - 80), right - 3)
     )
