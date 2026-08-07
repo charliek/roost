@@ -1,8 +1,11 @@
 # Iced visual and interaction parity inventory
 
-Status: active POC gap register, not a parity claim
+Status: active gap register, not a parity claim
 
 Baseline: `poc/iced` at `dea73a5` (2026-08-01)
+Refresh audit: `main` at `166d2d6` (2026-08-07) — every row re-verified;
+see "Refresh audit method and evidence" below. Verdicts in the registers
+cite that audit unless they name an earlier plan.
 
 This inventory turns the Iced POC's remaining product work into named,
 testable slices. GTK is the primary Linux visual reference. Swift/AppKit is a
@@ -97,6 +100,47 @@ mostly transparent dark chrome with selection applied only to the active row or
 pill. Iced therefore reads as a generic widget demonstration despite having a
 real terminal and shared state behind it.
 
+## Refresh audit method and evidence (2026-08-07, main@166d2d6)
+
+The plan-021 audit re-verified every row against current behavior. Evidence
+classes, all reproducible from this commit:
+
+- **Suite runs (primary evidence for functional rows).** Shed (real Linux,
+  Xvfb): full GTK e2e `pytest tools/roosttest --roost-target gtk
+  --roost-fresh` → **171 passed, 11 skipped**; the full 13-file iced list +
+  clipboard pair under X11 → **80 passed, 2 benign skips** on *both*
+  renderers (wgpu, tiny-skia). macOS: iced list → 54 passed, 27 platform
+  skips (the one non-CI-parity failure is a dev-loop invocation artifact:
+  `make e2e-iced` launches without `ROOST_TEST_MODE=1`, so the test-mode
+  `window.resize` op is refused; the same test passes fresh + test-mode).
+- **Hermetic parity captures** (`tools/screenshot/parity.py`): macOS iced
+  (run `166d2d6-944d5d6354`), shed GTK + iced X11 (runs
+  `166d2d6-4832defb2d`, `166d2d6-96dd344b53`). Load-bearing digests
+  (SHA-256, shell captures): iced-macOS
+  `3b171ec502c0cbce…`, iced-linux-x11 `9f26264e780ace35…`, gtk-linux-x11
+  `7d4b922ed97a5428…`. The GTK run's agent-palette *measurement* failed on
+  a one-bit rounding drift — see the harness-fragility note below; the
+  captures themselves are visually correct.
+- **Code refs** for rows whose truth is structural (file:line cited in the
+  row), and the real-input guard `tools/input/linux/iced_clipboard_check.py`
+  (CI-wired) for pointer-path rows.
+
+Harness-fragility note: GTK's palette selection is `alpha(#ffffff, 0.13)`
+over `#2d2d33` (`crates/roost-linux/src/resources/style.css`), whose blue
+channel composites to 77.52; cairo's rounding of that value is
+library-version-dependent, so `parity.py`'s previously exact `#48484E`
+match now fails against `#48484D` on current shed cairo. Current pango
+likewise no longer produces the exact text-pixel constants inside the
+selected row (white name peaks at `#FBFBFB`, red status at `(221,82,82)`).
+The `measure_agent_palette` measurement gained a scoped ±2 tolerance on
+the alpha-composited selection (both its positive match and its
+ink-exclusion use), and its two text *presence* scans now classify ink
+semantically (bright-neutral / red-dominant predicates) instead of
+matching fixed constants; geometry assertions and every solid-fill color
+match elsewhere stay exact. This
+fragility class — alpha compositing and text rasterization shifting under
+library updates — is part of the [#284] evidence.
+
 ## Chrome foundation result
 
 The first production-facing styling slice removes the stock-primary-button
@@ -113,8 +157,9 @@ Side-by-side product captures on macOS and real Linux X11 show that the former
 purple/full-width-control concern is closed: the shell now reads as the same
 Roost product rather than a generic Iced demonstration. Both wgpu and tiny-skia
 render the structure consistently. This is a positive styling-feasibility
-decision, not a final parity claim; the remaining P0/P1 work below is mostly
-missing interaction/polish rather than inability to express the look.
+decision, not a final parity claim; the remaining open work below is mostly
+missing interaction/polish rather than inability to express the look (the
+last P0 closed with plan 010; re-verified by the 2026-08-07 audit).
 
 Correctness stays in focused reusable gates. `app.window_metrics` now reports
 Iced's optional `terminal_top`, constrained X11 pointer coverage reaches the
@@ -133,25 +178,29 @@ product polish, and P2 is an optional native/toolkit refinement.
 | Shell hierarchy | Sidebar and tab strip are compact chrome bands around a darker terminal | Closed in chrome slice, band height trued up to 32 pt in plan 016: compact seam and explicit dark surfaces | closed | Same named fixture; focused band-height/background assertions; side-by-side capture |
 | Sidebar surface | 220 pt default, `#282828` GTK chrome; Swift material resolves near `#3a3a3a`; header reads `PROJECTS` | Closed: 220 pt `#282828` surface and `PROJECTS` header | closed | Metrics remain 220 pt; background sample and header-content assertion |
 | Project rows | 28 pt compact rows; active project is an inset deep-blue rounded pill; lifecycle rollup is a narrow leading stripe | Closed: compact transparent rows, active `#13509d` pill, shared rollup stripe | closed | Selected/unselected geometry and color assertions; lifecycle stripe fixture; click E2E |
-| Agent rows | Transparent compact nested rows; only active agent has a faint wash; lifecycle dot, name, status, and time have distinct roles | Shared lifecycle colors/alignment and a gray active wash are implemented; current one-line rows remain taller and typographically less distinct than GTK/AppKit | P1 | Add active-row background and row-height bounds to the existing four-state capture; retain click E2E |
-| Sidebar footer | Centered compact `+ New Project` action in a separated footer | `Hide Sidebar` full-width action occupies list content; no visible project creation | P0 | Real directory-selection/create path plus capture and functional test |
+| Agent rows | Transparent compact nested rows; only active agent has a faint wash; lifecycle dot, name, status, and time have distinct roles | Audited 2026-08-07: shared lifecycle colors/alignment and the gray active wash hold; agent rows share the Mac-derived `ROW_HEIGHT` 32 (`chrome.rs:7`, plan 016) vs GTK's 20 px min-height rows (`style.css:148-152`) — but GTK no longer leads (see divergence note). The typographic gaps are concrete: agent name/detail render in the default font, not `chrome_font` (`app.rs:1649-1667`), and there is no active-name weight change where GTK bolds (`style.css:157-158`) | P1 → 3h (needs Charlie) | Typographic distinctness is his call; the measurable half (row-height bound, active-wash color) can join the four-state capture when 3h lands. Click E2E retained (suite evidence: audit runs) |
+| Sidebar footer | Centered compact `+ New Project` action in a separated footer | closed (plans 010 + 016): the footer is a fixed `+ New Project` chip; create ships **without a directory picker** (name `""` + cwd `$HOME` — matching both shipped UIs, roadmap 3b), reachable via footer, keybind, and palette | closed | Audit captures show the footer on macOS + Linux X11 (parity runs 2026-08-07); real-input fixed-footer-after-scroll click (`iced_clipboard_check.py::_chrome_overflow_navigation`); functional `test_project_lifecycle.py` in the iced CI lanes |
 | Sidebar overflow | Project and agent lists scroll vertically without moving the header/footer | Closed: body scrolls independently and final row activates in a constrained real-pointer fixture | closed | Small-window many-row fixture, wheel/drag navigation, final-row activation |
 | Sidebar collapse/resize | Both references expose a toolbar toggle. Swift persists a 160–400 pt user width; GTK uses a 160 pt minimum/default 220 pt `GtkPaned` without persisting a 400 pt cap | Resolved (plan 016): no in-window collapse affordance, matching the Mac — reopen via keybind/palette only, the ☰ button is removed. Dragging the grip past half the 160 pt floor (below 80 px, unclamped) collapses the sidebar and drops the live drag width without committing, so reopening restores the pre-drag committed width rather than the 160 pt floor. Recorded parity divergence: NSSplitView lets a drag continue past the floor and re-expand within the same gesture; here the grip leaves the tree at collapse, so drag-back-to-reopen within one gesture is impossible | closed | Resize: functional e2e + real-input grip segment (shipped, plan 011). Collapse: unit matrix (threshold crossing, no-Dragged-after-Collapse, released-event no-op, reopen-width invariant) plus capture (shipped, plan 016) |
 | Tab strip | About 24 pt pills in a compact band with 6 pt gaps and horizontal overflow | Closed for active/manual reachability: 24 pt dark pills in a 32 pt band (trued up from 34 pt in plan 016) with independent horizontal overflow | closed | Band/pill geometry assertions under both renderers; overflow test |
-| Tab status | Shared lifecycle dot at leading edge, white active label, muted inactive label | Implemented with shared lifecycle derivation; inactive slots are transparent, but the current parity fixture does not yet pin dot/label geometry | P1 | Add focused status-slot geometry/color capture; retain the semantic color unit test |
-| Tab close/badge | Active or hovered pill exposes close; inactive notification uses a distinct blue trailing badge | Active exact-ID close and blue badge implemented; hover-close remains deferred | P1 | Real click-close test, badge color/position assertion, notification clear test |
+| Tab status | Shared lifecycle dot at leading edge, white active label, muted inactive label | Audit-confirmed 2026-08-07: shared lifecycle derivation holds and the semantic color logic is unit-tested (`app.rs:3502-3529`), but no pixel test captures dot/label geometry — `test_tab_strip_pixels.py` pins only the #281 scrollbar band and the divider hairline | P1 → 3h | Add focused status-slot geometry/color capture; retain the semantic color unit test |
+| Tab close/badge | **Corrected 2026-08-07**: the shipped Mac shows × only on the *active* pill with no hover reveal (`App.swift:4747` — `closeButton.isHidden = !isActive`); the original "or hovered" framing was wrong. Inactive notification uses a blue trailing badge — GTK deliberately hardcodes Mac's `#007aff` (`style.css:277-286`) | Active exact-ID close implemented and covered (real-input `_direct_tab_close`: exact removal, survivor PTY, last-tab cascade; badge suppression + clear in `test_notifications.py`). Hover-close is a *product* decision, not a parity port → 3h. **Open finding: iced's badge is `#4e9af1` (`chrome.rs:59`) vs the references' `#007aff`** — undocumented divergence, filed as [#311](https://github.com/charliek/roost/issues/311) | P1 | Badge color one-constant fix + a badge color/position pixel assertion remain; close/cascade/clear coverage is done (audit runs 2026-08-07) |
 | Tab rename | Inline rename through double-click or the configured command, with authoritative persistence | Closed: compact inline editor uses stable IDs, select-all focus, Enter commit, Escape/click-away cancel, and shared GTK/Iced trim/no-op policy | closed | X11 physical shortcut/double-click/Enter/Escape/click-away gate, zero PTY leakage, relaunch persistence, and named GTK/Iced captures |
 | Tab reorder | Pointer drag reorder with visible insertion feedback | Closed: stable-ID drag preview, insertion feedback, exact authoritative commit, cancellation, overflow, and relaunch persistence work under both renderers | closed | Bidirectional physical X11/Wayland input, outside-release/palette cancellation, zero PTY leakage, and named product captures |
 | New-tab affordance | Compact plus control following the pills | Closed (re-shaped by plan 016): the plus sits inside the scrolling strip 6px after the last pill and scrolls with overflow — Mac parity, where ＋ is an arranged strip subview. Under overflow it scrolls offscreen (accepted; keybind/palette still create tabs) | closed | Real-input click computed from the last pill's rendered right edge opens one PTY-backed tab (plan 016 harness rework) |
 | Notification entry | Header bell with count badge opens the inbox palette (original framing) — the Mac reference actually has no bell at all | Resolved (plan 016): the bell is removed entirely — a deliberate divergence from this row's original framing, brought into line with the Mac reference, which has no bell. Shipped shape: sidebar project-row dots (any project with a notifying tab, active project included) plus the existing pill badges; the palette/keybind own the inbox entry | closed | Sidebar-dot + pill-badge capture; `roostctl notify` demo comparison against the Mac; inbox-via-palette/keybind e2e (shipped, plan 016) |
-| Terminal padding | Compact consistent inset around the grid — the Mac reference is edge-pinned at zero | Resolved (plan 016): `TERMINAL_PADDING` 0 on all sides, Mac-parity — the measurement half of this row is done. Typography/glyph-baseline comparison against the reference remains open (3h) | P1 | Cell-origin/viewport-edge assertions at padding 0 (shipped, plan 016); glyph-baseline comparison tracked under 3h |
+| Terminal padding | Compact consistent inset around the grid — the Mac reference is edge-pinned at zero | Resolved (plan 016): `TERMINAL_PADDING` 0 on all sides, Mac-parity — the measurement half of this row is done. Typography/glyph-baseline comparison against the reference remains open (3h) | P1 → 3h | Cell-origin/viewport-edge assertions at padding 0 (shipped, plan 016); glyph-baseline comparison tracked under 3h |
 | Terminal scrollback | Wheel/page navigation scrolls retained history locally when mouse reporting is off; alternate-screen behavior follows terminal modes | Closed: wheel and bare PageUp/PageDown page navigation both route through the shared GTK/Iced `roost-vt` policy — retained history, exact bottom state, next-terminal-key snap, mouse-report precedence, alternate-screen arrows/forwarding, and a full-viewport local page move that preserves selection and bypasses snap only on the local route. Swift Mac has no PageUp/PageDown scrollback route (deliberate Rust-UI-first divergence; no prior reference behavior existed) | closed | Physical X11 wheel under both renderers; `roost-vt::route_page` unit/fixture coverage plus both-UI (GTK/Iced) adapter fixtures (selection preserved, zero local PTY bytes, byte-identical Forward path); physical PageUp/PageDown segment in `iced_clipboard_check.py` |
-| Terminal typography | Configured family/size, baseline and cell metrics stable across styles and graphemes | Renderer-measured size and installed-family selection now reflow every live tab atomically, persist through the shared config policy, and reach new/restored tabs; focused glyph baseline/style comparison remains | P1 | Latin/wide/combined/style fixture under wgpu and tiny-skia; shared GTK/Iced font selection E2E |
-| Terminal cursor/selection/link | Shared colors and modes with reference-like cursor, selection, and link feedback | Functional coverage exists; geometry/color comparison remains incomplete | P1 | Focused cursor/selection/link screenshots plus existing real-input gates |
+| Terminal typography | Configured family/size, baseline and cell metrics stable across styles and graphemes | Renderer-measured size and installed-family selection now reflow every live tab atomically, persist through the shared config policy, and reach new/restored tabs (audit-confirmed: `test_z_typography.py` pins reflow, persistence, preview/confirm across GTK/Iced); focused glyph baseline/style comparison remains | P1 → 3h | Latin/wide/combined/style fixture under wgpu and tiny-skia; shared GTK/Iced font selection E2E |
+| Terminal cursor/selection/link | Shared colors and modes with reference-like cursor, selection, and link feedback | Audit-confirmed 2026-08-07: functional coverage is real and CI-wired (multi-click word/line select, OSC 22 cursor shape, Alt-hover link pointer in `iced_clipboard_check.py`; selection round-trips in `test_selection.py`; all four cursor styles implemented `terminal_widget.rs:756-798`) — but zero pixel assertions exist for cursor shape/color, selection tint, or link underline | P1 → 3h | Focused cursor/selection/link screenshots plus existing real-input gates |
 | Terminal box-drawing/block glyphs | Both shipped UIs draw U+2500–U+257F and U+2580–U+259F geometrically rather than from the font, because font glyphs do not tile pixel-perfectly across adjacent cells — `mac/Sources/Roost/Sprite.swift` and `crates/roost-linux/src/sprite.rs`, both ports of Ghostty's `font/sprite/draw/{block,box}.zig` and kept in lockstep per the CLAUDE.md parity rule | Closed (plan 020, engine-track slice E5): the geometry moved to `roost_ui_model::sprite` (pure-data primitives; `tessellate` flattens stroked shapes into stamped rects for quad-only renderers) and Iced draws U+2500–U+259F as integer-edge-snapped `fill_quad`s inside the glyph pass — seams gone; GTK's `sprite.rs` is now a thin cairo adapter over the same shared geometry. Row added 2026-08-06; the gap existed unnoticed because this inventory had no box-drawing row. Recorded divergences, decided not discovered: wgpu's linear-space alpha blend renders the shade glyphs (░▒▓) lighter than cairo's sRGB blend, and arcs/diagonals are stamped-quad staircases rather than cairo AA strokes | closed | Seam-free capture verified by the committed `tools/roosttest/test_sprite_pixels.py` pixel guards (seam + internal-edge + counter assertions, running in all three iced CI lanes) plus plan-020 screenshot artifacts; codepoint-dispatch unit coverage in `roost_ui_model::sprite` (dispatch/rejection/full-range tests) mirroring the existing Swift/Rust sprite tests; GTK regression pinned by the golden-hash fixture (153 codepoints × 3 cell sizes) |
 | Palette placement | Centered, elevated compact panel over an undimmed terminal, styled semantic rows, keyboard focus, and scrolling | Closed for the visual-feasibility slice: exact reference neutrals, border/shadow, content-sized 660 pt card capped at 500 pt, compact command/agent/notification/provider rows, shortcut hints, fuzzy-match accents, disabled state, and a narrow neutral scrollbar | closed | Five named GTK/Iced captures; focus/scroll tests plus real row/card/outside pointer routing |
-| Empty/loading/error states | Deliberate shell placeholders without changing hierarchy | Plain `Starting terminal…`; status errors are appended to the sidebar | P1 | Seeded empty/loading/error snapshots and recovery tests |
-| Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Mostly inherited stock theme states | P1 | Renderer-neutral state-style unit tests plus real pointer/keyboard capture |
+| Terminal IME (dead keys, CJK composition, emoji picker) | **Row added by the plan-021 audit — no row existed (the E5 omission class).** Neither shipped UI wires terminal-surface IME: GTK's terminal is a bare `EventControllerKey` with no `IMContext` (deferral documented at `crates/roost-linux/src/key_encoder.rs:21-24`); Swift's `TerminalView` never adopts `NSTextInputClient` nor calls `interpretKeyEvents` (`KeyEncoder.swift:151-153`); both hardcode `set_composing(false)`. GTK/Swift absence is recorded divergence (GTK retiring; Swift under the M6 decision) | Iced handles no `Ime` events either (roadmap E6) — engine-track slice **E6 is in flight (plan 021)** to make iced the first Roost UI with working terminal IME: commit→PTY through the libghostty encoder, widget-drawn preedit at the cursor, enable/disable around the keyboard route | P1 — E6 in flight | `tools/roosttest/test_ime.py` (lands with E6) + real-IME human smoke; GTK/Swift rows stay documented-divergent |
+| Window vibrancy / translucency | Mac sidebar translucency is AppKit-native (no `NSVisualEffectView` in the Swift source — roadmap § 6f, :736-737); GTK has none | Not implemented; the frosted/translucent spike is explicitly 3h scope with the decision reserved to the project owner (roadmap :224-234, 6f) | P2 → 3h (needs Charlie) | Platform captures once 3h decides the direction |
+| Context menus (right-click) | Both references expose right-click menus: GTK project-row popover (`crates/roost-linux/src/app.rs:1393-1408`) and per-pill right-click popover (button-3 gesture, `app.rs:1824`), Mac `NSMenu` on project rows (`App.swift:712-723`) and tab pills (`TabPillView.menu(for:)`, `App.swift:5105`) | None in iced — every covered operation (rename, delete, close) is reachable via double-click, keybind, or palette, so no capability is lost, but the affordance itself is absent. Row added by the plan-021 audit; previously mentioned only as a delete-mechanism option | P2 | Decide with 3h whether iced grows menus or the alternate affordances are the accepted shape |
+| Terminal bell (BEL) | **Absent in all three products** — parity holds in absence. The shared VT layer deliberately defers the second-callback refactor that a bell needs (`crates/roost-vt/src/terminal.rs:336`) | Same absence | — | Row added by the plan-021 audit so the absence is a recorded decision, not an unnoticed gap; revisit if any UI grows a bell |
+| Empty/loading/error states | Deliberate shell placeholders without changing hierarchy | Corrected 2026-08-07: plain `Starting terminal…` placeholder stands (`app.rs:1895`); errors are **no longer sidebar-appended** — they render as a 5 s self-expiring bottom-right toast (`app.rs:1911-1922`, `chrome::status_toast`). Additional recorded divergence (roadmap 3h): deleting the last project lands iced in the engine's empty-workspace state while both shipped UIs close their window | P1 → 3h | Seeded empty/loading/error snapshots and recovery tests remain unbuilt; 3h owns the state designs |
+| Hover/focus/disabled states | Subtle per-control hover and visible focus without global blue fills | Corrected 2026-08-07 — "stock theme states" is no longer accurate: explicit custom hover/press/disabled styling ships for footer chip, danger button, palette rows, transparent controls, active agent wash, and rename-input focus border, each unit-tested (`chrome.rs:285-302,136-168,256-283,219-233` + its `#[cfg(test)]` module). Narrowed remainder: no keyboard focus ring anywhere, no tab-pill hover state, no sidebar-row hover distinct from active | P1 → 3h | State-style unit tests exist (audit-verified); the real pointer/keyboard capture half and the remaining states land with 3h |
 | File/image drops | Swift and GTK accept text/file URI drops and image-paste paths using terminal-attached native adapters | Local file drops anywhere in the owned Iced window target the active terminal when no palette/editor owns input, using the shared GTK/Iced resolver and bracketed-paste path on macOS/X11. Clipboard image paste is also shipped: a System-clipboard read materializes to a GTK-parity temp PNG (same cap/naming/0600 policy) on paste, wrapped through the shared bracketed-paste path. Documented divergences: the pixel cap runs post-decode (arboard decodes internally), uri-list-only file copies stay GTK-only, and macOS is compiled but not live-verified. Exact hit-testing, raw text/URI drops, and native Wayland DnD are upstream-blocked (issue #302) | P1 | Shared payload/PTY-byte tests, real Finder evidence, and a reusable shed XDND guard proven under wgpu/tiny-skia; clipboard image materialization unit/paste-path tests (cap, naming, permissions, no-shell-escaping charset pin); retain the upstream-tracked coordinate/Wayland gaps (#302) |
 | Native chrome | Platform-appropriate window controls and title/subtitle behavior | Native winit decorations; renderer screenshot cannot compare them directly | P2 | Platform launch artifacts and manual checklist, separate from content pixels |
 | Renderer consistency | The terminal surface fills the available right pane under every supported renderer/backend | Closed for the current shell: renderer-neutral widget begins at x=220/y=32 with the sidebar and x=0/y=32 collapsed under wgpu/tiny-skia on macOS, X11, and Wayland (band height trued up to 32 pt in plan 016) | closed | Focused product screenshot regression runs in the existing renderer matrix; repeatable parity captures remain available for human review |
@@ -166,10 +215,10 @@ does not justify a second state machine.
 |---|---|---|---|
 | Select project/tab/agent | implemented | implemented | Preserve while restyling; keep one authoritative active state |
 | Sidebar scrolling | UI-owned presentation | implemented | Body scrolls independently while the header/footer stay fixed; constrained real-pointer fixture activates the final row |
-| Create project | implemented | missing | Native/portal directory picker, then engine command; no renderer dependency in engine |
+| Create project | implemented | implemented (plan 010) | None outstanding. Ships without a directory picker — name `""` + cwd `$HOME`, deliberately matching both shipped UIs (roadmap 3b); footer + keybind + palette routes covered by `test_project_lifecycle.py` and the real-input footer click |
 | Rename project | implemented | implemented | Compact stable-ID inline editor; shared trim/no-op policy, physical input, exact dispatch, and relaunch persistence are covered |
-| Delete project | implemented | missing | Context menu or equivalent, confirmation, and deterministic error handling |
-| Reorder projects | implemented | missing | Pointer drag with stable IDs and explicit insertion feedback |
+| Delete project | implemented | implemented (plan 010) | None outstanding: in-app confirm overlay then engine cascade; real-input keybind confirm/cancel with zero PTY leakage (`iced_clipboard_check.py`); the separate tab-close→project cascade is covered by `_direct_tab_close` |
+| Reorder projects | implemented | implemented (plan 010) | None outstanding: vertical `ReorderStrip` instantiation with stable IDs and insertion feedback; real-input XTEST project drag + sub-threshold select covered (`iced_clipboard_check.py`) |
 | Open tab | implemented | implemented | Restyle plus control and preserve PTY launch path |
 | Close tab | implemented | active-pill close implemented | Keep exact rendered tab IDs and last-tab/project cascade coverage; add hover-close polish separately |
 | Rename tabs | implemented | implemented | Double-click/configured command uses the authoritative operation; physical input proves focus, cancel, commit, zero PTY leakage, and restoration |
@@ -178,13 +227,14 @@ does not justify a second state machine.
 | Sidebar resize | UI-owned geometry | implemented | Shipped in slice 3c (plan 011): grip drag adapter + engine-persisted 160–400 pt width policy |
 | Notifications inbox | shared model/UI port | implemented | Resolved (plan 016): bell removed; sidebar project-row dots + existing pill badges replace it, palette/keybind own the inbox entry |
 | Command/agent/provider palettes | shared model/UI port | implemented | Visual/focus polish; provider activation behavior remains shared |
-| New Project command | shared command ID | reports unimplemented | Route through the same Iced directory-picker port as the footer |
+| New Project command | shared command ID | implemented (plan 010) | None outstanding — palette command routes through the same `new_project` dispatch as the footer and keybind |
 | Select Font command | shared command ID | implemented | Shared ordering/resolution/confirmation policy drives toolkit discovery adapters; preview/cancel/confirm and config persistence are covered by the target-neutral Rust-UI E2E |
-| Configured workspace shortcuts | shared keybinding IDs | exhaustive dispatch is implemented; supported actions route to the workspace/UI port and unavailable project actions show a deterministic status without PTY bytes | Implement the remaining project adapters behind the already-safe action routes |
+| Configured workspace shortcuts | shared keybinding IDs | exhaustive dispatch is implemented; every action now routes to a real adapter — plan 010 closed the last project stubs (the `Err("… not available in Iced yet")` grep has zero hits, roadmap :243-249) | None outstanding |
 | Font increase/decrease/reset | shared keybinding IDs/config | implemented | Renderer-measured metrics reflow all live tabs atomically and persist exact values; new tabs inherit the live typography |
 | Terminal scrollback | shared VT policy | implemented (wheel + bare PageUp/PageDown) | None outstanding — shared mode precedence, snap/selection semantics, and physical wheel + page real-input gates are covered |
 | Text/file/image drop | UI-owned native adapter | partial | macOS/X11 local files batch to a stable active tab, share GTK normalization, and honor bracketed paste; clipboard image paste materializes to a GTK-parity temp PNG through the shared paste path. Iced 0.14 has no drag coordinates, so the owned window is the current target boundary. Exact native hit-testing, raw text/URI drops, and native Wayland DnD are upstream-blocked (#302); no further adapter work is possible until iced/winit ships them |
 | Native notifications | engine action exists | implemented (Linux) | Linux D-Bus adapter ships fire, GTK-parity replace-not-stack, and click-to-focus via the freedesktop default action → focus tab + clear badge + reveal sidebar + best-effort raise; adapter-only, engine suppression untouched. The "never issue native UI calls from engine locks" constraint is satisfied structurally: the engine drain sends over a channel, one worker owns all notify-rust I/O. macOS backend deferred (#303) |
+| IME input (terminal) | UI-owned input path | missing — E6 in flight (plan 021) | Consume `Event::InputMethod` in the terminal widget, commit through the shared libghostty encoder path, widget-drawn preedit, enable/disable around the keyboard route; see the visual register's Terminal IME row for the cross-UI context |
 
 ## Ordered implementation slices
 
@@ -214,9 +264,10 @@ renderers, and is pushed only after the complete applicable gate is green.
    reachable, then dispatch every configured workspace shortcut before terminal
    encoding so missing UI commands cannot leak bytes. Sidebar and tab chrome
    scrolling landed with slice 3.
-6. **Project manipulation:** inline rename is complete; add portal/native
-   directory selection, create, delete, pointer reorder, and the shared
-   `new_project` command route.
+6. **Project manipulation (complete — plan 010):** inline rename, create
+   (no directory picker — the decided shipped shape, matching both
+   references), delete with confirmation, pointer reorder, and the shared
+   `new_project` command route all shipped.
 7. **Tab manipulation:** inline rename, pointer drag reorder/overflow, and
    restoration coverage are complete; add hover-close and automatic offscreen
    reveal behavior.
@@ -252,15 +303,14 @@ does not dismiss, an exact row click activates once, and an outside click
 dismisses without activating the tab control underneath.
 
 This result establishes a credible path to reference-level Iced styling on
-macOS, X11, and Wayland with both released renderers. The project owner accepted
-the styling-feasibility result and authorized continued parity work; no further
-approval pause is required. Direct manipulation is the next implementation and
-cost-validation milestone: project or tab editing must still demonstrate that
-focus, text editing, drag feedback, accessibility, and maintenance cost can be
-competitive with GTK. The footer, project/tab manipulation, sidebar resizing,
-dedicated PageUp/PageDown scrollback handling, terminal glyph-level visual
-comparison, and several native adapters remain material P0/P1 work elsewhere
-in this register.
+macOS, X11, and Wayland with both released renderers. The project owner
+accepted the styling-feasibility result and authorized continued parity work.
+(Historical note, superseded by later plans and re-verified by the 2026-08-07
+audit: the direct-manipulation milestone this paragraph originally set —
+footer, project/tab manipulation, sidebar resizing, PageUp/PageDown
+scrollback — has since shipped across plans 010-016; the open remainder is
+the user-directed 3h polish cluster plus the rows the registers above mark
+open.)
 
 ## First slice contract
 
@@ -301,9 +351,10 @@ These are sequencing decisions, not accepted final gaps:
   and lifecycle indicators remain required regardless of backend.
 - Arbitrary 2× software-renderer detail remains governed by the capture policy
   in `iced-poc-plan.md`; all focused pixel/geometry gates run at 1×.
-- The footer temporarily retains `Hide Sidebar` until the project-manipulation
-  slice supplies the shared `New Project` route and a portal/native directory
-  picker; the missing direct creation path remains P0.
+- ~~The footer temporarily retains `Hide Sidebar`~~ Resolved (plans 010 +
+  016): the footer is the fixed `+ New Project` chip and the create path
+  shipped without a directory picker (the decided shape, matching both
+  references). Kept for history; see the Sidebar footer row.
 - Only the active tab exposes close. Hover-close and automatic reveal after
   programmatic selection of an offscreen tab remain in the tab-manipulation
   slice. Pointer reorder, drag insertion feedback, persistence, and manual
@@ -322,3 +373,5 @@ These are sequencing decisions, not accepted final gaps:
   the current compact controls without more adapter work. Semantic icon,
   tooltip, focus-ring, and assistive-technology refinement remains required
   before a release claim.
+
+[#284]: https://github.com/charliek/roost/issues/284
