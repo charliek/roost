@@ -188,10 +188,39 @@ fn init_logging(log_dir: &Path) {
         .init();
 }
 
+/// Forces a panic when `ROOST_TEST_PANIC` is set, so the crash-report path
+/// can be exercised end to end against a real binary. Env-gated the same way
+/// as `ROOST_TEST_MODE`, and called before the single-instance lock so it can
+/// never disturb a running instance.
+fn forced_test_panic() {
+    match std::env::var("ROOST_TEST_PANIC").as_deref() {
+        Ok("1") => panic!("ROOST_TEST_PANIC: forced startup panic"),
+        Ok("thread") => {
+            // The join never returns — the hook aborts the process from the
+            // spawned thread. It is here so main can't race ahead into app
+            // init (and a real window) before the abort lands.
+            // A spawn failure must not fall through into app init —
+            // expect() panics on main, which the hook also catches.
+            let handle = std::thread::Builder::new()
+                .name("roost-test-panic".into())
+                .spawn(|| panic!("ROOST_TEST_PANIC: forced thread panic"))
+                .expect("ROOST_TEST_PANIC: failed to spawn panic thread");
+            let _ = handle.join();
+        }
+        _ => {}
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let profile = BundleProfile::resolve(BundleProfileKind::Gtk)?;
     init_logging(&profile.log_dir);
     install_log_filter();
+    roost_engine::crash::install_panic_hook(
+        profile.log_dir.clone(),
+        profile.app_label,
+        env!("CARGO_PKG_VERSION"),
+    );
+    forced_test_panic();
 
     let lock_path = profile.lock_path();
 

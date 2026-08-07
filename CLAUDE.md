@@ -122,7 +122,7 @@ on the main thread.
 | Persistence          | `state.json` (atomic tmp + rename; write-through, fsync on clean exit) | No SQLite. Projects, next_id, and per-project tab **layout** (title+cwd+position) + active selection — relaunch re-opens prior tabs as fresh shells in their dirs (no process/scrollback). Inline write-through during the session (page-cache cheap, no fsync); `Workspace::flush()` fsyncs on clean exit and freezes further writes. Crash loses at most the kernel writeback window; the atomic rename means the file is never torn. |
 | libghostty-vt        | cgo via `roost-vt` (`--features ffi`)                          | Pinned Ghostty SHA in `third_party/ghostty/build.sh`.                                                |
 | JSON IPC             | `roost-ipc` (server + client + framing + paths + target picker) | Newline-delimited JSON, 16 MiB frame cap; client + server share the wire-types module.               |
-| swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a one-line zero-long-metrics guard (issue #292 — debug SIGABRT when iced/cosmic-text shapes such a font). `README.roost.md` has the delta + removal condition. |
+| swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a small set of malformed-font guards (issues #292 + #299 — debug SIGABRTs, an unbounded name-table read, and a hang when iced/cosmic-text shapes such a font). `README.roost.md` enumerates the deltas + removal condition. |
 | notify-rust           | iced-side Linux desktop notifications (`crates/roost-iced`)   | Target-scoped to Linux; `z-with-tokio` = zbus 5 riding the app's existing tokio runtime. macOS backend deliberately absent — issue #303. |
 | arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
 | Inter (bundled font)   | `third_party/inter` (`include_bytes!` via `roost-iced`)       | v4.1 static Regular/Medium/SemiBold, SIL OFL 1.1; iced chrome font only (terminal cells keep the configured monospace); single `chrome_font()` seam so a future config swap is small. `README.roost.md` has provenance + removal condition. |
@@ -225,6 +225,12 @@ wrapper small.
     byte-level OSC/reply wiring end-to-end without needing a real
     shell — pattern walk in
     [`tools/roosttest/README.md`](tools/roosttest/README.md#osc-routed-regression-patterns).
+    A sibling env gate, `ROOST_TEST_PANIC`, forces the crash-report +
+    abort path in the Rust UIs for end-to-end verification: `=1` panics
+    on the main thread at startup, `=thread` panics from a named
+    background thread. It fires right after the panic hook is installed
+    and before the single-instance lock, so it never touches a running
+    instance.
 
 ## Build
 

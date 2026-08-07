@@ -373,7 +373,7 @@ recorded alongside it rather than quietly edited away.
   the "do not start without the number" gate existed. Three
   disqualifiers, strongest first:
   1. **Grid drift.** Both UIs position cells at the **floored** font
-     advance (`terminal_widget.rs` `measured.width.floor()`;
+     advance (`crates/roost-iced/src/terminal_widget.rs` `measured.width.floor()`;
      `crates/roost-linux/src/cell_metrics.rs:60-63`, floored against
      smearing) while a shaped run advances at the natural fractional
      width — measured 8.83 px vs 8 at 11 pt, so a coalesced 60-cell run
@@ -419,11 +419,24 @@ recorded alongside it rather than quietly edited away.
   events, so dead keys, CJK input, and the emoji picker are broken.
   winit surfaces IME on both platforms — this is a Linux-shipping gap
   too, not a macOS-only one.
-* **E7. Crash robustness.** No `panic::set_hook` anywhere in `roost-iced`
-  or `roost-engine`; GTK ships to Linux users today with none. Add a
-  panic hook that logs + writes a crash file, and close [#299] (verified
-  release-build infinite loop on a malformed font) — promote it out of
-  the maintenance backlog. Both are entry gates for M6.
+* **E7. Crash robustness.** ✅ **Complete (plan 019).** Shipped shape:
+  `roost-engine::crash::install_panic_hook` — one shared formatter/
+  writer; both Rust UI mains install it right after logging init and
+  before the single-instance lock. A panic on any thread writes
+  `crash-<secs>-<pid>.txt` next to `roost.log` (payload, location,
+  backtrace via `force_capture`, version, OS), copies the report to
+  stderr, logs one correlating line, then **aborts** — no
+  catch-and-continue, since both UIs hold unsafe FFI state.
+  `ROOST_TEST_PANIC` (`=1` main thread, `=thread` named background
+  thread) forces the path; spawn-based integration tests run the real
+  binaries hermetically and assert the artifact end-to-end. [#299]
+  closed alongside: five malformed-font guards in vendored swash
+  (format-4 bitmap-index infinite loop — the release-build hang — plus
+  three debug underflows in `var.rs` and a both-profiles OOB in
+  `string.rs`), each with a crafted-font regression test; the hang
+  test is timeout-capped so a regression fails instead of wedging CI.
+  Swift Mac deliberately keeps no hook (parity deviation, tracked
+  under the M6 decision). Both M6 entry-gate halves are done.
 * **E8. Ghostty pin + zig bump** — *sequenced after the M6 direction
   resolves.* `third_party/ghostty/build.sh` pins `c74f6d5` (2026-04-25)
   against zig 0.15.2 (`.mise.toml`); `../libghostty-rs` pins `ab0b9da`
@@ -461,7 +474,7 @@ when it touches the code you are already in:
 | ~~Mac `app.window_metrics` omits `terminal_top` / `terminal_font_family`~~ **fixed** (PR #301) | [#287] |
 | ~~Iced hit-tests positionless presses at the batch-newest cursor~~ **fixed for `SidebarResizeGrip`** (PR #301, harness dwell removed); the `ReorderStrip` half is blocked by scrollable event/cursor space mismatch → split to [#300] | [#295] |
 | Iced `ReorderStrip` presses still batch-cursor-anchored: iced scrollables pass children a translated cursor but the raw untranslated event, so an event-position anchor is off by the scroll offset | [#300] |
-| Vendored swash: three further malformed-font robustness findings (incl. a verified upstream format-4 bitmap-index infinite loop — release-build hang) | [#299] |
+| ~~Vendored swash: three further malformed-font robustness findings (incl. a verified upstream format-4 bitmap-index infinite loop — release-build hang)~~ **fixed** (plan 019: five guards in `third_party/swash` — strike.rs bisection typo, var.rs ×3 debug underflows, string.rs OOB read — each with a crafted-font regression test; the format-4 record-offset off-by-one is documented residual, README.roost.md has the delta list) | [#299] |
 | Terminal multi-click is wall-clock-only — **parked deliberately** (PR #301 triage): porting the strip's frame-grace would fuse deliberate slow clicks into word-select on idle terminals (a click schedules a redraw, so a 1-2 frame gap is the normal idle signature, not a stall); revisit only if it actually flakes | [#297] |
 | No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) — decide "required or waived" as part of the M4 entry audit | [#284] |
 | No real-input (CGEvent) harness on macOS — uinput tier is Linux-only | [#285] |

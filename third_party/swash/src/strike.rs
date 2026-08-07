@@ -624,6 +624,14 @@ fn get_location(
                 return Some(loc);
             }
             4 => {
+                // XXX: roost delta vs upstream 0.2.10 (issue #299, see
+                // README.roost.md): the `Greater` arm below read `l = i + i`,
+                // which leaves `l` at 0 whenever `i` is 0, so a malformed or
+                // crafted EBLC spins this bisection forever on the calling
+                // thread. The adjacent record-offset off-by-one (`rec = base +
+                // i * 4`; format 4's records begin at `base + 4`, past the u32
+                // `numGlyphs`) is left as upstream wrote it — this delta is a
+                // safety fix only.
                 let mut l = 0;
                 let mut h = d.read::<u32>(base)? as usize;
                 while l < h {
@@ -633,7 +641,7 @@ fn get_location(
                     let id = d.read::<u16>(rec)?;
                     match glyph_id.cmp(&id) {
                         Less => h = i,
-                        Greater => l = i + i,
+                        Greater => l = i + 1,
                         Equal => {
                             let offset1 = d.read::<u16>(rec + 2)? as u32;
                             let offset2 = d.read::<u16>(rec + 6)? as u32;

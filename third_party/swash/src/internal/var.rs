@@ -96,11 +96,16 @@ impl<'a> Fvar<'a> {
         let name_id = b.read::<u16>(offset)?;
         let values = b.read_array::<Fixed>(offset + 4, self.axis_count as usize)?;
         let ps_name_offset = 4 + self.axis_count as usize * 4;
-        let postscript_name_id = if ps_name_offset == self.inst_size as usize - 2 {
-            b.read::<u16>(ps_name_offset)
-        } else {
-            None
-        };
+        // XXX: roost delta vs upstream 0.2.10 (issue #299, see README.roost.md):
+        // an fvar declaring instanceSize < 2 underflows the subtraction below in
+        // debug builds. Reporting no postscript name id matches release
+        // semantics, where the wrapped value never equals ps_name_offset.
+        let postscript_name_id =
+            if self.inst_size as usize >= 2 && ps_name_offset == self.inst_size as usize - 2 {
+                b.read::<u16>(ps_name_offset)
+            } else {
+                None
+            };
         Some(VarInstance {
             index,
             name_id,
@@ -275,7 +280,10 @@ pub fn item_delta(
         let short_count = b.read::<u16>(data_base + 2)? as usize;
         let count = region_index_count;
         let base = data_base + 6 + count * 2;
-        let elem_len = (count - short_count) + short_count * 2;
+        // XXX: roost delta vs upstream 0.2.10 (issue #299, see README.roost.md):
+        // an item variation data subtable declaring shortDeltaCount greater than
+        // regionIndexCount underflows this subtraction in debug builds.
+        let elem_len = count.checked_sub(short_count)? + short_count * 2;
         let offset = base + inner * elem_len;
         (short_count, offset)
     };
@@ -353,6 +361,12 @@ fn metric_delta(
     offset += base as usize;
     let format = b.read::<u16>(offset)? as u32;
     let count = b.read::<u16>(offset + 2)?;
+    // XXX: roost delta vs upstream 0.2.10 (issue #299, see README.roost.md): a
+    // delta set index map declaring mapCount == 0 underflows `count - 1` below
+    // in debug builds, and has no entry to look up either way.
+    if count == 0 {
+        return None;
+    }
     let bit_count = (format & 0xF) + 1;
     let entry_size = ((format & 0x30) >> 4) + 1;
     let base = offset + 4;
