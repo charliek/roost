@@ -16,6 +16,7 @@ pub mod render_stats;
 pub mod reorder;
 pub mod rollup;
 pub mod shell_escape;
+pub mod sprite;
 pub mod theme;
 pub mod typography;
 pub mod window_title;
