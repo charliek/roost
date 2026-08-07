@@ -225,6 +225,12 @@ wrapper small.
     byte-level OSC/reply wiring end-to-end without needing a real
     shell — pattern walk in
     [`tools/roosttest/README.md`](tools/roosttest/README.md#osc-routed-regression-patterns).
+    A sibling env gate, `ROOST_TEST_PANIC`, forces the crash-report +
+    abort path in the Rust UIs for end-to-end verification: `=1` panics
+    on the main thread at startup, `=thread` panics from a named
+    background thread. It fires right after the panic hook is installed
+    and before the single-instance lock, so it never touches a running
+    instance.
 
 ## Build
 
