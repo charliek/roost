@@ -15,6 +15,7 @@
 //! there (GTK's `app.rs` (M3b) installs a `glib::MainContext::channel`;
 //! Iced drains its subscription on its own event loop).
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,9 +34,9 @@ use roost_ipc::messages::{
     TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSetHookActiveParams,
+    TabSetStateParams, TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
     WindowResizeParams,
 };
 use roost_ipc::{Handler, HandlerError};
@@ -269,6 +270,21 @@ pub enum UiRequest {
         row: u16,
         click_count: u8,
         reply: ExpandSelectionReply,
+    },
+    /// `tab.feed_ime` — drive an IME preedit/commit/session-boundary
+    /// event through the terminal's active keyboard route, the same
+    /// production path (`ime_preedit` / `ime_commit` /
+    /// `ime_session_boundary`) a real IME event takes. `action` is
+    /// `"preedit" | "commit" | "clear"`. Routes by the UI's keyboard
+    /// route, not directly by `tab_id`: the UI rejects (`Err`) when
+    /// `tab_id` doesn't match the tab currently holding the route.
+    /// Gated like `TabFeedPtyBytes` (ROOST_TEST_MODE=1).
+    TabFeedIme {
+        tab_id: i64,
+        action: String,
+        text: String,
+        cursor: Option<Range<usize>>,
+        reply: UnitReply,
     },
     /// `app.window_metrics` — read window size + sidebar pane width +
     /// collapsed flag (logical points). Backs the sidebar-holds-width
@@ -905,6 +921,41 @@ async fn dispatch(
                 text: data.text,
             })
         }
+        ops::TAB_FEED_IME => {
+            let p: TabFeedImeParams = decode(params)?;
+            if !matches!(p.action.as_str(), "preedit" | "commit" | "clear") {
+                return Err(HandlerError::invalid_param(format!(
+                    "action must be one of preedit/commit/clear (got {:?})",
+                    p.action
+                )));
+            }
+            let cursor = match (p.cursor_start, p.cursor_end) {
+                (Some(start), Some(end)) => {
+                    if start > end {
+                        return Err(HandlerError::invalid_param(format!(
+                            "cursor_start must be <= cursor_end (got {start}..{end})"
+                        )));
+                    }
+                    Some(start..end)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(HandlerError::invalid_param(
+                        "cursor_start and cursor_end must be given together",
+                    ));
+                }
+            };
+            h.ui_call(|reply| UiRequest::TabFeedIme {
+                tab_id: p.tab_id,
+                action: p.action,
+                text: p.text,
+                cursor,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
         ops::WINDOW_RESIZE => {
             let p: WindowResizeParams = decode(params)?;
             if !(p.width.is_finite() && p.height.is_finite() && p.width > 0.0 && p.height > 0.0) {
@@ -1091,18 +1142,27 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 ///     (whitespace double-click → no span) → `not-found`. The Mac
 ///     handler returns `not-found` for the no-span case too — the
 ///     `no word/line span` substring keeps both UIs symmetric.
+///   * `tab.feed_ime`'s `tab_id` not matching the tab that currently
+///     holds the keyboard route → `invalid-param` — the caller asked
+///     to feed the wrong tab, not a server failure.
+///   * an op a UI hasn't wired up yet (`tab.feed_ime` on GTK, still
+///     iced-only) → `not-implemented`, mirroring `events.subscribe`.
 ///   * anything else (capture buffer poisoned, feed channel closed)
 ///     → `internal`, so a real failure surfaces clearly rather than
 ///     being mistaken for a missing tab.
 ///
 /// The substring contract is the simplest seam between the UI and
 /// the dispatcher while the surface stays small; bumping to a typed
-/// error is the right move when the third arm grows.
+/// error is the right move when the arms keep growing.
 fn map_test_op_err(err: String) -> HandlerError {
     if err.contains("ROOST_TEST_MODE") {
         HandlerError::new("not-enabled", err)
     } else if err.contains("has no live terminal") || err.contains("no word/line span") {
         HandlerError::not_found(err)
+    } else if err.contains("is not the active terminal") {
+        HandlerError::invalid_param(err)
+    } else if err.contains("not supported on this UI") {
+        HandlerError::new("not-implemented", err)
     } else {
         HandlerError::new("internal", err)
     }

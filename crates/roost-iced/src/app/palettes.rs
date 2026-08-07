@@ -829,6 +829,7 @@ impl App {
         );
         self.palette = Some(palette::PaletteState::new(frame));
         self.palette_focus_requested = true;
+        self.cancel_ime_composition();
         self.refresh_agent_palette();
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         Ok(())
@@ -869,6 +870,7 @@ impl App {
         )));
         self.palette_present_reply = Some(reply);
         self.palette_focus_requested = true;
+        self.cancel_ime_composition();
         self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
     }
 

@@ -212,6 +212,10 @@ impl App {
                 refresh_or_warn(*tab_id, tab, "pointer reset after active tab changed");
             }
         }
+        // Every focus change funnels through `focus_tab_and_clear`, which
+        // reconciles — so this is the one place a tab switch cancels a
+        // composition the user left behind.
+        cancel_preedits(&mut self.tabs, &mut self.ime_discard, Some(active_tab_id));
         let now = Instant::now();
         for tab_id in &live_ids {
             if self.tabs.contains_key(tab_id) {
@@ -749,6 +753,49 @@ impl App {
                             })
                             .map_err(|_| "PTY input capture lock poisoned".to_string())
                     });
+                let _ = reply.send(result);
+            }
+            UiRequest::TabFeedIme {
+                tab_id,
+                action,
+                text,
+                cursor,
+                reply,
+            } => {
+                let result = if !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".to_string())
+                } else {
+                    match self.keyboard_route() {
+                        KeyboardRoute::Terminal(active_tab) if active_tab == tab_id => {
+                            match action.as_str() {
+                                "preedit" => {
+                                    self.ime_preedit(text, cursor);
+                                    Ok(())
+                                }
+                                "commit" => {
+                                    self.ime_commit(&text);
+                                    Ok(())
+                                }
+                                "clear" => {
+                                    self.ime_session_boundary();
+                                    Ok(())
+                                }
+                                other => Err(format!("unknown tab.feed_ime action: {other}")),
+                            }
+                        }
+                        KeyboardRoute::Terminal(active_tab) => Err(format!(
+                            "tab {tab_id} is not the active terminal \
+                                 (keyboard route owns tab {active_tab})"
+                        )),
+                        KeyboardRoute::None
+                        | KeyboardRoute::Confirm
+                        | KeyboardRoute::Editor
+                        | KeyboardRoute::Palette => Err(format!(
+                            "tab {tab_id} is not the active terminal \
+                                 (keyboard route is not a terminal)"
+                        )),
+                    }
+                };
                 let _ = reply.send(result);
             }
             UiRequest::TabDumpResolved { tab_id, reply } => {

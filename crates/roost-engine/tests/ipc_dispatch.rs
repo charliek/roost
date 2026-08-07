@@ -165,6 +165,92 @@ async fn events_subscribe_returns_not_implemented() {
     }
 }
 
+/// `tab.feed_ime`'s cursor range is validated at the dispatcher, ahead
+/// of any UI round trip — an inverted range must fail `invalid-param`
+/// even with no UI attached (this test's handler has no `ui_tx`),
+/// proving the check happens before `ui_call` rather than surfacing
+/// as a confusing "no UI attached" internal error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_feed_ime_rejects_inverted_cursor_range() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    let err = client
+        .call_raw(
+            ops::TAB_FEED_IME,
+            serde_json::json!({
+                "tab_id": "1",
+                "action": "preedit",
+                "text": "hi",
+                "cursor_start": 5,
+                "cursor_end": 2,
+            }),
+        )
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "invalid-param"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
+/// Same dispatcher-level guard for an unrecognized `action`: rejected
+/// before `ui_call`, so a typo doesn't reach the UI as an ambiguous
+/// no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tab_feed_ime_rejects_unknown_action() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    let err = client
+        .call_raw(
+            ops::TAB_FEED_IME,
+            serde_json::json!({
+                "tab_id": "1",
+                "action": "bogus",
+                "text": "",
+            }),
+        )
+        .await
+        .expect_err("expected error");
+    match err {
+        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "invalid-param"),
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
 /// Connect to a freshly-bound server with bounded retries instead of
 /// a flat sleep. CI runners under load can take more than 50ms to
 /// schedule the accept loop; a bounded retry is robust without

@@ -623,6 +623,32 @@ pub struct TabCapturePtyInputResult {
     pub data: Vec<u8>,
 }
 
+/// `tab.feed_ime` request: drive an IME preedit/commit/session-boundary
+/// event through the terminal's active keyboard route — the same
+/// production path (`ime_preedit` / `ime_commit` / `ime_session_boundary`)
+/// a real input-method event takes. Routes by the UI's keyboard route,
+/// not directly by `tab_id`: `tab_id` must match the tab currently
+/// holding the route, so a stale/wrong id fails loudly instead of
+/// silently feeding the wrong tab. Gated like `tab.feed_pty_bytes`
+/// (ROOST_TEST_MODE=1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabFeedImeParams {
+    #[serde(with = "string_int64")]
+    pub tab_id: i64,
+    /// `"preedit" | "commit" | "clear"`.
+    pub action: String,
+    #[serde(default)]
+    pub text: String,
+    /// Byte offsets into `text` for the preedit cursor/underline span.
+    /// Both must be given together — one without the other, or
+    /// `cursor_start > cursor_end`, is rejected with `invalid-param`.
+    #[serde(default)]
+    pub cursor_start: Option<usize>,
+    #[serde(default)]
+    pub cursor_end: Option<usize>,
+}
+
 /// `tab.dump_resolved` request: walk a tab's render state through
 /// the same resolver the production paint path uses (including the
 /// theme's bold-color override).
@@ -1286,6 +1312,11 @@ pub mod ops {
     /// bytes is something only a test harness should do.
     pub const TAB_FEED_PTY_BYTES: &str = "tab.feed_pty_bytes";
     pub const TAB_CAPTURE_PTY_INPUT: &str = "tab.capture_pty_input";
+    /// Test-only IME driver. Same gate as `tab.feed_pty_bytes`; drives
+    /// the production `ime_preedit` / `ime_commit` /
+    /// `ime_session_boundary` path so the e2e suite can pin composed
+    /// text (CJK, emoji, accents) without a real input method.
+    pub const TAB_FEED_IME: &str = "tab.feed_ime";
     /// Programmatically resize the running UI's window. Gated for the
     /// same reason as the PTY drain ops: harness-only driver for the
     /// sidebar layout regression suite (`tools/roosttest`); a real user
@@ -1686,6 +1717,42 @@ mod tests {
             text: None,
         };
         round_trip(&r_none);
+    }
+
+    #[test]
+    fn tab_feed_ime_params_round_trip() {
+        let p = TabFeedImeParams {
+            tab_id: 9,
+            action: "preedit".to_string(),
+            text: "こ".to_string(),
+            cursor_start: Some(0),
+            cursor_end: Some(3),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"tab_id\":\"9\""), "got: {json}");
+        assert!(json.contains("\"action\":\"preedit\""), "got: {json}");
+        round_trip(&p);
+    }
+
+    /// `text` defaults to empty and both cursor fields default to
+    /// `None` when omitted, matching the `"clear"` action's shape
+    /// (no composed text, no cursor span).
+    #[test]
+    fn tab_feed_ime_params_defaults() {
+        let p: TabFeedImeParams =
+            serde_json::from_str(r#"{"tab_id":"9","action":"clear"}"#).unwrap();
+        assert_eq!(p.tab_id, 9);
+        assert_eq!(p.action, "clear");
+        assert_eq!(p.text, "");
+        assert_eq!(p.cursor_start, None);
+        assert_eq!(p.cursor_end, None);
+        round_trip(&p);
+    }
+
+    #[test]
+    fn tab_feed_ime_params_reject_unknown_field() {
+        let bad = r#"{"tab_id":"9","action":"commit","text":"a","extra":"x"}"#;
+        assert!(serde_json::from_str::<TabFeedImeParams>(bad).is_err());
     }
 
     /// `tab.capture_pty_input` params: `drain` defaults to false

@@ -41,6 +41,22 @@ pub(super) fn refresh_or_warn(tab_id: i64, tab: &mut TerminalTab, reason: &str) 
     }
 }
 
+/// Drop a tab's composition, logging rather than propagating for the same
+/// reason [`refresh_or_warn`] does: every cancel site is a UI transition
+/// with no error channel. Reports whether a live composition was
+/// discarded — that is what arms `App::ime_discard_next_commit`.
+pub(super) fn clear_preedit_or_warn(tab_id: i64, tab: &mut TerminalTab) -> bool {
+    match tab.clear_preedit() {
+        Ok(cleared) => cleared,
+        Err(error) => {
+            // Only the repaint after the composition was already taken
+            // can fail, so it is gone either way.
+            tracing::warn!(?error, tab_id, "terminal preedit clear failed");
+            true
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct TerminalGeometry {
     pub(super) cols: u16,
@@ -201,6 +217,10 @@ pub(super) struct TerminalTab {
     osc_router: OscRouter,
     pub(super) pointer_shape: String,
     pub(super) theme: Theme,
+    /// The live platform-IME composition, mirrored into every snapshot
+    /// this tab publishes. Never written into `terminal` — see
+    /// [`ImePreedit`].
+    pub(super) preedit: Option<ImePreedit>,
     pub(super) snapshot: TerminalSnapshot,
     /// The per-row render cache `refresh_snapshot` maintains; the snapshot
     /// gets a clone of it (O(rows) refcount bumps). The three `cached_*`
@@ -296,6 +316,7 @@ impl TerminalTab {
             osc_router: OscRouter::new(),
             pointer_shape: "default".into(),
             theme,
+            preedit: None,
             snapshot: TerminalSnapshot::blank(DEFAULT_COLS, DEFAULT_ROWS),
             // Left empty on purpose: the first `refresh_snapshot` finds no
             // cached grid size, sizes the grid and forces a full rebuild.
@@ -590,6 +611,44 @@ impl TerminalTab {
             self.refresh_snapshot()?;
         }
         Ok(snapped)
+    }
+
+    /// Store what the platform IME is composing. Empty text cancels the
+    /// composition — that is how winit reports both "cleared" and the
+    /// clear that precedes every commit. A live composition snaps
+    /// scrollback to the bottom exactly as a keypress does, so the caret
+    /// the IME anchors on is on screen.
+    pub(super) fn set_preedit(&mut self, text: String, cursor: Option<Range<usize>>) -> Result<()> {
+        if text.is_empty() {
+            self.clear_preedit()?;
+            return Ok(());
+        }
+        self.snap_to_bottom_for_input()?;
+        self.preedit = Some(ImePreedit { text, cursor });
+        self.refresh_snapshot()
+    }
+
+    pub(super) fn clear_preedit(&mut self) -> Result<bool> {
+        if self.preedit.take().is_none() {
+            return Ok(false);
+        }
+        self.refresh_snapshot()?;
+        Ok(true)
+    }
+
+    /// Send text the IME committed. The composition is dropped first —
+    /// the committed text is the whole of what reaches the PTY.
+    pub(super) fn commit_ime(&mut self, text: &str) -> Result<()> {
+        // A failed repaint must not swallow the commit: the composition is
+        // already gone on the IME's side, so these bytes are the user's
+        // only copy of the text.
+        let cleared = self.clear_preedit();
+        let snapped = self.snap_to_bottom_for_input();
+        let bytes = input::encode_ime_commit(&mut self.encoder, &self.terminal, text);
+        self.session.send_input(bytes);
+        cleared?;
+        snapped?;
+        Ok(())
     }
 
     /// Route a native pointer gesture with terminal mouse reporting taking
@@ -988,6 +1047,7 @@ impl TerminalTab {
                     col1: hover.col1.saturating_add(1),
                 }),
             pointer_shape: self.effective_pointer_shape().into(),
+            preedit: self.preedit.clone(),
         };
         let elapsed = refresh_started_at.elapsed();
         self.render_stats

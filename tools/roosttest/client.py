@@ -448,6 +448,36 @@ class Roost:
             "data": base64.b64encode(data).decode("ascii"),
         })
 
+    def tab_feed_ime(
+        self,
+        tab: int,
+        action: str,
+        text: str = "",
+        cursor: tuple[int, int] | None = None,
+    ) -> None:
+        """Drive an IME preedit/commit/session-boundary event through
+        the UI's active keyboard route — the same production path
+        (`ime_preedit` / `ime_commit` / `ime_session_boundary`) a real
+        input method takes. `action` in {"preedit", "commit",
+        "clear"}. Routes by keyboard route, not directly by `tab`:
+        `tab` must match the tab currently holding the route or the
+        call raises `RoostError('invalid-param')` rather than
+        silently feeding the wrong tab. `cursor`, if given, is a
+        `(start, end)` byte-offset pair into `text` for the preedit
+        cursor/underline span; both ends are required together.
+        Gated by ROOST_TEST_MODE=1 (raises `RoostError('not-enabled')`
+        when off); iced-only for now (`RoostError('not-implemented')`
+        on GTK)."""
+        params: dict = {
+            "tab_id": str(tab),
+            "action": action,
+            "text": text,
+        }
+        if cursor is not None:
+            params["cursor_start"] = cursor[0]
+            params["cursor_end"] = cursor[1]
+        self.call("tab.feed_ime", params)
+
     def tab_capture_pty_input(self, tab_id: int, drain: bool = True) -> bytes:
         """Return (and by default drain) the bytes the UI has queued
         onto this tab's PTY-input channel since the last drain.
