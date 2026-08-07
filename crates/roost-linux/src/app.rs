@@ -1096,6 +1096,21 @@ impl App {
                                 click_count,
                             ));
                         }
+                        // GTK has no IME preedit/commit wiring yet (plan 021
+                        // is iced-only); reject rather than silently no-op so
+                        // a test run against this UI fails loudly instead of
+                        // reporting a false pass.
+                        UiRequest::TabFeedIme {
+                            tab_id: _,
+                            action: _,
+                            text: _,
+                            cursor: _,
+                            reply,
+                        } => {
+                            let _ = reply.send(Err(
+                                "tab.feed_ime is not supported on this UI (iced only)".into(),
+                            ));
+                        }
                         UiRequest::WindowMetrics { reply } => {
                             let _ = reply.send(app.ipc_window_metrics());
                         }

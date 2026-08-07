@@ -355,6 +355,35 @@ defaults to `false` (peek). Response:
 {"data": "G10xMTtyZ2I6MDAwMC8xMTExLzIyMjIH"}
 ```
 
+### `tab.feed_ime` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives an IME
+preedit/commit/session-boundary event through the same production
+path (`ime_preedit` / `ime_commit` / `ime_session_boundary`) a real
+input-method event takes.
+
+Request:
+```json
+{"params": {"tab_id": "3", "action": "preedit", "text": "こ",
+            "cursor_start": 0, "cursor_end": 3}}
+```
+
+`action` is `"preedit"` (update the composed-text buffer), `"commit"`
+(finalize `text` and send it to the PTY), or `"clear"` (cancel any
+in-flight composition — the session-boundary path a real IME takes
+between compositions). `cursor_start` / `cursor_end` are optional byte
+offsets into `text` marking the preedit cursor/underline span; they
+must be given together (either alone is rejected with
+`invalid-param`), and `cursor_start > cursor_end` is rejected the same
+way. Response: `{}`.
+
+The op routes by the UI's active keyboard route, not directly by
+`tab_id`: `tab_id` must match the tab currently holding the route, or
+the call fails `invalid-param` rather than silently feeding the wrong
+tab. iced-only for now — the GTK UI has no IME wiring yet and answers
+`not-implemented`.
+
 ### `project.create`
 
 Request: `{"params": {"name": "", "cwd": "/tmp"}}`. `name` empty means
