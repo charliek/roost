@@ -19,6 +19,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use iced::advanced::input_method;
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
 use iced::{event, keyboard, time, window, Event, Size, Subscription, Task, Theme};
@@ -76,6 +77,10 @@ enum Message {
     },
     UrlOpenCompleted(Result<(), String>),
     Keyboard(keyboard::Event),
+    /// A platform input-method event the terminal widget claimed. The
+    /// app-level `event::listen_with` below only forwards keyboard
+    /// events, so this is the only route composition ever takes.
+    Ime(input_method::Event),
     CapturedEscape,
     CapturedEnterRelease,
     TerminalPointer(terminal_widget::TerminalPointer),
@@ -256,6 +261,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Keyboard(event) => app.keyboard(event).map_task(),
+        Message::Ime(event) => {
+            match event {
+                // A session boundary cannot carry an older composition
+                // across it — Iced's own `TextInput` drops its preedit on
+                // `Opened` for the same reason.
+                input_method::Event::Opened | input_method::Event::Closed => {
+                    app.ime_session_boundary()
+                }
+                input_method::Event::Preedit(text, cursor) => app.ime_preedit(text, cursor),
+                input_method::Event::Commit(text) => app.ime_commit(&text),
+            }
+            Task::none()
+        }
         Message::CapturedEscape => app.captured_escape().map_task(),
         Message::CapturedEnterRelease => {
             app.captured_enter_release();

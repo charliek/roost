@@ -2,7 +2,9 @@
 
 use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::widget::{self, Widget};
-use iced::advanced::{layout, renderer, text, Clipboard, Layout, Renderer as _, Shell};
+use iced::advanced::{
+    input_method, layout, renderer, text, Clipboard, InputMethod, Layout, Renderer as _, Shell,
+};
 #[cfg(test)]
 use iced::event;
 use iced::{
@@ -14,7 +16,7 @@ use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, Sprite
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The grid is edge-pinned: it starts at the widget's own origin and keeps
 /// every pixel the layout gives it (Mac parity — `app.window_metrics` puts
@@ -126,6 +128,23 @@ fn draw_font(base: Font, text: &str, bold: bool, italic: bool) -> Font {
     }
 }
 
+/// The text primitive every terminal glyph draw shares: one cell-tall run
+/// on the grid's own baseline, never wrapped or aligned — the cell's
+/// position is the caller's, not the layout's.
+fn cell_text(content: String, font: Font, metrics: TerminalMetrics) -> text::Text<String> {
+    text::Text {
+        content,
+        bounds: Size::new(f32::INFINITY, metrics.cell_height),
+        size: Pixels(metrics.font_pixels),
+        line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
+        font,
+        align_x: text::Alignment::Default,
+        align_y: alignment::Vertical::Top,
+        shaping: text::Shaping::Auto,
+        wrapping: text::Wrapping::None,
+    }
+}
+
 /// One resolved cell. Deliberately carries no row index: its row is the
 /// index of the [`RenderedRow`] that owns it. Storing the row here as well
 /// would let the two disagree, which is exactly the "right cells, wrong
@@ -210,6 +229,58 @@ impl RenderedRow {
     }
 }
 
+/// One live platform-IME composition.
+///
+/// **Overlay invariant — a preedit is draw-time only.** Composition text
+/// is never written into the terminal, so the VT never sees a character
+/// the user has not committed and clearing a preedit restores the cells
+/// by construction. `cursor` is the IME's caret as a byte range into
+/// `text`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImePreedit {
+    pub text: String,
+    pub cursor: Option<std::ops::Range<usize>>,
+}
+
+impl ImePreedit {
+    /// How many terminal cells precede the composition caret.
+    fn caret_cells(&self) -> u16 {
+        let head = self
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.start)
+            .filter(|start| self.text.is_char_boundary(*start))
+            .unwrap_or(self.text.len());
+        preedit_cells(&self.text[..head])
+    }
+}
+
+/// Where a composition sits on the cursor's row.
+///
+/// Shared by the overlay and the rectangle the OS anchors its candidate
+/// window on, so the two can never disagree — a composition that slid
+/// left to stay on the row has to take its caret with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreeditPlacement {
+    start_col: u16,
+    caret_col: u16,
+    total: u16,
+}
+
+fn preedit_placement(preedit: &ImePreedit, cursor_col: u16, cols: u16) -> PreeditPlacement {
+    // No wrap: a composition that would run past the row's end slides
+    // left so its tail — and the caret riding it — stays on screen.
+    let total = preedit_cells(&preedit.text);
+    let start_col = cursor_col.min(cols.saturating_sub(total));
+    PreeditPlacement {
+        start_col,
+        caret_col: start_col
+            .saturating_add(preedit.caret_cells())
+            .min(cols.saturating_sub(1)),
+        total,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalSnapshot {
     pub cols: u16,
@@ -223,6 +294,7 @@ pub struct TerminalSnapshot {
     pub selection_spans: Vec<SelectionSpan>,
     pub link_hover: Option<SelectionSpan>,
     pub pointer_shape: String,
+    pub preedit: Option<ImePreedit>,
 }
 
 impl TerminalSnapshot {
@@ -255,6 +327,7 @@ impl TerminalSnapshot {
             selection_spans: Vec::new(),
             link_hover: None,
             pointer_shape: "default".into(),
+            preedit: None,
         }
     }
 }
@@ -265,6 +338,10 @@ pub struct TerminalWidget {
     pub snapshot: TerminalSnapshot,
     pub metrics: TerminalMetrics,
     pub metric_generation: u64,
+    /// Whether this terminal owns keyboard input right now — the app
+    /// computes it as "the keyboard route is this tab and the window is
+    /// focused". Only then does the widget ask the platform for an IME.
+    pub ime_active: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -548,6 +625,118 @@ impl TerminalWidget {
         )))
     }
 
+    /// The IME strategy this widget re-issues on every `RedrawRequested`
+    /// — iced honors `request_input_method` only during that event, so a
+    /// request made anywhere else is dropped.
+    ///
+    /// `preedit` is always `None`: that is what makes iced_winit clear
+    /// its own over-the-spot overlay and leaves the on-the-spot drawing
+    /// to [`TerminalWidget::draw`].
+    fn input_method(&self, bounds: Rectangle) -> InputMethod<&str> {
+        if !self.ime_active {
+            return InputMethod::Disabled;
+        }
+        InputMethod::Enabled {
+            cursor: self.ime_cursor_rect(bounds),
+            purpose: input_method::Purpose::Terminal,
+            preedit: None,
+        }
+    }
+
+    /// Where the OS should keep its candidate window clear of, in window
+    /// coordinates. With a composition up this tracks the composition
+    /// caret rather than the terminal's own cursor cell.
+    fn ime_cursor_rect(&self, bounds: Rectangle) -> Rectangle {
+        let size = Size::new(self.metrics.cell_width, self.metrics.cell_height);
+        let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) else {
+            return Rectangle::new(bounds.position(), size);
+        };
+        let col = self
+            .snapshot
+            .preedit
+            .as_ref()
+            .map_or(cursor.col as u16, |preedit| {
+                preedit_placement(preedit, cursor.col as u16, self.snapshot.cols).caret_col
+            });
+        Rectangle::new(
+            cell_position(bounds.position(), col, cursor.row, self.metrics),
+            size,
+        )
+    }
+
+    /// Overlay the live composition on the cursor row. Returns the glyph
+    /// draws it contributed. Nothing here touches the grid — a preedit is
+    /// pixels only (see [`ImePreedit`]).
+    fn draw_preedit(&self, renderer: &mut Renderer, bounds: Rectangle, clip: Rectangle) -> u64 {
+        // A cursor the terminal is not reporting — hidden by DECTCEM, or
+        // scrolled out of the viewport — leaves nowhere to anchor the
+        // composition. The IME stays enabled; only the overlay is
+        // suppressed.
+        let (Some(preedit), Some(cursor)) = (
+            self.snapshot.preedit.as_ref(),
+            self.snapshot.cursor.filter(|cursor| cursor.visible),
+        ) else {
+            return 0;
+        };
+        let clusters = preedit_clusters(&preedit.text);
+        if clusters.is_empty() {
+            return 0;
+        }
+        let metrics = self.metrics;
+        let placement = preedit_placement(preedit, cursor.col as u16, self.snapshot.cols);
+        let start_col = placement.start_col;
+        let origin = cell_position(bounds.position(), start_col, cursor.row, metrics);
+        let span = f32::from(placement.total.min(self.snapshot.cols)) * metrics.cell_width;
+        fill_quad(
+            renderer,
+            Rectangle::new(origin, Size::new(span, metrics.cell_height)),
+            color(self.snapshot.selection_background),
+        );
+
+        let mut fill_text_calls = 0;
+        let mut col = start_col;
+        for (cluster, width) in clusters {
+            if col >= self.snapshot.cols {
+                break;
+            }
+            let position = cell_position(bounds.position(), col, cursor.row, metrics);
+            renderer.fill_text(
+                cell_text(
+                    cluster.to_string(),
+                    draw_font(metrics.font, cluster, false, false),
+                    metrics,
+                ),
+                Point::new(position.x, position.y + 1.0),
+                color(self.snapshot.foreground),
+                clip,
+            );
+            fill_text_calls += 1;
+            col = col.saturating_add(width);
+        }
+
+        fill_quad(
+            renderer,
+            Rectangle::new(
+                Point::new(origin.x, origin.y + metrics.cell_height - 2.0),
+                Size::new(span, 2.0),
+            ),
+            color(self.snapshot.foreground),
+        );
+        fill_text_calls
+    }
+
+    /// The composition message this event owes the app, if any. An IME
+    /// event reaching a terminal that does not own input belongs to
+    /// whatever surface does, so it is left uncaptured.
+    fn ime_message(&self, event: &Event) -> Option<crate::Message> {
+        match event {
+            Event::InputMethod(event) if self.ime_active => {
+                Some(crate::Message::Ime(event.clone()))
+            }
+            _ => None,
+        }
+    }
+
     fn pointer_interaction_at(
         &self,
         bounds: Rectangle,
@@ -608,6 +797,10 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                 shell.capture_event();
             }
         }
+        if let Some(message) = self.ime_message(event) {
+            shell.publish(message);
+            shell.capture_event();
+        }
 
         let interaction = self.pointer_interaction_at(layout.bounds(), cursor);
         if matches!(
@@ -615,6 +808,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
             Event::Window(iced::window::Event::RedrawRequested(_))
         ) {
             state.last_mouse_interaction = Some(interaction);
+            shell.request_input_method(&self.input_method(layout.bounds()));
         } else if state
             .last_mouse_interaction
             .is_some_and(|previous| previous != interaction)
@@ -700,17 +894,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                         let font =
                             draw_font(metrics.font, cell.text.as_str(), cell.bold, cell.italic);
                         renderer.fill_text(
-                            text::Text {
-                                content: cell.text.clone(),
-                                bounds: Size::new(f32::INFINITY, metrics.cell_height),
-                                size: Pixels(metrics.font_pixels),
-                                line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
-                                font,
-                                align_x: text::Alignment::Default,
-                                align_y: iced::alignment::Vertical::Top,
-                                shaping: text::Shaping::Auto,
-                                wrapping: text::Wrapping::None,
-                            },
+                            cell_text(cell.text.clone(), font, metrics),
                             Point::new(position.x, position.y + 1.0),
                             color(cell.foreground),
                             clip,
@@ -797,6 +981,8 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                     ),
                 }
             }
+
+            fill_text_calls += self.draw_preedit(renderer, bounds, clip);
         });
         crate::perf::record_draw(draw_started_at.elapsed(), fill_text_calls);
     }
@@ -865,6 +1051,38 @@ fn fill_quad(renderer: &mut Renderer, bounds: Rectangle, background: Color) {
         },
         background,
     );
+}
+
+/// How many terminal cells a composition occupies, counted exactly the
+/// way the overlay lays it out. The grid's own widths come from
+/// libghostty, which is not consulted for overlay text that never enters
+/// the terminal — `unicode-width` is the same table it uses to decide
+/// that a CJK cluster takes two cells, and is already this crate's source
+/// for the wide-cell font policy in `draw_font`.
+fn preedit_cells(text: &str) -> u16 {
+    preedit_clusters(text)
+        .iter()
+        .fold(0, |total, (_, width)| total.saturating_add(*width))
+}
+
+/// Split composition text into (cluster, cell width) pairs. Zero-width
+/// codepoints — combining marks, variation selectors — attach to the
+/// cluster they modify instead of claiming a cell of their own.
+fn preedit_clusters(text: &str) -> Vec<(&str, u16)> {
+    let mut clusters: Vec<(&str, u16)> = Vec::new();
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0) as u16;
+        let end = index + character.len_utf8();
+        match clusters.last_mut() {
+            Some(last) if width == 0 => last.0 = &text[start..end],
+            _ => {
+                start = index;
+                clusters.push((&text[index..end], width.max(1)));
+            }
+        }
+    }
+    clusters
 }
 
 fn cell_position(origin: Point, col: u16, row: u32, metrics: TerminalMetrics) -> Point {
@@ -965,6 +1183,7 @@ mod tests {
             snapshot,
             metrics: metrics(),
             metric_generation: 1,
+            ime_active: false,
         }
     }
 
@@ -1550,6 +1769,198 @@ mod tests {
             ),
             0.5
         );
+    }
+
+    fn composing_snapshot(text: &str, cursor: Option<std::ops::Range<usize>>) -> TerminalSnapshot {
+        composing_snapshot_at(4, text, cursor)
+    }
+
+    fn composing_snapshot_at(
+        col: u32,
+        text: &str,
+        cursor: Option<std::ops::Range<usize>>,
+    ) -> TerminalSnapshot {
+        let mut snapshot = TerminalSnapshot::blank(80, 24);
+        snapshot.cursor = Some(CursorInfo {
+            col,
+            row: 2,
+            wide_tail: false,
+            visible: true,
+            blinking: false,
+            visual_style: CursorVisualStyle::Block,
+            color: None,
+        });
+        snapshot.preedit = Some(ImePreedit {
+            text: text.to_string(),
+            cursor,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn preedit_clusters_measure_wide_and_combining_codepoints_in_cells() {
+        assert_eq!(preedit_clusters("ni"), vec![("n", 1), ("i", 1)]);
+        assert_eq!(preedit_clusters("你好"), vec![("你", 2), ("好", 2)]);
+        assert_eq!(preedit_clusters("e\u{0301}"), vec![("e\u{0301}", 1)]);
+        assert_eq!(preedit_cells("你好"), 4);
+        assert_eq!(preedit_cells("e\u{0301}"), 1);
+        assert!(preedit_clusters("").is_empty());
+    }
+
+    /// A composition never wraps: once it would run past the row it slides
+    /// left so the tail — and the caret the IME anchors on — stays visible.
+    /// The caret has to slide with it, or the OS parks its candidate
+    /// window past the end of the row.
+    #[test]
+    fn an_overflowing_preedit_slides_itself_and_its_caret_onto_the_row() {
+        let caret_at_end = |text: &str| ImePreedit {
+            text: text.into(),
+            cursor: None,
+        };
+        assert_eq!(
+            preedit_placement(&caret_at_end("abc"), 4, 80),
+            PreeditPlacement {
+                start_col: 4,
+                caret_col: 7,
+                total: 3
+            }
+        );
+        assert_eq!(
+            preedit_placement(&caret_at_end("你好好"), 78, 80),
+            PreeditPlacement {
+                start_col: 74,
+                caret_col: 79,
+                total: 6
+            }
+        );
+        // Longer than the whole row: everything that fits still lands on it.
+        let long = "x".repeat(200);
+        let placement = preedit_placement(&caret_at_end(&long), 4, 80);
+        assert_eq!(placement.start_col, 0);
+        assert_eq!(placement.caret_col, 79);
+    }
+
+    #[test]
+    fn the_ime_caret_tracks_the_composition_cursor_in_cells() {
+        let preedit = ImePreedit {
+            text: "你好".into(),
+            cursor: Some(3..3),
+        };
+        assert_eq!(preedit.caret_cells(), 2);
+        assert_eq!(
+            ImePreedit {
+                text: "你好".into(),
+                cursor: None,
+            }
+            .caret_cells(),
+            4
+        );
+        // A byte range the IME reports off a char boundary must not panic.
+        assert_eq!(
+            ImePreedit {
+                text: "你好".into(),
+                cursor: Some(1..1),
+            }
+            .caret_cells(),
+            4
+        );
+    }
+
+    #[test]
+    fn only_a_terminal_that_owns_input_asks_for_an_input_method() {
+        let bounds = Rectangle::new(Point::new(220.0, 44.0), Size::new(800.0, 600.0));
+        let mut program = widget(3, composing_snapshot("你", Some(0..0)));
+        assert_eq!(program.input_method(bounds), InputMethod::Disabled);
+        assert!(program
+            .ime_message(&Event::InputMethod(input_method::Event::Commit(
+                "你".into()
+            )))
+            .is_none());
+
+        program.ime_active = true;
+        let InputMethod::Enabled {
+            cursor,
+            purpose,
+            preedit,
+        } = program.input_method(bounds)
+        else {
+            panic!("an active terminal must enable the input method")
+        };
+        assert_eq!(purpose, input_method::Purpose::Terminal);
+        // `None` is what makes iced_winit clear its own over-the-spot
+        // overlay and leave the drawing to us.
+        assert!(preedit.is_none());
+        assert_eq!(
+            cursor,
+            Rectangle::new(
+                cell_position(bounds.position(), 4, 2, metrics()),
+                Size::new(CELL_WIDTH, CELL_HEIGHT)
+            )
+        );
+
+        let mut carried = widget(3, composing_snapshot("你好", Some(3..3)));
+        carried.ime_active = true;
+        let InputMethod::Enabled { cursor, .. } = carried.input_method(bounds) else {
+            panic!("enabled")
+        };
+        assert_eq!(
+            cursor.x,
+            cell_position(bounds.position(), 4, 2, metrics()).x + 2.0 * CELL_WIDTH,
+            "the candidate window follows the composition caret"
+        );
+
+        let mut slid = widget(3, composing_snapshot_at(78, "你好好", None));
+        slid.ime_active = true;
+        let InputMethod::Enabled { cursor, .. } = slid.input_method(bounds) else {
+            panic!("enabled")
+        };
+        assert_eq!(
+            cursor.x,
+            cell_position(bounds.position(), 79, 2, metrics()).x,
+            "a slid composition drags the candidate window onto the row with it"
+        );
+
+        // Both a cursor the terminal never reported and one DECTCEM hid
+        // leave nothing to anchor on.
+        let mut invisible = composing_snapshot("你", Some(0..0));
+        invisible.cursor = invisible.cursor.map(|cursor| CursorInfo {
+            visible: false,
+            ..cursor
+        });
+        for snapshot in [TerminalSnapshot::blank(80, 24), invisible] {
+            let mut hidden = widget(3, snapshot);
+            hidden.ime_active = true;
+            let InputMethod::Enabled { cursor, .. } = hidden.input_method(bounds) else {
+                panic!("enabled")
+            };
+            assert_eq!(
+                cursor.position(),
+                bounds.position(),
+                "an unanchorable cursor falls back to the widget origin"
+            );
+        }
+    }
+
+    #[test]
+    fn an_active_terminal_claims_every_input_method_event() {
+        let mut program = widget(3, composing_snapshot("n", Some(1..1)));
+        program.ime_active = true;
+        for event in [
+            input_method::Event::Opened,
+            input_method::Event::Preedit("ni".into(), Some(2..2)),
+            input_method::Event::Commit("你".into()),
+            input_method::Event::Closed,
+        ] {
+            let Some(crate::Message::Ime(carried)) =
+                program.ime_message(&Event::InputMethod(event.clone()))
+            else {
+                panic!("an active terminal must claim {event:?}")
+            };
+            assert_eq!(carried, event);
+        }
+        assert!(program
+            .ime_message(&Event::Mouse(mouse::Event::CursorLeft))
+            .is_none());
     }
 
     #[test]

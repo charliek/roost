@@ -51,10 +51,12 @@ pub(crate) fn accelerator_modifiers(value: keyboard::Modifiers) -> AccelMods {
     result
 }
 
-/// Whether this event is a real terminal key press that should snap local
-/// scrollback first. Releases, modifier-state events, and modifier-only presses
-/// must not disturb scrollback or selection before a later copy chord.
-pub(crate) fn should_snap_for_terminal_input(event: &keyboard::Event) -> bool {
+/// A key press that is not a bare modifier — the events a live IME
+/// composition owns, and the real terminal presses that snap local
+/// scrollback first. Releases, modifier-state events, and modifier-only
+/// presses must not disturb scrollback or selection before a later copy
+/// chord.
+pub(crate) fn non_modifier_press(event: &keyboard::Event) -> bool {
     let keyboard::Event::KeyPressed { key, .. } = event else {
         return false;
     };
@@ -150,10 +152,20 @@ fn canonical_character(value: &str) -> String {
     name.to_string()
 }
 
+/// Allocate a libghostty key event. A failure here is an allocation
+/// failure inside the FFI, not a key we can encode differently, so it
+/// warns and drops the keystroke.
+fn new_key_event() -> Option<KeyEvent> {
+    KeyEvent::new()
+        .inspect_err(|error| tracing::warn!(?error, "failed to allocate libghostty key event"))
+        .ok()
+}
+
 pub fn encode_press(
     encoder: &mut KeyEncoder,
     terminal: &Terminal,
     event: keyboard::Event,
+    composing: bool,
 ) -> Vec<u8> {
     let keyboard::Event::KeyPressed {
         key,
@@ -172,12 +184,8 @@ pub fn encode_press(
     let Some(keycode) = ghostty_key(&key) else {
         return Vec::new();
     };
-    let mut event = match KeyEvent::new() {
-        Ok(event) => event,
-        Err(error) => {
-            tracing::warn!(?error, "failed to allocate libghostty key event");
-            return Vec::new();
-        }
+    let Some(mut event) = new_key_event() else {
+        return Vec::new();
     };
     let utf8 = text.as_deref().unwrap_or("").as_bytes();
     let unshifted = latin.map_or_else(
@@ -197,12 +205,41 @@ pub fn encode_press(
         .set_key(keycode)
         .set_mods(ghostty_modifiers(modifiers))
         .set_consumed_mods(0)
-        .set_composing(false)
+        .set_composing(composing)
         .set_unshifted_codepoint(unshifted)
         .set_utf8(utf8);
     encoder.sync_from_terminal(terminal);
     encoder.encode(&event).unwrap_or_else(|error| {
         tracing::warn!(?error, "libghostty key encoding failed");
+        Vec::new()
+    })
+}
+
+/// Encode text the platform input method committed.
+///
+/// A commit has no originating key — only the resulting text — so this
+/// takes libghostty's documented path for a printable codepoint with no
+/// physical-key enum: `UNIDENTIFIED` plus the utf8 payload. `composing`
+/// is false because the composition is over; the bytes are meant to
+/// reach the PTY.
+pub fn encode_ime_commit(encoder: &mut KeyEncoder, terminal: &Terminal, text: &str) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let Some(mut event) = new_key_event() else {
+        return Vec::new();
+    };
+    event
+        .set_action(key_action::PRESS)
+        .set_key(ghostty::GhosttyKey_GHOSTTY_KEY_UNIDENTIFIED)
+        .set_mods(0)
+        .set_consumed_mods(0)
+        .set_composing(false)
+        .set_unshifted_codepoint(0)
+        .set_utf8(text.as_bytes());
+    encoder.sync_from_terminal(terminal);
+    encoder.encode(&event).unwrap_or_else(|error| {
+        tracing::warn!(?error, "libghostty IME commit encoding failed");
         Vec::new()
     })
 }
@@ -322,6 +359,17 @@ mod tests {
     use super::*;
     use iced::keyboard::key::{Code, Physical};
     use iced::keyboard::Location;
+    use roost_vt::TerminalOptions;
+
+    fn encoder_pair() -> (KeyEncoder, Terminal) {
+        let terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .expect("test terminal");
+        (KeyEncoder::new().expect("test key encoder"), terminal)
+    }
 
     fn key_press(
         key: Key,
@@ -375,26 +423,24 @@ mod tests {
             Physical::Code(Code::KeyX),
             keyboard::Modifiers::empty(),
         );
-        assert!(should_snap_for_terminal_input(&character));
+        assert!(non_modifier_press(&character));
 
         let modifier = key_press(
             Key::Named(Named::Shift),
             Physical::Code(Code::ShiftLeft),
             keyboard::Modifiers::SHIFT,
         );
-        assert!(!should_snap_for_terminal_input(&modifier));
-        assert!(!should_snap_for_terminal_input(
-            &keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)
-        ));
-        assert!(!should_snap_for_terminal_input(
-            &keyboard::Event::KeyReleased {
-                key: Key::Character("x".into()),
-                modified_key: Key::Character("x".into()),
-                physical_key: Physical::Code(Code::KeyX),
-                location: Location::Standard,
-                modifiers: keyboard::Modifiers::empty(),
-            }
-        ));
+        assert!(!non_modifier_press(&modifier));
+        assert!(!non_modifier_press(&keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::SHIFT
+        )));
+        assert!(!non_modifier_press(&keyboard::Event::KeyReleased {
+            key: Key::Character("x".into()),
+            modified_key: Key::Character("x".into()),
+            physical_key: Physical::Code(Code::KeyX),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        }));
     }
 
     #[test]
@@ -531,5 +577,89 @@ mod tests {
             keyboard::Modifiers::CTRL,
         );
         assert_eq!(accelerator(&space).unwrap().key, "space");
+    }
+
+    /// Plain typing must be byte-identical to the hardcoded
+    /// `set_composing(false)` this parameter replaced. The vectors are the
+    /// bytes that build produced.
+    #[test]
+    fn ordinary_presses_encode_the_same_bytes_when_not_composing() {
+        let (mut encoder, terminal) = encoder_pair();
+        let letter = keyboard::Event::KeyPressed {
+            key: Key::Character("a".into()),
+            modified_key: Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("a".into()),
+            repeat: false,
+        };
+        assert_eq!(
+            encode_press(&mut encoder, &terminal, letter, false),
+            b"a".to_vec()
+        );
+        assert_eq!(
+            encode_press(
+                &mut encoder,
+                &terminal,
+                key_press(
+                    Key::Named(Named::Enter),
+                    Physical::Code(Code::Enter),
+                    keyboard::Modifiers::empty(),
+                ),
+                false,
+            ),
+            b"\r".to_vec()
+        );
+        assert_eq!(
+            encode_press(
+                &mut encoder,
+                &terminal,
+                key_press(
+                    Key::Character("c".into()),
+                    Physical::Code(Code::KeyC),
+                    keyboard::Modifiers::CTRL,
+                ),
+                false,
+            ),
+            b"\x03".to_vec()
+        );
+    }
+
+    /// The keys an IME declines are forwarded to us as ordinary presses
+    /// mid-composition (winit's `doCommandBySelector` path). Marking them
+    /// composing is what keeps them out of the PTY.
+    #[test]
+    fn composing_presses_are_swallowed_by_the_encoder() {
+        let (mut encoder, terminal) = encoder_pair();
+        for key in [
+            (Key::Named(Named::Enter), Physical::Code(Code::Enter)),
+            (Key::Named(Named::Escape), Physical::Code(Code::Escape)),
+            (
+                Key::Named(Named::ArrowDown),
+                Physical::Code(Code::ArrowDown),
+            ),
+            (Key::Character("n".into()), Physical::Code(Code::KeyN)),
+        ] {
+            let event = key_press(key.0.clone(), key.1, keyboard::Modifiers::empty());
+            assert!(
+                encode_press(&mut encoder, &terminal, event, true).is_empty(),
+                "{:?} must not reach the PTY while composing",
+                key.0
+            );
+        }
+    }
+
+    #[test]
+    fn ime_commits_encode_their_exact_utf8() {
+        let (mut encoder, terminal) = encoder_pair();
+        for text in ["é", "e\u{0301}", "你好", "👍", "ｱ"] {
+            assert_eq!(
+                encode_ime_commit(&mut encoder, &terminal, text),
+                text.as_bytes().to_vec(),
+                "commit {text:?}"
+            );
+        }
+        assert!(encode_ime_commit(&mut encoder, &terminal, "").is_empty());
     }
 }

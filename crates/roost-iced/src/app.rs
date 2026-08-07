@@ -60,7 +60,7 @@ use crate::palette_scroll::Visibility;
 use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
 use crate::terminal_widget::{
-    DrawCell, RenderedRow, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
+    DrawCell, ImePreedit, RenderedRow, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
     TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
 };
 use crate::Message;
@@ -96,8 +96,8 @@ use self::palettes::{
 };
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::terminal_tab::{
-    apply_geometry_batch, pointer_origin_tab, refresh_or_warn, terminal_grid,
-    GeometryBatchOperation, NativePointerDispatch, TerminalTab,
+    apply_geometry_batch, clear_preedit_or_warn, pointer_origin_tab, refresh_or_warn,
+    terminal_grid, GeometryBatchOperation, NativePointerDispatch, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
@@ -626,6 +626,128 @@ enum KeyboardRoute {
     Terminal(i64),
 }
 
+/// The tab a preedit update belongs to. Only a terminal that owns the
+/// keyboard may hold a composition — every other surface has its own
+/// `TextInput`, which requests its own IME.
+fn ime_preedit_target(route: KeyboardRoute) -> Option<i64> {
+    match route {
+        KeyboardRoute::Terminal(tab_id) => Some(tab_id),
+        KeyboardRoute::None
+        | KeyboardRoute::Confirm
+        | KeyboardRoute::Editor
+        | KeyboardRoute::Palette => None,
+    }
+}
+
+/// The tab a commit belongs to. The tab holding the composition wins over
+/// the current route, so a commit that races a tab switch still lands
+/// where the user was typing.
+fn ime_commit_target(preedit_holder: Option<i64>, route: KeyboardRoute) -> Option<i64> {
+    preedit_holder.or_else(|| ime_preedit_target(route))
+}
+
+/// One-shot latch that drops the commit the OS re-offers after a cancel
+/// already discarded its marked text — without it that stray commit would
+/// fall through to whichever terminal owns the route by then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ImeDiscard(bool);
+
+impl ImeDiscard {
+    fn arm(&mut self, discarded_live_composition: bool) {
+        self.0 |= discarded_live_composition;
+    }
+
+    fn disarm(&mut self) {
+        self.0 = false;
+    }
+
+    /// Whether this commit belongs to a composition already discarded, and
+    /// must therefore be dropped. Consumes the latch either way.
+    fn claims_commit(&mut self) -> bool {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// Cancel every composition except `keep`'s. Always a cancel, never a
+/// commit: losing focus or handing the keyboard to another surface must
+/// not type text the user never confirmed.
+///
+/// This drops Roost's side only. The OS keeps its own composition — the
+/// terminal is still the keyboard route, so the IME stays enabled and the
+/// candidate window can linger until the user acts on it. `discard` is
+/// what keeps that residue off the PTY. Abandoning it OS-side would mean
+/// pulsing `InputMethod::Disabled` for a frame, which needs verification
+/// against a real IME before it goes in.
+fn cancel_preedits(
+    tabs: &mut HashMap<i64, TerminalTab>,
+    discard: &mut ImeDiscard,
+    keep: Option<i64>,
+) {
+    let mut cancelled = false;
+    for (tab_id, tab) in tabs.iter_mut() {
+        if Some(*tab_id) == keep {
+            continue;
+        }
+        cancelled |= clear_preedit_or_warn(*tab_id, tab);
+    }
+    discard.arm(cancelled);
+}
+
+fn set_preedit_in(
+    tabs: &mut HashMap<i64, TerminalTab>,
+    discard: &mut ImeDiscard,
+    route: KeyboardRoute,
+    text: String,
+    cursor: Option<Range<usize>>,
+) {
+    let Some(tab_id) = ime_preedit_target(route) else {
+        return;
+    };
+    let Some(tab) = tabs.get_mut(&tab_id) else {
+        return;
+    };
+    // Only a fresh composition disarms the latch. An empty preedit is the
+    // clear winit sends immediately before every commit, so treating that
+    // as a new composition would defeat the discard.
+    let started = !text.is_empty();
+    if let Err(error) = tab.set_preedit(text, cursor) {
+        tracing::warn!(?error, tab_id, "terminal preedit update failed");
+    }
+    if started {
+        discard.disarm();
+    }
+}
+
+fn commit_ime_in(
+    tabs: &mut HashMap<i64, TerminalTab>,
+    discard: &mut ImeDiscard,
+    route: KeyboardRoute,
+    text: &str,
+) {
+    if discard.claims_commit() {
+        return;
+    }
+    let holder = tabs
+        .iter()
+        .find(|(_, tab)| tab.preedit.is_some())
+        .map(|(tab_id, _)| *tab_id);
+    let Some(tab_id) = ime_commit_target(holder, route) else {
+        return;
+    };
+    let Some(tab) = tabs.get_mut(&tab_id) else {
+        return;
+    };
+    if let Err(error) = tab.commit_ime(text) {
+        tracing::warn!(?error, tab_id, "terminal IME commit failed");
+    }
+}
+
+/// Whether the terminal for `active_tab` should ask the platform for an
+/// input method: it owns the keyboard and the window has focus.
+fn terminal_ime_active(route: KeyboardRoute, active_tab: i64, window_focused: bool) -> bool {
+    window_focused && ime_preedit_target(route) == Some(active_tab)
+}
+
 fn resolve_keyboard_route(
     confirm_open: bool,
     editor_open: bool,
@@ -759,6 +881,8 @@ pub struct App {
     /// committed width, and persisting per pointer-move would rewrite
     /// `state.json` on every frame.
     sidebar_drag_width: Option<f32>,
+    window_focused: bool,
+    ime_discard: ImeDiscard,
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
@@ -922,6 +1046,8 @@ impl App {
             screenshots: ScreenshotQueue::default(),
             window_size: Size::new(1100.0, 720.0),
             sidebar_drag_width: None,
+            window_focused: true,
+            ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
             test_mode: std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1"),
             status: StatusBanner::default(),
@@ -1269,11 +1395,21 @@ impl App {
             return UiTask::None;
         }
 
-        if let Some(action) = input::accelerator(&event)
-            .and_then(|accelerator| self.keybindings.get(&accelerator).copied())
-        {
-            let repeat = matches!(&event, keyboard::Event::KeyPressed { repeat: true, .. });
-            return self.dispatch_keybind_action(action, repeat);
+        // winit withholds the presses an IME consumed, so the only ones
+        // arriving mid-composition are the keys the IME declined and
+        // forwarded (Enter, Escape, arrows). Those belong to the
+        // composition, never to a Roost binding — but a modifier-state
+        // event still has to reach its handling above and below. The
+        // accepted cost is that every binding, Copy/Paste included, waits
+        // for the composition to end rather than cutting it short.
+        let composing = self.terminal_composing();
+        if !(composing && input::non_modifier_press(&event)) {
+            if let Some(action) = input::accelerator(&event)
+                .and_then(|accelerator| self.keybindings.get(&accelerator).copied())
+            {
+                let repeat = matches!(&event, keyboard::Event::KeyPressed { repeat: true, .. });
+                return self.dispatch_keybind_action(action, repeat);
+            }
         }
 
         let KeyboardRoute::Terminal(active_tab) = self.keyboard_route() else {
@@ -1286,7 +1422,12 @@ impl App {
         // policy keeps it local — no snap, no encode, nothing on the PTY. The
         // bypass is the policy's decision, never the key's: `Forward` (mouse
         // tracking, alternate screen) falls through to the normal encode below.
-        if let Some(direction) = input::bare_page_direction(&event, self.modifiers) {
+        let page_direction = if composing {
+            None
+        } else {
+            input::bare_page_direction(&event, self.modifiers)
+        };
+        if let Some(direction) = page_direction {
             match tab.handle_page(direction) {
                 Ok(PageRoute::LocalViewport { .. }) => return UiTask::None,
                 Ok(PageRoute::Forward) => {}
@@ -1298,14 +1439,43 @@ impl App {
                 }
             }
         }
-        if input::should_snap_for_terminal_input(&event) {
+        if input::non_modifier_press(&event) {
             if let Err(error) = tab.snap_to_bottom_for_input() {
                 tracing::warn!(?error, active_tab, "terminal snap-to-bottom failed");
             }
         }
-        let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event);
+        let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
         tab.session.send_input(bytes);
         UiTask::None
+    }
+
+    /// Whether the terminal that owns the keyboard is mid-composition.
+    fn terminal_composing(&self) -> bool {
+        ime_preedit_target(self.keyboard_route())
+            .and_then(|tab_id| self.tabs.get(&tab_id))
+            .is_some_and(|tab| tab.preedit.is_some())
+    }
+
+    fn cancel_ime_composition(&mut self) {
+        cancel_preedits(&mut self.tabs, &mut self.ime_discard, None);
+    }
+
+    /// The IME session ended or restarted: the composition goes, and so
+    /// does any pending discard — across a session boundary the OS will
+    /// not re-offer the marked text a cancel already dropped.
+    pub fn ime_session_boundary(&mut self) {
+        self.cancel_ime_composition();
+        self.ime_discard.disarm();
+    }
+
+    pub fn ime_preedit(&mut self, text: String, cursor: Option<Range<usize>>) {
+        let route = self.keyboard_route();
+        set_preedit_in(&mut self.tabs, &mut self.ime_discard, route, text, cursor);
+    }
+
+    pub fn ime_commit(&mut self, text: &str) {
+        let route = self.keyboard_route();
+        commit_ime_in(&mut self.tabs, &mut self.ime_discard, route, text);
     }
 
     /// Handle the one captured text-input key that belongs to application
@@ -1458,7 +1628,9 @@ impl App {
             self.rename_completion_key = None;
             self.cancel_drags();
             self.cancel_confirm_delete();
+            self.cancel_ime_composition();
         }
+        self.window_focused = focused;
         self.workspace.set_window_focused(focused);
         if let Some(tab) = self.tabs.get(&self.workspace.active().1) {
             tab.set_window_focus(focused);
@@ -1890,6 +2062,11 @@ impl App {
                 snapshot: tab.snapshot.clone(),
                 metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
                 metric_generation: tab.metric_generation,
+                ime_active: terminal_ime_active(
+                    self.keyboard_route(),
+                    active_tab,
+                    self.window_focused,
+                ),
             }
             .into(),
             _ => container(text("Starting terminal…"))
@@ -2277,6 +2454,7 @@ impl App {
             }
         }
         self.confirm_delete = Some(target);
+        self.cancel_ime_composition();
         Ok(())
     }
 
@@ -3216,6 +3394,67 @@ mod tests {
         assert_eq!(
             resolve_keyboard_route(true, false, false, 7, true),
             KeyboardRoute::Confirm
+        );
+    }
+
+    #[test]
+    fn composition_routes_only_to_a_focused_terminal_that_owns_the_keyboard() {
+        assert_eq!(ime_preedit_target(KeyboardRoute::Terminal(7)), Some(7));
+        for route in [
+            KeyboardRoute::None,
+            KeyboardRoute::Confirm,
+            KeyboardRoute::Editor,
+            KeyboardRoute::Palette,
+        ] {
+            assert_eq!(
+                ime_preedit_target(route),
+                None,
+                "{route:?} owns its own text input"
+            );
+        }
+
+        assert!(terminal_ime_active(KeyboardRoute::Terminal(7), 7, true));
+        assert!(!terminal_ime_active(KeyboardRoute::Terminal(7), 7, false));
+        assert!(!terminal_ime_active(KeyboardRoute::Terminal(8), 7, true));
+        assert!(!terminal_ime_active(KeyboardRoute::Palette, 7, true));
+    }
+
+    /// A commit can arrive after the active tab already moved. It belongs
+    /// to the composition, so the tab holding one outranks the route.
+    #[test]
+    fn a_commit_follows_the_composition_not_the_active_route() {
+        assert_eq!(
+            ime_commit_target(Some(3), KeyboardRoute::Terminal(9)),
+            Some(3)
+        );
+        assert_eq!(ime_commit_target(Some(3), KeyboardRoute::Palette), Some(3));
+        assert_eq!(ime_commit_target(None, KeyboardRoute::Terminal(9)), Some(9));
+        assert_eq!(ime_commit_target(None, KeyboardRoute::Palette), None);
+    }
+
+    #[test]
+    fn the_discard_latch_is_one_shot_and_a_session_boundary_clears_it() {
+        let mut latch = ImeDiscard::default();
+        assert!(!latch.claims_commit(), "nothing cancelled, nothing dropped");
+
+        latch.arm(false);
+        assert!(
+            !latch.claims_commit(),
+            "a cancel that discarded no live composition arms nothing"
+        );
+
+        latch.arm(true);
+        assert!(latch.claims_commit());
+        assert!(
+            !latch.claims_commit(),
+            "the latch drops one commit, not every commit"
+        );
+
+        latch.arm(true);
+        latch.disarm();
+        assert!(
+            !latch.claims_commit(),
+            "a new composition or a session boundary disarms it"
         );
     }
 

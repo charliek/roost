@@ -212,6 +212,10 @@ impl App {
                 refresh_or_warn(*tab_id, tab, "pointer reset after active tab changed");
             }
         }
+        // Every focus change funnels through `focus_tab_and_clear`, which
+        // reconciles — so this is the one place a tab switch cancels a
+        // composition the user left behind.
+        cancel_preedits(&mut self.tabs, &mut self.ime_discard, Some(active_tab_id));
         let now = Instant::now();
         for tab_id in &live_ids {
             if self.tabs.contains_key(tab_id) {

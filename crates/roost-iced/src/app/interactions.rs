@@ -235,6 +235,7 @@ impl App {
         }
         self.rename_editor = Some(editor);
         self.rename_focus_requested = true;
+        self.cancel_ime_composition();
         Ok(())
     }
 
@@ -4004,6 +4005,7 @@ mod tests {
             &mut tab.encoder,
             &tab.terminal,
             page_press(named, modifiers),
+            false,
         );
         tab.session.send_input(bytes);
     }
@@ -4499,5 +4501,216 @@ mod tests {
         assert!(!tab.link_modifier_held);
         assert!(!tab.reset_pointer_state());
         supervisor.close(98);
+    }
+
+    fn named_press(named: Named) -> keyboard::Event {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+
+        keyboard::Event::KeyPressed {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: Physical::Code(Code::Enter),
+            location: Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    /// The sequence winit actually delivers for a dead key: a preedit, an
+    /// empty preedit, then the commit — with no `KeyPressed` in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_key_reaches_the_pty_once_as_the_composed_character() {
+        let (mut tab, supervisor) = attached_test_terminal(400);
+        clear_captured_input(&tab);
+
+        tab.set_preedit("´".into(), Some(0..2))
+            .expect("dead-key preedit");
+        assert_eq!(
+            tab.snapshot
+                .preedit
+                .as_ref()
+                .map(|preedit| preedit.text.as_str()),
+            Some("´")
+        );
+        assert!(
+            captured_input(&tab).is_empty(),
+            "a composition must not reach the PTY"
+        );
+        assert_eq!(
+            tab.dump().rows_text[0],
+            "",
+            "a preedit never enters the grid"
+        );
+
+        tab.set_preedit(String::new(), None).expect("preedit clear");
+        tab.commit_ime("é").expect("commit");
+        assert!(tab.preedit.is_none());
+        assert!(tab.snapshot.preedit.is_none());
+        assert_eq!(captured_input(&tab), "é".as_bytes());
+        supervisor.close(400);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_selection_swallows_forwarded_keys_and_commits_the_choice() {
+        let (mut tab, supervisor) = attached_test_terminal(401);
+        clear_captured_input(&tab);
+
+        for step in ["n", "ni", "你"] {
+            tab.set_preedit(step.into(), Some(step.len()..step.len()))
+                .expect("candidate step");
+            assert_eq!(
+                tab.snapshot
+                    .preedit
+                    .as_ref()
+                    .map(|preedit| preedit.text.as_str()),
+                Some(step)
+            );
+        }
+        assert!(captured_input(&tab).is_empty());
+
+        // The IME declined this Enter and winit forwarded it as an
+        // ordinary press; `composing` is what keeps it off the PTY.
+        let swallowed = input::encode_press(
+            &mut tab.encoder,
+            &tab.terminal,
+            named_press(Named::Enter),
+            true,
+        );
+        assert!(swallowed.is_empty());
+
+        tab.set_preedit(String::new(), None).expect("preedit clear");
+        tab.commit_ime("你").expect("commit");
+        assert_eq!(captured_input(&tab), "你".as_bytes());
+        supervisor.close(401);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_composition_sends_nothing_and_restores_the_row() {
+        let (mut tab, supervisor) = attached_test_terminal(402);
+        tab.write_vt(b"\x1b[2J\x1b[Hprompt$ ");
+        tab.refresh_snapshot().expect("baseline snapshot");
+        clear_captured_input(&tab);
+        let baseline = tab.dump().rows_text;
+
+        tab.set_preedit("你好".into(), Some(6..6)).expect("preedit");
+        assert!(tab.clear_preedit().expect("cancel"));
+        assert!(!tab.clear_preedit().expect("cancelling twice is inert"));
+        assert!(tab.preedit.is_none());
+        assert!(tab.snapshot.preedit.is_none());
+        assert!(captured_input(&tab).is_empty(), "cancel is never a commit");
+        assert_eq!(tab.dump().rows_text, baseline);
+        supervisor.close(402);
+    }
+
+    fn composing_pair(
+        first: i64,
+        second: i64,
+    ) -> (HashMap<i64, TerminalTab>, Vec<Arc<PtySupervisor>>) {
+        let (one, one_supervisor) = attached_test_terminal(first);
+        let (two, two_supervisor) = attached_test_terminal(second);
+        let tabs = HashMap::from_iter([(first, one), (second, two)]);
+        for tab in tabs.values() {
+            clear_captured_input(tab);
+        }
+        (tabs, vec![one_supervisor, two_supervisor])
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_racing_a_tab_switch_lands_on_the_composing_tab() {
+        let (mut tabs, supervisors) = composing_pair(403, 404);
+        let mut discard = ImeDiscard::default();
+
+        set_preedit_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(403),
+            "你".into(),
+            Some(0..3),
+        );
+        // The active tab already moved; the composition still owns the commit.
+        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(404), "你");
+        assert_eq!(captured_input(&tabs[&403]), "你".as_bytes());
+        assert!(captured_input(&tabs[&404]).is_empty());
+        supervisors[0].close(403);
+        supervisors[1].close(404);
+    }
+
+    /// A cancel discards the marked text, but the OS may still offer its
+    /// commit. That commit belongs to a composition that no longer exists
+    /// and must land nowhere — least of all on whichever terminal owns the
+    /// route by then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_after_a_cancelled_composition_lands_nowhere() {
+        let (mut tabs, supervisors) = composing_pair(405, 406);
+        let mut discard = ImeDiscard::default();
+
+        set_preedit_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(405),
+            "你".into(),
+            Some(0..3),
+        );
+        // What a tab switch does: reconcile cancels every composition the
+        // newly active tab does not own.
+        cancel_preedits(&mut tabs, &mut discard, Some(406));
+        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(406), "你");
+        assert!(
+            captured_input(&tabs[&405]).is_empty(),
+            "the cancelled composition must not type into the tab it left"
+        );
+        assert!(
+            captured_input(&tabs[&406]).is_empty(),
+            "nor into the tab that now owns the route"
+        );
+
+        // One-shot: the next real composition commits normally.
+        for text in ["好".to_string(), String::new()] {
+            set_preedit_in(
+                &mut tabs,
+                &mut discard,
+                KeyboardRoute::Terminal(406),
+                text,
+                None,
+            );
+        }
+        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(406), "好");
+        assert_eq!(captured_input(&tabs[&406]), "好".as_bytes());
+        assert!(captured_input(&tabs[&405]).is_empty());
+        supervisors[0].close(405);
+        supervisors[1].close(406);
+    }
+
+    /// The emoji-picker path: a commit with no preedit before it. The
+    /// route target claims it, and a cancel that discarded nothing must
+    /// not eat it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_with_no_composition_behind_it_still_reaches_the_route() {
+        let (tab, supervisor) = attached_test_terminal(407);
+        let mut tabs = HashMap::from_iter([(407, tab)]);
+        clear_captured_input(&tabs[&407]);
+        let mut discard = ImeDiscard::default();
+
+        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(407), "👍");
+        assert_eq!(captured_input(&tabs[&407]), "👍".as_bytes());
+        clear_captured_input(&tabs[&407]);
+
+        set_preedit_in(
+            &mut tabs,
+            &mut discard,
+            KeyboardRoute::Terminal(407),
+            String::new(),
+            None,
+        );
+        cancel_preedits(&mut tabs, &mut discard, None);
+        commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(407), "é");
+        assert_eq!(
+            captured_input(&tabs[&407]),
+            "é".as_bytes(),
+            "cancelling an already-empty composition arms nothing"
+        );
+        supervisor.close(407);
     }
 }
