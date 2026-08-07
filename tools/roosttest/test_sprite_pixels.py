@@ -132,7 +132,7 @@ def _pixel(shot, x: int, y: int) -> tuple[int, int, int]:
 
 
 def _near(px, color) -> bool:
-    return all(abs(a - b) <= COLOR_TOL for a, b in zip(px, color))
+    return all(abs(a - b) <= COLOR_TOL for a, b in zip(px, color, strict=True))
 
 
 def _classify(px, fg, bg) -> str | None:
@@ -243,8 +243,21 @@ class TestSpritePixels:
         shot, scale = latest["shot"], latest["scale"]
         x0, y0 = term_x * scale, term_y * scale
 
-        cell_w = _color_run(shot, x0, y0, 1, 0, MARKER)
-        cell_h = _color_run(shot, x0, y0, 0, 1, MARKER)
+        # Measure from the interior pixel `painted` already validated
+        # ((x0+1, y0+1)) and sum both directions (minus the shared
+        # start pixel): if edge snapping ever shifts the marker's
+        # leading edge off (x0, y0) by one, a run started there would
+        # read 0 and hard-fail instead of retrying.
+        cell_w = (
+            _color_run(shot, x0 + 1, y0 + 1, 1, 0, MARKER)
+            + _color_run(shot, x0 + 1, y0 + 1, -1, 0, MARKER)
+            - 1
+        )
+        cell_h = (
+            _color_run(shot, x0 + 1, y0 + 1, 0, 1, MARKER)
+            + _color_run(shot, x0 + 1, y0 + 1, 0, -1, MARKER)
+            - 1
+        )
         assert cell_w >= 4 * scale and cell_h >= 8 * scale, (cell_w, cell_h)
         run_w = RUN_CELLS * cell_w
 

@@ -1207,7 +1207,7 @@ mod tests {
         }
         assert!(r[0].0.x + r[0].0.w < r[1].0.x, "dashes must not touch");
         assert!(r[1].0.x + r[1].0.w < r[2].0.x, "dashes must not touch");
-        // ┆ four vertical dashes.
+        // ┆ three vertical dashes, ┊ four.
         assert_eq!(rects(0x2506, 12.0, 24.0).len(), 3);
         assert_eq!(rects(0x250A, 12.0, 24.0).len(), 4);
     }
