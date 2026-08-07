@@ -73,7 +73,7 @@ fn run_forced_panic(variant: &str) -> (TempDir, Outcome) {
         "expected a failing exit for ROOST_TEST_PANIC={variant}, got {status:?}\n{captured}"
     );
 
-    let files = find_files(path);
+    let files = find_files(path).expect("walk tempdir");
     let crash_files = matching(&files, |name| {
         name.starts_with("crash-") && name.ends_with(".txt")
     });
@@ -117,20 +117,17 @@ fn describe(stdout: &[u8], stderr: &[u8]) -> String {
 /// Recursively collects every file under `root` in a single walk; the two
 /// call sites in `run_forced_panic` each narrow the result with `matching`
 /// rather than re-walking the tree per pattern.
-fn find_files(root: &Path) -> Vec<PathBuf> {
+fn find_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
         if path.is_dir() {
-            found.extend(find_files(&path));
+            found.extend(find_files(&path)?);
         } else {
             found.push(path);
         }
     }
-    found
+    Ok(found)
 }
 
 fn matching(files: &[PathBuf], matches: impl Fn(&str) -> bool) -> Vec<PathBuf> {

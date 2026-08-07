@@ -37,9 +37,13 @@ Authoritative rationale: `CLAUDE.md` § Library preferences.
 
 **Removal condition.** Delete `third_party/swash/` and the
 `[patch.crates-io]` entry once a published swash release ships equivalent
-guards for every delta listed above. Cargo enforces re-evaluation on its own:
-the patch is pinned to 0.2.10, so any future dependency bump that requires a
-newer swash fails resolution with a patch version mismatch.
+guards for every delta listed above. Note cargo alone does NOT enforce this:
+a `[patch.crates-io]` entry only shadows the version it matches, so a future
+dependency bump requiring a newer swash would resolve the unpatched registry
+release with just a warning. The enforcement is `make check-iced`'s
+assertion (Makefile) that `cargo tree -p roost-iced` resolves swash 0.2.10
+to `third_party/swash` — it fails the build (and CI) if the patch ever stops
+applying.
 
 Regression tests: `crates/roost-iced/tests/swash_zero_metrics_test.rs` and
 `crates/roost-iced/tests/swash_malformed_font_test.rs`.

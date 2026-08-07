@@ -146,11 +146,15 @@ fn write_crash_file(log_dir: &Path, report: &str, now_secs: u64, pid: u32) -> Op
             .open(&candidate)
         {
             Ok(mut file) => {
-                // Best-effort: a failed write still leaves stderr as
-                // the record of what happened.
-                let _ = file.write_all(report.as_bytes());
-                let _ = file.flush();
-                return Some(candidate);
+                // Only report success for a fully written file — a
+                // partial artifact would make the "crash report
+                // written" log line a lie; stderr still has the full
+                // report either way.
+                if file.write_all(report.as_bytes()).is_ok() && file.flush().is_ok() {
+                    return Some(candidate);
+                }
+                let _ = std::fs::remove_file(&candidate);
+                return None;
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 attempt += 1;
