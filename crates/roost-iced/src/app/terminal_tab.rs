@@ -639,10 +639,15 @@ impl TerminalTab {
     /// Send text the IME committed. The composition is dropped first —
     /// the committed text is the whole of what reaches the PTY.
     pub(super) fn commit_ime(&mut self, text: &str) -> Result<()> {
-        self.clear_preedit()?;
-        self.snap_to_bottom_for_input()?;
+        // A failed repaint must not swallow the commit: the composition is
+        // already gone on the IME's side, so these bytes are the user's
+        // only copy of the text.
+        let cleared = self.clear_preedit();
+        let snapped = self.snap_to_bottom_for_input();
         let bytes = input::encode_ime_commit(&mut self.encoder, &self.terminal, text);
         self.session.send_input(bytes);
+        cleared?;
+        snapped?;
         Ok(())
     }
 

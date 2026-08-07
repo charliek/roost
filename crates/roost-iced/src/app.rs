@@ -1629,6 +1629,11 @@ impl App {
             self.cancel_drags();
             self.cancel_confirm_delete();
             self.cancel_ime_composition();
+        } else {
+            // macOS discards marked text when the window loses focus, so a
+            // commit arriving after refocus is fresh input (emoji picker),
+            // not residue of the composition the unfocus cancel discarded.
+            self.ime_discard.disarm();
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
