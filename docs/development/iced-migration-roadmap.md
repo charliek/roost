@@ -556,7 +556,7 @@ when it touches the code you are already in:
 | Iced `ReorderStrip` presses still batch-cursor-anchored: iced scrollables pass children a translated cursor but the raw untranslated event, so an event-position anchor is off by the scroll offset | [#300] |
 | ~~Vendored swash: three further malformed-font robustness findings (incl. a verified upstream format-4 bitmap-index infinite loop — release-build hang)~~ **fixed** (plan 019: five guards in `third_party/swash` — strike.rs bisection typo, var.rs ×3 debug underflows, string.rs OOB read — each with a crafted-font regression test; the format-4 record-offset off-by-one is documented residual, README.roost.md has the delta list) | [#299] |
 | Terminal multi-click is wall-clock-only — **parked deliberately** (PR #301 triage): porting the strip's frame-grace would fuse deliberate slow clicks into word-select on idle terminals (a click schedules a redraw, so a 1-2 frame gap is the normal idle signature, not a stall); revisit only if it actually flakes | [#297] |
-| No CI gate for GTK↔Iced visual parity (capture tooling is human-reviewed) — the plan-021 audit recorded a **waive** recommendation with a revisit trigger (see the M4 entry-criteria block); Charlie's final call pending | [#284] |
+| ~~No CI gate for GTK↔Iced visual parity~~ **resolved (2026-08-07)**: no cross-UI gate ever; the parity capture tooling is convergence scaffolding, deleted when GTK retires (disposition in the M4 block) | [#284] |
 | No real-input (CGEvent) harness on macOS — uinput tier is Linux-only | [#285] |
 | `roost-engine::facade` has no consumer; prove it or delete it (blocks M5) | [#286] |
 | `app/interactions.rs` at 2,960 lines — finer split when fixtures allow | [#288] |
@@ -583,11 +583,26 @@ when it touches the code you are already in:
 
 ### M4 — ship Iced to Linux users
 
-Release packaging + appcast/apt integration, a state-migration decision
-(does Iced adopt the GTK profile's `state.json` or migrate it), a beta
-period behind an explicit opt-in, then the GTK deprecation decision. Entry
-criteria: M3 complete, parity inventory shows no open P0/P1, and the
-real-input tier passes on Iced for the drag/clipboard guards.
+Release packaging + appcast/apt integration, then the GTK deprecation
+decision. Entry criteria: M3 complete, parity inventory shows no open
+P0/P1, and the real-input tier passes on Iced for the drag/clipboard
+guards.
+
+**Decisions (Charlie, 2026-08-07):**
+
+* **State migration — adopt the GTK profile in place.** The release deb's
+  iced build ships as `roost` and uses the existing GTK profile paths on
+  Linux — same `state.json`, same socket
+  (`$XDG_RUNTIME_DIR/roost/roost.sock`), same log dir — so existing users
+  keep projects/tabs transparently and `roostctl`/Claude hooks keep
+  working unchanged. Dev builds keep the separate `roost-iced` profile
+  for side-by-side development.
+* **Deb composition — clean swap.** The next deb release ships only the
+  iced UI; GTK leaves the package (its source stays in-repo until the
+  separate retirement decision). No beta/opt-in phase — the swap rides
+  the next regular release, whenever Charlie cuts it (he is explicitly
+  not ready to release yet; the packaging work proceeds now so the next
+  release simply has it).
 
 Entry-criteria status (2026-08-05): the real-input criterion is **met** —
 PR #301 removed the last harness workaround (the seam-press dwell) and the
@@ -626,20 +641,20 @@ audited open set is:
   owner decision that must be recorded on the row in the inventory before
   M4 can be declared entered.
 
-**[#284] recommendation (recorded by the audit; final call is Charlie's):
-waive** the cross-toolkit golden-image CI gate for M4. Cross-toolkit pixel
-identity is structurally unattainable (per-platform text rasterization;
-wgpu's linear-space alpha blending vs cairo sRGB — an accepted E5
-divergence; per-capture native-chrome ownership), and the audit itself hit
-the fragility class directly: a cairo/pango update shifted GTK's
-alpha-composited palette-selection color and its AA text pixels enough to
-break `parity.py`'s exact matches on a visually correct capture (fixed by
-scoped tolerances/predicates, plan 021). The focused per-UI pixel guards
-(sidebar, tab-strip, sprite, typography suites) stay the CI-enforced
-regression layer; `parity.py` captures stay the human release-review
-artifact. Revisit trigger: reopen if a shipped visual regression is ever
-traced to a gap the parity captures would have caught, or at the M6
-go/no-go review, whichever comes first.
+**[#284] — resolved (Charlie, 2026-08-07): no cross-UI visual-parity CI
+gate, ever.** Cross-toolkit pixel identity is structurally unattainable
+(per-platform text rasterization; wgpu's linear-space alpha blending vs
+cairo sRGB — an accepted E5 divergence; per-capture native-chrome
+ownership), and the plan-021 audit hit the fragility class directly: a
+cairo/pango update shifted GTK's alpha-composited palette-selection color
+and its AA text pixels enough to break `parity.py`'s exact matches on a
+visually correct capture. The parity capture tooling
+(`tools/screenshot/parity.py` + `tools/roosttest/parity_capture.py`) is
+convergence-period scaffolding, never CI-wired: it gets **deleted when
+GTK retires** (nothing cross-toolkit remains on Linux; the M6 evaluation
+is the only other prospective consumer). The focused per-UI pixel guards
+(sidebar, tab-strip, sprite, typography suites) are and remain the
+CI-enforced regression layer.
 
 ### M5 — Rust under Swift (exploration, frozen)
 
