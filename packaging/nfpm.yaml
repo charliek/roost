@@ -21,14 +21,40 @@ description: |
   Roost is a cross-platform desktop terminal multiplexer built around
   libghostty-vt: a sidebar of projects, tabs per project, one terminal per tab,
   with notification routing for AI coding agents (Claude Code, Codex). Ships the
-  gtk4-rs UI (roost) plus the roostctl CLI for shell + hook integration.
+  iced UI (roost) plus the roostctl CLI for shell + hook integration.
 
+# DO NOT derive this list from `ldd`/`readelf -d`. winit, wgpu and ash
+# `dlopen` the entire graphics + input stack, so the binary's real NEEDED set
+# is only libc.so.6 / libgcc_s.so.1 / libm.so.6 — a linkage-derived list would
+# be two entries, install cleanly everywhere, and then fail to launch on any
+# machine that didn't already happen to have the stack.
+#
+# The list below is what an `strace -f -e trace=openat` of a real launch
+# actually opened, mapped through `dpkg -S` and reduced to the libraries the
+# application itself loads (their own Depends pull the rest of the closure —
+# Mesa alone accounts for ~30 more packages that must NOT be pinned here).
 depends:
-  - libgtk-4-1 (>= 4.10)
-  - libadwaita-1-0 (>= 1.4)
   - libc6 (>= 2.31)
+  - libgcc-s1
+  # winit: keyboard mapping, and the X11/Wayland client libraries.
+  - libxkbcommon0
+  - libxkbcommon-x11-0
+  - libwayland-client0
+  - libx11-6
+  - libx11-xcb1
+  - libxcb1
+  - libxcursor1
+  - libxi6
+# Vulkan is deliberately NOT a hard dependency. Measured: with
+# /usr/share/vulkan/icd.d removed entirely the app still opens a window —
+# wgpu falls back to the software renderer that is compiled in alongside it.
+# Recommends is installed by default for ordinary `apt install`, so users get
+# GPU acceleration; only `--no-install-recommends` (containers, CI) drops to
+# software, which works.
 recommends:
   - fonts-noto-color-emoji
+  - libvulkan1
+  - mesa-vulkan-drivers
 
 contents:
   - src: ./dist/roost

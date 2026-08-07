@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # Build the Roost Linux .deb.
 #
-# Builds the gtk4-rs UI (`roost`) + the `roostctl` CLI in release config, stages
-# them with the packaging assets, and runs nfpm to emit
+# Builds the iced UI (`roost-iced`, staged as `roost`) + the `roostctl` CLI in
+# release config, stages them with the packaging assets, and runs nfpm to emit
 #   out/roost_<version>_<arch>.deb
+#
+# The iced build is done with `--features roost-iced/linux-package`. That
+# feature makes the shipped binary resolve the *production* `roost` bundle
+# profile (socket path, state.json, log dir) that the GTK package already
+# owned, so existing users upgrade in place with no migration step. Regular
+# dev builds omit the feature and keep the isolated `roost-iced` profile so
+# both UIs can run side by side during development.
 #
 # This is the developer-facing entry point — the release CI calls it too. Run it
 # on the target architecture (no cross-compile): an amd64 deb is built on amd64,
 # arm64 on arm64.
 #
 # Prerequisites (Ubuntu/Debian):
-#   sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config
+#   sudo apt-get install -y libclang-dev pkg-config
 #   mise install            # rust (rust-toolchain.toml) + zig 0.15.x
 #   nfpm on PATH            # https://nfpm.goreleaser.com
 #
@@ -47,11 +54,11 @@ export ROOST_VERSION="${VERSION}"
 echo "==> Building libghostty-vt (cached)"
 "${REPO_ROOT}/third_party/ghostty/build.sh"
 
-echo "==> cargo build --release (roost + roostctl)"
-cargo build --release -p roost-linux -p roost-cli
+echo "==> cargo build --release (roost-iced + roostctl, linux-package feature)"
+cargo build --release -p roost-iced -p roost-cli --features roost-iced/linux-package
 
 CARGO_TARGET="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
-ROOST_BIN="${CARGO_TARGET}/release/roost"
+ROOST_BIN="${CARGO_TARGET}/release/roost-iced"
 ROOSTCTL_BIN="${CARGO_TARGET}/release/roostctl"
 for b in "${ROOST_BIN}" "${ROOSTCTL_BIN}"; do
   if [ ! -x "${b}" ]; then
@@ -59,6 +66,12 @@ for b in "${ROOST_BIN}" "${ROOSTCTL_BIN}"; do
     exit 1
   fi
 done
+# The existence checks above only confirm *a* binary was produced, not that
+# it was built with `linux-package`. There's no cheap, reliable way to prove
+# a Cargo feature was compiled in from the binary alone (it doesn't leave a
+# stable, introspectable marker) — that's verified end-to-end by the release
+# smoke test and CI, which exercise the packaged binary against the
+# production `roost` profile paths.
 
 echo "==> Staging dist/"
 rm -rf "${REPO_ROOT}/dist"
