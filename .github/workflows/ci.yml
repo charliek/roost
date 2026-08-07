@@ -63,6 +63,11 @@ jobs:
               - 'tools/wayland/**'
               - 'pyproject.toml'
               - 'uv.lock'
+              # The e2e jobs invoke Makefile targets, so the test-module
+              # lists (ICED_E2E_TESTS, ICED_RELEASE_E2E_TESTS) live there.
+              # Without this, editing which tests a lane runs doesn't
+              # retrigger the lane that runs them.
+              - 'Makefile'
             ci:
               - '.github/workflows/ci.yml'
 
@@ -654,6 +659,105 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # iced-build-e2e above only ever builds roost-iced in debug, but the deb
+  # ships a release build (`lto = "thin"`, `codegen-units = 1` in
+  # `[profile.release]`), and this stack has already produced a release-only
+  # bug: #299's swash shaping hang didn't reproduce in debug. Single
+  # ubuntu-latest/wgpu lane, not a matrix — the renderer split is already
+  # covered in debug above; what's untested here is the release profile
+  # itself, not the backend.
+  iced-release:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Iced native dependencies (Linux)
+        run: |
+          sudo apt-get update
+          # iced-build-e2e's set minus weston: this lane is X11-only
+          # (xvfb-run), so a Wayland compositor is pure install time.
+          sudo apt-get install -y \
+            fonts-noto-cjk libclang-dev libxkbcommon-x11-0 libwayland-client0 \
+            mesa-vulkan-drivers xvfb xdotool zsh
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache vendored libghostty-vt
+        id: cache-ghostty
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/ghostty/out
+            third_party/ghostty/src
+          key: vendored-ghostty-${{ runner.os }}-${{ hashFiles('third_party/ghostty/build.sh') }}
+
+      - name: Build libghostty-vt
+        if: steps.cache-ghostty.outputs.cache-hit != 'true'
+        run: ./third_party/ghostty/build.sh
+
+      - name: Cache cargo registry + Iced target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-iced-release-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: cargo-iced-release-${{ runner.os }}-
+
+      - name: Build Iced + roostctl (release)
+        run: cargo build --release -p roost-iced -p roost-cli
+
+      - name: Run Iced release-profile E2E (Linux X11)
+        env:
+          ICED_BACKEND: wgpu
+          RUST_LOG: warn
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_ICED_BIN: ${{ github.workspace }}/target/release/roost-iced
+          # util.py's roostctl fallback is target/debug/roostctl, and it
+          # cargo-builds a debug CLI when that's missing. No module in the
+          # release subset needs roostctl today, but adding one later would
+          # otherwise exercise a debug CLI inside the release gate.
+          ROOST_ROOSTCTL: ${{ github.workspace }}/target/release/roostctl
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-release-x11-artifacts
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-release-x11-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          make e2e-iced-release-ci
+
+      - name: Collect Iced diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-logs/*.log' \
+            -exec cp '{}' diagnostics/ \; 2>/dev/null || true
+          while IFS= read -r screenshot; do
+            suite="$(basename "$(dirname "${screenshot}")")"
+            cp "${screenshot}" "diagnostics/${suite}-$(basename "${screenshot}")"
+          done < <(find "${RUNNER_TEMP}" -path '*/roost-iced-e2e-*-artifacts/*.png' 2>/dev/null)
+          ls -la diagnostics || true
+
+      - name: Upload Iced diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-iced-release-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Functional E2E: launch the real GTK UI headless under Xvfb and drive
   # it through the IPC op set with the pytest harness (tools/roosttest).
   # Required — Linux is the cheap, reliable headless target.
@@ -1104,14 +1208,14 @@ jobs:
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
   ci-success:
-    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, e2e-gtk, e2e-mac]
+    needs: [changes, rust-lint, harness-unit, themes-parity, rust-build, swift-mac, gtk-build, iced-build-e2e, iced-release, e2e-gtk, e2e-mac]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.iced-release.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           # Allowlist, not a denylist. A denylist of failure/cancelled let
           # `abandoned` through — the status GitHub assigns when its own

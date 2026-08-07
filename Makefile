@@ -67,10 +67,15 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_selection.py tools/roosttest/test_osc52.py
+# The release-profile lane's curated subset, not the full ICED_E2E_TESTS
+# list: startup, the core op set, the VT pipeline, and font shaping/glyph
+# rasterization — the last two because the one release-only bug this stack
+# has produced was issue #299's swash shaping hang.
+ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_z_typography.py tools/roosttest/test_sprite_pixels.py
 test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
 # roost-vt's tests/*.rs all start with `#![cfg(feature = "ffi")]`, so the
@@ -116,6 +121,14 @@ e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated sta
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
 	ROOST_TEST_MODE=1 uv run --group test pytest $$tests --roost-target iced --roost-fresh
+
+e2e-iced-release-ci:  ## Release-profile Iced E2E gate: curated subset against a real release binary (ROOST_ICED_BIN required)
+	@test -n "$$ROOST_ICED_BIN" || \
+		( echo "ROOST_ICED_BIN is not set: tools/roosttest/ui.py falls back to target/debug/<binary> and will silently cargo build a debug binary, so this gate would test a debug build while claiming to test release. Set ROOST_ICED_BIN to the release binary."; exit 1 )
+	@for f in $(ICED_RELEASE_E2E_TESTS); do \
+		test -f "$$f" || { echo "missing release E2E test file: $$f (ICED_RELEASE_E2E_TESTS is stale)"; exit 1; }; \
+	done
+	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_RELEASE_E2E_TESTS) --roost-target iced --roost-fresh
 
 e2e-mac-ci:  ## Mac E2E at CI parity. DESTRUCTIVE: force-quits any running Roost.app
 	ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest --roost-target mac --roost-fresh
