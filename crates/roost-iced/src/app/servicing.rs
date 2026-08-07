@@ -759,6 +759,21 @@ impl App {
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
             }
+            UiRequest::AppRenderStats { reset, reply } => {
+                let stats = crate::perf::snapshot();
+                if reset {
+                    crate::perf::reset();
+                }
+                let _ = reply.send(Ok(AppRenderStatsResult {
+                    refresh_calls: stats.refresh_calls as i64,
+                    refresh_nanos: stats.refresh_nanos as i64,
+                    rows_rebuilt: stats.rows_rebuilt as i64,
+                    cells_walked: stats.cells_walked as i64,
+                    draw_calls: stats.draw_calls as i64,
+                    draw_nanos: stats.draw_nanos as i64,
+                    fill_text_calls: stats.fill_text_calls as i64,
+                }));
+            }
             UiRequest::WindowMetrics { reply } => {
                 let collapsed = self.workspace.sidebar_collapsed();
                 let resolved_family = self
@@ -1304,7 +1319,7 @@ mod tests {
         assert!(collected.error.is_none());
         let tab = tabs.get_mut(&70).expect("the tab is still attached");
         tab.refresh_snapshot().expect("refresh the touched tab");
-        assert_eq!(tab.snapshot.rows_text[0], "hello");
+        assert_eq!(tab.snapshot.grid[0].text, "hello");
         supervisor.close(70);
     }
 
@@ -1508,5 +1523,434 @@ mod tests {
             "a banner outliving its tab is a no-op"
         );
         assert_eq!(workspace.active().1, other.id, "and moves nothing");
+    }
+
+    /// Pins the per-tab counters `refresh_snapshot` maintains. These are
+    /// asserted on the tab's own `TabRenderStats`, not the process-global
+    /// aggregate in `perf` — `cargo test -p roost-iced` runs concurrently
+    /// with other tests that spawn their own PTY and refresh their own
+    /// tab, and a global counter would pick up their activity too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_snapshot_updates_the_tabs_own_render_stats() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(75, feed_tx);
+        assert_eq!(tab.render_stats, crate::perf::TabRenderStats::default());
+
+        tab.refresh_snapshot().expect("refresh");
+
+        assert_eq!(tab.render_stats.refresh_calls, 1);
+        assert_eq!(
+            tab.render_stats.rows_rebuilt,
+            u64::from(DEFAULT_ROWS),
+            "the first refresh has no cached grid, so it rebuilds every row"
+        );
+        assert_eq!(
+            tab.render_stats.cells_walked,
+            u64::from(DEFAULT_COLS) * u64::from(DEFAULT_ROWS)
+        );
+        assert!(
+            tab.render_stats.refresh_nanos > 0,
+            "refresh does real work, so elapsed time should be nonzero"
+        );
+
+        tab.refresh_snapshot().expect("second refresh");
+        assert_eq!(
+            tab.render_stats.refresh_calls, 2,
+            "counters accumulate across calls rather than resetting"
+        );
+        assert_eq!(
+            tab.render_stats.rows_rebuilt,
+            u64::from(DEFAULT_ROWS),
+            "nothing touched the terminal, so the second refresh rebuilds \
+             zero rows and the total does not move"
+        );
+        assert_eq!(
+            tab.render_stats.cells_walked,
+            u64::from(DEFAULT_COLS) * u64::from(DEFAULT_ROWS),
+            "and walks no cells either"
+        );
+
+        supervisor.close(75);
+    }
+
+    /// The failure a per-row cache can silently produce is "right cells,
+    /// wrong row" — content landing one row off, or a stale row surviving
+    /// a rebuild. A substring search over the joined dump would not catch
+    /// either, so this writes a distinct marker to one row at a time and
+    /// checks the WHOLE row vector element-for-element after every write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_rebuild_keeps_every_row_at_its_own_index() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(76, feed_tx);
+        // Absolute positioning only: a scroll would move every row and
+        // turn this into a full-rebuild test by accident.
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        tab.refresh_snapshot().expect("refresh the cleared grid");
+
+        let rows = usize::from(DEFAULT_ROWS);
+        let mut expected = vec![String::new(); rows];
+        // Out of order on purpose, and not every row: a cache that keys on
+        // walk order rather than the reported row index passes an
+        // in-order fill.
+        for (step, row) in [4usize, 1, rows - 1, 0, 9, 4].into_iter().enumerate() {
+            let marker = format!("marker-{step}-row-{row}");
+            tab.write_vt(format!("\x1b[{};1H{marker}", row + 1).as_bytes());
+            tab.refresh_snapshot().expect("refresh after the write");
+            expected[row] = marker;
+            assert_eq!(
+                tab.dump().rows_text,
+                expected,
+                "after step {step} (row {row}) every row must hold exactly its own content"
+            );
+        }
+
+        supervisor.close(76);
+    }
+
+    /// `TerminalSnapshot::blank` fills its rows with an empty string while
+    /// `refresh_snapshot` builds `" "`-filled rows and trims them. Both
+    /// must land on `""`, because `tab.dump` — and the whole e2e suite
+    /// through it — reads one before the first refresh and the other
+    /// after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blank_snapshot_and_a_refreshed_empty_grid_dump_the_same_rows() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(77, feed_tx);
+        let blank = tab.dump().rows_text;
+        assert_eq!(blank, vec![String::new(); usize::from(DEFAULT_ROWS)]);
+
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        tab.refresh_snapshot().expect("refresh the cleared grid");
+        assert_eq!(
+            tab.dump().rows_text,
+            blank,
+            "a refreshed empty grid trims down to the same rows blank starts at"
+        );
+
+        supervisor.close(77);
+    }
+
+    /// `OSC 11` changes the terminal's default background with libghostty
+    /// reporting nothing dirty, so only `refresh_snapshot`'s cached-default
+    /// guard keeps cached rows from freezing at the old color. Without it
+    /// the untouched row below would keep rendering the old background.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changing_the_default_background_rebuilds_cached_rows() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(78, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[1;1Hcolored");
+        tab.refresh_snapshot()
+            .expect("refresh with the row written");
+        let before = tab.snapshot.background;
+
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        tab.write_vt(b"\x1b]11;rgb:00/00/ff\x07");
+        tab.refresh_snapshot().expect("refresh after OSC 11");
+
+        assert_ne!(
+            tab.snapshot.background, before,
+            "OSC 11 must reach the render state's default background"
+        );
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            u64::from(DEFAULT_ROWS),
+            "a default-color change invalidates every cached row"
+        );
+        let resolved = tab.resolved_cells();
+        let cell = resolved
+            .cells
+            .iter()
+            .find(|cell| cell.row == 0 && cell.col == 0)
+            .expect("row 0 col 0 is in the resolved grid");
+        assert_eq!(
+            cell.bg,
+            (
+                tab.snapshot.background.r,
+                tab.snapshot.background.g,
+                tab.snapshot.background.b
+            ),
+            "the rebuilt row resolves against the new default, not the cached one"
+        );
+
+        supervisor.close(78);
+    }
+
+    /// `tab.dump_resolved` densifies the sparse per-row cells back into a
+    /// full grid. It is the one consumer that has to re-derive a cell's row
+    /// from its grid position now that `DrawCell` no longer carries one, so
+    /// it gets its own coverage: dense, row-major, and each cell resolved
+    /// against the row it actually came from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_cells_densifies_the_grid_row_major_from_the_row_index() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(79, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        // Row 3 (1-based) col 2 (1-based) — off both axes' origin, so a
+        // transposed or off-by-one index cannot coincide with the truth.
+        tab.write_vt(b"\x1b[3;2H\x1b[1;41mX\x1b[0m");
+        tab.refresh_snapshot().expect("refresh");
+
+        let resolved = tab.resolved_cells();
+        assert_eq!(resolved.cols, DEFAULT_COLS);
+        assert_eq!(resolved.rows, DEFAULT_ROWS);
+        assert_eq!(
+            resolved.cells.len(),
+            usize::from(DEFAULT_COLS) * usize::from(DEFAULT_ROWS),
+            "the resolved grid is dense"
+        );
+        for (index, cell) in resolved.cells.iter().enumerate() {
+            assert_eq!(cell.row, (index / usize::from(DEFAULT_COLS)) as u32);
+            assert_eq!(cell.col, (index % usize::from(DEFAULT_COLS)) as u16);
+        }
+
+        let marked = &resolved.cells[2 * usize::from(DEFAULT_COLS) + 1];
+        assert_eq!(marked.text, "X");
+        assert!(marked.bold);
+        assert!(marked.has_explicit_bg);
+        let red = tab.theme.palette[1];
+        assert_eq!(
+            marked.bg,
+            (red.r, red.g, red.b),
+            "SGR 41 resolves through the theme palette's red"
+        );
+
+        let neighbor = &resolved.cells[2 * usize::from(DEFAULT_COLS)];
+        assert_eq!(neighbor.text, " ");
+        assert!(!neighbor.has_explicit_bg);
+        assert!(!neighbor.bold);
+        assert_eq!(
+            neighbor.bg,
+            (
+                tab.snapshot.background.r,
+                tab.snapshot.background.g,
+                tab.snapshot.background.b
+            ),
+            "an untouched cell falls back to the terminal default"
+        );
+
+        supervisor.close(79);
+    }
+
+    /// A single-row write with the cursor already parked on that row must
+    /// rebuild exactly one row — the headline claim `refresh_snapshot`'s
+    /// per-row cache makes. The cursor is parked and settled *before* the
+    /// write under test because libghostty dirties both the row the cursor
+    /// leaves and the row it lands on (pinned by
+    /// `crates/roost-vt/tests/render_dirty_test.rs`'s
+    /// `row_flags_are_cleared_alongside_the_global_layer`); moving and
+    /// writing in the same step would fold that cursor-motion row into the
+    /// count this test is trying to isolate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_row_write_with_the_cursor_already_parked_rebuilds_exactly_that_row() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(80, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[H");
+        tab.refresh_snapshot().expect("settle the cleared grid");
+
+        tab.write_vt(b"\x1b[3;1H");
+        tab.refresh_snapshot()
+            .expect("settle with the cursor parked on row 2");
+
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        let cells_before = tab.render_stats.cells_walked;
+        tab.write_vt(b"X");
+        tab.refresh_snapshot()
+            .expect("refresh after the single-row write");
+
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            1,
+            "the cursor was already on row 2, so writing to it dirties only that row"
+        );
+        assert_eq!(
+            tab.render_stats.cells_walked - cells_before,
+            u64::from(DEFAULT_COLS),
+            "walk_dirty hands the whole row's cells to the one rebuilt row"
+        );
+
+        supervisor.close(80);
+    }
+
+    /// `set_theme` bumps `theme_generation`, and `refresh_snapshot`'s
+    /// `cached_theme_generation` guard exists precisely to force a full
+    /// rebuild off that bump — today nothing but the default fg/bg pair
+    /// (already covered by the default-color guard) is theme-derived, but
+    /// the guard is there so a future theme-derived input (e.g. GTK's
+    /// `bold_color` override) fails safe toward over-rebuilding rather than
+    /// silently keeping stale rows.
+    ///
+    /// Measured while writing this test: `apply_theme_candidate`'s color
+    /// FFI calls (`set_color_foreground`/`background`/`cursor`/`palette`)
+    /// already report `Dirty::Full` on their own at our pinned Ghostty SHA
+    /// — pinned separately by `theme_color_changes_report_full` in
+    /// `crates/roost-vt/tests/render_dirty_test.rs` — so with a real theme
+    /// apply neither `cached_defaults` nor `cached_theme_generation` is
+    /// individually load-bearing for this test (confirmed: disabling both
+    /// at once still left it passing). What *does* make it fail is the
+    /// same class of bug as the resize guard above — the FFI calls
+    /// silently not reaching libghostty while `theme_generation` still
+    /// bumps: stubbing those calls out with the generation guard in place
+    /// still passed (`DEFAULT_ROWS`), and disabling the guard on top of
+    /// that stub dropped the rebuild to 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn applying_a_theme_rebuilds_every_row() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(81, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[Hhello");
+        tab.refresh_snapshot().expect("settle the written grid");
+
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        let dracula = Theme::load_bundled("Dracula");
+        tab.set_theme(&dracula).expect("theme applies");
+
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            u64::from(DEFAULT_ROWS),
+            "set_theme's own refresh must rebuild every row, not just the changed ones"
+        );
+
+        supervisor.close(81);
+    }
+
+    /// Pins the `(cols, rows)` cache-size guard against a narrower
+    /// row-count-only guard: a width-only resize leaves `self.rows`
+    /// unchanged, so a guard keyed on row count alone would miss it and
+    /// every cached row would keep rendering at the old column width.
+    ///
+    /// Measured while writing this test: at our pinned Ghostty SHA,
+    /// `Terminal::resize` itself always reports `Dirty::Full` regardless of
+    /// which axis moved (pinned separately by
+    /// `resize_reports_full_over_the_new_row_count` in
+    /// `crates/roost-vt/tests/render_dirty_test.rs`), so on the real
+    /// `apply_geometry` path this guard's own `mark_full` is currently a
+    /// redundant second line of defense, not the sole reason this test
+    /// passes. It stops being redundant, and this test starts actually
+    /// depending on it, the moment `apply_geometry`'s call into libghostty
+    /// silently no-ops while `self.cols`/`self.rows` still move — verified
+    /// by temporarily stubbing that call out during review: with the
+    /// `(cols, rows)` guard intact the rebuild count held at
+    /// `DEFAULT_ROWS`, and narrowing the guard to rows-only on top of that
+    /// stub dropped it to 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_width_only_resize_rebuilds_every_row() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(82, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[Hhello");
+        tab.refresh_snapshot().expect("settle the written grid");
+
+        let metrics = tab.applied_metrics.expect("installed metrics");
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        let change = tab
+            .apply_geometry(
+                DEFAULT_COLS + 10,
+                DEFAULT_ROWS,
+                metrics,
+                tab.metric_generation + 1,
+            )
+            .expect("apply a width-only geometry change")
+            .expect("cols moved, so this is a real geometry change");
+        assert!(
+            change.grid_changed,
+            "cols moved, so the grid-changed flag must fire even though rows did not"
+        );
+        tab.commit_geometry(change);
+        tab.refresh_snapshot()
+            .expect("refresh after the width-only resize");
+
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            u64::from(DEFAULT_ROWS),
+            "a width-only resize invalidates every cached row even though the row count is unchanged"
+        );
+
+        supervisor.close(82);
+    }
+
+    /// Pins that a scrolled-back viewport is never served from the stale
+    /// row cache. None of `refresh_snapshot`'s three cache-key guards fire
+    /// here — grid size, defaults, and theme generation are all unchanged
+    /// by a page up — so this pins libghostty's own dirty reporting for a
+    /// viewport move (it reports every row dirty) rather than one of this
+    /// module's guards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scrolling_back_into_history_rebuilds_every_row_and_changes_the_text() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(83, feed_tx);
+        for line in 0..(usize::from(DEFAULT_ROWS) * 3) {
+            tab.write_vt(format!("history-{line:04}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("settle at the live bottom");
+        let before_text = tab.dump().rows_text;
+
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        let route = tab
+            .handle_page(PageDirection::Up)
+            .expect("page up into history");
+        assert!(
+            matches!(
+                route,
+                PageRoute::LocalViewport {
+                    scrolled_back: true
+                }
+            ),
+            "enough history exists that page up must move the local viewport: {route:?}"
+        );
+
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            u64::from(DEFAULT_ROWS),
+            "a viewport move rebuilds every row rather than reusing the live-bottom cache"
+        );
+        assert_ne!(
+            tab.dump().rows_text,
+            before_text,
+            "the scrolled-back viewport must show different rows than the live bottom"
+        );
+
+        supervisor.close(83);
+    }
+
+    /// The headline win of the dirty-tracking change: a hover-only motion
+    /// event — no button, no terminal mouse tracking — never writes to the
+    /// terminal, so `refresh_snapshot` must rebuild nothing even though it
+    /// still republishes the snapshot (pointer shape / hover overlay can
+    /// change independently of content).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pointer_motion_refresh_with_no_terminal_change_rebuilds_zero_rows() {
+        let (feed_tx, _) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(84, feed_tx);
+        tab.write_vt(b"\x1b[2J\x1b[Hhello");
+        tab.refresh_snapshot().expect("settle the written grid");
+
+        let rebuilt_before = tab.render_stats.rows_rebuilt;
+        let cells_before = tab.render_stats.cells_walked;
+        // What `App::pointer` does for a hover-only motion: dispatch through
+        // `handle_native_pointer`, then refresh.
+        tab.handle_native_pointer(NativePointerDispatch {
+            action: PointerAction::Motion,
+            button: None,
+            col: 2,
+            row: 0,
+            mods: 0,
+            click_count: 0,
+            inside: true,
+            link_modifier_held: false,
+        })
+        .expect("hover motion dispatch");
+        tab.refresh_snapshot()
+            .expect("refresh after the motion event");
+
+        assert_eq!(
+            tab.render_stats.rows_rebuilt - rebuilt_before,
+            0,
+            "a motion event with no mouse tracking touches only overlay state, not content"
+        );
+        assert_eq!(
+            tab.render_stats.cells_walked - cells_before,
+            0,
+            "and walks no cells either"
+        );
+
+        supervisor.close(84);
     }
 }

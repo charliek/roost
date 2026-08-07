@@ -21,16 +21,16 @@ use std::sync::Arc;
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
-    AppSetWindowFocusParams, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    AppCursorShapeParams, AppCursorShapeResult, AppRenderStatsParams, AppRenderStatsResult,
+    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
     TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
     TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
     TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
@@ -65,6 +65,12 @@ type WindowMetricsReply = tokio::sync::oneshot::Sender<Result<WindowMetricsResul
 /// Reply for [`UiRequest::SidebarDump`]. Read-only: always answers
 /// `Ok`, matching `WindowMetricsReply`.
 type SidebarDumpReply = tokio::sync::oneshot::Sender<Result<SidebarDumpResult, String>>;
+
+/// Reply for [`UiRequest::AppRenderStats`]: the UI's render-path
+/// counters. Read-only; always answers `Ok`, matching
+/// `WindowMetricsReply`. A UI with no instrumentation answers with a
+/// zeroed struct rather than an error — see the GTK arm.
+type RenderStatsReply = tokio::sync::oneshot::Sender<Result<AppRenderStatsResult, String>>;
 
 /// Reply for a [`UiRequest::Dump`]: the viewport text on success, an
 /// error message (e.g. tab not found / no live terminal) on failure.
@@ -268,6 +274,15 @@ pub enum UiRequest {
     /// collapsed flag (logical points). Backs the sidebar-holds-width
     /// regression suite. Ungated (read-only).
     WindowMetrics { reply: WindowMetricsReply },
+    /// `app.render_stats` — read the UI's render-path counters, and
+    /// zero them afterward when `reset`. Ungated. Not read-only: with
+    /// `reset` it reads and then clears. The counters are the only way
+    /// to measure the real draw path, which needs a live renderer no
+    /// unit test can construct.
+    AppRenderStats {
+        reset: bool,
+        reply: RenderStatsReply,
+    },
     /// `app.sidebar_dump` — read the sidebar's last-rendered agent rows
     /// per project, plus the agents-visible toggle. Ungated (read-only);
     /// reads `ProjectUi::rendered_agents`, the same cache the sidebar
@@ -677,6 +692,17 @@ async fn dispatch(
             let _p: WindowMetricsParams = decode(params)?;
             let result = h
                 .ui_call(|reply| UiRequest::WindowMetrics { reply })
+                .await?
+                .map_err(|m| HandlerError::new("internal", m))?;
+            encode(&result)
+        }
+        ops::APP_RENDER_STATS => {
+            let p: AppRenderStatsParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppRenderStats {
+                    reset: p.reset,
+                    reply,
+                })
                 .await?
                 .map_err(|m| HandlerError::new("internal", m))?;
             encode(&result)

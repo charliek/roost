@@ -67,14 +67,19 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced
+.PHONY: test test-rust test-iced test-mac test-harness e2e e2e-gtk e2e-iced e2e-iced-clipboard e2e-mac e2e-gtk-ci e2e-iced-ci e2e-mac-ci smoke-gtk smoke-iced smoke-mac visual-parity smoke-mac-launch test-real-input test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py
 ICED_CLIPBOARD_TESTS := tools/roosttest/test_selection.py tools/roosttest/test_osc52.py
 test: test-rust test-mac test-harness  ## All unit/integration tests (Rust + Swift + harness)
 
-test-rust:  ## cargo test --workspace
+# roost-vt's tests/*.rs all start with `#![cfg(feature = "ffi")]`, so the
+# `--workspace` run compiles and then silently skips every one of them. The
+# second line mirrors CI's separate `cargo test -p roost-vt --features ffi`
+# step (.github/workflows/ci.yml, rust job) so `make test` runs them too.
+test-rust:  ## cargo test --workspace (+ roost-vt ffi tests, cfg-gated out of the default run)
 	cargo test --workspace
+	cargo test -p roost-vt --features ffi
 
 test-iced:  ## Iced unit tests (renderer + input + adapter)
 	cargo test -p roost-iced
@@ -139,6 +144,12 @@ test-iced-real-input: build-iced  ## Iced real clipboard input (self-contained L
 
 test-iced-wayland-input: build-iced  ## Iced system clipboard with cage + a real uinput seat
 	ROOST_REQUIRE_REAL_INPUT=1 uv run --group test python tools/input/linux/iced_wayland_clipboard_check.py
+
+perf-refresh:  ## In-crate refresh_snapshot perf harness (release, --ignored; see tools/perf/README.md)
+	cargo test -p roost-iced --release -- --ignored --nocapture
+
+perf-render-stats:  ## Render-path counters for a running Iced UI (tools/perf/render-stats.sh iced <duration>; args for other targets)
+	tools/perf/render-stats.sh iced
 
 # ---- code quality -----------------------------------------------------
 

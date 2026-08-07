@@ -21,6 +21,7 @@
 //!   roostctl project {list,create,rename,delete,reorder}
 //!   roostctl palette {open,state,query,activate,dismiss}
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
+//!   roostctl render-stats [--reset]
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install [--force]
 //!
@@ -45,13 +46,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use roost_agent::claude::{canonical_hook_event, claude_event_to_reports, CLAUDE_HOOK_EVENTS};
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteItemView, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
-    ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
-    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams, TabDumpResult,
-    TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams,
+    AppRenderStatsParams, AppRenderStatsResult, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteItemView, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateResult,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
+    ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
+    TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSetStateParams, TabSetTitleParams,
+    TabState, TabWriteParams,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
@@ -168,6 +170,16 @@ enum Cmd {
         /// Out-of-range values are rejected by clap with exit code 2.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
         scale: u32,
+    },
+    /// Read the running UI's render-path counters — refresh/draw call
+    /// counts, elapsed nanos, rows and cells walked, `fill_text` calls.
+    /// The only way to measure the real draw path: it needs a live
+    /// renderer no unit test can construct.
+    RenderStats {
+        /// Zero the counters after reading them, so the next read is a
+        /// clean delta over whatever ran in between.
+        #[arg(long)]
+        reset: bool,
     },
     /// Claude Code hook entry point. Reads the JSON event payload
     /// from stdin (Claude's contract), dispatches state +
@@ -880,6 +892,33 @@ async fn main() -> Result<()> {
                     stdout.flush()?;
                 }
             }
+        }
+        Cmd::RenderStats { reset } => {
+            let stats: AppRenderStatsResult = client
+                .call(ops::APP_RENDER_STATS, AppRenderStatsParams { reset })
+                .await?;
+            let per = |total: i64, calls: i64| {
+                if calls > 0 {
+                    (total / calls).to_string()
+                } else {
+                    "-".to_string()
+                }
+            };
+            println!("refresh_calls    {}", stats.refresh_calls);
+            println!("refresh_nanos    {}", stats.refresh_nanos);
+            println!("rows_rebuilt     {}", stats.rows_rebuilt);
+            println!("cells_walked     {}", stats.cells_walked);
+            println!("draw_calls       {}", stats.draw_calls);
+            println!("draw_nanos       {}", stats.draw_nanos);
+            println!("fill_text_calls  {}", stats.fill_text_calls);
+            println!(
+                "ns_per_refresh   {}",
+                per(stats.refresh_nanos, stats.refresh_calls)
+            );
+            println!(
+                "ns_per_draw      {}",
+                per(stats.draw_nanos, stats.draw_calls)
+            );
         }
         Cmd::Palette(PaletteCmd::Open { kind, json }) => {
             let state: PaletteStateResult = client

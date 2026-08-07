@@ -196,6 +196,19 @@ roostctl screenshot > shot.png            # raw PNG bytes to stdout
 
 `--scale` is `1` (default, logical window size) or `2`. With `--out` the CLI writes the file and prints the dimensions + byte count to stderr; without it, the raw PNG bytes go to stdout (nothing else is printed, so the stream stays binary-clean). Backed by the `app.screenshot` IPC op — see [ipc.md](ipc.md).
 
+## `render-stats`
+
+Read the running UI's render-path counters — the only way to measure the real draw path, since `TerminalWidget::draw` needs a live renderer no unit test can construct.
+
+```bash
+roostctl render-stats             # running totals since process start
+roostctl render-stats --reset     # read, then zero for a clean next delta
+```
+
+Prints one counter per line plus two derived averages (`ns_per_refresh`, `ns_per_draw`, shown as `-` when the matching call count is zero). `--reset` zeroes the counters **after** the read, so the read-reset / run workload / read pattern gives you a delta directly.
+
+`refresh_*` covers the snapshot rebuild that walks libghostty's render state (with `rows_rebuilt` / `cells_walked` measuring what it touched); `draw_*` and `fill_text_calls` cover the widget draw pass. Note that `roostctl screenshot` re-renders the window and so inflates the draw counters — read before capturing, or reset after. The GTK UI reports all zeros (no instrumentation yet). Backed by the `app.render_stats` IPC op — see [ipc.md](ipc.md).
+
 ## `palette` subcommands
 
 Drive the command-palette overlay: open it, inspect its rows, filter, activate a row, dismiss. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.

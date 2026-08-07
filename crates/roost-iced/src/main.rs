@@ -6,6 +6,7 @@ mod input;
 mod notifications;
 mod palette_scroll;
 mod paste_image;
+mod perf;
 mod png_encode;
 mod screenshot;
 mod sidebar_resize;

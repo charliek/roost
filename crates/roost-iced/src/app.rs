@@ -29,8 +29,8 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
-    SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
+    AppRenderStatsResult, PaletteItemView, PalettePresentResult, PaletteStateResult, Project,
+    SidebarDumpAgentRow, SidebarDumpProject, SidebarDumpResult, WindowMetricsResult,
 };
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::IpcServer;
@@ -47,9 +47,9 @@ use roost_ui_model::{
 };
 use roost_url::HoverUrl;
 use roost_vt::{
-    key_action, mouse_action, mouse_button, KeyEncoder, KeyEvent, MouseEncoder, MouseEvent,
-    PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal, TerminalOptions,
-    TerminalScroll, TerminalSelection,
+    key_action, mouse_action, mouse_button, ColorRgb, KeyEncoder, KeyEvent, MouseEncoder,
+    MouseEvent, PageDirection, PageRoute, RenderState, ScrollDirection, ScrollRoute, Terminal,
+    TerminalOptions, TerminalScroll, TerminalSelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -60,7 +60,7 @@ use crate::palette_scroll::Visibility;
 use crate::sidebar_resize::SidebarResizeGrip;
 use crate::strip_reorder::{ReorderStrip, StripEvent};
 use crate::terminal_widget::{
-    resolve_colors, DrawCell, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
+    DrawCell, RenderedRow, TerminalMetrics, TerminalPointerEvent, TerminalSnapshot,
     TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
 };
 use crate::Message;
@@ -73,6 +73,12 @@ mod interactions;
 mod palettes;
 mod servicing;
 mod terminal_tab;
+// The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
+// how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
+// `attach_test_terminal` fixture it depends on; it carries no production
+// code, so the whole module (not just an inner `mod tests`) is test-only.
+#[cfg(test)]
+mod perf_bench;
 
 pub(crate) use self::interactions::RenameTarget;
 use self::interactions::{

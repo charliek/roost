@@ -1104,10 +1104,19 @@ jobs:
         run: |
           results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
+          # Allowlist, not a denylist. A denylist of failure/cancelled let
+          # `abandoned` through — the status GitHub assigns when its own
+          # infrastructure kills a job — so a run where 7 of 9 jobs never
+          # executed reported this gate GREEN. Observed on PR #306 during a
+          # GitHub "Failed to resolve action download info" incident.
+          # Anything that is not an actual pass now fails the gate.
           for r in ${results}; do
-            if [ "${r}" = "failure" ] || [ "${r}" = "cancelled" ]; then
-              echo "::error::a CI job failed (${results})"
-              exit 1
-            fi
+            case "${r}" in
+              success|skipped) ;;
+              *)
+                echo "::error::a required CI job did not pass: '${r}' (${results})"
+                exit 1
+                ;;
+            esac
           done
           echo "all good"

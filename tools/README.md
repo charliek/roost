@@ -2,7 +2,9 @@
 
 Three layers, by *what they can verify* and *how they drive the app*.
 Reach for the highest layer that can answer your question — it's faster,
-more deterministic, and more portable.
+more deterministic, and more portable. Layers 1-3 verify *correctness*;
+[`perf/`](perf/README.md) measures *cost* instead and is not part of this
+ladder — see its own README.
 
 ```
 tools/
@@ -11,6 +13,10 @@ tools/
   input/          Layer 3 — real OS input injection, platform-specific.
     linux/          uinput key/pointer + clipboard + single-monitor (COSMIC/Wayland).
     (mac/)          CGEvent equivalent — planned.
+  perf/           Render-path cost — a sibling axis, not a layer (see intro above).
+  roosttest_unit/ (non-tier — fast unit tests for the harness wiring itself)
+  shed/           (non-tier — Apple VZ Linux microVM driver for Linux testing from a Mac)
+  wayland/        (non-tier — Wayland-specific test support)
 ```
 
 | Layer | Dir | Drives via | Verifies | Platforms | CI |

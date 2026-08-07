@@ -1028,6 +1028,46 @@ pub struct SidebarDumpResult {
     pub projects: Vec<SidebarDumpProject>,
 }
 
+/// `app.render_stats` request — read the running UI's render-path
+/// counters. `reset` zeroes them *after* the read, so a caller can
+/// read-reset, run a workload, then read the delta directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppRenderStatsParams {
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// `app.render_stats` response — running totals since process start
+/// (or the last `reset: true`).
+///
+/// Every counter is string-wrapped: the nanosecond accumulators pass
+/// 2^53 after roughly 104 days of measured render time, and a JSON
+/// number would silently lose precision in any JS client. The
+/// remaining counters ride the same convention so the shape is
+/// uniform rather than half-and-half.
+///
+/// Permissive (no `deny_unknown_fields`) like every other result
+/// struct, so a newer UI can add counters without breaking older
+/// clients.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRenderStatsResult {
+    #[serde(with = "string_int64")]
+    pub refresh_calls: i64,
+    #[serde(with = "string_int64")]
+    pub refresh_nanos: i64,
+    #[serde(with = "string_int64")]
+    pub rows_rebuilt: i64,
+    #[serde(with = "string_int64")]
+    pub cells_walked: i64,
+    #[serde(with = "string_int64")]
+    pub draw_calls: i64,
+    #[serde(with = "string_int64")]
+    pub draw_nanos: i64,
+    #[serde(with = "string_int64")]
+    pub fill_text_calls: i64,
+}
+
 /// `window.resize` request — programmatically set the window's logical
 /// size. Test-mode only (gated by `ROOST_TEST_MODE=1`); see the op
 /// const comment block below for the rationale.
@@ -1204,6 +1244,15 @@ pub mod ops {
     /// is a wire-visible test failure rather than an invisible one
     /// (plan 007 §3.8).
     pub const SIDEBAR_DUMP: &str = "app.sidebar_dump";
+    /// Read the running UI's render-path counters (refresh + draw call
+    /// counts, elapsed nanos, rows/cells walked, `fill_text` calls),
+    /// optionally zeroing them after the read. Ungated for the same
+    /// reason as `tab.dump_resolved`: reading counters mutates nothing
+    /// a user can see. The draw-side numbers only exist in a running
+    /// app — `TerminalWidget::draw` needs a live renderer, which unit
+    /// tests can't construct — so this op is the only way to measure
+    /// the real draw path.
+    pub const APP_RENDER_STATS: &str = "app.render_stats";
 
     /// Command-palette overlay: open a root frame, read the current
     /// frame's rows, set the filter, activate a row (same dispatch as its
@@ -1899,6 +1948,60 @@ mod tests {
         round_trip(&SidebarDumpParams {});
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<SidebarDumpParams>(bad).is_err());
+    }
+
+    /// `reset` defaults to false so `{"op":"app.render_stats"}` with no
+    /// params at all is a plain read — the common case. Same shape as
+    /// `TabCapturePtyInputParams::drain`.
+    #[test]
+    fn app_render_stats_params_default_reset_is_false() {
+        let p: AppRenderStatsParams = serde_json::from_str("{}").unwrap();
+        assert!(!p.reset);
+        assert!(!AppRenderStatsParams::default().reset);
+        round_trip(&AppRenderStatsParams { reset: true });
+        let bad = r#"{"reset":true,"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppRenderStatsParams>(bad).is_err());
+    }
+
+    /// Every counter is string-wrapped int64: nanosecond accumulators
+    /// exceed JS's 2^53 safe range, and a mixed number/string shape
+    /// would be the worst of both. Assert the *encoding*, not just the
+    /// round-trip, so dropping `string_int64` from a field fails here.
+    #[test]
+    fn app_render_stats_result_counters_are_string_wrapped() {
+        let r = AppRenderStatsResult {
+            refresh_calls: 12,
+            refresh_nanos: 9_007_199_254_740_993,
+            rows_rebuilt: 288,
+            cells_walked: 23_040,
+            draw_calls: 30,
+            draw_nanos: 4_500_000,
+            fill_text_calls: 720,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""refresh_calls":"12""#), "got: {json}");
+        assert!(
+            json.contains(r#""refresh_nanos":"9007199254740993""#),
+            "got: {json}"
+        );
+        assert!(json.contains(r#""rows_rebuilt":"288""#), "got: {json}");
+        assert!(json.contains(r#""cells_walked":"23040""#), "got: {json}");
+        assert!(json.contains(r#""draw_calls":"30""#), "got: {json}");
+        assert!(json.contains(r#""draw_nanos":"4500000""#), "got: {json}");
+        assert!(json.contains(r#""fill_text_calls":"720""#), "got: {json}");
+        round_trip(&r);
+    }
+
+    /// Result structs stay permissive so a newer UI can add a counter
+    /// without breaking older clients — the same contract
+    /// `TabDumpResolvedResult` documents.
+    #[test]
+    fn app_render_stats_result_accepts_extra_fields() {
+        let json = r#"{"refresh_calls":"1","refresh_nanos":"2","rows_rebuilt":"3",
+                       "cells_walked":"4","draw_calls":"5","draw_nanos":"6",
+                       "fill_text_calls":"7","gpu_nanos":"8"}"#;
+        let r: AppRenderStatsResult = serde_json::from_str(json).expect("permissive decode");
+        assert_eq!(r.fill_text_calls, 7);
     }
 
     #[test]

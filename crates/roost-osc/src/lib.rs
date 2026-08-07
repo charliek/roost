@@ -1,18 +1,26 @@
 //! Streaming OSC scanner — Phase 6a P4.
 //!
-//! OSC scanner tailored to the daemon's architecture:
+//! Originally written for the daemon, which was intentionally
+//! libghostty-free: the UI reported raw OSC bytes via `ReportOsc` and
+//! the daemon parsed everything it needed to route, so this scanner
+//! emits `Title` for OSC 0/1/2 on top of the notification/cwd/color
+//! classes even though the UI's libghostty handles titles itself.
 //!
-//!   * The UI's libghostty handles window-title OSC (0/1/2) itself,
-//!     so a scanner sitting next to it would only need to cover the
-//!     OSC classes libghostty doesn't surface (notifications, cwd,
-//!     color queries).
+//! **That premise is obsolete — the daemon is gone and both Rust UIs
+//! embed libghostty — but the conclusion still holds, for a different
+//! reason.** libghostty's OSC parser cannot replace this one:
+//! `GhosttyOscCommandData` exposes exactly one payload accessor
+//! (`CHANGE_WINDOW_TITLE_STR`), identical in our pinned header and at
+//! Ghostty tip. It discriminates 22 command *types* but hands back no
+//! data for OSC 7 / 9 / 10-12 / 4 / 133 / 52 / 22 — seven of the eight
+//! [`OscEvent`] variants. The policy below (percent-decode +
+//! `file://` extraction, ConEmu OSC 9 sub-command filtering, OSC 52
+//! base64 decode with refuse-on-truncation, `MAX_BODY`, reply
+//! synthesis) has no C-API counterpart and would survive regardless.
 //!
-//!   * This scanner instead sits in the daemon, which is
-//!     intentionally libghostty-free (see goal-rust-port-polish DL
-//!     choices). The UI reports raw OSC bytes via `ReportOsc` and the
-//!     daemon parses everything it needs to route. So this scanner
-//!     also emits `Title` for OSC 0/1/2, on top of the
-//!     notification/cwd/color classes.
+//! Re-evaluate only if libghostty-vt grows `GHOSTTY_OSC_DATA_*`
+//! accessors beyond window title — tracked as a watch item in
+//! `docs/development/iced-migration-roadmap.md`.
 //!
 //! Architecture:
 //!

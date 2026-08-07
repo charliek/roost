@@ -248,6 +248,163 @@ architecture cleanup that everything real-time depends on; 3f is done and
 (plan 016) — only 3h (polish parity II, user-directed) remains open on
 this track.
 
+### Engine track (E) — shared renderer + robustness
+
+Deliberately **not** M3 slices. These span `roost-vt` / `roost-ui-model`
+and land in all three UIs, so they are not part of "Iced functional
+parity"; they run alongside M3/M4 rather than gating either. Lettered `E`
+to avoid colliding with the parity inventory's P0/P1/P2 *priority* labels.
+
+Recorded 2026-08-06 from a Ghostty-comparison discovery pass. The headline
+finding: **libghostty-vt's render-state dirty tracking is exposed in the
+pinned header and wrapped by nobody** — not Swift, not GTK, not Iced. All
+three walk the full grid on every update.
+
+The E-entries below were written as predictions before any of this
+shipped; where the measured result corrected one, that correction is
+recorded alongside it rather than quietly edited away.
+
+* **E1. Renderer baseline measurement — done, prediction corrected.**
+  The original plan was frame time under a full-screen scrolling TUI at
+  max window size. That workload is precisely the one E3 cannot move:
+  libghostty full-rebuilds its render state whenever the viewport pin
+  changes ("If our viewport pin changed, we do a full rebuild" —
+  `third_party/ghostty/src/src/terminal/render.zig:299-302`), so any
+  output that scrolls is a full rebuild by construction, independent of
+  our dirty-tracking wrapper. Measuring only that would have produced a
+  near-flat number and fed a false "no win here" into E4's go/no-go.
+  What actually shipped: deterministic per-tab counters
+  (`refresh_calls` / `refresh_nanos` / `rows_rebuilt` / `cells_walked`,
+  plus `draw_calls` / `draw_nanos` / `fill_text_calls` for the
+  draw path) and CPU-side span timings, exercised by three workloads —
+  W1 pointer-motion storm, W2 in-place TUI redraw, W3 scrolling stream
+  as an explicit control expected to stay flat — readable three ways:
+  CI unit tests, an `#[ignore]`d in-crate harness (`make perf-refresh`),
+  and the `app.render_stats` IPC op via `roostctl render-stats`
+  (`make perf-render-stats`), which is the only way to get draw-path
+  numbers at all (no unit test constructs a live `iced::Renderer`).
+  Locked-Mac caveat: presented frame rate is meaningless on a locked or
+  occluded Mac (macOS throttles presentation), which is why this
+  measures CPU spans and counters instead. See `tools/perf/README.md`
+  for the harness.
+* **E2. Render-state dirty coverage — done.** Shipped in
+  `crates/roost-vt/src/render_state.rs`: `Dirty { Clean, Partial, Full }`,
+  `dirty()`, `mark_full()`, `dirty_rows()`, `walk_dirty()`. The footgun
+  (render.h's "extremely important detail" that clearing one dirty layer
+  does not clear the other) is handled by making consumption imply
+  reset — `walk_dirty` clears BOTH layers together, and there is
+  deliberately no public way to lower the dirty state otherwise: a
+  general `set_dirty` would have made `set_dirty(Clean)` the very
+  footgun this wrapper exists to prevent. `walk` is unchanged, so E2 is
+  purely additive and GTK is untouched by it. 14 tests in
+  `crates/roost-vt/tests/render_dirty_test.rs` pin the measured
+  semantics.
+  **Two-phase `begin_update` / `end_update` is NOT available at our pin** —
+  it landed upstream after `c74f6d5` (present at `../ghostty` tip and in
+  `../libghostty-rs`, absent from our generated bindings). It is an E8
+  follow-on, not part of E2; don't plan around it.
+  `../libghostty-rs`'s `crates/libghostty-vt/src/render.rs` is MIT and a
+  useful reference for the dirty accessors regardless.
+* **E3. Dirty-row snapshot rebuild — done for `roost-iced`.** Consumes
+  E2. `refresh_snapshot` (`app/terminal_tab.rs`) used to rebuild the
+  whole grid per PTY update, allocating `vec![vec![String::new(); cols];
+  rows]` — a `String` per cell including blanks — plus a `String` per
+  `DrawCell`. Shipped shape: `TerminalSnapshot`'s `cells` + `rows_text`
+  became `grid: Vec<Arc<RenderedRow>>`, `DrawCell` lost its `row` field
+  so the row index has exactly one source of truth (the owning
+  `RenderedRow`'s position), and three invalidation guards force a full
+  rebuild outside `walk_dirty`'s own signal: grid size on both axes,
+  the default fg/bg pair, and a theme generation counter.
+  Measured (`refresh_snapshot`, `--release`, N=200/workload, before =
+  `f3e2657` pre-E3, after = this branch's HEAD, both built fresh in a
+  `git worktree` back-to-back):
+
+  | workload | before ns/refresh | after ns/refresh | speedup | rows rebuilt/refresh |
+  |---|---|---|---|---|
+  | W1 pointer-motion storm | 107,605 | 956 | 113x | 32.00 → 0.16 |
+  | W2 in-place TUI redraw | 110,025 | 6,163 | 17.9x | 32.00 → 2.15 |
+  | W3 scrolling stream (control) | 116,609 | 57,473 | 2.0x | 32.00 → 27.50 |
+
+  **Important limitation:** streaming/scrolling output gets **no
+  dirty-tracking benefit** — W3 barely moves in rows rebuilt (32.00 →
+  27.50) because libghostty full-rebuilds on any viewport-pin change, per
+  E1's correction above. Its 2.0x clock gain is a *separate* effect: E3
+  also deleted the dense `vec![vec![String::new(); cols]; rows]`
+  allocation, which cost a `String` per cell including blanks, so even
+  full rebuilds got cheaper. Judge W3 on rows/refresh staying high, not
+  on its timing. The dirty-tracking wins are concentrated in in-place TUI
+  redraws and the non-PTY refresh callers — above all mouse motion (W1),
+  which previously rebuilt the entire grid on every pointer event for
+  zero content change.
+  **libghostty limitation worked around:** `OSC 10`/`OSC 11` and DECSCNM
+  change the reported default colors while libghostty reports
+  `dirty=Clean` with zero rows flagged — the dirty API alone can't see
+  it — so the consumer must compare the default fg/bg pair itself
+  (the `cached_defaults` guard above). Tripwire tests in
+  `crates/roost-vt/tests/render_dirty_test.rs` will fail loudly if a
+  future Ghostty bump changes this.
+* **E3b. Dirty-row rebuild for GTK + real `render_stats` — not started.**
+  Split out of E3, which originally read "GTK's `terminal_view.rs` gets
+  the same treatment." Two parts: `crates/roost-linux/src/terminal_view.rs`
+  adopts `walk_dirty` the same way `roost-iced` did, and
+  `app.render_stats` gets a real implementation — today it answers with
+  zeroed counters as a deliberate parity placeholder
+  (`crates/roost-linux/src/app.rs`'s `UiRequest::AppRenderStats` arm),
+  so the op's contract is identical on both Rust UIs while only one
+  collects real numbers. GTK is unaffected by the E1–E3 pass beyond that
+  placeholder, since `walk` itself was left unchanged.
+* **E4. Run coalescing — future work, GO per E1's number.** Merge
+  adjacent cells sharing fg/bg/style into one `fill_text` run. A
+  `roost-ui-model` change, so GTK benefits too. Was "conditional on E1
+  — do not start this without E1's number"; that number now exists:
+  a running (debug-build) app doing a 300-line scrolling burst on a full
+  screen issues ~2,410 `fill_text` calls per draw (one per visible
+  cell), and draw now dominates a refresh at ~1.37 ms vs. ~1 µs for an
+  idle refresh post-E3 (696 µs for a full refresh). `fill_text_calls` is
+  a deterministic counter (host- and build-independent); the nanosecond
+  figures are debug-build and indicative only. Not being done in this
+  pass.
+* **E5. Sprite parity in Iced.** `mac/Sources/Roost/Sprite.swift` and
+  `crates/roost-linux/src/sprite.rs` draw U+2500–U+259F (box-drawing,
+  block elements) geometrically because font glyphs don't tile
+  pixel-perfectly across adjacent cells. **`roost-iced` has no sprite
+  path at all** — so TUI chrome shows hairline seams there and not in
+  either shipped UI. This is a regression against our own shipped Linux
+  UI, not a macOS concern. The Linux sibling is already Rust: move it to
+  a shared crate and add the draw call. Add the matching row to the
+  parity inventory (it has none today, which is why this went unnoticed).
+* **E6. IME input.** `crates/roost-iced/src/input.rs` handles no `Ime`
+  events, so dead keys, CJK input, and the emoji picker are broken.
+  winit surfaces IME on both platforms — this is a Linux-shipping gap
+  too, not a macOS-only one.
+* **E7. Crash robustness.** No `panic::set_hook` anywhere in `roost-iced`
+  or `roost-engine`; GTK ships to Linux users today with none. Add a
+  panic hook that logs + writes a crash file, and close [#299] (verified
+  release-build infinite loop on a malformed font) — promote it out of
+  the maintenance backlog. Both are entry gates for M6.
+* **E8. Ghostty pin + zig bump** — *sequenced after the M6 direction
+  resolves.* `third_party/ghostty/build.sh` pins `c74f6d5` (2026-04-25)
+  against zig 0.15.2 (`.mise.toml`); `../libghostty-rs` pins `ab0b9da`
+  (2026-07-22, **603 commits ahead**) and needs zig 0.16.x. Wanted
+  eventually regardless. A large share of the cost is revalidating the
+  **Swift** build — `mac/Package.swift` links the same static archive —
+  so the price drops sharply if Swift is retiring. That is why this sits
+  after the M6 decision, not before it. Carries E2's deferred half: the
+  two-phase `begin_update` / `end_update` split arrives with the newer
+  pin, letting the renderer drop the terminal lock before the deferred
+  work — a latency win under heavy PTY output.
+* **E9. `libghostty-rs` integration spike + library audit.** Depends on
+  E8. Checked out at `../libghostty-rs` (tip `72ac98f`, 2026-07-29, MIT,
+  not on crates.io — fine, `publish = false`). It is broader than
+  `roost-vt` (osc, kitty graphics, paste, sgr, screen, unicode, focus)
+  and more rigorous (borrow-checked lifetimes, typestate updates). Two
+  integration notes: `GHOSTTY_SOURCE_DIR` can point its `build.rs` at our
+  existing checkout, and a `pkg-config` feature can discover a
+  pre-built archive — worth a spike so we don't run zig twice. Adopting
+  it dissolves the `render_state.rs` ↔ `RenderState.swift` 1:1 parity
+  correspondence, which is a *cost* while Swift lives and a non-issue
+  after. Audit for further wins once integrated.
+
 ### Maintenance backlog (filed, not scheduled)
 
 Work this migration surfaced that should not block a slice. Pull one in
@@ -269,6 +426,7 @@ when it touches the code you are already in:
 | `roost-engine::facade` has no consumer; prove it or delete it (blocks M5) | [#286] |
 | `app/interactions.rs` at 2,960 lines — finer split when fixtures allow | [#288] |
 | swift-testing runner SIGABRT on fast value-check swarms (XCTest workaround) | [#289] |
+| **OSC consolidation — watch item, do not act.** `roost-osc` cannot fold into libghostty's OSC parser: `GhosttyOscCommandData` exposes exactly one payload accessor (`CHANGE_WINDOW_TITLE_STR`), identical in our pinned header and in `../ghostty` tip, so a pin bump does not help. libghostty discriminates 22 command *types* but hands back no data for OSC 7 / 9 / 10-12 / 4 / 133 / 52 / 22 — 7 of the 8 events `OscEvent` needs. The custom parts (percent-decode + `file://` extraction, ConEmu OSC 9 sub-command filtering, OSC 52 base64 decode + refuse-on-truncation, `MAX_BODY`, reply synthesis) are policy with no C-API counterpart and would survive anyway. **Exit condition:** libghostty-vt adds `GHOSTTY_OSC_DATA_*` accessors beyond window title — then re-evaluate. | — |
 
 [#281]: https://github.com/charliek/roost/issues/281
 [#282]: https://github.com/charliek/roost/issues/282
@@ -306,42 +464,20 @@ should re-verify every row against current behavior, close what shipped,
 and decide [#284] (visual-parity CI gate: required for M4 or waived).
 After plan 015, the open P1 set is expected to be exactly the 3e polish
 scope plus the upstream-blocked drops row ([#302]) — the audit confirms
-that expectation rather than assuming it.
-
-### Possible direction — macOS side-by-side evaluation (not committed)
-
-Recorded 2026-08-05: the Iced work has landed better than expected, and
-replacing the Swift app is now a *possible* direction rather than a
-non-goal — but it is not guaranteed, a lot of testing stands between here
-and any commitment, and **Swift remains the production daily driver
-regardless** (guardrail #1 unchanged). Two consequences today:
-
-1. **Design Iced platform-clean now.** New roost-iced capability with a
-   native surface gets a per-OS backend seam rather than a Linux-only
-   shape — notifications (slice 3f) are the first instance: Linux D-Bus
-   ships; the macOS backend (`UNUserNotificationCenter`, which needs a
-   real .app bundle identity + code signature) is deferred, not
-   designed out. No macOS backend gets half-shipped from an unbundled
-   binary.
-2. **M5 is frozen pending this direction** — see below.
-
-If the direction firms up, the evaluation vehicle is a parallel-install
-signed+notarized DMG (the `ai.stridelabs.Roost.iced` profile is already
-fully isolated for side-by-side running), gated on a robustness pass:
-release-profile CI coverage for Iced, the [#299] swash release-hang fix
-(a Mac daily driver meets the full macOS font universe), a panic-hook
-crash/feedback story, and a mac-UX gap audit (menu bar, cmd-key
-conventions, dock badge — plus 3e's vibrancy spike). Guardrail #3's
-"absent from release artifacts" would be amended consciously at that
-point (separate opt-in artifact, never bundled into the Swift release).
+that expectation rather than assuming it. Amended 2026-08-06: add the new
+box-drawing/sprite row (engine-track slice E5) to that expected set. It is
+a genuine P1 gap against *both* references, and the fact that it went
+unnoticed until a Ghostty-comparison pass — because the inventory had no
+row for it — is exactly the drift the audit exists to catch. Treat
+"is there a row for this at all?" as an audit question, not just "is this
+row current?".
 
 ### M5 — Rust under Swift (exploration, frozen)
 
-Frozen 2026-08-05 pending the possible-direction note above: if a
-full Iced replacement is evaluated, a Swift-facing FFI boundary is
-likely wasted investment — [#286] holds at "don't invest, don't
-delete" until the direction resolves. Original exploration plan kept
-below for when/if it resumes.
+Frozen 2026-08-05 pending M6 below: if a full Iced replacement is
+evaluated, a Swift-facing FFI boundary is likely wasted investment —
+[#286] holds at "don't invest, don't delete" until the direction
+resolves. Original exploration plan kept below for when/if it resumes.
 
 The Swift app's polish and daily use make replacement remote; the question
 is where shared Rust reduces duplication *without* slowdowns.
@@ -362,6 +498,142 @@ is where shared Rust reduces duplication *without* slowdowns.
    per-frame render paths **never**.
 4. Decision gate with data; until then `IPCHandlerImpl.swift` /
    `Workspace.swift` remain authoritative on Mac.
+
+### M6 — macOS Iced (evaluation → parity)
+
+**Runs parallel to M4, not after it.** The number follows M5 for document
+order only; nothing here waits on shipping Iced to Linux users.
+
+Status (2026-08-06): replacing the Swift app is now **likely** rather than
+merely possible — but it is not committed, it is a ways off, and
+**Swift remains the production daily driver throughout** (guardrail #1
+unchanged). This section supersedes the earlier "Possible direction —
+macOS side-by-side evaluation" note. Two standing consequences:
+
+1. **Design Iced platform-clean now.** New roost-iced capability with a
+   native surface gets a per-OS backend seam rather than a Linux-only
+   shape — notifications (slice 3f) are the first instance: Linux D-Bus
+   ships; the macOS backend is deferred, not designed out. No macOS
+   backend gets half-shipped from an unbundled binary.
+2. **M5 stays frozen** while this is live. M6 is the *opposite* direction
+   from M5 (Iced replaces Swift vs. Rust under Swift); keep them separate
+   so the frozen thing stays frozen.
+
+**Entry gate:** E5 and E7 complete; release-profile CI coverage for Iced;
+parity-inventory audit clean. Note the reference bar here is the **Swift
+app**, which is consistently stricter than M4's GTK bar — the inventory
+tracks both, and M6 is the superset.
+
+**Accepted regressions**, decided rather than discovered: accessibility.
+AppKit gives the Swift sidebar and menus VoiceOver support for free; an
+Iced canvas gives essentially none. Named here so it is a conscious trade.
+
+Guardrail #3's "absent from release artifacts" is amended consciously at
+6a: a separate opt-in artifact, never bundled into the Swift release.
+
+Slices:
+
+* **6a. Bundling + parallel install.** The foundation — Sparkle,
+  notifications, and TCC testing all need real bundle identity, so
+  nothing below starts until this lands. `mac/scripts/bundle.sh` is
+  toolkit-agnostic apart from `swift build --show-bin-path`; fork or
+  parameterize it over (binary, bundle id, plist). `make-dmg.sh` needs no
+  change. `roost-iced` must also resolve its profile from its own bundle
+  id rather than calling `BundleProfile::iced()` unconditionally.
+  Decisions taken 2026-08-06:
+    * **Display name `Roost-Iced`** (`CFBundleName` /
+      `CFBundleDisplayName`; window title should match) — two apps called
+      "Roost" in the Dock and Cmd-Tab is genuinely confusing.
+      **Display-only.** `app_label` stays `Roost-iced` (lowercase `i`):
+      it drives the socket dir, the log dir, and the `identify` wire
+      response (`roost-ipc/src/messages.rs`), which roosttest asserts on,
+      and case-changing it is a no-op on macOS but a breaking path change
+      on Linux, where `roost-iced` also runs. Do not "fix" the
+      inconsistency.
+    * **Fresh, separate `state.json`** — no import, no migration. This is
+      already what `BundleProfile::iced()` does, so it is *zero* work.
+      Scoped to macOS side-by-side; it does **not** settle M4's Linux
+      adopt-or-migrate question, where Iced eventually replaces GTK for
+      the same users.
+    * **Sparkle/appcast deferred to 6c.** 6a ships with no auto-update
+      (`SUEnableAutomaticChecks` is already `false`).
+  Side-by-side is mostly already solved and needs no new machinery:
+  distinct bundle ids, per-profile socket/state/log paths with tests
+  asserting distinctness (`roost-ipc/src/paths.rs`), per-profile
+  single-instance locks. **Claude hooks need no per-app configuration** —
+  `ROOST_SOCKET` is injected into every PTY child (`roost-engine/src/pty.rs`,
+  `PtySupervisor.swift`) and sits at precedence #2 in target resolution,
+  above `--target` and auto-detect, so a Claude session in an Iced tab
+  dials the Iced socket automatically; `claude_settings_document()`
+  (`roost-cli/src/main.rs`) bakes no socket or profile into
+  `claude-settings.json`. One operational wrinkle to note in the install
+  output, not fix in code: `claude install` writes `self_exe()`, so with
+  two bundles the hook file points at whichever `roostctl` ran it last.
+  Two bundle ids also mean two entries in System Settings › Notifications.
+* **6b. Native shim seam.** One decision with three consumers (6c/6d/6e):
+  call AppKit via `objc2` (already in the lockfile through winit) or
+  build a small Swift static library behind a C ABI. Leaning Swift lib —
+  it amortizes across Sparkle, menus, and notifications, and the Swift
+  toolchain is already a build dependency. Decide with a spike, not in
+  the abstract.
+* **6c. Sparkle auto-update.** `mac/Package.swift` + `App.swift` use
+  ~two API calls (`SPUStandardUpdaterController`, `checkForUpdates(_:)`);
+  `bundle.sh` already embeds and inside-out-signs the framework, and
+  `release.yml` already EdDSA-signs and publishes the appcast. The
+  evaluation build needs a **separate feed or none** so the two apps do
+  not offer each other's updates. Design note for the eventual cutover:
+  Sparkle does not care what language wrote the app, so an Iced build
+  shipping under the *same* bundle id with the same `SUPublicEDKey` and a
+  higher `CFBundleVersion` upgrades existing Swift installs in place.
+* **6d. Menu bar.** winit installs none, so Iced on macOS currently has
+  no menus at all. `App.swift` builds ~35 items across App/File/View/
+  Edit/Window plus a dynamic Window menu of tabs and projects. Options:
+  `muda` (designed to sit alongside winit) or hand-rolled NSMenu via
+  `objc2-app-kit`. The keybind story is *better* in Rust — the table
+  already lives in `roost-ui-model`, so menu equivalents and the terminal
+  key encoder read one source instead of Swift re-deriving them. Highest
+  volume, lowest risk; also where "custom options later" becomes cheap
+  once menu items are just `Message` variants.
+* **6e. Desktop notifications, macOS backend.** Closes [#303]. The seam
+  from slice 3f is backend-agnostic already (`notifications.rs`: worker,
+  per-tab replace semantics, click routing); only `mod backend` is
+  missing. `UNUserNotificationCenter` requires a bundled, signed app —
+  hence the 6a dependency, and it cannot be validated from `make
+  run-iced`. Match `mac/Sources/Roost/DesktopNotifications.swift`
+  semantics. Replace-by-server-id becomes UN's stable per-tab identifier,
+  which is simpler than the D-Bus version.
+* **6f. Window vibrancy.** May partly land in 3h, which already owns the
+  spike. Worth knowing before starting: there is **no `NSVisualEffectView`
+  anywhere in the Swift source** — the sidebar's translucency is AppKit's
+  implicit source-list material (`outline.style = .sourceList` plus
+  `scrollView.drawsBackground = false` and no pane fill), and the Swift
+  code only ever works *around* it. So there is nothing to port 1:1;
+  Iced must build it explicitly. The seam is
+  `iced::window::run(id, |w: &dyn Window| …)` — a main-thread
+  `HasWindowHandle`, with `raw-window-handle` at 0.6.2, the version
+  `window-vibrancy` wants. Same call is the hook for Sparkle init, NSMenu
+  install, and dock badge. Do **not** use `window::Settings { blur }`:
+  winit's macOS impl calls the private `CGSSetWindowBackgroundBlurRadius`
+  SPI and blurs the whole window, not a region. The effect view sits
+  behind the wgpu surface, so the terminal region must stay opaque.
+* **6g. macOS platform hygiene.** Individually small, collectively a
+  pass. Entitlements + purpose strings first: Roost is the TCC
+  *responsible app* for every child process in a tab, so without
+  `device.audio-input` / `device.camera` / `automation.apple-events` a
+  `/voice` or `osascript` in a tab fails **silently** — no prompt, no
+  error (see the rationale comment in `mac/Resources/Roost.entitlements`,
+  including which entitlements we deliberately omit). Then: Dock badge +
+  dock menu, `NSApplicationDelegate` lifecycle (reopen-from-Dock,
+  open-file/URL, graceful terminate), activation policy, and Secure
+  Keyboard Entry (`EnableSecureEventInput` — a terminal convention
+  neither app has today).
+* **6h. macOS verification tier.** What makes the parity claim honest
+  instead of hand-verified: a CGEvent real-input harness ([#285] — the
+  uinput tier is Linux-only, a gap that matters far more once Mac is a
+  target), `e2e-iced-mac` as a required gate, and release-profile CI
+  coverage for Iced. Remember the enumerated-list trap: new roosttest
+  modules need `ICED_E2E_TESTS` in the `Makefile` *and* the `ci.yml`
+  lists, or they never run.
 
 ## Gauntlet operating notes
 

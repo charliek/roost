@@ -5,11 +5,18 @@
 //!      and row-cells handles once. They're reused across frames.
 //!   2. `update(&terminal)` snapshots the current screen.
 //!   3. `walk(|cell| ...)` iterates rows × cells, calling the closure
-//!      once per cell.
+//!      once per cell; `walk_dirty` iterates only the rows that
+//!      changed and consumes the frame's damage.
 //!   4. `cursor()` / `colors()` extract additional per-frame data.
 //!
-//! Matches `mac/Sources/Roost/RenderState.swift` 1:1 in shape — same
-//! constructor pattern, same walk surface, same cursor info layout.
+//! `mac/Sources/Roost/RenderState.swift` mirrors the constructor,
+//! walk, and cursor-info shape — but the two have **intentionally
+//! diverged** as of the dirty-tracking API below (`Dirty`, `dirty`,
+//! `mark_full`, `dirty_rows`, `walk_dirty`). Swift deliberately does
+//! not get dirty tracking: it is the daily driver, its full-grid
+//! renderer is adequate, and the macOS-Iced evaluation may retire it,
+//! so investing in its render path is potentially wasted work. Do not
+//! "restore parity" here without that decision changing.
 
 use std::ptr;
 
@@ -113,6 +120,28 @@ pub struct Cell {
     /// SGR style bits (bold / italic / inverse). Default-style cells
     /// carry `Style::default()` — all bits clear.
     pub style: Style,
+}
+
+/// Global dirty state after `update`. Maps `GhosttyRenderStateDirty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dirty {
+    Clean,
+    Partial,
+    Full,
+}
+
+impl Dirty {
+    fn from_raw(v: sys::GhosttyRenderStateDirty) -> Self {
+        match v {
+            sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_FALSE => Self::Clean,
+            sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_PARTIAL => Self::Partial,
+            // Anything we don't recognize — including a variant a future
+            // Ghostty adds — maps to `Full`, not `Clean`. Guessing "clean"
+            // for an unknown state would skip the rebuild and freeze the
+            // screen; guessing "full" only costs a redraw.
+            _ => Self::Full,
+        }
+    }
 }
 
 pub struct RenderState {
@@ -269,46 +298,19 @@ impl RenderState {
     /// libghostty's contract says they're safe to re-bind via the next
     /// `_next` call without reallocation.
     pub fn walk(&mut self, terminal: &Terminal, mut f: impl FnMut(u32, Cell)) -> Result<()> {
-        // Rebind the row iterator to this frame's state. The C signature
-        // expects `GhosttyRenderStateRowIterator*` (pointer-to-handle slot),
-        // not the handle's value — the function writes into the slot to
-        // re-anchor the pre-allocated iterator at the new frame. Passing
-        // `self.row_iter as *mut _` would point at the iterator's IMPL
-        // and corrupt its internal state, leaving `..._next` returning
-        // false on every row (silent: no error, just zero cells walked).
-        // Mirrors `mac/Sources/Roost/RenderState.swift::walk`'s
-        // `withUnsafeMutablePointer(to: &self.rowIter)` pattern.
-        // SAFETY: state + iter handles non-null per constructor.
-        let rc = unsafe {
-            sys::ghostty_render_state_get(
-                self.handle,
-                sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
-                (&mut self.row_iter) as *mut _ as *mut _,
-            )
-        };
-        Error::from_result(rc)?;
+        self.bind_row_iterator()?;
         // Keep `terminal` alive across the walk so libghostty doesn't
         // drop allocations that back the iterators. Borrowing & makes
         // the lifetime explicit; the variable itself is intentionally
         // unused.
         let _ = terminal;
 
-        let mut row_idx: u32 = 0;
-        // SAFETY: iter handle non-null.
-        while unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
-            // Bind this row's cells to row_cells. Same pointer-to-slot
-            // semantics as the row iterator above — pass `&mut`, not the
-            // handle value.
-            // SAFETY: iter + cells handles non-null.
-            let rc = unsafe {
-                sys::ghostty_render_state_row_get(
-                    self.row_iter,
-                    sys::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                    (&mut self.row_cells) as *mut _ as *mut _,
-                )
-            };
-            if Error::from_result(rc).is_err() {
-                row_idx += 1;
+        for row_idx in 0u32.. {
+            // SAFETY: iter handle non-null.
+            if !unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
+                break;
+            }
+            if self.bind_row_cells().is_err() {
                 continue;
             }
 
@@ -319,9 +321,212 @@ impl RenderState {
                 f(row_idx, cell);
                 col = col.saturating_add(1);
             }
-            row_idx += 1;
         }
         Ok(())
+    }
+
+    /// Global dirty state. Pure read — clears nothing.
+    pub fn dirty(&self) -> Result<Dirty> {
+        let raw = self.read_u32(sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_DIRTY)?;
+        Ok(Dirty::from_raw(raw))
+    }
+
+    /// Raise the global dirty state to `Full`, forcing the next
+    /// `walk_dirty` to visit every row. Monotonic: this is the only
+    /// public way to move the dirty state at all, and it only ever
+    /// raises. Lowering lives solely inside `walk_dirty`, where both
+    /// layers are cleared together — which is what keeps libghostty's
+    /// two-layer footgun (clearing one layer does not clear the other)
+    /// structurally unreachable from safe code.
+    pub fn mark_full(&mut self) -> Result<()> {
+        self.set_global_dirty(sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_FULL)
+    }
+
+    /// Viewport row indices libghostty currently marks dirty. Pure with
+    /// respect to dirty state — clears nothing, on either layer. It does
+    /// rebind the cached row-iterator handle (`self.row_iter`) to walk the
+    /// rows, so it must not be called from inside a `walk` / `walk_dirty`
+    /// callback: that would re-anchor the iterator mid-iteration and
+    /// corrupt the caller's in-flight walk. Diagnostic / test accessor;
+    /// renderers want `walk_dirty`.
+    pub fn dirty_rows(&mut self, terminal: &Terminal) -> Result<Vec<u32>> {
+        self.bind_row_iterator()?;
+        // Keep `terminal` alive across the walk (see `walk`).
+        let _ = terminal;
+
+        let mut rows = Vec::new();
+        for row_idx in 0u32.. {
+            // SAFETY: iter handle non-null.
+            if !unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
+                break;
+            }
+            if self.read_row_dirty() {
+                rows.push(row_idx);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Walk only the rows that changed, handing each row's complete cell
+    /// list to `f`. Visits every row when the global state is `Full`.
+    ///
+    /// **Consumes the frame's damage: clears BOTH dirty layers.** A
+    /// `Clean` frame visits nothing but still clears both, so the
+    /// contract is uniform regardless of what came back.
+    ///
+    /// Contract: `f` is called exactly once per visited row, with that
+    /// row's COMPLETE cell slice. It is never called mid-row, and never
+    /// for a row whose read failed — so a caller may replace its cached
+    /// row wholesale on each callback without a half-built row ever
+    /// landing in the cache. A row whose cells could not be read keeps
+    /// its dirty flag set, so the next frame retries it.
+    ///
+    /// Returns the global state as it was on ENTRY.
+    ///
+    /// On an early `Err` return some rows may already be cleared while
+    /// the global layer is not. That is safe by construction: residual
+    /// damage means the next frame redraws MORE than necessary, never
+    /// less.
+    pub fn walk_dirty(
+        &mut self,
+        terminal: &Terminal,
+        mut f: impl FnMut(u32, &[Cell]),
+    ) -> Result<Dirty> {
+        let global = self.dirty()?;
+        self.bind_row_iterator()?;
+        // Keep `terminal` alive across the walk so libghostty doesn't
+        // drop allocations that back the iterators (see `walk`).
+        let _ = terminal;
+
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut retry_pending = false;
+        for row_idx in 0u32.. {
+            // SAFETY: iter handle non-null.
+            if !unsafe { sys::ghostty_render_state_row_iterator_next(self.row_iter) } {
+                break;
+            }
+
+            let row_dirty = self.read_row_dirty();
+            let visit = match global {
+                Dirty::Clean => false,
+                // `render.h` does not promise that a `Full` frame also
+                // flags every row, so don't depend on it.
+                Dirty::Full => true,
+                Dirty::Partial => row_dirty,
+            };
+
+            if visit {
+                if self.bind_row_cells().is_err() {
+                    // Leave this row's flag SET so the next walk retries
+                    // it, and don't call `f` with a partial row.
+                    retry_pending = true;
+                    continue;
+                }
+
+                cells.clear();
+                let mut col: u16 = 0;
+                // SAFETY: row_cells handle non-null.
+                while unsafe { sys::ghostty_render_state_row_cells_next(self.row_cells) } {
+                    cells.push(self.read_current_cell(col));
+                    col = col.saturating_add(1);
+                }
+                f(row_idx, &cells);
+            }
+
+            if row_dirty {
+                self.clear_row_dirty()?;
+            }
+        }
+
+        // A row we could not read kept its flag, but clearing the global
+        // layer to FALSE would strand it: the next `walk_dirty` reads
+        // `Clean` and visits nothing at all, so the retry the contract
+        // promises would never happen. Leave the frame `Partial` instead,
+        // which is exactly what the surviving row flags mean.
+        self.set_global_dirty(if retry_pending {
+            sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_PARTIAL
+        } else {
+            sys::GhosttyRenderStateDirty_GHOSTTY_RENDER_STATE_DIRTY_FALSE
+        })?;
+        Ok(global)
+    }
+
+    /// Rebind `self.row_iter` to the current frame's state.
+    ///
+    /// The C signature expects `GhosttyRenderStateRowIterator*` (a
+    /// pointer-to-handle slot), not the handle's value — the call writes
+    /// into the slot to re-anchor the pre-allocated iterator at the new
+    /// frame. Passing `self.row_iter as *mut _` would point at the
+    /// iterator's IMPL and corrupt its internal state, leaving
+    /// `..._next` returning false on every row (silent: no error, just
+    /// zero cells walked). Mirrors
+    /// `mac/Sources/Roost/RenderState.swift::walk`'s
+    /// `withUnsafeMutablePointer(to: &self.rowIter)` pattern.
+    fn bind_row_iterator(&mut self) -> Result<()> {
+        // SAFETY: state + iter handles non-null per constructor.
+        let rc = unsafe {
+            sys::ghostty_render_state_get(
+                self.handle,
+                sys::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+                (&mut self.row_iter) as *mut _ as *mut _,
+            )
+        };
+        Error::from_result(rc)
+    }
+
+    /// Rebind `self.row_cells` to the row the iterator currently sits
+    /// on. Same pointer-to-slot semantics as `bind_row_iterator`.
+    fn bind_row_cells(&mut self) -> Result<()> {
+        // SAFETY: iter + cells handles non-null per constructor.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_get(
+                self.row_iter,
+                sys::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+                (&mut self.row_cells) as *mut _ as *mut _,
+            )
+        };
+        Error::from_result(rc)
+    }
+
+    /// Dirty flag of the row the iterator currently sits on. A failed
+    /// read reports `false`, which leaves the flag alone rather than
+    /// clearing damage we could not confirm.
+    fn read_row_dirty(&self) -> bool {
+        let mut out: bool = false;
+        // SAFETY: iter handle non-null; out is a real local.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_get(
+                self.row_iter,
+                sys::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
+                (&mut out) as *mut bool as *mut _,
+            )
+        };
+        Error::from_result(rc).is_ok() && out
+    }
+
+    fn clear_row_dirty(&mut self) -> Result<()> {
+        let value = false;
+        // SAFETY: iter handle non-null; value is a real local.
+        let rc = unsafe {
+            sys::ghostty_render_state_row_set(
+                self.row_iter,
+                sys::GhosttyRenderStateRowOption_GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY,
+                (&value) as *const bool as *const _,
+            )
+        };
+        Error::from_result(rc)
+    }
+
+    fn set_global_dirty(&mut self, value: sys::GhosttyRenderStateDirty) -> Result<()> {
+        // SAFETY: handle non-null; value is a real local.
+        let rc = unsafe {
+            sys::ghostty_render_state_set(
+                self.handle,
+                sys::GhosttyRenderStateOption_GHOSTTY_RENDER_STATE_OPTION_DIRTY,
+                (&value) as *const _ as *const _,
+            )
+        };
+        Error::from_result(rc)
     }
 
     fn read_current_cell(&self, col: u16) -> Cell {

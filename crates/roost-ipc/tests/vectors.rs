@@ -210,6 +210,40 @@ fn sidebar_dump_vector_decodes_into_its_typed_params() {
     assert!(result.projects[1].agents.is_empty());
 }
 
+/// `app.render_stats` is the one op whose *every* result field is a
+/// string-wrapped int64. Generic round-tripping would happily accept a
+/// vector that wrote them as JSON numbers, which is exactly the drift
+/// this convention exists to prevent — so decode it into the typed
+/// struct.
+#[test]
+fn render_stats_vector_decodes_into_its_typed_params() {
+    use roost_ipc::messages::{ops, AppRenderStatsParams, AppRenderStatsResult, RawRequest};
+
+    let mut path = vectors_dir();
+    path.push("app.render_stats.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::APP_RENDER_STATS);
+    let params: AppRenderStatsParams =
+        serde_json::from_value(req.params).expect("decode render_stats params");
+    assert!(!params.reset);
+
+    let mut path = vectors_dir();
+    path.push("app.render_stats.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let result: AppRenderStatsResult =
+        serde_json::from_value(resp.result.expect("result body")).expect("decode result");
+    assert_eq!(result.refresh_calls, 412);
+    assert_eq!(result.refresh_nanos, 51_500_000);
+    assert_eq!(result.rows_rebuilt, 9_888);
+    assert_eq!(result.cells_walked, 790_400);
+    assert_eq!(result.draw_calls, 377);
+    assert_eq!(result.draw_nanos, 94_250_000);
+    assert_eq!(result.fill_text_calls, 9_048);
+}
+
 #[test]
 fn event_vectors_have_required_envelope_shape() {
     let dir = vectors_dir();

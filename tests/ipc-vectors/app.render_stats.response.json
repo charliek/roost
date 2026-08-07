@@ -1,0 +1,13 @@
+{
+  "id": "21",
+  "ok": true,
+  "result": {
+    "refresh_calls": "412",
+    "refresh_nanos": "51500000",
+    "rows_rebuilt": "9888",
+    "cells_walked": "790400",
+    "draw_calls": "377",
+    "draw_nanos": "94250000",
+    "fill_text_calls": "9048"
+  }
+}

@@ -124,7 +124,7 @@ pub use mouse_encoder::{
     mouse_action, mouse_button, MouseAction, MouseButton, MouseEncoder, MouseEvent,
 };
 #[cfg(feature = "ffi")]
-pub use render_state::{Cell, Colors, CursorInfo, CursorVisualStyle, RenderState, Style};
+pub use render_state::{Cell, Colors, CursorInfo, CursorVisualStyle, Dirty, RenderState, Style};
 #[cfg(feature = "ffi")]
 pub use scroll::{PageDirection, PageRoute, ScrollDirection, ScrollRoute, TerminalScroll};
 #[cfg(feature = "ffi")]
