@@ -505,9 +505,20 @@ mod golden_tests {
     }
 
     fn surface_hash(cp: u32, w: i32, h: i32) -> u64 {
-        let (data, _, handled) = render(cp, w, h);
+        let (data, stride, handled) = render(cp, w, h);
         assert!(handled, "U+{cp:04X} should be handled");
-        fnv1a64(&data)
+        // Hash only the w*4 pixel bytes of each row: the stride tail is
+        // cairo's alignment padding (`cairo_format_stride_for_width`),
+        // an implementation detail that could drift across cairo
+        // versions with nothing wrong in the geometry — the same class
+        // of false failure the stroked-glyph exclusion avoids.
+        let row_bytes = (w * 4) as usize;
+        let mut pixels = Vec::with_capacity(row_bytes * h as usize);
+        for y in 0..h {
+            let start = (y * stride) as usize;
+            pixels.extend_from_slice(&data[start..start + row_bytes]);
+        }
+        fnv1a64(&pixels)
     }
 
     fn current() -> Vec<String> {
