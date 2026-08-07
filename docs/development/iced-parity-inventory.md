@@ -116,9 +116,12 @@ classes, all reproducible from this commit:
 - **Hermetic parity captures** (`tools/screenshot/parity.py`): macOS iced
   (run `166d2d6-944d5d6354`), shed GTK + iced X11 (runs
   `166d2d6-4832defb2d`, `166d2d6-96dd344b53`). Load-bearing digests
-  (SHA-256, shell captures): iced-macOS
-  `3b171ec502c0cbce…`, iced-linux-x11 `9f26264e780ace35…`, gtk-linux-x11
-  `7d4b922ed97a5428…`. The GTK run's agent-palette *measurement* failed on
+  (SHA-256, shell captures):
+  - iced-macOS (wgpu, native): `3b171ec502c0cbce908deda7339e70aa996e74a9b46f2891f33ba29d597a2afc`
+  - iced-linux-x11 (default renderer): `9f26264e780ace35129e7e0732589929d05399c8dbc9061156953f2656d0c8ab`
+  - gtk-linux-x11: `7d4b922ed97a54281b2a43a791cee56de48e1f950f442af52714d2478c617f6c`
+  Each run directory carries its own `measurements.json` +
+  `manifest.md` naming target, OS, display backend, renderer, and scale. The GTK run's agent-palette *measurement* failed on
   a one-bit rounding drift — see the harness-fragility note below; the
   captures themselves are visually correct.
 - **Code refs** for rows whose truth is structural (file:line cited in the

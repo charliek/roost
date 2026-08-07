@@ -585,7 +585,11 @@ audited open set is:
   "no open P0/P1" criterion therefore reduces to: land E6, fix the badge
   constant, and either complete or explicitly waive the 3h items and the
   #302-blocked remainder for the beta — his call, flagged in the plan-021
-  checklist.
+  checklist. To be precise about waiver semantics: the criterion itself is
+  unchanged and this audit waives nothing — [#284]'s recommendation covers
+  only the cross-toolkit CI-gate question, and any per-row waiver is an
+  owner decision that must be recorded on the row in the inventory before
+  M4 can be declared entered.
 
 **[#284] recommendation (recorded by the audit; final call is Charlie's):
 waive** the cross-toolkit golden-image CI gate for M4. Cross-toolkit pixel

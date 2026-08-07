@@ -79,8 +79,13 @@ class PixelMeasurementTests(unittest.TestCase):
         self.assertTrue(parity.is_bright_neutral_ink((236, 236, 237)))
         self.assertFalse(parity.is_bright_neutral_ink((170, 170, 173)))
         self.assertTrue(parity.is_red_dominant_ink((221, 82, 82)))
+        self.assertTrue(parity.is_red_dominant_ink((210, 81, 81)))
         self.assertFalse(parity.is_red_dominant_ink((72, 72, 77)))
         self.assertFalse(parity.is_red_dominant_ink((130, 76, 79)))
+        self.assertFalse(
+            parity.is_red_dominant_ink(parity.LIFECYCLE_COLORS["waiting"])
+        )
+        self.assertFalse(parity.is_bright_neutral_ink(parity.LIFECYCLE_COLORS["waiting"]))
 
     def test_color_components_tolerance_matches_rounded_palette_selection_only(self):
         selected = parity.PALETTE_SELECTION

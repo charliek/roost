@@ -74,8 +74,10 @@ def is_bright_neutral_ink(value: tuple[int, int, int]) -> bool:
 
 
 def is_red_dominant_ink(value: tuple[int, int, int]) -> bool:
+    # The near-equal g/b term separates failed red from waiting orange
+    # (240,160,64), whose r-dominance alone would pass.
     r, g, b = value
-    return r >= 150 and r - max(g, b) >= 50
+    return r >= 150 and r - max(g, b) >= 50 and abs(g - b) <= 30
 
 
 def count_color(
