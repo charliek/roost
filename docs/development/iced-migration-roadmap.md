@@ -264,6 +264,32 @@ The E-entries below were written as predictions before any of this
 shipped; where the measured result corrected one, that correction is
 recorded alongside it rather than quietly edited away.
 
+#### Results scoreboard (E1–E3b, measured) and what's deferred
+
+The per-entry prose below carries the full evidence; this is the
+scoreboard. All numbers are release builds; workloads are E1's W1–W3.
+
+| surface | metric | before | after | change |
+|---|---|---|---|---|
+| iced refresh, W1 pointer-motion storm | ns/refresh | 107,605 | 956 | **113×** |
+| iced refresh, W2 in-place TUI redraw | ns/refresh | 110,025 | 6,163 | **17.9×** |
+| iced refresh, W3 scroll (control) | ns/refresh | 116,609 | 57,473 | 2.0× (allocation removal only — see E3's limitation) |
+| GTK refresh, idle/blink frames | per frame | 1.09 ms | 13.6 µs | **~80×**, zero rows rebuilt |
+| GTK scroll burst (300 lines) | rebuilds | every frame | once | — |
+| E4 run coalescing | — | — | — | **NO-GO**: release draw cost was already 172 µs/frame; floored-grid drift up to +50 px @ 60 cols |
+
+Not perf but shipped in the same track: E7 crash robustness (panic
+hooks + crash files in both Rust UIs; #299's malformed-font guards).
+
+**Consider-later items are tracked in [#309]** (renderer-performance
+deferred considerations): the GTK *draw* phase (15–25 ms/frame Xvfb,
+the one measured cost still standing — with the oracle warning), E8's
+two-phase update, E4's exit conditions, the scroll full-rebuild
+constraint, wgpu cache sensitivity, and iced release-profile CI. Pull
+from there rather than re-deriving.
+
+[#309]: https://github.com/charliek/roost/issues/309
+
 * **E1. Renderer baseline measurement — done, prediction corrected.**
   The original plan was frame time under a full-screen scrolling TUI at
   max window size. That workload is precisely the one E3 cannot move:
