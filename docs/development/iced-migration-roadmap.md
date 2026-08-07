@@ -460,10 +460,45 @@ from there rather than re-deriving.
   iced's interleaved bg+glyph draw order can shave diagonal overshoot at
   explicit-bg boundaries where GTK's two-pass order preserves it. No CI
   cross-UI pixel gate, per [#284].
-* **E6. IME input.** `crates/roost-iced/src/input.rs` handles no `Ime`
-  events, so dead keys, CJK input, and the emoji picker are broken.
-  winit surfaces IME on both platforms — this is a Linux-shipping gap
-  too, not a macOS-only one.
+* **E6. IME input.** ✅ **Complete (plan 021).** Discovery corrected the
+  premise: *neither shipped UI* had terminal IME either (GTK's terminal
+  is a bare `EventControllerKey` with no `IMContext` — the deferral is
+  documented at `crates/roost-linux/src/key_encoder.rs:21-24`; Swift's
+  `TerminalView` never adopts `NSTextInputClient` — `KeyEncoder.swift:
+  151-153`), so this slice made iced the **first** Roost UI with working
+  terminal IME rather than a parity port. Shipped shape: the terminal
+  widget consumes `Event::InputMethod` (the app-level subscription drops
+  non-keyboard events by design) and re-requests the input method every
+  `RedrawRequested` — `Enabled` with a caret-tracking cursor rect and
+  `Purpose::Terminal` only while the terminal owns the keyboard route
+  and the window is focused, `Disabled` otherwise, always with
+  `preedit: None` so iced_winit's own overlay stays cleared. Commits
+  encode through the libghostty encoder (`UNIDENTIFIED` + utf8, its
+  documented composed-input path) into the per-tab write path, routed to
+  the preedit-holding tab. The preedit is a draw-time overlay at the
+  cursor cell (terminal font, selection background, underline,
+  cell-width-aware, right-aligned on overflow, suppressed while the
+  cursor is hidden) — never a grid mutation. Clearing is
+  cancel-not-commit (window unfocus, tab switch, rename/palette/confirm);
+  a one-shot discard latch drops the commit the OS may still deliver for
+  a canceled composition, so canceled text cannot type into whichever
+  tab now owns the route, while preedit-less commits (the emoji-picker
+  path) still land. While composing, key presses carry `composing=true`
+  (libghostty verifiably swallows them) and accelerator dispatch waits —
+  a pinned decision (no Cmd+V mid-composition). Coverage: unit vectors
+  model winit's actual delivery (dead key, candidate-selection Enter,
+  cancel, discard-latch state machine, geometry incl. the caret slide);
+  `tools/roosttest/test_ime.py` drives the `tab.feed_ime` test-mode op
+  (three-layer sibling of `tab.feed_pty_bytes`; GTK rejects it as
+  iced-only) through the same production App methods in all three iced
+  CI lanes. Honest residuals: the widget's `InputMethod` arm/per-frame
+  request wiring and real dead-key/CJK/emoji behavior are only provable
+  with a live OS IME (human smoke — plan-021 checklist); the OS
+  candidate window can linger after a tab-switch cancel (the latch keeps
+  it off the PTY; abandoning it OS-side needs a one-frame `Disabled`
+  pulse, deferred until real-IME verification); macOS press-and-hold vs
+  terminal auto-repeat is unobservable by any automated gate (checklist).
+  The parity-inventory Terminal IME row tracks the cross-UI picture.
 * **E7. Crash robustness.** ✅ **Complete (plan 019).** Shipped shape:
   `roost-engine::crash::install_panic_hook` — one shared formatter/
   writer; both Rust UI mains install it right after logging init and
@@ -577,8 +612,8 @@ audited open set is:
   comparison (typography + padding halves), cursor/selection/link pixel
   geometry, empty/loading/error states, remaining hover/focus states,
   offscreen-tab reveal, and confirm-overlay pointer modality; (b) **file/image drops**, upstream-blocked
-  ([#302]); (c) **terminal IME**, engine slice E6 in flight under plan
-  021; (d) one objective one-constant fix: iced's tab notification badge
+  ([#302]); (c) **terminal IME** — closed by engine slice E6 (plan 021,
+  merged with this entry's edit); (d) one objective one-constant fix: iced's tab notification badge
   is `#4e9af1` where GTK deliberately hardcodes the Mac's `#007aff` —
   found by the audit, filed as [#311].
 * The subjective P1s in (a) are Charlie-directed by design; M4's
