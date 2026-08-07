@@ -547,6 +547,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_selection.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
@@ -592,6 +593,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_osc_pipeline.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced functional E2E (macOS)
@@ -616,6 +618,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_selection.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
