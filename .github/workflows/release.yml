@@ -236,7 +236,14 @@ jobs:
         run: |
           set -euo pipefail
           deb="$(./linux/scripts/resolve-one-deb.sh out)"
-          ver="$(printf '%s' "${GITHUB_REF_NAME#v}" | tr '-' '~')"
+          # Replace only the FIRST `-`, matching nfpm's semver schema: it
+          # splits version from prerelease at the first hyphen and joins them
+          # with `~`, leaving any later hyphen in the prerelease intact
+          # (v1.2.3-rc-2 -> 1.2.3~rc-2). A blanket `tr '-' '~'` would produce
+          # 1.2.3~rc~2 and fail this assertion *after* create-release has
+          # already published the Release.
+          raw="${GITHUB_REF_NAME#v}"
+          ver="${raw/-/\~}"
           ./linux/scripts/smoke-deb.sh "${deb}" \
             --work-dir "${RUNNER_TEMP}/roost-smoke" \
             --expect-version "${ver}"

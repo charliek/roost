@@ -84,10 +84,17 @@ jobs:
             # trigger nothing capable of validating it. `Cargo.lock` is here
             # because a new dependency can pull in a new shared library and
             # change the package's runtime closure.
+            # Manifests, not `crates/**`: enabling a feature on an
+            # already-locked dependency changes what the binary dlopens
+            # without touching Cargo.lock, and the closure check is the only
+            # thing that would notice. Source edits still don't trigger it —
+            # that's the cost line this filter exists to hold.
             deb:
               - 'linux/**'
               - 'packaging/**'
+              - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'crates/*/Cargo.toml'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
 
@@ -1433,7 +1440,13 @@ jobs:
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.iced-release.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          # `changes` is first for a reason: it gates every other job, so if it
+          # fails, all of them report `skipped` — which the allowlist below
+          # accepts — and this gate went GREEN with nothing having been built.
+          # Same greenwash shape as the #306 incident, one level further up.
+          # `release.yml`'s ci-gate trusts this check, so that hole reached the
+          # release path.
+          results="${{ needs.changes.result }} ${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.iced-release.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           # Allowlist, not a denylist. A denylist of failure/cancelled let
           # `abandoned` through — the status GitHub assigns when its own
