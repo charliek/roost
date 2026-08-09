@@ -658,14 +658,19 @@ audited open set is:
   geometry, empty/loading/error states, remaining hover/focus states,
   offscreen-tab reveal, and confirm-overlay pointer modality; (b) **file/image drops**, upstream-blocked
   ([#302]); (c) **terminal IME** — closed by engine slice E6 (plan 021,
-  merged with this entry's edit); (d) one objective one-constant fix: iced's tab notification badge
-  is `#4e9af1` where GTK deliberately hardcodes the Mac's `#007aff` —
-  found by the audit, filed as [#311].
+  merged with this entry's edit); (d) fixed: the one-constant fix landed —
+  `chrome::badge()` now renders a dedicated `NOTIFICATION_BADGE` (`#007aff`)
+  instead of `#4e9af1`, pixel-verified by
+  `test_tab_strip_pixels.py::test_notification_dots_paint_the_accent` — and
+  it turned out to cover two dots, not one: the tab-pill badge and the
+  sidebar project-row dot both style off `badge()` and both were corrected —
+  found by the audit, filed and fixed as [#311].
 * The subjective P1s in (a) are Charlie-directed by design; M4's
-  "no open P0/P1" criterion therefore reduces to: land E6, fix the badge
-  constant, and either complete or explicitly waive the 3h items and the
-  #302-blocked remainder for the beta — his call, flagged in the plan-021
-  checklist. To be precise about waiver semantics: the criterion itself is
+  "no open P0/P1" criterion reduces to: E6 landed (c) and the badge
+  constant is fixed (d), so what remains is only to complete or explicitly
+  waive the 3h items and the #302-blocked remainder for the beta — his
+  call, flagged in the plan-021 checklist. To be precise about waiver
+  semantics: the criterion itself is
   unchanged and this audit waives nothing — [#284]'s recommendation covers
   only the cross-toolkit CI-gate question, and any per-row waiver is an
   owner decision that must be recorded on the row in the inventory before
