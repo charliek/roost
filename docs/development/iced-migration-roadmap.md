@@ -628,7 +628,7 @@ stages it as `/usr/bin/roost`; the `Depends`/`Recommends` list in
 of a real launch (not `ldd`, which undercounts because winit/wgpu/ash
 dlopen their stack) — Vulkan is `Recommends`, not `Depends`, since a
 launch with `/usr/share/vulkan/icd.d` removed still opens a window on
-the software fallback. Verified end to end in a pristine `ubuntu:24.04`
+the software fallback. Verified end-to-end in a pristine `ubuntu:24.04`
 container via a real apt upgrade transaction: `desktop-file-validate`
 passes and the installed entry's `StartupWMClass` matches the WM_CLASS
 the packaged binary announces. Cutting an actual release remains a

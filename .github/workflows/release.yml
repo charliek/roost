@@ -313,6 +313,51 @@ jobs:
             exit 1
           fi
 
+      # The step above extracts the .deb, so it validates the payload (file
+      # list, exec bits, destinations) but NOT the dependency closure: this
+      # runner already carries the whole graphics stack from the build step,
+      # so a `Depends:` line that forgot a library would still launch here.
+      # Missing runtime dependencies are the failure mode users actually hit
+      # — the package installs cleanly and then won't start — so the closure
+      # gets checked where nothing is pre-installed: a clean ubuntu:24.04
+      # container with --no-install-recommends, which also proves the
+      # Recommends-vs-Depends split (no Vulkan loader in there at all).
+      - name: Verify the dependency closure in a clean container
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(out/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one out/*.deb, found ${#debs[@]}"
+            exit 1
+          fi
+          deb="$(cd "$(dirname "${debs[0]}")" && pwd)/$(basename "${debs[0]}")"
+
+          docker run --rm -v "${deb}:/tmp/roost.deb:ro" ubuntu:24.04 bash -eu -c '
+            apt-get update -qq
+            # --no-install-recommends is the strict case: only what Depends
+            # actually names gets installed.
+            apt-get install -y -qq --no-install-recommends /tmp/roost.deb
+            # xvfb/xauth are the harness, not the package under test.
+            apt-get install -y -qq --no-install-recommends xvfb xauth
+            export XDG_RUNTIME_DIR=/tmp/rt
+            mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+            xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c "
+              /usr/bin/roost >/tmp/app.log 2>&1 &
+              ok=no
+              for _ in \$(seq 1 60); do
+                if /usr/bin/roostctl identify >/dev/null 2>&1; then ok=yes; break; fi
+                sleep 0.5
+              done
+              if [ \"\$ok\" != yes ]; then
+                echo \"the installed package never came up — likely a missing runtime dependency\"
+                tail -40 /tmp/app.log || true
+                exit 1
+              fi
+              /usr/bin/roostctl identify
+            "
+          ' || { echo "::error::the .deb installed but could not launch in a clean container — its Depends: list is incomplete."; exit 1; }
+
       - name: Upload .deb to the Release
         env:
           GH_TOKEN: ${{ github.token }}
