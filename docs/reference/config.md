@@ -2,9 +2,10 @@
 
 Roost reads a single user-level config file at `~/.config/roost/config.conf`
 (XDG-style on macOS by deliberate divergence from Apple HIG — matching
-Ghostty / nvim / fish). Both UIs (Swift Mac app, Linux gtk4-rs binary)
-parse the same file with the same semantics, so a config tuned on one
-platform is portable to the other.
+Ghostty / nvim / fish). All three UIs (Swift Mac app, Linux gtk4-rs
+binary, Linux iced binary) parse the same file with the same
+semantics, so a config tuned on one platform is portable to the
+others.
 
 The file is plain text, one `key = value` per line, `#`-prefixed comments
 allowed, whitespace forgiving. Unknown keys are silently dropped — this

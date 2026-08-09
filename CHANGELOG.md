@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/). Releases are
-cut with `/release:release vX.Y.Z` — it curates the section below, commits, tags
+cut with `/release-workflows:release vX.Y.Z` — it curates the section below, commits, tags
 `vX.Y.Z`, and pushes; the tag triggers `.github/workflows/release.yml`, which
 builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the

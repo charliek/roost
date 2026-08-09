@@ -1,9 +1,10 @@
 # Roost — common dev tasks. Run `make` (or `make help`) to list them.
 #
 # Three native UIs around libghostty-vt: Swift + AppKit (mac/),
-# Rust + gtk4-rs (crates/roost-linux), and the isolated Iced POC
-# (crates/roost-iced), plus the roostctl CLI. See
-# docs/development/vision.md for the architecture + north star.
+# Rust + gtk4-rs (crates/roost-linux, in-repo dev/parity), and Rust +
+# iced (crates/roost-iced, what the Linux package ships), plus the
+# roostctl CLI. See docs/development/vision.md for the architecture +
+# north star.
 
 .DEFAULT_GOAL := help
 

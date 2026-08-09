@@ -8,11 +8,13 @@ the north star every PR is measured against.
 A single-window, cross-platform terminal multiplexer: a sidebar of
 projects, tabs per project, one terminal per tab. The differentiator is
 the multi-project workspace with **notification routing for AI coding
-agents** (Claude Code, Codex, …). It ships as **two native UIs that each
-embed the workspace + PTY supervisor in-process** — Swift + AppKit on
-macOS (`Roost.app`), Rust + gtk4-rs on Linux (`roost-linux`).
-`libghostty-vt` is vendored once and linked into both for in-process VT
-parsing and rendering. There is no daemon.
+agents** (Claude Code, Codex, …). It ships **two platform products, each
+embedding the workspace + PTY supervisor in-process** — Swift + AppKit on
+macOS (`Roost.app`), Rust + iced on Linux (`roost`, the packaged `.deb`).
+A third UI implementation, Rust + gtk4-rs (`roost-linux`), lives in the
+repo as the Linux development/parity implementation. `libghostty-vt` is
+vendored once and linked into all three for in-process VT parsing and
+rendering. There is no daemon.
 
 ## The command core (north star)
 
@@ -131,8 +133,8 @@ flowchart LR
     macWS --- macIPC
   end
 
-  subgraph LinuxApp["roost-linux (Rust + gtk4-rs)"]
-    linuxView["Cell renderer<br/>(Cairo + Pango)"]
+  subgraph LinuxApp["roost (Rust + iced) — packaged Linux UI"]
+    linuxView["Cell renderer<br/>(iced + wgpu)"]
     linuxVT["libghostty-vt<br/>(in-process VT parse)"]
     linuxWS["Workspace + PtySupervisor<br/>(tokio + portable-pty)"]
     linuxIPC["JSON IPC server<br/>(tokio UnixListener)"]

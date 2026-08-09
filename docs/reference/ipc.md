@@ -13,7 +13,7 @@ The socket path is the bundle profile's `socket_path` (see
 
 * Mac (Swift `Roost.app`): `~/Library/Caches/Roost/roost.sock`
 * GTK dev mode on Mac:    `~/Library/Caches/Roost-gtk/roost.sock`
-* Iced POC on Mac:        `~/Library/Caches/Roost-iced/roost.sock`
+* Iced dev build on Mac:  `~/Library/Caches/Roost-iced/roost.sock`
 * GTK on Linux (XDG):     `$XDG_RUNTIME_DIR/roost/roost.sock`
 * Iced on Linux (XDG):    `$XDG_RUNTIME_DIR/roost-iced/roost.sock`
 * Linux fallback:         `/tmp/roost[-iced]-<uid>/roost.sock`
