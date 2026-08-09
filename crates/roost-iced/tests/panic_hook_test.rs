@@ -142,13 +142,28 @@ fn matching(files: &[PathBuf], matches: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The crash report stamps `profile.app_label`, and this test deliberately
+/// clears `ROOST_BUNDLE_PROFILE` so the child resolves its *compiled-in*
+/// default — which the `linux-package` packaging feature moves from the Iced
+/// profile to the production one. Hardcoding "Roost-iced" made this test pass
+/// only in the unpackaged configuration; the expectation has to follow the
+/// same two `cfg!`s `main` does (integration tests compile with the crate's
+/// feature set, so these resolve identically here).
+fn expected_app_label() -> &'static str {
+    if cfg!(feature = "linux-package") && cfg!(target_os = "linux") {
+        "Roost-gtk"
+    } else {
+        "Roost-iced"
+    }
+}
+
 #[test]
 fn forced_startup_panic_writes_crash_file_and_aborts() {
     let (_dir, outcome) = run_forced_panic("1");
     let report = &outcome.crash_report;
     assert!(report.contains("ROOST_TEST_PANIC"), "{report}");
     assert!(report.contains("main.rs"), "{report}");
-    assert!(report.contains("Roost-iced"), "{report}");
+    assert!(report.contains(expected_app_label()), "{report}");
     assert!(report.contains("backtrace:"), "{report}");
     assert!(outcome.log.contains("ROOST_TEST_PANIC"), "{}", outcome.log);
 }
