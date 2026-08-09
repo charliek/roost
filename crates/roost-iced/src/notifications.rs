@@ -104,8 +104,19 @@ pub(crate) struct DesktopNotifications {
 }
 
 impl DesktopNotifications {
-    pub(crate) fn new(runtime: &tokio::runtime::Handle, feed: EngineFeedSender) -> Self {
-        Self::spawn_on(runtime, backend::show, feed)
+    /// `app_id` is the resolved bundle profile's id, captured rather than
+    /// threaded through `spawn_on`'s `Fn(Payload) -> Fut` bound so the
+    /// backend shape stays the one the tests implement.
+    pub(crate) fn new(
+        runtime: &tokio::runtime::Handle,
+        feed: EngineFeedSender,
+        app_id: String,
+    ) -> Self {
+        Self::spawn_on(
+            runtime,
+            move |payload| backend::show(payload, app_id.clone()),
+            feed,
+        )
     }
 
     fn spawn_on<F, Fut>(runtime: &tokio::runtime::Handle, show: F, feed: EngineFeedSender) -> Self
@@ -241,16 +252,15 @@ mod backend {
 
     use super::{Payload, Shown};
 
-    /// Best-effort shell grouping: a desktop file may not be installed for
-    /// a dev build, and the hint is simply ignored then.
-    const DESKTOP_ENTRY: &str = "ai.stridelabs.Roost.iced";
-
     /// The freedesktop key a server invokes for a click on the banner body
     /// rather than on a button. Declaring it is what makes the banner
     /// clickable at all — servers only invoke actions a notification lists.
     const DEFAULT_ACTION: &str = "default";
 
-    pub(super) async fn show(payload: Payload) -> Result<Shown, String> {
+    /// `app_id` is the desktop-entry hint — best-effort shell grouping: a
+    /// desktop file may not be installed for a dev build, and the hint is
+    /// simply ignored then.
+    pub(super) async fn show(payload: Payload, app_id: String) -> Result<Shown, String> {
         let Payload {
             title,
             body,
@@ -261,7 +271,7 @@ mod backend {
             .appname("Roost")
             .summary(&title)
             .action(DEFAULT_ACTION, "Open")
-            .hint(Hint::DesktopEntry(DESKTOP_ENTRY.to_string()));
+            .hint(Hint::DesktopEntry(app_id));
         if let Some(body) = &body {
             notification.body(body);
         }
@@ -299,7 +309,7 @@ mod backend {
 
     /// macOS is deferred, not designed out: a UNUserNotificationCenter
     /// backend drops in at this signature, activation included.
-    pub(super) async fn show(payload: Payload) -> Result<Shown, String> {
+    pub(super) async fn show(payload: Payload, _app_id: String) -> Result<Shown, String> {
         let Payload {
             title,
             body,

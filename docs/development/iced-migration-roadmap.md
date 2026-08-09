@@ -18,13 +18,19 @@ gauntlet passes sized one milestone slice at a time.
 1. **The Swift/AppKit app is the production daily driver.** It must stay
    release-ready on `main` at all times. No Swift behavior change lands
    without its own tests, and `e2e-mac` stays a required gate.
-2. **The GTK app ships to Linux users.** No regressions — `e2e-gtk` and the
-   Wayland drag guard are its no-regression gates — but GTK is the UI Iced
-   eventually replaces, so it receives fixes, not new investment.
-3. **`roost-iced` may live on `main` incomplete.** It is fully isolated (own
-   binary, `ai.stridelabs.Roost.iced` profile, own socket/state/log paths,
-   absent from release artifacts), so incompleteness cannot leak into either
-   shipped app.
+2. **~~The GTK app ships to Linux users.~~ Superseded by M4 (plan 022):**
+   the `.deb` now ships Iced as `/usr/bin/roost` on the production GTK
+   bundle profile. GTK stays in-repo as the development and parity
+   implementation, still gated by `e2e-gtk` and the Wayland drag guard,
+   still receiving fixes rather than new investment — but it is no longer
+   what Linux users install. Retirement remains a separate decision.
+3. **`roost-iced` may live on `main` incomplete** — with the M4 caveat that
+   this no longer holds for the Linux package. Off Linux, and in every dev
+   build, it stays isolated (own binary, `ai.stridelabs.Roost.iced` profile,
+   own socket/state/log paths). What a *packaged* Linux build does is the
+   opposite by design: it adopts the production profile, so incompleteness
+   there reaches users. That is what the M4 entry criteria and the parity
+   inventory exist to gate.
 4. **One op set.** All Rust UI capability routes through
    `roost-engine`/`roost-ui-model`; the exhaustive `UiRequest` match in both
    Rust UIs is the parity mechanism. Never add a wildcard arm.
@@ -286,8 +292,9 @@ E5 sprite parity in iced (shared `roost_ui_model::sprite` geometry).
 deferred considerations): the GTK *draw* phase (15–25 ms/frame Xvfb,
 the one measured cost still standing — with the oracle warning), E8's
 two-phase update, E4's exit conditions, the scroll full-rebuild
-constraint, wgpu cache sensitivity, and iced release-profile CI. Pull
-from there rather than re-deriving.
+constraint, and wgpu cache sensitivity. Pull from there rather than
+re-deriving. (Iced release-profile CI, formerly listed here as
+deferred, shipped as the `iced-release` job in `ci.yml` — plan 022 C2.)
 
 [#309]: https://github.com/charliek/roost/issues/309
 
@@ -603,6 +610,29 @@ guards.
   the next regular release, whenever Charlie cuts it (he is explicitly
   not ready to release yet; the packaging work proceeds now so the next
   release simply has it).
+
+**Packaging shipped against both decisions (2026-08-07, plan 022
+commits 91b3c49/3b021fe/5733930).** `roost-iced` gained a
+`linux-package` Cargo feature that is off by default and only flips
+the *compiled-in default* profile — `ROOST_BUNDLE_PROFILE` still wins,
+so every dev harness stays correct regardless of how the binary was
+built. With it on, a Linux build resolves the `Gtk` profile kind
+(same `roost` socket/`state.json`/log dir the GTK package owned), and
+the window's `application_id` (WM_CLASS/app_id) and the desktop
+notification's `desktop-entry` hint are now derived from that resolved
+profile rather than hardcoded to `.iced`, so the packaged binary
+matches the installed `ai.stridelabs.Roost.gtk.desktop` entry.
+`linux/scripts/build-deb.sh` builds `roost-iced` with the feature and
+stages it as `/usr/bin/roost`; the `Depends`/`Recommends` list in
+`packaging/nfpm.yaml` was derived from an `strace -f -e trace=openat`
+of a real launch (not `ldd`, which undercounts because winit/wgpu/ash
+dlopen their stack) — Vulkan is `Recommends`, not `Depends`, since a
+launch with `/usr/share/vulkan/icd.d` removed still opens a window on
+the software fallback. Verified end-to-end in a pristine `ubuntu:24.04`
+container via a real apt upgrade transaction: `desktop-file-validate`
+passes and the installed entry's `StartupWMClass` matches the WM_CLASS
+the packaged binary announces. Cutting an actual release remains a
+separate, manual step — not part of this work and not yet done.
 
 Entry-criteria status (2026-08-05): the real-input criterion is **met** —
 PR #301 removed the last harness workaround (the seam-press dwell) and the

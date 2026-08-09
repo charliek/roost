@@ -125,8 +125,36 @@ enum Message {
     },
 }
 
+/// The compiled-in default profile, and only the default:
+/// `ROOST_BUNDLE_PROFILE` still overrides it inside `BundleProfile::resolve`,
+/// which is what keeps the dev harnesses correct no matter how the binary was
+/// compiled — they all pin that variable explicitly.
+///
+/// A packaged Linux build adopts the production `roost` namespace the GTK
+/// package already owns, so an in-place upgrade keeps the user's socket,
+/// `state.json` and logs. The `linux` guard keeps the feature inert
+/// everywhere else: on macOS `Gtk` resolves `Roost-gtk`, the *GTK dev*
+/// profile — not the Swift app — so an unguarded feature would collide with
+/// the macOS GTK binary that CLAUDE.md supports running side by side.
+///
+/// Parameterized rather than a bare `#[cfg]` at the call site so all four
+/// cells are unit-testable in a single build.
+fn default_profile_kind(packaged: bool, linux: bool) -> BundleProfileKind {
+    if packaged && linux {
+        BundleProfileKind::Gtk
+    } else {
+        BundleProfileKind::Iced
+    }
+}
+
+/// The two `cfg!`s `main` actually resolves its profile from, hoisted to
+/// consts so a test can assert against the same values rather than
+/// re-evaluating its own copy (which would pass even if these drifted).
+const PACKAGED: bool = cfg!(feature = "linux-package");
+const PACKAGED_PLATFORM: bool = cfg!(target_os = "linux");
+
 fn main() -> anyhow::Result<()> {
-    let profile = BundleProfile::resolve(BundleProfileKind::Iced)?;
+    let profile = BundleProfile::resolve(default_profile_kind(PACKAGED, PACKAGED_PLATFORM))?;
     init_logging(&profile)?;
     roost_engine::crash::install_panic_hook(
         profile.log_dir.clone(),
@@ -164,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
         .default_font(chrome::chrome_font(iced::font::Weight::Normal))
-        .window(window_settings())
+        .window(window_settings(&profile))
         .run()
         .context("run Iced application")
 }
@@ -201,9 +229,13 @@ fn forced_test_panic() {
 /// it is not a window-settings change alone. Linux `PlatformSpecific` is a
 /// disjoint struct: `application_id` fills WM_CLASS (X11) / app_id (Wayland),
 /// which winit otherwise leaves empty — the dynamic window title made an
-/// empty class unfindable for tooling, and the id matches the notification
-/// adapter's `desktop-entry` hint so shells group both under one identity.
-fn window_settings() -> window::Settings {
+/// empty class unfindable for tooling. The id comes from the resolved
+/// profile, so a packaged build announces the production identity the
+/// installed desktop entry already declares as its `StartupWMClass`; it is
+/// the same id the notification adapter sends as its `desktop-entry` hint,
+/// so shells group both under one identity.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn window_settings(profile: &BundleProfile) -> window::Settings {
     window::Settings {
         size: Size::new(1100.0, 720.0),
         min_size: Some(Size::new(640.0, 360.0)),
@@ -215,7 +247,7 @@ fn window_settings() -> window::Settings {
         },
         #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific {
-            application_id: "ai.stridelabs.Roost.iced".to_owned(),
+            application_id: profile.app_id.to_owned(),
             ..window::settings::PlatformSpecific::default()
         },
         ..window::Settings::default()
@@ -762,5 +794,39 @@ mod tests {
         assert_eq!(window_id, id);
         assert_eq!(mapped, path);
         assert!(window_event_message(id, window::Event::FilesHoveredLeft).is_none());
+    }
+
+    #[test]
+    fn only_a_packaged_linux_build_adopts_the_production_profile() {
+        assert_eq!(
+            default_profile_kind(true, true),
+            BundleProfileKind::Gtk,
+            "the Linux .deb adopts the `roost` namespace in place"
+        );
+        assert_eq!(default_profile_kind(true, false), BundleProfileKind::Iced);
+        assert_eq!(default_profile_kind(false, true), BundleProfileKind::Iced);
+        assert_eq!(default_profile_kind(false, false), BundleProfileKind::Iced);
+    }
+
+    /// The four-cell test above never compiles the feature, so it passes
+    /// whether or not the gate reaches the call site. This one asserts on
+    /// `PACKAGED` — the same const `main` resolves from — so it fails if the
+    /// feature stops flowing to the profile decision. Asserting a locally
+    /// re-evaluated `cfg!(feature = ...)` here instead would be tautological.
+    ///
+    /// A misspelled feature name is caught earlier and harder: an unknown
+    /// name makes `cfg!` an `unexpected_cfgs` warning, and both the Makefile
+    /// and CI lint this crate with `-D warnings`.
+    #[cfg(feature = "linux-package")]
+    #[test]
+    fn the_packaging_feature_reaches_the_profile_decision() {
+        // Passing `PACKAGED` (not a re-evaluated `cfg!`) is what makes this
+        // real: if the feature stopped reaching `main`'s const, this would be
+        // `default_profile_kind(false, true)` — `Iced`, and the test fails.
+        assert_eq!(
+            default_profile_kind(PACKAGED, true),
+            BundleProfileKind::Gtk,
+            "a packaged Linux build must adopt the production profile"
+        );
     }
 }

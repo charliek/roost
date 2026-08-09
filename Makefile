@@ -182,8 +182,13 @@ clippy:  ## Lint Rust at CI parity (warnings are errors)
 	cargo clippy --workspace --exclude roost-linux --all-targets -- -D warnings
 	cargo clippy -p roost-linux --all-targets -- -D warnings
 
+# `linux-package` is off in every dev build, so without the second test +
+# clippy pair the packaging configuration would compile for the first time
+# during a release build.
 check-iced: fmt-check test-iced  ## Iced formatting, lint, tests, and dependency boundaries
 	cargo clippy -p roost-iced --all-targets -- -D warnings
+	cargo test -p roost-iced --features linux-package
+	cargo clippy -p roost-iced --features linux-package --all-targets -- -D warnings
 	@! cargo tree -p roost-iced | grep -E '(^| )(gtk4|libadwaita|pango|cairo-rs|roost-linux) v' || \
 		( echo "roost-iced has a forbidden GTK dependency"; exit 1 )
 	@! cargo tree -p roost-engine | grep -E '(^| )(gtk4|libadwaita|iced|notify-rust|zbus|arboard) v' || \

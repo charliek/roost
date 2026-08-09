@@ -2,7 +2,9 @@
 
 Roost resolves all of its filesystem state once at startup. Other components read the paths from this resolution; nothing should derive its own.
 
-Each UI owns its own `BundleProfile` — `Mac` (Swift `Roost.app`, `CFBundleIdentifier ai.stridelabs.Roost`), `Gtk` (gtk4-rs `roost-linux`, app id `ai.stridelabs.Roost.gtk`), or `Iced` (the Rust/Iced POC, app id `ai.stridelabs.Roost.iced`). There is no shared daemon; the profile a UI resolves determines the socket `roostctl` dials. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. The two implementations are tested in lockstep.
+Each UI owns its own `BundleProfile` — `Mac` (Swift `Roost.app`, `CFBundleIdentifier ai.stridelabs.Roost`), `Gtk` (gtk4-rs `roost-linux`, app id `ai.stridelabs.Roost.gtk`), or `Iced` (`roost-iced`, app id `ai.stridelabs.Roost.iced`). There is no shared daemon; the profile a UI resolves determines the socket `roostctl` dials. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. The two implementations are tested in lockstep.
+
+The Linux `.deb` ships `roost-iced` built with the `roost-iced/linux-package` Cargo feature, which flips its compiled-in default profile from `Iced` to `Gtk` on Linux. That makes the packaged binary resolve the production `roost` namespace the GTK package already owned — same socket, `state.json`, and log dir — so an existing GTK install upgrades in place with no migration and no change to `roostctl` or Claude hooks. Dev builds (no feature) and every non-Linux platform keep the isolated `Iced` profile. `ROOST_BUNDLE_PROFILE` overrides the compiled-in default in every build, packaged or not.
 
 The profile defaults to:
 
@@ -10,7 +12,7 @@ The profile defaults to:
 |--------------|------------------|----------|
 | Swift `Roost.app` | `Mac` | n/a (the app picks `Mac` directly) |
 | `roost-linux`     | `Gtk` | `ROOST_BUNDLE_PROFILE=mac` to dial a `Mac`-profile UI |
-| `roost-iced`      | `Iced` | reserved for test/profile overrides |
+| `roost-iced`      | `Iced` (dev build) / `Gtk` (Linux `.deb`, `--features roost-iced/linux-package`) | `ROOST_BUNDLE_PROFILE=iced` to keep the isolated profile in a packaged build (or `=mac`/`=gtk` to target another UI) |
 | `roostctl` (binary from the `roost-cli` crate) | auto-detect | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,gtk,iced}` |
 
 ## File locations
@@ -56,9 +58,11 @@ at once:
 
 ### Linux
 
-Linux follows XDG conventions for everything. The legacy `Mac` and `Gtk`
-profile kinds resolve to the production `roost` namespace. The Iced POC stays
-in a separate `roost-iced` namespace so it can run beside GTK.
+Linux follows XDG conventions for everything. The `Mac` and `Gtk` profile
+kinds resolve to the production `roost` namespace; the packaged `.deb`
+build of `roost-iced` resolves `Gtk` (see above), so the installed package
+lands here too. A dev build of `roost-iced` stays in a separate
+`roost-iced` namespace so it can run beside GTK during development.
 
 | Path | Purpose |
 |---|---|
@@ -67,8 +71,9 @@ in a separate `roost-iced` namespace so it can run beside GTK.
 | `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |
 | `$XDG_STATE_HOME/roost/roost.log` | app log (also teed to stdout); falls back to `~/.local/state/roost/` |
 
-For Iced, replace each `roost` path component with `roost-iced`; its socket
-fallback is `/tmp/roost-iced-<uid>/roost.sock`.
+For a dev build of Iced, replace each `roost` path component with
+`roost-iced`; its socket fallback is `/tmp/roost-iced-<uid>/roost.sock`. A
+packaged (`.deb`) Iced build uses the `roost` paths above, unchanged.
 
 The directories are created at first launch with mode `0700`.
 

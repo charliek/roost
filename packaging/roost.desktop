@@ -1,3 +1,5 @@
+# StartupWMClass matches the app id the packaged (iced) binary announces —
+# unchanged from the prior GTK package so the icon/taskbar association holds.
 [Desktop Entry]
 Type=Application
 Name=Roost

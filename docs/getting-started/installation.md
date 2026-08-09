@@ -53,12 +53,22 @@ socket for external tooling (`roostctl`, Claude Code hooks):
 | Platform | UI | How it builds |
 |---|---|---|
 | macOS | Swift + AppKit (`Roost.app`) | SwiftPM via `mac/scripts/bundle.sh` |
-| Linux | Rust + gtk4-rs (`roost-linux`) | `cargo build -p roost-linux` |
+| Linux (packaged `.deb`) | Rust + iced (`roost-iced`) | `linux/scripts/build-deb.sh`, built with `--features roost-iced/linux-package` |
+| Linux (build from source) | Rust + gtk4-rs (`roost-linux`) | `cargo build -p roost-linux` |
 
-The Linux UI, the `roostctl` CLI, the JSON IPC crate, and the
-`libghostty-vt` FFI all live in one Cargo workspace under
-`crates/`. The Swift UI is its own SwiftPM package under `mac/`
-and links the same vendored `libghostty-vt` static archive.
+The `roost-iced` and `roost-linux` UIs, the `roostctl` CLI, the JSON
+IPC crate, and the `libghostty-vt` FFI all live in one Cargo
+workspace under `crates/`. The Swift UI is its own SwiftPM package
+under `mac/` and links the same vendored `libghostty-vt` static
+archive.
+
+The Linux `.deb` ships the iced UI as `/usr/bin/roost` — see
+[Paths & Environment](../reference/paths.md) for how the packaged
+binary resolves the same profile (socket, `state.json`, log dir) the
+GTK package used to own. `roost-linux` (gtk4-rs) still lives in this
+repo and is still built and tested in CI; it's the UI to build from
+source if you're contributing to the GTK side or want it running
+alongside iced during development.
 
 `mac/scripts/bundle.sh` embeds `target/<config>/roostctl` under
 `Roost.app/Contents/Resources/bin/roostctl` so a packaged .app is
@@ -68,10 +78,10 @@ self-contained for `claude install`.
 
 | Tool | Purpose | Pinned version |
 |---|---|---|
-| Rust | CLI + Linux UI | 1.97.1 (via `mise`) |
+| Rust | CLI + Linux UIs | 1.97.1 (via `mise`) |
 | Zig | Builds `libghostty-vt` from the vendored Ghostty source | 0.15.x (via `mise`) |
 | Xcode Command Line Tools | Builds the Mac UI | macOS only |
-| GTK4 + libadwaita dev packages | Linker dependencies for the Linux UI | Linux only |
+| GTK4 + libadwaita dev packages | Linker dependencies for `roost-linux` (source builds only — not needed for the packaged `.deb`, which ships iced) | Linux only |
 | `mise` | Manages the pinned Rust + Zig versions | any |
 
 ## macOS
@@ -121,6 +131,13 @@ open mac/build/Roost.app
 
 ## Linux (Ubuntu / Debian)
 
+This section builds `roost-linux`, the gtk4-rs UI, from source — useful
+for contributing to the GTK side or running it alongside iced during
+development. If you just want the packaged `.deb` (iced UI), see
+[Shipping builds](#shipping-builds) above; building that package
+yourself doesn't need GTK — see
+[Building the `.deb` package](#building-the-deb-package) below.
+
 System packages:
 
 ```bash
@@ -169,6 +186,27 @@ Run the Linux UI:
 ```bash
 ~/.cargo/bin/cargo run --release -p roost-linux
 ```
+
+### Building the `.deb` package
+
+The packaged `.deb` ships the iced UI (`roost-iced`, built with
+`--features roost-iced/linux-package`) as `/usr/bin/roost`, plus
+`roostctl` — no GTK packages required. Instead:
+
+```bash
+sudo apt-get install -y libclang-dev pkg-config
+```
+
+Then, with `mise install` and `./third_party/ghostty/build.sh` already
+done (above) and [`nfpm`](https://nfpm.goreleaser.com) on `PATH`:
+
+```bash
+./linux/scripts/build-deb.sh 0.0.1-dev
+```
+
+See [`linux/README.md`](../../linux/README.md) and
+[`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) for what the
+package contains.
 
 ## CLI on PATH
 
