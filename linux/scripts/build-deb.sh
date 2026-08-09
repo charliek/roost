@@ -80,7 +80,13 @@ install -m 0755 "${ROOST_BIN}"    "${REPO_ROOT}/dist/roost"
 install -m 0755 "${ROOSTCTL_BIN}" "${REPO_ROOT}/dist/roostctl"
 
 echo "==> nfpm pkg (version=${ROOST_VERSION}, arch=${ROOST_ARCH})"
+# Clear prior .debs the way dist/ is cleared above. Repeated local builds at
+# different versions otherwise accumulate here, and every consumer
+# (resolve-one-deb.sh, and through it the smoke, closure and upload steps)
+# asserts exactly one match. Narrow on purpose — `rm -rf out` would also take
+# anything a developer happened to park in the directory.
 mkdir -p "${REPO_ROOT}/out"
+rm -f "${REPO_ROOT}"/out/*.deb
 nfpm pkg --packager deb --config "${REPO_ROOT}/packaging/nfpm.yaml" --target "${REPO_ROOT}/out/"
 
 echo "==> Built:"
