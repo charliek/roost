@@ -41,15 +41,17 @@ truth.**
 - A hotkey (`Cmd+Shift+T`), a `roostctl` call, and a Lua script all
   invoke the **same** command — e.g. "run action" or "open tab".
 
-**One contract, two implementations.** There is no shared *codebase*
-core — Swift and Rust can't share one. There is one shared **contract**
-— the IPC op set in [`crates/roost-ipc`](../reference/ipc.md) —
-implemented by **Swift `Workspace` + AppKit** and **Rust `Workspace` +
-GTK**. "Same interface" means same op contract + behavioral parity,
-which the cross-platform E2E suite ([test-automation.md](test-automation.md))
-exists to enforce. Per platform: identical command surface,
-platform-specific guts (`forkpty` vs `portable-pty`, Core Graphics vs
-Cairo).
+**One contract, three implementations.** There is no shared *codebase*
+core across languages — Swift and Rust can't share one. There is one
+shared **contract** — the IPC op set in
+[`crates/roost-ipc`](../reference/ipc.md) — implemented by **Swift
+`Workspace` + AppKit**, **Rust + GTK**, and **Rust + iced** (the two
+Rust UIs additionally share `roost-engine`). "Same interface" means same
+op contract + behavioral parity, which the cross-platform E2E suite
+([test-automation.md](test-automation.md)) exists to enforce. Per
+implementation: identical command surface, platform-specific guts
+(`forkpty` vs `portable-pty`; Core Graphics vs Cairo + Pango vs
+iced + wgpu).
 
 **Two seams** connect the surfaces to the core:
 
@@ -77,7 +79,7 @@ for at once:
 
 Every decision below — and every new feature — is measured against it:
 *does it route through the one op set, keep the UI reactive, and stay at
-parity across both implementations?*
+parity across all three implementations?*
 
 ## Why this shape
 
