@@ -25,6 +25,7 @@ jobs:
       fixtures: ${{ steps.filter.outputs.fixtures }}
       tests: ${{ steps.filter.outputs.tests }}
       ci: ${{ steps.filter.outputs.ci }}
+      deb: ${{ steps.filter.outputs.deb }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -37,7 +38,9 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
-              - 'mise.toml'
+              # The file is a dotfile. The old 'mise.toml' pattern could
+              # never match, so a toolchain bump triggered no Rust job.
+              - '.mise.toml'
               - 'clippy.toml'
               - 'crates/**'
               - 'third_party/ghostty/**'
@@ -71,6 +74,29 @@ jobs:
               - 'Makefile'
             ci:
               - '.github/workflows/ci.yml'
+            # Deliberately NOT `linux`: that filter folds in the *rustcore
+            # anchor, so it's true on essentially every Rust PR — gating the
+            # deb work on it would pay an nfpm download, an nfpm package, and
+            # a Docker Hub pull on each one. This list is only the paths that
+            # can actually change what the .deb contains or how it's checked.
+            # `release.yml` is here because it appears in no other filter at
+            # all: a PR that edits only the release workflow would otherwise
+            # trigger nothing capable of validating it. `Cargo.lock` is here
+            # because a new dependency can pull in a new shared library and
+            # change the package's runtime closure.
+            # Manifests, not `crates/**`: enabling a feature on an
+            # already-locked dependency changes what the binary dlopens
+            # without touching Cargo.lock, and the closure check is the only
+            # thing that would notice. Source edits still don't trigger it —
+            # that's the cost line this filter exists to hold.
+            deb:
+              - 'linux/**'
+              - 'packaging/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/*/Cargo.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
 
   rust-lint:
     needs: changes
@@ -680,8 +706,10 @@ jobs:
     # packaging/**): this lane builds the same packaged configuration the deb
     # ships, so a build-deb.sh or nfpm.yaml change must be able to reach it.
     # Without that, a packaging-only PR triggered no lane that compiles the
-    # linux-package feature at all.
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true'
+    # linux-package feature at all. `deb` additionally turns on the packaging
+    # steps further down (build the real .deb, then smoke it and verify its
+    # dependency closure).
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.linux == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.deb == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -729,20 +757,54 @@ jobs:
           key: cargo-iced-release-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-iced-release-${{ runner.os }}-
 
-      # One build, not two: [profile.release] is `lto = "thin"` +
-      # `codegen-units = 1`, and a second cold LTO link would blow the
-      # job's 45-minute budget. `linux-package` is the configuration that
-      # actually ships (it's what makes a packaged build adopt the
-      # production `roost` bundle profile instead of the isolated
-      # `roost-iced` one, per `default_profile_kind()` in
-      # `crates/roost-iced/src/main.rs`) — building it here, rather than
+      # Must precede the build, because on the `deb` path the build is done by
+      # build-deb.sh, which ends in `nfpm pkg`. Mirrors release.yml's install
+      # exactly (same pinned version, same source) rather than inventing a
+      # second mechanism — this lane is ubuntu-latest, i.e. amd64, so the arch
+      # is unconditionally x86_64.
+      - name: Install nfpm
+        if: needs.changes.outputs.deb == 'true'
+        run: |
+          set -euo pipefail
+          ver="2.46.3"
+          url="https://github.com/goreleaser/nfpm/releases/download/v${ver}/nfpm_${ver}_Linux_x86_64.tar.gz"
+          curl -fsSL "${url}" -o /tmp/nfpm.tgz
+          sudo tar -C /usr/local/bin -xzf /tmp/nfpm.tgz nfpm
+          nfpm --version
+
+      # One build, not two — and now enforced rather than assumed.
+      # [profile.release] is `lto = "thin"` + `codegen-units = 1`, so a second
+      # cold LTO link would blow this job's 45-minute budget. build-deb.sh's
+      # cargo invocation is byte-identical to the one here, so on the `deb`
+      # path it subsumes this step; the two `if:`s are exact complements, so
+      # exactly one always runs. Splitting it this way keeps ONE source of
+      # truth for the build command instead of relying on an unenforced
+      # coincidence between a workflow and a script.
+      #
+      # `linux-package` is the configuration that actually ships (it's what
+      # makes a packaged build adopt the production `roost` bundle profile
+      # instead of the isolated `roost-iced` one, per `default_profile_kind()`
+      # in `crates/roost-iced/src/main.rs`) — building it here, rather than
       # the featureless dev config, is what makes this lane worth gating.
-      # The e2e step right below still exercises this same binary as an
-      # ordinary dev instance, because it pins `ROOST_BUNDLE_PROFILE`; the
-      # profile-adoption step further down is what actually leaves that
-      # var unset and checks where the packaged binary lands on its own.
+      # Either path leaves target/release/{roost-iced,roostctl} exactly where
+      # every downstream step expects them: the e2e step below exercises the
+      # binary as an ordinary dev instance because it pins
+      # `ROOST_BUNDLE_PROFILE`, and the profile-adoption step further down is
+      # what leaves that var unset and checks where it lands on its own.
       - name: Build Iced + roostctl (release)
+        if: needs.changes.outputs.deb != 'true'
         run: cargo build --release -p roost-iced -p roost-cli --features roost-iced/linux-package
+
+      # build-deb.sh also re-runs third_party/ghostty/build.sh. That's
+      # idempotent on a cache hit, but it needs `zig` on PATH *before* it
+      # reaches its cache check — satisfied by the jdx/mise-action@v4 step
+      # above, which is why this can't move ahead of it.
+      #
+      # Version 0.0.0-ci: nfpm normalizes `-` to `~`, yielding `0.0.0~ci` — a
+      # valid Debian version that can never be mistaken for a real release.
+      - name: Build the .deb (also produces the release binaries)
+        if: needs.changes.outputs.deb == 'true'
+        run: ./linux/scripts/build-deb.sh 0.0.0-ci
 
       - name: Run Iced release-profile E2E (Linux X11)
         env:
@@ -855,6 +917,49 @@ jobs:
           fi
 
           echo "OK: packaged build adopted the production namespace ($SOCKET_PATH)"
+
+      # ---- Packaging checks (deb-gated) -------------------------------------
+      # These three steps run the *same* scripts release.yml runs. Until now
+      # their first execution was during an actual release — i.e. after the
+      # GitHub Release had already been created, with a broken artifact
+      # already attached to it. Running them on ordinary PRs that touch the
+      # packaging paths is the whole point: the release path's only real
+      # artifact checks get proven somewhere other than a real release.
+      # They sit after the profile-adoption assertion above so the cheap,
+      # already-proven check still reports first.
+
+      # Release-critical shell with no other lint anywhere in the repo.
+      # shellcheck ships preinstalled on GitHub's ubuntu runners, so this is
+      # seconds; `bash -n` additionally catches syntax errors in code paths
+      # shellcheck may not flag.
+      - name: Lint the release-path shell scripts
+        if: needs.changes.outputs.deb == 'true'
+        run: |
+          set -euo pipefail
+          shellcheck linux/scripts/*.sh
+          for f in linux/scripts/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Smoke the packaged artifact
+        if: needs.changes.outputs.deb == 'true'
+        run: |
+          set -euo pipefail
+          deb="$(./linux/scripts/resolve-one-deb.sh out)"
+          ./linux/scripts/smoke-deb.sh "${deb}" \
+            --work-dir "${RUNNER_TEMP}/roost-deb-smoke" \
+            --expect-version 0.0.0~ci
+
+      # The smoke above extracts the .deb, so it proves the payload but not
+      # the `Depends:` line — this runner already carries the whole graphics
+      # stack from the build, so a missing dependency would still launch
+      # here. The container run is what catches that.
+      - name: Verify the dependency closure
+        if: needs.changes.outputs.deb == 'true'
+        run: |
+          set -euo pipefail
+          deb="$(./linux/scripts/resolve-one-deb.sh out)"
+          ./linux/scripts/verify-deb-closure.sh "${deb}"
 
       - name: Collect Iced diagnostics
         if: always()
@@ -1335,7 +1440,13 @@ jobs:
     steps:
       - name: Verify no required job failed
         run: |
-          results="${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.iced-release.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
+          # `changes` is first for a reason: it gates every other job, so if it
+          # fails, all of them report `skipped` — which the allowlist below
+          # accepts — and this gate went GREEN with nothing having been built.
+          # Same greenwash shape as the #306 incident, one level further up.
+          # `release.yml`'s ci-gate trusts this check, so that hole reached the
+          # release path.
+          results="${{ needs.changes.result }} ${{ needs.rust-lint.result }} ${{ needs.harness-unit.result }} ${{ needs.themes-parity.result }} ${{ needs.rust-build.result }} ${{ needs.swift-mac.result }} ${{ needs.gtk-build.result }} ${{ needs.iced-build-e2e.result }} ${{ needs.iced-release.result }} ${{ needs.e2e-gtk.result }} ${{ needs.e2e-mac.result }}"
           echo "job results: ${results}"
           # Allowlist, not a denylist. A denylist of failure/cancelled let
           # `abandoned` through — the status GitHub assigns when its own

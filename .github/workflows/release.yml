@@ -224,139 +224,39 @@ jobs:
       - name: Build .deb
         run: ./linux/scripts/build-deb.sh "${GITHUB_REF_NAME#v}"
 
-      # This is the only thing in the release path that actually launches
-      # the artifact being shipped. Nothing upstream (cargo build, nfpm pkg)
-      # can catch "wrong binary staged" or "linux-package silently didn't
-      # compile in" — both fail *only* by the running binary binding the
-      # wrong IPC namespace, which is exactly what this checks. Runs the
-      # dist/roost build-deb.sh just staged (the real packaged build,
-      # feature and all) in a throwaway XDG_* sandbox so it can't touch
-      # anything else on the runner, and deliberately leaves
-      # ROOST_BUNDLE_PROFILE UNSET — the point is to prove the *compiled-in
-      # default* lands on the production `roost` namespace (what existing
-      # GTK users already have on disk), not an env override papering over
-      # a build that defaults to the dev `roost-iced` namespace.
+      # This is the only thing in the release path that actually launches the
+      # artifact being shipped. The assertions live in linux/scripts/
+      # smoke-deb.sh (payload contents, control metadata, and — the real
+      # point — that the packaged binary's compiled-in default lands on the
+      # production `roost` IPC namespace) so the same code can run on
+      # ordinary PRs in ci.yml instead of first executing during a release.
+      # `--expect-version` gets the nfpm-normalized string: nfpm rewrites `-`
+      # to `~` in Debian versions (v0.0.18-rc1 -> 0.0.18~rc1).
       - name: Smoke the packaged artifact
         run: |
           set -euo pipefail
-          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/roost-smoke/runtime"
-          export XDG_DATA_HOME="${RUNNER_TEMP}/roost-smoke/data"
-          export XDG_STATE_HOME="${RUNNER_TEMP}/roost-smoke/state"
-          mkdir -p "${XDG_RUNTIME_DIR}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
-          chmod 700 "${XDG_RUNTIME_DIR}"
+          deb="$(./linux/scripts/resolve-one-deb.sh out)"
+          # Replace only the FIRST `-`, matching nfpm's semver schema: it
+          # splits version from prerelease at the first hyphen and joins them
+          # with `~`, leaving any later hyphen in the prerelease intact
+          # (v1.2.3-rc-2 -> 1.2.3~rc-2). A blanket `tr '-' '~'` would produce
+          # 1.2.3~rc~2 and fail this assertion *after* create-release has
+          # already published the Release.
+          raw="${GITHUB_REF_NAME#v}"
+          ver="${raw/-/\~}"
+          ./linux/scripts/smoke-deb.sh "${deb}" \
+            --work-dir "${RUNNER_TEMP}/roost-smoke" \
+            --expect-version "${ver}"
 
-          # Smoke what nfpm actually produced, not what build-deb.sh staged.
-          # Running ./dist/roost would prove the binary works while leaving
-          # every packaging-layer mistake — a wrong `contents:` destination,
-          # a dropped entry, a lost exec bit — to be discovered by users.
-          shopt -s nullglob
-          debs=(out/*.deb)
-          if [ "${#debs[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one out/*.deb to smoke, found ${#debs[@]}: ${debs[*]:-none}"
-            exit 1
-          fi
-          payload="${RUNNER_TEMP}/roost-smoke/payload"
-          rm -rf "${payload}"; mkdir -p "${payload}"
-          dpkg-deb -x "${debs[0]}" "${payload}"
-          for f in usr/bin/roost usr/bin/roostctl; do
-            if [ ! -x "${payload}/${f}" ]; then
-              echo "::error::${f} missing or not executable inside ${debs[0]}"
-              exit 1
-            fi
-          done
-          UI="${payload}/usr/bin/roost"
-          ROOSTCTL="${payload}/usr/bin/roostctl"
-
-          xvfb-run -a --server-args="-screen 0 1280x800x24" "${UI}" \
-            > "${RUNNER_TEMP}/roost-smoke/app.log" 2>&1 &
-          APP=$!
-          trap 'kill "${APP}" 2>/dev/null || true; wait "${APP}" 2>/dev/null || true' EXIT
-
-          # Poll a successful `identify` round-trip, NOT socket-file
-          # existence: a stale socket file can sit there with nothing
-          # listening, so a file-existence check races and can pass on a
-          # dead UI.
-          identify_out=""
-          ok=0
-          for _ in $(seq 1 60); do
-            if identify_out="$("${ROOSTCTL}" identify 2>/dev/null)"; then
-              ok=1
-              break
-            fi
-            sleep 0.5
-          done
-          if [ "${ok}" -ne 1 ]; then
-            echo "::error::roostctl identify never succeeded against the packaged /usr/bin/roost after 30s — the UI never came up (or never opened its IPC socket)."
-            tail -50 "${RUNNER_TEMP}/roost-smoke/app.log" || true
-            exit 1
-          fi
-          echo "${identify_out}"
-
-          socket_path="$(printf '%s\n' "${identify_out}" | awk -F= '/^socket=/{print $2}')"
-          if [ -z "${socket_path}" ]; then
-            echo "::error::identify succeeded but printed no socket= line: ${identify_out}"
-            exit 1
-          fi
-
-          case "${socket_path}" in
-            "${XDG_RUNTIME_DIR}/roost/"*)
-              echo "socket ${socket_path} is under the production roost/ namespace — ok."
-              ;;
-            *)
-              echo "::error::packaged roost bound socket '${socket_path}', expected it under ${XDG_RUNTIME_DIR}/roost/ (the production GTK/roost namespace shared with existing users). The linux-package feature may be missing from this build."
-              exit 1
-              ;;
-          esac
-
-          if [ -d "${XDG_RUNTIME_DIR}/roost-iced" ]; then
-            echo "::error::${XDG_RUNTIME_DIR}/roost-iced exists — the packaged binary created the DEV iced namespace instead of defaulting to production roost."
-            exit 1
-          fi
-
-      # The step above extracts the .deb, so it validates the payload (file
-      # list, exec bits, destinations) but NOT the dependency closure: this
-      # runner already carries the whole graphics stack from the build step,
-      # so a `Depends:` line that forgot a library would still launch here.
-      # Missing runtime dependencies are the failure mode users actually hit
-      # — the package installs cleanly and then won't start — so the closure
-      # gets checked where nothing is pre-installed: a clean ubuntu:24.04
-      # container with --no-install-recommends, which also proves the
-      # Recommends-vs-Depends split (no Vulkan loader in there at all).
+      # The step above extracts the .deb, so it validates the payload but NOT
+      # the dependency closure: this runner already carries the whole graphics
+      # stack from the build step, so a `Depends:` line that forgot a library
+      # would still launch here. See the script for the rest of the reasoning.
       - name: Verify the dependency closure in a clean container
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          debs=(out/*.deb)
-          if [ "${#debs[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one out/*.deb, found ${#debs[@]}"
-            exit 1
-          fi
-          deb="$(cd "$(dirname "${debs[0]}")" && pwd)/$(basename "${debs[0]}")"
-
-          docker run --rm -v "${deb}:/tmp/roost.deb:ro" ubuntu:24.04 bash -eu -c '
-            apt-get update -qq
-            # --no-install-recommends is the strict case: only what Depends
-            # actually names gets installed.
-            apt-get install -y -qq --no-install-recommends /tmp/roost.deb
-            # xvfb/xauth are the harness, not the package under test.
-            apt-get install -y -qq --no-install-recommends xvfb xauth
-            export XDG_RUNTIME_DIR=/tmp/rt
-            mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
-            xvfb-run -a --server-args="-screen 0 1280x800x24" bash -c "
-              /usr/bin/roost >/tmp/app.log 2>&1 &
-              ok=no
-              for _ in \$(seq 1 60); do
-                if /usr/bin/roostctl identify >/dev/null 2>&1; then ok=yes; break; fi
-                sleep 0.5
-              done
-              if [ \"\$ok\" != yes ]; then
-                echo \"the installed package never came up — likely a missing runtime dependency\"
-                tail -40 /tmp/app.log || true
-                exit 1
-              fi
-              /usr/bin/roostctl identify
-            "
-          ' || { echo "::error::the .deb installed but could not launch in a clean container — its Depends: list is incomplete."; exit 1; }
+          deb="$(./linux/scripts/resolve-one-deb.sh out)"
+          ./linux/scripts/verify-deb-closure.sh "${deb}"
 
       - name: Upload .deb to the Release
         env:
@@ -365,19 +265,14 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
           # Match on the arch this job's label claims, not any .deb: the
           # `file#label` syntax needs one concrete path, and a bare glob would
           # happily hand an arm64 package to the job that labels it Intel/AMD
-          # — the exact mislabeling the labels exist to prevent. Asserting the
-          # count also means a build that emitted nothing fails here, naming
-          # the arch, instead of passing an unexpanded glob down to gh.
-          debs=(out/*_"${ARCH}".deb)
-          if [ "${#debs[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one out/*_${ARCH}.deb, found ${#debs[@]}"
-            exit 1
-          fi
-          gh release upload "${GITHUB_REF_NAME}" "${debs[0]}#${ASSET_LABEL}" --clobber
+          # — the exact mislabeling the labels exist to prevent. resolve-one-deb
+          # also means a build that emitted nothing fails here, naming the arch,
+          # instead of passing an unexpanded glob down to gh.
+          deb="$(./linux/scripts/resolve-one-deb.sh out --arch "${ARCH}")"
+          gh release upload "${GITHUB_REF_NAME}" "${deb}#${ASSET_LABEL}" --clobber
 
   mac:
     needs: create-release
