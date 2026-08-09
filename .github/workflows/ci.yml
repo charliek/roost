@@ -723,8 +723,20 @@ jobs:
           key: cargo-iced-release-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-iced-release-${{ runner.os }}-
 
+      # One build, not two: [profile.release] is `lto = "thin"` +
+      # `codegen-units = 1`, and a second cold LTO link would blow the
+      # job's 45-minute budget. `linux-package` is the configuration that
+      # actually ships (it's what makes a packaged build adopt the
+      # production `roost` bundle profile instead of the isolated
+      # `roost-iced` one, per `default_profile_kind()` in
+      # `crates/roost-iced/src/main.rs`) — building it here, rather than
+      # the featureless dev config, is what makes this lane worth gating.
+      # The e2e step right below still exercises this same binary as an
+      # ordinary dev instance, because it pins `ROOST_BUNDLE_PROFILE`; the
+      # profile-adoption step further down is what actually leaves that
+      # var unset and checks where the packaged binary lands on its own.
       - name: Build Iced + roostctl (release)
-        run: cargo build --release -p roost-iced -p roost-cli
+        run: cargo build --release -p roost-iced -p roost-cli --features roost-iced/linux-package
 
       - name: Run Iced release-profile E2E (Linux X11)
         env:
@@ -739,9 +751,104 @@ jobs:
           ROOST_ROOSTCTL: ${{ github.workspace }}/target/release/roostctl
           ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-release-x11-artifacts
           ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-iced-e2e-release-x11-logs
+        # Even though ROOST_ICED_BIN above is the *packaged*
+        # (linux-package) binary, it lands on the isolated `roost-iced`
+        # dev profile here just like a plain dev build: ui.py sets
+        # ROOST_BUNDLE_PROFILE=iced unconditionally for every "iced"
+        # target launch (tools/roosttest/ui.py, ~line 481), which outranks
+        # the compiled-in default per BundleProfile::resolve's precedence
+        # order. `e2e-iced-release-ci` (Makefile) already guards that
+        # ROOST_ICED_BIN is non-empty — a blank value would silently fall
+        # back to a cargo-built debug binary and test the wrong thing —
+        # so that check isn't duplicated here.
         run: >
           xvfb-run -a --server-args="-screen 0 1920x1080x24"
           make e2e-iced-release-ci
+
+      # The only pre-release exercise of the linux-package adoption
+      # mechanism: without this, "does the packaged binary really land on
+      # the production `roost` namespace instead of the isolated
+      # `roost-iced` one" is first proven at tag time, in front of users
+      # doing the deb upgrade. Runs the SAME already-built binary above,
+      # but with ROOST_BUNDLE_PROFILE deliberately left unset (unlike the
+      # e2e step above, which pins it to `iced`) so
+      # `default_profile_kind()`'s packaged+Linux branch gets to decide
+      # the profile on its own, exactly as it will for a real user.
+      - name: Assert the packaged build adopts the production profile
+        env:
+          ICED_BACKEND: wgpu
+          RUST_LOG: warn
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/iced-release-profile-check/run
+          XDG_DATA_HOME: ${{ runner.temp }}/iced-release-profile-check/data
+          XDG_STATE_HOME: ${{ runner.temp }}/iced-release-profile-check/state
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          UI_BIN="${GITHUB_WORKSPACE}/target/release/roost-iced"
+          ROOSTCTL_BIN="${GITHUB_WORKSPACE}/target/release/roostctl"
+          UI_LOG="${RUNNER_TEMP}/iced-release-profile-check.log"
+
+          xvfb-run -a --server-args="-screen 0 1280x800x24" "$UI_BIN" >"$UI_LOG" 2>&1 &
+          UI_PID=$!
+
+          cleanup() {
+            # A no-op kill (UI already dead, or never started) must not
+            # fail the job.
+            kill "$UI_PID" >/dev/null 2>&1 || true
+            wait "$UI_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # Poll a real `identify` round-trip, NOT the socket file's
+          # existence — a stale socket file with nothing listening would
+          # make a file check pass and race the real readiness signal.
+          IDENTIFY_OUTPUT=""
+          for _ in $(seq 1 60); do
+            if IDENTIFY_OUTPUT=$("$ROOSTCTL_BIN" identify 2>/dev/null); then
+              break
+            fi
+            IDENTIFY_OUTPUT=""
+            sleep 0.5
+          done
+
+          if [ -z "$IDENTIFY_OUTPUT" ]; then
+            echo "::error::packaged roost-iced never answered 'roostctl identify' after ~30s"
+            echo "--- UI log ($UI_LOG) ---"
+            cat "$UI_LOG" || true
+            exit 1
+          fi
+
+          SOCKET_PATH=$(printf '%s\n' "$IDENTIFY_OUTPUT" | awk -F= '$1 == "socket" { print $2 }')
+
+          if [ -z "$SOCKET_PATH" ]; then
+            echo "::error::could not parse a socket= line out of 'roostctl identify' output:"
+            printf '%s\n' "$IDENTIFY_OUTPUT"
+            exit 1
+          fi
+
+          # 1. The reported socket must be under the production
+          #    namespace ($XDG_RUNTIME_DIR/roost/), not the isolated
+          #    roost-iced one.
+          case "$SOCKET_PATH" in
+            "$XDG_RUNTIME_DIR"/roost/*)
+              ;;
+            *)
+              echo "::error::packaged build's socket is not under \$XDG_RUNTIME_DIR/roost/ (production namespace): $SOCKET_PATH"
+              exit 1
+              ;;
+          esac
+
+          # 2. The isolated roost-iced/ namespace must not have been
+          #    created at all.
+          if [ -d "$XDG_RUNTIME_DIR/roost-iced" ]; then
+            echo "::error::packaged build still created the isolated roost-iced/ namespace at $XDG_RUNTIME_DIR/roost-iced — linux-package adoption did not take effect"
+            exit 1
+          fi
+
+          echo "OK: packaged build adopted the production namespace ($SOCKET_PATH)"
 
       - name: Collect Iced diagnostics
         if: always()
