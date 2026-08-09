@@ -93,7 +93,15 @@ timeout "${DOCKER_TIMEOUT}" docker run --rm \
     # turns a finished check into a hung one.
     kill \"\$ui\" 2>/dev/null || true
     wait \"\$ui\" 2>/dev/null || true
-  "
+  " || {
+    inner=$?
+    # Re-map the inner timeout off 124. Both timeouts exit 124, and the inner
+    # one propagates out as the container status, so leaving it would make the
+    # launch timeout report itself as the outer docker budget — the same
+    # misdiagnosis this script was rewritten to stop making, one layer down.
+    [ "$inner" -eq 124 ] && { tail -40 /tmp/app.log || true; exit 125; }
+    exit "$inner"
+  }
 '
 rc=$?
 set -e
@@ -104,7 +112,10 @@ set -e
 case "${rc}" in
   0) ;;
   124)
-    die "the closure check timed out after ${DOCKER_TIMEOUT}s (docker pull, apt, or the UI launch wedged). This is a harness/environment failure, NOT evidence about the Depends: list."
+    die "the closure check exceeded its overall ${DOCKER_TIMEOUT}s budget before the UI launch was reached (docker pull or apt wedged). This is a harness/environment failure, NOT evidence about the Depends: list."
+    ;;
+  125)
+    die "the installed package did not answer roostctl identify within ${LAUNCH_TIMEOUT}s and the launch was killed. Distinct from the ${DOCKER_TIMEOUT}s budget above: the package DID install, so this points at the app or its runtime dependencies, not at docker or apt."
     ;;
   *)
     die "the .deb installed but did not come up in a clean container (exit ${rc}). The most likely cause is an incomplete Depends: list — the container has nothing preinstalled — but check the log above before concluding that: a docker or apt-mirror failure lands here too."

@@ -30,6 +30,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --arch)
       [ "$#" -ge 2 ] || { usage >&2; die "--arch requires a value"; }
+      # An empty value would fall through to the unfiltered branch and match
+      # any .deb, silently disabling the guard this flag exists for.
+      # release.yml passes "${ARCH}" from the matrix, so an unset ARCH could
+      # otherwise hand an arm64 package to the job that labels it Intel/AMD.
+      [ -n "$2" ] || { usage >&2; die "--arch requires a non-empty value"; }
       arch="$2"
       shift 2
       ;;

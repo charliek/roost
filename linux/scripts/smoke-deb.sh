@@ -84,11 +84,19 @@ cleanup() {
   if [ -n "${APP}" ]; then
     # TERM the whole process group, not just $APP: $APP is the xvfb-run
     # wrapper, and reaping it does not necessarily reap the Xvfb + roost
-    # children it started. `wait` before the KILL sweep so the UI gets a
-    # chance to shut down cleanly.
+    # children it started.
     kill -TERM -- "-${APP}" 2>/dev/null || true
-    wait "${APP}" 2>/dev/null || true
+    # Poll for a clean exit on a deadline rather than a bare `wait`. An
+    # unbounded wait here would block the EXIT trap forever if anything in
+    # the group ignored SIGTERM — the same hang this script's sibling was
+    # rewritten to prevent, and on the same release-gating path. The KILL
+    # sweep has to be reachable, so it cannot sit behind the wait.
+    for _ in $(seq 1 20); do
+      kill -0 "${APP}" 2>/dev/null || break
+      sleep 0.5
+    done
     kill -KILL -- "-${APP}" 2>/dev/null || true
+    wait "${APP}" 2>/dev/null || true
   fi
   # Only ever delete a directory this script created. A caller-supplied
   # --work-dir keeps its contents — after a failure the app log in there is
